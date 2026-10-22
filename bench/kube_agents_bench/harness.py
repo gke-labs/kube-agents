@@ -640,18 +640,14 @@ _FAILURE_STATUSES = frozenset({"blocked", "triage", "failed"})
 _RATE_LIMIT_REASON_PREFIX = "provider rate limit: API retries exhausted"
 _FAILURE_REASON_PATTERN = re.compile(r"\bfailure_reason=([a-zA-Z0-9_]+)\b")
 _LITELLM_429_PATTERN = re.compile(
-    r"\b(?:429|RESOURCE_EXHAUSTED|Too Many Requests|RateLimitError|quota exceeded|API retries exhausted)\b",
+    r'(?:"(?:code|status)":\s*429\b|status_code=429\b|HTTP/\d\.\d"\s+429\b|\bRESOURCE_EXHAUSTED\b|\bRateLimitError\b)',
     re.IGNORECASE,
 )
-_MAX_LITELLM_LOG_READ = 2 * 1024 * 1024
 
 
 def _scan_log_for_429(path: Path) -> bool:
     try:
-        size = path.stat().st_size
         with path.open("r", encoding="utf-8", errors="replace") as f:
-            if size > _MAX_LITELLM_LOG_READ:
-                f.seek(size - _MAX_LITELLM_LOG_READ)
             return bool(_LITELLM_429_PATTERN.search(f.read()))
     except OSError:
         return False
@@ -670,14 +666,13 @@ def _extract_infra_failure_reason(text: str | None) -> str | None:
     return None
 
 
-def _corroborate_platform_rate_limit(timeout: float = 10.0) -> bool:
-    """Verify provider quota exhaustion against the platform inference gateway (LiteLLM) log.
+def _corroborate_platform_rate_limit() -> bool | None:
+    """Verify provider quota exhaustion against platform inference gateway (LiteLLM) log if available.
 
-    A worker outside goal mode can invoke ``kanban_block`` with ``kind="transient"``
-    and the rate limit prefix directly. To prevent worker-fabricated 429 blocks from
-    escaping evaluation, board-reported rate limits are corroborated against the
-    platform's LiteLLM proxy log (which records Vertex AI 429 RESOURCE_EXHAUSTED events)
-    when proxy telemetry is available.
+    Returns:
+        True: Telemetry log was read and confirmed a 429 status code or RESOURCE_EXHAUSTED event.
+        False: Telemetry log was read and showed no 429 event (refusing infra classification).
+        None: Telemetry log was unavailable at settle time (telemetry not pre-collected).
     """
     path = os.environ.get("LITELLM_LOG_PATH")
     if path:
@@ -689,7 +684,7 @@ def _corroborate_platform_rate_limit(timeout: float = 10.0) -> bool:
         if art_path.is_file():
             return _scan_log_for_429(art_path)
 
-    return True
+    return None
 
 
 def _mark_result_infra_failure(result: AgentResult, detail: str) -> None:
@@ -2633,8 +2628,8 @@ class KubeAgentsHarness(AgentHarness):
             # RATE_LIMIT_BLOCK_KIND ("transient"), upstream's kanban_block tool also
             # accepts "transient" outside goal mode (hermes_cli/kanban_db.py:93).
             # Non-transient blocks (e.g. worker-authored needs_input or capability per
-            # SOUL.md §0) are excluded here, and transient board messages are further
-            # corroborated against platform inference gateway telemetry in _settle.
+            # SOUL.md §0) are excluded here, and transient board messages are checked
+            # against platform inference gateway telemetry in _settle when available.
             if status in ("blocked", "triage") and bblock_kinds.get(task_id) != "transient":
                 return []
             if task_id in bsummaries:
@@ -3392,14 +3387,16 @@ class KubeAgentsHarness(AgentHarness):
             for text in board_messages:
                 reason = _extract_infra_failure_reason(text)
                 if reason:
-                    if _corroborate_platform_rate_limit():
-                        infra_reason = reason
-                        infra_detail = f"card on board recorded {reason}: {text[:200]}"
-                        break
-                    else:
+                    corroborated = _corroborate_platform_rate_limit()
+                    if corroborated is False:
                         result.errors.append(
                             f"card on board recorded {reason} ({text[:200]}) but platform proxy log showed no 429"
                         )
+                    else:
+                        infra_reason = reason
+                        infra_detail = f"card on board recorded {reason}: {text[:200]}"
+                        result.metadata["platform_rate_limit_corroborated"] = (corroborated is True)
+                        break
 
         _purge_card_state(awaited, _EXEC_TIMEOUT)
 

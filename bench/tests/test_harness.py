@@ -4605,9 +4605,9 @@ def test_worker_with_tool_calls_before_429_rate_limit_is_infrastructure(
 def test_litellm_log_with_429_in_token_count_or_latency_does_not_corroborate(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
-    """A log with 429 appearing only as a substring in token counts or latencies does not match word-boundary 429 pattern."""
+    """A log with 429 appearing as a bare numeric field for tokens/latencies does not match HTTP status code pattern."""
     log_file = tmp_path / "litellm.log"
-    log_file.write_text('INFO: 200 OK POST /v1/chat/completions {"prompt_tokens": 14293, "latency_ms": 1429, "request_id": "a429f"}\n')
+    log_file.write_text('INFO: 200 OK POST /v1/chat/completions {"prompt_tokens": 429, "latency_ms": 429, "request_id": "req-429-x"}\n')
     monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
 
     stub_agent.turns = [
@@ -4705,6 +4705,41 @@ def test_platform_429_corroboration_from_litellm_log_marks_infra(
 
     assert any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
     assert result.output == ""
+    assert result.metadata.get("platform_rate_limit_corroborated") is True
+
+
+def test_platform_429_corroboration_when_log_absent_records_metadata_and_marks_infra(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """When ARTIFACTS is set but litellm.log is absent at settle time, transient block marks infra with metadata recorded."""
+    monkeypatch.setenv("ARTIFACTS", str(tmp_path))
+
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("failed", block_kind="transient"),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {
+                    _TASK_ID: f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=rate_limit): 429 quota exhausted"
+                },
+                "errors": {},
+                "block_kinds": {_TASK_ID: "transient"},
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Investigate.")
+
+    assert any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert result.output == ""
+    assert result.metadata.get("platform_rate_limit_corroborated") is False
 
 
 def test_record_unsettled_prepends_marked_ceiling_error_preserving_existing_errors(results_json: Any) -> None:

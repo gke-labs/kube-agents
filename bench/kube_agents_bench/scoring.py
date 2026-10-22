@@ -1238,6 +1238,12 @@ def classify_rep(
     infra_marker_entry = next((str(e) for e in errors if INFRA_FAILURE_MARKER in str(e)), None)
     if infra_marker_entry is not None:
         detail = infra_marker_entry.partition(INFRA_FAILURE_MARKER)[2].lstrip(": ").strip()
+        if "delegated worker" in detail:
+            return rep(
+                "infra",
+                f"{INFRA_FAILURE_MARKER}: delegated worker hit an infrastructure condition: "
+                f"the record is scored, but there is no answer in it to grade ({detail})",
+            )
         return rep(
             "infra",
             "the harness recorded an infrastructure condition or exhausted its retries without reaching the agent "

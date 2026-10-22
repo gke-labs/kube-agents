@@ -1722,6 +1722,9 @@ def test_reps_hitting_429_quota_are_infra_and_do_not_trigger_judged_regression(
     )
     assert verdict.rung is Rung.GREEN
     assert verdict.reps[0].outcome == "infra"
+    assert "without reaching the agent" not in verdict.reps[0].reason
+    assert "delegated worker hit an infrastructure condition" in verdict.reps[0].reason
+    assert INFRA_FAILURE_MARKER in verdict.reps[0].reason
     assert verdict.reps[1].outcome == "infra"
     assert verdict.reps[2].outcome == "pass"
 
