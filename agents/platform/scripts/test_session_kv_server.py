@@ -2264,9 +2264,11 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             self.real_trigger("sess-aborted", "msg", {}, anchor_id)
             self.assertEqual(self._inject("aborted-api-6cfdb6b98b-bbbbb")["status"], "injected")
 
-    def test_only_a_4xx_reads_as_a_refused_turn(self):
+    def test_only_a_5xx_other_than_503_reads_as_a_started_turn(self):
         import urllib.error
-        for code, started in ((307, True), (400, False), (404, False), (500, True), (503, True)):
+        # 503 is Hermes's gateway_draining and session_db_unavailable, both
+        # before the turn; a POST 307 is not followed.
+        for code, started in ((307, False), (400, False), (404, False), (500, True), (502, True), (503, False)):
             with patch("urllib.request.urlopen", side_effect=urllib.error.HTTPError("http://gw", code, "x", {}, None)):
                 self.assertEqual(session_kv_server._start_agent_turn("http://gw", "s", "q", {}), started, code)
         with patch("urllib.request.urlopen", side_effect=TimeoutError("read timed out")):

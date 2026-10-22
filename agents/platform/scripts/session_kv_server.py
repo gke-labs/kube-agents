@@ -552,19 +552,23 @@ INCIDENT_WORKLOAD_DEDUP_MAX_SECONDS = 86400
 INCIDENT_WORKLOAD_DEDUP_SECONDS = min(
     _alert_daily_limit("INCIDENT_WORKLOAD_DEDUP_SECONDS", 0), INCIDENT_WORKLOAD_DEDUP_MAX_SECONDS
 )
-# A Deployment's pod: its ReplicaSet's pod-template hash, then the pod's own
-# suffix (`checkout-6cfdb6b98b-zwv24`). The one pod name clean_workload_name
-# strips that still names one workload; its second pattern also strips the last
-# segment of a bare pod (`api-cache` -> `api`), which is a display choice and
-# not an identity, so only this one sets a fold key.
+# A pod named like a Deployment's: 8-10 hex characters (its ReplicaSet's
+# pod-template hash), then the pod's own suffix (`checkout-6cfdb6b98b-zwv24`).
+# A CronJob's pods have the same shape, the run minute standing in for the hash,
+# and so does any pod whose owner's name happens to end in 8-10 hex characters.
+# The one pattern clean_workload_name strips that names one workload in
+# practice; its second also strips the last segment of a bare pod
+# (`api-cache` -> `api`), which is a display choice and not an identity, so only
+# this one sets a fold key.
 DEPLOYMENT_POD_NAME_RE = re.compile(r"^(.*?)-[a-f0-9]{8,10}-[a-z0-9]{5}$")
 # The severity get_severity_details grades a blocker, which folds only into an
 # anchor of its own grade (_workload_incident_anchor).
 CRITICAL_SEVERITY = "Critical"
-# A refused turn is a 4xx: the gateway answered and said no. A 5xx can come
-# after the turn already filed its card (_start_agent_turn).
-HTTP_CLIENT_ERROR_MIN = 400
+# A 5xx other than 503 can come after the turn already filed its card, so it
+# reads as a started turn; a 503 and anything below 500 come before any turn
+# (_start_agent_turn).
 HTTP_SERVER_ERROR_MIN = 500
+HTTP_SERVICE_UNAVAILABLE = 503
 # Bounds the anchor lookup's wait on a locked database, as the other ledger
 # writers here do; a lookup that gives up announces the event.
 INCIDENT_FOLD_DB_TIMEOUT_S = 5.0
@@ -1249,10 +1253,12 @@ def mark_triage_not_started(event_row_id: Optional[int]) -> None:
 def _fold_key(object_kind: str, object_name: str) -> str:
     """What an event folds on, or "" for an event that neither folds nor anchors.
 
-    A Deployment's pod folds on its workload, the name clean_workload_name
-    gives it. Any other Pod name does not fold: a StatefulSet's `web-0` and
-    `web-1` keep their ordinals, and a bare pod's last segment is not a replica
-    suffix. A non-Pod object folds on its own name, which is exact.
+    A pod whose name has a Deployment pod's shape (DEPLOYMENT_POD_NAME_RE)
+    folds on its workload, the name clean_workload_name gives it. Any other Pod
+    name does not fold: a StatefulSet's `web-0` and `web-1` keep their
+    ordinals, and a DaemonSet's, a Job's or a bare pod's last segment is not
+    one workload's replica suffix. A non-Pod object folds on its own name,
+    which is exact.
     """
     if object_kind.lower() != "pod":
         return object_name
@@ -2862,15 +2868,17 @@ def _stall_agent_query(payload: Dict[str, Any]) -> str:
 def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[str, str]) -> bool:
     """Post the agent query request to execute the diagnostic reasoning loop.
 
-    False only when the gateway refused the turn with a 4xx. Anything else is
-    True. The route (Hermes `_handle_session_chat`) runs its checks before the
-    turn and answers a failed one with a 4xx; its one pre-turn 500 is for a
-    model lock this caller never requests. A 5xx otherwise comes out of
-    `_run_agent`, after the turn started and possibly after the front door
-    filed its card, and a transport error may be a turn that outlived the
-    timeout. Reading either as refused would let a sibling open a second
-    triage beside it (mark_triage_not_started). A gateway that is down fails
-    `_create_gateway_session` first, which does release the anchor.
+    True when the turn may have started: a 5xx other than 503, or a transport
+    error, which may be a turn that outlived the timeout. Reading either as
+    refused would let a sibling open a second triage beside it
+    (mark_triage_not_started). Anything else is False. In the Hermes route
+    (`_handle_session_chat`) a 4xx is a failed check before the turn, a 503 is
+    `gateway_draining` (the admission wrapper, which `POST /api/sessions` does
+    not have, so a draining gateway creates the session and refuses the turn)
+    or `session_db_unavailable`, and a 307 or 308 is a redirect urlopen does
+    not follow for a POST; no turn ran for any of them. A 5xx out of
+    `_run_agent` comes after the turn started, possibly after the front door
+    filed its card.
     """
     try:
         req = urllib.request.Request(
@@ -2879,13 +2887,14 @@ def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[s
             headers=headers,
             method="POST"
         )
-        # urlopen raises HTTPError for every non-2xx, so a returned response
-        # is an accepted turn.
+        # urlopen raises HTTPError for every non-2xx it does not follow, so a
+        # returned response is an accepted turn (a followed 301/302/303 would
+        # land elsewhere as a GET; the Hermes route sends none).
         with urllib.request.urlopen(req, timeout=300.0):
             pass
     except urllib.error.HTTPError as exc:
         logger.error(f"Gateway API chat execution failed (status {exc.code})")
-        return not HTTP_CLIENT_ERROR_MIN <= exc.code < HTTP_SERVER_ERROR_MIN
+        return exc.code >= HTTP_SERVER_ERROR_MIN and exc.code != HTTP_SERVICE_UNAVAILABLE
     except Exception as exc:
         logger.error(f"Failed to call gateway API chat execution: {exc}")
     return True
