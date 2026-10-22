@@ -439,6 +439,7 @@ type Bridge struct {
 	// is not reported as a lost one.
 	routesMu sync.Mutex
 	routes   map[string]rememberedRoute
+	kanban   kanbanTracker
 	// The activity door (activity.go); nil when Config.ActivityListen is "".
 	activityLn   net.Listener
 	activitySrv  *http.Server
@@ -561,6 +562,9 @@ func (b *Bridge) Run(ctx context.Context) error {
 		return fmt.Errorf("startup sweep: %w", err)
 	}
 	b.serveActivity(ctx)
+	if b.cfg.Executor == ExecutorAPI {
+		go b.watchOutOfTurnKanbanCards(ctx)
+	}
 	for i := 0; i < b.cfg.Concurrency; i++ {
 		b.wg.Add(1)
 		go b.worker(ctx)

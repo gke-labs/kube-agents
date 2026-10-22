@@ -122,6 +122,20 @@ const defaultCardStopTimeout = 75 * time.Second
 // has to wait for the turn it just cancelled.
 const cardStopTimeoutFloor = 30 * time.Second
 
+// The in-cluster MCP HTTP listener's environment variables, default listen
+// address, and disable tokens.
+const (
+	envMCPListen           = "A2A_MCP_LISTEN"
+	envMCPToken            = "A2A_MCP_TOKEN"
+	envMCPNATSUser         = "A2A_MCP_NATS_USER"
+	envMCPNATSPassword     = "A2A_MCP_NATS_PASSWORD"
+	defaultMCPListen       = "127.0.0.1:8089"
+	mcpListenOff           = "off"
+	mcpListenFalse         = "false"
+	mcpListenDisabled      = "disabled"
+	mcpListenNone          = "none"
+)
+
 // Config is the gateway's runtime configuration. The env contract matches
 // what the W6 operator renders onto the a2a-gateway Deployment; everything
 // else has playground defaults.
@@ -272,10 +286,25 @@ type Config struct {
 	// MetricsPort is the metrics-only listener's port (A2A_METRICS_PORT);
 	// zero means no listener. It binds every interface, because its caller
 	// is the managed-Prometheus collector on the pod network, and serves
-	// MetricsPath and nothing else. It may not be either door's port: a door
-	// that lost its port to this listener would fail to bind, and a door
-	// that won it would be what the collector's NetworkPolicy rule admits.
+	// MetricsPath and nothing else. It may not be either door's port or the
+	// MCP listener's port: a door or MCP listener that lost its port to this
+	// listener would fail to bind, and one that won it would be what the
+	// collector's NetworkPolicy rule admits.
 	MetricsPort int
+
+	// MCPListen is the Model Context Protocol (MCP) HTTP listener address
+	// (A2A_MCP_LISTEN, default "127.0.0.1:8089"; "off", "false", "disabled",
+	// or "none" disables it). When armed, the gateway serves /mcp,
+	// /mcp/swarm, /mcp/events, and /healthz backed by the in-cluster NATS bus.
+	MCPListen string
+	// MCPToken is the optional bearer token required on /mcp, /mcp/swarm, and
+	// /mcp/events requests (A2A_MCP_TOKEN).
+	MCPToken string
+	// MCPNATSUser and MCPNATSPassword override the NATS credentials used by
+	// the in-cluster MCP server (A2A_MCP_NATS_USER / A2A_MCP_NATS_PASSWORD,
+	// defaulting to "console" or NATSUser/NATSPassword).
+	MCPNATSUser     string
+	MCPNATSPassword string
 
 	// DisplayMode is the existing Chat integration's default-vs-debug split
 	// (GoogleChatSpec.Mode), honoured by this relay rather than reinvented:
@@ -594,6 +623,9 @@ func (c *Config) InjectArmed() bool { return c.InjectListen != "" }
 // A2ADoorArmed reports whether the A2A door is open.
 func (c *Config) A2ADoorArmed() bool { return c.A2ADoorListen != "" }
 
+// MCPArmed reports whether the in-cluster MCP HTTP listener is configured.
+func (c *Config) MCPArmed() bool { return c.MCPListen != "" }
+
 // FromEnv loads the config from the environment.
 func FromEnv() (*Config, error) {
 	cfg := &Config{
@@ -661,6 +693,18 @@ func FromEnv() (*Config, error) {
 			cfg.A2ADoorAllowedUsers = append(cfg.A2ADoorAllowedUsers, u)
 		}
 	}
+	mcpListen := strings.TrimSpace(os.Getenv(envMCPListen))
+	switch strings.ToLower(mcpListen) {
+	case "":
+		cfg.MCPListen = defaultMCPListen
+	case mcpListenOff, mcpListenFalse, mcpListenDisabled, mcpListenNone:
+		cfg.MCPListen = ""
+	default:
+		cfg.MCPListen = mcpListen
+	}
+	cfg.MCPToken = strings.TrimSpace(os.Getenv(envMCPToken))
+	cfg.MCPNATSUser = strings.TrimSpace(os.Getenv(envMCPNATSUser))
+	cfg.MCPNATSPassword = os.Getenv(envMCPNATSPassword)
 	metricsPort, err := metricsPortFromEnv(cfg)
 	if err != nil {
 		return nil, err
@@ -915,6 +959,7 @@ func metricsPortFromEnv(cfg *Config) (int, error) {
 	for _, door := range []struct{ name, listen string }{
 		{"the inject door", cfg.InjectListen},
 		{"the A2A door", cfg.A2ADoorListen},
+		{"the MCP listener", cfg.MCPListen},
 	} {
 		if door.listen == "" {
 			continue

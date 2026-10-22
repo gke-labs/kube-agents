@@ -2220,7 +2220,7 @@ The gateway serves Prometheus counters on a metrics-only listener, the credentia
 pattern copied: its own port, `/metrics` and nothing else (any other path is 404, any method
 but GET or HEAD 405), every interface rather than loopback because its caller is the managed-Prometheus
 collector on the pod network. `A2A_METRICS_PORT` names the port; unset means no listener, and a
-value that is not a port, or is either door's port, refuses the boot. A port that will not bind
+value that is not a port, or is either door's port or the MCP listener's port, refuses the boot. A port that will not bind
 costs the gateway its metrics and logs an `ALERT` line; conversations carry on. The operator
 renders `A2A_METRICS_PORT=9096` and declares container port `a2a-metrics` on 9096 from one
 constant (`a2aGatewayMetricsPort`), and the chart's `<name>-a2a-gateway-monitoring`

@@ -1891,3 +1891,73 @@ func TestAPI_CancelBetweenTurnsStaysCanceledWhenTheResultCopyFails(t *testing.T)
 		t.Fatalf("%d requests sent", n)
 	}
 }
+
+// A console fan-out used to deliver the raw concatenation of every card's report as the answer
+// (16 clusters -> ~27 KB, no synthesis). Now: the raw results go on the stream as a turn artifact,
+// and one extra API turn on the same session (its own Idempotency-Key, never the opening turn's)
+// synthesizes them; a substantive model answer is kept as is; a failing synthesis turn falls back
+// to the concatenation rather than failing the task.
+func TestAPI_CardResultsAreSynthesizedNotConcatenated(t *testing.T) {
+	_, url := startServer(t)
+	var synthMode atomic.Int32 // 0 = answer, 1 = refuse
+	stub := newAPIStub(t, func(w http.ResponseWriter, r *http.Request, c apiCall) {
+		if strings.Contains(c.prompt, "specialist card(s) you filed") {
+			if synthMode.Load() == 1 {
+				http.Error(w, "nope", http.StatusInternalServerError)
+				return
+			}
+			if synthMode.Load() == 2 {
+				writeCompletion(w, c.sessionID, "[SILENT]")
+				return
+			}
+			writeCompletion(w, c.sessionID, "SYNTH: 2/2 healthy")
+			return
+		}
+		writeCompletion(w, c.sessionID, "answer to "+c.prompt)
+	})
+	b := startAPIBridge(t, url, stub, nil)
+	run := &taskRun{origin: &lib.Envelope{TaskID: "task-cards", ContextID: "ctx-cards", CorrelationID: "corr"}, state: stateRunning}
+	cards := []kanbanCardRow{
+		{ID: "t-1", Title: "check a", Status: "done", Result: strings.Repeat("a is healthy. ", 40)},
+		{ID: "t-2", Title: "check b", Status: "done", Result: strings.Repeat("b is healthy. ", 40)},
+	}
+	parts := []string{cards[0].Result, cards[1].Result}
+
+	got := b.synthesizeCardAnswer(run, context.Background(), "a2a-ctx-cards", 1, "checking 2 clusters.", cards, parts)
+	if got != "SYNTH: 2/2 healthy" {
+		t.Fatalf("short model answer should be replaced by the synthesis, got %q", got[:min(len(got), 80)])
+	}
+	calls := stub.seen()
+	if len(calls) != 1 || calls[0].idempotency != "task-cards/synth-1" || !strings.Contains(calls[0].prompt, "### Card 2: check b (done)") {
+		t.Fatalf("synthesis request = %+v", calls)
+	}
+
+	long := strings.Repeat("The fleet is fine. ", 60)
+	if got := b.synthesizeCardAnswer(run, context.Background(), "a2a-ctx-cards", 2, long, cards, parts); got != long {
+		t.Fatalf("a substantive model answer must be kept, got %q", got[:min(len(got), 80)])
+	}
+	if n := len(stub.seen()); n != 1 {
+		t.Fatalf("no synthesis turn expected for a substantive answer; requests = %d", n)
+	}
+
+	synthMode.Store(1)
+	got = b.synthesizeCardAnswer(run, context.Background(), "a2a-ctx-cards", 3, "checking.", cards, parts)
+	if got != strings.Join(parts, "\n\n") {
+		t.Fatalf("a refused synthesis turn must fall back to the raw concatenation, got %q", got[:min(len(got), 80)])
+	}
+	if run.state != stateRunning {
+		t.Fatalf("synthesis failure must never finalize the task; state = %v", run.state)
+	}
+
+	// The chat doctrine's "[SILENT]" (soak round 8: a single-card question delivered the literal
+	// token) is never an answer on a console conversation: fall back to the evidence.
+	synthMode.Store(2)
+	if got := b.synthesizeCardAnswer(run, context.Background(), "a2a-ctx-cards", 4, "checking.", cards, parts); got != strings.Join(parts, "\n\n") {
+		t.Fatalf("[SILENT] synthesis must fall back to the raw results, got %q", got[:min(len(got), 80)])
+	}
+	// A single card's report is the answer; no synthesis turn is spent on it.
+	before := len(stub.seen())
+	if got := b.synthesizeCardAnswer(run, context.Background(), "a2a-ctx-cards", 5, "checking.", cards[:1], parts[:1]); got != parts[0] || len(stub.seen()) != before {
+		t.Fatalf("single card should be returned verbatim without a synthesis turn; got %q, requests %d->%d", got[:min(len(got), 60)], before, len(stub.seen()))
+	}
+}

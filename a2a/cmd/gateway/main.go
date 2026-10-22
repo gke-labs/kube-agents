@@ -25,6 +25,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/gateway"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/mcp"
 )
 
 const (
@@ -36,6 +37,10 @@ const (
 	// metricsUnavailableAlert is the one line a metrics listener that could
 	// not start leaves, whichever step refused it.
 	metricsUnavailableAlert = "ALERT metrics listener unavailable; the gateway serves no /metrics until it restarts, and conversations are unaffected"
+
+	// defaultMCPNATSUser is the NATS principal the in-cluster MCP server dials
+	// as when A2A_MCP_NATS_USER is unset.
+	defaultMCPNATSUser = "console"
 )
 
 func main() {
@@ -236,6 +241,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		"backend", backend,
 		"injectDoor", cfg.InjectArmed(),
 		"a2aDoor", cfg.A2ADoorArmed(),
+		"mcpServer", cfg.MCPArmed(),
 		"defaultAddressee", cfg.DefaultAddressee,
 		"spawnSessions", cfg.SpawnSessions,
 		"idleTTL", cfg.IdleTTL.String())
@@ -286,11 +292,59 @@ func chatNotifier(cfg *gateway.Config, backend gateway.Adapter, conversations fu
 // which cannot start leaves its ALERT line and does not stop the gateway.
 func serve(ctx context.Context, cfg *gateway.Config, metrics *gateway.Metrics, log *slog.Logger, run func(context.Context) error) error {
 	startMetricsListener(ctx, cfg, metrics, log)
+	stopMCP := startMCPListener(ctx, cfg, log)
+	defer stopMCP()
 	if err := run(ctx); err != nil && ctx.Err() == nil {
 		log.Error("gateway exited", "err", err)
 		return err
 	}
 	return nil
+}
+
+// startMCPListener starts the in-cluster Model Context Protocol HTTP server on
+// A2A_MCP_LISTEN when armed (default 127.0.0.1:8089; disabled by off/false/disabled/none).
+// Like the metrics listener, a failure to start logs an error without taking down the
+// chatops gateway.
+func startMCPListener(ctx context.Context, cfg *gateway.Config, log *slog.Logger) func() {
+	if !cfg.MCPArmed() {
+		return func() {}
+	}
+	busUser := cfg.MCPNATSUser
+	if busUser == "" {
+		busUser = defaultMCPNATSUser
+	}
+	busPass := cfg.MCPNATSPassword
+	mcpSrv, err := mcp.NewInClusterServer(ctx, mcp.InClusterOptions{
+		NATSURL:           cfg.NATSURL,
+		BusUser:           busUser,
+		BusPassword:       busPass,
+		ObserverPassword:  cfg.NATSPassword,
+		Namespace:         cfg.Namespace,
+		PlatformAgentName: cfg.OwnerDeployment,
+	})
+	if err != nil {
+		log.Error("mcp HTTP server init failed", "err", err)
+		return func() {}
+	}
+	httpSrv, err := mcp.NewHTTPServer(cfg.MCPListen, mcpSrv, cfg.MCPToken, log)
+	if err != nil {
+		mcpSrv.Close()
+		log.Error("mcp HTTP listener unavailable", "err", err)
+		return func() {}
+	}
+	mcpCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if runErr := httpSrv.Run(mcpCtx); runErr != nil {
+			log.Error("mcp HTTP listener exited", "err", runErr)
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+		mcpSrv.Close()
+	}
 }
 
 // startMetricsListener serves the counters on A2A_METRICS_PORT when it is

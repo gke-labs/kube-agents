@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/stepmsg"
 )
 
 // The activity door, end to end: a stub standing in for hermes delivers the
@@ -359,7 +360,7 @@ print("ENV=" + open(os.path.join(d, ".env")).read().strip())
 	if !strings.Contains(out, "DIR="+want) {
 		t.Fatalf("child scope dir: %s", out)
 	}
-	for _, needle := range []string{"default: pinned/model", "name: theirs", "name: " + hookEntryName, "url: " + b.ActivityURL(), "secret_env: " + ActivitySecretEnv, "- pre_tool_call", "- post_tool_call", "timeout: 10", "ENV=PINNED_KEY=pinned-value"} {
+	for _, needle := range []string{"default: pinned/model", "name: theirs", "name: " + hookEntryName, "url: " + b.ActivityURL(), "secret_env: " + ActivitySecretEnv, "- pre_tool_call", "- post_tool_call", "- post_api_request", "timeout: 10", "ENV=PINNED_KEY=pinned-value"} {
 		if !strings.Contains(out, needle) {
 			t.Fatalf("child scope lacks %q:\n%s", needle, out)
 		}
@@ -1328,5 +1329,268 @@ func TestServeActivity_CloseIsNotAStoppedDoor(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if strings.Contains(logs.String(), "activity door stopped") {
 		t.Fatalf("close logged a stopped door: %s", logs.String())
+	}
+}
+
+func TestActivity_PostAPIRequestBecomesThinkingArtifact(t *testing.T) {
+	_, url := startServer(t)
+	startBridgeCfg(t, url, hermesStub(t, `
+post("post_api_request", "", {}, {
+    "api_call_count": 1,
+    "finish_reason": "tool_calls",
+    "assistant_message": "ChatCompletionMessage(content='<think>Checking GKE cluster inventory first.</think>', role='assistant', tool_calls=[...])",
+    "response": {
+        "finish_reason": "tool_calls",
+        "assistant_message": {
+            "role": "assistant",
+            "content": "<think>Checking GKE cluster inventory first.</think>",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__gke__list_clusters",
+                        "arguments": json.dumps({"project_id": "my-proj", "token": "secret123"})
+                    }
+                }
+            ]
+        }
+    }
+})
+call("mcp__gke__list_clusters", {"project_id": "my-proj"}, "call_1")
+post("post_api_request", "", {}, {
+    "api_call_count": 2,
+    "finish_reason": "stop",
+    "assistant_message": "ChatCompletionMessage(content='Here is the fleet summary.', role='assistant', tool_calls=None)",
+    "response": {
+        "finish_reason": "stop",
+        "assistant_message": {
+            "role": "assistant",
+            "content": "Here is the fleet summary.",
+            "tool_calls": []
+        }
+    }
+})
+print("Here is the fleet summary.")
+`), nil)
+	c := gatewayClient(t, url)
+
+	submit(t, c, "task-thinking", "list the fleet")
+	task := waitTerminal(t, c, "task-thinking")
+	if task.State != lib.StateCompleted {
+		t.Fatalf("state = %s, want completed", task.State)
+	}
+	if err := task.ValidateArtifacts(); err != nil {
+		t.Fatalf("assertion 18: %v", err)
+	}
+	// The plan and the synthesis travel as step records; thinking carries
+	// the model's reasoning text only, as the spec reserves it for.
+	stepsArt := task.Artifact(stepmsg.ArtifactName)
+	if stepsArt == nil || len(stepsArt.Parts) != 2 {
+		t.Fatalf("steps artifact = %+v, want 2 parts", stepsArt)
+	}
+	first, ok := stepmsg.Decode(stepsArt.Parts[0])
+	if !ok || first.Kind != stepmsg.KindPlan || first.Title != "Listing GKE clusters in the fleet." ||
+		first.Thought != "Checking GKE cluster inventory first." || len(first.CallIDs) != 1 || first.CallIDs[0] != "call_1" {
+		t.Fatalf("first step = %+v (ok=%v)", first, ok)
+	}
+	if raw := string(stepsArt.Parts[0].Data); strings.Contains(raw, "secret123") || strings.Contains(raw, "my-proj") {
+		t.Fatalf("first step leaks tool arguments: %s", raw)
+	}
+	second, ok := stepmsg.Decode(stepsArt.Parts[1])
+	if !ok || second.Kind != stepmsg.KindSynthesis || second.Title != "Synthesizing findings into final response." {
+		t.Fatalf("second step = %+v (ok=%v)", second, ok)
+	}
+	thinking := task.Artifact(lib.ArtifactThinking)
+	if thinking == nil || len(thinking.Parts) != 1 || thinking.Parts[0].Text != "Checking GKE cluster inventory first." {
+		t.Fatalf("thinking artifact = %+v, want the one reasoning text part", thinking)
+	}
+	activity := task.Artifact(lib.ArtifactActivity)
+	if activity == nil || len(activity.Parts) != 1 {
+		t.Fatalf("activity artifact = %+v, want 1 entry", activity)
+	}
+	var entry ActivityEntry
+	if err := json.Unmarshal(activity.Parts[0].Data, &entry); err != nil || entry.Title != "Listing GKE clusters in the fleet." {
+		t.Fatalf("activity entry = %+v (err=%v), want the planned step title", entry, err)
+	}
+}
+
+func TestSessionActivityState_DetailedInputsResultPreviewsAndWorkerAttribution(t *testing.T) {
+	act := newSessionActivityState("a2a-platform-1", true)
+
+	mustDelivery := func(raw string) hookDelivery {
+		var d hookDelivery
+		if err := json.Unmarshal([]byte(raw), &d); err != nil {
+			t.Fatalf("unmarshal hookDelivery: %v", err)
+		}
+		return d
+	}
+
+	// Sync Kanban card metadata from waitForKanbanCards.
+	act.SyncKanbanCard("t_01", "Live health check for drift-peer-ap-1", "worker-sess-01")
+
+	// 1. Platform read_file call with an inline token and secret key in arguments:
+	// real file path must be preserved while sensitive keys and inline tokens are scrubbed.
+	fakeGHP := "ghp_" + "secretTokenValue123456"
+	fakeOAuth := "ya29." + "a0AfH6SMBsecret999"
+	act.observe(mustDelivery(`{
+		"hook_event_name": "pre_tool_call",
+		"tool_name": "read_file",
+		"session_id": "a2a-platform-1",
+		"tool_input": {"path":"/var/lib/hermes/skills/gke-cluster-diagnostics/SKILL.md","token":"` + fakeGHP + `","note":"auth with Bearer ` + fakeOAuth + `"},
+		"extra": {"tool_call_id": "c-read-1"}
+	}`))
+	e1, ok := act.observe(mustDelivery(`{
+		"hook_event_name": "post_tool_call",
+		"tool_name": "read_file",
+		"session_id": "a2a-platform-1",
+		"extra": {
+			"tool_call_id": "c-read-1",
+			"duration_ms": 42,
+			"status": "ok",
+			"result": "# GKE Cluster Diagnostics Skill\nCheck node pools and pods.\nToken ` + fakeGHP + `"
+		}
+	}`))
+	if !ok {
+		t.Fatal("expected post_tool_call to produce entry")
+	}
+	if e1.Worker != "platform" || e1.SessionID != "a2a-platform-1" {
+		t.Fatalf("unexpected worker/session: worker=%q session=%q", e1.Worker, e1.SessionID)
+	}
+	inStr := string(e1.Input)
+	if !strings.Contains(inStr, "/var/lib/hermes/skills/gke-cluster-diagnostics/SKILL.md") {
+		t.Fatalf("expected unshaped path in session activity input, got %s", inStr)
+	}
+	if strings.Contains(inStr, fakeGHP) || strings.Contains(inStr, fakeOAuth) {
+		t.Fatalf("secret leaked in input: %s", inStr)
+	}
+	if !strings.Contains(e1.ResultPreview, "GKE Cluster Diagnostics Skill") || strings.Contains(e1.ResultPreview, fakeGHP) {
+		t.Fatalf("unexpected resultPreview: %q", e1.ResultPreview)
+	}
+
+	// 2. Specialist card worker tool call (attributed via SyncKanbanCard session binding).
+	act.observe(mustDelivery(`{
+		"hook_event_name": "pre_tool_call",
+		"tool_name": "terminal",
+		"session_id": "worker-sess-01",
+		"tool_input": {"command":"kubectl --context=gke_adamparco-kage_us-east4_drift-peer-ap-1 get pods -A"},
+		"extra": {"tool_call_id": "c-term-1"}
+	}`))
+	e2, ok := act.observe(mustDelivery(`{
+		"hook_event_name": "post_tool_call",
+		"tool_name": "terminal",
+		"session_id": "worker-sess-01",
+		"extra": {
+			"tool_call_id": "c-term-1",
+			"duration_ms": 810,
+			"status": "error",
+			"error_type": "ExitCode1",
+			"error_message": "error: server https://user:secretpass@10.0.0.1:443 returned 403"
+		}
+	}`))
+	if !ok {
+		t.Fatal("expected specialist post_tool_call entry")
+	}
+	if e2.Worker != "card:t_01 (drift-peer-ap-1)" {
+		t.Fatalf("expected worker label card:t_01 (drift-peer-ap-1), got %q", e2.Worker)
+	}
+	if !strings.Contains(e2.ErrorMessage, ":[redacted]@") || strings.Contains(e2.ErrorMessage, "secretpass") {
+		t.Fatalf("expected scrubbed errorMessage, got %q", e2.ErrorMessage)
+	}
+
+	// 3. Resource-qualified step title from post_api_request on session activity state.
+	act.observe(mustDelivery(`{
+		"hook_event_name": "post_api_request",
+		"session_id": "a2a-platform-1",
+		"extra": {
+			"finish_reason": "tool_calls",
+			"response": {
+				"finish_reason": "tool_calls",
+				"assistant_message": {
+					"role": "assistant",
+					"content": "<think>Inspecting drift-peer-ap-1 cluster configuration.</think>",
+					"tool_calls": [
+						{
+							"id": "call_gke_1",
+							"type": "function",
+							"function": {
+								"name": "mcp__gke__get_cluster",
+								"arguments": "{\"name\":\"projects/p/locations/us-east4/clusters/drift-peer-ap-1\"}"
+							}
+						}
+					]
+				}
+			}
+		}
+	}`))
+	steps, reasoning := act.takePending()
+	if len(steps) != 1 || steps[0].Kind != stepmsg.KindPlan || steps[0].Title != "Inspecting GKE cluster drift-peer-ap-1." {
+		t.Fatalf("expected one resource-qualified plan step, got %+v", steps)
+	}
+	if steps[0].Thought != "Inspecting drift-peer-ap-1 cluster configuration." || reasoning != steps[0].Thought {
+		t.Fatalf("expected the reasoning as the step's thought and the thinking text, got thought=%q reasoning=%q", steps[0].Thought, reasoning)
+	}
+	if len(steps[0].CallIDs) != 1 || steps[0].CallIDs[0] != "call_gke_1" {
+		t.Fatalf("expected the step to carry the planned call id, got %v", steps[0].CallIDs)
+	}
+	// The call planned under that step carries its title and card.
+	e3, ok := act.observe(mustDelivery(`{
+		"hook_event_name": "post_tool_call",
+		"session_id": "a2a-platform-1",
+		"tool_name": "mcp__gke__get_cluster",
+		"tool_input": {"name": "projects/p/locations/us-east4/clusters/drift-peer-ap-1"},
+		"extra": {"tool_call_id": "call_gke_1", "status": "ok", "duration_ms": 12, "result": "{\"status\":\"RUNNING\"}"}
+	}`))
+	if !ok || e3.Title != "Inspecting GKE cluster drift-peer-ap-1." {
+		t.Fatalf("expected the activity entry to carry its planned step title, got ok=%v entry=%+v", ok, e3)
+	}
+
+	// 4. Kanban worker post_api_request while waitingCard is true: must emit incremental worker
+	// steps (instead of dropping them because d.SessionID != a.sessionID) and bind
+	// session to cardID from top-level cwd (/opt/data/kanban/workspaces/<card_id>).
+	act.waitingCard.Store(true)
+	act.observe(mustDelivery(`{
+		"hook_event_name": "post_api_request",
+		"session_id": "20261017_140036_e0c3f7",
+		"cwd": "/opt/data/kanban/workspaces/t_01",
+		"profile": "platform",
+		"extra": {
+			"finish_reason": "tool_calls",
+			"response": {
+				"finish_reason": "tool_calls",
+				"assistant_message": {
+					"role": "assistant",
+					"content": "<think>Editing deployment manifest to increase replicas from 1 to 2.</think>",
+					"tool_calls": [
+						{
+							"id": "call_patch_1",
+							"type": "function",
+							"function": {
+								"name": "patch",
+								"arguments": "{\"path\":\"/opt/data/kanban/workspaces/t_01/repo/workloads/store-v1/deployment.yaml\"}"
+							}
+						}
+					]
+				}
+			}
+		}
+	}`))
+	workerSteps, _ := act.takePending()
+	if len(workerSteps) != 1 || workerSteps[0].Title != "Editing store-v1/deployment.yaml." || !strings.HasPrefix(workerSteps[0].Thought, "Editing deployment manifest") {
+		t.Fatalf("expected Kanban worker post_api_request step, got %+v", workerSteps)
+	}
+	if !act.hasWorkerSession("20261017_140036_e0c3f7") {
+		t.Fatal("expected worker session to be bound via cwd /kanban/workspaces/t_01")
+	}
+	e4, ok := act.observe(mustDelivery(`{
+		"hook_event_name": "post_tool_call",
+		"session_id": "20261017_140036_e0c3f7",
+		"cwd": "/opt/data/kanban/workspaces/t_01",
+		"tool_name": "patch",
+		"tool_input": {"path": "/opt/data/kanban/workspaces/t_01/repo/workloads/store-v1/deployment.yaml"},
+		"extra": {"tool_call_id": "call_patch_1", "status": "ok", "duration_ms": 30, "result": "ok"}
+	}`))
+	if !ok || e4.CardID != "t_01" || e4.Title != "Editing store-v1/deployment.yaml." {
+		t.Fatalf("expected the worker's call to carry its card id and planned title, got ok=%v entry=%+v", ok, e4)
 	}
 }

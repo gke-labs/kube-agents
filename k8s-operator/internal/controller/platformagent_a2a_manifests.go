@@ -1545,7 +1545,7 @@ var a2aCredsKeys = []string{
 }
 
 // a2aActivityHookEvents are the hook events the door reads.
-var a2aActivityHookEvents = []string{"pre_tool_call", "post_tool_call"}
+var a2aActivityHookEvents = []string{"pre_tool_call", "post_tool_call", "post_api_request"}
 
 // a2aWildcardListenHosts are the listen hosts that bind every interface, the
 // hook's loopback address included: the empty host (":8651") and the IPv4

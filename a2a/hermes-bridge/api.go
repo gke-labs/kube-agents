@@ -120,6 +120,10 @@ const (
 	// it is absent, and the task ends hermes-api-unreachable.
 	DefaultAPIConnectRetry  = 2 * time.Minute
 	apiConnectRetryInterval = time.Second
+	// kanbanStartGraceSeconds is subtracted from the task's start timestamp
+	// when polling kanban.db for cards created during the turn, tolerating
+	// sub-second clock skew between the Go sidecar and Python's time.time().
+	kanbanStartGraceSeconds = 2
 )
 
 // errWaitingForTurn is the error a task whose context ended while it waited
@@ -178,8 +182,8 @@ func (t *sessionTurns) acquire(ctx context.Context, sessionID string) func() {
 	s := t.slots[sessionID]
 	if s == nil {
 		s = &sessionSlot{ch: make(chan struct{}, 1)}
-		t.slots[sessionID] = s
 	}
+	t.slots[sessionID] = s
 	s.refs++
 	t.mu.Unlock()
 	drop := func() {
@@ -339,6 +343,11 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 		return
 	}
 	sessionID := apiSessionID(run.origin.ContextID)
+	defer func() {
+		if run.canceled.Load() {
+			b.markSessionCanceled(sessionID)
+		}
+	}()
 	// The task's own context: the deadline bounds every turn together;
 	// cancel and shutdown end whichever request is in flight. Not the
 	// consumer's context, which a shutdown cancels before shutdownTasks can
@@ -396,6 +405,9 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	// Only a recorded route lets a card's post reach the conversation, so only
 	// then may the terminal keep the ask for those posts to settle (cardsMark).
 	run.routeRecorded.Store(routeErr == nil)
+	if routeErr != nil {
+		b.rememberConsoleSession(sessionID, run.origin)
+	}
 
 	// The door's side of this task: attributed by the session id the hook
 	// payload carries, signed with the pod's shared secret, and only while
@@ -412,12 +424,26 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	go b.runActivity(run)
 	run.mu.Unlock()
 
+	if !run.routeRecorded.Load() {
+		b.beginKanbanWait(sessionID)
+		defer b.endKanbanWait(sessionID)
+	}
+	taskStartUnix := time.Now().Unix() - kanbanStartGraceSeconds
 	var steer *lib.Envelope // the follow-up this turn runs; nil on turn 1
 	var prev string         // the turn before's answer, published as a turn artifact
 	for turn := 1; ; turn++ {
 		text, ok := b.apiTurn(run, taskCtx, sessionID, prompt, steer, turn, prev)
 		if !ok {
 			return
+		}
+		if !run.routeRecorded.Load() {
+			text, ok = b.waitForKanbanCards(run, taskCtx, act, sessionID, taskStartUnix, turn, text)
+			if !ok {
+				return
+			}
+			if !act.cardsFiled.Load() {
+				taskStartUnix = time.Now().Unix() - kanbanStartGraceSeconds
+			}
 		}
 		next, nextPrompt := b.runnableSteer(ctx, run)
 		if next == nil {

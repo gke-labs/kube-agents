@@ -44,10 +44,12 @@ func TestMain(m *testing.M) {
 	for _, k := range []string{
 		"A2A_DOOR_LISTEN", "A2A_DOOR_TOKEN", "A2A_DOOR_PRINCIPAL_MAP", "A2A_DOOR_PUBLIC_URL",
 		"A2A_INJECT_LISTEN", "A2A_INJECT_TOKEN", "A2A_INJECT_PRINCIPAL_MAP",
+		"A2A_MCP_TOKEN", "A2A_MCP_NATS_USER", "A2A_MCP_NATS_PASSWORD",
 		"A2A_SPAWN_SESSIONS", "A2A_SESSION_SERVICE_ACCOUNT", "A2A_DEFAULT_ADDRESSEE",
 	} {
 		os.Unsetenv(k)
 	}
+	_ = os.Setenv("A2A_MCP_LISTEN", "off")
 	os.Exit(m.Run())
 }
 

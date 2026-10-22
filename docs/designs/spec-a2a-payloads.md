@@ -455,8 +455,15 @@ or unreported at its drain; `dropped` counts them all, and a delivery the execut
 read or refused over its body cap is outside it, logged, the call it belonged to in the trace
 as `interrupted` when its opening delivery arrived and whole from the closing one when the
 opening one was unreadable; over the cap the closing delivery is larger still, so that call is absent), `errorType` (the executor's own word for
-an error), `durationMs` and `at`; the library
+an error), `errorMessage`, `resultPreview`, `sessionId`, `worker`, `title`, `cardId`, `durationMs` and `at`; the library
 validates the part kind (assertion 18), and a reader tolerates the keys it does not know.
+
+One unreserved name is in use and worth knowing: `steps`, `kube-agents.step/v1` data parts
+(`a2a/lib/stepmsg`) by which the Hermes bridge states what a turn planned, which specialist
+cards settled, and when it synthesized an answer, so a renderer (the kube-agents MCP server)
+lists a turn's steps without parsing them out of `thinking`. It carries no reserved semantics:
+the relay ignores it, the fold keeps it, and a reader that does not know it skips it
+([`a2a/docs/mcp-server.md`](../../a2a/docs/mcp-server.md), "The step contract").
 
 ## Verified identity (added 9/9)
 
