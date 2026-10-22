@@ -5635,8 +5635,8 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				// changed or deleted, so the bus and LiteLLM stop admitting
 				// a namespace whose fence is gone, and LiteLLM admits one
 				// the pass after its fence lands.
-				if ns := agentNamespaceOfProfileFence(obj); ns != "" {
-					return enqueueAgentsInNamespace(ctx, ns)
+				if agent, ok := agentOfProfileFence(obj); ok {
+					return []reconcile.Request{{NamespacedName: agent}}
 				}
 				if obj.GetName() != litellmNetworkPolicyName {
 					return nil

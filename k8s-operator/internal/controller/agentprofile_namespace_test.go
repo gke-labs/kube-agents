@@ -160,23 +160,25 @@ func TestLiteLLMAdmitsProfilePodsOnNextOnly(t *testing.T) {
 	}
 }
 
-// The watch maps a profile fence, and nothing else, back to its agent's
-// namespace.
-func TestAgentNamespaceOfProfileFence(t *testing.T) {
+// The watch maps a profile fence, and nothing else, back to the one agent
+// its name names.
+func TestAgentOfProfileFence(t *testing.T) {
 	agent := a2aTestAgent()
 	fence := buildProfileNetworkPolicy(agent, nil)
-	if got := agentNamespaceOfProfileFence(fence); got != "test-ns" {
-		t.Errorf("the profile fence maps to %q, want test-ns", got)
+	if got, ok := agentOfProfileFence(fence); !ok || got != (types.NamespacedName{Namespace: "test-ns", Name: "test-agent"}) {
+		t.Errorf("the profile fence maps to %v %v, want test-ns/test-agent", got, ok)
 	}
-	other := fence.DeepCopy()
-	other.Labels[a2aComponentLabel] = "session-netpol"
-	if got := agentNamespaceOfProfileFence(other); got != "" {
-		t.Errorf("a policy with another component maps to %q, want none", got)
-	}
-	elsewhere := fence.DeepCopy()
-	elsewhere.Namespace = "test-ns"
-	if got := agentNamespaceOfProfileFence(elsewhere); got != "" {
-		t.Errorf("a profile-netpol outside a -profiles namespace maps to %q, want none", got)
+	for name, mutate := range map[string]func(*networkingv1.NetworkPolicy){
+		"another component":             func(np *networkingv1.NetworkPolicy) { np.Labels[a2aComponentLabel] = "session-netpol" },
+		"outside a -profiles namespace": func(np *networkingv1.NetworkPolicy) { np.Namespace = "test-ns" },
+		"a name without the suffix":     func(np *networkingv1.NetworkPolicy) { np.Name = "something-else" },
+		"the bare suffix":               func(np *networkingv1.NetworkPolicy) { np.Name = "-profile-netpol" },
+	} {
+		np := fence.DeepCopy()
+		mutate(np)
+		if got, ok := agentOfProfileFence(np); ok {
+			t.Errorf("%s maps to %v, want nothing", name, got)
+		}
 	}
 }
 

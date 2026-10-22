@@ -186,6 +186,12 @@ func TestLiteLLMAdmitsProfilePodsOnlyWhenTheyAreFenced(t *testing.T) {
 	if err := c.Create(ctx, chartProfileNamespace(agent)); err != nil {
 		t.Fatal(err)
 	}
+	// The state the gate exists for: the namespace is there and marked, and
+	// its fence isn't yet (every first next pass, since LiteLLM's policy is
+	// applied before the fence pass).
+	if admitted() {
+		t.Error("LiteLLM admits the profile namespace before its fence is in place")
+	}
 	if fenced, err := r.reconcileProfileFence(ctx, agent, nil); err != nil || !fenced {
 		t.Fatalf("profile fence: %v %v", fenced, err)
 	}
@@ -426,5 +432,54 @@ func TestAProfileFenceFailureStillAppliesTheOtherFences(t *testing.T) {
 		if peer.NamespaceSelector != nil && peer.NamespaceSelector.MatchLabels[corev1.LabelMetadataName] == profileNamespaceName(agent) {
 			t.Error("the NATS fence admits the profile namespace though its fence failed to apply")
 		}
+	}
+}
+
+// A refusal confined to the profile namespace doesn't stop the rest of the
+// stack rendering: the console and the session quota still land, and
+// the error comes back naming the profile namespace.
+func TestAProfileNamespaceRefusalDoesNotStopTheRender(t *testing.T) {
+	cfg, scheme := startEnvtestConfig(t)
+	c, err := client.NewWithWatch(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{
+		ProjectID: envtestHarnessProject, Location: envtestHarnessLocation, ClusterName: envtestHarnessCluster,
+	}
+	if err := c.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: agent.Namespace}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Create(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Create(ctx, chartProfileNamespace(agent)); err != nil {
+		t.Fatal(err)
+	}
+	refusing := interceptor.NewClient(c, interceptor.Funcs{
+		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if obj.GetNamespace() == profileNamespaceName(agent) {
+				return fmt.Errorf("refused by a policy in the profile namespace")
+			}
+			return cl.Patch(ctx, obj, patch, opts...)
+		},
+	})
+	r := &PlatformAgentReconciler{Client: refusing, Scheme: scheme}
+	_, err = r.reconcileA2A(ctx, agent)
+	if err == nil || !strings.Contains(err.Error(), profileNamespaceName(agent)) {
+		t.Fatalf("reconcileA2A = %v, want the refusal, naming the profile namespace", err)
+	}
+	var q corev1.ResourceQuota
+	if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aSessionQuotaName(agent)}, &q); err != nil {
+		t.Errorf("the session quota, after the fences, was not rendered: %v", err)
+	}
+	// The console renders right after the fences, which the profile
+	// namespace's error used to stop. (The provision Job, later on, waits for
+	// a serving callout, which envtest never runs.)
+	var console appsv1.Deployment
+	if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aConsoleName(agent)}, &console); err != nil {
+		t.Errorf("the console, after the fences, was not rendered: %v", err)
 	}
 }

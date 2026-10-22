@@ -350,14 +350,29 @@ func (r *PlatformAgentReconciler) profileFenceRendered(ctx context.Context, agen
 	return renderedByAgent(&np, agent, profileNetpolComponent), nil
 }
 
-// agentNamespaceOfProfileFence maps a NetworkPolicy back to the agent's
-// namespace when it is a profile fence, for the watch that re-reconciles the
-// agent when its fence changes or is deleted: the fence carries no owner
-// reference, so Owns() never sees it. "" for anything else.
-func agentNamespaceOfProfileFence(obj client.Object) string {
+// agentOfProfileFence maps a NetworkPolicy back to the one agent whose
+// profile fence it is, for the watch that re-reconciles that agent when its
+// fence changes or is deleted: the fence carries no owner reference, so
+// Owns() never sees it. Exactly the agent the fence's name names
+// (<agent>-profile-netpol in <agent-ns>-profiles), with no List, so a
+// NetworkPolicy writer there can reach one agent at most; ok is false for
+// anything else.
+func agentOfProfileFence(obj client.Object) (types.NamespacedName, bool) {
 	ns, ok := strings.CutSuffix(obj.GetNamespace(), "-profiles")
 	if !ok || ns == "" || obj.GetLabels()[a2aComponentLabel] != profileNetpolComponent {
-		return ""
+		return types.NamespacedName{}, false
 	}
-	return ns
+	name, ok := strings.CutSuffix(obj.GetName(), "-profile-netpol")
+	if !ok || name == "" {
+		return types.NamespacedName{}, false
+	}
+	return types.NamespacedName{Namespace: ns, Name: name}, true
 }
+
+// profileNamespaceError marks a failure confined to the profile namespace,
+// which reconcileA2A records and returns after the rest of the stack has
+// rendered, rather than stopping on it.
+type profileNamespaceError struct{ err error }
+
+func (e *profileNamespaceError) Error() string { return e.err.Error() }
+func (e *profileNamespaceError) Unwrap() error { return e.err }

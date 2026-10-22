@@ -41,6 +41,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	goerrors "errors"
 	"fmt"
 	"net"
 	"os"
@@ -5064,14 +5065,29 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 		}
 	}
 	if profileErr != nil {
-		return gatewayFenced, false, profileErr
+		return gatewayFenced, false, &profileNamespaceError{err: profileErr}
 	}
 	return gatewayFenced, profileFenced, nil
 }
 
 // reconcileA2A renders the next stack. Callers gate on renderMode; this
 // function assumes the answer was ModeNext.
+//
+// A failure confined to the profile namespace (its fence or its quota
+// refused, say by an admission policy scoped there) doesn't stop the rest of
+// the stack: the namespace is optional, and the agent's own namespace must
+// keep rendering. The error is returned once the render is done, unless
+// something else failed first.
 func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (a2aProvisionState, error) {
+	var profileErr error
+	state, err := r.reconcileA2AStack(ctx, agent, &profileErr)
+	if err == nil && profileErr != nil {
+		err = fmt.Errorf("the profile namespace %s: %w", profileNamespaceName(agent), profileErr)
+	}
+	return state, err
+}
+
+func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profileErr *error) (a2aProvisionState, error) {
 	state := a2aProvisionState{}
 
 	creds, err := r.ensureA2ACredsSecret(ctx, agent)
@@ -5171,6 +5187,11 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// frozen, running bus keeps its ingress policy and the workers on it keep
 	// their egress one.
 	gatewayFenced, profileFenced, err := r.reconcileA2ANetworkFences(ctx, agent)
+	var pnErr *profileNamespaceError
+	if goerrors.As(err, &pnErr) {
+		*profileErr = pnErr.err
+		err = nil
+	}
 	if err != nil {
 		return state, err
 	}
@@ -5196,7 +5217,7 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// The profile namespace's quota. The chart creates the namespace; until
 	// it exists this renders nothing. Its fence is reconcileA2ANetworkFences'.
 	if err := r.reconcileProfileQuota(ctx, agent, profiles, profileFenced); err != nil {
-		return state, err
+		*profileErr = goerrors.Join(*profileErr, err)
 	}
 
 	// Jobs are immutable, so the provision Job is create-if-absent under its
@@ -6203,8 +6224,9 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// The early exit. This path runs on every reconcile of every install that
 	// is not `next` — forever, on installs that have never rendered an A2A
 	// object — so proving "nothing to do" one object at a time is a standing
-	// cost for a no-op. Ten reads answer it instead of walking every object
-	// in the teardown sequence:
+	// cost for a no-op. Eleven reads answer it instead of walking every object
+	// in the teardown sequence (the ten below, and the profile namespace's
+	// fence, which is tested by this agent's labels):
 	//
 	//   - the StatefulSet, which is deleted LAST below, so its absence means an
 	//     earlier pass ran to completion rather than dying partway,
