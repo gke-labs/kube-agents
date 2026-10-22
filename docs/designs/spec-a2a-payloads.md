@@ -708,8 +708,8 @@ and only its `mark` is validated. When the newest task ends with no mark on its 
 
 Reserved 10/22 for the profile dispatcher (`spec-subagent-profiles.md`), and used from the gateway's
 delegation to profiles onward; nothing writes them yet. Both are `data` parts, and only the gateway
-writes them: a reader takes the first such part in a message, and the gateway strips any a client
-or a task supplies.
+writes them: the gateway strips any a client or a task supplies, and a reader refuses a message carrying two
+`taskParameters` parts.
 
 **Task parameters.** A profile task's submission carries
 `{"taskParameters": {"parameters": {"<name>": "<value>", …}}}`: the parameters its persona
@@ -719,7 +719,7 @@ builds the verifier's resource from them (`project/<p>/location/<l>/cluster/<c>`
 to the worker as `PROFILE_TASK_<NAME>`. The verifier refuses a target outside the grant's scope,
 and that check is what makes these message fields authoritative.
 
-- A name is a lower-case identifier of at most 32 characters. A value is one token of at most 128
+- A name is a lower-case identifier of at most 63 characters, the persona loader's own rule (`lib.TaskParameterNameRE`). A value is one token of at most 128
   characters, starting with a letter or digit and then letters, digits and `. _ : -`, so it is never
   `.`, `..` or a flag.
 - A value can't contain `/` or a space, because the dispatcher joins values into a resource path.

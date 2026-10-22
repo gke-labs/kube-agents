@@ -175,7 +175,7 @@ func TestTaskParametersRefuseWhatCouldForgeAResource(t *testing.T) {
 		"a long value":        {"cluster": strings.Repeat("a", TaskParameterValueMaxLen+1)},
 		"an upper-case name":  {"Cluster": "web-1"},
 		"a name with a dash":  {"target-cluster": "web-1"},
-		"a long name":         {strings.Repeat("a", TaskParameterNameMaxLen+1): "v"},
+		"a long name":         {strings.Repeat("a", 64): "v"},
 		"too many parameters": tooMany,
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -249,5 +249,24 @@ func TestTaskParametersOfRefusesAPartWithNoParametersObject(t *testing.T) {
 		if _, ok, err := TaskParametersOf([]Part{{Kind: "data", Data: json.RawMessage(data)}}); !ok || err == nil {
 			t.Errorf("%s: ok=%v err=%v, want found and refused", data, ok, err)
 		}
+	}
+}
+
+// A name as long as the persona loader allows (63) is one a submission can
+// carry: the two share TaskParameterNameRE, so a persona never declares a
+// parameter its tasks cannot be handed.
+func TestATaskParameterNameAsLongAsAPersonaAllowsIsValid(t *testing.T) {
+	if err := ValidateTaskParameters(map[string]string{strings.Repeat("a", 63): "v"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Two taskParameters parts leave a task's target ambiguous: an error, never
+// the first or the last quietly chosen.
+func TestTaskParametersOfRefusesTwoParts(t *testing.T) {
+	one, _ := TaskParametersPart(TaskParameters{Parameters: map[string]string{"cluster": "web-1"}})
+	two, _ := TaskParametersPart(TaskParameters{Parameters: map[string]string{"cluster": "prod-1"}})
+	if _, ok, err := TaskParametersOf([]Part{one, two}); !ok || err == nil {
+		t.Fatalf("ok=%v err=%v, want found and refused", ok, err)
 	}
 }
