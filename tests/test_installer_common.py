@@ -240,6 +240,8 @@ class InstallerCommonTest(unittest.TestCase):
                     "SCOPED_SA_POOL_MAX_ACCOUNTS": "",
                     # And the mode, refused on a value outside the CRD's enum.
                     "PLATFORM_AGENT_MODE": "",
+                    # And the data volume size, refused when malformed.
+                    "PLATFORM_AGENT_STORAGE_SIZE": "",
                     **(env or {}),
                 },
                 bin_dir=str(bin_dir),
@@ -1415,6 +1417,89 @@ class InstallerCommonTest(unittest.TestCase):
                     proc = self._run(
                         f'load_install_env "{file}"; write_tfvars_from_state "{dest}"; echo "rc=$?"',
                         env={"API_SERVER_KEY": "k", "PLATFORM_AGENT_MODE": exported},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    self.assertIn(expected, dest.read_text())
+
+    # ── PLATFORM_AGENT_STORAGE_SIZE: the PlatformAgent's spec.storage.size ──
+
+    def test_tfvars_carry_the_platform_agent_storage_size(self):
+        # Written on every run, the default included; the composition renders
+        # nothing into the chart for the default.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for env, expected in (
+                ({}, 'platform_agent_storage_size = "50Gi"\n'),
+                ({"PLATFORM_AGENT_STORAGE_SIZE": ""}, 'platform_agent_storage_size = "50Gi"\n'),
+                ({"PLATFORM_AGENT_STORAGE_SIZE": "80Gi"}, 'platform_agent_storage_size = "80Gi"\n'),
+                ({"PLATFORM_AGENT_STORAGE_SIZE": "1Ti"}, 'platform_agent_storage_size = "1Ti"\n'),
+                ({"PLATFORM_AGENT_STORAGE_SIZE": "64Ti"}, 'platform_agent_storage_size = "64Ti"\n'),
+                ({"PLATFORM_AGENT_STORAGE_SIZE": "67108864Mi"}, 'platform_agent_storage_size = "67108864Mi"\n'),
+            ):
+                with self.subTest(env=env):
+                    proc = self._run(
+                        f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", **env},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    self.assertIn(expected, dest.read_text())
+
+    def test_tfvars_refuse_a_malformed_platform_agent_storage_size(self):
+        # The generator is the installer's only check on the value: it names
+        # the key and writes nothing, rather than leave the variable's
+        # validation to refuse it at plan.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for value in ("0Gi", "80", "80G", "1.5Ti", "-10Gi", "080Gi", "80Gi ", "65Ti", "65537Gi", "99999999999Ti"):
+                with self.subTest(value=value):
+                    proc = self._run(
+                        f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                        env={"API_SERVER_KEY": "k", "PLATFORM_AGENT_STORAGE_SIZE": value},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=1", proc.stdout, proc.stderr)
+                    self.assertIn(
+                        f"PLATFORM_AGENT_STORAGE_SIZE='{value}' is not a whole number of Mi, Gi or Ti above zero",
+                        proc.stderr,
+                    )
+                    self.assertIn("Fix it in install.env, or on a first install, in the value this shell exports.", proc.stderr)
+                    self.assertFalse(dest.exists(), "no tfvars is written for a value Terraform would refuse")
+
+    def test_load_install_env_reads_the_storage_size_from_the_file_alone(self):
+        # An inherited size would grow the claims for one run, and the next run
+        # from a clean shell would drop the field again; the file's own key
+        # still loads.
+        with tempfile.TemporaryDirectory() as tmp:
+            silent = pathlib.Path(tmp) / "silent.env"
+            silent.write_text("PROJECT_ID=p\n")
+            recorded = pathlib.Path(tmp) / "recorded.env"
+            recorded.write_text("PLATFORM_AGENT_STORAGE_SIZE=80Gi\n")
+            for file, expected in ((silent, "SIZE=[]"), (recorded, "SIZE=[80Gi]")):
+                with self.subTest(file=file.name):
+                    proc = self._run(
+                        f'load_install_env "{file}"; echo "SIZE=[${{PLATFORM_AGENT_STORAGE_SIZE:-}}]"',
+                        env={"PLATFORM_AGENT_STORAGE_SIZE": "120Gi"},
+                    )
+                    self.assertIn(expected, proc.stdout, proc.stderr)
+
+    def test_a_recorded_storage_size_is_carried_into_the_regenerated_tfvars(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = pathlib.Path(tmp) / "terraform.tfvars"
+            recorded = pathlib.Path(tmp) / "recorded.env"
+            recorded.write_text("PLATFORM_AGENT_STORAGE_SIZE=80Gi\n")
+            silent = pathlib.Path(tmp) / "silent.env"
+            silent.write_text("PROJECT_ID=test-project\n")
+            for file, exported, expected in (
+                (recorded, "", 'platform_agent_storage_size = "80Gi"\n'),
+                (recorded, "120Gi", 'platform_agent_storage_size = "80Gi"\n'),
+                (silent, "120Gi", 'platform_agent_storage_size = "50Gi"\n'),
+            ):
+                with self.subTest(file=file.name, exported=exported):
+                    proc = self._run(
+                        f'load_install_env "{file}"; write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", "PLATFORM_AGENT_STORAGE_SIZE": exported},
                         describe_stub="printf '\\n'; exit 0",
                     )
                     self.assertIn("rc=0", proc.stdout, proc.stderr)

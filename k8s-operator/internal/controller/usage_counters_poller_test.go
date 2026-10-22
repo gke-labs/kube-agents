@@ -337,6 +337,7 @@ type usageHarness struct {
 	pruningChat     bool
 	pruningBlocked  bool
 	pruningFailures bool
+	pruningHuman    bool
 }
 
 func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...client.Object) *usageHarness {
@@ -350,8 +351,8 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 			// the echo, so the store is stripped with a second patch the poller
 			// never sees, and the echo the poller reads is stripped the same way.
 			pa, isAgent := obj.(*agentv1alpha1.PlatformAgent)
-			if err == nil && isAgent && (h.pruning || h.pruningGauges || h.pruningMerged || h.pruningChat || h.pruningBlocked || h.pruningFailures) {
-				strip := `{"status":{"usage":{"clustersRegistered":null,"clustersMonitored":null,"remediationsMergedTotal":null,"chatMessagesInboundTotal":null,"toolExecutionsBlockedTotal":null,"brokerFailuresTotal":null}}}`
+			if err == nil && isAgent && (h.pruning || h.pruningGauges || h.pruningMerged || h.pruningChat || h.pruningBlocked || h.pruningFailures || h.pruningHuman) {
+				strip := `{"status":{"usage":{"clustersRegistered":null,"clustersMonitored":null,"remediationsMergedTotal":null,"chatMessagesInboundTotal":null,"toolExecutionsBlockedTotal":null,"brokerFailuresTotal":null,"lastHumanActiveTime":null}}}`
 				if h.pruningMerged {
 					strip = `{"status":{"usage":{"remediationsMergedTotal":null}}}`
 				}
@@ -363,6 +364,9 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 				}
 				if h.pruningFailures {
 					strip = `{"status":{"usage":{"brokerFailuresTotal":null}}}`
+				}
+				if h.pruningHuman {
+					strip = `{"status":{"usage":{"lastHumanActiveTime":null}}}`
 				}
 				if h.pruning {
 					strip = `{"status":{"usage":null}}`
@@ -388,6 +392,9 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 			}
 			if isAgent && (h.pruningGauges || h.pruningFailures) {
 				pa.Status.Usage.BrokerFailuresTotal = 0
+			}
+			if isAgent && (h.pruningGauges || h.pruningHuman) {
+				pa.Status.Usage.LastHumanActiveTime = nil
 			}
 			return err
 		},
@@ -737,6 +744,8 @@ func TestUsagePoller_ReseedsAnInvalidDocument(t *testing.T) {
 		{"a total above the float64-exact ceiling", func(d *usageDocument) { d.Totals[usageCounterToolExecutions] = usageTotalCeiling + 1 }},
 		{"a total below the status", func(d *usageDocument) { d.Totals[usageCounterToolExecutions] = 1 }},
 		{"a first-recorded time in the future", func(d *usageDocument) { d.FirstRecorded = metav1.NewTime(usageClock(59)) }},
+		{"a last-moved time in the future", func(d *usageDocument) { d.LastMoved = ptr.To(metav1.NewTime(usageClock(59))) }},
+		{"a last-human-moved time in the future", func(d *usageDocument) { d.LastHumanMoved = ptr.To(metav1.NewTime(usageClock(59))) }},
 		{"a first-recorded time before the CR", func(d *usageDocument) { d.FirstRecorded = metav1.NewTime(created.Add(-time.Minute)) }},
 		{"a negative sample", func(d *usageDocument) { podEntry(d, "broker-b").Sample = -1 }},
 		{"an unknown version", func(d *usageDocument) { d.Version = usageDocumentVersion + 1 }},
@@ -1661,10 +1670,6 @@ func TestUsagePoller_AChatServingCRDWithoutTheBlockedCounterKeepsTheOthersFlowin
 	}
 }
 
-// A current-layout document that predates a counter is written back with the
-// counter added even when the poll read nothing that changed it: the broker
-// unread, the gateway level. Otherwise it would be re-migrated and re-logged
-// every poll until the broker is read.
 // The broker's failure family counts into brokerFailuresTotal and nowhere
 // else, and a failure alone is not activity: lastActiveTime stays.
 func TestUsagePoller_BrokerFailuresCount(t *testing.T) {
@@ -1725,6 +1730,172 @@ func TestUsagePoller_AChatServingCRDWithoutTheFailuresCounterKeepsTheOthersFlowi
 	}
 }
 
+// A current-layout document that predates a counter is written back with the
+// counter added even when the poll read nothing that changed it: the broker
+// unread, the gateway level. Otherwise it would be re-migrated and re-logged
+// every poll until the broker is read.
+// lastHumanActiveTime follows the counters a person moves and nothing else:
+// a brokered command moves lastActiveTime alone, a chat message moves both.
+func TestUsagePoller_LastHumanActiveTimeFollowsHumanCountersAlone(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(chatAddr(), 1, ptr.To(1.0))
+	h.stub.set(brokerAddr(), 10, ptr.To(200.0))
+	h.poll(5)
+	h.stub.set(brokerAddr(), 14, ptr.To(200.0))
+	h.poll(10)
+	status := h.status()
+	if status.LastActiveTime == nil || !status.LastActiveTime.Time.Equal(usageClock(10)) || status.LastHumanActiveTime != nil {
+		t.Fatalf("after a command: lastActiveTime=%v lastHumanActiveTime=%v, want 10 and absent", status.LastActiveTime, status.LastHumanActiveTime)
+	}
+	h.stub.set(chatAddr(), 2, ptr.To(1.0))
+	h.poll(15)
+	status = h.status()
+	if status.LastHumanActiveTime == nil || !status.LastHumanActiveTime.Time.Equal(usageClock(15)) || !status.LastActiveTime.Time.Equal(usageClock(15)) {
+		t.Fatalf("after a message: lastActiveTime=%v lastHumanActiveTime=%v, want both at 15", status.LastActiveTime, status.LastHumanActiveTime)
+	}
+	h.stub.set(brokerAddr(), 20, ptr.To(200.0))
+	h.poll(20)
+	status = h.status()
+	if !status.LastHumanActiveTime.Time.Equal(usageClock(15)) || !status.LastActiveTime.Time.Equal(usageClock(20)) {
+		t.Fatalf("after another command: lastActiveTime=%v lastHumanActiveTime=%v, want 20 and 15", status.LastActiveTime, status.LastHumanActiveTime)
+	}
+	if doc := h.document(); doc.LastHumanMoved == nil || !doc.LastHumanMoved.Time.Equal(usageClock(15)) {
+		t.Fatalf("document lastHumanMoved = %v, want 15", doc.LastHumanMoved)
+	}
+}
+
+// A served CRD from the release before this one prunes lastHumanActiveTime
+// alone: its absence is recorded against it, the counters keep landing, and a
+// poll with it alone behind does not re-patch while the record is fresh.
+func TestUsagePoller_AChatServingCRDWithoutLastHumanActiveTimeKeepsTheOthersFlowing(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
+	h.pruningHuman = true
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(chatAddr(), 1, ptr.To(1.0))
+	h.stub.set(brokerAddr(), 10, nil)
+	h.poll(5)
+	h.stub.set(chatAddr(), 3, ptr.To(1.0))
+	h.poll(10)
+	if status := h.status(); status.ChatMessagesInboundTotal != 2 || status.LastHumanActiveTime != nil || status.LastActiveTime == nil {
+		t.Fatalf("after a message: %+v, want 2 messages, lastActiveTime, no lastHumanActiveTime", status)
+	}
+	if h.p.newerFieldPruned(agent, usageCounterChatMessagesInbound) || !h.p.newerFieldPruned(agent, usageNewerFieldLastHumanActive) {
+		t.Fatal("the time's absence was not recorded against lastHumanActiveTime alone")
+	}
+	patches := h.patches
+	h.poll(12)
+	if h.patches != patches {
+		t.Fatal("a poll with lastHumanActiveTime alone behind re-patched the status while its record was fresh")
+	}
+	h.stub.set(brokerAddr(), 11, nil)
+	h.poll(14)
+	if got := h.status().ToolExecutionsTotal; got != 1 {
+		t.Fatalf("a command waited on the time's record: %d, want 1", got)
+	}
+	if h.r.usageStatusPruned(agent) {
+		t.Fatal("the time's absence was recorded as the counters' pruning")
+	}
+}
+
+// A lastHumanActiveTime the operator never writes -- in the future, before
+// the CR existed, after lastActiveTime, or without a lastActiveTime at all --
+// is not seeded into a fresh document, as a future lastActiveTime is not.
+func TestUsagePoller_AnOutOfBoundsHumanTimeIsNotSeeded(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	last := metav1.NewTime(usageClock(2))
+	cases := []struct {
+		name       string
+		active     *metav1.Time
+		human      metav1.Time
+		wantSeeded bool
+	}{
+		{"in the future", &last, metav1.NewTime(usageClock(5).Add(time.Hour)), false},
+		{"before the CR", &last, metav1.NewTime(created.Add(-time.Minute)), false},
+		{"after lastActiveTime", &last, metav1.NewTime(usageClock(3)), false},
+		{"without a lastActiveTime", nil, metav1.NewTime(usageClock(2)), false},
+		{"inside the bounds", &last, metav1.NewTime(usageClock(1)), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := usageTestAgent(created)
+			agent.Status.Usage.LastActiveTime = tc.active
+			human := tc.human
+			agent.Status.Usage.LastHumanActiveTime = &human
+			h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
+			h.stub.set(gatewayAddr(), 0, nil)
+			h.stub.set(brokerAddr(), 0, nil)
+			h.poll(5)
+			doc := h.document()
+			if seeded := doc.LastHumanMoved != nil; seeded != tc.wantSeeded {
+				t.Fatalf("seeded=%v, want %v: %+v", seeded, tc.wantSeeded, doc.LastHumanMoved)
+			}
+		})
+	}
+}
+
+// A moved time outside the CR's life is refused as a first-recorded time is:
+// a zero (Go renders a zero metav1.Time as null, so only a hand-written
+// document carries one, which is why it is planted in the raw JSON here; admitted,
+// it would patch the status field as null and the echo would record a pruning
+// CRD), a time before the CR was created, or a human time after the last
+// move of any kind, which one stamp setting both cannot produce.
+func TestUsagePoller_ReseedsADocumentWithATimeOutsideTheCRsLife(t *testing.T) {
+	cases := []struct{ name, field, value string }{
+		{"a zero lastMoved", "lastMoved", "0001-01-01T00:00:00Z"},
+		{"a zero lastHumanMoved", "lastHumanMoved", "0001-01-01T00:00:00Z"},
+		{"a lastMoved before the CR", "lastMoved", "1970-01-01T00:00:01Z"},
+		{"a lastHumanMoved before the CR", "lastHumanMoved", "1970-01-01T00:00:01Z"},
+		{"a lastHumanMoved after lastMoved", "lastHumanMoved", usageClock(9).UTC().Format(time.RFC3339)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			field := tc.field
+			created := usageClock(0).Add(-time.Hour)
+			h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+			h.stub.set(gatewayAddr(), 0, nil)
+			h.stub.set(brokerAddr(), 10, nil)
+			h.poll(3)
+			// A command, so the document carries a lastMoved of minute 5.
+			h.stub.set(brokerAddr(), 11, nil)
+			h.poll(5)
+			cm := &corev1.ConfigMap{}
+			key := client.ObjectKey{Namespace: usageTestNamespace, Name: usageTestAgentName + usageCountersConfigMapSuffix}
+			if err := h.cl.Get(context.Background(), key, cm); err != nil {
+				t.Fatal(err)
+			}
+			var raw map[string]any
+			if err := json.Unmarshal([]byte(cm.Data[usageCountersDocumentKey]), &raw); err != nil {
+				t.Fatal(err)
+			}
+			raw[field] = tc.value
+			b, err := json.Marshal(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cm.Data[usageCountersDocumentKey] = string(b)
+			if err := h.cl.Update(context.Background(), cm); err != nil {
+				t.Fatal(err)
+			}
+			h.poll(10)
+			doc := h.document()
+			if !doc.FirstRecorded.Time.Equal(usageClock(10)) {
+				t.Fatalf("a document with %s was not re-seeded: firstRecorded=%v", tc.name, doc.FirstRecorded)
+			}
+			if doc.LastHumanMoved != nil || (doc.LastMoved != nil && !doc.LastMoved.Time.Equal(usageClock(5))) {
+				t.Fatalf("the planted time survived the re-seed: lastMoved=%v lastHumanMoved=%v", doc.LastMoved, doc.LastHumanMoved)
+			}
+		})
+	}
+}
+
+// A current-layout document that predates a counter is written back with the
+// counter added even when the poll read nothing that changed it: the broker
+// unread, the gateway level. Otherwise it would be re-migrated and re-logged
+// every poll until the broker is read.
 func TestUsagePoller_ADocumentWithoutANewerCounterIsWrittenWhenNothingElseMoved(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)

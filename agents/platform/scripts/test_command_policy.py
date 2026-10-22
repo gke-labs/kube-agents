@@ -826,6 +826,47 @@ class GcloudReadOnlyTest(unittest.TestCase):
             # refused either way.
             self.assertFalse(evaluate(argv).allowed, argv)
 
+    def test_monitoring_alert_policy_reads_are_allowed_on_every_track(self):
+        # A Cluster Agent reads alert policies to answer "which alerts exist,
+        # and are they enabled". The imported gke-alert-configuration skill
+        # spells the call with `alpha`; GA and beta are the other spellings
+        # gcloud accepts. --filter, --format, --limit, --sort-by, --page-size
+        # and --project are already in the flag table.
+        for track in ([], ["beta"], ["alpha"]):
+            listed = ["gcloud", *track, "monitoring", "policies", "list",
+                      "--filter=displayName ~ '^\\[K8s\\]'", "--format=table(name,displayName,enabled)",
+                      "--project=p", "--limit=50", "--sort-by=displayName", "--page-size=100"]
+            described = ["gcloud", *track, "monitoring", "policies", "describe",
+                         "projects/p/alertPolicies/123", "--format=json"]
+            short_id = ["gcloud", *track, "monitoring", "policies", "describe", "123", "--project=p"]
+            for argv in (listed, described, short_id):
+                with self.subTest(argv=argv):
+                    self.assertTrue(evaluate(argv).allowed, argv)
+
+    def test_monitoring_alert_policy_writes_and_channel_reads_are_refused(self):
+        # The writes one word away change or remove alerting. Channel reads are
+        # refused too, because a channel label can hold a webhook URL with a
+        # token in it. `channel-descriptors list` carries no secret; it is here
+        # because nothing grants it, so it shows the allowlist names
+        # `policies` and nothing else in the group. Every argv carries only
+        # flags the table knows, so the refusal is the allowlist's and not the
+        # unknown-flag gate's.
+        for track in ([], ["beta"], ["alpha"]):
+            for words in (["policies", "create", "--project=p"],
+                          ["policies", "update", "projects/p/alertPolicies/123", "--project=p"],
+                          ["policies", "delete", "projects/p/alertPolicies/123", "--project=p"],
+                          ["policies", "migrate", "--project=p"],
+                          ["policies", "conditions", "delete", "projects/p/alertPolicies/123/conditions/1"],
+                          ["channels", "list", "--project=p"],
+                          ["channels", "describe", "projects/p/notificationChannels/1"],
+                          ["channels", "delete", "projects/p/notificationChannels/1"],
+                          ["channel-descriptors", "list", "--project=p"]):
+                argv = ["gcloud", *track, "monitoring", *words]
+                with self.subTest(argv=argv):
+                    decision = evaluate(argv)
+                    self.assertFalse(decision.allowed, argv)
+                    self.assertEqual("gcp.read-only", decision.rule_id, argv)
+
     def test_config_set_is_refused(self):
         # `config set` is not in GCLOUD_READ_COMMANDS, so it should be refused.
         decision = evaluate(["gcloud", "config", "set", "core.project", "my-proj"])

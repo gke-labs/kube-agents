@@ -373,7 +373,7 @@ leases the project stops at that step.
 
 On a fleet only you use, leave `FLEET_READONLY_SA` unset and set
 `FLEET_ALLOW_RUNNER_CREDENTIAL=1` to read it on your own credential. The alternative
-was reading the fleet as the runner's own identity, which holds `roles/container.admin` among the twelve project roles
+was reading the fleet as the runner's own identity, which holds `roles/container.admin` among the thirteen project roles
 `scripts/provision_ci_pool_project.sh` grants at onboarding (`PROW_RUNNER_ROLES` in
 `scripts/verify_ci_pool_project.py` is the list) — measured, not assumed:
 `kubectl auth can-i delete deployments -n seeded-debug` answers yes. There are zero

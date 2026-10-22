@@ -71,6 +71,44 @@ spec:
   {{- with .Values.platformAgent.mode }}
   mode: {{ . | quote }}
   {{- end }}
+  {{- /*
+    `with`, as for mode: the null default renders no field, and the operator
+    sizes both data claims from its own default. The schema checks the
+    quantity's grammar only, so the range fails here, as the webhook (off by
+    default) would refuse it. Zero passes the grammar, and the operator would
+    ignore it for its default while the CR said 0. parseBytes truncates to
+    whole bytes, so a size below one byte, such as 0.5, fails here too, where
+    the webhook would admit it. A size above 64Ti, the largest persistent
+    disk (70368744177664 bytes), is a unit typo that would patch both claims
+    to a size no disk reaches, and a claim cannot shrink back. The CRD guard
+    is the scoped pool's: `helm upgrade` never applies crds/, an API server
+    serving a CRD from before spec.storage prunes the block, and the claims
+    stay at the default while the release record carries the size. `lookup`
+    is empty under `helm template`, so the guard fires only against a live
+    install.
+  */}}
+  {{- with (.Values.platformAgent.storage | default dict).size }}
+  {{- if le (include "kube-agents.parseBytes" . | int64) 0 }}
+  {{- fail (printf "platformAgent.storage.size is %s, which reads as zero whole bytes; the data volume size must be at least one byte. Leave it null to keep the operator default" .) }}
+  {{- end }}
+  {{- if gt (include "kube-agents.parseBytes" . | int64) 70368744177664 }}
+  {{- fail (printf "platformAgent.storage.size is %s; the data volume size must be at most 64Ti, the largest persistent disk size" .) }}
+  {{- end }}
+  {{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
+  {{- if $crd }}
+  {{- $specProps := dict }}
+  {{- range $crd.spec.versions }}
+  {{- if eq .name "v1alpha1" }}
+  {{- $specProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" (dict) . }}
+  {{- end }}
+  {{- end }}
+  {{- if not (hasKey $specProps "storage") }}
+  {{- fail "platformAgent.storage.size needs a PlatformAgent CRD that has spec.storage, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
+  {{- end }}
+  {{- end }}
+  storage:
+    size: {{ . | quote }}
+  {{- end }}
   harness:
     clusterName: {{ required "platformAgent.harness.clusterName is required" .Values.platformAgent.harness.clusterName | quote }}
     location: {{ required "platformAgent.harness.location is required" .Values.platformAgent.harness.location | quote }}

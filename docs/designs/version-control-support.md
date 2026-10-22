@@ -400,7 +400,7 @@ sidecar validates across a trust boundary and must not pull in a module that she
   `credential_proxy.is_valid_repository` and the inline check in
   `github_token_refresh.refresh_git_credentials` are calls to it, and
   `gitops_workspace.is_valid_repo_slug` starts with it and then admits a host-qualified name
-  (`gitlab.com/acme/platform/infra`, or `github.com/owner/name`) on the same rule. All three answer
+  (`gitlab.com/<group>/<subgroup>/<project>`, or `github.com/owner/name`) on the same rule. All three answer
   about a string their caller then passes on verbatim — so a predicate that said yes about a value
   it had quietly trimmed would be answering about a string nobody holds.
 - `forge._parse_repo` was the sixth. #504 removed the `SETTINGS.md` path that called it, so it is
@@ -2144,7 +2144,10 @@ and only ever adds. Its entries carry no role, so the GitOps repository is the o
 the entry the token refresh mints for when nothing names a repository — and a GitOps repository
 the list does not yet hold is added at the front rather than the end. The skills' own resolvers
 refuse to guess among several entries, so once a `managed` repository sits beside the GitOps one,
-a caller names its target with `--repo`.
+a caller names its target with `--repo`. The one exception is the fleet audit: the operator also
+writes the GitOps repository, as one `managed_repos` entry, to the key `gitops_repo`, and
+removes it when no repository has that role or when two have it, and the audit sends its ledger issue and fixes there
+when several repositories are managed ([`fleet-audit-issue-ledger.md`](fleet-audit-issue-ledger.md) §6).
 
 `baseBranch` is the branch every proposal onto that repository must target, empty for the
 repository's own default. A `gitops` or `managed` entry may set it; the schema refuses it on a
