@@ -7860,8 +7860,10 @@ func TestTheGatewayAlwaysArmsTheConsoleDoor(t *testing.T) {
 		// proves the backend is really there beside the console door.
 		backendEnv string
 	}{
+		// Discord has no case of its own: its env is an optional Secret
+		// reference rendered on every gateway, so it renders exactly as
+		// "no backend" does, which covers it.
 		{"no backend", "", "", a2aTestAgent, ""},
-		{"discord", "", "", a2aTestAgent, "DISCORD_TOKEN"},
 		{"google chat", "", "", func() *agentv1alpha1.PlatformAgent { return gchatTestAgent("next", true) }, a2aGchatRelayURLEnvVar},
 		{"slack", "", "", func() *agentv1alpha1.PlatformAgent { return slackTestAgent("next", true) }, a2aSlackAppTokenEnvVar},
 		{"inject door", "true", "", a2aTestAgent, a2aInjectListenEnvVar},
