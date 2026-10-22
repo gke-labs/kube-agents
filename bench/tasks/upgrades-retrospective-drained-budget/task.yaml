@@ -94,7 +94,7 @@ expected_output: >-
   mutation of any kind.
 infrastructure:
   deployer: noop
-validated: false
+validated: true
 
 # Slug per docs/designs/domains.yaml.
 domain: upgrades
