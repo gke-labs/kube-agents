@@ -2190,7 +2190,23 @@ class GitlabWorkloadManifestTest(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertIn("the seed stands", result.message)
         self.assertIn("makes the index raise", result.message)
+        self.assertIn("clusters/seeded-a/apps/x.yaml", result.message, "the raiser is named")
         self.assertNotIn("seed-file", result.message)
+
+    def test_a_seed_that_does_not_key_the_deployment_keeps_the_replace_verdict_beside_a_raising_sibling(self):
+        bad_seed = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: checkout-gateway\n  namespace: seeded-reliability\n"
+        result = self._check(self._Forge({self._PATH: bad_seed, "clusters/seeded-a/apps/x.yaml": "data:\n  n: !!int two\n"}))
+        self.assertFalse(result.passed)
+        self.assertNotIn("the seed stands", result.message)
+        self.assertIn("seed-file", result.message, "the seed is the file at fault, so the replace command is right")
+
+    def test_an_unwritable_scratch_tree_leaves_the_check_unread(self):
+        forge = self._Forge({self._PATH: checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n", "clusters/seeded-a/apps/x.yaml": "a: 1\n"})
+        with mock.patch.object(checker.tempfile, "TemporaryDirectory", side_effect=FileNotFoundError("TMPDIR")):
+            result = self._check(forge)
+        self.assertTrue(result.passed)
+        self.assertFalse(result.read)
+        self.assertIn("temporary directory", result.warnings[0])
 
     def test_a_body_the_index_does_not_key_fails_with_the_replace_instruction(self):
         result = self._check(self._Forge({self._PATH: "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: checkout-gateway\n  namespace: seeded-reliability\n"}))

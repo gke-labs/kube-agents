@@ -788,9 +788,15 @@ def seed_file_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--content-file", required=True, help="the file's content, or - for stdin")
     parser.add_argument("--host", default=DEFAULT_HOST)
     args = parser.parse_args(argv)
-    token = os.environ.get(SEED_TOKEN_ENV, "")
+    token = os.environ.get(SEED_TOKEN_ENV, "").strip()
     if not token:
         print("seed-file: no token in %s" % SEED_TOKEN_ENV, file=sys.stderr)
+        return 2
+    if any(ch.isspace() or not ch.isprintable() for ch in token):
+        # http.client would refuse the header with the value in its error
+        # text; refused here instead, and never printed. A header file with
+        # a second line, cut as the recipe cuts it, reads like this.
+        print("seed-file: %s is not one token on one line; export the bare token" % SEED_TOKEN_ENV, file=sys.stderr)
         return 2
     project = f"{GROUP}/{args.project_id}{PROJECT_SUFFIX}"
     try:
@@ -798,7 +804,11 @@ def seed_file_main(argv: list[str] | None = None) -> int:
     except ResetError as exc:
         print("seed-file: %s" % exc, file=sys.stderr)
         return 2
-    content = sys.stdin.read() if args.content_file == "-" else pathlib.Path(args.content_file).read_text(encoding="utf-8")
+    try:
+        content = sys.stdin.read() if args.content_file == "-" else pathlib.Path(args.content_file).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        print("seed-file: cannot read --content-file %s: %s" % (args.content_file, exc), file=sys.stderr)
+        return 2
     if not content.strip():
         print("seed-file: the content is empty; refusing to write an empty %s" % args.path, file=sys.stderr)
         return 2

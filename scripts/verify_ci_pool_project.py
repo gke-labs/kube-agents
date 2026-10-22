@@ -3044,7 +3044,12 @@ def check_gitops_workload_manifest(project_id: str) -> CheckResult:
                 return unread(f"{path} (over the contents API's inline limit, read raw)", body)
             if state == GITHUB_PATH_ABSENT:
                 return absent()
-            if state in (GITHUB_PATH_FAILED, GITHUB_PATH_UNDECODABLE):
+            if state == GITHUB_PATH_UNDECODABLE:
+                # The index reads it with replacement characters and keys
+                # what parses; this reader cannot, so the file is unjudged,
+                # as a sibling with the same byte is.
+                return unread(f"{path} (over the contents API's inline limit, read raw)", body)
+            if state == GITHUB_PATH_FAILED:
                 return failed(f"{path} (over the contents API's inline limit, read raw)", body)
         else:
             # Decoded as the index reads the file (`errors="replace"`), so a
@@ -3377,17 +3382,33 @@ def _workload_manifest_problem(body: str, collect, siblings: dict[str, str] | No
 
     try:
         index = index_of({GITOPS_WORKLOAD_MANIFEST_PATH: body, **(siblings or {})})
+    except OSError:
+        # The scratch tree, not the index: the callers report it unread.
+        raise
     except Exception as exc:
         if siblings:
             # PyYAML's message names no file. Index the seed alone to say
-            # which side is at fault: a clean seed makes the raise a sibling's,
-            # and a replace of the seed would change nothing.
+            # which side is at fault: a seed that indexes and keys the
+            # Deployment makes the raise a sibling's, and a replace of the
+            # seed would change nothing; then each sibling alone, to name it.
             try:
-                index_of({GITOPS_WORKLOAD_MANIFEST_PATH: body})
+                alone = index_of({GITOPS_WORKLOAD_MANIFEST_PATH: body})
+            except OSError:
+                raise
             except Exception:
-                pass
-            else:
-                return f"{SIBLING_RAISE_PREFIX}{type(exc).__name__}: {exc}); the seed alone indexes"
+                alone = None
+            if alone is not None and alone.get(GITOPS_WORKLOAD_MANIFEST_KEY):
+                raiser = ""
+                for rel, text in siblings.items():
+                    try:
+                        index_of({rel: text})
+                    except OSError:
+                        raise
+                    except Exception:
+                        raiser = rel
+                        break
+                named = f" {raiser}" if raiser else ""
+                return f"{SIBLING_RAISE_PREFIX}{type(exc).__name__}: {exc}){named}; the seed alone indexes and keys it"
         return f"the index raises on it ({type(exc).__name__}: {exc})"
     paths = index.get(GITOPS_WORKLOAD_MANIFEST_KEY)
     if not paths:

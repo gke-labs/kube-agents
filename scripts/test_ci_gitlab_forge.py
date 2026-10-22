@@ -255,6 +255,16 @@ class SeedFileTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {gitlab.SEED_TOKEN_ENV: "owner-tok"}), mock.patch.object(gitlab, "api", fake), redirect_stderr(err):
             self.assertEqual(gitlab.seed_file_main(["--project-id", "", "--path", self.FILE, "--message", "m", "--content-file", "-"]), 2, "the guard refuses an unnamed project before any call")
         self.assertIn("unnamed lease", err.getvalue())
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {gitlab.SEED_TOKEN_ENV: "tok1\ntok2"}), mock.patch.object(gitlab, "api", fake), \
+                mock.patch.object(sys, "stdin", io.StringIO("x: 1\n")), redirect_stderr(err):
+            self.assertEqual(gitlab.seed_file_main(["--project-id", "kube-agents-evals-2", "--path", self.FILE, "--message", "m", "--content-file", "-"]), 2, "a two-line token is refused before any call")
+        self.assertIn("one token on one line", err.getvalue())
+        self.assertNotIn("tok1", err.getvalue(), "and never printed")
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {gitlab.SEED_TOKEN_ENV: "owner-tok"}), mock.patch.object(gitlab, "api", fake), redirect_stderr(err):
+            self.assertEqual(gitlab.seed_file_main(["--project-id", "kube-agents-evals-2", "--path", self.FILE, "--message", "m", "--content-file", "/nonexistent/seed.yaml"]), 2, "an unreadable content file is a usage error, not a traceback")
+        self.assertIn("cannot read --content-file", err.getvalue())
 
     def test_a_project_the_token_cannot_see_is_named_with_the_status(self):
         def gone(method, path, token, body=None, host=gitlab.DEFAULT_HOST):
