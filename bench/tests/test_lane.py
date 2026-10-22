@@ -31,9 +31,8 @@ TASKS = REPO_ROOT / "bench" / "tasks"
 # A presubmit case that requests no pull request, neither through its own
 # checks nor through the file's `requesting:` list, and a nightly case that
 # requests one (its objective is a pull_request_opened check). Not
-# obtainability-remediation-proposal: it asks for a proposal, the lane file
-# no longer lists it among the requesting, and it is the case the
-# zero-allowance safeguard exists to watch.
+# obtainability-remediation-proposal: it asks for a proposal and the lane
+# file lists it among the requesting (#3439), so it is not read-only.
 READ_ONLY_CASE = "reliability-pdb-probe"
 REQUESTING_CASE = "pdb-remediation-pr"
 # The count a scratch lane file's `requesting:` entry gives READ_ONLY_CASE,

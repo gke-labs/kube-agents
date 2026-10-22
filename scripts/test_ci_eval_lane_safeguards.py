@@ -198,17 +198,16 @@ class InjectLaneTest(unittest.TestCase):
         self.assertIn("BENCH_GITOPS_REPO=gke-agentic/kube-agents-evals-21-infra", result.stdout)
         # The presubmit cases that request a pull request, by their own
         # checks or the file's `requesting:` list: the second phase holds
-        # them and the log says so. obtainability-remediation-proposal left
-        # the list when the persona's rule put its manifest in the reply
-        # (#2037), so it is graded at zero writes with the rest of the first
-        # phase. pdb-remediation-pr, which asks for its pull request by its
-        # own check, was the presubmit's one requesting case until its
-        # demotion to the nightly (2026-10-17, #3120), so today the list is
-        # empty and the log says "none";
+        # them and the log says so. obtainability-remediation-proposal is on
+        # the list (#3439): the persona answers its "propose a manifest"
+        # prompt with a pull request, so it is held out of the first phase.
+        # pdb-remediation-pr, which asks for its pull request by its own
+        # check, left the presubmit on its demotion to the nightly
+        # (2026-10-17, #3120).
         # test_the_requesting_cases_are_named_for_the_second_phase below
         # covers a matrix that holds them.
         requesting = requesting_among(presubmit_tasks())
-        self.assertNotIn("obtainability-remediation-proposal", requesting.split(","))
+        self.assertIn("obtainability-remediation-proposal", requesting.split(","))
         self.assertEqual(value(result, "REQUESTING"), requesting)
         self.assertIn(f"run after every other unit: {requesting or 'none'}\n", result.stdout)
 

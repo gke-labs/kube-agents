@@ -69,6 +69,9 @@
 # requests by design than its checks grade: its count is the total, and it
 # stays.
 requesting:
+  # Asks for a manifest and is answered with a pull request (#3439); listed
+  # so it runs in the second phase, away from the probes' windows.
+  obtainability-remediation-proposal: 1
   # Opens a pull request and closes it to spend the branch name, then opens
   # the second one its check grades; the reply names both.
   vcs-spent-branch-reuse: 2
