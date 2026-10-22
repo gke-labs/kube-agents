@@ -555,7 +555,8 @@ INCIDENT_WORKLOAD_DEDUP_SECONDS = min(
 # A pod named like a Deployment's: 8-10 hex characters (its ReplicaSet's
 # pod-template hash), then the pod's own suffix (`checkout-6cfdb6b98b-zwv24`).
 # A CronJob's pods have the same shape, the run minute standing in for the hash,
-# and so does any pod whose owner's name happens to end in 8-10 hex characters.
+# and so does any pod whose owner's last hyphen-separated segment is 8-10 hex
+# characters (`db-migrate-20261021`, which folds as `db-migrate`).
 # The one pattern clean_workload_name strips that names one workload in
 # practice; its second also strips the last segment of a bare pod
 # (`api-cache` -> `api`), which is a display choice and not an identity, so only
@@ -2875,8 +2876,9 @@ def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[s
     (`_handle_session_chat`) a 4xx is a failed check before the turn, a 503 is
     `gateway_draining` (the admission wrapper, which `POST /api/sessions` does
     not have, so a draining gateway creates the session and refuses the turn)
-    or `session_db_unavailable`, and a 307 or 308 is a redirect urlopen does
-    not follow for a POST; no turn ran for any of them. A 5xx out of
+    or `session_db_unavailable`, and no turn ran for either. The route sends
+    no redirect; a 307 or 308 from anything in front of it is one urlopen does
+    not follow for a POST, so no turn ran for that either. A 5xx out of
     `_run_agent` comes after the turn started, possibly after the front door
     filed its card.
     """

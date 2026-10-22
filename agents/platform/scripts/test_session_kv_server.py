@@ -2264,7 +2264,7 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             self.real_trigger("sess-aborted", "msg", {}, anchor_id)
             self.assertEqual(self._inject("aborted-api-6cfdb6b98b-bbbbb")["status"], "injected")
 
-    def test_only_a_5xx_other_than_503_reads_as_a_started_turn(self):
+    def test_a_5xx_other_than_503_or_a_transport_error_reads_as_a_started_turn(self):
         import urllib.error
         # 503 is Hermes's gateway_draining and session_db_unavailable, both
         # before the turn; a POST 307 is not followed.
