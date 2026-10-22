@@ -224,13 +224,6 @@ def case_verdicts(parts: dict[str, list[dict]], cases: list[str], tracked: dict[
     open kept-case issue: one with no line anywhere in the window still has
     its nights read (on that part), from the window's start."""
     homes = case_homes(parts)
-    eligible: dict[str, dict[str, dict]] = {}
-    for part, nights in parts.items():
-        fullest = max((len(n["tasks"]) for n in nights), default=0)
-        eligible[part] = {n["date"]: n for n in nights if not n["lost"] and not n["unrescued"]
-                          and not infra_event([t for t, _ in n["tasks"].values()], fullest)}
-    every = {part: {n["date"]: n for n in nights} for part, nights in parts.items()}
-    dates = sorted({n["date"] for nights in parts.values() for n in nights})
     # The cases each date's inject lane dropped before the fan-out
     # (runs[].lane_excluded, SCHEMA.md): a next-mode night was never going to
     # run them, so their absence that date is not a night they were kept from.
@@ -239,6 +232,18 @@ def case_verdicts(parts: dict[str, list[dict]], cases: list[str], tracked: dict[
         for n in nights:
             names = n["run"].get("lane_excluded") or []
             lane_excluded.setdefault(n["date"], set()).update(x for x in names if isinstance(x, str))
+    eligible: dict[str, dict[str, dict]] = {}
+    for part, nights in parts.items():
+        fullest = max((len(n["tasks"]) for n in nights), default=0)
+        seen = {name for n in nights for name in n["tasks"]}
+        # A fullest night from before the flip counts the cases the lane now
+        # drops. They are not missing from a next-mode night, so its size is
+        # the fullest less those the part ran before and this night did not.
+        eligible[part] = {n["date"]: n for n in nights if not n["lost"] and not n["unrescued"]
+                          and not infra_event([t for t, _ in n["tasks"].values()],
+                                              fullest - len((lane_excluded.get(n["date"], set()) & seen) - set(n["tasks"])))}
+    every = {part: {n["date"]: n for n in nights} for part, nights in parts.items()}
+    dates = sorted({n["date"] for nights in parts.values() for n in nights})
     out: dict[str, list[dict]] = {}
     for case in cases:
         if case in (tracked or {}):

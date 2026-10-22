@@ -491,8 +491,9 @@ what the renderer does with them.
   `result` stands in for one rep.
 - `runs[].lane_excluded` — the case ids `hack/ci-eval-pr.sh` dropped from
   the matrix before the fan-out on the inject lane
-  (`hack/eval/inject-lane-exclusions.txt`), parsed from its `AGENT_TRANSPORT=…:
-  <case> leaves the matrix` lines. Present only when there are any, so on a
+  (`hack/eval/inject-lane-exclusions.txt`), parsed from its
+  `leaves the matrix -- excluded on this lane` lines. Present only when there
+  are any, so on a
   run that graded `spec.mode: next` through the inject door. The Nightly
   report does not expect those cases of the night (`expected`, below).
 - `runs[].eval_verdict` — `GREEN` | `RED` | `null`: the Nightly report reads

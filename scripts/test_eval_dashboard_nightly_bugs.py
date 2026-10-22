@@ -714,6 +714,21 @@ class InfraCaseTest(Harness):
         gh, _, _ = self.run_once(data(night(14, [green("case-red")]), *nights))
         self.assertEqual(self.filed(gh, infra=True), [])
 
+    def test_lane_excluded_cases_do_not_count_toward_a_pool_wide_night(self):
+        # The 14th ran four cases the next-mode lane drops from the 15th on.
+        # Each later night has 2 of 5 cases infra: 40%, not pool-wide, though
+        # it would read as 6 of 9 if the dropped four counted as no line.
+        gone = ("gone-1", "gone-2", "gone-3", "gone-4")
+        before = night(14, [green("case-red"), *(green(n) for n in gone)])
+        after = []
+        for d in (15, 16, 17):
+            run = night(d, [infra_task("case-red"), infra_task("filler-1"), *(green(n) for n in FILLER[1:])], filler=False)
+            run["lane_excluded"] = list(gone)
+            after.append(run)
+        gh, _, _ = self.run_once(data(before, *after))
+        [issue] = self.filed(gh, infra=True)
+        self.assertIn("case-red", issue["title"])
+
     def test_nights_before_a_case_first_ran_do_not_count(self):
         gh, _, _ = self.run_once(data(night(15, []), night(16, []), night(17, [infra_task("case-red")])))
         self.assertEqual(self.filed(gh, infra=True), [])
