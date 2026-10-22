@@ -1053,7 +1053,8 @@
 # stack plants one disabled policy in the install's project, which needs
 # roles/monitoring.alertPolicyEditor on the runners (#3632, granted on every
 # pool project). Red on main, three greens on the fix, on a dev install.
-# Nightly from its first merge.
+# Nightly from its first merge. A unit killed between apply and destroy
+# leaves its policy behind; the sweep for those is #3797.
 ./tasks/monitoring-alert-policy-read/task.yaml
 
 # A delegated card written to outrun the worker budget: the worker runs under
