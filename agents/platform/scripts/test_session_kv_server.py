@@ -8281,10 +8281,9 @@ class TestTriageStartBurst(unittest.TestCase):
     BURST = 20
     STAGGER_S = 0.05
     DEADLINE_S = 30.0
-    # Not on the client scale: about three times it, so a slow runner does not
-    # time the probe out at cap 4, while cap 8 still keeps every worker busy
-    # for longer than this.
-    PROBE_TIMEOUT_S = 0.5
+    # Not on the client scale: a loaded runner must not time the probe out at
+    # cap 4, while cap 8 keeps every worker busy for TURN_HOLD_S, longer than this.
+    PROBE_TIMEOUT_S = 1.0
     PROBE_INTERVAL_S = 0.1
 
     def setUp(self):
