@@ -148,6 +148,14 @@ def test_a_trailing_slash_or_fragment_after_the_url_still_cites_it(root):
         assert _verify(f"compliance-audit: {URL_COMPLIANCE}{tail}", audits=(COMPLIANCE,)).status == "pass", tail
 
 
+def test_a_markdown_escaped_url_or_id_is_still_read(root):
+    url = "https://gitlab.com/acme/platform/gitops/-/work_items/4"
+    _write(COMPLIANCE, issue_url=url, issue_number=4, written=BEFORE, repo="gitlab.com/acme/platform/gitops")
+    reply = "compliance\\-audit: UPDATED, ledger https://gitlab.com/acme/platform/gitops/-/work\\_items/4"
+    assert "\\_" in reply and "\\-" in reply
+    assert _verify(reply, audits=(COMPLIANCE,)).status == "pass"
+
+
 def test_a_longer_issue_number_does_not_cite_a_shorter_one():
     assert not cites("see https://github.com/acme/gitops/issues/120", "https://github.com/acme/gitops/issues/12")
     assert cites("see HTTPS://GitHub.com/Acme/GitOps/issues/12/", "https://github.com/acme/gitops/issues/12")

@@ -78,6 +78,9 @@ STORE_READ = "__REPORT_STORE_REPLY__"
 # store holds whatever the forge handed back (GitHub's /issues/<n>, GitLab's /-/work_items/<n>), and
 # a reply may add a trailing slash or a fragment.
 CITATION_SUFFIX = r"(?!\d)"
+# A backslash before punctuation is a Markdown escape (`work\_items`, `compliance\-audit`), which
+# chat models write freely; the reply is read with those escapes removed.
+MARKDOWN_ESCAPE_RE = re.compile(r"\\([^A-Za-z0-9\s])")
 
 # Runs report_status.py's helpers under a module name that is not __main__, so its CLI does not
 # run, then prints, per audit and repository, the envelopes the check needs: every file's write
@@ -182,6 +185,11 @@ def _mention_re(audit: str) -> re.Pattern[str]:
     )
 
 
+def unescaped(reply: str) -> str:
+    """``reply`` with its Markdown backslash escapes removed."""
+    return MARKDOWN_ESCAPE_RE.sub(r"\1", reply)
+
+
 def cites(reply: str, url: str) -> bool:
     """True when ``reply`` carries ``url`` (case-insensitive, a trailing slash on either side ignored)."""
     return re.search(re.escape(url.rstrip("/")) + CITATION_SUFFIX, reply, re.IGNORECASE) is not None
@@ -234,7 +242,7 @@ class ReportStoreReplyVerifier(_OnboardingPollVerifier):
             audit: {str(row["issue_url"]) for rows in repos.values() for row in rows if row.get("issue_url")}
             for audit, repos in accepted.items()
         }
-        reply = snap.final_message or ""
+        reply = unescaped(snap.final_message or "")
         mentioned = mentioned_audits(reply, audits)
         failures = []
         for audit in audits:
