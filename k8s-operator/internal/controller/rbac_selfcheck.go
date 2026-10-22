@@ -159,6 +159,8 @@ var requiredPermissions = []requiredPermission{
 	{Group: "batch", Resources: []string{"jobs"}, Verbs: rbacWriteVerbs},
 	{Group: "coordination.k8s.io", Resources: []string{"leases"}, Verbs: rbacWriteVerbs},
 	{Group: "node.k8s.io", Resources: []string{"runtimeclasses"}, Verbs: rbacReadVerbs},
+	// storageclasses: growDataClaim reads a data claim's class by name.
+	{Group: "storage.k8s.io", Resources: []string{"storageclasses"}, Verbs: []string{"get"}},
 	{Group: "networking.k8s.io", Resources: []string{"networkpolicies"}, Verbs: rbacWriteVerbs},
 	{Group: "networking.k8s.io", Resources: []string{"ingresses"}, Verbs: rbacReadVerbs},
 	{Group: "networking.gke.io", Resources: []string{"fqdnnetworkpolicies"}, Verbs: rbacWriteVerbs},

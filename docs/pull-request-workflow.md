@@ -547,7 +547,7 @@ The two labels are the two people:
 - **`approved` is an `OWNERS` approver's.** `/approve`, from someone in the `OWNERS` file governing
   the changed paths — [`OWNERS`](../OWNERS) at the root and [`hack/OWNERS`](../hack/OWNERS) for the
   presubmit eval rosters (`hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt`)
-  alone, with [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `eval-crew`. The last names only
+  and the inject lane's exclusions and safeguards under `hack/eval/` alone, with [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `eval-crew`. The last names only
   `eval-crew` and sets `no_parent_owners`, so a root approver's `/approve` does not clear a change
   to what the presubmit runs or what blocks; the nightly file and the case directories under
   `bench/tasks/` fall through to the root approvers (#1546). An approver's
@@ -671,11 +671,13 @@ sync, and the sweep sometimes loses it; when it does, Tide starts the retest as 
 batch, when two or more qualify), crier's `pending` is then the newer status, and the sweep leaves
 it alone. That retest is what [`hack/ci-revalidate.sh`](../hack/ci-revalidate.sh), the job's step 0,
 makes cheap: before the job leases an evaluation project it looks for a green build of this job — at
-the pull request's head, or at an earlier head from which every change since is inert — attested by
-the Prow-posted success status, or failing both an admin `/override` of this job at the pull
+the pull request's head, at an earlier head with the same tree, or at an earlier head from which every
+change since is inert — attested by the Prow-posted success status, or failing all three an admin
+`/override` of this job at the pull
 request's current head, and reuses that verdict whatever `main` has done since — a batch pull by pull, every one or none — so a lost race
 costs the minutes of a pod start and a clone rather than the 1.5 to 3.5 hours of the matrix. A push
-still starts a fresh run, and a run it is: step 0 reuses an earlier head's green only when
+still starts a fresh run, and a run it is: step 0 reuses an earlier head's green only when that head
+has the same tree (an empty commit, or a message-only rewrite), whatever `main` did since, or when
 everything since, on the pull request's side and on `main`'s, is inert.
 `/test pull-kube-agents-smoke-test` on the same head posts `pending`, which wins until that run
 reports (`/retest` does not, because it reruns only failed contexts), and that run too reuses the
@@ -696,6 +698,18 @@ reads the key so that such a run is never itself taken for a green. What this tr
 away, on every retest and not only when the sweep wins: the combination of a head with the `main`
 it lands on, and in a batch with the other pulls, is not tested before the merge; the nightly eval
 on `main` is what finds a bad combination, as is the next smoke run that actually starts after it.
+Neither carries a verdict across a change to what the job grades. When the blocking job's
+`spec.mode` changes in `oss-test-infra` (the swap to `next`, or a rollback to `today`), set the
+repository variable `SMOKE_PIN_NOT_BEFORE` right after it merges, to that merge time plus the job's
+360-minute timeout (a run in flight at the change reports afterwards; later only costs retests),
+then dispatch `smoke-test-sticky.yml` by hand: the re-pin then never pins an older green, and makes
+one Tide still credits stale, which the change itself would not, as it moves nothing on `main`.
+Then move `main` once, with a docs-only pull request the job skips: Tide also credits a live
+ProwJob at `main`'s head, and a retest that started under the old mode stays credited that way
+until `main` moves. Ship the change with `EVAL_SKIP_REVALIDATION=1` on the job, so the retests Tide then starts run the
+matrix instead of reusing the old green. The follow-up that drops that lever sets
+`EVAL_REVALIDATION_NOT_BEFORE` on the job to the same time as the variable, so step 0 never reuses
+a green first reported before it, however long its pull request sat.
 Prow's own form of the re-pin — a `[prow:skip-retest]` sentinel written by `/override-sticky` — is
 upstream but not in the Prow build this repository merges through; `scripts/pin_smoke_status.py`
 says when to switch.

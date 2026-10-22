@@ -160,6 +160,9 @@ ADDED_AFTER_THE_MOVE = [
     "fleet-audit-reports-past-run",  # the report store's reader, PR #2115
     "platform-worker-refuses-shipped-skill-edit",  # skill governance, #1848
     "chat-voice-ack-names-target",  # the front door's delegation ack
+    "chat-sample-report-is-not-cluster-state",  # nothing filed on a sample report's say-so, #3080
+    "chat-sample-report-is-not-cluster-state-labelled",  # the same, with the patched adapter's label
+    "chat-real-report-fix-files-confirm-first",  # a real report still files at once, confirm-first
     "bootstrap-inventory-ranking-delivery",  # the onboarding prioritization stage, #2143
     "chat-question-wake-stays-silent",  # SOUL §2 step 5's already-posted rule
     "chat-question-typed-answer-fresh-session",  # a typed answer from a new thread session
@@ -192,6 +195,7 @@ ADDED_AFTER_THE_MOVE = [
     "stop-on-permission-refusal",  # retry after a command-policy refusal, #1948
     "not-found-target-stops-as-failure",  # a missing target stops its card on a hard wall, mock 06
     "alert-config-terraform-promql-probe",  # the gke-alert-configuration skill sync
+    "cluster-agent-observation-time-read",  # an audit trail states no time it did not read, #3256
     "security-chat-request-runs-collector",  # a plain security-posture request runs the compliance collector, #2386
     "compute-class-canary-active-migration-pdb-probe",  # the gke-compute-classes skill sync
     "observability-trace-latency-brokered",  # the trace latency helper through the broker, unparked 2026-10-16 (#2244)
@@ -279,6 +283,7 @@ HELD_OUT_IN_PRESUBMIT = [
 DEMOTED_AFTER_THE_SPLIT = [
     ("upgrades-lagging-master-probe", "fleet-cost-idle-pool"),  # 2026-10-16, #3269 (agent reads upgradeTargetVersion)
     ("pdb-remediation-pr", "upgrades-lagging-master-probe"),  # 2026-10-17, #3120 (worker declines a pull request into an -infra repo with no manifest; #3145)
+    ("consistency-authorized-networks-probe", None),  # 2026-10-21, #3598 (Gemini reads seeded-c's leftover authorized-networks block as configured; #3448 for the 429s)
 ]
 DEMOTED = {case for case, _ in DEMOTED_AFTER_THE_SPLIT}
 # The demotions recorded before the freeze (#3495), whose lines sit in the
@@ -714,6 +719,17 @@ class InjectLaneExclusionsTest(unittest.TestCase):
 
     def test_the_file_is_the_pinned_set(self):
         self.assertEqual(list(eval_rosters.inject_lane_exclusions()), INJECT_LANE_EXCLUDED)
+
+    def test_the_blocking_roster_cases_it_excludes_are_the_pinned_set(self):
+        # The merge-blocking presubmit runs on the inject lane, so a roster
+        # case listed here leaves what can red a pull request: hack/ci-eval-pr.sh
+        # drops it from the matrix and from BOOTSTRAP_ADMITTED there. It keeps
+        # its seat on the today lane, which grades over the api transport but
+        # gates nothing. Adding another is that decision, made here and in
+        # docs/eval-gate-roster.md ("The inject lane"), not a side effect of an
+        # exclusion entry.
+        roster = set(eval_rosters.blocking_roster())
+        self.assertEqual([case for case in eval_rosters.inject_lane_exclusions() if case in roster], ["agent-kanban-smoke"])
 
     def test_every_exclusion_names_a_registered_case(self):
         registered = set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases())

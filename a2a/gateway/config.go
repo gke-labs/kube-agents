@@ -85,6 +85,10 @@ const (
 // busyNoticeAtEnv names the busy notice's threshold (Config.BusyNoticeAt).
 const busyNoticeAtEnv = "A2A_BUSY_NOTICE_AT"
 
+// EnvNATSCAConfigMap names the ConfigMap the gateway's CA bundle comes from
+// (Config.NATSCAConfigMap), which the operator renders beside NATS_CA_FILE.
+const EnvNATSCAConfigMap = "NATS_CA_CONFIGMAP"
+
 // The display-mode values, matching the GoogleChatSpec.Mode enum.
 const (
 	displayModeDefault = "default"
@@ -131,6 +135,13 @@ type Config struct {
 	NATSUser     string
 	NATSPassword string
 	DiscordToken string
+
+	// NATSCAFile is the CA bundle this gateway trusts the bus by
+	// (lib.EnvNATSCAFile), and NATSCAConfigMap the ConfigMap it was mounted
+	// from. The spawner hands both to every session pod: the pod mounts the
+	// same ConfigMap at the same path, so it trusts what the gateway trusts.
+	NATSCAFile      string
+	NATSCAConfigMap string
 
 	// SlackBotToken and SlackAppToken arm the Slack backend: Socket Mode
 	// needs both (xoxb- drives the Web API, xapp- the outbound websocket —
@@ -596,6 +607,8 @@ func (c *Config) A2ADoorArmed() bool { return c.A2ADoorListen != "" }
 func FromEnv() (*Config, error) {
 	cfg := &Config{
 		NATSURL:          os.Getenv("NATS_URL"),
+		NATSCAFile:       os.Getenv(lib.EnvNATSCAFile),
+		NATSCAConfigMap:  os.Getenv(EnvNATSCAConfigMap),
 		NATSUser:         os.Getenv("NATS_USER"),
 		NATSPassword:     os.Getenv("NATS_PASSWORD"),
 		DiscordToken:     os.Getenv("DISCORD_TOKEN"),
@@ -669,6 +682,13 @@ func FromEnv() (*Config, error) {
 	}
 	if cfg.NATSURL == "" {
 		return nil, fmt.Errorf("NATS_URL is required")
+	}
+	// The CA and the ConfigMap it came from arm the session pods' trust
+	// together. With the file alone the gateway itself connects, while every
+	// session pod it spawns gets the tls:// URL and no CA, and fails
+	// verification on its first connect.
+	if (cfg.NATSCAFile != "") != (cfg.NATSCAConfigMap != "") {
+		return nil, fmt.Errorf("%s and %s arm the session pods' bus trust together; only one is set", lib.EnvNATSCAFile, EnvNATSCAConfigMap)
 	}
 	// Socket Mode needs the whole Slack pair; half a pair is a typo, not a
 	// choice, so it refuses rather than silently running another backend.

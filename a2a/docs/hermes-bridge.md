@@ -131,7 +131,9 @@ opt-out is tracked in [#2623](https://github.com/gke-labs/kube-agents/issues/262
 ordinary `corev1.Container` entries, so a declared bridge's shape is CR-authored and
 reconcile leaves it alone: it has to carry its own `NATS_URL` and creds, and, for the `api`
 executor, `API_SERVER_KEY`, `A2A_ACTIVITY_SECRET` and `SESSION_KV_API_KEY` (without the last,
-every chat turn ends saying a card's answer cannot be posted back). The operator reads `BRIDGE_CONCURRENCY`
+every chat turn ends saying a card's answer cannot be posted back). The one thing the operator adds is the
+bus CA: `NATS_CA_FILE` and the bundle mount at `/etc/a2a-nats-ca`, overriding any value of the entry's own,
+since the bus requires TLS and a bridge that cannot verify it never connects. The operator reads `BRIDGE_CONCURRENCY`
 back out of the entry, to size the TASKS consumer reserve, and `BRIDGE_EXECUTOR`,
 `API_SERVER_KEY` and `BRIDGE_ACTIVITY_LISTEN`, to decide whether the `api` executor's
 pod-wide hook is rendered; it writes none of those.
@@ -171,7 +173,9 @@ bridge, unset `spec.deployment.sidecars` _before_ flipping to `today`. In any fl
 for such an install that step is a blocker, not tidiness. `hack/rollback-roundtrip.sh`
 follows it: a CR with declared sidecars has the whole list unset, not only the sidecars
 that look like bus clients, flipped, and the saved list declared again once `next` is back;
-a CR with none, the lane's own, is only flipped.
+a CR with none, the lane's own, is only flipped. Asked to end under `today`
+(`ROLLBACK_END_MODE=today`, the today lane's run), it refuses a CR with declared sidecars before
+changing anything, since the last flip would leave them unset.
 
 **The webhook does not screen sidecar env, on purpose.** The `SensitiveEnvVars`
 refusal applies to `spec.deployment.env` only; a sidecar's own `env` is unscreened (the

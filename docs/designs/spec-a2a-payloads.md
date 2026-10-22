@@ -458,6 +458,14 @@ opening one was unreadable; over the cap the closing delivery is larger still, s
 an error), `durationMs` and `at`; the library
 validates the part kind (assertion 18), and a reader tolerates the keys it does not know.
 
+One unreserved name has a defined shape: `steps`, `kube-agents.step/v1` data parts
+([`a2a/lib/stepmsg`](../../a2a/lib/stepmsg/stepmsg.go)), by which an executor may state what a turn
+planned, which of its subtasks settled, and when it synthesized an answer, so a renderer lists a
+turn's steps without parsing them out of `thinking`. It carries no reserved semantics: the relay
+ignores it, the fold keeps it, and a reader that does not know it skips it. A later version of the record is a new
+schema, as with chat messages: a v1 reader skips a `kube-agents.step/v2` part rather than guess
+at it, and skips a v1 part with an unknown `kind`.
+
 ## Verified identity (added 9/9)
 
 **An envelope's publisher is the principal implied by the subject it arrived on** - the

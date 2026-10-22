@@ -40,6 +40,24 @@ UNKNOWN_ROSTER = (
 )
 NO_DESCRIPTION = "(no description provided)"
 
+# The cluster_identity block a Cluster Agent's config.yaml carries
+# (agents/platform/scripts/cluster_agent_profile.py, _inject_cluster_identity):
+# the scaffold's yaml.safe_dump output, a top-level key then scalars indented by
+# IDENTITY_INDENT. Quote characters a dumped scalar may be wrapped in.
+PROFILE_CONFIG = "config.yaml"
+IDENTITY_BLOCK = "cluster_identity:"
+IDENTITY_NAME_KEY = "cluster"
+IDENTITY_PLACE_KEYS = ("project", "location")
+IDENTITY_KEYS = (IDENTITY_NAME_KEY, *IDENTITY_PLACE_KEYS)
+IDENTITY_INDENT = "  "
+YAML_QUOTES = "'\""
+# discover() stores each identity value under this prefix plus its key, and the
+# roster line shows it with these templates (see _identity_note).
+IDENTITY_FIELD_PREFIX = "cluster_"
+IDENTITY_NOTE = " (the {cluster} cluster agent{where})"
+IDENTITY_WHERE = "; {places}"
+IDENTITY_PLACE = "{key} {value}"
+
 
 def log(msg: str) -> None:
     print(f"[AGENT-ROSTER] {msg}", file=sys.stderr)
@@ -81,6 +99,40 @@ def _responsibilities(home: Path) -> str:
     return _summarize_soul(home)
 
 
+def _cluster_identity(home: Path) -> dict[str, str]:
+    """The cluster a Cluster Agent's profile targets, from its config.yaml, or {}.
+
+    The profile name is a sanitized, sometimes truncated-and-hashed assignee id,
+    not a name to show a person, and the cluster name cannot be read back out of
+    it (project, cluster and location may all hold hyphens). The scaffold stamps
+    the real identity into config.yaml; reading it here gives the front door the
+    name to say. A line scan rather than a YAML load, because this module is
+    stdlib-only (it runs ahead of every front-door turn and in the MCP server):
+    the block is the scaffold's own `yaml.safe_dump` output, top-level key then
+    two-space-indented scalars.
+    """
+    try:
+        cfg = home / PROFILE_CONFIG
+        if not cfg.is_file():
+            return {}
+        lines = cfg.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return {}
+    identity: dict[str, str] = {}
+    inside = False
+    for line in lines:
+        if not inside:
+            inside = line.rstrip() == IDENTITY_BLOCK
+            continue
+        if not line.startswith(IDENTITY_INDENT) or line.startswith(IDENTITY_INDENT + " "):
+            break
+        key, sep, value = line.strip().partition(":")
+        value = value.strip().strip(YAML_QUOTES)
+        if sep and key in IDENTITY_KEYS and value:
+            identity[key] = value
+    return identity if identity.get("cluster") else {}
+
+
 def discover(base: Path | None = None) -> list[dict[str, str]] | None:
     """Enumerate every routable specialist profile (all profiles except `default`).
 
@@ -107,7 +159,9 @@ def discover(base: Path | None = None) -> list[dict[str, str]] | None:
         try:
             if not p.is_dir() or p.name == SELF_PROFILE:
                 continue
-            agents.append({"name": p.name, "responsibilities": _responsibilities(p)})
+            agent = {"name": p.name, "responsibilities": _responsibilities(p)}
+            agent.update({IDENTITY_FIELD_PREFIX + k: v for k, v in _cluster_identity(p).items()})
+            agents.append(agent)
         except OSError as e:
             log(f"skipping unreadable profile {p.name}: {e}")
     return agents
@@ -147,18 +201,40 @@ def format_roster(agents: list[dict[str, str]] | None) -> str | None:
     # Distinct specialists first, then the shared-role fleets — the front door routes to a
     # named specialist far more often than to a specific cluster. The undescribed trail
     # both: they are the least useful entries to route from.
+    # The name a person reads beside the assignee id, when the profile records
+    # its cluster (a Cluster Agent does): "the <cluster> cluster agent".
+    shown = {a["name"]: _identity_note(a) for a in agents}
+
     blocks: list[str] = []
     for desc, names in sorted(groups.items(), key=lambda kv: len(kv[1])):
         if len(names) == 1:
-            blocks.append(f"- {names[0]}: {desc}")
+            blocks.append(f"- {names[0]}{shown[names[0]]}: {desc}")
             continue
-        listed = "\n".join(f"  - {n}" for n in names)
+        listed = "\n".join(f"  - {n}{shown[n]}" for n in names)
         blocks.append(
             f"The following {len(names)} agents share one role — pick the one whose cluster "
             f"you need:\n{listed}\n  Shared role: {desc}"
         )
-    blocks.extend(f"- {name}: {NO_DESCRIPTION}" for name in undescribed)
+    blocks.extend(f"- {name}{shown[name]}: {NO_DESCRIPTION}" for name in undescribed)
     return "\n\n".join(blocks)
+
+
+def _identity_note(agent: dict[str, str]) -> str:
+    """" (the <cluster> cluster agent; project <p>, location <l>)", or "" without one.
+
+    Set apart from the assignee id by a space and parentheses, so the id stays
+    the exact token the footer tells the caller to copy.
+    """
+    cluster = agent.get(IDENTITY_FIELD_PREFIX + IDENTITY_NAME_KEY, "")
+    if not cluster:
+        return ""
+    places = ", ".join(
+        IDENTITY_PLACE.format(key=k, value=agent[IDENTITY_FIELD_PREFIX + k])
+        for k in IDENTITY_PLACE_KEYS
+        if agent.get(IDENTITY_FIELD_PREFIX + k)
+    )
+    where = IDENTITY_WHERE.format(places=places) if places else ""
+    return IDENTITY_NOTE.format(cluster=cluster, where=where)
 
 
 def render(base: Path | None = None) -> str | None:

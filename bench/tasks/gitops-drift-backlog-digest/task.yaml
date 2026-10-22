@@ -1,0 +1,128 @@
+# Domain: incident triage. Journey: changes queue while the drift detector is
+# not pulling (an install, a pod roll), and a burst of them is recorded and
+# summarised in one digest rather than triaged one card each; a lone late
+# change, a late kubectl write and a change made after the detector is pulling
+# again still get their cards.
+#
+# Issue #3387: an install's own Helm apply runs under the installer's account,
+# reaches the detector as a burst of human-tier records when it first pulls,
+# and on main became one triage card per object, spending the day's drift
+# alert budget before any real drift arrived.
+#
+# The fixture (bench/tf/prebuilt/gitops-drift-backlog) stops the detector
+# process for real (SIGSTOP in its sidecar), publishes records to the topic,
+# and kills it; start-services.sh relaunches it, and the relaunched process
+# finds those records published before its first pull. So the case grades the
+# detector marking them as well as the daemon digesting them: a payload marked
+# backlog by hand would go green with the detector unchanged.
+#
+# The verdict rests on the ledger and the board, read by the fixture, not on
+# the agent's reply: the agent's part is to retrieve the live change's card,
+# which proves the pipeline was still triaging live drift after the restart.
+# The fixture's header lists the verdicts and which ones exclude a repetition.
+#
+# Published in the same stopped window: one record by a second principal and
+# three kubectl writes by the backlog principal. Each must still get a card: a
+# lone late edit and a late kubectl edit are more likely a person's change made
+# just before a restart than part of an install's burst.
+#
+# The eval installs run with the drift alert ceiling off and chat off, so the
+# digest is recorded headless there (backlog = 3); on an install with chat it
+# is posted (backlog = 2). Either is ok.
+id: gitops-drift-backlog-digest
+name: Changes that queued while drift detection was down are digested, and a later change still gets its card
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/gitops-drift-backlog"
+  teardown: true
+  variables:
+    namespace: "eval-drift-backlog"
+    live_workload: "eval-drift-backlog-api"
+    live_container: "api"
+    gitops_field_manager: "argocd-controller"
+    drift_field_manager: "kubectl-edit"
+    declared_memory: "256Mi"
+    drifted_memory: "512Mi"
+    live_principal: "ada@example.com"
+    backlog_principal: "installer@example.com"
+    backlog_record_count: 6
+    lone_principal: "grace@example.com"
+    kubectl_record_count: 3
+validated: false
+domain: incident-triage
+fixtures: []
+prompt: |
+  A change landed against a workload in the 'eval-drift-backlog' namespace of
+  GKE cluster '{{CLUSTER_NAME}}' in the last few minutes. If it was made outside
+  GitOps it has already been triaged, and its card is on the kanban board.
+
+  Retrieve that triage and report it. Do not diagnose anything yourself: do not
+  inspect the namespace, the workload, or its field ownership. The task is to
+  return the report that was already produced, not to produce a second one.
+
+  1. Find the card. Call kanban_list separately for status 'running', 'done'
+     and 'blocked'. Do not call kanban_list without a status filter -- it
+     returns the oldest tasks first and stops at a page, so the newest card is
+     not in the default response. The card you want is the most recent one
+     concerning 'eval-drift-backlog-api'.
+  2. If it has not finished, wait for it. Call kanban_show on its id, and keep
+     re-checking until its status is 'done', 'blocked' or 'archived'.
+  3. Reproduce the finished card's result in your reply in full and verbatim.
+     Do not summarise it, shorten it, or re-order it.
+
+  Make no changes to the cluster.
+expected_output: |
+  critical requirements:
+  - The report is the triage the drift pipeline already produced, read off the
+    kanban board rather than worked out fresh. A correct reply is not required
+    to say where it came from.
+  - It concerns 'eval-drift-backlog-api' and the memory limit raised on its
+    'api' container.
+  - It says the change was made outside the GitOps manager, by naming the field
+    manager that took the field ('kubectl-edit') against the one owning the
+    declared spec ('argocd-controller').
+  - Nothing is applied to the cluster; in particular the memory limit is not
+    put back.
+verification_spec:
+  - name: triage-was-read-off-the-board
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_list"]
+      require_success: true
+  - name: triage-names-the-live-change
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["eval-drift-backlog-api"]
+  - name: triage-names-what-changed
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases: ["memory limit", "limits.memory"]
+  - name: fixture-observed-the-backlog-digested
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: resource_property
+      kind: configmap
+      resource_name: eval-drift-backlog-verdict
+      namespace: eval-drift-backlog
+      path: data.verdict
+      op: eq
+      value: ok
+  - name: triage-did-not-revert-the-live-cluster
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: resource_property
+      kind: deployment
+      resource_name: eval-drift-backlog-api
+      namespace: eval-drift-backlog
+      path: spec.template.spec.containers[?(@.name=='api')].resources.limits.memory
+      op: eq
+      value: "512Mi"

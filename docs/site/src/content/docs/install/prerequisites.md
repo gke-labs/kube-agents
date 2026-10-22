@@ -101,7 +101,11 @@ The chart's quota check counts a `today` release only, not the `spec.mode: next`
 
 A quota is more than CPU and memory, and so is the check: a `today` install also needs 7
 pods, 4 persistent volume claims totalling 102 GiB of `requests.storage`, and 5 GiB of
-ephemeral-storage requests against 5 GiB of limits. A namespace quota that caps pod or
+ephemeral-storage requests against 5 GiB of limits. Two of those claims, the agent's data
+claim and the shell sandbox's, are 50 GiB each and follow
+[`spec.storage.size`](/kube-agents/operator/platformagent-crd/#specstorage), so each GiB
+added to it adds 2 GiB of `requests.storage`, and the chart's check counts it. A
+namespace quota that caps pod or
 claim counts below what the release needs refuses the install the same way; note that
 constraining ephemeral storage additionally requires every container to declare it (or
 a `LimitRange` to default it), as the chart README explains. Under `spec.mode: next`,

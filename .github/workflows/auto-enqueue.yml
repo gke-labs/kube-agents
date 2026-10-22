@@ -9,7 +9,8 @@ name: Auto Enqueue
 # a `do-not-merge` label. It also re-posts the gate statuses of the approved
 # pull requests, in case `merge-gate.yml` missed an event. A pull request the
 # queue removed, or that someone took out by hand, stays out until its head
-# moves; to keep one out past that, add a hold label.
+# moves; to keep one out past that, add a hold label. The one exception: after
+# the first `failed_checks` removal since the push, the sweep puts it back once.
 #
 # Inert until the repository variable `MERGE_QUEUE` is `on`, which is the last
 # step of the cut-over: the queue is enabled on `main` and the repository is
@@ -23,7 +24,8 @@ name: Auto Enqueue
 # unless the token can write workflows).
 # `GITHUB_TOKEN` cannot do them: an event it causes starts no workflow run, so
 # its queue entries could get no `merge_group` runs. The job's own
-# `GITHUB_TOKEN` only reads and posts the gate statuses.
+# `GITHUB_TOKEN` reads, posts the gate statuses, and posts one comment on a
+# pull request removed from the queue, with the reason and what to do.
 #
 # Two triggers, as in `hold-unresolved-threads.yml`. The schedule is the
 # guarantee; the label fast path enqueues the moment the last label lands and
@@ -82,7 +84,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read # check out the default branch: the script
-      pull-requests: read # the open pull requests, their labels and queue state
+      pull-requests: write # read the open pull requests; post the left-out comment
       statuses: write # re-post the gate statuses
     steps:
       # The default branch, never a pull request head: this job holds a
@@ -117,6 +119,7 @@ jobs:
         continue-on-error: ${{ github.event_name == 'pull_request_target' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SMOKE_PIN_NOT_BEFORE: ${{ vars.SMOKE_PIN_NOT_BEFORE }}
           ENQUEUE_TOKEN: ${{ steps.enqueue-token.outputs.token }}
           ACTOR: ${{ steps.enqueue-token.outputs.app-slug }}
           DRY_RUN: ${{ inputs.dry_run }}
