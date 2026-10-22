@@ -21,7 +21,6 @@ import typing
 import unittest
 
 import yaml
-
 from eval_dashboard import nightly_bugs
 
 TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_nightly_bugs"
@@ -705,6 +704,15 @@ class InfraCaseTest(Harness):
         [issue] = self.filed(gh, infra=True)
         self.assertIn("no line for the case", issue["body"])
         self.assertNotIn("eval_case-red_rep1.log", issue["body"], "no transcript link for a run that recorded nothing")
+
+    def test_a_case_the_inject_lane_dropped_is_not_kept_from_running(self):
+        # case-red ran on the 14th (today mode), then the nightly moved to
+        # next, whose inject lane drops it before the fan-out: not kept.
+        nights = [night(d, []) for d in (15, 16, 17)]
+        for run in nights:
+            run["lane_excluded"] = ["case-red"]
+        gh, _, _ = self.run_once(data(night(14, [green("case-red")]), *nights))
+        self.assertEqual(self.filed(gh, infra=True), [])
 
     def test_nights_before_a_case_first_ran_do_not_count(self):
         gh, _, _ = self.run_once(data(night(15, []), night(16, []), night(17, [infra_task("case-red")])))

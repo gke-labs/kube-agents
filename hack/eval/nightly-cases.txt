@@ -11,12 +11,14 @@
 # night). The registration lint (scripts/validate_bench_cases.py) reads this
 # file as well as the presubmit one; the domain-coverage lint reads only
 # blocking-roster.txt, so neither an entry here nor a held-out presubmit
-# seat counts as coverage. The Gemini nightly runs as two periodics:
-# ci-kube-agents-eval-nightly with EVAL_NIGHTLY_PART=main, and
-# ci-kube-agents-eval-nightly-writers with EVAL_NIGHTLY_PART=writers, the
-# cases that request a pull request, on a second project (the variable's
-# comment in the script says why). EVAL_NIGHTLY_PART=main-a and main-b halve
-# the main part again, for two jobs on two projects (#3384).
+# seat counts as coverage. The main nightly grades spec.mode next
+# (EVAL_MODE_NEXT=1) as two periodics: ci-kube-agents-eval-nightly with
+# EVAL_NIGHTLY_PART=main, and ci-kube-agents-eval-nightly-writers with
+# EVAL_NIGHTLY_PART=writers, the cases that request a pull request, on a
+# second project (the variable's comment in the script says why).
+# EVAL_NIGHTLY_PART=main-a and main-b halve the main part again, for two jobs
+# on two projects (#3384). ci-kube-agents-eval-nightly-today runs the whole
+# matrix on spec.mode today as the rollback check.
 #
 # WHO APPROVES. The normal approvers (root OWNERS). Only the presubmit files
 # beside this one carry the eval-crew rule (#1546, decided 2026-09-15).

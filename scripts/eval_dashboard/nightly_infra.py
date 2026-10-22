@@ -231,6 +231,14 @@ def case_verdicts(parts: dict[str, list[dict]], cases: list[str], tracked: dict[
                           and not infra_event([t for t, _ in n["tasks"].values()], fullest)}
     every = {part: {n["date"]: n for n in nights} for part, nights in parts.items()}
     dates = sorted({n["date"] for nights in parts.values() for n in nights})
+    # The cases each date's inject lane dropped before the fan-out
+    # (runs[].lane_excluded, SCHEMA.md): a next-mode night was never going to
+    # run them, so their absence that date is not a night they were kept from.
+    lane_excluded: dict[str, set[str]] = {}
+    for nights in parts.values():
+        for n in nights:
+            names = n["run"].get("lane_excluded") or []
+            lane_excluded.setdefault(n["date"], set()).update(x for x in names if isinstance(x, str))
     out: dict[str, list[dict]] = {}
     for case in cases:
         if case in (tracked or {}):
@@ -243,6 +251,8 @@ def case_verdicts(parts: dict[str, list[dict]], cases: list[str], tracked: dict[
             if first and datetime.date.fromisoformat(day) < first:
                 continue
             recorders = [p for p in nightly.PARTS if case in every.get(p, {}).get(day, {}).get("tasks", {})]
+            if not recorders and case in lane_excluded.get(day, ()):
+                continue
             # A graded line is direct evidence the case ran: it claims the
             # date even on a pool-wide or unrescued night (not a lost
             # one, whose lines the domain reader skips too), so "a graded
