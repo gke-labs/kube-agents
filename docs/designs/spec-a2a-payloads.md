@@ -706,7 +706,10 @@ and only its `mark` is validated. When the newest task ends with no mark on its 
 
 ### Task parameters and child results
 
-Added 10/22 for the profile dispatcher (`spec-profiles-dispatch.md`). Both are `data` parts.
+Reserved 10/22 for the profile dispatcher (`spec-subagent-profiles.md`), and used from the gateway's
+delegation to profiles onward; nothing writes them yet. Both are `data` parts, and only the gateway
+writes them: a reader takes the first such part in a message, and the gateway strips any a client
+or a task supplies.
 
 **Task parameters.** A profile task's submission carries
 `{"taskParameters": {"parameters": {"<name>": "<value>", …}}}`: the parameters its persona
@@ -721,8 +724,11 @@ and that check is what makes these message fields authoritative.
   `.`, `..` or a flag.
 - A value can't contain `/` or a space, because the dispatcher joins values into a resource path.
 - A set has at most 16 parameters.
-- A reader that finds the part and it breaks these bounds refuses the task rather than running it
-  without parameters (`lib.TaskParametersOf`).
+- A reader that finds the part and it breaks these bounds, or carries no parameters object, refuses
+  the task rather than running it without parameters (`lib.TaskParametersOf`). The dispatcher also
+  checks that every parameter the persona declares is present before it builds the resource.
+- A child result that is malformed (no task id, a non-terminal state, text past the cap) is
+  skipped: it is no event, where a malformed parameter set would change what runs.
 
 **Child results.** When a child task ends, the gateway publishes a `message` on its parent's `…in`
 carrying `{"childResult": {"childTaskId", "addressee", "state", "text"?}}`. The parent's per-task

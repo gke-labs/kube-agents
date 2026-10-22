@@ -215,9 +215,6 @@ func TestChildResultRefusesWhatIsNotAnEnd(t *testing.T) {
 			if _, err := ChildResultPart(c); err == nil {
 				t.Error("ChildResultPart accepted it")
 			}
-			if c.Text != "" {
-				return
-			}
 			data, _ := json.Marshal(map[string]ChildResult{"childResult": c})
 			if _, ok := ChildResultOf([]Part{{Kind: "data", Data: data}}); ok {
 				t.Error("ChildResultOf read it")
@@ -237,5 +234,20 @@ func TestADelegateRequestWithoutParametersIsUnchangedOnTheWire(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"addressee":"cluster","text":"t","parameters":{"cluster":"web-1"}}`), &got); err != nil ||
 		got.Parameters["cluster"] != "web-1" {
 		t.Fatalf("decoded %+v, %v", got, err)
+	}
+}
+
+// A part that is there but carries no parameters object (null, or a
+// misspelt field) is broken, not an empty set: an error, never a task run
+// with no target.
+func TestTaskParametersOfRefusesAPartWithNoParametersObject(t *testing.T) {
+	for _, data := range []string{
+		`{"taskParameters":null}`,
+		`{"taskParameters":{"parameters":null}}`,
+		`{"taskParameters":{"parameterz":{"cluster":"web-1"}}}`,
+	} {
+		if _, ok, err := TaskParametersOf([]Part{{Kind: "data", Data: json.RawMessage(data)}}); !ok || err == nil {
+			t.Errorf("%s: ok=%v err=%v, want found and refused", data, ok, err)
+		}
 	}
 }

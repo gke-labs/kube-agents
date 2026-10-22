@@ -359,3 +359,18 @@ func finalText(task *lib.Task) string {
 	}
 	return task.FinalMessage.Parts[0].Text
 }
+
+// The adapter keeps a delegate request whose parameters break lib's bounds
+// off the bus, as it does an empty or oversized text; the gateway's check
+// is the one that matters.
+func TestValidateDelegateRefusesBadParameters(t *testing.T) {
+	ok := lib.DelegateRequest{Addressee: "cluster", Text: "check web-1", Parameters: map[string]string{"cluster": "web-1"}}
+	if got := validateDelegate(ok); got != "" {
+		t.Fatalf("a valid request was refused: %s", got)
+	}
+	bad := ok
+	bad.Parameters = map[string]string{"cluster": "web-1/../prod"}
+	if got := validateDelegate(bad); got == "" {
+		t.Fatal("a parameter value with a '/' reached the bus")
+	}
+}

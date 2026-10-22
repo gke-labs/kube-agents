@@ -2,6 +2,7 @@ package lib
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"regexp"
@@ -182,8 +183,10 @@ func UsageTotal(turns []Usage) Usage {
 // ArtifactDelegate, rather than duplicated per caller.
 //
 // Parameters are the child task's parameters (TaskParameters), the target
-// cluster among them, which the gateway carries into the child's submission;
-// the gateway refuses a child whose target is not inside its parent's.
+// cluster among them. The contract (spec-a2a-payloads.md, "Task parameters
+// and child results"): the gateway carries them into the child's submission
+// and refuses a child whose target is not inside its parent's. No gateway
+// reads them yet.
 type DelegateRequest struct {
 	Addressee  string            `json:"addressee"`
 	Text       string            `json:"text"`
@@ -273,6 +276,12 @@ func TaskParametersOf(parts []Part) (TaskParameters, bool, error) {
 		if err := json.Unmarshal(raw, &tp); err != nil {
 			return TaskParameters{}, true, fmt.Errorf("task parameters: %w", err)
 		}
+		// A null part, a null set or a misspelt field decodes to no
+		// parameters at all; that is a broken part, not an empty set, which
+		// is written {"parameters":{}}.
+		if tp.Parameters == nil {
+			return TaskParameters{}, true, errors.New("task parameters: the part carries no parameters object")
+		}
 		if err := ValidateTaskParameters(tp.Parameters); err != nil {
 			return TaskParameters{}, true, err
 		}
@@ -315,7 +324,9 @@ func ChildResultPart(c ChildResult) (Part, error) {
 }
 
 // ChildResultOf finds the childResult part among parts. A data part that is
-// not one, or one without a task id or a terminal state, is skipped.
+// not one, or one without a task id or a terminal state or with text past
+// the cap, is skipped: a malformed child result is no event, where a
+// malformed parameter set (TaskParametersOf) would change what runs.
 func ChildResultOf(parts []Part) (ChildResult, bool) {
 	for _, p := range parts {
 		raw, ok := wrappedData(p, childResultKey)
@@ -323,7 +334,8 @@ func ChildResultOf(parts []Part) (ChildResult, bool) {
 			continue
 		}
 		var c ChildResult
-		if json.Unmarshal(raw, &c) != nil || !ValidSubjectToken(c.ChildTaskID) || !c.State.Terminal() {
+		if json.Unmarshal(raw, &c) != nil || !ValidSubjectToken(c.ChildTaskID) || !c.State.Terminal() ||
+			len(c.Text) > ChildResultTextCap {
 			continue
 		}
 		return c, true

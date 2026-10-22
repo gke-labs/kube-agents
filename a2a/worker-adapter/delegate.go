@@ -115,6 +115,9 @@ func validateDelegate(req lib.DelegateRequest) string {
 	case len(req.Text) > lib.DelegateTextCap:
 		return "text is too long for a delegation"
 	}
+	if err := lib.ValidateTaskParameters(req.Parameters); err != nil {
+		return err.Error()
+	}
 	return ""
 }
 
