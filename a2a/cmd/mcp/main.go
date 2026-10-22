@@ -149,12 +149,13 @@ func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string)
 		return err
 	}
 	defer bus.Close()
-	convs := mcp.NewConversations()
+	convs := mcp.NewConversations().WithEvents(bus.Events())
 	srv, err := mcp.NewServer(
 		mcp.ConnectionStatusTool(bus),
 		mcp.SendMessageTool(bus, convs),
 		mcp.TaskControlTool(bus, convs),
 		mcp.ManageSessionTool(bus, convs),
+		mcp.PollEventsTool(bus.Events(), convs),
 	)
 	if err != nil {
 		log.Error("mcp server", "err", err)

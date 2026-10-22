@@ -15,6 +15,7 @@ import (
 const (
 	ToolSendMessage = "send_message"
 	ToolTaskControl = "task_control"
+	ToolPollEvents  = "poll_events"
 
 	actionGet  = "get"
 	actionStop = "stop"
@@ -28,6 +29,9 @@ const (
 	// maxAnswerBytes caps the answer shown in one result; the full answer
 	// stays on the task.
 	maxAnswerBytes = 64 * 1024
+
+	// maxPollSeconds bounds poll_events' wait for a new frame.
+	maxPollSeconds = 60
 )
 
 // MaxTurnWait is the longest a turn tool holds a request: the wait for the
@@ -59,7 +63,10 @@ func SendMessageTool(bus TurnBus, convs *Conversations) Tool {
 		Definition: ToolDefinition{
 			Name: ToolSendMessage,
 			Description: "Send a message to this kube-agents install, as a console user, and wait for the answer. " +
-				"A turn still running when the wait ends returns its task; read it later with task_control.",
+				"A turn still running when the wait ends returns its task; read it later with task_control. " +
+				"Once the turn's tasks end, the reports of any card it filed are gathered too, until the wait ends or " +
+				"no new report has come for a while; a card's report can take minutes, so for card work pass a longer " +
+				"wait_seconds, or read later reports with poll_events.",
 			InputSchema: map[string]any{
 				"type":     "object",
 				"required": []string{"text"},
@@ -117,7 +124,155 @@ func sendAndWait(ctx context.Context, bus TurnBus, convs *Conversations, alias, 
 		return sb.String(), nil
 	}
 	writeOutcome(&sb, out)
+	writeReports(&sb, out, token)
 	return sb.String(), nil
+}
+
+// writeReports renders the cards' reports on a turn, in the order they
+// arrived, and why gathering them stopped. A report is an agent's text, so
+// it is shown inert: a card's post must not read as this server's words.
+func writeReports(sb *strings.Builder, out TurnOutcome, token string) {
+	if out.ReportsEnd == reportsNotGathered {
+		return
+	}
+	if len(out.Reports) > 0 {
+		fmt.Fprintf(sb, "\nCard reports on this turn (%d), in the order they arrived:\n", len(out.Reports))
+		for _, f := range out.Reports {
+			sb.WriteString("\n")
+			writeEventHead(sb, "Report from a card", f)
+			sb.WriteString(inertBlock(f.Text))
+		}
+	}
+	later := fmt.Sprintf("later reports can be read with poll_events (conversation_token `%s`, since %d)", token, out.ReportCursor)
+	switch out.ReportsEnd {
+	case reportsRunning:
+		fmt.Fprintf(sb, "\nThe turn was still running when the wait ended; %s.\n", later)
+	case reportsQuiet:
+		if len(out.Reports) == 0 {
+			fmt.Fprintf(sb, "\nNo card report came within %s of the turn's end; a card's report can take minutes: %s.\n", reportQuiet, later)
+		} else {
+			fmt.Fprintf(sb, "\nStopped gathering after %s with no new report; %s.\n", reportQuiet, later)
+		}
+	case reportsWaitOver:
+		fmt.Fprintf(sb, "\nStopped gathering when the wait ended; %s, or wait longer with a larger wait_seconds.\n", later)
+	}
+}
+
+// writeEventHead is a buffered frame's heading line: label, then its message
+// id, the task it reports on, and its state, each an inert cell.
+func writeEventHead(sb *strings.Builder, label string, f EventFrame) {
+	fmt.Fprintf(sb, "%s (message %s", label, cell(f.MessageID))
+	if f.ReplyTo != "" {
+		fmt.Fprintf(sb, ", on task %s", cell(f.ReplyTo))
+	}
+	if f.TaskID != "" {
+		task := f.TaskID
+		if f.Addressee != "" {
+			task = f.Addressee + taskRefSep + task
+		}
+		fmt.Fprintf(sb, ", task %s", cell(task))
+	}
+	if f.State != "" {
+		fmt.Fprintf(sb, ", %s", cell(f.State))
+	}
+	if f.Edited {
+		sb.WriteString(", updated")
+	}
+	sb.WriteString("):\n\n")
+}
+
+type pollEventsArgs struct {
+	Conversation      string `json:"conversation"`
+	ConversationToken string `json:"conversation_token"`
+	Since             uint64 `json:"since"`
+	WaitSeconds       int    `json:"wait_seconds"`
+}
+
+// PollEventsTool reads the reports and results a conversation was posted
+// since a cursor, from what this server heard.
+func PollEventsTool(events *Events, convs *Conversations) Tool {
+	return Tool{
+		Definition: ToolDefinition{
+			Name: ToolPollEvents,
+			Description: "Read what a conversation was posted outside a turn's answer: cards' reports (kind notify) and " +
+				"delegated tasks' results (kind result), as this server heard them, newer than a cursor. " +
+				"An update to a report comes back under a new cursor. Live only: posts made before this server first " +
+				"heard of the conversation, or before it restarted, are not kept.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"conversation":       map[string]any{"type": "string", "description": "The conversation's name. Default: " + DefaultConversation + "."},
+					"conversation_token": map[string]any{"type": "string", "description": "The conversation, by token, instead of by name."},
+					"since":              map[string]any{"type": "integer", "description": "Return frames newer than this cursor, as an earlier answer reported it. Default 0: everything kept."},
+					"wait_seconds":       map[string]any{"type": "integer", "description": fmt.Sprintf("When nothing is newer, wait up to this long for a frame, %d at most. Default 0.", maxPollSeconds)},
+				},
+			},
+		},
+		Call: func(ctx context.Context, raw json.RawMessage) (string, error) {
+			var a pollEventsArgs
+			if err := json.Unmarshal(orEmptyObject(raw), &a); err != nil {
+				return "", fmt.Errorf("arguments: %w", err)
+			}
+			if a.WaitSeconds < 0 || a.WaitSeconds > maxPollSeconds {
+				return "", fmt.Errorf("wait_seconds is %d; it takes 0 to %d", a.WaitSeconds, maxPollSeconds)
+			}
+			byToken := a.ConversationToken != "" || strings.HasPrefix(a.Conversation, consoleConversationPrefix)
+			// Resolved without Resolve's listen, so that the answer can say
+			// whether the server had been listening before this call.
+			token, named, evicted, err := convs.resolve(a.Conversation, a.ConversationToken)
+			if err != nil {
+				return "", err
+			}
+			convs.events.Unname(evicted)
+			heard, err := events.Watch(token, named)
+			if err != nil {
+				return "", fmt.Errorf("listen to the conversation's posts: %w", err)
+			}
+			var sb strings.Builder
+			if byToken {
+				fmt.Fprintf(&sb, "Conversation by token `%s`.\n\n", token)
+			} else {
+				writeConversation(&sb, a.Conversation, token)
+			}
+			since := a.Since
+			if cur := events.Cursor(token); since > cur {
+				fmt.Fprintf(&sb, "since %d is past this conversation's cursor %d (this server may have restarted); reading from 0.\n\n", since, cur)
+				since = 0
+			}
+			page := events.Since(ctx, token, since, time.Duration(a.WaitSeconds)*time.Second)
+			writeEventPage(&sb, page, heard)
+			return sb.String(), nil
+		},
+	}
+}
+
+// writeEventPage renders poll_events' frames in cursor order, each frame's
+// text inert, and the cursor to read on from.
+func writeEventPage(sb *strings.Builder, page EventPage, heard bool) {
+	if !heard && len(page.Frames) == 0 {
+		sb.WriteString("This server had not heard this conversation before; it listens from now on. No events have been heard yet, " +
+			"and anything posted before now is lost.\n\n")
+	} else if len(page.Frames) == 0 {
+		sb.WriteString("No new events.\n\n")
+	}
+	for _, f := range page.Frames {
+		label := "Report from a card"
+		if f.Kind == frameKindResult {
+			label = "A task's result"
+		}
+		fmt.Fprintf(sb, "Cursor %d. ", f.Cursor)
+		writeEventHead(sb, label, f)
+		sb.WriteString(inertBlock(f.Text))
+		sb.WriteString("\n")
+	}
+	if page.Dropped > 0 {
+		fmt.Fprintf(sb, "%d older events were dropped: this server keeps %d events or %d bytes per conversation.\n", page.Dropped,
+			maxEventsPerConversation, maxEventBytesPerConversation)
+	}
+	if page.Rejected > 0 {
+		fmt.Fprintf(sb, "%d malformed frames were ignored.\n", page.Rejected)
+	}
+	fmt.Fprintf(sb, "Cursor: %d (pass it as since to read only what comes next).\n", page.Cursor)
 }
 
 type taskControlArgs struct {

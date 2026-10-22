@@ -113,6 +113,10 @@ type gatewayScenario struct {
 	delegate bool      // the root delegates; a child runs and a wake task carries the answer
 	decoys   bool      // before the root: another conversation's turn, a delegated child here, an earlier turn's late submission, and a cancel here
 	frames   *frameLog // when set, every frame the gateway reads is recorded
+	// after, when set, runs once the turn's tasks are published, on its
+	// own goroutine, with the gateway's connection: a card's posts come
+	// from there (publishNotify).
+	after func(nc *nats.Conn, token string, turn int32)
 }
 
 // sentFrame is one console frame as the fake gateway read it.
@@ -206,6 +210,9 @@ func runFakeGateway(t *testing.T, url string, js jetstream.JetStream, sc gateway
 		default:
 			publishRun(t, js, fakeAddressee, root, answerText, sc.finish)
 		}
+		if sc.after != nil {
+			go sc.after(nc, token, i)
+		}
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -226,8 +233,8 @@ func turnServer(t *testing.T, sc gatewayScenario) (*Server, jetstream.JetStream,
 	url, js := testBus(t)
 	n := runFakeGateway(t, url, js, sc)
 	b := dial(t, url)
-	convs := NewConversations()
-	return mustServer(t, SendMessageTool(b, convs), TaskControlTool(b, convs)), js, n, b
+	convs := NewConversations().WithEvents(b.Events())
+	return mustServer(t, SendMessageTool(b, convs), TaskControlTool(b, convs), PollEventsTool(b.Events(), convs)), js, n, b
 }
 
 func mustContain(t *testing.T, text string, want ...string) {

@@ -2,7 +2,7 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one `spec.mode: next` install, so an external coding agent or IDE host can talk to it. It is a console client of the install's A2A bus: it holds the `console` bus credential and nothing else, and it can do on the bus exactly what the console page can.
 
-It answers `connection_status`, the turn tools `send_message` and `task_control`, and `manage_session`. Further tools from gke-labs/kube-agents#3653 come in later changes.
+It answers `connection_status`, the turn tools `send_message` and `task_control`, `manage_session`, and `poll_events`. Further tools from gke-labs/kube-agents#3653 come in later changes.
 
 ## Turn it on
 
@@ -54,3 +54,21 @@ Names are this server's memory only, and they're shared:
 - `session_on`, `session_off`, `status`, `help`: send `/session`, `/session off`, `status` or `help` on the conversation, exactly as `send_message` would, and return the answer. `/session` and `/session off` are the gateway's commands. `status` and `help` are messages to the agent: while a task runs, `status` replays its progress and `help` steers it.
 
 The original client's `switch`, `debug_on`, `debug_off`, `transcript` and `clear_killed` are not offered; a call to one is answered with an error that says why.
+
+## Card reports and poll_events
+
+A turn that files a card gets the card's reports later, often minutes after the turn's own task ended: the gateway posts each one to the conversation as a `notify` frame on `chat.console.<token>.out`, naming the task whose turn filed the card. A delegation chain's terminal result is posted there too, as a `result` frame.
+
+The server listens to every conversation it knows: every name in its table, and every token a caller has used in the last hour. It keeps each conversation's `notify` and `result` frames, at most 256 of them or 1 MiB, whichever comes first, dropping the oldest and counting what it dropped. An update to a report replaces it in place. Frames that aren't JSON are dropped, and a frame's text is cut at 16 KiB characters.
+
+What it keeps is live only. Lost:
+
+- frames posted before the server first heard of the conversation;
+- frames past the bound;
+- everything, across a restart of the server.
+
+`send_message` gathers the reports. Once the turn's task, and the tasks delegated from it, have ended, it keeps collecting the reports on any of those tasks until no new one has come for 15 seconds, or the wait ends, whichever is first. It returns them in the order they arrived, each labelled as a card's report and shown as quoted text, and says why it stopped. A card's report can take minutes, so for card work pass a longer `wait_seconds`, or read later reports with `poll_events`.
+
+`poll_events` reads a conversation's kept frames: `conversation` or `conversation_token` as for `send_message`, `since` (a cursor; 0 for everything kept), and `wait_seconds` (up to 60) to wait for a frame newer than `since`. It returns the frames newer than `since` in cursor order, the new cursor, and how many were dropped. An updated report comes back under a new cursor. A conversation the server hadn't heard of is listened to from that call on.
+
+The swarm view's pending events come from this buffer in a later change.

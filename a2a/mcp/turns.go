@@ -80,11 +80,18 @@ type ConsoleInFrame struct {
 // (gateway.ConsoleOutFrame). Kind is unset on its notices about a turn; a
 // frame with a kind reports something else (a task's terminal result, a
 // proactive notification) and is not a notice about the turn being sent.
+// A result names its task, addressee and state; a notification names, in
+// ReplyTo, the task whose turn filed the work it reports on, and an edit
+// re-sends a notification's message id with Edit set.
 type ConsoleOutFrame struct {
 	MessageID string `json:"messageId"`
 	Text      string `json:"text"`
 	Edit      bool   `json:"edit,omitempty"`
 	Kind      string `json:"kind,omitempty"`
+	State     string `json:"state,omitempty"`
+	Addressee string `json:"addressee,omitempty"`
+	TaskID    string `json:"taskId,omitempty"`
+	ReplyTo   string `json:"replyTo,omitempty"`
 }
 
 // submissionAuthority is the part of a submission's authority block that says
@@ -116,6 +123,9 @@ type Conversations struct {
 	clock   uint64
 	// now is the wall clock an alias's last use is stamped with; tests set it.
 	now func() time.Time
+	// events, when set, listens to every conversation resolved here, and
+	// is told when the table forgets one.
+	events *Events
 }
 
 // aliasEntry is one alias: its token, the description manage_session's new
@@ -146,10 +156,37 @@ func NewConversations() *Conversations {
 	return &Conversations{byAlias: map[string]*aliasEntry{}, sending: map[string]*sendLock{}, now: time.Now}
 }
 
+// WithEvents has the table's conversations listened to by events.
+func (c *Conversations) WithEvents(events *Events) *Conversations {
+	c.events = events
+	return c
+}
+
 // Resolve returns the console token for a call: token when the caller names
 // one (to resume a conversation, after a restart of this server included),
-// otherwise the alias's, minted on first use.
+// otherwise the alias's, minted on first use. The conversation is listened
+// to from then on.
 func (c *Conversations) Resolve(alias, token string) (string, error) {
+	t, named, evicted, err := c.resolve(alias, token)
+	if err != nil {
+		return "", err
+	}
+	return t, c.listen(t, named, evicted)
+}
+
+// listen tells events of a conversation resolved and of one the table
+// evicted for it.
+func (c *Conversations) listen(token string, named bool, evicted string) error {
+	c.events.Unname(evicted)
+	if _, err := c.events.Watch(token, named); err != nil {
+		return fmt.Errorf("listen to the conversation's posts: %w", err)
+	}
+	return nil
+}
+
+// resolve is Resolve's table work: the token, whether the table holds it by
+// a name, and the token of an alias forgotten to make room.
+func (c *Conversations) resolve(alias, token string) (string, bool, string, error) {
 	// A conversation's token given as its name, as list shows it
 	// (console:<token>), is the token: never a new name spelled like one.
 	if token == "" && strings.HasPrefix(alias, consoleConversationPrefix) {
@@ -160,29 +197,30 @@ func (c *Conversations) Resolve(alias, token string) (string, error) {
 		// names it.
 		token = strings.TrimPrefix(token, consoleConversationPrefix)
 		if !lib.ValidSubjectToken(token) {
-			return "", fmt.Errorf("%q is not a conversation token", token)
+			return "", false, "", fmt.Errorf("%q is not a conversation token", token)
 		}
-		return token, nil
+		return token, false, "", nil
 	}
 	if alias == "" {
 		alias = DefaultConversation
 	}
 	if err := checkAlias(alias); err != nil {
-		return "", err
+		return "", false, "", err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if e, ok := c.byAlias[alias]; ok {
 		c.touchLocked(e)
-		return e.token, nil
+		return e.token, true, "", nil
 	}
 	// So is a known conversation's bare token, as the original client took
 	// a name or a token in the same argument.
 	if a, ok := c.aliasOfTokenLocked(alias); ok {
 		c.touchLocked(c.byAlias[a])
-		return alias, nil
+		return alias, true, "", nil
 	}
-	return c.addLocked(alias, "")
+	t, evicted, err := c.addLocked(alias, "")
+	return t, err == nil, evicted, err
 }
 
 // aliasOfTokenLocked finds the alias whose conversation has token t.
@@ -206,27 +244,35 @@ func (c *Conversations) Create(alias, description string) (string, error) {
 		return "", err
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if _, ok := c.byAlias[alias]; ok {
+		c.mu.Unlock()
 		return "", fmt.Errorf("%w: %s", ErrConversationExists, cell(alias))
 	}
-	return c.addLocked(alias, description)
+	t, evicted, err := c.addLocked(alias, description)
+	c.mu.Unlock()
+	if err != nil {
+		return "", err
+	}
+	return t, c.listen(t, true, evicted)
 }
 
 // Forget drops alias, and reports whether it was there. The conversation
 // itself is untouched: it stays reachable by its token.
 func (c *Conversations) Forget(alias string) bool {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if _, ok := c.byAlias[alias]; !ok {
 		// Named by its token, as list shows it, or bare.
 		a, found := c.aliasOfTokenLocked(strings.TrimPrefix(alias, consoleConversationPrefix))
 		if !found {
+			c.mu.Unlock()
 			return false
 		}
 		alias = a
 	}
+	token := c.byAlias[alias].token
 	delete(c.byAlias, alias)
+	c.mu.Unlock()
+	c.events.Unname(token)
 	return true
 }
 
@@ -256,19 +302,21 @@ func (c *Conversations) touchLocked(e *aliasEntry) {
 }
 
 // addLocked mints a token for a new alias, forgetting the least recently
-// used alias first if the table is full.
-func (c *Conversations) addLocked(alias, description string) (string, error) {
+// used alias first if the table is full, and returns the forgotten alias's
+// token too.
+func (c *Conversations) addLocked(alias, description string) (string, string, error) {
 	t, err := mintConversationToken()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
+	evicted := ""
 	if len(c.byAlias) >= maxConversations {
-		c.forgetOldestLocked()
+		evicted = c.forgetOldestLocked()
 	}
 	e := &aliasEntry{token: t, description: description}
 	c.touchLocked(e)
 	c.byAlias[alias] = e
-	return t, nil
+	return t, evicted, nil
 }
 
 func mintConversationToken() (string, error) {
@@ -303,14 +351,16 @@ func checkAlias(alias string) error {
 	return nil
 }
 
-func (c *Conversations) forgetOldestLocked() {
+func (c *Conversations) forgetOldestLocked() string {
 	oldest, at := "", uint64(0)
 	for a, e := range c.byAlias {
 		if oldest == "" || e.used < at {
 			oldest, at = a, e.used
 		}
 	}
+	token := c.byAlias[oldest].token
 	delete(c.byAlias, oldest)
+	return token
 }
 
 // lock takes the conversation's send lock, or gives up when ctx does.
@@ -383,10 +433,14 @@ func turnFate(text string) (settled bool, texts []string) {
 // turn's own task once it appears, then the tasks delegated from it.
 type turnWatch struct {
 	conversation string
+	token        string
 	texts        []string
-	subs         chan *nats.Msg
-	notices      chan *nats.Msg
-	unsubscribe  func()
+	// since is the conversation's event cursor before the turn was sent:
+	// a card's report on this turn comes after it.
+	since       uint64
+	subs        chan *nats.Msg
+	notices     chan *nats.Msg
+	unsubscribe func()
 
 	// mu guards followed and known, which the follower goroutine fills
 	// from the conversation's submissions once the turn's task is known.
@@ -402,6 +456,7 @@ func (b *NATSBus) openTurn(token string, texts []string, submissions bool) (*tur
 	nc := b.client.Conn()
 	w := &turnWatch{
 		conversation: fmt.Sprintf(consoleConversationOf, token),
+		token:        token,
 		texts:        texts,
 		subs:         make(chan *nats.Msg, 256),
 		notices:      make(chan *nats.Msg, 64),
@@ -419,7 +474,16 @@ func (b *NATSBus) openTurn(token string, texts []string, submissions bool) (*tur
 			return nil, err
 		}
 	}
-	nsub, err := nc.ChanSubscribe(fmt.Sprintf(consoleOutSubject, token), w.notices)
+	// Notices are read only until the turn's task appears, and a card's
+	// posts can come in bursts while the turn is followed (Events keeps
+	// those), so a notice that finds the channel full is dropped rather
+	// than left to back up into a slow consumer.
+	nsub, err := nc.Subscribe(fmt.Sprintf(consoleOutSubject, token), func(m *nats.Msg) {
+		select {
+		case w.notices <- m:
+		default:
+		}
+	})
 	if err != nil {
 		if sub != nil {
 			_ = sub.Unsubscribe()
@@ -466,10 +530,16 @@ func (b *NATSBus) SendTurn(ctx context.Context, convs *Conversations, token, tex
 	if err := ctx.Err(); err != nil {
 		return res, nil, err
 	}
+	// The conversation's reports are listened to before the turn goes,
+	// so none on it is missed, whether or not its name was resolved here.
+	if _, err := b.events.Watch(token, false); err != nil {
+		return res, nil, err
+	}
 	w, err := b.openTurn(token, texts, true)
 	if err != nil {
 		return res, nil, err
 	}
+	w.since = b.events.Cursor(token)
 	if err := b.publishFrame(token, text); err != nil {
 		w.close()
 		return res, nil, err
@@ -644,6 +714,14 @@ func (w *turnWatch) follow() {
 	}
 }
 
+// inChain reports whether id is a task of this turn: its own, or one
+// delegated from it, directly or not.
+func (w *turnWatch) inChain(id string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return id != "" && w.known[id]
+}
+
 func (w *turnWatch) followedTasks() []TaskRef {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -661,7 +739,32 @@ type TurnOutcome struct {
 	// task that wakes the delegator), else the root.
 	AnswerFrom *TaskRef
 	Answer     *lib.Task
+	// Reports are the cards' posts on the turn, in arrival order, an edit
+	// in its post's place; ReportsEnd says why gathering them stopped, and
+	// ReportCursor is the conversation's cursor then, for poll_events.
+	Reports      []EventFrame
+	ReportsEnd   reportsEnd
+	ReportCursor uint64
 }
+
+// reportsEnd is why a turn's report gathering stopped.
+type reportsEnd int
+
+const (
+	// reportsNotGathered: no listener (a bus without events).
+	reportsNotGathered reportsEnd = iota
+	// reportsRunning: the wait ended before the turn's tasks did.
+	reportsRunning
+	// reportsQuiet: reportQuiet passed with no new post on the turn.
+	reportsQuiet
+	// reportsWaitOver: the wait ended while gathering.
+	reportsWaitOver
+)
+
+// reportQuiet is how long, once a turn's tasks have ended, gathering waits
+// for a card's next post on it before it stops: counted from the end, then
+// from each post.
+var reportQuiet = 15 * time.Second
 
 // FollowedTask is one delegated task as last read.
 type FollowedTask struct {
@@ -678,22 +781,38 @@ const delegationSettle = 2 * time.Second
 // delegated (it carries a delegate or handoff artifact), for the tasks
 // delegated from it: the answer of a delegation lands on the task that wakes
 // the delegator, which may come minutes after the delegator itself finished.
-// Followed tasks are read one at a time on one reader slot. It closes the
-// watch.
+// Followed tasks are read one at a time on one reader slot. Then, in what is
+// left of wait, it gathers the cards' reports on the turn (gatherReports).
+// It closes the watch.
 func (b *NATSBus) WaitForTurn(ctx context.Context, w *turnWatch, root TaskRef, wait time.Duration) (TurnOutcome, error) {
 	defer w.close()
 	ctx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
-	out := TurnOutcome{Root: root}
-	t, err := b.WaitForTask(ctx, root, wait)
-	if err != nil && !errors.Is(err, ErrTaskNotFound) {
+	out, ended, err := b.waitForChain(ctx, w, root)
+	if err != nil {
 		return out, err
+	}
+	b.gatherReports(ctx, w, &out, ended)
+	return out, nil
+}
+
+// waitForChain is WaitForTurn's task wait. ended is a turn whose tasks all
+// finished inside the wait.
+func (b *NATSBus) waitForChain(ctx context.Context, w *turnWatch, root TaskRef) (TurnOutcome, bool, error) {
+	out := TurnOutcome{Root: root}
+	t, err := b.WaitForTask(ctx, root, time.Until(deadlineOf(ctx)))
+	if err != nil && !errors.Is(err, ErrTaskNotFound) {
+		return out, false, err
 	}
 	out.Task = t
 	out.AnswerFrom, out.Answer = &out.Root, t
-	if t == nil || !t.Final || !delegated(t) {
-		return out, nil
+	if t == nil || !t.Final {
+		return out, false, nil
 	}
+	if !delegated(t) {
+		return out, true, nil
+	}
+	ended := false
 	read := map[string]FollowedTask{}
 	var order []TaskRef
 	settledAt := time.Time{}
@@ -726,6 +845,7 @@ func (b *NATSBus) WaitForTurn(ctx context.Context, w *turnWatch, root TaskRef, w
 			if settledAt.IsZero() {
 				settledAt = time.Now()
 			} else if time.Since(settledAt) >= delegationSettle {
+				ended = true
 				break
 			}
 		}
@@ -737,7 +857,58 @@ func (b *NATSBus) WaitForTurn(ctx context.Context, w *turnWatch, root TaskRef, w
 	for _, ref := range order {
 		out.Followed = append(out.Followed, read[ref.TaskID])
 	}
-	return out, nil
+	return out, ended, nil
+}
+
+// gatherReports collects the cards' posts on the turn: notify frames heard
+// since the turn was sent whose ReplyTo is one of its tasks (a card filed on
+// the default route answers the root; through a session pod, the platform
+// task it delegated to). When the turn's tasks ended, it keeps gathering
+// until reportQuiet passes with no new post on the turn, or the wait ends;
+// a card's post says nothing reliable about whether it is the last, so
+// nothing in its text ends the gathering. Otherwise it takes what is
+// already here.
+func (b *NATSBus) gatherReports(ctx context.Context, w *turnWatch, out *TurnOutcome, ended bool) {
+	if b.events == nil {
+		return
+	}
+	quiet := time.NewTimer(reportQuiet)
+	defer quiet.Stop()
+	var last uint64
+	for {
+		page, changed := b.events.snapshot(w.token)
+		out.Reports, out.ReportCursor = nil, page.Cursor
+		newest := last
+		for _, f := range page.Frames {
+			if f.Kind == frameKindNotify && f.Cursor > w.since && w.inChain(f.ReplyTo) {
+				out.Reports = append(out.Reports, f)
+				newest = max(newest, f.Cursor)
+			}
+		}
+		// A new post on the turn, or an edit of one, starts the quiet
+		// period again; a post on another turn, or a result, does not.
+		if newest > last {
+			last = newest
+			quiet.Reset(reportQuiet)
+		}
+		switch {
+		case !ended:
+			out.ReportsEnd = reportsRunning
+			return
+		case ctx.Err() != nil:
+			out.ReportsEnd = reportsWaitOver
+			return
+		}
+		select {
+		case <-changed:
+		case <-quiet.C:
+			out.ReportsEnd = reportsQuiet
+			return
+		case <-ctx.Done():
+			out.ReportsEnd = reportsWaitOver
+			return
+		}
+	}
 }
 
 // delegated reports whether a finished task handed its work on.
