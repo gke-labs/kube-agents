@@ -390,6 +390,25 @@ const (
 	a2aStrictEventsWriterEnvVar = "A2A_STRICT_EVENTS_WRITER"
 	a2aWorkerImageName          = "a2a-worker"
 
+	// a2aCardStopEnvVar is a third controller-read override, rendered onto
+	// the gateway under the same name: whether a chat `stop` also stops the
+	// kanban cards the conversation filed (gke-labs#3263). Off unless the
+	// operator carries an explicit "true", so the rollout is opt-in per
+	// install: the control it sends needs a hermes-bridge sidecar and an
+	// agent image that answer it, and the operator cannot tell which images
+	// an install runs. An older bridge rejects the control and the gateway
+	// answers that it couldn't confirm the cards stopped, so an early flip
+	// is a hedged reply rather than broken; the default stays off until the
+	// images that answer it ship together. a2aCardStopTimeoutEnvVar is the gateway's wait for the
+	// control, rendered at the gateway's default (a2aCardStopTimeout).
+	a2aCardStopEnvVar        = "A2A_CARD_STOP"
+	a2aCardStopTimeoutEnvVar = "A2A_CARD_STOP_TIMEOUT"
+	// a2aCardStopTimeout is the gateway's default wait for a card-stop
+	// control, rendered explicitly: above the bridge's worst case for one
+	// (about 60 s: its 5 s capability check, 20 s turn wait and 35 s POST;
+	// a2a/hermes-bridge/cardstop.go).
+	a2aCardStopTimeout = "75s"
+
 	// a2aCapabilityRequiredEnvVar is the other controller-read override, and
 	// it defaults the other way round. The capability check is armed unless
 	// an operator explicitly disarms it, because the posture it protects —
@@ -555,10 +574,13 @@ const (
 	a2aSlackMinChannelIDLen = 3
 	// The kanban notifier's half (deploy/docker/patches/kanban_chat_notify.py,
 	// and kanban_event_routing.py, which addresses a card to the conversation):
-	// the platform whose gateway conversations a card reports back to. Its own
+	// the platform whose gateway conversations a card reports back to, and
+	// onboarding's first report too (agents/chat/scripts/bootstrap_delivery.py). Its own
 	// variable because the route serves conversations with no home channel,
 	// while A2A_NOTIFY_PLATFORM sends every proactive post to the home channel
-	// and so needs one.
+	// and so needs one. The cron relay (agents/platform/scripts/chat_notify.py,
+	// gateway_platform) reads it too, to name the platform whose home channel
+	// is missing when it refuses a report.
 	a2aNotifyConversationsEnvVar = "A2A_NOTIFY_CONVERSATIONS"
 	// The prefix of a Chat space resource name.
 	a2aGchatSpacePrefix      = "spaces/"
@@ -640,14 +662,14 @@ const (
 	a2aProvisionReportOutcomeReported   = "reported"
 	a2aProvisionReportOutcomeClean      = "clean"
 	a2aProvisionReportOutcomeUnreadable = "unreadable"
-	// a2aProvisionReportGrace bounds how long a Complete Job with no
-	// succeeded pod in the cache is read as "the cache has not caught up"
-	// rather than "the pod is gone" (a2aProvisionPodVanished). The pod's
-	// terminated state precedes the Job's Complete condition, and the Job is
-	// read live while the pods come from the cache, so a pass can see the
-	// completion a little before its own cache holds the pod. A minute is
-	// far past any informer lag and far short of the Job's 24h TTL, which is
-	// how long an unbounded wait would re-list and re-log for.
+	// a2aProvisionReportGrace bounds how long a Complete Job whose succeeded
+	// pod a read did not find is treated as "not visible yet" rather than
+	// "the pod is gone" (a2aProvisionPodVanished). Both reads are live — the
+	// Job through a2aReader, the pods through podReader — so the informer lag
+	// this grace was first written for no longer applies; what is left is the
+	// pod deleted in the gap between the two reads. A minute is far past that
+	// and far short of the Job's 24h TTL, which is how long an unbounded wait
+	// would re-list and re-log for.
 	a2aProvisionReportGrace = time.Minute
 	// reasonTasksSubjectCapMissing is the Warning Event's reason when the live
 	// TASKS stream carries no per-subject cap; tasksSubjectCapEventMessage is
@@ -1153,6 +1175,16 @@ func a2aStrictEventsWriter() string {
 	return "false"
 }
 
+// a2aCardStop renders "false" for anything but an explicit "true", as
+// a2aStrictEventsWriter does: a typo leaves the card stop off, the reply a
+// stop has always had.
+func a2aCardStop() string {
+	if os.Getenv(a2aCardStopEnvVar) == "true" {
+		return "true"
+	}
+	return "false"
+}
+
 // a2aInjectBackendEnabled reports whether the operator was deployed with the
 // eval flag. Anything but an explicit "true" is off, for the reason
 // a2aStrictEventsWriter gives: a typo must relax rather than tighten, and
@@ -1449,13 +1481,14 @@ func a2aCredsSecretName(agent *agentv1alpha1.PlatformAgent) string {
 
 // a2aNATSAddress is the bus's in-cluster host:port. a2aNATSClientURL is the
 // same thing as a client URL; both exist because the nats CLI takes the first
-// and the Go client takes the second.
+// and the Go client takes the second. The URL is tls://: the bus requires TLS
+// of every client, and the host is the Service name its certificate carries.
 func a2aNATSAddress(agent *agentv1alpha1.PlatformAgent) string {
 	return fmt.Sprintf("%s.%s.svc:%d", a2aNATSName(agent), agent.Namespace, a2aNATSClientPort)
 }
 
 func a2aNATSClientURL(agent *agentv1alpha1.PlatformAgent) string {
-	return "nats://" + a2aNATSAddress(agent)
+	return a2aNATSTLSScheme + a2aNATSAddress(agent)
 }
 
 // The provision Job's pods run as their own ServiceAccount so the auth callout
@@ -2034,6 +2067,17 @@ server_name: ` + a2aNATSName(agent) + `
 port: ` + strconv.Itoa(a2aNATSClientPort) + `
 http: ` + strconv.Itoa(a2aNATSMonitorPort) + `
 
+# TLS on the client listener, required of every connection: the server
+# advertises tls_required, so a client that dials nats:// is told to upgrade
+# and one that cannot verify this certificate is refused. The serving pair is
+# the operator-minted one in the ` + agentv1alpha1.A2ANATSTLSSecretName(agent.Name) + ` Secret,
+# mounted as a directory (platformagent_a2a_tls.go). The monitoring port above
+# stays plain HTTP: it carries health and stats, not payloads or tokens.
+tls {
+  cert_file: "` + a2aNATSTLSMountDir + `/` + a2aNATSTLSCertKey + `"
+  key_file: "` + a2aNATSTLSMountDir + `/` + a2aNATSTLSKeyKey + `"
+}
+
 # A ServiceAccount token travels inside the client's CONNECT frame, and the
 # default max_control_line of 4096 bounds that whole frame - measured, the
 # usable room for the token itself is around 3920 bytes once the rest of the
@@ -2056,8 +2100,8 @@ max_control_line: 65536
 # it forwards the websocket here with the browser's headers intact. It is not
 # an in-cluster door for anything else. A port-forward straight to 9222 still
 # works for local tooling and the live tests, because it enters from the
-# node, which NetworkPolicy does not govern. Production still terminates TLS
-# in front of the bus, which is not a toggle that exists yet.
+# node, which NetworkPolicy does not govern. The client listener above is
+# TLS; this one is still plain.
 #
 # The origin allow-list is the console server's origin as the browser sees it
 # through the documented port-forward. The proxy forwards Origin unchanged,
@@ -2245,11 +2289,18 @@ func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.
 // (stampSecretEnvHash in reconcileA2A), which moves when its password's value
 // does, within secretEnvReprobeInterval. The provision Job holds no password: it
 // authenticates with its projected bus token (a2aBusTokenVolumeSource).
-func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys) string {
+//
+// The serving certificate's fingerprint is the third input, for the same
+// reason as the conf: nats-server reads its certificate at boot, so a renewed
+// one that the kubelet has already written into the mounted directory is not
+// served until the pod restarts. Until a reloader sends the reload signal
+// instead, a renewal rolls the bus once a year.
+func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys, servingFingerprint string) string {
 	redacted := renderA2ANATSConf(agent, func(key string) string {
 		return fmt.Sprintf(a2aConfigHashPlaceholder, key)
 	}, keys)
-	sum := sha256.Sum256([]byte(redacted + a2aConfigHashRotationSeparator + creds.ResourceVersion))
+	sum := sha256.Sum256([]byte(redacted + a2aConfigHashRotationSeparator + creds.ResourceVersion +
+		a2aConfigHashRotationSeparator + servingFingerprint))
 	return hex.EncodeToString(sum[:])[:a2aConfigHashLength]
 }
 
@@ -2319,6 +2370,7 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 						},
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "config", MountPath: "/etc/nats", ReadOnly: true},
+							{Name: a2aNATSTLSVolume, MountPath: a2aNATSTLSMountDir, ReadOnly: true},
 							{Name: a2aNATSDataClaim, MountPath: "/data"},
 						},
 						SecurityContext: hardenedSecurityContext(),
@@ -2333,6 +2385,11 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 						Name: "config",
 						VolumeSource: corev1.VolumeSource{
 							Secret: &corev1.SecretVolumeSource{SecretName: a2aNATSConfigSecretName(agent)},
+						},
+					}, {
+						Name: a2aNATSTLSVolume,
+						VolumeSource: corev1.VolumeSource{
+							Secret: &corev1.SecretVolumeSource{SecretName: agentv1alpha1.A2ANATSTLSSecretName(agent.Name)},
 						},
 					}},
 				},
@@ -2827,7 +2884,7 @@ BUS_TOKEN="$(cat ` + a2aBusTokenPath + `/` + a2aBusTokenFile + `)"
 # lands on an inbox, and this principal may only subscribe under
 # _INBOX.provision.> — the CLI's default _INBOX.<nuid> would be refused and
 # every call would time out.
-NATS="nats --server ` + server + ` --user ${BUS_USER} --password ${BUS_TOKEN} --inbox-prefix=_INBOX.provision"
+NATS="nats --server ` + a2aNATSTLSScheme + server + ` --tlsca ` + a2aNATSCAFile() + ` --user ${BUS_USER} --password ${BUS_TOKEN} --inbox-prefix=_INBOX.provision"
 
 # max_consumers caps each stream. Consumer durability is a request-body
 # field, so no permission list can hold web to ephemeral ones (see the web user
@@ -3220,7 +3277,7 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 					// The nats CLI wants a writable HOME for its context
 					// directory even when every call passes --server, so the
 					// hardened read-only root needs somewhere to point it.
-					Volumes: []corev1.Volume{a2aBusTokenVolumeSource(), {
+					Volumes: []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent), {
 						Name:         "tmp",
 						VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 					}},
@@ -3263,6 +3320,7 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "tmp", MountPath: a2aProvisionWritablePath},
 							a2aBusTokenVolumeMount(),
+							a2aNATSCABundleMount(),
 						},
 					}},
 				},
@@ -3319,13 +3377,13 @@ func a2aProvisionJobName(agent *agentv1alpha1.PlatformAgent, spec batchv1.JobSpe
 //
 // Best effort throughout, because nothing here changes what the render did
 // or what the phase says. A report the operator cannot deliver is logged; the
-// Job is left unstamped where a retry can still deliver it (a pod the cache
-// has not caught up with, for a2aProvisionReportGrace after the completion)
-// and stamped where it cannot (a message the script did not write, a pod
-// that is gone, a finding the reader cannot trust). The pods come from the
-// cache, which already watches them for the agent pod's status, so a retry
-// costs no API call; the Job itself came through a2aReader, so the stamp is
-// read back live on the next pass.
+// Job is left unstamped where a retry can still deliver it (a pod not visible
+// yet, for a2aProvisionReportGrace after the completion) and stamped where it
+// cannot (a message the script did not write, a pod that is gone, a finding
+// the reader cannot trust). The pods come through podReader and the Job came
+// through a2aReader, so both the report and the stamp are read live: this
+// runs once per Job, and an informer over every Pod in the cluster is not
+// what it costs.
 func (r *PlatformAgentReconciler) reportA2AProvisionFindings(ctx context.Context, agent *agentv1alpha1.PlatformAgent, job *batchv1.Job) {
 	if job.Annotations[a2aProvisionReportAnnotation] != "" {
 		return
@@ -3337,7 +3395,7 @@ func (r *PlatformAgentReconciler) reportA2AProvisionFindings(ctx context.Context
 	// until the garbage collector reaches them, and a report read off one
 	// of those would be the previous run's.
 	pods := &corev1.PodList{}
-	if err := r.List(ctx, pods, client.InNamespace(job.Namespace), client.MatchingLabels{
+	if err := r.podReader().List(ctx, pods, client.InNamespace(job.Namespace), client.MatchingLabels{
 		batchv1.JobNameLabel:       job.Name,
 		batchv1.ControllerUidLabel: string(job.UID),
 	}); err != nil {
@@ -3445,13 +3503,14 @@ func parseA2AProvisionReport(message string) (*tasksSubjectCapFinding, error) {
 	return &tasksSubjectCapFinding{live: live, want: want, hasWant: hasWant}, nil
 }
 
-// a2aProvisionPodVanished says whether a Complete Job with no succeeded
-// provision pod in the cache has lost that pod rather than not shown it yet.
+// a2aProvisionPodVanished says whether a Complete Job whose succeeded
+// provision pod the read did not return has lost that pod rather than not
+// shown it yet.
 // Gone means the Job controller counted the success (Succeeded is its count,
 // written in the same status as Complete) and the completion is older than
-// a2aProvisionReportGrace: past that, a pod the cache has still not
-// delivered is one the pod garbage collector, a Succeeded-pod cleanup or a
-// hand delete has taken. A counted success with no completion time is not a
+// a2aProvisionReportGrace: past that, a pod a live read still does not return
+// is one the pod garbage collector, a Succeeded-pod cleanup or a hand delete
+// has taken. A counted success with no completion time is not a
 // shape the Job controller writes; with nothing to bound the wait on it is
 // read as gone rather than polled for the rest of the Job's TTL.
 func a2aProvisionPodVanished(job *batchv1.Job, now time.Time) bool {
@@ -4622,6 +4681,10 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	// settings, then the Chat backend's and the inject door's additions.
 	env := []corev1.EnvVar{
 		{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
+		a2aNATSCAFileEnvVar(),
+		// The bundle's ConfigMap as well as its file: the gateway mounts the
+		// same ConfigMap into each session pod it spawns.
+		{Name: a2aNATSCAConfigMapEnv, Value: a2aNATSCABundleName(agent)},
 		{Name: "NATS_USER", Value: "gateway"},
 		{Name: "NATS_PASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
 			LocalObjectReference: corev1.LocalObjectReference{Name: a2aCredsSecretName(agent)},
@@ -4674,6 +4737,15 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// own environment rather than the gateway's. Both
 		// routes, one switch.
 		{Name: a2aCapabilityRequiredEnvVar, Value: a2aCapabilityRequired()},
+		// The card stop, rendered explicitly at its
+		// default (off) like the two lines above, so
+		// turning it on for an install is an edit to a
+		// value already in the live Deployment, through
+		// the operator's own environment; and its wait,
+		// at the gateway's default, so a reader sees the
+		// bound beside the switch.
+		{Name: a2aCardStopEnvVar, Value: a2aCardStop()},
+		{Name: a2aCardStopTimeoutEnvVar, Value: a2aCardStopTimeout},
 		// The namespace from the downward API, not a baked
 		// default: the boot-time owner resolution below
 		// reads the gateway's own Deployment in THIS
@@ -4771,10 +4843,10 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						}),
 						VolumeMounts: append(append([]corev1.VolumeMount{{
 							Name: a2aPrincipalMapVolume, MountPath: a2aPrincipalMapDir, ReadOnly: true,
-						}}, chatMounts...), injectMounts...),
+						}, a2aNATSCABundleMount()}, chatMounts...), injectMounts...),
 						SecurityContext: hardenedSecurityContext(),
 					}},
-					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource(agent)}, chatVolumes...), injectVolumes...),
+					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource(agent), a2aNATSCABundleVolume(agent)}, chatVolumes...), injectVolumes...),
 				},
 			},
 		},
@@ -4993,6 +5065,14 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		return state, fmt.Errorf("failed to ensure A2A callout keys: %w", err)
 	}
 
+	// Before the config and every client: the server mounts the serving pair
+	// and each client mounts the bundle, and a pod started against a Secret
+	// or ConfigMap that does not exist yet waits in ContainerCreating.
+	natsTLS, err := r.ensureA2ANATSTLS(ctx, agent)
+	if err != nil {
+		return state, fmt.Errorf("failed to ensure A2A NATS TLS: %w", err)
+	}
+
 	// The identity map before the server that will be authorizing against
 	// it: the callout refuses connections until it is serving a map, so
 	// rendering the map first shortens the window in which a restarting bus
@@ -5024,7 +5104,7 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		return state, fmt.Errorf("failed to apply A2A NATS config: %w", err)
 	}
 
-	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys))
+	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys, natsTLS.ServingFingerprint))
 	if err := ctrl.SetControllerReference(agent, sts, r.Scheme); err != nil {
 		return state, err
 	}
@@ -6058,6 +6138,13 @@ func (r *PlatformAgentReconciler) a2aBusTeardown(agent *agentv1alpha1.PlatformAg
 		// wait this reconcile has no reason to block on.
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSConfigSecretName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		// The TLS material goes with the bus, unlike the creds Secret: a CA
+		// reissued on the next flip to next costs nothing, since every client
+		// is re-rendered with the new bundle in the same pass, while a CA key
+		// left behind is a signing key for a bus that no longer exists.
+		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: agentv1alpha1.A2ANATSTLSSecretName(agent.Name), Namespace: agent.Namespace}}, r.a2aReader()},
+		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: agentv1alpha1.A2ANATSCASecretName(agent.Name), Namespace: agent.Namespace}}, r.a2aReader()},
+		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSCABundleName(agent), Namespace: agent.Namespace}}, r.Client},
 		// ResourceQuota is not a watched kind, so the read goes through
 		// a2aReader like the Secrets. Deleting it here is safe even with
 		// session pods still draining (see the function comment): a quota

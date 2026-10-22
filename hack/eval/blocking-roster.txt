@@ -49,7 +49,6 @@
 reliability-pdb-probe
 capacity-pinned-pool-probe
 security-overgrant-probe
-consistency-authorized-networks-probe
 cost-idle-pool-probe
 obtainability-remediation-proposal
 cluster-agent-crashloop-debug

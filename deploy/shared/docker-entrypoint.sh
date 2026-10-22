@@ -1048,8 +1048,9 @@ fi
 # Writing jobs.json serializes under Hermes' `<cron_dir>/.jobs.lock` advisory lock to
 # coordinate with any concurrent in-pod Hermes cron mutations (`hermes cron pause|resume|add`).
 #
-# At availability.replicas > 1 — where the operator gives the replicas ONE ReadWriteMany PVC
-# rather than a volume each — every replica's gateway is an owner and several of them run
+# At availability.replicas > 1 — where the operator would give the replicas ONE ReadWriteMany PVC
+# rather than a volume each, a shape it does not render while it caps the gateway at one
+# replica — every replica's gateway is an owner and several of them run
 # this against the same file, with a rolling update overlapping new pods and old. While
 # .jobs.lock serializes writers on filesystems supporting advisory locking, eliminating
 # cross-pod scheduler races on shared volumes requires running the reconcile once per volume,
@@ -1327,8 +1328,9 @@ sync_profile_skills() {
     [ -d "$_src" ] || return 0
 
     # The staging paths are per POD, and that is load-bearing rather than tidy.
-    # $_dst lives on the PVC, and at availability.replicas > 1 the operator hands
-    # every replica the SAME PVC (ReadWriteMany; see step 2c-bis and cron_jobs_sync.py's
+    # $_dst lives on the PVC, and at availability.replicas > 1 the operator handed
+    # every replica the SAME PVC (ReadWriteMany; the operator now caps the gateway at
+    # one replica, but this stays for when that lifts; see step 2c-bis and cron_jobs_sync.py's
     # Concurrency section), so fixed siblings named `skills.new` and `skills.old`
     # are shared names on a shared volume. The unconditional `rm -rf` below then
     # reaches into another pod's swap: pod A completes `mv skills skills.old`, so
@@ -1523,6 +1525,15 @@ fi
 # repairs. Kept after 2.6a only because it is the caller — everything here belongs to
 # 2.6's force-sync, not to it.
 CLUSTER_TEMPLATE="/opt/cluster-template"
+# The plugin code a cluster profile copies once, at scaffold time, from the shared
+# plugins tree (cluster_agent_profile.py), and that no later step refreshes. These two
+# hold no per-profile state, unlike hermes_otel, whose config.yaml carries the
+# profile's pinned collector endpoint. The template enables tool_call_audit, and the
+# back-fill below turns it on for a profile already on the volume, so the loop has to
+# give that profile the image's code too: a copy scaffolded before the plugin wrote
+# logs/audit.jsonl logs its records where the sidecar does not ship them.
+CLUSTER_SHARED_PLUGINS="/opt/defaults/plugins"
+CLUSTER_IMAGE_PLUGINS="tool_call_audit common"
 if [ -d "$CLUSTER_TEMPLATE" ]; then
     CLUSTER_PROFILE_SCRIPT="/opt/defaults/scripts/cluster_agent_profile.py"
     [ -f "$CLUSTER_PROFILE_SCRIPT" ] || CLUSTER_PROFILE_SCRIPT="$TARGET_DIR/scripts/cluster_agent_profile.py"
@@ -1541,6 +1552,27 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
                 || echo "WARN: failed to stamp cluster identity into $d/SOUL.md" >&2
         fi
         sync_profile_skills "$CLUSTER_TEMPLATE" "$d"
+        # Refresh the image-owned plugin code (see CLUSTER_IMAGE_PLUGINS). Each file is
+        # copied to a temporary name beside its target and renamed over it, so a copy
+        # that fails part-way leaves the old file whole, never a truncated module that
+        # stops the plugin loading. The temporary name carries the pod name, because
+        # replicas share this volume. A symlink is an operator-mounted plugin volume
+        # (step 2.65) and is left alone.
+        # shellcheck disable=SC3028 # falls back to $$ where HOSTNAME is unset
+        _refresh_tag="${HOSTNAME:-$$}"
+        for _plugin in $CLUSTER_IMAGE_PLUGINS; do
+            _src="$CLUSTER_SHARED_PLUGINS/$_plugin"
+            _dst="$d/plugins/$_plugin"
+            [ -d "$_src" ] || continue
+            [ -L "$_dst" ] && continue
+            if ! (cd "$_src" && find . -type f) | while IFS= read -r _file; do
+                _tmp="$_dst/$_file.refresh.$_refresh_tag"
+                { mkdir -p "$(dirname "$_dst/$_file")" && cp -p "$_src/$_file" "$_tmp" && mv -f "$_tmp" "$_dst/$_file"; } 2>/dev/null \
+                    || { rm -f "$_tmp" 2>/dev/null; exit 1; }
+            done; then
+                echo "WARN: could not refresh the $_plugin plugin in $d; each file not yet replaced keeps the copy it was scaffolded with" >&2
+            fi
+        done
         # Targeted self-heal: drop `memory.provider` from cluster configs already
         # on the PVC. The template no longer sets it (per-user memory scopes by
         # gateway user identity, which a dispatcher-spawned worker never has), but
@@ -1887,6 +1919,19 @@ if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ "$(command -v tirith 2>/dev/null)" = "
             echo "Reclaimed a per-profile tirith copy: $stale_tirith ($stale_bytes bytes); the image's $IMAGE_TIRITH is on PATH"
         fi
     done
+fi
+
+# 4.4b Point npm in every home on the volume at one cache, <agentHome>/.cache/npm,
+# through a ~/.npm symlink in each home. Each profile's processes run with HOME at
+# profiles/<name>/home, so npm kept a ~100 MiB cache per profile (gke-labs#3376).
+# The scaffolder links each profile it creates; this sweep covers the homes created
+# before it did. It also removes each old per-profile ~/.npm directory and logs its
+# size. The scaffolder leaves an old cache in place, because a process of the
+# profile can be using it. A symlink a user made stays. Image copy of the script,
+# as for step 2.5.
+if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$SCAFFOLD" ]; then
+    "$INSTALL_DIR/.venv/bin/python3" "$SCAFFOLD" --share-npm-cache \
+        || echo "WARN: could not point npm at the shared cache; each profile keeps its own" >&2
 fi
 
 # Everything that writes shared volume state is done; release the bootstrap lock

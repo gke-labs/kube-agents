@@ -203,6 +203,91 @@ class ConfigurationTest(unittest.TestCase):
             )
 
 
+class ReadCredentialTest(unittest.TestCase):
+    """The optional read-only token a context repository clones with."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        self.token = self.dir / "token"
+        self.token.write_text("glpat-write\n")
+        self.read = self.dir / "read-token"
+
+    def built(self, read_token_path=None):
+        path = str(self.read) if read_token_path is None else read_token_path
+        return GitLabForge("gitlab.com", str(self.token), read_token_path=path)
+
+    def test_no_read_token_path_is_no_credential(self):
+        built = GitLabForge("gitlab.com", str(self.token))
+        self.assertIsInstance(built.read_credential("acme/notes"), providers.NoCredential)
+
+    def test_a_missing_or_empty_file_is_no_credential(self):
+        # The Secret may lack the key: the operator's projection is optional,
+        # so the file is absent and the clone keeps today's behaviour.
+        built = self.built()
+        self.assertIsInstance(built.read_credential("acme/notes"), providers.NoCredential)
+        for empty in ("", "\n", "  \n"):
+            with self.subTest(empty=empty):
+                self.read.write_text(empty)
+                self.assertIsInstance(built.read_credential("acme/notes"), providers.NoCredential)
+
+    def test_a_malformed_read_token_is_no_credential(self):
+        # The git helper drops a token that is not one line of printable ASCII
+        # in silence; the forge refuses it first, by the same rule, so the
+        # broker's "presents none" warning names the key.
+        built = self.built()
+        for bad in ("glpat read\n", "\ufeffglpat-read\n", "glpat-read\nsecond-line\n"):
+            with self.subTest(bad=bad):
+                self.read.write_text(bad, encoding="utf-8")
+                self.assertIsInstance(built.read_credential("acme/notes"), providers.NoCredential)
+        self.read.write_bytes("glpat-read".encode("utf-16"))
+        self.assertIsInstance(built.read_credential("acme/notes"), providers.NoCredential)
+
+    def test_a_stored_read_token_is_presented_as_the_write_token_is_and_never_is_it(self):
+        self.read.write_text("glpat-read\n")
+        built = self.built()
+        first = built.read_credential("acme/notes")
+        self.assertIsInstance(first, providers.StaticFileCredential)
+        self.assertIsNot(first, built.read_credential("acme/notes"), "one object per clone")
+        self.assertEqual({"PRIVATE-TOKEN": "glpat-read"}, first.headers("acme/notes"))
+        config = dict(first.git_config("acme/notes"))
+        self.assertEqual("", config["credential.helper"])
+        helper = config["credential.https://gitlab.com.helper"].split()
+        self.assertEqual([str(self.read), "oauth2"], helper[1:])
+        # The write credential is untouched by the read one existing.
+        self.assertEqual({"PRIVATE-TOKEN": "glpat-write"}, built.credential.headers("acme/infra"))
+        self.assertEqual(
+            str(self.token),
+            dict(built.credential.git_config("acme/infra"))["credential.https://gitlab.com.helper"].split()[1],
+        )
+
+    def test_a_key_added_after_start_is_read_with_no_restart(self):
+        built = self.built()
+        self.assertIsInstance(built.read_credential("acme/notes"), providers.NoCredential)
+        self.read.write_text("glpat-read")
+        self.assertIsInstance(built.read_credential("acme/notes"), providers.StaticFileCredential)
+        self.read.unlink()
+        self.assertIsInstance(built.read_credential("acme/notes"), providers.NoCredential)
+
+    def test_a_read_token_path_git_may_not_be_handed_stops_the_build(self):
+        for bad in ("relative/read-token", "/t/../read-token", "/t/read token"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    self.built(bad)
+
+    def test_the_configuration_carries_the_read_token_path(self):
+        [built] = GitLabForge.for_config({"forges": [
+            {"provider": "gitlab", "host": "gitlab.com", "token_path": str(self.token),
+             "read_token_path": str(self.read), "allowed_paths": ()},
+        ]})
+        self.assertEqual(str(self.read), built.read_token_path)
+        [plain] = GitLabForge.for_config({"forges": [
+            {"provider": "gitlab", "host": "gitlab.com", "token_path": str(self.token), "allowed_paths": ()},
+        ]})
+        self.assertEqual("", plain.read_token_path)
+
+
 class ProposalTest(unittest.TestCase):
     def test_a_draft_is_a_title_prefix_and_never_doubled(self):
         # The `draft` field is accepted and ignored on create.

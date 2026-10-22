@@ -59,6 +59,9 @@ locals {
   litellm_ksa     = "kubeagents-litellm"
 
   use_openai_compatible = var.model_provider == "openai_compatible"
+  # The providers the chart knows a default model for; any other slug needs
+  # model_default_name, checked below so the plan fails rather than the render.
+  model_provider_has_default = contains(["gemini", "anthropic", "openai", "vertex_ai", "sap"], var.model_provider)
   # The key the CA bundle Secret holds the PEM under, as for the GitLab CA.
   openai_compatible_ca_key = "ca.crt"
 
@@ -224,11 +227,9 @@ locals {
   }
 
   # The registry third-party images are pulled from on a mirrored install:
-  # third_party_image_registry, falling back to image_registry, the same
-  # precedence the chart's kube-agents.thirdPartyImageRegistry helper applies.
-  # Empty means the upstream registries.
+  # third_party_image_registry. Empty means the upstream registries.
   third_party_registry = trimsuffix(
-    var.third_party_image_registry != "" ? var.third_party_image_registry : var.image_registry,
+    var.third_party_image_registry,
     "/"
   )
 
@@ -327,6 +328,19 @@ locals {
       try(var.extra_helm_values.platformAgent.harness.driftDetector, "absent") == null
     )
   )
+}
+
+# A warning rather than a precondition: setting image_registry without
+# third_party_image_registry is a valid configuration if the operator only
+# intends to mirror first-party images. But third-party images (cert-manager,
+# LiteLLM, fluent-bit, the GitHub token minter, Hindsight, and the cleanup hook)
+# will remain on upstream public registries. On restricted or air-gapped clusters,
+# operators must be informed so deployments do not fail on ImagePullBackOff.
+check "unmirrored_third_party_images" {
+  assert {
+    condition     = trimsuffix(var.image_registry, "/") == "" || local.third_party_registry != ""
+    error_message = "var.image_registry is set (${var.image_registry}), but var.third_party_image_registry is empty. Third-party images (cert-manager, LiteLLM, fluent-bit, the GitHub token minter, Hindsight, and the cleanup hook) will still be pulled from their upstream public registries. If this cluster is restricted or air-gapped, set var.third_party_image_registry (commonly the same prefix) to pull third-party images from your mirror too."
+  }
 }
 
 # A warning rather than a precondition: an install that enables Slack before
@@ -847,6 +861,15 @@ locals {
   alert_daily_limits = { for bucket, limit in var.alert_daily_limits : bucket => limit if limit != null }
 }
 
+# The operator's own data volume size (agentDataStorageSize), which is also the
+# platform_agent_storage_size default. That value passes the chart nothing, so
+# the CR carries no spec.storage and the operator default applies.
+# tests/test_platform_agent_storage_size_defaults.py pins this local, the
+# variable default and install.defaults.env to the operator constant.
+locals {
+  platform_agent_default_storage_size = "50Gi"
+}
+
 resource "helm_release" "kube_agents" {
   name             = "kube-agents"
   chart            = "${path.module}/../../../charts/kube-agents"
@@ -865,17 +888,17 @@ resource "helm_release" "kube_agents" {
   timeout = 600
 
   values = [yamlencode({
-    # Reaches every image this release pulls, including the three the chart
-    # does not render itself — the agent Deployment, the shell sandbox
-    # StatefulSet, and the fluent-bit sidecar the operator resolves at
-    # reconcile time. See the chart README's "Installing from a mirrored
-    # registry".
+    # Reaches every image this release pulls, including the two the chart
+    # does not render itself — the agent Deployment and the shell sandbox
+    # StatefulSet the operator resolves at reconcile time (the fluent-bit
+    # sidecar follows thirdPartyImageRegistry). See the chart README's
+    # "Installing from a mirrored registry".
     #
     # It does NOT reach helm_release.cert_manager above: that is a separate
     # release of an upstream chart, and these values are not passed to it.
-    # local.cert_manager_mirror_values carries the same registry to that
-    # release's image repositories, so a mirrored install pulls every image —
-    # cert-manager's included — from the mirror.
+    # When third_party_image_registry is set, local.cert_manager_mirror_values
+    # carries it to that release's image repositories, so a fully mirrored
+    # install pulls cert-manager from the mirror too.
     global = {
       imageRegistry           = var.image_registry
       thirdPartyImageRegistry = var.third_party_image_registry
@@ -913,6 +936,10 @@ resource "helm_release" "kube_agents" {
         modelDefaultName = var.model_default_name
         maxTokens        = var.model_max_tokens
       },
+      # Only when named, so an install without one renders the values it did.
+      var.litellm_env_secret_name != "" ? {
+        envFromSecret = var.litellm_env_secret_name
+      } : {},
       local.use_vertex ? {
         vertex = {
           serviceAccountName = local.litellm_ksa
@@ -953,7 +980,9 @@ resource "helm_release" "kube_agents" {
     )
     # merge(), so "today" adds no key and the values this composition hands the
     # chart stay what they were before platform_agent_mode existed; the chart
-    # leaves spec.mode out of the CR while its value is null.
+    # leaves spec.mode out of the CR while its value is null. The storage size
+    # works the same way: the default adds no key, and the CR carries no
+    # spec.storage.
     platformAgent = merge({
       # The durable record of an adoption that accepted a cluster with no
       # NetworkPolicy enforcement. Derived from what the module read, not from
@@ -1076,6 +1105,8 @@ resource "helm_release" "kube_agents" {
         data   = local.credentials
       }
       integration = local.platform_agent_integration
+      }, var.platform_agent_storage_size == local.platform_agent_default_storage_size ? {} : {
+      storage = { size = var.platform_agent_storage_size }
       }, var.platform_agent_mode == "today" ? {} : {
       mode = var.platform_agent_mode
     })
@@ -1180,6 +1211,10 @@ resource "helm_release" "kube_agents" {
     precondition {
       condition     = !local.use_openai_compatible || var.openai_compatible_api_base != ""
       error_message = "model_provider = \"openai_compatible\" requires openai_compatible_api_base, the server's base URL including /v1."
+    }
+    precondition {
+      condition     = local.model_provider_has_default || local.use_openai_compatible || var.model_default_name != ""
+      error_message = "model_provider = \"${var.model_provider}\" is a LiteLLM provider slug outside the chart's table, which has no default model: set model_default_name to the model it serves."
     }
 
     precondition {

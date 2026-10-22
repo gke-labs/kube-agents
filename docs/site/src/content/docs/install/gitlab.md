@@ -37,9 +37,11 @@ a Kubernetes Secret in the agent's namespace. Nothing else ever holds it.
   wildcard that matches these names blocks the agent. Two
   limits apply:
   - The broker uses the token only for the declared repositories. Another project in the
-    same group gets no token; `inspect-repository` reads it without one, so only a public
-    project is readable. A project outside those groups is refused. For
-    `platform/infra/gitops`, the group is `platform/infra`.
+    same group gets no write token. `inspect-repository` reads a public project with no
+    token. It reads a private project only when the project is a context repository and you
+    stored a read-only token, as
+    [Private context repositories](#private-context-repositories) shows. A project outside
+    those groups is refused. For `platform/infra/gitops`, the group is `platform/infra`.
   - The token limits what GitLab lets the broker do. Give it the smallest reach: a project
     access token on the GitOps project, or a group access token on the project's own group
     (`platform/infra`, not `platform`).
@@ -185,14 +187,15 @@ password manager. No flag or variable takes the token itself:
 For an instance behind a private CA, add `--gitops-ca-file`, as
 [A self-managed GitLab with a private CA](#a-self-managed-gitlab-with-a-private-ca) shows.
 
-| Flag                    | `install.env` key                      | Meaning                                                                                                                                                                                                                 |
-| ----------------------- | -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--gitops-forge`        | `GITOPS_FORGE`                         | `github` (default) or `gitlab`.                                                                                                                                                                                         |
-| `--gitops-host`         | `GITOPS_HOST`                          | The GitLab hostname, with no scheme, port or path. Omit it for gitlab.com. The installer refuses a GitHub host.                                                                                                         |
-| `--gitops-repo`         | `GITOPS_REPO`                          | The project's full path, `group/project` or `group/subgroup/project`, or its `https://` URL on that host. `--gitops-org` is not used.                                                                                   |
-| `--gitlab-token-file`   | _never recorded_                       | A file, `/dev/stdin` (not under `curl … \| bash`) or `<(command)` that holds the token. The installer checks a regular file before the apply, reads the token once after the apply, and writes it only into the Secret. |
-| `--gitlab-token-secret` | `GITLAB_TOKEN_SECRET`                  | The Secret's name, default `gitlab-forge-token`.                                                                                                                                                                        |
-| `--gitops-ca-file`      | `GITOPS_CA_SECRET` (the Secret's name) | A regular PEM file with the CA certificates of a self-managed instance behind a private CA. The installer stores it in Secret `gitlab-forge-ca`. Its path is not recorded. See below.                                   |
+| Flag                    | `install.env` key                      | Meaning                                                                                                                                                                                                                                |
+| ----------------------- | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--gitops-forge`        | `GITOPS_FORGE`                         | `github` (default) or `gitlab`.                                                                                                                                                                                                        |
+| `--gitops-host`         | `GITOPS_HOST`                          | The GitLab hostname, with no scheme, port or path. Omit it for gitlab.com. The installer refuses a GitHub host.                                                                                                                        |
+| `--gitops-repo`         | `GITOPS_REPO`                          | The project's full path, `group/project` or `group/subgroup/project`, or its `https://` URL on that host. `--gitops-org` is not used.                                                                                                  |
+| `--gitlab-token-file`   | _never recorded_                       | A file, `/dev/stdin` (not under `curl … \| bash`) or `<(command)` that holds the token. The installer checks a regular file before the apply, reads the token once after the apply, and writes it only into the Secret.                |
+| _none_                  | `GITLAB_READ_TOKEN_FILE`               | Optional. A file, `/dev/stdin` or `<(command)` that holds a read-only token for private context repositories, read as `--gitlab-token-file` is, and never recorded. See [Private context repositories](#private-context-repositories). |
+| `--gitlab-token-secret` | `GITLAB_TOKEN_SECRET`                  | The Secret's name, default `gitlab-forge-token`.                                                                                                                                                                                       |
+| `--gitops-ca-file`      | `GITOPS_CA_SECRET` (the Secret's name) | A regular PEM file with the CA certificates of a self-managed instance behind a private CA. The installer stores it in Secret `gitlab-forge-ca`. Its path is not recorded. See below.                                                  |
 
 The installer refuses `--github-app-id` and `--github-pem-path` with `--gitops-forge=gitlab`.
 
@@ -281,7 +284,8 @@ The installer pipes the token straight into `kubectl create secret … --from-fi
 and a server-side `kubectl apply`, so it never appears in a process's arguments, an exported environment variable, the
 installer's output, `install.env`, `terraform.tfvars` or the Terraform state. Terraform and
 the Helm release name the Secret and nothing more. The operator mounts the Secret's `token`
-key into the credential broker's pod only; the agent and its shell sandbox never see it.
+key into the credential broker's pod only; the agent and its shell sandbox never see it. A
+read-only token for context repositories takes the same path, under the key `read-token`.
 
 ## Rotating the token
 
@@ -298,6 +302,91 @@ kubectl create secret generic gitlab-forge-token -n kubeagents-system \
 Use `--server-side`. A plain `kubectl apply` stores the whole object, token included, in the
 Secret's `kubectl.kubernetes.io/last-applied-configuration` annotation. The broker removes
 whitespace around the token when it reads it, so a trailing newline does no harm.
+
+## Private context repositories
+
+A context repository is a repository that the agent only reads, for example a Terraform
+repository that an audit reads for declared intent. The broker never presents the write token
+for it. Without a read-only token, the broker clones a context repository with no credential,
+so a private project refuses the clone. The read-only token needs a release whose
+`install.env.example` lists `GITLAB_READ_TOKEN_FILE`; an older operator does not mount the key.
+
+To read a private context repository, store a read-only token in the same Secret as the write
+token, under the key `read-token`. Use a project access token on the context project, or a
+group access token on its group, with the Reporter role and only the `read_repository` scope.
+Create it on the host of the GitOps forge: gitlab.com, or your self-managed instance. The
+broker presents it only when it clones a context repository. It never presents it on a commit,
+a push, an API call or a token refresh. A Secret without the key works as before.
+
+The project must be in the `context_repos` key of the `platform-agent-gitops-state`
+ConfigMap, with `"type": "gitlab"`. It must also be in a group that the forge serves: for
+`platform/infra/gitops`, the group `platform/infra` or a subgroup of it. This command replaces
+the value of `context_repos`, so if the key already holds entries, keep them in the list:
+
+```bash
+kubectl patch configmap platform-agent-gitops-state -n kubeagents-system --type merge \
+  -p '{"data":{"context_repos":"[{\"type\":\"gitlab\",\"url\":\"https://gitlab.example.com/platform/infra/terraform\"}]"}}'
+```
+
+### On a new install
+
+Set `GITLAB_READ_TOKEN_FILE` to a file that holds the read token, in `install.env` or in the
+environment of `install.sh`. The installer reads it as it reads `--gitlab-token-file`, and does
+not record the path. It writes the token into the token Secret under the key `read-token`:
+
+```bash
+GITLAB_READ_TOKEN_FILE=<(pass show gitlab/read-token | head -n1) ./install.sh -y \
+  --gitops-forge=gitlab \
+  --gitops-host=gitlab.example.com \
+  --gitops-repo=platform/infra/gitops \
+  --gitlab-token-file=<(pass show gitlab/agent-token | head -n1)
+```
+
+Add the other flags from [Run the installer](#run-the-installer). For gitlab.com, omit
+`--gitops-host`. For an instance behind a private CA, add `--gitops-ca-file`: the broker
+trusts the CA for the read token's clones too. Set `GITLAB_READ_TOKEN_FILE` only for the run
+that stores or replaces the read token, then remove it from `install.env`: a run with it set
+writes the file again, over a token you rotated since, and stops if the file is gone. A later run
+without `GITLAB_READ_TOKEN_FILE` keeps the `read-token` key.
+
+### On an existing install
+
+Add the key to the existing Secret with a server-side apply. The command is the same for
+gitlab.com and for a self-managed instance. An instance behind a private CA needs no other
+step, because the CA Secret is already in place:
+
+```bash
+kubectl create secret generic gitlab-forge-token -n kubeagents-system \
+  --from-file=read-token=<(pass show gitlab/read-token | head -n1) --dry-run=client -o yaml |
+  kubectl apply --server-side --force-conflicts \
+    --field-manager=kube-agents-installer-read-token -f -
+```
+
+Keep `--field-manager`. The apply then owns only `read-token`, so it keeps the `token` key, and
+the command in [Rotating the token](#rotating-the-token) keeps the `read-token` key. Use the
+same command to replace the read token. The broker checks for the file on each clone, so the
+change needs no restart. kubelet can take about a minute to write the file.
+
+To check it, open the repository from the shell sandbox:
+
+```bash
+kubectl exec -n kubeagents-system -c shell platform-agent-shell-0 -- \
+  python3 /opt/data/skills/inspect-repository/scripts/inspect_repository.py open \
+  --repo https://gitlab.example.com/platform/infra/terraform --depth 1
+```
+
+The answer has a `handle` and a `sha`. Close the workspace with `close --handle <handle>`. If
+the clone fails, the broker's log shows whether it had a read token:
+
+```bash
+kubectl logs -n kubeagents-system deploy/platform-agent-credential-proxy \
+  -c envoy-credential-proxy | grep "role=context"
+```
+
+A line that says the forge "has no usable read-only token" means that the `read-token` file is
+missing, unreadable or empty, or does not hold one line of printable ASCII: check the key for a space, a
+byte-order mark or a second line. A line that says the broker's config "names no readTokenPath"
+means that the operator predates the read-only token: upgrade the operator.
 
 ## The `install.env` keys
 
@@ -459,12 +548,51 @@ Notes:
   namespace, or only these Secrets with the command in
   [What a teardown leaves](/kube-agents/install/uninstall/#what-a-teardown-leaves). That command reads the
   Secret names and the namespace from `install.env`.
-- After an uninstall, revoke the token in GitLab.
+- After an uninstall, revoke the token in GitLab, and the read token if you made one.
+
+## Where the audits report
+
+The fleet audits put their ledger issue and their fix merge requests in the `--gitops-repo`
+project, which the install declares with `role: gitops`. They never use a context repository. If
+you register a second project, for example a Terraform project as `managed`, the audits still use
+the `gitops` project. [Which repository gets the ledger](/kube-agents/concepts/declarative-workflow/#which-repository-gets-the-ledger)
+says how to change it, and what happens with several projects and no `role: gitops`, with no
+project, or with a project that the token cannot reach.
+
+To register a second project, for example `infra/terraform` as `managed`, set the full repository
+list in the chart value `platformAgent.integration.repositories`. Helm replaces a list and does not
+merge it, so the list must also hold the `--gitops-repo` project with `role: gitops`. If it does
+not, the install loses that project. Use the forge name `gitlab`, which is the name that the
+installer gives the forge. On an install made with `install.sh`, put the list in the
+`TF_VAR_extra_helm_values` line in `install.env`, as
+[Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) shows, and run
+`install.sh` again. If `install.env` already has that line, add the key to the same object,
+because a second line replaces the first. Replace `platform/infra/gitops` with your
+`--gitops-repo` project:
+
+```bash
+TF_VAR_extra_helm_values='{platformAgent={integration={repositories=[{forge="gitlab",repository="platform/infra/gitops",role="gitops"},{forge="gitlab",repository="infra/terraform",role="managed"}]}}}'
+```
+
+The broker then also serves the group of the second project. The token must reach that project
+with the Developer role: a project access token reaches one project only, and a group access token
+reaches its group and the subgroups of that group. For two
+projects with no common parent group, use the token of a dedicated account that is a Developer
+member of both. Run the access-level check in
+[Check the token](#check-the-token) once for each project. Then make sure that the install has both
+projects:
+
+```bash
+kubectl get platformagent platform-agent -n kubeagents-system -o jsonpath='{.spec.integration.repositories}'
+```
 
 ## Limits
 
 - The skills read GitLab entries in `managed_repos`, but only GitHub entries in `context_repos`.
-  A GitLab repository that you add as a context repository is skipped with a warning.
+  A GitLab repository that you add as a context repository is skipped with a warning, so the
+  audit does not search it for declared intent. The clone itself works: with a read token,
+  `inspect-repository` reads a private GitLab context repository, as
+  [Private context repositories](#private-context-repositories) shows.
 
 ## What the install declares
 

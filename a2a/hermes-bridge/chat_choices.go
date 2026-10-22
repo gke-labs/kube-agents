@@ -16,7 +16,9 @@ import (
 //     leads the detail, rather than clipped;
 //   - answerChoices, slack_moments.answer_choices: an answer that ends by
 //     asking which of two to five options to take offers them as choices,
-//     with the explanation under "why".
+//     with the explanation under "why";
+//   - nextStep, slack_moments.next_step: an answer that declares its next
+//     step on a last line of its own offers that step as its one choice.
 const (
 	// clauseScanMax is CLAUSE_SCAN_MAX: how many code points into a first
 	// sentence clauseCut looks for a break.
@@ -81,6 +83,14 @@ var (
 		`|^(?:(?:does\s+(?:this|that|it|the)|do\s+(?:these|they|those|the))(?:\s+[\w-]+){0,2}\s+)?(?:sounds?|looks?)\s+(?:good|ok(?:ay)?|right|fine)` +
 		`(?:\s+to\s+you)?\s*\?$` +
 		`|^(?:ok(?:ay)?|agreed|any\s+objections)\s*\?$`)
+)
+
+var (
+	// nextStepLine is NEXT_STEP_LINE, matched against a whole line, and
+	// nextStepRefused is NEXT_STEP_REFUSED: what a declared step's label
+	// cannot hold.
+	nextStepLine    = regexp.MustCompile(`(?i)^\[next:([^\]\n]*)\]$`)
+	nextStepRefused = regexp.MustCompile(`[<>|\[\]]`)
 )
 
 // clauseCut is slack_presenter.clause_cut: the headline and the rest for a
@@ -474,4 +484,73 @@ func answerChoices(rest string) (answerOffer, bool) {
 	offer.shown = strings.Join(shownParts, "\n\n")
 	offer.folded = pyStrip(strings.Join(folded, "\n"))
 	return offer, true
+}
+
+// visibleText is slack_moments.visible_text: answer with every step-shaped
+// line at its end taken off, since the "[next: ...]" line is plumbing no
+// surface shows as text; the answer as written when it ends on none.
+func visibleText(answer string) string {
+	// One pass from the end: blank lines and step lines come off until
+	// anything else.
+	lines := strings.Split(strings.TrimRightFunc(answer, isPySpace), "\n")
+	end, took := len(lines), false
+	for end > 0 && (pyStrip(lines[end-1]) == "" || stepShaped(lines[end-1])) {
+		took = took || pyStrip(lines[end-1]) != ""
+		end--
+	}
+	if !took {
+		return answer
+	}
+	return strings.TrimRightFunc(strings.Join(lines[:end], "\n"), isPySpace)
+}
+
+// stepShaped is slack_moments._step_shaped: whether line, trimmed as the
+// whole answer is, is a step line.
+func stepShaped(line string) bool {
+	return nextStepLine.MatchString(pyStrip(line))
+}
+
+// withNote is answer with note added above any step lines at its end, so
+// the step line stays last, where every reader looks for it.
+func withNote(answer, note string) string {
+	shown := visibleText(answer)
+	if shown == answer {
+		return answer + note
+	}
+	return shown + note + "\n\n" + strings.TrimLeftFunc(answer[len(shown):], isPySpace)
+}
+
+// visibleOr is visibleText, or answer as written when nothing else is left,
+// so an answer that is only a step line still publishes text.
+func visibleOr(answer string) string {
+	if shown := visibleText(answer); shown != "" {
+		return shown
+	}
+	return answer
+}
+
+// nextStep is slack_moments.next_step: the one next step an answer declares
+// on its last line, a line of its own reading "[next: <label>]", split off as
+// (the answer above that line, the label). The label is made plain as an
+// option's is (plainLine); one that is then longer than a button, holds no
+// letter or digit, or holds a link or a mention, or a second "[next: ...]"
+// line anywhere, declares none, and the answer is returned as written with
+// an empty label.
+func nextStep(answer string) (string, string) {
+	lines := strings.Split(strings.TrimRightFunc(answer, isPySpace), "\n")
+	m := nextStepLine.FindStringSubmatch(pyStrip(lines[len(lines)-1]))
+	if m == nil {
+		return answer, ""
+	}
+	for _, line := range lines[:len(lines)-1] {
+		if stepShaped(line) {
+			return answer, ""
+		}
+	}
+	label := strings.Join(strings.FieldsFunc(plainLine(m[1]), isPySpace), " ")
+	if runeLen(label) > buttonTextMax || nextStepRefused.MatchString(label) ||
+		strings.IndexFunc(label, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsNumber(r) }) < 0 {
+		return answer, ""
+	}
+	return strings.TrimRightFunc(strings.Join(lines[:len(lines)-1], "\n"), isPySpace), label
 }

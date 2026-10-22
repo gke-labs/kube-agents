@@ -29,7 +29,8 @@ Pure functions only, like ``slack_presenter``, whose layout this reuses.
 
 A finished answer that ends by asking which of its options to take gets the same
 option rules from :func:`answer_choices`, for ``gateway/slack_ux_answer.py`` under today
-and ``chat_message.answer_message`` under next.
+and ``chat_message.answer_message`` under next. One that declares its next step on a last
+line of its own (:func:`next_step`) gets that step as its one choice button instead.
 
 Both lay out as one block list; ``slack_presenter.with_side_bar`` splits it
 into the headline and the attachment that carries the bar when it is posted.
@@ -294,6 +295,13 @@ SHOWN_OPTION = "{marker} **{label}**"
 SHOWN_SUMMARY = "{line} — {summary}"
 #: A line that is not prose: a quote or a table row, beside the presenter's headings, items and fences.
 NOT_PROSE = re.compile(r"^\s*[>|]")
+#: The next step an answer declares (:func:`next_step`): a line of its own, ``[next: <label>]``.
+#: Matched against a line already stripped, with one quantifier, so a long blank run cannot
+#: backtrack; the label's own blanks are collapsed afterwards.
+NEXT_STEP_LINE = re.compile(r"\[next:([^\]\n]*)\]", re.IGNORECASE)
+#: What a declared step's label cannot hold: a Slack link or mention, which a button shows as
+#: typed, and the brackets of a second step.
+NEXT_STEP_REFUSED = re.compile(r"[<>|\[\]]")
 
 
 def opened_pr(
@@ -839,3 +847,62 @@ def answer_choices(rest: str, buttons: bool = True) -> tuple[str, str, str, list
     return shown, "\n".join(folded).strip(), question, [
         (label, i == first) for i, (label, _primary, _shown, _whole) in enumerate(options)
     ]
+
+
+def step_line(text: str) -> tuple[str, str]:
+    """``(text above, line)`` when the last line is shaped as a declared step, whether or not
+    :func:`next_step` accepts its label; ``(text, "")`` otherwise. A layout that reads the closing
+    question from the last line sets the line aside first, so a refused step cannot hide it."""
+    lines = (text or "").rstrip().split("\n")
+    if not _step_shaped(lines[-1]):
+        return text, ""
+    return "\n".join(lines[:-1]).rstrip(), lines[-1].strip()
+
+
+def _step_shaped(line: str) -> bool:
+    """Whether ``line``, trimmed as the whole answer is (any whitespace, ``\r`` included), is a step line."""
+    return NEXT_STEP_LINE.fullmatch(line.strip()) is not None
+
+
+def visible_text(text: str) -> str:
+    """``text`` as a person sees it: every step-shaped line at its end taken off.
+
+    The ``[next: ...]`` line is plumbing between the agent and the presenters,
+    which draw it as a button where one can render; no surface shows it as
+    text, a refused or second one included. Returns the text as written when it
+    ends on no such line.
+    """
+    # One pass from the end: blank lines and step lines come off until anything else.
+    lines = (text or "").rstrip().split("\n")
+    end, took = len(lines), False
+    while end and (not lines[end - 1].strip() or _step_shaped(lines[end - 1])):
+        took = took or bool(lines[end - 1].strip())
+        end -= 1
+    return "\n".join(lines[:end]).rstrip() if took else text
+
+
+def next_step(text: str) -> tuple[str, str]:
+    """``(text, label)``: the one next step an answer declares, split off, or ``(text, "")``.
+
+    The agent declares it on the answer's last line, a line of its own reading
+    ``[next: <label>]``, the words a user would type to ask for it. The label is
+    one line of 1 to ``BUTTON_TEXT_MAX`` characters once its markup is made plain
+    as an option's label is (``slack_presenter._plain``: paired emphasis and code
+    marks go, a lone ``*`` in a glob stays), holding a letter or digit and no link
+    or mention; the text returned is the answer above that line. Anything else,
+    including a second ``[next: ...]`` line anywhere, declares none and leaves
+    the text as written.
+    """
+    lines = (text or "").rstrip().split("\n")
+    # Each line is trimmed as the whole answer is, so no step line hides behind a "\r" or other space.
+    match = NEXT_STEP_LINE.fullmatch(lines[-1].strip())
+    if match is None or any(_step_shaped(line) for line in lines[:-1]):
+        return text, ""
+    label = " ".join(_presenter._plain(match.group(1)).split())
+    if (
+        len(label) > _presenter.BUTTON_TEXT_MAX
+        or NEXT_STEP_REFUSED.search(label)
+        or not any(c.isalnum() for c in label)
+    ):
+        return text, ""
+    return "\n".join(lines[:-1]).rstrip(), label

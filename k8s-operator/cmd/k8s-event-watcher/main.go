@@ -655,7 +655,10 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		result = reopened
 	}
 	// Create or reuse a troubleshooter session, then inject event telemetry.
+	// opened says this dispatch created the session, which is what
+	// triageSessions counts once the inject below is delivered.
 	sid := d.targetSid
+	opened := false
 	if d.mode == "per-incident" && !d.dryRun {
 		newSid, err := d.injector.CreateSession(ctx)
 		if err != nil {
@@ -670,6 +673,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 			return
 		}
 		sid = newSid
+		opened = true
 		d.metrics.sessionCreates.WithLabelValues(ev.Cluster, ev.Project, ev.Location, "ok").Inc()
 		d.dedup.BindSession(ev.Key, ev.Message, sid)
 	}
@@ -747,6 +751,9 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		return
 	}
 	d.metrics.eventsInjected.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, ev.Namespace).Inc()
+	if opened {
+		d.metrics.triageSessions.WithLabelValues(ev.Cluster, ev.Project, ev.Location).Inc()
+	}
 	log.Printf("fire %s pod=%s/%s → sid=%s (mode=%s)",
 		ev.Key.Reason, ev.Namespace, ev.Name, sid, d.mode)
 }

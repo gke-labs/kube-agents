@@ -2,6 +2,7 @@
 """Unit tests for stall_report.py: fixture objects, kubectl stubbed."""
 
 import io
+import json
 import os
 import sys
 import unittest
@@ -456,6 +457,52 @@ class Helpers(unittest.TestCase):
             self.assertEqual(stall_report.kubectl_names("secrets", NAMESPACE), {"a", "b"})
         with patch.object(stall_report, "run_kubectl", return_value=(1, "", "forbidden")):
             self.assertIsNone(stall_report.kubectl_names("secrets", NAMESPACE))
+
+
+class Exempt(unittest.TestCase):
+    """The stall watch's opt-out annotation marks the rows; it hides nothing here."""
+
+    @staticmethod
+    def wedged(name, annotations=None):
+        dep = healthy_deployment(name)
+        dep["status"]["conditions"] = [condition("Progressing", "False", 30, "ProgressDeadlineExceeded")]
+        if annotations is not None:
+            dep["metadata"]["annotations"] = annotations
+        return dep
+
+    def run_main(self, objects, *argv):
+        with patch.object(stall_report, "collect", return_value=(objects, [])):
+            with patch.object(stall_report, "NameResolver", lambda: FakeResolver({})):
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    self.assertEqual(stall_report.main(["--namespace", NAMESPACE, *argv]), 0)
+        return out.getvalue()
+
+    def test_the_exempt_field_comes_from_the_objects_annotation(self):
+        rows = analyze([
+            self.wedged("exempt", {stall_report.EXEMPT_ANNOTATION: stall_report.EXEMPT_VALUE}),
+            self.wedged("other-value", {stall_report.EXEMPT_ANNOTATION: "yes"}),
+            self.wedged("unrelated", {"team": "payments"}),
+            self.wedged("bare"),
+        ])
+        self.assertEqual({r["object"]: r[stall_report.EXEMPT_FIELD] for r in rows}, {
+            "Deployment/exempt": True,
+            "Deployment/other-value": False,
+            "Deployment/unrelated": False,
+            "Deployment/bare": False,
+        })
+
+    def test_json_rows_carry_the_field_and_the_count_is_unchanged(self):
+        report = json.loads(self.run_main([self.wedged("web", {stall_report.EXEMPT_ANNOTATION: stall_report.EXEMPT_VALUE})], "--json"))
+        self.assertEqual(report["stalled_resources"], 1)
+        self.assertIs(report["findings"][0][stall_report.EXEMPT_FIELD], True)
+
+    def test_the_table_is_the_same_with_or_without_the_annotation(self):
+        exempt = self.run_main([self.wedged("web", {stall_report.EXEMPT_ANNOTATION: stall_report.EXEMPT_VALUE})])
+        plain = self.run_main([self.wedged("web")])
+        self.assertEqual(exempt, plain)
+        self.assertEqual(exempt.splitlines()[0].split(), list(stall_report.TABLE_COLUMNS))
+        self.assertEqual(exempt.splitlines()[-1], "stalled resources: 1")
 
 
 class Main(unittest.TestCase):

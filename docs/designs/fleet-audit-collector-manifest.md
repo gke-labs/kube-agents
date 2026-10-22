@@ -11,6 +11,9 @@
 > `gcp-networking-fabric-audit`;
 > each of those streams' SOPs runs its collector and passes the flag, and every other stream
 > publishes on the document's own attestation, exactly as it did before the flag existed.
+> `fleet_health.py` emits the same shape for `fleet-health`, a chat-only sweep that no stream and
+> no `finish` reads, except that its per-project metric reads are recorded once under a top-level
+> `project_reads` rather than in every cluster's `commands`.
 
 **Scope:** the machine boundary between a per-stream collector script and the fleet-audit harness.
 The ledger itself, the delta, coverage gaps, and remediation pull requests are

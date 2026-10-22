@@ -67,7 +67,7 @@
       "repository": "ghcr.io/gke-labs/kube-agents/a2a-gateway",
       "tagPolicy": "release",
       "override": "A2A_GATEWAY_IMAGE",
-      "pulledBy": "The A2A gateway Deployment the operator renders under spec.mode: next, and nothing on a default install. The operator derives it from its own image, else from the agent image it resolves (registry and tag), unless the override is set; the worker, the callout and the console resolve the same way.",
+      "pulledBy": "The A2A gateway Deployment the operator renders under spec.mode: next, and nothing under spec.mode: today. The operator derives it from its own image, else from the agent image it resolves (registry and tag), unless the override is set; the worker, the callout and the console resolve the same way.",
       "description": "The chat gateway of the A2A next stack: adapters, the bus relay and the session spawner (a2a/Dockerfile.gateway)."
     },
     {
@@ -85,7 +85,7 @@
       "repository": "ghcr.io/gke-labs/kube-agents/a2a-authcallout",
       "tagPolicy": "release",
       "override": "A2A_CALLOUT_IMAGE",
-      "pulledBy": "The auth callout Deployment the operator renders under spec.mode: next, and nothing on a default install.",
+      "pulledBy": "The auth callout Deployment the operator renders under spec.mode: next, and nothing under spec.mode: today.",
       "description": "The NATS auth callout that turns a projected ServiceAccount token into a bus identity (a2a/Dockerfile.authcallout)."
     },
     {
@@ -94,7 +94,7 @@
       "repository": "ghcr.io/gke-labs/kube-agents/a2a-console",
       "tagPolicy": "release",
       "override": "A2A_CONSOLE_IMAGE",
-      "pulledBy": "The console server Deployment the operator renders under spec.mode: next, and nothing on a default install.",
+      "pulledBy": "The console server Deployment the operator renders under spec.mode: next, and nothing under spec.mode: today.",
       "description": "The A2A console: the console page built to static files and the server that serves it, hands it its bus credential and proxies its websocket to the bus (a2a/Dockerfile.console)."
     },
     {
@@ -103,7 +103,7 @@
       "repository": "ghcr.io/gke-labs/kube-agents/a2a-verifier",
       "tagPolicy": "release",
       "override": "A2A_VERIFIER_IMAGE",
-      "pulledBy": "The capability verifier Deployment the operator renders under spec.mode: next, and nothing on a default install. It resolves the same way the gateway, the worker and the callout do.",
+      "pulledBy": "The capability verifier Deployment the operator renders under spec.mode: next, and nothing under spec.mode: today. It resolves the same way the gateway, the worker and the callout do.",
       "description": "The one reader of the capability bucket: it answers every executor's capability check over the bus and holds no RBAC (a2a/Dockerfile.verifier)."
     },
     {
@@ -112,14 +112,14 @@
       "repository": "ghcr.io/gke-labs/kube-agents/hermes-bridge",
       "tagPolicy": "release",
       "override": "A2A_BRIDGE_IMAGE",
-      "pulledBy": "The hermes-bridge sidecar the operator renders beside the agent container under spec.mode: next, and nothing on a default install. The operator derives it from the agent image (registry and tag) unless the override is set; a CR that declares its own hermes-bridge sidecar on spec.deployment.sidecars keeps it, and that sidecar's image is the CR's.",
+      "pulledBy": "The hermes-bridge sidecar the operator renders beside the agent container under spec.mode: next, and nothing under spec.mode: today. The operator derives it from the agent image (registry and tag) unless the override is set; a CR that declares its own hermes-bridge sidecar on spec.deployment.sidecars keeps it, and that sidecar's image is the CR's.",
       "description": "The platform-agent image of the same commit plus the bridge binary that runs the platform persona as the bus executor (a2a/Dockerfile.hermes-bridge)."
     },
     {
       "name": "litellm",
       "origin": "third-party",
       "repository": "ghcr.io/berriai/litellm",
-      "tag": "v1.104.0",
+      "tag": "v1.106.0",
       "override": "LITELLM_IMAGE",
       "pulledBy": "The LiteLLM gateway, from either the chart or the kustomize integration.",
       "description": "The model gateway the agent's baked default endpoint points at."
@@ -139,7 +139,7 @@
       "repository": "docker.io/library/nats",
       "tag": "2.10-alpine",
       "override": "A2A_NATS_IMAGE",
-      "pulledBy": "The NATS StatefulSet the operator renders under spec.mode: next, and nothing on a default install.",
+      "pulledBy": "The NATS StatefulSet the operator renders under spec.mode: next, and nothing under spec.mode: today.",
       "description": "The JetStream bus behind the A2A next stack. The pin is the operator's compiled default; the env var is the only override, since the chart does not set it."
     },
     {
@@ -148,7 +148,7 @@
       "repository": "docker.io/natsio/nats-box",
       "tag": "0.14.5",
       "override": "A2A_PROVISION_IMAGE",
-      "pulledBy": "The provision Job the operator runs against that NATS under spec.mode: next, and nothing on a default install.",
+      "pulledBy": "The provision Job the operator runs against that NATS under spec.mode: next, and nothing under spec.mode: today.",
       "description": "Carries the nats CLI the provisioning script drives to create the streams and buckets. Same pin and override arrangement as nats."
     },
     {

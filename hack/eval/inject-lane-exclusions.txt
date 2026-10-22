@@ -1,7 +1,7 @@
 # The inject lane's exclusions: registered cases that do not run when the
 # matrix goes through the A2A gateway's inject door (the harness's
 # AGENT_TRANSPORT=inject, which hack/ci-eval-pr.sh exports under
-# EVAL_MODE_NEXT=1), because the case's premise needs something the door
+# EVAL_MODE_NEXT=1 except on the today lane), because the case's premise needs something the door
 # does not carry: a specialist's answer folded back into the chat thread, or
 # a card's wake, which the harness replays on the api transport only. A case
 # excluded while the lane pinned the bridge's cli executor, for a reason that
@@ -27,9 +27,10 @@
 # still runs and still reports (docs/designs/eval-scorer.md). An entry here
 # is for a premise the transport removes, not a check it blinds.
 #
-# WHO APPROVES. The normal approvers: this file changes what the inject lane
-# runs, not what can red a pull request on the api lane, so hack/OWNERS
-# leaves it to the root OWNERS the way it leaves nightly-cases.txt.
+# WHO APPROVES. The eval crew, as for presubmit-cases.txt: the merge-blocking
+# presubmit runs on the inject lane, so an entry takes a case out of every
+# pull request's matrix and, for a blocking-roster case, out of what can red
+# one; hack/OWNERS scopes this file to the eval-crew alias.
 
 # #2039: grades delegation through the chat front door -- kanban_create by
 # the default profile, then the specialist's answer folded back into the
@@ -131,3 +132,14 @@ chat-fanout-fleet-restarts-rows
 # ids, so the worker checks fail closed. Returns to the lane with
 # agent-kanban-smoke.
 chat-question-asked-to-choose-pauses
+# #2039: grades the chat front door's reply to the wake a blocked card sends
+# it, as chat-voice-failure-leads-with-fact does: a card-wake replay needs
+# AGENT_TRANSPORT=api and errors on this lane. Returns to the lane with it.
+chat-failure-reply-declares-next-step
+# #2039: grades the worker's answer under the one card the chat front door
+# files, as chat-question-asked-to-choose-pauses does: the lane's delegation
+# wait reads no card ids. Returns to the lane with agent-kanban-smoke.
+chat-answer-declares-next-step
+# #2039: grades the worker's answer under the door's one card, as
+# chat-answer-declares-next-step does. Returns to the lane with agent-kanban-smoke.
+chat-answer-tangent-offer-declares-no-step

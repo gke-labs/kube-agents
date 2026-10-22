@@ -1032,4 +1032,3 @@ func TestStaleCacheLaggingInformerDoesNotWriteSyncA2AConditions_BusProvisionedLi
 		t.Fatalf("syncA2AConditions did not adopt live resourceVersion into agent; got %q, want %q", staleAgent.ResourceVersion, agent.ResourceVersion)
 	}
 }
-

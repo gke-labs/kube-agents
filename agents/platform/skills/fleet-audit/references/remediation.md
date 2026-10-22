@@ -11,7 +11,8 @@ to put in a diff otherwise. Three paths lead there:
   `MAJOR_SWEEP_CHECKS` (`no-pdb`, `unbound-sa-automount`, `ccc-no-ondemand-floor`) where the
   collector's candidate is at least `major` — that is a `manifest`, has no live pull request on its branch — and, on a run that passed
   `--manifest-file`, is neither uncorroborated nor triage-marked by the collector — is promoted
-  automatically by `finish` — **at most five per run**. Every other `major` finding is held to the `critical` floor:
+  automatically by `finish` — **at most five per run** — unless the install's
+  `KUBEAGENTS_AUDIT_AUTO_PROMOTE` switch is `false`, when `finish` opens only what `/remediate` named. Every other `major` finding is held to the `critical` floor:
   a SOP's grade says how bad the finding is, not whether its fix is safe to open unasked. The collector marks a fix that scales a controller to zero, writes a
   default-deny NetworkPolicy, resizes a `Guaranteed` pod, needs a new ComputeClass, owes its
   `major` to the Autopilot bump, turns off a namespace's default ServiceAccount token, rewrites
@@ -87,7 +88,10 @@ All of these are guarded by a hidden marker carrying the triggering comment's no
 A `/remediate` read on the ledger is never run through the subcommand — `finish` answers those on
 the comment's own timestamp, which is what lets a fresh post-close command revive a finding the
 subcommand would report as `superseded`. Run a direct ask's targets through it, `--finding` once
-per id:
+per id. Without `--repo` it acts on the repository with `role: gitops`. If the finding is from a run
+that a person ran with `--repo`, pass the same `--repo` here. With several managed repositories,
+none with `role: gitops`, and no `--repo`, it refuses (`FATAL: Multiple repositories configured …`,
+exit 1); report that message to the user, and do not choose a repository:
 
 ```bash
 /opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py remediate --audit <audit-id> \
@@ -112,7 +116,10 @@ agent relaying an ask it cannot tie to a GitHub identity never passes that flag.
 
 `refused` names the targets whose remediation is not a readable file inside the workspace — either the
 audit promised a manifest and never wrote it, or the path does not resolve inside the repository at
-all. Both leave nothing to put in a diff; a `SECURITY:` line in the log says which one happened. The
+all. Both leave nothing to put in a diff; a `SECURITY:` line in the log says which one happened. A
+target is also refused when its fix adds a new file that its kustomization does not list, or the
+audit could not check that. Its `REFUSED` line names the `resources:` line to add when the audit saw
+the kustomization, and says what it could not check otherwise. The
 other targets still open — `/remediate all` expands to every **manifest-remediation** id in the
 document, and failing the batch over one unwritten file would answer a request for many fixes with
 none. Say which were refused when you acknowledge the command.
@@ -147,3 +154,19 @@ in the group that still reproduces. A pull request the harness closed as stale b
 the finding's detail block, a `manifest` remediation path links to the file at the audited repository
 commit when the forge's `capabilities` response supplies a `fileUrl` template and the file exists at
 that commit, and stays a bare path for a newly written file or when `fileUrl` is absent.
+
+## Kustomize roots
+
+Kustomize renders only the files its kustomization names, and a remediation carries one
+file, so it cannot add the `resources:` entry too. Make such a finding `manual`, and put the new
+file's content and the `resources:` line it needs in `remediation.note`. When `finish` refuses a
+declared `major` 3.3 fix of this kind as unwritten, keep it `manual` that way and pass
+`--decline-fix <id> "<why>"` with a reason that names the kustomization; otherwise the refusal
+repeats. Where the file is not in the repository and the nearest kustomization above it (in its
+directory or a parent) does not name it, `finish` degrades the finding to `manual`. The note names
+the kustomization and the `resources:` line to add, and holds your file as a YAML block, capped in
+lines and in characters. It also degrades the finding, and says so, when git cannot answer, the broker
+refuses a question, or the kustomization cannot be read. A broker outage (no answer, a server
+error, or too many requests) stops `finish` with `BROKER UNAVAILABLE`, as at publish. It does not refuse the run for these, and `remediate`
+refuses them by name. `finish --dry-run` only warns, only in directory mode, and reads the
+kustomization in the working tree, where the real run reads it at the audited commit.

@@ -26,6 +26,8 @@ Produce clear, actionable documents — upgrade plans, runbooks, or checklists �
 
 Always frame guidance around the auto-upgrade model: auto-upgrade with maintenance windows and exclusions is the preferred control mechanism.
 
+> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes. A control-plane upgrade reaches the cluster as a pull request changing the version floor or release-channel field (`spec.minMasterVersion` or `spec.releaseChannel.channel` on the `ContainerCluster`). A node-pool version change (an upgrade, a downgrade or rollback, or resuming a stopped upgrade) is an operation, not desired state: write the exact `gcloud container clusters upgrade CLUSTER_NAME --node-pool NODE_POOL_NAME --cluster-version VERSION --location LOCATION` command as a step for the platform operator to run, not one to run from here, and never propose `spec.version` on a `ContainerNodePool`. A pool on a release channel cannot turn auto-upgrade off, so a version pinned in the repository fights it: Config Connector moves the pool back to the pin after each automatic upgrade, re-rolling its nodes, and a rollback pin holds the pool at the old version indefinitely. The pool's upgrade strategy (`spec.upgradeSettings`) is desired state and stays a pull request.
+
 ## Context Gathering
 
 Before producing any upgrade artifact, establish:
@@ -93,8 +95,8 @@ Configure maintenance windows to control auto-upgrade timing. GKE also supports 
 2. **Warn against "No channel"**: You MUST explicitly warn that disabling release channels ("No channel" / static versioning) is deprecated and must not be used as a replacement for exclusions.
 3. **Compare Scopes**: You MUST explain the difference between 'No upgrades' (limitations, blocks patches) and 'No minor or node upgrades' (allows patches, longer duration). Recommend 'No minor or node upgrades' when the user wants to allow security patches/fixes while blocking minor version jumps.
 4. **Handle periods > 90 days**: If the user needs to block upgrades for more than 90 days, you MUST explain that 'No upgrades' is limited to 90 days per exclusion (max 3 per cluster, and 48 hours of maintenance availability must remain in any rolling 92-day window, preventing chaining into longer continuous freezes) and advise using scoped exclusions ('No minor or node upgrades' / 'No minor upgrades'), which have no fixed day cap and can run until the minor version's End of Support.
-5. **Version skew**: Be mindful of version skew (between control plane and node pools) when using exclusions. Ensure skew does not exceed the supported 2 minor versions. Use `--add-maintenance-exclusion-until-end-of-support` for persistent exclusions.
-6. **Correct gcloud syntax**: When providing `gcloud` commands for exclusions, you MUST use the separate flag syntax: `--add-maintenance-exclusion-name`, `--add-maintenance-exclusion-start`, `--add-maintenance-exclusion-end` (or `--add-maintenance-exclusion-until-end-of-support`), and `--add-maintenance-exclusion-scope` (do NOT use a single comma-separated `--add-maintenance-exclusion` flag).
+5. **Version skew**: Be mindful of version skew (between control plane and node pools) when using exclusions. Ensure skew does not exceed the supported 2 minor versions.
+6. **Correct exclusion fields**: When proposing exclusions, you MUST write each one as its own entry in `spec.maintenancePolicy.maintenanceExclusion` on the cluster's `ContainerCluster`, with `exclusionName`, `startTime`, `endTime`, and `exclusionOptions.scope` (`NO_UPGRADES`, `NO_MINOR_UPGRADES` or `NO_MINOR_OR_NODE_UPGRADES`, as the GKE API spells them, not gcloud's lowercase forms). For an exclusion that runs until End of Support, set `endTime` to the minor version's End of Support date (from the GKE release schedule) with scope `NO_MINOR_UPGRADES` or `NO_MINOR_OR_NODE_UPGRADES`. The `ContainerCluster` schema carries a fixed `endTime` and no field for gcloud's form that follows the End of Support date if it moves (confirm with `kubectl explain` against the customer's CRD), so a later End of Support date is a new pull request moving `endTime`.
 
 ## Mandatory Upgrade Overrides
 
@@ -171,9 +173,9 @@ Produce checklists as copyable markdown with checkboxes. See [`references/checkl
 
 ## Maintenance runbooks
 
-Produce step-by-step runbooks with actual `gcloud` and `kubectl` commands. See `references/runbook-template.md` for the standard command sequences.
+Produce step-by-step runbooks in which each change is a pull request editing the field in the GitOps repository's format, a node pool's version change is the exact `gcloud container clusters upgrade --node-pool` command as a step for the platform operator, and each check is an actual `gcloud` or `kubectl` read command. See `references/runbook-template.md` for the standard sequences.
 
-**Any runbook that relaxes a safety control must restore it in the same runbook.** This applies above all to PDBs during a node-pool migration or rollback: back the PDBs up before draining, and make restoring them by patch a numbered step with its own verification, not a closing remark. A runbook that patches `maxUnavailable: 100%` to unblock a drain and never reverts it leaves the cluster without disruption protection, and the gap is invisible until the next voluntary eviction. The same rule covers maintenance exclusions, cordons, and autoscaler `minNodes` overrides added to get through the procedure.
+**Any runbook that relaxes a safety control must restore it in the same runbook.** This applies above all to PDBs during a node-pool migration or rollback: back the PDBs up before draining, and make restoring them by pull request a numbered step with its own verification, not a closing remark. A runbook that sets `maxUnavailable: 100%` to unblock a drain and never reverts it leaves the cluster without disruption protection, and the gap is invisible until the next voluntary eviction. The same rule covers maintenance exclusions, cordons, and autoscaler `minNodes` overrides added to get through the procedure.
 
 ## Maintenance Window Pauses
 
@@ -182,7 +184,7 @@ When diagnosing a \"stuck\" upgrade, consider if it was paused by a maintenance 
 - **Silent Pause Behavior:** If a maintenance window closes before a surge upgrade (auto or manual) completes, GKE intentionally pauses the rollout to prevent disruption outside allowed times. A blue-green node-pool upgrade does not pause: it continues past the window to completion (`references/troubleshooting.md` §11), so for a blue-green pool the window is not the cause and the rest of this section does not apply.
 - **Mixed-Version State:** The cluster is left in a stable mixed-version state (some nodes upgraded, some not). You MUST explicitly state that this is a supported and safe intended outcome.
 - **Resumption:** The upgrade will automatically resume when the next maintenance window opens.
-- **Mitigation for immediate completion:** If the user wants to complete the upgrade immediately, you MUST suggest **temporarily widening the maintenance window** to include the current time (e.g., using `gcloud container clusters update ... --maintenance-window-start ... --maintenance-window-duration ...`). Do not suggest re-triggering the manual upgrade or bypassing the window.
+- **Mitigation for immediate completion:** If the user wants to complete the upgrade immediately, you MUST suggest **temporarily widening the maintenance window** to include the current time (a pull request changing `spec.maintenancePolicy.recurringWindow` on the cluster's `ContainerCluster`). Do not suggest re-triggering the manual upgrade or bypassing the window.
 
 ## Troubleshooting
 
@@ -226,7 +228,7 @@ table rather than reasoning from memory:
 
 ```bash
 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --target-version <version> \
-  --output /opt/data/scratch/fleet_versions.json
+  --output /opt/data/scratch/fleet_versions_$(date +%s)_$$.json
 ```
 
 Without `--target-version` it measures each cluster against its own release channel's default and

@@ -418,12 +418,14 @@ RECOVERY_GREEN_RUNS = 3
 #
 # The rule: the median wall clock of the newest SLOW_RUNS full runs -- a
 # concluded run of at least SLOW_MIN_TASKS cases (one fewer than the
-# presubmit file lists, read from hack/eval/presubmit-cases.txt: 11 for the
-# twelve the presubmit runs since 2026-10-17, eleven roster cases and the
-# held-out compliance canary (#2013), after two demotions (#3269 on 10-16,
-# #3120 on 10-17); fourteen from 2026-09-29: thirteen roster cases and the
-# canary from 2026-10-14, twelve and two seats before that (#2016); twelve
-# from 2026-09-22, when it became the
+# presubmit runs: the cases hack/eval/presubmit-cases.txt lists, less those
+# hack/eval/inject-lane-exclusions.txt drops, since the presubmit grades
+# spec.mode next through the inject door and so runs that lane; 9 for the
+# ten it runs there once agent-kanban-smoke left on that lane: nine roster
+# cases and the held-out compliance canary (#2013), after three demotions
+# (#3269 on 10-16, #3120 on 10-17, #3598 on 10-21); fourteen from 2026-09-29: thirteen roster
+# cases and the canary from 2026-10-14, twelve and two seats before that
+# (#2016); twelve from 2026-09-22, when it became the
 # blocking roster only, #1023, having run 18-19 before); a run Prow cut short
 # at its ceiling recorded fewer and is not one; the floor was a literal 15
 # until the roster shrank under it, which would have made every run since a
@@ -445,10 +447,12 @@ SLOW_WINDOW = timedelta(hours=6)
 
 
 def _slow_min_tasks(default: int = 11) -> int:
-    """One fewer than the presubmit file's case count; `default` when the
-    file cannot be read (a checkout without hack/eval/, an old era)."""
+    """One fewer than the cases the presubmit runs: its file's, less the
+    inject lane's exclusions, the lane it grades on; `default` when the files
+    cannot be read (a checkout without hack/eval/, an old era)."""
     try:
-        cases = eval_rosters.presubmit_cases()
+        excluded = eval_rosters.inject_lane_exclusions()
+        cases = [case for case in eval_rosters.presubmit_cases() if case not in excluded]
     except (OSError, ValueError):
         return default
     return max(1, len(cases) - 1) if cases else default
@@ -555,6 +559,24 @@ UNKNOWN_NODE = "(name unknown)"
 ADVICE_FIXTURE_DRIFT = (
     "A red on a case that depends on {roles} from a run that leased {projects} is the fixture, not your change;"
     " retest after the daily reconcile has re-applied bench/tf/fleet there (08:30 UTC) and the scan that follows reads it healthy."
+)
+# A role that reads seeded-a's default-pool capacity rather than a planted
+# object's shape: a re-apply changes nothing while the pool is full, so the
+# advice names the pool's size instead. post_health.py and gate_issue.py carry
+# the same split for the Chat message and the tracking issue.
+CAPACITY_ROLES = frozenset({"default-pool-headroom"})
+ADVICE_FIXTURE_CAPACITY = (
+    "A red on a case that needs a pod placed on seeded-a's default pool from a run that leased {projects} is the pool running out of room, not your change;"
+    " {roles} reads capacity: the pool is below the headroom margin the scan keeps for the next fixtures, a re-apply changes nothing,"
+    " and the pool's size in bench/tf/fleet/main.tf (seeded_a_default) is the fix: if a size change has just merged, the postsubmit reconcile"
+    " is rolling it project by project and the scans clear as it lands."
+)
+# Appended to the re-apply advice when a capacity role drifts beside planted
+# ones, the usual shape: a pool that fills strands a fixture whose own role
+# then drifts too.
+ADVICE_FIXTURE_CAPACITY_MIXED = (
+    " {roles} beside them reads capacity: seeded-a's default pool is below the headroom margin the scan keeps for the next fixtures,"
+    " a re-apply changes nothing for it, and the pool's size in bench/tf/fleet/main.tf (seeded_a_default) is its fix."
 )
 ADVICE_POOL_DRIFT = (
     "A 403 or a missing-resource red from a run that leased {projects} is the pool project's shape, not your change"
@@ -1963,10 +1985,16 @@ def advice_for(
         )
     if condition == FIXTURE_DRIFT:
         incident = incident or {}
-        return ADVICE_FIXTURE_DRIFT.format(
-            roles=", ".join(incident.get("roles") or []) or "the drifted fixture roles",
+        roles = list(incident.get("roles") or [])
+        capacity = [role for role in roles if role in CAPACITY_ROLES]
+        template = ADVICE_FIXTURE_CAPACITY if roles and len(capacity) == len(roles) else ADVICE_FIXTURE_DRIFT
+        advice = template.format(
+            roles=", ".join(roles) or "the drifted fixture roles",
             projects=_project_list(list(incident.get("projects") or [])) or "the drifted projects",
         )
+        if capacity and len(capacity) < len(roles):
+            advice += ADVICE_FIXTURE_CAPACITY_MIXED.format(roles=", ".join(capacity))
+        return advice
     if condition == POOL_DRIFT:
         return _pool_drift_advice(incident or {})
     return ADVICE_SETUP

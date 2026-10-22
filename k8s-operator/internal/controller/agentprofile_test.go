@@ -165,6 +165,7 @@ func agentProfileSpecPaths() []string {
 		p.Spec.Identity.ServiceAccountName = "sa"
 		p.Spec.ClusterRef = &agentv1alpha1.AgentProfileClusterRef{ProjectID: "p", Cluster: "c", Location: "l"}
 		p.Spec.QueueTimeoutSeconds = 1
+		p.Spec.Tools = []agentv1alpha1.AgentProfileTool{{Name: "jq", Image: "registry.example/jq:1"}}
 	})
 	raw, _ := json.Marshal(p.Spec)
 	var top map[string]json.RawMessage

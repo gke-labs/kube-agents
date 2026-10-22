@@ -278,7 +278,7 @@ resource "null_resource" "sweep" {
       state="$(agent_py "${local.scan_job}" <<'PY' || true
       import json, os, sys
       home = "${local.home}"
-      if os.path.exists(home + "/.user_aligned"):
+      if os.path.exists(home + "/.user_aligned") or os.path.exists(home + "/.user_aligned_conversation") or os.path.exists(home + "/onboarding_conversation.json"):
           print("aligned")
       elif os.path.exists(home + "/.bootstrap_completed"):
           print("completed")
@@ -295,7 +295,7 @@ resource "null_resource" "sweep" {
       case "$state" in
         clear) ;;
         aligned)
-          echo "ERROR: ${local.home}/.user_aligned exists on ${var.host_cluster_name}: a person has connected, and the report a fresh sweep writes would be delivered to their chat. Run this case on an install nobody is chatting with." >&2
+          echo "ERROR: ${local.home}/.user_aligned exists (or .user_aligned_conversation) on ${var.host_cluster_name}: a person has connected, and the report a fresh sweep writes would be delivered to their chat. Run this case on an install nobody is chatting with." >&2
           exit 1 ;;
         completed)
           echo "ERROR: onboarding already delivered on ${var.host_cluster_name} (${local.home}/.bootstrap_completed), and the ${local.scan_job} job removes itself after delivery once its audits stage is done. There is no gate left to re-arm." >&2

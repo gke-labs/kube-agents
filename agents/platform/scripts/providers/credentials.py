@@ -438,6 +438,19 @@ class StaticFileCredential:
             )
         return token
 
+    def holds_token(self) -> bool:
+        """Whether the file holds a token now, by the rule `_token` applies.
+
+        For a caller that must decide before presenting: a clone reads only
+        `git_config`, which never opens the file, so without this a malformed
+        token would reach the git helper and be dropped there in silence.
+        """
+        try:
+            self._token()
+        except WorkspaceError:
+            return False
+        return True
+
     def headers(self, repo: str) -> dict[str, str]:
         return {self._header: self._format.format(token=self._token())}
 

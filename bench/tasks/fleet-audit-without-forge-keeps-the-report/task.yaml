@@ -50,9 +50,6 @@ validated: false
 # Slug per docs/designs/domains.yaml.
 domain: fleet-audits
 
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
-
 fixtures:
   - rbac-overgrant
 

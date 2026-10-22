@@ -12,6 +12,7 @@ from command_policy import (
     _IMPERSONATION_FLAGS,
     _KUBECTL_FILE_WRITE_FLAGS,
     _KUBECTL_IDENTITY_FLAGS,
+    _GOVERNED_TOOLS,
     _gcloud_asks_for_help,
     _gcloud_words_and_flag,
 )
@@ -24,11 +25,49 @@ from command_policy import (
 CONFIG_CONNECTOR_SKILL_DIR = (
     Path(__file__).resolve().parents[1] / "skills" / "gcp-config-connector"
 )
-FENCED_SHELL_BLOCK = re.compile(r"^```(?:bash|sh|shell)\n(.*?)^```", re.MULTILINE | re.DOTALL)
+# A fence may be indented, as one inside a numbered list is. The languages
+# are deploy/docker/check_skill_commands.py's SHELL_LANGUAGES.
+FENCED_SHELL_BLOCK = re.compile(
+    r"^(?P<indent>[ \t]*)```(?:bash|sh|shell|zsh)[ \t]*\n(?P<body>.*?)^(?P=indent)```[ \t]*$",
+    re.MULTILINE | re.DOTALL,
+)
+
+
+def _shell_blocks(text):
+    """The body of each shell fence. A fence closes at a ``` with its opener's
+    indentation, so an indented fence quoted inside a heredoc does not end the
+    block around it."""
+    return [m.group("body") for m in FENCED_SHELL_BLOCK.finditer(text)]
+
+
 GOVERNED_TOOLS = frozenset({"kubectl", "gcloud"})
 # Fewer fenced commands than this means the parser or the path went stale
 # and the allowed-commands test would pass by finding nothing.
 MIN_FENCED_COMMANDS = 8
+# The gcp-terraform skill writes HCL for a pull request and checks it with
+# `tofu fmt`, the one OpenTofu command that needs no provider plugins, state
+# or credentials. The sandbox image carries tofu for that alone.
+TERRAFORM_SKILL_DIR = Path(__file__).resolve().parents[1] / "skills" / "gcp-terraform"
+SHIPPED_SKILLS_ROOT = Path(__file__).resolve().parents[2]
+MIN_TERRAFORM_FENCED_COMMANDS = 3
+# tofu or terraform as a word followed by whitespace, wherever it stands on a
+# fenced line (after `if !`, `time`, `bash -lc '`, `eval "`, a path), with
+# global options (`-chdir=DIR`) skipped to reach the subcommand. A path that
+# merely contains the name (`$REPO/terraform/examples`) is not followed by
+# whitespace and does not match.
+IAC_INVOCATION = re.compile(
+    r"(?i)(?<![\w.-])(tofu|terraform)\s(?:\s*-(?:[^\s'\"]|\"[^\"]*\"|'[^']*')+)*\s*([^\s'\"`;|&)]+)?"
+)
+# The gitops-helm-chart skill declares a chart for a reconciler to install and
+# never runs helm, which the policy does not govern. Its reads are checked the
+# same way, and every shipped skill (gke-basics' reference among them, whose
+# helm lines it replaced) is checked for a helm command.
+HELM_CHART_SKILL_DIR = Path(__file__).resolve().parents[1] / "skills" / "gitops-helm-chart"
+HELM_INVOCATION = re.compile(
+    r"(?im)(?:^|[;&|(`]|-c\s+['\"]|\$|/|\b\w+=\S*\s|\b(?:sudo|env|timeout\s+\d+|xargs|exec|command|nohup)\s)\s*helm\s"
+)
+SHIPPED_SKILL_DIRS = sorted(Path(__file__).resolve().parents[2].glob("*/skills/*/"))
+MIN_HELM_CHART_FENCED_COMMANDS = 6
 
 
 def _gcloud_words(argv):
@@ -40,6 +79,22 @@ def _gcloud_words(argv):
     """
     words, _ = _gcloud_words_and_flag(argv)
     return words
+
+
+def _fenced_shell_commands(skill_dir):
+    """Every command line in the fenced shell blocks of a skill's Markdown."""
+    commands = []
+    for path in sorted(skill_dir.rglob("*.md")):
+        text = path.read_text(encoding="utf-8")
+        for block in _shell_blocks(text):
+            for line in block.replace("\\\n", " ").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                argv = shlex.split(line)
+                if argv:
+                    commands.append((path.name, argv))
+    return commands
 
 
 class KubectlReadOnlyTest(unittest.TestCase):
@@ -770,6 +825,47 @@ class GcloudReadOnlyTest(unittest.TestCase):
             # flag table, so the unknown-flag refusal fires before the allowlist is read;
             # refused either way.
             self.assertFalse(evaluate(argv).allowed, argv)
+
+    def test_monitoring_alert_policy_reads_are_allowed_on_every_track(self):
+        # A Cluster Agent reads alert policies to answer "which alerts exist,
+        # and are they enabled". The imported gke-alert-configuration skill
+        # spells the call with `alpha`; GA and beta are the other spellings
+        # gcloud accepts. --filter, --format, --limit, --sort-by, --page-size
+        # and --project are already in the flag table.
+        for track in ([], ["beta"], ["alpha"]):
+            listed = ["gcloud", *track, "monitoring", "policies", "list",
+                      "--filter=displayName ~ '^\\[K8s\\]'", "--format=table(name,displayName,enabled)",
+                      "--project=p", "--limit=50", "--sort-by=displayName", "--page-size=100"]
+            described = ["gcloud", *track, "monitoring", "policies", "describe",
+                         "projects/p/alertPolicies/123", "--format=json"]
+            short_id = ["gcloud", *track, "monitoring", "policies", "describe", "123", "--project=p"]
+            for argv in (listed, described, short_id):
+                with self.subTest(argv=argv):
+                    self.assertTrue(evaluate(argv).allowed, argv)
+
+    def test_monitoring_alert_policy_writes_and_channel_reads_are_refused(self):
+        # The writes one word away change or remove alerting. Channel reads are
+        # refused too, because a channel label can hold a webhook URL with a
+        # token in it. `channel-descriptors list` carries no secret; it is here
+        # because nothing grants it, so it shows the allowlist names
+        # `policies` and nothing else in the group. Every argv carries only
+        # flags the table knows, so the refusal is the allowlist's and not the
+        # unknown-flag gate's.
+        for track in ([], ["beta"], ["alpha"]):
+            for words in (["policies", "create", "--project=p"],
+                          ["policies", "update", "projects/p/alertPolicies/123", "--project=p"],
+                          ["policies", "delete", "projects/p/alertPolicies/123", "--project=p"],
+                          ["policies", "migrate", "--project=p"],
+                          ["policies", "conditions", "delete", "projects/p/alertPolicies/123/conditions/1"],
+                          ["channels", "list", "--project=p"],
+                          ["channels", "describe", "projects/p/notificationChannels/1"],
+                          ["channels", "delete", "projects/p/notificationChannels/1"],
+                          ["channel-descriptors", "list", "--project=p"]):
+                argv = ["gcloud", *track, "monitoring", *words]
+                with self.subTest(argv=argv):
+                    decision = evaluate(argv)
+                    self.assertFalse(decision.allowed, argv)
+                    self.assertEqual("gcp.read-only", decision.rule_id, argv)
 
     def test_config_set_is_refused(self):
         # `config set` is not in GCLOUD_READ_COMMANDS, so it should be refused.
@@ -1794,18 +1890,11 @@ class TheConfigConnectorSkillStaysInsideThePolicy(unittest.TestCase):
 
     @staticmethod
     def _fenced_commands():
-        commands = []
-        for path in sorted(CONFIG_CONNECTOR_SKILL_DIR.rglob("*.md")):
-            text = path.read_text(encoding="utf-8")
-            for block in FENCED_SHELL_BLOCK.findall(text):
-                for line in block.replace("\\\n", " ").splitlines():
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    argv = shlex.split(line)
-                    if argv and argv[0] in GOVERNED_TOOLS:
-                        commands.append((path.name, argv))
-        return commands
+        return [
+            (name, argv)
+            for name, argv in _fenced_shell_commands(CONFIG_CONNECTOR_SKILL_DIR)
+            if argv[0] in GOVERNED_TOOLS
+        ]
 
     def test_every_fenced_kubectl_and_gcloud_command_is_allowed(self):
         commands = self._fenced_commands()
@@ -1837,6 +1926,137 @@ class TheConfigConnectorSkillStaysInsideThePolicy(unittest.TestCase):
               "--cluster=c", "--location=us-central1"], "node-pools update"),
             (["gcloud", "compute", "firewall-rules", "update", "allow-ssh",
               "--project=p"], "firewall-rules update"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertFalse(evaluate(argv).allowed, desc)
+
+
+class TheTerraformSkillStaysInsideThePolicy(unittest.TestCase):
+    """agents/platform/skills/gcp-terraform edits Terraform for a pull request
+    and validates it with `tofu fmt` alone. Every kubectl and gcloud command
+    its fenced blocks spell must be one the policy allows; every tofu command
+    must be `tofu fmt`, and no shipped skill may run `terraform` or any other
+    tofu subcommand, which is the condition the sandbox's tofu binary ships on;
+    and the writes it leaves to the customer's CI must be refused.
+    """
+
+    @staticmethod
+    def _fenced_lines(skill_dir):
+        for path in sorted(skill_dir.rglob("*.md")):
+            for block in _shell_blocks(path.read_text(encoding="utf-8")):
+                for line in block.replace("\\\n", " ").splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        yield path, line
+
+    def test_every_fenced_kubectl_and_gcloud_command_is_allowed(self):
+        commands = []
+        for path, line in self._fenced_lines(TERRAFORM_SKILL_DIR):
+            argv = shlex.split(line)
+            if argv and argv[0] in GOVERNED_TOOLS:
+                commands.append((path.name, argv))
+        self.assertGreaterEqual(
+            len(commands), MIN_TERRAFORM_FENCED_COMMANDS,
+            f"found {len(commands)} governed commands under "
+            f"{TERRAFORM_SKILL_DIR}; the skill moved or the fence parser is stale",
+        )
+        for name, argv in commands:
+            with self.subTest(file=name, command=" ".join(argv)):
+                decision = evaluate(argv)
+                self.assertTrue(decision.allowed, f"{decision.rule_id}: {decision.message}")
+
+    def test_the_skill_runs_tofu_fmt_and_nothing_else(self):
+        found = [
+            (path.name, match.group(1), match.group(2))
+            for path, line in self._fenced_lines(TERRAFORM_SKILL_DIR)
+            for match in IAC_INVOCATION.finditer(line)
+        ]
+        self.assertTrue(
+            any(tool == "tofu" and sub == "fmt" for _, tool, sub in found),
+            "the skill no longer spells its tofu fmt check; the fence parser or the step moved",
+        )
+        for name, tool, sub in found:
+            with self.subTest(file=name, command=f"{tool} {sub}"):
+                self.assertEqual(("tofu", "fmt"), (tool, sub))
+
+    def test_no_shipped_skill_runs_terraform_or_another_tofu_command(self):
+        self.assertNotIn("tofu", _GOVERNED_TOOLS)
+        self.assertNotIn("terraform", _GOVERNED_TOOLS)
+        for skill_dir in sorted(SHIPPED_SKILLS_ROOT.glob("*/skills/*/")):
+            for path, line in self._fenced_lines(skill_dir):
+                for match in IAC_INVOCATION.finditer(line):
+                    with self.subTest(skill=skill_dir.name, file=path.name, line=line):
+                        self.assertEqual(("tofu", "fmt"), (match.group(1).lower(), match.group(2)))
+
+    def test_what_the_skill_leaves_to_ci_is_refused(self):
+        for argv, desc in (
+            (["gcloud", "container", "node-pools", "update", "default-pool",
+              "--cluster=c", "--location=us-central1", "--project=p"], "node-pools update"),
+            (["gcloud", "container", "node-pools", "create", "batch",
+              "--cluster=c", "--location=us-central1", "--project=p"], "node-pools create"),
+            (["gcloud", "container", "clusters", "create", "c",
+              "--location=us-central1", "--project=p"], "clusters create"),
+            (["gcloud", "compute", "firewall-rules", "update", "allow-ssh",
+              "--project=p"], "firewall-rules update"),
+            (["gcloud", "sql", "instances", "describe", "orders-db", "--project=p"],
+             "the sql read the skill says it lacks"),
+            (["gcloud", "auth", "print-access-token"], "access token"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertFalse(evaluate(argv).allowed, desc)
+
+
+class TheHelmChartSkillStaysInsideThePolicy(unittest.TestCase):
+    """agents/platform/skills/gitops-helm-chart declares a third-party chart in
+    the GitOps repository for the customer's reconciler to install. Every
+    kubectl and gcloud command its fenced blocks spell must be one the policy
+    allows; none may be helm, which the policy does not govern and the shell
+    cannot run against a cluster; and the writes and the token it leaves alone
+    must be refused.
+    """
+
+    def test_every_fenced_kubectl_and_gcloud_command_is_allowed(self):
+        commands = [
+            (name, argv)
+            for name, argv in _fenced_shell_commands(HELM_CHART_SKILL_DIR)
+            if argv[0] in GOVERNED_TOOLS
+        ]
+        self.assertGreaterEqual(
+            len(commands), MIN_HELM_CHART_FENCED_COMMANDS,
+            f"found {len(commands)} governed commands under "
+            f"{HELM_CHART_SKILL_DIR}; the skill moved or the fence parser is stale",
+        )
+        for name, argv in commands:
+            with self.subTest(file=name, command=" ".join(argv)):
+                decision = evaluate(argv)
+                self.assertTrue(decision.allowed, f"{decision.rule_id}: {decision.message}")
+
+    def test_helm_is_ungoverned_so_no_skill_tells_the_model_to_run_it(self):
+        # A broker shim for helm would be a write path no allowlist checks,
+        # which is why the skill declares charts instead. If helm ever becomes
+        # governed, this skill's premise changed and needs rereading.
+        self.assertNotIn("helm", _GOVERNED_TOOLS)
+        self.assertIn(HELM_CHART_SKILL_DIR, SHIPPED_SKILL_DIRS)
+        # Matched by pattern rather than shlex: some skills' blocks carry
+        # quoting that spans lines, and a helm after `&&` or `|` counts too.
+        for skill_dir in SHIPPED_SKILL_DIRS:
+            for path in sorted(skill_dir.rglob("*.md")):
+                for block in _shell_blocks(path.read_text(encoding="utf-8")):
+                    for line in block.splitlines():
+                        with self.subTest(skill=skill_dir.name, file=path.name, line=line):
+                            self.assertIsNone(HELM_INVOCATION.search(line))
+
+    def test_what_the_skill_leaves_to_the_reconciler_is_refused(self):
+        # The Red Lines name the apply, the create and the token for helm as
+        # things the agent never does; each is asserted refused so the skill
+        # cannot describe a boundary the policy does not hold.
+        for argv, desc in (
+            (["kubectl", "apply", "-f", "helmrelease.yaml"], "apply"),
+            (["kubectl", "apply", "--dry-run=server", "-f", "application.yaml"],
+             "server-side dry-run"),
+            (["kubectl", "create", "-f", "rootsync.yaml"], "create"),
+            (["kubectl", "create", "namespace", "cert-manager"], "create namespace"),
+            (["gcloud", "auth", "print-access-token"], "access token"),
         ):
             with self.subTest(desc=desc):
                 self.assertFalse(evaluate(argv).allowed, desc)
@@ -1991,6 +2211,50 @@ class LocalRenderTests(unittest.TestCase):
             ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=client", "--dry-run=none"],
         ):
             self.assertFalse(command_policy.local_render(argv), argv)
+
+
+class TheDeletionSectionStaysInsideThePolicy(unittest.TestCase):
+    """submit-suggestion's "Deleting a resource" (#3077) answers a delete
+    request with a stated stop. It must run no cluster or cloud command, and
+    the direct delete it rules out must be one the policy refuses, or the
+    section would rest on a refusal that is not there. Its fences sit inside
+    a numbered list, so they are indented.
+    """
+
+    SKILL = Path(__file__).resolve().parents[1] / "skills" / "submit-suggestion" / "SKILL.md"
+    INDENTED_FENCE = re.compile(r"^( *)```(?:bash|sh|shell)\n(.*?)^\1```", re.MULTILINE | re.DOTALL)
+
+    def _section(self):
+        text = self.SKILL.read_text(encoding="utf-8")
+        start = text.index("### Deleting a resource")
+        return text[start:text.index("\n### ", start + 1)]
+
+    def test_the_section_runs_no_cluster_or_cloud_command(self):
+        # Every case in the section ends in a stated stop: its fences are the
+        # preflight and a search of the working copy, and none runs kubectl
+        # or gcloud, so nothing in it can coach a write the policy refuses.
+        lines = []
+        for _, block in self.INDENTED_FENCE.findall(self._section()):
+            lines += [line.strip() for line in block.splitlines() if line.strip()]
+        self.assertGreaterEqual(len(lines), 3, "the section's fences moved or the parser is stale")
+        for line in lines:
+            with self.subTest(command=line):
+                argv = shlex.split(line)
+                self.assertNotIn(argv[0], GOVERNED_TOOLS)
+
+    def test_the_direct_delete_is_refused(self):
+        for argv in (
+            ["kubectl", "delete", "namespace", "scratch-ns"],
+            ["kubectl", "delete", "ns", "scratch-ns", "--wait=false"],
+            ["kubectl", "annotate", "namespace", "scratch-ns", "kube-agents.x-k8s.io/state=deleted"],
+        ):
+            with self.subTest(command=" ".join(argv)):
+                self.assertFalse(evaluate(argv).allowed)
+
+    def test_the_section_writes_no_marker_manifest(self):
+        # The #3077 failure was a manifest carrying an invented annotation.
+        # The section names no annotation or label of its own to write.
+        self.assertNotRegex(self._section(), r"kube-agents\.x-k8s\.io/|state: deleted")
 
 
 if __name__ == "__main__":

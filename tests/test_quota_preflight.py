@@ -71,8 +71,8 @@ _DEFAULT_LIMITS_CPU_MILLIS = 10200
 # Memory and ephemeral storage are summed by the same helper as CPU but were asserted
 # nowhere, so a generator that stopped parsing them could be regenerated and committed
 # together with a green `--check` (both sides move at once) and nothing would catch it.
-_DEFAULT_REQUESTS_MEMORY_BYTES = 8832 * 1024**2
-_DEFAULT_LIMITS_MEMORY_BYTES = 23040 * 1024**2
+_DEFAULT_REQUESTS_MEMORY_BYTES = 8896 * 1024**2
+_DEFAULT_LIMITS_MEMORY_BYTES = 23424 * 1024**2
 _DEFAULT_REQUESTS_EPHEMERAL_BYTES = 5 * 1024**3
 _DEFAULT_LIMITS_EPHEMERAL_BYTES = 5 * 1024**3
 # Cleanup hook Job: 50m requested / 200m limit, 64Mi requested / 128Mi limit, 1 pod.
@@ -100,7 +100,11 @@ _LARGEST_SURGING_REQUEST_MILLIS = 100
 _OPERATOR_REQUEST_MILLIS = 10
 # Two operator-rendered claims plus two from the shell StatefulSet's volumeClaimTemplates.
 _OPERATOR_PVC_COUNT = 4
-_OPERATOR_STORAGE_BYTES = 22 * 1024**3
+_OPERATOR_STORAGE_BYTES = 102 * 1024**3
+# The two claims platformAgent.storage.size sizes (the agent's data claim and the shell
+# sandbox's), at the operator default each.
+_DATA_CLAIMS = 2
+_DATA_CLAIM_DEFAULT_BYTES = 50 * 1024**3
 # hindsight.postgresql.storage, the volumeClaimTemplate the StatefulSet renders.
 _HINDSIGHT_STORAGE_BYTES = 8 * 1024**3
 # A memory quota written in decimal SI. 1G is 1,000,000,000 bytes, which is a whole number
@@ -118,7 +122,7 @@ _EPHEMERAL_SET_GIB = 3
 # Retain/Retain, so these two claims survive `helm uninstall` and are in `used` on the
 # next install, to be reused by name rather than created again.
 _RETAINED_PVC_COUNT = 2
-_RETAINED_STORAGE_GIB = 11
+_RETAINED_STORAGE_GIB = 51
 _MILLICORES_PER_CORE = 1000
 # The credential proxy's footprint.yaml entry (the operator's defaults), and an override
 # of the one key an install raises (#2324). The preflight merges the override over the
@@ -232,6 +236,57 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertEqual(req["limitsMemory"], _DEFAULT_LIMITS_MEMORY_BYTES)
         self.assertEqual(req["requestsEphemeral"], _DEFAULT_REQUESTS_EPHEMERAL_BYTES)
         self.assertEqual(req["limitsEphemeral"], _DEFAULT_LIMITS_EPHEMERAL_BYTES)
+
+    def test_a_data_volume_size_moves_both_data_claims(self) -> None:
+        """platformAgent.storage.size resizes two claims, so each GiB counts twice.
+
+        80Gi is 30Gi over the default on each claim: 102Gi + 2 x 30Gi = 162Gi. A size
+        below the default lowers the total the same way, and no claim is added.
+        """
+        base = self._requirements()
+        self.assertEqual(base["requestsStorage"], _OPERATOR_STORAGE_BYTES)
+        totals = {}
+        for size, size_bytes in (("80Gi", 80 * 1024**3), ("20Gi", 20 * 1024**3),
+                                 ("50Gi", _DATA_CLAIM_DEFAULT_BYTES), ("1Ti", 1024**4)):
+            with self.subTest(size=size):
+                req = self._requirements([f"platformAgent.storage.size={size}"])
+                totals[size] = req["requestsStorage"]
+                self.assertEqual(
+                    req["requestsStorage"],
+                    _OPERATOR_STORAGE_BYTES + _DATA_CLAIMS * (size_bytes - _DATA_CLAIM_DEFAULT_BYTES),
+                )
+                self.assertEqual(req["persistentVolumeClaims"], base["persistentVolumeClaims"])
+        self.assertEqual(totals["80Gi"], 162 * 1024**3)
+
+    def test_a_data_volume_size_that_does_not_fit_the_quota_fails_the_render(self) -> None:
+        # The default fits a 102Gi requests.storage quota exactly; 80Gi does not.
+        quota = [{
+            "metadata": {"name": "storage-quota"},
+            "spec": {"hard": {"requests.storage": "102Gi"}},
+            "status": {"hard": {"requests.storage": "102Gi"}, "used": {"requests.storage": "0"}},
+        }]
+        fits = self._render({"probe": {"quotas": quota}})
+        self.assertEqual(fits.returncode, 0, fits.stderr)
+        refused = self._render({"probe": {"quotas": quota}}, ["platformAgent.storage.size=80Gi"])
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("requests.storage", refused.stderr)
+
+    def test_an_oversized_data_volume_size_saturates_rather_than_wraps(self) -> None:
+        """`9Ei` parses to MaxInt64, and two claims of it wrapped the total negative.
+
+        The CR template refuses a size above 64Ti first, so this renders a copy
+        without it, to reach the preflight's own arithmetic.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            chart = pathlib.Path(tmp) / "kube-agents"
+            shutil.copytree(self.chart, chart)
+            (chart / "templates" / "platform-agent-cr.yaml").unlink()
+            original, self.chart = self.chart, chart
+            try:
+                req = self._requirements(["platformAgent.storage.size=9Ei"])
+            finally:
+                self.chart = original
+        self.assertEqual(req["requestsStorage"], 2**63 - 1)
 
     def test_credential_proxy_memory_limit_override_moves_only_that_total(self) -> None:
         """The one key an install raises moves limits.memory by its difference and nothing else.
@@ -1108,7 +1163,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small limits.memory quota must fail")
         self.assertIn("  - limits.memory:", res.stderr)
-        self.assertIn('"limits.memory":"26112Mi"', res.stderr)
+        self.assertIn('"limits.memory":"26496Mi"', res.stderr)
 
     def test_limits_ephemeral_storage_shortfall_is_enforced(self) -> None:
         """A quota deficient in limits.ephemeral-storage must be refused and named in the patch."""
@@ -1137,7 +1192,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small memory shorthand quota must fail")
         self.assertIn("  - memory:", res.stderr)
-        self.assertIn('"memory":"10880Mi"', res.stderr)
+        self.assertIn('"memory":"10944Mi"', res.stderr)
 
     def test_shorthand_ephemeral_storage_spelling_is_enforced(self) -> None:
         """`ephemeral-storage` is the shorthand spelling for `requests.ephemeral-storage`."""
@@ -1157,7 +1212,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small storage shorthand quota must fail")
         self.assertIn("  - storage:", res.stderr)
-        self.assertIn('"storage":"22Gi"', res.stderr)
+        self.assertIn('"storage":"102Gi"', res.stderr)
 
     def test_the_install_patch_for_claims_does_not_double_count_retained_used(self) -> None:
         """Retained claims sitting in `used` on install must not double the suggested patch."""

@@ -40,7 +40,7 @@ Do **not** edit the rendered policy in the cluster: the operator applies it with
 
 ## The Service
 
-The operator applies a `ClusterIP` Service named after the CR (`platform-agent` on a stock install) whose selector matches what it labels its gateway pods, `<agent-name>-gateway`, plus `kubeagents.io/is-leader: "true"` when the agent runs more than one replica. Its `app.kubernetes.io/*` labels follow the project-wide contract that makes the whole kube-agents footprint selectable in one query — [Resource labels](/kube-agents/reference/resource-labels/) is canonical for what each key means and why `component` and `version` are absent.
+The operator applies a `ClusterIP` Service named after the CR (`platform-agent` on a stock install) whose selector matches what it labels its gateway pods, `<agent-name>-gateway`, plus `kubeagents.io/is-leader: "true"` when the agent runs more than one replica, which the operator does not render today: it runs the gateway as a single replica whatever `spec.deployment.availability.replicas` asks for. Its `app.kubernetes.io/*` labels follow the project-wide contract that makes the whole kube-agents footprint selectable in one query — [Resource labels](/kube-agents/reference/resource-labels/) is canonical for what each key means and why `component` and `version` are absent.
 
 The exposed ports:
 

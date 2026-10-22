@@ -124,6 +124,19 @@ class SpecToolRegistryTest(unittest.TestCase):
     }
     HERMES_BUILTIN_TOOLS = set().union(*HERMES_BUILTIN_EVIDENCE.values())
 
+    # Tools of Hermes's built-in `file` toolset that a spec names: a check that
+    # a worker wrote a file. No image patch touches them, so their evidence is
+    # different (test_the_file_tools_still_have_evidence_in_the_configs): the
+    # Chat Agent's config names the tools beside the `file` toolset it
+    # disables, and the Platform Agent's config gives its kanban workers the
+    # `hermes-cli` bundle (which holds that toolset) on `cli` and does not
+    # disable `file`. A name added here needs the same.
+    HERMES_FILE_TOOLS = {"write_file", "patch"}
+    HERMES_FILE_TOOLSET = "file"
+    HERMES_FILE_TOOL_DOC = "agents/chat/config.yaml"
+    PLATFORM_CONFIG = "agents/platform/config.yaml"
+    PLATFORM_WORKER_TOOLSET_KEY = "cli"
+    PLATFORM_WORKER_BUNDLE = "hermes-cli"
     # Hermes core tools no image patch touches, so the patches carry no
     # evidence of them. Evidence of each is the agent text that tells the agent
     # to use it, backticked or called
@@ -321,6 +334,7 @@ class SpecToolRegistryTest(unittest.TestCase):
             self._registered_mcp_tools()
             | self._remote_mcp_tools()
             | self.HERMES_BUILTIN_TOOLS
+            | self.HERMES_FILE_TOOLS
             | self.HERMES_CORE_TOOLS
             | self.SESSION_HARNESS_TOOLS
             | self.TRANSPORT_MARKERS
@@ -369,6 +383,35 @@ class SpecToolRegistryTest(unittest.TestCase):
         self.assertTrue(self._names_builtin("kanban_create", 'if action == "create":'))
         self.assertFalse(self._names_builtin("skill_manage", 'if action == "create":'))
 
+
+    def test_the_file_tools_still_have_evidence_in_the_configs(self):
+        yaml = _yaml()
+        doc = (REPO_ROOT / self.HERMES_FILE_TOOL_DOC).read_text(errors="replace")
+        toolset_line = next(
+            (line for line in doc.splitlines() if re.match(rf"\s*-\s*{self.HERMES_FILE_TOOLSET}\s*#", line)),
+            "",
+        )
+        for name in sorted(self.HERMES_FILE_TOOLS):
+            self.assertRegex(
+                toolset_line,
+                rf"\b{name}\b",
+                f"{name} is allowlisted as a `{self.HERMES_FILE_TOOLSET}` toolset tool but "
+                f"{self.HERMES_FILE_TOOL_DOC} no longer names it beside that toolset — stale allowlist entry",
+            )
+        platform = yaml.safe_load((REPO_ROOT / self.PLATFORM_CONFIG).read_text())
+        worker = platform["platform_toolsets"][self.PLATFORM_WORKER_TOOLSET_KEY]
+        self.assertIn(
+            self.PLATFORM_WORKER_BUNDLE,
+            worker,
+            f"{self.PLATFORM_CONFIG} no longer gives its kanban workers {self.PLATFORM_WORKER_BUNDLE}, "
+            "so the file tools are not a platform worker's — stale allowlist entry",
+        )
+        self.assertNotIn(
+            self.HERMES_FILE_TOOLSET,
+            (platform.get("agent") or {}).get("disabled_toolsets") or [],
+            f"{self.PLATFORM_CONFIG} disables the `{self.HERMES_FILE_TOOLSET}` toolset, so no "
+            "platform worker can call the file tools — stale allowlist entry",
+        )
 
     def test_the_core_allowlist_still_has_evidence_in_the_agent_text(self):
         corpus = "\n".join(

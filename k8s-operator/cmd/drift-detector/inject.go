@@ -86,6 +86,16 @@ const (
 	// identical, in every other line, to one that alerted a human each time.
 	injectStatusSuppressed = "suppressed"
 
+	// driftBacklogPath is the daemon route a backlog record is posted to. It
+	// takes the payload with no session: a backlog record opens no triage
+	// turn, so creating a session for it would only leave one behind.
+	driftBacklogPath = "/v1/drift-backlog"
+
+	// featureDriftBacklog is the /healthz feature a daemon advertises when it
+	// serves driftBacklogPath. Without it every record, backlog included, goes
+	// through the session inject as before.
+	featureDriftBacklog = "drift-backlog"
+
 	// injectRetries is how many times one failed call is retried. One, and only
 	// for a fault that a second attempt could plausibly clear (see
 	// retryableInjectFailure). The handler runs inside the batch's shared join
@@ -254,6 +264,13 @@ type DriftInjectPayload struct {
 	// can say why it is reasoning without ownership rather than presenting a
 	// partial picture as a complete one.
 	LookupError string `json:"lookup_error,omitempty"`
+
+	// Backlog and PublishTime are set on a record posted to driftBacklogPath.
+	// PublishTime is when the entry reached the topic; with Timestamp it says
+	// how late the record was. The daemon records neither today: the digest
+	// shows when the rows were recorded.
+	Backlog     bool   `json:"backlog,omitempty"`
+	PublishTime string `json:"publish_time,omitempty"`
 }
 
 // DriftInjectResource is the object reference on the payload.
@@ -311,6 +328,10 @@ type driftInjectorConfig struct {
 type driftInjector struct {
 	cfg    driftInjectorConfig
 	client *http.Client
+
+	// features is what the daemon's /healthz advertised, read once by
+	// VerifyKindSupported.
+	features []string
 }
 
 // newDriftInjector validates the endpoint and returns the injector.
@@ -383,6 +404,7 @@ type injectResponse struct {
 // same thing here and neither is distinguished from the other.
 type healthzResponse struct {
 	InjectKinds []string `json:"inject_kinds"`
+	Features    []string `json:"features"`
 }
 
 // VerifyKindSupported refuses to run against a daemon that does not understand
@@ -434,6 +456,7 @@ func (i *driftInjector) VerifyKindSupported(ctx context.Context, kind string) er
 	}
 
 	if slices.Contains(parsed.InjectKinds, kind) {
+		i.features = parsed.Features
 		return nil
 	}
 
@@ -446,6 +469,12 @@ func (i *driftInjector) VerifyKindSupported(ctx context.Context, kind string) er
 	return fmt.Errorf("inject: the daemon at %s does not handle %q (it advertises %v), so every record sent to it "+
 		"would take its event path and be reported back as delivered. Upgrade the agent image, or drop "+
 		"--daemon-url to log drift without escalating it", i.cfg.daemonURL, kind, parsed.InjectKinds)
+}
+
+// Supports reports whether the daemon advertised a feature on /healthz. False
+// until VerifyKindSupported has succeeded.
+func (i *driftInjector) Supports(feature string) bool {
+	return slices.Contains(i.features, feature)
 }
 
 // CreateSession opens a session for one drift event and returns its id.
@@ -521,6 +550,37 @@ func (i *driftInjector) Inject(ctx context.Context, sessionID string, payload Dr
 	return parsed.Status, nil
 }
 
+// InjectBacklog posts one backlog record to driftBacklogPath and returns the
+// daemon's status. The body is the payload itself, with none of the session
+// inject's envelope.
+func (i *driftInjector) InjectBacklog(ctx context.Context, payload DriftInjectPayload) (string, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("inject: marshal payload: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, i.cfg.daemonURL+driftBacklogPath, bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("inject: build POST %s: %w", driftBacklogPath, err)
+	}
+	i.authorise(req)
+	req.Header.Set(contentTypeHeader, contentTypeJSON)
+
+	resp, err := i.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("inject: POST %s: %w", driftBacklogPath, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, errorBodyLimit))
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return "", &injectHTTPError{status: resp.StatusCode, body: string(respBody), call: "POST " + driftBacklogPath}
+	}
+
+	var parsed injectResponse
+	_ = json.Unmarshal(respBody, &parsed)
+	return parsed.Status, nil
+}
+
 // authorise sets the headers both calls share.
 func (i *driftInjector) authorise(req *http.Request) {
 	req.Header.Set(authorizationHeader, bearerPrefix+i.cfg.bearerToken)
@@ -587,14 +647,18 @@ type injectCounts struct {
 	// that is the daemon declining a card this binary sent, and this is a card
 	// never sent, so the day's budget is untouched.
 	OutOfScope int
+
+	// Backlog is events posted to the daemon's digest route instead of a
+	// session: recorded, and owed one digest line rather than a card.
+	Backlog int
 }
 
 // String renders the tally, always printing every field. A zero that is absent
 // reads as a category that did not apply; a printed zero reads as one that did
 // not happen, and those differ.
 func (c injectCounts) String() string {
-	return fmt.Sprintf("injected=%d suppressed=%d duplicate=%d failed=%d out_of_scope=%d",
-		c.Injected, c.Suppressed, c.Duplicate, c.Failed, c.OutOfScope)
+	return fmt.Sprintf("injected=%d suppressed=%d duplicate=%d failed=%d out_of_scope=%d backlog=%d",
+		c.Injected, c.Suppressed, c.Duplicate, c.Failed, c.OutOfScope, c.Backlog)
 }
 
 // insertIDSet remembers the audit entries this process has already injected,
@@ -652,11 +716,20 @@ type driftInjectHandler struct {
 	inject *driftInjector
 	seen   *insertIDSet
 	counts injectCounts
+
+	// backlogRoute is whether the daemon advertises featureDriftBacklog. realMain
+	// passes it to the joiner, which sets DriftEvent.Digest from it; Handle
+	// routes on that field.
+	backlogRoute bool
 }
 
 // newDriftInjectHandler wires the injector into a driftEventHandler.
 func newDriftInjectHandler(inject *driftInjector) *driftInjectHandler {
-	return &driftInjectHandler{inject: inject, seen: newInsertIDSet(seenInsertIDsCap)}
+	return &driftInjectHandler{
+		inject:       inject,
+		seen:         newInsertIDSet(seenInsertIDsCap),
+		backlogRoute: inject != nil && inject.Supports(featureDriftBacklog),
+	}
 }
 
 // AlreadyInjected reports whether a card was already sent for an insertId, for
@@ -733,6 +806,19 @@ func (h *driftInjectHandler) Handle(ctx context.Context, event DriftEvent) {
 	injectCtx, cancelInject := context.WithTimeout(ctx, perRecordInjectBudget)
 	defer cancelInject()
 
+	// event.Digest, set by the joiner from the same route this handler holds,
+	// so the DRIFT line's backlog marker and the route taken are one decision.
+	if event.Digest {
+		if err := h.sendBacklog(injectCtx, payloadForEvent(event)); err != nil {
+			h.counts.Failed++
+			log.Printf("%s: BACKLOG POST FAILED for insert_id=%s cluster=%s resource=%s; the record was acked and will not be redelivered: %v",
+				commandName, record.InsertID, record.Cluster, record.Resource, err)
+			return
+		}
+		h.counts.Backlog++
+		return
+	}
+
 	status, err := h.send(injectCtx, payloadForEvent(event))
 	if err != nil {
 		h.counts.Failed++
@@ -794,6 +880,29 @@ func (h *driftInjectHandler) send(ctx context.Context, payload DriftInjectPayloa
 	return "", lastErr
 }
 
+// sendBacklog posts a backlog record, retrying once on the faults send
+// retries on. A retry after the daemon had written its row cannot write a
+// second one: the daemon keeps one backlog row per insert_id.
+func (h *driftInjectHandler) sendBacklog(ctx context.Context, payload DriftInjectPayload) error {
+	var lastErr error
+	for attempt := 0; attempt <= injectRetries; attempt++ {
+		if attempt > 0 {
+			if !sleepCtx(ctx, injectRetryDelay) {
+				return fmt.Errorf("%w (retrying after: %v)", ctx.Err(), lastErr)
+			}
+		}
+		_, err := h.inject.InjectBacklog(ctx, payload)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !retryableInjectFailure(err) || ctx.Err() != nil {
+			return err
+		}
+	}
+	return lastErr
+}
+
 // Counts reports the tally so far.
 func (h *driftInjectHandler) Counts() injectCounts {
 	return h.counts
@@ -835,6 +944,11 @@ func payloadForEvent(event DriftEvent) DriftInjectPayload {
 		Join:         string(event.Outcome),
 		Reconciled:   event.Reconciled,
 		ReconciledBy: event.ReconciledBy,
+	}
+
+	if event.Digest {
+		payload.Backlog = true
+		payload.PublishTime = formatAuditTimestamp(record.PublishTime)
 	}
 
 	if event.LookupError != nil {

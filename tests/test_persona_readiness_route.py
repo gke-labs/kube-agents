@@ -20,6 +20,7 @@ Run:
 
 from __future__ import annotations
 
+import re
 import unittest
 from pathlib import Path
 
@@ -186,6 +187,78 @@ class ReadinessRouteCarriesTheScopeTest(unittest.TestCase):
 
     def test_the_slot_is_the_one_the_skill_spells(self):
         self.assertIn(COLLECTOR_ARGS_SLOT, READINESS_SKILL.read_text(encoding="utf-8"))
+
+
+SCAN_SCRIPT = "api_deprecation_scan.py"
+SCRIPTS_DIR = READINESS_SKILL.parent / "scripts"
+# The scan reads its floor from one of these; without either it exits with a usage error.
+SCAN_FLOOR_FLAGS = ("--versions", "--current-version")
+PLACEHOLDER_PATTERN = re.compile(r"<[^<>]*>")
+FLAG_PATTERN = re.compile(r"(?<![\w-])--[a-z][a-z-]*")
+DEFINED_FLAG_PATTERN = re.compile(r"add_argument\(\s*\"(--[a-z][a-z-]*)\"")
+# A dictated command, read from the raw line: from `python3 <path>/<script>` to the end of its
+# --output file name. A placeholder may hold a code span of its own, which ends the inline span
+# early, so the raw line is the only form that keeps the command whole.
+DICTATED_COMMAND_FORMAT = r"python3 \S*/{script}.*?\.json"
+
+
+def _defined_flags(script: str) -> set[str]:
+    return set(DEFINED_FLAG_PATTERN.findall((SCRIPTS_DIR / script).read_text(encoding="utf-8")))
+
+
+def _dictated_commands(script: str) -> list[tuple[str, str]]:
+    """(file name, command) for each persona-dictated run of ``script``, read from the raw text."""
+    pattern = re.compile(DICTATED_COMMAND_FORMAT.format(script=re.escape(script)))
+    return [(path.name, match.group(0)) for path in PERSONA_FILES for match in pattern.finditer(path.read_text(encoding="utf-8"))]
+
+
+def _flags_outside_placeholders(command: str) -> set[str]:
+    return set(FLAG_PATTERN.findall(PLACEHOLDER_PATTERN.sub(" ", command)))
+
+
+class EveryDictatedReportOrScanRunIsRunnableTest(unittest.TestCase):
+    """The readiness tests above bind only a run that carries --readiness. A persona file also
+    dictates the report without it, ahead of the deprecation scan, and the scan itself; a
+    dropped slot or a misspelt flag there is a usage error on every install that no other
+    static check reads."""
+
+    def test_each_script_is_dictated(self):
+        for script in (REPORT_SCRIPT, SCAN_SCRIPT):
+            with self.subTest(script=script):
+                self.assertTrue(_dictated_commands(script), f"no persona file dictates {script}")
+
+    def test_every_dictated_report_run_carries_the_collector_args_slot(self):
+        for name, command in _dictated_commands(REPORT_SCRIPT):
+            with self.subTest(file=name, command=command[:80]):
+                self.assertIn(COLLECTOR_ARGS_SLOT, command)
+
+    def test_every_dictated_scan_run_names_its_floor(self):
+        for name, command in _dictated_commands(SCAN_SCRIPT):
+            with self.subTest(file=name, command=command[:80]):
+                self.assertTrue(_flags_outside_placeholders(command) & set(SCAN_FLOOR_FLAGS), f"{name} dictates a scan with no floor flag: {command}")
+
+    def test_every_dictated_flag_is_one_the_script_defines(self):
+        for script in (REPORT_SCRIPT, SCAN_SCRIPT):
+            defined = _defined_flags(script)
+            for name, command in _dictated_commands(script):
+                with self.subTest(file=name, script=script):
+                    self.assertLessEqual(_flags_outside_placeholders(command), defined, f"{name} dictates a flag {script} does not define")
+
+    def test_every_dictated_output_name_is_this_runs_own(self):
+        for script in (REPORT_SCRIPT, SCAN_SCRIPT):
+            for name, command in _dictated_commands(script):
+                output = command.split(OUTPUT_FLAG, 1)[1]
+                for mark in PER_RUN_NAME_MARKS:
+                    with self.subTest(file=name, script=script, mark=mark):
+                        self.assertIn(mark, output)
+
+    def test_the_reader_refuses_a_misspelt_flag_and_a_dropped_slot(self):
+        defined = _defined_flags(SCAN_SCRIPT)
+        misspelt = f"python3 x/{SCAN_SCRIPT} --versionz <the file> --output /tmp/a_$$.json"
+        self.assertFalse(_flags_outside_placeholders(misspelt) <= defined)
+        self.assertFalse(_flags_outside_placeholders(misspelt) & set(SCAN_FLOOR_FLAGS))
+        # A flag spelt inside a placeholder is prose, not an argument.
+        self.assertEqual({"--output"}, _flags_outside_placeholders("x <say --versionz here> --output a.json"))
 
 
 if __name__ == "__main__":

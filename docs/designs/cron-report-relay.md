@@ -221,7 +221,18 @@ it renders from its own line and the findings document (`render_chat_report`;
 hours (the stream lease, which covers one step) and that holds no finished
 report for this repository is the same run; any other `start` opens a new
 record, and so does a `start` that finds no finished part, which a run that
-never reached `finish` left. A `finish` applies the age and repository rule. The relay
+never reached `finish` left. A `start` after a `finish` that died after saving its verdict keeps the record and the verdict, so the next `finish` of that repository is not silent. A `finish` applies the
+age and repository rule, with one exception: a later `finish` of a repository whose entry
+`start` opened and an earlier `finish` filled, while the record's last step is within the
+two hours, is the same run. It adds its report under the earlier one's, below a label line,
+and gives the record a new `run` stamp; when the earlier `finish` died before it wrote its
+report, the later one fills the entry in its place. The earlier `finish` saves its
+`silent_ok` on the entry as each pull request its sweep opens is created, and again before
+it writes the report store. When that was `false` the later one is not silent either and its automatic
+sweep opens no pull request (`earlier_finish`). A `finish` with no `start` fills no entry,
+but while a current record holds this repository's entry with a saved verdict it is taken for a
+later `finish` of that run, and the
+relay posts that run's report again with its own under it. The relay
 reads the record, over the gateway's sandbox login where the shell runs in the
 shell sandbox (`sandbox_exec.read_bytes`).
 
@@ -549,6 +560,15 @@ booleans and therefore settles it outright on a deployed pod), then `CONFIG_PATH
 — `/opt/data/config.yaml`, the front door's own writable file rather than a named
 profile's — then per-platform environment signals for an install neither file
 describes.
+
+An install with no chat route gets no send at all: when the managed scope turns
+every platform off and nothing routes one through the gateway — a `next` install
+whose only chat platform is held by the gateway with no home channel, or an
+install with neither Google Chat nor Slack — the relay answers 502 without posting. The detail names the gateway's
+platform from `A2A_NOTIFY_CONVERSATIONS` and the CR field that sets its home
+channel (`composed but not delivered to slack (no home channel: set
+spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`), or says that no route
+exists when no platform can be named.
 
 The one narrowing is `also_delivered_to`: a platform the cron child already
 posted the raw report to is skipped, and where that would empty the set the
