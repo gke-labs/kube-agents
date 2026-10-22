@@ -82,6 +82,13 @@ locals {
   ns       = var.incident_namespace
   workload = var.workload_name
 
+  # What the watcher logs once it has handed a pod's event to the daemon:
+  # `fire` when the daemon opened an incident, `folded` when it recorded the
+  # event against an incident already open for the workload. Only a case that
+  # grades the fold accepts the second (var.accept_folded); for one that waits
+  # on its own card, a folded event means no card is coming.
+  watcher_handled = var.accept_folded ? "(fire|folded)" : "fire"
+
   ci_labels = {
     "managed-by"  = "kube-agents-bench"
     "build-id"    = var.prow_build_id != "" ? var.prow_build_id : "local"
@@ -408,9 +415,9 @@ resource "null_resource" "incident" {
       until kubectl logs "deployment/${var.agent_deployment}" \
               -n "${var.agent_namespace}" -c "${var.agent_container}" \
               --since-time="$started_at" --tail=-1 2>/dev/null \
-            | grep -q "fire .*pod=${local.ns}/"; do
+            | grep -qE "${local.watcher_handled} .*pod=${local.ns}/"; do
         if [ "$elapsed" -ge 300 ]; then
-          echo "ERROR: the workload is crash-looping past the debounce, but k8s-event-watcher logged no 'fire' for a pod in ${local.ns} within $${elapsed}s. The incident was detected by Kubernetes and not by the watcher, so nothing downstream will run. Its recent log follows." >&2
+          echo "ERROR: the workload is crash-looping past the debounce, but k8s-event-watcher logged no '${local.watcher_handled}' for a pod in ${local.ns} within $${elapsed}s. The incident was detected by Kubernetes and not by the watcher, so nothing downstream will run. Its recent log follows." >&2
           kubectl logs "deployment/${var.agent_deployment}" -n "${var.agent_namespace}" \
             -c "${var.agent_container}" --since-time="$started_at" --tail=200 >&2 || true
           exit 1

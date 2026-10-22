@@ -49,6 +49,7 @@ infrastructure:
     memory_limit_mib: 64
     allocate_mib: 96
     replicas: 3
+    accept_folded: true
 
 validated: false
 
