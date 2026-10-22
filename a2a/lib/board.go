@@ -34,12 +34,11 @@ type Board struct {
 	PRs []BoardPR `json:"prs"`
 	// Audit is the most recent fleet audit run to finish; nil when none has.
 	Audit *BoardAudit `json:"audit,omitempty"`
-	// FirstReportPending is onboarding's first report not yet claimed for
-	// delivery while the findings queue holds no row: a cluster with no open
-	// finding has not been checked yet, not found clean. FirstMessagePending
-	// adds that no message has primed onboarding yet, which is what delivers
-	// that report. Both are absent from an older sender, which renders as
-	// before.
+	// FirstReportPending is onboarding's sweep filed and its first report not
+	// yet claimed for delivery: a cluster with no open finding has not been
+	// checked yet, not found clean. FirstMessagePending adds that no message
+	// has primed onboarding yet, which is what delivers that report. Both are
+	// absent from an older sender, which renders as before.
 	FirstReportPending  bool `json:"first_report_pending,omitempty"`
 	FirstMessagePending bool `json:"first_message_pending,omitempty"`
 	// Error, when set, is why the sender could not read the board; the rest

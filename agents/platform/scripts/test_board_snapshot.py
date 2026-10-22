@@ -122,6 +122,8 @@ class BoardSnapshotTest(unittest.TestCase):
 
     def test_before_the_first_report_the_board_says_so(self):
         home = self.profiles.parent
+        self.assertNotIn("first_report_pending", self.snap(), "no sweep filed: onboarding never ran")
+        (home / board_snapshot.SCAN_FILED_MARKER).touch()
         board = self.snap()
         self.assertTrue(board["first_report_pending"])
         self.assertTrue(board["first_message_pending"])
@@ -130,13 +132,18 @@ class BoardSnapshotTest(unittest.TestCase):
         self.assertTrue(board["first_report_pending"])
         self.assertNotIn("first_message_pending", board)
 
-    def test_a_delivered_report_or_a_queued_row_ends_the_pending_state(self):
+    def test_a_row_before_delivery_keeps_the_other_clusters_pending(self):
+        # One cluster's finding landed first; the rest are still unchecked.
+        (self.profiles.parent / board_snapshot.SCAN_FILED_MARKER).touch()
+        findings_queue.register_findings(self.session, [finding("seeded-a", "oom crash", "critical")])
+        board = self.snap()
+        self.assertTrue(board["first_report_pending"])
+        self.assertEqual([c["findings"] for c in board["clusters"]], [1, 0])
+
+    def test_a_delivered_report_ends_the_pending_state(self):
         home = self.profiles.parent
+        (home / board_snapshot.SCAN_FILED_MARKER).touch()
         (home / board_snapshot.FIRST_REPORT_CLAIMED_MARKER).touch()
-        self.assertNotIn("first_report_pending", self.snap())
-        (home / board_snapshot.FIRST_REPORT_CLAIMED_MARKER).unlink()
-        findings_queue.register_findings(self.session, [finding("seeded-a", "gone", "critical")])
-        self.session.execute("UPDATE findings SET state = 'resolved'")
         board = self.snap()
         self.assertNotIn("first_report_pending", board)
         self.assertNotIn("first_message_pending", board)
