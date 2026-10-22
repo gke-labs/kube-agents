@@ -557,6 +557,13 @@ INCIDENT_WORKLOAD_DEDUP_SECONDS = min(
 # segment of a bare pod (`api-cache` -> `api`), which is a display choice and
 # not an identity, so only this one sets a fold key.
 DEPLOYMENT_POD_NAME_RE = re.compile(r"^(.*?)-[a-f0-9]{8,10}-[a-z0-9]{5}$")
+# The severity get_severity_details grades a blocker, which folds only into an
+# anchor of its own grade (_workload_incident_anchor).
+CRITICAL_SEVERITY = "Critical"
+# A refused turn: the gateway answered and said no. A 5xx can come after the
+# turn already filed its card, and a 2xx other than 200 is an acceptance.
+HTTP_CLIENT_ERROR_MIN = 400
+HTTP_SERVER_ERROR_MIN = 500
 # Bounds the anchor lookup's wait on a locked database, as the other ledger
 # writers here do; a lookup that gives up announces the event.
 INCIDENT_FOLD_DB_TIMEOUT_S = 5.0
@@ -1252,7 +1259,9 @@ def _fold_key(object_kind: str, object_name: str) -> str:
     return m.group(1) if m else ""
 
 
-def _workload_incident_anchor(cluster: str, namespace: str, object_kind: str, fold_key: str) -> Optional[int]:
+def _workload_incident_anchor(
+    cluster: str, namespace: str, object_kind: str, fold_key: str, severity: str
+) -> Optional[int]:
     """The ledger id of the workload's open incident, or None (INCIDENT_WORKLOAD_DEDUP_SECONDS).
 
     An anchor is a row the route admitted: `notified` non-zero, or a
@@ -1267,6 +1276,11 @@ def _workload_incident_anchor(cluster: str, namespace: str, object_kind: str, fo
     refused event cannot silence a later warning. Only a row with a `fold_key`
     anchors, which leaves out the drift and stall rows that share the table.
 
+    A Critical event folds only into a Critical anchor. A workload that gets
+    worse after its Warning was announced (a `BackOff`, then `OOMKilled`) is a
+    second announcement chat should see; folded, the Critical would reach no
+    one, and the Warning's triage was opened on the lesser symptom.
+
     Best-effort: a failed read returns None, so the event is announced rather
     than lost.
     """
@@ -1277,6 +1291,7 @@ def _workload_incident_anchor(cluster: str, namespace: str, object_kind: str, fo
             row = conn.execute(
                 "SELECT id FROM intercepted_events "
                 "WHERE cluster = ? AND namespace = ? AND object_kind = ? AND fold_key = ? "
+                "AND (? != ? OR severity = ?) "
                 "AND (notified != 0 OR delivery_error != '') "
                 "AND created_at >= datetime('now', ?) "
                 "ORDER BY id DESC LIMIT 1",
@@ -1285,6 +1300,9 @@ def _workload_incident_anchor(cluster: str, namespace: str, object_kind: str, fo
                     namespace,
                     object_kind,
                     fold_key,
+                    severity,
+                    CRITICAL_SEVERITY,
+                    CRITICAL_SEVERITY,
                     f"-{INCIDENT_WORKLOAD_DEDUP_SECONDS} seconds",
                 ),
             ).fetchone()
@@ -2843,10 +2861,11 @@ def _stall_agent_query(payload: Dict[str, Any]) -> str:
 def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[str, str]) -> bool:
     """Post the agent query request to execute the diagnostic reasoning loop.
 
-    False only when the gateway answered and refused the turn. A transport
-    error is True: the request may have started a turn that outlived the
-    timeout, and reading it as refused would let a sibling open a second
-    triage beside it (mark_triage_not_started).
+    False only when the gateway refused the turn with a 4xx. Anything else is
+    True: a transport error or a 5xx may come after the turn started (the
+    route is synchronous, so a model failure late in the turn surfaces here
+    after the front door filed its card), and reading it as refused would let
+    a sibling open a second triage beside it (mark_triage_not_started).
     """
     try:
         req = urllib.request.Request(
@@ -2856,12 +2875,12 @@ def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[s
             method="POST"
         )
         with urllib.request.urlopen(req, timeout=300.0) as resp:
-            if resp.status != 200:
+            if resp.status >= HTTP_CLIENT_ERROR_MIN:
                 logger.error(f"Gateway API chat execution failed (status {resp.status})")
-                return False
+                return resp.status >= HTTP_SERVER_ERROR_MIN
     except urllib.error.HTTPError as exc:
         logger.error(f"Gateway API chat execution failed (status {exc.code})")
-        return False
+        return exc.code >= HTTP_SERVER_ERROR_MIN
     except Exception as exc:
         logger.error(f"Failed to call gateway API chat execution: {exc}")
     return True
@@ -4881,7 +4900,7 @@ def inject_message(
     with _WORKLOAD_FOLD_LOCK if INCIDENT_WORKLOAD_DEDUP_SECONDS > 0 else nullcontext():
         fold_key = _fold_key(object_kind, object_name)
         if not suppressed:
-            anchor_id = _workload_incident_anchor(event_cluster, namespace, object_kind, fold_key)
+            anchor_id = _workload_incident_anchor(event_cluster, namespace, object_kind, fold_key, severity_label)
         if not suppressed and anchor_id is None:
             allowed, suppressed_today = _claim_alert_quota(severity_label)
             quota_denied = not allowed
@@ -4912,10 +4931,10 @@ def inject_message(
         # rolls back its entry on "suppressed", and flags it on "filtered" so
         # the next Warning sighting of the same key reopens it; either way this
         # pod's (UID, reason) comes back at kubelet's repeat cadence while the
-        # anchor's triage runs. Every watcher reads a status it does not know
-        # as delivered and keeps the entry closed, which is the right answer
-        # here, so no feature negotiation is needed. The cost is that the
-        # watcher counts it in k8s_event_watcher_events_injected_total.
+        # anchor's triage runs. The watcher keeps its entry for "folded" and
+        # counts it in k8s_event_watcher_events_folded_total. One that predates
+        # the status reads it as delivered, which keeps the entry the same way
+        # and counts it as injected, so no feature negotiation is needed.
         logger.info(
             f"Folded {severity_label} event {event_reason} for {namespace}/{object_kind}/{object_name} "
             f"into ledger row {anchor_id} (no chat alert, no triage session)"

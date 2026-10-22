@@ -422,10 +422,11 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         else:
             total_occurrences += count
 
-        # `notified = 0` covers three unrelated outcomes and they must not be
+        # `notified = 0` covers four unrelated outcomes and they must not be
         # reported as one: the severity gate held the event back as
         # informational, the daily ceiling dropped an alert that was going to
-        # be posted, or chat itself refused the post. Conflating the second
+        # be posted, chat itself refused the post, or the event was folded into
+        # an incident already open for its workload. Conflating the second
         # with the first is how a day of cap-dropped OOMKills comes out as
         # "suppressed informational events"; conflating the third with the
         # second sends the reader to raise a limit that is not the problem.

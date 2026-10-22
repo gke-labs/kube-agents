@@ -2153,8 +2153,8 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             later = [
                 self._inject("burst-api-6cfdb6b98b-bbbbb", reason="Unhealthy"),
                 self._inject("burst-api-6cfdb6b98b-ccccc", reason="Unhealthy"),
-                # A cascade's next reason, and a Critical one, folds too.
-                self._inject("burst-api-6cfdb6b98b-aaaaa", reason="CrashLoopBackOff"),
+                # A cascade's next reason folds too.
+                self._inject("burst-api-6cfdb6b98b-aaaaa", reason="BackOff"),
             ]
 
         self.assertEqual(first["status"], "injected")
@@ -2164,6 +2164,20 @@ class TestWorkloadIncidentFold(unittest.TestCase):
         self.assertEqual({r["duplicate_of"] for r in later}, {str(anchor_id)})
         self.assertEqual(self.trigger.call_count, 1)
         self.assertEqual([(r[2], r[3]) for r in rows], [(1, None)] + [(0, anchor_id)] * 3)
+
+    def test_a_critical_folds_only_into_a_critical(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            statuses = [
+                self._inject("worse-api-6cfdb6b98b-aaaaa", reason="BackOff")["status"],
+                # The workload got worse after its Warning went out: announced.
+                self._inject("worse-api-6cfdb6b98b-bbbbb", reason="CrashLoopBackOff")["status"],
+                # A second Critical, and a Warning after it, fold into that one.
+                self._inject("worse-api-6cfdb6b98b-ccccc", reason="OOMKilled")["status"],
+                self._inject("worse-api-6cfdb6b98b-ddddd", reason="BackOff")["status"],
+            ]
+        self.assertEqual(statuses, ["injected", "injected", "folded", "folded"])
+        rows = self._rows("worse-api")
+        self.assertEqual([r[3] for r in rows], [None, None, rows[1][0], rows[1][0]])
 
     def test_a_folded_event_spends_no_alert_budget(self):
         with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
@@ -2250,13 +2264,23 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             self.real_trigger("sess-aborted", "msg", {}, anchor_id)
             self.assertEqual(self._inject("aborted-api-6cfdb6b98b-bbbbb")["status"], "injected")
 
-    def test_a_refused_turn_releases_the_anchor_and_a_transport_error_does_not(self):
+    def test_only_a_4xx_reads_as_a_refused_turn(self):
         import urllib.error
-        refused = urllib.error.HTTPError("http://gw", 503, "busy", {}, None)
-        with patch("urllib.request.urlopen", side_effect=refused):
-            self.assertFalse(session_kv_server._start_agent_turn("http://gw", "s", "q", {}))
+        for code, started in ((400, False), (404, False), (500, True), (503, True)):
+            with patch("urllib.request.urlopen", side_effect=urllib.error.HTTPError("http://gw", code, "x", {}, None)):
+                self.assertEqual(session_kv_server._start_agent_turn("http://gw", "s", "q", {}), started, code)
         with patch("urllib.request.urlopen", side_effect=TimeoutError("read timed out")):
             self.assertTrue(session_kv_server._start_agent_turn("http://gw", "s", "q", {}))
+
+    @patch.object(session_kv_server, "_start_agent_turn", return_value=False)
+    @patch.object(session_kv_server, "_create_gateway_session", return_value=True)
+    @patch.object(session_kv_server, "_register_session_routing")
+    @patch.object(session_kv_server, "_post_initial_alert", return_value="spaces/A/threads/B")
+    def test_a_refused_turn_releases_the_anchor(self, *_):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            self._inject("refusedturn-api-6cfdb6b98b-aaaaa")
+            self.real_trigger("sess-refused", "msg", {}, self._rows("refusedturn-api")[0][0])
+            self.assertEqual(self._inject("refusedturn-api-6cfdb6b98b-bbbbb")["status"], "injected")
 
     def test_only_a_deployments_pods_and_whole_objects_fold(self):
         key = session_kv_server._fold_key
