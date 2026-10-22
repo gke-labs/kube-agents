@@ -251,10 +251,12 @@ func TestBusCredentialRoutes(t *testing.T) {
 	if got := A2ACredsSecretName("test-agent"); got != "test-agent-a2a-nats-creds" {
 		t.Fatalf("A2ACredsSecretName(test-agent) = %q, want test-agent-a2a-nats-creds", got)
 	}
-	// The three Secrets the render writes bus credentials into, spelled as the
-	// render spells them (a2aTestCreds, buildA2ANATSConfigSecret, ensureA2ACalloutKeys).
+	// The Secrets the render writes bus credentials or keys into, spelled as the
+	// render spells them (a2aTestCreds, buildA2ANATSConfigSecret, ensureA2ACalloutKeys,
+	// ensureA2ANATSTLS).
 	if got := A2ACredentialSecretNames("test-agent"); !reflect.DeepEqual(got, []string{
-		"test-agent-a2a-nats-creds", "test-agent-a2a-nats-config", "test-agent-a2a-callout-keys"}) {
+		"test-agent-a2a-nats-creds", "test-agent-a2a-nats-config", "test-agent-a2a-callout-keys",
+		"test-agent-a2a-nats-tls", "test-agent-a2a-nats-ca"}) {
 		t.Fatalf("A2ACredentialSecretNames(test-agent) = %v", got)
 	}
 	if A2ABusTokenAudience != "a2a-bus" {

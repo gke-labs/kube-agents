@@ -514,6 +514,32 @@ with workspace lease markers and the git remote kept as fallbacks. This resolves
 `github-issue-resolver` and `fleet-audit` read from the same ConfigMap, so the two skills now agree
 by construction rather than by coincidence.
 
+The order is `--repo`, the lease record, the repository with `role: gitops`, and then the one managed
+repository. The lease record lasts on the shared volume across runs, so it counts only for the run
+that wrote it: while the stream's in-flight note exists and the lease is not older than that note.
+A `--repo` run, or a role that moved since, therefore does not hold later runs on the old repository. The operator writes the repository with `role: gitops` to the
+`gitops_repo` key of the same ConfigMap, as one `managed_repos` entry, and removes the key when no
+repository has that role. The key is read only when more than one repository is managed, and a key
+that names a repository not in `managed_repos` is ignored. So an install that manages a second
+repository (Terraform, applications) still sends the ledger issue and every fix to its GitOps
+repository, and a context repository is never the target. With several managed repositories and no
+`role: gitops`, the run takes the no-forge path with the reason and the fix (give one repository
+that role, or pass `--repo` for one run): the findings go to chat and the report store, and the
+harness never chooses among the repositories, nor may the agent.
+
+Before it publishes, `start` lists one open issue in the resolved repository through the broker and
+records the result in the run record. `finish` follows that record, and lists one only when there is
+no record of this run. When the forge answers that the repository is missing or that the credential
+cannot see it (`FORGE_NOT_FOUND`, `FORGE_FORBIDDEN`, `FORGE_UNAUTHENTICATED`), or the broker does not
+manage it (`REPOSITORY_NOT_MANAGED`), the run takes the no-forge path of a run with no repository:
+the findings go to the report store and to chat, and the note names the repository and the reason.
+It does not try another repository. Such a run is never silent, on every run, and it is not compared
+with the no-forge history of the store, so its new and resolved counts are unknown. Its envelope is
+stored under that repository's own store directory, marked unreachable, so the store keeps one
+directory for the stream; a run with no repository never uses a marked envelope as its baseline, and
+the forge path reads its memory from the newest envelope that is not marked. A broker that does not answer is `BrokerUnavailable`, as on every
+other forge call, and any other refusal leaves the run on its forge path.
+
 `start` is also the **only** subcommand that scrubs the working tree — see the note under
 `remediate`. Note the removed behaviour: it no longer resets a report branch. There is no report
 branch.
@@ -1176,6 +1202,18 @@ reaches the channel. The ledger stays the record in both cases.
 | `audit:stale-closed` | PRs only    | The harness closed this, not a human (§3.3)  |
 | `severity:*`         | issue + PRs | Highest live severity, mutually exclusive    |
 
+A forge with no labels (Bitbucket; `capabilities` answers `labels: false`) gets none of these.
+There, a remediation PR is found by its branch prefix `platform-agent/fix-<audit-id>-`, the marker
+`<!-- audit-remediation: <audit-id> -->` in its description, its author (this install) and its
+source repository (this one, not a fork). A harness close adds `<!-- audit:stale-closed -->` to the
+description before the close, under the same rule as the label: no close without it.
+
+A forge with no issue verbs, or no labels, cannot hold the ledger issue. The design for it is in
+[`version-control-support.md`](version-control-support.md) §8, "The ledger without issues": the
+ledger goes to the report store and to chat, and remediation PRs still open on the forge. The
+harness does not make that decision yet. Until it does, a run against such a repository refuses at
+`start`, because the ledger lookup refuses rather than answer "none".
+
 ## 9. Red lines (carried forward, plus new)
 
 Unchanged: read-only against clusters; never `git add .` or `-A`; never force-push a protected
@@ -1472,7 +1510,9 @@ directory's `origin`, which is the GitOps repo — correct for the PRs, but a pl
 audit issues in an ops/tracking repo instead. If they must differ, `start` needs an explicit
 issue-repo argument and the App token needs scope on both.
 
-_Resolved: the GitOps repo._ No new argument, no second token scope, no second place to look.
+_Resolved: the GitOps repo._ No new argument, no second token scope, no second place to look. On an
+install with several managed repositories, the GitOps repo is the one with `role: gitops` (§6,
+`start`).
 
 The divergence this question surfaced — `audit_report.py` deriving the repo from the working
 directory's `origin` remote while `github-issue-resolver/scripts/resolver.py` derives it from

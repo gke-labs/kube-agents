@@ -63,6 +63,7 @@ from kube_agents_bench.verifiers import (
     ReplyIsSilentVerifier,
     ReportContainsVerifier,
     ToolCalledVerifier,
+    VerifiedClaimsBackedVerifier,
     _fold_line_decoration,
 )
 
@@ -9726,3 +9727,208 @@ def test_every_forbidden_pattern_has_a_contradiction_row(case):
     rows = {objective: len(lines) for objective, lines in _CONTRADICTIONS.get(case, {}).items()}
     clauses = {objective: len(patterns) for objective, patterns in _forbidden_clauses(case).items()}
     assert rows == clauses, (rows, clauses)
+
+
+# verified_claims_backed: the reply's evidence blocks against the workers' calls.
+_PODS_CMD = "kubectl get pod -n seeded-debug -l app=payments-api -o jsonpath='{.items[0].status.containerStatuses[0].lastState}'"
+# As the pod stores it: worker_trajectory.supplement re-serialises a JSON output with spaces.
+_PODS_OUT = json.dumps({"output": json.dumps({"terminated": {"exitCode": 137, "reason": "OOMKilled"}}), "exit_code": 0})
+# What the worker saw and copied: kubectl's compact JSON.
+_PODS_EXCERPT = '"exitCode":137,"reason":"OOMKilled"'
+
+
+def _block(command, excerpt):
+    return f"```\n$ {command}\n```\n```\n{excerpt}\n```"
+
+
+_EVIDENCE = (
+    "**payments-api is OOMKilled.**\n\n**Evidence for verified claims**\n\n"
+    "The last termination was OOMKilled (exit 0, 2026-10-20T12:00:00Z, on card t_2)\n\n" + _block(_PODS_CMD, _PODS_EXCERPT)
+)
+
+
+def _grade_claims(reply, calls, gaps=None, min_blocks=1):
+    transcript.set("ok", _TRAJECTORY + calls, final_message=reply, worker_capture_gaps=gaps)
+    return VerifiedClaimsBackedVerifier(type="verified_claims_backed", min_blocks=min_blocks).verify(5.0)
+
+
+def test_verified_claims_backed_passes_evidence_a_worker_produced():
+    res = _grade_claims(_EVIDENCE, [_terminal(_PODS_CMD, result=_PODS_OUT, agent="cluster-seeded-a", task="t_2")])
+    assert res.status == "pass", res
+    assert "not checked" not in res.reason
+
+
+def test_verified_claims_backed_fails_the_pilots_unbacked_label():
+    res = _grade_claims("Verification check: no mismatch exceeds 30%. **Verified.**", [_terminal(_PODS_CMD, result=_PODS_OUT)])
+    assert res.status == "fail"
+    assert "calls claims verified with 0 evidence block(s)" in res.reason
+
+
+def test_verified_claims_backed_fails_a_command_no_worker_ran():
+    res = _grade_claims(_EVIDENCE, [_terminal("kubectl get pods -A", result=_PODS_OUT)])
+    assert res.status == "fail" and "not a command any worker ran" in res.reason
+
+
+def test_verified_claims_backed_ignores_the_routers_own_call():
+    router = dict(_ROUTER_TERMINAL, args={"command": _PODS_CMD}, result=_PODS_OUT)
+    res = _grade_claims(_EVIDENCE, [router, _terminal("kubectl get nodes")])
+    assert res.status == "fail" and "not a command any worker ran" in res.reason
+
+
+def test_verified_claims_backed_no_worker_call_at_all_is_an_error():
+    res = _grade_claims(_EVIDENCE, [])
+    assert res.status == "error" and "no worker terminal call" in res.reason
+
+
+def test_verified_claims_backed_fails_an_invented_excerpt():
+    res = _grade_claims(_EVIDENCE.replace("137", "1"), [_terminal(_PODS_CMD, result=_PODS_OUT)])
+    assert res.status == "fail" and "is not in the output of" in res.reason
+
+
+def test_verified_claims_backed_reads_a_multi_line_command_from_its_own_fence():
+    command = "kubectl get pods -n seeded-debug \\\n  -o wide"
+    out = json.dumps({"output": "NAME  STATUS\npayments-api-1  OOMKilled", "exit_code": 0})
+    res = _grade_claims(_block(command, "payments-api-1  OOMKilled"), [_terminal(command, result=out)])
+    assert res.status == "pass", res
+
+
+def test_verified_claims_backed_a_lone_command_fence_is_not_evidence():
+    # A suggested fix after real evidence: a $ fence with no output fence after it.
+    fix = "\n\nTo fix it:\n\n```\n$ kubectl set resources deployment payments-api --limits=memory=256Mi\n```\n\nThen watch it."
+    res = _grade_claims(_EVIDENCE + fix, [_terminal(_PODS_CMD, result=_PODS_OUT)])
+    assert res.status == "pass", res
+
+
+def test_verified_claims_backed_a_clipped_output_checks_only_the_command():
+    clipped = _PODS_OUT[:20] + " ...[clipped 40 chars]"
+    res = _grade_claims(_EVIDENCE, [_terminal(_PODS_CMD, result=clipped)])
+    assert res.status == "pass" and "1 excerpt(s) not checked, output clipped" in res.reason
+
+
+def test_verified_claims_backed_finds_an_excerpt_in_a_clipped_head():
+    out = json.dumps({"output": "phase \u2026 node-b NotReady " + "x" * 3000, "exit_code": 0})
+    clipped = out[:200] + " ...[clipped 3000 chars]"
+    res = _grade_claims(_block("kubectl get nodes", "phase \u2026 node-b NotReady"), [_terminal("kubectl get nodes", result=clipped)])
+    assert res.status == "pass" and "not checked" not in res.reason, res
+
+
+def test_verified_claims_backed_masks_addresses_as_the_pod_does():
+    out = json.dumps({"output": "user:[REDACTED_EMAIL] roles/viewer", "exit_code": 0})
+    res = _grade_claims(_block("gcloud projects get-iam-policy p", "user:ana@example.com roles/viewer"),
+                        [_terminal("gcloud projects get-iam-policy p", result=out)])
+    assert res.status == "pass", res
+
+
+def test_verified_claims_backed_a_capture_gap_is_an_error():
+    res = _grade_claims(_EVIDENCE, [], gaps=["profile platform: state.db missing"])
+    assert res.status == "error" and "state.db missing" in res.reason
+
+
+def test_verified_claims_backed_withheld_arguments_are_an_error():
+    from kube_agents_bench import worker_trajectory
+
+    withheld = _terminal("", args={"raw": worker_trajectory.WITHHELD}, result=worker_trajectory.WITHHELD)
+    res = _grade_claims(_EVIDENCE, [withheld])
+    assert res.status == "error" and "withheld" in res.reason
+
+
+def test_verified_claims_backed_min_blocks_zero_passes_a_reply_with_no_evidence():
+    assert _grade_claims("All good.", [], min_blocks=0).status == "pass"
+
+
+def test_verified_claims_backed_reads_what_the_gate_renders():
+    # The gate's render_evidence, loaded from the image patch, through this verifier's parser.
+    import importlib.util
+    import pathlib
+
+    path = pathlib.Path(__file__).resolve().parents[2] / "deploy/docker/patches/kanban_verified_claims.py"
+    spec = importlib.util.spec_from_file_location("kanban_verified_claims", path)
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+    command = "kubectl get pods -n seeded-debug \\\n  -o wide"
+    out = json.dumps({"output": "NAME  STATUS\npayments-api-1  OOMKilled", "exit_code": 0})
+    claim = {"claim": "payments-api-1 is OOMKilled.", "command": command, "excerpt": "payments-api-1  OOMKilled",
+             "exit_code": 0, "ran_at": "2026-10-20T12:00:00Z", "card": "t_2"}
+    reply = "**payments-api is OOMKilled.**\n\n" + gate.render_evidence([claim])
+    res = _grade_claims(reply, [_terminal(command, result=out, task="t_2")])
+    assert res.status == "pass", res
+
+
+def test_verified_claims_backed_a_lone_command_fence_before_the_section_is_not_evidence():
+    # The gate appends the section at the end, so a suggested fix in the body comes first.
+    fix = "To fix it:\n\n```\n$ kubectl set resources deployment payments-api --limits=memory=256Mi\n```\n\nThen watch it.\n\n"
+    res = _grade_claims(fix + _EVIDENCE, [_terminal(_PODS_CMD, result=_PODS_OUT)])
+    assert res.status == "pass", res
+
+
+def test_verified_claims_backed_a_redacted_output_checks_only_the_command():
+    out = json.dumps({"output": "data:\n  JAVA_OPTS: [REDACTED_SECRET]", "exit_code": 0})
+    res = _grade_claims(_block("kubectl get cm api-config -o yaml", "JAVA_OPTS: -Xmx512m"),
+                        [_terminal("kubectl get cm api-config -o yaml", result=out)])
+    assert res.status == "pass" and "clipped or redacted" in res.reason, res
+
+
+def test_verified_claims_backed_a_redacted_span_of_a_command_matches():
+    out = json.dumps({"output": "NAME  READY\nweb-1  1/1", "exit_code": 0})
+    stored = _terminal("kubectl get pods --token=[REDACTED_SECRET] -n web", result=out)
+    res = _grade_claims(_block("kubectl get pods --token=abc123 -n web", "web-1  1/1"), [stored])
+    assert res.status == "pass", res
+    res = _grade_claims(_block("kubectl get pods --token=abc123 -n other", "web-1  1/1"), [stored])
+    assert res.status == "fail" and "not a command any worker ran" in res.reason
+
+
+def test_verified_claims_backed_reads_escaped_characters_as_the_worker_saw_them():
+    # The pod re-serialises JSON output with ensure_ascii; kubectl escapes & as &.
+    raw = {"message": "out of memory — killed", "command": "a && b"}
+    out = json.dumps({"output": json.dumps(raw), "exit_code": 0})
+    cmd = "kubectl get pod p -o json"
+    res = _grade_claims(_block(cmd, '"message":"out of memory — killed"'), [_terminal(cmd, result=out)])
+    assert res.status == "pass", res
+    res = _grade_claims(_block(cmd, '"command":"a \\u0026\\u0026 b"'), [_terminal(cmd, result=out)])
+    assert res.status == "pass", res
+
+
+def test_verified_claims_backed_a_fix_fence_then_a_manifest_fence_is_not_evidence():
+    # A remediation shown as a command fence and then a manifest fence, before the real section.
+    fix = "To fix it:\n\n```\n$ kubectl apply -f payments-api.yaml\n```\n\n```yaml\nresources:\n  limits:\n    memory: 256Mi\n```\n\n"
+    res = _grade_claims(fix + _EVIDENCE, [_terminal(_PODS_CMD, result=_PODS_OUT)])
+    assert res.status == "pass", res
+    adjacent = "```\n$ kubectl apply -f payments-api.yaml\n```\n```yaml\nmemory: 256Mi\n```\n\n"
+    res = _grade_claims(adjacent + _EVIDENCE, [_terminal(_PODS_CMD, result=_PODS_OUT)])
+    assert res.status == "pass", res
+
+
+def test_verified_claims_backed_a_redacted_span_cannot_hide_a_second_command():
+    # The pod masks one word; a span may not stand for a separator or a second command.
+    out = json.dumps({"output": "NAME  READY\nweb-1  1/1", "exit_code": 0})
+    stored = _terminal("kubectl get pods --token=[REDACTED_SECRET] -n web", result=out)
+    for forged in ("kubectl get pods --token=x; kubectl delete namespace prod -n web",
+                   "kubectl get pods --token=x\nkubectl delete ns prod -n web"):
+        res = _grade_claims(_block(forged, "web-1  1/1"), [stored])
+        assert res.status == "fail" and "not a command any worker ran" in res.reason, (forged, res)
+
+
+def test_verified_claims_backed_an_excerpt_inside_a_longer_word_fails():
+    out = json.dumps({"output": "node-a  NotReady  <none>", "exit_code": 0})
+    res = _grade_claims(_block("kubectl get nodes", "Ready  <none>"), [_terminal("kubectl get nodes", result=out)])
+    assert res.status == "fail" and "is not in the output of" in res.reason
+
+
+def test_verified_claims_backed_a_short_excerpt_fails():
+    out = json.dumps({"output": "healthy: 1", "exit_code": 0})
+    res = _grade_claims(_block("kubectl get pods", "1"), [_terminal("kubectl get pods", result=out)])
+    assert res.status == "fail" and "fewer than 8" in res.reason
+
+
+def test_verified_claims_backed_a_short_excerpt_that_is_the_whole_output_passes():
+    # A precise jsonpath query, as on a green run: its whole output is the exit code.
+    cmd = "kubectl get pod p -o jsonpath='{.exitCode}'"
+    out = json.dumps({"output": "137", "exit_code": 0, "error": None})
+    res = _grade_claims(_block(cmd, "137"), [_terminal(cmd, result=out)])
+    assert res.status == "pass", res
+
+
+def test_verified_claims_backed_a_stored_command_that_is_only_a_marker_matches_nothing():
+    out = json.dumps({"output": "NAME  READY\nweb-1  1/1", "exit_code": 0})
+    res = _grade_claims(_block("kubectl", "web-1  1/1"), [_terminal("[REDACTED_SECRET]", result=out)])
+    assert res.status == "fail" and "not a command any worker ran" in res.reason

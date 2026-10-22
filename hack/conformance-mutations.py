@@ -688,11 +688,43 @@ Mutation(
     Mutation(
         "C1-watcher-subscription-unpinned",
         "agents/platform/scripts/watcher_policy.py",
-        ('        if not subscription or match.group("sub") != subscription:\n',
-         '        if not subscription:\n'),
+        ('    if match.group("sub") not in subscriptions:\n',
+         '    if not subscriptions:\n'),
         "test_C1_the_watcher_pubsub_routes_reach_only_the_configured_subscription",
-        "drop the equality check when renaming the subscription env -- the "
-        "relay then pulls and acks any subscription the broker can reach",
+        "drop the membership check when renaming the subscription env -- the "
+        "relay then pulls and acks any subscription the broker can reach "
+        "(the platform relay shares the check, so its test goes red too)",
+    ),
+    Mutation(
+        "C1-platform-pubsub-pinned-to-project-not-subscription",
+        "agents/platform/scripts/watcher_policy.py",
+        ('    return _evaluate_subscription_call(method, path, body, subscriptions, _PLATFORM_SUBSCRIPTION_RULES)\n',
+         '    match = _PUBSUB_SUBSCRIPTION.fullmatch(path)\n'
+         '    if match and any(match.group("sub").rsplit("/", 2)[0] == s.rsplit("/", 2)[0] for s in subscriptions):\n'
+         '        subscriptions = subscriptions | {match.group("sub")}\n'
+         '    return _evaluate_subscription_call(method, path, body, subscriptions, _PLATFORM_SUBSCRIPTION_RULES)\n'),
+        "test_C1_the_platform_pubsub_relay_reaches_only_the_configured_subscriptions",
+        "let a plugin pull any subscription in a project it already has one in, "
+        "so a new route needs no operator render -- the gateway then reads the "
+        "drift watcher's and every other subscription in the harness project",
+    ),
+    Mutation(
+        "C1-platform-pubsub-route-opened-to-shell",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    (watcher_policy.PLATFORM_PUBSUB_PREFIX, (CALLER_ROLE_CHAT,)),\n",
+         "    (watcher_policy.PLATFORM_PUBSUB_PREFIX, (CALLER_ROLE_CHAT, CALLER_ROLE_SHELL)),\n"),
+        "test_C1_only_the_chat_role_reaches_the_platform_pubsub_relay",
+        "let a skill in the shell sandbox pull the stockout subscription directly "
+        "-- the agent's own commands then drain a queue meant for the gateway",
+    ),
+    Mutation(
+        "C1-platform-adapter-default-credential",
+        "agentplugins/pubsub-platform/files/platforms/pubsub/adapter.py",
+        ("import json\n",
+         "import json\n\nimport google.auth  # the project id from the pod's default credential when the env is unset\n"),
+        "test_C1_no_shipped_platform_adapter_holds_a_google_credential_path",
+        "fall back to google.auth.default() for the project id -- the path that "
+        "failed quietly for every alert once the gateway lost Workload Identity",
     ),
     Mutation(
         "C1-watcher-routes-opened-to-chat",
@@ -837,6 +869,17 @@ Mutation(
         "test_B2_the_enqueue_sweep_assents_only_on_both_human_labels",
         "simplify the enqueue test to the two labels it wants, dropping the "
         "do-not-merge check, so a held pull request is enqueued anyway",
+    ),
+    Mutation(
+        "B2-enqueue-retry-skips-labels",
+        "scripts/merge_gate.py",
+        ('    queued = pull["auto_merge"] or pull["queue_entry"] is not None\n',
+         '    queued = pull["auto_merge"] or pull["queue_entry"] is not None\n'
+         '    if pull.get("retry") and not queued:\n'
+         '        return ENABLE\n'),
+        "test_B2_the_enqueue_sweep_assents_only_on_both_human_labels",
+        "put a pull request back on its retry before the label test, since it "
+        "was approved when it entered, so one that lost lgtm is enqueued anyway",
     ),
     Mutation(
         "B2-app-token-grants-pull-requests",
@@ -1325,6 +1368,14 @@ Mutation(
          'safe_hint = log_hint if log_hint else "unknown"'),
         "test_D1_a_log_hint_cannot_forge_a_record",
         "log the hint raw, which is the state the sanitiser was added to fix",
+    ),
+    Mutation(
+        "D1-cluster-profile-unaudited",
+        "agents/cluster/config.yaml",
+        ("    - hermes_otel\n    - tool_call_audit\n", "    - hermes_otel\n"),
+        "test_D1_every_profile_records_its_tool_calls",
+        "trim the Cluster Agent template's plugin list back to otel alone, the "
+        "state the template shipped in",
     ),
     Mutation(
         "D1-platform-role-reaches-secrets",

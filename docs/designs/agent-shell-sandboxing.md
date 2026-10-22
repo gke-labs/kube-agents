@@ -1454,9 +1454,9 @@ Sizing the two volumes together has an upgrade cost, because `volumeClaimTemplat
 immutable and the template sizes only the claims it creates. An install that predates it
 therefore needs both halves done to it: the operator widens the existing claim in place
 (online, with the volume still mounted) and recreates the StatefulSet with Orphan
-propagation so the pod and its disk survive the swap. Both are in `reconcileShellSandbox`;
-the widening is `growDataClaim`, which `reconcilePVC` also runs on the agent's own claim,
-and both are best-effort in the direction that matters — a StorageClass without
+propagation so the pod and its disk survive the swap. The recreate is in
+`reconcileShellSandbox`; the widening is `growShellSandboxDataClaim`, which `reconcilePVC` runs
+through `growDataClaim` before it grows the agent's own claim, and both are best-effort in the direction that matters — a StorageClass without
 `allowVolumeExpansion` leaves a smaller volume and a bounded migration rather than a failed
 reconcile that would take the agent down with it.
 
@@ -1991,8 +1991,8 @@ build fails if anything under it is not owned by root or is writable by group or
 
 #### Cron scripts stay in the agent pod and reach into the sandbox from there
 
-A `no_agent` cron job — one carrying a `script` rather than a `prompt` — is unaffected
-by the terminal backend. The scheduler's `_run_job_script` resolves the script against
+A cron job's `script` — the whole of a `no_agent` job, or a prompt job's pre-run step — is
+unaffected by the terminal backend. The scheduler's `_run_job_script` resolves the script against
 `HERMES_HOME/scripts`, rejects anything resolving outside it, picks `/bin/bash` or
 `sys.executable` by extension, and calls `subprocess.run` with an environment from
 `build_subprocess_env` — imported from `tools.environments.local`, hardcoded. There is
@@ -2145,8 +2145,14 @@ placeholders in the platform home; the identity and kubeconfig in a cluster home
 by name and type, goes to `logs/kanban_workspace_gc.log` on the
 agent pod with its mtime and size, as does any sandbox profile home the agent pod has no
 profile for: the volume has no owner, so a cluster dropped from scope keeps its home and
-kubeconfig there. Inventory only, no moves: whether to move anything waits for data from
-the test fleet after cron runs get a working directory of their own. The listing runs as
+kubeconfig there. The inventory moves nothing: whether to move loose files waits for data
+from the test fleet now that cron runs have a working directory of their own. A stale
+`cluster-*` home itself is removed, as `delete_profile` removes the agent pod's: the sandbox
+is listed before the pod's profile list is read, so a profile scaffolded between the two
+reads is never taken for stale; only cluster-prefixed names go, only when the pod lists the
+platform profile, and only under a profiles root that `find -P` reports as a real directory,
+by one `rm` per home as the model's account, which owns the homes; a home whose `rm` fails
+is named in one chat bullet each night until it goes. The listing runs as
 `hermes`, the default principal, because its output is believed, under the sandbox's own
 `workspace_root` rather than the agent pod's home, and with NUL-terminated records so a
 name cannot forge a row.
@@ -2159,8 +2165,9 @@ worker's copy of a shipped skill or script, patched to run in place of the origi
 the literal paths it reads in shipped import-path calls, shell `PYTHONPATH` and configs
 off them. That test is a guard on the obvious forms, not a proof; the prune is the
 enforcement. Both
-prunes cover the homes the agent pod has a profile for, so a stale sandbox home is left
-to the inventory. Neither follows a symlink the model planted: the home, `cron` and
+prunes cover the homes the agent pod has a profile for; a sandbox home the pod has no
+profile for goes to the stale-home removal above when it is a cluster home, and stays in
+the inventory otherwise. Neither follows a symlink the model planted: the home, `cron` and
 `cron/runs` must be real directories for the runs prune, a symlinked home is left alone
 by the override prune, and a symlinked override entry is unlinked rather than followed.
 
@@ -2834,6 +2841,8 @@ The Slack relay holds a socket-mode WebSocket. Two replicas means two connection
 duplicate event delivery, so the broker Deployment pins `replicas: 1`. The credential
 broker cannot be made highly available while it is fused with an inbound event pump, and
 splitting the two is the obvious follow-up.
+[`credential-proxy-single-pod.md`](credential-proxy-single-pod.md) owns the replica decision
+and the other state that keeps the broker at one pod.
 
 ### The proxy image is not the agent image
 
