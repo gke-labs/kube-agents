@@ -77,6 +77,12 @@ started with (`claude-code` or `antigravity`).
 
 - **`antigravity`**: not written yet; `render.For` refuses it by name.
 
+## An example
+
+[`agents/cluster/persona`](../../../agents/cluster/persona/README.md) is the
+cluster agent in this format: a read-only SRE for the GKE cluster each task
+names, with its skills and the two broker MCP servers it reads.
+
 ## Checking a persona
 
 Run these from `a2a/`:
