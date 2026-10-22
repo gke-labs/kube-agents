@@ -552,21 +552,23 @@ INCIDENT_WORKLOAD_DEDUP_MAX_SECONDS = 86400
 INCIDENT_WORKLOAD_DEDUP_SECONDS = min(
     _alert_daily_limit("INCIDENT_WORKLOAD_DEDUP_SECONDS", 0), INCIDENT_WORKLOAD_DEDUP_MAX_SECONDS
 )
-# A pod named like a Deployment's: 8-10 hex characters (its ReplicaSet's
-# pod-template hash, which is 8-10 characters long for all but about 0.2% of
-# templates; a shorter one does not fold), then the pod's own suffix
-# (`checkout-6cfdb6b98b-zwv24`). The lower bound stays at 8 because a shorter
-# one would match short hex-looking name segments (`log-db`, `cache-1`) and fold
-# different owners together, which silences an alert; a missed fold only
-# announces it.
-# A CronJob's pods have the same shape, the run minute standing in for the hash,
-# and so does any pod whose owner's last hyphen-separated segment is 8-10 hex
-# characters (`db-migrate-20261021`, which folds as `db-migrate`).
-# The one pattern clean_workload_name strips that names one workload in
-# practice; its second also strips the last segment of a bare pod
-# (`api-cache` -> `api`), which is a display choice and not an identity, so only
-# this one sets a fold key.
+# A pod named like a Deployment's for display: 8-10 hex characters, then the
+# pod's own suffix (`checkout-6cfdb6b98b-zwv24` -> `checkout`). clean_workload_name
+# strips it, and so a CronJob run's pod (`report-29812345-abcde`) and a
+# date-stamped Job's (`db-migrate-20261021-abcde`) display under their owner's
+# prefix too, which is a display choice and not an identity.
 DEPLOYMENT_POD_NAME_RE = re.compile(r"^(.*?)-[a-f0-9]{8,10}-[a-z0-9]{5}$")
+# What a fold key is read from: a ReplicaSet's pod-template hash is
+# rand.SafeEncodeString of a decimal number, which maps the ten digits to
+# exactly `4-9bcdf`, so this matches every Deployment pod the display pattern
+# does and refuses a segment holding any of `0-3`, `a` or `e` (every Unix-minute
+# CronJob run until the 2040s, every date stamp, `deadbeef`). Folding those
+# would put a Job's failure under a same-named Deployment's incident and
+# silence it. The lower bound stays at 8: the hash is shorter for about 0.2% of
+# templates, which then do not fold, and a lower bound would also match short
+# name segments (`log-bd`) and fold different owners together; a missed fold
+# only announces an event, a wrong one silences it.
+POD_TEMPLATE_HASH_POD_RE = re.compile(r"^(.*?)-[4-9bcdf]{8,10}-[a-z0-9]{5}$")
 # The severity get_severity_details grades a blocker, which folds only into an
 # anchor of its own grade (_workload_incident_anchor).
 CRITICAL_SEVERITY = "Critical"
@@ -1271,16 +1273,16 @@ def mark_triage_not_started(event_row_id: Optional[int]) -> None:
 def _fold_key(object_kind: str, object_name: str) -> str:
     """What an event folds on, or "" for an event that neither folds nor anchors.
 
-    A pod whose name has a Deployment pod's shape (DEPLOYMENT_POD_NAME_RE)
-    folds on its workload, the name clean_workload_name gives it. Any other Pod
-    name does not fold: a StatefulSet's `web-0` and `web-1` keep their
-    ordinals, and a DaemonSet's, a Job's or a bare pod's last segment is not
-    one workload's replica suffix. A non-Pod object folds on its own name,
-    which is exact.
+    A Deployment's pod (POD_TEMPLATE_HASH_POD_RE) folds on its workload. Any
+    other Pod name does not fold: a StatefulSet's `web-0` and `web-1` keep their
+    ordinals, a CronJob run's or a date-stamped Job's pod is not the same
+    workload as a same-named Deployment, and a DaemonSet's, a Job's or a bare
+    pod's last segment is not one workload's replica suffix. A non-Pod object
+    folds on its own name, which is exact.
     """
     if object_kind.lower() != "pod":
         return object_name
-    m = DEPLOYMENT_POD_NAME_RE.match(object_name)
+    m = POD_TEMPLATE_HASH_POD_RE.match(object_name)
     return m.group(1) if m else ""
 
 

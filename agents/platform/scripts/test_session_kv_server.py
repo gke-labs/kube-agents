@@ -2314,6 +2314,18 @@ class TestWorkloadIncidentFold(unittest.TestCase):
         self.assertEqual(key("Pod", "api-cache"), "")
         self.assertEqual(key("Pod", "web-0"), "")
         self.assertEqual(key("Deployment", "checkout"), "checkout")
+        # A CronJob run and a date-stamped Job look like a Deployment pod to
+        # the display cleaner, but their segments hold digits a pod-template
+        # hash never does: a same-named Deployment's incident must not take them.
+        self.assertEqual(key("Pod", "checkout-29812345-abcde"), "")
+        self.assertEqual(key("Pod", "checkout-20261021-abcde"), "")
+        self.assertEqual(key("Pod", "checkout-deadbeef-abcde"), "")
+        self.assertEqual(clean_workload_name("Pod", "checkout-29812345-abcde"), "checkout")
+
+    def test_a_cronjob_run_does_not_fold_into_a_same_named_deployment(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            self._inject("report-6cfdb6b98b-zwv24")
+            self.assertEqual(self._inject("report-29812345-abcde")["status"], "injected")
 
     def test_two_bare_pods_that_clean_to_one_name_are_two_incidents(self):
         with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
