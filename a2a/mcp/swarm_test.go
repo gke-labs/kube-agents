@@ -77,7 +77,7 @@ func fixtureInput() SwarmInput {
 	}
 }
 
-func mustJSON(t *testing.T, v any) []byte {
+func swarmJSON(t *testing.T, v any) []byte {
 	t.Helper()
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
@@ -111,7 +111,7 @@ func TestBuildSwarmStateEmpty(t *testing.T) {
 	// The zero Now is still deterministic: no clock is read.
 	a, _ := BuildSwarmState(SwarmInput{}, freshLedger())
 	b, _ := BuildSwarmState(SwarmInput{}, freshLedger())
-	if !bytes.Equal(mustJSON(t, a), mustJSON(t, b)) {
+	if !bytes.Equal(swarmJSON(t, a), swarmJSON(t, b)) {
 		t.Error("zero Now is not deterministic")
 	}
 }
@@ -211,14 +211,14 @@ func TestBuildSwarmStateLedgerDedupe(t *testing.T) {
 	}
 	// Round-trip the ledger through JSON, as the bridge does.
 	var back BoardLedger
-	if err := json.Unmarshal(mustJSON(t, l1), &back); err != nil {
+	if err := json.Unmarshal(swarmJSON(t, l1), &back); err != nil {
 		t.Fatal(err)
 	}
 	snap2, l2 := BuildSwarmState(in, back)
 	if len(snap2.NewMessages) != 0 {
 		t.Errorf("second call re-emitted:\n%s", boardTexts(snap2))
 	}
-	if !bytes.Equal(mustJSON(t, l1), mustJSON(t, l2)) {
+	if !bytes.Equal(swarmJSON(t, l1), swarmJSON(t, l2)) {
 		t.Error("ledger changed on an identical second call")
 	}
 	// A task finishing later posts exactly its completion, citing its submission.
@@ -463,7 +463,7 @@ func TestBuildSwarmStateDeterministic(t *testing.T) {
 		})
 	}
 	wantSnap, wantLedger := BuildSwarmState(in, freshLedger())
-	want := append(mustJSON(t, wantSnap), mustJSON(t, wantLedger)...)
+	want := append(swarmJSON(t, wantSnap), swarmJSON(t, wantLedger)...)
 	r := rand.New(rand.NewPCG(1, 2))
 	for i := 0; i < 20; i++ {
 		shuf := in
@@ -474,7 +474,7 @@ func TestBuildSwarmStateDeterministic(t *testing.T) {
 		})
 		r.Shuffle(len(shuf.Tasks), func(a, b int) { shuf.Tasks[a], shuf.Tasks[b] = shuf.Tasks[b], shuf.Tasks[a] })
 		s, l := BuildSwarmState(shuf, freshLedger())
-		if got := append(mustJSON(t, s), mustJSON(t, l)...); !bytes.Equal(got, want) {
+		if got := append(swarmJSON(t, s), swarmJSON(t, l)...); !bytes.Equal(got, want) {
 			t.Fatalf("shuffle %d changed the output", i)
 		}
 	}
@@ -484,7 +484,7 @@ func TestSwarmSnapshotGolden(t *testing.T) {
 	snap, ledger := BuildSwarmState(fixtureInput(), freshLedger())
 	for name, v := range map[string]any{"swarm_snapshot.golden.json": snap, "swarm_ledger.golden.json": ledger} {
 		path := filepath.Join("testdata", name)
-		got := mustJSON(t, v)
+		got := swarmJSON(t, v)
 		if *updateSwarmGolden {
 			if err := os.WriteFile(path, got, 0o600); err != nil {
 				t.Fatal(err)
@@ -518,7 +518,7 @@ func TestSwarmGoldenBridgeCompatible(t *testing.T) {
 		if err := dec.Decode(target); err != nil {
 			t.Fatalf("%s: bridge decode: %v", name, err)
 		}
-		if got := mustJSON(t, target); !bytes.Equal(got, raw) {
+		if got := swarmJSON(t, target); !bytes.Equal(got, raw) {
 			t.Errorf("%s: bridge re-encode differs:\n%s", name, got)
 		}
 	}
@@ -807,7 +807,7 @@ func TestBuildSwarmStateViewTextNeutralised(t *testing.T) {
 	raw, _ := json.Marshal(snap)
 	var back SwarmSnapshot
 	_ = json.Unmarshal(raw, &back)
-	all := string(mustJSON(t, back.View)) + back.Title
+	all := string(swarmJSON(t, back.View)) + back.Title
 	for _, m := range back.Members {
 		all += m.Model
 	}
