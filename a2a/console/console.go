@@ -64,9 +64,10 @@ const (
 
 	hostSeparator = " or "
 
-	// busDialTimeout bounds the TCP connect to the bus. A NetworkPolicy that
-	// drops SYNs rather than rejecting them would otherwise hold the browser's
-	// upgrade request for however long the platform's default dial timeout is.
+	// busDialTimeout bounds the TCP connect to the bus, and on an https bus
+	// the TLS handshake after it. A NetworkPolicy that drops SYNs rather than
+	// rejecting them would otherwise hold the browser's upgrade request for
+	// however long the platform's default dial timeout is.
 	busDialTimeout = 2 * time.Second
 	// busResponseHeaderTimeout bounds the wait for the bus's upgrade response
 	// once the connection is up. A bus that accepts TCP but never answers the
@@ -82,6 +83,7 @@ const (
 	msgBusDown       = "the bus did not answer"
 	msgNoCA          = "the CA file %s holds no PEM certificate"
 	msgBusUnverified = "the bus's certificate did not verify against the bus CA"
+	msgBusWrongName  = "the bus's certificate does not name %s - set NATS_TLS_SERVER_NAME to a name it carries"
 	msgNoCredential  = "no console credential at %s"
 	healthBody       = "ok\n"
 )
@@ -303,9 +305,16 @@ func busHandler(cfg Config, log *slog.Logger) http.Handler {
 			log.Error("bus proxy failed", "bus", cfg.BusURL.Redacted(), "err", err)
 			// A bus that answered with a certificate the CA does not vouch
 			// for is a different fault from one that did not answer, and
-			// the person reading the page should be told which.
+			// the person reading the page should be told which. A name
+			// mismatch arrives wrapped the same way as an unknown authority,
+			// and its remedy is the server name, not the CA bundle.
 			var verify *tls.CertificateVerificationError
 			if errors.As(err, &verify) {
+				var wrongName x509.HostnameError
+				if errors.As(verify.Err, &wrongName) {
+					http.Error(w, fmt.Sprintf(msgBusWrongName, wrongName.Host), http.StatusBadGateway)
+					return
+				}
 				http.Error(w, msgBusUnverified, http.StatusBadGateway)
 				return
 			}

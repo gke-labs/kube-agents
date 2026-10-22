@@ -179,9 +179,12 @@ func TestServerNameOverridesTheBusURLsHost(t *testing.T) {
 	for _, tc := range []struct {
 		serverName string
 		want       int
+		body       string
 	}{
-		{"", http.StatusBadGateway},
-		{busServerName, http.StatusSwitchingProtocols},
+		// The CA is right and the name is not: the body says so, and
+		// names the remedy, rather than sending the reader to the CA.
+		{"", http.StatusBadGateway, "does not name 127.0.0.1 - set NATS_TLS_SERVER_NAME"},
+		{busServerName, http.StatusSwitchingProtocols, ""},
 	} {
 		cfg := fixture(t, "x")
 		cfg.BusURL = &loopback
@@ -189,9 +192,13 @@ func TestServerNameOverridesTheBusURLsHost(t *testing.T) {
 		cfg.ServerName = tc.serverName
 		ts := httptest.NewServer(handler(t, cfg))
 		resp, _, _ := handshake(t, ts.Listener.Addr().String(), "http://localhost:8080")
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
 		ts.Close()
 		if resp.StatusCode != tc.want {
 			t.Errorf("server name %q: status = %d, want %d", tc.serverName, resp.StatusCode, tc.want)
+		}
+		if tc.body != "" && !strings.Contains(string(body), tc.body) {
+			t.Errorf("server name %q: body = %q, want it to contain %q", tc.serverName, body, tc.body)
 		}
 	}
 }
