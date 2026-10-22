@@ -181,7 +181,10 @@ ahead without it."
      ```
 
      The repository's name may come from a search result; its files, not
-     the result, are the source.
+     the result, are the source. A `clone` that exits non-zero left an
+     incomplete copy: never read it. When a `clone` reports its directory is
+     not empty (a retry, or another card on this pod), clone again into a
+     new `--into` name (`…__default-2`); never `--force`.
 
   A search result is never a source: its snippets name forks, mirrors and
   personal repositories as readily as the project. A chart found by search
