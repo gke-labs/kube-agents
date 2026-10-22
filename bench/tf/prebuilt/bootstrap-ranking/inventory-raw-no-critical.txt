@@ -1,0 +1,55 @@
+# GKE Environment Discovery Report — raw findings
+
+First-time environment scan, compiled at 2026-10-20 12:00 UTC from the per-cluster audit cards of sweep `t_sweep_posture`. It carries every entry the audits filed under `findings`, and the delivered report is ranked from those alone; a condition an audit recorded only in a structured field (startup probe, read-only root filesystem, namespace governance, node autoscaling) is not carried forward. This scan ran 9 configuration checks; security and RBAC, reliability, capacity and cost come from the first-run audits. The 9 checks: startup probes, ResourceQuota and LimitRange, read-only root filesystems, Shielded Nodes, Dataplane V2, Managed Service for Prometheus, node auto-upgrade, static Google Cloud keys in pods and added capabilities.
+
+## Coverage
+
+| Cluster | Project | Location | Card | Workloads audited | Scanned in full |
+| :------ | :------ | :------- | :--- | ----------------: | :-------------- |
+| prod-east | onboarding-posture-prod | us-east1 | t_prod_east | 3 | yes |
+
+## GKE Fleet Discovery
+
+| Cluster Name | GCP Region / Zone | K8s Version | Node Pools / Machine Types | Workload Identity | Dataplane V2 | Observability Stack | Deployment Toolchain |
+| :----------- | :---------------- | :---------- | :------------------------- | :---------------- | :----------- | :------------------ | :------------------- |
+| prod-east | us-east1 | 1.33.4-gke.1245000 | default-pool (e2-standard-4) | enabled | enabled | Cloud Logging only | kubectl apply from CI |
+
+## Workloads Inventory
+
+| Cluster | Namespace | Workload Name | Kind | Replicas | Startup Probe | Telemetry | ReadOnlyFS |
+| :------ | :-------- | :------------ | :--- | :------- | :------------ | :-------- | :--------- |
+| prod-east | web | storefront | Deployment | 3/3 | yes | none | no |
+| prod-east | web | search-api | Deployment | 2/2 | no | none | yes |
+| prod-east | jobs | report-builder | Deployment | 1/1 | yes | none | yes |
+
+## Prioritized SRE Remediation Plan
+
+### Priority 1 — Security & Identity Hardening
+
+- **[LOW]** `prod-east/web/storefront`: storefront runs with a writable root filesystem. Recommended: Set readOnlyRootFilesystem: true and mount an emptyDir for the paths it writes
+
+### Priority 2 — Workload Reliability & Probes
+
+- **[LOW]** `prod-east/web/search-api`: search-api has no startupProbe. Recommended: Add a startupProbe so a slow start is not read as a failed liveness check
+- **[LOW]** `prod-east/jobs/jobs`: Namespace jobs has no ResourceQuota or LimitRange. Recommended: Add a ResourceQuota and a LimitRange to jobs
+
+### Priority 3 — Observability & Telemetry
+
+- **[LOW]** `prod-east/prod-east`: Managed Service for Prometheus is not enabled on prod-east. Recommended: Enable Managed Service for Prometheus so workload metrics are collected
+
+### Other
+
+- None reported.
+
+## Gaps
+
+- None.
+
+## Machine-Readable Findings
+
+```findings
+{"check": "readonly-root-fs", "project": "onboarding-posture-prod", "cluster": "prod-east", "object": "storefront", "title": "storefront runs with a writable root filesystem", "namespace": "web", "detail": "Set readOnlyRootFilesystem: true and mount an emptyDir for the paths it writes", "severity_hint": "low"}
+{"check": "probes-startup", "project": "onboarding-posture-prod", "cluster": "prod-east", "object": "search-api", "title": "search-api has no startupProbe", "namespace": "web", "detail": "Add a startupProbe so a slow start is not read as a failed liveness check", "severity_hint": "low"}
+{"check": "no-resourcequota", "project": "onboarding-posture-prod", "cluster": "prod-east", "object": "jobs", "title": "Namespace jobs has no ResourceQuota or LimitRange", "namespace": "jobs", "detail": "Add a ResourceQuota and a LimitRange to jobs", "severity_hint": "low"}
+{"check": "managed-prometheus", "project": "onboarding-posture-prod", "cluster": "prod-east", "object": "prod-east", "title": "Managed Service for Prometheus is not enabled on prod-east", "detail": "Enable Managed Service for Prometheus so workload metrics are collected", "severity_hint": "low"}
+```

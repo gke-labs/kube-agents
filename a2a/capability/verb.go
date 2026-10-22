@@ -4,11 +4,16 @@ package capability
 //
 // The entry does not carry a list of these, deliberately: 09's shape is
 // {tier, scope, delegate} and A4 owes 09 the action-list amendment along with
-// the per-call lookup. So a verb is permitted by the *tier* it requires, and
-// that mapping is code rather than data on the wire. The consequence worth
-// stating plainly: adding a verb here widens what every existing capability at
-// that tier already permits, retroactively and without a rewrite. That is the
-// property the action list would remove, and it is A4's to remove.
+// the per-call lookup. So a verb is permitted by the *tier* the entry carries,
+// through tierVerbs below, and that mapping is code rather than data on the
+// wire. The consequence worth stating plainly: adding a verb to a tier's set
+// widens what every existing capability at that tier already permits,
+// retroactively and without a rewrite. That is the property the action list
+// would remove, and it is A4's to remove. The same holds for narrowing:
+// Narrows compares the sets, so changing a tier's set also changes which
+// stored chains still resolve, not only what Permits allows. A tier must never
+// have an empty set; that set is a subset of every other, so the tier would sit
+// under any parent (TestTierSetsAreNonEmpty).
 type Verb string
 
 const (
@@ -32,16 +37,65 @@ const (
 	VerbFleetRead Verb = "fleet.read"
 )
 
-// verbTier is the required tier for each verb. A verb absent from this table is
-// refused: the table is the allowlist, and an unknown verb reaching a verifier
-// means a caller and a verifier disagree about the vocabulary, which is not a
-// condition to resolve in the permissive direction.
-var verbTier = map[Verb]Tier{
-	VerbTaskExecute:        TierDeveloperTeam,
-	VerbTaskDelegate:       TierDeveloperTeam,
-	VerbTopicPublishShared: TierClusterAdmin,
-	VerbClusterMutate:      TierClusterAdmin,
-	VerbFleetRead:          TierPlatform,
+// tierVerbs is each tier's verb set: the tier permits exactly these verbs and
+// nothing else. It replaced a ranked lattice (#3659) because the tiers to come
+// are not a rank: one that may only propose is not "below" one that may read
+// logs, it simply holds a different set. The three tiers here still nest,
+// developer-team inside cluster-admin inside platform, so every decision the
+// rank used to make comes out the same (TestTierSetsMatchTheRetiredRank pins
+// each pair).
+//
+// The table is the allowlist twice over. A tier absent from it is not a tier:
+// an entry carrying one is refused rather than given an empty set, because an
+// empty set would still pass the subset check against any parent. And a verb in
+// no tier's set is refused as unknown, because a caller and a verifier that
+// disagree about the vocabulary is not a condition to resolve in the permissive
+// direction.
+var tierVerbs = map[Tier]verbSet{
+	TierDeveloperTeam: newVerbSet(VerbTaskExecute, VerbTaskDelegate),
+	TierClusterAdmin:  newVerbSet(VerbTaskExecute, VerbTaskDelegate, VerbTopicPublishShared, VerbClusterMutate),
+	TierPlatform: newVerbSet(
+		VerbTaskExecute, VerbTaskDelegate, VerbTopicPublishShared, VerbClusterMutate, VerbFleetRead,
+	),
+}
+
+// verbSet is a tier's verbs. A map rather than a slice so membership is one
+// lookup and a duplicate in the table cannot change a decision.
+type verbSet map[Verb]struct{}
+
+func newVerbSet(verbs ...Verb) verbSet {
+	s := make(verbSet, len(verbs))
+	for _, v := range verbs {
+		s[v] = struct{}{}
+	}
+	return s
+}
+
+func (s verbSet) has(v Verb) bool {
+	_, ok := s[v]
+	return ok
+}
+
+// subsetOf reports whether every verb in s is also in other. It is what
+// "narrower" means between two tiers: a child may carry a tier whose set is
+// inside its parent's, and nothing else.
+func (s verbSet) subsetOf(other verbSet) bool {
+	for v := range s {
+		if !other.has(v) {
+			return false
+		}
+	}
+	return true
+}
+
+// knownVerb reports whether any tier's set names v.
+func knownVerb(v Verb) bool {
+	for _, set := range tierVerbs {
+		if set.has(v) {
+			return true
+		}
+	}
+	return false
 }
 
 // Permits answers the question the verifier exists to answer: does this
@@ -49,16 +103,15 @@ var verbTier = map[Verb]Tier{
 // resolved chain, after the chain itself has been walked — a leaf is never
 // wider than its root, so checking the leaf checks the chain.
 func Permits(e Entry, v Verb, r Scope) error {
-	need, ok := verbTier[v]
-	if !ok {
+	if !knownVerb(v) {
 		return refuse("verb is not in the table")
 	}
-	have, ok := tierRank[e.Tier]
+	set, ok := tierVerbs[e.Tier]
 	if !ok {
-		return refuse("capability carries a tier that is not in the lattice")
+		return refuse("capability carries a tier that is not a known tier")
 	}
-	if have < tierRank[need] {
-		return refuse("capability's tier is below the tier the verb requires")
+	if !set.has(v) {
+		return refuse("capability's tier does not permit the verb: its verb set does not include it")
 	}
 	if err := r.validate(); err != nil {
 		return refuse("the resource is not a well-formed scope")
@@ -69,12 +122,18 @@ func Permits(e Entry, v Verb, r Scope) error {
 	return nil
 }
 
-// Verbs returns the verb vocabulary, sorted for the conformance suite. The
-// suite holds this table to the documented one in both directions, the way
-// profiles.TestFieldsMatchTheSpecTable holds the profile struct to its spec.
+// Verbs returns the verb vocabulary, every verb some tier's set names,
+// sorted. TestTierSetsKeepTheVocabulary holds it to the verbs the retired
+// rank knew.
 func Verbs() []Verb {
-	out := make([]Verb, 0, len(verbTier))
-	for v := range verbTier {
+	all := verbSet{}
+	for _, set := range tierVerbs {
+		for v := range set {
+			all[v] = struct{}{}
+		}
+	}
+	out := make([]Verb, 0, len(all))
+	for v := range all {
 		out = append(out, v)
 	}
 	sortVerbs(out)

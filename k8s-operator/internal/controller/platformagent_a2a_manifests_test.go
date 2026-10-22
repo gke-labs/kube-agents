@@ -859,8 +859,8 @@ func TestBuildA2AGatewayIdentityAndOwnerWiring(t *testing.T) {
 	}
 
 	role := buildA2AGatewayRole(agent)
-	if len(role.Rules) != 2 {
-		t.Fatalf("gateway Role has %d rules, want the session-pod rule plus the pinned owner get", len(role.Rules))
+	if len(role.Rules) != 3 {
+		t.Fatalf("gateway Role has %d rules, want the session-pod rule, the pinned owner get and the pinned PlatformAgent get", len(role.Rules))
 	}
 	// The owner rule is one verb on one named object — a deployments read
 	// would be a finding.
@@ -870,6 +870,15 @@ func TestBuildA2AGatewayIdentityAndOwnerWiring(t *testing.T) {
 		len(owner.Verbs) != 1 || owner.Verbs[0] != "get" ||
 		len(owner.ResourceNames) != 1 || owner.ResourceNames[0] != "test-agent-a2a-gateway" {
 		t.Errorf("owner rule = %+v", owner)
+	}
+	// The PlatformAgent rule, for "/feedback summary", is the same shape:
+	// one verb on this agent's one resource.
+	usage := role.Rules[2]
+	if len(usage.APIGroups) != 1 || usage.APIGroups[0] != agentv1alpha1.GroupVersion.Group ||
+		len(usage.Resources) != 1 || usage.Resources[0] != "platformagents" ||
+		len(usage.Verbs) != 1 || usage.Verbs[0] != "get" ||
+		len(usage.ResourceNames) != 1 || usage.ResourceNames[0] != "test-agent" {
+		t.Errorf("PlatformAgent rule = %+v", usage)
 	}
 
 	rb := buildA2AGatewayRoleBinding(agent)

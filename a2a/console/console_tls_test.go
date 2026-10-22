@@ -76,17 +76,23 @@ func (ca testCA) writeCA(t *testing.T) string {
 // serving issues a certificate for busServerName.
 func (ca testCA) serving(t *testing.T) tls.Certificate {
 	t.Helper()
+	now := time.Now()
+	return ca.servingFor(t, now.Add(-time.Hour), now.Add(time.Hour))
+}
+
+// servingFor issues the bus's serving certificate for the given window.
+func (ca testCA) servingFor(t *testing.T, notBefore, notAfter time.Time) tls.Certificate {
+	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	now := time.Now()
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(2),
 		Subject:      pkix.Name{CommonName: busServerName},
 		DNSNames:     []string{busServerName},
-		NotBefore:    now.Add(-time.Hour),
-		NotAfter:     now.Add(time.Hour),
+		NotBefore:    notBefore,
+		NotAfter:     notAfter,
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
@@ -102,13 +108,22 @@ func (ca testCA) serving(t *testing.T) tls.Certificate {
 // returns the listener as the https URL the proxy dials.
 func wssBus(t *testing.T, ca testCA) *url.URL {
 	t.Helper()
+	return busServing(t, &tls.Config{Certificates: []tls.Certificate{ca.serving(t)}, MinVersion: tls.VersionTLS12})
+}
+
+// busServing starts the bus with the given websocket TLS config, or a
+// plaintext websocket listener when it is nil, and returns the https URL the
+// proxy dials either way.
+func busServing(t *testing.T, tlsConfig *tls.Config) *url.URL {
+	t.Helper()
 	opts := &natsserver.Options{}
 	opts.NoLog, opts.NoSigs = true, true
 	opts.Host = "127.0.0.1"
 	opts.Port = -1
 	opts.Websocket.Host = "127.0.0.1"
 	opts.Websocket.Port = -1
-	opts.Websocket.TLSConfig = &tls.Config{Certificates: []tls.Certificate{ca.serving(t)}, MinVersion: tls.VersionTLS12}
+	opts.Websocket.TLSConfig = tlsConfig
+	opts.Websocket.NoTLS = tlsConfig == nil
 	opts.Websocket.AllowedOrigins = []string{"http://localhost:8080"}
 	srv, err := natsserver.NewServer(opts)
 	if err != nil {
@@ -123,8 +138,8 @@ func wssBus(t *testing.T, ca testCA) *url.URL {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if u.Scheme != "wss" {
-		t.Fatalf("test bus advertises %s, want a wss listener", u)
+	if want := map[bool]string{true: "wss", false: "ws"}[tlsConfig != nil]; u.Scheme != want {
+		t.Fatalf("test bus advertises %s, want a %s listener", u, want)
 	}
 	u.Scheme = schemeHTTPS
 	u.Host = busServerName + ":" + u.Port()
@@ -162,7 +177,7 @@ func TestATLSBusUnderAnotherCAIsA502(t *testing.T) {
 		t.Fatalf("status = %d, want 502: the bus's certificate is not from the trusted CA", resp.StatusCode)
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
-	if !strings.Contains(string(body), msgBusUnverified) {
+	if !strings.Contains(string(body), "did not verify: ") || !strings.Contains(string(body), "unknown authority") {
 		t.Errorf("body %q does not say the certificate failed to verify; a bus that answered is not a bus that is down", body)
 	}
 }
@@ -179,9 +194,12 @@ func TestServerNameOverridesTheBusURLsHost(t *testing.T) {
 	for _, tc := range []struct {
 		serverName string
 		want       int
+		body       string
 	}{
-		{"", http.StatusBadGateway},
-		{busServerName, http.StatusSwitchingProtocols},
+		// The CA is right and the name is not: the body says so, and
+		// names the remedy, rather than sending the reader to the CA.
+		{"", http.StatusBadGateway, "for 127.0.0.1 because it doesn't contain any IP SANs" + msgBusWrongName},
+		{busServerName, http.StatusSwitchingProtocols, ""},
 	} {
 		cfg := fixture(t, "x")
 		cfg.BusURL = &loopback
@@ -189,9 +207,13 @@ func TestServerNameOverridesTheBusURLsHost(t *testing.T) {
 		cfg.ServerName = tc.serverName
 		ts := httptest.NewServer(handler(t, cfg))
 		resp, _, _ := handshake(t, ts.Listener.Addr().String(), "http://localhost:8080")
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
 		ts.Close()
 		if resp.StatusCode != tc.want {
 			t.Errorf("server name %q: status = %d, want %d", tc.serverName, resp.StatusCode, tc.want)
+		}
+		if tc.body != "" && !strings.Contains(string(body), tc.body) {
+			t.Errorf("server name %q: body = %q, want it to contain %q", tc.serverName, body, tc.body)
 		}
 	}
 }
@@ -229,6 +251,42 @@ func TestTheCAFileIsReadOnEveryDial(t *testing.T) {
 	}
 	if resp, _, _ := handshake(t, ts.Listener.Addr().String(), "http://localhost:8080"); resp.StatusCode != http.StatusSwitchingProtocols {
 		t.Errorf("status = %d after the CA file was rewritten, want 101", resp.StatusCode)
+	}
+
+	// Rewritten to something unusable after start: the page is told the
+	// console's own CA file failed, not that the bus did not answer.
+	if err := os.WriteFile(caFile, []byte("not a certificate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resp, _, _ := handshake(t, ts.Listener.Addr().String(), "http://localhost:8080")
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	if resp.StatusCode != http.StatusBadGateway || !strings.Contains(string(body), "NATS_CA_FILE") || !strings.Contains(string(body), caFile) {
+		t.Errorf("status %d, body %q after the CA file went bad; want a 502 naming NATS_CA_FILE and %s", resp.StatusCode, body, caFile)
+	}
+}
+
+// Each other shape a dial can fail in reaches the page as what it is.
+func TestABusThatAnsweredIsNotCalledDown(t *testing.T) {
+	ca := newTestCA(t)
+	past := time.Now().Add(-48 * time.Hour)
+	for name, tc := range map[string]struct {
+		bus  *url.URL
+		want string
+	}{
+		"an expired serving certificate": {
+			busServing(t, &tls.Config{Certificates: []tls.Certificate{ca.servingFor(t, past, past.Add(time.Hour))}, MinVersion: tls.VersionTLS12}),
+			"did not verify: x509: certificate has expired",
+		},
+		"a bus still serving plaintext": {busServing(t, nil), msgBusPlaintext},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ts := tlsConsole(t, tc.bus, ca.writeCA(t))
+			resp, _, _ := handshake(t, ts.Listener.Addr().String(), "http://localhost:8080")
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+			if resp.StatusCode != http.StatusBadGateway || !strings.Contains(string(body), tc.want) {
+				t.Errorf("status %d, body %q; want a 502 saying %q", resp.StatusCode, body, tc.want)
+			}
+		})
 	}
 }
 
