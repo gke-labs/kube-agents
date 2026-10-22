@@ -234,14 +234,14 @@ def case_verdicts(parts: dict[str, list[dict]], cases: list[str], tracked: dict[
             lane_excluded.setdefault(n["date"], set()).update(x for x in names if isinstance(x, str))
     eligible: dict[str, dict[str, dict]] = {}
     for part, nights in parts.items():
-        fullest = max((len(n["tasks"]) for n in nights), default=0)
-        seen = {name for n in nights for name in n["tasks"]}
-        # A fullest night from before the flip counts the cases the lane now
-        # drops. They are not missing from a next-mode night, so its size is
-        # the fullest less those the part ran before and this night did not.
+        # The fullest night as this date's lane would have run it: each
+        # night's cases less the ones this date's inject lane drops, so a
+        # pre-flip night does not count cases a next-mode night never runs.
+        def fullest(day: str, nights: list[dict] = nights) -> int:
+            dropped = lane_excluded.get(day, set())
+            return max((len(set(n["tasks"]) - dropped) for n in nights), default=0)
         eligible[part] = {n["date"]: n for n in nights if not n["lost"] and not n["unrescued"]
-                          and not infra_event([t for t, _ in n["tasks"].values()],
-                                              fullest - len((lane_excluded.get(n["date"], set()) & seen) - set(n["tasks"])))}
+                          and not infra_event([t for t, _ in n["tasks"].values()], fullest(n["date"]))}
     every = {part: {n["date"]: n for n in nights} for part, nights in parts.items()}
     dates = sorted({n["date"] for nights in parts.values() for n in nights})
     out: dict[str, list[dict]] = {}
