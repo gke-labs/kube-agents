@@ -79,11 +79,15 @@ readonly EVAL_ALERT_DAILY_LIMIT_DRIFT="0"
 # value is bounded on both sides by that. It must outlast the spread of one
 # Deployment's replicas crossing the watcher's BackOff debounce together, which
 # is seconds. And it must stay shorter than the gap between two repetitions of
-# a case that re-plants the same workload in the same namespace
-# (autoops-warning-event-triage, autoops-crashloop-config-triage): a repetition
-# is a stack apply plus a triage turn of several minutes, and a window longer
-# than that folds repetition 2's incident into repetition 1's, so the case
-# waits out its timeout for a card nobody files.
+# a case that re-plants the same workload in the same namespace and then waits
+# for that repetition's own card (autoops-warning-event-triage,
+# autoops-crashloop-config-triage): their turn waits for the card to finish, a
+# median of ~7 minutes, and a window longer than the gap folds repetition 2's
+# incident into repetition 1's, so the case waits out its timeout for a card
+# nobody files. incident-triage-workload-fold's own repetitions can run ~4
+# minutes apart and do fold into the first one's incident; its check still
+# fails on a daemon that does not fold, since every replica's row is then
+# admitted.
 readonly EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS="300"
 
 # The subscription the drift detector pulls from. The pool project's own

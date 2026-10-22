@@ -15,6 +15,11 @@
 # case does not fold into the last (the comment above
 # EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS says why it must stay so).
 #
+# A repetition is a short apply and a short turn, ~4 minutes, so a later
+# repetition's burst can land inside the first one's window and fold into its
+# incident. That still passes, and correctly: a daemon that does not fold
+# admits every replica's row, so the newest incident has nothing folded into it.
+#
 # The grade is deterministic and reads the daemon's ledger, not the agent's
 # words: the watcher logs a `fire` line for every replica whatever the daemon
 # answers, so its log cannot tell one incident from three. The prompt gives the

@@ -143,10 +143,14 @@ def _ledger_time(value: Any) -> datetime | None:
 class WorkloadIncidentFoldedVerifier(_OnboardingPollVerifier):
     """Checks that one workload's burst of events became one incident.
 
-    Reads the ledger rows for ``namespace``/``name`` through the Session KV
-    server's ``GET /v1/intercepted-events`` in the agent container. The anchor
-    is the newest admitted row (status ``injected`` or ``undelivered``). Passes
-    when at least ``min_folded`` rows name it in ``duplicate_of``.
+    Reads the ledger rows for ``namespace``/``name`` of object ``kind`` through
+    the Session KV server's ``GET /v1/intercepted-events`` in the agent
+    container. The anchor is the newest admitted row (status ``injected`` or
+    ``undelivered``). Passes when at least ``min_folded`` rows name it in
+    ``duplicate_of``. ``kind`` matters because the daemon folds within one
+    object kind, and other producers share the ledger under the same name: the
+    drift detector records the stack's own Deployment apply as kind
+    ``deployments``, often seconds before the burst.
 
     Keyed on the newest admitted row rather than on a time window, because the
     stack plants its burst before the agent turn starts, and the previous
@@ -164,6 +168,7 @@ class WorkloadIncidentFoldedVerifier(_OnboardingPollVerifier):
     type: Literal["workload_incident_folded"]
     namespace: str = Field(min_length=1)
     name: str = Field(min_length=1)
+    kind: str = Field(default="Pod", min_length=1)
     min_folded: int = Field(ge=1)
     # The stack's own budget for raising the incident (a 420s debounce wait and
     # a 300s wait for the watcher in bench/tf/prebuilt/autoops-incident), plus
@@ -182,7 +187,11 @@ class WorkloadIncidentFoldedVerifier(_OnboardingPollVerifier):
             return "error", "the agent pod could not be read (kubectl exec failed or the command did not run)", None
         if read["error"]:
             return "error", f"the event ledger could not be read: {read['error']}", None
-        rows = sorted(read["events"], key=lambda row: int(row.get("id") or 0), reverse=True)
+        rows = sorted(
+            (row for row in read["events"] if row.get("kind") == self.kind),
+            key=lambda row: int(row.get("id") or 0),
+            reverse=True,
+        )
         workload = f"{self.namespace}/{self.name}"
         admitted = [row for row in rows if row.get("status") in ADMITTED_STATUSES]
         recent = [row for row in admitted if (_ledger_time(row.get("timestamp")) or since) > since]

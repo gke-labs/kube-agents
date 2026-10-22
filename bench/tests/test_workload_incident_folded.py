@@ -168,6 +168,20 @@ def test_the_anchor_is_the_newest_admitted_row(feed) -> None:
     assert "ledger row 11" in result.reason
 
 
+def test_a_drift_record_for_the_same_name_is_not_the_anchor(feed) -> None:
+    # The drift detector records the stack's own apply of the Deployment, under
+    # the workload's name and kind `deployments`, sometimes after the anchor.
+    feed.rows = [
+        _row(10, "injected"),
+        _row(11, "folded", duplicate_of=10),
+        _row(12, "injected", kind="deployments", reason="OutOfBandChange"),
+        _row(13, "folded", duplicate_of=10),
+    ]
+    result = _verify()
+    assert result.status == "pass", result.reason
+    assert "ledger row 10" in result.reason
+
+
 def test_an_incident_from_before_this_run_fails(feed) -> None:
     feed.rows = [_row(1, "injected", minutes_ago=60), _row(2, "folded", minutes_ago=60, duplicate_of=1),
                  _row(3, "folded", minutes_ago=60, duplicate_of=1)]
