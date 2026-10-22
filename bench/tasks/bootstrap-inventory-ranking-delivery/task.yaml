@@ -111,12 +111,12 @@ verification_spec:
     check:
       type: bootstrap_findings
       expected_findings:
-        - { check: sa-key-in-secret, object: invoice-worker }
-        - { check: rbac-cluster-admin, object: release-bot }
+        - { check: static-sa-key, object: invoice-worker }
+        - { check: image-pull-backoff, object: log-shipper }
         - { check: crashloop-backoff, object: quote-api }
         - { check: create-container-config-error, object: pricing-engine }
-        - { check: probes-readiness, object: gift-cards }
-        - { check: no-memory-limit, object: orders-db }
+        - { check: readonly-root-fs, object: gift-cards }
+        - { check: no-resourcequota, object: ledger }
         - { check: managed-prometheus, object: prod-central }
   # Reads the report and INVENTORY.scores.json off the shell sandbox
   # (kube_agents_bench/onboarding.py) and scores the batch with the sandbox's

@@ -161,7 +161,8 @@ For a storm, retest after the time the message gives; for lost pods, once new
 jobs are progressing; for a delegation-ceiling wave, once workers are
 finishing again (the gateway log in a run's artifacts says whether the
 dispatcher stalled); for fixture drift, once the daily reconcile has re-applied
-the stack — a red on a case that depends on the drifted fixture, from a run
+the stack (for `default-pool-headroom`, once seeded-a's default pool has CPU to
+spare again) — a red on a case that depends on the drifted fixture, from a run
 that leased one of those projects, is the fixture's, not the change's; for pool
 drift, once the pool owner has run the repair the issue carries. Who the
 fleet owner, the pool owner and the person who owns the gate are is recorded
@@ -247,7 +248,7 @@ latency (#1586). The wall clock is therefore a note beside the state, never a
 state, and only beside a GREEN one: inside a storm or an outage the long runs
 are the incident's symptom, and the incident's advice stands alone.
 `health.json`'s `slow` is set, while the state is GREEN, when the median wall
-clock of the last 5 full runs — a concluded run of at least one case fewer than `hack/eval/presubmit-cases.txt` lists (13+ today), all five
+clock of the last 5 full runs — a concluded run of at least one case fewer than the presubmit runs (`hack/eval/presubmit-cases.txt` less the inject lane's exclusions), all five
 finished in the last 6 hours — is at least 1.2× the median of the trailing 7
 days' full runs (at least 20 of them), and stays set until that median is back
 under 1.1×. Wall clock is a run's finish minus its start, the digest's
@@ -902,7 +903,13 @@ window, the evidence, and the reconcile — the daily run re-applies
 `hack/fleet_reconcile.py --project` from `main` does it sooner
 (`bench/tf/fleet/README.md`, "State and reconcile"; for `stalled-controller`
 drift where an in-cluster heal started the container, hand-delete the pod in `seeded-stall`
-and replace the Deployment if the condition persists) — and the
+and replace the Deployment if the condition persists; for `default-pool-headroom`, the role
+that asserts seeded-a's default pool keeps 100m unrequested for the next fixtures, the Chat
+message and the health box's advice say that the pool is below that margin and its size in
+`bench/tf/fleet/main.tf` is the fix, rolling project by project if a size change has just
+merged, beside the re-apply line when a planted role drifts too, and the issue carries the
+same exception beside the re-apply paragraph, since a re-apply of a stack that is already
+applied changes nothing) — and the
 line "Filed automatically by the smoke health bot; the daily reconcile re-applies
 the stack in the projects named, and the bot comments here when a scan reads
 them healthy; the bot will not close it." An open

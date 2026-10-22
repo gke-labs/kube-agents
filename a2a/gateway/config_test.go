@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // setBaseEnv pins the required env plus empty values for every optional
@@ -23,6 +24,8 @@ import (
 func setBaseEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("NATS_URL", "nats://127.0.0.1:4222")
+	t.Setenv(lib.EnvNATSCAFile, "")
+	t.Setenv(EnvNATSCAConfigMap, "")
 	t.Setenv("NATS_PASSWORD", "pw")
 	t.Setenv("DISCORD_TOKEN", "x")
 	t.Setenv("SLACK_BOT_TOKEN", "")
@@ -1014,5 +1017,28 @@ func TestDelegationDepthMaxFromEnv(t *testing.T) {
 		} else if !strings.Contains(err.Error(), "A2A_DELEGATION_DEPTH_MAX") {
 			t.Fatalf("A2A_DELEGATION_DEPTH_MAX=%q: error %q does not name the variable", bad, err)
 		}
+	}
+}
+
+// The CA file and its ConfigMap come as a pair: the gateway would connect on
+// the file alone while every session pod it spawned got no CA.
+func TestFromEnvRefusesHalfTheBusTrust(t *testing.T) {
+	for _, tc := range []struct{ file, cm string }{{"/etc/a2a-nats-ca/ca.crt", ""}, {"", "agent-a2a-nats-ca-bundle"}} {
+		setBaseEnv(t)
+		t.Setenv(lib.EnvNATSCAFile, tc.file)
+		t.Setenv(EnvNATSCAConfigMap, tc.cm)
+		if _, err := FromEnv(); err == nil {
+			t.Errorf("FromEnv accepted %s=%q with %s=%q", lib.EnvNATSCAFile, tc.file, EnvNATSCAConfigMap, tc.cm)
+		}
+	}
+	setBaseEnv(t)
+	t.Setenv(lib.EnvNATSCAFile, "/etc/a2a-nats-ca/ca.crt")
+	t.Setenv(EnvNATSCAConfigMap, "agent-a2a-nats-ca-bundle")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatalf("FromEnv refused the pair: %v", err)
+	}
+	if cfg.NATSCAFile != "/etc/a2a-nats-ca/ca.crt" || cfg.NATSCAConfigMap != "agent-a2a-nats-ca-bundle" {
+		t.Errorf("cfg = %q / %q", cfg.NATSCAFile, cfg.NATSCAConfigMap)
 	}
 }

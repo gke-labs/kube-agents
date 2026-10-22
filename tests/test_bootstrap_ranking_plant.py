@@ -54,6 +54,8 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _STACK = _REPO_ROOT / "bench" / "tf" / "prebuilt" / "bootstrap-ranking"
 _MODULE = _STACK / "main.tf"
 _RAW = _STACK / "inventory-raw.txt"
+# Every case's planted report on this stack, which each teardown resolves.
+_PLANTED = [base64.b64encode(raw.read_bytes()).decode() for raw in sorted(_STACK.glob("inventory-raw*.txt"))]
 _CHAT_SCRIPTS = _REPO_ROOT / "agents" / "chat" / "scripts"
 _PLATFORM_SCRIPTS = _REPO_ROOT / "agents" / "platform" / "scripts"
 _HEREDOC_RE = re.compile(r"command\s*=\s*<<-EOT\n(.*?)\n\s*EOT\n", re.S)
@@ -112,6 +114,10 @@ _INTERPOLATIONS = {
         )
     ),
     "local.raw_b64": base64.b64encode(_RAW.read_bytes()).decode(),
+    # Every case's planted report: a leftover teardown resolves whichever case registered.
+    'join(" ", local.planted_b64)': " ".join(
+        base64.b64encode(raw.read_bytes()).decode() for raw in sorted(_STACK.glob("inventory-raw*.txt"))
+    ),
     "local.card_key": "bootstrap-inventory-prioritize",
     "local.card_assignee": "platform",
     "local.card_title": "Prioritize the onboarding inventory report",
@@ -155,7 +161,7 @@ _DESTROY_INTERPOLATIONS = {
     "self.triggers.inventory": _INTERPOLATIONS["local.inventory"],
     "self.triggers.disarm_b64": _INTERPOLATIONS["base64encode(local.disarm_py)"],
     "self.triggers.resolve_b64": _INTERPOLATIONS["base64encode(local.resolve_py)"],
-    "self.triggers.raw_b64": _INTERPOLATIONS["local.raw_b64"],
+    "self.triggers.planted_b64": _INTERPOLATIONS['join(" ", local.planted_b64)'],
 }
 
 # Records every call to $CALLS, tagging the in-pod Python by what it reads, and
@@ -472,6 +478,10 @@ class BootstrapRankingPlantTest(unittest.TestCase):
         self.assertLess(disarm[0], resolve[0])
         self.assertLess(resolve[0], states[1])
         self.assertLess(states[1], self._indices(calls, "[plant pod/platform-agent-shell-0]")[0])
+        # The leftover may be the other case's on this stack, so it resolves every planted report.
+        argv = (self._state / "resolve_argv").read_text().split("\n")
+        self.assertEqual(len(_PLANTED), 2)
+        self.assertEqual(argv, ["/opt/hermes/.venv/bin/python3", "-", *_PLANTED])
 
     def test_a_leftover_arm_that_will_not_tear_down_stops_the_apply(self):
         for fail in ("DISARM_FAIL", "RESOLVE_FAIL"):
@@ -584,7 +594,7 @@ class BootstrapRankingPlantTest(unittest.TestCase):
         self.assertEqual(len(resolve), 1, calls)
         self.assertLess(self._indices(calls, "[disarm]")[0], resolve[0])
         argv = (self._state / "resolve_argv").read_text().split("\n")
-        self.assertEqual(argv, ["/opt/hermes/.venv/bin/python3", "-", _INTERPOLATIONS["local.raw_b64"]])
+        self.assertEqual(argv, ["/opt/hermes/.venv/bin/python3", "-", *_PLANTED])
         archived = self._indices(calls, "archive t_card [archive]")
         self.assertEqual(len(archived), 1, calls)
         self.assertLess(self._indices(calls, "[create]")[0], archived[0])
@@ -701,7 +711,7 @@ class BootstrapRankingPlantTest(unittest.TestCase):
         self.assertEqual(len(resolve), 1)
         self.assertLess(disarm[0], resolve[0])
         argv = (self._state / "resolve_argv").read_text().split("\n")
-        self.assertEqual(argv, ["/opt/hermes/.venv/bin/python3", "-", _INTERPOLATIONS["local.raw_b64"]])
+        self.assertEqual(argv, ["/opt/hermes/.venv/bin/python3", "-", *_PLANTED])
 
     def test_destroy_carries_on_past_a_failed_step_and_names_it(self):
         completed, calls = self._run(
@@ -807,10 +817,10 @@ class ResolveTest(unittest.TestCase):
         self._endpoint = "http://127.0.0.1:%d" % server.server_port
         self._code = _in_pod("resolve_py", {**_IN_POD, "local.scripts": str(_PLATFORM_SCRIPTS)})
 
-    def _resolve(self):
+    def _resolve(self, *reports):
         env = {**os.environ, "FINDINGS_ENDPOINT": self._endpoint, "SESSION_KV_API_KEY": "kv-key"}
         return subprocess.run(
-            [sys.executable, "-", _INTERPOLATIONS["local.raw_b64"]],
+            [sys.executable, "-", *(reports or [_INTERPOLATIONS["local.raw_b64"]])],
             input=self._code, env=env, capture_output=True, text=True, timeout=60,
         )
 
@@ -823,6 +833,21 @@ class ResolveTest(unittest.TestCase):
             self.assertEqual(auth, "Bearer kv-key")
             self.assertEqual(body["outcome"], "resolved")
         self.assertIn("resolved 7 planted finding(s)", out.stdout)
+
+    def test_every_planted_report_passed_is_resolved(self):
+        # The teardowns pass both cases' reports; each report's findings are resolved.
+        import findings_queue
+        import inventory_findings
+
+        out = self._resolve(*_PLANTED)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        every = [
+            findings_queue.derive_finding_id(i["check"], i["project"], i["cluster"], i.get("namespace", ""), i["object"])
+            for raw in sorted(_STACK.glob("inventory-raw*.txt"))
+            for i in inventory_findings.parse_block(raw.read_text())
+        ]
+        self.assertGreater(len(every), len(self._ids))
+        self.assertEqual(sorted(path for path, _, _ in self._seen), sorted(f"/v1/findings/{i}/verified" for i in every))
 
     def test_a_finding_never_registered_is_skipped_and_any_other_refusal_fails(self):
         self._status = {self._ids[0]: 404}

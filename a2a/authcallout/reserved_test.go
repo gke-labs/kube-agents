@@ -92,7 +92,7 @@ func TestANarrowedPodNamedAfterAStaticPrincipalIsRefusedAtConnect(t *testing.T) 
 	names := renderedFixtureAuthUsers(t)
 	h := startHarness(t, sessionMap, reservedPodTokens(names))
 
-	nc, err := nats.Connect(h.url, nats.Token(tokenPodA), nats.CustomInboxPrefix("_INBOX."+podA))
+	nc, err := nats.Connect(h.url, h.tls, nats.Token(tokenPodA), nats.CustomInboxPrefix("_INBOX."+podA))
 	if err != nil {
 		t.Fatalf("a narrowed pod with an ordinary name was refused: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestANarrowedPodNamedAfterAStaticPrincipalIsRefusedAtConnect(t *testing.T) 
 
 	for _, name := range names {
 		t.Run(name, func(t *testing.T) {
-			nc, err := nats.Connect(h.url, nats.Token(reservedPodToken(name)), nats.CustomInboxPrefix("_INBOX."+name))
+			nc, err := nats.Connect(h.url, h.tls, nats.Token(reservedPodToken(name)), nats.CustomInboxPrefix("_INBOX."+name))
 			if err == nil {
 				nc.Close()
 				t.Fatalf("a narrowed pod named %q connected; it would hold %s's inbox", name, name)
@@ -324,7 +324,7 @@ func TestANarrowedPodNamedAfterAnIdentityMapUserIsRefusedAtConnect(t *testing.T)
 	users := renderedFixtureMapUsers(t)
 	h := startHarness(t, renderedFixtureMap(t), reservedPodTokens(users))
 
-	nc, err := nats.Connect(h.url, nats.Token(tokenPodA), nats.CustomInboxPrefix("_INBOX."+podA))
+	nc, err := nats.Connect(h.url, h.tls, nats.Token(tokenPodA), nats.CustomInboxPrefix("_INBOX."+podA))
 	if err != nil {
 		t.Fatalf("a narrowed pod with an ordinary name was refused: %v", err)
 	}
@@ -332,7 +332,7 @@ func TestANarrowedPodNamedAfterAnIdentityMapUserIsRefusedAtConnect(t *testing.T)
 
 	for _, name := range users {
 		t.Run(name, func(t *testing.T) {
-			nc, err := nats.Connect(h.url, nats.Token(reservedPodToken(name)), nats.CustomInboxPrefix("_INBOX."+name))
+			nc, err := nats.Connect(h.url, h.tls, nats.Token(reservedPodToken(name)), nats.CustomInboxPrefix("_INBOX."+name))
 			if err == nil {
 				nc.Close()
 				t.Fatalf("a narrowed pod named %q connected; it would hold %s's inbox", name, name)

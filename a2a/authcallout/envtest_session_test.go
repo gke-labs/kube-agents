@@ -330,7 +330,7 @@ func TestLiveASessionTokenWithNoPodBindingIsRefusedByTheRealCallout(t *testing.T
 	h := startLiveHarness(t)
 
 	unbound := h.mintToken(t, sessionSAName, busAudience)
-	nc, err := nats.Connect(h.nats.ClientURL(), nats.Token(unbound), nats.Name("unbound-session"))
+	nc, err := nats.Connect(h.nats.ClientURL(), h.tls, nats.Token(unbound), nats.Name("unbound-session"))
 	if err == nil {
 		nc.Close()
 		t.Fatal("an unbound token for the session ServiceAccount authenticated to the bus")

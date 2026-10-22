@@ -973,6 +973,30 @@ class CapabilityTest(BrokerCase):
             self.assertFalse(provider.supports_acknowledge(REPO))
 
 
+class LabelsCapabilityTest(BrokerCase):
+    """A forge with no labels says `labels: false`; everything else reads as labels."""
+
+    def test_a_forge_that_says_no_labels_has_none(self):
+        provider = self.provider(capabilities={"forge": "bitbucket", "labels": False, "missing": []})
+        self.assertFalse(provider.supports_labels(REPO))
+
+    def test_a_host_this_install_does_not_serve_is_not_a_forge_without_labels(self):
+        provider = self.provider(capabilities={"forge": "gitlab", "verbs": [], "labels": False, "missing": ["no credential is configured for gitlab.com"]})
+        self.assertTrue(provider.supports_labels(REPO))
+
+    def test_a_broker_older_than_the_field_reads_as_labels(self):
+        # The agent image and the broker image can differ by a release.
+        provider = self.provider(capabilities={"forge": "github", "acknowledge": True, "missing": []})
+        self.assertTrue(provider.supports_labels(REPO))
+
+    def test_capabilities_that_cannot_be_read_read_as_labels(self):
+        # What every forge was taken to have before the field existed.
+        self.broker.refuse["capabilities"] = vcs_client.VcsError("down")
+        provider = forge.provider_for()
+        with self.assertLogs(forge.LOGGER, logging.INFO):
+            self.assertTrue(provider.supports_labels(REPO))
+
+
 # ---- the operations ----------------------------------------------------------
 
 
@@ -998,6 +1022,50 @@ class ListOpenPrsTest(BrokerCase):
         self.assertEqual(pr.author, "kube-agents-bot")
         self.assertEqual(pr.labels, ("bug", "agent:ignore"))
         self.assertTrue(pr.is_ignored)
+
+    def test_on_a_forge_without_labels_a_description_line_opts_out(self):
+        provider = self.provider(
+            capabilities={"forge": "bitbucket", "labels": False, "missing": []},
+            **{
+                "proposal-list": {
+                    "proposals": [
+                        proposal(1, body="Fix.\n\n<!-- agent:ignore -->\n"),
+                        proposal(2, body="Fix.\r\nagent:ignore\r\n"),
+                        proposal(3, body="Do not write agent:ignore inline."),
+                    ]
+                }
+            },
+        )
+        ignored = {pr.number: pr.is_ignored for pr in provider.list_open_prs(REPO)}
+        self.assertEqual({1: True, 2: True, 3: False}, ignored)
+
+    def test_on_a_forge_with_labels_a_description_line_changes_nothing(self):
+        # GitHub and GitLab: the label is the only opt-out, as before.
+        provider = self.provider(
+            capabilities={"forge": "github", "labels": True, "missing": []},
+            **{"proposal-list": {"proposals": [proposal(1, body="agent:ignore")]}},
+        )
+        (pr,) = provider.list_open_prs(REPO)
+        self.assertFalse(pr.is_ignored)
+        self.assertEqual((), pr.labels)
+
+    def test_unreadable_capabilities_keep_a_parked_proposal_parked(self):
+        # Review: answering "has labels" on a failed read swept a proposal a
+        # person had parked on a forge with no labels.
+        self.broker.refuse["capabilities"] = vcs_client.VcsError("down")
+        self.broker.answers["proposal-list"] = {
+            "proposals": [proposal(1, body="agent:ignore"), proposal(2, body="Fix.")]
+        }
+        provider = forge.provider_for()
+        with self.assertLogs(forge.LOGGER, logging.INFO):
+            ignored = {pr.number: pr.is_ignored for pr in provider.list_open_prs(REPO)}
+        self.assertEqual({1: True, 2: False}, ignored)
+
+    def test_no_description_line_means_no_capabilities_call(self):
+        # A forge with labels makes exactly the calls it made before.
+        provider = self.provider(**{"proposal-list": {"proposals": [proposal(1, body="Fix.")]}})
+        provider.list_open_prs(REPO)
+        self.assertEqual([], self.broker.payloads("capabilities"))
 
     def test_the_head_repository_is_what_tells_a_fork_from_this_one(self):
         """`sourceRepo` is the first of the three things `is_agent_pull_request` checks."""

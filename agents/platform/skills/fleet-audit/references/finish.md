@@ -74,7 +74,7 @@ gives its `started_at` and `finished_at`. A timer without its input is absent. T
   `comments could not be read`). Not a clean result; report it as
   [The clean run](clean-run.md#the-clean-run) says.
 - `{"status":"NO_FORGE","issue_url":null,…,"findings":4,"critical":2,"no_forge":"…","summary":"…"}`
-  — no forge is configured, so nothing was published; see
+  — no forge is configured, or the broker cannot reach the repository, so nothing was published; see
   [No forge configured](#no-forge-configured).
 
 Add `--dry-run` to validate and print the rendered ledger body — and every PR body it _would_ open —
@@ -161,7 +161,14 @@ for the full rule.
 ### No forge configured
 
 An install with no GitOps repository registered in `$GITOPS_STATE_CONFIGMAP` (and no `--repo`) has
-no forge to write a ledger to. The audit runs anyway:
+no forge to write a ledger to. A run whose repository the broker cannot reach (the forge says that it
+does not exist, or that the credential cannot read it) is the same: its `no_forge` note names the
+repository and the reason, and the JSON line of `finish` carries them under `unreachable_repo`. The
+check is one issue listing that `start` makes through the broker, and `finish` follows its result.
+The run does not choose another repository, and it is never silent (`silent_ok: false`). A run for
+which several repositories are managed and none can be chosen (none has `role: gitops`) is the same
+too: its note gives the reason and the fix, and the JSON line carries it under
+`no_repository_chosen`. The audit runs anyway:
 
 - `start` skips the credential, the labels and the ledger lookup, and prints `"mode": "none"`,
   `"repo": null`, `"issue": null`, a `no_forge` note, and a `workspace` path to an empty directory. Pass that `workspace` to the collector as the SOP says. There is no repository, so
@@ -170,14 +177,19 @@ no forge to write a ledger to. The audit runs anyway:
 - Run every check as the SOP says and write the findings document as usual. A `manifest`
   remediation is still a valid way to describe a fix, but nothing opens it as a pull request.
 - `finish` validates the document as usual, then writes it to the report store instead of a ledger
-  and prints `status: "NO_FORGE"`, `issue_url: null`, `new` and `resolved` against the previous
-  no-forge run, `findings`, `critical`, the `no_forge` note, and `summary`. A previous finding the
-  collector still flags is held, as on a ledger: it stays in the store and is not resolved. If the
-  store write fails, the note and the summary say so.
+  and prints `status: "NO_FORGE"`, `issue_url: null`, `new`, `resolved`, `findings`, `critical`,
+  the `no_forge` note, and `summary`. If the store write fails, the note and the summary say so.
+- On an install with no repository, `new` and `resolved` are against the previous no-forge run, and
+  a previous finding the collector still flags is held, as on a ledger: it stays in the store and is
+  not resolved.
+- On a run whose repository could not be reached, or for which no repository could be chosen,
+  the change is unknown: `new` and `resolved` are 0, nothing is held, and `silent_ok` is false. An
+  unreachable repository's report is stored under that repository; a run with no repository chosen
+  is stored as a run with no forge.
 
 **Report.** `status: "NO_FORGE"` replaces the SOP's report lines, which all name a ledger URL that
 does not exist. `silent_ok` decides silence as usual: on a scheduled run, `silent_ok: true` → exactly
 `[SILENT]`. Otherwise, and on every on-demand run, your final response is `summary` verbatim. It
 names the most severe findings with the object each one is about, the ids held for the collector,
-the coverage gaps, and that no forge is configured. Do not report the run as
+the coverage gaps, and that no forge is configured or which repository could not be reached. Do not report the run as
 failed, and do not invent an issue URL.

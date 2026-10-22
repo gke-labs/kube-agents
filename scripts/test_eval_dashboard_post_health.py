@@ -1932,6 +1932,15 @@ class FixtureDrift(RunHarness):
     def environ(self):
         return {post_health.SPACE_ENV: SPACE, post_health.TOKEN_ENV: TOKEN, **GH_ENV}
 
+    def test_a_headroom_drift_points_at_the_pool_size_not_at_a_re_apply(self):
+        rc, err = self.tick(fixture_drift(roles=("default-pool-headroom",)), T14, environ=self.environ())
+        self.assertEqual(rc, 0, err)
+        text = self.opener.texts[0]
+        self.assertIn("seeded fixture default-pool-headroom out of designed state on 3 pool projects", text)
+        self.assertNotIn("re-applied", text)
+        self.assertNotIn(post_health.FIXTURE_RECONCILE_HINT, text)
+        self.assertIn(post_health.FIXTURE_CAPACITY_HINT, text)
+
     def test_a_new_drift_condition_posts_once_and_files_the_fleet_owner_issue(self):
         rc, err = self.tick(fixture_drift(evidence=[f"{DRIFT_ROLE} drifted on 3 pool project(s) (kube-agents-evals-1, kube-agents-evals-2, kube-agents-evals-3) at the 13:00 UTC scan"]), T14, environ=self.environ())
         self.assertEqual(rc, 0, err)
