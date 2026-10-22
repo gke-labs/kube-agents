@@ -60,6 +60,15 @@ var controlTexts = map[string]string{
 	actionHelp:       helpText,
 }
 
+// actionSynonyms are the original client's other spellings, accepted so its
+// prompts keep working; they are not offered in the schema.
+var actionSynonyms = map[string]string{
+	"start":  actionSessionOn,
+	"end":    actionSessionOff,
+	"remove": actionDelete,
+	"prune":  "clear_killed",
+}
+
 // droppedActions are the original client's manage_session actions this server
 // does not offer. They are kept out of the schema but answered by name, since
 // that client's prompts may still call them.
@@ -76,6 +85,8 @@ type manageSessionArgs struct {
 	Conversation      string `json:"conversation"`
 	ConversationToken string `json:"conversation_token"`
 	Description       string `json:"description"`
+	// Alias is the original client's name for conversation.
+	Alias string `json:"alias"`
 }
 
 // ManageSessionTool lists, creates and forgets conversation aliases, and sends
@@ -89,10 +100,9 @@ func ManageSessionTool(bus TurnBus, convs *Conversations) Tool {
 				"ask what is running (status), or ask for help. Names are this server's memory only; " +
 				"a conversation resumes by its token after a restart.",
 			InputSchema: map[string]any{
-				"type":     "object",
-				"required": []string{"action"},
+				"type": "object",
 				"properties": map[string]any{
-					"action": map[string]any{"type": "string", "enum": []string{
+					"action": map[string]any{"type": "string", "description": "Default: " + actionList + ".", "enum": []string{
 						actionList, actionNew, actionDelete, actionSessionOn, actionSessionOff, actionStatus, actionHelp,
 					}},
 					"conversation": map[string]any{"type": "string", "description": "The conversation's name. new: the name to create " +
@@ -109,6 +119,18 @@ func ManageSessionTool(bus TurnBus, convs *Conversations) Tool {
 			var a manageSessionArgs
 			if err := json.Unmarshal(orEmptyObject(raw), &a); err != nil {
 				return "", fmt.Errorf("arguments: %w", err)
+			}
+			if a.Conversation == "" {
+				a.Conversation = a.Alias
+			}
+			// As the original client had it: no action lists, and its other
+			// spellings mean what they meant there.
+			a.Action = strings.ToLower(strings.TrimSpace(a.Action))
+			if a.Action == "" {
+				a.Action = actionList
+			}
+			if canonical, ok := actionSynonyms[a.Action]; ok {
+				a.Action = canonical
 			}
 			if text, ok := controlTexts[a.Action]; ok {
 				return sendAndWait(ctx, bus, convs, a.Conversation, a.ConversationToken, text, controlWait)

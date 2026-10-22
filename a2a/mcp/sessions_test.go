@@ -228,6 +228,27 @@ func TestManageSessionControlActionsSendTheirText(t *testing.T) {
 	}
 }
 
+// The original client's spellings still work: no action lists, start and end
+// are session_on and session_off, remove is delete, prune is answered as the
+// dropped clear_killed, and alias names the conversation.
+func TestManageSessionTakesTheOriginalSpellings(t *testing.T) {
+	s, convs, frames := sessionServer(t)
+	token, _ := convs.Resolve("ops", "")
+	mustContain(t, mustSucceed(t, callTool(t, s, ToolManageSession, map[string]any{})), "`ops`")
+	for action, text := range map[string]string{"start": sessionOnText, "END": sessionOffText} {
+		n := len(frames.all())
+		mustSucceed(t, callTool(t, s, ToolManageSession, map[string]any{"action": action, "alias": "ops"}))
+		if got := frames.all()[n:]; len(got) != 1 || got[0] != (sentFrame{token, text}) {
+			t.Errorf("%s sent %+v, want one %q on %s", action, got, text, token)
+		}
+	}
+	mustSucceed(t, callTool(t, s, ToolManageSession, map[string]any{"action": "remove", "alias": "ops"}))
+	if again, _ := convs.Resolve("ops", ""); again == token {
+		t.Error("remove did not forget the name")
+	}
+	mustFail(t, callTool(t, s, ToolManageSession, map[string]any{"action": "prune"}), "cannot see session pods")
+}
+
 // The original client's dropped actions are answered by name, not as unknown.
 func TestManageSessionAnswersDroppedActions(t *testing.T) {
 	s, _ := busless(t)
@@ -260,7 +281,7 @@ func TestManageSessionAnswersDroppedActions(t *testing.T) {
 func TestManageSessionRefusesBadInput(t *testing.T) {
 	s, _, frames := sessionServer(t)
 	for name, args := range map[string]map[string]any{
-		"no action":               {},
+		"a name past the cap":     {"action": actionNew, "conversation": strings.Repeat("n", maxAliasRunes+1)},
 		"an unknown action":       {"action": "steer"},
 		"new with a token":        {"action": actionNew, "conversation": "x", "conversation_token": "mcpabc"},
 		"delete without a name":   {"action": actionDelete},

@@ -180,6 +180,9 @@ var ErrConversationExists = errors.New("conversation already exists")
 // already in use rather than handing back its conversation: a caller asking
 // for a new conversation must not find itself continuing someone else's.
 func (c *Conversations) Create(alias, description string) (string, error) {
+	if err := checkAlias(alias); err != nil {
+		return "", err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if _, ok := c.byAlias[alias]; ok {
