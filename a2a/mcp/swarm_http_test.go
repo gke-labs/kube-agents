@@ -17,6 +17,7 @@ import (
 	"testing"
 	"testing/iotest"
 	"time"
+	"unicode/utf8"
 
 	"github.com/nats-io/nats.go/jetstream"
 
@@ -927,5 +928,41 @@ func TestTheSwarmReadBoundsWhatATaskKeeps(t *testing.T) {
 	}
 	if prompts > maxSwarmReadBytes || !read.bytesCapped {
 		t.Errorf("kept %d prompt bytes under a %d cap (capped=%v)", prompts, maxSwarmReadBytes, read.bytesCapped)
+	}
+}
+
+// A task waiting on input carries its question and the question's stream
+// sequence into the projection: the latest input-required message, text
+// only and capped.
+func TestTheSwarmReadCarriesATasksQuestion(t *testing.T) {
+	url, js := testBus(t)
+	publishSubmission(t, js, "s-triage", "t-ask", consoleConversationPrefix+convTriage, "turn", "")
+	ask := func(text string) {
+		msg := &lib.Message{Role: "agent", MessageID: "m-" + text[:3], Parts: []lib.Part{{Kind: "text", Text: text}, {Kind: "data", Data: json.RawMessage(`{"x":1}`)}}}
+		p := mustJSON(t, lib.StatusUpdate{TaskID: "t-ask", ContextID: "ctx", Status: lib.TaskStatus{State: lib.StateInputRequired, Message: msg}})
+		env, err := lib.NewStatusUpdateEnvelope(executor("s-triage"), "t-ask", "ctx", "corr", p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pub(t, js, lib.TaskEventsSubject("s-triage", "t-ask"), env)
+	}
+	ask("Which namespace first?")
+	ask("Delete the pod " + strings.Repeat("x", maxSwarmQuestionRunes))
+	read, err := dial(t, url).swarmTasks(context.Background(), time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(read.tasks) != 1 || read.tasks[0].Question == nil {
+		t.Fatalf("tasks %+v; want one carrying its question", read.tasks)
+	}
+	q := read.tasks[0]
+	if len(q.Question.Parts) != 1 || !strings.HasPrefix(q.Question.Parts[0].Text, "Delete the pod") {
+		t.Errorf("question = %+v; want the latest one, text parts only", q.Question.Parts)
+	}
+	if n := utf8.RuneCountInString(q.Question.Parts[0].Text); n > maxSwarmQuestionRunes+8 {
+		t.Errorf("question kept %d runes, cap %d", n, maxSwarmQuestionRunes)
+	}
+	if q.QuestionSeq == 0 {
+		t.Error("the question's stream sequence was not carried")
 	}
 }

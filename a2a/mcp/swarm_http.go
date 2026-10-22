@@ -517,8 +517,9 @@ func (b *NATSBus) swarmTasks(ctx context.Context, since time.Time) (swarmRead, e
 			return
 		}
 		var at time.Time
+		var seq uint64
 		if md, err := msg.Metadata(); err == nil {
-			at = md.Timestamp
+			at, seq = md.Timestamp, md.Sequence.Stream
 		}
 		ref := TaskRef{Addressee: addressee, TaskID: taskID}
 		if !at.IsZero() && at.Before(since) {
@@ -542,6 +543,7 @@ func (b *NATSBus) swarmTasks(ctx context.Context, since time.Time) (swarmRead, e
 			order = append(order, rd)
 		}
 		if class != lib.TaskClassIn {
+			noteQuestion(rd, env, seq)
 			keepEvent(rd, env, len(msg.Data()))
 			return
 		}
@@ -614,4 +616,33 @@ func (b *NATSBus) swarmTasks(ctx context.Context, since time.Time) (swarmRead, e
 		read.tasks = append(read.tasks, t)
 	}
 	return read, derr
+}
+
+// maxSwarmQuestionRunes caps the text kept of a task's input-required
+// question; the projection shortens it further for display.
+const maxSwarmQuestionRunes = 4096
+
+// noteQuestion records the task's latest input-required status message and
+// its stream sequence, which the fold does not keep but the projection posts
+// and keys on. Only its text parts are kept, capped: a question is shown as
+// text, and the event it came in is charged against the byte cap already.
+func noteQuestion(rd *swarmTaskRead, env *lib.Envelope, seq uint64) {
+	if env.Kind != lib.KindStatusUpdate {
+		return
+	}
+	var su lib.StatusUpdate
+	if json.Unmarshal(env.Payload, &su) != nil || su.Status.State != lib.StateInputRequired || su.Status.Message == nil {
+		return
+	}
+	q := &lib.Message{Role: su.Status.Message.Role, MessageID: su.Status.Message.MessageID}
+	left := maxSwarmQuestionRunes
+	for _, p := range su.Status.Message.Parts {
+		if p.Text == "" || left <= 0 {
+			continue
+		}
+		t := swarmCapRunes(p.Text, left)
+		left -= utf8.RuneCountInString(t)
+		q.Parts = append(q.Parts, lib.Part{Kind: p.Kind, Text: t})
+	}
+	rd.task.Question, rd.task.QuestionSeq = q, seq
 }
