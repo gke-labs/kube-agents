@@ -80,8 +80,8 @@ const maxSwarmPromptRunes = 4096
 // maxSwarmRefBytes caps a conversation reference kept from a submission.
 const maxSwarmRefBytes = 256
 
-// capRunes cuts s to at most n runes.
-func capRunes(s string, n int) string {
+// swarmCapRunes cuts s to at most n runes.
+func swarmCapRunes(s string, n int) string {
 	if utf8.RuneCountInString(s) <= n {
 		return s
 	}
@@ -569,7 +569,7 @@ func (b *NATSBus) swarmTasks(ctx context.Context, since time.Time) (swarmRead, e
 		if a.Via != nil && lib.ValidSubjectToken(a.Via.TaskID) {
 			via = a.Via.TaskID
 		}
-		text = capRunes(text, maxSwarmPromptRunes)
+		text = swarmCapRunes(text, maxSwarmPromptRunes)
 		if kept+len(text) > maxSwarmReadBytes {
 			text = ""
 			read.bytesCapped = true
