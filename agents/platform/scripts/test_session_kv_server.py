@@ -2266,7 +2266,7 @@ class TestWorkloadIncidentFold(unittest.TestCase):
 
     def test_only_a_4xx_reads_as_a_refused_turn(self):
         import urllib.error
-        for code, started in ((400, False), (404, False), (500, True), (503, True)):
+        for code, started in ((307, True), (400, False), (404, False), (500, True), (503, True)):
             with patch("urllib.request.urlopen", side_effect=urllib.error.HTTPError("http://gw", code, "x", {}, None)):
                 self.assertEqual(session_kv_server._start_agent_turn("http://gw", "s", "q", {}), started, code)
         with patch("urllib.request.urlopen", side_effect=TimeoutError("read timed out")):

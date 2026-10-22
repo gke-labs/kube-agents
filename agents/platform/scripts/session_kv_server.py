@@ -538,8 +538,9 @@ ALERT_DAILY_LIMITS = {
 
 # How long an admitted event holds its workload's incident open: within this
 # many seconds of it, a later Warning-or-worse event for the same (cluster,
-# namespace, object kind, workload) is recorded as a duplicate of it and starts
-# no triage, posts nothing and spends no alert budget. The watcher deduplicates
+# namespace, object kind, fold key) is recorded as a duplicate of it and starts
+# no triage, posts nothing and spends no alert budget; a Critical is folded only
+# into a Critical (_workload_incident_anchor). The watcher deduplicates
 # on (object UID, reason), so without this every replica of a broken Deployment,
 # every replacement pod and every reason in a cascade opens a triage of its own.
 # The window runs from the anchor, not from the latest duplicate, so a new pod
@@ -560,8 +561,8 @@ DEPLOYMENT_POD_NAME_RE = re.compile(r"^(.*?)-[a-f0-9]{8,10}-[a-z0-9]{5}$")
 # The severity get_severity_details grades a blocker, which folds only into an
 # anchor of its own grade (_workload_incident_anchor).
 CRITICAL_SEVERITY = "Critical"
-# A refused turn: the gateway answered and said no. A 5xx can come after the
-# turn already filed its card, and a 2xx other than 200 is an acceptance.
+# A refused turn is a 4xx: the gateway answered and said no. A 5xx can come
+# after the turn already filed its card (_start_agent_turn).
 HTTP_CLIENT_ERROR_MIN = 400
 HTTP_SERVER_ERROR_MIN = 500
 # Bounds the anchor lookup's wait on a locked database, as the other ledger
@@ -2862,10 +2863,14 @@ def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[s
     """Post the agent query request to execute the diagnostic reasoning loop.
 
     False only when the gateway refused the turn with a 4xx. Anything else is
-    True: a transport error or a 5xx may come after the turn started (the
-    route is synchronous, so a model failure late in the turn surfaces here
-    after the front door filed its card), and reading it as refused would let
-    a sibling open a second triage beside it (mark_triage_not_started).
+    True. The route (Hermes `_handle_session_chat`) runs its checks before the
+    turn and answers a failed one with a 4xx; its one pre-turn 500 is for a
+    model lock this caller never requests. A 5xx otherwise comes out of
+    `_run_agent`, after the turn started and possibly after the front door
+    filed its card, and a transport error may be a turn that outlived the
+    timeout. Reading either as refused would let a sibling open a second
+    triage beside it (mark_triage_not_started). A gateway that is down fails
+    `_create_gateway_session` first, which does release the anchor.
     """
     try:
         req = urllib.request.Request(
@@ -2874,13 +2879,13 @@ def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[s
             headers=headers,
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=300.0) as resp:
-            if resp.status >= HTTP_CLIENT_ERROR_MIN:
-                logger.error(f"Gateway API chat execution failed (status {resp.status})")
-                return resp.status >= HTTP_SERVER_ERROR_MIN
+        # urlopen raises HTTPError for every non-2xx, so a returned response
+        # is an accepted turn.
+        with urllib.request.urlopen(req, timeout=300.0):
+            pass
     except urllib.error.HTTPError as exc:
         logger.error(f"Gateway API chat execution failed (status {exc.code})")
-        return exc.code >= HTTP_SERVER_ERROR_MIN
+        return not HTTP_CLIENT_ERROR_MIN <= exc.code < HTTP_SERVER_ERROR_MIN
     except Exception as exc:
         logger.error(f"Failed to call gateway API chat execution: {exc}")
     return True

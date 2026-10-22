@@ -469,9 +469,9 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
             if not excluded:
                 suppressed_info += count
         elif event.get("duplicate_of") is not None:
-            # Folded into an earlier alert for the same workload
-            # (INCIDENT_WORKLOAD_DEDUP_SECONDS in session_kv_server.py): that
-            # alert went to chat, and the ceiling withheld nothing.
+            # Folded into an incident already admitted for the same workload
+            # (INCIDENT_WORKLOAD_DEDUP_SECONDS in session_kv_server.py): the
+            # ceiling withheld nothing, whatever became of the anchor's post.
             pass
         else:
             cap_dropped += 1
@@ -502,9 +502,11 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         # without it, the two merge and the pair is listed as two withheld
         # events or as none, while the 📉 total counts one.
         #
-        # A folded row takes its anchor's outcome: it is one more sighting of
-        # an alert that went out, not a second, withheld one, and keyed on its
-        # own `notified = 0` one folded workload would read as two groups.
+        # A folded row is keyed as one that went out: its incident was
+        # admitted, so it is not a second, withheld alert, and keyed on its own
+        # `notified = 0` one folded workload would read as two groups. It
+        # joins its anchor's group only when the reason, severity and the
+        # anchor's delivery match.
         went_out = bool(event.get("notified")) or event.get("duplicate_of") is not None
         group_key = f"{cluster}/{ns}/{workload}/{reason}/{severity}/{int(went_out)}"
         if cap_row:

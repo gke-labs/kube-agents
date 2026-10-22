@@ -214,7 +214,7 @@ Three properties of the listing follow from what a suppressed event is:
   `notified = 1` on informational events, so for a day or two after an upgrade a group can hold both
   outcomes; the key splits them rather than announcing a delivered event under a heading that says
   it never arrived. A row folded into its workload's open incident is keyed as one that went out,
-  since its incident did.
+  since its incident was admitted.
 
 ## What this recap does not report
 
