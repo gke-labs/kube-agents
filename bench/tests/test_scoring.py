@@ -1168,6 +1168,24 @@ def test_a_delegation_ceiling_with_nothing_delivered_is_its_own_infra_class(tofu
     assert INFRA_FAILURE_MARKER not in verdict.reps[0].reason
 
 
+def test_an_unsettled_card_ceiling_marker_classifies_infra_with_unsettled_reason(tofu_spec, make_run):
+    """An unsettled failure card unblocked at settle leads with DELEGATION_CEILING_MARKER
+    and explains that delegated cards unblocked to non-terminal at settle without delivering."""
+    def at_unsettled(rec):
+        rec["errors"] = [
+            f"{DELEGATION_CEILING_MARKER}: delegated task t1 was reported blocked during wait but running at settle; nothing delivered"
+        ]
+        rec["scores"]["VerificationCorrectness"] = 0.0
+
+    run = make_run(mutate=at_unsettled)
+    verdict = grade_case(tofu_spec, [run], admitted=True)
+    assert verdict.rung is Rung.INFRA
+    assert verdict.reps[0].outcome == "infra"
+    assert verdict.reps[0].reason.startswith(DELEGATION_CEILING_MARKER)
+    assert "delegated cards unblocked to non-terminal at settle without delivering a result" in verdict.reps[0].reason
+    assert "t1 was reported blocked during wait but running at settle" in verdict.reps[0].reason
+
+
 def test_a_ceiling_hit_after_a_partial_delivery_still_grades(tofu_spec, make_run):
     """No marker, no carve-out: a fan-out that delivered some results is graded
     on what arrived, exactly as before."""

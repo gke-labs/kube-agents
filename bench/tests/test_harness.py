@@ -1902,6 +1902,13 @@ def instant_polls(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def no_telemetry_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate telemetry and proxy log environment variables from developer shell."""
+    monkeypatch.delenv("LITELLM_LOG_PATH", raising=False)
+    monkeypatch.delenv("ARTIFACTS", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def no_cluster_exec(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """Keep settling a card off whatever cluster kubectl is pointed at.
 
@@ -4407,6 +4414,10 @@ def test_a_needs_input_card_unblocked_and_running_at_settle_remains_graded(
                 }
                 return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
             elif idx == 1:
+                # Status turn 1's needed_read for t1 (reported blocked) fails,
+                # so the settle read below is the one that sees the board.
+                return ""
+            elif idx == 2:
                 # Settle read: failure_cards is [t1]. Board shows t1 was unblocked and is running with needs_input
                 payload = {
                     "statuses": {t1: "running"},
@@ -4462,6 +4473,10 @@ def test_a_card_blocked_during_wait_and_done_at_settle_remains_graded(
                 }
                 return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
             elif idx == 1:
+                # Status turn 1's needed_read for t1 (reported blocked) fails,
+                # so the settle read below is the one that sees the board.
+                return ""
+            elif idx == 2:
                 # Settle read: card finished and is done
                 payload = {
                     "statuses": {t1: "done"},
@@ -4540,10 +4555,10 @@ def test_worker_acted_and_delivered_before_sibling_429_rate_limit_remains_graded
     assert not result.metadata.get("infra_failure")
 
 
-def test_worker_acted_with_tool_calls_before_429_rate_limit_remains_graded(
+def test_worker_with_tool_calls_before_429_rate_limit_is_infrastructure(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
 ) -> None:
-    """When a worker executed tool actions before hitting 429 quota exhaustion, the rep stays graded."""
+    """When a worker executed tool actions before hitting 429 quota exhaustion without delivery, the rep is marked infra."""
     t1 = _TASK_ID
     stub_agent.turns = [
         _create_turn(),
@@ -4581,9 +4596,45 @@ def test_worker_acted_with_tool_calls_before_429_rate_limit_remains_graded(
 
     result = KubeAgentsHarness().run("Investigate incident.")
 
+    assert any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any("delegated worker hit infrastructure failure (rate_limit)" in e for e in result.errors)
+    assert result.output == ""
+    assert result.metadata.get("infra_failure")
+
+
+def test_litellm_log_with_429_in_token_count_or_latency_does_not_corroborate(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """A log with 429 appearing only as a substring in token counts or latencies does not match word-boundary 429 pattern."""
+    log_file = tmp_path / "litellm.log"
+    log_file.write_text('INFO: 200 OK POST /v1/chat/completions {"prompt_tokens": 14293, "latency_ms": 1429, "request_id": "a429f"}\n')
+    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("failed", block_kind="transient"),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {
+                    _TASK_ID: f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=rate_limit): 429 quota exhausted"
+                },
+                "errors": {},
+                "block_kinds": {_TASK_ID: "transient"},
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Investigate.")
+
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
-    assert any("delegated worker failed (rate_limit)" in e for e in result.errors)
-    assert not result.metadata.get("infra_failure")
+    assert any("platform proxy log showed no 429" in e for e in result.errors)
 
 
 def test_worker_fabricated_transient_block_without_platform_429_remains_graded(

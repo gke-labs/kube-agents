@@ -55,6 +55,8 @@ FORGE_ENV_VARS = (
 def _no_forge_from_the_shell(monkeypatch):
     for name in FORGE_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("LITELLM_LOG_PATH", raising=False)
+    monkeypatch.delenv("ARTIFACTS", raising=False)
 
 
 FIXTURE_RUNS = Path(__file__).parent / "fixtures" / "runs"

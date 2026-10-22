@@ -640,9 +640,21 @@ _FAILURE_STATUSES = frozenset({"blocked", "triage", "failed"})
 _RATE_LIMIT_REASON_PREFIX = "provider rate limit: API retries exhausted"
 _FAILURE_REASON_PATTERN = re.compile(r"\bfailure_reason=([a-zA-Z0-9_]+)\b")
 _LITELLM_429_PATTERN = re.compile(
-    r"429|RESOURCE_EXHAUSTED|Too Many Requests|RateLimitError|quota exceeded|API retries exhausted",
+    r"\b(?:429|RESOURCE_EXHAUSTED|Too Many Requests|RateLimitError|quota exceeded|API retries exhausted)\b",
     re.IGNORECASE,
 )
+_MAX_LITELLM_LOG_READ = 2 * 1024 * 1024
+
+
+def _scan_log_for_429(path: Path) -> bool:
+    try:
+        size = path.stat().st_size
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            if size > _MAX_LITELLM_LOG_READ:
+                f.seek(size - _MAX_LITELLM_LOG_READ)
+            return bool(_LITELLM_429_PATTERN.search(f.read()))
+    except OSError:
+        return False
 
 
 def _extract_infra_failure_reason(text: str | None) -> str | None:
@@ -669,19 +681,13 @@ def _corroborate_platform_rate_limit(timeout: float = 10.0) -> bool:
     """
     path = os.environ.get("LITELLM_LOG_PATH")
     if path:
-        try:
-            return bool(_LITELLM_429_PATTERN.search(Path(path).read_text(errors="replace")))
-        except OSError:
-            return False
+        return _scan_log_for_429(Path(path))
 
     artifacts = os.environ.get(_ARTIFACTS_ENV)
     if artifacts:
         art_path = Path(artifacts) / "litellm.log"
         if art_path.is_file():
-            try:
-                return bool(_LITELLM_429_PATTERN.search(art_path.read_text(errors="replace")))
-            except OSError:
-                return False
+            return _scan_log_for_429(art_path)
 
     return True
 
@@ -1350,7 +1356,8 @@ def _record_ceiling(
     marker routes it to its own class in the scorer rather than a graded
     failure of the agent under test. A partial delivery keeps the plain report
     and grades on what arrived. Both delegation waits end their deadline path
-    here, so the two transports cannot drift on what the scorer reads.
+    here, so the two transports cannot drift on what the scorer reads. (Unsettled
+    unblocked cards at settle also produce this marker via ``_record_unsettled``).
     """
     if not outstanding:
         return
@@ -3402,9 +3409,7 @@ class KubeAgentsHarness(AgentHarness):
             for tid, text in delivered_results(observed, awaited).items()
             if reported.get(tid) not in _FAILURE_STATUSES and not _extract_infra_failure_reason(text)
         }
-        worker_acted = bool(
-            successful_deliveries or (captured is not None and bool(captured.entries))
-        )
+        worker_acted = bool(successful_deliveries)
         if infra_reason:
             if opening_turn and not worker_acted:
                 _mark_result_infra_failure(
