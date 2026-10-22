@@ -228,11 +228,17 @@ and a manifest you add declares its object, so merging it keeps the object.
    `namespaces/<name>/` directory (Config Sync's hierarchical layout), or an
    Argo CD `Application` with `CreateNamespace=true` deploying into it. Any of
    those counts as declared. The search matches the key anywhere on the line,
-   so JSON and flow-style manifests are found too:
+   so JSON and flow-style manifests are found too. Search only the target
+   cluster's directory (`clusters/<cluster>/`, or the path its reconciler
+   syncs): the same name under another cluster's directory is another
+   cluster's object. When the repository has no per-cluster layout and the
+   name is declared in more than one place, or you cannot tell which
+   directory is the target's, stop and name each file; never remove a
+   declaration you have not tied to the target cluster:
 
    ```bash
-   grep -rlE "[\"' {,]?(name|namespace|targetNamespace)[\"']?: *[\"']?<name>[\"']?([ ,}#]|$)" <workspace>
-   find <workspace> -type d -path "*/namespaces/<name>"
+   grep -rlE "[\"' {,]?(name|namespace|targetNamespace)[\"']?: *[\"']?<name>[\"']?([ ,}#]|$)" <workspace>/clusters/<cluster>
+   find <workspace>/clusters/<cluster> -type d -path "*/namespaces/<name>"
    ```
 
 3. **The repository declares it.** A delete needs the user's confirmation
@@ -252,17 +258,21 @@ and a manifest you add declares its object, so merging it keeps the object.
      parent `kustomization.yaml` names in its `resources:` (for example
      `- gitops-owned-scratch/` in `clusters/<cluster>/namespaces/kustomization.yaml`)
      loses that one line in the same pull request; left in, the parent no
-     longer renders and the whole synced path stops applying. Find it with
-     `grep -rn -- "- <name>/\?$" <workspace>`, edit only that line, and name
-     the edit in the body.
+     longer renders and the whole synced path stops applying. Read the parent
+     directory's `kustomization.yaml` `resources:` list itself (an entry may
+     be `<name>/`, `./<name>`, `<name>/<file>.yaml` or part of a flow list),
+     remove only the entries that name what this pull request removes, and
+     name the edit in the body.
    - **A shared declaration is a stop.** A `kustomization.yaml`, Argo CD
-     `Application` or Flux `Kustomization` that also creates objects outside
-     the request, or a `namespaces/<name>/` directory with namespaces under it
+     `Application`, Flux `Kustomization` or Flux `HelmRelease` that also
+     creates objects outside the request, or a `namespaces/<name>/` directory with namespaces under it
      (Config Sync's hierarchical abstract namespace), would delete those too.
      Stop with: "`<file>` also declares `<other objects>`; removing it would
      delete them as well. I have changed nothing." Never remove an
-     `Application`: with its resources finalizer, deleting it deletes
-     everything it deploys.
+     `Application` or a `HelmRelease`: an Application's resources finalizer
+     deletes everything it deploys, and helm-controller uninstalls a removed
+     release, cluster-scoped objects included. A request that would need one
+     removed is a stop that names it.
 
    Then continue with Step 3. A delete's pull request body ends with what
    step 5 read about the reconciler, in place of the template's closing line
