@@ -1331,6 +1331,8 @@ gateway) when no chat backend is configured, so the operator no longer withholds
 zero, and a backend taken away leaves the same gateway running on the console. `NoChatBackend` is no
 longer written; an install upgraded from an operator that wrote it has its zero-replica gateway
 scaled back to one, and the condition stays, as `WaitingForReplica`, until that replica is ready.
+Where that operator never created the gateway, the condition clears on the first pass and Ready
+waits on the new gateway.
 The paragraphs above are the history._
 
 ## The Google Chat adapter (added 9/5)
