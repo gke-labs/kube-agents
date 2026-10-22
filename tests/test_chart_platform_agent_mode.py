@@ -43,6 +43,17 @@ _REQUIRED = [
 ]
 
 
+_PROFILES_SOURCE = "# Source: kube-agents/templates/profiles-namespace.yaml"
+
+
+def _split_profiles_namespace(stdout: str) -> tuple:
+    """The render without the profile namespace's document, and that document."""
+    docs = stdout.split("\n---\n")
+    keep = [d for d in docs if _PROFILES_SOURCE not in d]
+    taken = [d for d in docs if _PROFILES_SOURCE in d]
+    return "\n---\n".join(keep), "\n---\n".join(taken)
+
+
 def _render(*extra: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["helm", "template", "kube-agents", str(_CHART), "--namespace", "kubeagents-system", *_REQUIRED, *extra],
@@ -111,9 +122,13 @@ class ModeRenderTest(unittest.TestCase):
                 out = _render("--set", f"platformAgent.mode={mode}")
                 self.assertEqual(out.returncode, 0, out.stderr)
                 self.assertEqual(_cr(out.stdout)["spec"]["mode"], mode)
+                # next also renders the AgentProfile namespace (#3655), its own
+                # document; set it aside and the CR's diff is still one line.
+                rendered, profiles = _split_profiles_namespace(out.stdout)
+                self.assertEqual(bool(profiles), mode == "next", profiles)
                 changed = [
                     line
-                    for line in difflib.unified_diff(self.default.splitlines(), out.stdout.splitlines(), lineterm="", n=0)
+                    for line in difflib.unified_diff(self.default.splitlines(), rendered.splitlines(), lineterm="", n=0)
                     if line[:1] in "+-" and not line.startswith(("+++", "---"))
                 ]
                 self.assertEqual(changed, [f'+  mode: "{mode}"'])

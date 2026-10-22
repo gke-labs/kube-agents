@@ -2583,7 +2583,8 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 // buildA2ANATSNetworkPolicy governs ingress to the NATS pod. Without it every
 // pod in the cluster reaches 4222/8222/9222 while the deny-by-default bus
 // grants do the real refusing; with it the network layer agrees with the
-// grants: 4222 from exactly the enumerated bus clients, 9222 from exactly the
+// grants: 4222 from exactly the enumerated bus clients (and every pod in the
+// AgentProfile namespace, once that namespace's own fence is in place), 9222 from exactly the
 // console server, nothing else.
 //
 // 8222 (monitor) gets no pod-network peer at all, decided rather than
@@ -2679,6 +2680,10 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 						labelPartOf:       a2aPartOf,
 						a2aComponentLabel: "seed",
 					}}},
+					// Profile pods: every pod in the profile namespace,
+					// whose own fence keeps them to the bus, LiteLLM and
+					// DNS (agentprofile_namespace.go).
+					profileNamespacePeer(agent),
 				}, a2aOperatorNATSPeers()...),
 			}, {
 				// 9222 from the console server alone. See the doc comment
@@ -4997,8 +5002,18 @@ func (r *PlatformAgentReconciler) a2aSessionDNSClusterIPs(ctx context.Context, a
 // gateway section there); the refusal path has no use for it.
 func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (gatewayFenced bool, err error) {
 	dnsClusterIPs := r.a2aSessionDNSClusterIPs(ctx, agent)
+	// The profile namespace's fence goes first, and the bus admits that
+	// namespace only once the fence is in place (agentprofile_namespace.go).
+	profileFenced, err := r.reconcileProfileFence(ctx, agent, dnsClusterIPs)
+	if err != nil {
+		return false, err
+	}
+	nats := buildA2ANATSNetworkPolicy(agent)
+	if !profileFenced {
+		withoutProfilePeer(nats, agent)
+	}
 	fences := []*networkingv1.NetworkPolicy{
-		buildA2ANATSNetworkPolicy(agent),
+		nats,
 		buildA2ASessionNetworkPolicy(agent, dnsClusterIPs),
 		buildA2AVerifierNetworkPolicy(agent, dnsClusterIPs),
 		buildA2AConsoleNetworkPolicy(agent),
@@ -5169,6 +5184,12 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	}
 	if err := r.applyManaged(ctx, agent, quota); err != nil {
 		return state, fmt.Errorf("failed to apply A2A session ResourceQuota: %w", err)
+	}
+
+	// The profile namespace's quota. The chart creates the namespace; until
+	// it exists this renders nothing. Its fence is reconcileA2ANetworkFences'.
+	if err := r.reconcileProfileQuota(ctx, agent); err != nil {
+		return state, err
 	}
 
 	// Jobs are immutable, so the provision Job is create-if-absent under its
@@ -6301,6 +6322,13 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		if err := r.deleteOwnedA2AObject(ctx, agent, entry.obj, entry.reader); err != nil {
 			return err
 		}
+	}
+
+	// What this agent rendered into the profile namespace, which carries no
+	// owner reference (agentprofile_namespace.go). Before the bus, like the
+	// other fences' consumers.
+	if err := r.deleteProfileNamespaceObjects(ctx, agent); err != nil {
+		return err
 	}
 
 	// 2. The callout's ClusterRoleBinding. Cluster-scoped, so it carries no

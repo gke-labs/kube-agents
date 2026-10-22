@@ -854,6 +854,14 @@ platformAgent:
       # maxSessions caps the A2A session pods a "next" install runs at once;
       # the operator's default applies when it is unset, and "today" ignores it.
       # maxSessions: 10
+      # profiles sizes AgentProfile work on a "next" install: ceiling is the most
+      # profile tasks running at once across every profile (default 8), and
+      # warmReplicas the warm workers kept per interactive (profile, tier)
+      # (default 1). The <release namespace>-profiles namespace's pod quota is
+      # the warm workers, a surge pod per warm pool, and the ceiling.
+      # profiles:
+      #   ceiling: 8
+      #   warmReplicas: 1
       # platform:
       #   apiMaxRetries: 8
       #   maxTurns: 200

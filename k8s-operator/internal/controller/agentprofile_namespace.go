@@ -1,0 +1,306 @@
+package controller
+
+import (
+	"context"
+	"fmt"
+	"reflect"
+
+	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+)
+
+// The profile namespace (#3655; #3660, "Execution"). Profile worker pods and
+// their ServiceAccounts run in a namespace of their own, <agent-ns>-profiles,
+// so profile work never takes a session slot: the session quota counts every
+// pod in the agent's namespace. The chart creates the namespace, next to the
+// release namespace, and the operator never does: creating and deleting
+// Namespaces is a cluster-scoped grant that can't be narrowed by name on
+// create, which is more than a controller should hold for one namespace it
+// knows the name of. What the operator renders inside it (the quota and the
+// network policy here, the identities and pods later) carries no owner
+// reference, because one can't point across namespaces. Uninstalling the
+// release deletes the namespace and everything in it.
+
+// The markers the chart puts on the profile namespace, which the operator
+// requires before it treats a namespace of that name as the profile
+// namespace. Anyone who can create a Namespace could create one with this
+// name first, and its pods would then be admitted to the bus and LiteLLM.
+// The markers can be copied by such a creator, so they are not a guarantee.
+// What they stop is a namespace that merely shares the name, and Helm
+// refuses to install over a namespace it doesn't own, so a squatted name
+// shows up as a failed install. A kustomize or hand install sets them too.
+const (
+	profileNamespaceComponent      = "profiles"
+	helmReleaseNamespaceAnnotation = "meta.helm.sh/release-namespace"
+	profileNamespaceComponentLabel = "app.kubernetes.io/component"
+)
+
+// profileNamespaceName is the namespace profile work runs in.
+func profileNamespaceName(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Namespace + "-profiles"
+}
+
+// resolveProfileCeiling is spec.harness.tuning.profiles.ceiling, defaulted.
+func resolveProfileCeiling(agent *agentv1alpha1.PlatformAgent) int {
+	if t := agentTuning(agent); t != nil && t.Profiles != nil && t.Profiles.Ceiling != nil {
+		return *t.Profiles.Ceiling
+	}
+	return agentv1alpha1.DefaultProfileCeiling
+}
+
+// resolveProfileWarmReplicas is spec.harness.tuning.profiles.warmReplicas,
+// defaulted.
+func resolveProfileWarmReplicas(agent *agentv1alpha1.PlatformAgent) int {
+	if t := agentTuning(agent); t != nil && t.Profiles != nil && t.Profiles.WarmReplicas != nil {
+		return *t.Profiles.WarmReplicas
+	}
+	return agentv1alpha1.DefaultProfileWarmReplicas
+}
+
+// interactiveProfileTiers counts the warm pools the profiles need: one per
+// (profile, tier) whose tier is interactive. Read is the only interactive
+// tier until tiers are CR data (#3659).
+func interactiveProfileTiers(profiles []agentv1alpha1.AgentProfile) int {
+	n := 0
+	for i := range profiles {
+		for _, tier := range profiles[i].AllowedTierList() {
+			if tier == agentv1alpha1.AgentProfileTierRead {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// profileQuotaHard is the profile namespace's quota, one entry per key.
+//
+// pods covers the three kinds of pod the namespace runs: the warm workers
+// (warmReplicas for each interactive (profile, tier)), one rollout surge pod
+// per warm pool, and the unattended tier's Job pods, which the dispatcher
+// holds to the ceiling. Interactive tasks run in the warm workers, so they
+// add no pods. Like the session quota, the key is `pods`, which counts
+// non-terminal pods only. It is the only key for now; requests.cpu and
+// requests.memory join the map once the sizing budget gives them values,
+// and adding one is a line here.
+func profileQuotaHard(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) map[corev1.ResourceName]int64 {
+	pools := interactiveProfileTiers(profiles)
+	return map[corev1.ResourceName]int64{
+		corev1.ResourcePods: int64(pools*resolveProfileWarmReplicas(agent) + pools + resolveProfileCeiling(agent)),
+	}
+}
+
+func profileQuotaName(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Name + "-profile-quota"
+}
+
+func buildProfileQuota(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) *corev1.ResourceQuota {
+	hard := corev1.ResourceList{}
+	for key, n := range profileQuotaHard(agent, profiles) {
+		hard[key] = *resource.NewQuantity(n, resource.DecimalSI)
+	}
+	return &corev1.ResourceQuota{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ResourceQuota"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      profileQuotaName(agent),
+			Namespace: profileNamespaceName(agent),
+			Labels:    a2aLabels(agent, "profile-quota"),
+		},
+		Spec: corev1.ResourceQuotaSpec{Hard: hard},
+	}
+}
+
+func profileNetpolName(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Name + "-profile-netpol"
+}
+
+// buildProfileNetworkPolicy fences every pod in the profile namespace: no
+// ingress, and egress to DNS, the bus and LiteLLM only, the same allowlist a
+// session pod has. The credential proxy joins it with the worker PR, together
+// with the proxy's own allowed callers, so neither half lands without the
+// other.
+func buildProfileNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsClusterIPs []string) *networkingv1.NetworkPolicy {
+	return &networkingv1.NetworkPolicy{
+		TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      profileNetpolName(agent),
+			Namespace: profileNamespaceName(agent),
+			Labels:    a2aLabels(agent, "profile-netpol"),
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{},
+			PolicyTypes: []networkingv1.PolicyType{
+				networkingv1.PolicyTypeIngress,
+				networkingv1.PolicyTypeEgress,
+			},
+			Egress: []networkingv1.NetworkPolicyEgressRule{
+				{
+					Ports: []networkingv1.NetworkPolicyPort{udpPort(a2aDNSPort), tcpPort(a2aDNSPort)},
+					To:    clusterDNSPeers(dnsClusterIPs),
+				},
+				{
+					Ports: []networkingv1.NetworkPolicyPort{tcpPort(a2aNATSClientPort)},
+					To: []networkingv1.NetworkPolicyPeer{
+						namespacedPodPeer(agent.Namespace, map[string]string{
+							labelPartOf:       a2aPartOf,
+							a2aComponentLabel: "nats",
+						}),
+					},
+				},
+				{
+					Ports: []networkingv1.NetworkPolicyPort{
+						tcpPort(a2aLiteLLMServicePort),
+						tcpPort(a2aLiteLLMUpstreamPort),
+						tcpPort(a2aLiteLLMContainerPort),
+					},
+					To: []networkingv1.NetworkPolicyPeer{
+						namespacedPodPeer(agent.Namespace, map[string]string{"app": "litellm"}),
+					},
+				},
+			},
+		},
+	}
+}
+
+// profileNamespacePeer admits every pod in the profile namespace, for the
+// ingress policies of what profile pods reach (the bus and LiteLLM). The
+// profile namespace's own fence is what keeps those pods to that list.
+func profileNamespacePeer(agent *agentv1alpha1.PlatformAgent) networkingv1.NetworkPolicyPeer {
+	return networkingv1.NetworkPolicyPeer{
+		NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+			corev1.LabelMetadataName:       profileNamespaceName(agent),
+			profileNamespaceComponentLabel: profileNamespaceComponent,
+		}},
+	}
+}
+
+// profileNamespaceExists reads the profile namespace. A namespace that
+// doesn't exist is an install the chart didn't make it for (a CR applied by
+// hand, or a chart from before #3655): profile work renders nothing there,
+// and the operator never creates it.
+func (r *PlatformAgentReconciler) profileNamespaceExists(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
+	var ns corev1.Namespace
+	if err := r.Get(ctx, types.NamespacedName{Name: profileNamespaceName(agent)}, &ns); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read the profile namespace %s: %w", profileNamespaceName(agent), err)
+	}
+	if ns.Labels[profileNamespaceComponentLabel] != profileNamespaceComponent || ns.Annotations[helmReleaseNamespaceAnnotation] != agent.Namespace {
+		logf.FromContext(ctx).Info("a namespace has the profile namespace's name without the chart's markers; treating it as absent",
+			"namespace", ns.Name, "want label", profileNamespaceComponentLabel+"="+profileNamespaceComponent,
+			"want annotation", helmReleaseNamespaceAnnotation+"="+agent.Namespace)
+		return false, nil
+	}
+	return true, nil
+}
+
+// reconcileProfileFence applies the profile namespace's fence, and reports
+// whether one is in place. reconcileA2ANetworkFences calls it ahead of the
+// fences that admit the profile namespace, on the refusal path as well as
+// the render path, and admits the namespace only when this returns true: a
+// policy that lets profile pods reach the bus is never applied over pods
+// their own fence doesn't yet confine.
+func (r *PlatformAgentReconciler) reconcileProfileFence(ctx context.Context, agent *agentv1alpha1.PlatformAgent, dnsClusterIPs []string) (bool, error) {
+	exists, err := r.profileNamespaceExists(ctx, agent)
+	if err != nil || !exists {
+		if err == nil {
+			logf.FromContext(ctx).V(1).Info("profile namespace absent; the chart creates it, and profile work renders nothing until it exists",
+				"namespace", profileNamespaceName(agent))
+		}
+		return false, err
+	}
+	if err := r.applyManaged(ctx, agent, buildProfileNetworkPolicy(agent, dnsClusterIPs)); err != nil {
+		return false, fmt.Errorf("failed to apply the profile NetworkPolicy: %w", err)
+	}
+	return true, nil
+}
+
+// profileFenced reports whether the profile namespace's fence is in place,
+// for a policy applied outside reconcileA2ANetworkFences (LiteLLM's).
+func (r *PlatformAgentReconciler) profileFenced(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
+	var np networkingv1.NetworkPolicy
+	err := r.Get(ctx, types.NamespacedName{Namespace: profileNamespaceName(agent), Name: profileNetpolName(agent)}, &np)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// withoutProfilePeer drops the profile namespace from np's ingress, and any
+// rule left with no peer, for a pass where the profile fence isn't in place.
+func withoutProfilePeer(np *networkingv1.NetworkPolicy, agent *agentv1alpha1.PlatformAgent) {
+	want := profileNamespacePeer(agent)
+	var rules []networkingv1.NetworkPolicyIngressRule
+	for _, rule := range np.Spec.Ingress {
+		var from []networkingv1.NetworkPolicyPeer
+		for _, peer := range rule.From {
+			if !reflect.DeepEqual(peer, want) {
+				from = append(from, peer)
+			}
+		}
+		if len(rule.From) > 0 && len(from) == 0 {
+			continue
+		}
+		rule.From = from
+		rules = append(rules, rule)
+	}
+	np.Spec.Ingress = rules
+}
+
+// reconcileProfileQuota renders the quota into the profile namespace, when
+// it exists.
+func (r *PlatformAgentReconciler) reconcileProfileQuota(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	exists, err := r.profileNamespaceExists(ctx, agent)
+	if err != nil || !exists {
+		return err
+	}
+	profiles, err := boundAgentProfiles(ctx, r.Client, agent)
+	if err != nil {
+		return fmt.Errorf("list the AgentProfiles for the profile quota: %w", err)
+	}
+	if err := r.applyManaged(ctx, agent, buildProfileQuota(agent, profiles)); err != nil {
+		return fmt.Errorf("failed to apply the profile ResourceQuota: %w", err)
+	}
+	return nil
+}
+
+// deleteProfileNamespaceObjects removes what this agent rendered into the
+// profile namespace, for the flip back to today. Those objects carry no
+// owner reference, so nothing else reclaims them, and an install that
+// isn't running next should look like it never did. An object of that name
+// that this agent's labels don't mark as its own is left to its owner, like
+// the callout's unowned ClusterRoleBinding.
+func (r *PlatformAgentReconciler) deleteProfileNamespaceObjects(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	ns := profileNamespaceName(agent)
+	for _, entry := range []struct {
+		obj       client.Object
+		reader    client.Reader
+		component string
+	}{
+		{&corev1.ResourceQuota{ObjectMeta: metav1.ObjectMeta{Name: profileQuotaName(agent), Namespace: ns}}, r.a2aReader(), "profile-quota"},
+		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: profileNetpolName(agent), Namespace: ns}}, r.Client, "profile-netpol"},
+	} {
+		if err := entry.reader.Get(ctx, client.ObjectKeyFromObject(entry.obj), entry.obj); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return err
+		}
+		labels := entry.obj.GetLabels()
+		if labels[labelInstance] != instanceLabel(agent.Namespace, agent.Name) || labels[a2aComponentLabel] != entry.component {
+			continue
+		}
+		if err := r.Delete(ctx, entry.obj); client.IgnoreNotFound(err) != nil {
+			return fmt.Errorf("delete %s/%s: %w", ns, entry.obj.GetName(), err)
+		}
+	}
+	return nil
+}

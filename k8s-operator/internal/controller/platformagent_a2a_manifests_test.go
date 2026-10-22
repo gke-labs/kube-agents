@@ -1048,8 +1048,15 @@ func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 		{labelPartOf: a2aPartOf, a2aComponentLabel: "provision"},
 		{labelPartOf: a2aPartOf, a2aComponentLabel: "seed"},
 	}
-	if len(rule.From) != len(wantPeers) {
-		t.Fatalf("expected %d peers, got %d: %+v", len(wantPeers), len(rule.From), rule.From)
+	// After the same-namespace pods, one namespace-crossing peer: every pod
+	// in the profile namespace (#3655). That namespace's own fence keeps
+	// its pods to the bus, LiteLLM and DNS, and the bus grants do the rest.
+	if len(rule.From) != len(wantPeers)+1 {
+		t.Fatalf("expected %d peers, got %d: %+v", len(wantPeers)+1, len(rule.From), rule.From)
+	}
+	if profile := rule.From[len(wantPeers)]; profile.PodSelector != nil || profile.IPBlock != nil || profile.NamespaceSelector == nil ||
+		!reflect.DeepEqual(profile.NamespaceSelector.MatchLabels, map[string]string{corev1.LabelMetadataName: "test-ns-profiles", "app.kubernetes.io/component": "profiles"}) {
+		t.Errorf("the last 4222 peer = %+v, want every pod in namespace test-ns-profiles, carrying the chart's component label", profile)
 	}
 	for i, want := range wantPeers {
 		peer := rule.From[i]

@@ -98,6 +98,8 @@ const (
 // Ingress:
 //   - Port 8080 from pods in the same namespace (the agent and sidecars)
 //   - Port 8080 from gke-gmp-system namespace (Prometheus scraping)
+//   - Port 8080 from the AgentProfile namespace, on next installs, once that
+//     namespace's own fence is in place (agentprofile_namespace.go)
 //
 // Egress:
 //   - Port 53 (UDP/TCP) to kube-dns, node-local-dns, 169.254.20.10/32, 169.254.169.254/32,
@@ -135,6 +137,15 @@ func buildLiteLLMNetworkPolicy(agent *agentv1alpha1.PlatformAgent, profile netpo
 				},
 			},
 		},
+	}
+
+	// Profile pods, from their own namespace, on next installs where they
+	// exist (agentprofile_namespace.go).
+	if a2aStackRendering(agent) {
+		ingressRules = append(ingressRules, networkingv1.NetworkPolicyIngressRule{
+			Ports: []networkingv1.NetworkPolicyPort{tcpPort(litellmPort)},
+			From:  []networkingv1.NetworkPolicyPeer{profileNamespacePeer(agent)},
+		})
 	}
 
 	dnsPeers := []networkingv1.NetworkPolicyPeer{
@@ -518,6 +529,13 @@ func (r *PlatformAgentReconciler) reconcileLiteLLMNetworkPolicy(ctx context.Cont
 	}
 
 	netpol := buildLiteLLMNetworkPolicy(agent, profile)
+	// LiteLLM admits the profile namespace only once that namespace's own
+	// fence is in place (agentprofile_namespace.go).
+	if fenced, err := r.profileFenced(ctx, agent); err != nil {
+		return err
+	} else if !fenced {
+		withoutProfilePeer(netpol, agent)
+	}
 	if agent.Spec.Telemetry != nil && agent.Spec.Telemetry.OTLPEndpoint != "" && otlpCollectorNamespace(agent.Spec.Telemetry.OTLPEndpoint) == "" {
 		if litellmOTLPCollectorNamespace(agent) == "" {
 			// Not a warning: an external endpoint on port 443 is a supported shape, and the
