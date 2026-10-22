@@ -1226,7 +1226,10 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		// between. A fence left behind only restricts, and the chart's
 		// uninstall removes the namespace with it.
 		if err := r.deleteProfileQuota(ctx, agent); err != nil {
-			return ctrl.Result{}, err
+			// A stale quota only caps a successor of another name, and the
+			// chart's uninstall removes the namespace; it never holds the
+			// finalizer.
+			r.profileNamespaceFailure(ctx, agent, "delete the quota on deletion", err)
 		}
 
 		// Delete managed litellm-policy during finalizer teardown only if Deployment/litellm
@@ -3167,7 +3170,12 @@ func (r *PlatformAgentReconciler) reconcileAgentNetworkGuardrails(ctx context.Co
 	}
 	if a2aStackRendering(agent) {
 		if _, _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
-			errs = append(errs, err)
+			var pnErr *profileNamespaceError
+			if goerrors.As(err, &pnErr) {
+				r.profileNamespaceFailure(ctx, agent, "fence", pnErr.err)
+			} else {
+				errs = append(errs, err)
+			}
 		}
 	}
 	if err := r.reconcileLiteLLMNetworkPolicy(ctx, agent, netpolProf); err != nil {

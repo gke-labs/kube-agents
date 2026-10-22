@@ -369,9 +369,28 @@ func agentOfProfileFence(obj client.Object) (types.NamespacedName, bool) {
 	return types.NamespacedName{Namespace: ns, Name: name}, true
 }
 
-// profileNamespaceError marks a failure confined to the profile namespace,
-// which reconcileA2A records and returns after the rest of the stack has
-// rendered, rather than stopping on it.
+// The profile namespace is optional (absent renders nothing), so a failure
+// confined to it never blocks work in the agent's own namespace: the
+// render, the status, the teardown and the finalizer all carry on, and the
+// failure is logged. Each site that touches the profile namespace follows
+// that one rule, through profileNamespaceFailure, which logs it and writes a Warning Event. A status condition
+// naming the failure comes with the worker PR, when something there is
+// something a user would notice.
+func (r *PlatformAgentReconciler) profileNamespaceFailure(ctx context.Context, agent *agentv1alpha1.PlatformAgent, what string, err error) {
+	logf.FromContext(ctx).Error(err, "profile namespace: "+what+"; the agent's own namespace carries on",
+		"namespace", profileNamespaceName(agent))
+	r.recordEvent(agent, corev1.EventTypeWarning, reasonProfileNamespaceFailed,
+		fmt.Sprintf("profile namespace %s: %s failed: %v", profileNamespaceName(agent), what, err))
+}
+
+// reasonProfileNamespaceFailed is the Warning Event a failure confined to
+// the profile namespace writes on the PlatformAgent, so it shows in
+// kubectl describe until a status condition carries it.
+const reasonProfileNamespaceFailed = "ProfileNamespaceFailed"
+
+// profileNamespaceError marks a failure confined to the profile namespace
+// coming out of reconcileA2ANetworkFences, so its callers can log it rather
+// than stop on it.
 type profileNamespaceError struct{ err error }
 
 func (e *profileNamespaceError) Error() string { return e.err.Error() }

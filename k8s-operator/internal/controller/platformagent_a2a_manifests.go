@@ -5074,15 +5074,14 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 // function assumes the answer was ModeNext.
 //
 // A failure confined to the profile namespace (its fence or its quota
-// refused, say by an admission policy scoped there) doesn't stop the rest of
-// the stack: the namespace is optional, and the agent's own namespace must
-// keep rendering. The error is returned once the render is done, unless
-// something else failed first.
+// refused, say by an admission policy scoped there) is logged and doesn't
+// stop the stack, the status writes or the requeue terms: the namespace is
+// optional (agentprofile_namespace.go, profileNamespaceFailure).
 func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (a2aProvisionState, error) {
 	var profileErr error
 	state, err := r.reconcileA2AStack(ctx, agent, &profileErr)
-	if err == nil && profileErr != nil {
-		err = fmt.Errorf("the profile namespace %s: %w", profileNamespaceName(agent), profileErr)
+	if profileErr != nil {
+		r.profileNamespaceFailure(ctx, agent, "render", profileErr)
 	}
 	return state, err
 }
@@ -6366,7 +6365,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// The profile namespace's quota, which carries no owner reference
 	// (agentprofile_namespace.go). Its fence goes after the bus below.
 	if err := r.deleteProfileQuota(ctx, agent); err != nil {
-		return err
+		r.profileNamespaceFailure(ctx, agent, "delete the quota on the flip to today", err)
 	}
 
 	// 2. The callout's ClusterRoleBinding. Cluster-scoped, so it carries no
@@ -6416,7 +6415,9 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// when it re-rendered for today). Before the sentinel, so a failed delete
 	// leaves cleanup to resume.
 	if err := r.deleteProfileFence(ctx, agent); err != nil {
-		return err
+		// A fence left behind only restricts; it keeps counting as a
+		// sentinel, so later passes retry it without holding the bus.
+		r.profileNamespaceFailure(ctx, agent, "delete the fence on the flip to today", err)
 	}
 
 	// 5. LAST, deliberately: the StatefulSet is this function's sentinel. The

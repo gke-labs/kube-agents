@@ -436,8 +436,8 @@ func TestAProfileFenceFailureStillAppliesTheOtherFences(t *testing.T) {
 }
 
 // A refusal confined to the profile namespace doesn't stop the rest of the
-// stack rendering: the console and the session quota still land, and
-// the error comes back naming the profile namespace.
+// stack rendering, and isn't returned: the console and the session quota
+// still land, and the pass goes on to the status writes.
 func TestAProfileNamespaceRefusalDoesNotStopTheRender(t *testing.T) {
 	cfg, scheme := startEnvtestConfig(t)
 	c, err := client.NewWithWatch(cfg, client.Options{Scheme: scheme})
@@ -467,9 +467,8 @@ func TestAProfileNamespaceRefusalDoesNotStopTheRender(t *testing.T) {
 		},
 	})
 	r := &PlatformAgentReconciler{Client: refusing, Scheme: scheme}
-	_, err = r.reconcileA2A(ctx, agent)
-	if err == nil || !strings.Contains(err.Error(), profileNamespaceName(agent)) {
-		t.Fatalf("reconcileA2A = %v, want the refusal, naming the profile namespace", err)
+	if _, err := r.reconcileA2A(ctx, agent); err != nil && strings.Contains(err.Error(), "refused by a policy in the profile namespace") {
+		t.Fatalf("reconcileA2A returned the profile namespace's refusal (%v); it is logged, not returned", err)
 	}
 	var q corev1.ResourceQuota
 	if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aSessionQuotaName(agent)}, &q); err != nil {
@@ -481,5 +480,56 @@ func TestAProfileNamespaceRefusalDoesNotStopTheRender(t *testing.T) {
 	var console appsv1.Deployment
 	if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aConsoleName(agent)}, &console); err != nil {
 		t.Errorf("the console, after the fences, was not rendered: %v", err)
+	}
+}
+
+// LiteLLM's apply site withholds the peer on a profile-namespace read error
+// and applies the policy anyway, returning nothing.
+func TestLiteLLMWithholdsThePeerOnAProfileReadError(t *testing.T) {
+	cfg, scheme := startEnvtestConfig(t)
+	c, err := client.NewWithWatch(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	if err := c.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: agent.Namespace}}); err != nil {
+		t.Fatal(err)
+	}
+	labels := map[string]string{"app": "litellm"}
+	if err := c.Create(ctx, &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: litellmDeploymentName, Namespace: agent.Namespace},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: labels},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "litellm", Image: "litellm:1"}}},
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	failing := interceptor.NewClient(c, interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*corev1.Namespace); ok && key.Name == profileNamespaceName(agent) {
+				return fmt.Errorf("throttled")
+			}
+			return cl.Get(ctx, key, obj, opts...)
+		},
+	})
+	r := &PlatformAgentReconciler{Client: failing, Scheme: scheme}
+	if err := r.reconcileLiteLLMNetworkPolicy(ctx, agent, netpolProfile{Generated: true, DNSClusterIPs: []string{"10.96.0.10"}}); err != nil {
+		t.Fatalf("LiteLLM policy with a failing profile read = %v, want it logged and the policy applied", err)
+	}
+	var np networkingv1.NetworkPolicy
+	if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: litellmNetworkPolicyName}, &np); err != nil {
+		t.Fatalf("the LiteLLM policy was not applied: %v", err)
+	}
+	for _, rule := range np.Spec.Ingress {
+		for _, peer := range rule.From {
+			if peer.NamespaceSelector != nil && peer.NamespaceSelector.MatchLabels[corev1.LabelMetadataName] == profileNamespaceName(agent) {
+				t.Error("LiteLLM admits the profile namespace though its fence couldn't be read")
+			}
+		}
 	}
 }

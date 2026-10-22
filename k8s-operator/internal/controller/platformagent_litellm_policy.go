@@ -535,9 +535,13 @@ func (r *PlatformAgentReconciler) reconcileLiteLLMNetworkPolicy(ctx context.Cont
 	// fence is in place (agentprofile_namespace.go). Asked only where the
 	// peer renders, so a today install pays no reads for it.
 	if a2aAgentSurface(agent) {
-		if fenced, err := r.profileFenced(ctx, agent); err != nil {
-			return err
-		} else if !fenced {
+		fenced, err := r.profileFenced(ctx, agent)
+		if err != nil {
+			// Read failures withhold the peer, the safe direction, and stop
+			// nothing else (profileNamespaceFailure).
+			r.profileNamespaceFailure(ctx, agent, "read for LiteLLM's policy", err)
+		}
+		if !fenced {
 			withoutProfilePeer(netpol, agent)
 		}
 	}

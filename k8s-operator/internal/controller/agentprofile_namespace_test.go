@@ -2,7 +2,12 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"k8s.io/client-go/tools/record"
 	"reflect"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -290,5 +295,52 @@ func TestWithoutProfilePeer(t *testing.T) {
 	withoutProfilePeer(open, agent)
 	if len(open.Spec.Ingress) != 1 {
 		t.Error("a rule with no peers (allow from anywhere) was dropped; only one the profile peer emptied may be")
+	}
+}
+
+// A refused delete in the profile namespace holds neither the finalizer nor
+// the flip's teardown: both carry on and log it.
+func TestAProfileDeleteRefusalHoldsNothing(t *testing.T) {
+	scheme := setupScheme()
+	refuse := interceptor.Funcs{
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			if obj.GetNamespace() == "test-ns-profiles" {
+				return fmt.Errorf("refused by a policy in the profile namespace")
+			}
+			return c.Delete(ctx, obj, opts...)
+		},
+	}
+	// Deletion: the finalizer comes off.
+	agent := a2aTestAgent()
+	agent.Finalizers = []string{platformAgentFinalizer}
+	quota := buildProfileQuota(agent, nil)
+	withCommonLabels(quota, agent)
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, quota).WithInterceptorFuncs(refuse).Build()
+	events := record.NewFakeRecorder(8)
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: events}
+	if _, err := r.handleDeletion(context.Background(), agent); err != nil {
+		t.Fatalf("handleDeletion with a refused profile delete = %v, want it logged", err)
+	}
+	select {
+	case ev := <-events.Events:
+		if !strings.Contains(ev, "Warning "+reasonProfileNamespaceFailed) || !strings.Contains(ev, "test-ns-profiles") {
+			t.Errorf("event %q, want a %s Warning naming the profile namespace", ev, reasonProfileNamespaceFailed)
+		}
+	default:
+		t.Error("no Warning Event for the refused profile delete")
+	}
+	var got agentv1alpha1.PlatformAgent
+	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name}, &got); err == nil && len(got.Finalizers) > 0 {
+		t.Errorf("the finalizer is still on the agent (%v) after a refused profile delete", got.Finalizers)
+	}
+	// The flip to today: cleanupA2A returns nothing for it.
+	today := a2aTestAgent()
+	today.Spec.Mode = ptr.To("today")
+	fence := buildProfileNetworkPolicy(today, nil)
+	withCommonLabels(fence, today)
+	cl = fake.NewClientBuilder().WithScheme(scheme).WithObjects(today, fence).WithInterceptorFuncs(refuse).Build()
+	r = &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	if err := r.cleanupA2A(context.Background(), today); err != nil {
+		t.Errorf("cleanupA2A with a refused profile delete = %v, want it logged", err)
 	}
 }
