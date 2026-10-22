@@ -190,7 +190,7 @@ Filed automatically by the smoke health bot; edit freely. Fix PRs: reference thi
 FIXTURE_DRIFT_TITLE = "Seeded fleet drift: {roles} out of designed state on {projects} pool {noun} since {since}"
 PROJECT_NOUN = ("project", "projects")
 FIXTURE_DRIFT_BODY = """\
-The seeded fleet's fixture role(s) below are present but not in the state the cases depend on, on the pool projects named, and have been so on two consecutive hourly scans or on three projects at once. Nothing in the presubmit runs this check and nothing acts on a drift (decision 2026-09-14: evals v1 detects, does not act), so the cases that depend on a drifted role run against it and red on every run that leases one of these projects; that red is the fixture's, not the pull request's, and a retest is worth it only after the re-apply below.
+The seeded fleet's fixture role(s) below are present but not in the state the cases depend on, on the pool projects named, and have been so on two consecutive hourly scans or on three projects at once. Nothing in the presubmit runs this check and nothing acts on a drift (decision 2026-09-14: evals v1 detects, does not act), so the cases that depend on a drifted role run against it and red on every run that leases one of these projects; that red is the fixture's, not the pull request's, and a retest is worth it only after the repair below.
 
 **Drifted roles**
 
@@ -205,7 +205,7 @@ The seeded fleet's fixture role(s) below are present but not in the state the ca
 
 {evidence}
 
-**Reconcile:** the daily `ci-kube-agents-fleet-reconcile-daily` run re-applies `bench/tf/fleet` in each project named (08:30 UTC; `docs/ci-pool-projects.md` 6.2), and the scan after it confirms. To repair sooner, run `python3 hack/fleet_reconcile.py --project <project>` from a `main` checkout under a Boskos lease (`bench/tf/fleet/README.md`, "State and reconcile"); never apply a branch. (For `stalled-controller` drift where the workload started during an in-cluster heal, re-apply plans no changes: delete the pod in `seeded-stall` and if the condition reason remains `NewReplicaSetAvailable`, replace the Deployment rather than `rollout restart`.)
+**Reconcile:** the daily `ci-kube-agents-fleet-reconcile-daily` run re-applies `bench/tf/fleet` in each project named (08:30 UTC; `docs/ci-pool-projects.md` 6.2), and the scan after it confirms. To repair sooner, run `python3 hack/fleet_reconcile.py --project <project>` from a `main` checkout under a Boskos lease (`bench/tf/fleet/README.md`, "State and reconcile"); never apply a branch. (For `stalled-controller` drift where the workload started during an in-cluster heal, re-apply plans no changes: delete the pod in `seeded-stall` and if the condition reason remains `NewReplicaSetAvailable`, replace the Deployment rather than `rollout restart`. `default-pool-headroom` is the other exception: it reads capacity, not an unapplied stack; while seeded-a's default pool is below the 100m headroom margin the scan keeps for the next fixtures, a re-apply changes nothing and the pool's size in `bench/tf/fleet/main.tf`, `seeded_a_default`, is the fix: if a size change has just merged, the postsubmit reconcile is rolling it project by project and the scans clear as it lands.)
 
 Incident brief: {brief}
 

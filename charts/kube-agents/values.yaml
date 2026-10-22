@@ -677,6 +677,22 @@ platformAgent:
   # the CR by hand with kubectl is left alone while this stays null, because
   # Helm patches only the fields its renders differ in.
   mode: null
+  storage:
+    # The PlatformAgent's spec.storage.size: the request of the agent's
+    # <name>-data claim and of the shell sandbox's data claim. The operator
+    # requests the same size for both. null, the default, leaves the field out
+    # of the CR, and the operator default applies (50Gi). Raising it expands both
+    # existing claims online where their StorageClass sets allowVolumeExpansion.
+    # Where it does not, the claims keep their size and the CR's
+    # DataVolumeNotExpanded condition says so. A claim cannot shrink, so the
+    # admission webhook refuses a lower value when operator.webhooks.enabled is
+    # true (off by default). Without the webhook a lower value is admitted, and
+    # the operator keeps the claims at their size. Setting this back to null
+    # never shrinks a claim. Each GiB added counts twice against a namespace
+    # requests.storage quota, once for each claim, and the quota preflight
+    # counts it so. A Kubernetes quantity above zero and at most 64Ti, the
+    # largest persistent disk, for example 80Gi.
+    size: null
   # Annotations to add to the PlatformAgent custom resource metadata. The
   # operator reads its kubeagents.x-k8s.io/* keys from here (chart README,
   # "PlatformAgent annotations"). Three of them the chart also derives from

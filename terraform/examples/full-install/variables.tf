@@ -905,6 +905,26 @@ variable "platform_agent_mode" {
   }
 }
 
+variable "platform_agent_storage_size" {
+  description = "The PlatformAgent's spec.storage.size: the request of the agent's <name>-data claim and of the shell sandbox's data claim, which the operator gives the same size. The default is the operator's own default, and passes the chart nothing, so the CR carries no storage field. Raising it expands both existing claims online where their StorageClass sets allowVolumeExpansion; elsewhere the claims keep their size and the CR's DataVolumeNotExpanded condition says so. A claim cannot shrink, so the operator's admission webhook refuses a lower value, and returning to the default never shrinks a claim. Each GiB added counts twice against the project's disk quota, once for each claim. At most 64Ti, the largest persistent disk. Mirrors PLATFORM_AGENT_STORAGE_SIZE in install.env, and its default is DEFAULT_PLATFORM_AGENT_STORAGE_SIZE in install.defaults.env."
+  type        = string
+  default     = "50Gi"
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[1-9][0-9]*(Mi|Gi|Ti)$", var.platform_agent_storage_size))
+    error_message = "platform_agent_storage_size must be a whole number of Mi, Gi or Ti above zero, for example \"80Gi\". It sets the PlatformAgent CRD's spec.storage.size."
+  }
+
+  # 67108864 Mi is 64Ti, the largest persistent disk, the limit the admission
+  # webhook, the chart and the installer also take. A value the grammar above
+  # refuses passes here, so it is refused once.
+  validation {
+    condition     = try(tonumber(regex("^[0-9]+", var.platform_agent_storage_size)) * lookup({ Mi = 1, Gi = 1024, Ti = 1048576 }, regex("[MGT]i$", var.platform_agent_storage_size)) <= 67108864, true)
+    error_message = "platform_agent_storage_size must be at most 64Ti, the largest persistent disk size."
+  }
+}
+
 variable "extra_helm_values" {
   description = "Extra values for the kube-agents Helm release, covering chart settings this composition does not expose as its own variable (telemetry.otlpEndpoint, litellm.otel, the resource blocks, the PlatformAgent harness knobs). Passed as a second values document, so Helm deep-merges it key by key over the ones computed here and anything set wins. Setting a key the composition also computes — platformAgent.harness.clusterName, say — overrides it, which is rarely what you want."
   type        = any

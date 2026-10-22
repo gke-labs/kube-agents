@@ -77,9 +77,11 @@ _KUBECTL_SUBCOMMANDS: dict[str, frozenset[str]] = {
 # credential_proxy_client runs on import.
 from credential_proxy_client import (  # noqa: F401  (re-export)
     API_RELAY_PREFIX,
+    CONTEXT_FLAG,
     END_OF_FLAGS,
     KUBECONFIG_FLAG,
     ClusterTarget,
+    kubectl_context_flag,
     parse_gke_context,
     read_current_context,
 )
@@ -95,6 +97,65 @@ SLACK_ERROR_DIAGNOSTIC_FIELDS = ("ok", "error", "needed", "provided")
 # request that names no cluster resolves to this rather than to whatever the
 # base kubeconfig currently points at.
 HOST_CONTEXT_ENV = "KUBE_CONTEXT_NAME"
+
+# A kubectl read that names no cluster -- no `--context`, no `--kubeconfig`, no
+# KUBECONFIG forwarded by the shim -- runs on the host cluster through the
+# broker's default kubeconfig. When it finds nothing, the caller cannot tell
+# "absent" from "absent on the host": a worker read a namespace on the host and
+# reported it missing from the fleet (#3371, #3375). So a NotFound or an empty
+# answer to such a read gets one line naming the cluster it ran on. Appended to
+# stderr, so stdout -- often parsed as JSON -- is untouched; the exit code is
+# never changed; and any other result is returned as it came. The trigger is
+# the output's shape, not the cluster's state, so a partial NotFound
+# (`get ns a b`, one missing) or an existing pod with no logs gets the line too;
+# it only says where the read went, which is true either way.
+#
+# The wording is a plain statement of where the read went. It must stay clear
+# of what the refusal stop reads (deploy/docker/patches/permission_refusal_stop.py:
+# the action boundary notice, the `policy rule:`/`policy verb:` lines, and the
+# API-denial shapes), so the hint is never counted as a refusal or a halt.
+# test_credential_proxy.ContextlessKubectlHostHintTest holds it to that.
+KUBECTL_HOST_HINT_VERBS = frozenset({"get", "describe", "events", "logs", "top"})
+# kubectl's prefix for a server NotFound, the only "nothing there" a failed read
+# carries. A client-side "not found" (an unknown resource type, a context the
+# kubeconfig lacks) is a different fault and gets no hint.
+KUBECTL_NOT_FOUND_MARKER = "Error from server (NotFound)"
+# An empty list in `-o json`/`-o yaml` is a few hundred bytes; anything longer
+# has items and is not parsed at all.
+KUBECTL_EMPTY_LIST_PROBE_BYTES = 4096
+# Only kubectl's own list wrapper counts: `kubectl get <type>` prints
+# `apiVersion: v1, kind: List` for every resource type, built-in or custom. A
+# found object is never that pair -- the core group has no `List` resource, and
+# a custom kind (`AllowList`) carries its own group in `apiVersion` -- so an
+# object with an `items` field of its own is never read as an empty answer. A
+# typed list (`PodList`) only comes from `get --raw` and gets no line, which is
+# today's behaviour.
+KUBECTL_LIST_ITEMS_KEY = "items"
+KUBECTL_LIST_KIND_KEY = "kind"
+KUBECTL_LIST_API_VERSION_KEY = "apiVersion"
+KUBECTL_LIST_KIND = "List"
+KUBECTL_LIST_API_VERSION = "v1"
+KUBECTL_EMPTY_YAML_ITEMS_RE = re.compile(r"^items: \[\]\s*$", re.MULTILINE)
+KUBECTL_YAML_LIST_KIND_RE = re.compile(r"^kind: List\s*$", re.MULTILINE)
+KUBECTL_YAML_LIST_API_VERSION_RE = re.compile(r"^apiVersion: v1\s*$", re.MULTILINE)
+# `-o custom-columns` prints its header row even over an empty list, and the
+# generic printer it goes through prints no "No resources found", so a header
+# alone is the empty answer in that mode. Matched on the output flag's value,
+# in every spelling kubectl takes; the last one wins, as in kubectl.
+KUBECTL_OUTPUT_FLAGS = ("-o", "--output")
+KUBECTL_CUSTOM_COLUMNS_PREFIX = "custom-columns"
+KUBECTL_NO_HEADERS_FLAG = "--no-headers"
+KUBECTL_HOST_HINT_PREFIX = "[credential-proxy] "
+KUBECTL_HOST_HINT_NAMED = (
+    "This kubectl named no cluster, so it read the host cluster {cluster}"
+    " (the credential proxy's default kubeconfig). To read another cluster,"
+    " pass " + CONTEXT_FLAG + " <name>."
+)
+KUBECTL_HOST_HINT_UNNAMED = (
+    "This kubectl named no cluster, so it read this install's host cluster"
+    " (the credential proxy's default kubeconfig). To read another cluster,"
+    " pass " + CONTEXT_FLAG + " <name>."
+)
 
 # Bounds on a one-shot kubectl read. kubectl's own client default is 300s, so a
 # control plane that is down, private or firewalled parks a broker worker for
@@ -540,6 +601,55 @@ VCS_VERB_LABEL = "verb"
 # (vcs_broker.VcsBroker._count_merges); the series the operator reads
 # `status.usage.remediationsMergedTotal` from. No labels.
 VCS_MERGED_METRIC = "kubeagents_vcs_proposals_merged_total"
+# The broker's own failures, by kind: work it took on and could not carry out
+# for a reason that is its own or its upstream's, never the command's exit
+# code and never a refusal. A second count beside the tool counter rather
+# than a new status in it, so toolExecutionsTotal keeps its meaning across
+# versions; the operator folds the whole family into
+# status.usage.brokerFailuresTotal.
+BROKER_FAILURES_METRIC = "kubeagents_broker_execution_failures_total"
+BROKER_FAILURE_KIND_LABEL = "kind"
+# A brokered command that ran past its deadline (exit 124), recorded where
+# the command completes.
+BROKER_FAILURE_EXEC_TIMEOUT = "exec_timeout"
+# Everything else is read off the response, keyed by its route family
+# (BROKER_FAILURE_KIND_BY_ROUTE). On the broker's own routes a 500, 502 or
+# 504 is one and a 503 is not: that 503 is the broker's busy, contention
+# rather than failure, and the exec route's busy is already an outcome of the
+# tool counter. The one 503 of the broker's that is a fault, the
+# version-control route's unreadable managed-repository list, is recorded at
+# its site. On the relays the upstream's status passes through, so any 5xx is
+# one, a 503 included: there it is the upstream saying unavailable.
+BROKER_FAILURE_EXEC_FAILED = "exec_failed"
+BROKER_FAILURE_VCS_FAILED = "vcs_failed"
+BROKER_FAILURE_FORGE_REFRESH_FAILED = "forge_refresh_failed"
+BROKER_FAILURE_API_RELAY_FAILED = "api_relay_failed"
+# The broker's own chat event pull failing: its Pub/Sub subscription or its
+# credential to it, recorded at the three pull sites, since the chat families
+# are otherwise excluded from the response hook (their 502 is the caller's).
+BROKER_FAILURE_CHAT_PULL_FAILED = "chat_pull_failed"
+BROKER_FAILURE_OTHER_FAILED = "other_failed"
+BROKER_FAILURE_KINDS = frozenset({
+    BROKER_FAILURE_EXEC_TIMEOUT,
+    BROKER_FAILURE_EXEC_FAILED,
+    BROKER_FAILURE_VCS_FAILED,
+    BROKER_FAILURE_FORGE_REFRESH_FAILED,
+    BROKER_FAILURE_API_RELAY_FAILED,
+    BROKER_FAILURE_CHAT_PULL_FAILED,
+    BROKER_FAILURE_OTHER_FAILED,
+})
+# The methods the broker serves. The base class answers any other with a 501
+# of its own before authentication, which is no relay's failure.
+BROKER_FAILURE_COUNTED_METHODS = frozenset({"GET", "POST"})
+BROKER_FAILURE_STATUS_CODES = frozenset({
+    str(int(HTTPStatus.INTERNAL_SERVER_ERROR)),
+    str(int(HTTPStatus.BAD_GATEWAY)),
+    str(int(HTTPStatus.GATEWAY_TIMEOUT)),
+})
+# The relays' bound is the whole 5xx class, since the upstream's status passes
+# through: a 501 or 507 from a Cloud API counts as the 503 does.
+BROKER_FAILURE_RELAY_STATUS_FLOOR = int(HTTPStatus.INTERNAL_SERVER_ERROR)
+BROKER_FAILURE_RELAY_STATUS_CEILING = BROKER_FAILURE_RELAY_STATUS_FLOOR + 100
 TOOL_DURATION_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0)
 # The label key the operator's usage poller filters outcomes on
 # (toolInvocationsStatusLabel in usage_counters_scrape.go): a rename here
@@ -560,6 +670,12 @@ TOOL_STATUS_ABANDONED = "abandoned"
 # under saturation "never started" and "failed" are the two numbers an
 # operator needs apart.
 TOOL_STATUS_BUSY = "busy"
+# The tool counter's whole outcome vocabulary, declared once so the operator's
+# side can be held to it: tests/test_usage_counters_series_names.py reads this
+# set and asserts the statuses the poller sums plus the ones it leaves out are
+# exactly these, so a status added here and nowhere else fails the suite
+# rather than landing silently outside every status counter.
+TOOL_STATUSES = frozenset({TOOL_STATUS_SUCCESS, TOOL_STATUS_ERROR, TOOL_STATUS_BLOCKED, TOOL_STATUS_ABANDONED, TOOL_STATUS_BUSY})
 # What a label reads when the request named nothing in its vocabulary: an
 # executable the broker does not serve, a verb no policy table lists, a path
 # no route claims, an argv whose verb cannot be read past an unknown flag.
@@ -1029,6 +1145,53 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("/v1/vcs/", (CALLER_ROLE_SHELL,)),
     ("/v1/workspace/", (CALLER_ROLE_SHELL,)),
 )
+
+# The failure kind a 5xx on a route family counts under, keyed by the family
+# label _endpoint_label reads off ROUTE_ROLES (the prefix without its trailing
+# slash). None is a family whose 5xx is not the broker's failure: the chat and
+# Slack relays answer 502 for the caller's own channel, scope and space errors
+# (channel_not_found, not_in_channel, missing_scope), which the request
+# counter still shows; their event pulls, which fail on the broker's own
+# subscription, are recorded at their sites as chat_pull_failed. A family not
+# listed counts as other_failed.
+BROKER_FAILURE_KIND_BY_ROUTE: dict[str, str | None] = {
+    "/v1/exec": BROKER_FAILURE_EXEC_FAILED,
+    "/v1/vcs": BROKER_FAILURE_VCS_FAILED,
+    "/v1/forge": BROKER_FAILURE_FORGE_REFRESH_FAILED,
+    # The legacy name of the forge refresh route, served for one release of
+    # skew: the same mint, the same kind.
+    "/v1/github": BROKER_FAILURE_FORGE_REFRESH_FAILED,
+    API_RELAY_PREFIX.rstrip("/"): BROKER_FAILURE_API_RELAY_FAILED,
+    mcp_policy.MCP_RELAY_PREFIX.rstrip("/"): BROKER_FAILURE_API_RELAY_FAILED,
+    watcher_policy.WATCHER_GCP_PREFIX.rstrip("/"): BROKER_FAILURE_API_RELAY_FAILED,
+    watcher_policy.WATCHER_K8S_PREFIX.rstrip("/"): BROKER_FAILURE_API_RELAY_FAILED,
+    "/v1/chat/a2a": None,
+    "/v1/chat/api": None,
+    "/v1/chat": None,
+}
+
+
+def _route_failure_kind(path: str) -> str:
+    """The failure kind a fault on ``path`` counts under, for a site that knows
+    it answered a fault whatever the status: the route family's kind, or
+    other_failed for a family that has none."""
+    return BROKER_FAILURE_KIND_BY_ROUTE.get(_endpoint_label(path)) or BROKER_FAILURE_OTHER_FAILED
+
+
+def _broker_failure_kind(family: str, status_code: str) -> str | None:
+    """The failure kind a response counts under, or None for one that is not a
+    failure of the broker's: a status under 500, the broker's own 503 on a
+    route of its own, or any status on a family whose 5xx is the caller's."""
+    kind = BROKER_FAILURE_KIND_BY_ROUTE.get(family, BROKER_FAILURE_OTHER_FAILED)
+    if kind is None:
+        return None
+    if kind == BROKER_FAILURE_API_RELAY_FAILED:
+        try:
+            status = int(status_code)
+        except ValueError:
+            return None
+        return kind if BROKER_FAILURE_RELAY_STATUS_FLOOR <= status < BROKER_FAILURE_RELAY_STATUS_CEILING else None
+    return kind if status_code in BROKER_FAILURE_STATUS_CODES else None
 
 
 def _validate_route_roles(table: tuple[tuple[str, tuple[str, ...]], ...]) -> None:
@@ -3395,6 +3558,79 @@ def _is_get_credentials(argv: list[str]) -> bool:
     except ValueError:
         return False
     return argv[index + 1 : index + 3] == ["clusters", "get-credentials"]
+
+
+def _kubectl_output_format(argv: list[str]) -> str:
+    """The value of the last `-o`/`--output` in a kubectl argv, or ""."""
+    value = ""
+    index = 1
+    while index < len(argv):
+        argument = argv[index]
+        if argument == END_OF_FLAGS:
+            break
+        if argument in KUBECTL_OUTPUT_FLAGS and index + 1 < len(argv):
+            value = argv[index + 1]
+            index += 2
+            continue
+        for flag in KUBECTL_OUTPUT_FLAGS:
+            if argument.startswith(f"{flag}="):
+                value = argument.partition("=")[2]
+                break
+        else:
+            short = KUBECTL_OUTPUT_FLAGS[0]
+            if argument.startswith(short) and not argument.startswith("--"):
+                value = argument[len(short):]
+        index += 1
+    return value
+
+
+def _kubectl_no_headers(argv: list[str]) -> bool:
+    """Does argv turn off kubectl's header row? `--no-headers` is a boolean
+    flag, so `--no-headers=false` keeps the header and the last setting wins."""
+    no_headers = False
+    for arg in argv:
+        if arg == KUBECTL_NO_HEADERS_FLAG:
+            no_headers = True
+        elif arg.startswith(KUBECTL_NO_HEADERS_FLAG + "="):
+            no_headers = arg.split("=", 1)[1].strip().lower() not in ("false", "0", "f")
+    return no_headers
+
+
+def _kubectl_output_is_empty(argv: list[str], stdout: str) -> bool:
+    """Did a successful kubectl read print nothing, or a list with no items?
+
+    "No resources found" goes to stderr, leaving stdout empty; `-o json` and
+    `-o yaml` print kubectl's empty `List` instead, `-o jsonpath='{.items}'` a
+    bare `[]`, and `-o custom-columns` its header row alone. Anything longer
+    than an empty list can be is not parsed.
+    """
+    text = stdout.strip()
+    if not text:
+        return True
+    if len(text) > KUBECTL_EMPTY_LIST_PROBE_BYTES:
+        return False
+    if _kubectl_output_format(argv).startswith(KUBECTL_CUSTOM_COLUMNS_PREFIX):
+        # With --no-headers the one line is a found row, not a header; an
+        # empty read already returned above.
+        return not _kubectl_no_headers(argv) and len(text.splitlines()) == 1
+    if (
+        KUBECTL_EMPTY_YAML_ITEMS_RE.search(text)
+        and KUBECTL_YAML_LIST_KIND_RE.search(text)
+        and KUBECTL_YAML_LIST_API_VERSION_RE.search(text)
+    ):
+        return True
+    try:
+        document = json.loads(text)
+    except ValueError:
+        return False
+    if document == []:
+        return True
+    return (
+        isinstance(document, dict)
+        and document.get(KUBECTL_LIST_ITEMS_KEY) == []
+        and document.get(KUBECTL_LIST_KIND_KEY) == KUBECTL_LIST_KIND
+        and document.get(KUBECTL_LIST_API_VERSION_KEY) == KUBECTL_LIST_API_VERSION
+    )
 
 
 def _kubectl_runs_long(argv: list[str]) -> bool:
@@ -6061,7 +6297,7 @@ class CommandExecutor:
             kubeconfig_path = self._default_kubeconfig()
         else:
             kubeconfig_path = None
-        return self._execute(
+        result = self._execute(
             command,
             stdin=stdin,
             cwd=cwd,
@@ -6069,6 +6305,49 @@ class CommandExecutor:
             timeout_seconds=kubectl_deadline,
             caller=caller,
         )
+        # Read off the caller's argv, not `command`: the request timeout added
+        # above is not the caller's, and a rerouted `--kubeconfig` is already
+        # in `flag_kubeconfig`.
+        if (
+            executable == "kubectl"
+            and flag_kubeconfig is None
+            and not kubeconfig_context
+            # An empty value (`--context "$UNSET"`) names nothing: kubectl
+            # reads current-context, the host.
+            and not kubectl_context_flag(argv)
+        ):
+            return self._with_host_hint(argv, result)
+        return result
+
+    def _with_host_hint(self, argv: list[str], result: ExecutionResult) -> ExecutionResult:
+        """`result`, plus a line naming the host when a context-less read found nothing.
+
+        See KUBECTL_HOST_HINT_VERBS. Only a read verb, only a server NotFound or
+        an empty answer, and never a result that was cut, timed out or
+        abandoned: what those say about the cluster is unknown. stdout and the
+        exit code are returned as they came.
+        """
+        if result.truncated or result.timed_out or result.abandoned:
+            return result
+        verb, _ = command_policy._kubectl_verb_and_flag(argv)
+        if not verb or verb[0] not in KUBECTL_HOST_HINT_VERBS:
+            return result
+        if result.exit_code == 0:
+            found_nothing = _kubectl_output_is_empty(argv, result.stdout)
+        else:
+            found_nothing = KUBECTL_NOT_FOUND_MARKER in result.stderr
+        if not found_nothing:
+            return result
+        target = self._ambient_target()
+        hint = (
+            KUBECTL_HOST_HINT_NAMED.format(cluster=target.context_name)
+            if target is not None
+            else KUBECTL_HOST_HINT_UNNAMED
+        )
+        stderr = result.stderr
+        if stderr and not stderr.endswith("\n"):
+            stderr += "\n"
+        return replace(result, stderr=f"{stderr}{KUBECTL_HOST_HINT_PREFIX}{hint}\n")
 
     def execute_internal(
         self, argv: list[str], cwd: str | None = None
@@ -8158,6 +8437,7 @@ class ProxyMetrics:
         self._requests: dict[tuple[str, str], int] = {}
         self._vcs: dict[tuple[str, str], int] = {}
         self._merged = 0
+        self._failures: dict[str, int] = {}
         # Per tool: cumulative bucket counts (one per TOOL_DURATION_BUCKETS
         # bound, the +Inf bucket being the count), the sum, and the count.
         self._duration_buckets: dict[str, list[int]] = {}
@@ -8251,12 +8531,18 @@ class ProxyMetrics:
         with self._lock:
             self._merged += count
 
+    def record_failure(self, kind: str) -> None:
+        kind = kind if kind in BROKER_FAILURE_KINDS else BROKER_FAILURE_OTHER_FAILED
+        with self._lock:
+            self._failures[kind] = self._failures.get(kind, 0) + 1
+
     def render(self) -> str:
         with self._lock:
             invocations = sorted(self._tool_invocations.items())
             requests = sorted(self._requests.items())
             vcs = sorted(self._vcs.items())
             merged = self._merged
+            failures = sorted(self._failures.items())
             durations = {
                 tool: (list(self._duration_buckets[tool]), self._duration_sum[tool], self._duration_count[tool])
                 for tool in sorted(self._duration_buckets)
@@ -8335,6 +8621,12 @@ class ProxyMetrics:
             f"# TYPE {VCS_MERGED_METRIC} counter",
             f"{VCS_MERGED_METRIC} {merged}",
         ]
+        lines += [
+            f"# HELP {BROKER_FAILURES_METRIC} Brokered work the broker could not carry out, by kind: a command past its deadline, a broker fault, a git failure, a failed token mint or an upstream relay error.",
+            f"# TYPE {BROKER_FAILURES_METRIC} counter",
+        ]
+        for kind, count in failures:
+            lines.append(f'{BROKER_FAILURES_METRIC}{{{BROKER_FAILURE_KIND_LABEL}="{_escape_label_value(kind)}"}} {count}')
         lines += [
             f"# HELP {PROCESS_START_TIME_METRIC} Start time of the process since unix epoch in seconds, captured once at start.",
             f"# TYPE {PROCESS_START_TIME_METRIC} gauge",
@@ -8616,6 +8908,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 type(exc).__name__,
             )
             self.repository_refusal_status = HTTPStatus.SERVICE_UNAVAILABLE
+            # A fault, not a refusal, answered with the status the response
+            # hook reads as busy: counted here, where the difference is known,
+            # under the kind of the route that asked (the version-control
+            # route or a forge refresh).
+            self.metrics.record_failure(_route_failure_kind(getattr(self, "path", "")))
             self._json(
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 {
@@ -8673,6 +8970,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, {"event": self.slack_relay.pull()})
             except Exception as exc:
                 LOGGER.warning("Slack event pull failed: %s", type(exc).__name__)
+                self.metrics.record_failure(BROKER_FAILURE_CHAT_PULL_FAILED)
                 self._json(
                     HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Slack event pull failed"}
                 )
@@ -8688,6 +8986,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 event = self.a2a_chat_relay.pull()
                 self._json(HTTPStatus.OK, {"event": event, "subscription": subscription})
             except Exception as exc:
+                self.metrics.record_failure(BROKER_FAILURE_CHAT_PULL_FAILED)
                 fields = _log_chat_pull_failure("a2a chat", self.a2a_chat_relay, exc)
                 pubsub = {key: fields[key] for key in ("type", "code") if key in fields}
                 self._json(
@@ -8708,6 +9007,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, {"event": event})
             except Exception as exc:
                 _log_chat_pull_failure("chat", self.chat_relay, exc)
+                self.metrics.record_failure(BROKER_FAILURE_CHAT_PULL_FAILED)
                 self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "chat event pull failed"})
             return
         if self.path != HEALTHZ_PATH:
@@ -9086,6 +9386,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     subcommand_label,
                     TOOL_STATUS_SUCCESS if result.exit_code == 0 else TOOL_STATUS_ERROR,
                 )
+                if result.timed_out:
+                    self.metrics.record_failure(BROKER_FAILURE_EXEC_TIMEOUT)
                 self.metrics.observe_duration(tool_label, result.duration_ms / MILLISECONDS_PER_SECOND)
                 response = {
                     "status": "completed",
@@ -10630,7 +10932,13 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # request line itself could not be parsed, and that response counts
         # under LABEL_OTHER like any other unclaimed one.
         status_code = str(int(code)) if isinstance(code, int) else str(code)
-        self.metrics.record_request(_endpoint_label(getattr(self, "path", "")), status_code)
+        family = _endpoint_label(getattr(self, "path", ""))
+        self.metrics.record_request(family, status_code)
+        # The same hook counts the broker's failures, by the route's family
+        # and the status (_broker_failure_kind).
+        kind = _broker_failure_kind(family, status_code)
+        if kind is not None and getattr(self, "command", "") in BROKER_FAILURE_COUNTED_METHODS:
+            self.metrics.record_failure(kind)
         super().log_request(code, size)
 
     def log_message(self, message: str, *args: Any) -> None:

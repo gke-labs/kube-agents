@@ -65,6 +65,7 @@ const (
 	usageCounterRemediationsProposed = "remediationsProposedTotal"
 	usageCounterRemediationsMerged   = "remediationsMergedTotal"
 	usageCounterChatMessagesInbound  = "chatMessagesInboundTotal"
+	usageCounterBrokerFailures       = "brokerFailuresTotal"
 	// sessionsTotal is two document counters, because its halves aggregate
 	// differently (usageAggregationFor): the sessions the watcher opens for
 	// triage, read on every gateway replica over the same event stream, and
@@ -90,11 +91,23 @@ var (
 	// samples out.
 	usageGatewayCounters = []string{usageCounterEventsIngested, usageCounterSessionsTriage}
 	usageChatCounters    = []string{usageCounterChatMessagesInbound, usageCounterSessionsChat}
-	usageBrokerCounters  = []string{usageCounterToolExecutions, usageCounterRemediationsProposed, usageCounterRemediationsMerged, usageCounterToolExecutionsBlocked}
+	usageBrokerCounters  = []string{usageCounterToolExecutions, usageCounterRemediationsProposed, usageCounterRemediationsMerged, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures}
 	// usageCounters is every counter the document keeps and the status seeds.
-	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterRemediationsMerged, usageCounterChatMessagesInbound, usageCounterSessionsTriage, usageCounterSessionsChat, usageCounterToolExecutionsBlocked}
+	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterRemediationsMerged, usageCounterChatMessagesInbound, usageCounterSessionsTriage, usageCounterSessionsChat, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures}
+	// usageQuietCounters are the counters whose advance is not activity and
+	// leaves LastMoved alone: the broker's failures, which a watcher retrying
+	// an unreachable fleet cluster through the relay produces every poll on
+	// an install nobody is using.
+	usageQuietCounters = map[string]bool{usageCounterBrokerFailures: true}
 	// usageSessionsCounters is the pair that projects to usageStatusFieldSessions.
 	usageSessionsCounters = []string{usageCounterSessionsTriage, usageCounterSessionsChat}
+	// usageHumanCounters is the counter only a person moves: a chat message.
+	// An advance in it stamps LastHumanMoved as well as LastMoved. Every other
+	// counter stamps LastMoved alone: the stall-watch cron runs brokered
+	// commands and the event watcher accepts events on their own, the fleet
+	// audits open proposals with nobody asking, a merge can be a forge rule,
+	// and a chat session begins with a message this counter already counted.
+	usageHumanCounters = map[string]bool{usageCounterChatMessagesInbound: true}
 )
 
 // usageStatusFieldFor is the status.usage field a document counter projects
@@ -184,6 +197,13 @@ type usageDocument struct {
 	// LastMoved is the poll in which a total last advanced, projected to
 	// status.usage.lastActiveTime; nil until one has.
 	LastMoved *metav1.Time `json:"lastMoved,omitempty"`
+	// LastHumanMoved is the poll in which a usageHumanCounters total last
+	// advanced, projected to status.usage.lastHumanActiveTime; nil until one
+	// has. An operator from before the field ignores and drops it on its next
+	// write, and its Ready writer drops the status field too, so a rollback
+	// and return loses the time until the next message; the older operator
+	// itself loses nothing it uses.
+	LastHumanMoved *metav1.Time `json:"lastHumanMoved,omitempty"`
 	// Pods is the baseline, keyed by pod UID and counter (usagePodEntryKey).
 	Pods map[string]*usagePodEntry `json:"pods"`
 	// migrated is set by migrateUsageDocument on a document it changed on read,
@@ -309,8 +329,9 @@ type usageScrapedPod struct {
 // usageSeed is what a poll that finds no usable document starts from: the
 // status's counters, when it carries any, and the time they last moved.
 type usageSeed struct {
-	Totals    map[string]int64
-	LastMoved *metav1.Time
+	Totals         map[string]int64
+	LastMoved      *metav1.Time
+	LastHumanMoved *metav1.Time
 }
 
 // usageFoldResult is a poll's outcome: the document to keep and whether it
@@ -349,12 +370,13 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 
 	if doc == nil {
 		next := &usageDocument{
-			Version:       usageDocumentVersion,
-			AgentUID:      agentUID,
-			FirstRecorded: stamp,
-			Totals:        usageZeroTotals(),
-			LastMoved:     seed.LastMoved,
-			Pods:          map[string]*usagePodEntry{},
+			Version:        usageDocumentVersion,
+			AgentUID:       agentUID,
+			FirstRecorded:  stamp,
+			Totals:         usageZeroTotals(),
+			LastMoved:      seed.LastMoved,
+			LastHumanMoved: seed.LastHumanMoved,
+			Pods:           map[string]*usagePodEntry{},
 		}
 		for counter, total := range seed.Totals {
 			if total > 0 {
@@ -512,7 +534,7 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 		}
 	}
 
-	moved := false
+	moved, humanMoved := false, false
 	counters := make([]string, 0, len(candidates))
 	for counter := range candidates {
 		counters = append(counters, counter)
@@ -552,7 +574,8 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 				}
 				if taken && (i == best || c.delta == list[best].delta) {
 					c.entry.Marker = stamp
-					moved = true
+					moved = moved || !usageQuietCounters[counter]
+					humanMoved = humanMoved || usageHumanCounters[counter]
 				}
 			}
 		default:
@@ -562,7 +585,8 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 				}
 				if addUsageTotal(doc, counter, c.delta) {
 					c.entry.Marker = stamp
-					moved = true
+					moved = moved || !usageQuietCounters[counter]
+					humanMoved = humanMoved || usageHumanCounters[counter]
 				}
 			}
 		}
@@ -570,6 +594,9 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 	if moved {
 		doc.LastMoved = &stamp
 		changed = true
+	}
+	if humanMoved {
+		doc.LastHumanMoved = &stamp
 	}
 	return usageFoldResult{Document: doc, Changed: changed}
 }

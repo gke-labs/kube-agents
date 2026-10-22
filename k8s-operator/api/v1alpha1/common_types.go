@@ -2122,7 +2122,7 @@ type AgentStatus struct {
 // The operator writes ActiveInterfaces, from the spec, on every Ready status
 // update, and ToolExecutionsTotal, ToolExecutionsBlockedTotal, EventsIngestedTotal,
 // SessionsTotal, RemediationsProposedTotal, RemediationsMergedTotal,
-// ChatMessagesInboundTotal, LastActiveTime, ClustersRegistered and
+// ChatMessagesInboundTotal, LastActiveTime, LastHumanActiveTime, ClustersRegistered and
 // ClustersMonitored from the broker's, the event watcher's, the chat
 // plugin's and, on a next install, the A2A gateway's metrics
 // listeners, which it reads every five minutes on the leader; the agent's own
@@ -2211,7 +2211,8 @@ type AgentUsageStatus struct {
 	// kubeagents_a2a_gateway_messages_inbound_total as well, since Chat
 	// ingress is that gateway's there; kept monotonic the same way as
 	// ToolExecutionsTotal. Moves LastActiveTime, so a chat turn that runs no
-	// brokered command is activity.
+	// brokered command is activity, and LastHumanActiveTime, which nothing
+	// else moves.
 	// +optional
 	ChatMessagesInboundTotal int64 `json:"chatMessagesInboundTotal,omitempty"`
 
@@ -2230,6 +2231,29 @@ type AgentUsageStatus struct {
 	// a refused command is still the agent at work.
 	// +optional
 	ToolExecutionsBlockedTotal int64 `json:"toolExecutionsBlockedTotal,omitempty"`
+	// BrokerFailuresTotal is the cumulative count of brokered work the
+	// credential broker took on and could not carry out for a reason that is
+	// its own or its upstream's: a command that ran past its deadline (exit
+	// 124), a broker fault on the exec route (a 500), a git failure on the
+	// version-control route (a 500 or 502), a failed forge token mint (a
+	// 502), or any 5xx on the Cloud API, MCP and watcher relays, whose
+	// upstream status passes through. A command's own non-zero exit is not
+	// one (that is ToolExecutionsTotal's error outcome), nor is a policy
+	// refusal or the broker's own busy (a 403 or 503; the version-control
+	// route's 503 for an unreadable managed-repository list is a fault and
+	// does count), nor a chat or Slack post the forge refused for the
+	// caller's channel or scope; the broker's own chat event pull failing,
+	// its Pub/Sub subscription or its credential to it, does count. Read from the
+	// broker's kubeagents_broker_execution_failures_total, summed over its
+	// kind label, every five minutes and kept monotonic the same way as
+	// ToolExecutionsTotal; a timed-out command counts here and as an error
+	// there. A rising share of this against ToolExecutionsTotal says the
+	// broker, its credentials or its upstreams are failing, where a policy
+	// refusal is the tool counter's blocked outcome in Prometheus. Does not
+	// move LastActiveTime: a watcher retrying an unreachable fleet cluster
+	// through the relay is not the agent at work.
+	// +optional
+	BrokerFailuresTotal int64 `json:"brokerFailuresTotal,omitempty"`
 
 	// ClustersRegistered is the number of clusters the event watcher built a
 	// client for at its last start: the management cluster and the Cluster
@@ -2276,13 +2300,28 @@ type AgentUsageStatus struct {
 	// LastActiveTime is the time of the last poll in which a counter above
 	// moved: a brokered command ran or was refused, a proposal was opened or
 	// merged, a chat message reached the gateway, or an event was accepted
-	// for triage.
+	// for triage; BrokerFailuresTotal alone leaves it where it was.
 	// Scheduled maintenance jobs that run brokered commands move it too --
 	// the Controller Stall Watch cron runs some every 30 minutes by default
 	// -- so it marks agent activity of any origin, not human or operator use
-	// alone. Advances at most once per five minutes.
+	// alone; LastHumanActiveTime is the one that does. Advances at most once
+	// per five minutes.
 	// +optional
 	LastActiveTime *metav1.Time `json:"lastActiveTime,omitempty"`
+
+	// LastHumanActiveTime is the time of the last poll in which the one
+	// counter only a person moves advanced: ChatMessagesInboundTotal, a chat
+	// message that reached the gateway, counted before the sender allowlist,
+	// so an unlisted sender is still a person. Nothing else moves it. Brokered
+	// commands and accepted events come from the stall-watch cron and the
+	// event watcher on their own, proposals from the fleet audits, which open
+	// them with nobody asking, and a merge can be a forge rule; all of those
+	// move LastActiveTime and leave this alone, so an install nobody has
+	// talked to in a month shows it. Absent until a person has sent a message
+	// since the operator that writes it started. Advances at most once per
+	// five minutes.
+	// +optional
+	LastHumanActiveTime *metav1.Time `json:"lastHumanActiveTime,omitempty"`
 }
 
 const (
