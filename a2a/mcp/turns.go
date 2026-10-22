@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -27,7 +28,9 @@ import (
 const (
 	consoleInSubject      = "chat.console.%s.in"
 	consoleOutSubject     = "chat.console.%s.out"
-	consoleConversationOf = "console:%s"
+	consoleConversationOf = consoleConversationPrefix + "%s"
+	// consoleConversationPrefix is the console door's conversation key prefix.
+	consoleConversationPrefix = "console:"
 	// submissionSubjects is every task's .in subject, which the console grant
 	// lets the server watch (a2a.>): submissions, follow-ups and cancels.
 	submissionSubjects = "a2a.tasks.*.*." + lib.TaskClassIn
@@ -106,11 +109,26 @@ type Conversations struct {
 	byAlias map[string]*aliasEntry
 	sending map[string]*sendLock
 	clock   uint64
+	// now is the wall clock an alias's last use is stamped with; tests set it.
+	now func() time.Time
 }
 
+// aliasEntry is one alias: its token, the description manage_session's new
+// gave it, and when it was last used, by counter (which orders uses exactly)
+// and by wall clock (which a person can read).
 type aliasEntry struct {
-	token string
-	used  uint64
+	token       string
+	description string
+	used        uint64
+	lastUsed    time.Time
+}
+
+// ConversationInfo is one alias as manage_session lists it.
+type ConversationInfo struct {
+	Alias       string
+	Token       string
+	Description string
+	LastUsed    time.Time
 }
 
 type sendLock struct {
@@ -120,7 +138,7 @@ type sendLock struct {
 
 // NewConversations returns an empty alias table.
 func NewConversations() *Conversations {
-	return &Conversations{byAlias: map[string]*aliasEntry{}, sending: map[string]*sendLock{}}
+	return &Conversations{byAlias: map[string]*aliasEntry{}, sending: map[string]*sendLock{}, now: time.Now}
 }
 
 // Resolve returns the console token for a call: token when the caller names
@@ -128,6 +146,9 @@ func NewConversations() *Conversations {
 // otherwise the alias's, minted on first use.
 func (c *Conversations) Resolve(alias, token string) (string, error) {
 	if token != "" {
+		// manage_session lists a conversation as console:<token>; either form
+		// names it.
+		token = strings.TrimPrefix(token, consoleConversationPrefix)
 		if !lib.ValidSubjectToken(token) {
 			return "", fmt.Errorf("%q is not a conversation token", token)
 		}
@@ -138,21 +159,87 @@ func (c *Conversations) Resolve(alias, token string) (string, error) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.clock++
 	if e, ok := c.byAlias[alias]; ok {
-		e.used = c.clock
+		c.touchLocked(e)
 		return e.token, nil
+	}
+	return c.addLocked(alias, "")
+}
+
+// ErrConversationExists is Create's refusal of an alias already in use.
+var ErrConversationExists = errors.New("conversation already exists")
+
+// Create adds alias with a fresh token and description, and refuses an alias
+// already in use rather than handing back its conversation: a caller asking
+// for a new conversation must not find itself continuing someone else's.
+func (c *Conversations) Create(alias, description string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.byAlias[alias]; ok {
+		return "", fmt.Errorf("%w: %s", ErrConversationExists, cell(alias))
+	}
+	return c.addLocked(alias, description)
+}
+
+// Forget drops alias, and reports whether it was there. The conversation
+// itself is untouched: it stays reachable by its token.
+func (c *Conversations) Forget(alias string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.byAlias[alias]; !ok {
+		return false
+	}
+	delete(c.byAlias, alias)
+	return true
+}
+
+// List returns the aliases, most recently used first.
+func (c *Conversations) List() []ConversationInfo {
+	c.mu.Lock()
+	type row struct {
+		info ConversationInfo
+		used uint64
+	}
+	rows := make([]row, 0, len(c.byAlias))
+	for a, e := range c.byAlias {
+		rows = append(rows, row{ConversationInfo{Alias: a, Token: e.token, Description: e.description, LastUsed: e.lastUsed}, e.used})
+	}
+	c.mu.Unlock()
+	slices.SortFunc(rows, func(x, y row) int { return cmp.Compare(y.used, x.used) })
+	out := make([]ConversationInfo, len(rows))
+	for i, r := range rows {
+		out[i] = r.info
+	}
+	return out
+}
+
+func (c *Conversations) touchLocked(e *aliasEntry) {
+	c.clock++
+	e.used, e.lastUsed = c.clock, c.now()
+}
+
+// addLocked mints a token for a new alias, forgetting the least recently
+// used alias first if the table is full.
+func (c *Conversations) addLocked(alias, description string) (string, error) {
+	t, err := mintConversationToken()
+	if err != nil {
+		return "", err
 	}
 	if len(c.byAlias) >= maxConversations {
 		c.forgetOldestLocked()
 	}
+	e := &aliasEntry{token: t, description: description}
+	c.touchLocked(e)
+	c.byAlias[alias] = e
+	return t, nil
+}
+
+func mintConversationToken() (string, error) {
 	b := make([]byte, conversationTokenBytes)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
-	t := conversationTokenPrefix + hex.EncodeToString(b)
-	c.byAlias[alias] = &aliasEntry{token: t, used: c.clock}
-	return t, nil
+	return conversationTokenPrefix + hex.EncodeToString(b), nil
 }
 
 func (c *Conversations) forgetOldestLocked() {

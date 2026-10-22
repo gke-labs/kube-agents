@@ -78,32 +78,39 @@ func SendMessageTool(bus TurnBus, convs *Conversations) Tool {
 			if err := json.Unmarshal(orEmptyObject(raw), &a); err != nil {
 				return "", fmt.Errorf("arguments: %w", err)
 			}
-			token, err := convs.Resolve(a.Conversation, a.ConversationToken)
-			if err != nil {
-				return "", err
-			}
-			res, w, err := bus.SendTurn(ctx, convs, token, a.Text)
-			if err != nil {
-				return "", err
-			}
-			var sb strings.Builder
-			writeConversation(&sb, a.Conversation, token)
-			writeNotices(&sb, res.Notices)
-			if res.Task == nil {
-				if len(res.Notices) == 0 {
-					sb.WriteString("The gateway answered with no task and no notice.\n")
-				}
-				return sb.String(), nil
-			}
-			out, err := bus.WaitForTurn(ctx, w, *res.Task, waitFor(a.WaitSeconds))
-			if err != nil {
-				fmt.Fprintf(&sb, "Task `%s` carries the turn, but reading it failed: %v\n", res.Task, err)
-				return sb.String(), nil
-			}
-			writeOutcome(&sb, out)
-			return sb.String(), nil
+			return sendAndWait(ctx, bus, convs, a.Conversation, a.ConversationToken, a.Text, waitFor(a.WaitSeconds))
 		},
 	}
+}
+
+// sendAndWait sends text as one turn of the conversation named by alias or
+// token and renders what came of it: the gateway's notices, and the turn's
+// task as it stands after wait.
+func sendAndWait(ctx context.Context, bus TurnBus, convs *Conversations, alias, token, text string, wait time.Duration) (string, error) {
+	token, err := convs.Resolve(alias, token)
+	if err != nil {
+		return "", err
+	}
+	res, w, err := bus.SendTurn(ctx, convs, token, text)
+	if err != nil {
+		return "", err
+	}
+	var sb strings.Builder
+	writeConversation(&sb, alias, token)
+	writeNotices(&sb, res.Notices)
+	if res.Task == nil {
+		if len(res.Notices) == 0 {
+			sb.WriteString("The gateway answered with no task and no notice.\n")
+		}
+		return sb.String(), nil
+	}
+	out, err := bus.WaitForTurn(ctx, w, *res.Task, wait)
+	if err != nil {
+		fmt.Fprintf(&sb, "Task `%s` carries the turn, but reading it failed: %v\n", res.Task, err)
+		return sb.String(), nil
+	}
+	writeOutcome(&sb, out)
+	return sb.String(), nil
 }
 
 type taskControlArgs struct {
@@ -215,11 +222,13 @@ func waitFor(seconds int) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
+// writeConversation names the conversation; the alias is the caller's, so it
+// is shown as an inert cell.
 func writeConversation(sb *strings.Builder, alias, token string) {
 	if alias == "" {
 		alias = DefaultConversation
 	}
-	fmt.Fprintf(sb, "Conversation `%s` (token `%s`).\n\n", alias, token)
+	fmt.Fprintf(sb, "Conversation %s (token `%s`).\n\n", cell(alias), token)
 }
 
 func writeNotices(sb *strings.Builder, notices []string) {

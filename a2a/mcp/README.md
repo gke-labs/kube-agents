@@ -2,7 +2,7 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one `spec.mode: next` install, so an external coding agent or IDE host can talk to it. It is a console client of the install's A2A bus: it holds the `console` bus credential and nothing else, and it can do on the bus exactly what the console page can.
 
-It answers `connection_status`, and the turn tools `send_message` and `task_control`. Further tools from gke-labs/kube-agents#3653 come in later changes.
+It answers `connection_status`, the turn tools `send_message` and `task_control`, and `manage_session`. Further tools from gke-labs/kube-agents#3653 come in later changes.
 
 ## Turn it on
 
@@ -35,3 +35,16 @@ To rotate the token, write a new value into the Secret. The server reads it on e
 ## What it reads
 
 `connection_status` reports the bus endpoint and identity, whether the connection is TLS, the size of the four message streams, whether the gateway and the platform agent are consuming, and the agents registered on `DIRECTORY`. It reads all of it through the console's grants, at most once every five seconds whatever the call rate. Agent names and descriptions are shown as code, as published, shortened.
+
+## Conversations
+
+Each call names its conversation with `conversation` (a name; `default` if omitted) or `conversation_token` (the token an earlier answer reported, as `<token>` or `console:<token>`). There is no server-wide active conversation. Names are this server's memory only: a restart forgets them, and a conversation resumes by its token.
+
+`manage_session` handles the names and the console's control turns:
+
+- `list`: the named conversations, most recently used first, with token, description and last use;
+- `new`: create a name, with an optional description of at most 200 characters; an existing name is refused;
+- `delete`: forget a name. The conversation's history stays on the bus, and a `/session` worker for it idles out by itself; send `session_off` first to end one now;
+- `session_on`, `session_off`, `status`, `help`: send `/session`, `/session off`, `status` or `help` on the conversation, exactly as `send_message` would, and return the answer.
+
+The original client's `switch`, `debug_on`, `debug_off`, `transcript` and `clear_killed` are not offered; a call to one is answered with an error that says why.

@@ -145,6 +145,7 @@ func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string)
 		mcp.ConnectionStatusTool(bus),
 		mcp.SendMessageTool(bus, convs),
 		mcp.TaskControlTool(bus, convs),
+		mcp.ManageSessionTool(bus, convs),
 	)
 	if err != nil {
 		log.Error("mcp server", "err", err)
