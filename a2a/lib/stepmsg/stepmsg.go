@@ -3,9 +3,9 @@
 // turn did - one row per planned action, settled subtask, or synthesis pass -
 // without reading prose.
 //
-// An executor publishes steps as it observes the model's requests and its
-// subtasks settle; a client folds them into the step list it shows while a
-// turn runs. Without this contract the same facts travel as "thinking" text
+// An executor may publish steps as it observes the model's requests and its
+// subtasks settle; a client that renders them folds them into the step list
+// it shows while a turn runs. Without this contract the same facts travel as "thinking" text
 // that a renderer has to parse back out, while spec-a2a-payloads.md reserves
 // "thinking" for the model's reasoning.
 //
@@ -28,9 +28,6 @@ const (
 	ArtifactName = "steps"
 	// Schema is the value of a step record's "schema" key.
 	Schema = "kube-agents.step/v1"
-	// schemaFamily prefixes every version of the schema; a data part whose
-	// "schema" starts with it is a step record.
-	schemaFamily = "kube-agents.step/"
 	// partKindData is the A2A part kind step records travel on.
 	partKindData = "data"
 )
@@ -40,9 +37,8 @@ type Kind string
 
 const (
 	// KindPlan is one planned action: a tool call the model asked for. The
-	// executor titles it; one that publishes structure only, as the Hermes
-	// bridge does, uses the tool's name and never builds a title from a
-	// call's arguments.
+	// executor titles it; one that publishes structure only uses the tool's
+	// name and never builds a title from a call's arguments.
 	KindPlan Kind = "plan"
 	// KindSubtask is one subtask the turn started reaching a settled status;
 	// Subtask carries it and how many of the turn's subtasks had settled.
@@ -78,24 +74,65 @@ type Step struct {
 	Subtask *Subtask `json:"subtask,omitempty"`
 }
 
+// Size bounds on what a step carries. A step is a row, not a report, so a
+// record over them is refused on both sides rather than trimmed.
+const (
+	maxTitleBytes   = 256
+	maxThoughtBytes = 4096
+	maxCallIDs      = 64
+	maxCallIDBytes  = 128
+)
+
+// validate is the one rule Part and Decode share, so a step Part emits is
+// one Decode reads and the reverse.
+func (s Step) validate() error {
+	if s.Schema != Schema {
+		return fmt.Errorf("stepmsg: schema %q is not %s", s.Schema, Schema)
+	}
+	if s.Title == "" {
+		return errors.New("stepmsg: a step needs a title")
+	}
+	if len(s.Title) > maxTitleBytes || len(s.Thought) > maxThoughtBytes {
+		return fmt.Errorf("stepmsg: title over %d bytes or thought over %d", maxTitleBytes, maxThoughtBytes)
+	}
+	if len(s.CallIDs) > maxCallIDs {
+		return fmt.Errorf("stepmsg: more than %d call ids", maxCallIDs)
+	}
+	for _, id := range s.CallIDs {
+		if id == "" || len(id) > maxCallIDBytes {
+			return fmt.Errorf("stepmsg: a call id is empty or over %d bytes", maxCallIDBytes)
+		}
+	}
+	switch s.Kind {
+	case KindPlan, KindSynthesis:
+		if s.Subtask != nil {
+			return fmt.Errorf("stepmsg: a %s step carries no subtask", s.Kind)
+		}
+	case KindSubtask:
+		st := s.Subtask
+		if st == nil || st.ID == "" {
+			return errors.New("stepmsg: a subtask step needs its subtask's id")
+		}
+		if st.Settled < 0 || st.Total < 0 || (st.Total > 0 && st.Settled > st.Total) {
+			return fmt.Errorf("stepmsg: settled %d of %d is not a count", st.Settled, st.Total)
+		}
+	default:
+		return fmt.Errorf("stepmsg: kind %q is not plan, subtask or synthesis", s.Kind)
+	}
+	return nil
+}
+
 // Part encodes the step as the data part it travels as. The schema key is
-// filled in when the caller left it empty. A step Decode would refuse (no
-// title, an unknown kind, a schema outside the family) is an error rather
-// than a part that every reader drops silently.
+// filled in when the caller left it empty. A step Decode would refuse is an
+// error rather than a part that every reader drops silently.
 func (s Step) Part() (lib.Part, error) {
 	if s.Schema == "" {
 		s.Schema = Schema
 	}
-	if !strings.HasPrefix(s.Schema, schemaFamily) {
-		return lib.Part{}, fmt.Errorf("stepmsg: schema %q is not a %s* schema", s.Schema, schemaFamily)
-	}
-	if strings.TrimSpace(s.Title) == "" {
-		return lib.Part{}, errors.New("stepmsg: a step needs a title")
-	}
-	switch s.Kind {
-	case KindPlan, KindSubtask, KindSynthesis:
-	default:
-		return lib.Part{}, fmt.Errorf("stepmsg: kind %q is not plan, subtask or synthesis", s.Kind)
+	s.Title = strings.TrimSpace(s.Title)
+	s.Thought = strings.TrimSpace(s.Thought)
+	if err := s.validate(); err != nil {
+		return lib.Part{}, err
 	}
 	raw, err := json.Marshal(s)
 	if err != nil {
@@ -104,16 +141,17 @@ func (s Step) Part() (lib.Part, error) {
 	return lib.Part{Kind: partKindData, Data: raw}, nil
 }
 
-// stepKeys and subtaskKeys are the record's keys, matched exactly.
+// stepKeys and subtaskKeys are the record's keys, matched exactly. The
+// subtask is read on its own, so its keys match exactly too.
 var (
-	stepKeys    = []string{"schema", "kind", "title", "thought", "callIds", "subtask"}
+	stepKeys    = []string{"schema", "kind", "title", "thought", "callIds"}
 	subtaskKeys = []string{"id", "title", "status", "verdict", "summary", "settled", "total", "parentTaskId"}
 )
 
 // decodeExact unmarshals the object raw into v through only the keys named,
 // matched exactly: encoding/json would match a struct field to "Schema" or
 // "TITLE" too, and the other schema readers here (chatmsg, the fold) match
-// keys exactly. Other keys are a later version's, and skipped.
+// keys exactly. It returns the whole object for the caller's other keys.
 func decodeExact(raw json.RawMessage, keys []string, v any) (map[string]json.RawMessage, error) {
 	var all map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &all); err != nil {
@@ -129,40 +167,37 @@ func decodeExact(raw json.RawMessage, keys []string, v any) (map[string]json.Raw
 	if err != nil {
 		return nil, err
 	}
-	return kept, json.Unmarshal(clean, v)
+	return all, json.Unmarshal(clean, v)
 }
 
-// Decode reads a step record off a data part. It returns false for a part
-// that is not a step record: a text part, a data part of another schema, or
-// one without a title. Keys match exactly. A record with no kind reads as a
-// plan step.
+// Decode reads a step record off a data part. It returns false for anything
+// that is not a valid v1 step record: a text part, another schema, a later
+// version of this one (which is a new schema, as chatmsg treats its own), an
+// unknown kind, or a record Part would refuse. Keys match exactly at both
+// levels. A record with no kind reads as a plan step.
 func Decode(p lib.Part) (Step, bool) {
 	if p.Kind != partKindData || len(p.Data) == 0 {
 		return Step{}, false
 	}
 	var s Step
-	kept, err := decodeExact(p.Data, stepKeys, &s)
+	all, err := decodeExact(p.Data, stepKeys, &s)
 	if err != nil {
 		return Step{}, false
 	}
-	s.Subtask = nil
-	if raw, ok := kept["subtask"]; ok && string(raw) != "null" {
+	if raw, ok := all["subtask"]; ok && string(raw) != "null" {
 		var st Subtask
 		if _, err := decodeExact(raw, subtaskKeys, &st); err != nil {
 			return Step{}, false
 		}
 		s.Subtask = &st
 	}
-	if !strings.HasPrefix(s.Schema, schemaFamily) {
-		return Step{}, false
-	}
 	s.Title = strings.TrimSpace(s.Title)
 	s.Thought = strings.TrimSpace(s.Thought)
-	if s.Title == "" {
-		return Step{}, false
-	}
 	if s.Kind == "" {
 		s.Kind = KindPlan
+	}
+	if s.validate() != nil {
+		return Step{}, false
 	}
 	return s, true
 }

@@ -64,22 +64,30 @@ func TestDecodeRejectsNonSteps(t *testing.T) {
 		"malformed json":        {Kind: "data", Data: json.RawMessage(`{"schema":`)},
 		"keys in another case":  {Kind: "data", Data: json.RawMessage(`{"Schema":"kube-agents.step/v1","TITLE":"x"}`)},
 		"title in another case": {Kind: "data", Data: json.RawMessage(`{"schema":"kube-agents.step/v1","Title":"x"}`)},
+		// A later version is a new schema; a v1 reader does not guess at it.
+		"a later version":    {Kind: "data", Data: json.RawMessage(`{"schema":"kube-agents.step/v2","title":"x"}`)},
+		"the bare family":    {Kind: "data", Data: json.RawMessage(`{"schema":"kube-agents.step/","title":"x"}`)},
+		"an unknown kind":    {Kind: "data", Data: json.RawMessage(`{"schema":"kube-agents.step/v1","kind":"card","title":"x"}`)},
+		"a kind in caps":     {Kind: "data", Data: json.RawMessage(`{"schema":"kube-agents.step/v1","kind":"Plan","title":"x"}`)},
+		"subtask kind, none": {Kind: "data", Data: json.RawMessage(`{"schema":"kube-agents.step/v1","kind":"subtask","title":"x"}`)},
+		"subtask on a plan":  {Kind: "data", Data: json.RawMessage(`{"schema":"kube-agents.step/v1","kind":"plan","title":"x","subtask":{"id":"s"}}`)},
+		"settled past total": {Kind: "data", Data: json.RawMessage(`{"schema":"kube-agents.step/v1","kind":"subtask","title":"x","subtask":{"id":"s","settled":3,"total":2}}`)},
 	}
 	for name, p := range cases {
 		if s, ok := Decode(p); ok {
 			t.Errorf("%s: Decode accepted %+v", name, s)
 		}
 	}
-	s, ok := Decode(lib.Part{Kind: "data", Data: json.RawMessage(`{"schema":"kube-agents.step/v2","title":" Reading a file. "}`)})
-	if !ok || s.Kind != KindPlan || s.Title != "Reading a file." {
-		t.Fatalf("a later schema version with a title should decode as a plan step, got %+v ok=%v", s, ok)
+	s, ok := Decode(lib.Part{Kind: "data", Data: json.RawMessage(`{"schema":"kube-agents.step/v1","title":" Reading a file. ","thought":"  why  "}`)})
+	if !ok || s.Kind != KindPlan || s.Title != "Reading a file." || s.Thought != "why" {
+		t.Fatalf("a v1 record with no kind should decode as a trimmed plan step, got %+v ok=%v", s, ok)
 	}
 }
 
 // A subtask's keys match exactly too.
 func TestDecodeMatchesSubtaskKeysExactly(t *testing.T) {
 	s, ok := Decode(lib.Part{Kind: "data", Data: json.RawMessage(
-		`{"schema":"kube-agents.step/v1","kind":"subtask","title":"x","subtask":{"ID":"wrong","id":"s1"}}`)})
+		`{"schema":"kube-agents.step/v1","kind":"subtask","title":"x","subtask":{"id":"s1","ID":5,"Settled":"many"}}`)})
 	if !ok || s.Subtask == nil || s.Subtask.ID != "s1" {
 		t.Fatalf("got %+v ok=%v, want the exact-case id", s.Subtask, ok)
 	}
@@ -88,13 +96,32 @@ func TestDecodeMatchesSubtaskKeysExactly(t *testing.T) {
 // Part refuses what Decode would drop, rather than publish it silently.
 func TestPartRefusesWhatDecodeWouldDrop(t *testing.T) {
 	for name, s := range map[string]Step{
-		"empty":          {},
-		"blank title":    {Kind: KindPlan, Title: "  "},
-		"unknown kind":   {Kind: "card", Title: "x"},
-		"foreign schema": {Schema: "kube-agents.chat/v1", Kind: KindPlan, Title: "x"},
+		"empty":           {},
+		"blank title":     {Kind: KindPlan, Title: "  "},
+		"unknown kind":    {Kind: "card", Title: "x"},
+		"foreign schema":  {Schema: "kube-agents.chat/v1", Kind: KindPlan, Title: "x"},
+		"a later version": {Schema: "kube-agents.step/v2", Kind: KindPlan, Title: "x"},
+		"no subtask":      {Kind: KindSubtask, Title: "x"},
+		"subtask, no id":  {Kind: KindSubtask, Title: "x", Subtask: &Subtask{}},
+		"long title":      {Kind: KindPlan, Title: strings.Repeat("x", maxTitleBytes+1)},
+		"empty call id":   {Kind: KindPlan, Title: "x", CallIDs: []string{""}},
 	} {
 		if p, err := s.Part(); err == nil {
 			t.Errorf("%s: Part encoded %s", name, p.Data)
 		}
+	}
+}
+
+// A synthesis step round-trips and says so, and a null subtask is no subtask.
+func TestSynthesisAndNullSubtask(t *testing.T) {
+	p, err := Step{Kind: KindSynthesis, Title: "Writing the answer"}.Part()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s, ok := Decode(p); !ok || !s.IsSynthesis() {
+		t.Fatalf("a synthesis step did not round-trip as one: %+v ok=%v", s, ok)
+	}
+	if s, ok := Decode(lib.Part{Kind: "data", Data: json.RawMessage(`{"schema":"kube-agents.step/v1","title":"x","subtask":null}`)}); !ok || s.Subtask != nil {
+		t.Fatalf("a null subtask: got %+v ok=%v, want a plan step with no subtask", s, ok)
 	}
 }
