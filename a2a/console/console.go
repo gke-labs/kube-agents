@@ -82,8 +82,10 @@ const (
 	msgWebsocketOnly = "websocket only"
 	msgBusDown       = "the bus did not answer"
 	msgNoCA          = "the CA file %s holds no PEM certificate"
-	msgBusUnverified = "the bus's certificate did not verify against the bus CA"
-	msgBusWrongName  = "the bus's certificate does not name %s - set NATS_TLS_SERVER_NAME to a name it carries"
+	msgBusUnverified = "the bus's certificate did not verify: %v"
+	msgBusWrongName  = " - set NATS_TLS_SERVER_NAME to a name it carries"
+	msgBusPlaintext  = "the bus answered without TLS - it may still be restarting onto its TLS listener"
+	msgBusCAFile     = "the console could not use its bus CA (NATS_CA_FILE): %v"
 	msgNoCredential  = "no console credential at %s"
 	healthBody       = "ok\n"
 )
@@ -279,14 +281,18 @@ func busTransport(cfg Config) *http.Transport {
 func loadBusCA(path string) (*x509.CertPool, error) {
 	pem, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("the bus CA: %w", err)
+		return nil, fmt.Errorf("%w: %w", errBusCA, err)
 	}
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(pem) {
-		return nil, fmt.Errorf(msgNoCA, path)
+		return nil, fmt.Errorf("%w: "+msgNoCA, errBusCA, path)
 	}
 	return pool, nil
 }
+
+// errBusCA marks a failure to load the bus CA file, the console's own mount,
+// so the page is not told the bus failed when the bus was never dialled.
+var errBusCA = errors.New("the bus CA")
 
 // busHandler proxies the page's websocket to the bus. The browser's Origin
 // goes through unchanged, so the bus's allowed_origins checks the page and
@@ -303,22 +309,30 @@ func busHandler(cfg Config, log *slog.Logger) http.Handler {
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Error("bus proxy failed", "bus", cfg.BusURL.Redacted(), "err", err)
-			// A bus that answered with a certificate the CA does not vouch
-			// for is a different fault from one that did not answer, and
-			// the person reading the page should be told which. A name
-			// mismatch arrives wrapped the same way as an unknown authority,
-			// and its remedy is the server name, not the CA bundle.
+			// The person reading the page is told which side failed, not
+			// handed one sentence per guessed cause: the console's own CA
+			// file, a bus that answered in plaintext, a certificate that did
+			// not verify (with Go's own reason, which already says unknown
+			// authority, expired, or the wrong name), or no answer at all.
+			// Only the wrong name gets a remedy added, because its fix is a
+			// setting rather than the certificate.
 			var verify *tls.CertificateVerificationError
-			if errors.As(err, &verify) {
+			var plaintext tls.RecordHeaderError
+			switch {
+			case errors.Is(err, errBusCA):
+				http.Error(w, fmt.Sprintf(msgBusCAFile, err), http.StatusBadGateway)
+			case errors.As(err, &plaintext):
+				http.Error(w, msgBusPlaintext, http.StatusBadGateway)
+			case errors.As(err, &verify):
+				body := fmt.Sprintf(msgBusUnverified, verify.Err)
 				var wrongName x509.HostnameError
 				if errors.As(verify.Err, &wrongName) {
-					http.Error(w, fmt.Sprintf(msgBusWrongName, wrongName.Host), http.StatusBadGateway)
-					return
+					body += msgBusWrongName
 				}
-				http.Error(w, msgBusUnverified, http.StatusBadGateway)
-				return
+				http.Error(w, body, http.StatusBadGateway)
+			default:
+				http.Error(w, msgBusDown, http.StatusBadGateway)
 			}
-			http.Error(w, msgBusDown, http.StatusBadGateway)
 		},
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
