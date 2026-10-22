@@ -1521,6 +1521,32 @@ class EvalScriptGitLabTest(unittest.TestCase):
         self.assertNotIn("glpat-ledger", out.replace("LEDGER=glpat-ledger", ""))
         self.assertIn("PULLS_RC=0", out)
 
+    def test_the_resets_run_on_a_per_run_gitlab_without_the_app_key(self):
+        # The skip gate reads the kind, not the name: on gitlab-ce the agent token
+        # drives both resets with no GitHub App key mounted (found live, kube-agents#3682).
+        state = self.dir / "forge-state"
+        state.mkdir()
+        (state / "ca.crt").write_text("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
+        (state / "agent-token").write_text("glpat-perrun-agent\n")
+        (state / "ledger-token").write_text("glpat-perrun-ledger\n")
+        body = self._preamble().replace(f'EVAL_FORGE="{self.forge}"', 'EVAL_FORGE="gitlab-ce"', 1) + "\n".join(
+            [
+                "",
+                "read_gitlab_tokens >/dev/null || exit 9",
+                'EVAL_LEDGER_REPO="$(eval_gitlab_project "${PROJECT_ID}")"',
+                'reset_audit_ledgers "lease"',
+                'reset_agent_pulls "lease"; echo "PULLS_RC=$?"',
+            ]
+        )
+        proc = self._run(body)
+        out = proc.stdout
+        self.assertNotIn("EVAL_LEDGER_APP_KEY_FILE is unset", out)
+        per_run = f"gke-agentic/{PROJECT}-infra"
+        self.assertIn(f'HELPER argv=["--repo", "{per_run}", "--project", "{PROJECT}", "--build", "1", "--forge", "gitlab", "--host", "gitlab.eval.internal", "--ca-file", "{state}/ca.crt"]', out)
+        self.assertIn("HELPER token=glpat-perrun-agent", out)
+        self.assertEqual(out.count("HELPER argv="), 2)
+        self.assertIn("PULLS_RC=0", out)
+
     def test_the_forge_switch_refuses_an_unknown_forge(self):
         src = SCRIPT.read_text(encoding="utf-8")
         start = src.index('EVAL_FORGE="${EVAL_FORGE:-github}"')
