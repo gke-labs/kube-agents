@@ -73,6 +73,9 @@
 #   drift_poll_interval       seconds between board polls
 #
 # Optional:
+#   drift_card_finish_timeout seconds to wait, once the card is on the board, for
+#                             it to finish before the agent's turn (default
+#                             below)
 #   drift_failure_resources   comma-separated kinds the failure dump prints
 #                             (default below). gitops-drift-deleted-policy sets
 #                             networkpolicies, which is the object its scenario
@@ -115,6 +118,15 @@ DRIFT_SIGTERM_EXIT=143
 DRIFT_ENVELOPE_FILE="envelope.json"
 DRIFT_PAYLOAD_FILE="payload.json"
 DRIFT_PROBE_STDERR="probe.err"
+# How long, once the card is on the board, to wait for it to finish before the
+# agent's turn starts. A card that is still running at this ceiling is handed
+# over unfinished rather than failing the plant -- the case's prompt still
+# tells the agent to wait -- so a slow night degrades to the old behaviour
+# instead of losing the repetition. Sized above the slowest card the recorder
+# nightly has shown these cases, and overridable per stack.
+DRIFT_DEFAULT_CARD_FINISH_TIMEOUT=900
+# What the probe prints for "finished" when the board has no status column.
+DRIFT_FINISHED_UNKNOWN=-1
 DRIFT_BOARD_PROBE="board_probe.py"
 DRIFT_BUILD_PAYLOAD="build_payload.py"
 
@@ -338,7 +350,8 @@ except Exception:
   echo "Daemon accepted the drift record (insert_id=$drift_insert_id)."
 }
 
-# Wait for the triage card carrying drift_insert_id to reach the board.
+# Wait for the triage card carrying drift_insert_id to reach the board, and
+# then to finish.
 #
 # The inject returns as soon as the daemon has queued the front-door turn, and
 # that turn -- one kanban_create against the cluster agent scoped to the host
@@ -352,7 +365,7 @@ except Exception:
 # Not on the title: the front door composes that and could reword it, and it
 # carries no id.
 drift_wait_for_card() {
-  local board_probe pod_python candidate elapsed found probe_rc probe_err
+  local board_probe pod_python candidate elapsed found finished out probe_rc probe_err finish_timeout
 
   board_probe="$DRIFT_MODULE_DIR/$DRIFT_BOARD_PROBE"
   probe_err="$drift_kubeconfig_dir/$DRIFT_PROBE_STDERR"
@@ -373,18 +386,9 @@ drift_wait_for_card() {
     exit 1
   fi
 
-  # The count is read into a variable and checked for shape before `-ge` sees
-  # it. `[ "" -ge 1 ]` is a syntax error under errexit, and a kubectl exec that
-  # fails halfway can return partial output as easily as none. The exec's own
-  # stderr is kept and reported at the timeout, so a refused exec is not
-  # reported as a verdict about the front door.
   elapsed=0
   while :; do
-    probe_rc=0
-    found="$("${drift_exec_in_pod_stdin[@]}" "$pod_python" - "$drift_insert_id" < "$board_probe" 2>"$probe_err")" || probe_rc=$?
-    case "$found" in
-      "" | *[!0-9]*) found=0 ;;
-    esac
+    drift_probe_board
     if [ "$found" -ge 1 ]; then
       break
     fi
@@ -401,7 +405,60 @@ drift_wait_for_card() {
   done
   echo "Triage card for $drift_insert_id appeared after ${elapsed}s."
 
-  # The card then takes minutes to run. Waiting for THAT here would spend the
-  # wait outside the agent turn for no gain; the task's prompt polls the board
-  # with kanban_show instead, which is the read path the product actually offers.
+  # Then wait for it to finish, here rather than in the agent's turn.
+  #
+  # This used to be left to the agent, on the grounds that polling kanban_show
+  # is the read path the product offers. It does not hold up: the agent runtime
+  # filters a tool call identical to an earlier one with the same result, and
+  # tells the agent to "proceed with what you have". Waiting on a running card
+  # is exactly that call, so on the recorder nightly of 2026-10-22 seven cases
+  # each lost a repetition to an agent that obeyed the filter and reported a
+  # card it had not seen finish -- two of them CUJ 1's, after 12 and 14 polls,
+  # where every repetition that passed had needed at least 15. The cases grade
+  # the triage, not the polling, so the wait moves here and the agent's turn
+  # becomes the read it was meant to be. The runtime gap is filed separately.
+  #
+  # Inside the unit either way, so it costs the infra-lock chain nothing: the
+  # repetitions that passed already spent this wait in the agent's turn.
+  finish_timeout="${drift_card_finish_timeout:-$DRIFT_DEFAULT_CARD_FINISH_TIMEOUT}"
+  elapsed=0
+  while :; do
+    drift_probe_board
+    if [ "$finished" -eq "$DRIFT_FINISHED_UNKNOWN" ]; then
+      echo "WARNING: the board has no status column to read, so this run cannot wait for the card to finish; the agent's turn starts with the card in whatever state it is in." >&2
+      return 0
+    fi
+    if [ "$finished" -ge 1 ]; then
+      echo "Triage card for $drift_insert_id finished after a further ${elapsed}s."
+      return 0
+    fi
+    if [ "$elapsed" -ge "$finish_timeout" ]; then
+      echo "WARNING: the triage card for $drift_insert_id was still running ${elapsed}s after it appeared. Handing it to the agent's turn unfinished; the case's prompt tells the agent to wait for it." >&2
+      return 0
+    fi
+    sleep "$drift_poll_interval"
+    elapsed=$((elapsed + drift_poll_interval))
+  done
+}
+
+# One read of the board into `found` and `finished`, shape-checked.
+#
+# Both are checked for shape before `-ge` sees them. `[ "" -ge 1 ]` is a syntax
+# error under errexit, and a kubectl exec that fails halfway can return partial
+# output as easily as none, so anything that is not two integers reads as
+# "nothing yet" and the caller keeps polling. The exec's stderr is kept for the
+# appearance timeout to report, so a refused exec is not taken for a verdict
+# about the front door.
+drift_probe_board() {
+  probe_rc=0
+  out="$("${drift_exec_in_pod_stdin[@]}" "$pod_python" - "$drift_insert_id" < "$board_probe" 2>"$probe_err")" || probe_rc=$?
+  found="${out%% *}"
+  finished="${out#* }"
+  case "$found" in
+    "" | *[!0-9]*) found=0 ;;
+  esac
+  case "$finished" in
+    "$DRIFT_FINISHED_UNKNOWN") ;;
+    "" | *[!0-9]*) finished=0 ;;
+  esac
 }
