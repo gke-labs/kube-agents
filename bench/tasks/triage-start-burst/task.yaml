@@ -55,6 +55,9 @@ infrastructure:
     burst_namespace: "eval-triage-burst"
     pod_name_prefix: "eval-burst-pod"
     pod_count: 20
+    # The product gives a queued start up to 20 minutes (TRIAGE_QUEUE_WAIT_LIMIT_S), so a
+    # start the product calls on time must not fail the check.
+    start_settle_seconds: 1200
 
 validated: false
 
