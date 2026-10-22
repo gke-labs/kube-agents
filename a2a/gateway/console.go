@@ -24,12 +24,13 @@ import (
 // to chat.console.<token>.in; this adapter turns each into one InboundMessage
 // and the gateway handles it like any DM. The gateway's own notices (the
 // placeholder while a pod comes up, the rolling progress line, drop notices)
-// go back as ConsoleOutFrame JSON on chat.console.<token>.out, and so does
-// each task's terminal, as a frame naming the task (PostTerminal). The page
-// renders answers from TASKS and skips a completed task's frame, so for the
-// page a lost .out frame still costs a notice and never an answer. A client
-// with no TASKS view (the MCP server) reads its answers here. .out is core
-// NATS, so that client has them live only.
+// go back as ConsoleOutFrame JSON on chat.console.<token>.out. So does each
+// task's end, as one frame naming the task (PostTerminal, from the gateway's
+// consoleFrame): one per delegation chain, under the task the turn started,
+// as every observer is told. The page renders answers from TASKS and skips
+// those frames, so for the page a lost .out frame still costs a notice and
+// never an answer. A client with no TASKS view (the MCP server) reads each
+// end here, live only, since .out is core NATS.
 //
 // Identity is the grant. Only the `console` user may publish on
 // chat.console.*.in (the operator's consoleIdentity), so the sender IS
@@ -93,10 +94,20 @@ const (
 	consoleResultIDPrefix = "r-"
 	// consoleResultTextCap bounds a terminal frame's text. The frame goes out
 	// whole, under the server's max_payload (1 MiB by default; the render
-	// sets none), and JSON escaping can grow the text on the way. An answer
-	// past the cap is cut and says so; the task's result artifact keeps it
-	// whole on TASKS.
+	// sets none); PostTerminal cuts again if escaping still takes it past.
+	// An answer past the cap is cut and says so; the task's result artifact
+	// keeps it whole on TASKS.
 	consoleResultTextCap = 256 * bytesPerKiB
+	// consoleResultStashCap bounds the deliverables consoleResultStash
+	// holds. Each is taken by the terminal that follows it on the same
+	// worker, so the stash holds one per conversation mid-terminal; past the
+	// cap it is cleared, and a terminal whose deliverable went with it says
+	// the result is on the stream (completedNonTextResult).
+	consoleResultStashCap = 1024
+	// consoleResultShrinkNum/Den is the extra cut (nine tenths of the share
+	// that fits) PostTerminal takes when an encoded frame is still too big.
+	consoleResultShrinkNum = 9
+	consoleResultShrinkDen = 10
 	// consoleResultCutNote ends a cut answer.
 	consoleResultCutNote = "\n\n(cut here: the full answer is the task's result on the bus)"
 	// consoleQueueFullNotice is posted once per fill when consoleQueueCap
@@ -136,6 +147,31 @@ type ConsoleTerminal struct {
 	Addressee string
 	State     lib.TaskState
 	Text      string
+}
+
+// consoleResultStash carries a completed task's deliverable from the
+// observer call that hands it over (TaskDelivered's) to the terminal that
+// ends it, so the console's one frame per end carries both.
+type consoleResultStash struct {
+	mu sync.Mutex
+	m  map[string]string
+}
+
+func (c *consoleResultStash) put(taskID, result string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.m == nil || len(c.m) >= consoleResultStashCap {
+		c.m = make(map[string]string)
+	}
+	c.m[taskID] = result
+}
+
+func (c *consoleResultStash) take(taskID string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	result, ok := c.m[taskID]
+	delete(c.m, taskID)
+	return result, ok
 }
 
 // errNoTerminalFrames is a conversation whose backend takes no terminal
@@ -233,7 +269,7 @@ func NewConsoleAdapter(url string, natsOpts []nats.Option, log *slog.Logger) (*C
 			// permissions violation, so the subject comes from the error
 			// text, or from the one subscription this adapter makes.
 			if m := consolePublishViolationRe.FindStringSubmatch(err.Error()); m != nil {
-				log.Error("console publish refused: the NATS config predates the console identity, or the NATS pod has not rolled onto the new config yet; notices are lost until the config carries chat.console.*.out for the gateway",
+				log.Error("console publish refused: the NATS config predates the console identity, or the NATS pod has not rolled onto the new config yet; notices and terminal frames are lost until the config carries chat.console.*.out for the gateway",
 					"subject", m[1], "err", err)
 				return
 			}
@@ -432,20 +468,49 @@ func (a *ConsoleAdapter) publishFrame(conversation string, f ConsoleOutFrame) er
 	return a.nc.Publish(consoleOutSubject(token), data)
 }
 
-// PostTerminal publishes one task's terminal frame (TerminalPoster).
+// PostTerminal publishes one task's terminal frame (TerminalPoster). The
+// text is cut to consoleResultTextCap, and cut again while the encoded frame
+// is still past the server's max_payload: JSON escaping can grow a string up
+// to six times, so the byte cap alone does not bound the frame.
 func (a *ConsoleAdapter) PostTerminal(conversation string, t ConsoleTerminal) error {
-	text := t.Text
-	if len(text) > consoleResultTextCap {
-		text = strings.ToValidUTF8(text[:consoleResultTextCap-len(consoleResultCutNote)], "") + consoleResultCutNote
+	token, ok := consoleConversationToken(conversation)
+	if !ok {
+		return fmt.Errorf("console adapter: malformed conversation id %q", conversation)
 	}
-	return a.publishFrame(conversation, ConsoleOutFrame{
+	f := ConsoleOutFrame{
 		MessageID: consoleResultIDPrefix + t.TaskID,
-		Text:      text,
+		Text:      cutConsoleResult(t.Text, consoleResultTextCap),
 		Kind:      consoleFrameKindResult,
 		State:     t.State,
 		Addressee: t.Addressee,
 		TaskID:    t.TaskID,
-	})
+	}
+	limit := a.nc.MaxPayload()
+	for {
+		data, err := json.Marshal(f)
+		if err != nil {
+			return err
+		}
+		if int64(len(data)) <= limit {
+			return a.nc.Publish(consoleOutSubject(token), data)
+		}
+		// Shrink the text by the share of the frame that is over, and a
+		// tenth more, so the loop ends in a step or two.
+		keep := int(int64(len(f.Text)) * limit / int64(len(data)) * consoleResultShrinkNum / consoleResultShrinkDen)
+		if keep <= len(consoleResultCutNote) {
+			return fmt.Errorf("console adapter: terminal frame for %s does not fit under max_payload %d", t.TaskID, limit)
+		}
+		f.Text = cutConsoleResult(f.Text, keep)
+	}
+}
+
+// cutConsoleResult cuts text to at most max bytes, ending with the cut note
+// and dropping a rune the cut would split. Text within max is returned as is.
+func cutConsoleResult(text string, max int) string {
+	if len(text) <= max {
+		return text
+	}
+	return strings.ToValidUTF8(text[:max-len(consoleResultCutNote)], "") + consoleResultCutNote
 }
 
 // Post publishes a new notice frame and returns its id.

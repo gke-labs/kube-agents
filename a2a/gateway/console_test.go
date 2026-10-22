@@ -305,6 +305,36 @@ func TestConsoleTerminalCutsAnOversizeAnswer(t *testing.T) {
 	}
 }
 
+// Text that JSON escapes six bytes for one (`<` becomes \u003c) passes the
+// byte cap and would still overrun max_payload once encoded; the frame is cut
+// again until it fits, rather than failing to publish.
+func TestConsoleTerminalFitsUnderMaxPayloadAfterEscaping(t *testing.T) {
+	r := startConsoleRig(t)
+	sub, err := r.browser.SubscribeSync("chat.console.tab-7.out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.browser.Flush()
+	escapable := strings.Repeat("<", consoleResultTextCap)
+	if err := r.adapter.PostTerminal("console:tab-7", ConsoleTerminal{TaskID: "task-3", State: lib.StateCompleted, Text: escapable}); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := sub.NextMsg(5 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if max := r.browser.MaxPayload(); int64(len(msg.Data)) > max {
+		t.Fatalf("frame is %d bytes, over max_payload %d", len(msg.Data), max)
+	}
+	var f ConsoleOutFrame
+	if err := json.Unmarshal(msg.Data, &f); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(f.Text, consoleResultCutNote) {
+		t.Errorf("the escaped answer was not cut: %d bytes", len(f.Text))
+	}
+}
+
 // Notice ids carry a per-adapter random component, so a restarted gateway's
 // first notice is not c-1 again and a page holding the last boot's c-1 does
 // not take the new one's edits as its own.

@@ -106,13 +106,13 @@ describe("console frames", () => {
     expect(frame?.state).toBe("completed");
   });
 
-  it("keeps a completed answer's frame out of the pane and every other frame in", () => {
-    // The pane renders a completed answer from TASKS, so its frame would print it twice.
+  it("keeps every terminal frame out of the pane and every notice in", () => {
+    // The pane renders answers from TASKS and gets the gateway's notice for a
+    // failure or a cancel, so a terminal frame would print either twice.
     expect(paneShows(parseOutFrame('{"messageId":"r-t","text":"a","kind":"result","state":"completed"}')!)).toBe(false);
-    // A failed or canceled task's frame is the pane's only word that the task ended.
-    expect(paneShows(parseOutFrame('{"messageId":"r-t","text":"❌","kind":"result","state":"failed"}')!)).toBe(true);
-    expect(paneShows(parseOutFrame('{"messageId":"r-t","text":"🛑","kind":"result","state":"canceled"}')!)).toBe(true);
-    // A notice about a turn carries no kind.
+    expect(paneShows(parseOutFrame('{"messageId":"r-t","text":"❌","kind":"result","state":"failed"}')!)).toBe(false);
+    // A notice carries no kind.
+    expect(paneShows(parseOutFrame('{"messageId":"c-1","text":"❌ the task failed"}')!)).toBe(true);
     expect(paneShows(parseOutFrame('{"messageId":"c-1","text":"⏳ submitted…"}')!)).toBe(true);
   });
 

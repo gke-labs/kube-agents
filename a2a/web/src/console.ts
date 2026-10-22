@@ -52,13 +52,12 @@ export interface ConsoleOutFrame {
   edit: boolean;
   /** "result" on a task's terminal frame; absent on a notice about a turn. */
   kind?: string;
-  /** The A2A state a terminal frame's task ended in. */
+  /** The A2A state a terminal frame's task ended in (the pane does not read it). */
   state?: string;
 }
 
 /** The kind the gateway gives a task's terminal frame (a2a/gateway/console.go). */
 export const RESULT_FRAME_KIND = "result";
-const COMPLETED_STATE = "completed";
 
 export type Random = (buf: Uint8Array) => Uint8Array;
 
@@ -132,13 +131,13 @@ export function parseOutFrame(data: Uint8Array | string): ConsoleOutFrame | null
 }
 
 /**
- * Whether the chat pane shows a frame. A completed task's terminal frame
- * carries the answer, which the pane already renders from TASKS, so showing
- * it as a notice too would print the answer twice. Every other terminal
- * (failed, canceled, rejected) is a notice the pane has no other source for.
+ * Whether the chat pane shows a frame. A task's terminal frame is for a
+ * console client with no TASKS view: the pane renders answers from TASKS and
+ * already gets the gateway's notice for a task that failed or was canceled,
+ * so showing the frame too would print either twice.
  */
 export function paneShows(frame: ConsoleOutFrame): boolean {
-  return !(frame.kind === RESULT_FRAME_KIND && frame.state === COMPLETED_STATE);
+  return frame.kind !== RESULT_FRAME_KIND;
 }
 
 /** Mirrors Go's strings.TrimSpace (the unicode.IsSpace set). */

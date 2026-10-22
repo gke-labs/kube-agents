@@ -268,7 +268,7 @@ func TestAConsoleAnswerIsATerminalFrame(t *testing.T) {
 }
 
 // A failure on a console conversation is a terminal frame too, carrying the
-// notice text, and is not posted a second time as a plain notice.
+// notice text.
 func TestAConsoleFailureIsATerminalFrame(t *testing.T) {
 	r := startRig(t)
 	r.adapter.setTakesTerminals()
@@ -288,10 +288,89 @@ func TestAConsoleFailureIsATerminalFrame(t *testing.T) {
 	if len(got) != 1 || got[0] != want {
 		t.Fatalf("terminal frames = %+v, want exactly %+v", got, want)
 	}
-	for _, p := range r.adapter.postTexts() {
-		if strings.Contains(p, "the task failed") {
-			t.Errorf("the failure was also posted as a console notice: %q", p)
-		}
+	// The page still gets the gateway's notice, which carries no kind.
+	waitFor(t, "the failure notice", postedContaining(r, "the task failed"))
+}
+
+// The heal tells a console client the end it finds, as it tells every
+// observer: a task whose terminal the relay missed still reaches .out. Here
+// the relay saw it too, so the heal's frame repeats the relay's for the same
+// task, which a client drops on its repeated id.
+func TestAHealedConsoleTaskIsAFrame(t *testing.T) {
+	r := startRig(t)
+	r.adapter.setTakesTerminals()
+	r.adapter.roster = []string{consoleAuthor}
+	conv := "console:tab-heal"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", Backend: consoleBackend, AuthorID: consoleAuthor, MessageID: "m1", Text: "start"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	completeTask(t, exec, "done")
+	waitFor(t, "the relay's frame", func() bool { return len(r.adapter.terminalPosts()) == 1 })
+
+	// Fake the relay having missed the terminal: restore ActiveTask in KV,
+	// the state a transient KV failure on the final event leaves.
+	ctx := context.Background()
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil || rec == nil {
+		t.Fatal(err)
+	}
+	rec.ActiveTask = &ActiveTask{TaskID: origin.TaskID, CorrelationID: origin.CorrelationID}
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", Backend: consoleBackend, AuthorID: consoleAuthor, MessageID: "m2", Text: "next question"}
+	waitFor(t, "the heal's frame", func() bool { return len(r.adapter.terminalPosts()) == 2 })
+	got := r.adapter.terminalPosts()
+	if got[1] != got[0] || got[1].TaskID != origin.TaskID || got[1].Text != "done" {
+		t.Fatalf("heal frame = %+v, want a repeat of %+v", got[1], got[0])
+	}
+}
+
+// A delegation chain ends once toward a console client: no frame for the turn
+// that delegated or for its child, and one for the wake's end, under the task
+// the turn started (observedAs), as every observer is told.
+func TestAConsoleDelegationChainEndsInOneFrame(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	r.adapter.setTakesTerminals()
+	conv := consoleKeyPrefix + "t-chain"
+	origin, session, child := delegated(t, r, spawn, conv, "")
+	completeTask(t, r.execFor(t, child, targetPlatform), "fleet is green")
+	waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
+	wakeSession := spawn.calls()[1].Session
+	wake := r.awaitTask(t, wakeSession)
+	completeTask(t, r.execFor(t, wake, wakeSession), "the fleet is green, all three clusters")
+	waitFor(t, "the chain's frame", func() bool { return len(r.adapter.terminalPosts()) > 0 })
+	got := r.adapter.terminalPosts()
+	want := fakeTerminal{conv, ConsoleTerminal{TaskID: origin.TaskID, Addressee: session, State: lib.StateCompleted, Text: "the fleet is green, all three clusters"}}
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("terminal frames = %+v, want exactly %+v", got, want)
+	}
+}
+
+// A session turn whose delegate request minted no child ends failed with the
+// reason, though its executor said completed: the hand-off line ("delegated
+// to ...") is never an answer (handOffEnd).
+func TestAConsoleHandOffWithNoChildIsAFailedFrame(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	r.adapter.setTakesTerminals()
+	conv := consoleKeyPrefix + "t-handoff"
+	exec, origin, _ := sessionTurnVia(t, r, spawn, conv, "", "how is the fleet?")
+	if err := exec.PublishArtifact(context.Background(), delegateArtifact(t, "nobody-here", "report fleet health")); err != nil {
+		t.Fatal(err)
+	}
+	// The refusal's notice follows the turn's answer, so wait on the record.
+	waitFor(t, "the refusal on the record", func() bool {
+		rec, _ := r.g.reg.Get(context.Background(), conv)
+		ref, _ := rec.TaskRefFor(origin.TaskID)
+		return ref.DelegationEnd != ""
+	})
+	completeTask(t, exec, "delegated to nobody-here")
+	waitFor(t, "the frame", func() bool { return len(r.adapter.terminalPosts()) > 0 })
+	got := r.adapter.terminalPosts()
+	if len(got) != 1 || got[0].TaskID != origin.TaskID || got[0].State != lib.StateFailed ||
+		!strings.HasPrefix(got[0].Text, "❌ failed: ") || !strings.Contains(got[0].Text, "delegation refused") ||
+		strings.Contains(got[0].Text, "delegated to nobody-here") {
+		t.Fatalf("terminal frames = %+v, want one failed frame for %s with the reason", got, origin.TaskID)
 	}
 }
 
