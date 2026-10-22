@@ -54,9 +54,16 @@ const (
 	profileNetpolComponent = "profile-netpol"
 )
 
+// The suffixes the profile namespace and the objects in it are named with.
+const (
+	profileNamespaceSuffix = "-profiles"
+	profileQuotaSuffix     = "-profile-quota"
+	profileNetpolSuffix    = "-profile-netpol"
+)
+
 // profileNamespaceName is the namespace profile work runs in.
 func profileNamespaceName(agent *agentv1alpha1.PlatformAgent) string {
-	return agent.Namespace + "-profiles"
+	return agent.Namespace + profileNamespaceSuffix
 }
 
 // resolveProfileCeiling is spec.harness.tuning.profiles.ceiling, defaulted.
@@ -109,7 +116,7 @@ func profileQuotaHard(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alph
 }
 
 func profileQuotaName(agent *agentv1alpha1.PlatformAgent) string {
-	return agent.Name + "-profile-quota"
+	return agent.Name + profileQuotaSuffix
 }
 
 func buildProfileQuota(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) *corev1.ResourceQuota {
@@ -129,7 +136,7 @@ func buildProfileQuota(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alp
 }
 
 func profileNetpolName(agent *agentv1alpha1.PlatformAgent) string {
-	return agent.Name + "-profile-netpol"
+	return agent.Name + profileNetpolSuffix
 }
 
 // buildProfileNetworkPolicy fences every pod in the profile namespace: no
@@ -358,11 +365,11 @@ func (r *PlatformAgentReconciler) profileFenceRendered(ctx context.Context, agen
 // NetworkPolicy writer there can reach one agent at most; ok is false for
 // anything else.
 func agentOfProfileFence(obj client.Object) (types.NamespacedName, bool) {
-	ns, ok := strings.CutSuffix(obj.GetNamespace(), "-profiles")
+	ns, ok := strings.CutSuffix(obj.GetNamespace(), profileNamespaceSuffix)
 	if !ok || ns == "" || obj.GetLabels()[a2aComponentLabel] != profileNetpolComponent {
 		return types.NamespacedName{}, false
 	}
-	name, ok := strings.CutSuffix(obj.GetName(), "-profile-netpol")
+	name, ok := strings.CutSuffix(obj.GetName(), profileNetpolSuffix)
 	if !ok || name == "" {
 		return types.NamespacedName{}, false
 	}

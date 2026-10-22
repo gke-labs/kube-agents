@@ -6295,7 +6295,8 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// no owner reference and is tested by this agent's labels instead.
 	//
 	// Adding an object to reconcileA2A ahead of the keys Secret, or to
-	// reconcileA2ANetworkFences ahead of the NATS fence, means adding it here.
+	// reconcileA2ANetworkFences ahead of its first write (the profile fence,
+	// then the NATS fence), means adding it here.
 	// TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere walks every
 	// prefix of both renders and is what makes forgetting it red rather than
 	// silent: without the keys Secret below, its writes 3 and 4 fail, and
@@ -6364,8 +6365,9 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 
 	// The profile namespace's quota, which carries no owner reference
 	// (agentprofile_namespace.go). Its fence goes after the bus below.
-	if err := r.deleteProfileQuota(ctx, agent); err != nil {
-		r.profileNamespaceFailure(ctx, agent, "delete the quota on the flip to today", err)
+	profileQuotaErr := r.deleteProfileQuota(ctx, agent)
+	if profileQuotaErr != nil {
+		r.profileNamespaceFailure(ctx, agent, "delete the quota on the flip to today", profileQuotaErr)
 	}
 
 	// 2. The callout's ClusterRoleBinding. Cluster-scoped, so it carries no
@@ -6414,10 +6416,14 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// namespace is gone (LiteLLM's policy dropped it earlier in the pass,
 	// when it re-rendered for today). Before the sentinel, so a failed delete
 	// leaves cleanup to resume.
-	if err := r.deleteProfileFence(ctx, agent); err != nil {
-		// A fence left behind only restricts; it keeps counting as a
-		// sentinel, so later passes retry it without holding the bus.
-		r.profileNamespaceFailure(ctx, agent, "delete the fence on the flip to today", err)
+	// Skipped on a pass whose quota delete failed: the fence then stays as
+	// the sentinel that brings the teardown back for the quota, transient
+	// failure or not. A fence left behind only restricts, so a failed fence
+	// delete is logged and retried the same way, without holding the bus.
+	if profileQuotaErr == nil {
+		if err := r.deleteProfileFence(ctx, agent); err != nil {
+			r.profileNamespaceFailure(ctx, agent, "delete the fence on the flip to today", err)
+		}
 	}
 
 	// 5. LAST, deliberately: the StatefulSet is this function's sentinel. The

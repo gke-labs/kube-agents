@@ -3,8 +3,10 @@ package controller
 import (
 	"context"
 	"fmt"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/tools/record"
 	"reflect"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"strings"
@@ -298,6 +300,122 @@ func TestWithoutProfilePeer(t *testing.T) {
 	}
 }
 
+// A persistent refusal of the quota delete (Forbidden) releases the
+// finalizer and writes the Warning Event; a transient failure is returned so
+// the workqueue retries it, since nothing would come back for the quota once
+// the finalizer is gone.
+func TestTheDeletionReleasesOnlyOnAPersistentRefusal(t *testing.T) {
+	scheme := setupScheme()
+	for _, tc := range []struct {
+		name     string
+		err      error
+		released bool
+	}{
+		{"forbidden", apierrors.NewForbidden(schema.GroupResource{Resource: "resourcequotas"}, "test-agent-profile-quota", fmt.Errorf("denied by a policy")), true},
+		{"transient", apierrors.NewTooManyRequests("throttled", 1), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			agent.Finalizers = []string{platformAgentFinalizer}
+			quota := buildProfileQuota(agent, nil)
+			withCommonLabels(quota, agent)
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, quota).WithInterceptorFuncs(interceptor.Funcs{
+				Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+					if obj.GetNamespace() == "test-ns-profiles" {
+						return tc.err
+					}
+					return c.Delete(ctx, obj, opts...)
+				},
+			}).Build()
+			events := record.NewFakeRecorder(8)
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: events}
+			_, err := r.handleDeletion(context.Background(), agent)
+			var got agentv1alpha1.PlatformAgent
+			getErr := cl.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name}, &got)
+			stillHeld := getErr == nil && len(got.Finalizers) > 0
+			if tc.released {
+				if err != nil || stillHeld {
+					t.Errorf("a forbidden quota delete: err=%v, finalizer held=%v; want it released", err, stillHeld)
+				}
+				select {
+				case ev := <-events.Events:
+					if !strings.Contains(ev, "Warning "+reasonProfileNamespaceFailed) {
+						t.Errorf("event %q, want a %s Warning", ev, reasonProfileNamespaceFailed)
+					}
+				default:
+					t.Error("no Warning Event for the refused delete")
+				}
+			} else if err == nil || !stillHeld {
+				t.Errorf("a transient quota delete failure: err=%v, finalizer held=%v; want it returned and the finalizer kept for the retry", err, stillHeld)
+			}
+		})
+	}
+}
+
+// The flip deletes the profile fence after the bus fence that admits the
+// namespace, so no pass leaves the bus admitting a namespace nothing
+// confines; and a pass whose quota delete fails keeps the fence, the
+// sentinel that brings the teardown back for the quota.
+func TestTheFlipDeletesTheProfileFenceAfterTheBusFence(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	agent.Spec.Mode = ptr.To("today")
+	agent.UID = "agent-uid"
+	nats := buildA2ANATSNetworkPolicy(agent)
+	if err := ctrl.SetControllerReference(agent, nats, scheme); err != nil {
+		t.Fatal(err)
+	}
+	fence := buildProfileNetworkPolicy(agent, nil)
+	withCommonLabels(fence, agent)
+	quota := buildProfileQuota(agent, nil)
+	withCommonLabels(quota, agent)
+	var order []string
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, nats, fence, quota).WithInterceptorFuncs(interceptor.Funcs{
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			order = append(order, obj.GetNamespace()+"/"+obj.GetName())
+			return c.Delete(ctx, obj, opts...)
+		},
+	}).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	if err := r.cleanupA2A(context.Background(), agent); err != nil {
+		t.Fatalf("cleanupA2A: %v", err)
+	}
+	at := func(name string) int {
+		for i, o := range order {
+			if o == name {
+				return i
+			}
+		}
+		return -1
+	}
+	busAt, fenceAt := at("test-ns/"+nats.Name), at("test-ns-profiles/"+fence.Name)
+	if busAt < 0 || fenceAt < 0 || fenceAt < busAt {
+		t.Errorf("delete order %v: the profile fence (at %d) must go after the bus fence (at %d)", order, fenceAt, busAt)
+	}
+
+	// A transient failure on the quota keeps the fence for the retry.
+	fence2 := buildProfileNetworkPolicy(agent, nil)
+	withCommonLabels(fence2, agent)
+	quota2 := buildProfileQuota(agent, nil)
+	withCommonLabels(quota2, agent)
+	cl = fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, fence2, quota2).WithInterceptorFuncs(interceptor.Funcs{
+		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			if obj.GetName() == quota2.Name {
+				return apierrors.NewTooManyRequests("throttled", 1)
+			}
+			return c.Delete(ctx, obj, opts...)
+		},
+	}).Build()
+	r = &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	if err := r.cleanupA2A(context.Background(), agent); err != nil {
+		t.Fatalf("cleanupA2A with a throttled quota delete: %v", err)
+	}
+	var np networkingv1.NetworkPolicy
+	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "test-ns-profiles", Name: fence2.Name}, &np); err != nil {
+		t.Errorf("the profile fence was deleted on a pass whose quota delete failed, so nothing brings the teardown back for the quota (err %v)", err)
+	}
+}
+
 // A refused delete in the profile namespace holds neither the finalizer nor
 // the flip's teardown: both carry on and log it.
 func TestAProfileDeleteRefusalHoldsNothing(t *testing.T) {
@@ -305,7 +423,7 @@ func TestAProfileDeleteRefusalHoldsNothing(t *testing.T) {
 	refuse := interceptor.Funcs{
 		Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
 			if obj.GetNamespace() == "test-ns-profiles" {
-				return fmt.Errorf("refused by a policy in the profile namespace")
+				return apierrors.NewForbidden(schema.GroupResource{Resource: "resourcequotas"}, obj.GetName(), fmt.Errorf("refused by a policy in the profile namespace"))
 			}
 			return c.Delete(ctx, obj, opts...)
 		},

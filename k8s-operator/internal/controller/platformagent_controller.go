@@ -1226,9 +1226,15 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		// between. A fence left behind only restricts, and the chart's
 		// uninstall removes the namespace with it.
 		if err := r.deleteProfileQuota(ctx, agent); err != nil {
-			// A stale quota only caps a successor of another name, and the
-			// chart's uninstall removes the namespace; it never holds the
-			// finalizer.
+			// A persistent refusal (RBAC or an admission policy in the
+			// profile namespace) never holds the finalizer: a stale quota
+			// only caps a successor of another name, and the chart's
+			// uninstall removes the namespace. Anything else (a timeout, a
+			// throttle) is retried, since no later pass would come back
+			// for the quota once the finalizer is gone.
+			if !errors.IsForbidden(err) && !errors.IsInvalid(err) {
+				return ctrl.Result{}, err
+			}
 			r.profileNamespaceFailure(ctx, agent, "delete the quota on deletion", err)
 		}
 
