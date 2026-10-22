@@ -667,12 +667,14 @@ def _register_findings(data_dir: Path, in_sandbox: bool, no_ranking: bool | None
         sys.stderr.write(f"bootstrap_delivery: could not read the sweep's findings; registering nothing: {detail}\n")
         return suppressed
     endpoint = _findings_endpoint()
+    refused = 0
     for where, batch, scope in batches:
         try:
             result = inventory_findings.post_batch(endpoint, batch, scope)
         except urllib.error.HTTPError as e:
             # This cluster only.
             sys.stderr.write(f"bootstrap_delivery: the findings queue refused {where}'s findings: {e.code}\n")
+            refused += 1
             continue
         except Exception as e:
             sys.stderr.write(
@@ -684,7 +686,9 @@ def _register_findings(data_dir: Path, in_sandbox: bool, no_ranking: bool | None
         for entry in outcomes if isinstance(outcomes, list) else []:
             if isinstance(entry, dict) and entry.get("outcome") == SUPPRESSED:
                 suppressed.add(str(entry.get("id")))
-    _mark_registered(data_dir)
+    # A refused batch is a cluster the queue does not hold, so the fleet is not checked yet.
+    if not refused:
+        _mark_registered(data_dir)
     return suppressed
 
 

@@ -888,6 +888,13 @@ class DeliveryRegistersFindingsTest(unittest.TestCase):
             self._run()
         self.assertFalse((self.d / bootstrap_delivery.FINDINGS_REGISTERED_MARKER).exists())
 
+    def test_a_refused_batch_records_no_check(self):
+        self._write()
+        refused = urllib.error.HTTPError("http://q", 400, "bad", None, None)
+        with mock.patch.object(inventory_findings, "post_batch", side_effect=refused):
+            self._run()
+        self.assertFalse((self.d / bootstrap_delivery.FINDINGS_REGISTERED_MARKER).exists())
+
     def test_the_check_marker_is_the_one_the_board_reads(self):
         import board_snapshot  # agents/platform/scripts, beside this script in the image
 
