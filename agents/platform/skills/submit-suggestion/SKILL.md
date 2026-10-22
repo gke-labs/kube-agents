@@ -248,6 +248,13 @@ and a manifest you add declares its object, so merging it keeps the object.
      each named in its body, because any one left behind recreates it: the
      objects in it, its directory, and the `kustomization.yaml` that lists
      only them.
+   - **The listing above it is an edit.** A removed file or directory that a
+     parent `kustomization.yaml` names in its `resources:` (for example
+     `- gitops-owned-scratch/` in `clusters/<cluster>/namespaces/kustomization.yaml`)
+     loses that one line in the same pull request; left in, the parent no
+     longer renders and the whole synced path stops applying. Find it with
+     `grep -rn -- "- <name>/\?$" <workspace>`, edit only that line, and name
+     the edit in the body.
    - **A shared declaration is a stop.** A `kustomization.yaml`, Argo CD
      `Application` or Flux `Kustomization` that also creates objects outside
      the request, or a `namespaces/<name>/` directory with namespaces under it
