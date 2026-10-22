@@ -913,3 +913,47 @@ func TestSwarmWireTypesMatchBridge(t *testing.T) {
 	cmp("SwarmSnapshot", reflect.TypeOf(SwarmSnapshot{}), reflect.TypeOf(bridgeSwarmSnapshot{}))
 	cmp("BoardLedger", reflect.TypeOf(BoardLedger{}), reflect.TypeOf(bridgeBoardLedger{}))
 }
+
+func TestBuildSwarmStateMemberCarriesTheClientConversationID(t *testing.T) {
+	now := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
+	in := SwarmInput{Title: "t", Now: now}
+	ids := map[string]string{
+		"good":     "3f2b9c1e-7a4d-4c1b-9e0f-2a6d8b5c4e11",
+		"slash":    "../../etc/passwd",
+		"back":     `a\b`,
+		"dots":     "a..b",
+		"ctrl":     "abc\x07def",
+		"bidi":     "abc‮def",
+		"space":    "a b",
+		"long":     strings.Repeat("x", maxConversationIDRunes+1),
+		"atlimit":  strings.Repeat("y", maxConversationIDRunes),
+		"unicode":  "会话-1",
+		"empty":    "",
+		"badutf8":  "a\xffb",
+		"zerowide": "a​b",
+	}
+	want := map[string]string{"good": ids["good"], "atlimit": ids["atlimit"], "unicode": ids["unicode"]}
+	for alias, id := range ids {
+		in.Conversations = append(in.Conversations, SwarmConversation{
+			Alias: alias, Token: "tok-" + alias, AGYConversationID: id, LastUsed: now.Add(-time.Minute),
+		})
+	}
+	snap, _ := BuildSwarmState(in, freshLedger())
+	found := 0
+	for _, m := range snap.Members {
+		if m.Role != swarmRoleWorker {
+			continue
+		}
+		alias := strings.TrimPrefix(m.Name, "session-")
+		if _, ok := ids[alias]; !ok {
+			continue
+		}
+		found++
+		if m.ConversationID != want[alias] {
+			t.Errorf("member %s conversation_id = %q, want %q", m.Name, m.ConversationID, want[alias])
+		}
+	}
+	if found != len(ids) {
+		t.Fatalf("matched %d session members, want one per conversation (%d); members: %+v", found, len(ids), snap.Members)
+	}
+}
