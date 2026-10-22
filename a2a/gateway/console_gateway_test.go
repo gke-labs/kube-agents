@@ -267,6 +267,31 @@ func TestAConsoleAnswerIsATerminalFrame(t *testing.T) {
 	}
 }
 
+// A turn that handed work to kanban cards (the bridge's handoff artifact)
+// says so on its frame, so a console client waits for the cards' reports;
+// one that did not leaves the field off (TestAConsoleAnswerIsATerminalFrame
+// pins that), and the client need not wait.
+func TestAConsoleTurnThatFiledCardsSaysSoOnItsFrame(t *testing.T) {
+	r := startRig(t)
+	r.adapter.setTakesTerminals()
+	r.adapter.roster = []string{consoleAuthor}
+	r.adapter.inbox <- InboundMessage{
+		Conversation: "console:tab-cards", Kind: "dm", Backend: consoleBackend,
+		AuthorID: consoleAuthor, MessageID: "m1", Text: "how is the fleet",
+	}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactHandoff, Parts: []lib.Part{{Kind: "text", Text: lib.HandoffCards}}}); err != nil {
+		t.Fatal(err)
+	}
+	completeTask(t, exec, "checking the fleet.")
+	waitFor(t, "the terminal frame", func() bool { return len(r.adapter.terminalPosts()) > 0 })
+	if got := r.adapter.terminalPosts()[0]; !got.CardsPending || got.TaskID != origin.TaskID {
+		t.Fatalf("terminal frame = %+v, want cardsPending for %s", got, origin.TaskID)
+	}
+}
+
 // A failure on a console conversation is a terminal frame too, carrying the
 // notice text.
 func TestAConsoleFailureIsATerminalFrame(t *testing.T) {

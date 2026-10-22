@@ -644,6 +644,13 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// and the root's one terminal comes from the wake or, when none runs,
 	// from observeChildEnd below.
 	if !ref.TerminalObserved {
+		// A console client is told the turn handed work to cards, so it
+		// waits for their reports (notify frames) only when there are some.
+		if isConsoleConversation(rec.Key) && handedOff(s.Status.State, rs.handoff) {
+			if id, ends := rec.observedAs(taskID); ends {
+				g.consoleCardsPending.put(id, "")
+			}
+		}
 		g.observeEnded(rec, taskID, s.Status.State, source, reason)
 	}
 

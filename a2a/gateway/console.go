@@ -149,14 +149,19 @@ type ConsoleOutFrame struct {
 	// ReplyTo, on a notify frame, is the task whose turn filed the work the
 	// post reports on, when its sender knew it.
 	ReplyTo string `json:"replyTo,omitempty"`
+	// CardsPending, on a completed terminal frame, says the task handed
+	// work to kanban cards, whose reports follow as notify frames naming it
+	// (ReplyTo). Absent, no handoff was seen, so a client need not wait.
+	CardsPending bool `json:"cardsPending,omitempty"`
 }
 
 // ConsoleTerminal is one task's end as a console conversation is told it.
 type ConsoleTerminal struct {
-	TaskID    string
-	Addressee string
-	State     lib.TaskState
-	Text      string
+	TaskID       string
+	Addressee    string
+	State        lib.TaskState
+	Text         string
+	CardsPending bool
 }
 
 // consoleResultStash carries a completed task's deliverable from the
@@ -486,12 +491,13 @@ func (a *ConsoleAdapter) PostTerminal(conversation string, t ConsoleTerminal) er
 		return fmt.Errorf("console adapter: malformed conversation id %q", conversation)
 	}
 	return a.publishBounded(token, ConsoleOutFrame{
-		MessageID: consoleResultIDPrefix + t.TaskID,
-		Text:      t.Text,
-		Kind:      consoleFrameKindResult,
-		State:     t.State,
-		Addressee: t.Addressee,
-		TaskID:    t.TaskID,
+		MessageID:    consoleResultIDPrefix + t.TaskID,
+		Text:         t.Text,
+		Kind:         consoleFrameKindResult,
+		State:        t.State,
+		Addressee:    t.Addressee,
+		TaskID:       t.TaskID,
+		CardsPending: t.CardsPending,
 	})
 }
 

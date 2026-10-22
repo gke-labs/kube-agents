@@ -178,6 +178,10 @@ type Gateway struct {
 	// observeTaskDelivered to the observeTaskTerminal that follows it
 	// (consoleFrame).
 	consoleResults consoleResultStash
+	// consoleCardsPending marks a console chain end whose task handed work
+	// to kanban cards (lib.ArtifactHandoff), from the relay's terminal to
+	// the frame (consoleFrame); the value is unused.
+	consoleCardsPending consoleResultStash
 
 	// runCtx is Run's context; queue workers derive their timeouts from it.
 	runCtx context.Context
@@ -1995,6 +1999,7 @@ func (g *Gateway) consoleFrame(rec *SessionRecord, taskID string, state lib.Task
 		return
 	}
 	delivered, ok := g.consoleResults.take(taskID)
+	_, cardsPending := g.consoleCardsPending.take(taskID)
 	text := terminalNotice(state, reason)
 	if state == lib.StateCompleted {
 		text = completedNonTextResult
@@ -2008,6 +2013,7 @@ func (g *Gateway) consoleFrame(rec *SessionRecord, taskID string, state lib.Task
 	}
 	if err := poster.PostTerminal(rec.Key, ConsoleTerminal{
 		TaskID: taskID, Addressee: rec.AddresseeFor(taskID), State: state, Text: text,
+		CardsPending: cardsPending && state == lib.StateCompleted,
 	}); err != nil {
 		g.log.Error("console terminal frame failed", "conversation", rec.Key, "taskId", taskID, "err", err)
 	}

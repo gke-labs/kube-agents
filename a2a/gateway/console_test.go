@@ -278,6 +278,27 @@ func TestConsoleTerminalArrivesAsAResultFrame(t *testing.T) {
 	}
 }
 
+// cardsPending is spelled on the wire only when set.
+func TestConsoleTerminalSpellsCardsPendingOnlyWhenSet(t *testing.T) {
+	r := startConsoleRig(t)
+	sub, err := r.browser.SubscribeSync("chat.console.tab-9.out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.browser.Flush()
+	if err := r.adapter.PostTerminal("console:tab-9", ConsoleTerminal{TaskID: "task-4", Addressee: "platform", State: lib.StateCompleted, Text: "ack", CardsPending: true}); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := sub.NextMsg(5 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `{"messageId":"r-task-4","text":"ack","kind":"result","state":"completed","addressee":"platform","taskId":"task-4","cardsPending":true}`
+	if string(msg.Data) != want {
+		t.Errorf("frame = %s, want %s", msg.Data, want)
+	}
+}
+
 // A terminal past consoleResultTextCap is cut to fit under the server's
 // max_payload, says so, and stays valid UTF-8 where the cut lands inside a
 // multi-byte rune.

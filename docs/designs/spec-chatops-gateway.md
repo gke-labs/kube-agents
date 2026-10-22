@@ -2034,7 +2034,10 @@ protocol, and the payload spec's agreement rules do not apply to it. Each task's
 on `.out` too (added 10/22), as every observer is told it (`observeTaskTerminal`): once per
 delegation chain, under the task the turn started, with the hand-off rule applied. It is one
 frame with `"kind": "result"`, the A2A `state`, the task as `addressee` and `taskId`, and
-`messageId` `r-<taskId>`, so a repeated end (a redelivery, a heal) repeats its id. Its text
+`messageId` `r-<taskId>`, so a repeated end (a redelivery, a heal) repeats its id. A completed
+task that handed work to kanban cards (the bridge's `handoff` artifact) carries `"cardsPending":
+true`, so a client waits for the cards' notify frames; without it, no handoff was seen and the
+client need not wait. Its text
 is the deliverable for a completed task and the gateway's notice otherwise. A kanban card's
 report into the conversation is a frame too, with `"kind": "notify"` and the turn it answers as
 `replyTo` ("Proactive posts: the chat.notify route", the console's route). A notice carries
