@@ -15,17 +15,29 @@ import (
 	lib "github.com/gke-labs/kube-agents/a2a/lib"
 )
 
+// completionHead and completionFoot wrap the answer text in the completion
+// completionOfSize serves.
+const (
+	completionHead = `{"choices":[{"message":{"role":"assistant","content":"`
+	completionFoot = `"},"finish_reason":"stop"}]}`
+)
+
+// answerOfSize is the answer text completionOfSize(size) carries: the padding
+// that makes the completion exactly size bytes.
+func answerOfSize(t *testing.T, size int) string {
+	t.Helper()
+	pad := size - len(completionHead) - len(completionFoot)
+	if pad < 0 {
+		t.Fatalf("size %d is smaller than an empty completion", size)
+	}
+	return strings.Repeat("x", pad)
+}
+
 // completionOfSize answers with a valid chat completion whose body is
 // exactly size bytes, padding the answer text to get there.
 func completionOfSize(t *testing.T, size int) func(w http.ResponseWriter, r *http.Request, c apiCall) {
 	t.Helper()
-	const head = `{"choices":[{"message":{"role":"assistant","content":"`
-	const foot = `"},"finish_reason":"stop"}]}`
-	pad := size - len(head) - len(foot)
-	if pad < 0 {
-		t.Fatalf("size %d is smaller than an empty completion", size)
-	}
-	body := head + strings.Repeat("x", pad) + foot
+	body := completionHead + answerOfSize(t, size) + completionFoot
 	return func(w http.ResponseWriter, _ *http.Request, c apiCall) {
 		w.Header().Set(apiSessionIDHeader, c.sessionID)
 		w.Header().Set("Content-Type", "application/json")
@@ -77,6 +89,18 @@ type resultPublishCall struct {
 	output      string
 }
 
+// foldTime folds answer into a chat part once and returns how long it took:
+// the at-cap test's reference for what a fold inside the publish window
+// would have spent of it.
+func foldTime(t *testing.T, answer string) time.Duration {
+	t.Helper()
+	start := time.Now()
+	if _, ok := resultChatPart(answer); !ok {
+		t.Fatal("the at-cap answer did not fold into a chat part")
+	}
+	return time.Since(start)
+}
+
 // The boundary's other side: an answer of exactly apiResponseCap bytes is
 // read whole and completes, so the one-byte look-ahead refuses nothing the
 // cap admits.
@@ -87,10 +111,17 @@ type resultPublishCall struct {
 // is short of the whole finalizePublishTimeout by one nil check; with the
 // fold inside the window it is short by the fold, about 0.85 s for this
 // answer without the race detector and 5 s under it. The bound is half of a
-// fold of the same answer timed here, after the terminal and outside the
-// window, so the check is red on that order in either mode and on any host.
+// fold of the same answer timed here, outside the window, so the check is
+// red on that order in either mode without a timing constant of its own.
+// The reference fold is taken twice, once before the submit and once after
+// the terminal, and the smaller of the two is the bound: the bridge's fold
+// runs between them, so a load change on the host between it and either
+// reference cannot double the reference and let the old order through.
+// What the bound still cannot see is a load dip confined to the bridge's
+// fold alone, with both references slower than it.
 func TestAPI_AnswerAtTheCapCompletes(t *testing.T) {
 	_, url := startServer(t)
+	answer := answerOfSize(t, apiResponseCap)
 	published := make(chan resultPublishCall, 1)
 	startAPIBridgeHooked(t, url, newAPIStub(t, completionOfSize(t, apiResponseCap)), nil, func(b *Bridge) {
 		publish := b.resultPublish
@@ -104,6 +135,7 @@ func TestAPI_AnswerAtTheCapCompletes(t *testing.T) {
 		}
 	}, func(net.Addr) bool { return true })
 	c := gatewayClient(t, url)
+	foldBefore := foldTime(t, answer)
 	submitIn(t, c, "task-atcap", "ctx-atcap", "write something large")
 	task := waitTerminalFor(t, c, "task-atcap", atCapTerminalWait)
 	if task.State != lib.StateCompleted {
@@ -122,15 +154,16 @@ func TestAPI_AnswerAtTheCapCompletes(t *testing.T) {
 	if !call.hasDeadline {
 		t.Fatal("resultPublish got a context with no deadline; finalizeResult publishes under finalizePublishTimeout")
 	}
-	start := time.Now()
-	if _, ok := resultChatPart(call.output); !ok {
-		t.Fatal("the at-cap answer did not fold into a chat part")
+	if call.output != answer {
+		t.Fatalf("resultPublish got an answer of %d bytes, want the %d-byte answer the stub served", len(call.output), len(answer))
 	}
-	fold := time.Since(start)
+	foldAfter := foldTime(t, call.output)
+	fold := min(foldBefore, foldAfter)
 	spent := finalizePublishTimeout - call.remaining
-	t.Logf("resultPublish entered %v into its %v window; a fold of its answer takes %v", spent, finalizePublishTimeout, fold)
+	t.Logf("resultPublish entered %v into its %v window; a fold of its answer takes %v before the submit and %v after the terminal",
+		spent, finalizePublishTimeout, foldBefore, foldAfter)
 	if spent > fold/2 {
-		t.Errorf("resultPublish entered %v into its window, more than half a %v fold of its answer: the chat fold ran inside the window",
+		t.Errorf("resultPublish entered %v into its window, more than half the %v shorter fold of its answer: the chat fold ran inside the window",
 			spent, fold)
 	}
 }
