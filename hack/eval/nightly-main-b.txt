@@ -46,3 +46,4 @@ first-install-hello-done
 # main". This line is inert until they exist, which is why it is placed on
 # the arithmetic alone.
 gitops-drift-load-bearing-change-triage
+triage-start-burst

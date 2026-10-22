@@ -8,8 +8,9 @@
 # logged a `fire` line for every one of them. Each fire means the daemon
 # admitted the alert, wrote its ledger row and queued its triage start in the
 # background (trigger_agent_troubleshooter in
-# agents/platform/scripts/session_kv_server.py). The stack then waits five
-# minutes so a daemon that starts turns a few at a time can finish. The
+# agents/platform/scripts/session_kv_server.py). The stack then waits 20
+# minutes, the product's own queue limit, so a daemon that starts turns a few
+# at a time can finish. The
 # triage_starts verifier joins each admitted ledger row for those pods (by pod
 # UID) to the default profile's state.db and passes only when every one has a
 # session with a message: a started turn. A session alone is not enough, because

@@ -981,11 +981,13 @@
 # closed. Its first nightly is its first observation outside a dev install.
 ./tasks/gitops-drift-load-bearing-change-triage/task.yaml
 
-# Twenty image-pull Warnings at once: every alert the daemon admits gets a
-# Hermes gateway session, graded by the triage_starts check on the session
-# store (#3583). A tofu stack on the infra lock that plants in its own
-# namespace on the install's cluster; needs the Warning alert limit off, which
-# hack/ci-deploy.sh sets. Each repetition files twenty triage cards.
+# Twenty image-pull Warnings at once: every alert the daemon admits starts its
+# triage turn within the product's 20-minute queue limit, graded by the
+# triage_starts check on the session store (#3583). A tofu stack on the infra
+# lock that plants in its own namespace on the install's cluster; needs the
+# Warning alert limit off, which hack/ci-deploy.sh sets. Each repetition files
+# twenty triage cards and takes about 25 minutes; ten back-to-back runs beside
+# three other cases passed 10 of 10 on a dev install (2026-10-22).
 ./tasks/triage-start-burst/task.yaml
 
 # Catalogue entry 12 (a node label is removed): seeded-a's
