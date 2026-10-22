@@ -2264,7 +2264,7 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             self.real_trigger("sess-aborted", "msg", {}, anchor_id)
             self.assertEqual(self._inject("aborted-api-6cfdb6b98b-bbbbb")["status"], "injected")
 
-    def test_a_5xx_other_than_503_or_a_transport_error_reads_as_a_started_turn(self):
+    def test_a_5xx_other_than_503_or_a_wait_for_the_response_reads_as_a_started_turn(self):
         import urllib.error
         # 503 is Hermes's gateway_draining and session_db_unavailable, both
         # before the turn; a POST 307 is not followed.
@@ -2273,6 +2273,9 @@ class TestWorkloadIncidentFold(unittest.TestCase):
                 self.assertEqual(session_kv_server._start_agent_turn("http://gw", "s", "q", {}), started, code)
         with patch("urllib.request.urlopen", side_effect=TimeoutError("read timed out")):
             self.assertTrue(session_kv_server._start_agent_turn("http://gw", "s", "q", {}))
+        # Refused while connecting: the gateway never had the request.
+        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError(ConnectionRefusedError(111, "refused"))):
+            self.assertFalse(session_kv_server._start_agent_turn("http://gw", "s", "q", {}))
 
     @patch.object(session_kv_server, "_start_agent_turn", return_value=False)
     @patch.object(session_kv_server, "_create_gateway_session", return_value=True)

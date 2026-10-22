@@ -553,7 +553,12 @@ INCIDENT_WORKLOAD_DEDUP_SECONDS = min(
     _alert_daily_limit("INCIDENT_WORKLOAD_DEDUP_SECONDS", 0), INCIDENT_WORKLOAD_DEDUP_MAX_SECONDS
 )
 # A pod named like a Deployment's: 8-10 hex characters (its ReplicaSet's
-# pod-template hash), then the pod's own suffix (`checkout-6cfdb6b98b-zwv24`).
+# pod-template hash, which is 8-10 characters long for all but about 0.2% of
+# templates; a shorter one does not fold), then the pod's own suffix
+# (`checkout-6cfdb6b98b-zwv24`). The lower bound stays at 8 because a shorter
+# one would match short hex-looking name segments (`log-db`, `cache-1`) and fold
+# different owners together, which silences an alert; a missed fold only
+# announces it.
 # A CronJob's pods have the same shape, the run minute standing in for the hash,
 # and so does any pod whose owner's last hyphen-separated segment is 8-10 hex
 # characters (`db-migrate-20261021`, which folds as `db-migrate`).
@@ -570,6 +575,9 @@ CRITICAL_SEVERITY = "Critical"
 # (_start_agent_turn).
 HTTP_SERVER_ERROR_MIN = 500
 HTTP_SERVICE_UNAVAILABLE = 503
+# How long _start_agent_turn waits on the gateway's synchronous chat route,
+# which answers only when the turn has finished.
+GATEWAY_TURN_TIMEOUT_S = 300.0
 # Bounds the anchor lookup's wait on a locked database, as the other ledger
 # writers here do; a lookup that gives up announces the event.
 INCIDENT_FOLD_DB_TIMEOUT_S = 5.0
@@ -2878,8 +2886,9 @@ def _stall_agent_query(payload: Dict[str, Any]) -> str:
 def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[str, str]) -> bool:
     """Post the agent query request to execute the diagnostic reasoning loop.
 
-    True when the turn may have started: a 5xx other than 503, or a transport
-    error, which may be a turn that outlived the timeout. Reading either as
+    True when the turn may have started: a 5xx other than 503, or an error
+    while waiting for the response, which may be a turn that outlived the
+    timeout. An error while connecting or sending (URLError) is False. Reading either as
     refused would let a sibling open a second triage beside it
     (mark_triage_not_started). Anything else is False. In the Hermes route
     (`_handle_session_chat`) a 4xx is a failed check before the turn, a 503 is
@@ -2901,11 +2910,18 @@ def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[s
         # urlopen raises HTTPError for every non-2xx it does not follow, so a
         # returned response is an accepted turn (a followed 301/302/303 would
         # land elsewhere as a GET; the Hermes route sends none).
-        with urllib.request.urlopen(req, timeout=300.0):
+        with urllib.request.urlopen(req, timeout=GATEWAY_TURN_TIMEOUT_S):
             pass
     except urllib.error.HTTPError as exc:
         logger.error(f"Gateway API chat execution failed (status {exc.code})")
         return exc.code >= HTTP_SERVER_ERROR_MIN and exc.code != HTTP_SERVICE_UNAVAILABLE
+    except urllib.error.URLError as exc:
+        # urlopen wraps an error raised while connecting or sending the request
+        # (a refused connection, a connect timeout) in URLError; an error while
+        # waiting for the response, such as a read timeout, comes out unwrapped.
+        # So this one is a request the gateway never had in full: no turn.
+        logger.error(f"Gateway API chat request was not delivered: {exc.reason}")
+        return False
     except Exception as exc:
         logger.error(f"Failed to call gateway API chat execution: {exc}")
     return True
