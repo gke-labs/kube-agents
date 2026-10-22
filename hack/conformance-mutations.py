@@ -23,6 +23,7 @@ counts as KILLED: the recorded gap moved, which is exactly the signal wanted.
 Usage:
     python3 hack/conformance-mutations.py            # every mutation
     python3 hack/conformance-mutations.py --list
+    python3 hack/conformance-mutations.py --summary  # counts, nothing run
     python3 hack/conformance-mutations.py -k C1      # substring filter on the id
 
 The tree must be clean. It edits tracked files in place and restores them, so a
@@ -57,8 +58,7 @@ class Mutation:
     #: True for a mutation that must NOT be caught. A suite that goes red on a
     #: harmless change is a suite people learn to override, so a no-op edit is
     #: run as a control on the harness itself: SURVIVED is the pass for these
-    #: and KILLED is the failure. Three today: B1-denylist-rule, A3-fastpath-redundant
-    #: and B1-gke-mcp-overlay-copy-redundant.
+    #: and KILLED is the failure. `--summary` names the current ones.
     must_survive: bool = False
 
 
@@ -728,11 +728,43 @@ Mutation(
     Mutation(
         "C1-watcher-subscription-unpinned",
         "agents/platform/scripts/watcher_policy.py",
-        ('        if not subscription or match.group("sub") != subscription:\n',
-         '        if not subscription:\n'),
+        ('    if match.group("sub") not in subscriptions:\n',
+         '    if not subscriptions:\n'),
         "test_C1_the_watcher_pubsub_routes_reach_only_the_configured_subscription",
-        "drop the equality check when renaming the subscription env -- the "
-        "relay then pulls and acks any subscription the broker can reach",
+        "drop the membership check when renaming the subscription env -- the "
+        "relay then pulls and acks any subscription the broker can reach "
+        "(the platform relay shares the check, so its test goes red too)",
+    ),
+    Mutation(
+        "C1-platform-pubsub-pinned-to-project-not-subscription",
+        "agents/platform/scripts/watcher_policy.py",
+        ('    return _evaluate_subscription_call(method, path, body, subscriptions, _PLATFORM_SUBSCRIPTION_RULES)\n',
+         '    match = _PUBSUB_SUBSCRIPTION.fullmatch(path)\n'
+         '    if match and any(match.group("sub").rsplit("/", 2)[0] == s.rsplit("/", 2)[0] for s in subscriptions):\n'
+         '        subscriptions = subscriptions | {match.group("sub")}\n'
+         '    return _evaluate_subscription_call(method, path, body, subscriptions, _PLATFORM_SUBSCRIPTION_RULES)\n'),
+        "test_C1_the_platform_pubsub_relay_reaches_only_the_configured_subscriptions",
+        "let a plugin pull any subscription in a project it already has one in, "
+        "so a new route needs no operator render -- the gateway then reads the "
+        "drift watcher's and every other subscription in the harness project",
+    ),
+    Mutation(
+        "C1-platform-pubsub-route-opened-to-shell",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    (watcher_policy.PLATFORM_PUBSUB_PREFIX, (CALLER_ROLE_CHAT,)),\n",
+         "    (watcher_policy.PLATFORM_PUBSUB_PREFIX, (CALLER_ROLE_CHAT, CALLER_ROLE_SHELL)),\n"),
+        "test_C1_only_the_chat_role_reaches_the_platform_pubsub_relay",
+        "let a skill in the shell sandbox pull the stockout subscription directly "
+        "-- the agent's own commands then drain a queue meant for the gateway",
+    ),
+    Mutation(
+        "C1-platform-adapter-default-credential",
+        "agentplugins/pubsub-platform/files/platforms/pubsub/adapter.py",
+        ("import json\n",
+         "import json\n\nimport google.auth  # the project id from the pod's default credential when the env is unset\n"),
+        "test_C1_no_shipped_platform_adapter_holds_a_google_credential_path",
+        "fall back to google.auth.default() for the project id -- the path that "
+        "failed quietly for every alert once the gateway lost Workload Identity",
     ),
     Mutation(
         "C1-watcher-routes-opened-to-chat",
@@ -877,6 +909,17 @@ Mutation(
         "test_B2_the_enqueue_sweep_assents_only_on_both_human_labels",
         "simplify the enqueue test to the two labels it wants, dropping the "
         "do-not-merge check, so a held pull request is enqueued anyway",
+    ),
+    Mutation(
+        "B2-enqueue-retry-skips-labels",
+        "scripts/merge_gate.py",
+        ('    queued = pull["auto_merge"] or pull["queue_entry"] is not None\n',
+         '    queued = pull["auto_merge"] or pull["queue_entry"] is not None\n'
+         '    if pull.get("retry") and not queued:\n'
+         '        return ENABLE\n'),
+        "test_B2_the_enqueue_sweep_assents_only_on_both_human_labels",
+        "put a pull request back on its retry before the label test, since it "
+        "was approved when it entered, so one that lost lgtm is enqueued anyway",
     ),
     Mutation(
         "B2-app-token-grants-pull-requests",
@@ -1365,6 +1408,14 @@ Mutation(
          'safe_hint = log_hint if log_hint else "unknown"'),
         "test_D1_a_log_hint_cannot_forge_a_record",
         "log the hint raw, which is the state the sanitiser was added to fix",
+    ),
+    Mutation(
+        "D1-cluster-profile-unaudited",
+        "agents/cluster/config.yaml",
+        ("    - hermes_otel\n    - tool_call_audit\n", "    - hermes_otel\n"),
+        "test_D1_every_profile_records_its_tool_calls",
+        "trim the Cluster Agent template's plugin list back to otel alone, the "
+        "state the template shipped in",
     ),
     Mutation(
         "D1-platform-role-reaches-secrets",
@@ -2492,13 +2543,37 @@ def _git_clean() -> bool:
     ).stdout.strip()
 
 
-def main() -> int:
+def summary(mutations: list[Mutation]) -> str:
+    """The counts a reader wants from the mutation table, computed (#3553).
+
+    The README used to restate them by hand, so every pull request that added
+    a mutation rewrote the same line and conflicted with every other one. What
+    a run measures (killed, noisy) is true only of the commit it ran on, and
+    belongs to the pull request that ran it.
+    """
+    controls = [m.id for m in mutations if m.must_survive]
+    return (
+        f"{len(mutations)} mutations, {len(controls)} must_survive control(s): "
+        f"{', '.join(controls) or 'none'}.\n"
+        f"A full run's last line counts the other {len(mutations) - len(controls)}: "
+        f"killed + noisy + survived + stale. A control that passes, SURVIVED (expected), "
+        f"is none of those; one that goes red (OVERSHOT) counts as survived, and one "
+        f"whose anchor moved counts as stale."
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true")
+    parser.add_argument("--summary", action="store_true",
+                        help="print the mutation and must_survive counts; runs nothing")
     parser.add_argument("-k", "--filter", default="")
-    arguments = parser.parse_args()
+    arguments = parser.parse_args(argv)
 
     selected = [m for m in MUTATIONS if arguments.filter in m.id]
+    if arguments.summary:
+        print(summary(selected))
+        return 0
     if arguments.list:
         for mutation in selected:
             print(f"{mutation.id:38} {mutation.path}")

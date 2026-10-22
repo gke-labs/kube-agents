@@ -22,6 +22,38 @@ from common.redactor import SALT_ENV_VAR, AuditRedactor, RedactionRule  # noqa: 
 import common.redactor as redactor_module  # noqa: E402
 
 
+class SecondPassTest(unittest.TestCase):
+    """A second pass over redacted text is a no-op: markers are never rewritten."""
+
+    def test_a_loose_pattern_rule_does_not_nest_its_own_marker(self):
+        rules = AuditRedactor.rules_from_config({
+            "ip": {"action": "off"},
+            "rules": [{"name": "project", "pattern": "[a-z][a-z0-9_-]{5,28}", "action": "pseudonym"}],
+        })
+        once, counts = AuditRedactor.apply_rules("pods in acme-prod now", rules)
+        self.assertRegex(once, r"^pods in \[project:[0-9a-f]{12}\] now$")
+        self.assertEqual(counts, {"project": 1})
+        twice, counts_again = AuditRedactor.apply_rules(once, rules)
+        self.assertEqual(twice, once)
+        self.assertEqual(counts_again, {})
+
+    def test_a_mask_marker_is_not_rewritten_by_an_upper_case_pattern(self):
+        rules = AuditRedactor.rules_from_config({
+            "ip": {"action": "off"},
+            "rules": [{"name": "cluster-name", "pattern": "[A-Za-z0-9-]{8,}"}],
+        })
+        once, _ = AuditRedactor.apply_rules("on prod-eu-cluster-1 today", rules)
+        self.assertEqual(once, "on [REDACTED_CLUSTER_NAME] today")
+        self.assertEqual(AuditRedactor.apply_rules(once, rules)[0], once)
+
+    def test_text_beside_a_marker_is_still_redacted(self):
+        rules = AuditRedactor.rules_from_config({"ip": {"action": "mask"}, "rules": [{"name": "c", "literal": "prod-eu-1"}]})
+        text = "[REDACTED_SECRET] at 10.1.2.3 on prod-eu-1 [ip:a6788cec5b31]"
+        out, counts = AuditRedactor.apply_rules(text, rules)
+        self.assertEqual(out, "[REDACTED_SECRET] at [REDACTED_IP] on [REDACTED_C] [ip:a6788cec5b31]")
+        self.assertEqual(counts["c"], 1)
+
+
 class TestRedactText(unittest.TestCase):
 
     def assertRedacted(self, text, secret):

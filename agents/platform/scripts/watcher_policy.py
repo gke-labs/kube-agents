@@ -9,11 +9,17 @@ those calls through the broker, on the broker's credential, under the
 `watcher` role, and this module is the whole of what decides which calls the
 broker makes for them.
 
-Two tables, one per route family:
+Two tables, one per route family, and a third family that reuses the Pub/Sub
+half of the first:
 
 - `/v1/watcher/gcp/<host>/<path>`: the GKE `clusters.get` the watchers use to
   learn a cluster's Autopilot bit, and the four Pub/Sub calls the drift detector
   makes, each pinned to the one subscription the operator configured.
+- `/v1/pubsub/gcp/<host>/<path>`: the same four Pub/Sub calls for the gateway's
+  Pub/Sub platform adapter (agentplugins/pubsub-platform), under the `chat`
+  role, pinned to the set of subscriptions the operator rendered from the
+  AgentPlugin configs. The gateway pod holds no Google credential of its own,
+  so this is the adapter's only way to a subscription. `evaluate_pubsub`.
 - `/v1/k8s/<project>/<location>/<cluster>/<path>`: GET only. List and watch of
   core/v1 events across the cluster (the event watcher), and a GET of one named
   object of a kind in `WATCHER_NAMED_READS` (the drift detector's join reads the
@@ -34,6 +40,10 @@ from command_policy import Decision
 
 WATCHER_GCP_PREFIX = "/v1/watcher/gcp/"
 WATCHER_K8S_PREFIX = "/v1/k8s/"
+# The platform adapter's family. Its own prefix rather than a second caller on
+# the watcher's: the two roles are confined to different subscriptions, and the
+# prefix is what ROUTE_ROLES keys the role on.
+PLATFORM_PUBSUB_PREFIX = "/v1/pubsub/gcp/"
 
 METHOD_GET = "GET"
 METHOD_POST = "POST"
@@ -47,6 +57,10 @@ RULE_GCP_ROUTE = "gcp.watcher.route"
 RULE_GCP_SUBSCRIPTION = "gcp.watcher.subscription"
 RULE_GCP_BODY = "gcp.watcher.body"
 RULE_GCP_CLUSTER_GET = "gcp.watcher.cluster-get"
+RULE_PUBSUB_METHOD = "gcp.pubsub.method"
+RULE_PUBSUB_ROUTE = "gcp.pubsub.route"
+RULE_PUBSUB_SUBSCRIPTION = "gcp.pubsub.subscription"
+RULE_PUBSUB_BODY = "gcp.pubsub.body"
 RULE_K8S_METHOD = "kubernetes.watcher.method"
 RULE_K8S_TARGET = "kubernetes.watcher.target"
 RULE_K8S_PATH = "kubernetes.watcher.path"
@@ -227,6 +241,65 @@ def _refuse(rule_id: str, message: str) -> Decision:
     return Decision(allowed=False, rule_id=rule_id, message=message)
 
 
+class _SubscriptionRules:
+    """The rule ids and refusal texts one relay family answers Pub/Sub calls with.
+
+    The watcher's and the platform adapter's families decide the same four calls
+    the same way; only who they say they are, and which subscriptions they
+    reach, differ. One decision procedure, two vocabularies, so the two cannot
+    drift apart on what a body may carry.
+    """
+
+    def __init__(self, *, method: str, route: str, subscription: str, body: str, allowed_prefix: str,
+                 route_message: str, subscription_message: str) -> None:
+        self.method = method
+        self.route = route
+        self.subscription = subscription
+        self.body = body
+        self.allowed_prefix = allowed_prefix
+        self.route_message = route_message
+        self.subscription_message = subscription_message
+
+
+_WATCHER_SUBSCRIPTION_RULES = _SubscriptionRules(
+    method=RULE_GCP_METHOD,
+    route=RULE_GCP_ROUTE,
+    subscription=RULE_GCP_SUBSCRIPTION,
+    body=RULE_GCP_BODY,
+    allowed_prefix="gcp.watcher.subscription",
+    route_message="The watcher relay makes four Pub/Sub calls on one subscription.",
+    subscription_message="The watcher relay reaches only the drift detector's configured subscription.",
+)
+_PLATFORM_SUBSCRIPTION_RULES = _SubscriptionRules(
+    method=RULE_PUBSUB_METHOD,
+    route=RULE_PUBSUB_ROUTE,
+    subscription=RULE_PUBSUB_SUBSCRIPTION,
+    body=RULE_PUBSUB_BODY,
+    allowed_prefix="gcp.pubsub.subscription",
+    route_message="The platform Pub/Sub relay makes four Pub/Sub calls on its configured subscriptions.",
+    subscription_message="The platform Pub/Sub relay reaches only the subscriptions the AgentPlugins configure.",
+)
+
+
+def _evaluate_subscription_call(
+    method: str, path: str, body: bytes, subscriptions: frozenset[str], rules: _SubscriptionRules
+) -> Decision:
+    """The four Pub/Sub calls on one of `subscriptions`; an empty set refuses them all."""
+    match = _PUBSUB_SUBSCRIPTION.fullmatch(path)
+    if match is None:
+        return _refuse(rules.route, rules.route_message)
+    if match.group("sub") not in subscriptions:
+        return _refuse(rules.subscription, rules.subscription_message)
+    verb = match.group("verb")
+    if verb is None:
+        if method != METHOD_GET:
+            return _refuse(rules.method, "A subscription is read with GET.")
+        return Decision(allowed=True, rule_id=rules.allowed_prefix + "-get", message="")
+    if method != METHOD_POST or not _body_fits(body, PUBSUB_BODIES[verb]):
+        return _refuse(rules.body, "That Pub/Sub call carries a body this relay does not forward.")
+    return Decision(allowed=True, rule_id=rules.allowed_prefix + verb.replace(":", "-"), message="")
+
+
 def evaluate_gcp(method: str, host: str, path: str, body: bytes, subscription: str) -> Decision:
     """Allow or refuse one `/v1/watcher/gcp/` call.
 
@@ -240,23 +313,24 @@ def evaluate_gcp(method: str, host: str, path: str, body: bytes, subscription: s
             return Decision(allowed=True, rule_id=RULE_GCP_CLUSTER_GET, message="")
         return _refuse(RULE_GCP_ROUTE, "The watcher relay reads one GKE cluster by name and nothing else.")
     if host == PUBSUB_HOST:
-        match = _PUBSUB_SUBSCRIPTION.fullmatch(path)
-        if match is None:
-            return _refuse(RULE_GCP_ROUTE, "The watcher relay makes four Pub/Sub calls on one subscription.")
-        if not subscription or match.group("sub") != subscription:
-            return _refuse(
-                RULE_GCP_SUBSCRIPTION,
-                "The watcher relay reaches only the drift detector's configured subscription.",
-            )
-        verb = match.group("verb")
-        if verb is None:
-            if method != METHOD_GET:
-                return _refuse(RULE_GCP_METHOD, "A subscription is read with GET.")
-            return Decision(allowed=True, rule_id="gcp.watcher.subscription-get", message="")
-        if method != METHOD_POST or not _body_fits(body, PUBSUB_BODIES[verb]):
-            return _refuse(RULE_GCP_BODY, "That Pub/Sub call carries a body this relay does not forward.")
-        return Decision(allowed=True, rule_id="gcp.watcher.subscription" + verb.replace(":", "-"), message="")
+        allowed = frozenset({subscription}) if subscription else frozenset()
+        return _evaluate_subscription_call(method, path, body, allowed, _WATCHER_SUBSCRIPTION_RULES)
     return _refuse(RULE_GCP_ROUTE, "The watcher relay reaches the GKE and Pub/Sub APIs only.")
+
+
+def evaluate_pubsub(method: str, host: str, path: str, body: bytes, subscriptions: frozenset[str]) -> Decision:
+    """Allow or refuse one `/v1/pubsub/gcp/` call for the gateway's platform adapter.
+
+    `subscriptions` is the set of `projects/<p>/subscriptions/<s>` the operator
+    rendered from the AgentPlugin configs; empty means no plugin route the
+    operator could qualify, and every call is refused. Pub/Sub is the only host: the
+    adapter has no business with the GKE API.
+    """
+    if method not in (METHOD_GET, METHOD_POST):
+        return _refuse(RULE_PUBSUB_METHOD, "The platform Pub/Sub relay forwards GET and POST only.")
+    if host != PUBSUB_HOST:
+        return _refuse(RULE_PUBSUB_ROUTE, "The platform Pub/Sub relay reaches the Pub/Sub API only.")
+    return _evaluate_subscription_call(method, path, body, subscriptions, _PLATFORM_SUBSCRIPTION_RULES)
 
 
 def _body_fits(body: bytes, keys: dict[str, type]) -> bool:

@@ -671,11 +671,13 @@ sync, and the sweep sometimes loses it; when it does, Tide starts the retest as 
 batch, when two or more qualify), crier's `pending` is then the newer status, and the sweep leaves
 it alone. That retest is what [`hack/ci-revalidate.sh`](../hack/ci-revalidate.sh), the job's step 0,
 makes cheap: before the job leases an evaluation project it looks for a green build of this job — at
-the pull request's head, or at an earlier head from which every change since is inert — attested by
-the Prow-posted success status, or failing both an admin `/override` of this job at the pull
+the pull request's head, at an earlier head with the same tree, or at an earlier head from which every
+change since is inert — attested by the Prow-posted success status, or failing all three an admin
+`/override` of this job at the pull
 request's current head, and reuses that verdict whatever `main` has done since — a batch pull by pull, every one or none — so a lost race
 costs the minutes of a pod start and a clone rather than the 1.5 to 3.5 hours of the matrix. A push
-still starts a fresh run, and a run it is: step 0 reuses an earlier head's green only when
+still starts a fresh run, and a run it is: step 0 reuses an earlier head's green only when that head
+has the same tree (an empty commit, or a message-only rewrite), whatever `main` did since, or when
 everything since, on the pull request's side and on `main`'s, is inert.
 `/test pull-kube-agents-smoke-test` on the same head posts `pending`, which wins until that run
 reports (`/retest` does not, because it reruns only failed contexts), and that run too reuses the

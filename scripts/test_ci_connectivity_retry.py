@@ -26,7 +26,9 @@ DEPLOY_SCRIPT = REPO_ROOT / "hack" / "ci-deploy.sh"
 ENV_SCRIPT = REPO_ROOT / "hack" / "ci-env.sh"
 
 SECTION_START = "# ─── 7. Agent API Connectivity Verification"
-SECTION_END = "TOTAL_DURATION="
+# The next section's header: 7b gates on the Pub/Sub platform adapter and has
+# its own test (tests/test_ci_deploy_pubsub_relay_gate.py) and constants.
+SECTION_END = "# ─── 7b. "
 
 KUBECTL_STUB = """#!/usr/bin/env bash
 echo "$@" >> "${STUB_LOG}/kubectl.args"

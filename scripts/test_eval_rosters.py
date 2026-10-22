@@ -160,6 +160,9 @@ ADDED_AFTER_THE_MOVE = [
     "fleet-audit-reports-past-run",  # the report store's reader, PR #2115
     "platform-worker-refuses-shipped-skill-edit",  # skill governance, #1848
     "chat-voice-ack-names-target",  # the front door's delegation ack
+    "chat-sample-report-is-not-cluster-state",  # nothing filed on a sample report's say-so, #3080
+    "chat-sample-report-is-not-cluster-state-labelled",  # the same, with the patched adapter's label
+    "chat-real-report-fix-files-confirm-first",  # a real report still files at once, confirm-first
     "bootstrap-inventory-ranking-delivery",  # the onboarding prioritization stage, #2143
     "chat-question-wake-stays-silent",  # SOUL §2 step 5's already-posted rule
     "chat-question-typed-answer-fresh-session",  # a typed answer from a new thread session
@@ -280,6 +283,7 @@ HELD_OUT_IN_PRESUBMIT = [
 DEMOTED_AFTER_THE_SPLIT = [
     ("upgrades-lagging-master-probe", "fleet-cost-idle-pool"),  # 2026-10-16, #3269 (agent reads upgradeTargetVersion)
     ("pdb-remediation-pr", "upgrades-lagging-master-probe"),  # 2026-10-17, #3120 (worker declines a pull request into an -infra repo with no manifest; #3145)
+    ("consistency-authorized-networks-probe", None),  # 2026-10-21, #3598 (Gemini reads seeded-c's leftover authorized-networks block as configured; #3448 for the 429s)
 ]
 DEMOTED = {case for case, _ in DEMOTED_AFTER_THE_SPLIT}
 # The demotions recorded before the freeze (#3495), whose lines sit in the

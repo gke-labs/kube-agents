@@ -64,7 +64,8 @@
 # are frozen in the order they landed.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
-# Spec-ready, each domain covered in the presubmit by its probe:
+# Spec-ready, each domain covered in the presubmit by its probe (upgrades'
+# probe nightly since 2026-10-16, #3269; consistency's since 2026-10-21, #3598):
 #   -- obtainability-planted-pdb: measured PASSED at 962s on 2026-08-26
 #      (build 2092638061140643840); too slow for a presubmit seat.
 #   -- stockout-pinned-pool: same full-audit shape and cost band; its
@@ -178,7 +179,8 @@
 # the same SOP-faithful shape and 900s band as consistency-drift-outlier
 # above, grading the collector-only `no-environment-label` check (SOP §4.14)
 # against the install's own unlabelled host cluster beside the labelled
-# seeded trio. Its domain's presubmit seat stays with the probe.
+# seeded trio. Its domain's presubmit seat stayed with the probe (nightly
+# since 2026-10-21, #3598).
 ./tasks/consistency-no-environment-label/task.yaml
 
 # The third tofu-provisioned case, and the drift half of incident triage
@@ -496,6 +498,17 @@
 # the card round trip.
 ./tasks/chat-voice-ack-names-target/task.yaml
 
+# The front door files nothing for a workload named only in a sample report the
+# bot once posted in the thread (#3080; agents/chat/SOUL.md §2, step 3).
+# deployer: noop, transcript-only, a single front-door turn and no card.
+./tasks/chat-sample-report-is-not-cluster-state/task.yaml
+# Its labelled twin: the same turn as the patched Slack adapter delivers it,
+# with the bot's own root marked "posted by you earlier" (#3080).
+./tasks/chat-sample-report-is-not-cluster-state-labelled/task.yaml
+# And the ordinary path the same rule must keep: a real report the bot posted,
+# "fix the first one", a card filed at once with a confirm-first criterion.
+./tasks/chat-real-report-fix-files-confirm-first/task.yaml
+
 # The onboarding prioritization stage (#2143): plants a fixed raw inventory
 # report on the install under test's shell sandbox, files the
 # bootstrap-inventory-prioritize card, and grades the findings its worker
@@ -792,11 +805,11 @@
 # A plain chat request for the clusters that differ from their peers runs the
 # drift audit's collector (#2386), and answers in chat without publishing.
 # deployer: noop; reads the seeded fleet's drift-outlier role (slot c).
-# Nightly rather than presubmit: consistency-authorized-networks-probe holds
-# the domain's presubmit seat. Red on main: no SOUL.md row routes the question
-# to fleet_drift.py. Marked expected_fail: true, so the nightly records it as
-# EXPECTED_FAIL and also records whether the outlier and facet reply checks
-# pass on seeded-c. The follow-up that adds the drift row removes the marker.
+# Nightly rather than presubmit: consistency-authorized-networks-probe held
+# the domain's presubmit seat (nightly too since 2026-10-21, #3598). Red on
+# main: no SOUL.md row routes the question to fleet_drift.py. Marked
+# expected_fail: true, so the nightly records it as EXPECTED_FAIL and also
+# records whether the outlier and facet reply checks pass on seeded-c. The follow-up that adds the drift row removes the marker.
 ./tasks/drift-chat-request-runs-collector/task.yaml
 
 # A plain chat request about the security of the fleet's AI and
@@ -881,6 +894,24 @@
 # Add a case at its place in that order, so two pull requests that each add
 # a case don't edit the same lines. scripts/test_eval_rosters.py checks both.
 
+# autoops-warning-event-no-action-triage (#3267): a Warning event that cleared
+# by itself is triaged to one "No action needed" bullet, with no Option
+# letters and no "To authorize:" call to action. Its stack plants a healthy
+# Deployment, injects a recorded NetworkNotReady event for its pod through the
+# daemon, and waits for the card to finish; the agent turn is a board read.
+# Infra-lock exempt in hack/ci-eval-pr.sh: the stack writes only its own
+# labelled namespace through a kubeconfig of its own, plus its one daemon
+# session, so it runs beside the lock-infra chain rather than adding ~45
+# serial minutes to it. 900s hint, unmeasured (the shape of
+# autoops-warning-event-triage).
+./tasks/autoops-warning-event-no-action-triage/task.yaml
+
+# #3090: the first onboarding report opens with the scan counts and the line
+# `inventory_findings.py select` prints, graded by equality. The
+# bootstrap-ranking stack with a planted report that has no critical finding;
+# the onboarding lock, like bootstrap-inventory-ranking-delivery.
+./tasks/bootstrap-inventory-posture-scope/task.yaml
+
 # "/feedback <text>" is written up and shown for a yes before anything is
 # filed (docs/designs/chat-feedback-command.md): the Planning Agent's reply
 # carries the composed submission, the public-issue warning and a question,
@@ -894,6 +925,19 @@
 # cluster agent", not its profile id (#3082). deployer: noop, transcript-only,
 # one front-door turn with no card: +3 units.
 ./tasks/chat-voice-capabilities-names-cluster-agents/task.yaml
+
+# #3598: consistency-authorized-networks-probe demoted 2026-10-21. On the
+# Gemini setup it failed about 30% of repetitions on unrelated pull requests
+# and on main's eval-next (37 of 126 across 42 runs; the store's record
+# 18/21, would-demote). 15 of the 37 were Vertex 429s (#3399, fix open in
+# #3448); 22 were real misses: the agent read seeded-c's leftover
+# masterAuthorizedNetworksConfig {gcpPublicCidrsAccessEnabled: true} (no
+# `enabled`) as configured or open and said seeded-c matches its peers, or
+# named the wrong facet, or (once) a tool error. The Claude nightlies pass
+# it. Back on the roster once #3448 has merged, the agent-side fix (#3605)
+# lands, and the case passes the roster's bar, 90% over 20 runs, on the
+# Gemini nightly (#3598).
+./tasks/consistency-authorized-networks-probe/task.yaml
 
 # gitops-drift-backlog-digest (#3387): records that queue while the drift
 # detector is not pulling are digested, not triaged one card each. The
@@ -909,6 +953,46 @@
 # late-edit-not-carded. The eval install runs uncapped. Priced at the drift
 # band (900s) until the nightly record measures it.
 ./tasks/gitops-drift-backlog-digest/task.yaml
+
+# The revert half of CUJ 1 (#2889): a GitOps-owned NetworkPolicy deleted out
+# of band, where the live state is the accident and restoring what git
+# declares is the right answer. Its stack plants the policy under the GitOps
+# field manager, deletes it, and asserts the namespace holds none; the record
+# carries `join: no_object` and no `owners` key, which is what the detector
+# emits for a delete. Holds the infra lock; 900s, the drift band every
+# gitops-drift case carries.
+#
+# Both halves waited on room in that chain. The recorder periodic's ceiling
+# went 480m to 720m on 2026-10-20 and its first night at the new one ran 401
+# minutes, graded its part whole, and measured a 16-case infra-lock chain --
+# where 10-14, 10-16 and 10-19 had each stopped at 484-485m with a partial
+# verdict, which is 480m plus the grace. Six new units at the band add ~90
+# minutes, or ~45 at the rate the sibling drift cases actually run, and
+# gitops-drift-backlog-digest joined the same chain after that night with as
+# much again: 491-581 minutes against 720 on the 401-minute night. One night
+# of margin, so this pair is the first to drop if the ceiling returns.
+./tasks/gitops-drift-deleted-policy-triage/task.yaml
+
+# The codify half of CUJ 1 (#2889), and the discriminating one: a hardening
+# setting loosened by hand that turns out to be the only reason the workload
+# runs, so the correct answer is to write the live state into git. Without it
+# an agent that answers "revert" to every security drift scores full marks on
+# the suite, which is the failure CUJ 1 exists to beat. The stack plants three
+# rollout revisions -- declared (never started), non-root uid (crash-looped),
+# root (healthy) -- so the load-bearing property is observable. Holds the
+# infra lock; 900s, and listed in nightly-main-b.txt to balance the halves.
+#
+# It was red until #3227 shipped `gke-load-bearing-change` on 2026-10-16, and
+# carries no `expected_fail` marker because #3116, which owned that red, is
+# closed. Its first nightly is its first observation outside a dev install.
+./tasks/gitops-drift-load-bearing-change-triage/task.yaml
+
+# A general fleet health question ("check if my clusters are all healthy") runs
+# fleet_health.py once and files no per-cluster cards (#3302): on a 209-cluster
+# fleet the per-cluster fan-out queued behind the board's five user slots for
+# over thirty minutes. Reads the crashloop-workload role; read-only; requests
+# no pull request. Nightly from its first merge.
+./tasks/health-chat-request-runs-collector/task.yaml
 
 # Catalogue entry 12 (a node label is removed): seeded-a's
 # seeded-shapes/arch-pinned-worker (deprecated-label-selector), a
@@ -971,6 +1055,11 @@
 # record.
 ./tasks/upgrades-retired-registry-image-named/task.yaml
 
+# The weekly upgrade readiness brief's on-request route: a brief in the SOP's shape
+# whose Decide-now lines name slot b's singleton budget and keep the webhook outage
+# under Also-this-week. deployer: noop, read-only, one readiness report.
+./tasks/upgrades-weekly-brief-decisions-named/task.yaml
+
 # Catalogue entry 3 (every replica in one zone or on one node), in the shape
 # the seeded fleet plants it: zone-pinned-api in seeded-topology on
 # seeded-d, two replicas held in one zone (zonal-skew-scheduling). Read-only
@@ -981,3 +1070,9 @@
 # clean passes, 454-983s). Nightly from its first merge; a presubmit seat
 # is a later pull request that cites its record.
 ./tasks/upgrades-zonal-skew-replicas-warned/task.yaml
+
+# A reply that calls a claim verified shows, for each claim, the command a
+# worker ran and an excerpt of its real output (verified_claims_backed,
+# kanban_complete's verified_claims, #3200). deployer: noop, read-only against
+# the crashloop-workload fixture, three units at the 200s default.
+./tasks/verified-claims-carry-evidence/task.yaml
