@@ -494,15 +494,18 @@ def parse_manifests(path: str, data: bytes) -> tuple[list[Document], str | None]
         return [], REASON_ENCODING
     docs: list[Document] = []
     is_json = path.lower().endswith(JSON_SUFFIX)
-    # Anything the loader raises is this file's problem, not the repository's.
-    # PyYAML's YAMLError is not the whole set: its timestamp constructor raises a
-    # bare ValueError for a date that does not exist, and a pathologically nested
-    # document raises RecursionError.
+    # Anything the loader or the walk raises is this file's problem, not the
+    # repository's. PyYAML's YAMLError is not the whole set: its timestamp
+    # constructor raises a bare ValueError for a date that does not exist, and a
+    # pathologically nested document raises RecursionError, from the loader or,
+    # where the loader accepts the depth, from the walk below it.
     try:
         if is_json:
             parsed = [json.loads(text)] if text.strip() else []
         else:
             parsed = list(yaml.safe_load_all(text))
+        for node in parsed:
+            _documents_of(node, path, docs)
     except Exception as e:  # noqa: BLE001 - a file that does not parse is listed, never fatal
         if is_json:
             return [], REASON_JSON.format(error=e)
@@ -510,8 +513,6 @@ def parse_manifests(path: str, data: bytes) -> tuple[list[Document], str | None]
             return [], REASON_TEMPLATE
         first_line = str(e).splitlines()[0] if str(e) else ""
         return [], REASON_YAML.format(error=f"{type(e).__name__}: {first_line}" if first_line else type(e).__name__)
-    for node in parsed:
-        _documents_of(node, path, docs)
     return docs, None
 
 
@@ -669,8 +670,9 @@ def render_report(report: dict) -> str:
             f"Scope: apiVersions declared in Git, matched against {TABLE_NAME} "
             f"(as of Kubernetes {table['as_of']}, source {table['source_url']}). "
             "Files that did not parse are listed as skipped above and were not scanned. "
-            "Live client usage of deprecated APIs is GKE Deprecation Insights' job, not this "
-            f"script's: {DEPRECATION_INSIGHTS_URL} in the console, or "
+            "Live client usage of deprecated APIs is read from the audit log, not from Git: "
+            "`fleet_upgrade_report.py --readiness` reads seven days of it per member, and GKE "
+            f"Deprecation Insights read thirty: {DEPRECATION_INSIGHTS_URL} in the console, or "
             f"`{DEPRECATION_INSIGHTS_COMMAND}` run by a human; this script does not run it.",
         ]
     )

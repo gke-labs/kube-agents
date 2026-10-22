@@ -494,10 +494,9 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
         gaps.append(f"the hand-off stopped waiting {deadline(state) // SECONDS_PER_MINUTE} minutes after the sweep was filed")
 
     stamp = time.strftime(STAMP_FORMAT, time.gmtime(now if now is not None else time.time()))
-    owned = (
-        "Liveness and readiness probes, requests and limits, HPA, NetworkPolicy and pod security are not "
-        "checked by this scan: the first-run audits own them."
-    )
+    import inventory_findings  # beside this script in the pod
+
+    owned = f"{inventory_findings.SCAN_SCOPE_LINE} {inventory_findings.SCAN_CHECKS_SENTENCE}"
     out = [
         "# GKE Environment Discovery Report — raw findings",
         "",

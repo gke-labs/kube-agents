@@ -34,6 +34,7 @@ AT = datetime(2026, 9, 14, 15, 0, tzinfo=timezone.utc)
 LAGGING = "1.34.11-gke.1000"
 CURRENT = "1.35.1-gke.1000"
 POOL_LABEL = "cloud.google.com/gke-nodepool"
+POD_RANGE = "10.0.0.0/14"  # every GKE record carries one; the surge-capacity rule counts its free blocks
 
 
 def pool(name="default-pool", version="1.33.4-gke.1000", autoscaling=None, **config):
@@ -41,7 +42,7 @@ def pool(name="default-pool", version="1.33.4-gke.1000", autoscaling=None, **con
 
 
 def cluster(name="seeded-b", location="us-central1-a", pools=(), **extra):
-    record = {"name": name, "location": location, "status": "RUNNING", "currentMasterVersion": LAGGING, "nodePools": list(pools), "locations": [location]}
+    record = {"name": name, "location": location, "status": "RUNNING", "currentMasterVersion": LAGGING, "nodePools": list(pools), "locations": [location], "clusterIpv4Cidr": POD_RANGE}
     record.update(extra)
     return record
 
@@ -319,6 +320,33 @@ class SharedHelpersTest(unittest.TestCase):
         self.assertEqual(shared.describe(entry), "Deployment shop/web: keeps data on the node")
         self.assertEqual(shared.describe(shared.rule_unknown("x", None, "why")), "x: why")
         self.assertEqual(shared.new_result(), {"blocking": [], "risks": [], "unknown": [], "notes": []})
+
+
+class WorkloadsUnreadDetailTest(unittest.TestCase):
+    """The shared text for a failed workload read names the kinds read and the kinds not."""
+
+    KINDS = ("daemonset", "cronjob")
+
+    def test_every_kind_read_is_none(self):
+        self.assertIsNone(shared.workloads_unread_detail(read(items=[]), self.KINDS))
+
+    def test_the_namespaced_kinds_unread_leaves_the_pdb_reads_workloads_graded(self):
+        detail = shared.workloads_unread_detail(read(items=[], read_errors={"daemonset": "daemonsets is forbidden", "cronjob": "daemonsets is forbidden"}), self.KINDS)
+        self.assertEqual(detail, "DaemonSets and CronJobs not read (daemonsets is forbidden); Deployments and StatefulSets graded")
+        detail = shared.workloads_unread_detail(read(items=[], read_errors={"cronjob": "cronjobs is forbidden"}), self.KINDS)
+        self.assertEqual(detail, "CronJobs not read (cronjobs is forbidden); Deployments, StatefulSets and DaemonSets graded")
+
+    def test_no_read_at_all_says_nothing_was_graded(self):
+        for failed in (read(error="get-credentials failed"), None):
+            detail = shared.workloads_unread_detail(failed, self.KINDS)
+            self.assertTrue(detail.startswith("Deployments, StatefulSets, DaemonSets and CronJobs not read ("), detail)
+            self.assertTrue(detail.endswith("; nothing graded"), detail)
+        self.assertIn("(get-credentials failed)", shared.workloads_unread_detail(read(error="get-credentials failed"), self.KINDS))
+        # Through a rule: the unknown it files says the same, with no object graded.
+        from readiness_rules import retired_registry
+
+        out = retired_registry.evaluate(cluster(), {}, read(error="get-credentials failed"), TARGET, {shared.CONTEXT_POOLS: []})
+        self.assertEqual([u["detail"] for u in out["unknown"]], ["Deployments, StatefulSets, DaemonSets and CronJobs not read (get-credentials failed); nothing graded"])
 
 
 class FindingHelpersTest(unittest.TestCase):
@@ -1607,9 +1635,9 @@ class KnownIssuesMatrixRuleTest(unittest.TestCase):
 
 class RegistryOrderTest(unittest.TestCase):
     def test_the_incident_rules_are_registered_by_entry(self):
-        self.assertEqual([m.RULE_ID for m in r.EXTRA_RULES], ["zonal-control-plane", "lb-connection-draining", "orphan-node-objects", "control-plane-upgrade-history", "cluster-status-age", "target-patch-valid", "known-issues-matrix"])
+        self.assertEqual([m.RULE_ID for m in r.EXTRA_RULES], ["surge-capacity", "data-on-the-node", "removed-api-callers", "changed-defaults", "deprecated-api-callers", "client-addon-skew", "zonal-control-plane", "removed-node-label", "container-runtime", "cgroup-v2-runtime", "group-oom-kill", "network-dataplane", "node-image-coupled-agent", "gpu-driver", "in-tree-volumes", "retired-registry", "lb-connection-draining", "orphan-node-objects", "control-plane-upgrade-history", "cluster-status-age", "target-patch-valid", "known-issues-matrix"])
         # Every blocking rule says what its mechanism holds; the node-removal rules hold the pool move alone.
-        self.assertEqual({m.RULE_ID: m.HOLDS for m in r.EXTRA_RULES if m.CAN_BLOCK}, {"cluster-status-age": shared.HOLDS_BOTH, "target-patch-valid": shared.HOLDS_BOTH, "lb-connection-draining": (shared.HOLDS_NODE_POOL,), "orphan-node-objects": (shared.HOLDS_NODE_POOL,)})
+        self.assertEqual({m.RULE_ID: m.HOLDS for m in r.EXTRA_RULES if m.CAN_BLOCK and hasattr(m, r.HOLDS_ATTRIBUTE)}, {"cluster-status-age": shared.HOLDS_BOTH, "target-patch-valid": shared.HOLDS_BOTH, "lb-connection-draining": (shared.HOLDS_NODE_POOL,), "orphan-node-objects": (shared.HOLDS_NODE_POOL,)})
 
 
 if __name__ == "__main__":

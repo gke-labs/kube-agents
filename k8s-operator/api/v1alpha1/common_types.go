@@ -49,6 +49,8 @@ const (
 	a2aNATSConfigSuffix  = "-config"
 	a2aCalloutNameSuffix = "-a2a-callout"
 	a2aCalloutKeysSuffix = "-keys"
+	a2aNATSTLSSuffix     = "-tls"
+	a2aNATSCASuffix      = "-ca"
 )
 
 // A2ANATSName is the name of the NATS objects the operator renders for a
@@ -77,6 +79,18 @@ func A2ACalloutKeysSecretName(agentName string) string {
 	return A2ACalloutName(agentName) + a2aCalloutKeysSuffix
 }
 
+// A2ANATSTLSSecretName is the Secret holding the bus's serving certificate
+// and key, which the NATS pod mounts for its client listener.
+func A2ANATSTLSSecretName(agentName string) string {
+	return A2ANATSName(agentName) + a2aNATSTLSSuffix
+}
+
+// A2ANATSCASecretName is the Secret holding the CA the operator signs the
+// bus's serving certificate with, private key included.
+func A2ANATSCASecretName(agentName string) string {
+	return A2ANATSName(agentName) + a2aNATSCASuffix
+}
+
 // A2ACredentialSecretNames is every Secret the operator renders with a bus
 // credential in it, for a PlatformAgent of that name. It is the set
 // BusCredentialRoutes refuses a user volume for; a Secret added to the bus
@@ -87,6 +101,11 @@ func A2ACredentialSecretNames(agentName string) []string {
 		A2ACredsSecretName(agentName),
 		A2ANATSConfigSecretName(agentName),
 		A2ACalloutKeysSecretName(agentName),
+		// Not passwords, but a key either way: the serving key lets a pod
+		// impersonate the bus to every client, and the CA key lets it mint
+		// a certificate that does the same.
+		A2ANATSTLSSecretName(agentName),
+		A2ANATSCASecretName(agentName),
 	}
 }
 
@@ -154,9 +173,14 @@ var SensitiveEnvVars = map[string]struct{}{
 	// the platform in the cron relay's refusal when no home channel is set.
 	// The operator renders it exactly when the gateway arms the route.
 	"A2A_NOTIFY_CONVERSATIONS": {},
-	"NATS_URL":                 {},
-	"NATS_USER":                {},
-	"NATS_PASSWORD":            {},
+	// NATS_CA_FILE names the CA the client trusts the bus by. An override is
+	// the TLS half of a redirected NATS_URL: pointed at a CA of the setter's
+	// choosing, the client accepts a server that CA signed as the bus, and
+	// hands it the bearer token at CONNECT.
+	"NATS_CA_FILE":  {},
+	"NATS_URL":      {},
+	"NATS_USER":     {},
+	"NATS_PASSWORD": {},
 }
 
 // ReservedVolumeNames defines pod volume names the operator renders itself and
@@ -274,12 +298,13 @@ const BusCredentialRouteVolumeSource = -1
 // ServiceAccount, so the name on the volume changes nothing about what the
 // callout sees. The Secrets in A2ACredentialSecretNames need no token minting
 // at all and are the cheaper route; a check on the audience alone would narrow
-// the expensive route and advertise the cheap one. There are three of them
-// because the same credentials sit in three places: the creds Secret holds
-// the static passwords (`bridge-password` among them), the nats-config Secret
-// holds nats.conf with every one of those passwords inline, and the
-// callout-keys Secret holds the issuer seed that signs every identity the bus
-// accepts, which is worth more than any password in the other two.
+// the expensive route and advertise the cheap one. There are five of them:
+// the creds Secret holds the static passwords (`bridge-password` among them),
+// the nats-config Secret holds nats.conf with every one of those passwords
+// inline, the callout-keys Secret holds the issuer seed that signs every
+// identity the bus accepts, which is worth more than any password in the
+// others, and the two TLS Secrets hold the keys that let a pod pass as the
+// bus: the serving key, and the CA key that can mint another.
 //
 // Volume shapes only. A `secret` volume and a projected `secret` source are
 // the two volume shapes that put a Secret's data in the container; the other
@@ -947,7 +972,8 @@ type DeploymentSpec struct {
 	// its source is one of the routes to the agent's A2A bus credentials: a
 	// ServiceAccount token projection for the "a2a-bus" audience, or a reference
 	// to one of the Secrets the operator renders bus credentials into
-	// (<agent>-a2a-nats-creds, <agent>-a2a-nats-config, <agent>-a2a-callout-keys),
+	// (<agent>-a2a-nats-creds, <agent>-a2a-nats-config, <agent>-a2a-callout-keys,
+	// <agent>-a2a-nats-tls, <agent>-a2a-nats-ca),
 	// as either a secret volume or a projected secret source. The refusal is on
 	// the name and the shape of the source, not on what a given Secret happens to
 	// hold at the time. Reading those Secrets through env is not refused here. On
@@ -964,8 +990,9 @@ type DeploymentSpec struct {
 	// ExtraVolumes specifies custom volumes to mount for the main container.
 	// The same reserved names and reserved sources as SidecarVolumes are refused
 	// at admission -- a ServiceAccount token projection for the "a2a-bus"
-	// audience, or a reference to <agent>-a2a-nats-creds, <agent>-a2a-nats-config
-	// or <agent>-a2a-callout-keys -- and dropped from the render on an install
+	// audience, or a reference to <agent>-a2a-nats-creds, <agent>-a2a-nats-config,
+	// <agent>-a2a-callout-keys, <agent>-a2a-nats-tls or <agent>-a2a-nats-ca -- and
+	// dropped from the render on an install
 	// running the A2A surface.
 	// +listType=map
 	// +listMapKey=name
@@ -2254,6 +2281,23 @@ type AgentUsageStatus struct {
 	// through the relay is not the agent at work.
 	// +optional
 	BrokerFailuresTotal int64 `json:"brokerFailuresTotal,omitempty"`
+	// ChatTurnsErroredTotal is the cumulative count of synchronous chat turns
+	// the gateway failed to complete: on the Hermes gateway, an exception out
+	// of the turn, a result the agent marked failed (a provider 429 or 5xx, a
+	// connection error, the gateway timeout) or a provider authentication
+	// failure, counted by the chat_metrics plugin's
+	// kubeagents_chat_turns_errored_total on the gateway pod that runs
+	// Hermes; and on a next-mode install, an A2A task that ended failed or
+	// rejected, read from the A2A gateway's
+	// kubeagents_a2a_gateway_task_terminals_total under those two states.
+	// That family carries no platform, so on next it counts every A2A task's
+	// terminal, a door's program-to-program task included, not chat alone;
+	// rejected is a task the executor refused, counted as the design asks.
+	// Read every five minutes and kept monotonic the same way as
+	// ToolExecutionsTotal. Does not move LastActiveTime: the message that
+	// started the turn already did.
+	// +optional
+	ChatTurnsErroredTotal int64 `json:"chatTurnsErroredTotal,omitempty"`
 
 	// ClustersRegistered is the number of clusters the event watcher built a
 	// client for at its last start: the management cluster and the Cluster
@@ -2300,7 +2344,7 @@ type AgentUsageStatus struct {
 	// LastActiveTime is the time of the last poll in which a counter above
 	// moved: a brokered command ran or was refused, a proposal was opened or
 	// merged, a chat message reached the gateway, or an event was accepted
-	// for triage; BrokerFailuresTotal alone leaves it where it was.
+	// for triage; BrokerFailuresTotal and ChatTurnsErroredTotal alone leave it where it was.
 	// Scheduled maintenance jobs that run brokered commands move it too --
 	// the Controller Stall Watch cron runs some every 30 minutes by default
 	// -- so it marks agent activity of any origin, not human or operator use

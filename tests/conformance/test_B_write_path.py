@@ -750,7 +750,9 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
         Auto-merge goes on only for a pull request that is not a draft, carries
         both `lgtm` and `approved`, and carries none of the `do-not-merge`
         labels Tide's query excludes. Every other combination must leave it
-        off.
+        off. That holds on each removal path too: never removed, removed with
+        the one retry after a `failed_checks` removal due, and removed with it
+        spent, which stays out.
         """
         scripts = h.REPO_ROOT / "scripts"
         if str(scripts) not in sys.path:
@@ -770,13 +772,21 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
                         labels = {"size/S"} | ({"lgtm"} if lgtm else set()) | ({"approved"} if approved else set())
                         if hold:
                             labels.add(hold)
-                        pull = {"draft": draft, "labels": labels, "auto_merge": False, "queue_entry": None}
-                        expected = lgtm and approved and not hold and not draft
-                        with self.subTest(labels=sorted(labels), draft=draft):
-                            self.assertEqual(
-                                expected,
-                                merge_gate.enqueue_action(pull) == merge_gate.ENABLE,
-                            )
+                        for removed, retry in ((False, False), (True, True), (True, False)):
+                            pull = {
+                                "draft": draft,
+                                "labels": labels,
+                                "auto_merge": False,
+                                "queue_entry": None,
+                                "removed_since_push": removed,
+                                "retry": retry,
+                            }
+                            expected = lgtm and approved and not hold and not draft and (retry or not removed)
+                            with self.subTest(labels=sorted(labels), draft=draft, removed=removed, retry=retry):
+                                self.assertEqual(
+                                    expected,
+                                    merge_gate.enqueue_action(pull) == merge_gate.ENABLE,
+                                )
 
 
     def test_B2_app_token_write_grants_are_pinned(self) -> None:

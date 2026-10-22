@@ -45,11 +45,26 @@ from datetime import datetime, time, timedelta, timezone
 import readiness_rules
 from readiness_rules import (
     audit_log,
+    capacity,
+    cgroup_v2_runtime,
+    changed_defaults,
+    client_addon_skew,
     cluster_status_age,
+    container_runtime,
     control_plane_upgrade_history,
+    dataplane,
+    deprecated_api_callers,
+    gpu_driver_mismatch,
+    group_oom_kill,
+    intree_volumes,
     known_issues_matrix,
     lb_connection_draining,
+    node_image_coupled_agent,
+    node_local_state,
     orphan_node_objects,
+    removed_api_callers,
+    removed_node_label,
+    retired_registry,
     target_patch_valid,
     zonal_control_plane,
 )
@@ -400,7 +415,22 @@ RULE_NONE = "no rules"
 # this order, which is the order the table and the JSON list their findings in. One list,
 # grouped by entry number, the entry in the comment.
 EXTRA_RULES = [
+    capacity,  # entry 2
+    node_local_state,  # entry 4
+    removed_api_callers,  # entry 6
+    changed_defaults,  # entry 8
+    deprecated_api_callers,  # entry 9
+    client_addon_skew,  # entry 10
     zonal_control_plane,  # entry 11
+    removed_node_label,  # entry 12
+    container_runtime,  # entry 13
+    cgroup_v2_runtime,  # entry 14
+    group_oom_kill,  # entry 15
+    dataplane,  # entry 16
+    node_image_coupled_agent,  # entry 17
+    gpu_driver_mismatch,  # entry 18
+    intree_volumes,  # entry 19
+    retired_registry,  # entry 20
     lb_connection_draining,  # entry 21: a backend service whose connection drain outlasts the node's deregistration wait
     orphan_node_objects,  # entry 22: a Node whose instance is gone
     control_plane_upgrade_history,  # entry 23: an upgrade or repair that failed on compute capacity, against the maintenance window

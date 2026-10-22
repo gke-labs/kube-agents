@@ -53,6 +53,7 @@ def run_hook(
     rc_commit_sha: str = "",
     path_prepend: str = "",
     mode_next: str = "",
+    rollback_lane: str = "",
 ) -> subprocess.CompletedProcess:
     """Exit a `set -euo pipefail` shell with `exit_code`, real trap installed.
 
@@ -69,6 +70,7 @@ def run_hook(
         f'export PULL_NUMBER="{pull_number}"',
         f'export RC_COMMIT_SHA="{rc_commit_sha}"',
         f'export EVAL_MODE_NEXT="{mode_next}"',
+        f'export EVAL_ROLLBACK_LANE="{rollback_lane}"',
         # Always pinned: the suite itself runs under Prow, where a real
         # $ARTIFACTS is set, and the hook copies its log there.
         f'export ARTIFACTS="{artifacts}"',
@@ -204,11 +206,11 @@ class PublishHookFailSafeTest(unittest.TestCase):
             dash = pathlib.Path(tmp) / "scripts" / "eval_dashboard"
             self.assertEqual(list(dash.glob("*.ran")), [])
 
-    def test_a_next_mode_run_never_publishes(self):
-        """The next lane's periodic is also a periodic with no PULL_NUMBER and
-        no RC_COMMIT_SHA. It measures the next stack, which the dashboard has
-        no lane for, so publishing from one would file a next run as main's
-        today history. Mirrors the baseline recorder's fourth condition."""
+    def test_a_today_lane_run_never_publishes(self):
+        """The today lane's periodic is also a periodic with no PULL_NUMBER and
+        no RC_COMMIT_SHA, flagged EVAL_MODE_NEXT=1 for its deploy. It grades
+        an install rolled back from next, which is not main's history.
+        Mirrors the baseline recorder's fourth condition."""
         marker = (
             "import pathlib, sys\n"
             "pathlib.Path(sys.path[0], 'collect.py.ran').touch()\n"
@@ -222,10 +224,32 @@ class PublishHookFailSafeTest(unittest.TestCase):
                     target="gs://kube-agents-dashboards/evals/",
                     job_type="periodic",
                     mode_next="1",
+                    rollback_lane="1",
                 )
-                self.assert_skipped_once(result, code, "EVAL_MODE_NEXT=1")
+                self.assert_skipped_once(result, code, "EVAL_ROLLBACK_LANE=1")
             dash = pathlib.Path(tmp) / "scripts" / "eval_dashboard"
             self.assertEqual(list(dash.glob("*.ran")), [])
+
+    def test_a_next_mode_periodic_publishes(self):
+        """A next-mode run on main records under the version key's next mode,
+        so it is main's history like the today nightly's and the publisher
+        lets it through, mirroring the recorder."""
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_hack = dashboard_stubs(
+                pathlib.Path(tmp),
+                """\
+                import json, pathlib, sys
+                out = sys.argv[sys.argv.index("--out") + 1]
+                pathlib.Path(out).write_text(json.dumps({"runs": [{"build": "1"}]}))
+                """,
+            )
+            result = run_hook(
+                0, fake_hack, target="gs://kube-agents-dashboards/evals/",
+                job_type="periodic", mode_next="1",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("eval-dashboard: published to gs://kube-agents-dashboards/evals/", result.stdout)
+            self.assertNotIn(SKIP, result.stdout)
 
     def test_missing_collect_py_skips_fast_and_preserves_the_exit_code(self):
         """This PR may merge before the siblings that add scripts/eval_dashboard/."""

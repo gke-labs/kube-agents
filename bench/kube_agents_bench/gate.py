@@ -73,6 +73,8 @@ from typing import Any
 
 from kube_agents_bench.baselines import (
     ADMITTED_BY_RECORD,
+    MODE_NEXT,
+    MODE_TODAY,
     RECORD_WOULD_ADMIT,
     RECORD_WOULD_DEMOTE,
     AdmissionBar,
@@ -101,6 +103,7 @@ from kube_agents_bench.scoring import (
     Rung,
     grade_case,
     grade_suite,
+    is_inject_record,
     load_run,
 )
 
@@ -114,18 +117,40 @@ _DEFAULT_BASELINE_DIR = "baselines"
 AGENT_TRANSPORT_ENV = "AGENT_TRANSPORT"
 TRANSPORT_INJECT = "inject"
 
-#: Rung 6 off on the inject lane, said on every case it would have compared.
-#: Main's judged record is the today-mode nightly's over the api transport,
-#: filed at a version key that carries neither the mode nor the transport, so
-#: comparing an inject run's judged mean with it measures the transport and
-#: the mode, not the pull request: the next lane redded on rung 6 on four
-#: admitted cases at once on 2026-10-17 with nothing changed on its side.
-#: Back on when the key carries the mode (bench/baselines/README.md).
-JUDGED_OFF_ON_INJECT_NOTE = (
-    "rung 6 not compared on the inject lane: main's judged record is the api "
-    "transport's under spec.mode today, and the version key carries neither, "
-    "so the comparison would measure the lane rather than this change"
-)
+#: Rung 6 compares a run only with history from its own mode, because the
+#: mode is a component of the version key (``VersionKey.mode``). Before it
+#: was, main's judged record was the today-mode nightly's over the api
+#: transport, and the next lane redded on rung 6 on four admitted cases at
+#: once on 2026-10-17 with nothing changed on its side.
+
+#: Set beside EVAL_MODE_NEXT=1 on the today lane (hack/ci-eval-pr.sh): its
+#: matrix grades an install rolled back from next, which is neither the fresh
+#: today install today's window measures nor a next install, so
+#: ``bench-gate record`` refuses it.
+ROLLBACK_LANE_ENV = "EVAL_ROLLBACK_LANE"
+
+
+def graded_mode(env: dict[str, str] | None = None, *, inject_run: bool = False) -> str:
+    """The ``spec.mode`` the matrix graded: next when a repetition's record is
+    the inject transport's (``inject_run``, read off the run like the other
+    run-derived components) or, failing that, under ``AGENT_TRANSPORT=inject``;
+    today otherwise.
+
+    Read off the transport rather than off ``EVAL_MODE_NEXT``, because the
+    flag alone does not say which mode was graded: the today lane deploys
+    under it and grades a rolled-back install over the api transport.
+    ``hack/ci-eval-pr.sh`` exports the inject transport exactly when it
+    grades a next install (``EVAL_MODE_NEXT=1`` without
+    ``EVAL_ROLLBACK_LANE=1``), and the inject door exists only on one. The
+    record comes first so a next run regraded by hand without the variable
+    still files under next; the environment covers a run whose records carry
+    no trajectory to read the marker from.
+    """
+    if inject_run:
+        return MODE_NEXT
+    src = env if env is not None else os.environ
+    return MODE_NEXT if src.get(AGENT_TRANSPORT_ENV, "") == TRANSPORT_INJECT else MODE_TODAY
+
 
 #: What ``suite`` exits when the run could not be evaluated (see the module
 #: docstring's EXIT CODES): the code ``case`` uses for "could not grade",
@@ -395,8 +420,11 @@ def _cmd_case(args: argparse.Namespace) -> int:
         print(f"Task {spec.case_id} Result: [FAILED] {exc}", file=sys.stderr)
         return 2
 
-    for run_dir in run_dirs:
-        record = load_run(run_dir) if run_dir else None
+    # The mode is the one component read across every repetition: any record
+    # carrying the inject transport's marker makes the run next's.
+    loaded = [load_run(d) if d else None for d in run_dirs]
+    inject_run = any(r is not None and is_inject_record(r.trajectory) for r in loaded)
+    for record in loaded:
         if record is None or record.empty_record:
             continue
         key = VersionKey.from_run(
@@ -404,6 +432,7 @@ def _cmd_case(args: argparse.Namespace) -> int:
             scoring_version=record.scoring_version,
             judge_model=args.judge_model or os.environ.get("JUDGE_MODEL"),
             versions=versions,
+            mode=graded_mode(inject_run=inject_run),
         )
         if key is not None:
             break
@@ -433,29 +462,26 @@ def _cmd_case(args: argparse.Namespace) -> int:
     admitted, admission_reason = decision.admitted, decision.reason
 
     # Rung 6's comparator. None whenever the store has nothing at this key,
-    # which is every BOOTSTRAP_ADMITTED case until the nightly has appended
+    # which is every BOOTSTRAP_ADMITTED case until a run on main has appended
     # something for it: admitted by fiat with no measured judged mean to be
     # compared against, so the judged rung stays quiet. A listed case with a
     # partial window (`collecting`) does have a mean at the key, and rung 6
     # compares against it -- fewer runs behind it than a full window, but
-    # measured on main, which is what the rung asks for.
+    # measured on main, which is what the rung asks for. The key carries the
+    # mode, so an inject-lane run reads only next-mode history: quiet until
+    # a next-mode run on main has recorded the case at this key.
     evidence = store.evidence_for(spec.case_id, key, min_runs=bar.min_runs)
     baseline_judged = evidence.judged_means if evidence else None
-    # Main's mean is still reported in the payload below; it only stops
-    # being the comparator (JUDGED_OFF_ON_INJECT_NOTE).
-    judged_off = bool(baseline_judged) and os.environ.get(AGENT_TRANSPORT_ENV, "") == TRANSPORT_INJECT
 
     verdict = grade_case(
         spec,
         list(run_dirs),
         admitted=admitted,
         correctness_floor=args.correctness_floor,
-        baseline_judged=None if judged_off else baseline_judged,
+        baseline_judged=baseline_judged,
         judged_margin=args.judged_margin,
         judged_metrics=_judged_metrics(),
     )
-    if judged_off:
-        verdict.notes.append(JUDGED_OFF_ON_INJECT_NOTE)
 
     payload = verdict.to_dict()
     payload["admission_reason"] = admission_reason
@@ -627,7 +653,7 @@ def _read_case_results(paths: list[str]) -> list[dict[str, Any]] | str:
 
 def _baseline_rate(
     cases: list[dict[str, Any]], store: BaselineStore, bar: AdmissionBar
-) -> float | None:
+) -> tuple[float | None, list[str]]:
     """Main's pass rate over the same admitted cases this run graded.
 
     Pooled across cases rather than averaged over them, so a case with twenty
@@ -648,12 +674,22 @@ def _baseline_rate(
 
     A case the inject lane could not grade (rung NOT_GRADED_ON_TRANSPORT,
     #2039) is out of the pull request's side already -- its ``scored`` is 0
-    -- and is left out of main's side here for the same reason: the version
-    key carries no transport, so main's api-lane evidence for it would be
-    pooled against a run that graded nothing of it, moving the comparison
-    for nothing.
+    -- and is left out of main's side here for the same reason: whatever
+    main holds for it at this key would be pooled against a run that graded
+    nothing of it, moving the comparison for nothing.
+
+    A case graded at a next key with nothing recorded there falls back to
+    the today key that differs from it only in mode, and is returned in the
+    second element so the verdict says so. Rung 6 never does this; the
+    aggregate does, because it is one advisory number over the whole run
+    (armed only by ``EVAL_AGGREGATE_ARMED``) and going dark until a next-mode
+    window exists at the presubmit's agent model would leave the merge gate
+    with no whole-suite comparison at all, where before the mode was on the
+    key it compared with today's history. Same-mode evidence wins wherever
+    it exists.
     """
     passes = runs = 0
+    fallback: list[str] = []
     for case in cases:
         if not case.get("admitted"):
             continue
@@ -662,16 +698,20 @@ def _baseline_rate(
         raw_key = case.get("version_key")
         if not isinstance(raw_key, dict):
             continue
-        evidence = store.evidence_for(
-            str(case.get("case") or ""),
-            VersionKey.from_dict(raw_key),
-            min_runs=bar.min_runs,
-        )
+        case_id = str(case.get("case") or "")
+        key = VersionKey.from_dict(raw_key)
+        evidence = store.evidence_for(case_id, key, min_runs=bar.min_runs)
+        if evidence is None and key.mode != MODE_TODAY:
+            evidence = store.evidence_for(
+                case_id, dataclasses.replace(key, mode=MODE_TODAY), min_runs=bar.min_runs
+            )
+            if evidence is not None:
+                fallback.append(case_id)
         if evidence is None:
             continue
         passes += evidence.passes
         runs += evidence.runs
-    return (passes / runs) if runs else None
+    return ((passes / runs) if runs else None), sorted(fallback)
 
 
 def _cmd_suite(args: argparse.Namespace) -> int:
@@ -693,8 +733,9 @@ def _cmd_suite(args: argparse.Namespace) -> int:
     # the number comes from the store, which is the whole point: the aggregate
     # rule was a flag nothing supplied, and so never fired.
     baseline_rate = args.baseline_rate
+    cross_mode: list[str] = []
     if baseline_rate is None:
-        baseline_rate = _baseline_rate(cases, store, AdmissionBar.from_env())
+        baseline_rate, cross_mode = _baseline_rate(cases, store, AdmissionBar.from_env())
 
     verdict = grade_suite(
         cases,
@@ -755,6 +796,14 @@ def _cmd_suite(args: argparse.Namespace) -> int:
             "that is a typo, the case it was meant to keep blocking is not "
             "blocking."
         )
+    if cross_mode:
+        banners.append(
+            "> **NOTE — aggregate compared with today-mode history.** "
+            f"`{'`, `'.join(cross_mode)}` graded `next` with nothing recorded at "
+            "the next key, so main's side of the admitted-case rate uses its "
+            "today-mode lines at the same key otherwise. Rung 6 compares "
+            "same-mode history only."
+        )
     for note in case_notes:
         print(f"WARNING: {note}", file=sys.stderr)
         banners.append(f"> **WARNING — judged rung degraded.** {note}")
@@ -813,34 +862,42 @@ def _record_for_case(
         return f"{case_id}: no version key on this run, so nothing to file it under"
 
     reps = [r for r in (case.get("reps") or []) if isinstance(r, dict)]
-    # A repetition the inject lane touched (#2039) is not this store's
-    # evidence -- whether it was set aside whole (outcome `not_applicable`)
-    # or graded with one of its checks set aside (a `pass` or `fail` whose
-    # `not_applicable_checks` is non-empty, the captured agent-kanban-smoke
-    # shape). The record is main's api-lane record, filed at a version key
-    # that carries no transport; a 3/3 line graded on half the case's
-    # objectives would sit beside it as if comparable, and admission reads
-    # it. BaselineRecord has no column that could carry the outcome without
-    # dropping it. Skip the case, saying so.
+    key = VersionKey.from_dict(raw_key)
+    # A repetition the inject lane touched (#2039) -- set aside whole
+    # (outcome `not_applicable`) or graded with one of its checks set aside
+    # (a `pass` or `fail` whose `not_applicable_checks` is non-empty, the
+    # captured agent-kanban-smoke shape) -- is not evidence for a today key:
+    # today's window is the api lane's, graded on every objective, and a 3/3
+    # line graded on half of them would sit beside it as if comparable.
+    # Skip the case, saying so. At a next key it is the window's own shape:
+    # every next-mode run, on main or on a pull request, goes through the
+    # same door under the same set-aside rule, so the graded repetitions
+    # are recorded and a whole set-aside one counts as neither pass nor fail.
     set_aside = sum(
         1
         for r in reps
         if r.get("outcome") == REP_OUTCOME_NOT_APPLICABLE or r.get("not_applicable_checks")
     )
-    if set_aside:
+    if set_aside and key.mode == MODE_TODAY:
         return (
             f"{case_id}: {set_aside} of {len(reps)} repetition(s) {NOT_APPLICABLE_PHRASE} "
-            "(whole, or one of its checks); not recorded, the store holds api-lane evidence only"
+            "(whole, or one of its checks); not recorded at a today key, whose window "
+            "is the api lane's"
         )
     scored = [r for r in reps if r.get("outcome") in ("pass", "fail")]
     if not scored:
-        return (
-            f"{case_id}: no repetition produced a pass or a fail "
-            f"({len(reps)} repetition(s) blocked or hit infrastructure)"
-        )
+        # At a next key a repetition set aside whole reaches here too; it was
+        # neither blocked nor lost to infrastructure, so it is counted apart.
+        whole = sum(1 for r in reps if r.get("outcome") == REP_OUTCOME_NOT_APPLICABLE)
+        causes = []
+        if whole:
+            causes.append(f"{whole} {NOT_APPLICABLE_PHRASE}")
+        if len(reps) - whole or not whole:
+            causes.append(f"{len(reps) - whole} repetition(s) blocked or hit infrastructure")
+        return f"{case_id}: no repetition produced a pass or a fail ({', '.join(causes)})"
 
     return case_id, BaselineRecord(
-        key=VersionKey.from_dict(raw_key),
+        key=key,
         runs=len(scored),
         passes=sum(1 for r in scored if r.get("outcome") == "pass"),
         recorded_at=recorded_at,
@@ -918,13 +975,26 @@ def _cmd_record(args: argparse.Namespace) -> int:
         # Same invariant, second way in. A release-candidate eval is a periodic
         # with no PULL_NUMBER, so the check above lets it through, and a record
         # written from one is indistinguishable afterwards: VersionKey names the
-        # setup, the scoring version, the judge and the two content versions,
-        # and nothing about which build produced the sample. The candidate would
+        # setup, the scoring version, the judge, the two content versions and
+        # the mode, and nothing about which build produced the sample. The candidate would
         # then be judged non-inferior to a window it had just moved.
         print(
             "::error::refusing to record a baseline with RC_COMMIT_SHA set "
             f"({os.environ['RC_COMMIT_SHA']}): a release candidate is measured "
             "against main's window, not added to it",
+            file=sys.stderr,
+        )
+        return 2
+
+    if os.environ.get(ROLLBACK_LANE_ENV) == "1" and not args.force:
+        # Third way in, mirrored from hack/ci-eval-pr.sh's recorder decision:
+        # the today lane's periodic on main has no PULL_NUMBER and grades an
+        # install rolled back from next over the api transport. Its key reads
+        # today, and today's window measures a fresh today install.
+        print(
+            f"::error::refusing to record a baseline with {ROLLBACK_LANE_ENV}=1: "
+            "the today lane grades a rolled-back install, which is not what "
+            "today's window measures",
             file=sys.stderr,
         )
         return 2

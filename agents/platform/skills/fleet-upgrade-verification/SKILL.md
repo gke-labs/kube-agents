@@ -296,7 +296,7 @@ The per-entry rules run after those four, over the same cluster record and the r
 the webhook read, one per group of kinds: `kubectl get daemonset,cronjob,pvc,networkpolicy,namespace
 -A -o json`; `kubectl get pods -A -o json` on its own, because the pod list is the one most
 likely to exceed the credential proxy's output cap and a cut read must cost only the rules that
-need pods; the Nodes through a jsonpath template that keeps each node's name, `providerID`, labels, taints,
+need pods; the Nodes through a jsonpath template that keeps each node's name, `providerID`, Pod CIDR, labels, taints,
 whether it is cordoned, node info, allocatable and conditions and drops the rest (so a few
 hundred nodes stay under that cap); and `kubectl get storageclass,pv -o json`. Each of them
 fails on its own: a refused or unparsable read, or one the credential proxy cut at its output

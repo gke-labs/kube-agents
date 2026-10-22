@@ -316,10 +316,11 @@ KUBECTL_WEBHOOK_RESOURCES = "validatingwebhookconfigurations,mutatingwebhookconf
 # the namespaced kinds the per-entry rules read; the Pods on their own, since the pod list
 # is the one most likely to exceed the credential proxy's output cap and a cut read must
 # cost only the rules that need pods; the Nodes through a jsonpath template that keeps the
-# fields the rules use (name, labels, taints, whether the node is cordoned, nodeInfo,
-# allocatable, conditions) and drops the rest (`status.images`, the annotations), which is
-# what keeps a few hundred nodes under that cap (one line per node, tab-separated, each
-# field JSON as kubectl's jsonpath renders maps, lists and booleans, an absent field empty);
+# fields the rules use (name, its Pod CIDR, labels, taints, whether the node is cordoned,
+# nodeInfo, allocatable, conditions) and drops the rest (`status.images`, the annotations),
+# which is what keeps a few hundred nodes under that cap (one line per node, tab-separated,
+# the name and the Pod CIDR raw and each other field JSON as kubectl's jsonpath renders
+# maps, lists and booleans, an absent field empty);
 # and StorageClasses and PersistentVolumes as JSON. Each read fails on its own: a refused,
 # unparsable or cut read is recorded per kind in `read_errors`, costs only the rules that
 # need those kinds (each files `unknown` for itself), never the PDB rule, and sets no exit
@@ -343,16 +344,18 @@ LATER_READS = (
     (readiness_rules.CLUSTER_READ_KINDS, KUBECTL_CLUSTER_RESOURCES, READ_MODE_CLUSTER_JSON),
 )
 KUBECTL_READS_PER_MEMBER = 2 + len(LATER_READS)  # the PDB read, the webhook read, then LATER_READS
-KUBECTL_NODE_JSONPATH = '{range .items[*]}{.metadata.name}{"\\t"}{.spec.providerID}{"\\t"}{.metadata.creationTimestamp}{"\\t"}{.metadata.labels}{"\\t"}{.spec.taints}{"\\t"}{.spec.unschedulable}{"\\t"}{.status.nodeInfo}{"\\t"}{.status.allocatable}{"\\t"}{.status.conditions}{"\\n"}{end}'
+KUBECTL_NODE_JSONPATH = '{range .items[*]}{.metadata.name}{"\\t"}{.spec.providerID}{"\\t"}{.metadata.creationTimestamp}{"\\t"}{.spec.podCIDR}{"\\t"}{.metadata.labels}{"\\t"}{.spec.taints}{"\\t"}{.spec.unschedulable}{"\\t"}{.status.nodeInfo}{"\\t"}{.status.allocatable}{"\\t"}{.status.conditions}{"\\n"}{end}'
 JSONPATH_OUTPUT_FORMAT = "jsonpath={template}"
 NODE_FIELD_SEPARATOR = "\t"
 NODE_LINE_SEPARATOR = "\n"  # what the jsonpath template ends each node with; a NEL (U+0085) inside a field is not a line break
 # The name, the providerID (`gce://<project>/<zone>/<instance>`, the instance behind the
-# node, which the orphan-node rule joins to the project's instances) and the creation
-# timestamp (which that rule reads against the instance list's read time) are strings and come
-# raw; the fields after them are JSON as kubectl's jsonpath renders maps, lists and booleans.
-NODE_FIELD_COUNT = 9
-NODE_RAW_FIELDS = 3
+# node, which the orphan-node rule joins to the project's instances), the creation
+# timestamp (which that rule reads against the instance list's read time) and the Pod CIDR
+# are strings and come raw; the fields after them are JSON as kubectl's jsonpath renders
+# maps, lists and booleans.
+NODE_FIELD_COUNT = 10
+NODE_RAW_FIELDS = 4
+NODE_POD_CIDR_KEY = "podCIDR"
 NODE_KIND = readiness_rules.KIND_NODE
 # The credential proxy caps each stream a brokered command returns; past the cap it writes
 # the cut stdout, prints a marker on stderr (readiness_rules.PROXY_TRUNCATION_MARKER, which
@@ -1073,16 +1076,19 @@ def parse_node_lines(stdout: str) -> tuple[list[dict] | None, str | None]:
         fields = line.split(NODE_FIELD_SEPARATOR)
         if len(fields) != NODE_FIELD_COUNT:
             return None, f"node line has {len(fields)} field(s), not {NODE_FIELD_COUNT}: {line[:NOTE_ERROR_CHARS]!r}"
+        name, provider_id, created, pod_cidr = fields[:NODE_RAW_FIELDS]
         try:
             labels, taints, unschedulable, info, allocatable, conditions = (json.loads(f) if f.strip() else None for f in fields[NODE_RAW_FIELDS:])
         except ValueError as e:
             return None, f"node line unparsable: {e}"
         spec = {"taints": taints or [], "unschedulable": bool(unschedulable)}
-        if fields[1]:  # absent on a node the cloud provider has not registered; left out, as the API leaves it out
-            spec[readiness_rules.NODE_PROVIDER_ID_KEY] = fields[1]
-        metadata = {"name": fields[0], "labels": labels or {}}
-        if fields[2]:
-            metadata[readiness_rules.NODE_CREATION_TIMESTAMP_KEY] = fields[2]
+        if provider_id:  # absent on a node the cloud provider has not registered; left out, as the API leaves it out
+            spec[readiness_rules.NODE_PROVIDER_ID_KEY] = provider_id
+        if pod_cidr.strip():  # a node without a block (not yet registered) carries no key, as the API's object does not
+            spec[NODE_POD_CIDR_KEY] = pod_cidr.strip()
+        metadata = {"name": name, "labels": labels or {}}
+        if created:
+            metadata[readiness_rules.NODE_CREATION_TIMESTAMP_KEY] = created
         nodes.append({"kind": NODE_KIND, "metadata": metadata, "spec": spec, "status": {"nodeInfo": info or {}, "allocatable": allocatable or {}, "conditions": conditions or []}})
     return nodes, None
 

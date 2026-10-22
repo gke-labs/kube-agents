@@ -247,6 +247,10 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
   the call — report or fix the argument instead. `FORGE_UNAVAILABLE` means retry unchanged in a few minutes.
   `FORGE_NOT_FOUND` does not prove the thing is missing: a private repository
   this install cannot see answers the same way.
+  `LABELS_UNSUPPORTED` means this forge has no labels (`capabilities` says
+  `labels: false`): send the call again without the label option, do not call
+  `label ensure`, and find your own proposals by their branch name. `FORGE_IDENTITY_UNKNOWN` means the
+  forge cannot say which account this install is: report it.
 - **`discard` when finished.** It removes the local copy. Nothing is held on the
   credential side, so there is nothing else to release.
 - **Read `exitCode` and `stderr`.** The read verbs pass git's own exit status
