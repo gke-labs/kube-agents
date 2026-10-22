@@ -236,7 +236,7 @@ resource "null_resource" "incident" {
       # Step 3 polls the watcher's log with kubectl's stderr discarded, so a
       # container the pod no longer carries reads as "the watcher logged no
       # fire" 300s later, not as kubectl's own error. That is how #913's move
-      # of the watcher out of envoy-credential-proxy hid for 32 nights (#3681).
+      # of the watcher out of envoy-credential-proxy hid in the nightly (#3681).
       # Checked before anything is touched, so a wrong name costs seconds and
       # plants nothing. agent-api-auth is a native sidecar, listed under
       # initContainers, so both lists are read.

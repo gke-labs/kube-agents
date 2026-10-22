@@ -64,9 +64,10 @@ variable "agent_container" {
   # agent-api-auth sidecar of the gateway pod (buildAgentAPIAuthSidecar in
   # k8s-operator/internal/controller/platformagent_manifests.go). It used to
   # sit beside envoy-credential-proxy, which #913 moved to its own pod on
-  # 2026-09-05; this default still named that container until #3681, so every
-  # nightly from 09-17 timed out its watcher wait. Step 0a of main.tf now
-  # refuses a container the pod does not have, before anything is planted.
+  # 2026-09-05, and a default still naming it timed out the watcher wait on
+  # every apply (#3681). Step 0a of main.tf refuses a container the pod does
+  # not have, before anything is planted; tests/test_autoops_incident_plant.py
+  # pins this default to the operator's agentAPIAuthContainerName.
   description = "Container inside agent_deployment that k8s-event-watcher runs inside"
   default     = "agent-api-auth"
 }

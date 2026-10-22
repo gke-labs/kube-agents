@@ -53,6 +53,20 @@ import unittest
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _MODULE = _REPO_ROOT / "bench" / "tf" / "prebuilt" / "autoops-incident" / "main.tf"
+_VARIABLES = _MODULE.with_name("variables.tf")
+
+#: Where the operator names the gateway Pod's container that runs the watcher,
+#: and the stack's default that has to match it (#3681: the default kept
+#: naming envoy-credential-proxy after #913 moved the watcher).
+_OPERATOR_MANIFESTS = (
+    _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_manifests.go"
+)
+_OPERATOR_CONTAINER_RE = re.compile(
+    r'^\s*agentAPIAuthContainerName\s*=\s*"([^"]+)"', re.M
+)
+_AGENT_CONTAINER_DEFAULT_RE = re.compile(
+    r'variable "agent_container" \{.*?^\s*default\s*=\s*"([^"]+)"', re.S | re.M
+)
 
 #: The create-time provisioner is the first `command = <<-EOT` block in the
 #: module; the destroy-time one is the second.
@@ -388,6 +402,32 @@ class AutoopsIncidentPlantTest(unittest.TestCase):
             [],
             "the plant went on to plant and poll against a container the pod "
             f"does not have:\n{chr(10).join(calls)}",
+        )
+
+    def test_the_container_check_reads_native_sidecars(self):
+        # agent-api-auth is a native sidecar, so it is listed only under
+        # initContainers. A check reading .containers alone would refuse every
+        # run on a real install, which the stub's canned answer cannot show.
+        _, calls = self._run()
+        checks = self._indices(calls, "get deployment")
+        self.assertTrue(checks, f"no container check ran:\n{chr(10).join(calls)}")
+        self.assertIn(".spec.template.spec.initContainers[*].name", calls[checks[0]])
+        self.assertIn(".spec.template.spec.containers[*].name", calls[checks[0]])
+
+    def test_the_default_container_is_the_one_the_operator_runs_the_watcher_in(self):
+        operator = _OPERATOR_CONTAINER_RE.search(_OPERATOR_MANIFESTS.read_text())
+        default = _AGENT_CONTAINER_DEFAULT_RE.search(_VARIABLES.read_text())
+        self.assertIsNotNone(
+            operator, f"agentAPIAuthContainerName not found in {_OPERATOR_MANIFESTS}"
+        )
+        self.assertIsNotNone(
+            default, f"agent_container default not found in {_VARIABLES}"
+        )
+        self.assertEqual(
+            default.group(1),
+            operator.group(1),
+            "the stack would read the watcher's log from a container the "
+            "gateway Pod does not run it in",
         )
 
     def test_a_wedged_leftover_namespace_fails_with_its_own_message(self):
