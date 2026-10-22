@@ -61,8 +61,9 @@ func TestAPI_OversizeAnswerIsRefusedWithTheLimitNamed(t *testing.T) {
 // detector on an idle machine (0.6 s to read and parse, 6.4 s in the chat
 // fold scanning one 8 MiB line, 3 s publishing the result chunks; 1.3 s
 // without -race), so the shared terminalWait is crossed on a busy CI runner
-// at a two-fold slowdown. The task deadline bounds only the HTTP turn and
-// the publish has its own bound, so this budget is the one that decides.
+// at a two-fold slowdown. The task deadline bounds only the HTTP turn, and
+// the fold runs before finalizeResult opens its publish window, so this
+// budget is the one that decides.
 const atCapTerminalWait = 60 * time.Second
 
 // The boundary's other side: an answer of exactly apiResponseCap bytes is

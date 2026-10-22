@@ -1762,17 +1762,23 @@ func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, r
 	// complete and nothing of it can follow the final event.
 	b.drainActivity(run)
 	run.state = stateDone
-	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
+	// The answer folded for a chat renderer, on a completed task only: any
+	// other state's result is a copy beside the terminal's reason. A
+	// caller's own data part (finalizeData) takes its place. Folded before
+	// the publish window opens: the fold is CPU only, and scanning an answer
+	// at the read cap under load would otherwise spend the window the
+	// result and terminal publishes need.
+	var chat []byte
 	if resultOutput != nil {
-		// The answer folded for a chat renderer, on a completed task only:
-		// any other state's result is a copy beside the terminal's reason.
-		// A caller's own data part (finalizeData) takes its place.
-		chat := data
+		chat = data
 		if chat == nil && state == lib.StateCompleted {
 			if part, ok := resultChatPart(*resultOutput); ok {
 				chat = part.Data
 			}
 		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
+	if resultOutput != nil {
 		// The chat message is read from the answer as the agent wrote it; the text a
 		// person sees carries no step line (visibleText).
 		if err := b.resultPublish(ctx, run, visibleOr(*resultOutput), chat); err != nil && copyOnly {
