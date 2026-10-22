@@ -269,8 +269,8 @@ func TestMultiAdapterOpenDirectGoesToThePrimary(t *testing.T) {
 }
 
 // A terminal reaches the backend that owns the conversation when it takes
-// terminal frames; one that does not answers errNoTerminalFrames, so the
-// relay posts a notice instead.
+// terminal frames; one that does not answers errNoTerminalFrames, which the
+// caller treats as nothing to do (the relay's notices go out either way).
 func TestMultiAdapterRoutesATerminalToItsBackend(t *testing.T) {
 	d, c := newFakeAdapter(), newFakeAdapter()
 	c.setTakesTerminals()
