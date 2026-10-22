@@ -167,10 +167,10 @@
 # up into the list above. Its line leaves nightly-cases.txt (the nightly
 # runs both files). scripts/test_eval_rosters.py pins the set as
 # HELD_OUT_IN_PRESUBMIT; roster ⊆ presubmit still holds, presubmit == roster
-# holds less exactly this section. A seat added or withdrawn here moves the
-# case counts in this file's BUDGET line, docs/eval-gate-roster.md, docs/designs/testing-strategy.md and
-# docs/ci-health.md; SLOW_MIN_TASKS in scripts/eval_dashboard/health.py
-# reads this file.
+# holds less exactly this section. No comment or doc writes a seat count
+# (`python3 scripts/eval_rosters.py --summary` computes them), so a seat
+# added or withdrawn here edits only its own entry; SLOW_MIN_TASKS in
+# scripts/eval_dashboard/health.py reads this file.
 
 # The audit-machinery canary (fleet-audits), #2013 step 2, seated 2026-09-29.
 # Demoted from the roster 2026-09-02 (#1171, closed 2026-09-08; the bar now
