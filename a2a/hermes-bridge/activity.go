@@ -507,6 +507,11 @@ type activityState struct {
 	openStep    *stepmsg.Step
 	turnSession string
 	steps       int
+	// turnCalls is calls for the current turn only, which the synthesis
+	// rule reads: the API route keeps one activityState across a task's
+	// turns, and a follow-up that answers outright did no work however
+	// many calls an earlier turn made (beginTurn). calls stays task-wide.
+	turnCalls int
 	// stepRefused says a step record was refused at encoding and the log
 	// has said so; one line per task (publishSteps).
 	stepRefused atomic.Bool
@@ -663,6 +668,7 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool, []stepmsg.
 			a.openOrder = slices.DeleteFunc(a.openOrder, func(v string) bool { return v == id })
 		}
 		a.calls++
+		a.turnCalls++
 		status := activityStatus(d)
 		if d.ToolName == kanbanCreateTool && status != ActivityStatusError {
 			a.cardsFiled.Store(true)

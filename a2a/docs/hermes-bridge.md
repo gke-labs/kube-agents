@@ -780,7 +780,7 @@ Consecutive calls of one tool within one model request share a step; a call of a
 next model request, or the task's finalize closes it and publishes it. The model request
 (`post_api_request`) is read only for where one request ends and the next begins, and for the
 `synthesis` step: a request of the turn's own session that stopped with no call planned, after work
-(a later request in the turn, or one after a completed call), titled `Writing the answer`. It is
+(a later request in the turn, or one after a call that turn completed; a follow-up turn of an `api` task counts its own calls only), titled `Writing the answer`. It is
 never the source of a title or an id, since it fires before hermes validates and repairs the calls'
 names and de-duplicates their ids: a name read off it could be one the model invented, or one
 handed to it, and an id one the trace never carries. The turn's own session is the task's session

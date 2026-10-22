@@ -1,13 +1,20 @@
 package hermesbridge
 
 import (
+	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/stepmsg"
@@ -102,15 +109,17 @@ func TestSteps_PlanStepsComeFromTheTrace(t *testing.T) {
 // request fires before hermes validates the names, so it may carry text
 // the model invented or was handed.
 func TestSteps_ANamePlannedButNeverCalledIsNoStep(t *testing.T) {
-	a := newActivityState(false)
-	got := observeAll(a, apiRequest(t, "s1", 1, [2]string{"c1", "the token is ghp_x"}))
+	got := observeAll(newActivityState(false), apiRequest(t, "s1", 1, [2]string{"c1", "the token is ghp_x"}))
 	if len(got) != 0 {
 		t.Fatalf("steps = %+v, want none", got)
 	}
-	for _, st := range got {
-		if strings.Contains(st.Title, "ghp_x") {
-			t.Fatalf("a step titled %q", st.Title)
-		}
+	// Beside a call the trace did see, only that call is a step.
+	got = observeAll(newActivityState(false),
+		apiRequest(t, "s1", 1, [2]string{"c1", "the token is ghp_x"}, [2]string{"c2", "terminal"}),
+		preCall(t, "s1", "c2", "terminal"))
+	want := []stepmsg.Step{{Kind: stepmsg.KindPlan, Title: "terminal", CallIDs: []string{"c2"}}}
+	if !stepsEqual(got, want) {
+		t.Fatalf("steps = %+v, want %+v", got, want)
 	}
 }
 
@@ -331,5 +340,86 @@ func TestStepCapsFitTheRecord(t *testing.T) {
 		if _, err := st.Part(); err != nil {
 			t.Fatalf("a step the trace makes is refused: %v", err)
 		}
+	}
+}
+
+// postAPIRequest delivers a post_api_request that stopped, signed with the
+// pod's shared key, as the pod-wide entry does on the API route.
+func postAPIRequest(t *testing.T, url, key, sessionID string, count int) {
+	t.Helper()
+	body, _ := json.Marshal(map[string]any{
+		"hook_event_name": hookPostAPIRequest, "session_id": sessionID, "delivery_id": fmt.Sprintf("api-%s-%d-%d", sessionID, count, time.Now().UnixNano()),
+		"extra": map[string]any{"api_call_count": count, "finish_reason": "stop",
+			"response": map[string]any{"finish_reason": "stop", "assistant_message": map[string]any{"content": "done"}}},
+	})
+	req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	mac := hmac.New(sha256.New, []byte(key))
+	mac.Write(body)
+	req.Header.Set(hookSignatureHeader, hookSignaturePrefix+hex.EncodeToString(mac.Sum(nil)))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Errorf("delivery: %v", err)
+		return
+	}
+	resp.Body.Close()
+}
+
+// Two turns of one API task share an activityState. Turn 1 completes a call
+// and stops: its synthesis step. Turn 2's first request answers outright:
+// it did no work, so no synthesis step, whatever turn 1 did.
+func TestAPI_AFollowUpThatAnswersOutrightIsNoSynthesis(t *testing.T) {
+	_, url := startServer(t)
+	const shared = "pod-wide-activity-key"
+	var doorURL atomic.Value
+	door := func() string { return doorURL.Load().(string) }
+	release := make(chan struct{})
+	stub := newAPIStub(t, func(w http.ResponseWriter, r *http.Request, c apiCall) {
+		if !strings.Contains(c.idempotency, "/") {
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			}
+			postDelivery(t, door(), shared, c.sessionID, hookPreToolCall, "kubectl", "c1")
+			postDelivery(t, door(), shared, c.sessionID, hookPostToolCall, "kubectl", "c1")
+			postAPIRequest(t, door(), shared, c.sessionID, 2)
+		} else {
+			postAPIRequest(t, door(), shared, c.sessionID, 1)
+		}
+		writeCompletion(w, c.sessionID, "answer to "+c.prompt)
+	})
+	b := startAPIBridge(t, url, stub, func(cfg *Config) {
+		cfg.ActivityListen = "127.0.0.1:0"
+		cfg.ActivitySecret = shared
+	})
+	doorURL.Store(b.ActivityURL())
+	c := gatewayClient(t, url)
+	origin := submitIn(t, c, "task-two-turns", "ctx-two-turns", "first")
+	waitFor(t, 10*time.Second, "turn 1 in flight", func() bool { return len(stub.seen()) == 1 })
+	sendSteer(t, c, origin, "and then")
+	waitFor(t, 10*time.Second, "queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 1 })
+	close(release)
+	task := waitTerminal(t, c, origin.TaskID)
+	if len(stub.seen()) != 2 {
+		t.Fatalf("%d requests, want 2 turns", len(stub.seen()))
+	}
+	art := task.Artifact(stepmsg.ArtifactName)
+	if art == nil {
+		t.Fatal("no steps artifact")
+	}
+	var steps []stepmsg.Step
+	for _, p := range art.Parts {
+		st, ok := stepmsg.Decode(p)
+		if !ok {
+			t.Fatalf("not a step record: %+v", p)
+		}
+		steps = append(steps, st)
+	}
+	want := []stepmsg.Step{
+		{Kind: stepmsg.KindPlan, Title: "kubectl", CallIDs: []string{"c1"}},
+		{Kind: stepmsg.KindSynthesis, Title: synthesisStepTitle},
+	}
+	if !stepsEqual(steps, want) {
+		t.Fatalf("steps = %+v, want %+v: turn 2 did no work", steps, want)
 	}
 }

@@ -107,9 +107,9 @@ func (a *activityState) observeStepsLocked(d hookDelivery) []stepmsg.Step {
 // synthesisLocked reports whether a post_api_request is the turn writing
 // its answer: a request of the turn's own session that stopped, planned no
 // call, and came after work (a later request in the turn, or one after a
-// completed call). A delegated child runs in the same process and posts its
-// own requests, under its own session id; its final request is not the
-// turn's answer. A delivery with no session id is not known to be the
+// call this turn completed). A delegated child runs in the same process
+// and posts its own requests, under its own session id; its final request
+// is not the turn's answer. A delivery with no session id is not known to be the
 // turn's, so it makes no synthesis step.
 func (a *activityState) synthesisLocked(d hookDelivery) bool {
 	if d.SessionID == "" || d.SessionID != a.turnSession {
@@ -127,7 +127,16 @@ func (a *activityState) synthesisLocked(d hookDelivery) bool {
 		finish = resp.FinishReason
 	}
 	return finish == finishReasonStop && len(resp.AssistantMessage.ToolCalls) == 0 &&
-		(durationMillis(d.Extra.APICallCount) > 1 || a.calls > 0)
+		(durationMillis(d.Extra.APICallCount) > 1 || a.turnCalls > 0)
+}
+
+// beginTurn marks the start of a turn for the synthesis rule. The CLI route
+// runs one turn per process and state, so only the API route's turn loop
+// calls it.
+func (a *activityState) beginTurn() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.turnCalls = 0
 }
 
 // closeStepLocked returns the open step, if any, and forgets it.
