@@ -448,14 +448,18 @@ class CiDeployGitopsRepoTest(unittest.TestCase):
         # The row is split on whitespace and the chart takes a bare host, so a
         # port, a scheme or a space is refused at second zero, naming the variable.
         for forge, var in (("ghes", "EVAL_GHES_HOST"), ("gitlab-ce", "EVAL_GITLAB_CE_HOST")):
-            for bad in ("ghes.eval.internal:8443", "https://ghes.dev", "ghes.dev example", "-ghes.dev"):
+            for bad, why in (
+                ("ghes.eval.internal:8443", "is not a dotted bare hostname"), ("https://ghes.dev", "is not a dotted bare hostname"),
+                ("ghes.dev example", "is not a dotted bare hostname"), ("-ghes.dev", "is not a dotted bare hostname"),
+                ("localhost", "is not a dotted bare hostname"), ("GitHub.com", "is a public forge"), ("gitlab.com", "is a public forge"),
+            ):
                 with self.subTest(forge=forge, host=bad), tempfile.TemporaryDirectory() as tmp:
                     rc, out, err = self._resolve(
                         "kube-agents-evals-2", PULL_NUMBER="123", EVAL_FORGE=forge, EVAL_GITHUB_APP_ID="123456",
                         EVAL_FORGE_STATE_DIR=self._state_dir(tmp), **{var: bad},
                     )
                     self.assertNotEqual(rc, 0)
-                    self.assertIn(f"{var}='{bad}' is not a bare hostname", err)
+                    self.assertIn(f"{var}='{bad}' {why}", err)
                     self.assertNotIn("is not a forge this deploy knows", err)
                     self.assertNotIn("forges[0]", out)
 
