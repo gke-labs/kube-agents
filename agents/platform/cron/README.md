@@ -22,7 +22,7 @@ that store which runs `hermes cron tick` against every named profile with work d
 [`autonomous-watchdogs.md`](../../../docs/site/src/content/docs/concepts/autonomous-watchdogs.md)).
 
 An enabled entry here therefore fires in its own process, with this profile's
-persona, toolsets, `skills`, `model` and `max_turns` — which is the whole reason
+persona, toolsets (unless the entry's `enabled_toolsets` replaces them), `skills`, `model` and `max_turns` — which is the whole reason
 the watchdogs live here rather than as kanban cards filed from the Chat Agent's
 roster. A card is not a cron run, and that indirection is what stopped `skills`,
 `model` and `deliver` reaching the thing that ran.
@@ -184,10 +184,23 @@ Which clusters it reads is decided on the agent pod: `UPGRADE_READINESS_PROJECTS
 when set, otherwise the management project and every project a Cluster Agent
 profile's identity names, the roster `stall-watch` follows; with neither, the
 sandbox's configured project; and with nothing at all the tick fails closed,
-because the report script's own fallback is every project the credential can
-list. Within those projects the report script
+because on an install that declares no scope the report script's own fallback
+is every project the credential can list. A roster spelling with a space, a semicolon, or a
+comma inside one project's name is not a project id or number, so it fails the tick with the
+places to correct it. Within those projects the report script
 enumerates every cluster, so a cluster `spec.scope.exclude.clusters` keeps a
-Cluster Agent from is still read here. That read is `gcloud` cluster metadata
+Cluster Agent from is still read here. On an install that declares a scope (a
+`spec.scope` block), the report script, a fleet-audit collector, refuses a bare
+`--project` in the sandbox, so the job reads the declared scope on the agent
+pod (`fleet_scope_targets.declared_scope_targets()`) and hands the script the
+resolved scope beside each `--project`, the `collector_args` the
+platform_control `fleet_scope` tool hands the SOPs less the cluster exclusion
+(`--scope-projects`, `--scope-unread`): the script reads a project inside the scope and refuses one
+outside it, one listed but unread, a project number it cannot resolve, and any project in a
+sandbox still marked scoped after the scope is gone, each with the reason; the watch adds the
+install's remedy, and the table carries each as that project's failure, and a tick whose every project is
+refused fails, announced once. An install that declares none keeps the bare flag, and a scope
+render the pod cannot read fails the tick with the reason. The cluster read is `gcloud` cluster metadata
 for the version table and, on a report day, the readiness report's read set,
 the same as a run on request: one `get-credentials` and six `kubectl get`s
 per cluster (budgets, Deployments and StatefulSets; webhook configurations
@@ -217,7 +230,9 @@ It runs the skill the way `stall-watch` runs `stall_report.py`: every module
 under the skill's `scripts/` except its tests, with the data files beside them,
 is read from the agent image's `/opt/platform-template/skills/` copy and handed
 to `python3 -I -` in the sandbox on stdin, behind a loader (a meta-path finder
-serving the shipped set) before running `fleet_upgrade_report.main`. The
+serving the shipped set, the agent image's `fleet_scope_args` among them so the
+script formats a refusal with the constants the job parses it by) before
+running `fleet_upgrade_report.main`. The
 loader gives the report a private `tempfile.mkdtemp` directory for its JSON
 output and rollout record, so nothing the model can write to is on the path
 the result crosses, and removes it afterwards; the sandbox's `/opt/data` is
@@ -245,7 +260,8 @@ runs go project by project, the table within the first fifteen minutes and the
 readiness runs with the rest, each run gets what its share has left, a project
 the budget cannot reach or finish is left unread and named: the partial-table
 line names each project with a read error and its reason (the budget, the
-sandbox's error, a failed listing, an unresolved project number), the
+sandbox's error, a failed listing, an unresolved project number, a refusal under the
+declared scope with the install's remedy), the
 ledger's `table_errors` keeps the last tick's, and a version's own line names
 the project whose readiness run was not started or was cut short (a version
 none of whose projects ran is not recorded and is retried tomorrow),
@@ -262,11 +278,16 @@ chat line says "none graded" and the version is tried again tomorrow), and the
 weekly comparison carries ten minutes of slack so the tick's own drift cannot
 push a refresh to day eight. A partial table, an ungraded version or a failed
 tick is announced once, not daily: the ledger keeps what was announced (the
-kinds of read error for a partial table; each project and how it went
-ungraded for a version, never the error text, which an outage rewords from
-one run to the next), a
-failed tick (which writes nothing to the ledger) keeps its line in
-`last-failure.txt` beside it, and the next line is the recovery. A version
+kinds of read error for a partial table, and for a refusal the project and
+its cause; each project and how it went ungraded for a version, never the
+error text, which an outage rewords from one run to the next), a
+failed tick (which writes nothing to the ledger but its record of the projects
+the hops refused as outside the declared scope and the ids it learned for
+numbered spellings, kept at whichever step the tick failed unless the ledger
+itself cannot be written or re-read, so the next tick files them under the same cause)
+keeps its key in
+`last-failure.txt` beside it (its line, or, for a tick whose every run was refused, the
+refused projects and their causes), and the next line is the recovery. A version
 none of whose clusters can be read is retried
 three days running and then recorded, so an unreachable cluster costs its
 project one readiness sweep a week rather than one a day; a `blocked` verdict
@@ -277,6 +298,82 @@ at the gateway's home. The three
 environment knobs (`UPGRADE_READINESS_REFRESH_DAYS`, `_PROJECTS`,
 `_WATCH_HOME`) are for a run started by hand in the pod; the operator's
 `spec.deployment.env` allowlist does not carry them.
+
+## `upgrade-readiness-weekly-review` and `upgrade-readiness-weekly-brief` are one Saturday in two jobs
+
+The daily watch reads a cluster only while a release channel offers it a version it is below, and
+posts one line per report. The weekly pair reads every cluster of the roster's projects whatever its
+version (a declared scope refuses a project outside it), and ends in one message a person reads.
+
+`upgrade-readiness-weekly-review` (`0 6 * * 6`) is a `no_agent` script on this pod. It runs the
+`fleet-upgrade-verification` readiness report in the sandbox through the watch's own loader, one
+run per project inside the watch's 45-minute tick budget (Hermes kills a `no_agent` script at an
+hour), and turns every blocker and risk the report names (a drain-blocking budget, a fail-closed
+webhook, a pool past or at the skew ceiling, a covering exclusion, and each readiness rule's rows
+once the report carries rules) into a finding on the findings queue, through the Session KV
+server's `POST /v1/findings` route, reached at the endpoint and with the key `findings_nudge.py`
+uses. Each project is registered as soon as its run returns, so a run the hour cuts short keeps
+what it registered. The sends have ten minutes of their own past the reads, each waiting no longer
+than what is left, and a batch with no time left is booked as not sent, so a queue that hangs
+cannot hold the run past the hour before it writes its record. The queue's identity rule makes next Saturday's run an update of the same row;
+its rubric sets the severity (a budget over a single replica, a pool past the skew ceiling and a
+webhook in the upgrade's path are critical; a budget over several replicas, a pool at the ceiling
+and a webhook refusing only what it matches today are major; a covering exclusion is minor; a
+readiness rule's blocker is critical, and its risk is minor for catalogue entries 9, 10, 11, 13 and 16 and major for every other entry, as the rubric's
+entry table sets it); a row
+the user dismissed stays dismissed; and the hourly nudge paces what is named and reminds daily of
+undecided criticals. A cluster read in full sends its batch with a `scope` naming the job's check
+family (`upgrade-`) and its own source, an empty batch when nothing was found, so a finding the week
+no longer reports loses confidence and stops being reminded without touching another family's rows
+on that cluster, or the `upgrade-` rows another writer filed there. Three kinds of cluster claim nothing: one
+with more findings than one batch holds (500), sent in pieces; two of one name in one project, whose
+claims the queue could not tell apart; and one with a row the queue would refuse, since the claim
+would book that finding's row absent. A cluster with no upgrade target (no release channel, or a
+server config that did not answer) is never read in full, since the grader cannot judge its pools'
+skew, so it claims nothing either: a budget or webhook row there that is fixed stays on the queue
+until the user decides it. The same holds for a cluster on which a readiness rule failed or left an
+`unknown`, even a rule that cannot block: a claim would lower that rule's own rows, which the run
+could not read again. A cluster the listing no longer returns (deleted, renamed or out of scope) is
+not in the run at all, so nothing is sent for it, and its rows stay until the user decides them. On an install with no declared scope, a roster that names one
+project both by number and by id runs it twice until the daily watch has learned the number's id,
+and on a Saturday `gcloud projects describe` fails, the number's run is booked as a project not
+read; name the project by its id alone to avoid both. The script writes the technical report under `upgrade-readiness/weekly/` beside the
+watch's ledger, keeps the newest eight runs, and places a copy of `latest.md` and `latest.json` in
+the sandbox at `/opt/data/upgrade-readiness/weekly/` so the agent can read it when asked. It prints
+nothing on success: the brief speaks for the week and the queue for each finding. A project it could
+not read is one line naming it; a batch the findings queue refused, or a sandbox copy that failed,
+is one line each, since both leave the week's findings where the brief cannot act on them; a
+failure of the run is one line, once per distinct failure (numbers aside), with the recovery line
+on the next clean run. The entry declares `risk: high` as the watch does: the budget, pool, exclusion and webhook names it reads are tenant-written, and they reach the queue, the report, the sandbox copy and, by queue id and object name, the brief in chat.
+
+`upgrade-readiness-weekly-brief` (`0 7 * * 6`, an hour after the review starts and past its
+budget) is the model turn, and the reason the pair is not one job: the review can rank by rubric
+but cannot tell that two criticals on one cluster are one problem, or that a critical whose clock
+ends next week outranks one with no date. Its SOP (`governance/upgrade_readiness_brief_sop.md`) has it
+read the review's summary, the queue's open backlog (the rows whose `check` starts with `upgrade-`)
+and its snoozed and dismissed rows (read by state, since the backlog never carries them), and
+compose a brief of at most twenty-five lines: the week's headline, the
+undecided criticals that need a decision (one line per cluster, at most ten, with one clause of
+why and one action each), the rest of the week as counts, what was decided earlier, any project the review could not
+read, and where the full report is with the sentence that opens it in chat. It never registers,
+never decides, never runs the report, and is never `[SILENT]`: the brief is owed every week, a
+quiet one in three lines. If the review's summary is missing or older than two days (the review
+did not run, the hour cut it short, or its copy did not land), the brief says so in its headline and
+composes **Decide now** from the queue alone. The entry declares `risk: high`: a prompt job over
+tenant-written names, so its terminal is held to read-only inspection commands. For the same
+reason the turn holds no queue tool and no file-writing tool: the entry's `enabled_toolsets` gives
+it the terminal tool alone and no MCP server (`no_mcp`), so nothing a name says can make it
+register or decide a finding through `platform_control`, or write a file the command policy would
+refuse. The queue reads are made before the turn by the entry's
+pre-run `script`, `upgrade_readiness_brief_queue.py`, whose JSON the scheduler puts above the
+prompt. An open backlog it cannot read is said there and in the brief's headline; a page of
+decided rows it cannot read leaves out only the brief's **Decided earlier** line. The `deliver: "chat"` relay posts it as written and stores it against the
+thread, so a reply with an id and `dismiss`, `snooze until <date>` or `accept` reaches the agent
+with the brief attached.
+
+Why the queue and not a weekly chat line per finding: a line is read once; the queue keeps asking
+until a person answers, keeps the answer, and stops. That is the contract the review needs for a
+finding a user may have missed, and the one that lets a user say "ignore this" once.
 
 ## `sa-role-watch` says when the agent's account holds more than `read-only`
 
@@ -341,12 +438,19 @@ script; see `feedback-prompt` below.)
 The same log gets an inventory of the sandbox's profile homes, so that loose
 files a worker leaves there can be seen without exec'ing into the sandbox: each
 home's top-level entries that the product doesn't create, and any home the agent
-pod no longer has a profile for, such as a cluster dropped from scope. That's an
-inventory only: nothing is moved or deleted, and a failure to take it is logged
-there too rather than posted.
+pod no longer has a profile for. The inventory itself moves and deletes nothing;
+what the job removes is below. A
+`cluster-*` home the agent pod has no profile for is removed: a cluster dropped
+from scope or deleted loses its home on the agent pod, and the sandbox's copy,
+kubeconfig included, had nothing else to remove it. The agent pod's profile
+list is the authority, read after the sandbox is listed, and the job removes
+no stale home when that list lacks the platform profile. A stale home whose
+`rm` fails reaches chat, as the two guards do when they hold: one bullet
+naming it, each night until it goes. A failure to take the inventory is logged there too
+rather than posted.
 
-Two things in a profile home are removed, in every home the agent pod has a
-profile for, on the agent pod and in the sandbox. Cron run directories
+Inside a home the agent pod does have a profile for, two things are removed,
+on the agent pod and in the sandbox. Cron run directories
 (`cron/runs/<job>_<execution>`, each cron run's working directory) go after
 seven days, logged as a count. Override trees go the first night, logged by
 name: a top-level directory named `<something>_override`, such as a worker's
@@ -370,13 +474,18 @@ engine's findings, and prints only when something is wrong. One finding is
 reported whatever the severity floor says: a card `blocked` for more than a day
 with no comment or unblock since. A worker's or operator's block is sticky by
 design, nothing retries it, and #656 was a finished report parked that way for
-weeks because nothing periodically asked. Each such line carries the card's
-kind, reason and age, read from the board, and the `hermes kanban unblock` and
-`archive` commands, because the engine's JSON has neither the kind nor the
-reason and a line that names a stuck card without saying how to move it is a
-line the room learns to skip.
+weeks because nothing periodically asked. Cards are listed newest first, with
+their kind, reason, and age read from the board; where multiple cards share a
+title, they are grouped to keep the report readable, with task IDs and reasons
+retained. The `hermes kanban unblock` and `archive` commands appear once in a
+footer (using `<task_id>` when multiple cards are stuck) rather than repeated
+under every card, so the room knows how to move a card while long reports stay
+bounded within chat limits, summarizing any omitted cards by task ID up to
+the character budget (and falling back to a count and list command when omitted IDs
+exceed the limit).
 
 Daily, and it repeats: the rule is stateless, so a card still blocked is named
+(directly, or by task ID in the omitted list up to the budget)
 every morning until someone unblocks, comments on, or archives it. That is the
 intended nag, the same rule `findings-morning-nudge` keeps for the top
 criticals it named, and the reason a finer cadence buys nothing: the engine's threshold is a
@@ -517,7 +626,8 @@ written and stores the full report against its thread, so the user's reply there
 Chat Agent with the report attached. A fleet-audit job the image ships is the
 exception: its scheduled delivery posts the report the run's `finish` rendered,
 not the final message,
-which holds whatever else the model wrote in its last turn. A run over several
+which holds whatever else the model wrote in its last turn. A run publishes to
+one repository, the one with `role: gitops`; a run that a person ran for several
 repositories posts each finished repository's report, then a line naming any it
 did not finish. A failed run posts the scheduler's failure line, which says why,
 and a run that finished no repository without failing posts a one-line notice

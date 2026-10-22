@@ -31,7 +31,7 @@ partial window for it (`collecting`), that evidence feeds both. A case not named
 red a pull request on a graded failure, whatever its record says — and since 2026-09-22 it does
 not run on one either: the eval crew decided that the presubmit runs the blocking roster only
 ([#1023](https://github.com/gke-labs/kube-agents/issues/1023)), so `presubmit-cases.txt` holds
-the roster's eleven cases plus, since 2026-09-29, one documented exception: the held-out seat a
+the roster's ten cases plus, since 2026-09-29, one documented exception: the held-out seat a
 coverage tracker puts in the presubmit file without a roster line, one per tracker
 ([#2013](https://github.com/gke-labs/kube-agents/issues/2013) for the compliance canary;
 [#2016](https://github.com/gke-labs/kube-agents/issues/2016)'s seat for pdb-remediation-pr took
@@ -82,7 +82,7 @@ The variable is comma- or whitespace-separated task ids; `_bootstrap_admitted()`
 
 ## The admission bar, and who clears it
 
-Eleven of the twelve presubmit cases are admitted; the other one, the compliance canary,
+Ten of the eleven presubmit cases are admitted; the other one, the compliance canary,
 is the held-out seat described above (recount the entries of
 `hack/eval/presubmit-cases.txt` and
 `blocking-roster.txt` rather than trusting this sentence — an earlier copy of it miscounted
@@ -161,6 +161,23 @@ with a filed issue naming the exit condition:
   Enters again when [#3145](https://github.com/gke-labs/kube-agents/pull/3145), which seeds
   checkout-gateway's manifest into every pool's `*-infra` repository, has merged and the case's
   record holds (#3120).
+- **consistency-authorized-networks-probe** —
+  [#3598](https://github.com/gke-labs/kube-agents/issues/3598): demoted 2026-10-21 after it
+  failed about 30% of repetitions on the Gemini setup, on unrelated pull requests (#2997,
+  #3255, #3321, #3392, #3395 and others) and on `main`'s eval-next, red on this case alone on
+  2026-10-20: 37 of 126 repetitions across 42 runs, the store's record at 18/21,
+  `would-demote`. 15 of the 37 were Vertex 429s
+  ([#3399](https://github.com/gke-labs/kube-agents/issues/3399), fix open in
+  [#3448](https://github.com/gke-labs/kube-agents/pull/3448)). The other 22 were the agent
+  being wrong, not a narrow reference: seeded-c, which never enabled authorized networks,
+  still returns `masterAuthorizedNetworksConfig: {gcpPublicCidrsAccessEnabled: true}` with no
+  `enabled`, and the agent read that leftover block as configured or open and said seeded-c
+  matches its peers, or named the wrong facet (NetworkPolicies, Pod Security, database
+  encryption), or once, a tool error (a grep that missed seeded-c in its own saved cluster
+  list). The rung-4 collapses include #2997 at 0/3; `main`'s red was rung 6. The Claude nightlies passed every scored repetition. Its removal leaves
+  `consistency` with no presubmit case, so the domain is on the `domains.yaml` allowlist until
+  it returns. Enters again when #3448 has merged, the agent-side fix (#3605) has landed, and the
+  case passes the roster's bar, 90% over 20 runs, on the Gemini nightly (#3598).
 
 **autoops-warning-event-triage** is no longer in the presubmit at all (tofu wall clock,
 [#1218](https://github.com/gke-labs/kube-agents/pull/1218)); it runs and accrues its
@@ -332,7 +349,7 @@ blocking for every case by design, admitted or not: `grade_case` evaluates them 
 reads admission. Those classes signal a broken case or install, not flake, and the fix is
 on that side rather than on the roster.
 
-Since 2026-09-22 those rungs reach only the cases the presubmit runs: the roster's eleven and,
+Since 2026-09-22 those rungs reach only the cases the presubmit runs: the roster's ten and,
 since 2026-09-29, the held-out seat. The seats of 2026-09-29 put both GitHub-writing paths back on
 every pull request — the canary's (the minted token, the cloned `*-infra` workspace, the ledger
 write, the `ledger_issue_contains` verifier) and pdb-remediation-pr's (submit-suggestion opening
@@ -353,10 +370,10 @@ say what it ran by hand.
 ## The whole-suite rate
 
 Beside the per-case rungs the verdict carries one number for the whole pull request: the pooled
-pass rate of every roster case's scored repetitions — on the presubmit ten cases × three = 30
-units, since `agent-kanban-smoke` is off the inject lane ([below](#the-inject-lane)), and eleven ×
-three = 33 on the today lane (the api-transport count: 33 since 2026-10-17, 36 on 2026-10-16, 39
-from 2026-10-14, 36 before), `infra` repetitions left out — against `main`'s rate over the same cases from the evidence store (the
+pass rate of every roster case's scored repetitions — on the presubmit nine cases × three = 27
+units, since `agent-kanban-smoke` is off the inject lane ([below](#the-inject-lane)), and ten ×
+three = 30 on the today lane (the api-transport count: 30 since 2026-10-21, 33 from 2026-10-17, 36
+on 2026-10-16, 39 from 2026-10-14, 36 before), `infra` repetitions left out — against `main`'s rate over the same cases from the evidence store (the
 newest seven nightly lines per case, about 249 runs). It is the rule that can see a pull request
 which made several cases a little worse without making any one of them fail three times. The
 nightly that writes those lines grades `today` and the presubmit grades `next`, so the comparison

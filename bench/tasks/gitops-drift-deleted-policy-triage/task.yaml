@@ -68,14 +68,17 @@
 #
 # Isolation class: namespace-scoped. Eligible tier: nightly.
 #
-# NOT REGISTERED YET, and deliberately -- see the KNOWN_UNREGISTERED entry in
-# scripts/validate_bench_cases.py, which is where the reason lives and the one
-# place to edit it. The short form: every case with a `stack:` holds
-# lock-infra for its whole run, so the nightly's stack-bearing cases run one
-# at a time whatever EVAL_TASK_PARALLELISM is, and that serial chain is
-# already at or past the 480m periodic deadline. This case is written, run against a
-# dev install, and waits for stack capacity -- a roster line is a later pull
-# request, as it is for every case.
+# REGISTERED in hack/eval/nightly-cases.txt on 2026-10-20, at the 900s drift
+# band its siblings carry. It holds lock-infra for its whole run, as every
+# case with a `stack:` does, so it joins the chain the nightly's stack-bearing
+# cases run one at a time -- 16 of them before this pair.
+#
+# What it waited for was room on that chain, and what provided it was the
+# recorder periodic's ceiling going from 480m to 720m on 2026-10-20. Its first
+# night at the new ceiling ran 401 minutes and graded its part whole; the
+# three nights before it ran 484-485 and truncated, which is 480m plus the
+# grace. The margin is real but one night old: if that ceiling goes back,
+# this pair is among the first things to drop.
 ---
 id: gitops-drift-deleted-policy-triage
 name: A deleted NetworkPolicy is triaged with its exposure named and both remediations offered

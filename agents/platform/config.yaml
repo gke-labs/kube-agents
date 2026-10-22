@@ -78,10 +78,14 @@ mcp_servers:
       SLACK_HOME_CHANNEL: "${SLACK_HOME_CHANNEL}"
       # Under next send_notification posts through the A2A gateway with
       # `a2a notify` (chat_notify.py) instead of `hermes send`: the platform it
-      # routes, and the bus address and identity the CLI connects with. The
-      # bus token is a file mount, not environment, so nothing else is needed.
+      # routes, and the bus address and identity the CLI connects with, and
+      # the CA it trusts the bus by: the bus requires TLS, and without
+      # NATS_CA_FILE the CLI checks the bus against the system roots and every
+      # post fails verification. The bus token is a file mount, not
+      # environment, so nothing else is needed.
       A2A_NOTIFY_PLATFORM: "${A2A_NOTIFY_PLATFORM}"
       NATS_URL: "${NATS_URL}"
+      NATS_CA_FILE: "${NATS_CA_FILE}"
       A2A_BUS_USER: "${A2A_BUS_USER}"
       API_SERVER_KEY: "${API_SERVER_KEY}"
       # The bearer token for the loopback Session KV server on 8699. The

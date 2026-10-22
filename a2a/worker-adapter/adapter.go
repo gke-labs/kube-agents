@@ -499,7 +499,7 @@ func dialBus(ctx context.Context, cfg Config) (*busConns, func(), error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("connect (lib): %w", err)
 	}
-	nc, err := nats.Connect(cfg.NATSURL, natsOpts...)
+	nc, err := nats.Connect(cfg.NATSURL, append(natsOpts, lib.TLSOptions()...)...)
 	if err != nil {
 		c.Close()
 		return nil, nil, fmt.Errorf("connect (raw): %w", err)

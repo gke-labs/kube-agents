@@ -50,6 +50,10 @@ alert_daily_limits = {}
 # composition passes the chart nothing for "today", so its CR carries no mode.
 platform_agent_mode = "today"
 
+# The PlatformAgent's spec.storage.size (PLATFORM_AGENT_STORAGE_SIZE in
+# install.env). The composition passes the chart nothing for the default.
+platform_agent_storage_size = "50Gi"
+
 # Gateway redaction (LITELLM_REDACTION_* in install.env). The composition
 # renders nothing into the chart while enabled is false.
 litellm_redaction = { enabled = false }

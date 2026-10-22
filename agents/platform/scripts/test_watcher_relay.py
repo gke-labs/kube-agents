@@ -239,7 +239,8 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
         self.assertEqual(path, "/api/v1/events?limit=500")
         self.assertEqual(headers["Authorization"], "Bearer broker-token")
         # The describe is remembered: a second read costs no GKE call.
-        self._request("GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/nodes/node-1")
+        self._request("GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/namespaces/default/configmaps/app")
+        self.assertEqual(len(self.k8s_requests), 2)
         self.assertEqual(sum("/clusters/" in p for _, p, _, _ in self.google_requests), 1)
 
     def test_a_watch_streams_each_event_as_it_arrives(self):
@@ -266,6 +267,22 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
             with self.subTest(method=method, path=path):
                 status, _ = self._request(method, path, body=b"{}" if method == "POST" else None)
                 self.assertEqual(status, 403)
+        self.assertEqual(self.k8s_requests, [])
+
+    def test_a_refusal_is_a_kubernetes_status_naming_the_rule(self):
+        # client-go turns this into a StatusError with the message verbatim, so
+        # the drift join's lookup error says which rule refused the read.
+        status, body = self._request(
+            "GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/namespaces/default/pods/web-0"
+        )
+        self.assertEqual(status, 403)
+        refusal = json.loads(body)
+        self.assertEqual(
+            (refusal["kind"], refusal["apiVersion"], refusal["status"], refusal["reason"], refusal["code"]),
+            ("Status", "v1", "Failure", "Forbidden", 403),
+        )
+        self.assertIn(f"SECURITY_POLICY_BLOCKED ({watcher_policy.RULE_K8S_KIND})", refusal["message"])
+        self.assertEqual(refusal["details"]["causes"][0]["message"], watcher_policy.RULE_K8S_KIND)
         self.assertEqual(self.k8s_requests, [])
 
     def test_a_query_outside_the_relay_shape_is_400(self):

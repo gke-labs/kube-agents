@@ -1375,11 +1375,14 @@ class TestRepoDerivedFacts(unittest.TestCase):
         # demoted to the nightly on 2026-10-16 (#3269), uncovering upgrades.
         # pdb-remediation-pr, remediation's only roster case, was demoted to
         # the nightly on 2026-10-17 (#3120), uncovering remediation again.
+        # consistency-authorized-networks-probe, consistency's only roster
+        # case, was demoted to the nightly on 2026-10-21 (#3598), uncovering
+        # consistency.
         # observability and source-control are new rows whose cases are all
         # nightly cases, so both start on the allowlist.
         self.assertEqual(
             cov["uncovered"],
-            ["fleet-audits", "upgrades", "remediation", "observability", "source-control"],
+            ["fleet-audits", "upgrades", "remediation", "consistency", "observability", "source-control"],
         )
         self.assertEqual(cov["domains_covered"], cov["domains_total"] - len(cov["uncovered"]))
 
@@ -1389,6 +1392,7 @@ class TestRepoDerivedFacts(unittest.TestCase):
         self.assertIn("incident-triage-oom-event-probe", active)  # a roster seat since 2026-09-22
         self.assertIn("compliance-rbac-overgrant", active)  # held out in the presubmit since 2026-09-29 (#2013), off the roster
         self.assertNotIn("pdb-remediation-pr", active)  # held out from 2026-09-28, on the roster 2026-10-14 (#2016), nightly only since 2026-10-17 (#3120)
+        self.assertNotIn("consistency-authorized-networks-probe", active)  # on the roster from the split, nightly only since 2026-10-21 (#3598)
         self.assertNotIn("obtainability-planted-pdb", active)  # nightly only
         self.assertNotIn("stockout-pinned-pool", active)
 
