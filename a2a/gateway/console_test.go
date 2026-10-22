@@ -335,6 +335,42 @@ func TestConsoleTerminalFitsUnderMaxPayloadAfterEscaping(t *testing.T) {
 	}
 }
 
+// A notify frame's wire spelling is pinned (the MCP server and the page read
+// it): kind notify, the turn it answers, a minted n- id, and an edit that
+// repeats the id it names.
+func TestConsoleNotifyArrivesAsANotifyFrame(t *testing.T) {
+	r := startConsoleRig(t)
+	sub, err := r.browser.SubscribeSync("chat.console.tab-8.out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.browser.Flush()
+	id, err := r.adapter.PostNotifyFrame("console:tab-8", "", "the report", "task-7", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(id, consoleNotifyIDPrefix) {
+		t.Errorf("minted id %q lacks the %q prefix", id, consoleNotifyIDPrefix)
+	}
+	if _, err := r.adapter.PostNotifyFrame("console:tab-8", id, "the report, updated", "task-7", true); err != nil {
+		t.Fatal(err)
+	}
+	var raw []string
+	for len(raw) < 2 {
+		msg, err := sub.NextMsg(5 * time.Second)
+		if err != nil {
+			t.Fatalf("after %d frames: %v", len(raw), err)
+		}
+		raw = append(raw, string(msg.Data))
+	}
+	if want := `{"messageId":"` + id + `","text":"the report","kind":"notify","replyTo":"task-7"}`; raw[0] != want {
+		t.Errorf("notify frame = %s, want %s", raw[0], want)
+	}
+	if want := `{"messageId":"` + id + `","text":"the report, updated","edit":true,"kind":"notify","replyTo":"task-7"}`; raw[1] != want {
+		t.Errorf("edit frame = %s, want %s", raw[1], want)
+	}
+}
+
 // Notice ids carry a per-adapter random component, so a restarted gateway's
 // first notice is not c-1 again and a page holding the last boot's c-1 does
 // not take the new one's edits as its own.

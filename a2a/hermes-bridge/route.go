@@ -57,9 +57,14 @@ const (
 // A conversation on any other door (inject, the A2A door, Discord) has no
 // notify route, and no route is recorded for it.
 var routePlatforms = map[string]string{
-	"gchat:": lib.NotifyPlatformGchat,
-	"slack:": lib.NotifyPlatformSlack,
+	"gchat:":           lib.NotifyPlatformGchat,
+	"slack:":           lib.NotifyPlatformSlack,
+	consoleRoutePrefix: lib.NotifyPlatformConsole,
 }
+
+// consoleRoutePrefix is the console conversation's key prefix, the one route
+// that carries its task (conversationRoute.TaskID).
+const consoleRoutePrefix = "console:"
 
 // errNoChatConversation is an authority that names no chat conversation the
 // notify route serves; nothing is recorded and nothing is wrong.
@@ -71,11 +76,18 @@ var errRouteDisabled = errors.New("no route store configured")
 // conversationRoute is the PUT's body. Ask is the kind of the task's ask,
 // a mark.ask token (askKind in chat.go): the kanban notifier keeps it marked
 // on the chat messages its cards send while they run.
+//
+// TaskID, on a console conversation's route only, is the gateway task the
+// turn runs: a card the turn files snapshots it, and its report names it
+// (a2a notify --reply-to), so a console client can join the report to the
+// turn. A chat conversation's route leaves it out, so its route is the same
+// for every turn of the conversation and recordRoute skips the repeat PUTs.
 type conversationRoute struct {
 	Platform     string `json:"platform"`
 	Conversation string `json:"conversation"`
 	ContextID    string `json:"context_id"`
 	Ask          string `json:"ask,omitempty"`
+	TaskID       string `json:"task_id,omitempty"`
 }
 
 // routeFor reads the conversation the gateway's authority block names
@@ -94,7 +106,11 @@ func routeFor(env *lib.Envelope) (conversationRoute, error) {
 	key := strings.TrimSpace(auth.Audience.Conversation)
 	for prefix, platform := range routePlatforms {
 		if strings.HasPrefix(key, prefix) && len(key) > len(prefix) && env.ContextID != "" {
-			return conversationRoute{Platform: platform, Conversation: key, ContextID: env.ContextID}, nil
+			route := conversationRoute{Platform: platform, Conversation: key, ContextID: env.ContextID}
+			if prefix == consoleRoutePrefix {
+				route.TaskID = env.TaskID
+			}
+			return route, nil
 		}
 	}
 	return conversationRoute{}, errNoChatConversation

@@ -266,6 +266,21 @@ class TestSessionKvServerApi(unittest.TestCase):
             self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=body).status_code, 200, bad)
             self.assertNotIn("ask", self.client.get(f"/v1/sessions/{sid}/metadata").json()["conversation_route"], bad)
 
+    def test_a_console_route_keeps_the_turns_task_when_it_is_a_task_id(self):
+        # A console conversation's route carries the turn's gateway task,
+        # which a card the turn files snapshots for its report's reply_to;
+        # anything but a task id's shape is dropped, and the route recorded.
+        sid = "a2a-ctx-0123abcd"
+        body = {"platform": "console", "conversation": "console:tab-1", "context_id": "ctx-0123abcd", "task_id": "task-7"}
+        self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=body).status_code, 200)
+        self.assertEqual(self.client.get(f"/v1/sessions/{sid}/metadata").json()["conversation_route"],
+                         {"platform": "console", "conversation": "console:tab-1", "context_id": "ctx-0123abcd",
+                          "task_id": "task-7"})
+        for bad in ("Task-7", "task 7", "task#7", "-task", "x" * 64):
+            body["task_id"] = bad
+            self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=body).status_code, 200, bad)
+            self.assertNotIn("task_id", self.client.get(f"/v1/sessions/{sid}/metadata").json()["conversation_route"], bad)
+
     def test_a_hashed_session_takes_its_own_context(self):
         # The bridge hashes a context id that is not path-safe
         # (a2a/hermes-bridge/api.go, apiSessionID); the route is accepted for
@@ -284,6 +299,7 @@ class TestSessionKvServerApi(unittest.TestCase):
             ("k8s-evt-12345678", good, "an alert session cannot be re-addressed"),
             ("a2a-ctx-1", dict(good, platform="discord"), "a backend the gateway cannot hold for notify"),
             ("a2a-ctx-1", dict(good, conversation="slack:C1/1.2"), "a key for the other backend"),
+            ("a2a-ctx-1", dict(good, platform="console"), "a chat key on the console route"),
             ("a2a-ctx-1", dict(good, conversation="gchat:"), "an empty key"),
             ("a2a-ctx-1", dict(good, context_id=""), "no context id"),
             ("a2a-ctx-1", dict(good, context_id="x" * 600), "an oversized context id"),

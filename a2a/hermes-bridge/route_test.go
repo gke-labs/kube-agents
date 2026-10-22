@@ -212,3 +212,27 @@ func TestAPI_NoRouteIsRecordedForAConversationWithoutOne(t *testing.T) {
 		t.Fatalf("route PUTs = %+v, want none", puts)
 	}
 }
+
+// A console conversation's route carries the turn's task, which a card the
+// turn files snapshots so its report names the turn; a chat conversation's
+// does not, so its route stays the same from turn to turn and repeat PUTs
+// are skipped.
+func TestRouteFor_OnlyAConsoleRouteCarriesItsTask(t *testing.T) {
+	for _, tc := range []struct {
+		conversation, platform, task string
+	}{
+		{"console:tab-1", lib.NotifyPlatformConsole, "task-7"},
+		{"gchat:spaces/A/threads/B", lib.NotifyPlatformGchat, ""},
+	} {
+		env := &lib.Envelope{TaskID: "task-7", ContextID: "ctx-1",
+			Authority: json.RawMessage(`{"audience":{"conversation":"` + tc.conversation + `"}}`)}
+		got, err := routeFor(env)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.conversation, err)
+		}
+		want := conversationRoute{Platform: tc.platform, Conversation: tc.conversation, ContextID: "ctx-1", TaskID: tc.task}
+		if got != want {
+			t.Errorf("%s: route = %+v, want %+v", tc.conversation, got, want)
+		}
+	}
+}

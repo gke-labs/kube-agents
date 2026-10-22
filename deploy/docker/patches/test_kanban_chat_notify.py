@@ -193,16 +193,54 @@ class ResolveTest(unittest.TestCase):
             self.assertIsInstance(got, kanban_chat_notify.ConversationNotifyAdapter)
             # A home-thread subscription is not served by the conversation switch.
             self.assertIsNone(kanban_chat_notify.resolve(_Runner(), Platform.GOOGLE_CHAT, None, {"thread_id": "spaces/H/threads/T"}))
-            self.assertEqual(kanban_chat_notify.active_platforms(set()), {"google_chat"})
+            self.assertEqual(kanban_chat_notify.active_platforms(set()), {"google_chat", "console"})
         with mock.patch.dict(os.environ, ROUTED):
             # A2A_NOTIFY_PLATFORM alone does not route conversations.
             self.assertIsNone(kanban_chat_notify.resolve(_Runner(), Platform.GOOGLE_CHAT, None, sub))
 
     def test_active_platforms(self):
+        # The console's route is served whenever the console runs, with no
+        # variable naming it.
         with mock.patch.dict(os.environ, ROUTED):
-            self.assertEqual(kanban_chat_notify.active_platforms({"api_server"}), {"api_server", "google_chat"})
+            self.assertEqual(kanban_chat_notify.active_platforms({"api_server"}), {"api_server", "google_chat", "console"})
         with mock.patch.dict(os.environ, UNROUTED):
-            self.assertEqual(kanban_chat_notify.active_platforms({"api_server"}), {"api_server"})
+            self.assertEqual(kanban_chat_notify.active_platforms({"api_server"}), {"api_server", "console"})
+
+    def test_a_console_subscription_gets_the_conversation_stand_in_whatever_the_env_names(self):
+        console = types.SimpleNamespace(value="console")
+        sub = {"thread_id": "console:mcp0123456789abcdef01234567#task-1", "chat_id": "a2a-ctx-1"}
+        with mock.patch.dict(os.environ, UNROUTED):
+            got = kanban_chat_notify.resolve(_Runner(), console, None, sub)
+            self.assertIsInstance(got, kanban_chat_notify.ConversationNotifyAdapter)
+            # Another platform's conversation is still gated by the variable.
+            self.assertIsNone(kanban_chat_notify.resolve(_Runner(), Platform.GOOGLE_CHAT, None,
+                                                         {"thread_id": "gchat:spaces/A/threads/B", "chat_id": "a2a-ctx-1"}))
+
+    def test_a_console_report_names_the_turn_it_answers(self):
+        adapter = kanban_chat_notify.ConversationNotifyAdapter(types.SimpleNamespace(value="console"), _Runner())
+        with mock.patch.object(kanban_chat_notify, "conversation_context", return_value="ctx-1"):
+            self.assertEqual(adapter.notify_target("a2a-ctx-1", "console:tab-1#task-7"),
+                             ["--conversation", "console:tab-1", "--context", "ctx-1", "--reply-to", "task-7"])
+            # A console card filed before the route carried the task has no suffix.
+            self.assertEqual(adapter.notify_target("a2a-ctx-1", "console:tab-1"),
+                             ["--conversation", "console:tab-1", "--context", "ctx-1"])
+            # Only a console conversation passes a task on.
+            self.assertEqual(adapter.notify_target("a2a-ctx-1", "gchat:spaces/A/threads/B"),
+                             ["--conversation", "gchat:spaces/A/threads/B", "--context", "ctx-1"])
+
+    def test_the_console_platform_is_registered_with_hermes(self):
+        registered = {}
+        registry = types.SimpleNamespace(
+            is_registered=lambda name: name in registered,
+            register=lambda entry: registered.__setitem__(entry.name, entry),
+        )
+        module = types.SimpleNamespace(PlatformEntry=lambda **kw: types.SimpleNamespace(**kw), platform_registry=registry)
+        with mock.patch.dict(sys.modules, {"gateway.platform_registry": module}):
+            kanban_chat_notify._register_console_platform()
+        entry = registered.get("console")
+        self.assertIsNotNone(entry, "console was not registered")
+        self.assertEqual(entry.source, "builtin", "a plugin-scoped entry is invisible to other profiles")
+        self.assertIsNone(entry.adapter_factory(None))
 
 
 class _Proc:

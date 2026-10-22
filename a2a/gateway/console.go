@@ -88,6 +88,13 @@ const (
 	// turn (the placeholder, a refusal, a status answer) carries no kind, so
 	// a client waiting on a turn can tell the two apart.
 	consoleFrameKindResult = "result"
+	// consoleFrameKindNotify marks a frame carrying a chat.notify post aimed
+	// at the conversation (a kanban card's report), as distinct from a
+	// notice about a turn and from a task's terminal.
+	consoleFrameKindNotify = "notify"
+	// consoleNotifyIDPrefix starts a notify frame's messageId; the rest is
+	// the adapter's boot id and a counter, as a notice's is.
+	consoleNotifyIDPrefix = "n-"
 	// consoleResultIDPrefix starts a terminal frame's messageId, which is
 	// the prefix and the task id, so a redelivered terminal repeats its id
 	// and a client can drop the repeat.
@@ -139,6 +146,9 @@ type ConsoleOutFrame struct {
 	State     lib.TaskState `json:"state,omitempty"`
 	Addressee string        `json:"addressee,omitempty"`
 	TaskID    string        `json:"taskId,omitempty"`
+	// ReplyTo, on a notify frame, is the task whose turn filed the work the
+	// post reports on, when its sender knew it.
+	ReplyTo string `json:"replyTo,omitempty"`
 }
 
 // ConsoleTerminal is one task's end as a console conversation is told it.
@@ -468,23 +478,52 @@ func (a *ConsoleAdapter) publishFrame(conversation string, f ConsoleOutFrame) er
 	return a.nc.Publish(consoleOutSubject(token), data)
 }
 
-// PostTerminal publishes one task's terminal frame (TerminalPoster). The
-// text is cut to consoleResultTextCap, and cut again while the encoded frame
-// is still past the server's max_payload: JSON escaping can grow a string up
-// to six times, so the byte cap alone does not bound the frame.
+// PostTerminal publishes one task's terminal frame (TerminalPoster), bounded
+// as publishBounded says.
 func (a *ConsoleAdapter) PostTerminal(conversation string, t ConsoleTerminal) error {
 	token, ok := consoleConversationToken(conversation)
 	if !ok {
 		return fmt.Errorf("console adapter: malformed conversation id %q", conversation)
 	}
-	f := ConsoleOutFrame{
+	return a.publishBounded(token, ConsoleOutFrame{
 		MessageID: consoleResultIDPrefix + t.TaskID,
-		Text:      cutConsoleResult(t.Text, consoleResultTextCap),
+		Text:      t.Text,
 		Kind:      consoleFrameKindResult,
 		State:     t.State,
 		Addressee: t.Addressee,
 		TaskID:    t.TaskID,
+	})
+}
+
+// PostNotifyFrame publishes a chat.notify post aimed at the conversation as
+// a notify frame and returns its id. An empty messageID mints a new one;
+// edit republishes messageID with new text, for a keyed post (Update).
+func (a *ConsoleAdapter) PostNotifyFrame(conversation, messageID, text, replyTo string, edit bool) (string, error) {
+	token, ok := consoleConversationToken(conversation)
+	if !ok {
+		return "", fmt.Errorf("console adapter: malformed conversation id %q", conversation)
 	}
+	if messageID == "" {
+		a.mu.Lock()
+		a.nextID++
+		messageID = fmt.Sprintf("%s%s-%d", consoleNotifyIDPrefix, a.bootID, a.nextID)
+		a.mu.Unlock()
+	}
+	err := a.publishBounded(token, ConsoleOutFrame{
+		MessageID: messageID, Text: text, Edit: edit, Kind: consoleFrameKindNotify, ReplyTo: replyTo,
+	})
+	if err != nil {
+		return "", err
+	}
+	return messageID, nil
+}
+
+// publishBounded publishes a frame whose text may be answer-sized: cut to
+// consoleResultTextCap, and cut again while the encoded frame is still past
+// the server's max_payload, since JSON escaping can grow a string up to six
+// times and the byte cap alone does not bound the frame.
+func (a *ConsoleAdapter) publishBounded(token string, f ConsoleOutFrame) error {
+	f.Text = cutConsoleResult(f.Text, consoleResultTextCap)
 	limit := a.nc.MaxPayload()
 	for {
 		data, err := json.Marshal(f)
@@ -498,7 +537,7 @@ func (a *ConsoleAdapter) PostTerminal(conversation string, t ConsoleTerminal) er
 		// tenth more, so the loop ends in a step or two.
 		keep := int(int64(len(f.Text)) * limit / int64(len(data)) * consoleResultShrinkNum / consoleResultShrinkDen)
 		if keep <= len(consoleResultCutNote) {
-			return fmt.Errorf("console adapter: terminal frame for %s does not fit under max_payload %d", t.TaskID, limit)
+			return fmt.Errorf("console adapter: frame %s does not fit under max_payload %d", f.MessageID, limit)
 		}
 		f.Text = cutConsoleResult(f.Text, keep)
 	}

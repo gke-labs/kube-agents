@@ -1587,15 +1587,33 @@ so a block type it does not know travels as written and a field it does not mode
 home channel that is not a channel id leaves the route unarmed; the gateway logs
 "chat.notify route not armed" at start.
 
+The console has a route of its own, `chat.notify.console` (added 10/22), so a kanban card filed
+from a console turn reports back into its conversation. It serves conversation requests only:
+the console has no home channel, so a home post is refused. It runs whenever the gateway runs,
+as the console does, with no variable arming it. Each request is one frame on
+`chat.console.<token>.out` with `"kind": "notify"`, a minted `messageId` (`n-<boot>-<n>`), and
+the whole `text`, not chunked; a `chat` message's text is its fallback, and the console renders
+text. An `update` key edits the frame it posted, as it edits a chat message elsewhere. A
+request may carry `reply_to`, the gateway task whose turn filed the card (`a2a notify
+--reply-to`), which the frame passes on as `replyTo` so a console client can join the report to
+its turn. A `reply_to` that is not a task id's shape is dropped and the report still posted.
+The task reaches the card this way. The hermes-bridge records it on a console conversation's
+route (`task_id`). `kanban_event_routing` snapshots it into the card's subscription when the
+card is filed, as `console:<token>#<taskId>` (`#` cannot occur in a console token, which is one
+DNS-1123 label). The kanban notifier splits it back off as `--reply-to`. Hermes has no console
+platform, and its notifier reads a subscription's platform through its own `Platform` enum, so
+the notify patch registers one in Hermes's platform registry. That registration is kanban-era
+and goes when kanban does.
+
 A notify is not a task. It mints no capability, starts no executor, opens no session and
 carries no `authority` block; the requester rules above do not apply, because nobody
 requested it. What bounds it is where it may land and who may send it. Where: the home space,
 or a conversation the gateway holds a session record for carrying the request's context id; a
 thread of another space, or a conversation without that record and context, is refused before
 any post (on Slack, a home post lands in the home channel only, which the gateway sets on every
-post). Who: the agent principal alone publishes `chat.notify.gchat` and `chat.notify.slack`
-and reads `chat.notify.reply.agent.>`; the gateway alone reads the first two and publishes the
-third. The answer does not go to the agent's `_INBOX` for the reason the verifier's does not:
+post). Who: the agent principal alone publishes `chat.notify.gchat`, `chat.notify.slack` and
+`chat.notify.console`, and reads `chat.notify.reply.agent.>`; the gateway alone reads the first
+three and publishes the fourth. The answer does not go to the agent's `_INBOX` for the reason the verifier's does not:
 the agent reads its JetStream replies there, and a gateway able to publish into it could
 forge them; a request whose reply subject is outside the namespace is dropped unanswered.
 The agent could already post the same text to the same channel or conversation through
@@ -2017,8 +2035,10 @@ on `.out` too (added 10/22), as every observer is told it (`observeTaskTerminal`
 delegation chain, under the task the turn started, with the hand-off rule applied. It is one
 frame with `"kind": "result"`, the A2A `state`, the task as `addressee` and `taskId`, and
 `messageId` `r-<taskId>`, so a repeated end (a redelivery, a heal) repeats its id. Its text
-is the deliverable for a completed task and the gateway's notice otherwise. A notice carries
-none of those fields, so a client waiting on a turn can tell the two apart. The page reads
+is the deliverable for a completed task and the gateway's notice otherwise. A kanban card's
+report into the conversation is a frame too, with `"kind": "notify"` and the turn it answers as
+`replyTo` ("Proactive posts: the chat.notify route", the console's route), and the page shows
+it. A notice carries none of those fields, so a client waiting on a turn can tell the three apart. The page reads
 answers from TASKS and gets the notices, and it skips these frames, so for the page a lost
 `.out` frame across a reconnect still costs a notice and never an answer. A console client
 with no TASKS view, such as the MCP server, reads each task's end from these frames, live

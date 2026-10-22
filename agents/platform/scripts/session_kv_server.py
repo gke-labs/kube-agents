@@ -163,7 +163,7 @@ CONVERSATION_HASHED_HEX_CHARS = 32
 # The conversation key's prefix for each platform the A2A gateway can hold, as
 # the gateway spells its session-record keys (gchatConversationID,
 # slackConversationID); a key for another backend is refused.
-CONVERSATION_KEY_PREFIXES = {"google_chat": "gchat:", "slack": "slack:"}
+CONVERSATION_KEY_PREFIXES = {"google_chat": "gchat:", "slack": "slack:", "console": "console:"}
 # The metadata key the route is kept under. Its own key, not the row's
 # platform/chat_id/thread_id: those are a chat thread's address, which other
 # readers (send_notification, the delegation headers) use as one, and a
@@ -180,6 +180,12 @@ CONVERSATION_FIELD_MAX_CHARS = 512
 # a card needs.
 CONVERSATION_ROUTE_ASK_KEY = "ask"
 CONVERSATION_ASK_TOKEN = re.compile(r"[a-z0-9-]{1,16}")
+# A console conversation's route also carries the gateway task its turn runs,
+# which a card the turn files snapshots so its report names the turn it
+# answers. Kept only when it is a task id's shape: one DNS-1123 label, as the
+# gateway's lib.ValidSubjectToken requires of a task id.
+CONVERSATION_ROUTE_TASK_KEY = "task_id"
+CONVERSATION_TASK_ID_TOKEN = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
 
 # Hermes' managed scope, the administrator-pinned layer `load_hermes_dotenv`
 # applies LAST with override=True. The operator mounts it at /etc/hermes and
@@ -4858,7 +4864,8 @@ def put_conversation_route(session_id: str, request_data: Dict[str, Any]) -> Dic
     the turn files subscribes to `api_server` and this session id, and
     `deploy/docker/patches/kanban_event_routing.py` reads what this stores under
     `conversation_route` (`platform`, `conversation`, the gateway's key, and
-    `context_id`) and addresses the subscription to the conversation; `ask`,
+    `context_id`, and on a console conversation `task_id`, the turn's gateway
+    task) and addresses the subscription to the conversation; `ask`,
     when the bridge sends a valid token, is the kind of the turn's ask, which
     the notifier's chat messages keep marked while the cards run. The
     kanban notifier then posts the card's report with `a2a notify
@@ -4874,6 +4881,7 @@ def put_conversation_route(session_id: str, request_data: Dict[str, Any]) -> Dic
     conversation = str(request_data.get("conversation") or "").strip()
     context_id = str(request_data.get("context_id") or "").strip()
     ask = str(request_data.get(CONVERSATION_ROUTE_ASK_KEY) or "").strip()
+    task_id = str(request_data.get(CONVERSATION_ROUTE_TASK_KEY) or "").strip()
     prefix = CONVERSATION_KEY_PREFIXES.get(platform)
     if prefix is None:
         raise HTTPException(status_code=400, detail=f"platform {platform!r} is not one the gateway holds")
@@ -4905,6 +4913,8 @@ def put_conversation_route(session_id: str, request_data: Dict[str, Any]) -> Dic
             }
             if CONVERSATION_ASK_TOKEN.fullmatch(ask):
                 route[CONVERSATION_ROUTE_ASK_KEY] = ask
+            if CONVERSATION_TASK_ID_TOKEN.fullmatch(task_id):
+                route[CONVERSATION_ROUTE_TASK_KEY] = task_id
             meta[CONVERSATION_ROUTE_KEY] = route
             conn.execute(
                 "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?) "
