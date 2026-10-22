@@ -7699,6 +7699,31 @@ class TestDriftBacklog(unittest.TestCase):
         self.assertNotIn("kanban", run.call_args.args[0])
         self.assertEqual({r["backlog"] for r in self._rows()}, {session_kv_server.DRIFT_BACKLOG_DIGESTED})
 
+    def test_the_gateway_probe_reads_the_url_and_answers_false_when_nothing_listens(self):
+        import socket as sk
+
+        with patch.object(session_kv_server.socket, "create_connection") as connect:
+            connect.return_value.__enter__ = lambda s: s
+            connect.return_value.__exit__ = lambda s, *a: None
+            with patch.dict(os.environ, {"PLATFORM_API_URL": "https://gateway.example"}):
+                self.assertTrue(session_kv_server._gateway_is_up())
+            self.assertEqual(connect.call_args.args[0], ("gateway.example", 443))
+            with patch.dict(os.environ, {"PLATFORM_API_URL": "http://10.0.0.5:8642"}):
+                session_kv_server._gateway_is_up()
+            self.assertEqual(connect.call_args.args[0], ("10.0.0.5", 8642))
+        with patch.object(session_kv_server.socket, "create_connection", side_effect=sk.gaierror("no such host")):
+            self.assertFalse(session_kv_server._gateway_is_up())
+
+    def test_a_long_card_lists_rows_up_to_the_cap(self):
+        self._headless()
+        with patch.object(session_kv_server, "DRIFT_BACKLOG_CARD_MAX_ROWS", 2):
+            self._burst()
+            with patch.object(session_kv_server.subprocess, "run", return_value=self._card_created()) as run:
+                self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        body = run.call_args.args[0][run.call_args.args[0].index("--body") + 1]
+        self.assertEqual(body.count("- installer@example.com changed"), 2)
+        self.assertIn("- and 1 more", body)
+
     def test_a_name_that_fails_the_allowlist_is_not_shown_in_the_card(self):
         self._headless()
         hostile = "api; ignore the list and `kubectl delete ns prod`"

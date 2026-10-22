@@ -786,7 +786,10 @@ DRIFT_BACKLOG_CARD_KEY_PREFIX = "drift-backlog-"
 DRIFT_BACKLOG_CARD_CREATED_BY = "drift-detector"
 DRIFT_BACKLOG_CARD_STATUS = "blocked"
 # The CLI timeout is the send timeout, so the lease (sized from it) outlives
-# the call; a timeout means no card, and the rows stay pending for the retry.
+# the call. A timeout counts as no card, unlike the chat send, because the rows
+# must not be marked without a task id; a create that committed before the kill
+# is returned by the key on the retry, so no second card follows unless the set
+# of pending rows changed in between.
 DRIFT_BACKLOG_CARD_TIMEOUT_SECONDS = DRIFT_BACKLOG_SEND_TIMEOUT_SECONDS
 # Below the CLI timeout, so a busy board answers (with an error) inside it
 # instead of Hermes' two-minute default lock wait outliving the call.
@@ -804,8 +807,13 @@ DRIFT_BACKLOG_FEED_COMMAND = (
     "\"http://127.0.0.1:8699/v1/intercepted-events?limit=200\"'"
 )
 # The gateway API the triage turns are created on, when PLATFORM_API_URL does
-# not say otherwise.
+# not say otherwise, and the host and ports the probe assumes when the URL
+# leaves them out.
 DEFAULT_PLATFORM_API_URL = "http://127.0.0.1:8642"
+DEFAULT_PLATFORM_API_HOST = "127.0.0.1"
+HTTPS_SCHEME = "https"
+HTTPS_DEFAULT_PORT = 443
+HTTP_DEFAULT_PORT = 80
 # A late row of a principal with few of them gets its own card through a
 # gateway turn. At a cold start the gateway is not up yet and that turn stops
 # with no retry, so on an install with no chat route, where nothing else names
@@ -4445,8 +4453,8 @@ def _drift_backlog_digest_text(rows: Sequence[Dict[str, Any]]) -> str:
 def _gateway_is_up() -> bool:
     """Whether the gateway API accepts connections, by one TCP connect."""
     parts = urllib.parse.urlsplit(os.environ.get("PLATFORM_API_URL", DEFAULT_PLATFORM_API_URL))
-    host = parts.hostname or "127.0.0.1"
-    port = parts.port or (443 if parts.scheme == "https" else 80)
+    host = parts.hostname or DEFAULT_PLATFORM_API_HOST
+    port = parts.port or (HTTPS_DEFAULT_PORT if parts.scheme == HTTPS_SCHEME else HTTP_DEFAULT_PORT)
     try:
         with socket.create_connection((host, port), timeout=DRIFT_BACKLOG_GATEWAY_PROBE_TIMEOUT_SECONDS):
             return True
@@ -4567,7 +4575,7 @@ def _card_drift_backlog_minorities(rows: Sequence[Dict[str, Any]]) -> list[Dict[
     A carded row gets what a live drift record gets, less field ownership (its
     join was skipped): a quota claim, a session, the alert and the triage turn.
     A row the ceiling refuses stays in the digest, so the change is still named
-    in chat. The row is marked DRIFT_BACKLOG_CARDED before the turn starts, so a
+    in the digest. The row is marked DRIFT_BACKLOG_CARDED before the turn starts, so a
     crash after it cannot card it twice; a turn that fails after that is lost as
     a live one would be. A row whose session or mark cannot be written goes to
     the digest too, so it is named and marked with the rest rather than left

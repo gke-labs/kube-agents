@@ -45,7 +45,7 @@ Deduplication bounds how often _one_ failure is reported. It does nothing about 
 
 A [`gitops-drift` inject](#the-second-producer-gitops-drift) reaches the ceiling by a different route: it is graded `Warning` unconditionally and skips both the classifier and the gate, because the detector that sent it already decided the record was worth a human's attention. It is billed to a bucket of its own (`GitOpsDrift`) rather than to the `Warning` one its ledger row records it as, because `_claim_alert_quota` keys the table on the string it is handed and the two traffic shapes are not comparable: one `kubectl apply` over a directory is several audit entries and several injects, where the watcher's warnings arrive one incident at a time. Sharing the bucket therefore let routine drift cap-drop a deployed signal. The cost is that the ceilings add up, so a busy day of both posts more total alerts than the single budget allowed; neither ceiling bounds the fan-out itself.
 
-A [`controller-stall` inject](#the-third-producer-controller-stall) claims no allowance at all: the stall watch caps itself at three alerts a tick, and that cap is its only bound. Neither does a drift backlog record that is digested (`POST /v1/drift-backlog`): it starts no turn and is counted in one digest (a chat message, or one unassigned board card on an install with no chat route). A late record that is carded instead — a late `kubectl` write, or a late row of a principal with fewer than three in the digest — bills `GitOpsDrift` as a live record does. A refused minority row stays in the digest; a refused late `kubectl` write is suppressed as a live record is.
+A [`controller-stall` inject](#the-third-producer-controller-stall) claims no allowance at all: the stall watch caps itself at three alerts a tick, and that cap is its only bound. Neither does a drift backlog record that is digested (`POST /v1/drift-backlog`): it starts no turn and is counted in one digest (a chat message, or one unassigned board card on an install with no chat platform enabled). A late record that is carded instead — a late `kubectl` write, or a late row of a principal with fewer than three in the digest — bills `GitOpsDrift` as a live record does. A refused minority row stays in the digest; a refused late `kubectl` write is suppressed as a live record is.
 
 | Bucket        | Env var                      | Default |
 | ------------- | ---------------------------- | ------- |
@@ -121,9 +121,9 @@ What the drift branch does differently:
   route writes a ledger row with `backlog = 1` and the record's `principal`, spends no quota and
   starts no turn. A worker thread posts one digest per burst, after 60 seconds with no new backlog
   row or 10 minutes after the oldest, and marks the rows `2` (posted) or `3` (filed as one board card,
-  on an install with no chat route: unassigned and blocked, so no agent turn files or reads it, and
-  it stays in view until a person acts; at a cold start, while the gateway is not up, the rows that
-  would get their own card go into that card too). A
+  on an install with no chat platform enabled: unassigned and blocked, so no agent turn files or
+  reads it, and it stays in view until a person acts; at a cold start, while the gateway is not up,
+  the lone-principal rows go into that card too). A
   principal with fewer than three late rows is not digested: each of its rows gets a session, a quota
   claim and a card, as a live record does, rebuilt from the payload the row stores, and is marked
   `4`. A row the ceiling refuses stays in the digest. A row without a usable stored payload is
@@ -396,7 +396,7 @@ CREATE TABLE intercepted_events(
   delivery_error TEXT NOT NULL DEFAULT '',  -- non-empty when the chat post failed after notified = 1
   session_id  TEXT NOT NULL DEFAULT '',  -- the session the inject arrived on, joining the row to GET /v1/sessions/{id}/tasks
   created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  backlog     INTEGER NOT NULL DEFAULT 0,  -- drift backlog: 1 owed a digest, 2 digested, 3 filed as a board card (no chat route), 4 carded
+  backlog     INTEGER NOT NULL DEFAULT 0,  -- drift backlog: 1 owed a digest, 2 digested, 3 filed as a board card (no chat platform), 4 carded
   principal   TEXT NOT NULL DEFAULT '',    -- written on drift backlog rows only, for the digest's count
   payload     TEXT NOT NULL DEFAULT ''     -- drift backlog rows only: the record, to card it from
 );

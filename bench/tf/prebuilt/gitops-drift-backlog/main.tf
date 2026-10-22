@@ -31,9 +31,10 @@
 #   live-marked-backlog the live record was marked backlog.
 #   late-edit-not-carded a late record that must be carded (a lone principal's,
 #                       or one sent by kubectl) has no card.
-#   digest-card-missing the install has no chat route, and the digest did not
-#                       become exactly one new board card that counts the
-#                       backlog principal's records.
+#   digest-card-missing the digest's rows ended as a board card (backlog 3)
+#                       and exactly one new card counting the backlog
+#                       principal's records did not appear; or they ended as a
+#                       chat post (backlog 2) and a new card appeared.
 
 locals {
   kubectl = "kubectl"
@@ -418,18 +419,29 @@ resource "null_resource" "drift_backlog" {
         exit 0
       fi
 
-      # On an install with no chat route the digest is one board card. The eval
-      # installs have no chat route, so the card is expected there; an install
-      # with chat posts the digest instead and files no card.
+      # The ledger says how the digest ended: 3 is a board card (no chat platform
+      # enabled, which is every eval install), 2 is a chat post. The card check
+      # follows that mark, so an install with chat is not red for having no card.
+      digest_mark="$(printf '%s\n' "$rows" | awk -F'|' 'NF {print $4}' | sort -u | tr '\n' ' ')"
       digest_after="$(digest_cards)"
       digest_cards_after="$(printf '%s\n' "$digest_after" | head -1)"
       digest_cards_after="$${digest_cards_after:-0}"
       digest_body="$(printf '%s\n' "$digest_after" | sed -n 2p)"
       new_digest_cards=$(( digest_cards_after - digest_cards_before ))
-      if [ "$new_digest_cards" -ne 1 ] || ! printf '%s' "$digest_body" | grep -F "$BACKLOG_PRINCIPAL (${var.backlog_record_count})" >/dev/null; then
-        write_verdict digest-card-missing "expected exactly one new digest card counting $BACKLOG_PRINCIPAL (${var.backlog_record_count}); found $new_digest_cards new card(s); newest body: $${digest_body:0:200}"
-        exit 0
-      fi
+      case "$${digest_mark// /}" in
+        3)
+          if [ "$new_digest_cards" -ne 1 ] || ! printf '%s' "$digest_body" | grep -F "$BACKLOG_PRINCIPAL (${var.backlog_record_count})" >/dev/null; then
+            write_verdict digest-card-missing "the digest rows ended as a board card (3) but exactly one new card counting $BACKLOG_PRINCIPAL (${var.backlog_record_count}) did not appear: $new_digest_cards new card(s); newest body: $${digest_body:0:200}"
+            exit 0
+          fi
+          ;;
+        2)
+          if [ "$new_digest_cards" -ne 0 ]; then
+            write_verdict digest-card-missing "the digest rows ended as a chat post (2) yet $new_digest_cards new digest card(s) appeared"
+            exit 0
+          fi
+          ;;
+      esac
 
       write_verdict ok "$${#backlog_ids[@]} backlog records recorded with no card and given their digest card; $${#card_ids[@]} late records carded; live card finished"
       echo "backlog digested: no card for $${#backlog_ids[@]} backlog records, live card for $live_id finished"
