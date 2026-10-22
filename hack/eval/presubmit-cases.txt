@@ -1,6 +1,6 @@
 # The presubmit eval matrix: what every pull request runs -- since 2026-09-22
-# the blocking roster, plus the held-out seat the last section names (one
-# per coverage tracker: #2013 today).
+# the blocking roster, plus the held-out seats the last section names (at
+# most one per coverage tracker).
 #
 # One `./tasks/<id>/task.yaml` path per line, relative to bench/. `#` starts
 # a comment, blank lines are skipped. hack/ci-eval-pr.sh reads this file at
@@ -49,10 +49,12 @@
 # truncating this list's tail. A case known to be slow gets a unit_cost_hint
 # entry in the script, not a position here.
 #
-# BUDGET. Eleven cases, thirty-three units at the script's EVAL_REPETITIONS
-# of 3: four domain probes, one reliability prompt variation, three
-# cluster-debugging cases, the incident-triage probe, the kanban smoke, and
-# one held-out seat (the compliance canary, ~1000-2000s a repetition; its
+# BUDGET. How many cases and units this file comes to at the script's
+# EVAL_REPETITIONS of 3 is `python3 scripts/eval_rosters.py --summary`
+# ("presubmit cases", "presubmit units"); no count is written here, so a seat
+# change edits only its own entry. The mix: domain probes, a reliability
+# prompt variation, cluster-debugging cases, the incident-triage probe, the
+# kanban smoke, and the held-out seats (the compliance canary among them since 2026-09-29, ~1000-2000s a repetition; its
 # three repetitions serialize on the task lock). upgrades-lagging-master-probe
 # left for the nightly 2026-10-16 (#3269), putting upgrades on the
 # docs/designs/domains.yaml allowlist, and consistency-authorized-networks-probe
@@ -75,8 +77,7 @@
 # was a nightly case 2026-09-22 to 2026-09-29 and is seated held out below
 # since (#2013); fleet-audits stays on the docs/designs/domains.yaml
 # allowlist until its roster line lands. The comment above EVAL_REPETITIONS
-# in the script carries the measured history of that budget; recount the
-# entries here rather than trusting any count in prose.
+# in the script carries the measured history of that budget.
 
 # ── The domain probes ────────────────────────────────────────────────────────
 ./tasks/reliability-pdb-probe/task.yaml
@@ -150,7 +151,7 @@
 
 # ── Held out: seated here without a roster line ──────────────────────────────
 # The documented exception to the 2026-09-22 rule above, one case per
-# coverage tracker (one today: #2013, fleet-audits; #2016's seat became a
+# coverage tracker (today #2013, fleet-audits; #2016's seat became a
 # roster line 2026-10-14, demoted to the nightly 2026-10-17, #3120). A case
 # in this section runs on every pull request and, under the default
 # EVAL_ADMISSION_MODE=roster, CANNOT red one on a graded failure: it is not
@@ -166,10 +167,10 @@
 # up into the list above. Its line leaves nightly-cases.txt (the nightly
 # runs both files). scripts/test_eval_rosters.py pins the set as
 # HELD_OUT_IN_PRESUBMIT; roster ⊆ presubmit still holds, presubmit == roster
-# holds less exactly this section. A seat added or withdrawn here moves the
-# case counts in this file's BUDGET line, docs/eval-gate-roster.md, docs/designs/testing-strategy.md and
-# docs/ci-health.md; SLOW_MIN_TASKS in scripts/eval_dashboard/health.py
-# reads this file.
+# holds less exactly this section. No comment or doc writes a seat count
+# (`python3 scripts/eval_rosters.py --summary` computes them), so a seat
+# added or withdrawn here edits only its own entry; SLOW_MIN_TASKS in
+# scripts/eval_dashboard/health.py reads this file.
 
 # The audit-machinery canary (fleet-audits), #2013 step 2, seated 2026-09-29.
 # Demoted from the roster 2026-09-02 (#1171, closed 2026-09-08; the bar now

@@ -1333,6 +1333,8 @@ class LabelDerivationTest(unittest.TestCase):
             "/v1/chat/a2a/events": "/v1/chat/a2a",
             "/v1/chat/api": "/v1/chat/api",
             "/v1/gcp/monitoring.googleapis.com/v3/x?y=z": "/v1/gcp",
+            "/v1/watcher/gcp/pubsub.googleapis.com/v1/projects/p/subscriptions/s:pull": "/v1/watcher/gcp",
+            "/v1/pubsub/gcp/pubsub.googleapis.com/v1/projects/p/subscriptions/s:pull": "/v1/pubsub/gcp",
             "/v1/vcs/push": "/v1/vcs",
             "/v1/workspace/acquire": "/v1/workspace",
             "/v1/forge/refresh": "/v1/forge",

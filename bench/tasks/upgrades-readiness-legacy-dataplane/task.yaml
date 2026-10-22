@@ -1,0 +1,245 @@
+# Upgrade-failure catalogue entry 16 (docs/designs/upgrade-failure-catalogue.md):
+# the network dataplane changes. The seeded clusters hold the before-state
+# without a role of their own: the legacy dataplane with the network policy
+# add-on off, and default-deny NetworkPolicies in most seeded namespaces, so the
+# policies apply nowhere today and start to apply the moment enforcement turns
+# on (the node rebuild after enabling the add-on, or the Dataplane V2 cluster
+# that replaces one of these; GKE's recommender files the shape as
+# NETWORK_POLICIES_UNRECONCILED). The readiness mode of
+# fleet-upgrade-verification grades it with its network-dataplane rule as a
+# risk naming the namespaces; the kube-agents host cluster in the same project
+# runs Dataplane V2, where the same policies would be enforced.
+#
+# What the case grades is that the report states the shape per cluster: the
+# dataplane, that the policies are not enforced, which readiness rule filed the
+# finding, how the report graded it, and the report's own text for it; the
+# namespaces are the judge's to check. The rule id (`network-dataplane`) and the
+# grade are the report's vocabulary, which the skill's own text also names, so
+# neither slot alone proves the report ran. The cell slot does: on the clusters
+# that carry default-deny policies (slots a, b and d) it is the rule's
+# `describe` text as the `risks` column prints it, beginning `network-dataplane:
+# legacy dataplane with policy enforcement off and NetworkPolicies in <the
+# namespaces>: the policies apply nowhere today ...`, and on slot c, which
+# carries no NetworkPolicy, it is the rule's line in the note column,
+# `network-dataplane: legacy dataplane, policy enforcement off; network
+# policies: none, nothing to enforce`; both are wording the skill paraphrases
+# and a kubectl read cannot supply, so a report whose rule is missing prints
+# neither and a regression of the rule reds this case. The grade is per slot:
+# `risk` on a, b and d, `note` on c. The cells carry a `;`, which keeps the
+# verifier's value-wrap fold from removing a quote or angle bracket the agent
+# kept around them, so both of the cell objective's patterns admit one opener
+# before the text; the per-namespace counts are left open, since the fold reads
+# a `(1)` before a comma as a citation marker. The prompt asks for one declared
+# line per seeded cluster in a fixed vocabulary; the deterministic objectives
+# read those lines and nothing else.
+#
+# The patterns name the slots through `{cluster:<slot>}`, which the verifier
+# expands to the cluster the runner recorded for the slot.
+#
+# Isolation class: read-only (chat prompt; the script reads with gcloud
+# container and kubectl get and writes only its own record and per-member
+# kubeconfig files). Eligible tier: nightly from its first merge.
+#
+# No deterministic mutation safeguard, documented: the condition is two
+# settings of the cluster itself (its dataplane and its network policy add-on)
+# plus policies several roles' namespaces carry, none of them a planted object
+# of this entry's own; the catalogue's test table records that nothing declares
+# or watches the enforcement setting today.
+id: upgrades-readiness-legacy-dataplane
+name: Upgrade readiness names the clusters whose NetworkPolicies are not enforced
+
+prompt: >-
+  For every cluster in this project, run the upgrade readiness check against
+  each cluster's release channel default and include, per cluster, which
+  dataplane it runs, whether its NetworkPolicies are enforced today, which
+  namespaces carry policies that would start to apply if enforcement turned on,
+  which readiness rule in the report files that dataplane finding or note (its
+  rule id, as the report's JSON names it under readiness.rules), how the report
+  grades it: a risk, a blocker, or a note where the cluster carries no policy,
+  and the report's own text for it, copied as printed: the cell the `risks` or
+  `other blockers` column prints for the finding, or, where the rule filed a
+  note, the rule's line in the note column. A member may be blocked by other
+  rules on the same report; the rule, grade and cell slots are about the
+  dataplane finding only. Read only; change and upgrade nothing. End your
+  answer with one line per seeded cluster in exactly this form, no other words
+  on the line: "<cluster>: kind Cluster; dataplane: <legacy|v2>; network
+  policies enforced: <yes|no>; readiness rule: <rule id|none>; graded as:
+  <risk|blocker|note|none>; cell: <the report's cell or note line for that
+  finding, copied as printed|none>".
+
+expected_output: >-
+  The version table and the readiness table read during this run. Every seeded
+  cluster is reported on the legacy dataplane with the network policy add-on
+  off, so none of them enforces a NetworkPolicy today, and the clusters that
+  carry policies (seeded-a's nine namespaces: default-deny in
+  seeded-reliability, seeded-debug, seeded-capacity, seeded-stall,
+  seeded-token, seeded-headroom, seeded-shapes and seeded-defaults, an
+  egress-only policy in seeded-deprecation and a second one in seeded-shapes,
+  ten policies in all; seeded-b's seeded-upgrade; seeded-d's seeded-topology)
+  are named with those namespaces, each with its policy count,
+  as the ones whose traffic would start to be blocked the moment enforcement
+  turns on, at the node rebuild that follows enabling the add-on or on a
+  Dataplane V2 cluster such as the agent's own host. The answer names the
+  report's rule for the finding, network-dataplane, says the report grades it a
+  risk, not a blocker, on the clusters that carry policies and a note on the
+  cluster that carries none, whatever else blocks a member, and recommends
+  testing what the policies deny before enforcement changes. It ends with the
+  declared lines: "kind Cluster; dataplane: legacy; network policies enforced:
+  no; readiness rule: network-dataplane; graded as: risk; cell:
+  network-dataplane: legacy dataplane with policy enforcement off and
+  NetworkPolicies in <the cluster's namespaces, each with its count>: the
+  policies apply nowhere today and start to apply the moment enforcement turns
+  on, ..." for seeded-a, seeded-b and seeded-d, the cell copied from the
+  report's risks column, and "graded as: note; cell: network-dataplane: legacy
+  dataplane, policy enforcement off; network policies: none, nothing to
+  enforce" for seeded-c, the rule's line copied from the note column. It cites
+  no CVE identifiers and performs no upgrade.
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+# No role of this entry's own is read: the condition is the clusters' dataplane
+# and add-on settings plus the policies the fleet's namespaces carry. The four
+# roles below are one per slot, and they are how the declared-line objectives
+# tell a cluster the agent missed from a cluster the project does not have.
+fixtures:
+  - crashloop-workload
+  - version-laggard
+  - drift-outlier
+  - zonal-skew-scheduling
+
+verification_spec:
+  # One line per seeded cluster, fixed vocabulary, the cluster named at the
+  # start of the line; every pattern matches the whole declared frame, anchored
+  # at both ends, with the line's decoration folded first. Each value objective
+  # also forbids a frame whose value slot holds anything but the right word.
+  - name: every-seeded-cluster-has-a-declared-line
+    role: objective
+    # assert, not converge: the transcript is immutable once the run ends.
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: kind cluster; dataplane: [^;\n]+; network policies enforced: [^;\n]+; readiness rule: [^;\n]+; graded as: [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: kind cluster; dataplane: [^;\n]+; network policies enforced: [^;\n]+; readiness rule: [^;\n]+; graded as: [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: kind cluster; dataplane: [^;\n]+; network policies enforced: [^;\n]+; readiness rule: [^;\n]+; graded as: [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: kind cluster; dataplane: [^;\n]+; network policies enforced: [^;\n]+; readiness rule: [^;\n]+; graded as: [^\n]+$)'
+
+  - name: the-declared-lines-say-the-dataplane-is-legacy
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: kind cluster; dataplane: legacy; network policies enforced: [^;\n]+; readiness rule: [^;\n]+; graded as: [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: kind cluster; dataplane: (?!legacy;)[^;\n]+; network policies enforced: [^;\n]+; readiness rule: [^;\n]+; graded as: [^\n]+$'
+
+  # The fact the entry turns on: the policies exist and apply nowhere.
+  - name: the-declared-lines-say-policies-are-not-enforced
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: kind cluster; dataplane: [^;\n]+; network policies enforced: no; readiness rule: [^;\n]+; graded as: [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: kind cluster; dataplane: [^;\n]+; network policies enforced: (?!no;)[^;\n]+; readiness rule: [^;\n]+; graded as: [^\n]+$'
+
+  # The report's own output: the rule id the risks column, the note and the JSON
+  # carry. An agent that read the dataplane without the report has no id to give,
+  # and a report whose rule has regressed gives none, so the slot reads `none`.
+  - name: the-declared-lines-name-the-reports-rule
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: kind cluster; dataplane: [^;\n]+; network policies enforced: [^;\n]+; readiness rule: network-dataplane; graded as: [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: kind cluster; dataplane: [^;\n]+; network policies enforced: [^;\n]+; readiness rule: (?!network-dataplane;)[^;\n]+; graded as: [^\n]+$'
+
+  # The grade is the rule's own and follows the fleet's shape: a risk on the
+  # clusters that carry default-deny policies the dataplane does not enforce
+  # (slots a, b and d: defects-a.tf, defects-b.tf, defects-d.tf), a note on slot
+  # c, which carries no NetworkPolicy (its rule line states the dataplane and
+  # the enforcement with nothing to enforce). Never a blocker: the upgrade
+  # itself changes neither setting, and a member blocked by its budget or its
+  # exclusion on the same report still reads its dataplane grade here.
+  - name: the-declared-lines-grade-the-finding-by-the-clusters-policies
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: kind cluster; dataplane: [^;\n]+; network policies enforced: [^;\n]+; readiness rule: [^;\n]+; graded as: risk; cell: [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: kind cluster; dataplane: [^;\n]+; network policies enforced: [^;\n]+; readiness rule: [^;\n]+; graded as: risk; cell: [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: kind cluster; dataplane: [^;\n]+; network policies enforced: [^;\n]+; readiness rule: [^;\n]+; graded as: risk; cell: [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: kind cluster; dataplane: [^;\n]+; network policies enforced: [^;\n]+; readiness rule: [^;\n]+; graded as: note; cell: [^\n]+$)'
+      forbidden_patterns:
+        - '(?m)^(?:{cluster:a}|{cluster:b}|{cluster:d})(?:\s*\([^)\n]*\))?: kind cluster; dataplane: [^;\n]+; network policies enforced: [^;\n]+; readiness rule: [^;\n]+; graded as: (?!risk;)[^;\n]+; cell: [^\n]+$'
+        - '(?m)^{cluster:c}(?:\s*\([^)\n]*\))?: kind cluster; dataplane: [^;\n]+; network policies enforced: [^;\n]+; readiness rule: [^;\n]+; graded as: (?!note;)[^;\n]+; cell: [^\n]+$'
+
+  # The report's own wording: on slots a, b and d the cell the risks column
+  # prints is the rule's `describe` text, on slot c the rule's line in the note
+  # column; the skill paraphrases both and a kubectl read supplies neither. A
+  # report whose rule is missing prints no such text, so the slot reads `none`
+  # or something else and the line fails here, whatever the other slots say.
+  # The namespaces and their counts are the fleet's, left open; both cells
+  # carry a `;`, so both patterns admit one opener before the text.
+  - name: the-declared-lines-quote-the-reports-cell
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      # The `network-dataplane: ` prefix is the table's; report.json carries the bare text, so it is optional.
+      any_of_patterns:
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: kind cluster; dataplane: [^;\n]+; network policies enforced: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: ["''“‘<]?(?:network-dataplane: )?legacy dataplane with policy enforcement off and networkpolicies in [^:\n]+: the policies apply nowhere today[^\n]*$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: kind cluster; dataplane: [^;\n]+; network policies enforced: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: ["''“‘<]?(?:network-dataplane: )?legacy dataplane with policy enforcement off and networkpolicies in [^:\n]+: the policies apply nowhere today[^\n]*$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: kind cluster; dataplane: [^;\n]+; network policies enforced: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: ["''“‘<]?(?:network-dataplane: )?legacy dataplane with policy enforcement off and networkpolicies in [^:\n]+: the policies apply nowhere today[^\n]*$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: kind cluster; dataplane: [^;\n]+; network policies enforced: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: ["''“‘<]?(?:network-dataplane: )?legacy dataplane, policy enforcement off[^\n]*$)'
+      forbidden_patterns:
+        - '(?m)^(?:{cluster:a}|{cluster:b}|{cluster:d})(?:\s*\([^)\n]*\))?: kind cluster; dataplane: [^;\n]+; network policies enforced: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: (?!["''“‘<]?(?:network-dataplane: )?legacy dataplane with policy enforcement off and networkpolicies in [^:\n]+: the policies apply nowhere today)[^\n]*$'
+        - '(?m)^{cluster:c}(?:\s*\([^)\n]*\))?: kind cluster; dataplane: [^;\n]+; network policies enforced: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: (?!["''“‘<]?(?:network-dataplane: )?legacy dataplane, policy enforcement off)[^\n]*$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # No vulnerability feed; a CVE id in a readiness report is an invention.
+      forbidden_phrases: ["CVE-"]
