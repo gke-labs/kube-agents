@@ -82,8 +82,8 @@ The variable is comma- or whitespace-separated task ids; `_bootstrap_admitted()`
 
 ## The admission bar, and who clears it
 
-Every presubmit case but one is admitted; the other one, the compliance canary,
-is the held-out seat described above (`python3 scripts/eval_rosters.py --summary` counts
+Every presubmit case without a roster line is a held-out seat as described above, and the rest
+are admitted (`python3 scripts/eval_rosters.py --summary` counts
 `hack/eval/presubmit-cases.txt` and `blocking-roster.txt`; this page writes no count, so a seat
 change doesn't edit it). The bar a case clears to
 get there: its recent record shows failures only on its own regressions or on infra classes

@@ -122,10 +122,10 @@ DEFAULT_CORRECTNESS_FLOOR = 1.0
 #: stricter than 0.10 at that window. Revisit if main's window rate exceeds
 #: 0.96 or the side falls to DEFAULT_AGGREGATE_MIN_SCORED: a side at or under
 #: that floor leaves the aggregate advisory whenever one repetition is infra
-#: or blocked, and a side under it can't block at all. That has already
-#: happened: since the demotion of 2026-10-21 (#3598) the today lane's side
-#: sits on the floor and the inject lane's, which the presubmit runs, is
-#: under it, so the aggregate can't block a pull request. It is not armed by
+#: or blocked, and a side under it can't block at all. As of 2026-10-21
+#: (#3598's demotion) the today lane's side sat on the floor and the inject
+#: lane's, which the presubmit runs, under it, so the aggregate couldn't
+#: block a pull request; recompute before relying on that either way. It is not armed by
 #: default (EVAL_AGGREGATE_ARMED); recompute the side, and check it against
 #: that floor, before arming it.
 DEFAULT_AGGREGATE_MARGIN = 0.10

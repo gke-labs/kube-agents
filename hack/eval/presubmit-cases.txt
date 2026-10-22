@@ -1,6 +1,6 @@
 # The presubmit eval matrix: what every pull request runs -- since 2026-09-22
-# the blocking roster, plus the held-out seat the last section names (one
-# per coverage tracker: #2013 today).
+# the blocking roster, plus the held-out seats the last section names (at
+# most one per coverage tracker).
 #
 # One `./tasks/<id>/task.yaml` path per line, relative to bench/. `#` starts
 # a comment, blank lines are skipped. hack/ci-eval-pr.sh reads this file at
@@ -54,7 +54,7 @@
 # ("presubmit cases", "presubmit units"); no count is written here, so a seat
 # change edits only its own entry. The mix: domain probes, a reliability
 # prompt variation, cluster-debugging cases, the incident-triage probe, the
-# kanban smoke, and one held-out seat (the compliance canary, ~1000-2000s a repetition; its
+# kanban smoke, and the held-out seats (the compliance canary among them since 2026-09-29, ~1000-2000s a repetition; its
 # three repetitions serialize on the task lock). upgrades-lagging-master-probe
 # left for the nightly 2026-10-16 (#3269), putting upgrades on the
 # docs/designs/domains.yaml allowlist, and consistency-authorized-networks-probe
@@ -151,7 +151,7 @@
 
 # ── Held out: seated here without a roster line ──────────────────────────────
 # The documented exception to the 2026-09-22 rule above, one case per
-# coverage tracker (one today: #2013, fleet-audits; #2016's seat became a
+# coverage tracker (today #2013, fleet-audits; #2016's seat became a
 # roster line 2026-10-14, demoted to the nightly 2026-10-17, #3120). A case
 # in this section runs on every pull request and, under the default
 # EVAL_ADMISSION_MODE=roster, CANNOT red one on a graded failure: it is not
