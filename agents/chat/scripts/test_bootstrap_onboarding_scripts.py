@@ -2482,6 +2482,32 @@ class FirstRunAuditsTest(unittest.TestCase):
         self.assertEqual(self._lost(note), " `compliance-audit`")
         self.assertNotIn("failure notices", note)
 
+    def test_a_posted_failure_notice_that_marked_the_crashs_own_record_settles_no_earlier_run(self):
+        # The crash came after `start`, so the row's `run` is the crashed run's own stamp, inside no
+        # earlier run: the delivered run in between is not settled by it, and the lost run before is named.
+        now = time.time()
+        self._filed(now - 7200)
+        self._run("compliance-audit", now - 3000, bootstrap_delivery.DELIVERY_FAILED)
+        self._run("compliance-audit", now - 2000, "delivered")
+        self._run("compliance-audit", now - 1000, bootstrap_delivery.DELIVERY_FAILED, status="failed")
+        self._relay("compliance-audit", now - 940, run=self._stamp(now - 990))
+        self._skipped(oobe.SKIP_NOT_NEW)
+        note = self._note()
+        self.assertEqual(self._lost(note), " `compliance-audit`")
+        self.assertNotIn("failure notices", note)
+
+    def test_without_a_relay_record_a_crashed_run_whose_notice_was_delivered_does_not_hide_an_earlier_lost_summary(self):
+        # No session_kv.db to ask: the crashed run's delivered failure notice stands, and the earlier run's
+        # report, still in the store, is named.
+        now = time.time()
+        self._filed(now - 7200)
+        self._run("compliance-audit", now - 3000, bootstrap_delivery.DELIVERY_FAILED)
+        self._run("compliance-audit", now - 1000, "delivered", status="failed")
+        self._skipped(oobe.SKIP_NOT_NEW)
+        note = self._note()
+        self.assertEqual(self._lost(note), " `compliance-audit`")
+        self.assertNotIn("failure notices", note)
+
     def test_the_relay_run_stamp_format_is_the_report_records(self):
         sys.path.insert(0, str(FLEET_AUDIT_SCRIPTS))
         try:

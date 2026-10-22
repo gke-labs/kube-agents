@@ -308,8 +308,9 @@ DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 # SQLite's CURRENT_TIMESTAMP, which is UTC.
 RELAY_POSTED_AT_FORMAT = "%Y-%m-%d %H:%M:%S"
 # The row's `run`: the stamp the audit's `start` gave the report record the relay marked posted
-# (audit_report.REPORT_STAMP_FORMAT, UTC; a test holds the two equal). It falls inside that run's
-# claim and finish, which is what ties the row to a run once a later post has replaced `posted_at`.
+# (audit_report.REPORT_STAMP_FORMAT, UTC; a test holds the two equal). A run's own stamp falls inside
+# its claim and finish, which is what ties the row to a run once a later post has replaced `posted_at`.
+# A crash after `start` leaves its own stamp in the row, which then lies inside no earlier run.
 RELAY_RUN_STAMP_FORMAT = "%Y%m%dT%H%M%S.%fZ"
 
 # One ended run: (claimed_at, finished_at, delivery_outcome, status).
@@ -1129,7 +1130,9 @@ def _lost_audits(audits: tuple[str, ...], runs: dict[str, list[AuditRun]], windo
     relay's one row per job, so the post is read as the crashed run's and the row's record stamp then
     settles an earlier delivered run the stamp falls in as posted: that run wrote the record, and the
     relay posted it. A lost run the stamp falls in stays lost: the failure path marks the record on
-    disk posted without posting it.
+    disk posted without posting it. A stamp inside no earlier run (a crash after ``start`` stamps its
+    own record) settles nothing, and the walk goes on; where that names a summary that did post, the
+    user asks one question instead of missing a report.
     """
     lost = []
     for audit in audits:
@@ -1149,7 +1152,7 @@ def _lost_audits(audits: tuple[str, ...], runs: dict[str, list[AuditRun]], windo
                     break
                 posted = None
                 continue
-            if kind == OUTCOME_TRIED and record is not None and record >= claimed:
+            if kind == OUTCOME_TRIED and record is not None and record >= claimed and ended is not None and record <= ended:
                 break
             if kind == OUTCOME_LOST and status == RUN_FAILED_STATUS:
                 if not crashed:
@@ -1159,7 +1162,7 @@ def _lost_audits(audits: tuple[str, ...], runs: dict[str, list[AuditRun]], windo
             if kind == OUTCOME_LOST:
                 lost.append((audit, False))
                 break
-            if posts is None:
+            if posts is None and status != RUN_FAILED_STATUS:
                 break
     return lost
 
