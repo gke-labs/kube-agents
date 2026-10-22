@@ -676,3 +676,36 @@ func TestAConsoleChainWhoseChildFiledCardsSaysSoOnItsFrame(t *testing.T) {
 		t.Fatalf("terminal frames = %+v, want one for %s with cardsPending", got, origin.TaskID)
 	}
 }
+
+// The heal reads the task's fold from the stream, handoff included, so a
+// frame it produces carries cardsPending as the relay's does.
+func TestAHealedConsoleTaskThatFiledCardsSaysSo(t *testing.T) {
+	r := startRig(t)
+	r.adapter.setTakesTerminals()
+	r.adapter.roster = []string{consoleAuthor}
+	conv := "console:tab-heal-cards"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", Backend: consoleBackend, AuthorID: consoleAuthor, MessageID: "m1", Text: "start"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactHandoff, Parts: []lib.Part{{Kind: "text", Text: lib.HandoffCards}}}); err != nil {
+		t.Fatal(err)
+	}
+	completeTask(t, exec, "checking.")
+	waitFor(t, "the relay's frame", func() bool { return len(r.adapter.terminalPosts()) == 1 })
+
+	// Fake the relay having missed the terminal, as the heal finds it.
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil || rec == nil {
+		t.Fatal(err)
+	}
+	rec.ActiveTask = &ActiveTask{TaskID: origin.TaskID, CorrelationID: origin.CorrelationID}
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", Backend: consoleBackend, AuthorID: consoleAuthor, MessageID: "m2", Text: "next question"}
+	waitFor(t, "the heal's frame", func() bool { return len(r.adapter.terminalPosts()) == 2 })
+	if got := r.adapter.terminalPosts()[1]; !got.CardsPending || got.TaskID != origin.TaskID {
+		t.Fatalf("the heal's frame = %+v, want cardsPending for %s", got, origin.TaskID)
+	}
+}

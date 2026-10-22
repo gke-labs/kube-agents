@@ -1257,6 +1257,13 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 			}
 		}
 		g.logTaskTerminal(rec, addressee, active.TaskID, task.State, source, finalMessageText(task))
+		// A console client is told the task handed work to cards, as the
+		// relay tells it (relayTerminal): the fold read here carries the
+		// handoff too, so a heal-found end is not the one path without it.
+		if isConsoleConversation(rec.Key) && handedOff(task.State, foldHandedOff(task)) {
+			root, _ := rec.observedAs(active.TaskID)
+			g.consoleCardsPending.put(root, "")
+		}
 		// Under the chain's root, and not at all for a child: its result
 		// is the wake's to digest, not the root's deliverable, and the
 		// root's end comes from the wake below or, with no wake, from
