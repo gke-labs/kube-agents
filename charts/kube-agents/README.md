@@ -608,13 +608,18 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   `SLACK_APP_TOKEN` keys (the CRD requires both refs when Slack is enabled).
   Custom Secret references can be configured via `botTokenSecretRef` and
   `appTokenSecretRef` (`name` and `key`) if tokens are kept in a separate Secret.
+  On an installer-managed install (`install.sh` / `upgrade.sh`), custom refs can
+  be preserved across upgrades by specifying them via `TF_VAR_extra_helm_values`
+  in `install.env` (e.g.
+  `TF_VAR_extra_helm_values='{platformAgent={integration={slack={botTokenSecretRef={name="custom-slack-secret"}}}}}'`).
 - **Microsoft Teams** — `platformAgent.integration.teams.enabled=true`; the bot
   credentials are read from the credentials Secret's `TEAMS_APP_ID` and
   `TEAMS_APP_PASSWORD` keys. Custom Secret references can be configured via
   `appIdSecretRef` and `appPasswordSecretRef` (`name` and `key`). Optional
   single-tenant lock-down is set via `tenantId`, and user authorization is
   configured via `allowedUsers` (or `allowAllUsers: true`). Supports Microsoft
-  Adaptive Cards v1.5 with markdown fallback.
+  Adaptive Cards v1.5 with markdown fallback. Custom refs can likewise be
+  preserved across installer upgrades via `TF_VAR_extra_helm_values`.
 - **Git forges and repositories** — `platformAgent.integration.forges` lists
   the forges the agent talks to (`name`, `provider`, optional `host`,
   `namespace` and `credentialsRef`), and
