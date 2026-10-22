@@ -105,6 +105,12 @@ func TestPartRefusesWhatDecodeWouldDrop(t *testing.T) {
 		"subtask, no id":  {Kind: KindSubtask, Title: "x", Subtask: &Subtask{}},
 		"long title":      {Kind: KindPlan, Title: strings.Repeat("x", maxTitleBytes+1)},
 		"empty call id":   {Kind: KindPlan, Title: "x", CallIDs: []string{""}},
+		"long thought":    {Kind: KindPlan, Title: "x", Thought: strings.Repeat("x", maxThoughtBytes+1)},
+		"too many ids":    {Kind: KindPlan, Title: "x", CallIDs: strings.Split(strings.Repeat("c,", maxCallIDs)+"c", ",")},
+		"long call id":    {Kind: KindPlan, Title: "x", CallIDs: []string{strings.Repeat("c", maxIDBytes+1)}},
+		"long summary":    {Kind: KindSubtask, Title: "x", Subtask: &Subtask{ID: "s", Summary: strings.Repeat("x", maxSummaryBytes+1)}},
+		"long subtask id": {Kind: KindSubtask, Title: "x", Subtask: &Subtask{ID: strings.Repeat("s", maxIDBytes+1)}},
+		"long verdict":    {Kind: KindSubtask, Title: "x", Subtask: &Subtask{ID: "s", Verdict: strings.Repeat("v", maxWordBytes+1)}},
 	} {
 		if p, err := s.Part(); err == nil {
 			t.Errorf("%s: Part encoded %s", name, p.Data)

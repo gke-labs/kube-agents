@@ -30,6 +30,26 @@ const (
 	Schema = "kube-agents.step/v1"
 	// partKindData is the A2A part kind step records travel on.
 	partKindData = "data"
+	// subtaskKey is the record's key for its subtask, read on its own.
+	subtaskKey = "subtask"
+	// nullJSON is an explicit JSON null, which is no subtask.
+	nullJSON = "null"
+
+	// Size bounds on what a step carries. A step is a row, not a report, so
+	// a record over them is refused on both sides rather than trimmed.
+	maxTitleBytes   = 256
+	maxThoughtBytes = 4096
+	maxCallIDs      = 64
+	maxIDBytes      = 128
+	maxWordBytes    = 64
+	maxSummaryBytes = 4096
+)
+
+// stepKeys and subtaskKeys are the record's keys, matched exactly. The
+// subtask is read on its own, so its keys match exactly too.
+var (
+	stepKeys    = []string{"schema", "kind", "title", "thought", "callIds"}
+	subtaskKeys = []string{"id", "title", "status", "verdict", "summary", "settled", "total", "parentTaskId"}
 )
 
 // Kind says what a step row stands for.
@@ -74,15 +94,6 @@ type Step struct {
 	Subtask *Subtask `json:"subtask,omitempty"`
 }
 
-// Size bounds on what a step carries. A step is a row, not a report, so a
-// record over them is refused on both sides rather than trimmed.
-const (
-	maxTitleBytes   = 256
-	maxThoughtBytes = 4096
-	maxCallIDs      = 64
-	maxCallIDBytes  = 128
-)
-
 // validate is the one rule Part and Decode share, so a step Part emits is
 // one Decode reads and the reverse.
 func (s Step) validate() error {
@@ -99,8 +110,8 @@ func (s Step) validate() error {
 		return fmt.Errorf("stepmsg: more than %d call ids", maxCallIDs)
 	}
 	for _, id := range s.CallIDs {
-		if id == "" || len(id) > maxCallIDBytes {
-			return fmt.Errorf("stepmsg: a call id is empty or over %d bytes", maxCallIDBytes)
+		if id == "" || len(id) > maxIDBytes {
+			return fmt.Errorf("stepmsg: a call id is empty or over %d bytes", maxIDBytes)
 		}
 	}
 	switch s.Kind {
@@ -115,6 +126,11 @@ func (s Step) validate() error {
 		}
 		if st.Settled < 0 || st.Total < 0 || (st.Total > 0 && st.Settled > st.Total) {
 			return fmt.Errorf("stepmsg: settled %d of %d is not a count", st.Settled, st.Total)
+		}
+		if len(st.ID) > maxIDBytes || len(st.ParentTaskID) > maxIDBytes || len(st.Title) > maxTitleBytes ||
+			len(st.Status) > maxWordBytes || len(st.Verdict) > maxWordBytes || len(st.Summary) > maxSummaryBytes {
+			return fmt.Errorf("stepmsg: a subtask field is over its bound (ids %d, title %d, status and verdict %d, summary %d bytes)",
+				maxIDBytes, maxTitleBytes, maxWordBytes, maxSummaryBytes)
 		}
 	default:
 		return fmt.Errorf("stepmsg: kind %q is not plan, subtask or synthesis", s.Kind)
@@ -140,13 +156,6 @@ func (s Step) Part() (lib.Part, error) {
 	}
 	return lib.Part{Kind: partKindData, Data: raw}, nil
 }
-
-// stepKeys and subtaskKeys are the record's keys, matched exactly. The
-// subtask is read on its own, so its keys match exactly too.
-var (
-	stepKeys    = []string{"schema", "kind", "title", "thought", "callIds"}
-	subtaskKeys = []string{"id", "title", "status", "verdict", "summary", "settled", "total", "parentTaskId"}
-)
 
 // decodeExact unmarshals the object raw into v through only the keys named,
 // matched exactly: encoding/json would match a struct field to "Schema" or
@@ -184,7 +193,7 @@ func Decode(p lib.Part) (Step, bool) {
 	if err != nil {
 		return Step{}, false
 	}
-	if raw, ok := all["subtask"]; ok && string(raw) != "null" {
+	if raw, ok := all[subtaskKey]; ok && string(raw) != nullJSON {
 		var st Subtask
 		if _, err := decodeExact(raw, subtaskKeys, &st); err != nil {
 			return Step{}, false
