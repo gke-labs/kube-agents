@@ -3223,6 +3223,16 @@ def check_gitlab_workload_manifest(project_id: str) -> CheckResult:
     host = gitlab.DEFAULT_HOST
     import urllib.error as _urlerr
 
+    # The run's deadline, honoured as every other command honours it: the
+    # helper's calls are not run_cmd or _net_timeout, so its per-call
+    # timeout is cut to the time left here (the module is this check's own
+    # load), and a run already out of time starts no read.
+    if _RUN_DEADLINE is not None:
+        left = _RUN_DEADLINE - time.monotonic()
+        if left <= 0:
+            return unread(f"{host}/{project_path}", "the run's deadline passed before this check read anything")
+        gitlab.REQUEST_TIMEOUT_SECONDS = _net_timeout(gitlab.REQUEST_TIMEOUT_SECONDS)
+
     try:
         _, branch = gitlab.project_view(project_path, token, host=host)
         state, body = gitlab.repository_file(project_path, path, token, host=host, ref=branch)
@@ -3397,7 +3407,7 @@ def _workload_manifest_problem(body: str, collect, siblings: dict[str, str] | No
                 raise
             except Exception:
                 alone = None
-            if alone is not None and alone.get(GITOPS_WORKLOAD_MANIFEST_KEY):
+            if alone is not None:
                 raiser = ""
                 for rel, text in siblings.items():
                     try:
@@ -3408,7 +3418,15 @@ def _workload_manifest_problem(body: str, collect, siblings: dict[str, str] | No
                         raiser = rel
                         break
                 named = f" {raiser}" if raiser else ""
-                return f"{SIBLING_RAISE_PREFIX}{type(exc).__name__}: {exc}){named}; the seed alone indexes and keys it"
+                if alone.get(GITOPS_WORKLOAD_MANIFEST_KEY):
+                    return f"{SIBLING_RAISE_PREFIX}{type(exc).__name__}: {exc}){named}; the seed alone indexes and keys it"
+                # The seed is at fault for not keying the Deployment, and a
+                # sibling is at fault for the raise: the replace is right,
+                # and the sibling is named so the next run does not stop there.
+                return (
+                    "no document in it is keyed as " + "/".join(GITOPS_WORKLOAD_MANIFEST_KEY)
+                    + f"; beside it{named} makes the index raise ({type(exc).__name__}: {exc}), which the replace does not cure"
+                )
         return f"the index raises on it ({type(exc).__name__}: {exc})"
     paths = index.get(GITOPS_WORKLOAD_MANIFEST_KEY)
     if not paths:

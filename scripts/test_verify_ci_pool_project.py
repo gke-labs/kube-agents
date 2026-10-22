@@ -2199,6 +2199,23 @@ class GitlabWorkloadManifestTest(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertNotIn("the seed stands", result.message)
         self.assertIn("seed-file", result.message, "the seed is the file at fault, so the replace command is right")
+        self.assertIn("no document in it is keyed", result.message, "and the verdict says what the seed lacks, not that it raises")
+        self.assertIn("clusters/seeded-a/apps/x.yaml", result.message, "with the raising sibling named for the next run")
+
+    def test_the_run_deadline_cuts_the_helpers_timeout_and_stops_a_run_out_of_time(self):
+        forge = self._Forge({self._PATH: checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n"})
+        forge.REQUEST_TIMEOUT_SECONDS = 30
+        with mock.patch.object(checker, "_RUN_DEADLINE", time.monotonic() + 5):
+            result = self._check(forge)
+        self.assertTrue(result.passed, result.message)
+        self.assertLessEqual(forge.REQUEST_TIMEOUT_SECONDS, 5)
+        self.assertGreaterEqual(forge.REQUEST_TIMEOUT_SECONDS, checker.NET_TIMEOUT_FLOOR_SECONDS)
+        spent = self._Forge({self._PATH: checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n"})
+        with mock.patch.object(checker, "_RUN_DEADLINE", time.monotonic() - 1):
+            result = self._check(spent)
+        self.assertFalse(result.read)
+        self.assertIn("deadline passed", result.warnings[0])
+        self.assertEqual([], spent.calls, "a run out of time starts no read")
 
     def test_an_unwritable_scratch_tree_leaves_the_check_unread(self):
         forge = self._Forge({self._PATH: checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n", "clusters/seeded-a/apps/x.yaml": "a: 1\n"})
