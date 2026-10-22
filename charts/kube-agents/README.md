@@ -611,7 +611,7 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   On an installer-managed install (`upgrade.sh` full mode), custom refs can
   be preserved across upgrades by specifying them via `TF_VAR_extra_helm_values`
   in `install.env` (e.g.
-  `TF_VAR_extra_helm_values='{platformAgent={integration={slack={botTokenSecretRef={name="custom-slack-secret"}}}}}'`).
+  `TF_VAR_extra_helm_values='{platformAgent={integration={slack={botTokenSecretRef={name="custom-slack-secret"},appTokenSecretRef={name="custom-slack-secret"}}}}}'`).
   Note: installer recovery heuristics and front-door flag validation for split
   Secrets are decoupled and deferred to follow-up work; the installer expects
   the tokens in `install.env` or the shared Secret until that lands.
