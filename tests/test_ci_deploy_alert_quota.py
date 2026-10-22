@@ -98,13 +98,19 @@ class CiDeployAlertQuotaTest(unittest.TestCase):
         window = re.search(r'readonly EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS="(\d+)"', text)
         self.assertIsNotNone(window, "hack/ci-deploy.sh no longer sets EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS")
         assert window is not None
-        self.assertGreater(int(window.group(1)), 0, "the window is off, so incident-triage-workload-fold cannot pass")
-        self.assertLessEqual(
+        self.assertGreaterEqual(
             int(window.group(1)),
-            300,
-            "a window past 5 minutes approaches the gap between two repetitions of an "
-            "autoops case, which re-plants the same workload; read the comment above "
-            "EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS before raising it",
+            60,
+            "the window must outlast the spread of incident-triage-workload-fold's three "
+            "replicas (measured up to 32 s); read the comment above "
+            "EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS before lowering it",
+        )
+        self.assertLess(
+            int(window.group(1)),
+            270,
+            "a repetition of an autoops case lasts at least 4.5 minutes, so a window that "
+            "long can fold one repetition into the last when a matrix runs them back to "
+            "back; read the comment above EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS before raising it",
         )
 
     def test_no_two_env_overrides_share_an_index(self) -> None:

@@ -76,20 +76,29 @@ readonly EVAL_ALERT_DAILY_LIMIT_DRIFT="0"
 # in agents/platform/scripts/session_kv_server.py), on so that
 # incident-triage-workload-fold can see three replicas become one incident.
 # Like the ceilings above it is install-wide, so it reaches every case, and the
-# value is bounded on both sides by that. It must outlast the spread of one
-# Deployment's replicas crossing the watcher's BackOff debounce together, which
-# is seconds. And it must stay shorter than the gap between two repetitions of
-# a case that re-plants the same workload in the same namespace and then waits
-# for that repetition's own card (autoops-warning-event-triage,
-# autoops-crashloop-config-triage, autoops-warning-event-no-action-triage, whose
-# plant also fails on any answer but `injected`): their turn waits for the card to finish, a
-# median of ~7 minutes, and a window longer than the gap folds repetition 2's
-# incident into repetition 1's, so the case waits out its timeout for a card
-# nobody files. incident-triage-workload-fold's own repetitions can run ~4
-# minutes apart and do fold into the first one's incident; its check still
-# fails on a daemon that does not fold, since every replica's row is then
-# admitted.
-readonly EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS="300"
+# value is bounded on both sides by measurements, not medians:
+#
+# - Above: the spread of one Deployment's replicas crossing the watcher's
+#   BackOff debounce, first event to last. Measured up to 32 s over eight
+#   bursts of that case's three replicas on a dev install (2026-10-22). A
+#   replica that lands after the window opens an incident of its own, which
+#   reds the case.
+# - Below: the gap between two repetitions of a case that re-plants one
+#   workload and waits for that repetition's own card
+#   (autoops-warning-event-triage, autoops-crashloop-config-triage,
+#   autoops-warning-event-no-action-triage, whose plant also fails on any
+#   answer but `injected`). A window longer than the gap folds repetition 2's
+#   incident into repetition 1's and no card comes. The unit queue below is
+#   repetition-major (`sort -k1,1n`), so the rest of the matrix runs between
+#   two repetitions of one case: over 18 nightlies (2026-10) the watcher's own
+#   log (artifacts/agent-api-auth.log) put consecutive repetitions of the first
+#   two at least 48.5 and 51.8 minutes apart, and the third's 181 minutes. A
+#   matrix holding one such case alone runs them back to back, and a
+#   repetition then still lasts at least 4.5 minutes (the third's shortest).
+#
+# 150 s clears the first by almost five times and stays under the second's
+# floor of 270 s. tests/test_ci_deploy_alert_quota.py holds it between them.
+readonly EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS="150"
 
 # The subscription the drift detector pulls from. The pool project's own
 # provisioning owns the resource: scripts/provision_ci_pool_project.sh sets

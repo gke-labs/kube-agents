@@ -11,16 +11,16 @@
 #
 # The stack is autoops-warning-event-triage's, at three replicas and under its
 # own namespace and workload name: two cases on one name share the daemon's
-# fold window. The CI window is short enough that autoops-warning-event-triage's
-# repetitions, minutes apart while it waits for its card, do not fold into one
-# another; this case's own repetitions can (below). The comment above
-# EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS in hack/ci-deploy.sh says why it must
-# stay short.
+# fold window. The comment above EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS in
+# hack/ci-deploy.sh gives the measured bounds that keep the CI window (150 s)
+# longer than this case's burst and shorter than the gap between two
+# repetitions of the autoops cases.
 #
-# A repetition is a short apply and a short turn, ~4 minutes, so a later
-# repetition's burst can land inside the first one's window and fold into its
-# incident. That still passes, and correctly: a daemon that does not fold
-# admits every replica's row, so the newest incident has nothing folded into it.
+# A repetition run back to back with the last on a dev install can still land
+# inside a longer window there and fold into the previous repetition's
+# incident (accept_folded lets the plant end on that). That still passes, and
+# correctly: a daemon that does not fold admits every replica's row, so the
+# newest incident has nothing folded into it.
 #
 # The grade is deterministic and reads the daemon's ledger, not the agent's
 # words: the ledger is where a folded event is recorded against its anchor, and
