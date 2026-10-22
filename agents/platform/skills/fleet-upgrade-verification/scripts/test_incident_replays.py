@@ -26,8 +26,9 @@ EXTRA_NODE_BLOCKS = ("10.4.2.0/24", "10.4.3.0/24")
 class SurgeRuleIncidentReplayTest(unittest.TestCase):
     def test_2025_04_28_gpu_pool_upgrade_stalled_halfway_on_accelerator_capacity(self):
         """A GPU node pool's upgrade stalled halfway when the zone had no accelerator capacity
-        for its surge node and left the pool on two versions; before the window the rule blocks
-        on the surging accelerator pool with no reservation, naming the reservation first and
+        for its surge node and left the pool on two versions; before the window the rule files a
+        risk on the surging accelerator pool with no reservation (the upgrade waits with the old
+        node serving, so it is not a blocker), naming the reservation first and
         the in-place strategy only for a pool with a spare node, so the operator holds one or
         changes the strategy before the upgrade starts."""
         record, nodes = recorded()
@@ -35,9 +36,9 @@ class SurgeRuleIncidentReplayTest(unittest.TestCase):
         trainer = scheduled_pod("ml", "trainer", nodes[1]["metadata"]["name"], node_selector=GPU_LABEL, tolerations=[GPU_TOLERATION], cpu="1", memory="4Gi")
         trainer["spec"]["containers"][0]["resources"]["requests"][GPU_RESOURCE] = "1"
         out = evaluate(record, nodes + [trainer], target=GPU_TARGET)
-        self.assertEqual((out["risks"], out["unknown"]), ([], []))
-        self.assertEqual([f["finding"] for f in out["blocking"]], ["accelerator"])
-        finding = out["blocking"][0]
+        self.assertEqual((out["blocking"], out["unknown"]), ([], []))
+        self.assertEqual([f["finding"] for f in out["risks"]], ["accelerator"])
+        finding = out["risks"][0]
         self.assertEqual((finding["pool"], finding["accelerators"], finding["max_surge"], finding["reservation"]), ("gpu-pool", "1 x nvidia-l4", 1, None))
         text = capacity.describe(finding)
         self.assertIn("pool gpu-pool (1 x nvidia-l4) surges (maxSurge 1) with no reservation affinity: each surge node needs accelerator capacity the zone may not have, and a pool upgrade that cannot create one stalls between versions", text)

@@ -37,11 +37,7 @@ new rule adds its entry in that order.
   verdict. GKE's defaults (`maxSurge` 1, `maxUnavailable` 0) never trigger the placement half. The
   same pools are read for the surge node that must exist before a drain: every pool below the target
   on the surge strategy with `maxSurge` above 0 (the default is 1; a blue-green pool creates its
-  green pool instead and is not counted). A pool carrying accelerators (`config.accelerators`) that
-  surges with no reservation affinity (`config.reservationAffinity` consuming neither
-  `ANY_RESERVATION` nor `SPECIFIC_RESERVATION`) blocks, since a surge node needs accelerator
-  capacity the zone may not have and a pool upgrade that cannot create one stalls between versions;
-  one under a reservation is a note. Per Pod range (the pool's `networkConfig.podIpv4CidrBlock`,
+  green pool instead and is not counted). A pool carrying accelerators (`config.accelerators`) that surges with no reservation affinity (`config.reservationAffinity` consuming neither `ANY_RESERVATION` nor `SPECIFIC_RESERVATION`) is a risk, not a blocker: a surge node needs accelerator capacity the zone may not have, and a pool upgrade that cannot create one waits between versions with the old node serving (catalogue entry 2); one under a reservation is a note. Per Pod range (the pool's `networkConfig.podIpv4CidrBlock`,
   else the cluster's `clusterIpv4Cidr`), the free aligned blocks of the pools' per-node size (each
   node's `spec.podCIDR`, which the projected node read carries, else the block GKE sizes for the
   pool's pod limit; the largest block among the pools is the unit) are counted against the sum of

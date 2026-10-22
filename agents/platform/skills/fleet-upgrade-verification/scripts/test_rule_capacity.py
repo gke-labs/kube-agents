@@ -393,13 +393,15 @@ class SurgeHalvesTest(unittest.TestCase):
         self.assertIn("pool gpu-pool (maxSurge 0, maxUnavailable 1; 1 node(s), not autoscaled) removes a node before its replacement exists", out["notes"][0])
         self.assertEqual(capacity.free_blocks(capacity.pod_network(record["clusterIpv4Cidr"]), 24, nodes), (1022, 2, 1024))
 
-    def test_an_accelerator_pool_that_surges_with_no_reservation_blocks(self):
+    def test_an_accelerator_pool_that_surges_with_no_reservation_is_a_risk(self):
         record, nodes = recorded()
         surge(record, 1)
         out = evaluate(record, nodes, target=GPU_TARGET)
-        self.assertEqual((out["risks"], out["unknown"], out["notes"]), ([], [], []))
-        self.assertEqual(len(out["blocking"]), 1)
-        finding = out["blocking"][0]
+        # A risk, not a blocker: the surge upgrade waits for the accelerator with the old node
+        # serving (catalogue entry 2); only the Pod-range shortfall blocks.
+        self.assertEqual((out["blocking"], out["unknown"], out["notes"]), ([], [], []))
+        self.assertEqual(len(out["risks"]), 1)
+        finding = out["risks"][0]
         self.assertEqual((finding["finding"], finding["pool"], finding["accelerators"], finding["max_surge"], finding["reservation"]), ("accelerator", "gpu-pool", "1 x nvidia-l4", 1, None))
         text = capacity.describe(finding)
         self.assertIn("pool gpu-pool (1 x nvidia-l4) surges (maxSurge 1) with no reservation affinity", text)
@@ -408,16 +410,16 @@ class SurgeHalvesTest(unittest.TestCase):
         self.assertIn("; hold a reservation for the surge node, or, on a pool with a spare accelerator node for the drained pods, set the in-place strategy (max-surge 0, max-unavailable 1)", text)
         # NO_RESERVATION holds none either; a reservation the pool consumes is a note.
         record["nodePools"][1]["config"]["reservationAffinity"] = {"consumeReservationType": "NO_RESERVATION"}
-        self.assertEqual(len(evaluate(record, nodes, target=GPU_TARGET)["blocking"]), 1)
+        self.assertEqual(len(evaluate(record, nodes, target=GPU_TARGET)["risks"]), 1)
         record["nodePools"][1]["config"]["reservationAffinity"] = {"consumeReservationType": "SPECIFIC_RESERVATION", "key": "compute.googleapis.com/reservation-name", "values": ["l4-reservation"]}
         out = evaluate(record, nodes, target=GPU_TARGET)
-        self.assertEqual((out["blocking"], out["notes"]), ([], ["pool gpu-pool (1 x nvidia-l4) surges (maxSurge 1) under reservation affinity SPECIFIC_RESERVATION"]))
+        self.assertEqual((out["risks"], out["notes"]), ([], ["pool gpu-pool (1 x nvidia-l4) surges (maxSurge 1) under reservation affinity SPECIFIC_RESERVATION"]))
         # Two accelerators, and a pool at the target, which is not graded.
         del record["nodePools"][1]["config"]["reservationAffinity"]
         record["nodePools"][1]["config"]["accelerators"].append({"acceleratorCount": "2", "acceleratorType": "nvidia-tesla-t4"})
-        self.assertEqual(evaluate(record, nodes, target=GPU_TARGET)["blocking"][0]["accelerators"], "1 x nvidia-l4, 2 x nvidia-tesla-t4")
+        self.assertEqual(evaluate(record, nodes, target=GPU_TARGET)["risks"][0]["accelerators"], "1 x nvidia-l4, 2 x nvidia-tesla-t4")
         record["nodePools"][1]["version"] = "1.32.13-gke.2427000"
-        self.assertEqual(evaluate(record, nodes, target=GPU_TARGET)["blocking"], [])
+        self.assertEqual(evaluate(record, nodes, target=GPU_TARGET)["risks"], [])
 
     def test_a_pod_range_with_fewer_free_blocks_than_the_surge_need_blocks(self):
         record, nodes = recorded()
@@ -430,16 +432,17 @@ class SurgeHalvesTest(unittest.TestCase):
         text = capacity.describe(finding)
         self.assertIn("pod range 10.4.0.0/23 has 0 free /24 block(s) (2 of 2 hold a node) and the 1 surge node(s) of pool(s) default-pool (maxSurge 1) each need one", text)
         self.assertIn("lower max-surge or add a secondary Pod range", text)
-        # With the L4 pool surging too the need is two, and the accelerator half files its own blocker.
+        # With the L4 pool surging too the need is two, and the accelerator half files its own risk.
         surge(record, 1)
         out = evaluate(record, nodes, target=GPU_TARGET)
-        self.assertEqual([f["finding"] for f in out["blocking"]], ["accelerator", "pod-range"])
-        self.assertEqual((out["blocking"][1]["need"], out["blocking"][1]["pools"]), (2, [{"pool": "default-pool", "max_surge": 1}, {"pool": "gpu-pool", "max_surge": 1}]))
+        self.assertEqual([f["finding"] for f in out["blocking"]], ["pod-range"])
+        self.assertEqual([f["finding"] for f in out["risks"]], ["accelerator"])
+        self.assertEqual((out["blocking"][0]["need"], out["blocking"][0]["pools"]), (2, [{"pool": "default-pool", "max_surge": 1}, {"pool": "gpu-pool", "max_surge": 1}]))
         # A /22 has two free blocks, enough for both; a maxSurge of 3 is not.
         pod_range(record, "10.4.0.0/22")
-        self.assertEqual([f["finding"] for f in evaluate(record, nodes, target=GPU_TARGET)["blocking"]], ["accelerator"])
+        self.assertEqual([f["finding"] for f in evaluate(record, nodes, target=GPU_TARGET)["blocking"]], [])
         surge(record, 0, max_surge=3)
-        self.assertEqual([(f["finding"], f.get("need"), f.get("free")) for f in evaluate(record, nodes, target=GPU_TARGET)["blocking"]], [("accelerator", None, None), ("pod-range", 4, 2)])
+        self.assertEqual([(f["finding"], f.get("need"), f.get("free")) for f in evaluate(record, nodes, target=GPU_TARGET)["blocking"]], [("pod-range", 4, 2)])
         # No surge node, no need: both pools in place, or on a blue-green rollout.
         pod_range(record, "10.4.0.0/23")
         record["nodePools"][0]["upgradeSettings"] = NO_SURGE
@@ -499,7 +502,7 @@ class SurgeHalvesTest(unittest.TestCase):
         # Nodes not read: the accelerator half still grades; the Pod range half is unknown.
         surge(record, 1)
         out = evaluate(record, nodes, target=GPU_TARGET, read_errors={"node": "nodes is forbidden"})
-        self.assertEqual([f["finding"] for f in out["blocking"]], ["accelerator"])
+        self.assertEqual(([f["finding"] for f in out["blocking"]], [f["finding"] for f in out["risks"]]), ([], ["accelerator"]))
         self.assertIn("pod range headroom for the surge node(s) of pool(s) default-pool (maxSurge 1), gpu-pool (maxSurge 1): node not read (nodes is forbidden), so the free blocks were not counted", out["unknown"])
         # A record with no Pod range under either spelling, or one that does not parse.
         record, nodes = recorded()

@@ -13,7 +13,8 @@
 # per-node blocks are counted against the pools' `maxSurge` sum, and fewer blocks than
 # surge nodes blocks: a surge node with no block never registers and the pool upgrade
 # stalls between versions. A pool carrying accelerators that surges with no reservation
-# affinity blocks too: the surge node needs accelerator capacity the zone may not have.
+# affinity is a risk, not a blocker: the surge node needs accelerator capacity the zone may
+# not have, and the upgrade waits for it with the old node serving (catalogue entry 2).
 # Both findings name the numbers and the action (lower `max-surge` or add a secondary Pod
 # range; set the in-place strategy, `max-surge` 0 and `max-unavailable` 1, or hold a
 # reservation).
@@ -74,8 +75,9 @@ expected_output: >-
   their max-surge, so a surge node would never register, or a pool with
   accelerators surges with no reservation affinity, naming the pool, its
   accelerators and its max-surge, so the surge node needs capacity the zone
-  may not have. It says the report grades that a blocker, names the report's
-  rule for it, surge-capacity, and recommends the rule's action: lower
+  may not have. It says how the report grades it (the short Pod range a
+  blocker, the accelerator pool a risk), names the report's rule for it,
+  surge-capacity, and recommends the rule's action: lower
   max-surge or add a secondary Pod range, or set the in-place strategy
   (max-surge 0, max-unavailable 1) or hold a reservation. Other clusters'
   blockers and risks come from the same run. It ends with one declared line

@@ -375,8 +375,7 @@ rigid-scheduling and spreading checks already run (see Scope). The additions:
   placing each node's pods onto the nodes they may schedule on, blocks when it cannot grow and a pod
   has no node to take it; and the Pod IP side: per Pod range, the free aligned blocks of the pools'
   per-node size against the surge nodes the pools below the target need (the sum of their
-  `maxSurge`), fewer blocks than nodes blocking, and a pool with accelerators that surges with no
-  reservation affinity blocking, since the zone may not have the accelerator for the surge node.
+  `maxSurge`), fewer blocks than nodes blocking, and a pool with accelerators that surges with no reservation affinity a risk, since the zone may not have the accelerator for the surge node and the upgrade then waits with the old node serving.
   The quota side is unread by the rule; the stockout audit reads regional quota.
 - **Workloads pinned to a pool being retired.** A `nodeSelector` or affinity naming a pool that is
   going away leaves those pods nowhere to land.

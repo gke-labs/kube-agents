@@ -587,7 +587,9 @@ def _grade_surge(out: dict, cluster: dict, surge_pools: list[tuple[dict, dict]],
         if reservation:
             out["notes"].append(NOTE_ACCELERATOR_RESERVED.format(pool=name, accelerators=text, max_surge=settings["max_surge"], reservation=reservation))
         else:
-            out["blocking"].append({FINDING_KEY: FINDING_ACCELERATOR, "pool": name, "accelerators": text, "max_surge": settings["max_surge"], "reservation": None})
+            # A risk, not a blocker: the surge upgrade waits for the accelerator with the old
+            # node serving (catalogue entry 2); the Pod-range shortfall below is the blocker.
+            out["risks"].append({FINDING_KEY: FINDING_ACCELERATOR, "pool": name, "accelerators": text, "max_surge": settings["max_surge"], "reservation": None})
     by_range: dict = {}
     for pool, settings in pending:
         by_range.setdefault(pool_pod_range(pool, cluster), []).append((pool, settings))
