@@ -81,9 +81,12 @@ spec:
             requests:
               cpu: "100m"
               memory: "2Gi"
+              # The tmp emptyDir's sizeLimit plus 256Mi for logs, as the chart.
+              ephemeral-storage: "1280Mi"
             limits:
               cpu: "500m"
               memory: "3Gi"
+              ephemeral-storage: "1280Mi"
           env:
             # See the pod securityContext above: the only writable directory.
             - name: HOME
@@ -163,5 +166,7 @@ spec:
         - name: config-volume
           configMap:
             name: litellm-config
+        # As the chart (templates/litellm.yaml): HOME and the tokenizer caches.
         - name: tmp
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 1Gi
