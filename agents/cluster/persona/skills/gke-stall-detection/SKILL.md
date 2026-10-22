@@ -15,7 +15,7 @@ Use this skill when a controller has gone quiet rather than red: a Gateway that 
 
 ## Heuristics and thresholds
 
-`scripts/stall_report.py`, in this skill's directory, applies four heuristics to every object it reads. Each is gated by an age threshold, so a controller that is merely slow is not reported.
+`scripts/stall_report.py`, in this skill's directory (the base directory the harness gives when it loads the skill), applies four heuristics to every object it reads. Each is gated by an age threshold, so a controller that is merely slow is not reported.
 
 | Heuristic            | Fires when                                                                                                                                                                                                                                                             | Age measured from                                |
 | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------ |
@@ -29,6 +29,8 @@ Thresholds live at the top of the script: `DEFAULT_STALL_MINUTES = 15` for every
 A single run reads one snapshot, so `repeating-warnings` cannot watch a count move; the span and recency conditions are its stand-in. Run the script twice a few minutes apart when a rising count is the evidence you need.
 
 ## Running it
+
+Run these from this skill's directory (the base directory the harness gives when it loads the skill), where `scripts/stall_report.py` is.
 
 ```bash
 # Every namespaced kind in one namespace (kubectl api-resources decides which):

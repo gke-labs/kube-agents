@@ -47,8 +47,9 @@ on:
       - "agents/platform/scripts/credential_proxy.py"
       # lib/persona/claudecode's cluster persona tests read the persona, the
       # cluster skills its copies must match, and the two scripts its skills
-      # carry byte-identical copies of. An edit to any of them alone has to
-      # run those tests.
+      # carry byte-identical copies of; cmd/session-persona's
+      # TestSourceSkillsTeachNoWrites reads the persona's skills too. An edit
+      # to any of them alone has to run those tests.
       - "agents/cluster/persona/**"
       - "agents/platform/scripts/stall_report.py"
       - "agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh"

@@ -2249,7 +2249,8 @@ COPY --chown=hermes:hermes agents/platform/governance/ /opt/platform-template/go
 COPY --chown=hermes:hermes agents/platform/hindsight/ /opt/platform-template/hindsight/
 
 # Copy the Cluster Agent profile TEMPLATE (SOUL, config, skills), scaffolded
-# into per-cluster Hermes profiles at runtime by scripts/cluster_agent_profile.py.
+# into per-cluster Hermes profiles at runtime by scripts/cluster_agent_profile.py,
+# plus persona/, copied but not scaffolded.
 COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 
 # Platform config is self-contained (scaffold does not merge again): build it by

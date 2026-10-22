@@ -20,7 +20,7 @@ To begin troubleshooting, acquire the following context from the user or active 
   - **Workload Namespace** (e.g., `checkout`)
   - **Issue Time** (Optional, e.g., `2026-06-01T15:30:00Z`)
 
-Credentials for the target are served by the credential proxy under the task's grant; you never fetch or configure them yourself. Before running any diagnostics, confirm the target: `PROFILE_TASK_PROJECT`, `PROFILE_TASK_LOCATION` and `PROFILE_TASK_CLUSTER` must match the cluster the request names, and `kubectl get --raw /version` must answer. On an empty value or a mismatch, or if that read is refused, stop and say so, naming both clusters. Never investigate a cluster other than the target.
+Credentials for the target are served by the credential proxy under the task's grant; you never fetch or configure them yourself. Before running any diagnostics, confirm the target: `PROFILE_TASK_PROJECT`, `PROFILE_TASK_LOCATION` and `PROFILE_TASK_CLUSTER` must match the cluster the request names, and `kubectl version -o json` must answer. Pass `--project "$PROFILE_TASK_PROJECT"` to every `gcloud` call. On an empty value or a mismatch, or if the proxy denies that read or cannot reach the cluster, stop and say so, naming both clusters. Never investigate a cluster other than the target.
 
 #### Time Handling & Fallbacks:
 

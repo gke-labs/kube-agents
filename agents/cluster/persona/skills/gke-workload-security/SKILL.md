@@ -26,7 +26,7 @@ script.
 - Checks if Binary Authorization is enabled.
 - Checks for Private Cluster configuration.
 
-**Command:**
+**Command** (run from this skill's directory, the base directory the harness gives when it loads the skill):
 
 ```bash
 bash scripts/audit_cluster.sh <cluster-name> <region> <project-id>

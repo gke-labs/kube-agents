@@ -14,12 +14,20 @@ generic version of the same agent, with the kanban loop, the per-cluster
 stamping and the pinned kubeconfig taken out: credentials for the task's target
 come from the credential proxy under the task's grant.
 
-Its skills are copies of `agents/cluster/skills` with only the edits
-`a2a/lib/persona/claudecode/cluster_persona_test.go` lists, and they call their
-scripts by skill-relative paths (`scripts/...`). The scripts are byte-identical
-copies of `agents/platform/scripts/stall_report.py` and
-`agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh`; the
-same test checks both.
+The instructions' first step reads the target from `PROFILE_TASK_PROJECT`,
+`PROFILE_TASK_LOCATION` and `PROFILE_TASK_CLUSTER`, which the profile worker
+sets from the task's parameters (the contract agreed with the #3655 owner).
+Nothing sets them yet, so until that worker lands the first step stops every
+task.
+
+Each skill's `SKILL.md` is its `agents/cluster/skills` source with only the
+edits `a2a/lib/persona/claudecode/cluster_persona_test.go` lists. Every other
+file is a byte-identical copy: the assets of the same path under
+`agents/cluster/skills`, and the two scripts of
+`agents/platform/scripts/stall_report.py` and
+`agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh`. The
+same test checks both. The skills run their scripts by skill-relative paths
+(`scripts/...`), from the skill's directory.
 
 What it holds:
 

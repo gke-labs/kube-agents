@@ -109,24 +109,44 @@ func TestTheClusterPersonaNamesNoClusterAndNoBoard(t *testing.T) {
 func TestTheClusterPersonaStatesItsRedLines(t *testing.T) {
 	text := load(t, clusterPersonaDir).Instructions
 	for what, phrase := range map[string]string{
-		"target cluster only":         "**The target cluster only.**",
-		"never wildcard the project":  "`projects/-` is refused",
-		"read-only":                   "Never mutate cluster state",
-		"a denial is terminal":        "**A denial is terminal.**",
-		"a refused read is a gap":     "re-run it with a spelling the policy allows, or report it as a gap",
-		"no GitOps writes or PRs":     "Never open Pull Requests or push commits",
-		"never expose keys":           "Never expose raw passwords or GCP/GKE keys",
-		"target project env":          "`PROFILE_TASK_PROJECT`",
-		"target location env":         "`PROFILE_TASK_LOCATION`",
-		"target cluster env":          "`PROFILE_TASK_CLUSTER`",
-		"stop on a mismatch":          "If any is empty, or any differs, stop",
-		"liveness read through proxy": "`kubectl get --raw /version`",
+		"target cluster only":        "**The target cluster only.**",
+		"never wildcard the project": "`projects/-` is refused",
+		"read-only":                  "Never mutate cluster state",
+		"a denial is terminal":       "**A denial is terminal.**",
+		"a refused read is a gap":    "re-run it with a spelling the policy allows, or report it as a gap",
+		"no GitOps writes or PRs":    "Never open Pull Requests or push commits",
+		"never expose keys":          "Never expose raw passwords or GCP/GKE keys",
 	} {
 		if !strings.Contains(text, phrase) {
 			t.Errorf("instructions.md no longer says %s (%q)", what, phrase)
 		}
 	}
+	// The first step and the read-only rule are pinned whole: a weakened
+	// "stop", a refusal turned into "continue", a dropped verb or the lost
+	// "never investigate another cluster" line all fail here.
+	norm := normalizeMarkdown(text)
+	for what, pinned := range map[string]string{"the confirm-the-target block": confirmTargetBlock, "the read-only rule": readOnlyRule} {
+		if !strings.Contains(norm, normalizeMarkdown(pinned)) {
+			t.Errorf("instructions.md no longer carries %s as pinned in this test", what)
+		}
+	}
 }
+
+// confirmTargetBlock is §1's first step, and readOnlyRule §2's read-only
+// rule, as instructions.md states them.
+var (
+	confirmTargetBlock = `Credentials for the task's target are served by the credential proxy under the task's grant: ` + "`" + `kubectl` + "`" + ` and ` + "`" + `gcloud` + "`" + ` reach it through the proxy, and you never fetch or configure credentials yourself. Which cluster answers is the proxy's job, from the task's grant. Pass ` + "`" + `--project "$PROFILE_TASK_PROJECT"` + "`" + ` to every ` + "`" + `gcloud` + "`" + ` call.
+
+**First, confirm the target.** Before any diagnostics:
+
+1. The worker sets ` + "`" + `PROFILE_TASK_PROJECT` + "`" + `, ` + "`" + `PROFILE_TASK_LOCATION` + "`" + ` and ` + "`" + `PROFILE_TASK_CLUSTER` + "`" + ` from the task's parameters; read them with ` + "`" + `printenv PROFILE_TASK_PROJECT PROFILE_TASK_LOCATION PROFILE_TASK_CLUSTER` + "`" + `. If any env value is empty, stop. If the request names a project, location or cluster, each must match the env value (a zone and its region are not a match; stop and ask); if it names none, the env values are the target. On a mismatch, stop: say plainly that the task's target and the request disagree, and name both.
+2. Then make one liveness read through the proxy: ` + "`" + `kubectl version -o json` + "`" + `. A command-policy refusal of that spelling is retried once with an allowed one (§2). If the proxy denies the read (a 403, ` + "`" + `Forbidden` + "`" + `) or it cannot reach the cluster, say that the credential proxy will not serve the target, and stop.
+
+An investigation run against the wrong cluster produces a confident, wrong report. Never investigate a cluster other than the task's target.
+`
+	readOnlyRule = `- **Read-only.** Never mutate cluster state: no ` + "`" + `kubectl apply` + "`" + `, ` + "`" + `patch` + "`" + `, ` + "`" + `edit` + "`" + `, ` + "`" + `delete` + "`" + `, ` + "`" + `scale` + "`" + `, ` + "`" + `rollout restart` + "`" + `, or ` + "`" + `exec` + "`" + ` into workloads. Your tools are for read-only diagnostics: ` + "`" + `get` + "`" + `, ` + "`" + `describe` + "`" + `, ` + "`" + `logs` + "`" + `, ` + "`" + `events` + "`" + `, ` + "`" + `top` + "`" + `, and equivalent reads.
+`
+)
 
 // scriptSources maps a persona skill file to the platform script it copies;
 // every other file of a persona skill copies the same path under
@@ -181,6 +201,32 @@ func TestTheClusterPersonaSkillFilesMatchTheirSources(t *testing.T) {
 	}
 }
 
+// The other direction: every file a cluster skill has besides its SKILL.md
+// is in the persona's copy, so a script or asset added to the source is not
+// left behind.
+func TestTheClusterPersonaSkillsLackNoSourceFile(t *testing.T) {
+	err := filepath.WalkDir(clusterSkillsDir, func(full string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		rel, err := filepath.Rel(clusterSkillsDir, full)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		if path.Base(rel) == persona.SkillFile && path.Dir(path.Dir(rel)) == "." {
+			return nil
+		}
+		if _, err := os.Stat(path.Join(clusterPersonaDir, persona.SkillsDir, rel)); err != nil {
+			t.Errorf("agents/cluster/skills/%s has no copy in the persona: copy it to agents/cluster/persona/skills/%s", rel, rel)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 // clusterSkillsDir holds the skills the persona's copies are made from.
 const clusterSkillsDir = "../../../../agents/cluster/skills"
 
@@ -219,12 +265,14 @@ var (
 			{"card", "request", 0},
 		},
 		"gke-stall-detection": {
-			{"`/opt/data/scripts/stall_report.py`", "`scripts/stall_report.py`, in this skill's directory,", 1},
+			{"`/opt/data/scripts/stall_report.py`", "`scripts/stall_report.py`, in this skill's directory (the base directory the harness gives when it loads the skill),", 1},
+			{"## Running it\n\n", "## Running it\n\nRun these from this skill's directory (the base directory the harness gives when it loads the skill), where `scripts/stall_report.py` is.\n\n", 1},
 			{getCredentialsLine + "\n", "", 1},
 			{"/opt/data/scripts/stall_report.py", "scripts/stall_report.py", 4},
 		},
 		"gke-workload-security": {
 			{"/opt/data/scripts/audit_cluster.sh", "bash scripts/audit_cluster.sh", 1},
+			{"**Command:**", "**Command** (run from this skill's directory, the base directory the harness gives when it loads the skill):", 1},
 			// The persona loader reads a word-initial @ as an import.
 			{"<gsa-name>@<project-id>", "GSA_NAME@PROJECT_ID", 2},
 		},
@@ -245,53 +293,51 @@ var (
 	emphasisRE = regexp.MustCompile(`(^|[\s(])\*([^*\s][^*]*?)\*([\s,.;:)]|$)`)
 )
 
-// normalizeMarkdown undoes what prettier changes when it reflows an edited
-// file's prose: line breaks and indentation, table rule widths, and
-// *emphasis*. A fenced block is kept exactly, line by line, apart from the
-// indentation of the fence itself (a list item's block moves with the item),
-// so a de-indented yaml key inside one still shows.
+// normalizeMarkdown undoes what prettier changes when it rewrites an edited
+// file: in prose, runs of spaces inside a line, trailing spaces, table rule
+// widths and cell padding, and *emphasis*. Line breaks and the indentation a
+// line starts with (a list item's nesting) are kept. A fenced block is kept
+// exactly, line by line, apart from the indentation of the fence itself (a
+// list item's block moves with the item), so a de-indented yaml key inside
+// one still shows.
 func normalizeMarkdown(s string) string {
-	var out, prose []string
-	flush := func() {
-		if len(prose) > 0 {
-			p := strings.Join(strings.Fields(strings.Join(prose, "\n")), " ")
-			p = ruleRE.ReplaceAllString(p, "---")
-			out = append(out, emphasisRE.ReplaceAllString(p, "${1}_${2}_${3}"))
-			prose = nil
-		}
-	}
+	var out []string
 	lines := strings.Split(s, "\n")
 	for i := 0; i < len(lines); i++ {
-		trimmed := strings.TrimLeft(lines[i], " ")
+		line := strings.TrimRight(lines[i], " \t")
+		trimmed := strings.TrimLeft(line, " ")
+		indent := len(line) - len(trimmed)
 		if !strings.HasPrefix(trimmed, "```") && !strings.HasPrefix(trimmed, "~~~") {
-			prose = append(prose, lines[i])
+			body := strings.Join(strings.Fields(trimmed), " ")
+			if strings.HasPrefix(body, "|") {
+				body = ruleRE.ReplaceAllString(body, "---")
+			} else {
+				body = strings.Repeat(" ", indent) + body
+			}
+			out = append(out, emphasisRE.ReplaceAllString(body, "${1}_${2}_${3}"))
 			continue
 		}
-		flush()
-		indent := len(lines[i]) - len(trimmed)
 		fence := trimmed[:3]
-		block := []string{trimmed}
+		out = append(out, trimmed)
 		for i++; i < len(lines); i++ {
 			body := lines[i]
 			if len(body) >= indent && strings.TrimSpace(body[:indent]) == "" {
 				body = body[indent:]
 			}
-			block = append(block, body)
+			out = append(out, body)
 			if strings.HasPrefix(strings.TrimLeft(lines[i], " "), fence) {
 				break
 			}
 		}
-		out = append(out, strings.Join(block, "\n"))
 	}
-	flush()
-	return strings.Join(out, " ")
+	return strings.Join(out, "\n")
 }
 
 // The persona's text for each rewritten section: the reporting goes to the
 // final answer instead of a kanban card, and the target is checked against
 // the task instead of fetched.
 var (
-	troubleshootingTarget = `Credentials for the target are served by the credential proxy under the task's grant; you never fetch or configure them yourself. Before running any diagnostics, confirm the target: ` + "`" + `PROFILE_TASK_PROJECT` + "`" + `, ` + "`" + `PROFILE_TASK_LOCATION` + "`" + ` and ` + "`" + `PROFILE_TASK_CLUSTER` + "`" + ` must match the cluster the request names, and ` + "`" + `kubectl get --raw /version` + "`" + ` must answer. On an empty value or a mismatch, or if that read is refused, stop and say so, naming both clusters. Never investigate a cluster other than the target.
+	troubleshootingTarget = `Credentials for the target are served by the credential proxy under the task's grant; you never fetch or configure them yourself. Before running any diagnostics, confirm the target: ` + "`" + `PROFILE_TASK_PROJECT` + "`" + `, ` + "`" + `PROFILE_TASK_LOCATION` + "`" + ` and ` + "`" + `PROFILE_TASK_CLUSTER` + "`" + ` must match the cluster the request names, and ` + "`" + `kubectl version -o json` + "`" + ` must answer. Pass ` + "`" + `--project "$PROFILE_TASK_PROJECT"` + "`" + ` to every ` + "`" + `gcloud` + "`" + ` call. On an empty value or a mismatch, or if the proxy denies that read or cannot reach the cluster, stop and say so, naming both clusters. Never investigate a cluster other than the target.
 
 `
 	troubleshootingReport = `### Step 5: Report the RCA & Proposed Correction
@@ -328,7 +374,7 @@ func rewriteSpan(t *testing.T, name, s, start, end, text string) string {
 		}
 		j = i + k
 	}
-	return s[:i] + normalizeMarkdown(text) + " " + s[j:]
+	return s[:i] + normalizeMarkdown(text) + s[j:]
 }
 
 // Each persona skill is its source with only the allowed edits, so a fix to a
@@ -356,8 +402,9 @@ func TestTheClusterPersonaSkillsMatchTheirSources(t *testing.T) {
 			want = strings.ReplaceAll(want, ed.old, ed.new)
 		}
 		for _, r := range allowedSkillRewrites[name] {
-			want = strings.TrimSpace(rewriteSpan(t, name, want, r.start, r.end, r.text))
+			want = rewriteSpan(t, name, want, r.start, r.end, r.text)
 		}
+		want, got = strings.TrimSpace(want), strings.TrimSpace(got)
 		if want != got {
 			i := 0
 			for i < len(want) && i < len(got) && want[i] == got[i] {
