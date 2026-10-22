@@ -132,6 +132,15 @@ def test_a_missing_store_is_reported_not_raised(
     assert read is not None and "no such store" in read["error"]
 
 
+def test_a_store_without_a_messages_table_is_reported_not_graded(stores: tuple[Path, Path]) -> None:
+    """A schema change in a Hermes pin is an error, not twenty lost starts."""
+    _, state = stores
+    with sqlite3.connect(state) as conn:
+        conn.execute("DROP TABLE messages")
+    read = read_starts(_local_shell, NAMESPACE, ["uid-0"], 30)
+    assert read is not None and "no messages table" in read["error"]
+
+
 def test_an_unreadable_pod_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(triage_starts, "read_planted_pods", lambda ns, t: {f"uid-{i}": "p" for i in range(20)})
     monkeypatch.setattr(triage_starts, "agent_shell", lambda c, t: "")

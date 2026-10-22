@@ -111,8 +111,8 @@ variable "agent_cli_container" {
 
 variable "start_settle_seconds" {
   type        = number
-  description = "Seconds to wait after the last fire, so the daemon's triage starts can finish before the agent turn"
-  default     = 300
+  description = "Seconds to wait after the last fire before the agent turn: the product's queue limit (TRIAGE_QUEUE_WAIT_LIMIT_S in session_kv_server.py), so a start it calls on time is graded as started"
+  default     = 1200
 }
 
 # Identify the CI run that planted this, so a janitor can find what a killed

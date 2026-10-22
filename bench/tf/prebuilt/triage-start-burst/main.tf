@@ -19,8 +19,8 @@
 # each raises one image-pull Warning. It then waits until k8s-event-watcher has
 # logged a `fire` line for every one of them: the daemon answered `injected`
 # for each, so each has an admitted ledger row and a triage start queued behind
-# it. What the case grades -- whether every one of those starts produced a
-# Hermes session -- is left to the verifier.
+# it. What the case grades -- whether every one of those starts sent its turn,
+# a Hermes session with a message -- is left to the verifier.
 #
 # It builds nothing, for the reason bench/tf/prebuilt/autoops-incident/main.tf
 # gives at length: the host cluster is the only cluster the watcher is sure to
@@ -222,11 +222,12 @@ resource "null_resource" "burst" {
 
       # ---- Let the starts finish ---------------------------------------------
       # A fire means the daemon admitted the alert and queued its start; the
-      # turn itself can begin minutes later. A daemon that starts turns a few at
-      # a time took up to 4.5 minutes for 20 on a warm gateway (#3583), and the
-      # objective converges for only 120 s after the agent's turn, so the wait
-      # is here. A fixed wait, not a poll of the start: what started is the
-      # check's question, not the plant's.
+      # turn itself can begin minutes later, because the daemon starts a few at
+      # a time. The wait is the product's own queue limit, so a start the
+      # product calls on time is graded as started; the objective converges for
+      # only 120 s after the agent's turn, so the wait is here. A fixed wait,
+      # not a poll of the start: what started is the check's question, not the
+      # plant's.
       echo "Waiting ${var.start_settle_seconds}s for the triage starts to finish."
       sleep ${var.start_settle_seconds}
     EOT

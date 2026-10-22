@@ -3027,7 +3027,10 @@ def _attempt_triage_start(start: _TriageStart) -> None:
         if attempt.answered:
             answered += 1
             budget_spent += now - began
-        left = min(left, TRIAGE_RETRY_BUDGET_S - budget_spent)
+            # The budget bounds answered attempts only: a refused connection
+            # (a gateway restarting after it spent the budget) waits under the
+            # queue limit, and the next answered attempt settles it.
+            left = min(left, TRIAGE_RETRY_BUDGET_S - budget_spent)
         if answered >= TRIAGE_RETRY_MAX_ATTEMPTS or left <= 0:
             _triage_not_started(start, attempt.detail)
             return
@@ -3130,7 +3133,7 @@ def trigger_agent_troubleshooter(
                 )
 
         # 2. Register thread-to-session mappings for two-way chat routing. This has
-        #    to happen before the turn in step 5: the card that turn files reads
+        #    to happen before the turn step 3 queues: the card that turn files reads
         #    this row to address its completion back to the alert's thread (see
         #    deploy/docker/patches/kanban_event_routing.py).
         if thread_id:
@@ -5148,7 +5151,7 @@ def inject_message(
         f"🌱 _Digging down to the root cause..._"
     )
 
-    # Delegate the heavy REST API call to FastAPI BackgroundTasks to keep response times sub-millisecond
+    # Hand the alert post and the triage start to a FastAPI background task, so the answer is immediate
     background_tasks.add_task(
         trigger_agent_troubleshooter,
         session_id,

@@ -104,10 +104,12 @@ try:
     store = ro(state_db)
     if not has_table(store, "sessions"):
         raise LookupError(state_db + " has no sessions table")
+    if not has_table(store, "messages"):
+        raise LookupError(state_db + " has no messages table")
     if sids:
         out["sessions"] = [r[0] for r in store.execute(
             "SELECT id FROM sessions WHERE id IN (%s)" % marks(sids), sids)]
-        if out["sessions"] and has_table(store, "messages"):
+        if out["sessions"]:
             out["messages"] = {sid: n for sid, n in store.execute(
                 "SELECT session_id, COUNT(*) FROM messages WHERE session_id IN (%s) GROUP BY session_id"
                 % marks(out["sessions"]), out["sessions"])}

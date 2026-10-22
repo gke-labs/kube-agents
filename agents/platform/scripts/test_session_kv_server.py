@@ -8091,6 +8091,13 @@ class TestTriageStartRetry(unittest.TestCase):
         self.assertGreater(sum(self.clock.sleeps), session_kv_server.TRIAGE_RETRY_BUDGET_S)
         self.assertEqual(self._state(), session_kv_server.TRIAGE_STATE_STARTED)
 
+    def test_a_restart_after_the_budget_is_spent_is_still_waited_for(self):
+        """Five long drains spend the budget; the restart that follows is refused, not answered."""
+        busy = [_http_error(503, retry_after=60)] * 5
+        urlopen, _ = self._run([_answered()] + busy + [_refused()] * 3 + [_answered(), _answered()])
+        self.assertEqual(self._urls(urlopen)[-1], "chat")
+        self.assertEqual(self._state(), session_kv_server.TRIAGE_STATE_STARTED)
+
     def test_a_second_lost_session_is_not_retried(self):
         urlopen, logs = self._run([_answered(), _http_error(404)] * 10)
         self.assertEqual(self._urls(urlopen), ["sessions", "chat", "sessions", "chat"])
@@ -8337,6 +8344,9 @@ class TestTriageStartBurst(unittest.TestCase):
         self.addCleanup(self.server.shutdown)
 
         real_urlopen = session_kv_server.urllib.request.urlopen
+        # The probe below must not go through `scaled`, which the patch applies
+        # to every `urllib.request.urlopen` in the process.
+        self.real_urlopen = real_urlopen
 
         def scaled(req, timeout=None):
             return real_urlopen(req, timeout=timeout * self.TIMEOUT_SCALE)
@@ -8366,7 +8376,7 @@ class TestTriageStartBurst(unittest.TestCase):
         def probe():
             while not done.is_set():
                 try:
-                    urllib.request.urlopen(probe_url, timeout=self.PROBE_TIMEOUT_S).close()
+                    self.real_urlopen(probe_url, timeout=self.PROBE_TIMEOUT_S).close()
                 except OSError:
                     probe_timeouts.append(time.time())
                 time.sleep(self.PROBE_INTERVAL_S)

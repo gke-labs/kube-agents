@@ -537,7 +537,7 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # whole assertion.
     "audit_chat_report_posted": (),
     # This repository, agent-pod- and cluster-reading: the namespace names the
-    # burst whose admitted alerts must each have a Hermes session.
+    # burst whose admitted alerts must each have started a triage turn.
     "triage_starts": ("namespace",),
 }
 
