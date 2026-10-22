@@ -6,9 +6,11 @@ package hermesbridge
 // Under -Q hermes writes nothing to stdout until the final response, so the
 // bridge cannot learn about tool calls from the pipe it already holds. What
 // hermes does offer is its outbound webhooks (agent/outbound_webhooks.py): a
-// `hooks.outbound` config entry POSTs every pre_tool_call and post_tool_call
-// to a URL, fire-and-forget through a bounded queue, signed with HMAC-SHA256
-// when the variable named by `secret_env` is set. The bridge listens on a
+// `hooks.outbound` config entry POSTs every pre_tool_call, post_tool_call and
+// post_api_request to a URL, fire-and-forget through a bounded queue, signed
+// with HMAC-SHA256 when the variable named by `secret_env` is set. The tool
+// calls become the activity trace; each model request becomes the plan steps
+// it stands for (activity_steps.go). The bridge listens on a
 // loopback address (the sidecar shares the pod's network namespace), and
 // hands each child the entry through hermes's managed scope: a per-task
 // directory holding the operator's managed config.yaml and .env with a
@@ -63,6 +65,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/stepmsg"
 )
 
 const (
@@ -190,6 +193,7 @@ const (
 
 	hookPreToolCall     = "pre_tool_call"
 	hookPostToolCall    = "post_tool_call"
+	hookPostAPIRequest  = "post_api_request"
 	hookSignatureHeader = "X-Hermes-Signature-256"
 	hookSignaturePrefix = "sha256="
 	hookStatusOK        = "ok"
@@ -386,6 +390,13 @@ type hookDelivery struct {
 		DurationMs json.Number `json:"duration_ms"`
 		Status     string      `json:"status"`
 		ErrorType  string      `json:"error_type"`
+		// A post_api_request's: how the request ended, its ordinal in the
+		// turn, and hermes's sanitized response, of which the door reads
+		// the planned calls' names and ids and nothing else
+		// (plannedSteps).
+		FinishReason string          `json:"finish_reason"`
+		APICallCount json.Number     `json:"api_call_count"`
+		Response     json.RawMessage `json:"response"`
 	} `json:"extra"`
 }
 
@@ -414,6 +425,9 @@ func (d *hookDelivery) UnmarshalJSON(b []byte) error {
 	d.Extra.DurationMs = lenientNumber(extra["duration_ms"])
 	d.Extra.Status = lenientString(extra["status"])
 	d.Extra.ErrorType = lenientString(extra["error_type"])
+	d.Extra.FinishReason = lenientString(extra["finish_reason"])
+	d.Extra.APICallCount = lenientNumber(extra["api_call_count"])
+	d.Extra.Response = extra["response"]
 	return nil
 }
 
@@ -485,6 +499,12 @@ type activityState struct {
 	lastTool   string
 	startedAt  time.Time
 	appended   map[string]bool // artifact name -> a first part went out
+
+	// pendingSteps are the plan steps the last post_api_request stood for,
+	// taken and published by the delivering request (publishPendingSteps);
+	// steps counts the ones published, against activityStepBudget.
+	pendingSteps []stepmsg.Step
+	steps        int
 
 	// The heartbeat goroutine's lifecycle. Entries are not queued: the door
 	// publishes each one on the delivering request, under run.mu, so no
@@ -616,9 +636,14 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 		}
 		a.seen[d.DeliveryID] = struct{}{}
 	}
-	a.lastTool = capRunes(d.ToolName, activityToolNameCap)
 	switch d.Event {
+	case hookPostAPIRequest:
+		// A model request is not a call: no tool name to remember and
+		// nothing to open or close, only the steps it planned.
+		a.pendingSteps = append(a.pendingSteps, plannedSteps(d, a.calls)...)
+		return ActivityEntry{}, false
 	case hookPreToolCall:
+		a.lastTool = capRunes(d.ToolName, activityToolNameCap)
 		if _, seen := a.open[id]; !seen {
 			a.openOrder = append(a.openOrder, id)
 		}
@@ -630,6 +655,7 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 		}
 		return ActivityEntry{}, false
 	case hookPostToolCall:
+		a.lastTool = capRunes(d.ToolName, activityToolNameCap)
 		if _, seen := a.open[id]; seen {
 			delete(a.open, id)
 			a.openOrder = slices.DeleteFunc(a.openOrder, func(v string) bool { return v == id })
@@ -1057,7 +1083,7 @@ func (b *Bridge) childManagedScope(taskID string) (dir string, err error) {
 	outbound = append(outbound, map[string]any{
 		"name":       hookEntryName,
 		"url":        b.ActivityURL(),
-		"events":     []any{hookPreToolCall, hookPostToolCall},
+		"events":     []any{hookPreToolCall, hookPostToolCall, hookPostAPIRequest},
 		"secret_env": ActivitySecretEnv,
 		"timeout":    hookTimeoutSeconds,
 	})
@@ -1260,7 +1286,9 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 	// trace neither as completed nor as interrupted.
 	act := run.act.Load()
 	run.mu.Lock()
-	if entry, ok := act.observe(d); ok {
+	entry, ok := act.observe(d)
+	b.publishPendingSteps(run, act)
+	if ok {
 		if run.state == stateRunning {
 			if act.underBudget() {
 				if !b.publishActivityEntry(run, entry) {

@@ -682,7 +682,7 @@ retire with the bridge.
 Under `-Q` hermes writes nothing to stdout until the final response, so the pipe the
 bridge holds says nothing about tool calls while the run is on. What hermes does offer is
 its outbound webhooks: a `hooks.outbound` entry in the profile's config POSTs every
-`pre_tool_call` and `post_tool_call` to a URL, fire-and-forget through a bounded queue,
+`pre_tool_call`, `post_tool_call` and `post_api_request` to a URL, fire-and-forget through a bounded queue,
 HMAC-SHA256 signed when the variable its `secret_env` names is set. The bridge listens
 for those on a loopback address in the pod (`BRIDGE_ACTIVITY_LISTEN`, default
 `127.0.0.1:8651`, clear of hermes's API server on 8642 and the agent-api-auth
@@ -770,6 +770,21 @@ heartbeat and never the trace. Past the trace's share, calls are counted and one
 part; the relay drops the artifact on purpose (debug and audit views never render to
 chat), and the inject door's probe is where a reader sees it.
 
+Each model request (`post_api_request`) becomes the plan steps it stands for, published as
+`kube-agents.step/v1` records on the task's `steps` artifact ([`a2a/lib/stepmsg`](../lib/stepmsg/stepmsg.go)):
+one `plan` step per tool the request asked for, in plan order, titled with the tool's name and
+carrying the ids of its calls, so a renderer places each activity entry under the step that asked
+for it; and a request that stops after work (a later request in the turn, or one after a completed
+call) as one `synthesis` step titled `Writing the answer`. A step is structure only, like the
+trace: a tool's name, call ids, a kind and a fixed title. The request's response can quote
+whatever a tool returned, so the door reads the planned calls' names and ids out of it and nothing
+else; the model's text, a call's arguments, and a tool's result or error text reach no step, and
+`thinking` is not published from it. Nothing here knows a particular tool, so no title is built
+from what a call is about. A failed call's class stays on its activity entry as `errorType`; its
+error text is not published anywhere. One task publishes at most 256 steps, counted against the
+trace's share as well, and past either they are dropped uncounted (the `activity-budget` marker
+counts calls). The relay ignores `steps`, as it ignores `activity`.
+
 Each of these also carries a `kube-agents.chat/v1` chat message where the payload spec's
 "Chat messages" section puts one (`chat.go`): a completed `result`'s last chunk holds the
 answer laid out (its first sentence as the headline, the rest as the detail), and is
@@ -799,7 +814,7 @@ that entry empty and `API_SERVER_KEY` non-blank or taken from a reference. The d
 when `BRIDGE_ACTIVITY_LISTEN` is unset or names the hook's port on `127.0.0.1` or a wildcard
 host. With several bridge sidecars, every one must qualify; a value the operator cannot read
 (`BRIDGE_EXECUTOR` or `BRIDGE_ACTIVITY_LISTEN` through `valueFrom`) disqualifies. Then
-`hooks.outbound` gains `a2a-bridge-activity`, posting `pre_tool_call` and `post_tool_call` to
+`hooks.outbound` gains `a2a-bridge-activity`, posting `pre_tool_call`, `post_tool_call` and `post_api_request` to
 `http://127.0.0.1:8651/hermes/tool-events`, signed with `A2A_ACTIVITY_SECRET`, read from the
 `bridge-activity-key` entry of the a2a creds Secret. The operator puts it in the agent
 container's env; the sidecar needs it in its own. A `cli` bridge, including one that fell back
