@@ -225,8 +225,8 @@ func TestConsolePostAndEditArriveAsOutFrames(t *testing.T) {
 }
 
 // A terminal goes out as one frame naming its task, under an id derived from
-// the task alone, so the same terminal from a second adapter (a restart, a
-// redelivery) repeats it. The wire spelling is pinned, since the MCP server
+// the task and its state, so the same terminal from a second adapter (a
+// restart, a redelivery) repeats it. The wire spelling is pinned, since the MCP server
 // and the page match on it. A notice carries none of the terminal fields.
 func TestConsoleTerminalArrivesAsAResultFrame(t *testing.T) {
 	r := startConsoleRig(t)
@@ -259,7 +259,7 @@ func TestConsoleTerminalArrivesAsAResultFrame(t *testing.T) {
 		raw = append(raw, string(msg.Data))
 	}
 	// Two connections publish, so the frames arrive in no fixed order.
-	const want = `{"messageId":"r-task-1","text":"all green","kind":"result","state":"completed","addressee":"platform","taskId":"task-1"}`
+	const want = `{"messageId":"r-task-1-completed","text":"all green","kind":"result","state":"completed","addressee":"platform","taskId":"task-1"}`
 	var terminals, notices []string
 	for _, f := range raw {
 		if f == want {
@@ -293,7 +293,7 @@ func TestConsoleTerminalSpellsCardsPendingOnlyWhenSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = `{"messageId":"r-task-4","text":"ack","kind":"result","state":"completed","addressee":"platform","taskId":"task-4","cardsPending":true}`
+	const want = `{"messageId":"r-task-4-completed","text":"ack","kind":"result","state":"completed","addressee":"platform","taskId":"task-4","cardsPending":true}`
 	if string(msg.Data) != want {
 		t.Errorf("frame = %s, want %s", msg.Data, want)
 	}

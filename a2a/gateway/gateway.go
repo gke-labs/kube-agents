@@ -1985,7 +1985,7 @@ func (g *Gateway) observeTaskTerminal(rec *SessionRecord, taskID string, state l
 	if observer, ok := g.adapter.(TaskObserver); ok {
 		observer.TaskTerminal(rec.Key, taskID, state, source, reason)
 	}
-	g.consoleFrame(rec, taskID, state, reason)
+	g.consoleFrame(rec, taskID, state, source, reason)
 }
 
 // consoleFrame publishes a console conversation's terminal frame for the end
@@ -1994,13 +1994,23 @@ func (g *Gateway) observeTaskTerminal(rec *SessionRecord, taskID string, state l
 // any other end's is the relay's notice. The relay posts its notices as it
 // always has, so a frame that cannot go out costs the console client the end
 // and costs the page nothing.
-func (g *Gateway) consoleFrame(rec *SessionRecord, taskID string, state lib.TaskState, reason string) {
+func (g *Gateway) consoleFrame(rec *SessionRecord, taskID string, state lib.TaskState, source TerminalSource, reason string) {
 	if !isConsoleConversation(rec.Key) {
 		return
 	}
 	delivered, ok := g.consoleResults.take(taskID)
 	_, cardsPending := g.consoleCardsPending.take(taskID)
 	text := terminalNotice(state, reason)
+	// An end the gateway declared itself carries no executor reason; its
+	// frame says what the page's notice says rather than the bare line.
+	if state == lib.StateFailed && reason == "" {
+		switch source {
+		case TerminalFromGateway:
+			text = noticeBusUnreachable
+		case TerminalNeverStarted:
+			text = consoleNeverStartedText
+		}
+	}
 	if state == lib.StateCompleted {
 		text = completedNonTextResult
 		if ok {

@@ -2035,7 +2035,10 @@ on `.out` too (added 10/22), as every observer is told it (`observeTaskTerminal`
 delegation chain, under the task the turn started, with the hand-off rule applied. It is one
 frame with `"kind": "result"`, the A2A `state`, the task the turn started as `taskId` and the
 agent that turn was addressed to as `addressee` (not whichever agent answered at the chain's end),
-and `messageId` `r-<taskId>`, so a repeated end (a redelivery, a heal) repeats its id. A completed
+and `messageId` `r-<taskId>-<state>`, so a repeated end (a redelivery, a heal) repeats its id while
+a different end of the same task (a never-started heal, then its late completion) is a new frame. An
+end the gateway declared itself (the bus unreachable, a task released for producing nothing) is
+worded as the page's notice is. A completed
 task that handed work to kanban cards (the bridge's `handoff` artifact) carries `"cardsPending":
 true`, so a client waits for the cards' notify frames; without it, no handoff was seen and the
 client need not wait. Its text is the deliverable for a completed task and the gateway's notice
