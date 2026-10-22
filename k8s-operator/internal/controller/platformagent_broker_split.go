@@ -231,6 +231,11 @@ func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent) string {
 	if a2aSessionClusterViewEnabled(agent) {
 		callers = append(callers, a2aSessionBrokerCaller(agent))
 	}
+	// The MCP server's own ServiceAccount, under its flag
+	// (a2aMCPBrokerEnabled), never the namespace default it ran as before.
+	if a2aMCPBrokerEnabled(agent) {
+		callers = append(callers, a2aMCPBrokerCaller(agent))
+	}
 	return strings.Join(callers, ",")
 }
 

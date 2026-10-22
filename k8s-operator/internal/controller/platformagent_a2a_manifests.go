@@ -5174,7 +5174,12 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		return state, err
 	}
 	// The MCP server, the other console client, under its flag and for the
-	// same reasons: after the fences, ahead of the gateway's hold.
+	// same reasons: after the fences, ahead of the gateway's hold. Its
+	// broker identity first, so the ServiceAccount exists before the pod
+	// that names it.
+	if err := r.reconcileA2AMCPBrokerIdentity(ctx, agent); err != nil {
+		return state, err
+	}
 	if err := r.reconcileA2AMCP(ctx, agent); err != nil {
 		return state, err
 	}
@@ -6055,6 +6060,9 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPAccessName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		// Its broker identity (reconcileA2AMCPBrokerIdentity), after the
+		// Deployment that names it.
+		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPServiceAccountName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The auth callout, before the bus it authorizes for. Its Deployment
 		// goes first so its deletion is initiated while there is still a server to
 		// answer for; the keys Secret goes with it rather than surviving like

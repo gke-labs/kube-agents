@@ -4419,6 +4419,9 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 			corev1.EnvVar{Name: "CREDENTIAL_PROXY_SESSION_CALLERS", Value: a2aSessionBrokerCaller(agent)},
 		)
 	}
+	// The MCP server's audience, under its flag on a mode-next install only
+	// (a2aMCPBrokerEnabled), so an install without it confers no mcp role.
+	envVars = append(envVars, a2aMCPBrokerEnv(agent)...)
 	envVars = append(envVars,
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
@@ -4593,6 +4596,13 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// One that could set the session callers could unbind the session
 		// ServiceAccount from its audience, or bind another to it.
 		"CREDENTIAL_PROXY_SESSION_CALLERS",
+		// One that could set the MCP audience would decide who holds the mcp
+		// role. The MCP pod's own pair is not merged with spec.deployment.env
+		// at all; reserved here as well so no broker-side container can be
+		// handed a name the MCP client reads.
+		credentialProxyMCPAudienceEnvVar,
+		a2aMCPBrokerURLEnvVar,
+		a2aMCPBrokerTokenFileEnvVar,
 		// One that could set the watcher audience would decide who holds the
 		// watcher role; one that could set the subscription would point the
 		// watcher relay at any subscription the broker's credential can pull;
