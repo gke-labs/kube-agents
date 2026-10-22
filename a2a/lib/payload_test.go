@@ -166,6 +166,10 @@ func TestTaskParametersRefuseWhatCouldForgeAResource(t *testing.T) {
 	}
 	for name, params := range map[string]map[string]string{
 		"a slash in a value":  {"cluster": "web-1/../other"},
+		"a dot step":          {"cluster": "."},
+		"a parent step":       {"cluster": ".."},
+		"a flag":              {"cluster": "-rf"},
+		"a long flag":         {"cluster": "--kubeconfig=x"},
 		"a space in a value":  {"cluster": "web 1"},
 		"an empty value":      {"cluster": ""},
 		"a long value":        {"cluster": strings.Repeat("a", TaskParameterValueMaxLen+1)},

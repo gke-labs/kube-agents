@@ -717,7 +717,8 @@ to the worker as `PROFILE_TASK_<NAME>`. The verifier refuses a target outside th
 and that check is what makes these message fields authoritative.
 
 - A name is a lower-case identifier of at most 32 characters. A value is one token of at most 128
-  characters, from letters, digits and `. _ : -`.
+  characters, starting with a letter or digit and then letters, digits and `. _ : -`, so it is never
+  `.`, `..` or a flag.
 - A value can't contain `/` or a space, because the dispatcher joins values into a resource path.
 - A set has at most 16 parameters.
 - A reader that finds the part and it breaks these bounds refuses the task rather than running it

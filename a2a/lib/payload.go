@@ -211,7 +211,9 @@ type TaskParameters struct {
 // PROFILE_TASK_<NAME> spells it upper-cased. A value is one token with no
 // '/' or space, because the dispatcher joins values into a verifier resource
 // path (project/<p>/location/<l>/cluster/<c>) and a '/' would let a value
-// name a different resource.
+// name a different resource. It starts with a letter or digit, so it is
+// never "." or ".." (a path step) and never reads as a flag ("-x") where a
+// worker passes it to a command.
 const (
 	TaskParametersMax        = 16
 	TaskParameterNameMaxLen  = 32
@@ -220,7 +222,7 @@ const (
 
 var (
 	taskParameterName  = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
-	taskParameterValue = regexp.MustCompile(`^[A-Za-z0-9._:-]+$`)
+	taskParameterValue = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]*$`)
 )
 
 // ValidateTaskParameters reports the first way params break the bounds
@@ -234,7 +236,7 @@ func ValidateTaskParameters(params map[string]string) error {
 			return fmt.Errorf("task parameter name %q is not a lower-case identifier of at most %d characters", name, TaskParameterNameMaxLen)
 		}
 		if len(value) > TaskParameterValueMaxLen || !taskParameterValue.MatchString(value) {
-			return fmt.Errorf("task parameter %s: the value is not one token (letters, digits, . _ : -) of at most %d characters", name, TaskParameterValueMaxLen)
+			return fmt.Errorf("task parameter %s: the value is not one token (a letter or digit, then letters, digits, . _ : -) of at most %d characters", name, TaskParameterValueMaxLen)
 		}
 	}
 	return nil
