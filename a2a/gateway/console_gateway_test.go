@@ -581,3 +581,28 @@ func TestTheConsoleStashEvictsOneEntryAtTheCap(t *testing.T) {
 		t.Fatalf("re-putting a held key changed the size to %d", len(c.m))
 	}
 }
+
+// An end the gateway declares itself carries no executor reason; its frame
+// says what the page's notice says (the bus was unreachable, or the heal
+// released a task that produced nothing), not the bare "the task failed".
+// An executor's failure without a reason keeps the bare line.
+func TestAConsoleGatewayDeclaredEndIsWordedBySource(t *testing.T) {
+	a := newFakeAdapter()
+	a.setTakesTerminals()
+	g := &Gateway{adapter: a, log: slog.Default()}
+	rec := &SessionRecord{Key: "console:t-source", Tasks: []TaskRef{{ID: "task-1", Addressee: "platform"}}}
+	for _, tc := range []struct {
+		source TerminalSource
+		want   string
+	}{
+		{TerminalFromGateway, noticeBusUnreachable},
+		{TerminalNeverStarted, consoleNeverStartedText},
+		{TerminalFromExecutor, "❌ the task failed"},
+	} {
+		g.consoleFrame(rec, "task-1", lib.StateFailed, tc.source, "")
+		got := a.terminalPosts()
+		if last := got[len(got)-1]; last.Text != tc.want {
+			t.Errorf("source %v: frame text %q, want %q", tc.source, last.Text, tc.want)
+		}
+	}
+}

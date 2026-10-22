@@ -89,9 +89,13 @@ const (
 	// a client waiting on a turn can tell the two apart.
 	consoleFrameKindResult = "result"
 	// consoleResultIDPrefix starts a terminal frame's messageId, which is
-	// the prefix and the task id, so a redelivered terminal repeats its id
-	// and a client can drop the repeat.
+	// r-<taskId>-<state>: a redelivered end repeats its id and a client can
+	// drop the repeat, while a different end of the same task (a
+	// never-started heal, then the task's late completion) is a new frame.
 	consoleResultIDPrefix = "r-"
+	// consoleNeverStartedText is a terminal frame's text for a task the
+	// heal released because it produced nothing (TerminalNeverStarted).
+	consoleNeverStartedText = "⚠️ the task produced nothing on its event stream and was released"
 	// consoleResultTextCap bounds a terminal frame's text. The frame goes out
 	// whole, under the server's max_payload (1 MiB by default; the render
 	// sets none); PostTerminal cuts again if escaping still takes it past.
@@ -491,7 +495,7 @@ func (a *ConsoleAdapter) PostTerminal(conversation string, t ConsoleTerminal) er
 		return fmt.Errorf("console adapter: malformed conversation id %q", conversation)
 	}
 	f := ConsoleOutFrame{
-		MessageID: consoleResultIDPrefix + t.TaskID,
+		MessageID: consoleResultIDPrefix + t.TaskID + "-" + string(t.State),
 		Text:      cutConsoleResult(t.Text, consoleResultTextCap),
 		Kind:      consoleFrameKindResult,
 		State:     t.State,
