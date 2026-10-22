@@ -360,17 +360,17 @@ func finalText(task *lib.Task) string {
 	return task.FinalMessage.Parts[0].Text
 }
 
-// The adapter keeps a delegate request whose parameters break lib's bounds
-// off the bus, as it does an empty or oversized text; the gateway's check
-// is the one that matters.
-func TestValidateDelegateRefusesBadParameters(t *testing.T) {
-	ok := lib.DelegateRequest{Addressee: "cluster", Text: "check web-1", Parameters: map[string]string{"cluster": "web-1"}}
-	if got := validateDelegate(ok); got != "" {
-		t.Fatalf("a valid request was refused: %s", got)
+// No gateway reads a delegate request's parameters yet, so the adapter
+// refuses any rather than publish a request whose child would be minted
+// without the target it asked for. One without parameters goes as before.
+func TestValidateDelegateRefusesParametersUntilAGatewayReadsThem(t *testing.T) {
+	plain := lib.DelegateRequest{Addressee: "cluster", Text: "check web-1"}
+	if got := validateDelegate(plain); got != "" {
+		t.Fatalf("a request without parameters was refused: %s", got)
 	}
-	bad := ok
-	bad.Parameters = map[string]string{"cluster": "web-1/../prod"}
-	if got := validateDelegate(bad); got == "" {
-		t.Fatal("a parameter value with a '/' reached the bus")
+	with := plain
+	with.Parameters = map[string]string{"cluster": "web-1"}
+	if got := validateDelegate(with); got != delegateParametersNotYet {
+		t.Fatalf("a request with parameters = %q, want the not-yet refusal", got)
 	}
 }

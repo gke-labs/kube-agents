@@ -707,7 +707,9 @@ and only its `mark` is validated. When the newest task ends with no mark on its 
 ### Task parameters and child results
 
 Reserved 10/22 for the profile dispatcher (`spec-subagent-profiles.md`), and used from the gateway's
-delegation to profiles onward; nothing writes them yet. Both are `data` parts, and only the gateway
+delegation to profiles onward; nothing writes them yet. Until a gateway reads a `delegate` request's `parameters`, the
+worker adapter refuses a request carrying any, rather than publish one whose child would be minted
+without its target. Both are `data` parts, and only the gateway
 writes them: the gateway strips any a client or a task supplies, and a reader refuses a message carrying two
 `taskParameters` parts.
 
