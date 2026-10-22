@@ -335,8 +335,8 @@ resource "kubernetes_deployment_v1" "token_sidecar" {
 # check names the workload on memory and proposes a resize, while a pause
 # container's near-zero use keeps the peak under 20%. CPU stays at the 10m
 # every other fixture requests: it is below the 50m resize floor, so 3.1
-# drops that dimension, and anything larger does not schedule twice on the
-# slot's default pool, which runs above 90% CPU requested. Burstable, not
+# drops that dimension, and a small request keeps this fixture from deciding
+# where anything else on the default pool schedules. Burstable, not
 # Guaranteed: a memory limit above the request, no CPU limit. A budget, a
 # default-deny policy and the restricted container settings so no other
 # stream names the namespace. The one declarable cost posture observable

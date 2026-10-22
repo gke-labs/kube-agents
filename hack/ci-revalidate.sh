@@ -11,7 +11,9 @@
 # definition that has not yet hoisted it, where it saves the matrix alone.
 #
 # Three things count as a verdict this run could only repeat. The first is a
-# green build at THIS head (#1202): Tide credits a presubmit only against the
+# green build at THIS head (#1202), or at an earlier head with the same tree
+# (an empty commit, or a message-only rewrite: the matrix gets the same
+# files, so it is the same head in all but name): Tide credits a presubmit only against the
 # base SHA it ran on, so every merge to main retests, or batches, every other
 # green pull request whose head has not changed -- over the three weeks to
 # 2026-10-05 that was 150 Tide-started runs against 831 merges, 34 of them on
@@ -35,7 +37,9 @@
 # excuse it: it predates the first and answers a push, which is the
 # author's act, where the first answers a retest nobody asked for. Widening
 # it is a separate decision with its own record, not a consequence of this
-# one. The third is an admin /override of this job's context at THIS head:
+# one. The first rule's same-tree case answers a push too, and still skips
+# main's side: that push hands the matrix identical files, where an inert
+# push changes some. The third is an admin /override of this job's context at THIS head:
 # the override plugin posts a success status reading "Overridden by <user>"
 # (kubernetes-sigs/prow, pkg/plugins/override), which only a repository
 # admin can obtain, and it is the admin's decision that this head merges
@@ -103,10 +107,10 @@
 # and the check UI no longer says so. For an inert delta that is the same judgement a
 # passing /retest would render -- the delta cannot feed the eval differently,
 # so the red was flake or infrastructure by construction. For the same head
-# it is not: a full run that reached the matrix at a newer base (a step-0
+# (or the same tree) it is not: a full run that reached the matrix at a newer base (a step-0
 # fall-through, or the escape hatch) can red on the combination the reuse
 # does not test, and the rule still prefers the older green because the rule
-# is that the head passed once. Read a same-head red as either, not as
+# is that the head passed once. Read a same-head or same-tree red as either, not as
 # noise; reproducing one needs a non-inert push or EVAL_SKIP_REVALIDATION=1
 # in the job env.
 #
@@ -182,8 +186,8 @@ readonly REVALIDATION_HISTORY_PREFIX="gs://kube-agents-prow/pr-logs/pull/gke-lab
 # The job whose history and status context step 0 reads: the running job's
 # own name, which Prow exports as JOB_NAME. Every presubmit that runs this
 # script has its own history path and its own status context, so keying the
-# reuse on a fixed name would let a second job (the next-mode lane, which
-# runs step 0 too, under EVAL_MODE_NEXT=1) find the today job's green build
+# reuse on a fixed name would let a second job (the today lane's presubmit, which
+# runs step 0 too) find the blocking job's green build
 # at the same head and run nothing. Outside Prow the default keeps the log
 # lines and the tests naming the job that exists.
 readonly REVALIDATION_DEFAULT_JOB_NAME="pull-kube-agents-smoke-test"
@@ -225,6 +229,17 @@ readonly REVALIDATION_PULL_URL_PREFIX="https://github.com/gke-labs/kube-agents/p
 # gsutil cat (~1s); an active PR rarely stacks this many pushes between
 # greens, and a bound keeps the fall-through path seconds long.
 readonly REVALIDATION_HISTORY_LIMIT=20
+# A green from before the job changed what it grades is not a verdict this
+# run could only repeat. EVAL_REVALIDATION_NOT_BEFORE, a UTC time set in the
+# job's env in oss-test-infra (the swap to spec.mode next, or a rollback to
+# today), refuses a green build whose EARLIEST matching success status on
+# GitHub was created before it: the original crier event, which the sticky
+# re-pin's later copies (same build URL) cannot stand in for. GitHub's
+# time, not the GCS record's, for the trust-surface reason above. Unset or
+# empty, nothing changes; unparsable, an event with no readable time, or a
+# status read stopped at its page cap (the original may lie past it), is a
+# full run. It binds greens only: an /override is the admin's decision.
+readonly REVALIDATION_NOT_BEFORE="${EVAL_REVALIDATION_NOT_BEFORE:-}"
 # The status read pages through GitHub's newest-first events (100 a page,
 # following `Link: rel="next"`) up to this many pages. One page is not
 # enough: the sticky re-pin posts a copy on every open head after every
@@ -672,22 +687,57 @@ print(base, head)
 import json
 import sys
 
-context, build = sys.argv[1], sys.argv[2]
+from datetime import datetime
+
+
+def utc(value):
+    parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError(value)
+    return parsed
+
+
+context, build, not_before, partial = sys.argv[1], sys.argv[2], sys.argv[3].strip(), sys.argv[4]
 statuses = json.load(sys.stdin)
 needle = "/" + context + "/" + build
-for status in statuses:
-    if (
-        status.get("context") == context
-        and status.get("state") == "success"
-        and needle in (status.get("target_url") or "")
-    ):
-        print("attested")
+matches = [
+    status
+    for status in statuses
+    if status.get("context") == context
+    and status.get("state") == "success"
+    and needle in (status.get("target_url") or "")
+]
+if not matches:
+    print("absent")
+    sys.exit(0)
+if not_before:
+    try:
+        cutoff = utc(not_before)
+    except ValueError:
+        print("error EVAL_REVALIDATION_NOT_BEFORE is not a UTC time")
         sys.exit(0)
-print("absent")
-' "${REVALIDATION_JOB_NAME}" "${prev_green}" 2>/dev/null)" || attested="error unparsable"
+    try:
+        earliest = min(utc(status.get("created_at") or "") for status in matches)
+    except ValueError:
+        print("predates at an unreadable time")
+        sys.exit(0)
+    if earliest < cutoff:
+        print("predates " + earliest.isoformat())
+        sys.exit(0)
+    if partial:
+        print("predates at a time the capped read may not reach")
+        sys.exit(0)
+print("attested")
+' "${REVALIDATION_JOB_NAME}" "${prev_green}" "${REVALIDATION_NOT_BEFORE}" "${REVALIDATION_STATUS_PARTIAL:-}" 2>/dev/null)" || attested="error unparsable"
   fi
   case "${attested}" in
     attested) ;;
+    error\ EVAL_REVALIDATION_NOT_BEFORE*)
+      _revalidation_no_green "${attested#error } (${REVALIDATION_NOT_BEFORE}), so green build ${prev_green} of PR #${pull_number} is not reused"
+      return 1 ;;
+    predates*)
+      _revalidation_no_green "green build ${prev_green} of PR #${pull_number} was first reported ${attested#predates }, before EVAL_REVALIDATION_NOT_BEFORE (${REVALIDATION_NOT_BEFORE}) -- a verdict from before the job changed what it grades"
+      return 1 ;;
     absent)
       _revalidation_no_green "GitHub holds no ${REVALIDATION_JOB_NAME} success status on ${prev_head} naming build ${prev_green}${REVALIDATION_STATUS_PARTIAL:+ among the events read (the read stopped at ${REVALIDATION_STATUS_PARTIAL})} -- refusing to trust the GCS record alone"
       return 1 ;;
@@ -726,6 +776,23 @@ print("absent")
       fi
     fi
   done
+
+  # The same tree at a new head counts as the same head: an empty commit, or
+  # one that only rewrites the message, hands the matrix the same files, so
+  # it is the first kind of verdict and the base is not compared. A push to
+  # put a pull request back in the merge queue is this case. A tree that
+  # cannot be read falls through to the inert rule below.
+  local prev_tree cur_tree
+  if prev_tree="$(git -C "${repo_dir}" rev-parse --verify --quiet "${prev_head}^{tree}" 2>/dev/null)" \
+    && cur_tree="$(git -C "${repo_dir}" rev-parse --verify --quiet "${cur_head}^{tree}" 2>/dev/null)" \
+    && [ "${prev_tree}" = "${cur_tree}" ]; then
+    echo "PR #${pull_number} holds a reusable verdict: green build ${prev_green} -- this tree already passed"
+    echo "Reused verdict: ${REVALIDATION_SPYGLASS_PREFIX}/${pull_number}/${REVALIDATION_JOB_NAME}/${prev_green}"
+    echo "Attested by the Prow-posted ${REVALIDATION_JOB_NAME} success status on ${prev_head}"
+    echo "Same tree ${cur_tree} at head ${prev_head} then, ${cur_head} now; base ${prev_base} then, ${cur_base} now -- a tree that passed once passes"
+    REVALIDATION_REUSED+=("green build ${prev_green} (PR #${pull_number})")
+    return 0
+  fi
 
   # --no-renames is load-bearing: with rename detection (git's default) a
   # `git mv hack/tool.sh docs/tool.md` lists ONLY the inert destination, and

@@ -965,7 +965,7 @@ polls. It is `trend.py`'s block from `store.json` (below), the evidence
 store's read: `{source, read_at, error, window_days, lead_days, max_objects,
 truncated{case: n}, partial, warnings[], records, metrics[], default_metric,
 spread_nights, bar{rate, min_runs}, keys{}, nights[], cases{}, domains{},
-latency{}}`.
+latency{}, next}`.
 Without a `--store` every field is empty or `null` and the page says the
 store was not read; `error` set means the last read failed or was not
 attempted and the rest is the read before it. The page draws the
@@ -973,8 +973,9 @@ attempted and the rest is the read before it. The page draws the
 (store.py) and their records feed the first drawn nights' windows and
 spreads and appear nowhere else (not as points, nights, key changes or in
 `records`). `keys{}` maps a key id
-(`<setup_id>/<judge_model>/<scoring_version>-f<fleet>-v<verifiers>`) to its
-five components. `nights[]` is every night inside the drawn window the
+(`<setup_id>/<judge_model>/<scoring_version>-f<fleet>-v<verifiers>`, with
+`-<mode>` appended for a mode other than today) to its components (`mode`
+only when it is not today). `nights[]` is every night inside the drawn window the
 store holds a record for, oldest first, `{id, at, build, commit, started, log_url, cases}` — `id` is
 `build:<prow build id>` from the object name (or `at:<recorded_at>` for a
 record without one; the records of a split night's two builds share the
@@ -1003,6 +1004,12 @@ points[], key_changes[]}` with `points[]` the cases pooled per night
 high, cases}}}` (`mean` weighted by `n`, `low`/`high` the range of the
 cases' means). Only nightly records exist in the store (a pull request's
 run never writes it), so nothing here is a presubmit's.
+
+Everything above is the today-mode series: records whose key has no `mode`,
+or `mode: today`. `next` is the same `{records, metrics, default_metric,
+keys{}, nights[], cases{}, domains{}}` built from the records whose key has
+`mode: next` (the next-mode nightly's), or `null` when the store holds none;
+a key in any other mode is in neither. The page draws the today series.
 
 `latency{}` is the one part of the block not read from the store, which
 carries no timing: it is from `data.json`'s nightly runs inside the same

@@ -3,6 +3,7 @@ package lib
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -73,11 +74,104 @@ const (
 	// with KAGE_SLACK_UX on (#3258; spec-a2a-payloads.md, "Reserved artifact
 	// names").
 	ArtifactHandoff = "handoff"
+	// ArtifactUsage is what a task's turns cost: one data part per finished
+	// turn, a Usage object, published by the executor before the turn's
+	// answer settles (the worker adapter on each harness result, the
+	// hermes-bridge on each API turn's answer) and never after the
+	// terminal. Every field is optional and a reader tolerates the
+	// artifact's absence; UsageTotal folds a task's turns (#2816;
+	// spec-a2a-payloads.md, "Reserved artifact names").
+	ArtifactUsage = "usage"
 )
 
 // HandoffCards is the ArtifactHandoff text part: the work went to kanban
 // cards.
 const HandoffCards = "cards"
+
+// Usage is one finished turn's cost, the ArtifactUsage data part. Model is
+// the model the executor asked for or was told it ran; InputTokens is every
+// token the model read for the turn, cached reads included, and OutputTokens
+// every token it wrote; CostUsd is the producer's own estimate, carried only
+// when the producer had a figure it did not invent (a harness that prices
+// its turns; never Hermes behind the gateway, which records 0.0); DurationMs
+// is the turn's wall time as the producer measured it. A zero is "not
+// known" and is omitted on the wire, so a reader never mistakes unknown for
+// free; a part with no figure at all is refused.
+type Usage struct {
+	Model        string  `json:"model,omitempty"`
+	InputTokens  int64   `json:"inputTokens,omitempty"`
+	OutputTokens int64   `json:"outputTokens,omitempty"`
+	CostUsd      float64 `json:"costUsd,omitempty"`
+	DurationMs   int64   `json:"durationMs,omitempty"`
+}
+
+// hasFigure reports whether u carries at least one figure; a model name
+// alone is not usage.
+func (u Usage) hasFigure() bool {
+	return u.InputTokens > 0 || u.OutputTokens > 0 || u.CostUsd > 0 || u.DurationMs > 0
+}
+
+// negative reports whether any figure is below zero, which no producer can
+// have measured.
+func (u Usage) negative() bool {
+	return u.InputTokens < 0 || u.OutputTokens < 0 || u.CostUsd < 0 || u.DurationMs < 0
+}
+
+// UsagePart is u as the ArtifactUsage data part: the object itself, as an
+// activity entry is. A usage with no figure, or a negative one, is refused
+// here so it never reaches the bus.
+func UsagePart(u Usage) (Part, error) {
+	if !u.hasFigure() || u.negative() {
+		return Part{}, fmt.Errorf("usage part carries no figure, or a negative one: %+v", u)
+	}
+	data, err := json.Marshal(u)
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// UsageOf reads p as a usage part. A part that is not data, does not decode
+// as an object, carries no figure or a negative one is not usage; a key the
+// reader does not know is ignored.
+func UsageOf(p Part) (Usage, bool) {
+	if p.Kind != "data" || len(p.Data) == 0 {
+		return Usage{}, false
+	}
+	var u Usage
+	if err := json.Unmarshal(p.Data, &u); err != nil || !u.hasFigure() || u.negative() {
+		return Usage{}, false
+	}
+	return u, true
+}
+
+// UsageFigure is a producer's count or duration, read from a float, as the
+// whole number a Usage part carries, and whether it is one: a figure that is
+// not finite, below zero or at or above 2^63 (which int64 cannot hold and a
+// conversion would wrap) is not, and the producer drops that field and names
+// it rather than refuse the part or publish a wrapped value.
+func UsageFigure(f float64) (int64, bool) {
+	if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || f >= math.MaxInt64 {
+		return 0, false
+	}
+	return int64(f), true
+}
+
+// UsageTotal folds the turns of one task: the figures sum and Model is the
+// last one named. An absent figure stays absent.
+func UsageTotal(turns []Usage) Usage {
+	var total Usage
+	for _, u := range turns {
+		if u.Model != "" {
+			total.Model = u.Model
+		}
+		total.InputTokens += u.InputTokens
+		total.OutputTokens += u.OutputTokens
+		total.CostUsd += u.CostUsd
+		total.DurationMs += u.DurationMs
+	}
+	return total
+}
 
 // DelegateRequest is the ArtifactDelegate data part's shape: one child task
 // to mint, addressee and the task text. It is also the wire shape the

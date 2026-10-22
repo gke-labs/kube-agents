@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -137,6 +139,22 @@ const (
 	// gateway spawned, whose adapter exits after one task, is never sent one.
 	annoReuse  = "a2a.kubeagents.dev/session-reuse"
 	reuseValue = "true"
+	// annoBusTransport stamps a pod with the bus transport it was spawned
+	// with: a digest of the NATS URL and the CA file it was told to trust
+	// (busTransport). Reuse needs a pod that can still reach the bus, and a
+	// pod spawned before the bus moved to TLS keeps its nats:// URL and no
+	// CA, and retries forever without ever reconnecting, while still reading
+	// as running. So a pod is reused only when its stamp matches the
+	// gateway's, and a pod with no stamp at all is from before there was one.
+	// The CA's bytes are not in it: the pod mounts the bundle ConfigMap as a
+	// directory and reads it on every handshake, so a CA change reaches a
+	// running pod within the kubelet's sync, and abandoning every reusable
+	// pod for it would cost more than it saves.
+	annoBusTransport = "a2a.kubeagents.dev/bus-transport"
+	// busTransportLength is how much of the digest the stamp carries.
+	busTransportLength = 16
+	// natsCAVolume is the session pod's mount of the gateway's CA bundle.
+	natsCAVolume = "nats-ca"
 	// workerContainer is the session pod's one container, the adapter's.
 	workerContainer = "worker"
 	// delegateToolOn is lib.EnvDelegateTool's value for a pod whose adapter
@@ -343,7 +361,8 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 				// The rehydration primer, mounted for the worker as a file
 				// (primerVolume); bounded well under the object annotation
 				// budget.
-				annoPrimer: truncateRunes(primer, primerCap),
+				annoPrimer:       truncateRunes(primer, primerCap),
+				annoBusTransport: s.busTransport(),
 			},
 		},
 		Spec: corev1.PodSpec{
@@ -506,6 +525,22 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 			},
 		},
 	}
+	// The bus's CA, from the ConfigMap the gateway mounts it from, at the
+	// same path, so the worker's lib.TLSOptions trusts what the gateway does.
+	// The URL above is tls:// on a rendered install, and without the CA the
+	// worker cannot verify the bus and connects to nothing.
+	if s.cfg.NATSCAFile != "" && s.cfg.NATSCAConfigMap != "" {
+		c := &pod.Spec.Containers[0]
+		c.Env = append(c.Env, corev1.EnvVar{Name: lib.EnvNATSCAFile, Value: s.cfg.NATSCAFile})
+		c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: natsCAVolume, MountPath: path.Dir(s.cfg.NATSCAFile), ReadOnly: true})
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+			Name: natsCAVolume,
+			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: s.cfg.NATSCAConfigMap},
+				Items:                []corev1.KeyToPath{{Key: path.Base(s.cfg.NATSCAFile), Path: path.Base(s.cfg.NATSCAFile)}},
+			}},
+		})
+	}
 	if s.cfg.reusePod(rec) {
 		pod.Annotations[annoReuse] = reuseValue
 		c := &pod.Spec.Containers[0]
@@ -644,15 +679,26 @@ func (s *podSpawner) Reusable(ctx context.Context, podName string) (bool, error)
 	if err != nil {
 		return false, err
 	}
-	return podReusable(p, s.cfg.TaskDeadline, time.Now()), nil
+	return podReusable(p, s.busTransport(), s.cfg.TaskDeadline, time.Now()), nil
+}
+
+// busTransport is the stamp annoBusTransport carries: a digest of the NATS
+// URL and the CA file path the spawner hands a pod, which is what changes when
+// the bus moves to TLS.
+func (s *podSpawner) busTransport() string {
+	sum := sha256.Sum256([]byte(s.cfg.NATSURL + "\n" + s.cfg.NATSCAFile))
+	return hex.EncodeToString(sum[:])[:busTransportLength]
 }
 
 // podReusable is Reusable's judgement on a pod already read. The lifetime
 // check keeps a task off a pod the kubelet will end before the task's own
 // bound: the pod's age plus the task deadline and twice its grace (the
 // overdue check's point and a margin past it) has to fit in what is left.
-func podReusable(p *corev1.Pod, taskDeadline time.Duration, now time.Time) bool {
+func podReusable(p *corev1.Pod, transport string, taskDeadline time.Duration, now time.Time) bool {
 	if p.Annotations[annoReuse] != reuseValue || p.DeletionTimestamp != nil || p.Status.Phase != corev1.PodRunning {
+		return false
+	}
+	if p.Annotations[annoBusTransport] != transport {
 		return false
 	}
 	running := false

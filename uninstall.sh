@@ -925,6 +925,9 @@ main() {
   # The mode, likewise: the generator refuses a value outside the CRD's enum,
   # and the destroy removes the release whichever mode it renders.
   export PLATFORM_AGENT_MODE=""
+  # The data volume size, likewise: the generator refuses a malformed size,
+  # and a teardown must not stop on a typo in install.env.
+  export PLATFORM_AGENT_STORAGE_SIZE=""
   # The daily alert ceilings, likewise: the generator refuses a value that is
   # not a whole number, and the ceilings go with the release. Each key is
   # named here, because an older installer_common.sh has no

@@ -29,7 +29,10 @@ import (
 //
 // Env-gated:
 //
-//	A2A_LIVE_NATS_URL          e.g. nats://127.0.0.1:4222 via port-forward
+//	A2A_LIVE_NATS_URL          e.g. tls://127.0.0.1:4222 via port-forward, with
+//	                           NATS_CA_FILE set to the install's CA bundle
+//	                           (kubectl get cm <name>-a2a-nats-ca-bundle) and
+//	                           NATS_TLS_SERVER_NAME to the bus Service's name
 //	A2A_LIVE_GATEWAY_PASSWORD  from the install's creds Secret
 //	A2A_LIVE_KUBE_CONTEXT      pin --context on every kubectl call
 //	A2A_LIVE_NAMESPACE         default kubeagents-system
@@ -404,7 +407,9 @@ spec:
         - name: PROFILE
           value: chat
         - name: NATS_URL
-          value: nats://platform-agent-a2a-nats.%s.svc:4222
+          value: tls://platform-agent-a2a-nats.%s.svc:4222
+        - name: NATS_CA_FILE
+          value: /etc/a2a-nats-ca/ca.crt
         - name: A2A_SESSION
           value: %s
         - name: %s
@@ -421,12 +426,18 @@ spec:
       volumeMounts:
         - name: scratch
           mountPath: /scratch
+        - name: nats-ca
+          mountPath: /etc/a2a-nats-ca
+          readOnly: true
         - name: bus-token
           mountPath: %s
           readOnly: true%s
   volumes:
     - name: scratch
       emptyDir: {}
+    - name: nats-ca
+      configMap:
+        name: platform-agent-a2a-nats-ca-bundle
     - name: bus-token
       projected:
         sources:

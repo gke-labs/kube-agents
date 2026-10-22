@@ -1,5 +1,12 @@
-# ACTIVE — an entry in hack/eval/presubmit-cases.txt, and what takes
-# `consistency` off the coverage allowlist in docs/designs/domains.yaml.
+# NIGHTLY-ACTIVE — an entry in hack/eval/nightly-cases.txt since 2026-10-21,
+# demoted from the blocking roster on #3598 (on the Gemini setup it failed
+# about 30% of repetitions on unrelated pull requests and on main: Vertex
+# 429s, #3399, and real misses where the agent read seeded-c's leftover
+# masterAuthorizedNetworksConfig {gcpPublicCidrsAccessEnabled: true} as
+# configured or open); `consistency` is on the coverage allowlist in
+# docs/designs/domains.yaml until it returns, after #3448 merges, the
+# agent-side fix (#3605) lands and the case passes the roster's bar on the
+# Gemini nightly.
 #
 # A PROBE, not the audit. The full fleet-consistency-drift sweep exists and
 # is spec-ready (consistency-drift-outlier); on 2026-08-26 its run failed on
@@ -16,11 +23,16 @@
 # Planted defect required: the seeded fleet's slot-c cluster carries no
 # master authorized-networks config at all, where slots a and b both carry an
 # open-for-eval block — one cluster, one facet, against a two-peer majority.
+# (Slot d carries the block too, so the majority is three. GKE still returns
+# a leftover masterAuthorizedNetworksConfig {gcpPublicCidrsAccessEnabled:
+# true} with no `enabled` on slot c; the feature is off there. Reading that
+# leftover as configured is the miss #3598 records.)
 # "Master authorized networks" is the planted facet name, so an exact match
 # on it is fair.
 #
 # Isolation class: read-only (chat probe; no audit helper, no GitOps-repo
-# write). Eligible tier: presubmit.
+# write). Eligible tier: presubmit; a blocking-roster case until its
+# demotion to the nightly on 2026-10-21 (#3598).
 #
 # No deterministic mutation safeguard, documented: the planted defect is a
 # GKE master authorized-networks facet, not a Kubernetes object, and the
