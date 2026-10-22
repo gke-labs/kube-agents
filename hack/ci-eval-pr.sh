@@ -480,8 +480,11 @@ eval_forge_profile() { # <EVAL_FORGE> -> "<kind> <host> <yes|no>"
   eval "${body}"
   forge_profile "$1"
 }
-if ! EVAL_FORGE_PROFILE="$(eval_forge_profile "${EVAL_FORGE}")"; then
-  echo "ERROR: EVAL_FORGE='${EVAL_FORGE}' is not a forge this eval knows; use github (default), gitlab, ghes or gitlab-ce (forge_profile in hack/ci-deploy.sh)." >&2
+EVAL_FORGE_PROFILE_RC=0
+EVAL_FORGE_PROFILE="$(eval_forge_profile "${EVAL_FORGE}")" || EVAL_FORGE_PROFILE_RC=$?
+if [ "${EVAL_FORGE_PROFILE_RC}" -ne 0 ]; then
+  # 2 is a host override that is not a bare hostname; forge_profile said so itself.
+  [ "${EVAL_FORGE_PROFILE_RC}" -eq 2 ] || echo "ERROR: EVAL_FORGE='${EVAL_FORGE}' is not a forge this eval knows; use github (default), gitlab, ghes or gitlab-ce (forge_profile in hack/ci-deploy.sh)." >&2
   exit 1
 fi
 read -r EVAL_FORGE_KIND EVAL_FORGE_HOST EVAL_FORGE_SELF_MANAGED <<<"${EVAL_FORGE_PROFILE}"

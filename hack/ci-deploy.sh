@@ -1070,14 +1070,22 @@ fi
 # table; tests/test_ci_gitops_repo.py pins the rows.
 EVAL_FORGE_DEFAULT_GHES_HOST="ghes.eval.internal"
 EVAL_FORGE_DEFAULT_GITLAB_CE_HOST="gitlab.eval.internal"
-forge_profile() { # <EVAL_FORGE> -> "<kind> <host> <yes|no: self-managed>"
+forge_profile() { # <EVAL_FORGE> -> "<kind> <host> <yes|no: self-managed>"; 1 unknown forge, 2 bad host override
+  local kind host var
   case "$1" in
-    github)    echo "github github.com no" ;;
-    gitlab)    echo "gitlab gitlab.com no" ;;
-    ghes)      echo "github ${EVAL_GHES_HOST:-${EVAL_FORGE_DEFAULT_GHES_HOST}} yes" ;;
-    gitlab-ce) echo "gitlab ${EVAL_GITLAB_CE_HOST:-${EVAL_FORGE_DEFAULT_GITLAB_CE_HOST}} yes" ;;
+    github)    echo "github github.com no"; return 0 ;;
+    gitlab)    echo "gitlab gitlab.com no"; return 0 ;;
+    ghes)      kind=github; var=EVAL_GHES_HOST; host="${EVAL_GHES_HOST:-${EVAL_FORGE_DEFAULT_GHES_HOST}}" ;;
+    gitlab-ce) kind=gitlab; var=EVAL_GITLAB_CE_HOST; host="${EVAL_GITLAB_CE_HOST:-${EVAL_FORGE_DEFAULT_GITLAB_CE_HOST}}" ;;
     *) return 1 ;;
   esac
+  # A bare hostname only: the row is split on whitespace, and the chart and the
+  # bench take a host without scheme, port or path (hack/ghes-proxy/README.md).
+  if ! [[ "${host}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$ ]]; then
+    echo "ERROR: ${var}='${host}' is not a bare hostname (no scheme, port, path or spaces); the forge table takes a name such as ${EVAL_FORGE_DEFAULT_GHES_HOST}." >&2
+    return 2
+  fi
+  echo "${kind} ${host} yes"
 }
 
 # --- Which forge this run deploys against (EVAL_FORGE) ----------------------
@@ -1127,8 +1135,11 @@ GITLAB_AGENT_SM_SECRET="gitlab-agent-token"
 # so the pair is rotated by a human with overlap, and one home keeps that
 # the same size however many projects the pool has (docs/ci-pool-projects.md 5.6).
 GITLAB_SECRETS_PROJECT="kube-agents-prow"
-if ! EVAL_FORGE_PROFILE="$(forge_profile "${EVAL_FORGE}")"; then
-  echo "ERROR: EVAL_FORGE='${EVAL_FORGE}' is not a forge this deploy knows; use github (default), gitlab, ghes or gitlab-ce (forge_profile in hack/ci-deploy.sh)." >&2
+EVAL_FORGE_PROFILE_RC=0
+EVAL_FORGE_PROFILE="$(forge_profile "${EVAL_FORGE}")" || EVAL_FORGE_PROFILE_RC=$?
+if [ "${EVAL_FORGE_PROFILE_RC}" -ne 0 ]; then
+  # 2 is a host override that is not a bare hostname; forge_profile said so itself.
+  [ "${EVAL_FORGE_PROFILE_RC}" -eq 2 ] || echo "ERROR: EVAL_FORGE='${EVAL_FORGE}' is not a forge this deploy knows; use github (default), gitlab, ghes or gitlab-ce (forge_profile in hack/ci-deploy.sh)." >&2
   exit 1
 fi
 read -r EVAL_FORGE_KIND EVAL_FORGE_HOST EVAL_FORGE_SELF_MANAGED <<<"${EVAL_FORGE_PROFILE}"
