@@ -1921,6 +1921,19 @@ if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ "$(command -v tirith 2>/dev/null)" = "
     done
 fi
 
+# 4.4b Point npm in every home on the volume at one cache, <agentHome>/.cache/npm,
+# through a ~/.npm symlink in each home. Each profile's processes run with HOME at
+# profiles/<name>/home, so npm kept a ~100 MiB cache per profile (gke-labs#3376).
+# The scaffolder links each profile it creates; this sweep covers the homes created
+# before it did. It also removes each old per-profile ~/.npm directory and logs its
+# size. The scaffolder leaves an old cache in place, because a process of the
+# profile can be using it. A symlink a user made stays. Image copy of the script,
+# as for step 2.5.
+if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$SCAFFOLD" ]; then
+    "$INSTALL_DIR/.venv/bin/python3" "$SCAFFOLD" --share-npm-cache \
+        || echo "WARN: could not point npm at the shared cache; each profile keeps its own" >&2
+fi
+
 # Everything that writes shared volume state is done; release the bootstrap lock
 # before starting anything long-lived, so a peer container is not blocked behind
 # this one for the life of the pod. Closing the fd releases it too, but do both

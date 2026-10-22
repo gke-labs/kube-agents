@@ -140,10 +140,12 @@ var (
 	// gcloudReadCommands are the gcloud command paths that only read,
 	// matched as a prefix of the command's leading words the way the broker
 	// matches them, so positional arguments after the path are allowed. A
-	// release track (`beta`) is a word like any other: each track's path is
-	// listed on its own. get-credentials writes a local kubeconfig, which is
+	// release track (`alpha`, `beta`) is a word like any other: each track's
+	// path is listed on its own. get-credentials writes a local kubeconfig, which is
 	// how every other read here reaches the cluster; the broker serves it.
 	gcloudReadCommands = map[string]bool{
+		"alpha monitoring policies describe":           true,
+		"alpha monitoring policies list":               true,
 		"artifacts docker images describe":             true,
 		"artifacts repositories describe":              true,
 		"artifacts repositories list":                  true,
@@ -153,6 +155,8 @@ var (
 		"beta compute advice capacity":                 true,
 		"beta compute advice capacity-history":         true,
 		"beta monitoring metrics-scopes describe":      true,
+		"beta monitoring policies describe":            true,
+		"beta monitoring policies list":                true,
 		"billing budgets list":                         true,
 		"compute addresses describe":                   true,
 		"compute addresses list":                       true,
@@ -204,6 +208,8 @@ var (
 		"container operations list":                    true,
 		"info":                                         true,
 		"logging read":                                 true,
+		"monitoring policies describe":                 true,
+		"monitoring policies list":                     true,
 		"projects describe":                            true,
 		"projects get-iam-policy":                      true,
 		"projects list":                                true,

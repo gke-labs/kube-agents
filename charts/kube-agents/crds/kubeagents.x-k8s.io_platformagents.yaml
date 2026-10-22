@@ -11309,6 +11309,29 @@ spec:
                           type: string
                       type: object
                   type: object
+                storage:
+                  description: |-
+                    Storage sizes the agent's /opt/data volume and the shell sandbox's
+                    matching data volume.
+                  properties:
+                    size:
+                      anyOf:
+                        - type: integer
+                        - type: string
+                      description: |-
+                        Size is the request of the <name>-data claim and of the shell sandbox's
+                        data claim. The operator requests the same size for both claims and grows
+                        the sandbox's claim first, so the sandbox mirror fits. A StorageClass or a
+                        quota that refuses the growth of one claim can leave the two claims at
+                        different sizes. Absent, the operator default applies (50Gi). Raising it
+                        expands both existing claims online where the StorageClass sets
+                        allowVolumeExpansion; where it does not, the claims keep their size and
+                        the DataVolumeNotExpanded condition says so. The admission webhook refuses
+                        a lower value and a value of zero or less, because a claim cannot shrink.
+                        Removing the field never shrinks a claim.
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                  type: object
                 telemetry:
                   description: Telemetry configures OpenTelemetry export for this agent.
                   properties:
@@ -11571,7 +11594,8 @@ spec:
                         kubeagents_a2a_gateway_messages_inbound_total as well, since Chat
                         ingress is that gateway's there; kept monotonic the same way as
                         ToolExecutionsTotal. Moves LastActiveTime, so a chat turn that runs no
-                        brokered command is activity.
+                        brokered command is activity, and LastHumanActiveTime, which nothing
+                        else moves.
                       format: int64
                       type: integer
                     clustersMonitored:
@@ -11628,7 +11652,23 @@ spec:
                         Scheduled maintenance jobs that run brokered commands move it too --
                         the Controller Stall Watch cron runs some every 30 minutes by default
                         -- so it marks agent activity of any origin, not human or operator use
-                        alone. Advances at most once per five minutes.
+                        alone; LastHumanActiveTime is the one that does. Advances at most once
+                        per five minutes.
+                      format: date-time
+                      type: string
+                    lastHumanActiveTime:
+                      description: |-
+                        LastHumanActiveTime is the time of the last poll in which the one
+                        counter only a person moves advanced: ChatMessagesInboundTotal, a chat
+                        message that reached the gateway, counted before the sender allowlist,
+                        so an unlisted sender is still a person. Nothing else moves it. Brokered
+                        commands and accepted events come from the stall-watch cron and the
+                        event watcher on their own, proposals from the fleet audits, which open
+                        them with nobody asking, and a merge can be a forge rule; all of those
+                        move LastActiveTime and leave this alone, so an install nobody has
+                        talked to in a month shows it. Absent until a person has sent a message
+                        since the operator that writes it started. Advances at most once per
+                        five minutes.
                       format: date-time
                       type: string
                     remediationsAppliedTotal:

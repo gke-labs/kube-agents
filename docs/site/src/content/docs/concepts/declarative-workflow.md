@@ -65,6 +65,17 @@ The agent's only output is a validated `findings.json` — one entry per deviati
 
 What it publishes to the GitOps repository has two tiers: a durable report that is always there, and — only where there is something to merge — narrow pull requests that carry an actual diff. An install with no GitOps repository gets neither tier: the run keeps its findings in the report store and reports them in chat.
 
+### Which repository gets the ledger
+
+The ledger issue and every remediation pull request (a merge request on GitLab) go to one repository: the one with `role: gitops` in [`spec.integration.repositories`](/kube-agents/operator/platformagent-crd/#specintegration). The installer's `--gitops-repo` and the chart's `platformAgent.integration.github.gitRepo` give a repository that role. A `context` repository is never the target, because the agent only reads it. A `managed` repository gets the ledger only when it is the one managed repository and no repository has `role: gitops`.
+
+- **To change the repository**, give `role: gitops` to another repository. At most one repository can have that role. The next run writes its ledger in the new repository, because a run does not keep the repository of an earlier run. The open ledger issue in the old repository stays as it is.
+- **One run in another repository.** Ask the agent to run the audit with `--repo <repository>`. That repository must be managed. The repository applies to that run only: the next run goes back to the `role: gitops` repository.
+- **Several repositories and no `role: gitops`.** The audit does not choose one. It keeps its findings in the report store and reports them in chat on every run, with a message that tells you to give one repository `role: gitops`, or to name a repository for one run.
+- **No repository.** The run keeps its findings in the report store and reports them in chat, as the paragraph above says.
+- **A repository the agent cannot reach.** Before it publishes, the run reads one issue from the repository through the credential broker. If the forge says that the repository does not exist, or that the install's credential cannot read it, or the credential broker does not manage it, the run does not try another repository. It keeps its findings in the report store and reports them in chat on every run, and the report names the repository and the reason.
+- **Another forge error.** A TLS certificate that the credential broker does not trust, a forge host that does not answer, or a credential that the broker cannot load does not change the repository. The run stops with the error and publishes nothing to the forge or the report store. Chat says that the run did not finish, and the next run tries again. If the credential broker itself does not answer, the run stops with `BROKER UNAVAILABLE` and publishes nothing.
+
 ### Tier 1 — the ledger issue
 
 Each audit stream owns exactly one **GitHub issue**, rewritten in place on every run and labelled `agent:audit`, `audit:<audit-id>`, and `severity:<highest severity present>`. Its title is generated (`[audit] <human name> — <n> findings (<c> critical)`), and its body carries the scope table, a findings table with a state column whose every row links to the finding it names, and per-finding detail: evidence, impact, the finding's own id, recommendation, remediation, and a link to that finding's remediation PR where one exists.

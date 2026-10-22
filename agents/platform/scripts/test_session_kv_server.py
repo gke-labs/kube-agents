@@ -1132,6 +1132,7 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("PUT", "/v1/sessions/sess-1/route", {"platform": "slack", "conversation": "slack:dm/D1", "context_id": "c"}),
         ("GET", "/v1/intercepted-events", None),
         ("GET", "/v1/sessions/sess-1/tasks", None),
+        ("POST", "/v1/sessions/sess-1/cards/stop", {"context_id": "c"}),
         ("GET", "/v1/tasks", None),
         ("GET", "/v1/tasks/t-1", None),
     )
@@ -2257,7 +2258,7 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
         # under the heading -- the only thing kanban_notifier.actionable_report
         # can recognise the report by, so a report without it earns no
         # `incidents` row and the reply it invites arrives bare.
-        single_option = instructions.split("**With exactly one option:**", 1)[1]
+        single_option = instructions.split("**With exactly one option:**", 1)[1].split("\n\n", 1)[0]
         bullets = [
             line for line in single_option.splitlines() if line.startswith("- **")
         ]
@@ -2265,6 +2266,52 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
         self.assertTrue(bullets[0].startswith("- **Proposed fix (<Action Title>):**"))
         self.assertTrue(bullets[1].startswith("- **To authorize:** reply **'apply'**"))
         self.assertNotIn("Option", "\n".join(bullets))
+
+    def test_a_report_with_nothing_to_apply_has_no_call_to_action(self):
+        # A warning that resolved itself used to end on "To authorize: reply
+        # 'apply'" too, so the reader could not tell a decision from nothing to
+        # do (#3267). The no-action shape is one bullet and no call to action,
+        # so kanban_notifier.actionable_report stores no `incidents` row for it:
+        # a reply of "apply" has nothing to act on.
+        payload = {
+            "reason": "FailedScheduling",
+            "namespace": "test-ns",
+            "kind_of_object": "Pod",
+            "name": "test-pod",
+            "message": "0/3 nodes are available: insufficient memory."
+        }
+        query = session_kv_server._build_agent_query(payload)
+        instructions = query.split("## What to do", 1)[0]
+        no_action = instructions.split(
+            "**When no manifest change is warranted and nothing is left for anyone to do:**", 1
+        )[1].split("\n\n", 1)[0]
+        bullets = [line for line in no_action.splitlines() if line.startswith("- **")]
+        self.assertEqual(len(bullets), 1, bullets)
+        self.assertTrue(bullets[0].startswith("- **No action needed:**"))
+        self.assertIn("no 'To authorize:' bullet", no_action)
+        self.assertIn("Do not invent a fix to fill the section", no_action)
+        # The shapes that propose a fix still end on the call to action.
+        self.assertIn("When the report proposes a fix, the last bullet", instructions)
+        self.assertIn("- **To authorize:** reply **'apply'**", query.split("## What to do", 1)[1])
+
+    def test_every_triage_template_says_nothing_to_do_with_one_label(self):
+        # The warning, drift and stall cards each have a shape for "nothing to
+        # do", and one chat thread can show all three. They share one label,
+        # so a reader never mistakes the drift card's bullet for a fix to
+        # approve (3438-F1).
+        label = "- **No action needed:**"
+        bodies = {
+            "warning": session_kv_server._triage_task_body(
+                {"reason": "NetworkNotReady", "namespace": "ns", "kind_of_object": "Pod", "name": "p", "message": "m"}
+            ),
+            "drift": session_kv_server._drift_task_body(TestDriftInject.DRIFT_PAYLOAD),
+            "stall": session_kv_server._stall_task_body(TestStallInject.STALL_PAYLOAD),
+        }
+        for kind, body in bodies.items():
+            with self.subTest(kind=kind):
+                self.assertIn(label, body)
+                self.assertNotIn("No change needed", body)
+                self.assertNotIn("no change needed", body)
 
     def test_the_options_and_the_recommendation_are_still_there(self):
         # What the call-to-action points at. A reply of "apply Option B" is
@@ -4897,6 +4944,8 @@ class TestFindingsQueueApi(unittest.TestCase):
         self.assertEqual(len(self.client.get("/v1/findings?severity=major").json()["findings"]), 2)
         self.assertEqual(len(self.client.get("/v1/findings?project=acme-prod").json()["findings"]), 2)
         self.assertEqual(len(self.client.get("/v1/findings?project=acme-staging").json()["findings"]), 0)
+        self.assertEqual(len(self.client.get("/v1/findings?check_prefix=probes-").json()["findings"]), 2)
+        self.assertEqual(len(self.client.get("/v1/findings?check_prefix=upgrade-").json()["findings"]), 0)
         self.assertEqual(self.client.get("/v1/findings?state=pending").status_code, 400)
 
     def test_publication_round_trip(self):
@@ -6266,6 +6315,1140 @@ class TestReadOnlyActivityFeed(unittest.TestCase):
                     "/custom/home/kanban.db",
                 )
 
+
+
+class TestCardStop(unittest.TestCase):
+    """POST /v1/sessions/{id}/cards/stop (#3263): archive a conversation's cards.
+
+    The board is a temporary SQLite file through the `KANBAN_DB_PATH` hook, and
+    Hermes' kanban module is a stub whose `archive_task` does what the real one
+    does to the board: archive the row, clear its worker pid, then run
+    `recompute_ready`, which promotes a todo card whose parents are all done or
+    archived. Every promotion is recorded, because a promoted card in the set
+    is one the dispatcher can claim before this route archives it.
+    deploy/docker/patches/verify_card_stop.py drives the real Hermes functions
+    over the same tree.
+    """
+
+    CONTEXT = "ctx-0123456789ab"
+    SESSION = "a2a-ctx-0123456789ab"
+    CONVERSATION = "slack:C1/1700000000.000100"
+
+    def setUp(self):
+        import sqlite3
+        from fastapi.testclient import TestClient
+
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.root = Path(self._tmpdir.name)
+        self.board = self.root / "kanban.db"
+        self.state_db = self.root / "state.db"
+        with sqlite3.connect(self.board) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY, title TEXT, status TEXT, session_id TEXT,
+                    worker_pid INTEGER, claim_lock TEXT, created_at REAL
+                );
+                CREATE TABLE task_links (parent_id TEXT, child_id TEXT);
+                CREATE TABLE task_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, run_id INTEGER, kind TEXT,
+                    payload TEXT, created_at REAL
+                );
+                CREATE TABLE kanban_notify_subs (
+                    task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT
+                );
+                CREATE TABLE kanban_worker_children (
+                    child_id TEXT PRIMARY KEY, creator_id TEXT NOT NULL, created_at REAL
+                );
+                """
+            )
+        self.archived = []  # (task_id, status when archived), in order
+        self.promoted = []
+        self.on_archive = {}  # task_id -> callable(conn), after its archive commits
+        self.sleeps = []
+        self.on_sleep = []  # callables(conn), one per wait, in order
+        self.at = []  # (clock time, callable(conn)), run by the first wait that reaches it
+        self.busy_timeouts = []  # PRAGMA busy_timeout of each connection archive_task ran on
+        self.now = 0.0  # the deadline's clock; only the waits move it
+        for attribute, value in (
+            ("KANBAN_DB_PATH", str(self.board)),
+            ("CARD_STOP_STATE_DB_PATH", str(self.state_db)),
+            ("CARD_STOP_KILL_GRACE_SECONDS", 2.0),
+            ("_card_stop_sleep", self._sleep),
+            ("_card_stop_clock", lambda: self.now),
+        ):
+            patcher = patch.object(session_kv_server, attribute, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        modules = patch.dict(sys.modules, {"hermes_cli": self._stub_package(), "hermes_cli.kanban_db": self.kanban})
+        modules.start()
+        self.addCleanup(modules.stop)
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(lambda: os.environ.pop("SESSION_KV_API_KEY", None))
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+
+    # -- the stub Hermes ---------------------------------------------------
+
+    def _stub_package(self):
+        import signal
+        import sqlite3
+        import types
+
+        test = self
+        kanban = types.ModuleType("hermes_cli.kanban_db")
+        kanban.VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+
+        def connect(path):
+            conn = sqlite3.connect(str(path), timeout=5.0)
+            conn.row_factory = sqlite3.Row
+            return conn
+
+        def archive_task(conn, task_id, *, signal_fn=None):
+            test.busy_timeouts.append(conn.execute("PRAGMA busy_timeout").fetchone()[0])
+            row = conn.execute("SELECT status, worker_pid FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None or row["status"] == "archived":
+                return False
+            was_running = row["status"] == "running"
+            conn.execute("UPDATE tasks SET status = 'archived', worker_pid = NULL WHERE id = ?", (task_id,))
+            # Hermes' `archived` event carries the run it closed: a claimed card has one.
+            conn.execute(
+                "INSERT INTO task_events (task_id, run_id, kind) VALUES (?, ?, 'archived')",
+                (task_id, 1 if was_running else None),
+            )
+            conn.commit()
+            test.archived.append((task_id, row["status"]))
+            # _terminate_reclaimed_worker: SIGTERM through signal_fn, a refusal or a
+            # vanished pid recorded, never raised; then, past _poll_worker_exit
+            # with the worker still alive, SIGKILL through signal_fn too.
+            if was_running and row["worker_pid"] and signal_fn is not None:
+                try:
+                    signal_fn(row["worker_pid"], signal.SIGTERM)
+                    if session_kv_server._proc_alive(row["worker_pid"]):
+                        signal_fn(row["worker_pid"], signal.SIGKILL)
+                except OSError:
+                    pass
+            hook = test.on_archive.get(task_id)
+            if hook:
+                hook(conn)
+            # recompute_ready
+            for (child,) in conn.execute("SELECT id FROM tasks WHERE status = 'todo'").fetchall():
+                parents = [
+                    p[0]
+                    for p in conn.execute(
+                        "SELECT t.status FROM tasks t JOIN task_links l ON l.parent_id = t.id WHERE l.child_id = ?",
+                        (child,),
+                    )
+                ]
+                if all(p in ("done", "archived") for p in parents):
+                    conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'", (child,))
+                    test.promoted.append(child)
+            conn.commit()
+            return True
+
+        kanban.connect = connect
+        kanban.archive_task = archive_task
+        self.kanban = kanban
+        package = types.ModuleType("hermes_cli")
+        package.__path__ = []
+        package.kanban_db = kanban
+        return package
+
+    def _sleep(self, seconds):
+        import sqlite3
+
+        self.sleeps.append(seconds)
+        self.now += seconds
+        due = [fn for when, fn in self.at if when <= self.now]
+        self.at = [(when, fn) for when, fn in self.at if when > self.now]
+        if due:
+            with closing_conn(sqlite3.connect(self.board)) as conn:
+                for fn in due:
+                    fn(conn)
+                conn.commit()
+        if self.on_sleep:
+            with closing_conn(sqlite3.connect(self.board)) as conn:
+                self.on_sleep.pop(0)(conn)
+                conn.commit()
+
+    # -- the board ---------------------------------------------------------
+
+    def card(self, task_id, status, session=None, parents=(), creator=None, pid=None, title=None, created=None):
+        import sqlite3
+
+        with sqlite3.connect(self.board) as conn:
+            self._insert(conn, task_id, status, session, parents, creator, pid, title, created)
+
+    def _insert(self, conn, task_id, status, session=None, parents=(), creator=None, pid=None, title=None, created=None):
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, session_id, worker_pid, claim_lock, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (task_id, title or f"card {task_id}", status, session, pid, "host:1" if status == "running" else None,
+             created if created is not None else time.time()),
+        )
+        for parent in parents:
+            conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (parent, task_id))
+        if creator and conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'kanban_worker_children'").fetchone():
+            conn.execute("INSERT INTO kanban_worker_children (child_id, creator_id) VALUES (?, ?)", (task_id, creator))
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload) VALUES (?, 'created', ?)",
+            (task_id, json.dumps({"creator_task_id": creator, "parents": list(parents)})),
+        )
+        # Hermes' _inherit_notify_subs: create_task copies every parent's
+        # subscriptions onto the child, and inherit_creator_origin the creator's.
+        self._inherit_subs(conn, task_id, [*parents, *([creator] if creator else [])])
+
+    def _inherit_subs(self, conn, task_id, parents):
+        for parent in parents:
+            conn.execute(
+                "INSERT INTO kanban_notify_subs (task_id, platform, chat_id, thread_id) "
+                "SELECT ?, platform, chat_id, thread_id FROM kanban_notify_subs WHERE task_id = ?",
+                (task_id, parent),
+            )
+
+    def subscribe(self, task_id, chat_id=None, thread_id=None):
+        """The row `kanban_event_routing.py` writes for a card the turn filed."""
+        import sqlite3
+
+        with sqlite3.connect(self.board) as conn:
+            conn.execute(
+                "INSERT INTO kanban_notify_subs (task_id, platform, chat_id, thread_id) VALUES (?, 'slack', ?, ?)",
+                (task_id, chat_id or self.SESSION, thread_id or self.CONVERSATION),
+            )
+
+    def link(self, parent, child):
+        """Hermes' link_tasks: the edge, and the parent's subscriptions copied over."""
+        import sqlite3
+
+        with sqlite3.connect(self.board) as conn:
+            conn.execute("INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)", (parent, child))
+            self._inherit_subs(conn, child, [parent])
+
+    def status(self, task_id):
+        import sqlite3
+
+        with sqlite3.connect(self.board) as conn:
+            return conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()[0]
+
+    def stop(self, session=None, context=None, conversation=None):
+        return self.client.post(
+            f"/v1/sessions/{session or self.SESSION}/cards/stop",
+            json={"context_id": context or self.CONTEXT, "conversation": self.CONVERSATION if conversation is None else conversation},
+        )
+
+    def stopped_ids(self, body):
+        return sorted(entry["id"] for entry in body["stopped"])
+
+    def the_tree(self):
+        """A running parent gating a todo child, a ready fan-out child and its
+        todo grandchild: the shape a front-door card that fanned out has."""
+        self.card("t_parent", "running", session=self.SESSION, pid=None)
+        self.card("t_linked", "todo", session=self.SESSION, parents=["t_parent"])
+        self.card("t_fanout", "ready", session=self.SESSION, creator="t_parent")
+        self.card("t_grand", "todo", session=self.SESSION, parents=["t_fanout"])
+
+    # -- the tree ----------------------------------------------------------
+
+    def test_the_whole_tree_is_archived_and_nothing_is_promoted(self):
+        self.the_tree()
+        response = self.stop()
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertTrue(body["board"])
+        self.assertEqual(self.stopped_ids(body), ["t_fanout", "t_grand", "t_linked", "t_parent"])
+        self.assertEqual({t: self.status(t) for t in ("t_parent", "t_linked", "t_fanout", "t_grand")},
+                         dict.fromkeys(("t_parent", "t_linked", "t_fanout", "t_grand"), "archived"))
+        self.assertEqual(self.promoted, [], "a card in the set was promoted before it was archived")
+        # The running card goes last, and a gated card before its gate.
+        order = [task_id for task_id, _ in self.archived]
+        self.assertEqual(order[-1], "t_parent")
+        self.assertLess(order.index("t_grand"), order.index("t_fanout"))
+        by_id = {entry["id"]: entry for entry in body["stopped"]}
+        self.assertEqual(by_id["t_parent"]["prior_status"], "running")
+        self.assertEqual(by_id["t_parent"]["via"], "session")
+        self.assertEqual(by_id["t_parent"]["title"], "card t_parent")
+        self.assertIsNone(by_id["t_parent"]["worker"])
+        self.assertEqual(body["truncated"], False)
+        self.assertEqual(body["failed"], [])
+
+    def test_link_children_of_other_conversations_crons_and_alerts_are_left_alone(self):
+        """A `task_links` child that carries another session waits on our card;
+        it is not ours to stop. Archiving our card promotes it, as finishing it
+        would have."""
+        marker = session_kv_server.CARD_STOP_WORKER_TASK_ENV
+        self.card("t_parent", "running", session=self.SESSION)
+        foreign = {
+            "t_other_conv": "a2a-ctx-another00000",
+            "t_cron": "cron_nightly_audit",
+            "t_alert": "k8s-evt-1234",
+        }
+        for i, (task_id, session) in enumerate(foreign.items()):
+            self.card(task_id, "running", session=session, parents=["t_parent"], pid=7100 + i)
+        self.card("t_unowned", "todo", session=None, parents=["t_parent"])  # no session, not our fan-out
+        self.card("t_ours_anyway", "todo", session=None, parents=["t_parent"], creator="t_parent")
+        signals = self._fake_proc({7100 + i: (7100 + i, {marker: t}) for i, t in enumerate(foreign)})
+        body = self.stop().json()
+        self.assertEqual(self.stopped_ids(body), ["t_ours_anyway", "t_parent"])
+        for task_id in foreign:
+            self.assertEqual(self.status(task_id), "running", task_id)
+        self.assertEqual(self.status("t_unowned"), "ready")  # promoted, as by design
+        self.assertEqual(signals, [], "a foreign card's worker was signalled")
+        self.assertEqual({e["id"]: e["via"] for e in body["stopped"]}, {"t_parent": "session", "t_ours_anyway": "child"})
+
+    def test_a_done_cards_open_children_are_still_found(self):
+        self.card("t_done", "done", session=self.SESSION)
+        self.card("t_kid", "running", session="elsewhere", creator="t_done")
+        body = self.stop().json()
+        self.assertEqual(self.stopped_ids(body), ["t_kid"])
+        self.assertEqual(body["settled"], [{"id": "t_done", "title": "card t_done", "status": "done"}])
+        self.assertEqual(self.status("t_done"), "done")
+
+    def test_fan_out_children_are_found_from_the_created_event_without_the_patch_table(self):
+        import sqlite3
+
+        with sqlite3.connect(self.board) as conn:
+            conn.execute("DROP TABLE kanban_worker_children")
+        self.card("t_parent", "running", session=self.SESSION)
+        self.card("t_fanout", "ready", session="elsewhere", creator="t_parent")
+        body = self.stop().json()
+        self.assertEqual(self.stopped_ids(body), ["t_fanout", "t_parent"])
+
+    def test_fan_out_children_recorded_only_by_the_patch_table_are_found(self):
+        import sqlite3
+
+        self.card("t_parent", "running", session=self.SESSION)
+        self.card("t_fanout", "ready", session="elsewhere")  # its created event names no creator
+        with sqlite3.connect(self.board) as conn:
+            conn.execute("INSERT INTO kanban_worker_children (child_id, creator_id) VALUES ('t_fanout', 't_parent')")
+        body = self.stop().json()
+        self.assertEqual(self.stopped_ids(body), ["t_fanout", "t_parent"])
+
+    def test_another_sessions_cards_are_untouched(self):
+        self.the_tree()
+        self.card("t_other", "running", session="a2a-ctx-another00000")
+        self.card("t_other_kid", "todo", session="a2a-ctx-another00000", parents=["t_other"])
+        self.card("t_cron", "ready", session="cron_abc")
+        body = self.stop().json()
+        self.assertNotIn("t_other", self.stopped_ids(body))
+        for task_id, status in (("t_other", "running"), ("t_other_kid", "todo"), ("t_cron", "ready")):
+            self.assertEqual(self.status(task_id), status)
+
+    def test_settled_cards_are_not_archived(self):
+        self.card("t_done", "done", session=self.SESSION)
+        self.card("t_gone", "archived", session=self.SESSION)
+        body = self.stop().json()
+        self.assertEqual(body["stopped"], [])
+        self.assertEqual(self.archived, [])
+        self.assertEqual(self.status("t_done"), "done")
+        self.assertEqual([entry["id"] for entry in body["settled"]], ["t_done"])
+        self.assertEqual((body["rounds"], self.sleeps), (0, []), "nothing open, yet it waited to re-scan")
+
+    def test_a_card_another_caller_archived_first_is_not_reported(self):
+        import sqlite3
+
+        self.card("t_raced", "running", session=self.SESSION)
+
+        def loser(conn, task_id, **kwargs):
+            # The dashboard's archive committed between this route's read and
+            # its own; Hermes' UPDATE ... WHERE status != 'archived' then
+            # matches nothing and archive_task answers False.
+            with sqlite3.connect(self.board) as other:
+                other.execute("UPDATE tasks SET status = 'archived' WHERE id = ?", (task_id,))
+            return False
+
+        self.kanban.archive_task = loser
+        body = self.stop().json()
+        self.assertEqual(body["stopped"], [])
+
+    def test_every_open_status_is_stopped(self):
+        open_statuses = ("triage", "todo", "scheduled", "ready", "blocked", "review", "running")
+        for status in open_statuses:
+            self.card(f"t_{status}", status, session=self.SESSION)
+        body = self.stop().json()
+        self.assertEqual(self.stopped_ids(body), sorted(f"t_{s}" for s in open_statuses))
+
+    # -- the seed ----------------------------------------------------------
+
+    def _compressed(self, *chain):
+        import sqlite3
+
+        with sqlite3.connect(self.state_db) as conn:
+            conn.execute(
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT, "
+                "model_config TEXT, source TEXT)"
+            )
+            parent = None
+            for session_id, end_reason in chain:
+                conn.execute("INSERT INTO sessions VALUES (?, ?, ?, NULL, 'api_server')", (session_id, parent, end_reason))
+                parent = session_id
+
+    def test_branches_delegates_and_tool_sessions_are_not_continuations(self):
+        import sqlite3
+
+        self._compressed((self.SESSION, "compression"), ("cont-1", None))
+        with sqlite3.connect(self.state_db) as conn:
+            conn.executemany(
+                "INSERT INTO sessions VALUES (?, ?, NULL, ?, ?)",
+                [
+                    ("branch-1", self.SESSION, json.dumps({"_branched_from": self.SESSION}), "api_server"),
+                    ("delegate-1", self.SESSION, json.dumps({"_delegate_from": self.SESSION}), "api_server"),
+                    ("tool-1", self.SESSION, None, "tool"),
+                    ("junk-config", self.SESSION, "{not json", "api_server"),  # unparseable: a continuation
+                ],
+            )
+        for session in ("cont-1", "branch-1", "delegate-1", "tool-1", "junk-config"):
+            self.card(f"t_{session}", "ready", session=session)
+        body = self.stop().json()
+        self.assertEqual(self.stopped_ids(body), ["t_cont-1", "t_junk-config"])
+
+    def test_a_compressed_continuations_cards_are_found(self):
+        self._compressed((self.SESSION, "compression"), ("cont-1", "compression"), ("cont-2", None))
+        self.card("t_after_one", "running", session="cont-1")
+        self.card("t_after_two", "ready", session="cont-2")
+        body = self.stop().json()
+        self.assertEqual(self.stopped_ids(body), ["t_after_one", "t_after_two"])
+
+    def test_a_branch_that_is_not_a_compression_is_another_conversation(self):
+        self._compressed((self.SESSION, "user_exit"), ("branch-1", None))
+        self.card("t_branch", "ready", session="branch-1")
+        body = self.stop().json()
+        self.assertEqual(body["stopped"], [])
+        self.assertEqual(self.status("t_branch"), "ready")
+
+    def test_a_sessionless_card_subscribed_to_this_conversation_is_found(self):
+        self.card("t_subscribed", "running", session=None)
+        self.subscribe("t_subscribed")
+        self.card("t_other_thread", "running", session=None)
+        self.subscribe("t_other_thread", thread_id="slack:C1/1700000000.999999")
+        self.card("t_other_session", "running", session=None)
+        self.subscribe("t_other_session", chat_id="a2a-ctx-another00000")
+        # Filed with an explicit session of its own: the subscription alone
+        # cannot tell it from a card that inherited our thread, so it stays.
+        self.card("t_explicit", "running", session="explicit-session")
+        self.subscribe("t_explicit")
+        body = self.stop().json()
+        self.assertEqual(self.stopped_ids(body), ["t_subscribed"])
+        self.assertEqual(body["stopped"][0]["via"], "subscription")
+        for task_id in ("t_other_thread", "t_other_session", "t_explicit"):
+            self.assertEqual(self.status(task_id), "running", task_id)
+
+    def test_link_children_that_inherited_our_subscription_are_left_alone(self):
+        """Hermes copies our card's subscription onto every link child, from
+        create_task(parents=...) and from link_tasks; the copy does not make a
+        cron job's, an alert's or another conversation's card ours."""
+        marker = session_kv_server.CARD_STOP_WORKER_TASK_ENV
+        self.card("t_parent", "running", session=self.SESSION)
+        self.subscribe("t_parent")
+        foreign = {"t_other_conv": "a2a-ctx-another00000", "t_cron": "cron_nightly_audit", "t_alert": "k8s-evt-1234"}
+        for i, (task_id, session) in enumerate(foreign.items()):
+            self.card(task_id, "running", session=session, parents=["t_parent"], pid=7200 + i)
+        self.card("t_linked_later", "running", session="cron_hourly", pid=7210)
+        self.link("t_parent", "t_linked_later")
+        self.card("t_sessionless_link", "todo", session=None, parents=["t_parent"])
+        table = {7200 + i: (7200 + i, {marker: t}) for i, t in enumerate(foreign)}
+        table[7210] = (7210, {marker: "t_linked_later"})
+        signals = self._fake_proc(table)
+        import sqlite3
+
+        with sqlite3.connect(self.board) as conn:
+            inherited = conn.execute(
+                "SELECT COUNT(*) FROM kanban_notify_subs WHERE chat_id = ? AND thread_id = ?", (self.SESSION, self.CONVERSATION)
+            ).fetchone()[0]
+        self.assertEqual(inherited, 6, "the stub did not copy the subscription the way Hermes does")
+        body = self.stop().json()
+        self.assertEqual(self.stopped_ids(body), ["t_parent"])
+        for task_id in [*foreign, "t_linked_later"]:
+            self.assertEqual(self.status(task_id), "running", task_id)
+        self.assertEqual(signals, [], "a foreign card's worker was signalled")
+
+    # -- the re-scan -------------------------------------------------------
+
+    def test_a_card_filed_after_the_set_was_collected_is_caught_by_the_rescan(self):
+        self.the_tree()
+        # The dying worker's last act: a fan-out child, filed just after its
+        # card was archived.
+        self.on_archive["t_parent"] = lambda conn: self._insert(conn, "t_late", "ready", session="elsewhere", creator="t_parent")
+        body = self.stop().json()
+        self.assertIn("t_late", self.stopped_ids(body))
+        self.assertEqual(self.status("t_late"), "archived")
+        self.assertGreaterEqual(body["rounds"], 1)
+        self.assertEqual(self.sleeps[0], session_kv_server.CARD_STOP_RESCAN_INTERVAL_SECONDS)
+
+    def test_rescans_stop_once_nothing_is_open(self):
+        self.the_tree()
+        body = self.stop().json()
+        self.assertEqual(body["rounds"], 1)
+
+    def test_rescans_are_bounded(self):
+        self.the_tree()
+        counter = iter(range(100))
+        self.on_sleep = [
+            lambda conn: self._insert(conn, f"t_more_{next(counter)}", "ready", session=self.SESSION)
+            for _ in range(10)
+        ]
+        body = self.stop().json()
+        self.assertEqual(body["rounds"], session_kv_server.CARD_STOP_RESCAN_ROUNDS)
+
+    def test_nothing_open_means_no_rescan(self):
+        body = self.stop().json()
+        self.assertEqual((body["stopped"], body["rounds"], self.sleeps), ([], 0, []))
+
+    def test_a_second_call_stops_nothing(self):
+        self.the_tree()
+        first = self.stop().json()
+        self.assertEqual(len(first["stopped"]), 4)
+        second = self.stop()
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.json()["stopped"], [])
+        self.assertEqual(second.json()["rounds"], 0)
+
+    def test_the_set_is_capped_and_says_so(self):
+        import sqlite3
+
+        with patch.object(session_kv_server, "CARD_STOP_MAX_CARDS", 3), \
+             patch.object(session_kv_server, "CARD_STOP_RESCAN_ROUNDS", 0):
+            with sqlite3.connect(self.board) as conn:
+                for i in range(5):
+                    self._insert(conn, f"t_{i}", "ready", session=self.SESSION, created=i)
+            body = self.stop().json()
+        self.assertTrue(body["truncated"])
+        self.assertEqual(self.stopped_ids(body), ["t_0", "t_1", "t_2"])
+
+    def test_one_failing_archive_does_not_leave_the_rest_running(self):
+        self.the_tree()
+        real = self.kanban.archive_task
+
+        def flaky(conn, task_id, **kwargs):
+            if task_id == "t_linked":
+                raise RuntimeError("database is locked")
+            return real(conn, task_id, **kwargs)
+
+        self.kanban.archive_task = flaky
+        body = self.stop().json()
+        self.assertEqual(self.stopped_ids(body), ["t_fanout", "t_grand", "t_parent"])
+        self.assertEqual([entry["id"] for entry in body["failed"]], ["t_linked"])
+        self.assertIn("locked", body["failed"][0]["error"])
+
+    # -- the requests it refuses -------------------------------------------
+
+    def test_the_session_must_be_the_one_the_context_names(self):
+        self.card("t_parent", "running", session="k8s-evt-1")
+        cases = (
+            ("k8s-evt-1", {"context_id": "k8s-evt-1"}),  # not a bridge session
+            (self.SESSION, {"context_id": "ctx-another0000"}),  # another conversation's context
+            (self.SESSION, {}),  # no context at all
+            (self.SESSION, {"context_id": self.CONTEXT, "conversation": "x" * (session_kv_server.CONVERSATION_FIELD_MAX_CHARS + 1)}),
+        )
+        for session_id, body in cases:
+            with self.subTest(session=session_id, body=body):
+                response = self.client.post(f"/v1/sessions/{session_id}/cards/stop", json=body)
+                self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(self.archived, [])
+
+    def test_a_hashed_context_id_maps_to_its_session(self):
+        context = "ctx with spaces"
+        session = session_kv_server._conversation_session_id(context)
+        self.assertTrue(session.startswith("a2a-h-"))
+        self.card("t_hashed", "ready", session=session)
+        response = self.client.post(f"/v1/sessions/{session}/cards/stop", json={"context_id": context})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.stopped_ids(response.json()), ["t_hashed"])
+
+    def test_no_board_is_an_empty_answer(self):
+        self.board.unlink()
+        body = self.stop().json()
+        self.assertEqual((body["board"], body["stopped"]), (False, []))
+
+    def test_a_missing_hermes_is_a_503(self):
+        with patch.object(session_kv_server, "_hermes_kanban", side_effect=ImportError("no hermes_cli")):
+            response = self.stop()
+        self.assertEqual(response.status_code, 503)
+
+    # -- the worker's processes --------------------------------------------
+
+    def _fake_proc(self, table, ignores_sigterm=()):
+        """Patch the process table: {pid: (pgid, environ dict)}; signals delivered are recorded.
+        A pid in `ignores_sigterm` survives SIGTERM."""
+        import signal
+
+        signals = []
+
+        def kill(pid, sig):
+            signals.append((pid, sig))
+            if not (sig == signal.SIGTERM and pid in ignores_sigterm):
+                table.pop(pid, None)
+            return True
+
+        def environ(pid):
+            entry = table.get(pid)
+            if entry is None:
+                return b""
+            return b"\0".join(f"{k}={v}".encode() for k, v in entry[1].items()) + b"\0"
+
+        for attribute, value in (
+            ("_proc_pids", lambda: list(table)),
+            ("_proc_pgid", lambda pid: table[pid][0] if pid in table else None),
+            ("_proc_environ", environ),
+            ("_proc_alive", lambda pid: pid in table),
+            ("_signal_process", kill),
+        ):
+            patcher = patch.object(session_kv_server, attribute, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return signals
+
+    def test_a_worker_spawned_onto_an_archived_card_is_killed_and_cleared(self):
+        import signal
+        import sqlite3
+
+        marker = session_kv_server.CARD_STOP_WORKER_TASK_ENV
+        self.card("t_raced", "ready", session=self.SESSION)
+        self.card("t_reused", "ready", session=self.SESSION)
+        # The claim->spawn window: the dispatcher writes its worker's pid after
+        # the archive. One pid is t_raced's worker; the other has been handed
+        # to a process that is not t_reused's.
+        signals = self._fake_proc({
+            4101: (4101, {marker: "t_raced"}),
+            4102: (4101, {marker: "t_raced"}),  # its ssh client
+            4201: (4201, {marker: "t_somebody_else"}),
+        })
+
+        def spawn(conn):
+            conn.execute("UPDATE tasks SET worker_pid = 4101 WHERE id = 't_raced'")
+            conn.execute("UPDATE tasks SET worker_pid = 4201 WHERE id = 't_reused'")
+
+        self.on_sleep = [spawn]
+        body = self.stop().json()
+        self.assertEqual(sorted(pid for pid, sig in signals if sig == signal.SIGTERM), [4101, 4102])
+        self.assertNotIn(4201, [pid for pid, _ in signals])
+        with sqlite3.connect(self.board) as conn:
+            pids = dict(conn.execute("SELECT id, worker_pid FROM tasks"))
+        self.assertEqual(pids, {"t_raced": None, "t_reused": 4201})
+        late = {entry["id"]: entry.get("late_worker") for entry in body["stopped"]}
+        self.assertEqual(late["t_raced"]["pid"], 4101)
+        self.assertIsNone(late["t_reused"])
+
+    def test_only_marked_members_of_the_workers_group_are_signalled(self):
+        import signal
+
+        marker = session_kv_server.CARD_STOP_WORKER_TASK_ENV
+        self.card("t_run", "running", session=self.SESSION, pid=5000)
+        signals = self._fake_proc({
+            5001: (5000, {marker: "t_run"}),  # the worker's ssh client
+            5002: (5000, {"HERMES_DELEGATED_CHILD_CONTEXT": "1"}),  # scrubbed: unmarked
+            5003: (5003, {marker: "t_run"}),  # the shared ControlMaster: its own session
+            5004: (5000, {marker: "t_run_2"}),  # another card's marker, same number group
+        })
+        body = self.stop().json()
+        self.assertEqual(signals, [(5001, signal.SIGTERM)])
+        self.assertEqual(body["stopped"][0]["worker"], {"pid": 5000, "signalled": 1, "killed": 0})
+
+    def test_the_workers_group_is_signalled_with_the_worker_not_after_it(self):
+        """Hermes waits up to 5 s for the worker after its SIGTERM; the group's
+        marked members get theirs in the same call, not after that wait."""
+        import signal
+
+        marker = session_kv_server.CARD_STOP_WORKER_TASK_ENV
+        self.card("t_run", "running", session=self.SESSION, pid=5000)
+        signals = self._fake_proc({5000: (5000, {marker: "t_run"}), 5001: (5000, {marker: "t_run"})})
+        seen = []
+        self.on_archive["t_run"] = lambda conn: seen.extend(signals)  # still inside archive_task
+        self.stop()
+        self.assertEqual(sorted(seen), [(5000, signal.SIGTERM), (5001, signal.SIGTERM)])
+
+    def test_a_worker_group_that_ignores_sigterm_is_killed_through_signal_fn(self):
+        """Hermes' SIGKILL after its 5 s wait reaches the worker's marked group
+        members too, inside archive_task, not a grace period later."""
+        import signal
+
+        marker = session_kv_server.CARD_STOP_WORKER_TASK_ENV
+        self.card("t_run", "running", session=self.SESSION, pid=6100)
+        signals = self._fake_proc(
+            {6100: (6100, {marker: "t_run"}), 6101: (6100, {marker: "t_run"})}, ignores_sigterm={6100, 6101}
+        )
+        seen = []
+        self.on_archive["t_run"] = lambda conn: seen.extend(signals)
+        body = self.stop().json()
+        self.assertEqual(
+            sorted(seen),
+            sorted([(6100, signal.SIGTERM), (6100, signal.SIGKILL), (6101, signal.SIGTERM), (6101, signal.SIGKILL)]),
+        )
+        self.assertEqual(body["stopped"][0]["worker"]["killed"], 2)
+
+    def test_a_board_error_after_the_first_pass_is_reported_not_a_503(self):
+        import sqlite3
+
+        self.the_tree()
+
+        def locked(*args, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        with patch.object(session_kv_server, "_sweep_late_worker_pids", locked):
+            response = self.stop()
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(len(body["stopped"]), 4)
+        self.assertTrue(any("database is locked" in error for error in body["errors"]))
+
+    def test_a_rescan_read_error_is_reported_not_a_503(self):
+        import sqlite3
+
+        self.the_tree()
+        real = session_kv_server._collect_card_tree
+        calls = []
+
+        def second_fails(*args, **kwargs):
+            calls.append(1)
+            if len(calls) > 1:
+                raise sqlite3.OperationalError("disk I/O error")
+            return real(*args, **kwargs)
+
+        with patch.object(session_kv_server, "_collect_card_tree", second_fails):
+            response = self.stop()
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(response.json()["stopped"]), 4)
+        self.assertTrue(any("re-scan" in error for error in response.json()["errors"]))
+
+    def test_a_worker_that_ignores_sigterm_gets_sigkill(self):
+        import signal
+
+        marker = session_kv_server.CARD_STOP_WORKER_TASK_ENV
+        self.card("t_run", "running", session=self.SESSION, pid=6000)
+        table = {6001: (6000, {marker: "t_run"})}
+        signals = []
+
+        def stubborn(pid, sig):
+            signals.append((pid, sig))
+            if sig == signal.SIGKILL:
+                table.pop(pid, None)
+            return True
+
+        self._fake_proc(table)
+        with patch.object(session_kv_server, "_signal_process", stubborn), \
+             patch.object(session_kv_server, "CARD_STOP_KILL_GRACE_SECONDS", 0.2):
+            body = self.stop().json()
+        self.assertEqual(signals, [(6001, signal.SIGTERM), (6001, signal.SIGKILL)])
+        self.assertEqual(body["stopped"][0]["worker"]["killed"], 1)
+
+    def test_an_unmarked_pid_on_a_running_row_is_not_signalled(self):
+        # The row's pid now belongs to some other process: Hermes would signal
+        # it; our signal_fn refuses.
+        self.card("t_run", "running", session=self.SESSION, pid=8001)
+        signals = self._fake_proc({8001: (8001, {"PATH": "/usr/bin"})})
+        body = self.stop().json()
+        self.assertEqual(signals, [])
+        self.assertEqual(self.status("t_run"), "archived")
+        self.assertIn("refused", body["stopped"][0]["worker"])
+
+    def test_a_raise_after_the_archive_committed_still_sweeps_and_reports_stopped(self):
+        import signal
+
+        marker = session_kv_server.CARD_STOP_WORKER_TASK_ENV
+        self.card("t_run", "running", session=self.SESSION, pid=9000)
+        table = {9000: (9000, {marker: "t_run"}), 9001: (9000, {marker: "t_run"})}
+        signals = self._fake_proc(table)
+        real = self.kanban.archive_task
+
+        def commits_then_raises(conn, task_id, **kwargs):
+            real(conn, task_id, **kwargs)  # signal_fn has signalled 9000 and 9001 by now
+            # An ssh client the worker started as it died: only the sweep after
+            # the archive can reach it.
+            table[9002] = (9000, {marker: "t_run"})
+            raise RuntimeError("recompute_ready: database is locked")
+
+        self.kanban.archive_task = commits_then_raises
+        body = self.stop().json()
+        self.assertEqual(self.stopped_ids(body), ["t_run"])
+        self.assertIn("database is locked", body["stopped"][0]["note"])
+        self.assertEqual(body["failed"], [])
+        self.assertEqual(sorted(pid for pid, sig in signals if sig == signal.SIGTERM), [9000, 9001, 9002])
+        self.assertEqual(body["stopped"][0]["worker"]["signalled"], 3)
+
+    def test_a_worker_spawned_seconds_after_the_rescans_is_still_killed(self):
+        import signal
+        import sqlite3
+
+        marker = session_kv_server.CARD_STOP_WORKER_TASK_ENV
+        # Claimed, no pid yet: the dispatcher is still checking out a worktree.
+        self.card("t_claimed", "running", session=self.SESSION)
+        signals = self._fake_proc({7001: (7001, {marker: "t_claimed"})})
+        self.at = [(3.5, lambda conn: conn.execute("UPDATE tasks SET worker_pid = 7001 WHERE id = 't_claimed'"))]
+        body = self.stop().json()
+        self.assertEqual(body["rounds"], 1)  # the re-scans were over at 2 s
+        self.assertIn((7001, signal.SIGTERM), signals)
+        self.assertEqual(body["stopped"][0]["late_worker"]["pid"], 7001)
+        with sqlite3.connect(self.board) as conn:
+            self.assertIsNone(conn.execute("SELECT worker_pid FROM tasks WHERE id = 't_claimed'").fetchone()[0])
+        self.assertLess(self.now, 5.0, "it kept watching after the worker was killed")
+        self.assertFalse(body["deadline"])
+
+    def test_the_call_never_waits_past_its_deadline(self):
+        self.card("t_claimed", "running", session=self.SESSION)  # watched, and never gets a pid
+        body = self.stop().json()
+        self.assertEqual(body["stopped"][0]["id"], "t_claimed")
+        self.assertLessEqual(self.now, session_kv_server.CARD_STOP_DEADLINE_S)
+        self.assertGreaterEqual(self.now, session_kv_server.CARD_STOP_DEADLINE_S - 1)
+        self.assertEqual(body["unresolved"], [{"id": "t_claimed", "title": "card t_claimed"}])
+
+    def test_a_hanging_phase_one_keeps_phase_two_from_starting(self):
+        """A running parent archived while its todo child's archive hangs would
+        promote the child; past the deadline phase 2 does not start at all."""
+        import threading
+
+        release = threading.Event()
+        finished = threading.Event()
+        self.addCleanup(lambda: (release.set(), finished.wait(10)))
+        real = self.kanban.archive_task
+
+        def hangs(conn, task_id, **kwargs):
+            if task_id != "t_child":
+                return real(conn, task_id, **kwargs)
+            release.wait(30)
+            try:
+                return real(conn, task_id, **kwargs)
+            finally:
+                finished.set()
+
+        self.kanban.archive_task = hangs
+        self.card("t_parent", "running", session=self.SESSION)
+        self.card("t_child", "todo", session=self.SESSION, parents=["t_parent"])
+        for p in (
+            patch.object(session_kv_server, "_card_stop_clock", time.monotonic),
+            patch.object(session_kv_server, "CARD_STOP_DEADLINE_S", 1.5),
+            patch.object(session_kv_server, "CARD_STOP_ARCHIVE_RESERVE_S", 0.1),
+            patch.object(session_kv_server, "CARD_STOP_RESCAN_ROUNDS", 0),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+        started = time.monotonic()
+        body = self.stop().json()
+        self.assertLess(time.monotonic() - started, 1.5 + session_kv_server.CARD_STOP_BUSY_TIMEOUT_S + 1.0)
+        self.assertEqual([entry["id"] for entry in body["pending"]], ["t_child"])
+        self.assertEqual([entry["id"] for entry in body["failed"]], ["t_parent"])
+        self.assertNotIn("t_parent", [task_id for task_id, _ in self.archived])
+
+    def test_cards_queued_behind_a_hanging_archive_are_failed_not_pending(self):
+        """`pending` promises an archive that will finish. A card queued behind
+        a hanging one never starts: it is a deadline miss, and the straggler
+        thread does not archive it after the answer either."""
+        self._queued_behind_a_hanging_archive(reserve=0.1)
+
+    def test_the_closed_gate_alone_keeps_the_straggler_from_starting(self):
+        # A reserve the budget always grants: only the gate stands between the
+        # straggler and the queued cards once the route has answered.
+        self._queued_behind_a_hanging_archive(reserve=-1000.0)
+
+    def _queued_behind_a_hanging_archive(self, reserve):
+        import threading
+
+        release = threading.Event()
+        finished = threading.Event()
+        self.addCleanup(lambda: (release.set(), finished.wait(10)))
+        real = self.kanban.archive_task
+
+        def hangs(conn, task_id, **kwargs):
+            if task_id != "t_a":
+                return real(conn, task_id, **kwargs)
+            release.wait(30)
+            try:
+                return real(conn, task_id, **kwargs)
+            finally:
+                finished.set()
+
+        self.kanban.archive_task = hangs
+        for i, task_id in enumerate(("t_a", "t_b", "t_c")):
+            self.card(task_id, "ready", session=self.SESSION, created=i)
+        for p in (
+            patch.object(session_kv_server, "_card_stop_clock", time.monotonic),
+            patch.object(session_kv_server, "CARD_STOP_DEADLINE_S", 1.5),
+            patch.object(session_kv_server, "CARD_STOP_ARCHIVE_RESERVE_S", reserve),
+            patch.object(session_kv_server, "CARD_STOP_RESCAN_ROUNDS", 0),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+        body = self.stop().json()
+        self.assertEqual([entry["id"] for entry in body["pending"]], ["t_a"])
+        self.assertEqual(sorted(entry["id"] for entry in body["failed"]), ["t_b", "t_c"])
+        self.assertTrue(all("deadline" in entry["error"] for entry in body["failed"]))
+        # Let the straggler finish t_a, then check it started nothing else.
+        release.set()
+        self.assertTrue(finished.wait(10))
+        time.sleep(0.3)
+        self.assertEqual([task_id for task_id, _ in self.archived], ["t_a"])
+        self.assertEqual((self.status("t_b"), self.status("t_c")), ("ready", "ready"))
+
+    def test_a_running_card_queued_for_a_worker_thread_is_failed_not_pending(self):
+        import threading
+
+        release = threading.Event()
+        finished = threading.Event()
+        self.addCleanup(lambda: (release.set(), finished.wait(10)))
+        real = self.kanban.archive_task
+
+        def hangs(conn, task_id, **kwargs):
+            if task_id != "t_stuck":
+                return real(conn, task_id, **kwargs)
+            release.wait(30)
+            try:
+                return real(conn, task_id, **kwargs)
+            finally:
+                finished.set()
+
+        self.kanban.archive_task = hangs
+        self.card("t_stuck", "running", session=self.SESSION, created=1)
+        self.card("t_queued", "running", session=self.SESSION, created=2)
+        for p in (
+            patch.object(session_kv_server, "_card_stop_clock", time.monotonic),
+            patch.object(session_kv_server, "CARD_STOP_DEADLINE_S", 1.5),
+            patch.object(session_kv_server, "CARD_STOP_ARCHIVE_RESERVE_S", 0.1),
+            patch.object(session_kv_server, "CARD_STOP_RESCAN_ROUNDS", 0),
+            patch.object(session_kv_server, "CARD_STOP_PARALLEL", 1),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+        body = self.stop().json()
+        self.assertEqual([entry["id"] for entry in body["pending"]], ["t_stuck"])
+        self.assertEqual([entry["id"] for entry in body["failed"]], ["t_queued"])
+        release.set()
+        self.assertTrue(finished.wait(10))
+        time.sleep(0.3)
+        self.assertEqual(self.status("t_queued"), "running")
+
+    def test_the_tree_collection_stops_at_the_deadline(self):
+        self.card("t_root", "ready", session=self.SESSION)
+        self.card("t_kid", "ready", session="elsewhere", creator="t_root")
+        with patch.object(session_kv_server, "CARD_STOP_DEADLINE_S", 5.0):  # under the 6 s reserve
+            body = self.stop().json()
+        self.assertTrue(body["truncated"])
+        self.assertTrue(body["deadline"])
+        self.assertEqual(self.status("t_kid"), "ready")
+        self.assertEqual(self.archived, [])
+
+    def test_the_worst_case_is_the_deadline_plus_one_busy_wait(self):
+        """The number the bridge's and the gateway's timeouts are set above."""
+        self.assertEqual(
+            session_kv_server.CARD_STOP_WORST_CASE_S,
+            session_kv_server.CARD_STOP_DEADLINE_S + session_kv_server.CARD_STOP_BUSY_TIMEOUT_S + 1.0,
+        )
+        self.assertEqual(session_kv_server.CARD_STOP_WORST_CASE_S, 24.0)
+
+    def test_an_archive_that_hangs_is_reported_pending_and_not_waited_for(self):
+        """Hermes' write_txn retries, its 5 s worker wait and its git cleanup are
+        not bounded by the route; the answer is, on the real clock."""
+        import threading
+
+        release = threading.Event()
+        finished = threading.Event()
+        # Let the straggler finish before the board's directory is removed.
+        self.addCleanup(lambda: (release.set(), finished.wait(10)))
+        real = self.kanban.archive_task
+
+        def hangs(conn, task_id, **kwargs):
+            if task_id != "t_stuck":
+                return real(conn, task_id, **kwargs)
+            release.wait(30)
+            try:
+                return real(conn, task_id, **kwargs)
+            finally:
+                finished.set()
+
+        self.kanban.archive_task = hangs
+        self.card("t_stuck", "running", session=self.SESSION)
+        self.card("t_fine", "running", session=self.SESSION)
+        patches = [
+            patch.object(session_kv_server, "_card_stop_clock", time.monotonic),
+            patch.object(session_kv_server, "CARD_STOP_DEADLINE_S", 1.5),
+            patch.object(session_kv_server, "CARD_STOP_ARCHIVE_RESERVE_S", 0.1),
+            patch.object(session_kv_server, "CARD_STOP_BUSY_TIMEOUT_S", 0.5),
+            patch.object(session_kv_server, "CARD_STOP_RESCAN_ROUNDS", 0),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        started = time.monotonic()
+        body = self.stop().json()
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 1.5 + 0.5 + 1.0)
+        self.assertEqual([entry["id"] for entry in body["pending"]], ["t_stuck"])
+        self.assertIn("t_fine", self.stopped_ids(body))
+        self.assertTrue(body["deadline"])
+
+    def test_no_archive_starts_without_its_reserve_before_the_deadline(self):
+        import sqlite3
+
+        real = self.kanban.archive_task
+
+        def slow(conn, task_id, **kwargs):
+            self.now += 5.0  # a worker that took Hermes' whole SIGTERM wait
+            return real(conn, task_id, **kwargs)
+
+        self.kanban.archive_task = slow
+        with sqlite3.connect(self.board) as conn:
+            for i in range(4):
+                self._insert(conn, f"t_{i}", "ready", session=self.SESSION, created=i)
+        with patch.object(session_kv_server, "CARD_STOP_DEADLINE_S", 10.0):
+            body = self.stop().json()
+        self.assertTrue(body["deadline"])
+        self.assertEqual(len(body["stopped"]), 1)
+        self.assertEqual(len(body["failed"]), 3)
+        self.assertTrue(all("deadline" in entry["error"] for entry in body["failed"]))
+
+    def test_no_running_archive_starts_without_its_reserve_either(self):
+        for i in range(3):
+            self.card(f"t_run_{i}", "running", session=self.SESSION)
+        with patch.object(session_kv_server, "CARD_STOP_DEADLINE_S", 5.0):
+            body = self.stop().json()
+        self.assertTrue(body["deadline"])
+        self.assertEqual(body["stopped"], [])
+        self.assertEqual(self.archived, [])
+
+    def test_the_routes_connections_wait_seconds_not_minutes_for_a_lock(self):
+        self.the_tree()
+        self.stop()
+        self.assertTrue(self.busy_timeouts)
+        self.assertEqual(set(self.busy_timeouts), {int(session_kv_server.CARD_STOP_BUSY_TIMEOUT_S * 1000)})
+
+    def test_a_card_whose_archive_keeps_raising_is_retried_once(self):
+        calls = []
+        real = self.kanban.archive_task
+
+        def broken(conn, task_id, **kwargs):
+            if task_id == "t_bad":
+                calls.append(task_id)
+                raise RuntimeError("disk I/O error")
+            return real(conn, task_id, **kwargs)
+
+        self.kanban.archive_task = broken
+        self.card("t_bad", "ready", session=self.SESSION)
+        counter = iter(range(100))
+        # Fresh work every round keeps the re-scans going; t_bad must not.
+        self.on_sleep = [
+            lambda conn: self._insert(conn, f"t_new_{next(counter)}", "ready", session=self.SESSION)
+            for _ in range(2)
+        ]
+        body = self.stop().json()
+        self.assertEqual(calls, ["t_bad", "t_bad"])
+        self.assertEqual([entry["id"] for entry in body["failed"]], ["t_bad"])
+
+    def test_failed_archives_alone_do_not_keep_the_rescans_going(self):
+        self.kanban.archive_task = lambda conn, task_id, **kwargs: (_ for _ in ()).throw(RuntimeError("locked"))
+        self.card("t_bad", "ready", session=self.SESSION)
+        body = self.stop().json()
+        self.assertEqual(body["rounds"], 1)
+
+    def test_the_cap_keeps_the_deepest_cards(self):
+        with patch.object(session_kv_server, "CARD_STOP_MAX_CARDS", 2), \
+             patch.object(session_kv_server, "CARD_STOP_RESCAN_ROUNDS", 0):
+            self.card("t_p", "ready", session=self.SESSION, created=1)
+            self.card("t_c", "todo", session=self.SESSION, parents=["t_p"], created=2)
+            self.card("t_g", "todo", session=self.SESSION, parents=["t_c"], created=3)
+            body = self.stop().json()
+        self.assertTrue(body["truncated"])
+        self.assertEqual(self.stopped_ids(body), ["t_c", "t_g"])
+        self.assertEqual(self.promoted, [])
+        self.assertEqual(self.status("t_p"), "ready")
+
+    def test_a_malformed_created_payload_is_skipped(self):
+        import sqlite3
+
+        self.card("t_parent", "running", session=self.SESSION)
+        self.card("t_fanout", "ready", session="elsewhere", creator="t_parent")
+        with sqlite3.connect(self.board) as conn:
+            conn.execute("INSERT INTO task_events (task_id, kind, payload) VALUES ('t_junk', 'created', '{not json')")
+        response = self.stop()
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.stopped_ids(response.json()), ["t_fanout", "t_parent"])
+
+    def test_a_real_workers_subprocesses_do_not_outlive_the_stop(self):
+        """A worker started as the dispatcher starts one, with a `sleep 300` of
+        its own: Hermes' kill reaches the worker only, and the sweep the rest."""
+        import signal
+        import subprocess
+
+        marker = session_kv_server.CARD_STOP_WORKER_TASK_ENV
+        pids_file = self.root / "pids.json"
+        script = self.root / "fake_worker.py"
+        script.write_text(
+            "import json, os, subprocess, sys, time\n"
+            "marked = subprocess.Popen(['sleep', '300'])\n"
+            f"env = {{k: v for k, v in os.environ.items() if k != {marker!r}}}\n"
+            "scrubbed = subprocess.Popen(['sleep', '300'], env=env)\n"
+            "tmp = sys.argv[1] + '.tmp'\n"
+            "with open(tmp, 'w') as fh:\n"
+            "    json.dump({'marked': marked.pid, 'scrubbed': scrubbed.pid}, fh)\n"
+            "os.rename(tmp, sys.argv[1])\n"
+            "time.sleep(300)\n"
+        )
+        env = {**os.environ, marker: "t_real"}
+        worker = subprocess.Popen([sys.executable, str(script), str(pids_file)], env=env, start_new_session=True)
+        # The shared ssh ControlMaster: carries a worker's marker, in a session of its own.
+        master = subprocess.Popen(["sleep", "300"], env=env, start_new_session=True)
+        children = {}
+        try:
+            deadline = time.monotonic() + 10
+            while not pids_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            children = json.loads(pids_file.read_text())
+            self.card("t_real", "running", session=self.SESSION, pid=worker.pid)
+            if not os.path.exists("/proc/self/environ"):
+                self._ps_process_table(env_of={
+                    worker.pid: marker + "=t_real", children["marked"]: marker + "=t_real", master.pid: marker + "=t_real",
+                })
+            body = self.stop().json()
+            worker.wait(5)
+            self.assertEqual(body["stopped"][0]["worker"]["signalled"], 2)  # the worker and its sleep
+            deadline = time.monotonic() + 5
+            while _alive(children["marked"]) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertFalse(_alive(children["marked"]), "the worker's sleep outlived the stop")
+            self.assertTrue(_alive(children["scrubbed"]), "an unmarked process was signalled")
+            self.assertTrue(_alive(master.pid), "a process outside the worker's group was signalled")
+        finally:
+            for pid in [worker.pid, master.pid, *children.values()]:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            worker.wait(5)
+            master.wait(5)
+
+    def _ps_process_table(self, env_of):
+        """No /proc (macOS): list pids with ps, and read the environment from
+        `env_of`, since another process's is not readable here. Linux CI reads
+        the real /proc."""
+        import subprocess
+
+        def pids():
+            out = subprocess.run(["ps", "-A", "-o", "pid="], capture_output=True, text=True).stdout
+            return [int(p) for p in out.split()]
+
+        def environ(pid):
+            return (env_of[pid] + "\0").encode() if pid in env_of and _alive(pid) else b""
+
+        for attribute, value in (("_proc_pids", pids), ("_proc_environ", environ), ("_proc_alive", _alive)):
+            patcher = patch.object(session_kv_server, attribute, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+
+def _alive(pid):
+    """True while `pid` runs; a zombie is not running."""
+    import subprocess
+
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    if os.path.exists(f"/proc/{pid}/stat"):
+        with open(f"/proc/{pid}/stat") as fh:
+            return fh.read().rsplit(")", 1)[1].split()[0] != "Z"
+    state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+    return bool(state) and not state.startswith("Z")
+
+
+def closing_conn(conn):
+    from contextlib import closing
+
+    return closing(conn)
 
 
 class TestDriftBacklog(unittest.TestCase):

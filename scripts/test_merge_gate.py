@@ -58,13 +58,17 @@ def no_files():
 class FakeAPI:
     """Just enough of `GitHubAPI` for the functions that call it."""
 
-    def __init__(self, raw_pull=None, statuses=(), files=(), nodes=(), all_statuses=()):
+    def __init__(self, raw_pull=None, statuses=(), files=(), nodes=(), all_statuses=(), comments=()):
         self.repo = REPO
         self.raw_pull = raw_pull
         self.statuses = list(statuses)
         self.all_statuses = list(all_statuses)
         self.files = list(files)
         self.nodes = list(nodes)
+        self.comments = list(comments)
+        self.comment_reads = []
+        self.refuse_comments = False
+        self.refuse_comment_reads = False
         self.mutations = []
         self.posts = []
 
@@ -78,9 +82,16 @@ class FakeAPI:
             return self.files
         if path.endswith("/statuses"):
             return self.all_statuses
+        if "/comments" in path:
+            if self.refuse_comment_reads:
+                raise RuntimeError("HTTP 502")
+            self.comment_reads.append(path)
+            return self.comments
         return [self.raw_pull]
 
     def post(self, path, payload=None, tolerate=()):
+        if self.refuse_comments and path.endswith("/comments"):
+            raise RuntimeError("HTTP 403")
         self.posts.append((path, payload))
 
     def graphql(self, query, variables):
@@ -536,6 +547,60 @@ class SweepTest(unittest.TestCase):
         self.assertIn("enablePullRequestAutoMerge(input: {pullRequestId: $id})", gate.ENABLE_MUTATION)
         self.assertIn('enablePullRequestAutoMerge(input: {pullRequestId: "PR_7"})', query)
         self.assertNotIn("'", query)
+
+    def test_a_left_out_pull_request_gets_one_comment_with_the_line(self):
+        api, enqueuer = FakeAPI(nodes=[node(7, APPROVED, timeline=[removal("github-merge-queue", reason="failed_checks")])]), FakeAPI()
+        lines, failures = gate.sweep(api, enqueuer=enqueuer)
+        self.assertEqual(failures, 0)
+        comments = [(path, payload["body"]) for path, payload in api.posts if path.endswith("/comments")]
+        self.assertEqual([path for path, _ in comments], [f"/repos/{REPO}/issues/7/comments"])
+        body = comments[0][1]
+        self.assertTrue(body.startswith("<!-- merge-queue-left-out 2026-10-13T11:00:00Z -->\n"))
+        self.assertIn(gate.left_out_line(gate.graphql_pulls(api)[0]), body)
+        self.assertIn("```shell\ngh api graphql -f query='" + gate.ENABLE_COMMAND_QUERY.format(id="PR_7") + "'\n```", body)
+        self.assertEqual(enqueuer.posts, [], "the comment goes through GITHUB_TOKEN, not the App")
+        self.assertIn("#7: posted the left-out comment", lines)
+        self.assertEqual(api.comment_reads, [f"/repos/{REPO}/issues/7/comments?since=2026-10-13T11:00:00Z"])
+        # Prow reads a slash command at the start of a line; no line of the comment may start one.
+        self.assertFalse(any(line.startswith("/") for line in body.splitlines()))
+
+    def test_a_failed_comment_read_is_logged_and_does_not_fail_the_sweep(self):
+        api = FakeAPI(nodes=[node(7, APPROVED, timeline=[removal()])])
+        api.refuse_comment_reads = True
+        lines, failures = gate.sweep(api)
+        self.assertEqual(failures, 0)
+        self.assertIn("#7: left-out comment not posted: HTTP 502", lines)
+        self.assertEqual([path for path, _ in api.posts if path.endswith("/comments")], [])
+
+    def test_a_refused_comment_is_logged_and_does_not_fail_the_sweep(self):
+        api = FakeAPI(nodes=[node(7, APPROVED, timeline=[removal()])])
+        api.refuse_comments = True
+        lines, failures = gate.sweep(api)
+        self.assertEqual(failures, 0)
+        self.assertIn("#7: left-out comment not posted: HTTP 403", lines)
+        self.assertTrue(any(line.startswith("#7: left out, removed") for line in lines))
+
+    def test_the_same_removal_is_not_commented_twice(self):
+        posted = {"body": "<!-- merge-queue-left-out 2026-10-13T11:00:00Z -->\nThe merge queue removed this pull request."}
+        api = FakeAPI(nodes=[node(7, APPROVED, timeline=[removal()])], comments=[{"body": "lgtm"}, posted])
+        lines, _ = gate.sweep(api)
+        self.assertEqual([path for path, _ in api.posts if path.endswith("/comments")], [])
+        self.assertIn("#7: left-out comment already posted", lines)
+
+    def test_a_later_removal_gets_a_new_comment(self):
+        earlier = {"body": "<!-- merge-queue-left-out 2026-10-13T11:00:00Z -->\nThe merge queue removed this pull request."}
+        later = removal(at="2026-10-14T09:00:00Z")
+        api = FakeAPI(nodes=[node(7, APPROVED, timeline=[later])], comments=[earlier])
+        gate.sweep(api)
+        bodies = [payload["body"] for path, payload in api.posts if path.endswith("/comments")]
+        self.assertEqual(len(bodies), 1)
+        self.assertTrue(bodies[0].startswith("<!-- merge-queue-left-out 2026-10-14T09:00:00Z -->"))
+
+    def test_a_dry_run_posts_no_left_out_comment(self):
+        api = FakeAPI(nodes=[node(7, APPROVED, timeline=[removal()])])
+        lines, _ = gate.sweep(api, dry_run=True)
+        self.assertEqual(api.posts, [])
+        self.assertIn("#7: would post the left-out comment", lines)
 
     def test_a_dry_run_changes_nothing(self):
         api = FakeAPI(nodes=[node(1, APPROVED)])

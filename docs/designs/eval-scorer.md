@@ -573,7 +573,7 @@ job and withhold it from the other, so the split was unimplementable until the n
 dedicated account. That is not a reviewer's preference; it is what the guard is made of — which is
 why creating `eval-baseline-recorder` is step 2 of [Provisioning it](#provisioning-it) rather than a
 follow-up, and why the change that armed the store named it on the periodic in the same diff.
-Different accounts in `kube-agents-prow`, the same twelve roles in every pool project: the nightly
+Different accounts in `kube-agents-prow`, the same thirteen roles in every pool project: the nightly
 runs the same `hack/ci-eval-pr.sh` against a leased project, so
 [`docs/ci-pool-projects.md`](../ci-pool-projects.md) section 3 grants and verifies its account
 beside the presubmit's, after the second nightly died at `get-credentials` on a project that
@@ -1069,7 +1069,7 @@ merge-rate data:
   run.
 
 Three numbers in it are priced rather than measured. The repetition count is the script's default 3
-unless the job sets `EVAL_REPETITIONS`. The timeout is `480m`, not the presubmit's `360m`: the
+unless the job sets `EVAL_REPETITIONS`. The timeout is `720m`, not the presubmit's `360m`: the
 twenty-six-task matrix priced at ~532–552 serial minutes at three repetitions, and the presubmit
 realised only ~1.15× on whole-job wall clock against its serial matrix estimate on 2026-09-10 (the
 periodic's timeout comment; the fixed provision-and-deploy term is inside that figure, which is
@@ -1143,7 +1143,7 @@ periodics:
       # prices at ~532-552min serial at three repetitions, and the presubmit's
       # fan-out realised ~1.15x, which 360m would truncate most nights. Priced,
       # not measured; confirm on the first three nights (kube-agents#1491).
-      timeout: 480m
+      timeout: 720m
       grace_period: 5m
     spec:
       # NOT prowjob-default-sa, which is what the presubmit runs as. The
@@ -1550,7 +1550,7 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   missing. The absolute rungs (1, 2, 3, 5) and the correctness floor still block, so the failure
   looks like a working gate. Both exports exist since
   [oss-test-infra#2698](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2698).
-- The nightly periodic's three numbers — the script's default repetitions, the `480m` timeout and
+- The nightly periodic's three numbers — the script's default repetitions, the `720m` timeout and
   `EVAL_TASK_PARALLELISM=6` — are priced, not measured;
   [The job definition](#the-job-definition) says from what. Confirm them on the first three nights'
   wall clock and record the result on
