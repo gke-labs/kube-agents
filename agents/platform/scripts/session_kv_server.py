@@ -125,8 +125,9 @@ FEED_STATUS_UNDELIVERED = "undelivered"
 # others, because its `notified` is 0 and would otherwise read as suppressed. A
 # carded backlog row (DRIFT_BACKLOG_CARDED) reads as a live drift row does.
 FEED_STATUS_BACKLOG = "backlog"
-# The alert was admitted and its triage turn never started: the retries ran out
-# or the start waited past `TRIAGE_QUEUE_WAIT_LIMIT_S` (`triage_state = aborted`).
+# The alert was admitted and its triage turn never started: the retries ran out,
+# or the start was queued past `TRIAGE_QUEUE_WAIT_LIMIT_S` and its one attempt
+# failed (`triage_state = aborted`).
 FEED_STATUS_TRIAGE_ABORTED = "triage_aborted"
 # The severity the inject route filters out of chat (see `inject_message`).
 FEED_FILTERED_SEVERITY = "Info"
@@ -137,8 +138,8 @@ FEED_FILTERED_SEVERITY = "Info"
 NOTIFIED_HEADLESS = 2
 
 # A ledger row's `triage_state`: written `pending` when the triage start is
-# queued and moved to `started` or `aborted`, so a row a restart left `pending`
-# is a triage nobody started.
+# queued and moved to `started` once the turn is sent or `aborted`, so a row
+# left `pending` is a turn never confirmed sent (a restart drops the queue).
 TRIAGE_STATE_PENDING = "pending"
 TRIAGE_STATE_STARTED = "started"
 TRIAGE_STATE_ABORTED = "aborted"
@@ -172,8 +173,11 @@ TRIAGE_RETRY_MAX_DELAY_S = 60.0
 TRIAGE_RETRY_JITTER = (0.5, 1.0)
 # The gateway's loopback address, when PLATFORM_API_URL does not name one.
 PLATFORM_API_URL_DEFAULT = "http://127.0.0.1:8642"
-# A start not finished this long after it was queued gives up, whatever the budget says.
+# A start queued longer than this still gets one attempt, then no retry, whatever
+# the budget says: the wait bounds the retries, never the first try.
 TRIAGE_QUEUE_WAIT_LIMIT_S = 1200.0
+# The ledger write's wait for the SQLite lock, as the other ledger corrections use.
+LEDGER_WRITE_TIMEOUT_S = 5.0
 # How one gateway call on the way to a triage turn ended: done, worth another
 # try, not worth one, or `/chat` sent with no answer (the turn may be running).
 START_OK = "ok"
@@ -1263,7 +1267,7 @@ def mark_triage_state(event_row_id: Optional[int], state: str) -> None:
     if not event_row_id:
         return
     try:
-        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=LEDGER_WRITE_TIMEOUT_S)) as conn:
             with conn:
                 conn.execute(
                     "UPDATE intercepted_events SET triage_state = ? WHERE id = ?",
@@ -2988,9 +2992,6 @@ def _run_triage_start(start: _TriageStart) -> None:
 def _attempt_triage_start(start: _TriageStart) -> None:
     session_id = start.session_id
     waited = time.monotonic() - start.queued_at
-    if waited > TRIAGE_QUEUE_WAIT_LIMIT_S:
-        _triage_not_started(start, "queued")
-        return
     logger.info(f"TRIAGE_DEQUEUED session={session_id} waited={waited:.0f}s")
     api_url = os.environ.get("PLATFORM_API_URL", PLATFORM_API_URL_DEFAULT)
     # The session lands on the default profile — the front door — which

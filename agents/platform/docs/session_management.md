@@ -417,8 +417,9 @@ A start is retried only when it provably did not start: a refused connection, a 
 the session again once. A `/chat` call that was sent and got no answer, or a 5xx other than 503, is
 never sent again, because the turn may be running; the row records it as `started`, so `started`
 means the turn was sent, not that it ran. The budget is 6 answered attempts and 300 s of time spent on
-answered attempts and the waits after them. Refused connections spend neither, and a start not done 20
-minutes after it was queued gives up.
+answered attempts and the waits after them. Refused connections spend neither. A start dequeued more than
+20 minutes after it was queued still gets one attempt, and no retry: a long queue behind slow turns is not
+a gateway fault, and on `main` the start was at least attempted.
 
 A start that gives up logs `TRIAGE_NOT_STARTED session=<id> source=<event|drift|stall> reason=<...>`,
 sets `triage_state = aborted` (the feed reports it as `triage_aborted`, or `undelivered` when the

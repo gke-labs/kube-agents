@@ -8101,11 +8101,19 @@ class TestTriageStartRetry(unittest.TestCase):
         self.assertAlmostEqual(min(sum(self.clock.sleeps), session_kv_server.TRIAGE_QUEUE_WAIT_LIMIT_S), sum(self.clock.sleeps))
         self.assertIn("reason=refused", logs)
 
-    def test_a_start_that_waited_past_the_limit_gives_up_without_calling_the_gateway(self):
+    def test_a_start_that_waited_past_the_limit_still_gets_one_attempt(self):
+        """A long queue behind slow turns is not a gateway fault: the start is tried, as on main."""
         queued_at = self.clock.now - session_kv_server.TRIAGE_QUEUE_WAIT_LIMIT_S - 1
-        urlopen, logs = self._run([], queued_at=queued_at)
-        urlopen.assert_not_called()
-        self.assertIn("reason=queued", logs)
+        urlopen, _ = self._run([_answered(), _answered()], queued_at=queued_at)
+        self.assertEqual(self._urls(urlopen), ["sessions", "chat"])
+        self.assertEqual(self._state(), session_kv_server.TRIAGE_STATE_STARTED)
+
+    def test_a_start_that_waited_past_the_limit_is_not_retried(self):
+        queued_at = self.clock.now - session_kv_server.TRIAGE_QUEUE_WAIT_LIMIT_S - 1
+        urlopen, logs = self._run([TimeoutError("timed out")] * 5, queued_at=queued_at)
+        self.assertEqual(self._urls(urlopen), ["sessions"])
+        self.assertIn("reason=timeout", logs)
+        self.assertEqual(self._state(), session_kv_server.TRIAGE_STATE_ABORTED)
 
     def test_each_attempt_reads_the_key_again(self):
         keys = iter(["old", "new"])
