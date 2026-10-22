@@ -618,6 +618,9 @@ jobs:
       # a failed collect has nothing new that is safe to publish (header).
       - name: Render and publish the dashboard
         if: steps.collect.outcome == 'success'
+        env:
+          # The weekly email's read of the open nightly-red issues.
+          GH_TOKEN: ${{ github.token }}
         run: |
           render_args=()
           [ -f work/health.json ] && render_args+=(--health work/health.json)
@@ -631,6 +634,13 @@ jobs:
           # post_health.DASHBOARD_URL's directory, so the pages' links
           # resolve there whatever URL the console login lands on.
           python3 scripts/eval_dashboard/render.py --data work/data.json --out-dir work/site "${render_args[@]}" --public-url
+          # The weekly health email (docs/ci-health.md, "The weekly health
+          # email"), published beside data.json as health-email.html. It is
+          # rendered only when every integrity check passes; a refusal prints
+          # its reasons and leaves the last published copy in place. Nothing
+          # sends it yet: TODO(#3440) the mail route and its permissions.
+          python3 scripts/eval_dashboard/weekly_email.py --data work/data.json --store work/store.json --out work/site/health-email.html \
+            || echo "::warning::the weekly health email was not rendered this tick (reasons above)"
           python3 scripts/eval_dashboard/publish.py --out-dir work/site --target "$DASHBOARD_BUCKET/"
 
       - name: Fetch the webhook URL (optional alternative to the Chat API)
