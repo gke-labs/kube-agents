@@ -120,9 +120,10 @@ func configFromEnv(getenv func(string) string) (settings, error) {
 		listen:    or(envListen, defaultListen),
 		tokenFile: tokenFile,
 		bus: mcp.BusConfig{
-			URL:      url,
-			User:     or(envBusUser, defaultBusUser),
-			Password: password,
+			URL:          url,
+			User:         or(envBusUser, defaultBusUser),
+			Password:     password,
+			PasswordFile: passwordFile,
 			Deployment: mcp.Deployment{
 				Agent:     getenv(envAgent),
 				Namespace: getenv(envNamespace),
@@ -145,6 +146,12 @@ func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string)
 		return mcp.DialBus(dialCtx, s.bus)
 	})
 	if err != nil {
+		// Stopped while still waiting for the bus (a rollout or a drain
+		// during an outage): a clean stop, as serve treats one.
+		if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+			log.Info("stopped before the bus was reachable")
+			return nil
+		}
 		log.Error("mcp bus", "err", err)
 		return err
 	}
@@ -162,14 +169,22 @@ func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string)
 	return serve(ctx, log, ln, mcp.Handler(srv, s.tokenFile, log))
 }
 
-// dialWithRetry calls dial until it succeeds or ctx is done, waiting backoff
-// after the first failure and doubling it to maxDialBackoff, and logs each
-// failure with the wait before the next attempt.
+// dialWithRetry calls dial until it succeeds, the bus refuses it for good
+// (mcp.DialRefused), or ctx is done, waiting backoff after the first failure
+// and doubling it to maxDialBackoff, and logs each failure with the wait
+// before the next attempt.
 func dialWithRetry[B any](ctx context.Context, log *slog.Logger, backoff time.Duration, dial func(context.Context) (B, error)) (B, error) {
 	for {
 		b, err := dial(ctx)
 		if err == nil {
 			return b, nil
+		}
+		// A refused credential or an untrusted certificate is no transient:
+		// fail now, under its own cause, so the pod restarts with that in its
+		// log rather than retrying for minutes as "not reachable yet".
+		if mcp.DialRefused(err) {
+			var zero B
+			return zero, fmt.Errorf("the bus refused the connection (check the console credential and the bus CA): %w", err)
 		}
 		log.Warn("the bus is not reachable yet; retrying", "in", backoff, "err", err)
 		select {

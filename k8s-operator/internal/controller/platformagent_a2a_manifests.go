@@ -6217,7 +6217,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// The early exit. This path runs on every reconcile of every install that
 	// is not `next` — forever, on installs that have never rendered an A2A
 	// object — so proving "nothing to do" one object at a time is a standing
-	// cost for a no-op. Ten reads answer it instead of walking every object
+	// cost for a no-op. Eleven reads answer it instead of walking every object
 	// in the teardown sequence:
 	//
 	//   - the StatefulSet, which is deleted LAST below, so its absence means an
@@ -6261,6 +6261,9 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	//     inject flag. It is the third fence reconcileA2ANetworkFences writes,
 	//     so the same two deletes leave it standing alone there, and nothing
 	//     on the today path but this walk removes it either,
+	//   - the MCP server's fence, the same shape under A2A_MCP_DOOR: written
+	//     after the pair, so the same hand leaves it alone, and nothing on the
+	//     today path but this walk removes it,
 	//   - the callout keys Secret, which is the FIRST deletable object
 	//     reconcileA2A creates — the per-user creds Secret is created before it
 	//     and deliberately survives — so a render that died anywhere leaves this
@@ -6273,8 +6276,8 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	//
 	// Without the Secrets and the fences the exit would step over those objects
 	// and leave an A2A object on a `today` install, which is the darkness
-	// property. The first eight are Owns kinds and free; the two Secret reads
-	// are uncached and happen only when the free eight all miss.
+	// property. The first nine are Owns kinds and free; the two Secret reads
+	// are uncached and happen only when the free nine all miss.
 	//
 	// A sentinel counts only when this CR owns it: a squatted or stale-UID
 	// object under a reserved name is not residue of this CR and is left to
@@ -6283,7 +6286,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// counted would send every reconcile of a today install into that refusal
 	// -- the shape a next CR deleted and re-created under the same name in
 	// today mode takes, while its old fences still carry the old UID.
-	// Ownership is read off the fetched object, so the exit stays at ten
+	// Ownership is read off the fetched object, so the exit stays at eleven
 	// Gets.
 	//
 	// Adding an object to reconcileA2A ahead of the keys Secret, or to
@@ -6292,7 +6295,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// prefix of both renders and is what makes forgetting it red rather than
 	// silent: without the keys Secret below, its writes 3 and 4 fail, and
 	// without the fences every guardrail prefix does. The inject, door,
-	// console and gateway fences are the ones no prefix leaves alone;
+	// console, gateway and MCP fences are the ones no prefix leaves alone;
 	// TestAHandDeletedPairLeavesTheInjectFenceToDriveTheFlip, its A2A door
 	// twin, TestAHandDeletedPairLeavesTheConsoleFenceToDriveTheFlip and
 	// TestTheA2AGatewayFenceComesAndGoesWithTheGateway are what red without
