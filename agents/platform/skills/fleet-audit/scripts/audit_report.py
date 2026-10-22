@@ -852,6 +852,9 @@ CHAT_REPORT_NEW_IDS_KEY = "new_ids"
 CHAT_REPORT_BASELINE_IDS_KEY = "run_baseline_ids"
 CHAT_REPORT_BASELINE_KNOWN_KEY = "run_baseline_known"
 CHAT_REPORT_BASELINE_STALE_KEY = "run_baseline_stale"
+# Every id the previous run filed, rendered or not (a body over budget cuts some):
+# none is new on any count of this run, as `finish`'s own count already holds.
+CHAT_REPORT_BASELINE_FILED_KEY = "run_baseline_filed"
 # Above a later `finish`'s report in the same entry. Its counts cover the whole
 # run when they came from the entry's baseline; otherwise (no ledger, a HELD
 # report, an entry an older image wrote) they are measured against the report
@@ -3353,6 +3356,8 @@ class RunBaseline(NamedTuple):
     ids: list[str]
     known: bool
     stale_scheme: bool
+    # Every id the previous run filed, rendered or not; never counted new.
+    filed: list[str]
     # Read off the entry an earlier `finish` of this run saved it on.
     from_entry: bool
 
@@ -3363,6 +3368,7 @@ def run_baseline(
     previous_ids: list[str],
     delta_known: bool,
     stale_scheme: bool,
+    filed_ids: Iterable[str],
     now: datetime,
 ) -> RunBaseline:
     """The baseline on `repo`'s entry in this run, else this `finish`'s own, saved there.
@@ -3374,7 +3380,7 @@ def run_baseline(
     one that saved none (an older image, a failed write) leaves this one's
     memory a mid-run snapshot, which no later `finish` may count from.
     """
-    own = RunBaseline(list(previous_ids), bool(delta_known), bool(stale_scheme), False)
+    own = RunBaseline(list(previous_ids), bool(delta_known), bool(stale_scheme), sorted(set(filed_ids)), False)
     record = _live_chat_record(audit_id, now)
     filled = None if record is None else _filled_part(record, repo)
     part = filled or (None if record is None else _pending_part(record, repo))
@@ -3383,18 +3389,22 @@ def run_baseline(
     ids = part.get(CHAT_REPORT_BASELINE_IDS_KEY)
     known = part.get(CHAT_REPORT_BASELINE_KNOWN_KEY)
     stale = part.get(CHAT_REPORT_BASELINE_STALE_KEY)
+    filed = part.get(CHAT_REPORT_BASELINE_FILED_KEY)
     if (
         isinstance(ids, list)
         and all(isinstance(fid, str) for fid in ids)
         and isinstance(known, bool)
         and isinstance(stale, bool)
+        and isinstance(filed, list)
+        and all(isinstance(fid, str) for fid in filed)
     ):
-        return RunBaseline(ids, known, stale, True)
+        return RunBaseline(ids, known, stale, filed, True)
     if filled is not None:
         return own
     part[CHAT_REPORT_BASELINE_IDS_KEY] = own.ids
     part[CHAT_REPORT_BASELINE_KNOWN_KEY] = own.known
     part[CHAT_REPORT_BASELINE_STALE_KEY] = own.stale_scheme
+    part[CHAT_REPORT_BASELINE_FILED_KEY] = own.filed
     record[CHAT_REPORT_UPDATED_KEY] = now.timestamp()
     try:
         _write_chat_record(audit_id, record)
@@ -3933,6 +3943,25 @@ def report_finding_places(
             check, cluster, namespace, _object = derive_finding_id(finding).split(".")
             places[published_id(finding)] = (check, cluster, namespace)
     return places
+
+
+def previous_filed_ids(
+    memory: dict | None, previous_body: str, existing_issue: int | None, stale_scheme: bool
+) -> set[str]:
+    """Every id the previous run filed, rendered or not; what `new` is measured against.
+
+    From the stored document when there is one (`report_filed`); else from the
+    complete block a body that cut findings for space wrote. Empty for a first
+    run, a seeded memory with no such block, or another identity scheme.
+    """
+    filed = report_filed(memory) if existing_issue is not None and not stale_scheme else None
+    if filed is not None:
+        return set(filed[0])
+    complete = ALL_FINDINGS_RE.findall(normalise_newlines(previous_body))
+    try:
+        return set(json.loads(complete[-1])) if complete else set()
+    except (json.JSONDecodeError, TypeError):
+        return set()
 
 
 def report_filed(envelope: dict | None) -> tuple[set[str], set[tuple[str, str]]] | None:
@@ -18575,7 +18604,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             f"{ID_SCHEME}; withholding 'resolved' this run rather than reporting "
             "a rename as a fix."
         )
-    baseline = run_baseline(audit_id, repo, previous_ids, delta_known, stale_scheme, now)
+    filed_cut = previous_filed_ids(memory, previous_body, existing_issue, stale_scheme)
+    baseline = run_baseline(audit_id, repo, previous_ids, delta_known, stale_scheme, filed_cut, now)
     # Every finding in the document, rendered or not. The stale-close pass
     # below reads this set and must keep reading it: a finding the body budget
     # dropped still reproduces, and retiring its pull request on that basis
@@ -19453,17 +19483,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # that one did not: a ledger that cut findings for space, and one written
     # before cut findings were listed, would announce them all on the first
     # run that has room.
-    if filed is not None:
-        new_ids = [fid for fid in new_ids if fid not in filed[0]]
-    else:
-        # A seeded memory has no document, but a body that cut findings named
-        # every one it filed in its complete block.
-        complete = ALL_FINDINGS_RE.findall(normalise_newlines(previous_body))
-        try:
-            cut = set(json.loads(complete[-1])) if complete else set()
-        except (json.JSONDecodeError, TypeError):
-            cut = set()
-        new_ids = [fid for fid in new_ids if fid not in cut]
+    new_ids = [fid for fid in new_ids if fid not in filed_cut]
     # Held back again for the collector, on the same principle as the coverage
     # rule one source further out: a candidate the collector still emits is the
     # condition still holding, whatever this run's document did or did not say
@@ -19796,6 +19816,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     if baseline.from_entry and baseline.known:
         # The run's delta, on the yardsticks and filters this run's own took.
         run_new, run_resolved = compute_delta(baseline.ids, rendered.rendered_ids, current_ids)
+        run_new = [fid for fid in run_new if fid not in set(baseline.filed)]
         if any(fid in still_flagged - held_exclude for fid in run_resolved):
             run_resolved = [fid for fid in run_resolved if fid not in still_flagged]
         if gaps or baseline.stale_scheme:

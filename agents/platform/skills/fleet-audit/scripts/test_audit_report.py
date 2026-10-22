@@ -27765,6 +27765,34 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         self.assertEqual(len(heads), 3)
         self.assertIn(": 2 new, 0 resolved;", heads[-1])
 
+    def test_a_finding_the_previous_ledger_filed_but_cut_is_not_the_runs_new(self):
+        """The previous body was over budget: `b` was filed but not rendered, so it is not new."""
+        self.start()
+        ida, idb = derived_id(fid="a"), derived_id(fid="b")
+        body = (
+            f"## Findings\n\n<!-- audit-findings: {json.dumps([ida])} -->\n"
+            f"<!-- audit-findings-all: {json.dumps([ida, idb])} -->\n"
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME} -->\n"
+        )
+        self.previous_document = {
+            "findings": [
+                {"id": ida, "check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments", "object": "Namespace/a"},
+                {"id": idb, "check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments", "object": "Namespace/b"},
+            ]
+        }
+        self.seed_report(body)
+        self.harness.replies["issue-list"] = self.issue_list()
+        doc = make_doc(findings=[make_finding(fid=f, severity="major") for f in ("a", "b")])
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        self.assertEqual(self.stdout_json()["new"], 0)
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        self.assertEqual(self.stdout_json()["new"], 0)
+        first, second = self.heads()
+        self.assertIn(": 0 new, 0 resolved;", first)
+        self.assertIn(": 0 new, 0 resolved;", second)
+        [part] = self.chat_record()["parts"]
+        self.assertEqual(part[audit_report.CHAT_REPORT_BASELINE_FILED_KEY], sorted([ida, idb]))
+
     def test_a_clean_later_finish_counts_everything_the_run_resolved(self):
         self.start()
         self.on_a_ledger_of("a", "b")

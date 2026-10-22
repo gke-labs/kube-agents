@@ -227,7 +227,8 @@ age and repository rule, with one exception: a later `finish` of a repository wh
 two hours, is the same run. It adds its report under the earlier one's, below a label line,
 and gives the record a new `run` stamp; when the earlier `finish` died before it wrote its
 report, the later one fills the entry in its place. The first `finish` of the repository in the
-run saves the previous run's finding ids on the entry before it touches the ledger, and a later
+run saves the previous run's finding ids on the entry before it touches the ledger, with every id
+that run filed, rendered or not, so a finding a body over budget cut is not the run's new; a later
 `finish` counts its chat report against them (`run_baseline`): its label says the counts cover the
 whole run, and its line states the run's new and resolved findings, or says the change is unknown
 when the first `finish` had no trusted memory of the previous run. Its JSON line still counts
