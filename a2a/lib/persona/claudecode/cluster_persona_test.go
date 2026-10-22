@@ -3,8 +3,10 @@ package claudecode
 import (
 	"bytes"
 	"encoding/json"
+	"io/fs"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -126,24 +128,56 @@ func TestTheClusterPersonaStatesItsRedLines(t *testing.T) {
 	}
 }
 
-// The persona's scripts are copies of the ones the Hermes profiles run, kept
-// byte-identical so a fix to one is not lost from the other.
-func TestTheClusterPersonaScriptsMatchTheirSources(t *testing.T) {
-	for copied, source := range map[string]string{
-		"skills/gke-stall-detection/scripts/stall_report.py":    "../../../../agents/platform/scripts/stall_report.py",
-		"skills/gke-workload-security/scripts/audit_cluster.sh": "../../../../agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh",
-	} {
-		a, err := os.ReadFile(path.Join(clusterPersonaDir, copied))
+// scriptSources maps a persona skill file to the platform script it copies;
+// every other file of a persona skill copies the same path under
+// agents/cluster/skills.
+var scriptSources = map[string]string{
+	"gke-stall-detection/scripts/stall_report.py":    "../../../../agents/platform/scripts/stall_report.py",
+	"gke-workload-security/scripts/audit_cluster.sh": "../../../../agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh",
+}
+
+// Every file of a persona skill but its SKILL.md (the scripts and the assets)
+// is a byte-identical copy of its source, so a fix to one is not lost from the
+// other. A file with no known source fails.
+func TestTheClusterPersonaSkillFilesMatchTheirSources(t *testing.T) {
+	root := path.Join(clusterPersonaDir, persona.SkillsDir)
+	checked := 0
+	err := filepath.WalkDir(root, func(full string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		rel, err := filepath.Rel(root, full)
 		if err != nil {
-			t.Fatal(err)
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		if path.Base(rel) == persona.SkillFile && path.Dir(path.Dir(rel)) == "." {
+			return nil
+		}
+		source, ok := scriptSources[rel]
+		if !ok {
+			source = path.Join(clusterSkillsDir, rel)
+		}
+		a, err := os.ReadFile(full)
+		if err != nil {
+			return err
 		}
 		b, err := os.ReadFile(source)
 		if err != nil {
-			t.Fatal(err)
+			t.Errorf("%s has no source (looked for %s): copy files from agents/cluster/skills or name the source in scriptSources", rel, source)
+			return nil
 		}
+		checked++
 		if !bytes.Equal(a, b) {
-			t.Errorf("%s differs from %s; copy the source over it", copied, source)
+			t.Errorf("%s differs from %s; copy the source over it", rel, source)
 		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checked < len(scriptSources) {
+		t.Errorf("checked %d files, want at least the %d scripts", checked, len(scriptSources))
 	}
 }
 
@@ -165,7 +199,10 @@ type skillRewrite struct {
 	start, end, text string
 }
 
-const getCredentialsLine = "gcloud container clusters get-credentials <cluster_name> --region <cluster_location> "
+// getCredentialsLine is the credential fetch the cluster skills open a bash
+// block with; fenced blocks are compared line by line, so it carries its
+// newline (and, in gke-stall-detection, the blank line after it).
+const getCredentialsLine = "gcloud container clusters get-credentials <cluster_name> --region <cluster_location>\n"
 
 // allowedSkillEdits is every way a persona skill may differ from its source:
 // no credential fetching, no kanban reporting, "card" read as "request", and
@@ -183,7 +220,7 @@ var (
 		},
 		"gke-stall-detection": {
 			{"`/opt/data/scripts/stall_report.py`", "`scripts/stall_report.py`, in this skill's directory,", 1},
-			{getCredentialsLine, "", 1},
+			{getCredentialsLine + "\n", "", 1},
 			{"/opt/data/scripts/stall_report.py", "scripts/stall_report.py", 4},
 		},
 		"gke-workload-security": {
@@ -209,11 +246,45 @@ var (
 )
 
 // normalizeMarkdown undoes what prettier changes when it reflows an edited
-// file: line breaks and indentation, table rule widths, and *emphasis*.
+// file's prose: line breaks and indentation, table rule widths, and
+// *emphasis*. A fenced block is kept exactly, line by line, apart from the
+// indentation of the fence itself (a list item's block moves with the item),
+// so a de-indented yaml key inside one still shows.
 func normalizeMarkdown(s string) string {
-	s = strings.Join(strings.Fields(s), " ")
-	s = ruleRE.ReplaceAllString(s, "---")
-	return emphasisRE.ReplaceAllString(s, "${1}_${2}_${3}")
+	var out, prose []string
+	flush := func() {
+		if len(prose) > 0 {
+			p := strings.Join(strings.Fields(strings.Join(prose, "\n")), " ")
+			p = ruleRE.ReplaceAllString(p, "---")
+			out = append(out, emphasisRE.ReplaceAllString(p, "${1}_${2}_${3}"))
+			prose = nil
+		}
+	}
+	lines := strings.Split(s, "\n")
+	for i := 0; i < len(lines); i++ {
+		trimmed := strings.TrimLeft(lines[i], " ")
+		if !strings.HasPrefix(trimmed, "```") && !strings.HasPrefix(trimmed, "~~~") {
+			prose = append(prose, lines[i])
+			continue
+		}
+		flush()
+		indent := len(lines[i]) - len(trimmed)
+		fence := trimmed[:3]
+		block := []string{trimmed}
+		for i++; i < len(lines); i++ {
+			body := lines[i]
+			if len(body) >= indent && strings.TrimSpace(body[:indent]) == "" {
+				body = body[indent:]
+			}
+			block = append(block, body)
+			if strings.HasPrefix(strings.TrimLeft(lines[i], " "), fence) {
+				break
+			}
+		}
+		out = append(out, strings.Join(block, "\n"))
+	}
+	flush()
+	return strings.Join(out, " ")
 }
 
 // The persona's text for each rewritten section: the reporting goes to the

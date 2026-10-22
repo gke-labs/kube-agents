@@ -2290,7 +2290,7 @@ COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 #
 # check_skill_commands.py rides along the same way, with skill_documents.py,
 # which it imports. It runs every shell block in the skill documents of the
-# image's three skill trees through Hermes' Tirith scan, which is why the Cluster Agent template is
+# image's four skill trees through Hermes' Tirith scan, which is why the Cluster Agent template is
 # copied above this block rather than below it.
 # It scans with the image's pinned tirith (--tirith-bin), the binary that ships.
 COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml
