@@ -185,7 +185,7 @@ CLAIM_TEMPLATES = {
     CLAIM_MODEL_CHANGE: "This week ran {model}; last week ran {prev_model}, so the change compares two models.",
 }
 DOWN_ITEM = "{name} (down {pts} pts)"
-NOT_ENOUGH_WHY = "{prev} of last week's and {this} of this week's nights ran to completion, and a trend needs {need} in each"
+NOT_ENOUGH_WHY = "{prev} of last week's and {this} of this week's nights counted, and a trend needs {need} in each"
 NAMES_JOIN = ", "
 
 TITLE = "kube-agents weekly health, week of {day}"
@@ -213,6 +213,8 @@ ATTENTION_INTRO = (f"Areas below {NEEDS_ATTENTION_BELOW_PCT}% or down {NEEDS_ATT
                    "Each links to its open nightly bugs.")
 ATTENTION_NONE = (f"Nothing this week: every area is at {NEEDS_ATTENTION_BELOW_PCT}% or more and none is down "
                   f"{NEEDS_ATTENTION_DROP_PTS} points or more.")
+# A week with too few counted nights computes no change, so it claims none.
+ATTENTION_NONE_NO_TREND = f"Nothing this week: every area is at {NEEDS_ATTENTION_BELOW_PCT}% or more; no trend this week."
 ATTENTION_RATE = "{pct}%"
 ATTENTION_DOWN = "{pct}%, down {pts}"
 ATTENTION_FEW = "{pct}%, few scenarios"
@@ -262,6 +264,7 @@ ROWS_JOIN = "\n"
 WHY_CUT = "cut off"
 WHY_NO_MAIN = "no main part"
 WHY_RUN_EVENT = "nearly every scenario failed"
+WHY_NO_RUN = "no run on record"
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>{title}</title></head>
 <body style="margin:0;padding:0;background:{page_bg};">
@@ -635,7 +638,7 @@ def build_week(data: dict, store: dict | None, domain_rows: list[dict], week_end
     week = {
         "week_end": week_end.isoformat(), "days": [d.isoformat() for d in days], "prev_days": [d.isoformat() for d in prev_days],
         "counted": [d.isoformat() for d in this_nights], "prev_counted": [d.isoformat() for d in prev_nights],
-        "left_out": {d.isoformat(): left_out[d] for d in days + prev_days if d in left_out},
+        "left_out": {d.isoformat(): left_out.get(d, WHY_NO_RUN) for d in days + prev_days if d not in counted},
         "trend_ok": trend_ok, "cases": common,
         "one_week_only": sorted((set(this_cases) | set(prev_cases)) - set(common)),
         "data_domains": {}, "rows": [], "attention": [], "claims": [], "fatal": None,
@@ -838,10 +841,12 @@ def integrity_failures(week: dict, domain_rows: list[dict], bugs: dict | None,
             if html.escape(bugs_url(week.get("repo", ghcli.DEFAULT_REPO), slug)) not in page:
                 out.append(FAIL_LINK_MISSING.format(name=names.get(slug, slug)))
 
-    # 9. domains match
+    # 9. domains match. A case with no task.yaml on this checkout (renamed
+    # or deleted, its old runs still on record) is "unknown", the dashboard's
+    # "no domain" bucket, not a domains.yaml row to add.
     known = {r["slug"] for r in domain_rows}
     for domain, cases in sorted(week["data_domains"].items()):
-        if domain not in known:
+        if domain not in known and domain != nightly.DOMAIN_UNKNOWN:
             out.append(FAIL_DOMAIN_UNKNOWN.format(domain=domain, cases=NAMES_JOIN.join(cases)))
     this_domains = {nightly.domains(data).get(c) for c in this_cases}
     for row in domain_rows:
@@ -950,7 +955,7 @@ def render(week: dict, bugs: dict, repo: str = ghcli.DEFAULT_REPO) -> str:
         items.append(ATTENTION_ITEM.format(rule=RULE, ink=INK, muted=MUTED, link=LINK, name=esc(row["name"]), state=state,
                                            url=esc(bugs_url(repo, slug)), bugs=OPEN_BUGS.format(count=shown[slug])))
     if not items:
-        items.append(ATTENTION_EMPTY.format(rule=RULE, muted=MUTED, text=ATTENTION_NONE))
+        items.append(ATTENTION_EMPTY.format(rule=RULE, muted=MUTED, text=ATTENTION_NONE if week["trend_ok"] else ATTENTION_NONE_NO_TREND))
     week["shown_bugs"] = shown
     week["repo"] = repo
     attention = ATTENTION_ROW.format(bg=ATTENTION_BG, ink=INK, muted=MUTED, title=ATTENTION_TITLE, intro=ATTENTION_INTRO, items="".join(items))

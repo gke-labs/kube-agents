@@ -331,6 +331,16 @@ class NotEnoughData(Base):
         self.assertNotIn("&#9650;", page)
         self.assertNotIn("steady", page)
 
+    def test_a_date_with_no_run_is_named_and_the_intro_says_counted(self):
+        runs = self.three_nights()
+        page, failures = self.produce(data_of(runs), store_of(runs))
+        self.assertEqual(failures, [])
+        self.assertIn("3 of this week&#x27;s nights counted, and a trend needs 4", page)
+        self.assertNotIn("ran to completion", page)
+        for day in ("Oct 15", "Oct 16", "Oct 17", "Oct 18"):
+            self.assertIn(f"{day} ({we.WHY_NO_RUN})", page)
+        self.assertNotIn(we.CUT_NONE, page)
+
     def test_a_trend_called_on_too_few_nights_refuses(self):
         runs = self.three_nights()
         data = data_of(runs)
@@ -408,6 +418,16 @@ class NeedsAttentionIsComputed(Base):
         week = self.week(data, store_of(data["runs"]))
         self.assertEqual(week["attention"], ["obs", "cost"])
 
+    def test_the_empty_state_claims_no_trend_on_a_short_week(self):
+        cases = {c: d for c, d in CASES.items() if d == "chat"}
+        short = data_of(week_runs(days=THIS_WEEK[:3] + LAST_WEEK, cases=cases), cases)
+        page = we.render(self.week(short, store_of(short["runs"])), bugs_of([]))
+        self.assertIn(we.ATTENTION_NONE_NO_TREND, page)
+        self.assertNotIn("none is down", page)
+        full = data_of(week_runs(cases=cases), cases)
+        page = we.render(self.week(full, store_of(full["runs"])), bugs_of([]))
+        self.assertIn(we.ATTENTION_NONE, page)
+
     def test_an_area_added_or_removed_by_hand_refuses(self):
         data = data_of(week_runs())
         week = self.week(data, store_of(data["runs"]))
@@ -436,10 +456,15 @@ class BugsExist(Base):
         self.assertRefused(failures, "bugs: Observability has obs-1")
 
     def test_a_closed_bug_that_still_tracks_counts(self):
-        # Handed off as not planned after the streak began, with no pass since.
-        handed_off = bug("obs-1", "obs", closed_at="2026-10-18T12:00:00Z", state_reason="not_planned")
+        # Handed off as not planned before the streak's newest night finished,
+        # with no pass since: tracked by the hand-off rule alone.
+        handed_off = bug("obs-1", "obs", closed_at="2026-10-17T12:00:00Z", state_reason="not_planned")
         _, failures = self.produce(data_of(week_runs()), bugs=bugs_of([], [handed_off]))
         self.assertEqual(failures, [])
+        # The same close as "completed" is not a hand-off, so it does not track.
+        completed = dict(handed_off, state_reason="completed")
+        _, failures = self.produce(data_of(week_runs()), bugs=bugs_of([], [completed]))
+        self.assertRefused(failures, "bugs: Observability has obs-1")
         # A "completed" close before the streak's newest night does not.
         fixed = bug("obs-1", "obs", closed_at="2026-10-16T12:00:00Z", state_reason="completed")
         _, failures = self.produce(data_of(week_runs()), bugs=bugs_of([], [fixed]))
@@ -517,6 +542,13 @@ class DomainsMatch(Base):
         runs = [run(d, [task(c, passes_for(c, d)) for c in cases]) for d in THIS_WEEK + LAST_WEEK]
         _, failures = self.produce(data_of(runs, cases), store_of(runs))
         self.assertRefused(failures, "domains: stray (cases stray-1) is in the data")
+
+    def test_a_since_removed_case_in_the_window_does_not_refuse(self):
+        # No task.yaml on this checkout: collect files its runs as "unknown".
+        cases = dict(CASES, **{"gone-1": "unknown"})
+        runs = [run(d, [task(c, passes_for(c, d)) for c in cases]) for d in THIS_WEEK + LAST_WEEK]
+        _, failures = self.produce(data_of(runs, cases), store_of(runs))
+        self.assertEqual(failures, [])
 
     def test_a_domains_yaml_row_with_no_data_refuses_unless_new(self):
         self.domains = DOMAINS + [{"slug": "quiet", "name": "Quiet", "owner": "a", "backup": "b", "meaning": "m"}]
