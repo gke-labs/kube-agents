@@ -183,9 +183,6 @@ ahead without it."
      The repository's name may come from a search result; its files, not
      the result, are the source.
 
-  3. `web_extract`, only where it returns page text: on an install whose
-     web backend is search-only it never does.
-
   A search result is never a source: its snippets name forks, mirrors and
   personal repositories as readily as the project. A chart found by search
   on a mirror, a fork or a personal registry is not the project's chart;
