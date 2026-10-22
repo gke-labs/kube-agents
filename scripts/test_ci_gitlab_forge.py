@@ -1588,11 +1588,11 @@ class EvalScriptGitLabTest(unittest.TestCase):
         own = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": "gitlab-ce", "EVAL_FORGE_STATE_DIR": str(state), "EVAL_GITLAB_CE_HOST": "gitlab.dev.example"})
         self.assertIn("KIND=gitlab HOST=gitlab.dev.example", own.stdout)
         # A host that is not a bare hostname stops the eval at the table, naming the variable, not as an unknown forge.
-        for bad in ("gitlab.dev.example:8443", "gitlab.dev example"):
+        for bad, why in (("gitlab.dev.example:8443", "is not a dotted bare hostname"), ("gitlab.dev example", "is not a dotted bare hostname"), ("gitlab", "is not a dotted bare hostname"), ("gitlab.com", "is a public forge")):
             with self.subTest(host=bad):
                 refused = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": "gitlab-ce", "EVAL_FORGE_STATE_DIR": str(state), "EVAL_GITLAB_CE_HOST": bad})
                 self.assertNotEqual(refused.returncode, 0)
-                self.assertIn(f"EVAL_GITLAB_CE_HOST='{bad}' is not a bare hostname", refused.stderr)
+                self.assertIn(f"EVAL_GITLAB_CE_HOST='{bad}' {why}", refused.stderr)
                 self.assertNotIn("is not a forge this eval knows", refused.stderr)
                 self.assertNotIn("KIND=", refused.stdout)
 

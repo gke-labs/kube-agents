@@ -1079,12 +1079,19 @@ forge_profile() { # <EVAL_FORGE> -> "<kind> <host> <yes|no: self-managed>"; 1 un
     gitlab-ce) kind=gitlab; var=EVAL_GITLAB_CE_HOST; host="${EVAL_GITLAB_CE_HOST:-${EVAL_FORGE_DEFAULT_GITLAB_CE_HOST}}" ;;
     *) return 1 ;;
   esac
-  # A bare hostname only: the row is split on whitespace, and the chart and the
-  # bench take a host without scheme, port or path (hack/ghes-proxy/README.md).
-  if ! [[ "${host}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$ ]]; then
-    echo "ERROR: ${var}='${host}' is not a bare hostname (no scheme, port, path or spaces); the forge table takes a name such as ${EVAL_FORGE_DEFAULT_GHES_HOST}." >&2
+  # A dotted bare hostname only: the row is split on whitespace, and the chart
+  # takes a host without scheme, port or path (hack/ghes-proxy/README.md). The
+  # two public hosts are not self-managed; the chart refuses them with a CA set.
+  # The chart's finer rules (reserved domains, length) stay the chart's.
+  if ! [[ "${host}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]; then
+    echo "ERROR: ${var}='${host}' is not a dotted bare hostname (no scheme, port, path or spaces); the forge table takes a name such as ${EVAL_FORGE_DEFAULT_GHES_HOST}." >&2
     return 2
   fi
+  case "$(printf '%s' "${host}" | tr '[:upper:]' '[:lower:]')" in
+    github.com|gitlab.com)
+      echo "ERROR: ${var}='${host}' is a public forge, not a self-managed one; EVAL_FORGE=github or gitlab is that row." >&2
+      return 2 ;;
+  esac
   echo "${kind} ${host} yes"
 }
 
