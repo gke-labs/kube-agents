@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/mcp"
+	"github.com/nats-io/nats.go"
 )
 
 func env(m map[string]string) func(string) string {
@@ -178,5 +181,44 @@ func TestTheFirstDialIsRetried(t *testing.T) {
 		return "", errors.New("connection refused")
 	}); !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("a dial that never succeeds ended with %v, want the context's end", err)
+	}
+}
+
+// A dial the bus refused for good (the credential, or a certificate that does
+// not verify) is not retried as "not reachable yet": it fails at once.
+func TestARefusedDialIsNotRetried(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	for name, refusal := range map[string]error{
+		"authorization": fmt.Errorf("connect: %w", nats.ErrAuthorization),
+		"unknown CA":    fmt.Errorf("connect: %w", x509.UnknownAuthorityError{}),
+		"wrong name":    fmt.Errorf("connect: %w", x509.HostnameError{Host: "127.0.0.1"}),
+	} {
+		calls := 0
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_, err := dialWithRetry(ctx, log, time.Millisecond, func(context.Context) (string, error) {
+			calls++
+			return "", refusal
+		})
+		cancel()
+		if calls != 1 || err == nil || errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("%s: %d calls, err %v; want one call and the refusal", name, calls, err)
+		}
+	}
+}
+
+// Stopped while still waiting for an unreachable bus, the server exits
+// cleanly: a rollout or drain during an outage is not a failed container.
+func TestAStopDuringTheFirstDialIsClean(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	err := realMain(ctx, log, env(map[string]string{
+		envListen:       "127.0.0.1:0",
+		envTokenFile:    file(t, "a-token"),
+		envBusURL:       "tls://127.0.0.1:1",
+		envPasswordFile: file(t, "pw"),
+	}))
+	if err != nil {
+		t.Errorf("a stop during the first dial returned %v, want a clean stop", err)
 	}
 }
