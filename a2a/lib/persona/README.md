@@ -41,7 +41,11 @@ a server reached around the broker would be outside both.
 - an `@` import in `instructions.md` or a skill's markdown that could leave
   the persona. The check fails closed rather than parse imports the way the
   harness does: any `@` token that starts with `/` or `~`, or contains `..`,
-  a backslash or a non-ASCII character, is refused, in fenced blocks too;
+  a backslash or a non-ASCII character, is refused, in fenced blocks too.
+  An `@` that starts a word must also name a file the persona ships, as
+  rendered: `CLAUDE.md` or a file under `skills/`. Staying inside the
+  persona's directory is not enough, because the instructions land in the
+  harness's config directory beside files the persona does not own;
 - unknown and repeated keys in `persona.yaml` and `mcp.yaml`;
 - a file over 1 MiB, or a persona over 16 MiB in total.
 

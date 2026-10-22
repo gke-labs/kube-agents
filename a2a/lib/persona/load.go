@@ -46,6 +46,10 @@ var (
 	// through the next ASCII whitespace. Broader than the harness's own rule
 	// on purpose (see importEscapes).
 	importRE = regexp.MustCompile(`@(\S+)`)
+	// wordImportRE is an "@" that starts a word: at the start of a line or
+	// after anything but an ASCII letter or digit. The harness reads only
+	// these as imports; "oncall@example.com" is not one.
+	wordImportRE = regexp.MustCompile(`(?:^|[^A-Za-z0-9])@(\S+)`)
 )
 
 // Load reads and validates the persona directory dir. A validation failure
@@ -64,6 +68,7 @@ func Load(dir string) (*Persona, error) {
 
 type loader struct {
 	dir      string
+	imports  []pendingImport
 	problems []Problem
 	err      error
 	total    int
@@ -111,6 +116,7 @@ func (l *loader) load() *Persona {
 	if l.err != nil {
 		return nil
 	}
+	l.checkImportTargets(p)
 	l.validateMCP(p.MCP)
 	l.validateManifest(&p.Manifest, p.MCP)
 	return p
@@ -296,11 +302,19 @@ func (l *loader) skill(rel, name string) (Skill, bool) {
 	return s, true
 }
 
-// checkImports refuses @-imports that could leave the config directory.
-// Claude Code expands "@path" in CLAUDE.md and its imports, so such a line
-// would read a file from the pod into the prompt. Fenced code blocks are
-// checked too: mirroring the harness's fence rule is a parser to keep in
-// step, and refusing an example costs only a rewording.
+// pendingImport is an @-import seen while reading, checked against the
+// persona's files once they are all read.
+type pendingImport struct {
+	rel, target string
+	line        int
+}
+
+// checkImports refuses @-imports that could leave the config directory, and
+// records each word-initial one for checkImportTargets. Claude Code expands
+// "@path" in CLAUDE.md and its imports, so such a line would read a file
+// from the pod into the prompt. Fenced code blocks are checked too:
+// mirroring the harness's fence rule is a parser to keep in step, and
+// refusing an example costs only a rewording.
 func (l *loader) checkImports(rel string, data []byte) {
 	for i, line := range strings.Split(string(data), "\n") {
 		for _, m := range importRE.FindAllStringSubmatch(line, -1) {
@@ -309,8 +323,38 @@ func (l *loader) checkImports(rel string, data []byte) {
 					"the import %q could read a file outside the persona; an import names a path inside it, with no \"..\", \"\\\\\", leading \"/\" or \"~\", or non-ASCII", "@"+m[1])
 			}
 		}
+		for _, m := range wordImportRE.FindAllStringSubmatch(line, -1) {
+			if !importEscapes(m[1]) {
+				l.imports = append(l.imports, pendingImport{rel: rel, target: m[1], line: i + 1})
+			}
+		}
 	}
 }
+
+// checkImportTargets refuses an import that names no file the persona ships.
+// Staying inside the persona's own directory is not enough: the adapter
+// writes the instructions into the harness's config directory, beside files
+// the persona does not own (settings.json, .credentials.json). A target is
+// resolved as the harness would, in the rendered layout: the instructions
+// become CLAUDE.md at the root, and a skill's files keep their paths.
+func (l *loader) checkImportTargets(p *Persona) {
+	shipped := map[string]bool{renderedInstructions: true}
+	for _, s := range p.Skills {
+		for _, f := range s.Files {
+			shipped[path.Join(SkillsDir, s.Name, f.Path)] = true
+		}
+	}
+	for _, imp := range l.imports {
+		if !shipped[path.Clean(path.Join(path.Dir(imp.rel), imp.target))] {
+			l.add(imp.rel, fmt.Sprintf("line %d", imp.line),
+				"the import %q names no file the persona ships; an import names %s or a file under %s/", "@"+imp.target, renderedInstructions, SkillsDir)
+		}
+	}
+}
+
+// renderedInstructions is the name instructions.md is written under in the
+// config directory, which is where an import from it resolves.
+const renderedInstructions = "CLAUDE.md"
 
 // importEscapes fails closed rather than resolve the path the way the
 // harness does: the harness's token rules (Unicode spaces, backslash-escaped

@@ -280,6 +280,9 @@ func TestLoadImportsInsideThePersona(t *testing.T) {
 	// climb after a descent, an @ after a no-break space, a backslash-escaped
 	// space, a non-ASCII character.
 	for _, line := range []string{
+		// Inside the config directory, beside CLAUDE.md, but not the persona's.
+		"Read @settings.json and @.credentials.json",
+		"@instructions.md",
 		"@skills/../../outside",
 		"see\u00a0@/etc/hosts",
 		`@a\ b/x`,
