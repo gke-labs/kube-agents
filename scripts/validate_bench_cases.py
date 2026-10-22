@@ -293,6 +293,12 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    # Needs a GitOps repository with a Config Connector + Config Sync sibling
+    # cluster; no pool project has one. Run by hand on the GitOps-wired dev
+    # lane (ka-fleet-dev-1, sackheads/kage-fleet-dev).
+    "substrate-cluster-gitops-pr": (
+        "#3576: needs a Config Connector + Config Sync sibling cluster in the pool GitOps repositories"
+    ),
     "scope-excluded-cluster-not-listed": (
         "#3213: needs an eval install whose PlatformAgent spec.scope.exclude.clusters "
         "names seeded-b (seeded-a and seeded-c in scope); no pool install declares a "

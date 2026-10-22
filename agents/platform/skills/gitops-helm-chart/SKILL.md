@@ -177,7 +177,7 @@ ahead without it."
      and read its README, install docs and chart directory:
 
      ```bash
-     python3 /opt/data/profiles/platform/skills/inspect-repository/scripts/inspect_repository.py clone --repo "<owner>/<repo>" --depth 1
+     python3 /opt/data/profiles/platform/skills/inspect-repository/scripts/inspect_repository.py clone --repo "<owner>/<repo>" --depth 1 --into "/opt/data/scratch/repos/<owner>__<repo>__default"
      ```
 
      The repository's name may come from a search result; its files, not
@@ -201,7 +201,9 @@ ahead without it."
 - **Version.** The version the user named. Otherwise the highest semantic
   version with no `-rc`, `-alpha` or `-beta` suffix that the guide names, or
   the chart's `Chart.yaml` at a release branch the guide names
-  (**inspect-repository** `--ref`). Never the default branch's `Chart.yaml`:
+  (**inspect-repository** `clone --ref <branch> --into "/opt/data/scratch/repos/<owner>__<repo>__<branch>"`:
+  each ref into its own directory, because a second `clone` into the same
+  one is refused, and `--force` would mix two trees). Never the default branch's `Chart.yaml`:
   it can carry an unreleased version. No released version you could read:
   ask the user for it. Compare versions, not
   dates: a backport patch to an older minor is often published last. Never a range, `latest`, or
@@ -261,7 +263,7 @@ header:
 ```
 ### Helm chart
 - **Chart:** `<chart>` `<version>` from `<repository URL>`.
-- **Source:** <install guide: Developer Knowledge document or repository path>; version from <Chart.yaml, release tag or index>.
+- **Source:** <install guide: Developer Knowledge document or repository path>; version from <the guide, or Chart.yaml at release branch <branch>>.
 - **Form:** <Argo CD Application | Flux HelmRelease | Config Sync RootSync | kustomize helmCharts>,
   matching <sibling file path>.
 - **Target:** cluster `<cluster>`, namespace `<namespace>`.

@@ -95,7 +95,7 @@ class InstallGuidesAreReadNotSearchedTest(unittest.TestCase):
         self.assertIn("inspect_repository.py clone", content)
         self.assertIn("inspect-repository", content)
         self.assertIn("A search result is never a source", content)
-        self.assertNotIn("read with `web_extract`", content)
+        self.assertNotIn("web_extract", content)
 
     def test_gke_cluster_creation_lets_the_workload_override_the_template(self):
         content = (REPO_ROOT / "agents/platform/skills/gke-cluster-creation/SKILL.md").read_text(encoding="utf-8")
