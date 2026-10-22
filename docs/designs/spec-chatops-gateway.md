@@ -1691,7 +1691,10 @@ status phrases only; one shaped like a question ("how is the deploy doing") is a
 A bare `/session` asks for the next message in its thread. Slack's Stop button on an Agent
 Session's Working… line sends `agent_session_stopped`, which the adapter turns into a cancel that
 names no task, keyed on the thread's conversation, with `IntentCancel`, which no chat message
-carries, so the gateway tells the button from the word. Only a requester the conversation's record
+carries, so the gateway tells the button from the word. The event names no team for the presser, so
+the adapter checks the workspace itself: a member the allowed-users list names passes, anyone else
+must be in this workspace by `users.info` (cached per member for five minutes), and a lookup that
+fails, or a workspace auth.test never named, drops the press. Only a requester the conversation's record
 holds (a task's requester or steer author, or a session author) may press it; anyone else's press
 cancels nothing and posts nothing (`stopgate.go`), while typed `stop` keeps its rule. A record that
 cannot tell who asked gates nobody: nothing ran, a requester was cleared past `AskTTL`, a steer or

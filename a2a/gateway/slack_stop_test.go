@@ -2,12 +2,88 @@ package gateway
 
 import (
 	"testing"
+	"time"
 
+	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
 )
 
-func TestSlackStopBecomesAnUnnamedCancel(t *testing.T) {
+// stopTestAdapter is a Slack adapter in workspace T0URS that knows UALICE as
+// one of its members, so a Stop press passes the workspace check.
+func stopTestAdapter() *SlackAdapter {
+	s := newTestSlackAdapter(&fakeSlackAPI{users: map[string]*slack.User{"UALICE": {ID: "UALICE", TeamID: "T0URS"}}})
+	s.teamID = "T0URS"
+	return s
+}
+
+func stopEvent(user string) *slackevents.AgentSessionStoppedEvent {
+	return &slackevents.AgentSessionStoppedEvent{Channel: "C123", ThreadTimestamp: "1.1", User: user, EventTimestamp: "2.2"}
+}
+
+func TestSlackStopFromAnotherWorkspaceIsDropped(t *testing.T) {
+	api := &fakeSlackAPI{users: map[string]*slack.User{"UEXT": {ID: "UEXT", TeamID: "T0THEIRS"}}}
+	s := newTestSlackAdapter(api)
+	s.teamID = "T0URS"
+	if _, ok := s.inboundStop(stopEvent("UEXT")); ok {
+		t.Fatal("a Slack Connect member of another workspace pressed Stop")
+	}
+}
+
+func TestSlackStopFailsClosedWhenTheWorkspaceCannotBeTold(t *testing.T) {
+	// The lookup fails (an unknown user).
 	s := newTestSlackAdapter(&fakeSlackAPI{})
+	s.teamID = "T0URS"
+	if _, ok := s.inboundStop(stopEvent("UNOBODY")); ok {
+		t.Error("a press whose presser could not be looked up was taken")
+	}
+	// auth.test named no workspace.
+	s = stopTestAdapter()
+	s.teamID = ""
+	if _, ok := s.inboundStop(stopEvent("UALICE")); ok {
+		t.Error("a press was taken with no workspace to check it against")
+	}
+}
+
+func TestSlackStopListedMemberSkipsTheLookup(t *testing.T) {
+	api := &fakeSlackAPI{}
+	s := newTestSlackAdapter(api)
+	s.teamID = "T0URS"
+	// The allowed-users list names UEXT, so the install has vouched for them.
+	s.SetHome(func(member string) (bool, bool) { return member == "UEXT", false }, nil)
+	if _, ok := s.inboundStop(stopEvent("UEXT")); !ok {
+		t.Fatal("a member the allowed-users list names was refused")
+	}
+	if api.userInfoCalls != 0 {
+		t.Fatalf("a listed member cost %d users.info calls", api.userInfoCalls)
+	}
+}
+
+func TestSlackStopWorkspaceAnswerIsCached(t *testing.T) {
+	api := &fakeSlackAPI{users: map[string]*slack.User{"UALICE": {ID: "UALICE", TeamID: "T0URS"}}}
+	s := newTestSlackAdapter(api)
+	s.teamID = "T0URS"
+	clock := newFakeClock(s)
+	for i, ts := range []string{"2.1", "2.2", "2.3"} {
+		e := stopEvent("UALICE")
+		e.EventTimestamp = ts
+		if _, ok := s.inboundStop(e); !ok {
+			t.Fatalf("press %d was refused", i)
+		}
+	}
+	if api.userInfoCalls != 1 {
+		t.Fatalf("three presses cost %d users.info calls, want 1", api.userInfoCalls)
+	}
+	clock.advance(slackStopPresserTTL + time.Second)
+	e := stopEvent("UALICE")
+	e.EventTimestamp = "2.4"
+	s.inboundStop(e)
+	if api.userInfoCalls != 2 {
+		t.Fatalf("a press past the cache's bound cost %d calls in all, want 2", api.userInfoCalls)
+	}
+}
+
+func TestSlackStopBecomesAnUnnamedCancel(t *testing.T) {
+	s := stopTestAdapter()
 	msg, ok := s.inboundStop(&slackevents.AgentSessionStoppedEvent{
 		Type: "agent_session_stopped", Channel: "C123", ThreadTimestamp: "1700000000.000100",
 		User: "UALICE", EventTimestamp: "1700000050.000200",
@@ -26,7 +102,7 @@ func TestSlackStopBecomesAnUnnamedCancel(t *testing.T) {
 }
 
 func TestSlackStopInADMKeysTheDMThread(t *testing.T) {
-	s := newTestSlackAdapter(&fakeSlackAPI{})
+	s := stopTestAdapter()
 	msg, ok := s.inboundStop(&slackevents.AgentSessionStoppedEvent{
 		Channel: "D999", ThreadTimestamp: "1700000000.000100", User: "UALICE", EventTimestamp: "1700000050.000200",
 	})
@@ -39,7 +115,7 @@ func TestSlackStopInADMKeysTheDMThread(t *testing.T) {
 }
 
 func TestSlackStopDropsIncompleteBotAndRedelivered(t *testing.T) {
-	s := newTestSlackAdapter(&fakeSlackAPI{})
+	s := stopTestAdapter()
 	good := slackevents.AgentSessionStoppedEvent{Channel: "C123", ThreadTimestamp: "1.1", User: "UALICE", EventTimestamp: "2.2"}
 	for name, e := range map[string]slackevents.AgentSessionStoppedEvent{
 		"no user":    {Channel: "C123", ThreadTimestamp: "1.1", EventTimestamp: "2.2"},
@@ -62,7 +138,7 @@ func TestSlackStopDropsIncompleteBotAndRedelivered(t *testing.T) {
 }
 
 func TestSlackStopIsNotTakenForAMessageRedelivery(t *testing.T) {
-	s := newTestSlackAdapter(&fakeSlackAPI{})
+	s := stopTestAdapter()
 	// A message seen at the same channel and ts as the Stop's event_ts.
 	s.alreadySeen("C123/2.2")
 	if _, ok := s.inboundStop(&slackevents.AgentSessionStoppedEvent{

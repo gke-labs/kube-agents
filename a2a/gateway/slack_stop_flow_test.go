@@ -244,12 +244,40 @@ func TestSlackStopButtonFallbackIsItsOwn(t *testing.T) {
 
 	pressStop(d, "U1", "100.1", "200.1")
 	control := awaitSubmission(t, d.r, "platform", 1)
+	// Completed with no result part: a second press would repeat it, so the
+	// reply drops "Press Stop again".
 	answerControl(t, d.r, control, nil)
-	d.awaitPost(t, "the Slack Stop's fallback", "D1", "100.1", slackStopCouldntReply)
+	d.awaitPost(t, "the Slack Stop's fallback", "D1", "100.1", slackStopCouldntFinalReply)
 	for _, p := range slackPostsIn(d, "100.1") {
-		if p == cardStopUnconfirmedNotice {
-			t.Fatal("the Stop button posted the typed stop's fallback")
+		if p == cardStopUnconfirmedNotice || p == slackStopCouldntReply {
+			t.Fatalf("the Stop button posted %q for a failure a press would repeat", p)
 		}
+	}
+}
+
+func TestSlackStopButtonFailedControlKeepsPressStopAgain(t *testing.T) {
+	d := slackStopRig(t)
+	askAndAnswer(t, d)
+
+	pressStop(d, "U1", "100.1", "200.1")
+	control := awaitSubmission(t, d.r, "platform", 1)
+	// A failed control (session-kv unreachable, the turn wait ran out) can
+	// pass on a second press.
+	if err := d.r.execFor(t, control, "platform").PublishStatus(context.Background(), lib.StateFailed, true); err != nil {
+		t.Fatal(err)
+	}
+	d.awaitPost(t, "the retryable fallback", "D1", "100.1", slackStopCouldntReply)
+}
+
+func TestSlackStopUnconfirmedFinalDropsTheRetry(t *testing.T) {
+	if got := (CardStopRun{SlackStop: true}).unconfirmedFinal(); got != slackStopCouldntFinalReply {
+		t.Errorf("a Slack Stop's final fallback is %q", got)
+	}
+	if !strings.HasPrefix(slackStopCouldntReply, slackStopCouldntFinalReply) {
+		t.Error("the final fallback is not the approved line less its retry")
+	}
+	if got := (CardStopRun{}).unconfirmedFinal(); got != cardStopUnconfirmedNotice {
+		t.Errorf("a typed stop's fallback changed to %q", got)
 	}
 }
 

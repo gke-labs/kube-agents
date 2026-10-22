@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/slack-go/slack/slackevents"
 
@@ -31,6 +32,8 @@ const (
 	// channel thread, as inboundEvent sets them.
 	slackKindDM    = "dm"
 	slackKindGroup = "group"
+	// slackStopPresserTTL is how long a presser's workspace answer is cached.
+	slackStopPresserTTL = 5 * time.Minute
 )
 
 // The Slack Stop's replies, the maintainer's approved wording, one per stop.
@@ -43,6 +46,9 @@ const (
 	slackStopExceptReplyFormat = "Stopped, except one task that didn't respond: %s."
 	slackStopNothingReply      = "Nothing was running."
 	slackStopCouldntReply      = "I couldn't stop the work in this thread. Press Stop again."
+	// slackStopCouldntFinalReply is the same reply without "Press Stop
+	// again", for a failure a second press would only repeat.
+	slackStopCouldntFinalReply = "I couldn't stop the work in this thread."
 	// slackStopNewerTurnReply answers a stop that found nothing to stop while
 	// a newer question is running (approved 2026-10-22).
 	slackStopNewerTurnReply = "No tasks were running yet. I'm still answering your latest question."
@@ -98,6 +104,18 @@ func (run CardStopRun) unconfirmed() string {
 	return cardStopUnconfirmedNotice
 }
 
+// unconfirmedFinal is unconfirmed for a failure a second press would only
+// repeat: the control could not be built or minted, the executor rejected it
+// (a bridge older than the control), or it completed with no result part.
+// The Slack Stop's reply then drops "Press Stop again"; the card stop's
+// notice is the same either way.
+func (run CardStopRun) unconfirmedFinal() string {
+	if run.SlackStop {
+		return slackStopCouldntFinalReply
+	}
+	return cardStopUnconfirmedNotice
+}
+
 // slackStopReply words a completed control's result as the Slack Stop's one
 // reply. A stop that cancelled no turn and stopped no card says nothing was
 // running, or, with a newer question running by then (newerTurnRunning),
@@ -122,19 +140,75 @@ func slackStopReply(r *lib.CardStopResult, turnCancelled, newerTurnRunning bool)
 	return slackStopStoppedReply
 }
 
+// slackPresser is one cached workspace answer for a Stop presser.
+type slackPresser struct {
+	inWorkspace bool
+	at          time.Time
+}
+
+// presserInWorkspace reports whether user may press Stop as far as their
+// workspace goes. The event names no team for the presser, and a Slack
+// Connect member of another workspace can see a shared thread, so the
+// message path's foreign-sender check (which reads the message's own team
+// fields) has nothing to read here. A member the allowed-users list names
+// passes on the install's word, as on the Home tab (homeAdmitted). Anyone
+// else is looked up with users.info and must be in this workspace; a failed
+// lookup, or a workspace auth.test never named, refuses: closed for a
+// foreign presser, apart from the who-asked rule (stopgate.go). A decided
+// answer is cached for slackStopPresserTTL, so a press costs at most one
+// call; the lookup runs on the event pump, bounded by the adapter's HTTP
+// client, and Stop presses are rare.
+func (s *SlackAdapter) presserInWorkspace(user string) bool {
+	s.home.mu.Lock()
+	admits := s.home.admits
+	s.home.mu.Unlock()
+	if admits != nil {
+		if ok, byAllowAll := admits(user); ok && !byAllowAll {
+			return true
+		}
+	}
+	now := s.now()
+	s.mu.Lock()
+	if p, ok := s.pressers[user]; ok && now.Sub(p.at) < slackStopPresserTTL {
+		s.mu.Unlock()
+		return p.inWorkspace
+	}
+	team := s.teamID
+	s.mu.Unlock()
+	if team == "" {
+		s.log.Warn("slack: refusing a Stop press: auth.test named no workspace to check the presser against", "user", user)
+		return false
+	}
+	u, err := s.api.GetUserInfo(user)
+	if err != nil {
+		s.log.Warn("slack: refusing a Stop press: the presser's workspace could not be looked up", "user", user, "err", err)
+		return false
+	}
+	in := u.TeamID == team
+	s.mu.Lock()
+	if s.pressers == nil || len(s.pressers) >= slackSessionsCap {
+		s.pressers = map[string]slackPresser{}
+	}
+	s.pressers[user] = slackPresser{inWorkspace: in, at: now}
+	s.mu.Unlock()
+	return in
+}
+
 // inboundStop normalizes one agent_session_stopped event into a stop, or
 // reports it not-a-turn: a Stop with no user, channel, thread or timestamp,
-// one pressed by the bot itself, and a redelivery. The conversation is the
-// thread the session lives in. No foreign-workspace check: the event names
-// no team, and Slack sends it only for this app's own session, which a
-// member of another workspace cannot press Stop on unless Slack shows them
-// the thread; the gateway's sender check holds either way.
+// one pressed by the bot itself, a redelivery, and one from a presser outside
+// this workspace (presserInWorkspace). The conversation is the thread the
+// session lives in.
 func (s *SlackAdapter) inboundStop(e *slackevents.AgentSessionStoppedEvent) (InboundMessage, bool) {
 	if e.User == "" || e.User == s.botUserID || e.Channel == "" || e.ThreadTimestamp == "" ||
 		e.EventTimestamp == "" {
 		return InboundMessage{}, false
 	}
 	if s.alreadySeen(slackStopSeenPrefix + e.Channel + "/" + e.EventTimestamp) {
+		return InboundMessage{}, false
+	}
+	if !s.presserInWorkspace(e.User) {
+		s.log.Info("slack: ignoring a Stop press from outside this workspace", "user", e.User, "channel", e.Channel)
 		return InboundMessage{}, false
 	}
 	channelType, kind := "", slackKindGroup

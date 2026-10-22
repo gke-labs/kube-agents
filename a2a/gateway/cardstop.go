@@ -210,7 +210,7 @@ func (g *Gateway) stopCards(ctx context.Context, rec *SessionRecord, authority A
 // voice (its SlackStop and TurnCancelled): such a control posts no
 // placeholder, and every line it posts is a Slack Stop reply.
 func (g *Gateway) stopCardsAs(ctx context.Context, rec *SessionRecord, authority Authority, backend string, quiet bool, voice CardStopRun) {
-	unconfirmed := voice.unconfirmed()
+	unconfirmed, final := voice.unconfirmed(), voice.unconfirmedFinal()
 	taskID := "task-" + randHex(taskIDHexWidth)
 	correlationID := "corr-" + randHex(correlationIDHexWidth)
 	addressee := rec.Addressee
@@ -225,7 +225,7 @@ func (g *Gateway) stopCardsAs(ctx context.Context, rec *SessionRecord, authority
 	if err != nil {
 		if !g.cfg.CapabilityOptional {
 			notStarted("capability mint failed", err)
-			g.post(rec.Key, unconfirmed)
+			g.post(rec.Key, final)
 			return
 		}
 		g.log.Warn("A2A_CAPABILITY_REQUIRED=false; sending the card stop with no capability", "taskId", taskID, "err", err)
@@ -234,7 +234,7 @@ func (g *Gateway) stopCardsAs(ctx context.Context, rec *SessionRecord, authority
 	payload, err := cardStopPayload(taskID, rec.ContextID)
 	if err != nil {
 		notStarted("payload build failed", err)
-		g.post(rec.Key, unconfirmed)
+		g.post(rec.Key, final)
 		return
 	}
 	env, err := lib.NewMessageEnvelope(gatewayParty, taskID, rec.ContextID, correlationID, payload,
@@ -242,7 +242,7 @@ func (g *Gateway) stopCardsAs(ctx context.Context, rec *SessionRecord, authority
 		lib.WithAuthority(authority.Render(capRef)))
 	if err != nil {
 		notStarted("envelope build failed", err)
-		g.post(rec.Key, unconfirmed)
+		g.post(rec.Key, final)
 		return
 	}
 
@@ -356,8 +356,14 @@ func (g *Gateway) finishCardStop(ctx context.Context, rec *SessionRecord, rs *re
 		reason = joinTextParts(s.Status.Message.Parts)
 	}
 	answer, post, outcome, stopped := run.unconfirmed(), true, cardStopOutcomeExecutor, 0
+	if s.Status.State == lib.StateRejected {
+		// A rejection (a bridge older than the control) repeats on a
+		// second press.
+		answer = run.unconfirmedFinal()
+	}
 	if s.Status.State == lib.StateCompleted {
-		outcome = cardStopOutcomeNoResult
+		// So does a completed control with no result part.
+		outcome, answer = cardStopOutcomeNoResult, run.unconfirmedFinal()
 		result, ok := cardStopResultOf(rs.result)
 		if !ok && !rs.local {
 			// A restart lost the render state; the stream has the result.

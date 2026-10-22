@@ -248,6 +248,9 @@ type SlackAdapter struct {
 	// sessionErrorsSeen is the setStatus error texts already logged at Warn
 	// (firstSessionError), under s.mu.
 	sessionErrorsSeen map[string]bool
+	// pressers caches each Stop presser's workspace answer (slack_stop.go,
+	// presserInWorkspace), so a press costs at most one users.info call.
+	pressers map[string]slackPresser
 
 	// ux is the click and question state (slack_interactive.go), made on
 	// first use.
