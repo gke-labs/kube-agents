@@ -46,6 +46,7 @@ const (
 
 	msgInvalidFrame   = "invalid JSON-RPC frame"
 	msgMissingMethod  = "missing method"
+	msgNullID         = "a request id may not be null"
 	msgNotJSONRPC2    = "not a JSON-RPC 2.0 request"
 	msgBadID          = "an id must be a string, a number or null"
 	msgEmptyBatch     = "empty batch"
@@ -165,9 +166,14 @@ func (s *Server) HandleJSONRPC(ctx context.Context, raw []byte) []byte {
 }
 
 func (s *Server) handleOne(ctx context.Context, raw []byte) []byte {
+	// Unparseable JSON is a parse error; valid JSON that is not an object
+	// (a number, a string, an array inside a batch) is an invalid request.
+	if !json.Valid(raw) {
+		return marshalRPCError(json.RawMessage("null"), rpcErrParseError, msgInvalidFrame)
+	}
 	var req rpcRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
-		return marshalRPCError(json.RawMessage("null"), rpcErrParseError, msgInvalidFrame)
+		return marshalRPCError(json.RawMessage("null"), rpcErrInvalidRequest, msgInvalidFrame)
 	}
 	if !validID(req.ID) {
 		return marshalRPCError(json.RawMessage("null"), rpcErrInvalidRequest, msgBadID)
@@ -178,10 +184,15 @@ func (s *Server) handleOne(ctx context.Context, raw []byte) []byte {
 	if req.Method == "" && (len(req.Result) > 0 || len(req.Error) > 0) {
 		return nil
 	}
-	if len(req.ID) == 0 || string(req.ID) == "null" {
-		if req.Method == "" {
-			return marshalRPCError(json.RawMessage("null"), rpcErrInvalidRequest, msgMissingMethod)
-		}
+	if req.Method == "" {
+		return marshalRPCError(idOrNull(req.ID), rpcErrInvalidRequest, msgMissingMethod)
+	}
+	// MCP forbids a null id, and JSON-RPC answers one rather than treating
+	// it as a notification, so it is refused out loud, not dropped.
+	if string(req.ID) == "null" {
+		return marshalRPCError(json.RawMessage("null"), rpcErrInvalidRequest, msgNullID)
+	}
+	if len(req.ID) == 0 {
 		return nil
 	}
 
@@ -215,6 +226,11 @@ func (s *Server) handleOne(ctx context.Context, raw []byte) []byte {
 		}
 		if err := json.Unmarshal(req.Params, &params); err != nil || params.Name == "" {
 			return marshalRPCError(req.ID, rpcErrInvalidParams, msgNeedsToolName)
+		}
+		// An unknown tool is a protocol error, as the MCP spec has it, so the
+		// host sees it, not the model as a tool that ran and failed.
+		if _, ok := s.tools[params.Name]; !ok {
+			return marshalRPCError(req.ID, rpcErrInvalidParams, fmt.Sprintf(msgUnknownTool, params.Name))
 		}
 		return marshalRPCResult(req.ID, s.CallTool(ctx, params.Name, params.Arguments))
 	// Neither is a capability this server declares; an empty list is the

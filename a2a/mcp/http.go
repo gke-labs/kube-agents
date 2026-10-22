@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 )
@@ -33,6 +34,10 @@ const (
 	msgNoBrowsers   = "browser requests are refused; MCP clients send no Origin"
 	msgBodyTooLarge = "request body too large or unreadable"
 	msgNoToken      = "the token file %s is empty"
+	// headerProtocolVersion is the MCP revision a client names on each
+	// request after initialize (the 2025-06-18 transport).
+	headerProtocolVersion = "MCP-Protocol-Version"
+	msgUnsupportedVersion = "unsupported MCP protocol version %q"
 )
 
 // requestBudget bounds one request, every member of a batch together, inside
@@ -80,6 +85,13 @@ func Handler(s *Server, tokenFile string, log *slog.Logger) http.Handler {
 		}
 		if !authorized(r, tokenFile, tl) {
 			http.Error(w, msgUnauthorized, http.StatusUnauthorized)
+			return
+		}
+		// The transport has clients name their revision on every request
+		// after initialize; an absent header means an older client, and an
+		// unknown revision is refused rather than served in another dialect.
+		if v := r.Header.Get(headerProtocolVersion); v != "" && !slices.Contains(supportedProtocolVersions, v) {
+			http.Error(w, fmt.Sprintf(msgUnsupportedVersion, v), http.StatusBadRequest)
 			return
 		}
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
