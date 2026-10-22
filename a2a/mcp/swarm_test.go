@@ -65,7 +65,9 @@ func fixtureInput() SwarmInput {
 			{Addressee: "session-db-pod", TaskID: "t-102", Conversation: "console:tok-db-0002", Submitted: swarmNow.Add(-10 * time.Minute),
 				Task: runningTask("t-102", activityArtifact("kubectl_get", "psql_query"))},
 			{Addressee: "platform", TaskID: "t-103", Conversation: "console:tok-triage-0001", Submitted: swarmNow.Add(-8 * time.Minute),
-				Task: &lib.Task{ID: "t-103", State: lib.StateInputRequired, Artifacts: []lib.Artifact{textArtifact(lib.ArtifactProgress, "Approve the restart?")}}},
+				Task: &lib.Task{ID: "t-103", State: lib.StateInputRequired, StatusHistory: []lib.TaskState{lib.StateSubmitted, lib.StateWorking, lib.StateInputRequired},
+					Artifacts: []lib.Artifact{textArtifact(lib.ArtifactProgress, "Checking rollout history")}},
+				Question: &lib.Message{Parts: []lib.Part{{Kind: "text", Text: "Approve the restart?"}}}},
 			{Addressee: "platform", TaskID: "t-104", Conversation: "console:tok-triage-0001", Submitted: swarmNow.Add(-6 * time.Minute),
 				Task: &lib.Task{ID: "t-104", State: lib.StateFailed, Final: true, FinalMessage: &lib.Message{Parts: []lib.Part{{Kind: "text", Text: "reason: quota - out of tokens"}}}}},
 		},
@@ -324,18 +326,36 @@ func TestBuildSwarmStateLedgerValidation(t *testing.T) {
 }
 
 func TestBuildSwarmStateHostileStrings(t *testing.T) {
-	evil := "line1 `rm -rf` @coordinator \u202egnp.exe\u200b \x1b[31m\x07 | [x](javascript:alert(1))\nline2 " + strings.Repeat("A", 10000)
+	// payload is under maxSwarmAliasBytes and maxSwarmHandleBytes, so an
+	// alias or addressee carrying it passes validation and reaches the
+	// sanitisers; evil adds a long tail for the fields that take one.
+	payload := "line1 `rm -rf` @coordinator \u202egnp.exe\u200b \x1b[31m\x07 | [x](javascript:alert(1))"
+	evil := payload + "\nline2 " + strings.Repeat("A", 10000)
+	msg := func(s string) *lib.Message { return &lib.Message{Parts: []lib.Part{{Kind: "text", Text: s}}} }
+	failed := finishedTask("t-1", lib.StateFailed, evil)
+	failed.FinalMessage = msg(evil)
 	in := SwarmInput{
 		Title: evil,
 		Conversations: []SwarmConversation{
-			{Alias: evil, Token: "tok-evil", Description: evil, LastUsed: swarmNow},
+			{Alias: payload, Token: "tok-evil", Description: evil, LastUsed: swarmNow},
 		},
 		Tasks: []SwarmTask{
-			{Addressee: evil, TaskID: "t-1", Conversation: "console:tok-evil", Submitted: swarmNow, Task: finishedTask("t-1", lib.StateFailed, evil)},
+			{Addressee: payload, TaskID: "t-1", Conversation: "console:tok-evil", Submitted: swarmNow.Add(-4 * time.Minute), Prompt: evil, Task: failed},
+			{Addressee: "platform", TaskID: "t-2", Conversation: "console:tok-evil", Submitted: swarmNow.Add(-3 * time.Minute), Prompt: evil,
+				Task:     &lib.Task{ID: "t-2", State: lib.StateInputRequired, Artifacts: []lib.Artifact{textArtifact(lib.ArtifactProgress, evil)}},
+				Question: msg(evil)},
+			{Addressee: "platform", TaskID: "t-3", Conversation: "console:tok-evil", Submitted: swarmNow.Add(-2 * time.Minute),
+				Task: runningTask("t-3", textArtifact(lib.ArtifactProgress, evil), activityArtifact(payload))},
+			{Addressee: payload, TaskID: "t-4", Conversation: "console:tok-evil", ViaTaskID: "t-1", Submitted: swarmNow.Add(-time.Minute), Prompt: evil,
+				Task: finishedTask("t-4", lib.StateCompleted, evil)},
+			{Addressee: "platform", TaskID: "t-5", Conversation: "console:tok-evil", Submitted: swarmNow.Add(-30 * time.Second),
+				Task: &lib.Task{ID: "t-5", State: lib.StateFailed, Final: true, FinalMessage: msg(evil)}},
+			{Addressee: "platform", TaskID: "t-6", Conversation: "console:tok-evil", Submitted: swarmNow.Add(-20 * time.Second),
+				Task: &lib.Task{ID: "t-6", State: lib.StateInputRequired, Artifacts: []lib.Artifact{textArtifact(lib.ArtifactProgress, evil)}}},
 			{Addressee: "platform", TaskID: "bad id `x`", Submitted: swarmNow},
 			{Addressee: "platform", TaskID: strings.Repeat("t", 500), Submitted: swarmNow},
 		},
-		Cards: map[string]AgentCard{"platform": {Name: evil}, evil: {Name: evil}},
+		Cards: map[string]AgentCard{"platform": {Name: evil}, payload: {Name: evil}},
 		Now:   swarmNow,
 	}
 	snap, l := BuildSwarmState(in, freshLedger())
@@ -350,6 +370,17 @@ func TestBuildSwarmStateHostileStrings(t *testing.T) {
 		if n := len([]rune(s)); n > maxRunes {
 			t.Errorf("%s is %d runes > %d", where, n, maxRunes)
 		}
+	}
+	// The fixture must reach the board and the view, or the checks below
+	// run over nothing.
+	texts := boardTexts(snap)
+	for _, want := range []string{"joined from console conversation", "[task `t-1`]", "`failed`", "input required", "delegated task `t-4`", "`completed`"} {
+		if !strings.Contains(texts, want) {
+			t.Fatalf("hostile fixture did not reach the board (%q missing):\n%s", want, texts)
+		}
+	}
+	if len(snap.View.Attention) < 2 || len(snap.View.Milestones) < 2 {
+		t.Fatalf("hostile fixture did not reach the view: %+v", snap.View)
 	}
 	check("title", snap.Title, maxSwarmTitleChars)
 	for name, m := range snap.Members {
@@ -411,7 +442,7 @@ func TestBuildSwarmStateLineage(t *testing.T) {
 		}
 		in.Conversations = append(in.Conversations, conv(fmt.Sprintf("c%02d", i), parent))
 	}
-	convs := normalizeConversations(in.Conversations, swarmNow)
+	convs := normalizeConversations(in.Conversations, nil, swarmNow)
 	resolveLineage(convs)
 	got := map[string][2]string{}
 	for _, c := range convs {
@@ -807,7 +838,18 @@ func TestBuildSwarmStateViewTextNeutralised(t *testing.T) {
 	raw, _ := json.Marshal(snap)
 	var back SwarmSnapshot
 	_ = json.Unmarshal(raw, &back)
-	all := string(swarmJSON(t, back.View)) + back.Title
+	// Encode without HTML escaping: json.Marshal turns < and > into \u003c
+	// and \u003e, which would hide them from the check below.
+	var viewBuf bytes.Buffer
+	enc := json.NewEncoder(&viewBuf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(back.View); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(viewBuf.String(), "‹img") {
+		t.Fatalf("view never carried the hostile text, so the check is vacuous:\n%s", viewBuf.String())
+	}
+	all := viewBuf.String() + back.Title
 	for _, m := range back.Members {
 		all += m.Model
 	}
@@ -834,7 +876,7 @@ func TestBuildSwarmStateLedgerClampsNextSeq(t *testing.T) {
 
 func TestBuildSwarmStateInputNormalisation(t *testing.T) {
 	// LastUsed in the future is clamped to Now.
-	convs := normalizeConversations([]SwarmConversation{{Alias: "a", LastUsed: swarmNow.Add(24 * time.Hour)}}, swarmNow)
+	convs := normalizeConversations([]SwarmConversation{{Alias: "a", LastUsed: swarmNow.Add(24 * time.Hour)}}, nil, swarmNow)
 	if !convs[0].lastUsed.Equal(swarmNow) {
 		t.Errorf("lastUsed = %v", convs[0].lastUsed)
 	}
@@ -933,14 +975,15 @@ func TestBuildSwarmStateMemberCarriesTheClientConversationID(t *testing.T) {
 		"ctrl":     "abc\x07def",
 		"bidi":     "abc‮def",
 		"space":    "a b",
-		"long":     strings.Repeat("x", maxConversationIDRunes+1),
-		"atlimit":  strings.Repeat("y", maxConversationIDRunes),
+		"long":     strings.Repeat("x", maxConversationIDBytes+1),
+		"atlimit":  strings.Repeat("y", maxConversationIDBytes),
 		"unicode":  "会话-1",
 		"empty":    "",
 		"badutf8":  "a\xffb",
 		"zerowide": "a​b",
+		"padded":   "  conv-7  ",
 	}
-	want := map[string]string{"good": ids["good"], "atlimit": ids["atlimit"], "unicode": ids["unicode"]}
+	want := map[string]string{"good": ids["good"], "atlimit": ids["atlimit"], "padded": "conv-7"}
 	for alias, id := range ids {
 		in.Conversations = append(in.Conversations, SwarmConversation{
 			Alias: alias, Token: "tok-" + alias, AGYConversationID: id, LastUsed: now.Add(-time.Minute),
@@ -963,5 +1006,256 @@ func TestBuildSwarmStateMemberCarriesTheClientConversationID(t *testing.T) {
 	}
 	if found != len(ids) {
 		t.Fatalf("matched %d session members, want one per conversation (%d); members: %+v", found, len(ids), snap.Members)
+	}
+}
+
+// A delegated child that sorts before its skipped parent (same submission
+// time, smaller id; or a parent stamped Now for a missing time) is skipped
+// all the same: propagation does not depend on visit order.
+func TestBuildSwarmStateSkippedParentSortedAfterChild(t *testing.T) {
+	in := SwarmInput{Now: swarmNow,
+		Conversations: []SwarmConversation{{Alias: "old", Token: "tok-old", LastUsed: swarmNow.Add(-3 * time.Hour)}},
+		Tasks: []SwarmTask{
+			{Addressee: "platform", TaskID: "z-parent", Conversation: "console:tok-old", Submitted: swarmNow.Add(-3 * time.Hour),
+				Task: finishedTask("z-parent", lib.StateCompleted, "ok")},
+			{Addressee: "spec", TaskID: "a-child", ViaTaskID: "z-parent", Submitted: swarmNow.Add(-3 * time.Hour)},
+			// grandchild before both, parent with no submission time (stamped Now)
+			{Addressee: "spec", TaskID: "a-grandchild", ViaTaskID: "a-child", Submitted: swarmNow.Add(-4 * time.Hour)},
+			{Addressee: "platform", TaskID: "late-parent", Conversation: "console:tok-unknown"},
+			{Addressee: "spec", TaskID: "early-child", ViaTaskID: "late-parent", Submitted: swarmNow.Add(-time.Hour)},
+			{Addressee: "platform", TaskID: "keep-me", Submitted: swarmNow.Add(-time.Minute)},
+		},
+	}
+	tasks := normalizeTasks(in.Tasks, swarmNow)
+	idx := map[string]int{}
+	for i, task := range tasks {
+		idx[task.id] = i
+	}
+	if idx["a-child"] > idx["z-parent"] || idx["early-child"] > idx["late-parent"] {
+		t.Fatalf("fixture does not sort the children first: %v", idx)
+	}
+	snap, _ := BuildSwarmState(in, freshLedger())
+	texts := boardTexts(snap)
+	for _, gone := range []string{"z-parent", "a-child", "a-grandchild", "late-parent", "early-child"} {
+		if strings.Contains(texts, gone) {
+			t.Errorf("board shows %s:\n%s", gone, texts)
+		}
+	}
+	if !strings.Contains(texts, "keep-me") {
+		t.Errorf("board lacks keep-me:\n%s", texts)
+	}
+}
+
+func inputRequiredTask(id string, history ...lib.TaskState) *lib.Task {
+	return &lib.Task{ID: id, State: lib.StateInputRequired, StatusHistory: history,
+		Artifacts: []lib.Artifact{textArtifact(lib.ArtifactProgress, "Reading the rollout history")}}
+}
+
+// The input-required post and attention item carry the question from the
+// status message, not the progress line; without one they fall back.
+func TestBuildSwarmStateInputRequiredQuestion(t *testing.T) {
+	in := SwarmInput{Now: swarmNow, Tasks: []SwarmTask{
+		{Addressee: "platform", TaskID: "q-1", Submitted: swarmNow.Add(-time.Minute), Task: inputRequiredTask("q-1", lib.StateInputRequired),
+			Question: &lib.Message{Parts: []lib.Part{{Kind: "text", Text: "Restart `checkout` @narrator <now>?\nmore detail " + strings.Repeat("z", 5000)}}}},
+		{Addressee: "platform", TaskID: "q-2", Submitted: swarmNow.Add(-2 * time.Minute), Task: inputRequiredTask("q-2", lib.StateInputRequired)},
+	}}
+	snap, _ := BuildSwarmState(in, freshLedger())
+	var post1, post2 string
+	for _, m := range snap.NewMessages {
+		switch {
+		case strings.Contains(m.Text, "input required") && strings.Contains(m.Text, "`q-1`"):
+			post1 = m.Text
+		case strings.Contains(m.Text, "input required") && strings.Contains(m.Text, "`q-2`"):
+			post2 = m.Text
+		}
+	}
+	if want := "`Restart 'checkout' ＠narrator ‹now›?`"; !strings.HasSuffix(post1, want) {
+		t.Errorf("q-1 post = %q, want the sanitised question %s", post1, want)
+	}
+	if !strings.HasSuffix(post2, "`Reading the rollout history`") {
+		t.Errorf("q-2 post = %q, want the progress fallback", post2)
+	}
+	why := map[string]string{}
+	for _, a := range snap.View.Attention {
+		why[a.ID] = a.Why
+	}
+	if why["input-q-1"] != "Restart 'checkout' ＠narrator ‹now›?" || why["input-q-2"] != "Reading the rollout history" {
+		t.Errorf("attention why = %v", why)
+	}
+}
+
+// A task that asks, is answered (working) and asks again posts twice; an
+// unchanged ask stays deduped.
+func TestBuildSwarmStateInputRequiredAskedAgain(t *testing.T) {
+	task := func(lt *lib.Task) SwarmInput {
+		return SwarmInput{Now: swarmNow, Tasks: []SwarmTask{{Addressee: "platform", TaskID: "r-1", Submitted: swarmNow.Add(-time.Minute), Task: lt}}}
+	}
+	countAsks := func(s SwarmSnapshot) int {
+		n := 0
+		for _, m := range s.NewMessages {
+			if strings.Contains(m.Text, "input required") {
+				n++
+			}
+		}
+		return n
+	}
+	first := inputRequiredTask("r-1", lib.StateSubmitted, lib.StateWorking, lib.StateInputRequired)
+	s1, l := BuildSwarmState(task(first), freshLedger())
+	s2, l := BuildSwarmState(task(first), l)
+	answered := &lib.Task{ID: "r-1", State: lib.StateWorking, StatusHistory: []lib.TaskState{lib.StateSubmitted, lib.StateWorking, lib.StateInputRequired, lib.StateWorking}}
+	s3, l := BuildSwarmState(task(answered), l)
+	again := inputRequiredTask("r-1", lib.StateSubmitted, lib.StateWorking, lib.StateInputRequired, lib.StateWorking, lib.StateInputRequired)
+	s4, l := BuildSwarmState(task(again), l)
+	s5, _ := BuildSwarmState(task(again), l)
+	if got := []int{countAsks(s1), countAsks(s2), countAsks(s3), countAsks(s4), countAsks(s5)}; !reflect.DeepEqual(got, []int{1, 0, 0, 1, 0}) {
+		t.Errorf("input-required posts per call = %v, want [1 0 0 1 0]", got)
+	}
+	if len(s4.NewMessages) != 1 || !strings.HasPrefix(s4.NewMessages[0].Text, "@coordinator input required on #") {
+		t.Errorf("second ask = %+v, want one @coordinator post citing the submission", s4.NewMessages)
+	}
+}
+
+// At the conversation input cap, a conversation running a task is kept over
+// newer idle ones, so its work stays on the board.
+func TestBuildSwarmStateConversationCapKeepsRunning(t *testing.T) {
+	in := SwarmInput{Now: swarmNow}
+	for i := 0; i < maxSwarmInputConvs+20; i++ {
+		in.Conversations = append(in.Conversations, SwarmConversation{
+			Alias: fmt.Sprintf("idle-%04d", i), Token: fmt.Sprintf("tok-idle-%04d", i), LastUsed: swarmNow.Add(-time.Duration(i) * time.Second),
+		})
+	}
+	in.Conversations = append(in.Conversations,
+		SwarmConversation{Alias: "long-runner", Token: "tok-long", LastUsed: swarmNow.Add(-6 * time.Hour)},
+		SwarmConversation{Alias: "long-done", Token: "tok-done", LastUsed: swarmNow.Add(-6 * time.Hour)})
+	in.Tasks = []SwarmTask{
+		{Addressee: "session-long-pod", TaskID: "long-1", Conversation: "console:tok-long", Submitted: swarmNow.Add(-5 * time.Hour),
+			Task: runningTask("long-1", activityArtifact("kubectl_wait"))},
+		{Addressee: "platform", TaskID: "done-1", Conversation: "console:tok-done", Submitted: swarmNow.Add(-5 * time.Hour),
+			Task: finishedTask("done-1", lib.StateCompleted, "ok")},
+	}
+	snap, _ := BuildSwarmState(in, freshLedger())
+	m, ok := snap.Members["session-long-runner"]
+	if !ok || m.WakeMode != swarmWakeWorking {
+		t.Errorf("running conversation cut by the input cap: member %+v (present %v)", m, ok)
+	}
+	texts := boardTexts(snap)
+	if !strings.Contains(texts, "[task `long-1`]") {
+		t.Errorf("board lacks the running task:\n%s", texts)
+	}
+	if strings.Contains(texts, "done-1") {
+		t.Errorf("a stale finished conversation survived the cap:\n%s", texts)
+	}
+}
+
+// safeConversationID is an allowlist: [A-Za-z0-9._-], at most 128 bytes, no
+// leading '.', no "..", no Windows reserved device name; surrounding space is
+// trimmed.
+func TestSafeConversationID(t *testing.T) {
+	for id, want := range map[string]string{
+		"3f2b9c1e-7a4d":          "3f2b9c1e-7a4d",
+		"A.b_c-9":                "A.b_c-9",
+		"  trimmed\t":            "trimmed",
+		strings.Repeat("y", 128): strings.Repeat("y", 128),
+		strings.Repeat("y", 129): "",
+		"会话-1":                   "",
+		".":                      "",
+		"..":                     "",
+		".hidden":                "",
+		"a..b":                   "",
+		"a:b":                    "",
+		"a%2fb":                  "",
+		"a*b":                    "",
+		"a?b":                    "",
+		"a|b":                    "",
+		`a"b`:                    "",
+		"a/b":                    "",
+		`a\b`:                    "",
+		"a b":                    "",
+		"CON":                    "",
+		"con":                    "",
+		"Nul.txt":                "",
+		"com1":                   "",
+		"LPT9.log":               "",
+		"console":                "console",
+		"com10":                  "com10",
+		"conx.y":                 "conx.y",
+		"":                       "",
+	} {
+		if got := safeConversationID(id); got != want {
+			t.Errorf("safeConversationID(%q) = %q, want %q", id, got, want)
+		}
+	}
+}
+
+// Two copies of a task that differ only in the question, or only in the
+// question's sequence, dedupe to the same one whatever the input order.
+func TestNormalizeTasksQuestionTiebreak(t *testing.T) {
+	base := func(q string, seq uint64) SwarmTask {
+		return SwarmTask{Addressee: "platform", TaskID: "dup", Submitted: swarmNow, Task: &lib.Task{State: lib.StateInputRequired},
+			Question: &lib.Message{Parts: []lib.Part{{Kind: "text", Text: q}}}, QuestionSeq: seq}
+	}
+	for _, pair := range [][2]SwarmTask{{base("alpha?", 7), base("beta?", 7)}, {base("same?", 7), base("same?", 9)}} {
+		x := normalizeTasks([]SwarmTask{pair[0], pair[1]}, swarmNow)
+		y := normalizeTasks([]SwarmTask{pair[1], pair[0]}, swarmNow)
+		if len(x) != 1 || len(y) != 1 || x[0].question != y[0].question || x[0].questionSeq != y[0].questionSeq {
+			t.Errorf("duplicate pick depends on input order: %q@%d vs %q@%d", x[0].question, x[0].questionSeq, y[0].question, y[0].questionSeq)
+		}
+	}
+}
+
+// With QuestionSeq the input post is keyed on the ask's stream sequence: the
+// same seq never re-posts, a new seq re-posts even when the history count is
+// unchanged (TASKS dropped the oldest events).
+func TestBuildSwarmStateInputRequiredQuestionSeq(t *testing.T) {
+	call := func(seq uint64, history ...lib.TaskState) SwarmInput {
+		return SwarmInput{Now: swarmNow, Tasks: []SwarmTask{{Addressee: "platform", TaskID: "s-1", Submitted: swarmNow.Add(-time.Minute),
+			Task: inputRequiredTask("s-1", history...), QuestionSeq: seq,
+			Question: &lib.Message{Parts: []lib.Part{{Kind: "text", Text: fmt.Sprintf("Ask %d?", seq)}}}}}}
+	}
+	posts := func(s SwarmSnapshot) int {
+		n := 0
+		for _, m := range s.NewMessages {
+			if strings.Contains(m.Text, "input required") {
+				n++
+			}
+		}
+		return n
+	}
+	ir := lib.StateInputRequired
+	s1, l := BuildSwarmState(call(40, ir, lib.StateWorking, ir), freshLedger())
+	s2, l := BuildSwarmState(call(40, ir, lib.StateWorking, ir), l)
+	s3, l := BuildSwarmState(call(90, ir, lib.StateWorking, ir), l) // same count, new ask
+	if got := []int{posts(s1), posts(s2), posts(s3)}; !reflect.DeepEqual(got, []int{1, 0, 1}) {
+		t.Errorf("input-required posts per call = %v, want [1 0 1]", got)
+	}
+	if _, ok := l.EventSeqs["task-input:s-1@90"]; !ok {
+		t.Errorf("ledger lacks the seq key: %v", l.EventSeqs)
+	}
+	if !strings.HasSuffix(s3.NewMessages[0].Text, "`Ask 90?`") {
+		t.Errorf("second ask = %q", s3.NewMessages[0].Text)
+	}
+}
+
+// An input-required member's step line and workstream note show the
+// question, not the progress line.
+func TestBuildSwarmStateInputRequiredMemberShowsQuestion(t *testing.T) {
+	in := SwarmInput{Now: swarmNow,
+		Conversations: []SwarmConversation{{Alias: "ops", Token: "tok-ops", LastUsed: swarmNow}},
+		Tasks: []SwarmTask{{Addressee: "session-ops-pod", TaskID: "m-1", Conversation: "console:tok-ops", Submitted: swarmNow.Add(-time.Minute),
+			Task:     inputRequiredTask("m-1", lib.StateInputRequired),
+			Question: &lib.Message{Parts: []lib.Part{{Kind: "text", Text: "Scale `orders` to <3>?"}}}}},
+	}
+	snap, _ := BuildSwarmState(in, freshLedger())
+	if m := snap.Members["session-ops"].Model; !strings.HasSuffix(m, "⚡ Scale 'orders' to ‹3›?") {
+		t.Errorf("member model = %q, want the question", m)
+	}
+	var note string
+	for _, w := range snap.View.Workstreams {
+		if w.Title == "Conversation: ops" {
+			note = w.Note
+		}
+	}
+	if !strings.HasPrefix(note, "⚡ Scale 'orders' to ‹3›? — ") {
+		t.Errorf("workstream note = %q, want the question", note)
 	}
 }
