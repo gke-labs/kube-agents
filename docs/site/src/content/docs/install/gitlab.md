@@ -550,6 +550,42 @@ Notes:
   Secret names and the namespace from `install.env`.
 - After an uninstall, revoke the token in GitLab, and the read token if you made one.
 
+## Where the audits report
+
+The fleet audits put their ledger issue and their fix merge requests in the `--gitops-repo`
+project, which the install declares with `role: gitops`. They never use a context repository. If
+you register a second project, for example a Terraform project as `managed`, the audits still use
+the `gitops` project. [Which repository gets the ledger](/kube-agents/concepts/declarative-workflow/#which-repository-gets-the-ledger)
+says how to change it, and what happens with several projects and no `role: gitops`, with no
+project, or with a project that the token cannot reach.
+
+To register a second project, for example `infra/terraform` as `managed`, set the full repository
+list in the chart value `platformAgent.integration.repositories`. Helm replaces a list and does not
+merge it, so the list must also hold the `--gitops-repo` project with `role: gitops`. If it does
+not, the install loses that project. Use the forge name `gitlab`, which is the name that the
+installer gives the forge. On an install made with `install.sh`, put the list in the
+`TF_VAR_extra_helm_values` line in `install.env`, as
+[Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) shows, and run
+`install.sh` again. If `install.env` already has that line, add the key to the same object,
+because a second line replaces the first. Replace `platform/infra/gitops` with your
+`--gitops-repo` project:
+
+```bash
+TF_VAR_extra_helm_values='{platformAgent={integration={repositories=[{forge="gitlab",repository="platform/infra/gitops",role="gitops"},{forge="gitlab",repository="infra/terraform",role="managed"}]}}}'
+```
+
+The broker then also serves the group of the second project. The token must reach that project
+with the Developer role: a project access token reaches one project only, and a group access token
+reaches its group and the subgroups of that group. For two
+projects with no common parent group, use the token of a dedicated account that is a Developer
+member of both. Run the access-level check in
+[Check the token](#check-the-token) once for each project. Then make sure that the install has both
+projects:
+
+```bash
+kubectl get platformagent platform-agent -n kubeagents-system -o jsonpath='{.spec.integration.repositories}'
+```
+
 ## Limits
 
 - The skills read GitLab entries in `managed_repos`, but only GitHub entries in `context_repos`.

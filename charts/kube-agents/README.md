@@ -692,6 +692,23 @@ release is a mode switch rather than a setting: the operator rolls the agent
 and renders or retires the A2A stack. `platformAgent.harness.tuning.maxSessions`
 caps the A2A session pods a `next` install runs at once and renders only when set.
 
+### Data volume size (`platformAgent.storage.size`)
+
+`platformAgent.storage.size` is the CR's `spec.storage.size`: the request of the agent's
+`<name>-data` claim and of the shell sandbox's data claim. The operator requests the same size
+for both.
+It defaults to `null`, which renders no field, and the operator default (50Gi) applies.
+Raising it expands both existing claims online where their StorageClass sets
+`allowVolumeExpansion`; where it does not, the claims keep their size and the CR carries the
+`DataVolumeNotExpanded` condition. A claim cannot shrink, so the admission webhook refuses a
+lower value when `operator.webhooks.enabled` is `true` (off by default). Without the webhook, a
+lower value is admitted and the operator keeps the claims at their size. Setting the value back
+to `null` leaves claims above the default at their size, and grows claims below it to the
+default. The render fails on a size of zero or above `64Ti`, and on a live install whose CRD
+predates `spec.storage`. The
+[PlatformAgent CRD page](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specstorage)
+is canonical for the behaviour.
+
 ### Agent runtime knobs
 
 `platformAgent.harness.hermes`, `platformAgent.harness.memory`,
@@ -948,6 +965,9 @@ outside what the chart can see. A replica count of `0` costs nothing, and a `res
 though note that if a namespace ResourceQuota restricts that compute resource (such as
 `limits.cpu` or `limits.memory`), Kubernetes quota admission requires every container to
 declare it (or a `LimitRange` to default it), and will reject the pod if omitted.
+The two data claims are counted at `platformAgent.storage.size` when it is set: footprint.yaml
+records how many claims follow it (`dataClaims`) and their default size, and each one moves by
+the difference, so a raise of 30Gi adds 60Gi to `requests.storage`.
 The one value it will not guess is `hindsight.postgresql.storage`: the schema permits
 `null`, a claim sized from it would be counted as zero, so an empty one fails the check
 by name.

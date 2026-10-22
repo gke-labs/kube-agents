@@ -202,20 +202,21 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 	}
 	opts.NoLog, opts.NoSigs = true, true
 	// Ports and paths are the only things a test may move: the render pins
-	// 4222 and 9222 and a JetStream store at /data, none of which a test
-	// process can have. Everything the test is actually asserting about —
-	// accounts, users, grants, the callout block — is untouched.
+	// 4222, 8222 and 9222 and a JetStream store at /data, none of which a
+	// test process can have. -1 asks the server for a free port on each
+	// listener, the monitor included, so the server keeps the shipped shape
+	// while nothing fixed is bound. Everything the test is actually asserting
+	// about — accounts, users, grants, the callout block — is untouched.
 	opts.Port = -1
 	opts.Websocket.Port = -1
+	opts.HTTPPort = -1
 	opts.StoreDir = t.TempDir()
 
-	srv, err := natsserver.NewServer(opts)
+	// startNatsServer keeps the server's own log, so a server that never
+	// becomes ready fails the test with its reason rather than a timeout.
+	srv, err := startNatsServer(opts, 10*time.Second)
 	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-	go srv.Start()
-	if !srv.ReadyForConnections(10 * time.Second) {
-		t.Fatal("nats-server not ready")
+		t.Fatal(err)
 	}
 	t.Cleanup(srv.Shutdown)
 

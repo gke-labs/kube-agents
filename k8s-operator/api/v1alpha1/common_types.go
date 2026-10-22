@@ -2122,7 +2122,7 @@ type AgentStatus struct {
 // The operator writes ActiveInterfaces, from the spec, on every Ready status
 // update, and ToolExecutionsTotal, ToolExecutionsBlockedTotal, EventsIngestedTotal,
 // SessionsTotal, RemediationsProposedTotal, RemediationsMergedTotal,
-// ChatMessagesInboundTotal, LastActiveTime, ClustersRegistered and
+// ChatMessagesInboundTotal, LastActiveTime, LastHumanActiveTime, ClustersRegistered and
 // ClustersMonitored from the broker's, the event watcher's, the chat
 // plugin's and, on a next install, the A2A gateway's metrics
 // listeners, which it reads every five minutes on the leader; the agent's own
@@ -2211,7 +2211,8 @@ type AgentUsageStatus struct {
 	// kubeagents_a2a_gateway_messages_inbound_total as well, since Chat
 	// ingress is that gateway's there; kept monotonic the same way as
 	// ToolExecutionsTotal. Moves LastActiveTime, so a chat turn that runs no
-	// brokered command is activity.
+	// brokered command is activity, and LastHumanActiveTime, which nothing
+	// else moves.
 	// +optional
 	ChatMessagesInboundTotal int64 `json:"chatMessagesInboundTotal,omitempty"`
 
@@ -2303,9 +2304,24 @@ type AgentUsageStatus struct {
 	// Scheduled maintenance jobs that run brokered commands move it too --
 	// the Controller Stall Watch cron runs some every 30 minutes by default
 	// -- so it marks agent activity of any origin, not human or operator use
-	// alone. Advances at most once per five minutes.
+	// alone; LastHumanActiveTime is the one that does. Advances at most once
+	// per five minutes.
 	// +optional
 	LastActiveTime *metav1.Time `json:"lastActiveTime,omitempty"`
+
+	// LastHumanActiveTime is the time of the last poll in which the one
+	// counter only a person moves advanced: ChatMessagesInboundTotal, a chat
+	// message that reached the gateway, counted before the sender allowlist,
+	// so an unlisted sender is still a person. Nothing else moves it. Brokered
+	// commands and accepted events come from the stall-watch cron and the
+	// event watcher on their own, proposals from the fleet audits, which open
+	// them with nobody asking, and a merge can be a forge rule; all of those
+	// move LastActiveTime and leave this alone, so an install nobody has
+	// talked to in a month shows it. Absent until a person has sent a message
+	// since the operator that writes it started. Advances at most once per
+	// five minutes.
+	// +optional
+	LastHumanActiveTime *metav1.Time `json:"lastHumanActiveTime,omitempty"`
 }
 
 const (

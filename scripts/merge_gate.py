@@ -32,8 +32,9 @@ it. `Merge labels` does not read it, but on the queue the `Smoke gate` leg
 fails each group, so check the value before you set it. Only greens are posted on
 a head, so a head `Smoke gate` posted green before the cutoff stays green: the
 pull request enters the queue, fails its group there, and like any pull request
-the queue removed, stays out until its head moves. So the pending text asks for
-a push, not a `/test`.
+the queue removed, stays out until its head moves: the one retry after a
+`failed_checks` removal fails the same way. So the pending text asks for a push,
+not a `/test`.
 
 Tide also holds a merge on any other posted context that is not green, required
 or not, because no `context_options` entry for this repository says otherwise.
@@ -67,6 +68,13 @@ get no `merge_group` runs, and turning on auto-merge needs `contents: write`
 A pull request the queue removed, or that someone took out by hand, stays out
 until its head moves (its first check suite is newer than the removal): its head checks are still green, so turning auto-merge on
 again would put the same failing tree back in the queue every five minutes.
+One exception: after the first `failed_checks` removal since the push, the
+sweep puts it back once, because a flaky or cancelled check gets the same
+reason as a real failure. A second one keeps it out.
+The sweep posts one comment on such a pull request, with the reason and what
+to do for that reason. The first step is always a push: a fix, a rebase, or an
+empty commit. For a failed check, or a reason the comment does not name, a
+write user's re-add command follows if the push does not work.
 """
 
 import argparse
@@ -109,6 +117,9 @@ HOLD_LABELS = (
     "do-not-merge/invalid-owners-file",
     "do-not-merge/work-in-progress",
 )
+#: `trusted_team_for_sticky_lgtm` for this repository (`prow/oss/plugins.yaml` in oss-test-infra):
+#: Prow keeps `lgtm` across a push only for its members.
+STICKY_LGTM_TEAM = "gke-labs/Googlers"
 #: `skip_if_only_changed` of `pull-kube-agents-smoke-test` in oss-test-infra
 #: `prow/prowjobs/gke-labs/kube-agents/kube-agents-presubmits.yaml`. Keep the two identical.
 SMOKE_SKIP_RE = re.compile(
@@ -136,6 +147,78 @@ DISABLE = "disable"
 LEFT_OUT = "left out"
 #: What a left-out line says when the removal event carries no reason or actor.
 UNKNOWN_REMOVAL_FIELD = "unknown"
+#: The removal reason GitHub writes for a failed or cancelled `merge_group` check. A flake and a
+#: real failure both get it, so the sweep puts the pull request back once per head commit.
+FAILED_CHECKS_REASON = "failed_checks"
+#: Opens the comment that tells the author why the sweep left the pull request out. Keyed on the
+#: removal's time, so each removal gets one comment and a later removal gets a new one.
+LEFT_OUT_MARKER = "<!-- merge-queue-left-out {removed} -->"
+LEFT_OUT_COMMENT = """{marker}
+{headline} The sweep logged:
+
+```text
+{line}
+```
+
+{advice}
+
+A push keeps `lgtm` for members of {team}. Other authors may need a new `/lgtm`.
+"""
+#: The GraphQL type of an actor the comment may @-mention; an App or an unknown actor is named
+#: without the `@`, so the comment pings no account that only shares its name.
+USER_ACTOR_TYPE = "User"
+#: The other two removal reasons the comment answers by name.
+MANUAL_REASON = "manual"
+MERGE_CONFLICT_REASON = "merge_conflict"
+#: The commands the comment hands the author and a write user.
+EMPTY_PUSH_COMMAND = 'git commit --allow-empty -m "Re-enter the merge queue" && git push'
+ENABLE_COMMAND = "gh api graphql -f query='{query}'"
+#: The comment's first line and advice, per removal reason. The sweep posts it only when the pull
+#: request stays out, so a `failed_checks` one has already had its retry.
+LEFT_OUT_HEADLINES = {
+    FAILED_CHECKS_REASON: "This pull request was removed from the merge queue because a required check failed again, "
+    "after the one retry the enqueue sweep gives it.",
+    MANUAL_REASON: "This pull request was removed from the merge queue by {who}.",
+    MERGE_CONFLICT_REASON: "This pull request was removed from the merge queue because it conflicts with `main`, "
+    "or with a pull request ahead of it in the queue.",
+}
+LEFT_OUT_HEADLINE_OTHER = "This pull request was removed from the merge queue (reason: {why})."
+LEFT_OUT_ADVICE = {
+    FAILED_CHECKS_REASON: """If a check found a real problem, push a fix.
+
+If it was a flake, push an empty commit, and the sweep puts it back once its checks pass:
+
+```shell
+{push}
+```
+
+If that does not work, ask a write user to run this command:
+
+```shell
+{enable}
+```""",
+    MANUAL_REASON: """If {who} did not mean to keep it out, push (an empty commit is enough), and the sweep puts \
+it back once its checks pass:
+
+```shell
+{push}
+```
+
+If they did mean to keep it out, they should add a hold label (`/hold`), so that it stays out after \
+the next push.""",
+    MERGE_CONFLICT_REASON: "Rebase onto `main`, fix any conflict, and push. The sweep puts it back after its checks pass.",
+}
+LEFT_OUT_ADVICE_OTHER = """Push a fix, or an empty commit, and the sweep puts it back once its checks pass:
+
+```shell
+{push}
+```
+
+If that does not work, ask a write user to run this command:
+
+```shell
+{enable}
+```"""
 #: The sweep's own login when `--actor` names no App: `GITHUB_TOKEN`'s, which makes no queue
 #: call. A write run always passes the App's slug, whose own dequeue of a held pull request does
 #: not keep it out; a dry run has no App token, so it may report that dequeue as a removal.
@@ -147,6 +230,11 @@ BOT_SUFFIX = "[bot]"
 PUSH_REMOVAL_WINDOW = timedelta(minutes=2)
 #: Enough of the head's check suites to find the first; Actions and the CLA app each add one.
 CHECK_SUITES_READ = 10
+#: Queue removals read per pull request: enough to count the `failed_checks` ones since the push.
+REMOVALS_READ = 10
+#: How many times per head commit the sweep puts a pull request back after `failed_checks`
+#: removals. `LEFT_OUT_HEADLINES` and the sweep's log line say "one retry"; change them with it.
+FAILED_CHECKS_RETRIES = 1
 
 #: The smoke and the gates are commit statuses; the rollup also carries check runs, which this skips.
 PULLS_QUERY = """
@@ -159,11 +247,11 @@ query($owner: String!, $name: String!, $base: String!, $after: String) {
         labels(first: 100) { nodes { name } }
         autoMergeRequest { enabledAt }
         mergeQueueEntry { id }
-        timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
-          nodes { ... on RemovedFromMergeQueueEvent { createdAt reason actor { login } } }
+        timelineItems(last: %(removals)d, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
+          nodes { ... on RemovedFromMergeQueueEvent { createdAt reason actor { __typename login } } }
         }
         commits(last: 1) { nodes { commit {
-          checkSuites(first: %d) { nodes { createdAt } }
+          checkSuites(first: %(suites)d) { nodes { createdAt } }
           statusCheckRollup { contexts(first: 100) { nodes {
           __typename
           ... on StatusContext { context state description }
@@ -249,7 +337,7 @@ def enqueue_action(pull):
     wanted = not pull["draft"] and labels_verdict(pull["labels"])[0] == SUCCESS
     queued = pull["auto_merge"] or pull["queue_entry"] is not None
     if wanted and not queued:
-        return LEFT_OUT if pull.get("removed_since_push") else ENABLE
+        return LEFT_OUT if pull.get("removed_since_push") and not pull.get("retry") else ENABLE
     if queued and not wanted:
         return DISABLE
     return None
@@ -395,25 +483,58 @@ def rollup_statuses(nodes):
     }
 
 
-def removed_since_push(node, actor=SWEEP_ACTOR):
-    """Whether someone other than the sweep removed the pull request from the queue after its last push.
-
-    The push time is the head's first check suite: the timeline places a commit
-    by its commit date, not by when it was pushed. A head with no check suite
-    counts as pushed after any removal.
-    """
-    removals = ((node.get("timelineItems") or {}).get("nodes")) or []
-    if not removals or not removals[-1].get("createdAt"):
-        return False
-    login = ((removals[-1].get("actor")) or {}).get("login") or ""
-    if login.removesuffix(BOT_SUFFIX) == actor.removesuffix(BOT_SUFFIX):
-        return False
+def _pushed_at(node):
+    """When the head was pushed: its first check suite, or None. The timeline places a commit by
+    its commit date, not by when it was pushed."""
     commits = node["commits"]["nodes"]
     suites = ((commits[0]["commit"].get("checkSuites") or {}).get("nodes") or []) if commits else []
     pushed = [parse_time(suite["createdAt"]) for suite in suites if suite.get("createdAt")]
-    if not pushed:
+    return min(pushed) if pushed else None
+
+
+def _after_push(removal, pushed, actor):
+    """Whether a removal came from someone other than the sweep, after the push and not caused by it."""
+    if not removal.get("createdAt"):
         return False
-    return parse_time(removals[-1]["createdAt"]) - min(pushed) > PUSH_REMOVAL_WINDOW
+    login = ((removal.get("actor")) or {}).get("login") or ""
+    if login.removesuffix(BOT_SUFFIX) == actor.removesuffix(BOT_SUFFIX):
+        return False
+    return parse_time(removal["createdAt"]) - pushed > PUSH_REMOVAL_WINDOW
+
+
+def removed_since_push(node, actor=SWEEP_ACTOR):
+    """Whether someone other than the sweep removed the pull request from the queue after its last push.
+
+    Only the last removal counts. A head with no check suite counts as pushed
+    after any removal.
+    """
+    removals = ((node.get("timelineItems") or {}).get("nodes")) or []
+    pushed = _pushed_at(node)
+    return bool(removals and pushed and _after_push(removals[-1], pushed, actor))
+
+
+def retry_due(node, actor=SWEEP_ACTOR):
+    """Whether the sweep puts a removed pull request back once: the last removal is `failed_checks`
+    and it is the only `failed_checks` removal since the push.
+
+    A flake and a real failure get the same reason, so one retry per head
+    commit gives a flake its way back, and a second failure keeps the pull
+    request out. A `manual` or `merge_conflict` removal is never retried.
+
+    The hold race shares the one retry: a held pull request at the front of the
+    queue fails its own `Merge labels` job and gets `failed_checks` too. So
+    after `/hold cancel` it comes back only if that was the first
+    `failed_checks` removal since the push; a flake later on the same head then
+    keeps it out.
+    """
+    if not removed_since_push(node, actor):
+        return False
+    removals = node["timelineItems"]["nodes"]
+    if removals[-1].get("reason") != FAILED_CHECKS_REASON:
+        return False
+    pushed = _pushed_at(node)
+    failed = [r for r in removals if r.get("reason") == FAILED_CHECKS_REASON and _after_push(r, pushed, actor)]
+    return len(failed) <= FAILED_CHECKS_RETRIES
 
 
 def last_removal(node):
@@ -438,8 +559,57 @@ def left_out_line(pull):
     return (
         f"#{pull['number']}: left out, removed {when} by {who} (reason: {why}). "
         f"To re-add (a write user): gh api graphql -f query='{enable}', "
-        "or push a fix (a push drops lgtm unless the author is in gke-labs/Googlers)."
+        f"or push a fix (a push drops lgtm unless the author is in {STICKY_LGTM_TEAM})."
     )
+
+
+def left_out_comment(pull, marker, line):
+    """The comment body for a pull request the sweep leaves out: why, the logged line, what to do."""
+    removal = pull.get("removal") or {}
+    actor = removal.get("actor") or {}
+    login = actor.get("login")
+    why = removal.get("reason") or UNKNOWN_REMOVAL_FIELD
+    if login and actor.get("__typename") == USER_ACTOR_TYPE:
+        who = f"@{login}"
+    else:
+        who = f"`{login.removesuffix(BOT_SUFFIX)}`" if login else UNKNOWN_REMOVAL_FIELD
+    fields = {
+        "who": who,
+        "why": why,
+        "push": EMPTY_PUSH_COMMAND,
+        "enable": ENABLE_COMMAND.format(query=ENABLE_COMMAND_QUERY.format(id=pull["id"])),
+    }
+    headline = LEFT_OUT_HEADLINES.get(why, LEFT_OUT_HEADLINE_OTHER).format(**fields)
+    advice = LEFT_OUT_ADVICE.get(why, LEFT_OUT_ADVICE_OTHER).format(**fields)
+    return LEFT_OUT_COMMENT.format(marker=marker, headline=headline, line=line, advice=advice, team=STICKY_LGTM_TEAM)
+
+
+def comment_left_out(api, pull, line, dry_run=False):
+    """Post the left-out comment, with `line` in it, once on a pull request the sweep leaves out.
+
+    Returns a log line.
+
+    One comment per removal: the sweep runs every five minutes, so it reads the
+    comments since the removal first and skips a pull request that already has
+    this removal's marker. The read happens only for pull requests the sweep
+    leaves out. A failed read or post is logged and not counted as a failure:
+    the left-out line is already in the log, and a red every five minutes for
+    a notice would hide real failures.
+    """
+    removed = (pull.get("removal") or {}).get("createdAt")
+    marker = LEFT_OUT_MARKER.format(removed=removed or UNKNOWN_REMOVAL_FIELD)
+    path = f"/repos/{api.repo}/issues/{pull['number']}/comments"
+    try:
+        # The marker comment is newer than the removal, so only comments since then can hold it.
+        since = f"{path}?since={removed}" if removed else path
+        if any((comment.get("body") or "").startswith(marker) for comment in api.get_all(since)):
+            return f"#{pull['number']}: left-out comment already posted"
+        if not dry_run:
+            body = left_out_comment(pull, marker, line)
+            api.post(path, {"body": body})
+    except Exception as error:  # a notice that fails must not turn every sweep red
+        return f"#{pull['number']}: left-out comment not posted: {error}"
+    return f"#{pull['number']}: {'would post' if dry_run else 'posted'} the left-out comment"
 
 
 def parse_time(stamp):
@@ -453,7 +623,7 @@ def graphql_pulls(api, base=BASE, actor=SWEEP_ACTOR):
     pulls = []
     after = None
     while True:
-        page = api.graphql(PULLS_QUERY % CHECK_SUITES_READ, {"owner": owner, "name": name, "base": base, "after": after})
+        page = api.graphql(PULLS_QUERY % {"removals": REMOVALS_READ, "suites": CHECK_SUITES_READ}, {"owner": owner, "name": name, "base": base, "after": after})
         page = page["repository"]["pullRequests"]
         for node in page["nodes"]:
             commits = node["commits"]["nodes"]
@@ -468,6 +638,7 @@ def graphql_pulls(api, base=BASE, actor=SWEEP_ACTOR):
                 "auto_merge": node["autoMergeRequest"] is not None,
                 "queue_entry": (node["mergeQueueEntry"] or {}).get("id"),
                 "removed_since_push": removed_since_push(node, actor),
+                "retry": retry_due(node, actor),
                 "removal": last_removal(node),
                 "statuses": rollup_statuses(((rollup or {}).get("contexts") or {}).get("nodes") or []),
             })
@@ -479,8 +650,8 @@ def graphql_pulls(api, base=BASE, actor=SWEEP_ACTOR):
 def sweep(api, base=BASE, enqueuer=None, actor=SWEEP_ACTOR, dry_run=False, not_before=None):
     """Re-post head statuses and reconcile auto-merge for every pull request. (lines, failures).
 
-    `api` reads and posts statuses; `enqueuer`, the App token, makes the
-    auto-merge and dequeue calls.
+    `api` reads, posts statuses, and posts the left-out comment; `enqueuer`,
+    the App token, makes the auto-merge and dequeue calls.
 
     Statuses are refreshed only for pull requests that pass the label test:
     those are the ones the queue can take, and refreshing every open pull
@@ -504,9 +675,13 @@ def sweep(api, base=BASE, enqueuer=None, actor=SWEEP_ACTOR, dry_run=False, not_b
                     enqueuer.graphql(DISABLE_MUTATION, {"id": pull["id"]})
             if action:
                 if action == LEFT_OUT:
-                    lines.append(left_out_line(pull))
+                    line = left_out_line(pull)
+                    lines.append(line)
+                    lines.append(comment_left_out(api, pull, line, dry_run=dry_run))
                 else:
                     verb = {ENABLE: "auto-merge on", DISABLE: "auto-merge off and out of the queue"}[action]
+                    if action == ENABLE and pull.get("retry"):
+                        verb += f" again, the one retry after a {FAILED_CHECKS_REASON} removal"
                     lines.append(f"#{pull['number']}: {'would turn ' if dry_run else ''}{verb}")
         except Exception as error:  # one pull request must not stop the sweep
             failures += 1
