@@ -1,9 +1,11 @@
 package hermesbridge
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -66,12 +68,41 @@ func TestAPI_OversizeAnswerIsRefusedWithTheLimitNamed(t *testing.T) {
 // budget is the one that decides.
 const atCapTerminalWait = 60 * time.Second
 
+// resultPublishCall is what the at-cap test's publish hook records: how
+// much of the publish window was left when resultPublish was entered, and
+// the answer it was handed.
+type resultPublishCall struct {
+	remaining   time.Duration
+	hasDeadline bool
+	output      string
+}
+
 // The boundary's other side: an answer of exactly apiResponseCap bytes is
 // read whole and completes, so the one-byte look-ahead refuses nothing the
 // cap admits.
+//
+// The same answer is the one whose chat fold costs enough to see, so the
+// test also checks where finalizeResult runs it. The publish context
+// resultPublish receives is opened just before it, so on entry its deadline
+// is short of the whole finalizePublishTimeout by one nil check; with the
+// fold inside the window it is short by the fold, about 0.85 s for this
+// answer without the race detector and 5 s under it. The bound is half of a
+// fold of the same answer timed here, after the terminal and outside the
+// window, so the check is red on that order in either mode and on any host.
 func TestAPI_AnswerAtTheCapCompletes(t *testing.T) {
 	_, url := startServer(t)
-	startAPIBridge(t, url, newAPIStub(t, completionOfSize(t, apiResponseCap)), nil)
+	published := make(chan resultPublishCall, 1)
+	startAPIBridgeHooked(t, url, newAPIStub(t, completionOfSize(t, apiResponseCap)), nil, func(b *Bridge) {
+		publish := b.resultPublish
+		b.resultPublish = func(ctx context.Context, run *taskRun, output string, chat []byte) error {
+			deadline, ok := ctx.Deadline()
+			select {
+			case published <- resultPublishCall{time.Until(deadline), ok, output}:
+			default:
+			}
+			return publish(ctx, run, output, chat)
+		}
+	}, func(net.Addr) bool { return true })
 	c := gatewayClient(t, url)
 	submitIn(t, c, "task-atcap", "ctx-atcap", "write something large")
 	task := waitTerminalFor(t, c, "task-atcap", atCapTerminalWait)
@@ -81,6 +112,26 @@ func TestAPI_AnswerAtTheCapCompletes(t *testing.T) {
 			reason = task.FinalMessage.Parts[0].Text
 		}
 		t.Fatalf("state = %s (%s), want completed", task.State, reason)
+	}
+	var call resultPublishCall
+	select {
+	case call = <-published:
+	default:
+		t.Fatal("the result was not published through resultPublish")
+	}
+	if !call.hasDeadline {
+		t.Fatal("resultPublish got a context with no deadline; finalizeResult publishes under finalizePublishTimeout")
+	}
+	start := time.Now()
+	if _, ok := resultChatPart(call.output); !ok {
+		t.Fatal("the at-cap answer did not fold into a chat part")
+	}
+	fold := time.Since(start)
+	spent := finalizePublishTimeout - call.remaining
+	t.Logf("resultPublish entered %v into its %v window; a fold of its answer takes %v", spent, finalizePublishTimeout, fold)
+	if spent > fold/2 {
+		t.Errorf("resultPublish entered %v into its window, more than half a %v fold of its answer: the chat fold ran inside the window",
+			spent, fold)
 	}
 }
 
