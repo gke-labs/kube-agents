@@ -25,9 +25,10 @@ const (
 
 	// The console texts the control actions send, as a person would type
 	// them. The gateway settles /session and /session off with a notice
-	// (turnFate); status and help are ordinary turns on the console, which
-	// the gateway answers with a notice (status, while a task runs) or a
-	// task, and sendAndWait takes either.
+	// (turnFate). status and help are messages to the agent: status gets the
+	// gateway's replay notice while a task runs and is a new turn otherwise,
+	// and help is always a message, so while a task runs it steers that task.
+	// sendAndWait takes a notice or a task either way.
 	sessionOnText  = "/session"
 	sessionOffText = "/session off"
 	statusText     = "status"
@@ -97,7 +98,8 @@ func ManageSessionTool(bus TurnBus, convs *Conversations) Tool {
 			Name: ToolManageSession,
 			Description: "Manage this server's named conversations: list them, create one (new), forget one (delete), " +
 				"or send a control turn on one: start a /session worker (session_on), end it (session_off), " +
-				"ask what is running (status), or ask for help. Names are this server's memory only; " +
+				"or send the agent the message status or help (while a task runs, status replays its progress and help steers it). " +
+				"Names are this server's memory only; " +
 				"a conversation resumes by its token after a restart.",
 			InputSchema: map[string]any{
 				"type": "object",
@@ -120,7 +122,9 @@ func ManageSessionTool(bus TurnBus, convs *Conversations) Tool {
 			if err := json.Unmarshal(orEmptyObject(raw), &a); err != nil {
 				return "", fmt.Errorf("arguments: %w", err)
 			}
-			if a.Conversation == "" {
+			// The original client's alias wins over conversation, as it did
+			// there.
+			if a.Alias != "" {
 				a.Conversation = a.Alias
 			}
 			// As the original client had it: no action lists, and its other
@@ -145,8 +149,6 @@ func ManageSessionTool(bus TurnBus, convs *Conversations) Tool {
 				return newConversation(convs, a)
 			case actionDelete:
 				return deleteConversation(convs, a)
-			case "":
-				return "", errors.New("manage_session needs an action")
 			default:
 				return "", fmt.Errorf("unknown action %s; use %s, %s, %s, %s, %s, %s or %s", cell(a.Action),
 					actionList, actionNew, actionDelete, actionSessionOn, actionSessionOff, actionStatus, actionHelp)
@@ -162,7 +164,7 @@ func newConversation(convs *Conversations, a manageSessionArgs) (string, error) 
 	if n := utf8.RuneCountInString(a.Description); n > maxDescriptionRunes {
 		return "", fmt.Errorf("description is %d characters; at most %d", n, maxDescriptionRunes)
 	}
-	alias, token := a.Conversation, ""
+	alias, token := strings.TrimSpace(a.Conversation), ""
 	var err error
 	if alias != "" {
 		token, err = convs.Create(alias, a.Description)
@@ -196,7 +198,7 @@ func deleteConversation(convs *Conversations, a manageSessionArgs) (string, erro
 		return "", fmt.Errorf("no conversation named %s", cell(a.Conversation))
 	}
 	return fmt.Sprintf("Forgot the name %s. This only forgets the name: the conversation's history stays on the bus, "+
-		"and a /session worker for it idles out by itself (send session_off first to end one now). "+
+		"and a /session worker for it idles out by itself (to end one now, stop its running task and send session_off first). "+
 		"A later call with this name starts a new conversation.\n", cell(a.Conversation)), nil
 }
 

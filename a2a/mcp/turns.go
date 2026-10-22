@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/nats-io/nats.go"
@@ -149,6 +150,11 @@ func NewConversations() *Conversations {
 // one (to resume a conversation, after a restart of this server included),
 // otherwise the alias's, minted on first use.
 func (c *Conversations) Resolve(alias, token string) (string, error) {
+	// A conversation's token given as its name, as list shows it
+	// (console:<token>), is the token: never a new name spelled like one.
+	if token == "" && strings.HasPrefix(alias, consoleConversationPrefix) {
+		alias, token = "", alias
+	}
 	if token != "" {
 		// manage_session lists a conversation as console:<token>; either form
 		// names it.
@@ -170,7 +176,23 @@ func (c *Conversations) Resolve(alias, token string) (string, error) {
 		c.touchLocked(e)
 		return e.token, nil
 	}
+	// So is a known conversation's bare token, as the original client took
+	// a name or a token in the same argument.
+	if a, ok := c.aliasOfTokenLocked(alias); ok {
+		c.touchLocked(c.byAlias[a])
+		return alias, nil
+	}
 	return c.addLocked(alias, "")
+}
+
+// aliasOfTokenLocked finds the alias whose conversation has token t.
+func (c *Conversations) aliasOfTokenLocked(t string) (string, bool) {
+	for a, e := range c.byAlias {
+		if e.token == t {
+			return a, true
+		}
+	}
+	return "", false
 }
 
 // ErrConversationExists is Create's refusal of an alias already in use.
@@ -197,7 +219,12 @@ func (c *Conversations) Forget(alias string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if _, ok := c.byAlias[alias]; !ok {
-		return false
+		// Named by its token, as list shows it, or bare.
+		a, found := c.aliasOfTokenLocked(strings.TrimPrefix(alias, consoleConversationPrefix))
+		if !found {
+			return false
+		}
+		alias = a
 	}
 	delete(c.byAlias, alias)
 	return true
@@ -253,9 +280,25 @@ func mintConversationToken() (string, error) {
 }
 
 // checkAlias refuses a conversation name longer than maxAliasRunes.
+//
+// It also refuses what list could not show back as typed, so a name copied
+// from list is the same name: a token's console: prefix, backticks and pipes,
+// control and invisible (format) characters, and spaces at either end or
+// doubled.
 func checkAlias(alias string) error {
 	if n := utf8.RuneCountInString(alias); n > maxAliasRunes {
 		return fmt.Errorf("conversation name is %d characters; at most %d", n, maxAliasRunes)
+	}
+	if strings.HasPrefix(alias, consoleConversationPrefix) {
+		return fmt.Errorf("a name may not start with %q; pass a token as conversation_token", consoleConversationPrefix)
+	}
+	if strings.TrimSpace(alias) != alias || strings.Contains(alias, "  ") {
+		return errors.New("a conversation name may not start or end with spaces, or hold two in a row")
+	}
+	for _, r := range alias {
+		if r == '`' || r == '|' || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return fmt.Errorf("a conversation name may not hold %q", r)
+		}
 	}
 	return nil
 }

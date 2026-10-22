@@ -87,6 +87,9 @@ func SendMessageTool(bus TurnBus, convs *Conversations) Tool {
 // token and renders what came of it: the gateway's notices, and the turn's
 // task as it stands after wait.
 func sendAndWait(ctx context.Context, bus TurnBus, convs *Conversations, alias, token, text string, wait time.Duration) (string, error) {
+	// A token names the conversation whatever name came with it, so the
+	// answer is labelled by the token rather than by a name it may not have.
+	byToken := token != "" || strings.HasPrefix(alias, consoleConversationPrefix)
 	token, err := convs.Resolve(alias, token)
 	if err != nil {
 		return "", err
@@ -96,7 +99,11 @@ func sendAndWait(ctx context.Context, bus TurnBus, convs *Conversations, alias, 
 		return "", err
 	}
 	var sb strings.Builder
-	writeConversation(&sb, alias, token)
+	if byToken {
+		fmt.Fprintf(&sb, "Conversation by token `%s`.\n\n", token)
+	} else {
+		writeConversation(&sb, alias, token)
+	}
 	writeNotices(&sb, res.Notices)
 	if res.Task == nil {
 		if len(res.Notices) == 0 {

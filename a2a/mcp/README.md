@@ -38,13 +38,19 @@ To rotate the token, write a new value into the Secret. The server reads it on e
 
 ## Conversations
 
-Each call names its conversation with `conversation` (a name; `default` if omitted) or `conversation_token` (the token an earlier answer reported, as `<token>` or `console:<token>`). There is no server-wide active conversation. Names are this server's memory only: a restart forgets them, and a conversation resumes by its token.
+Each call names its conversation with `conversation` (a name; `default` if omitted) or `conversation_token` (the token an earlier answer reported, as `<token>` or `console:<token>`). A token given where a name goes, in either form, names that conversation too. There is no server-wide active conversation.
+
+Names are this server's memory only, and they're shared:
+
+- A restart forgets them, and so does the table itself past 1024 names, starting with the least recently used. A conversation resumes by its token either way.
+- Every caller holds the same bearer token, so every caller sees and can use every name.
+- A name is at most 128 characters, and holds nothing `list` couldn't show back as typed: no backticks, pipes, control or invisible characters, or spaces at either end or doubled.
 
 `manage_session` handles the names and the console's control turns:
 
 - `list`: the named conversations, most recently used first, with token, description and last use;
 - `new`: create a name, with an optional description of at most 200 characters; an existing name is refused;
-- `delete`: forget a name. The conversation's history stays on the bus, and a `/session` worker for it idles out by itself; send `session_off` first to end one now;
-- `session_on`, `session_off`, `status`, `help`: send `/session`, `/session off`, `status` or `help` on the conversation, exactly as `send_message` would, and return the answer.
+- `delete`: forget a name. The conversation's history stays on the bus, and a `/session` worker for it idles out by itself. To end one now, stop its running task and send `session_off` first;
+- `session_on`, `session_off`, `status`, `help`: send `/session`, `/session off`, `status` or `help` on the conversation, exactly as `send_message` would, and return the answer. `/session` and `/session off` are the gateway's commands. `status` and `help` are messages to the agent: while a task runs, `status` replays its progress and `help` steers it.
 
 The original client's `switch`, `debug_on`, `debug_off`, `transcript` and `clear_killed` are not offered; a call to one is answered with an error that says why.

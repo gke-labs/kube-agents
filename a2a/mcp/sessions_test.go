@@ -110,15 +110,16 @@ func TestManageSessionListIsCapped(t *testing.T) {
 }
 
 // A name and a description are the caller's: shown as one inert cell each,
-// whatever they hold, in list and in new's answer.
+// whatever they hold, in list and in new's answer. (A name is held to what
+// list can show back as typed, below, so its hostile text is markdown only.)
 func TestManageSessionRendersCallerTextInert(t *testing.T) {
 	s, _ := busless(t)
-	alias := "x`| **bold** |\n| forged | row |\u202egnp.exe"
+	alias := "x **bold** [link](https://evil.example) <b>hi</b>"
 	desc := "see [this](https://evil.example) `code` | pipe\r\nnext line\u200b\u2066"
 	created := mustSucceed(t, callTool(t, s, ToolManageSession, map[string]any{"action": actionNew, "conversation": alias, "description": desc}))
 	list := mustSucceed(t, callTool(t, s, ToolManageSession, map[string]any{"action": actionList}))
 	for name, out := range map[string]string{"new": created, "list": list} {
-		for _, bad := range []string{"\u202e", "\u200b", "\u2066", "\r", "x`|", "| forged |", "`code`"} {
+		for _, bad := range []string{"\u202e", "\u200b", "\u2066", "\r", "`code`", "| pipe"} {
 			if strings.Contains(out, bad) {
 				t.Errorf("%s output contains %q:\n%s", name, bad, out)
 			}
@@ -136,6 +137,74 @@ func TestManageSessionRendersCallerTextInert(t *testing.T) {
 	}
 	if strings.Count(list, "console:") != 1 {
 		t.Errorf("hostile text forged a row:\n%s", list)
+	}
+}
+
+// A name holds only what list can show back as typed, so one copied from list
+// is the same name; and a token is never taken as a new name spelled like one.
+func TestManageSessionRefusesNamesListCannotShowBack(t *testing.T) {
+	s, _ := busless(t)
+	for _, bad := range []string{"a`b", "a|b", "a\nb", "a\tb", "rtl\u202eexe", "zero\u200bwidth", "two  spaces", "console:mcpabc"} {
+		mustFail(t, callTool(t, s, ToolManageSession, map[string]any{"action": actionNew, "conversation": bad}))
+	}
+	// new trims a name, as the original did; a send does not, so it refuses.
+	mustSucceed(t, callTool(t, s, ToolManageSession, map[string]any{"action": actionNew, "conversation": "  padded  "}))
+	for _, bad := range []string{" lead", "trail "} {
+		if _, err := NewConversations().Resolve(bad, ""); err == nil {
+			t.Errorf("a send took the name %q", bad)
+		}
+	}
+}
+
+// A conversation's token, as list shows it or bare, names that conversation
+// wherever a name goes: in conversation or alias, for a control action and
+// for delete.
+func TestATokenGivenAsANameIsThatConversation(t *testing.T) {
+	s, convs, frames := sessionServer(t)
+	token, _ := convs.Resolve("ops", "")
+	for _, args := range []map[string]any{
+		{"action": actionSessionOff, "alias": consoleConversationPrefix + token},
+		{"action": actionSessionOff, "conversation": consoleConversationPrefix + token},
+		{"action": actionSessionOff, "conversation": token},
+	} {
+		n := len(frames.all())
+		out := mustSucceed(t, callTool(t, s, ToolManageSession, args))
+		if got := frames.all()[n:]; len(got) != 1 || got[0].token != token {
+			t.Errorf("%v sent %+v, want it on %s", args, got, token)
+		}
+		mustNotContain(t, out, "Conversation `"+consoleConversationPrefix)
+	}
+	if rows := convs.List(); len(rows) != 1 {
+		t.Errorf("a token given as a name minted a conversation: %+v", rows)
+	}
+	mustSucceed(t, callTool(t, s, ToolManageSession, map[string]any{"action": actionDelete, "alias": consoleConversationPrefix + token}))
+	if rows := convs.List(); len(rows) != 0 {
+		t.Errorf("delete by token left %+v", rows)
+	}
+}
+
+// The original client's alias wins over conversation, and a call naming a
+// token is labelled by the token, not by a name that came with it.
+func TestAliasWinsAndATokenLabelsTheAnswer(t *testing.T) {
+	s, convs, frames := sessionServer(t)
+	opsToken, _ := convs.Resolve("ops", "")
+	n := len(frames.all())
+	mustSucceed(t, callTool(t, s, ToolManageSession, map[string]any{"action": actionSessionOn, "alias": "ops", "conversation": "other"}))
+	if got := frames.all()[n:]; len(got) != 1 || got[0].token != opsToken {
+		t.Errorf("alias and conversation together sent %+v, want alias's %s", got, opsToken)
+	}
+	out := mustSucceed(t, callTool(t, s, ToolManageSession, map[string]any{"action": actionSessionOff, "conversation": "foo", "conversation_token": opsToken}))
+	mustContain(t, out, "Conversation by token `"+opsToken+"`")
+	mustNotContain(t, out, "`foo`")
+}
+
+// send_message's conversation line shows the caller's name as one inert code
+// span.
+func TestTheConversationLineIsInert(t *testing.T) {
+	s, _, _ := sessionServer(t)
+	out := mustSucceed(t, callTool(t, s, ToolSendMessage, map[string]any{"text": statusText, "conversation": "x **bold** [l](https://evil.example)"}))
+	if !strings.Contains(out, "Conversation `x **bold** [l](https://evil.example)` (token `") {
+		t.Errorf("the conversation line is not one code span:\n%s", out)
 	}
 }
 
