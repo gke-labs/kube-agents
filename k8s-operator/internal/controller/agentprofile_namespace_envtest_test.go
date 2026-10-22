@@ -265,8 +265,11 @@ func TestTheFlipToTodayRemovesTheProfileObjects(t *testing.T) {
 	if err := c.Create(ctx, foreign); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.deleteProfileNamespaceObjects(ctx, agent); err != nil {
-		t.Fatalf("delete: %v", err)
+	if err := r.deleteProfileQuota(ctx, agent); err != nil {
+		t.Fatalf("delete the quota: %v", err)
+	}
+	if err := r.deleteProfileFence(ctx, agent); err != nil {
+		t.Fatalf("delete the fence: %v", err)
 	}
 	var np networkingv1.NetworkPolicy
 	if err := c.Get(ctx, types.NamespacedName{Namespace: profileNamespaceName(agent), Name: profileNetpolName(agent)}, &np); !apierrors.IsNotFound(err) {
@@ -275,5 +278,57 @@ func TestTheFlipToTodayRemovesTheProfileObjects(t *testing.T) {
 	var q corev1.ResourceQuota
 	if err := c.Get(ctx, types.NamespacedName{Namespace: profileNamespaceName(agent), Name: profileQuotaName(agent)}, &q); err != nil {
 		t.Errorf("a quota this agent didn't render was deleted: %v", err)
+	}
+}
+
+// profileFenced trusts a fence only in a marked namespace and only if it's
+// this agent's.
+func TestProfileFencedChecksTheNamespaceAndTheFencesOwner(t *testing.T) {
+	c, scheme := startEnvtest(t)
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	r := &PlatformAgentReconciler{Client: c, Scheme: scheme}
+	// A fence of the right name, unlabelled, in an unmarked namespace.
+	if err := c.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: profileNamespaceName(agent)}}); err != nil {
+		t.Fatal(err)
+	}
+	foreign := buildProfileNetworkPolicy(agent, nil)
+	foreign.Labels = nil
+	if err := c.Create(ctx, foreign); err != nil {
+		t.Fatal(err)
+	}
+	if fenced, err := r.profileFenced(ctx, agent); err != nil || fenced {
+		t.Errorf("unmarked namespace: profileFenced = %v, %v, want false", fenced, err)
+	}
+	// Mark the namespace; the fence still isn't this agent's.
+	var ns corev1.Namespace
+	if err := c.Get(ctx, types.NamespacedName{Name: profileNamespaceName(agent)}, &ns); err != nil {
+		t.Fatal(err)
+	}
+	marked := chartProfileNamespace(agent)
+	ns.Labels, ns.Annotations = marked.Labels, marked.Annotations
+	if err := c.Update(ctx, &ns); err != nil {
+		t.Fatal(err)
+	}
+	if fenced, err := r.profileFenced(ctx, agent); err != nil || fenced {
+		t.Errorf("a fence this agent didn't render: profileFenced = %v, %v, want false", fenced, err)
+	}
+	// The agent's own fence.
+	if fenced, err := r.reconcileProfileFence(ctx, agent, nil); err != nil || !fenced {
+		t.Fatalf("reconcileProfileFence = %v, %v", fenced, err)
+	}
+	if fenced, err := r.profileFenced(ctx, agent); err != nil || !fenced {
+		t.Errorf("the agent's fence in a marked namespace: profileFenced = %v, %v, want true", fenced, err)
+	}
+	// The agent's own fence, in a namespace whose markers are then removed.
+	if err := c.Get(ctx, types.NamespacedName{Name: profileNamespaceName(agent)}, &ns); err != nil {
+		t.Fatal(err)
+	}
+	ns.Labels, ns.Annotations = nil, nil
+	if err := c.Update(ctx, &ns); err != nil {
+		t.Fatal(err)
+	}
+	if fenced, err := r.profileFenced(ctx, agent); err != nil || fenced {
+		t.Errorf("the agent's fence in a namespace that lost its markers: profileFenced = %v, %v, want false", fenced, err)
 	}
 }

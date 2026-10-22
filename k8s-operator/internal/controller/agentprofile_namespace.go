@@ -33,10 +33,12 @@ import (
 // requires before it treats a namespace of that name as the profile
 // namespace. Anyone who can create a Namespace could create one with this
 // name first, and its pods would then be admitted to the bus and LiteLLM.
-// The markers can be copied by such a creator, so they are not a guarantee.
-// What they stop is a namespace that merely shares the name, and Helm
-// refuses to install over a namespace it doesn't own, so a squatted name
-// shows up as a failed install. A kustomize or hand install sets them too.
+// The markers can be copied by such a creator, so they are not a guarantee:
+// they stop a namespace that merely shares the name, not one made to pass.
+// Helm won't adopt an existing namespace that lacks its release annotations,
+// so a squatter who doesn't copy those surfaces as a failed install; one who
+// does is someone with Namespace create, which is close to cluster admin. A
+// kustomize or hand install sets the markers too.
 const (
 	profileNamespaceComponent      = "profiles"
 	helmReleaseNamespaceAnnotation = "meta.helm.sh/release-namespace"
@@ -224,14 +226,30 @@ func (r *PlatformAgentReconciler) reconcileProfileFence(ctx context.Context, age
 }
 
 // profileFenced reports whether the profile namespace's fence is in place,
-// for a policy applied outside reconcileA2ANetworkFences (LiteLLM's).
+// for a policy applied outside reconcileA2ANetworkFences (LiteLLM's): the
+// namespace carries the chart's markers, and the fence there is this
+// agent's. The same test reconcileProfileFence passes before it applies one.
 func (r *PlatformAgentReconciler) profileFenced(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
+	if exists, err := r.profileNamespaceExists(ctx, agent); err != nil || !exists {
+		return false, err
+	}
 	var np networkingv1.NetworkPolicy
 	err := r.Get(ctx, types.NamespacedName{Namespace: profileNamespaceName(agent), Name: profileNetpolName(agent)}, &np)
 	if apierrors.IsNotFound(err) {
 		return false, nil
 	}
-	return err == nil, err
+	if err != nil {
+		return false, err
+	}
+	return renderedByAgent(&np, agent, "profile-netpol"), nil
+}
+
+// renderedByAgent reports whether obj carries this agent's labels for the
+// given component, the test for objects in the profile namespace, which
+// can't carry an owner reference.
+func renderedByAgent(obj client.Object, agent *agentv1alpha1.PlatformAgent, component string) bool {
+	labels := obj.GetLabels()
+	return labels[labelInstance] == instanceLabel(agent.Namespace, agent.Name) && labels[a2aComponentLabel] == component
 }
 
 // withoutProfilePeer drops the profile namespace from np's ingress, and any
@@ -272,35 +290,31 @@ func (r *PlatformAgentReconciler) reconcileProfileQuota(ctx context.Context, age
 	return nil
 }
 
-// deleteProfileNamespaceObjects removes what this agent rendered into the
-// profile namespace, for the flip back to today. Those objects carry no
-// owner reference, so nothing else reclaims them, and an install that
-// isn't running next should look like it never did. An object of that name
-// that this agent's labels don't mark as its own is left to its owner, like
-// the callout's unowned ClusterRoleBinding.
-func (r *PlatformAgentReconciler) deleteProfileNamespaceObjects(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	ns := profileNamespaceName(agent)
-	for _, entry := range []struct {
-		obj       client.Object
-		reader    client.Reader
-		component string
-	}{
-		{&corev1.ResourceQuota{ObjectMeta: metav1.ObjectMeta{Name: profileQuotaName(agent), Namespace: ns}}, r.a2aReader(), "profile-quota"},
-		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: profileNetpolName(agent), Namespace: ns}}, r.Client, "profile-netpol"},
-	} {
-		if err := entry.reader.Get(ctx, client.ObjectKeyFromObject(entry.obj), entry.obj); err != nil {
-			if apierrors.IsNotFound(err) {
-				continue
-			}
-			return err
-		}
-		labels := entry.obj.GetLabels()
-		if labels[labelInstance] != instanceLabel(agent.Namespace, agent.Name) || labels[a2aComponentLabel] != entry.component {
-			continue
-		}
-		if err := r.Delete(ctx, entry.obj); client.IgnoreNotFound(err) != nil {
-			return fmt.Errorf("delete %s/%s: %w", ns, entry.obj.GetName(), err)
-		}
+// deleteProfileQuota and deleteProfileFence remove what this agent rendered
+// into the profile namespace, for the flip back to today. Those objects
+// carry no owner reference, so nothing else reclaims them, and an install
+// that isn't running next should look like it never did. An object of that
+// name that this agent's labels don't mark as its own is left to its owner,
+// like the callout's unowned ClusterRoleBinding. cleanupA2A removes the
+// fence last, after the bus fence that admits the namespace is gone; a pass
+// that dies before then leaves a fence that only restricts.
+func (r *PlatformAgentReconciler) deleteProfileQuota(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	return r.deleteProfileObject(ctx, agent, &corev1.ResourceQuota{ObjectMeta: metav1.ObjectMeta{Name: profileQuotaName(agent), Namespace: profileNamespaceName(agent)}}, r.a2aReader(), "profile-quota")
+}
+
+func (r *PlatformAgentReconciler) deleteProfileFence(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	return r.deleteProfileObject(ctx, agent, &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: profileNetpolName(agent), Namespace: profileNamespaceName(agent)}}, r.Client, "profile-netpol")
+}
+
+func (r *PlatformAgentReconciler) deleteProfileObject(ctx context.Context, agent *agentv1alpha1.PlatformAgent, obj client.Object, reader client.Reader, component string) error {
+	if err := reader.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if !renderedByAgent(obj, agent, component) {
+		return nil
+	}
+	if err := r.Delete(ctx, obj); client.IgnoreNotFound(err) != nil {
+		return fmt.Errorf("delete %s/%s: %w", obj.GetNamespace(), obj.GetName(), err)
 	}
 	return nil
 }

@@ -6324,10 +6324,9 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		}
 	}
 
-	// What this agent rendered into the profile namespace, which carries no
-	// owner reference (agentprofile_namespace.go). Before the bus, like the
-	// other fences' consumers.
-	if err := r.deleteProfileNamespaceObjects(ctx, agent); err != nil {
+	// The profile namespace's quota, which carries no owner reference
+	// (agentprofile_namespace.go). Its fence goes after the bus below.
+	if err := r.deleteProfileQuota(ctx, agent); err != nil {
 		return err
 	}
 
@@ -6371,6 +6370,14 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		if err := r.deleteOwnedA2AObject(ctx, agent, entry.obj, entry.reader); err != nil {
 			return err
 		}
+	}
+
+	// The profile namespace's fence, now that the bus fence admitting that
+	// namespace is gone (LiteLLM's policy dropped it earlier in the pass,
+	// when it re-rendered for today). Before the sentinel, so a failed delete
+	// leaves cleanup to resume.
+	if err := r.deleteProfileFence(ctx, agent); err != nil {
+		return err
 	}
 
 	// 5. LAST, deliberately: the StatefulSet is this function's sentinel. The
