@@ -280,12 +280,45 @@ verification_spec:
       # The one run that did not was reading an unrelated k8s-event card, which
       # has no principal to carry (the collision that case's header records).
       #
-      # So a red here is one of two things and the order matters: first check
-      # the report was read off the DRIFT card and not a neighbouring event
-      # card; if it was, it is a finding about _drift_task_body's "Done when"
-      # clause, which the template should learn to ask for. The fix is never to
-      # weaken this objective.
-      required_phrases: ["eval-operator@example.com"]
+      # So a red here is one of three things and the order matters. First,
+      # check the report was read off the DRIFT card and not a neighbouring
+      # event card. Second, check whether the agent checked the card against
+      # Cloud Logging and reported the principal the audit entry records --
+      # see below; that is a pass. Only if neither is a finding about
+      # _drift_task_body's "Done when" clause, which the template should learn
+      # to ask for. The fix is never to weaken this objective.
+      #
+      # WHY IT ACCEPTS MORE THAN THE PLANTED PRINCIPAL. The planted principal
+      # is a story. The stack makes the deletion itself, under whatever
+      # identity runs it, and hands the daemon a record saying
+      # eval-operator@example.com did it -- and the card tells the agent to
+      # "search Cloud Logging for this to read the entry itself". An agent that
+      # does finds the audit entry naming the real caller, finds the card
+      # contradicted, and reports the principal the evidence supports.
+      # Measured on the recorder nightly of 2026-10-22, build
+      # 2113057845506215936, rep 2: "Cloud Logging records the delete under
+      # the principal eval-baseline-recorder@... That differs from the
+      # principal and insertId on this card". That is the behaviour CUJ 1
+      # exists to reward, and failing it graded verification as a defect.
+      #
+      # So the objective accepts the planted principal or either identity the
+      # nightlies plant under. Not "any service account": reports routinely
+      # name the Platform Agent's own GSA, and that must not pass for naming
+      # the actor. Making the story true instead was tried and does not work:
+      # a `kubectl --as` write is logged with the real caller as
+      # principalEmail and the impersonated user only as authoritySelector.
+      #
+      # The two identities are the Google accounts the periodics'
+      # serviceAccountName maps to (eval-baseline-recorder for the recorder
+      # and its siblings, prowjob-default-sa for the Claude twins), read off
+      # their own logs. If a periodic moves to another identity, an agent that
+      # verifies reds here again -- a false red, never a false pass.
+      any_of_phrases:
+        - "eval-operator@example.com"
+        # The recorder nightly plants under this identity, so the audit log names it.
+        - "eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
+        # The Claude nightly twins plant under this identity.
+        - "prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com"
 
   - name: triage-names-the-object-kind
     role: objective
