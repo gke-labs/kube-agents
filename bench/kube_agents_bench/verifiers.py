@@ -3389,6 +3389,224 @@ class ReplyIsSilentVerifier(BaseVerifier):
         return VerificationResult(success=False, elapsed_time=time.monotonic() - start, reason=reason)
 
 
+# ``verified_claims_backed``: one evidence block as ``kanban_complete`` renders
+# it (``deploy/docker/patches/kanban_verified_claims.py``): a fence holding
+# ``$ <command>``, which may span lines, then a fence holding the output
+# excerpt, with the output fence opening on the line right after the command
+# fence closes and carrying no info string, as the gate renders it. The gate
+# refuses a fence inside either, so neither group may cross one. A lone ``$``
+# fence, such as a suggested fix, or one followed by a manifest fence, is not
+# a block and cannot swallow the block after it.
+_EVIDENCE_BLOCK_RE = re.compile(
+    r"```[^\n]*\n\$ ((?:(?!```).)*?)\n```\n```\n((?:(?!```).)*?)\n?```", re.S
+)
+# The gate's own section heading, which says "verified" itself; taken out
+# before the reply is searched for the label.
+_EVIDENCE_HEADING = "**Evidence for verified claims**"
+_VERIFIED_LABEL_RE = re.compile(r"\bverified\b", re.I)
+# ``worker_trajectory.clip``'s marker on a result cut in the pod.
+_CLIPPED_RESULT_RE = re.compile(r" \.\.\.\[clipped \d+ chars\]$")
+# The head of a terminal result as the pod stores it: ``{"output": "``.
+_OUTPUT_HEAD_RE = re.compile(r'^\{\s*"output":\s*"')
+# The longest escape a cut can split (``\uXXXX``), trimmed one character at a
+# time until the head decodes.
+_MAX_SPLIT_ESCAPE = 6
+# ``AuditRedactor.EMAIL_PATTERN`` and its marker
+# (``agents/chat/defaults/plugins/common/redactor.py``): the pod masks an
+# address in the trajectory, and the gate's own redaction does not, so the
+# reply's copy is masked the same way before it is compared.
+_EMAIL_RE = re.compile(
+    r"[a-zA-Z0-9._%+\-]+@(?!(?:[a-zA-Z0-9\-]+\.)*gserviceaccount\.com(?!\.?[\w\-]))[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}"
+)
+_EMAIL_MARKER = "[REDACTED_EMAIL]"
+# What every marker the pod writes starts with (``[REDACTED_SECRET]``,
+# ``[REDACTED_EMAIL]``, ...): a span of the worker's text the stored copy no
+# longer holds.
+_REDACTED_PREFIX = "[REDACTED"
+_REDACTED_SPAN_RE = re.compile(r"\\\[REDACTED_[A-Z_]*\\\]")
+# What a redacted span of a command may stand for: one word, with no shell
+# separator that would start a second command.
+_REDACTED_WORD = r"[^\s;&|<>()$`]*"
+# Spaces around JSON and YAML punctuation, which the pod's re-serialisation
+# adds or drops.
+_JSON_SPACING_RE = re.compile(r"\s*([,:{}\[\]])\s*")
+_WORD_CHAR_RE = re.compile(r"\w")
+# ``kanban_verified_claims.MIN_EXCERPT_CHARS``: the fewest characters besides
+# whitespace an excerpt may hold, unless it is the command's whole output.
+_MIN_EXCERPT_CHARS = 8
+# A ``\uXXXX`` escape. The pod re-serialises a JSON output with
+# ``json.dumps``, which escapes every non-ASCII character, and kubectl escapes
+# ``&``, ``<`` and ``>`` the same way, so both copies are compared unescaped.
+_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def _squeezed(text: str) -> str:
+    """``text`` with ``\\uXXXX`` escapes undone, addresses masked, whitespace collapsed, and none around ``,:{}[]``.
+
+    The pod re-serialises a JSON output with ``", "`` and ``": "`` separators
+    (``worker_trajectory.supplement``), so compact JSON the worker saw and
+    copied differs from the stored text in those spaces and in escapes. Other
+    whitespace is kept as one space, so a word edge still reads as one.
+    """
+    return _JSON_SPACING_RE.sub(r"\1", " ".join(_normalized(text).split()))
+
+
+def _excerpt_in(needle: str, haystack: str) -> bool:
+    """Whether ``needle`` is in ``haystack`` starting and ending on a word edge, as the gate requires.
+
+    A side whose own end character is not a word character is an edge already.
+    """
+    start = haystack.find(needle)
+    while start != -1:
+        end = start + len(needle)
+        left = start == 0 or not (_WORD_CHAR_RE.match(needle[0]) and _WORD_CHAR_RE.match(haystack[start - 1]))
+        right = end == len(haystack) or not (_WORD_CHAR_RE.match(needle[-1]) and _WORD_CHAR_RE.match(haystack[end]))
+        if left and right:
+            return True
+        start = haystack.find(needle, start + 1)
+    return False
+
+
+def _normalized(text: str) -> str:
+    """``text`` with ``\\uXXXX`` escapes undone and addresses masked, whitespace kept."""
+    text = _UNICODE_ESCAPE_RE.sub(lambda m: chr(int(m.group(1), 16)), text)
+    text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+    return _EMAIL_RE.sub(_EMAIL_MARKER, text)
+
+
+def _same_command(stored: str, cited: str) -> bool:
+    """Whether the reply's ``cited`` command is the stored one, a redacted span standing for one word.
+
+    The pod's redactor masks a token, password or ``key=value`` value, each of
+    which stops at whitespace, so a span matches only text with no whitespace
+    and no shell separator. It is matched on the whitespace-collapsed text,
+    since squeezing first would let a span swallow a second command.
+    """
+    if _squeezed(stored) == _squeezed(cited):
+        return True
+    if _REDACTED_PREFIX not in stored or not re.search(r"\w", _REDACTED_SPAN_RE.sub("", re.escape(stored))):
+        # A stored command that is only a marker would match any one word.
+        return False
+    stored, cited = " ".join(_normalized(stored).split()), " ".join(_normalized(cited).split())
+    pattern = _REDACTED_SPAN_RE.sub(lambda _: _REDACTED_WORD, re.escape(stored))
+    return re.fullmatch(pattern, cited) is not None
+
+
+def _terminal_output(result: str) -> tuple[str, bool]:
+    """The ``output`` of a terminal result as the trajectory stores it, and whether the pod clipped it.
+
+    The result is the JSON text of ``{"output": ..., "exit_code": ...}``. A
+    clipped one no longer parses; its surviving head is decoded as a JSON
+    string, less any escape the cut split.
+    """
+    clipped = _CLIPPED_RESULT_RE.search(result)
+    if not clipped:
+        try:
+            parsed = json.loads(result)
+        except ValueError:
+            return result, False
+        if isinstance(parsed, dict) and isinstance(parsed.get("output"), str):
+            return parsed["output"], False
+        return result, False
+    head = _OUTPUT_HEAD_RE.sub("", result[: clipped.start()])
+    for cut in range(_MAX_SPLIT_ESCAPE + 1):
+        try:
+            return json.loads('"' + head[: len(head) - cut] + '"'), True
+        except ValueError:
+            continue
+    return head, True
+
+
+@VERIFIERS.register("verified_claims_backed")
+class VerifiedClaimsBackedVerifier(BaseVerifier):
+    """Every piece of evidence in the reply is a command a worker ran, with its real output.
+
+    Reads the ``final_message`` for evidence blocks: a fence holding
+    ``$ <command>``, then a fence holding an excerpt of its output, the shape
+    ``kanban_complete`` renders for ``verified_claims``. Each block's command
+    must equal (whitespace removed) a worker's tagged ``terminal`` or
+    ``execute_code`` call
+    (:func:`_worker_terminal_calls`), on any card, and its excerpt must appear
+    in that call's output. A reply with fewer than ``min_blocks`` blocks fails,
+    and the reason says when it calls something verified with nothing behind
+    it.
+
+    Text is compared with ``\\uXXXX`` escapes undone, addresses masked and
+    whitespace collapsed, with none around JSON punctuation (:func:`_squeezed`).
+    An excerpt must start and end on a word edge and hold at least
+    :data:`_MIN_EXCERPT_CHARS` characters unless it is the command's whole
+    output, as the gate requires. A redacted
+    span of a stored command matches one word (:func:`_same_command`). An excerpt missing
+    from an output the pod clipped (``worker_trajectory.MAX_RESULT_CHARS``) or
+    redacted is not held against the reply: the command is checked and the
+    pass says the excerpt was not, since the gate checked it against the
+    output the worker saw. A block whose command is missing is an
+    error, not a fail, while ``worker_capture_gaps`` reports a gap or the pod
+    withheld the workers' arguments; so is any block when the trajectory holds
+    no worker terminal call at all.
+    """
+
+    type: Literal["verified_claims_backed"]
+    min_blocks: int = Field(default=1, ge=0)
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+
+        def done(status: str, reason: str) -> VerificationResult:
+            return VerificationResult(
+                success=status == "pass", status=status, elapsed_time=time.monotonic() - start, reason=reason
+            )
+
+        snap = transcript.get()
+        if snap is None:
+            return done("error", _NO_TRANSCRIPT_REASON)
+        reply = snap.final_message
+        blocks = _EVIDENCE_BLOCK_RE.findall(reply)
+        if len(blocks) < self.min_blocks:
+            labelled = _VERIFIED_LABEL_RE.search(reply.replace(_EVIDENCE_HEADING, ""))
+            what = "calls claims verified with" if labelled else "has"
+            return done("fail", f"the reply {what} {len(blocks)} evidence block(s) (a $ command fence, then an "
+                        f"output fence); at least {self.min_blocks} required")
+        calls = [(command, result) for _, _, command, result, _ in _worker_terminal_calls(snap.trajectory)]
+        withheld = any(
+            entry.get("agent") and entry.get("name") in _CODE_TOOLS and _args_withheld(entry)
+            for entry in snap.trajectory if isinstance(entry, dict)
+        )
+        if blocks and not calls and not (snap.worker_capture_gaps or withheld):
+            return done("error", f"the reply has {len(blocks)} evidence block(s), but the trajectory holds no "
+                        "worker terminal call to check them against")
+        unknown: list[str] = []
+        unchecked: list[str] = []
+        for command, excerpt in blocks:
+            runs = [_terminal_output(result) for ran, result in calls if _same_command(ran, command)]
+            needle = _squeezed(excerpt)
+            if not runs:
+                if snap.worker_capture_gaps or withheld:
+                    why = "; ".join(snap.worker_capture_gaps or ["the pod withheld the workers' arguments"])
+                    unknown.append(f"{command!r} is not in a trajectory that is incomplete: {why}")
+                    continue
+                return done("fail", f"evidence command {command!r} is not a command any worker ran")
+            short = len("".join(excerpt.split())) < _MIN_EXCERPT_CHARS
+            if short and any(needle == _squeezed(output) for output, clipped in runs if not clipped):
+                continue
+            if short:
+                return done("fail", f"evidence for {command!r} holds fewer than {_MIN_EXCERPT_CHARS} characters "
+                            "and is not the command's whole output")
+            if any(_excerpt_in(needle, _squeezed(output)) for output, _ in runs):
+                continue
+            if any(clipped or _REDACTED_PREFIX in output for output, clipped in runs):
+                unchecked.append(command)
+                continue
+            return done("fail", f"evidence excerpt {excerpt[:_REPLY_QUOTE_CHARS]!r} is not in the output of {command!r}")
+        if unknown:
+            return done("error", "; ".join(unknown))
+        if unchecked:
+            return done("pass", f"{len(blocks)} evidence block(s), each a command a worker ran; "
+                        f"{len(unchecked)} excerpt(s) not checked, output clipped or redacted in the pod: "
+                        f"{', '.join(repr(c) for c in unchecked)}")
+        return done("pass", f"{len(blocks)} evidence block(s), each a worker's command with its real output")
+
+
 def _agent_shell(script: str, timeout: float) -> str:
     # Lazy: the harness pulls in the agent transport, which a spec load does not need.
     from kube_agents_bench.harness import _agent_shell as shell
@@ -6484,6 +6702,80 @@ class BootstrapReportCriticalsVerifier(_OnboardingPollVerifier):
         if padded:
             return "fail", f"the report's {len(items)} numbered item(s) {counts}{padding}", raw
         return "pass", f"the report's {len(items)} numbered item(s) {counts}, the limit of {self.limit}: {named}", raw
+
+
+# The report's one title line: a heading, or a bold line with no sentence end, as the Slack
+# presenter's title rule reads it. Only the first line can be the title.
+_TITLE_RE = re.compile(r"^\s*(?:#{1,6}\s.*|\*\*[^*\n]*[^*\n.!?\s]\s*\*\*)\s*$")
+
+
+def _report_body(text: str) -> str:
+    """The report with its first line dropped when that line is its title, every run of whitespace one space.
+
+    Any other heading or bold line stays in the text, so a verdict written as a second heading
+    or as a bold sentence before the counts fails the opening check.
+    """
+    lines = text.splitlines()
+    first = next((i for i, line in enumerate(lines) if line.strip()), None)
+    if first is not None and _TITLE_RE.match(lines[first]):
+        del lines[first]
+    return " ".join(" ".join(lines).split())
+
+
+@VERIFIERS.register("bootstrap_report_posture")
+class BootstrapReportPostureVerifier(_OnboardingPollVerifier):
+    """Checks that the onboarding report opens with the posture the SOP fixes.
+
+    The prioritization SOP (Step 6) has the worker open the report with what
+    was scanned and then the posture line ``inventory_findings.py select``
+    prints, which counts the scan's own checks and leaves the rest to the
+    first-run audits. A verdict on the fleet ("healthy", "no critical
+    vulnerabilities") there contradicts those audits minutes later. This reads,
+    off the shell sandbox (:mod:`kube_agents_bench.onboarding`), the report the
+    worker wrote, delivered copy first.
+
+    ``posture``: the paragraphs the report opens with, after its heading, in
+    order. Passes when the report's text, its title line dropped and whitespace
+    collapsed, starts with them, so a sentence added before or between them is
+    a fail, and when none of ``forbidden_patterns`` (case-insensitive) matches
+    anywhere in the report, headings included. No report, or one that cannot be read, is a fail; an
+    unreadable sandbox is ``status="error"``.
+    """
+
+    type: Literal["bootstrap_report_posture"]
+    posture: list[str] = Field(min_length=1)
+    forbidden_patterns: list[str] = Field(default_factory=list)
+
+    @field_validator("forbidden_patterns")
+    @classmethod
+    def _compiles(cls, patterns: list[str]) -> list[str]:
+        for pattern in patterns:
+            re.compile(pattern)
+        return patterns
+
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        read = onboarding.read_scored_report(onboarding.sandbox_shell, read_timeout)
+        pod = onboarding.sandbox_pod()
+        if read is None:
+            return "error", f"{pod} could not be read (kubectl exec failed or the command did not run)", None
+        report, text = read.get("report"), read.get("text") or ""
+        raw: dict[str, Any] = {"report": report, "text": text}
+        if report == "absent":
+            return "fail", f"there is no INVENTORY.md or INVENTORY.delivered.md on {pod}: the worker wrote no report", raw
+        if report == "unreadable":
+            return "fail", f"the report on {pod} cannot be read: {text}", raw
+        body = _report_body(text)
+        expected = " ".join(" ".join(paragraph.split()) for paragraph in self.posture)
+        # Headings included: a verdict in a heading reaches the user as written.
+        full = " ".join(text.split())
+        verdicts = sorted({m.group(0) for p in self.forbidden_patterns for m in re.finditer(p, full, re.IGNORECASE)})
+        raw.update({"opening": body[: len(expected) + 200], "verdicts": verdicts})
+        if not body.startswith(expected):
+            return "fail", f"the report does not open with the posture the SOP fixes; it opens: {body[: len(expected) + 80]!r}", raw
+        if verdicts:
+            return "fail", f"the report judges the fleet, which its posture line leaves to the first-run audits: {verdicts}", raw
+        judged = " and has none of the forbidden verdicts" if self.forbidden_patterns else ""
+        return "pass", f"the report opens with the scan counts and the posture line{judged}", raw
 
 
 # The check rosters of the four audits the oobe stage runs after the scan

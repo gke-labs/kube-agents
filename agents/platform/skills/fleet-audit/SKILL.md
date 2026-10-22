@@ -145,6 +145,12 @@ the SOP and these references.
   finding degrades to `manual` with a note saying so, the run logs a `SECURITY:` line naming the
   path, and the report still publishes — but no pull request opens for that finding until the path
   is a real file inside the workspace.
+- **Never work around a refusal from the credential proxy or the broker.** When it refuses a
+  repository, route or verb, that is an answer: report it, say what an administrator would change
+  (for a repository the install does not manage, add it to the managed list in
+  `$GITOPS_STATE_CONFIGMAP`), and stop. A `BROKER UNAVAILABLE` line is not that: the proxy did not
+  answer, so re-run the same command once it does (step 1, `references/finish.md`). Never copy a
+  skill or script into a `*_override` directory, or edit or re-path it, to get past either.
 - **Never open a second ledger issue for a stream.** Do not run `vcs.py issue create`. If the stream
   already has an open ledger, `finish` rewrites it in place; that is the whole point.
 - **Never open a remediation pull request yourself**, and never for a non-`manifest` finding.

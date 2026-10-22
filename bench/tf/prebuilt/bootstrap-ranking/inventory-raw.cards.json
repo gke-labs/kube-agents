@@ -1,0 +1,189 @@
+{
+  "sweep": {
+    "id": "t_sweep_criticals",
+    "status": "done",
+    "created_at": 1000,
+    "block_reason": "",
+    "metadata": {
+      "fleet": [
+        {
+          "project": "onboarding-criticals-prod",
+          "cluster": "prod-central",
+          "location": "us-central1",
+          "status": "RUNNING"
+        }
+      ]
+    }
+  },
+  "clusters": [
+    {
+      "id": "t_prod_central",
+      "status": "done",
+      "key": "bootstrap-inventory-cluster-t_prod_central",
+      "title": "Report cluster inventory: prod-central",
+      "block_reason": "",
+      "metadata": {
+        "project": "onboarding-criticals-prod",
+        "cluster": "prod-central",
+        "location": "us-central1",
+        "topology": {
+          "k8s_version": "1.33.4-gke.1245000",
+          "node_pools": [
+            {
+              "name": "default-pool",
+              "machine_type": "e2-standard-4"
+            }
+          ],
+          "workload_identity": "disabled",
+          "dataplane_v2": "enabled",
+          "observability": "Cloud Logging only",
+          "deployment_toolchain": "kubectl apply from CI"
+        },
+        "workloads": [
+          {
+            "namespace": "billing",
+            "name": "invoice-worker",
+            "kind": "Deployment",
+            "replicas": "2/2",
+            "probes": {
+              "startup": true
+            },
+            "telemetry": "none",
+            "security_context": {
+              "read_only_root_fs": true
+            }
+          },
+          {
+            "namespace": "logging",
+            "name": "log-shipper",
+            "kind": "DaemonSet",
+            "replicas": "0/4",
+            "probes": {
+              "startup": true
+            },
+            "telemetry": "none",
+            "security_context": {
+              "read_only_root_fs": true
+            }
+          },
+          {
+            "namespace": "shop",
+            "name": "quote-api",
+            "kind": "Deployment",
+            "replicas": "0/1",
+            "probes": {
+              "startup": true
+            },
+            "telemetry": "none",
+            "security_context": {
+              "read_only_root_fs": true
+            }
+          },
+          {
+            "namespace": "shop",
+            "name": "pricing-engine",
+            "kind": "Deployment",
+            "replicas": "0/2",
+            "probes": {
+              "startup": true
+            },
+            "telemetry": "none",
+            "security_context": {
+              "read_only_root_fs": true
+            }
+          },
+          {
+            "namespace": "shop",
+            "name": "gift-cards",
+            "kind": "Deployment",
+            "replicas": "3/3",
+            "probes": {
+              "startup": true
+            },
+            "telemetry": "none",
+            "security_context": {
+              "read_only_root_fs": false
+            }
+          },
+          {
+            "namespace": "ledger",
+            "name": "orders-db",
+            "kind": "StatefulSet",
+            "replicas": "1/1",
+            "probes": {
+              "startup": true
+            },
+            "telemetry": "none",
+            "security_context": {
+              "read_only_root_fs": true
+            }
+          }
+        ],
+        "findings": [
+          {
+            "check": "static-sa-key",
+            "severity": "high",
+            "area": "security",
+            "issue": "invoice-worker mounts a static project-editor service account key from the Secret invoice-gcp-key",
+            "recommendation": "Move invoice-worker to Workload Identity and delete the key: anyone who can read the Secret holds editor on the project",
+            "namespace": "billing",
+            "workload": "invoice-worker"
+          },
+          {
+            "check": "image-pull-backoff",
+            "severity": "high",
+            "area": "reliability",
+            "issue": "log-shipper DaemonSet has 0 of 4 pods running: every pod is in ImagePullBackOff on a tag that no longer exists",
+            "recommendation": "Point log-shipper at a published image tag; until then no node ships its logs",
+            "namespace": "logging",
+            "workload": "log-shipper"
+          },
+          {
+            "check": "crashloop-backoff",
+            "severity": "high",
+            "area": "reliability",
+            "issue": "quote-api, the only replica of a serving Deployment, is in CrashLoopBackOff, OOMKilled at its 256Mi limit after 47 restarts",
+            "recommendation": "Raise the memory limit or fix the leak; the Service has no ready endpoint",
+            "namespace": "shop",
+            "workload": "quote-api"
+          },
+          {
+            "check": "create-container-config-error",
+            "severity": "high",
+            "area": "reliability",
+            "issue": "pricing-engine has 0 of 2 replicas running: both pods are stuck in CreateContainerConfigError on the missing ConfigMap pricing-rules",
+            "recommendation": "Restore the ConfigMap pricing-rules; the Service has no ready endpoint",
+            "namespace": "shop",
+            "workload": "pricing-engine"
+          },
+          {
+            "check": "readonly-root-fs",
+            "severity": "medium",
+            "area": "security",
+            "issue": "gift-cards runs with a writable root filesystem",
+            "recommendation": "Set readOnlyRootFilesystem: true and mount an emptyDir for the paths it writes",
+            "namespace": "shop",
+            "workload": "gift-cards"
+          },
+          {
+            "check": "no-resourcequota",
+            "severity": "medium",
+            "area": "reliability",
+            "issue": "Namespace ledger has no ResourceQuota or LimitRange",
+            "recommendation": "Add a ResourceQuota and a LimitRange to ledger so one workload cannot take the namespace's share",
+            "namespace": "ledger"
+          },
+          {
+            "check": "managed-prometheus",
+            "severity": "low",
+            "area": "observability",
+            "issue": "Managed Service for Prometheus is not enabled on prod-central",
+            "recommendation": "Enable Managed Service for Prometheus so workload metrics are collected"
+          }
+        ],
+        "gaps": []
+      }
+    }
+  ],
+  "archived_clusters": 0
+}

@@ -523,7 +523,7 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 			cfg.Logger.Warn("nats async error", "err", err, "subject", subject)
 		}),
 	}, cfg.NATSOptions...)
-	b.nc, err = nats.Connect(cfg.NATSURL, natsOpts...)
+	b.nc, err = nats.Connect(cfg.NATSURL, append(natsOpts, lib.TLSOptions()...)...)
 	if err != nil {
 		b.c.Close()
 		return nil, fmt.Errorf("kv connection: %w", err)

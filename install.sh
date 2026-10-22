@@ -275,6 +275,12 @@ INSTALL_ENV_FILE="${KUBE_AGENTS_INSTALL_ENV:-}"
 INSTALL_ENV_EXPLICIT="false"
 if [ -n "$INSTALL_ENV_FILE" ]; then
   INSTALL_ENV_EXPLICIT="true"
+  # Absolute now, while the directory is the operator's: a run with no
+  # checkout clones one and cds into it before anything reads or writes this.
+  case "$INSTALL_ENV_FILE" in
+    /*) ;;
+    *) INSTALL_ENV_FILE="$(pwd)/${INSTALL_ENV_FILE}" ;;
+  esac
 else
   _install_env_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || echo "")"
   # An install.env the operator actually put beside the script, or in the
@@ -338,6 +344,10 @@ bootstrap_install_env() {
   # clean shell would switch it back. --mode is refused for the same reason
   # when it disagrees with this file (check_flags_against_install_env).
   unset PLATFORM_AGENT_MODE
+  # The data volume size too: an inherited PLATFORM_AGENT_STORAGE_SIZE would
+  # grow both data claims for one run, and the next run from a clean shell
+  # would drop the field again, leaving claims larger than the CR says.
+  unset PLATFORM_AGENT_STORAGE_SIZE
   # The GitOps forge keys likewise: an inherited GITOPS_FORGE=gitlab would
   # switch a recorded GitHub install's forge for this run. --gitops-forge is
   # the per-run way in.
@@ -2828,6 +2838,12 @@ bootstrap_install_env_file() {
   if [ "${PLATFORM_AGENT_MODE_GUESSED:-false}" != "true" ] || [ -n "${PARAM_PLATFORM_AGENT_MODE:-}" ]; then
     write_env_var "$tmp" PLATFORM_AGENT_MODE "${PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}"
   fi
+  # Only when set: a first install that inherits a size records it, because
+  # every later run reads the file alone, and a size missing there would read
+  # as the lower default. Unset, later runs follow the default.
+  if [ -n "${PLATFORM_AGENT_STORAGE_SIZE:-}" ]; then
+    write_env_var "$tmp" PLATFORM_AGENT_STORAGE_SIZE "$PLATFORM_AGENT_STORAGE_SIZE"
+  fi
   write_env_var "$tmp" MODEL_PROVIDER "${MODEL_PROVIDER:-}"
   write_env_var "$tmp" MODEL_DEFAULT_NAME "${MODEL_DEFAULT_NAME:-}"
   write_env_var "$tmp" MODEL_MAX_TOKENS "${MODEL_MAX_TOKENS:-}"
@@ -3922,13 +3938,20 @@ print_generate_only_handoff() {
   echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS"
   # A GitHub Enterprise Server's private CA: a run that applies writes the
   # Secret and restarts the minter after the apply; this route does neither.
+  local step=4
   if [ "${GITOPS_FORGE:-github}" != "gitlab" ] && [ -n "${GITOPS_HOST:-}" ] && [ -n "${GITOPS_CA_SECRET:-}" ]; then
     local ns="${NAMESPACE:-$DEFAULT_NAMESPACE}"
-    echo -e "${C_BOLD}4. After the apply, the GitHub Enterprise Server CA (any cluster):${C_RESET}"
+    echo -e "${C_BOLD}${step}. After the apply, the GitHub Enterprise Server CA (any cluster):${C_RESET}"
     echo -e "    kubectl create secret generic ${GITOPS_CA_SECRET} -n ${ns} --from-file=ca.crt=<path-to-ca.pem> --dry-run=client -o yaml | kubectl apply --server-side -f -"
     echo -e "    kubectl rollout restart deployment/${GITHUB_MINTER_DEPLOYMENT} -n ${ns}"
+    step=$((step + 1))
+  fi
+  if is_truthy "${GOOGLE_CHAT_ENABLED:-}" || is_truthy "${SLACK_ENABLED:-}"; then
+    echo -e "${C_BOLD}${step}. After the apply, the chat app's setup checklist (settings no apply can make):${C_RESET}"
+    print_chat_checklist_commands
   fi
 }
+
 
 # Runs lifecycle.sh apply against the generated terraform.tfvars. Reads the
 # install coordinates from the environment (load install.env first).
@@ -6033,7 +6056,7 @@ run_menu_system() {
   normalize_memory_vars
 
   local project_id="${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null || echo "")}"
-  local project_number="${PROJECT_NUMBER:-}"
+  local project_number=""
   local cluster_name="${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}"
   local region="${REGION:-$DEFAULT_REGION}"
   local model_provider="${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}"
@@ -6417,6 +6440,34 @@ run_menu_system() {
         print_info "Re-applying the install to GKE cluster '$cluster_name' (terraform apply)..."
         run_lifecycle_apply "$repo_dir" "/tmp/kube-agents-apply-$(date -u +%Y%m%dT%H%M%SZ).log"
         print_success "Configuration applied!"
+        # The DM link in the Google Chat checklist is this project's number,
+        # read here rather than inherited: install.env never records it.
+        if is_truthy "$google_chat_enabled"; then
+          project_number="$(gcloud projects describe "$project_id" --format="value(projectNumber)" 2>/dev/null || echo "")"
+        fi
+        local menu_mode="${PLATFORM_AGENT_MODE_AFTER_APPLY:-${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}}"
+        PROJECT_NUMBER="$project_number" print_chat_setup_checklists "$menu_mode"
+        if [ "$CHAT_SETUP_CHECKLIST_PRINTED" = "true" ]; then
+          # Unlike main(), this apply does not wait for a rollout, and the menu
+          # redrawn below would push the checklist off screen. Under next the
+          # A2A gateway answers the platform it holds; the agent, the rest.
+          local menu_listeners="" menu_deployment
+          if google_chat_moves_to_a2a_gateway "$menu_mode" "$google_chat_enabled" ||
+            slack_moves_to_a2a_gateway "$menu_mode" "$slack_enabled" "$google_chat_enabled"; then
+            menu_listeners="$PLATFORM_AGENT_A2A_GATEWAY_DEPLOYMENT"
+          fi
+          if { is_truthy "$google_chat_enabled" && ! google_chat_moves_to_a2a_gateway "$menu_mode" "$google_chat_enabled"; } ||
+            { is_truthy "$slack_enabled" && ! slack_moves_to_a2a_gateway "$menu_mode" "$slack_enabled" "$google_chat_enabled"; }; then
+            menu_listeners="${menu_listeners} ${PLATFORM_AGENT_DEPLOYMENT}"
+          fi
+          echo ""
+          for menu_deployment in $menu_listeners; do
+            print_info "Before the first chat message, wait for the rollout: kubectl rollout status deployment/${menu_deployment} -n ${NAMESPACE:-$DEFAULT_NAMESPACE} --context $(gke_context_name)"
+          done
+          # shellcheck disable=SC2034  # the answer is not read
+          local menu_ack=""
+          prompt_read "Press Enter to return to the control panel" menu_ack "" || true
+        fi
         ;;
       7)
         print_info "Exiting Control Panel."
@@ -8361,6 +8412,12 @@ main() {
         warn_install_env_keys_not_recorded
         print_warning "Provisioning paused by user. Install configuration: $INSTALL_ENV_FILE"
         print_info "To launch provisioning later, run: ${C_BOLD}cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=${DEFAULT_KUBE_AGENTS_STATE_BUCKET} ./lifecycle.sh apply${C_RESET}"
+        # After the lines above: the printers read the mode and the toggles
+        # from install.env, which this route leaves as it found it.
+        if is_truthy "${GOOGLE_CHAT_ENABLED:-}" || is_truthy "${SLACK_ENABLED:-}"; then
+          print_info "After the apply, set up the chat app with the checklist these print:"
+          print_chat_checklist_commands
+        fi
         write_json_report "PAUSED"
         print_next_home_channel_unset_summary flags
         exit 0
@@ -8579,35 +8636,8 @@ main() {
 
   # The checklists and the closing summary follow the mode the CR is left
   # on, which a mode set outside this installer can keep from the key.
-  local mode_after_apply="${PLATFORM_AGENT_MODE_AFTER_APPLY:-$platform_agent_mode}"
-  # shellcheck disable=SC2034  # read by print_next_home_channel_unset_summary
-  NEXT_HOME_CHANNEL_UNSET_KEY="$(next_home_channel_unset_key "$mode_after_apply" "${slack_enabled:-false}" \
-    "${google_chat_enabled:-false}" "$slack_home_channel" "$google_chat_home_channel")"
-  if [ "${google_chat_enabled:-false}" = "true" ]; then
-    echo ""
-    # As for Slack below.
-    IMAGE_TAG="$image_tag" KUBE_AGENTS_INSTALL_ENV="$INSTALL_ENV_FILE" \
-      GCHAT_STEPS_PLATFORM_AGENT_MODE="$mode_after_apply" \
-      GCHAT_STEPS_GOOGLE_CHAT_ENABLED="$google_chat_enabled" \
-      GCHAT_STEPS_HOME_CHANNEL="$google_chat_home_channel" \
-      GCHAT_STEPS_ALLOWED_USERS="$allowed_users" \
-      GCHAT_STEPS_TOPIC_NAME="$chat_topic_name" \
-      GCHAT_STEPS_SUB_NAME="$chat_sub_name" \
-      bash "${repo_dir}/scripts/installer/print_instructions_gchat.sh" || true
-  fi
-  if [ "${slack_enabled:-false}" = "true" ]; then
-    echo ""
-    # The install.env this run read, which need not be the checkout's, and
-    # what the run applied, which an interview answer install.env does not
-    # record makes differ from the file.
-    IMAGE_TAG="$image_tag" KUBE_AGENTS_INSTALL_ENV="$INSTALL_ENV_FILE" \
-      SLACK_STEPS_PLATFORM_AGENT_MODE="$mode_after_apply" \
-      SLACK_STEPS_SLACK_ENABLED="$slack_enabled" \
-      SLACK_STEPS_GOOGLE_CHAT_ENABLED="${google_chat_enabled:-false}" \
-      SLACK_STEPS_HOME_CHANNEL="$slack_home_channel" \
-      bash "${repo_dir}/scripts/installer/print_instructions_slack.sh" || true
-  fi
-  # Repeated here, where the two printers above give their instructions. Arm 4
+  print_chat_setup_checklists "${PLATFORM_AGENT_MODE_AFTER_APPLY:-$platform_agent_mode}"
+  # Repeated here, where the checklists above give their instructions. Arm 4
   # prints it as well, for the runs that never reach the end of main().
   if [ "$chat_choice" = "4" ]; then
     echo ""

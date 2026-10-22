@@ -559,14 +559,14 @@ class SelectCommandTests(unittest.TestCase):
         self.assertIn("roll-up: 1 more item, 1 of them critical", out)
         # The two listed fill the delivery day's allowance of 2.
         self.assertIn(
-            "pace: the critical items not listed are added in chat from 12:00 UTC the day after the report "
+            "pace: the critical items not listed are added in chat starting the day after the report "
             "arrives, at most 2 a day",
             out,
         )
 
     def test_criticals_left_out_start_the_same_day_while_the_allowance_lasts(self):
         _, out, _ = self.run_select(criticals(3), {"first_report_criticals": 1, "daily_criticals": 2})
-        self.assertIn("pace: the critical items not listed are added in chat from 12:00 UTC, at most 2 a day", out)
+        self.assertIn("pace: the critical items not listed are added in chat at most 2 a day", out)
 
     def test_a_daily_limit_of_zero_gives_no_arrival_time(self):
         _, out, _ = self.run_select(criticals(3), {"daily_criticals": 0})
@@ -581,8 +581,29 @@ class SelectCommandTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("list no item; there are no critical findings", out)
         self.assertIn("roll-up: 2 more items, none of them critical", out)
-        self.assertIn("pace: non-critical items are added in chat from 15:00 UTC, at most 4 a day", out)
+        self.assertIn("pace: non-critical items are added in chat, at most 4 a day", out)
+        self.assertNotIn("UTC", out)
         self.assertEqual(json.loads(self.shown.read_text(encoding="utf-8")), {"items": []})
+
+    def test_every_branch_prints_the_posture_line(self):
+        posture = f"posture: {inv.SCAN_SCOPE_LINE}"
+        for rows, limits in (
+            (criticals(3), None),
+            (criticals(2), {"first_report_criticals": 0}),
+            ([(MAJOR, {"check": "a"})], None),
+        ):
+            with self.subTest(limits=limits, rows=len(rows)):
+                _, out, _ = self.run_select(rows, limits)
+                self.assertIn(posture, out.splitlines())
+
+    def test_the_posture_line_counts_the_scan_checks_and_judges_nothing(self):
+        self.assertEqual(
+            inv.SCAN_SCOPE_LINE,
+            f"This scan ran {len(inv.SCAN_CHECKS)} configuration checks; security and RBAC, reliability, "
+            "capacity and cost come from the first-run audits.",
+        )
+        for verdict in ("healthy", "clean", "no critical", "running now"):
+            self.assertNotIn(verdict, inv.SCAN_SCOPE_LINE.lower())
 
     def test_a_limit_of_zero_says_so(self):
         _, out, _ = self.run_select(criticals(2), {"first_report_criticals": 0})
@@ -615,6 +636,7 @@ class SelectCommandTests(unittest.TestCase):
                              "--scores", str(self.dir / "absent.json"), "--out", str(self.shown)])
         self.assertEqual(code, 0)
         self.assertIn("list no item; there are no critical findings", out.getvalue())
+        self.assertIn(f"posture: {inv.SCAN_SCOPE_LINE}", out.getvalue())
         self.assertIn("roll-up: none", out.getvalue())
         self.assertEqual(json.loads(self.shown.read_text(encoding="utf-8")), {"items": []})
 

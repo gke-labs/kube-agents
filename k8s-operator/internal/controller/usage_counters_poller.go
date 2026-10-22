@@ -45,6 +45,9 @@ const (
 	// usageNewerFieldGauges names the two cluster gauges' shared pruning
 	// record: they arrived in one release and a CRD serves both or neither.
 	usageNewerFieldGauges = "clustersRegistered and clustersMonitored"
+	// usageNewerFieldLastHumanActive is lastHumanActiveTime's pruning record
+	// key, the status field's name.
+	usageNewerFieldLastHumanActive = "lastHumanActiveTime"
 	// gatewayLeaderLabel is the label leader_elect.py stamps on the gateway pod
 	// that holds the lease and runs Hermes, the one the gateway Service selects
 	// (platformagent_manifests.go); the chat listener lives in that process.
@@ -108,7 +111,7 @@ const (
 
 // UsageCounterPoller produces status.usage's toolExecutionsTotal,
 // eventsIngestedTotal, remediationsProposedTotal, remediationsMergedTotal,
-// chatMessagesInboundTotal, sessionsTotal, toolExecutionsBlockedTotal and lastActiveTime on every
+// chatMessagesInboundTotal, sessionsTotal, toolExecutionsBlockedTotal, brokerFailuresTotal, chatTurnsErroredTotal and lastActiveTime on every
 // PlatformAgent, and the two cluster gauges, from the broker's, the
 // watcher's, the chat plugin's and the A2A gateway's metrics listeners, as a
 // manager Runnable on the leader, off the reconcile path. docs/designs/usage-counters-producer.md is
@@ -135,7 +138,7 @@ type UsageCounterPoller struct {
 	streaks map[usageStreakKey]*usageScrapeStreak
 	// prunedNewerFields records, per CR and per newer field -- the cluster
 	// gauges as one, remediationsMergedTotal, chatMessagesInboundTotal,
-	// toolExecutionsBlockedTotal -- the last poll in which that
+	// toolExecutionsBlockedTotal brokerFailuresTotal and chatTurnsErroredTotal -- the last poll in which that
 	// field was written and came back absent: a served CRD at a previous
 	// schema, which has the first-schema counters (every CRD with status.usage
 	// has carried remediationsProposedTotal and sessionsTotal) and not every
@@ -839,8 +842,18 @@ func usageDocumentInvalid(doc *usageDocument, cm *corev1.ConfigMap, agent *agent
 	if doc.FirstRecorded.IsZero() || doc.FirstRecorded.Time.After(now) || doc.FirstRecorded.Time.Before(agent.CreationTimestamp.Time) {
 		return "the first-recorded time is outside the CR's life"
 	}
-	if doc.LastMoved != nil && doc.LastMoved.Time.After(now) {
-		return "the last-moved time is in the future"
+	// A moved time is held inside the CR's life as the first-recorded time
+	// is: a zero (metav1.Time renders it as null, which the status patch
+	// would turn into a deletion and the echo would record as a pruning CRD),
+	// a future, or a time before the CR existed is refused. The human time
+	// cannot be later than the last move of any kind, since one stamp sets
+	// both.
+	if doc.LastMoved != nil && (doc.LastMoved.IsZero() || doc.LastMoved.Time.After(now) || doc.LastMoved.Time.Before(agent.CreationTimestamp.Time)) {
+		return "the last-moved time is outside the CR's life"
+	}
+	if doc.LastHumanMoved != nil && (doc.LastHumanMoved.IsZero() || doc.LastHumanMoved.Time.After(now) || doc.LastHumanMoved.Time.Before(agent.CreationTimestamp.Time) ||
+		doc.LastMoved == nil || doc.LastHumanMoved.Time.After(doc.LastMoved.Time)) {
+		return "the last-human-moved time is outside the CR's life or after the last move"
 	}
 	if doc.Totals == nil || doc.Pods == nil {
 		return "no totals or no pods"
@@ -898,6 +911,8 @@ func usageStatusSeed(agent *agentv1alpha1.PlatformAgent, now time.Time) usageSee
 		usageCounterRemediationsProposed: usageStatusFloor(agent.Status.Usage.RemediationsProposedTotal),
 		usageCounterRemediationsMerged:   usageStatusFloor(agent.Status.Usage.RemediationsMergedTotal),
 		usageCounterChatMessagesInbound:  usageStatusFloor(agent.Status.Usage.ChatMessagesInboundTotal),
+		usageCounterBrokerFailures:       usageStatusFloor(agent.Status.Usage.BrokerFailuresTotal),
+		usageCounterChatTurnsErrored:     usageStatusFloor(agent.Status.Usage.ChatTurnsErroredTotal),
 		// One status value for two halves: it seeds the chat half, and the
 		// read-back bound holds the pair's sum to it (usageDocumentInvalid).
 		usageCounterSessionsTriage:        0,
@@ -906,6 +921,10 @@ func usageStatusSeed(agent *agentv1alpha1.PlatformAgent, now time.Time) usageSee
 	}}
 	if last := agent.Status.Usage.LastActiveTime; last != nil && !last.Time.After(now) {
 		seed.LastMoved = last.DeepCopy()
+	}
+	if last := agent.Status.Usage.LastHumanActiveTime; last != nil && !last.Time.After(now) && !last.Time.Before(agent.CreationTimestamp.Time) &&
+		seed.LastMoved != nil && !last.Time.After(seed.LastMoved.Time) {
+		seed.LastHumanMoved = last.DeepCopy()
 	}
 	return seed
 }
@@ -1049,13 +1068,15 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	proposed := doc.Totals[usageCounterRemediationsProposed]
 	merged := doc.Totals[usageCounterRemediationsMerged]
 	chat := doc.Totals[usageCounterChatMessagesInbound]
+	failures := doc.Totals[usageCounterBrokerFailures]
+	errored := doc.Totals[usageCounterChatTurnsErrored]
 	sessions := usageSessionsTotal(doc.Totals)
 	blocked := doc.Totals[usageCounterToolExecutionsBlocked]
 	usage := &agent.Status.Usage
 	wantRegistered, wantMonitored := usageGaugeFields(gauges)
 	// The first-schema counters are in every served CRD that has status.usage;
-	// the gauges, the merged counter, the chat counter and the blocked
-	// counter arrived later, each at its own release, and a CRD at a previous schema prunes some or all of
+	// the gauges, the merged counter, the chat counter, the blocked counter and
+	// the failures counter and the errored counter arrived later, each at its own release, and a CRD at a previous schema prunes some or all of
 	// them, so a difference in one of them alone waits while that field's
 	// record is fresh rather than re-patching every poll, and the others keep
 	// landing.
@@ -1063,14 +1084,19 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	mergedPruned := p.newerFieldPruned(agent, usageCounterRemediationsMerged)
 	chatPruned := p.newerFieldPruned(agent, usageCounterChatMessagesInbound)
 	blockedPruned := p.newerFieldPruned(agent, usageCounterToolExecutionsBlocked)
+	failuresPruned := p.newerFieldPruned(agent, usageCounterBrokerFailures)
+	erroredPruned := p.newerFieldPruned(agent, usageCounterChatTurnsErrored)
+	humanPruned := p.newerFieldPruned(agent, usageNewerFieldLastHumanActive)
+	humanBehind := !humanPruned && doc.LastHumanMoved != nil && (usage.LastHumanActiveTime == nil || !usage.LastHumanActiveTime.Equal(doc.LastHumanMoved))
 	gaugesMoved := gaugesKnown && !gaugesPruned &&
 		(!usageGaugeEqual(usage.ClustersRegistered, wantRegistered) || !usageGaugeEqual(usage.ClustersMonitored, wantMonitored))
 	newerBehind := (!mergedPruned && usage.RemediationsMergedTotal < merged) || (!chatPruned && usage.ChatMessagesInboundTotal < chat) ||
-		(!blockedPruned && usage.ToolExecutionsBlockedTotal < blocked)
+		(!blockedPruned && usage.ToolExecutionsBlockedTotal < blocked) || (!failuresPruned && usage.BrokerFailuresTotal < failures) ||
+		(!erroredPruned && usage.ChatTurnsErroredTotal < errored)
 	// sessionsTotal is in the first schema beside the first three counters
 	// (every CRD with status.usage has carried it), so it has no record of
 	// its own: a served CRD prunes it only with status.usage whole.
-	behind := usage.ToolExecutionsTotal < tool || usage.EventsIngestedTotal < events || usage.RemediationsProposedTotal < proposed || usage.SessionsTotal < sessions || newerBehind || gaugesMoved ||
+	behind := usage.ToolExecutionsTotal < tool || usage.EventsIngestedTotal < events || usage.RemediationsProposedTotal < proposed || usage.SessionsTotal < sessions || newerBehind || gaugesMoved || humanBehind ||
 		(doc.LastMoved != nil && (usage.LastActiveTime == nil || !usage.LastActiveTime.Equal(doc.LastMoved)))
 	if !behind || p.r.usageStatusPruned(agent) {
 		return nil
@@ -1081,10 +1107,15 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	usage.RemediationsProposedTotal = proposed
 	usage.RemediationsMergedTotal = merged
 	usage.ChatMessagesInboundTotal = chat
+	usage.BrokerFailuresTotal = failures
+	usage.ChatTurnsErroredTotal = errored
 	usage.SessionsTotal = sessions
 	usage.ToolExecutionsBlockedTotal = blocked
 	if doc.LastMoved != nil {
 		usage.LastActiveTime = doc.LastMoved.DeepCopy()
+	}
+	if doc.LastHumanMoved != nil {
+		usage.LastHumanActiveTime = doc.LastHumanMoved.DeepCopy()
 	}
 	if gaugesKnown {
 		usage.ClustersRegistered = wantRegistered
@@ -1115,6 +1146,15 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	}
 	if blocked > 0 {
 		p.noteNewerFieldEcho(ctx, agent, usageCounterToolExecutionsBlocked, agent.Status.Usage.ToolExecutionsBlockedTotal == blocked)
+	}
+	if failures > 0 {
+		p.noteNewerFieldEcho(ctx, agent, usageCounterBrokerFailures, agent.Status.Usage.BrokerFailuresTotal == failures)
+	}
+	if doc.LastHumanMoved != nil {
+		p.noteNewerFieldEcho(ctx, agent, usageNewerFieldLastHumanActive, agent.Status.Usage.LastHumanActiveTime != nil && agent.Status.Usage.LastHumanActiveTime.Equal(doc.LastHumanMoved))
+	}
+	if errored > 0 {
+		p.noteNewerFieldEcho(ctx, agent, usageCounterChatTurnsErrored, agent.Status.Usage.ChatTurnsErroredTotal == errored)
 	}
 	return nil
 }

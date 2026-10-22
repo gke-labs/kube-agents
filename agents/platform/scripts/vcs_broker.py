@@ -78,6 +78,7 @@ from providers import (
     HttpTransport,
     Forge,
     ForgeUnsupported,
+    IdentityUnknown,
     MAX_PAGE_SIZE,
     Registry,
     Transport,
@@ -312,9 +313,22 @@ class Binding:
         return self.refused_drops(lambda: self.transport().api(method, path, **kwargs))
 
     def whoami(self) -> str:
-        """The transport's login, on the credential made current first."""
+        """The credential's login, on the credential made current first.
+
+        The forge answers first (`Forge.whoami`): a configured identity, or a
+        lookup of its own for a token that cannot call the current-user
+        route. None from it means the transport's route, as before. An empty
+        login from a forge that declares `identity_required` raises
+        `IdentityUnknown`, so that every ownership check refuses instead of
+        reading "" as "do not compare".
+        """
         self.ensure()
-        return self.refused_drops(lambda: self.transport().whoami())
+        login = self.forge.whoami(self.api)
+        if login is None:
+            login = self.refused_drops(lambda: self.transport().whoami())
+        if not login and self.forge.identity_required:
+            raise IdentityUnknown(self.forge.name)
+        return login
 
     def refused_drops(self, call: Callable[[], Any]) -> Any:
         """Run `call`; on a 401, the credential drops a token it cached, so the next call mints anew."""
@@ -1256,6 +1270,10 @@ class VcsBroker:
             )
         try:
             viewer = self._viewer(bound)
+        except IdentityUnknown:
+            # Not a transient failure: no retry names the account. Refused
+            # with its own code, as the `advance` check does.
+            raise
         except WorkspaceError as failed:
             raise WorkspaceError(
                 f"asking the forge who this credential is failed, so whether "
@@ -1425,6 +1443,10 @@ class VcsBroker:
         # all, which is the incident with an extra step rather than a cost.
         try:
             viewer = self._viewer(bound)
+        except IdentityUnknown:
+            # The forge cannot name this install's account, and no retry
+            # changes that: refused with its own code, which names the fix.
+            raise
         except WorkspaceError as failed:
             # A lookup that did not happen is not a credential that cannot
             # say, and settling for the weaker bar on it would drop the
@@ -1491,6 +1513,14 @@ class VcsBroker:
         observe: Callable[[Binding, dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         bound = self._bind(payload)
+        # Before anything else that could spend a call: a forge with no labels
+        # refuses a label field by name, so a filter is not silently ignored
+        # and a label write does not look done. Only for a verb the forge
+        # serves (and `label-ensure`, which is the labels gap itself): an issue
+        # verb on a forge with no issue tracker is refused for that, which is
+        # the real gap, before its label field is looked at.
+        if verb == "label-ensure" or verb in bound.forge.verbs:
+            bound.forge.refuse_labels(verb, payload)
         if pinned_target:
             # Before the method is looked up and before `bound.api`, so a
             # refused target makes no forge call and spends no credential.

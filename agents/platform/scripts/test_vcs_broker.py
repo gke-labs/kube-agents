@@ -165,6 +165,82 @@ class ProposingLocalForge(LocalForge):
         return {"proposals": found, "truncated": False}
 
 
+class IdentityRequiredProposingForge(ProposingLocalForge):
+    """`ProposingLocalForge` whose credential always belongs to an account."""
+
+    identity_required = True
+
+
+class NoLabelsNoIssuesForge(LocalForge):
+    """A forge with proposals and no issue tracker and no labels: Bitbucket's shape.
+
+    Each verb writes down the payload it was handed, so a test can see that a
+    refused label field never reached the forge.
+    """
+
+    verbs = (
+        "proposal-create",
+        "proposal-list",
+        "proposal-view",
+        "proposal-comment",
+        "proposal-update",
+        "proposal-close",
+        "proposal-commits",
+    )
+    labels = False
+
+    def __init__(self, root, minted=None):
+        super().__init__(root, minted)
+        self.received: list[tuple[str, dict]] = []
+
+    def _record(self, verb, payload, answer):
+        self.received.append((verb, dict(payload)))
+        return answer
+
+    def proposal_list(self, api, repo, payload):
+        return self._record("proposal-list", payload, {"proposals": [], "count": 0, "truncated": False})
+
+    def proposal_create(self, api, repo, payload):
+        return self._record("proposal-create", payload, {"proposal": {"number": 1, "labels": []}})
+
+    def proposal_update(self, api, repo, payload):
+        return self._record("proposal-update", payload, {"proposal": {"number": 1, "labels": []}})
+
+
+class LabelledLocalForge(NoLabelsNoIssuesForge):
+    """The same forge with labels, so the refusal is shown to follow the capability."""
+
+    verbs = (*NoLabelsNoIssuesForge.verbs, "label-ensure")
+    labels = True
+
+    def label_ensure(self, api, repo, payload):
+        return self._record("label-ensure", payload, {"label": {"name": payload.get("name")}})
+
+
+class AskingForge(LocalForge):
+    """A forge that names its login by a lookup of its own, not the transport's route."""
+
+    identity_required = True
+
+    def whoami(self, api):
+        return str(api("GET", "user").get("uuid") or "")
+
+
+class ApiOnly:
+    """A transport whose current-user route must not be asked."""
+
+    def __init__(self, answer: dict) -> None:
+        self.answer = answer
+        self.calls: list[tuple[str, str]] = []
+
+    def api(self, method, path, **_kwargs):
+        self.calls.append((method, path))
+        return self.answer
+
+    def whoami(self) -> str:
+        raise AssertionError("the forge's own lookup answered; the route is not asked")
+
+
 class SelfAware:
     """A transport that can say who the credential is. `LocalForge` declares none.
 
@@ -1402,6 +1478,35 @@ class RepositoryVerbTest(unittest.TestCase):
         made = self._advance_onto(forge)
         self.assertEqual(self.remote_tip("release-1.2"), made)
 
+    def test_advance_is_refused_when_a_forge_that_must_name_itself_cannot(self):
+        """A forge with no current-user route refuses, and does not fall back.
+
+        The weaker bar below is for a forge that has nowhere to ask. A forge
+        that declares `identity_required` has an account behind its token, so
+        an empty login is a fault: the branch stays where it was, and the code
+        names the fix rather than "retry".
+        """
+        forge = IdentityRequiredProposingForge(
+            self.forges, self.refreshed, open_sources={"release-1.2"}, author="a-colleague"
+        )
+        self.broker._transport = lambda _forge, _repo: Nameless()
+        with self.assertRaises(WorkspaceError) as caught:
+            self._advance_onto(forge)
+        self.assertEqual(caught.exception.fields.get("code"), "FORGE_IDENTITY_UNKNOWN")
+        self.assertEqual(self.remote_tip("release-1.2"), self.origin_head)
+
+    def test_advance_compares_against_the_configured_identity(self):
+        """A configured identity is the login the author check compares with."""
+        forge = IdentityRequiredProposingForge(
+            self.forges, self.refreshed, open_sources={"release-1.2"}, author="a-colleague"
+        )
+        forge.identity = "kube-agents-bot"
+        with self.assertRaises(WorkspaceError) as caught:
+            self._advance_onto(forge)
+        self.assertEqual(caught.exception.fields.get("code"), "CLONED_BRANCH")
+        self.assertIn("kube-agents-bot", str(caught.exception))
+        self.assertEqual(self.remote_tip("release-1.2"), self.origin_head)
+
     def test_advance_keeps_the_weaker_bar_when_the_credential_cannot_say_who_it_is(self):
         """A forge this broker builds no transport for still gets the check it can have.
 
@@ -2227,6 +2332,15 @@ class BranchVerbTest(unittest.TestCase):
         self.closed(self.SPENT, tip)
         self.broker._transport = lambda _forge, _repo: LookupFailed()
         self.assertEqual(self.refused(self.SPENT, tip), "FORGE_CALL_FAILED")
+        self.assertTrue(self.exists(self.SPENT))
+
+    def test_delete_refuses_with_its_own_code_when_a_forge_that_must_name_itself_cannot(self):
+        # Not `FORGE_CALL_FAILED`, which a client retries: no retry names it.
+        tip = self.push_branch(self.SPENT)
+        self.closed(self.SPENT, tip)
+        self.forge.identity_required = True
+        self.broker._transport = lambda _forge, _repo: Nameless()
+        self.assertEqual(self.refused(self.SPENT, tip), "FORGE_IDENTITY_UNKNOWN")
         self.assertTrue(self.exists(self.SPENT))
 
     def test_branch_verbs_read_a_full_ref_as_the_branch_it_names(self):
@@ -3288,6 +3402,160 @@ class CollaborationTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # routing
 # ---------------------------------------------------------------------------
+
+
+class ForgeWithoutLabelsTest(unittest.TestCase):
+    """A forge that declares no labels refuses every label field by name.
+
+    The refusal is the broker's, before the forge is called, so a forge
+    package never has to remember to refuse one, and a filter it would have
+    ignored never answers a different set of proposals.
+    """
+
+    REPO = "local.test/acme/infra"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.broker = VcsBroker(Path(self.tmp.name) / "scratch", git_runner=git_runner)
+        self.forge = NoLabelsNoIssuesForge(Path(self.tmp.name) / "forges")
+        self.broker.registry.hosts["local.test"] = self.forge
+
+    def refused(self, call, payload):
+        with self.assertRaises(providers.LabelsUnsupported) as caught:
+            call({"repository": self.REPO, **payload})
+        self.assertEqual(caught.exception.status, 501)
+        self.assertEqual(caught.exception.fields.get("code"), "LABELS_UNSUPPORTED")
+        return caught.exception
+
+    def test_capabilities_say_there_are_no_labels_and_no_issues(self):
+        answer = self.broker.capabilities({"repository": self.REPO})
+        self.assertIs(answer["labels"], False)
+        for verb in providers.ISSUE_VERBS:
+            self.assertNotIn(verb, answer["verbs"])
+        self.assertNotIn("label-ensure", answer["verbs"])
+
+    def test_github_and_gitlab_declare_labels(self):
+        self.assertIs(self.broker.capabilities({"repository": "acme/infra"})["labels"], True)
+        for forge in providers.AVAILABLE:
+            with self.subTest(forge=forge.name):
+                self.assertIs(forge.labels, True)
+
+    def test_every_label_field_is_refused_before_the_forge_is_called(self):
+        cases = (
+            (self.broker.proposal_list, {"labels": ["audit:x"]}, "labels"),
+            (self.broker.proposal_list, {"excludeLabels": ["skip"]}, "excludeLabels"),
+            (self.broker.proposal_create, {"source": "b", "title": "t", "labels": ["x"]}, "labels"),
+            (self.broker.proposal_update, {"number": 1, "labelsAdd": ["x"]}, "labelsAdd"),
+            (self.broker.proposal_update, {"number": 1, "labelsRemove": ["x"]}, "labelsRemove"),
+        )
+        for call, payload, field in cases:
+            with self.subTest(field=field, verb=call.__name__):
+                refusal = self.refused(call, payload)
+                self.assertIn(field, str(refusal))
+        self.assertEqual([], self.forge.received)
+
+    def test_label_ensure_is_refused_with_the_labels_code(self):
+        # Not `FORGE_UNSUPPORTED`: the agent side reads that code as "no forge
+        # serves this host", and this host is served.
+        self.refused(self.broker.label_ensure, {"name": "audit:x"})
+
+    def test_an_empty_label_field_is_no_label_and_passes(self):
+        self.broker.proposal_list({"repository": self.REPO, "labels": None, "excludeLabels": []})
+        self.broker.proposal_update({"repository": self.REPO, "number": 1, "labelsAdd": [], "body": "b"})
+        self.assertEqual(["proposal-list", "proposal-update"], [verb for verb, _ in self.forge.received])
+
+    def test_an_issue_verb_is_refused_as_unsupported(self):
+        with self.assertRaises(ForgeUnsupported) as caught:
+            self.broker.issue_list({"repository": self.REPO})
+        self.assertEqual(caught.exception.fields.get("code"), "FORGE_UNSUPPORTED")
+
+    def test_an_unserved_verb_with_a_label_names_the_missing_verb_first(self):
+        # Review: the label was refused first, which sent the caller to drop
+        # the label and then meet the real gap on the second call.
+        for call, payload in (
+            (self.broker.issue_list, {"labels": ["agent:delivery-watch"]}),
+            (self.broker.issue_create, {"title": "t", "labels": ["x"]}),
+        ):
+            with self.subTest(verb=call.__name__):
+                with self.assertRaises(ForgeUnsupported) as caught:
+                    call({"repository": self.REPO, **payload})
+                self.assertEqual(caught.exception.fields.get("code"), "FORGE_UNSUPPORTED")
+
+    def test_an_unconfigured_forge_names_what_is_missing_not_labels(self):
+        # gitlab.com on an install with no GitLab: the stub's own gap wins.
+        with self.assertRaises(ForgeUnsupported) as caught:
+            self.broker.label_ensure({"repository": "https://gitlab.com/a/b", "name": "x"})
+        self.assertEqual(caught.exception.fields.get("code"), "FORGE_UNSUPPORTED")
+        with self.assertRaises(ForgeUnsupported) as caught:
+            self.broker.proposal_list({"repository": "https://gitlab.com/a/b", "labels": ["x"]})
+        self.assertEqual(caught.exception.fields.get("code"), "FORGE_UNSUPPORTED")
+
+    def test_a_forge_with_labels_receives_them(self):
+        forge = LabelledLocalForge(Path(self.tmp.name) / "forges")
+        self.broker.registry.hosts["local.test"] = forge
+        self.broker.proposal_list({"repository": self.REPO, "labels": ["audit:x"]})
+        self.broker.label_ensure({"repository": self.REPO, "name": "audit:x"})
+        self.assertEqual(
+            [("proposal-list", ["audit:x"]), ("label-ensure", None)],
+            [(verb, payload.get("labels")) for verb, payload in forge.received],
+        )
+
+
+class IdentityWithoutCurrentUserRouteTest(unittest.TestCase):
+    """`identity` for a token whose API has no current-user call, or refuses it."""
+
+    REPO = "local.test/acme/infra"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.broker = VcsBroker(Path(self.tmp.name) / "scratch", git_runner=git_runner)
+
+    def register(self, forge):
+        self.broker.registry.hosts["local.test"] = forge
+        return forge
+
+    def test_a_configured_identity_answers_without_a_transport(self):
+        forge = self.register(LocalForge(Path(self.tmp.name)))
+        forge.identity = "kube-agents-bot"
+        answer = self.broker.identity({"repository": self.REPO})
+        self.assertEqual("kube-agents-bot", answer["identity"]["login"])
+
+    def test_a_forge_that_must_name_itself_and_cannot_refuses(self):
+        forge = self.register(LocalForge(Path(self.tmp.name)))
+        forge.identity_required = True
+        self.broker._transport = lambda _forge, _repo: Nameless()
+        with self.assertRaises(providers.IdentityUnknown) as caught:
+            self.broker.identity({"repository": self.REPO})
+        self.assertEqual(caught.exception.fields.get("code"), "FORGE_IDENTITY_UNKNOWN")
+        self.assertEqual(caught.exception.status, 502)
+
+    def test_a_forge_that_may_not_know_still_answers_empty(self):
+        # The behaviour every forge had before, and GitHub's and GitLab's now.
+        self.register(LocalForge(Path(self.tmp.name)))
+        self.broker._transport = lambda _forge, _repo: Nameless()
+        self.assertEqual("", self.broker.identity({"repository": self.REPO})["identity"]["login"])
+
+    def test_the_forge_s_own_lookup_answers_and_the_route_is_not_asked(self):
+        self.register(AskingForge(Path(self.tmp.name)))
+        transport = ApiOnly({"uuid": "{7c1d}"})
+        self.broker._transport = lambda _forge, _repo: transport
+        answer = self.broker.identity({"repository": self.REPO})
+        self.assertEqual("{7c1d}", answer["identity"]["login"])
+        self.assertEqual([("GET", "user")], transport.calls)
+
+    def test_the_forge_s_own_lookup_with_no_login_refuses(self):
+        self.register(AskingForge(Path(self.tmp.name)))
+        self.broker._transport = lambda _forge, _repo: ApiOnly({})
+        with self.assertRaises(providers.IdentityUnknown):
+            self.broker.identity({"repository": self.REPO})
+
+    def test_github_and_gitlab_do_not_require_an_identity(self):
+        for forge in providers.AVAILABLE:
+            with self.subTest(forge=forge.name):
+                self.assertFalse(forge.identity_required)
+                self.assertEqual("", forge.identity)
 
 
 class RouteTableTest(unittest.TestCase):

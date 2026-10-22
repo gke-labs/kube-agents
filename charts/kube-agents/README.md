@@ -523,7 +523,7 @@ ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/ku
 
 `platformAgent.podMonitoring` renders a `PodMonitoring` for each of the agent's
 pods that serves metrics: the gateway pod, so GKE Managed Prometheus scrapes the
-event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's port 9095 on every replica, and, under a second `PodMonitoring` that selects the leader label alone, the chat plugin's `kubeagents_chat_messages_inbound_total` from the `platform-agent` container's port 9097 on the one pod that runs Hermes, and the credential-proxy pod, so it scrapes the broker's `kubeagents_*`
+event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's port 9095 on every replica, and, under a second `PodMonitoring` that selects the leader label alone, the chat plugin's `kubeagents_chat_*` series (`kubeagents_chat_messages_inbound_total` among them) from the `platform-agent` container's port 9097 on the one pod that runs Hermes, and the credential-proxy pod, so it scrapes the broker's `kubeagents_*`
 tool-invocation, request and version-control metrics from its metrics-only port 8766, and the A2A
 gateway pod a `spec.mode: next` install runs, so it scrapes the gateway's inbound-message,
 task terminal and Google Chat pull counters from its metrics-only port 9096 (elsewhere
@@ -692,6 +692,23 @@ release is a mode switch rather than a setting: the operator rolls the agent
 and renders or retires the A2A stack. `platformAgent.harness.tuning.maxSessions`
 caps the A2A session pods a `next` install runs at once and renders only when set.
 
+### Data volume size (`platformAgent.storage.size`)
+
+`platformAgent.storage.size` is the CR's `spec.storage.size`: the request of the agent's
+`<name>-data` claim and of the shell sandbox's data claim. The operator requests the same size
+for both.
+It defaults to `null`, which renders no field, and the operator default (50Gi) applies.
+Raising it expands both existing claims online where their StorageClass sets
+`allowVolumeExpansion`; where it does not, the claims keep their size and the CR carries the
+`DataVolumeNotExpanded` condition. A claim cannot shrink, so the admission webhook refuses a
+lower value when `operator.webhooks.enabled` is `true` (off by default). Without the webhook, a
+lower value is admitted and the operator keeps the claims at their size. Setting the value back
+to `null` leaves claims above the default at their size, and grows claims below it to the
+default. The render fails on a size of zero or above `64Ti`, and on a live install whose CRD
+predates `spec.storage`. The
+[PlatformAgent CRD page](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specstorage)
+is canonical for the behaviour.
+
 ### Agent runtime knobs
 
 `platformAgent.harness.hermes`, `platformAgent.harness.memory`,
@@ -844,8 +861,9 @@ These knobs need context beyond the chart:
 
 - `plugins.pubsubPlatform.enabled` (default `false`): Deploys the Cloud Pub/Sub platform adapter (`AgentPlugin/pubsubplatform`), providing Pub/Sub message ingress and kanban task dispatching.
 - `plugins.stockoutInvestigator.enabled` (default `false`): Deploys the GKE Stockout Investigator (`AgentPlugin/gkestockoutinvestigator`) targeting the `platform` profile, which investigates autoscaler scale-up failures. Requires `plugins.pubsubPlatform.enabled=true`.
+- `plugins.stockoutInvestigator.applyTuning` (default `true`): merges the plugin's execution limits into `platformAgent.harness.tuning`. `false` keeps the install's own tuning, for an install that runs the plugin only to prove its ingress.
 
-When `plugins.stockoutInvestigator.enabled=true`, the chart automatically seeds `platformAgent.harness.tuning` execution limits (`maxInProgress: 3`, `platform: {apiMaxRetries: 8, maxTurns: 200}`, `cluster: {apiMaxRetries: 8, maxTurns: 150}`). Stockout remediation is long-running and quota-intensive; these limits ensure the platform agent and delegated cluster workers have sufficient turns and retry budgets to diagnose and remediate capacity incidents across the fleet. Explicit settings in `platformAgent.harness.tuning.*` take precedence over these defaults.
+When `plugins.stockoutInvestigator.enabled=true` and `plugins.stockoutInvestigator.applyTuning` is not `false`, the chart automatically seeds `platformAgent.harness.tuning` execution limits (`maxInProgress: 3`, `platform: {apiMaxRetries: 8, maxTurns: 200}`, `cluster: {apiMaxRetries: 8, maxTurns: 150}`). Stockout remediation is long-running and quota-intensive; these limits ensure the platform agent and delegated cluster workers have sufficient turns and retry budgets to diagnose and remediate capacity incidents across the fleet. Explicit settings in `platformAgent.harness.tuning.*` take precedence over these defaults.
 
 ### Scoped service accounts
 
@@ -948,6 +966,9 @@ outside what the chart can see. A replica count of `0` costs nothing, and a `res
 though note that if a namespace ResourceQuota restricts that compute resource (such as
 `limits.cpu` or `limits.memory`), Kubernetes quota admission requires every container to
 declare it (or a `LimitRange` to default it), and will reject the pod if omitted.
+The two data claims are counted at `platformAgent.storage.size` when it is set: footprint.yaml
+records how many claims follow it (`dataClaims`) and their default size, and each one moves by
+the difference, so a raise of 30Gi adds 60Gi to `requests.storage`.
 The one value it will not guess is `hindsight.postgresql.storage`: the schema permits
 `null`, a claim sized from it would be counted as zero, so an empty one fails the check
 by name.

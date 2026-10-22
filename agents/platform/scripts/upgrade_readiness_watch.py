@@ -39,10 +39,24 @@ Which clusters. The projects come from this pod, not from the sandbox:
 (``GCP_PROJECT_ID``) together with every project a Cluster Agent profile's
 ``cluster_identity`` names, the roster the cluster reconciler keeps; with
 neither, the sandbox's ``gcloud config get-value project``; and with nothing
-at all the tick fails closed rather than let the report script enumerate every
-project the credential can list. Every cluster in those projects is read,
+at all the tick fails closed rather than let the report script fall back to
+its own scope, which on an install that declares none is every project the
+credential can list. Every cluster in those projects is read,
 including ones ``spec.scope.exclude.clusters`` keeps a Cluster Agent from,
-because the report script enumerates by project. A project spelled by its
+because the report script enumerates by project. On an install that declares
+a scope (a ``spec.scope`` block), the report script, a fleet-audit collector,
+refuses a bare ``--project`` in the sandbox (``fleet_scope_args``, under the
+operator's ``KUBEAGENTS_SCOPE_DECLARED``), so the tick reads the declared
+scope on this pod, where the reconcile's snapshot is
+(``fleet_scope_targets.declared_scope_targets()``, which reads the operator's
+render until a reconcile tick writes a snapshot that answers), and hands the report the resolved
+scope beside each ``--project``, the ``collector_args`` the platform_control
+``fleet_scope`` tool hands the SOPs less ``--scope-exclude-clusters``, which the
+watch omits beside ``--project`` (``--scope-projects``, ``--scope-unread``):
+the report reads a project inside the scope and refuses one outside it with
+the reason, which the table carries as that project's failure; an install
+that declares none keeps the bare flag, and a render this pod cannot read
+fails the tick with the reason. A project spelled by its
 number is keyed by the id ``gcloud projects describe`` resolves, learned on
 its first table run; a number the credential cannot resolve is never a key,
 so its clusters earn no report until it resolves: when nothing was read under
@@ -59,7 +73,9 @@ the sandbox login never executes a file under the agent-owned ``/opt/data``
 except its tests, with the data files beside them, is read here from the agent
 image's copy under ``/opt/platform-template`` and handed to ``python3 -I -`` on
 the command's stdin behind a loader, a meta-path finder that serves the shipped
-set, before running ``fleet_upgrade_report.main``: the route ``stall_watch.py``
+set with this image's ``fleet_scope_args`` beside it (the collectors' scope flags
+and refusals, so the report script formats a refusal with the constants this job
+parses it by), before running ``fleet_upgrade_report.main``: the route ``stall_watch.py``
 takes with ``stall_report.py``, widened to a package. ``-I`` keeps the sandbox's working directory off the
 module path. The loader gives the report script a private temporary directory
 of its own (``tempfile.mkdtemp``, owned by the sandbox login and readable by
@@ -103,6 +119,7 @@ or touching the ledger.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import re
@@ -114,6 +131,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fleet_scope_args  # noqa: E402
+import fleet_scope_targets  # noqa: E402
 import gitops_workspace  # noqa: E402
 import sandbox_exec  # noqa: E402
 
@@ -152,6 +171,17 @@ REFRESH_SLACK_SECONDS = 10 * 60
 
 # Which projects the report enumerates, resolved on this side.
 PROJECTS_ENV = "UPGRADE_READINESS_PROJECTS"
+# A project id or number is one token, as the refusal parser reads it
+# (`REFUSAL_TOKEN_PATTERN`): a hand-typed spelling with a space, a comma or a
+# semicolon is a typo, most often a list separated by spaces where commas were
+# meant. The list variable is split on its commas first, so a comma reaches
+# this check only from a source that holds one project.
+ROSTER_SPELLING_REFUSED = re.compile(r"[\s,;]")
+ROSTER_SPELLING_DETAIL = (
+    "the roster names {spellings}, which is not a project id or number; spell each project as its id, in "
+    + PROJECTS_ENV
+    + " separated by commas, in spec.harness.projectId, or in its Cluster Agent profile"
+)
 PROJECTS_SEPARATOR = ","
 MANAGEMENT_PROJECT_ENV = "GCP_PROJECT_ID"
 PROFILES_DIR = "profiles"
@@ -159,6 +189,18 @@ IDENTITY_PROJECT_KEY = "project"
 CONFIG_PROJECT_ARGV = ("gcloud", "config", "get-value", "project")
 PROJECT_LOOKUP_TIMEOUT_SECONDS = 30
 PROJECT_FLAG = "--project"
+# On an install that declares a scope (a ``spec.scope`` block) the operator
+# marks the shell sandbox (``KUBEAGENTS_SCOPE_DECLARED``) and the report
+# script, a fleet-audit collector, refuses a bare ``--project`` there
+# (``fleet_scope_args.DeclaredScope``): without the scope a collector cannot
+# tell a project inside it from one outside. The scope is read on this pod
+# (``scope_flags``) and handed on as the fleet_scope tool spells it, less the
+# cluster exclusion, so the flags cannot drift from the collectors'. A render the operator wrote that
+# this pod cannot read is a fault, not an undeclared install.
+SCOPE_UNREADABLE_DETAIL = (
+    "the operator's scope render could not be read, so whether the install declares a scope is unknown; "
+    "nothing was read: {error}"
+)
 NO_PROJECT_DETAIL = (
     f"no GCP project: set {PROJECTS_ENV} or {MANAGEMENT_PROJECT_ENV}, onboard a cluster, or configure gcloud in the sandbox; "
     "refusing to let the report enumerate every project the credential can list"
@@ -171,6 +213,11 @@ LOCAL_SKILL_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "skills" / "f
 SKILL_SCRIPTS_DIR_ENV = "UPGRADE_READINESS_SKILL_SCRIPTS"
 REPORT_MODULE = "fleet_upgrade_report"
 READINESS_MODULE = "upgrade_readiness"
+# The collectors' scope flags and refusal messages, handed to the sandbox from
+# this image's copy beside the skill's scripts, so the report script formats
+# the refusal with the constants this job parses it by (``refusal_detail``)
+# whatever copy the sandbox image carries.
+SCOPE_ARGS_MODULE = "fleet_scope_args"
 PYTHON_SOURCE_SUFFIX = ".py"
 # What the loader ships into the sandbox: every module under the skill's scripts directory
 # except its tests, behind a meta-path finder, so the report's imports (the readiness
@@ -219,6 +266,171 @@ BUDGET_EXHAUSTED_DETAIL = "tick budget exhausted before project {project} could 
 TABLE_UNRUN_DETAIL = "tick budget exhausted before the version table read project {project}"
 TABLE_CUT_SHORT_DETAIL = "the version table's run for project {project} was cut short by its share of the budget"
 TABLE_FAILED_DETAIL = "version table for {project} failed: {error}"
+# A refusal, said once where the exception becomes text (``ReportRefused``):
+# the reason in the install's terms and the install's remedy, never the
+# agent's remedy the report script's own message ends with.
+TABLE_REFUSED_DETAIL = "version table for {project} {error}"
+PROJECT_RUN_REFUSED_DETAIL = "readiness run for {project} {error}"
+REFUSED_DETAIL = "refused by the report script: {reason}; {remedy}"
+INSTALL_REMEDY_PREFIX = "the remedy is on the install, not this job: "
+ROSTER_REMEDY = "or take it out of the roster (its Cluster Agent profile, or UPGRADE_READINESS_PROJECTS)"
+# The remedies, chosen below on what the refusal captured and on the scope's
+# state rather than on which message it was: one message covers a project
+# the install cannot read, one merely over the cap and one an hour from
+# being resolved, and the remedies differ.
+REMEDY_DECLARE = INSTALL_REMEDY_PREFIX + "name the project in spec.scope, " + ROSTER_REMEDY
+# The same, on an install whose exclude entries name a project number: the
+# reconcile drops a member a Metrics Scope named by that number on every route
+# and records nothing an id matches, so the line cannot tell such a member
+# from a project the declaration never reached, and naming the member in
+# spec.scope drops it again on the number; the line names the entry too.
+REMEDY_DECLARE_OR_NUMBERED = (
+    INSTALL_REMEDY_PREFIX + "name the project in spec.scope, or, if the project number a spec.scope.exclude.projects entry names is this "
+    "project's, drop that entry, " + ROSTER_REMEDY
+)
+# An exclude entry matches the project, which has no row. Whether the entry is
+# why is the reconcile's knowledge, not the pod's: the project is in spec.scope
+# under exclude (onboarded by hand and never produced, which the reconcile
+# never prunes; one it produced and then dropped has a ``retiring`` row and
+# its own cause below), or under no part of the declaration and matched by a
+# glob all the same, where dropping the entry brings in nothing; the line
+# names both ways.
+REMEDY_EXCLUDED = (
+    INSTALL_REMEDY_PREFIX + "drop the entry if spec.scope names the project or a folder, organisation or selector that holds it, "
+    "else name the project in spec.scope, " + ROSTER_REMEDY
+)
+# The declaration no longer names the project and the reconcile has marked its
+# row ``retiring`` (``ScopeTargets.retiring``): its Cluster Agent profile stays
+# in the roster until the next clean reconcile run prunes it, longer while a
+# lookup is unclean or the prune's delete fails, and the declaration remedy
+# would send the operator to undo the removal or to delete a profile about to
+# go. Keyed like the others: a profile onboarded by hand after the prune has no
+# row and is filed as outside, so the line returns with that remedy.
+REMEDY_RETIRING = (
+    "nothing to do: the project left the declaration, and the reconcile prunes its Cluster Agent profile on its next clean run; "
+    "if the removal was a mistake, put the project back under spec.scope, and the next reconcile run that resolves it puts it back in the sweep"
+)
+# The same, where an exclude entry matches the project (``ScopeTargets.excludes``):
+# the reconcile drops an explicit project the entry matches and marks its row
+# retiring as it does a removal, so the project may still be under spec.scope
+# and the undo is the entry; whether the entry alone took it out is the
+# reconcile's knowledge (``REMEDY_EXCLUDED``), so the declaration is named
+# after it. The cause stays retiring: the row is the reconcile's verdict, and
+# the entry is the detail the reason and the undo clause carry.
+REMEDY_RETIRING_EXCLUDED = (
+    "nothing to do: the project left the declaration, and the reconcile prunes its Cluster Agent profile on its next clean run; "
+    "if the entry was a mistake, drop it, name the project in spec.scope if nothing there holds it, and the next reconcile run that "
+    "resolves the project puts it back in the sweep"
+)
+REMEDY_READ_ACCESS = INSTALL_REMEDY_PREFIX + "give the install read access to the project, " + ROSTER_REMEDY
+REMEDY_CAP = INSTALL_REMEDY_PREFIX + "raise spec.scope.maxProjects, " + ROSTER_REMEDY
+# A remedy states no cadence: the same detail reaches the partial line (posted
+# once per cause), the all-refused line and the readiness hop's ungraded line,
+# which repeats weekly once parked. So the text says what clears the cause and
+# that another outcome is named here, never when the line returns.
+REMEDY_UNRESOLVED = (
+    "the reconcile has not resolved it yet; the next tick that does reads it; the project stays "
+    "unread until a reconcile tick lists it, and another outcome the reconcile records for it is named here with its remedy"
+)
+# A project outside what the reconcile resolved while part of the declaration
+# is unresolved: the render window and a carried tick clear on the next tick,
+# a container or selector lookup that keeps failing does not, and the watch
+# cannot tell a member of the unresolved part from a project outside the
+# declaration, so the line names both ways out and returns when it can tell.
+# A project already filed as outside the resolved scope is not refiled here
+# when a lookup fails for a tick (``STANDING_OUTSIDE_KEY``): a failed lookup
+# carries the members it had, so the project is no more inside than it was.
+# A lookup of a container the declaration has gained since carries none, so
+# the project is refiled here and the line names the lookup.
+REMEDY_OUTSIDE_UNRESOLVED = (
+    "the declaration is not fully resolved ({note}); when it resolves, a project inside it is read and one outside it is "
+    "named here again with its remedy; a lookup that keeps failing needs the install's read access on that folder, "
+    "organisation or selector"
+)
+REMEDY_ID = INSTALL_REMEDY_PREFIX + "spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run), or grant the agent's identity resourcemanager.projects.get on it so the reporter can resolve the number"
+REMEDY_SANDBOX_RESTART = "the sandbox started under a spec.scope block this pod no longer reads; nothing to do: the sandbox restarts under the new declaration and the next tick runs again"
+# The same refusal from a run that reads no declaration at all: the sandbox is
+# right, and the fix is the run's environment, not a restart.
+REMEDY_SCOPE_UNSEEN = (
+    "this run reads no scope declaration ("
+    + fleet_scope_targets.SCOPE_FILE_ENV
+    + " is unset), so it handed the report none; run the watch with the gateway pod's own environment"
+)
+# The unresolved note for a declaration the reconcile did resolve in part: a
+# container or selector lookup did not finish on its last run, so the set it
+# wrote is short, as against ``fleet_scope_args.UNRESOLVED_SCOPE_NOTE``, which
+# says no resolved set was written at all and is quoted only then.
+PARTLY_UNRESOLVED_SCOPE_NOTE = (
+    "the install's declared scope is resolved in part (a container or selector lookup did not finish on the reconcile's last run, "
+    "so its resolved set is short)"
+)
+# The reconcile's listing of the project did not finish on its last run (a
+# timeout, a network or quota error, a gcloud failure it did not classify, or
+# a carried tick): not an access failure, so no grant is asked for. Worded as
+# ``REMEDY_UNRESOLVED`` is, with no cadence.
+REMEDY_LISTING_UNFINISHED = (
+    "the reconcile could not list the project on its last run (a timeout, a network or quota error, or a run that carried "
+    "it without resolving it); the next reconcile tick that lists it reads it; the project stays "
+    "unread until a reconcile tick lists it, and another outcome the reconcile records for it is named here with its remedy"
+)
+# A declared project the install could not read, by the outcome the reconcile
+# recorded; a denial, the one outcome that is an access failure, is read access.
+UNREAD_REMEDIES = {
+    fleet_scope_targets.OUTCOME_OVER_CAP: REMEDY_CAP,
+    fleet_scope_targets.OUTCOME_UNRESOLVED: REMEDY_UNRESOLVED,
+    fleet_scope_targets.OUTCOME_UNREACHABLE: REMEDY_LISTING_UNFINISHED,
+    fleet_scope_targets.OUTCOME_UNKNOWN: REMEDY_LISTING_UNFINISHED,
+}
+# The causes a refusal is filed under, each the kind its remedy is chosen by
+# and what the announcements key it on, so a cause that changes (a project
+# declared and then found unread, a scope that resolves, an exclude entry
+# added or dropped) is news.
+# The failure marker's key for a tick every project of which was refused: the refused
+# projects and their causes, as the partial line keys a refusal, never the line's text,
+# which names the resolved set and so moves with the scope's membership.
+FAILURE_KEY_REFUSED = "refused"
+REFUSAL_OUTSIDE = "outside the resolved scope"
+REFUSAL_OUTSIDE_UNRESOLVED = "outside a scope not yet resolved"
+REFUSAL_EXCLUDED = "excluded by spec.scope.exclude"
+REFUSAL_RETIRING = "retiring from the declaration"
+REFUSAL_UNREAD = "listed but unread ({outcome})"
+REFUSAL_NUMBER = "project number unresolved"
+REFUSAL_SANDBOX = "sandbox marker stale"
+# The refusals the report script can answer this job with, each a
+# fleet_scope_args message that ends in a remedy for an agent (the tool's
+# collector_args, an id the tool lists), with the same reason in the
+# install's terms and the cause it is filed under. Parsed with the script's
+# own constants, the copy the loader hands the sandbox, so the two cannot
+# differ; a message this job does not know stays the script's own failure.
+REFUSAL_REASONS = (
+    (fleet_scope_args.DECLARED_SCOPE_OVERRIDE_OUTSIDE_ERROR, "the install's declared scope does not list {project}; it lists {projects}", REFUSAL_OUTSIDE),
+    (fleet_scope_args.DECLARED_SCOPE_OVERRIDE_UNREAD_ERROR, "the install's declared scope lists {project} but the install could not read it ({outcome})", REFUSAL_UNREAD),
+    (fleet_scope_args.PROJECT_NUMBER_UNRESOLVED_ERROR, "the report script could not resolve project number {number} to an id", REFUSAL_NUMBER),
+    # The sandbox froze KUBEAGENTS_SCOPE_DECLARED when it started and this
+    # pod reads the declaration live, so between a spec.scope block's
+    # removal and the sandbox's restart the two can disagree for a tick.
+    (fleet_scope_args.DECLARED_SCOPE_ARGS_MISSING_ERROR, "the sandbox says the install declares a scope, but this pod reads no declaration", REFUSAL_SANDBOX),
+)
+# With an empty resolved set the script's message lists "none readable"; the
+# pod knows the set is empty from the scope itself and says that instead.
+EMPTY_SCOPE_REASON = "the declared scope resolved to no readable project this tick, so it does not list {project}"
+# The script's outside message covers a project an exclude entry matches too,
+# since an excluded project has no row; the scope the pod holds says which.
+EXCLUDED_REASON = "the install's declared scope does not list {project}, and a spec.scope.exclude.projects entry matches it"
+# The same message covers a project the declaration dropped, whose row the
+# reconcile marks retiring until the prune; the scope the pod holds says so,
+# and names the exclude entry where one matches the project.
+RETIRING_REASON = "the install's declared scope no longer lists {project}; the reconcile has it retiring"
+RETIRING_EXCLUDED_REASON = "the install's declared scope no longer lists {project}, and a spec.scope.exclude.projects entry matches it; the reconcile has it retiring"
+REFUSAL_PROJECT_FIELD = "project"
+REFUSAL_PROJECTS_FIELD = "projects"
+REFUSAL_OUTCOME_FIELD = "outcome"
+REFUSAL_FIELDS = (REFUSAL_PROJECT_FIELD, REFUSAL_PROJECTS_FIELD, REFUSAL_OUTCOME_FIELD, "number")
+REFUSAL_FIELD_PATTERN = "(?P<{field}>.+?)"
+# A project id or number is one token, so a stderr that also carries another
+# refusal (one line per refused id) cannot run the group across it.
+REFUSAL_TOKEN_FIELDS = (REFUSAL_PROJECT_FIELD, "number")
+REFUSAL_TOKEN_PATTERN = "(?P<{field}>[^\\s,;]+?)"
 # The remedy rides on the message: every read role the install binds carries
 # resourcemanager.projects.get (cluster_agent_reconcile.py relies on it), and
 # the CRD reference wants spec.harness.projectId to be the id, not the number.
@@ -234,6 +446,9 @@ STDERR_EXCERPT_CHARS = 300
 # The report's vocabulary this job reads (fleet_upgrade_report.py, upgrade_readiness.py).
 MEMBERS_KEY = "members"
 EXIT_OK = 0
+# The report script's EXIT_USAGE: it refused to read what it was asked and
+# wrote no report, with the reason on stderr; against a sandbox that failed.
+REPORT_USAGE_EXIT = 2
 STATUS_KEY = "status"
 TARGET_KEY = "target_version"
 READINESS_KEY = "readiness"
@@ -276,6 +491,22 @@ READINESS_RUNS_KEY = "readiness_runs"
 # The last tick's version-table read errors, reason included, so a cause the
 # partial line posted once is readable afterwards.
 TABLE_ERRORS_KEY = "table_errors"
+# The projects the watch last filed as outside the resolved scope, each with
+# the folders, organisations and selectors the declaration named then
+# (``ScopeTargets.declared_containers``): the record ``refusal_cause`` holds
+# that cause on while the scope is merely unresolved again. Its own key, since
+# ``table_errors`` is the last tick's record and a day the project's run was
+# left unrun by the budget or failed in the sandbox would otherwise forget the
+# cause. An entry is written when a project is filed so, dropped when the
+# project is read or refused under another cause, and kept through anything
+# else; it holds only while the declaration names no container it did not,
+# since a container just gained carries no members when its lookup fails.
+# Saved even when the tick fails (``keep_standing``), at whichever step after
+# a hop filed it, since a failed tick writes nothing else of the ledger but the
+# ids it learned: the
+# failure line is keyed on the refused projects and their causes
+# (``refused_tick_signature``), and the hold is what keeps that key the same.
+STANDING_OUTSIDE_KEY = "standing_outside"
 # The report script keys members and read errors by the project id it resolved,
 # so a project the roster spells as a number must be keyed the same way in the
 # watch's own read errors and stamps. learn_project_id is the one place that
@@ -289,8 +520,10 @@ REPORT_PROJECTS_KEY = "projects"
 ANNOUNCED_KEY = "announced"
 ANNOUNCED_PARTIAL_KEY = "partial"
 ANNOUNCED_UNGRADED_KEY = "ungraded"
-# A failed tick writes nothing to the ledger; the failure it announced is kept
-# in this file beside it, so the same failure is posted once and its recovery once.
+# A failed tick writes nothing to the ledger but the standing-outside record
+# and the ids it learned (``keep_standing``); the failure it announced is kept
+# in this file beside it, so the same failure is posted once and its recovery
+# once.
 FAILURE_MARKER_FILE_NAME = "last-failure.txt"
 RECOVERED_LINE = "{prefix} watch: the tick runs again"
 DETAIL_KEY = "detail"
@@ -300,6 +533,7 @@ ATTEMPTS_KEY = "attempts"
 # rewords from one run to the next. The detail rides on the line.
 SIGNATURE_KEY = "signature"
 UNGRADED_KIND_RUN_FAILED = "readiness run failed"
+UNGRADED_KIND_REFUSED = "readiness run refused: {cause}"
 UNGRADED_KIND_UNRUN = "readiness run not run to completion by the budget"
 UNGRADED_KIND_READS_FAILED = "reads failed"
 REASON_NEW = "new target version"
@@ -321,7 +555,8 @@ PARTIAL_LINE = (
     "every project that pends it has been read, or a readiness run has listed every cluster pending it as no longer below it"
 )
 # One reason per project the read errors name, so the line says what went
-# wrong where; the announcement stays keyed on the kinds, so the reasons are the day's.
+# wrong where; the announcement stays keyed on the kinds (and, for a refusal, on
+# the project and its cause), so the other reasons are the day's.
 PARTIAL_REASON = "{project}: {message}"
 REASONS_SEPARATOR = "; "
 PARTIAL_CLEARED_LINE = "{prefix} watch: the version table reads every project again"
@@ -356,11 +591,18 @@ TIMED_OUT_DETAIL = "the sandbox run timed out after {seconds}s"
 NEXT_REFRESH_PHRASE = "The next scheduled refresh is after {date} while any cluster is still pending"
 NEXT_TOMORROW_PHRASE = "None of the pending clusters was graded, so the job retries tomorrow"
 NEXT_WEEKLY_PHRASE = "None of the pending clusters was graded on {attempts} consecutive attempt(s), so the next attempt is at the weekly refresh"
-# What the partial-table announcement is keyed on: the kinds of read error and
-# how many of each, not their text, so a window of unread projects that turns
-# daily, or a timeout's figure, does not re-post the line.
+# What the partial-table announcement is keyed on: the kinds of read error, not
+# their count or text, and for a refusal the project and its cause
+# (``partial_signature``), so a window of unread projects that turns daily, or a
+# timeout's figure, does not re-post the line.
 ERROR_KIND_UNRUN = "table not run to completion by the budget"
 ERROR_KIND_TABLE_FAILED = "table failed"
+# A refusal's kind carries its cause (``ReportRefused.cause``), so a refusal
+# whose cause changed is a new line while a standing one is quiet (a remedy
+# that changes within one cause is not announced again); the prefix is what
+# the partial signature keys refusals by project on.
+ERROR_KIND_REFUSED_PREFIX = "refused by the report script"
+ERROR_KIND_REFUSED = ERROR_KIND_REFUSED_PREFIX + ": {cause}"
 ERROR_KIND_UNRESOLVED = "project number not resolved"
 # The watch writes its own read errors with the kind on them; the report
 # script's carry no kind and are classified by their shape.
@@ -378,6 +620,37 @@ MAX_NAMES_IN_LINE = 6
 NAMES_OVERFLOW = ", +{more} more"
 WRITE_FAILED_EXIT = 2
 DATE_FORMAT = "%Y-%m-%d"
+
+
+class ReportRefused(RuntimeError):
+    """The report script exited with its usage code and wrote no report
+    because it refused to read what it was asked: a project the declared
+    scope does not list, one it lists but the install cannot read, a number
+    it cannot resolve, a sandbox still marked as scoped after the declaration
+    went (``refusal_detail`` knows the four), as against a sandbox that
+    failed or a usage error this job does not know, which stay the plain
+    failure. Its text is the reason in the install's terms with the remedy
+    for its cause, composed once (``refusal_detail``) so the partial line,
+    the ungraded line and the tick's failure line all say the same thing and
+    none relays the remedy the script wrote for an agent; ``cause`` is what
+    the announcements key it on, so a changed cause is a new line, and a
+    remedy that changes within one cause is not.
+    ``signature`` is set where one refusal stands for a whole tick
+    (``versions_by_project``): the refused projects and their causes, the key
+    the tick's failure line is announced under instead of its text."""
+
+    def __init__(self, detail: str, cause: str) -> None:
+        super().__init__(detail)
+        self.cause = cause
+        self.signature: str | None = None
+        # The project the refusal names, as the reporter resolved it (``refused_project``).
+        self.project: str | None = None
+
+
+def refused_tick_signature(failed: dict) -> str:
+    """The failure marker's key for a tick whose every run was refused: the
+    refused projects and their causes, sorted, under ``FAILURE_KEY_REFUSED``."""
+    return json.dumps([FAILURE_KEY_REFUSED, signature_pairs({project: exc.cause for project, exc in failed.items() if isinstance(exc, ReportRefused)})])
 
 
 class SandboxTimedOut(RuntimeError):
@@ -454,12 +727,25 @@ def roster_projects() -> set[str]:
             identity = read_cluster_identity(home)
         except Exception:  # noqa: BLE001 - any unreadable file is an absent identity
             identity = None
-        if identity and identity.get(IDENTITY_PROJECT_KEY):
-            projects.add(identity[IDENTITY_PROJECT_KEY])
+        # Stripped as every other roster source is, so the spelling check sees one shape.
+        project = str((identity or {}).get(IDENTITY_PROJECT_KEY) or "").strip()
+        if project:
+            projects.add(project)
     return projects
 
 
 def projects() -> list[str]:
+    """The roster, every source of it held to the grammar the refusal parser
+    reads (``ROSTER_SPELLING_REFUSED``): a spelling that cannot be a project
+    fails the tick with its remedy before the report is asked for it."""
+    names = roster_names()
+    refused = [p for p in names if ROSTER_SPELLING_REFUSED.search(p)]
+    if refused:
+        raise RuntimeError(ROSTER_SPELLING_DETAIL.format(spellings=shown_names([repr(p) for p in refused])))
+    return names
+
+
+def roster_names() -> list[str]:
     explicit = [p.strip() for p in os.environ.get(PROJECTS_ENV, "").split(PROJECTS_SEPARATOR) if p.strip()]
     if explicit:
         return sorted(set(explicit))
@@ -498,6 +784,14 @@ def skill_scripts_dir() -> Path:
     raise RuntimeError(f"{REPORT_MODULE}.py not found under {', '.join(str(c) for c in candidates)}")
 
 
+def scope_args_path() -> Path:
+    """The ``fleet_scope_args`` this job imported, the one it parses refusals
+    by, which the loader hands the sandbox so the report script formats them
+    with the same constants: the same file by construction, wherever the
+    import resolved (beside this script in the image)."""
+    return Path(fleet_scope_args.__file__).resolve()
+
+
 def _stamped(path: Path, scripts: Path, root: str | None) -> str:
     """The path a shipped file is known by in the sandbox: where it was read from on the
     agent side, or the same path under ``root`` when a caller re-roots the set (the tests
@@ -510,7 +804,8 @@ def shipped_modules(root: str | None = None) -> dict[str, tuple[str, str, bool]]
     (the module's ``__file__`` in the sandbox, so the report's own path-relative lookups
     are unchanged) and whether it is a package. Every ``.py`` under the skill's scripts
     directory except the tests, so a module a later rule adds ships without a change here,
-    and an import the set does not satisfy fails the loader tests rather than the job."""
+    and an import the set does not satisfy fails the loader tests rather than the job;
+    plus this image's ``fleet_scope_args``, which the report imports."""
     scripts = skill_scripts_dir()
     shipped: dict[str, tuple[str, str, bool]] = {}
     for path in sorted(scripts.rglob("*" + PYTHON_SOURCE_SUFFIX)):
@@ -522,6 +817,11 @@ def shipped_modules(root: str | None = None) -> dict[str, tuple[str, str, bool]]
         if is_package:
             parts = parts[:-1]
         shipped[MODULE_SEPARATOR.join(parts)] = (path.read_text(encoding="utf-8"), _stamped(path, scripts, root), is_package)
+    # The collectors' scope module this job imported, not the skill's: the report imports
+    # it, and shipping the copy this job parses refusals by keeps the sandbox image's copy
+    # out of the format.
+    scope_args = scope_args_path()
+    shipped[SCOPE_ARGS_MODULE] = (scope_args.read_text(encoding="utf-8"), str(scope_args) if root is None else str(Path(root) / scope_args.name), False)
     return shipped
 
 
@@ -616,19 +916,70 @@ def envelope_line(stdout: str) -> str | None:
     return None
 
 
-def report_argv(names: list[str], readiness: bool) -> list[str]:
+def declared_scope() -> fleet_scope_targets.ScopeTargets | None:
+    """The install's declared scope as the reconcile resolved it, read on this
+    pod (the sandbox cannot read the snapshot), or None on an install that
+    declares none. A render the operator wrote that cannot be read is a fault,
+    not an undeclared install: the tick fails with the reason rather than hand
+    the report a bare ``--project`` a scoped sandbox refuses."""
+    try:
+        return fleet_scope_targets.declared_scope_targets()
+    except fleet_scope_targets.ScopeRenderUnreadable as exc:
+        raise RuntimeError(SCOPE_UNREADABLE_DETAIL.format(error=exc)) from None
+
+
+def scope_flags(scope: fleet_scope_targets.ScopeTargets | None) -> list[str]:
+    """What hands the report the declared scope beside ``--project``: nothing
+    on an install that declares none, where the report reads the project as
+    before; on one that does, the resolved scope as the platform_control
+    ``fleet_scope`` tool hands it to the SOPs (``ScopeTargets.collector_args``:
+    ``--scope-projects`` with the projects the reconcile read, ``--scope-unread``
+    with the declared ones it could not), the remedy the report's own refusal
+    names. Under ``--project`` the report then does what it does for an
+    agent's override (``DeclaredScope.override_error``): it reads the one
+    project when the id it resolves is inside the set, and refuses it with the
+    reason when it is not, the unread flag giving the reason for a declared
+    project the install could not read. The projects this pod decided on
+    (``projects``) are not all inside by construction: the reconcile keeps a
+    profile the scope never produced (one onboarded by hand before the scope
+    was declared) and, until its second clean run after the removal, a project
+    removed from the declaration,
+    and a hand run may name anything in ``UPGRADE_READINESS_PROJECTS``; such a
+    project's run is a table failure named in the partial line, not a read the
+    declaration did not allow; the table carries it under its own kind
+    (``ReportRefused``), so the partial line tells it from a sandbox that
+    fails. Until a reconcile tick writes a snapshot that answers (the first on
+    a new install, the next on one whose snapshot predates the ``boundary``
+    key and declares nothing) the render answers: the management project is the one project read
+    (none when the host is spelled by number, which the render cannot match to an id),
+    and every project the declaration names explicitly goes as unread, so the
+    report refuses another project, with that reason, until that tick. The whole set goes because nothing
+    records this argv: it is one line of the loader on the sandbox command's
+    stdin, beside both scripts' sources."""
+    if scope is None:
+        return []
     # No --scope-exclude-clusters, on purpose: the watch's report covers the
     # clusters spec.scope.exclude.clusters excludes, one of the reads the CRD
-    # field names as still covering them (#3081, #3026).
-    argv = project_flags(names)
+    # field names as still covering them (#3081); the report enumerates by
+    # project, so the scope goes without its cluster exclusion.
+    return list(dataclasses.replace(scope, excluded_clusters=()).collector_argv())
+
+
+def report_argv(names: list[str], readiness: bool, scope: fleet_scope_targets.ScopeTargets | None) -> list[str]:
+    argv = project_flags(names) + scope_flags(scope)
     if readiness:
         argv += [READINESS_FLAG, KUBECONFIG_DIR_FLAG, SANDBOX_KUBECONFIG_DIR]
     return argv
 
 
-def run_report(names: list[str], readiness: bool, timeout: float | None = None) -> dict:
+def run_report(
+    names: list[str], readiness: bool, *, scope: fleet_scope_targets.ScopeTargets | None, outside_stands: bool, timeout: float | None = None
+) -> dict:
     """Run the skill's report in the sandbox and return the envelope:
-    ``{"exit": int, "tables": str, "report": dict | None}``."""
+    ``{"exit": int, "tables": str, "report": dict | None}``. ``outside_stands``
+    is whether the last tick filed the project asked for as outside the
+    resolved scope, which ``refusal_cause`` keeps while the scope is merely
+    unresolved again."""
     if timeout is None:
         timeout = READINESS_TIMEOUT_SECONDS if readiness else VERSION_TABLE_TIMEOUT_SECONDS
     try:
@@ -636,7 +987,7 @@ def run_report(names: list[str], readiness: bool, timeout: float | None = None) 
             [PYTHON_EXECUTABLE, PYTHON_ISOLATED_FLAG, STDIN_SCRIPT_ARG],
             timeout=timeout,
             check=False,
-            stdin=loader_source(report_argv(names, readiness)),
+            stdin=loader_source(report_argv(names, readiness, scope)),
         )
     except subprocess.TimeoutExpired:
         raise SandboxTimedOut(TIMED_OUT_DETAIL.format(seconds=int(timeout))) from None
@@ -648,8 +999,151 @@ def run_report(names: list[str], readiness: bool, timeout: float | None = None) 
         raise RuntimeError(f"sandbox exited {completed.returncode} without a report: {detail}")
     envelope = json.loads(envelope_text)
     if not isinstance(envelope.get(ENVELOPE_REPORT_KEY), dict):
-        raise RuntimeError(f"report script exited {envelope.get(ENVELOPE_EXIT_KEY)} and wrote no report: {excerpt}")
+        detail = f"report script exited {envelope.get(ENVELOPE_EXIT_KEY)} and wrote no report: {excerpt}"
+        if envelope.get(ENVELOPE_EXIT_KEY) == REPORT_USAGE_EXIT:
+            refusal = refusal_detail(completed.stderr or "", scope, outside_stands=outside_stands)
+            if refusal is not None:
+                refused = ReportRefused(*refusal)
+                refused.project = refused_project(completed.stderr or "")
+                raise refused
+        raise RuntimeError(detail)
     return envelope
+
+
+def refusal_pattern(template: str) -> re.Pattern:
+    """The report script's message as a pattern: its text verbatim, each
+    placeholder a named group."""
+    pattern = re.escape(template)
+    for field in REFUSAL_FIELDS:
+        shape = REFUSAL_TOKEN_PATTERN if field in REFUSAL_TOKEN_FIELDS else REFUSAL_FIELD_PATTERN
+        pattern = pattern.replace(re.escape("{" + field + "}"), shape.format(field=field))
+    return re.compile(pattern)
+
+
+def unresolved_note(scope: fleet_scope_targets.ScopeTargets | None) -> str | None:
+    """Why the declared scope is not resolved, when it is not: the render's
+    note while no snapshot answers, else the fixed unresolved row's (a carried
+    tick, a failed container or selector lookup); None for a resolved scope."""
+    if scope is None:
+        return None
+    if scope.note:
+        return scope.note
+    if any(project == fleet_scope_args.UNRESOLVED_SCOPE_ROW for project, _ in scope.unread):
+        # The collectors' note says no resolved set was written; true only while the
+        # declaration resolved nothing, else the set is there and short.
+        return PARTLY_UNRESOLVED_SCOPE_NOTE if scope.projects else fleet_scope_args.UNRESOLVED_SCOPE_NOTE
+    return None
+
+
+def refusal_cause(kind: str, fields: dict[str, str], scope: fleet_scope_targets.ScopeTargets | None, *, outside_stands: bool = False) -> str:
+    """What a refusal is filed under: its kind, with the outcome for a project
+    the install could not read (a project declared and then found unread, or
+    unread for a new reason, is a new cause) and, for a project outside the
+    scope, the declaration's and the scope's state: one whose row the
+    reconcile marks retiring is retiring from the declaration, whatever else
+    the scope says, since the reconcile has judged it and an unclean run does
+    not unjudge it; one an exclude entry names is excluded, whatever the scope
+    resolved; otherwise outside a scope not yet resolved is one cause and
+    outside the resolved scope another,
+    except that a project last filed as outside the resolved scope under a
+    declaration that named every container this one does (``outside_stands``,
+    from ``stands_outside``) keeps that cause while the scope is merely
+    unresolved again, since a failed lookup carries the members it had and
+    the project is no more inside than it was: the scope resolving is the
+    news, not the lookup failing. False where no record exists, the first
+    tick's answer."""
+    project = fields.get(REFUSAL_PROJECT_FIELD, "")
+    if kind == REFUSAL_OUTSIDE and scope is not None and project in scope.retiring:
+        return REFUSAL_RETIRING
+    if kind == REFUSAL_OUTSIDE and scope is not None and scope.excludes(project):
+        return REFUSAL_EXCLUDED
+    if kind == REFUSAL_OUTSIDE and unresolved_note(scope) and not outside_stands:
+        return REFUSAL_OUTSIDE_UNRESOLVED
+    if kind == REFUSAL_UNREAD:
+        return REFUSAL_UNREAD.format(outcome=fields[REFUSAL_OUTCOME_FIELD])
+    return kind
+
+
+def refusal_remedy(cause: str, fields: dict[str, str], scope: fleet_scope_targets.ScopeTargets | None) -> str:
+    """The remedy for a refusal, by its cause: a project outside a scope the
+    reconcile has resolved is declared or dropped from the roster, with the
+    exclude entry named too where one is a project number; one the reconcile
+    has retiring needs nothing, its profile pruned on the next clean run, and
+    is declared again only if the removal was a mistake, or loses the exclude
+    entry where one matches it; one an exclude
+    entry matches loses the entry or is declared, or leaves the roster;
+    outside a scope the reconcile has not resolved, the line names both ways
+    out and returns when the scope resolves; a project the install could not
+    read is read access for a denial, the cap, the wait for the reconcile, or,
+    for a listing that did not finish, the next tick that lists it, by the
+    outcome it recorded."""
+    if cause == REFUSAL_OUTSIDE:
+        if scope is not None and any(is_project_number(entry) for entry in scope.excluded):
+            return REMEDY_DECLARE_OR_NUMBERED
+        return REMEDY_DECLARE
+    if cause == REFUSAL_EXCLUDED:
+        return REMEDY_EXCLUDED
+    if cause == REFUSAL_RETIRING:
+        if scope is not None and scope.excludes(fields.get(REFUSAL_PROJECT_FIELD, "")):
+            return REMEDY_RETIRING_EXCLUDED
+        return REMEDY_RETIRING
+    if cause == REFUSAL_OUTSIDE_UNRESOLVED:
+        return REMEDY_OUTSIDE_UNRESOLVED.format(note=unresolved_note(scope))
+    if cause.startswith(REFUSAL_UNREAD.split("{")[0]):
+        return UNREAD_REMEDIES.get(fields[REFUSAL_OUTCOME_FIELD], REMEDY_READ_ACCESS)
+    if cause == REFUSAL_NUMBER:
+        return REMEDY_ID
+    if not os.environ.get(fleet_scope_targets.SCOPE_FILE_ENV):
+        return REMEDY_SCOPE_UNSEEN
+    return REMEDY_SANDBOX_RESTART
+
+
+def refusal_detail(stderr: str, scope: fleet_scope_targets.ScopeTargets | None, *, outside_stands: bool = False) -> tuple[str, str] | None:
+    """What a refusal by the report script reads as, in the install's terms,
+    and the cause it is filed under: the message matched against the script's
+    own constants, re-said with what it named (the scope it lists shortened
+    to a few names; a project an exclude entry names said as excluded; one
+    the reconcile has retiring said as such, with the exclude entry that
+    matches it where one does; an empty resolved set said as
+    such; an unresolved scope with the scope's own
+    note on a project it lists as unresolved) and the remedy for its cause
+    (``refusal_remedy``); None for a usage exit this job does not know, which
+    is reported as the script wrote it. ``outside_stands`` as for
+    ``refusal_cause``."""
+    text = " ".join(stderr.split())
+    for template, said, kind in REFUSAL_REASONS:
+        found = refusal_pattern(template).search(text)
+        if not found:
+            continue
+        fields = found.groupdict()
+        if REFUSAL_PROJECTS_FIELD in fields:
+            fields[REFUSAL_PROJECTS_FIELD] = shown_names(fields[REFUSAL_PROJECTS_FIELD].split(fleet_scope_args.OVERRIDE_PROJECTS_SEPARATOR))
+        reason = said.format(**fields)
+        cause = refusal_cause(kind, fields, scope, outside_stands=outside_stands)
+        if cause == REFUSAL_EXCLUDED:
+            reason = EXCLUDED_REASON.format(project=fields[REFUSAL_PROJECT_FIELD])
+        elif cause == REFUSAL_RETIRING:
+            said_retiring = RETIRING_EXCLUDED_REASON if scope is not None and scope.excludes(fields[REFUSAL_PROJECT_FIELD]) else RETIRING_REASON
+            reason = said_retiring.format(project=fields[REFUSAL_PROJECT_FIELD])
+        elif kind == REFUSAL_OUTSIDE and scope is not None and not scope.projects:
+            reason = EMPTY_SCOPE_REASON.format(project=fields[REFUSAL_PROJECT_FIELD])
+        note = unresolved_note(scope)
+        if note and kind == REFUSAL_UNREAD and fields.get(REFUSAL_OUTCOME_FIELD) == fleet_scope_targets.OUTCOME_UNRESOLVED:
+            reason = f"{reason}; {note}"
+        return REFUSED_DETAIL.format(reason=reason, remedy=refusal_remedy(cause, fields, scope)), cause
+    return None
+
+
+def refused_project(stderr: str) -> str | None:
+    """The project a refusal by the report script names, as the script wrote it:
+    the id it resolved a number to when the describe succeeded, the spelling it
+    was handed otherwise; None when the message names none."""
+    text = " ".join(stderr.split())
+    for template, _said, _kind in REFUSAL_REASONS:
+        found = refusal_pattern(template).search(text)
+        if found:
+            return found.groupdict().get(REFUSAL_PROJECT_FIELD) or None
+    return None
 
 
 # --- project identity ------------------------------------------------------
@@ -749,8 +1243,18 @@ def error_kind(error: dict) -> str:
 def partial_signature(read_errors: list) -> str:
     """The announcement key for a partial table: the kinds of read error, not
     their count, since how many projects a morning's latency leaves unread
-    moves day to day while the condition is the same."""
-    return json.dumps(sorted({error_kind(error) for error in read_errors}))
+    moves day to day while the condition is the same; and, for a refusal, the
+    project and the cause as well, since that is a standing, per-project
+    condition only the operator clears, named nowhere but this line: a second
+    refused project, or a refusal whose cause changed, is a new line, while
+    the same refusal stays quiet, its remedy included. One pair per project, as
+    the ungraded key has: both spellings of a project, run on the tick its id
+    is learned, are one refusal, as the next tick that runs it once says."""
+    kinds = {error_kind(error) for error in read_errors}
+    refusals = signature_pairs(
+        {str(error.get(MEMBER_ID_KEYS[0])): error_kind(error) for error in read_errors if error_kind(error).startswith(ERROR_KIND_REFUSED_PREFIX)}
+    )
+    return json.dumps(sorted(kind for kind in kinds if not kind.startswith(ERROR_KIND_REFUSED_PREFIX)) + refusals)
 
 
 def unlisted_projects(read_errors: list) -> set[str]:
@@ -810,7 +1314,7 @@ def carry_forward_unlisted(pending: dict[str, list[str]], ledger: dict, read_err
 def empty_ledger() -> dict:
     return {
         LEDGER_SCHEMA_KEY: LEDGER_SCHEMA_VERSION, TARGETS_KEY: {}, LAST_TICK_KEY: None, ANNOUNCED_KEY: {},
-        TABLE_RUNS_KEY: {}, READINESS_RUNS_KEY: {}, PROJECT_IDS_KEY: {}, TABLE_ERRORS_KEY: [],
+        TABLE_RUNS_KEY: {}, READINESS_RUNS_KEY: {}, PROJECT_IDS_KEY: {}, TABLE_ERRORS_KEY: [], STANDING_OUTSIDE_KEY: {},
     }
 
 
@@ -852,6 +1356,11 @@ def load_ledger(path: Path) -> dict:
         data[key] = {k: v for k, v in runs.items() if isinstance(k, str) and isinstance(v, str)} if isinstance(runs, dict) else {}
     errors = data.get(TABLE_ERRORS_KEY)
     data[TABLE_ERRORS_KEY] = [e for e in errors if isinstance(e, dict)] if isinstance(errors, list) else []
+    standing = data.get(STANDING_OUTSIDE_KEY)
+    data[STANDING_OUTSIDE_KEY] = (
+        {project: [c for c in containers if isinstance(c, str)] for project, containers in standing.items() if isinstance(project, str) and isinstance(containers, list)}
+        if isinstance(standing, dict) else {}
+    )
     return data
 
 
@@ -1042,7 +1551,9 @@ def merge_envelope(merged: dict, envelope: dict) -> None:
     merge_exit(merged, envelope)
 
 
-def versions_by_project(names: list[str], deadline: float, ledger: dict, now: datetime) -> dict:
+def versions_by_project(
+    names: list[str], deadline: float, ledger: dict, now: datetime, scope: fleet_scope_targets.ScopeTargets | None, standing: dict[str, list[str]]
+) -> dict:
     """The version table, one sandbox run per project under its own timeout and
     what is left of the table's share of the budget before ``deadline``, merged
     into one envelope. A project whose run failed, or that the budget did not reach, is a
@@ -1053,13 +1564,18 @@ def versions_by_project(names: list[str], deadline: float, ledger: dict, now: da
     ledger never holds a key under a number (``learn_project_id``), and when
     the roster also spells the project by its id, that spelling's run lists
     it. A table that read nothing under a key fails the tick instead of
-    announcing a partial table of nothing: every run failed is the sandbox or
-    the credential, and every run an unresolved number is the credential's
+    announcing a partial table of nothing: every run failed is the sandbox, the
+    credential or, when the report script refused each one, the install's
+    scope, and every run an unresolved number is the credential's
     missing ``resourcemanager.projects.get`` or a roster that should name the
     id, said with the remedy. The ledger's table-run stamps are set for every
     project that ran to completion or to its own cap, so the next table starts
     with the ones it did not, and a run that resolves a project's id teaches
-    the ledger."""
+    the ledger. ``standing`` is the ledger's standing-outside record
+    (``STANDING_OUTSIDE_KEY``), read for the hold under the spelling or the key
+    a project was recorded by and kept current by this run's verdicts
+    (``file_refusal``), which the caller saves even when the tick fails
+    (``keep_standing``)."""
     last_runs = ledger[TABLE_RUNS_KEY]
     ids = ledger[PROJECT_IDS_KEY]
     merged = empty_envelope()
@@ -1084,8 +1600,12 @@ def versions_by_project(names: list[str], deadline: float, ledger: dict, now: da
             unrun.append(project)
             continue
         timeout = min(VERSION_TABLE_TIMEOUT_SECONDS, remaining)
+        # Under a declared scope a number is asked for by the id already learned for it:
+        # the scope lists ids, so the reporter reads it with no describe, and a describe
+        # that fails that morning is not a refusal the operator is told to fix.
+        asked = keyed(project) if scope is not None else project
         try:
-            envelope = run_report([project], readiness=False, timeout=timeout)
+            envelope = run_report([asked], readiness=False, scope=scope, outside_stands=stands_outside(standing, scope, project, keyed(project)), timeout=timeout)
         except SandboxTimedOut as exc:
             if timeout < VERSION_TABLE_TIMEOUT_SECONDS:
                 # Killed by the budget, not by its own cap: not stamped, so it goes first next time.
@@ -1097,6 +1617,27 @@ def versions_by_project(names: list[str], deadline: float, ledger: dict, now: da
                 {MEMBER_ID_KEYS[0]: keyed(project), MEMBER_ID_KEYS[1]: None, ERROR_KIND_KEY: ERROR_KIND_TABLE_FAILED, MESSAGE_KEY: TABLE_FAILED_DETAIL.format(project=project, error=str(exc))}
             )
             continue
+        except ReportRefused as exc:
+            # The script would not read the project: on a declared install,
+            # one the scope does not list. Its own kind, so the partial line's
+            # signature tells a refusal that stands from a sandbox that fails,
+            # and the remedy named is the install's, not an agent's.
+            last_runs[project] = iso(now)
+            failed[project] = exc
+            # A number the reporter resolved before refusing is taught its id, as a
+            # read teaches it: the next tick asks by the id with no describe, so a
+            # describe outage cannot turn an outside refusal into a number refusal,
+            # and the two spellings of one project run once.
+            if exc.project and not is_project_number(exc.project):
+                learn_project_id(ids, project, [exc.project])
+                # The id just learned is tabled too, as a read tables it, so the other
+                # spelling of the same project is not run again this tick.
+                tabled.add(keyed(project))
+            file_refusal(standing, keyed(project), exc.cause, scope)
+            merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append(
+                {MEMBER_ID_KEYS[0]: keyed(project), MEMBER_ID_KEYS[1]: None, ERROR_KIND_KEY: ERROR_KIND_REFUSED.format(cause=exc.cause), MESSAGE_KEY: TABLE_REFUSED_DETAIL.format(project=project, error=str(exc))}
+            )
+            continue
         except (RuntimeError, ValueError, KeyError, TypeError) as exc:
             last_runs[project] = iso(now)
             failed[project] = exc
@@ -1106,6 +1647,9 @@ def versions_by_project(names: list[str], deadline: float, ledger: dict, now: da
             )
             continue
         last_runs[project] = iso(now)
+        # Read, so inside the scope: no longer standing outside under any spelling.
+        for spelling in (project, keyed(project)):
+            standing.pop(spelling, None)
         key = learn_project_id(ids, project, envelope[ENVELOPE_REPORT_KEY].get(REPORT_PROJECTS_KEY))
         if key is None:
             # A number the report could not resolve keys nothing: the run is
@@ -1128,10 +1672,25 @@ def versions_by_project(names: list[str], deadline: float, ledger: dict, now: da
         # the runs, not the roster's spellings, since two spellings of one
         # project are one run. A sandbox failure outranks an unresolved number.
         if failed:
-            raise next(iter(failed.values()))
+            # A refusal is the operator's standing condition on its project;
+            # a sandbox failure or a timeout on another is what stopped the
+            # read this tick, so it is the one named, and a refusal only when
+            # every run was refused.
+            chosen = next((exc for exc in failed.values() if not isinstance(exc, ReportRefused)), next(iter(failed.values())))
+            if isinstance(chosen, ReportRefused):
+                # Every run was refused: the line names each refusal it is keyed on, the
+                # project before its reason when there is more than one, bounded as the
+                # partial line is; the marker keys on every refusal. Both are keyed by the
+                # id learned for each spelling, so one project is one refusal whichever
+                # spellings ran.
+                refusals = {keyed(project): exc for project, exc in failed.items()}
+                if len(refusals) > 1:
+                    chosen = ReportRefused(shown_names([PARTIAL_REASON.format(project=project, message=exc) for project, exc in refusals.items()], REASONS_SEPARATOR), chosen.cause)
+                chosen.signature = refused_tick_signature(refusals)
+            raise chosen
         if unresolved:
             raise ProjectUnresolved(
-                UNRESOLVED_TICK_DETAIL.format(reasons=REASONS_SEPARATOR.join(PARTIAL_REASON.format(project=p, message=d) for p, d in unresolved.items()))
+                UNRESOLVED_TICK_DETAIL.format(reasons=shown_names([PARTIAL_REASON.format(project=p, message=d) for p, d in unresolved.items()], REASONS_SEPARATOR))
             )
     # Both budget shapes are one kind: the announcement must not re-post when a
     # cut-short run comes and goes beside the projects never reached.
@@ -1147,8 +1706,15 @@ def versions_by_project(names: list[str], deadline: float, ledger: dict, now: da
 
 
 def readiness_by_project(
-    pending: dict[str, list[str]], due: dict[str, str], deadline: float, last_runs: dict[str, str], now: datetime, ids: dict[str, str]
-) -> tuple[dict, dict[str, str], dict[str, str]]:
+    pending: dict[str, list[str]],
+    due: dict[str, str],
+    deadline: float,
+    last_runs: dict[str, str],
+    now: datetime,
+    ids: dict[str, str],
+    scope: fleet_scope_targets.ScopeTargets | None,
+    standing: dict[str, list[str]],
+) -> tuple[dict, dict[str, str], dict[str, str], dict[str, str]]:
     """One readiness run per project that holds a due version's pending
     clusters, each capped by its own timeout and by what is left of the tick's
     budget before ``deadline`` (a ``time.monotonic`` instant), merged into one
@@ -1156,9 +1722,18 @@ def readiness_by_project(
     named in the second value; a project the budget did not reach, or cut
     short under a shrunk timeout, is named in the third with the phrase that
     says which, so the caller can tell a failed read from a read that never
-    finished. All are read errors in the envelope, so the report names them.
+    finished; a project the report script refused (``ReportRefused``: on a
+    declared install, one the scope does not list, whose clusters the ledger
+    pended before that) is in the second value with the refusal's text and
+    named again in the fourth with its cause, its own kind for the ungraded announcement,
+    so a refusal that stands is posted once, then on the weekly cadence an
+    unreachable cluster earns (``UNGRADED_ATTEMPTS_BEFORE_WEEKLY``: the
+    condition needs the operator, and the weekly line carries the remedy),
+    and a sandbox that then fails is still news. All are read errors in the
+    envelope, so the report names them.
     ``last_runs`` is stamped for a run that completed or hit its own cap, so
-    the least recently run projects go first next time."""
+    the least recently run projects go first next time. ``standing`` as for
+    ``versions_by_project``."""
     # Member keys carry the id the report resolved; the run is asked for by the
     # roster's spelling where one is known for that id.
     spelled = {resolved: given for given, resolved in ids.items()}
@@ -1166,14 +1741,17 @@ def readiness_by_project(
     merged = empty_envelope()
     failures: dict[str, str] = {}
     unfinished: dict[str, str] = {}
+    refused: dict[str, str] = {}
     for project in ordered_projects(needed, last_runs):
         remaining = deadline - time.monotonic()
         if remaining < MIN_PROJECT_RUN_SECONDS:
             unfinished[project] = PROJECT_NOT_RUN_DETAIL.format(project=project, error=BUDGET_EXHAUSTED_DETAIL.format(project=project))
             continue
         timeout = min(READINESS_TIMEOUT_SECONDS, remaining)
+        # By the id under a declared scope, as the table hop asks; else by the roster's spelling.
+        asked = project if scope is not None else spelled.get(project, project)
         try:
-            envelope = run_report([spelled.get(project, project)], readiness=True, timeout=timeout)
+            envelope = run_report([asked], readiness=True, scope=scope, outside_stands=stands_outside(standing, scope, project, asked), timeout=timeout)
         except SandboxTimedOut as exc:
             if timeout < READINESS_TIMEOUT_SECONDS:
                 # Killed by the budget, not by its own cap: not an attempt, not
@@ -1183,17 +1761,32 @@ def readiness_by_project(
             last_runs[project] = iso(now)
             failures[project] = str(exc)
             continue
+        except ReportRefused as exc:
+            last_runs[project] = iso(now)
+            failures[project] = str(exc)
+            refused[project] = exc.cause
+            file_refusal(standing, project, exc.cause, scope)
+            continue
         except (RuntimeError, ValueError, KeyError, TypeError) as exc:
             last_runs[project] = iso(now)
             failures[project] = f"{type(exc).__name__}: {exc}" if not isinstance(exc, RuntimeError) else str(exc)
             continue
         last_runs[project] = iso(now)
+        for spelling in (project, asked):
+            standing.pop(spelling, None)
         merge_envelope(merged, envelope)
     for project, error in failures.items():
-        merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append({MEMBER_ID_KEYS[0]: project, MESSAGE_KEY: PROJECT_RUN_FAILED_DETAIL.format(project=project, error=error)})
+        merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append({MEMBER_ID_KEYS[0]: project, MESSAGE_KEY: run_failure_detail(project, error, refused)})
     for project, detail in unfinished.items():
         merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append({MEMBER_ID_KEYS[0]: project, MESSAGE_KEY: detail})
-    return merged, failures, unfinished
+    return merged, failures, unfinished, refused
+
+
+def run_failure_detail(project: str, error: str, refused: dict[str, str]) -> str:
+    """What a readiness run that returned nothing reads as: refused, with the
+    refusal's own text, or failed, with the error."""
+    template = PROJECT_RUN_REFUSED_DETAIL if project in refused else PROJECT_RUN_FAILED_DETAIL
+    return template.format(project=project, error=error)
 
 
 def shown_names(names: list[str], separator: str = ", ") -> str:
@@ -1221,13 +1814,16 @@ def signature_pairs(kinds: dict[str, str]) -> list[list[str]]:
     return [[project, kinds[project]] for project in sorted(kinds)]
 
 
-def ungraded_signature(projects: set[str], failed: list[str], unrun: list[str]) -> list[list[str]]:
+def ungraded_signature(projects: set[str], failed: list[str], unrun: list[str], refused: dict[str, str]) -> list[list[str]]:
     """What an ungraded version's announcement is keyed on: each of its
     projects with how it went ungraded, as ``[project, kind]`` pairs in project
-    order. A project in neither list ran and graded nothing, so its reads
-    failed; the two budget shapes are one kind, as they are for the table."""
+    order. A project in no list ran and graded nothing, so its reads
+    failed; the two budget shapes are one kind, as they are for the table; a
+    run the report script refused is its own kind with its cause, as it is
+    for the table, so a changed cause is a new line."""
     kinds = {project: UNGRADED_KIND_READS_FAILED for project in projects}
     kinds.update({project: UNGRADED_KIND_RUN_FAILED for project in failed})
+    kinds.update({project: UNGRADED_KIND_REFUSED.format(cause=cause) for project, cause in refused.items()})
     kinds.update({project: UNGRADED_KIND_UNRUN for project in unrun})
     return signature_pairs(kinds)
 
@@ -1239,6 +1835,70 @@ def announced_as(previous: dict, signature: list[list[str]], detail: str) -> boo
     if SIGNATURE_KEY in previous:
         return previous[SIGNATURE_KEY] == signature
     return previous.get(DETAIL_KEY) == detail
+
+
+def stands_outside(standing: dict[str, list[str]], scope: fleet_scope_targets.ScopeTargets | None, *spellings: str) -> bool:
+    """Whether the project, under any spelling it is recorded by, was last
+    filed as outside the resolved scope (``STANDING_OUTSIDE_KEY``) under a
+    declaration that named every folder, organisation and selector this one
+    does. ``refusal_cause`` keeps that cause for it while the scope is merely
+    unresolved again, so a lookup that fails for a tick does not re-post a
+    standing refusal on the way out and again on the way back; a scope that
+    resolves still does, and so does a container the declaration has gained,
+    whose failed lookup carries no members and may hold the project."""
+    declared = set(scope.declared_containers) if scope is not None else set()
+    return any(spelling in standing and declared <= set(standing[spelling]) for spelling in spellings)
+
+
+def file_refusal(standing: dict[str, list[str]], project: str, cause: str, scope: fleet_scope_targets.ScopeTargets | None) -> None:
+    """Keep the standing-outside record current for a refusal on either hop:
+    a project filed as outside the resolved scope is recorded with the
+    containers the declaration names; one refused under another cause is
+    dropped. A read drops it too (the hops do that); a run the budget left
+    unrun or the sandbox failed says nothing about the scope and leaves it."""
+    if cause == REFUSAL_OUTSIDE:
+        standing[project] = sorted(scope.declared_containers) if scope is not None else []
+    else:
+        standing.pop(project, None)
+
+
+def keep_standing(path: Path, standing: dict[str, list[str]], loaded: dict[str, list[str]], ids: dict[str, str] | None = None, loaded_ids: dict[str, str] | None = None) -> None:
+    """Save the standing-outside record (``STANDING_OUTSIDE_KEY``) of a tick
+    that failed, at whichever step: a table that read nothing, a hop whose
+    sandbox call raised, a report that could not be written. Such a tick
+    writes nothing else to the ledger (``main`` announces its failure through
+    the marker, keyed on the failure's text or, for a refused tick, on its
+    refusals, or prints the write failure), but
+    the refusals and reads its hops filed are the scope's verdicts on those
+    projects, and the hold the next tick reads lives in the record: a roster
+    of nothing but outside projects would otherwise see its failure line
+    change cause, and post again, on each lookup that fails for a tick, and a
+    project filed on a tick whose report could not be written would be posted
+    under the lookup's remedy and then the declaration's.
+    The ids the tick learned (``PROJECT_IDS_KEY``, ``ids`` against
+    ``loaded_ids``) are saved beside it: the record is filed under the id a
+    refusal named, and a roster that spells the project by number finds the
+    record only through the id.
+    Written under those keys alone into the ledger as it is on disk, and only
+    when the record or the ids moved from what the tick read, so a failed
+    tick that filed nothing still leaves no ledger and a standing failure
+    rewrites nothing; a record that cannot be written is the hold not
+    carried, which the next refusal re-files."""
+    # Only a number that learned another id moves the ids: an id spelling maps to itself.
+    learned = {spelling: key for spelling, key in (ids or {}).items() if spelling != key}
+    ids_moved = ids is not None and learned != {s: k for s, k in (loaded_ids or {}).items() if s != k}
+    if standing == loaded and not ids_moved:
+        return
+    try:
+        ledger = load_ledger(path)
+        ledger[STANDING_OUTSIDE_KEY] = standing
+        if ids_moved:
+            ledger[PROJECT_IDS_KEY] = ids
+        save_ledger(path, ledger)
+    except (OSError, RuntimeError, ValueError):
+        # Called inside the failed tick's handler: a ledger this cannot read
+        # or write must not replace the failure the tick is reporting.
+        pass
 
 
 def tables_without_the_output_line(tables: str) -> str:
@@ -1356,15 +2016,39 @@ def clear_failure_marker(home: Path) -> bool:
 
 
 def tick(dry_run: bool = False) -> list[str]:
+    """One tick: the ledger loaded, the sweep run on it, and the standing-outside
+    record and the ids it learned kept when the sweep fails (``keep_standing``),
+    at whichever step it failed, since the hops file the record as they go and
+    a failed tick writes nothing else of the ledger. A dry run changes nothing."""
     started = time.monotonic()
-    now = now_utc()
-    days = refresh_days()
     home = watch_home()
     ledger_path = home / LEDGER_FILE_NAME
     ledger = load_ledger(ledger_path)
+    standing = ledger[STANDING_OUTSIDE_KEY]
+    loaded_standing = {project: list(containers) for project, containers in standing.items()}
+    loaded_ids = dict(ledger[PROJECT_IDS_KEY])
+    try:
+        return sweep(started, home, ledger, dry_run)
+    except Exception:
+        if not dry_run:
+            keep_standing(ledger_path, standing, loaded_standing, ledger[PROJECT_IDS_KEY], loaded_ids)
+        raise
+
+
+def sweep(started: float, home: Path, ledger: dict, dry_run: bool) -> list[str]:
+    """The tick's work on the ledger ``tick`` loaded: the version table, what
+    is due, the readiness runs, the reports and the ledger's save. ``started``
+    is the tick's first ``time.monotonic`` instant, which the budget counts
+    from. Raises out with the ledger unsaved when a step fails; ``tick`` keeps
+    the standing-outside record and the learned ids then."""
+    now = now_utc()
+    days = refresh_days()
+    ledger_path = home / LEDGER_FILE_NAME
+    standing = ledger[STANDING_OUTSIDE_KEY]
+    scope = declared_scope()
     names = projects()
     deadline = started + TICK_BUDGET_SECONDS
-    versions = versions_by_project(names, started + TABLE_BUDGET_SECONDS, ledger, now)
+    versions = versions_by_project(names, started + TABLE_BUDGET_SECONDS, ledger, now, scope, standing)
     canonicalise_projects(versions[ENVELOPE_REPORT_KEY], ledger[PROJECT_IDS_KEY])
     read_errors = versions[ENVELOPE_REPORT_KEY].get(ERRORS_KEY) or []
     # A table is partial when a read failed; the script's exit code alone (it
@@ -1388,13 +2072,16 @@ def tick(dry_run: bool = False) -> list[str]:
     signature = partial_signature(read_errors) if not complete else None
     already = announced(ledger).get(ANNOUNCED_PARTIAL_KEY)
     if signature and signature != already:
-        lines.append(PARTIAL_LINE.format(prefix=LINE_PREFIX, errors=len(read_errors), code=versions.get(ENVELOPE_EXIT_KEY), reasons=error_reasons(read_errors)))
+        # Counted by project, as the key and the reasons are: both spellings of one project,
+        # run on the tick its id is learned, are one read error.
+        errors = len({str(e.get(MEMBER_ID_KEYS[0]) or NONE_WORD) for e in read_errors})
+        lines.append(PARTIAL_LINE.format(prefix=LINE_PREFIX, errors=errors, code=versions.get(ENVELOPE_EXIT_KEY), reasons=error_reasons(read_errors)))
     elif complete and already:
         lines.append(PARTIAL_CLEARED_LINE.format(prefix=LINE_PREFIX))
     announced(ledger)[ANNOUNCED_PARTIAL_KEY] = signature
     ledger[TABLE_ERRORS_KEY] = read_errors
     if due:
-        readiness, failures, unfinished = readiness_by_project(pending, due, deadline, ledger[READINESS_RUNS_KEY], now, ledger[PROJECT_IDS_KEY])
+        readiness, failures, unfinished, refused = readiness_by_project(pending, due, deadline, ledger[READINESS_RUNS_KEY], now, ledger[PROJECT_IDS_KEY], scope, standing)
         canonicalise_projects(readiness[ENVELOPE_REPORT_KEY], ledger[PROJECT_IDS_KEY])
         for version in settle_from_readiness(readiness[ENVELOPE_REPORT_KEY], pending, ledger):
             if version in due and version in ledger[TARGETS_KEY]:
@@ -1408,6 +2095,7 @@ def tick(dry_run: bool = False) -> list[str]:
             blocked, ready, unknown, unread = readiness_verdicts(readiness[ENVELOPE_REPORT_KEY], clusters)
             version_projects = {project_of(k) for k in clusters}
             failed_projects = sorted(version_projects & set(failures))
+            refused_projects = {project: refused[project] for project in sorted(version_projects & set(refused))}
             unrun_projects = sorted(version_projects & set(unfinished))
             if not blocked and not ready and not unknown and unrun_projects and not failed_projects and len(unrun_projects) == len(version_projects):
                 # Nothing was attempted for this version: not a report, not an
@@ -1421,7 +2109,7 @@ def tick(dry_run: bool = False) -> list[str]:
                 )
                 continue
             failure_text = "; ".join(
-                [PROJECT_RUN_FAILED_DETAIL.format(project=p, error=failures[p]) for p in failed_projects]
+                [run_failure_detail(p, failures[p], refused) for p in failed_projects]
                 + [unfinished[p] for p in unrun_projects]
             )
             graded = bool(blocked or ready or unknown)
@@ -1431,7 +2119,7 @@ def tick(dry_run: bool = False) -> list[str]:
                 next_phrase = NEXT_REFRESH_PHRASE.format(date=(now + timedelta(days=days)).strftime(DATE_FORMAT))
             else:
                 detail = failure_text or READS_FAILED_DETAIL
-                condition = ungraded_signature(version_projects, failed_projects, unrun_projects)
+                condition = ungraded_signature(version_projects, failed_projects, unrun_projects, refused_projects)
                 attempts = (previous.get(ATTEMPTS_KEY) or 0) + 1
                 # Once parked, a version stays on the weekly cadence until graded:
                 # the ladder of daily retries runs once, not once a week.
@@ -1493,17 +2181,20 @@ def tick(dry_run: bool = False) -> list[str]:
     return lines
 
 
-def announce_failure_once(detail: str) -> bool:
-    """A failure that persists is posted once per distinct detail and the next
-    clean tick posts a recovery line. The marker lives beside the ledger, which
-    a failed tick never writes; a marker that cannot be read or written leaves
+def announce_failure_once(detail: str, key: str | None = None) -> bool:
+    """A failure that persists is posted once per distinct key, the detail
+    itself unless the caller hands one (a refused tick's, so the resolved set
+    the detail names can change membership without re-posting a standing
+    refusal), and the next clean tick posts a recovery line. The marker lives
+    beside the ledger, to which a failed tick writes nothing but the
+    standing-outside record and the learned ids; a marker that cannot be read or written leaves
     the line posted every time, since nothing can remember it."""
     try:
         marker = watch_home() / FAILURE_MARKER_FILE_NAME
-        if marker.exists() and marker.read_text(encoding="utf-8") == detail:
+        if marker.exists() and marker.read_text(encoding="utf-8") == (key or detail):
             return False
         marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(detail, encoding="utf-8")
+        marker.write_text(key or detail, encoding="utf-8")
     except (OSError, RuntimeError):
         pass
     return True
@@ -1522,7 +2213,8 @@ def main(argv: list[str] | None = None) -> int:
         detail = f"{type(exc).__name__}: {exc}"
         # A dry run changes nothing, the marker included, and is never silenced
         # by it: the operator running one is looking at the failure.
-        if args.dry_run or announce_failure_once(detail):
+        key = exc.signature if isinstance(exc, ReportRefused) else None
+        if args.dry_run or announce_failure_once(detail, key):
             print(FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_TICK, detail=detail))
         return 0
     for line in lines:
