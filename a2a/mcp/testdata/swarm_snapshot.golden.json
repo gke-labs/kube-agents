@@ -32,7 +32,7 @@
     "platform": {
       "name": "platform",
       "role": "worker",
-      "model": "hermes · Platform Agent · ⚡ Approve the restart?",
+      "model": "hermes · Platform Agent · ⚡ Checking rollout history",
       "conversation_id": "",
       "wake_mode": "working",
       "wait_since": 12,
@@ -46,7 +46,7 @@
     "session-triage": {
       "name": "session-triage",
       "role": "worker",
-      "model": "console:tok-triage-00… · ⚡ Approve the restart?",
+      "model": "console:tok-triage-00… · ⚡ Checking rollout history",
       "conversation_id": "",
       "wake_mode": "working",
       "wait_since": 12,
@@ -205,7 +205,7 @@
           "session-triage-db"
         ],
         "state": "active",
-        "note": "⚡ Approve the restart? — Cluster triage · 1 sub-conversation(s)",
+        "note": "⚡ Checking rollout history — Cluster triage · 1 sub-conversation(s)",
         "refs": [
           {
             "member": "session-triage"

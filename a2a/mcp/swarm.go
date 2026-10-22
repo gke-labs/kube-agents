@@ -109,6 +109,11 @@ type SwarmTask struct {
 	Submitted               time.Time // when it was submitted
 	Prompt                  string    // the submission's text; untrusted
 	Task                    *lib.Task // lib.FoldTask result, may be non-final or nil
+	// Question is the message of the task's latest input-required
+	// status-update: the question it is asking (spec-a2a-payloads.md). The
+	// fold keeps only the final status message (lib.Task.FinalMessage), so
+	// the caller reads this off the event. Untrusted; nil when it has none.
+	Question *lib.Message
 }
 
 // SwarmInput is everything BuildSwarmState reads. Now is the only clock.
@@ -258,6 +263,8 @@ type swarmTaskView struct {
 	result, reason      string // sanitised first lines
 	progress, step      string
 	prompt              string // the submission's text, sanitised first line
+	question            string // the input-required question, sanitised first line
+	asks                int    // input-required transitions in the status history
 }
 
 // activeStep is what a running task is doing: its newest tool call, its
@@ -291,7 +298,14 @@ func BuildSwarmState(in SwarmInput, prev BoardLedger) (SwarmSnapshot, BoardLedge
 		title = swarmDefaultTitle
 	}
 
-	convs := normalizeConversations(in.Conversations, now)
+	tasks := normalizeTasks(in.Tasks, now)
+	liveTokens := make(map[string]bool)
+	for _, t := range tasks {
+		if t.token != "" && !t.terminal {
+			liveTokens[t.token] = true
+		}
+	}
+	convs := normalizeConversations(in.Conversations, liveTokens, now)
 	resolveLineage(convs)
 	byToken := make(map[string]*swarmConv, len(convs))
 	byAlias := make(map[string]*swarmConv, len(convs))
@@ -303,7 +317,6 @@ func BuildSwarmState(in SwarmInput, prev BoardLedger) (SwarmSnapshot, BoardLedge
 			}
 		}
 	}
-	tasks := normalizeTasks(in.Tasks, now)
 
 	// Working state and recency per conversation.
 	for _, t := range tasks {
@@ -410,15 +423,30 @@ func BuildSwarmState(in SwarmInput, prev BoardLedger) (SwarmSnapshot, BoardLedge
 	// the member cap) is not projected, nor is anything delegated from a
 	// skipped task. Tasks off the console (no token) are kept, as Adam kept
 	// them.
+	// The delegation half runs to a fixed point over the whole set, so a
+	// child that sorts before its parent is skipped all the same. Each pass
+	// that changes anything skips at least one more task, so it ends within
+	// len(tasks) passes (and tasks is capped at maxSwarmInputTasks).
 	skipped := make(map[string]bool)
+	for _, t := range tasks {
+		if c := byToken[t.token]; t.token != "" && (c == nil || c.member == "") {
+			skipped[t.id] = true
+		}
+	}
+	for changed := true; changed; {
+		changed = false
+		for _, t := range tasks {
+			if !skipped[t.id] && t.viaTaskID != "" && skipped[t.viaTaskID] {
+				skipped[t.id] = true
+				changed = true
+			}
+		}
+	}
 	kept := tasks[:0:0]
 	for _, t := range tasks {
-		c := byToken[t.token]
-		if (t.token != "" && (c == nil || c.member == "")) || (t.viaTaskID != "" && skipped[t.viaTaskID]) {
-			skipped[t.id] = true
-			continue
+		if !skipped[t.id] {
+			kept = append(kept, t)
 		}
-		kept = append(kept, t)
 	}
 	tasks = kept
 
@@ -553,9 +581,9 @@ func BuildSwarmState(in SwarmInput, prev BoardLedger) (SwarmSnapshot, BoardLedge
 		// Adam's addressing: input-required goes to the coordinator; a
 		// completion to the coordinator, or to the delegating parent's owner.
 		if t.state == lib.StateInputRequired && !t.terminal {
-			ask := firstNonEmptyString(t.progress, t.reason, t.result, "awaiting user input")
+			ask := firstNonEmptyString(t.question, t.progress, t.reason, t.result, "awaiting user input")
 			addCandidate(candidateBoardEvent{
-				key: "task-input:" + t.id,
+				key: inputKey(t),
 				// lib.Task keeps no update time, so an observed state is
 				// stamped when this projection first saw it.
 				ts:       now,
@@ -771,7 +799,7 @@ func buildSwarmOverview(
 				Kind:     "decision",
 				Severity: "high",
 				Title:    swarmText(fmt.Sprintf("Input required on task %s (%s)", t.id, t.addrLabel), maxViewTitleChars),
-				Why:      swarmText(firstNonEmptyString(t.progress, t.reason, t.prompt), maxViewWhyChars),
+				Why:      swarmText(firstNonEmptyString(t.question, t.progress, t.reason, t.prompt), maxViewWhyChars),
 				Refs:     []SwarmRef{{Seq: seq}},
 				Actions:  jump(seq, "Jump to"),
 			})
@@ -1039,8 +1067,10 @@ func validTaskID(id string) bool {
 }
 
 // normalizeConversations validates, dedupes (by alias) and bounds the
-// conversations, returning them sorted by alias.
-func normalizeConversations(in []SwarmConversation, now time.Time) []*swarmConv {
+// conversations, returning them sorted by alias. At the cap, conversations
+// whose token owns a non-terminal task (liveTokens) are kept first, then the
+// most recently used, so live work is never cut for idle conversations.
+func normalizeConversations(in []SwarmConversation, liveTokens map[string]bool, now time.Time) []*swarmConv {
 	list := make([]SwarmConversation, 0, len(in))
 	for _, c := range in {
 		c.Alias = strings.TrimSpace(c.Alias)
@@ -1091,7 +1121,13 @@ func normalizeConversations(in []SwarmConversation, now time.Time) []*swarmConv 
 		})
 	}
 	if len(out) > maxSwarmInputConvs {
-		sort.SliceStable(out, func(i, j int) bool { return out[i].lastUsed.After(out[j].lastUsed) })
+		sort.SliceStable(out, func(i, j int) bool {
+			li, lj := out[i].token != "" && liveTokens[out[i].token], out[j].token != "" && liveTokens[out[j].token]
+			if li != lj {
+				return li
+			}
+			return out[i].lastUsed.After(out[j].lastUsed)
+		})
 		out = out[:maxSwarmInputConvs]
 		sort.Slice(out, func(i, j int) bool { return out[i].alias < out[j].alias })
 	}
@@ -1213,6 +1249,14 @@ func normalizeTasks(in []SwarmTask, now time.Time) []*swarmTaskView {
 				tv.progress = swarmLine(boundedText(art.Parts, true), maxBoardEventTextChars)
 			}
 			tv.step = swarmText(lastActivityTool(t), maxSwarmStepChars)
+			for _, s := range t.StatusHistory {
+				if s == lib.StateInputRequired {
+					tv.asks++
+				}
+			}
+		}
+		if tv.state == lib.StateInputRequired && st.Question != nil {
+			tv.question = swarmLine(boundedText(st.Question.Parts, false), maxBoardEventTextChars)
 		}
 		list = append(list, tv)
 	}
@@ -1244,6 +1288,18 @@ func normalizeTasks(in []SwarmTask, now time.Time) []*swarmTaskView {
 	return out
 }
 
+// inputKey is the ledger key of t's current input request. A task resumed
+// after input-required can ask again on the same id, so the n-th ask (n > 1,
+// counted in the status history) gets its own key and posts again; an
+// unchanged ask keeps its key and stays deduped. '#' is not a task id
+// character, so the keys of two tasks never collide.
+func inputKey(t *swarmTaskView) string {
+	if t.asks > 1 {
+		return fmt.Sprintf("task-input:%s#%d", t.id, t.asks)
+	}
+	return "task-input:" + t.id
+}
+
 func (t *swarmTaskView) pendingInput() bool {
 	return t.state == lib.StateInputRequired && !t.terminal
 }
@@ -1255,11 +1311,14 @@ func taskLess(a, b *swarmTaskView) bool {
 	for _, p := range [][2]string{
 		{a.id, b.id}, {a.addr, b.addr}, {a.token, b.token}, {a.viaTaskID, b.viaTaskID},
 		{string(a.state), string(b.state)}, {a.prompt, b.prompt}, {a.result, b.result},
-		{a.reason, b.reason}, {a.progress, b.progress}, {a.step, b.step},
+		{a.reason, b.reason}, {a.progress, b.progress}, {a.step, b.step}, {a.question, b.question},
 	} {
 		if p[0] != p[1] {
 			return p[0] < p[1]
 		}
+	}
+	if a.asks != b.asks {
+		return a.asks < b.asks
 	}
 	return !a.terminal && b.terminal
 }
