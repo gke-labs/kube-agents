@@ -667,7 +667,9 @@ pull from. Under the same flag
 `AGENT_INJECT_TOKEN`, read from the token Secret the operator renders beside the door, and
 changes nothing else about the run except what hangs off that transport switch: the inject
 lane's exclusion list (`hack/eval/inject-lane-exclusions.txt`, keyed on `AGENT_TRANSPORT` rather
-than on this flag) leaves out the cases whose premise needs the chat front door; the lane's
+than on this flag) leaves out the cases whose premise needs the chat front door, and its mirror
+(`hack/eval/api-lane-exclusions.txt`) keeps the cases only the door can carry off every other
+lane; the deploy also arms the card stop (`A2A_CARD_STOP`) for them; the lane's
 safeguards (`hack/eval/inject-lane-safeguards.yaml`) are appended to a scratch copy of every
 remaining task file, which the unit hands devops-bench, over the leased project's GitOps
 repository exported as `BENCH_GITOPS_REPO` (the lane refuses to start without one), with the

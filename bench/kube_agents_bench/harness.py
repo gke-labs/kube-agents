@@ -155,7 +155,7 @@ from devops_bench.agents import AgentHarness, AgentResult
 from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
-from kube_agents_bench import board, card_wake, gitops, transcript, worker_trajectory
+from kube_agents_bench import board, card_wake, gitops, stop_hook, transcript, worker_trajectory
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     STATUS_TOOL,
@@ -207,6 +207,9 @@ _INJECT_TOKEN_SECRET_KEY = "token"  # noqa: S105 -- a Secret key name, not a cre
 # follow-up apart -- and so the door's dedupe on the message id cannot fold a
 # second status turn into the first one's task.
 _INJECT_STATUS_TURN_SUFFIX = "/status-"
+# Appended to the opening turn's message id for the stop a stopped ask sends
+# (stop_hook), so the door's dedupe never answers it with the opening task.
+_INJECT_STOP_SUFFIX = "/stop"
 # The three budgets both transports share, named here rather than spelled at
 # each _numeric_env call: one default per knob, or the two doors disagree
 # about how long a case may take.
@@ -1695,6 +1698,10 @@ class KubeAgentsHarness(AgentHarness):
             )
         if transport == TRANSPORT_INJECT:
             return self._execute_inject(prompt)
+        if stop_hook.is_stopped_ask(prompt):
+            return AgentResult.errored(
+                f"{stop_hook.STOP_DIRECTIVE} needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
+            )
 
         api_path = os.environ.get("AGENT_API_PATH", "/v1/responses")
         try:
@@ -2039,8 +2046,11 @@ class KubeAgentsHarness(AgentHarness):
             poll_interval = _numeric_env(
                 "AGENT_DELEGATION_POLL_INTERVAL", _DEFAULT_DELEGATION_POLL_INTERVAL, float
             )
+            stop = stop_hook.parse(prompt)
         except ValueError as exc:
             return AgentResult.errored(str(exc))
+        if stop is not None:
+            prompt = stop.prompt
 
         agent_service = os.environ.get("AGENT_SERVICE_NAME", _DEFAULT_AGENT_SERVICE_NAME)
         service = os.environ.get("AGENT_INJECT_SERVICE") or (agent_service + _INJECT_SERVICE_SUFFIX)
@@ -2434,6 +2444,44 @@ class KubeAgentsHarness(AgentHarness):
                 f"task {exchange.task_id} ended {exchange.fold.terminal} (reason: {reason})"
             )
 
+        if stop is not None:
+            # A stopped ask waits on nothing it filed: the stop is the point.
+            def _send_stop() -> tuple[bool, str]:
+                stopper = inject.InjectTask(
+                    base_url=base_url,
+                    conversation=exchange.conversation,
+                    prompt=stop_hook.STOP_WORD,
+                    token=token,
+                    author=author,
+                    message_id=f"{message_id}{_INJECT_STOP_SUFFIX}",
+                )
+                try:
+                    started = stopper.submit()
+                except inject.InjectUnavailable as exc:
+                    # The door, not the agent: infrastructure, never graded.
+                    raise _TransportError(f"the stop could not reach the gateway: {exc}") from exc
+                if started:
+                    # A task means the gateway read the word as an ask, not a
+                    # stop; bound it like any stray.
+                    stopper.cancel(started, settle=0)
+                    return False, f"the gateway started task {started} for the stop instead of stopping"
+                if stopper.refusal != inject.REFUSAL_NO_TASK:
+                    return False, f"{inject.refusal_detail(stopper.refusal)}: {stopper.note}"
+                return True, stopper.note
+
+            context_id = exchange.probe.context_id if exchange.probe else ""
+            try:
+                self._stop_after_first_card(
+                    result,
+                    board.api_session_id(context_id) if context_id else "",
+                    stop,
+                    send_stop=_send_stop,
+                    poll_interval=poll_interval,
+                )
+            except _TransportError as exc:
+                return _infra_failure(str(exc))
+            return result
+
         if delegation_timeout > 0:
             # The seam for delegated work, and it is the case runner's rather
             # than the transport's on purpose (the A2A owner's instruction on
@@ -2522,6 +2570,79 @@ class KubeAgentsHarness(AgentHarness):
             except _DelegationTransportExhausted as exc:
                 return _infra_failure(str(exc))
         return result
+
+    def _stop_after_first_card(
+        self,
+        result: AgentResult,
+        session_id: str,
+        stop: stop_hook.Stop,
+        *,
+        send_stop: Callable[[], tuple[bool, str]],
+        poll_interval: float,
+    ) -> None:
+        """Stop the work a stopped ask filed, then watch it for the window (:mod:`stop_hook`).
+
+        The opening turn has ended. The cards its session filed are read off
+        the board; with one there, ``send_stop`` sends ``stop`` on the
+        conversation, and the harness then sleeps out the observation window
+        with no further turn, polling the board so the record says where
+        each card ended. A card still not terminal at the end is archived,
+        as a stalled card is, so it holds no dispatcher slot into the next
+        unit. :data:`stop_hook.STOP_ENTRY` goes on the trajectory either way,
+        ``completed`` only when a card was filed and the gateway took the word
+        as a stop.
+        """
+        entry: dict[str, Any] = {"name": stop_hook.STOP_ENTRY, "args": {"session": session_id}}
+        result.trajectory.append(entry)
+        read = board.read_session_cards(_agent_shell, session_id, _EXEC_TIMEOUT) if session_id else None
+        cards = list(read.card_ids) if read is not None and read.session_found else []
+        entry["args"]["cards"] = cards
+        if not cards:
+            why = "no session to read" if not session_id else (
+                "the session store could not be read" if read is None else "the turn filed no card"
+            )
+            entry.update(status="error", result=f"nothing was stopped: {why}")
+            result.errors.append(f"{stop_hook.STOP_ENTRY}: {why}")
+            return
+        try:
+            sent, detail = send_stop()
+        except _TransportError:
+            # The stop never reached the gateway: the cards are left running,
+            # so archive them before the run is classed as infrastructure.
+            entry.update(status="error", result="the stop could not reach the gateway")
+            _archive_stalled_cards(cards, _EXEC_TIMEOUT)
+            raise
+        entry.update(status="completed" if sent else "error", result=detail)
+        if not sent:
+            result.errors.append(f"{stop_hook.STOP_ENTRY}: {detail}")
+        result.metadata["stop_sent_at"] = time.time()
+        deadline = time.monotonic() + stop.observe_seconds
+        statuses: dict[str, str] = {}
+        while True:
+            seen = board.read_session_cards(_agent_shell, session_id, _EXEC_TIMEOUT)
+            if seen is not None:
+                statuses = {t: str(seen.cards.get(t, {}).get("status") or "unknown") for t in cards}
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            time.sleep(min(left, max(poll_interval, 1.0)))
+        result.metadata["stop_card_statuses"] = statuses
+        # What the stop did, read before the harness archives any leftover:
+        # every card it filed archived, or the stop did not reach them all.
+        stopped = bool(cards) and all(statuses.get(t) == stop_hook.STOPPED_STATUS for t in cards)
+        result.trajectory.append({
+            "name": stop_hook.CARDS_STOPPED_ENTRY,
+            "args": {"statuses": statuses},
+            "status": "completed" if sent and stopped else "error",
+            "result": "every card archived" if stopped else "not every card was archived by the stop",
+        })
+        still = [t for t in cards if statuses.get(t) not in _TERMINAL_STATUSES]
+        if still:
+            result.errors.append(
+                f"{stop_hook.STOP_ENTRY}: card(s) {', '.join(still)} were not terminal "
+                f"{stop.observe_seconds:.0f}s after the stop; archived now"
+            )
+            _archive_stalled_cards(still, _EXEC_TIMEOUT)
 
     def _await_delegated_cards(
         self,
