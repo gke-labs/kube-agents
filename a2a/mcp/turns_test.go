@@ -523,6 +523,12 @@ func TestConversationTablesCannotBeFilled(t *testing.T) {
 			}
 		}
 	}
+	if _, err := c.Resolve(strings.Repeat("é", maxAliasRunes+1), ""); err == nil {
+		t.Error("a name past the cap was taken")
+	}
+	if _, err := c.Resolve(strings.Repeat("é", maxAliasRunes), ""); err != nil {
+		t.Errorf("a name at the cap was refused: %v", err)
+	}
 	if len(c.byAlias) > maxConversations {
 		t.Errorf("alias table holds %d, cap %d", len(c.byAlias), maxConversations)
 	}

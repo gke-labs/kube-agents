@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -49,6 +50,9 @@ const (
 	// maxConversations bounds the alias table; past it the least recently
 	// used alias is forgotten.
 	maxConversations = 1024
+	// maxAliasRunes bounds a conversation's name, so the alias table's
+	// memory is bounded by its count too: a request body may be megabytes.
+	maxAliasRunes = 128
 
 	// submissionWait bounds the wait for the gateway to publish the turn.
 	// noticeGrace is how long notices alone are waited on before they are
@@ -157,6 +161,9 @@ func (c *Conversations) Resolve(alias, token string) (string, error) {
 	if alias == "" {
 		alias = DefaultConversation
 	}
+	if err := checkAlias(alias); err != nil {
+		return "", err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if e, ok := c.byAlias[alias]; ok {
@@ -240,6 +247,14 @@ func mintConversationToken() (string, error) {
 		return "", err
 	}
 	return conversationTokenPrefix + hex.EncodeToString(b), nil
+}
+
+// checkAlias refuses a conversation name longer than maxAliasRunes.
+func checkAlias(alias string) error {
+	if n := utf8.RuneCountInString(alias); n > maxAliasRunes {
+		return fmt.Errorf("conversation name is %d characters; at most %d", n, maxAliasRunes)
+	}
+	return nil
 }
 
 func (c *Conversations) forgetOldestLocked() {
