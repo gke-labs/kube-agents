@@ -107,8 +107,7 @@ This design adds a scheduled review, the **upgrade retrospective**. The requirem
    failure that is gone by then leaves no entry. "None" appears only when the count is zero.
 
 4. **Store the report where the agent can read it,** on the storage its tools use, with the latest
-   report at a fixed path. Post one line per reviewed cluster in chat, with the counts and the most
-   important finding. A weekend with no change posts nothing. A GitHub repository is not required;
+   report at a fixed path. Post the headline and the most important findings in chat, each with its cluster and object, from the record `finish` writes; the report carries one block per reviewed cluster with its counts. A weekend with no change posts nothing. A GitHub repository is not required;
    it adds only the tracked issue.
 5. **Be testable on the failures the test fleet already contains.** The test fleet has planted
    examples of the catalogue's failures. The first report over that fleet must classify those

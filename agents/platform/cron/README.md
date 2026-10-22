@@ -594,16 +594,9 @@ to `/opt/data/upgrade-retrospective/` on the shell sandbox's volume, with
 `upgrade-retro-report.md` pointing at the newest full run. The SOP's half is
 the judgement: it confirms every candidate against the six checks in its
 section 3 and copies the collector's grade, tailors the catalogue's mitigation
-text to the cluster's own objects, files the
-stream's one ledger issue where a repository is configured, and posts one chat
-line per reviewed cluster with its counts and top finding. A quiet weekend, with
-no cluster new or upgraded, posts nothing.
+text to the cluster's own objects, files the stream's one ledger issue where a repository is configured, and reaches `finish`, whose record is what chat receives (the relay posts what `finish` rendered, not the run's final message): the headline and the most severe findings, each with its cluster and object; the counts per cluster and the Errors and Warnings entries are the report's. A quiet weekend, with no cluster new or upgraded, posts nothing.
 
-Two things set it apart from the streams beside it. With no GitHub repository
-in `managed_repos` it runs the collector alone: the SOP skips `start` and
-`finish`, the report on the volume is the record, and the chat lines say so,
-where the streams beside it take the skill's no-forge path (`start` and `finish`
-with no ledger issue, the findings kept in the report store). The Chat Agent's
+Two things set it apart from the streams beside it. With no GitHub repository in `managed_repos` it takes the skill's no-forge path as they do (`start` and `finish` with no ledger issue, the findings kept in the report store), and keeps its own store on the volume beside it: the ledger, the guards and the dated reports the on-demand route reads. The Chat Agent's
 first-run stage (`agents/chat/scripts/oobe.py`) marks this job due after the four
 fleet audits it starts once the first inventory scan settles, so a fresh
 install's first report is a baseline of every cluster it manages. And it never
@@ -615,7 +608,8 @@ opens a pull request on its own: an Error files at
 
 The same report answers a question. `agents/platform/CAPABILITIES.md` and the
 persona's delegation list route "how did the upgrades go", "did anything break",
-"anything to fix before we upgrade" to the SOP's on-demand section, which answers
+"what broke last upgrade" to the SOP's on-demand section (a forward-looking question,
+"anything to worry about before we upgrade", is the readiness report's), which answers
 from the saved report when it is newer than the last upgrade operation on the
 clusters the question covers and runs the collector first when it is not: a
 fleet-wide question as a full run, a question about named clusters as a scoped
