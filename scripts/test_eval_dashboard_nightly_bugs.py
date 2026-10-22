@@ -126,7 +126,7 @@ class FakeGh:
 
             def conn(held):
                 items = [i for i in held if not i.get("pull_request")]
-                return {"totalCount": len(items), "nodes": [{"number": i["number"]} for i in items]}
+                return {"totalCount": len(items), "nodes": [{"number": i["number"]} for i in items[:nightly_bugs.GRAPHQL_FIRST]]}
             repo = {"open": conn(self.open_issues)}
             if body["variables"]["closed"]:
                 repo["closed"] = conn(self.closed_issues)
