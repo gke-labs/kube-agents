@@ -638,10 +638,11 @@ class ShippedRosterTest(unittest.TestCase):
         checked = 0
         for roster, entries in rosters.items():
             for entry in entries:
-                if not entry.get("no_agent"):
+                name = entry.get("script")
+                # A prompt job's pre-run script is resolved the same way.
+                if not entry.get("no_agent") and not name:
                     continue
                 checked += 1
-                name = entry.get("script")
                 self.assertTrue(
                     name, f"{roster}/{entry.get('id')}: no_agent with no script never runs"
                 )

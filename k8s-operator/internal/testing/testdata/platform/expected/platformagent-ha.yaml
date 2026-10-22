@@ -274,13 +274,6 @@ rules:
       - update
       - patch
       - delete
-  - apiGroups:
-      - ""
-    resources:
-      - pods
-    verbs:
-      - get
-      - patch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -327,11 +320,10 @@ metadata:
       uid: ""
 spec:
   accessModes:
-    - ReadWriteMany
+    - ReadWriteOnce
   resources:
     requests:
-      storage: 10Gi
-  storageClassName: standard-rwx
+      storage: 50Gi
 status: {}
 ---
 apiVersion: v1
@@ -353,11 +345,10 @@ metadata:
       uid: ""
 spec:
   accessModes:
-    - ReadWriteMany
+    - ReadWriteOnce
   resources:
     requests:
       storage: 1Gi
-  storageClassName: standard-rwx
 status: {}
 ---
 apiVersion: v1
@@ -410,6 +401,11 @@ data:
     KUBEAGENTS_SCOPE_FILE=/etc/kube-agents/scope.json
     RECONCILE_PROJECT=
     GKE_PROJECT_ID=example-project
+    STALL_WATCH_EXCLUDE_NAMESPACES=
+    STALL_WATCH_MIN_AGE_MINUTES=
+    STALL_WATCH_KINDS=
+    PUBSUB_RELAY_URL=
+    PUBSUB_RELAY_PROJECT=example-project
     GOOGLE_CHAT_RELAY_URL=http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
     GOOGLE_CHAT_PROJECT_ID=kube-agents-gkedemos
     GOOGLE_CHAT_SUBSCRIPTION_NAME=projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub
@@ -862,7 +858,7 @@ spec:
           - ReadWriteOnce
         resources:
           requests:
-            storage: 10Gi
+            storage: 50Gi
       status: {}
     - metadata:
         name: sshd
@@ -1314,15 +1310,12 @@ metadata:
       uid: ""
 spec:
   progressDeadlineSeconds: 1800
-  replicas: 3
+  replicas: 1
   selector:
     matchLabels:
       app: platformagent-gateway
   strategy:
-    rollingUpdate:
-      maxSurge: 25%
-      maxUnavailable: 1
-    type: RollingUpdate
+    type: Recreate
   template:
     metadata:
       annotations:
@@ -1337,13 +1330,11 @@ spec:
         app.kubernetes.io/managed-by: platformagent-controller
         app.kubernetes.io/name: platform-agent
         app.kubernetes.io/part-of: kube-agents
+        kubeagents.io/is-leader: "true"
     spec:
       automountServiceAccountToken: false
       containers:
-        - args:
-            - /opt/hermes/.venv/bin/python3
-            - /opt/data/leader_elect.py
-          env:
+        - env:
             - name: PLATFORM_AGENT_HOME
               value: /opt/data
             - name: HOME
@@ -1402,12 +1393,6 @@ spec:
             - name: GOOGLE_CHAT_HOME_CHANNEL
             - name: GOOGLE_CHAT_ALLOW_ALL_USERS
               value: "true"
-            - name: ENABLE_LEADER_ELECTION
-              value: "true"
-            - name: LEADER_ELECTION_LEASE_NAME
-              value: platformagent-leader
-            - name: LEADER_ELECTION_NAMESPACE
-              value: kubeagents-system
             - name: HERMES_MANAGED_DIR
               value: /etc/hermes
             - name: KUBEAGENTS_SCOPE_FILE
@@ -1424,6 +1409,9 @@ spec:
               value: /var/run/secrets/kubeagents/credential-proxy/token
             - name: KUBE_AGENTS_MCP_RELAY_URL
               value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765/v1/mcp
+            - name: PUBSUB_RELAY_URL
+            - name: PUBSUB_RELAY_PROJECT
+              value: example-project
             - name: PATH
               value: /opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
             - name: PYTHONPATH
@@ -1908,7 +1896,6 @@ spec:
       targetPort: dashboard
   selector:
     app: platformagent-gateway
-    kubeagents.io/is-leader: "true"
 status:
   loadBalancer: {}
 ---

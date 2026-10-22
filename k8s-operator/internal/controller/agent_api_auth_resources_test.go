@@ -133,10 +133,10 @@ func TestAgentAPIAuthOverrideDoesNotAliasTheCR(t *testing.T) {
 func TestValidateAgentAPIAuthResources(t *testing.T) {
 	path := field.NewPath("spec", "deployment", "agentAPIAuth", "resources")
 	cases := []struct {
-		name       string
-		override   *corev1.ResourceRequirements
-		wantErr    bool
-		wantWarn   bool
+		name     string
+		override *corev1.ResourceRequirements
+		wantErr  bool
+		wantWarn bool
 	}{
 		{"nil override", nil, false, false},
 		// Raising limits.memory alone warns that Autopilot without bursting clamps

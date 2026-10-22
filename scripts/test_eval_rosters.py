@@ -22,12 +22,17 @@ less the cases promoted out of it since, plus the seven, less any held-out
 seat. A later roster change
 edits the expected sets here in the same pull request; that is the point of
 pinning them, since the files are what the eval-crew rule in hack/OWNERS
-guards.
+guards. Since #3495 that pin covers the nightly file's frozen part only: a
+case registered since, or a line that comes back to the nightly (a demotion,
+a withdrawn seat), goes in its sorted section, which NightlySortedSectionTest
+holds by its properties, so a case pull request edits no list here.
 
 scripts/test_ci_eval_nightly.py runs the real shell over the real files and
 asserts it builds the arrays this module reads.
 """
 
+import contextlib
+import io
 import pathlib
 import subprocess
 import sys
@@ -143,7 +148,9 @@ ADDED_AFTER_THE_MOVED_BLOCK = [
     "vcs-forge-cli-request-uses-the-verbs",
 ]
 # Registered after the moved block, in file order, by the pull request that
-# authored each case.
+# authored each case. Frozen with the nightly file's frozen part (#3495): a
+# case registered since goes in that file's sorted section, which
+# NightlySortedSectionTest holds by its properties, so nothing is appended here.
 ADDED_AFTER_THE_MOVE = [
     "obtainability-design-quota-vs-capacity",  # the two obtainability-journey probes, PR #1841
     "obtainability-window-planning-probe",
@@ -153,6 +160,9 @@ ADDED_AFTER_THE_MOVE = [
     "fleet-audit-reports-past-run",  # the report store's reader, PR #2115
     "platform-worker-refuses-shipped-skill-edit",  # skill governance, #1848
     "chat-voice-ack-names-target",  # the front door's delegation ack
+    "chat-sample-report-is-not-cluster-state",  # nothing filed on a sample report's say-so, #3080
+    "chat-sample-report-is-not-cluster-state-labelled",  # the same, with the patched adapter's label
+    "chat-real-report-fix-files-confirm-first",  # a real report still files at once, confirm-first
     "bootstrap-inventory-ranking-delivery",  # the onboarding prioritization stage, #2143
     "chat-question-wake-stays-silent",  # SOUL §2 step 5's already-posted rule
     "chat-question-typed-answer-fresh-session",  # a typed answer from a new thread session
@@ -185,6 +195,7 @@ ADDED_AFTER_THE_MOVE = [
     "stop-on-permission-refusal",  # retry after a command-policy refusal, #1948
     "not-found-target-stops-as-failure",  # a missing target stops its card on a hard wall, mock 06
     "alert-config-terraform-promql-probe",  # the gke-alert-configuration skill sync
+    "cluster-agent-observation-time-read",  # an audit trail states no time it did not read, #3256
     "security-chat-request-runs-collector",  # a plain security-posture request runs the compliance collector, #2386
     "compute-class-canary-active-migration-pdb-probe",  # the gke-compute-classes skill sync
     "observability-trace-latency-brokered",  # the trace latency helper through the broker, unparked 2026-10-16 (#2244)
@@ -204,6 +215,7 @@ ADDED_AFTER_THE_MOVE = [
     "chat-answer-tangent-offer-declares-no-step",  # an offer about an unasked workload declares no step, mock 03
     "fleet-zonal-cluster-named-by-region",  # a zonal cluster named by its region, #3371
     "helm-chart-no-reconciler-stops",  # gitops-helm-chart stops where nothing renders charts, #2938
+    "delete-namespace-unowned-stops",  # a delete the repository cannot carry ends in a stated stop, #3077
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
@@ -265,17 +277,46 @@ HELD_OUT_IN_PRESUBMIT = [
 # case": the line leaves blocking-roster.txt and presubmit-cases.txt and lands
 # in the nightly file with its issue above it, as (case, the nightly line it
 # follows). Restoring a case deletes its entry here.
+# The second element is the frozen-part line the demoted case follows, or None
+# when its line went in the nightly file's sorted section (#3495), which is
+# where a demotion lands from now on.
 DEMOTED_AFTER_THE_SPLIT = [
     ("upgrades-lagging-master-probe", "fleet-cost-idle-pool"),  # 2026-10-16, #3269 (agent reads upgradeTargetVersion)
     ("pdb-remediation-pr", "upgrades-lagging-master-probe"),  # 2026-10-17, #3120 (worker declines a pull request into an -infra repo with no manifest; #3145)
+    ("consistency-authorized-networks-probe", None),  # 2026-10-21, #3598 (Gemini reads seeded-c's leftover authorized-networks block as configured; #3448 for the 429s)
 ]
 DEMOTED = {case for case, _ in DEMOTED_AFTER_THE_SPLIT}
+# The demotions recorded before the freeze (#3495), whose lines sit in the
+# frozen part after a named predecessor. Written out and not to grow: every
+# later demotion goes in the sorted section, recorded with None.
+DEMOTED_INTO_THE_FROZEN_PART = frozenset({
+    ("upgrades-lagging-master-probe", "fleet-cost-idle-pool"),
+    ("pdb-remediation-pr", "upgrades-lagging-master-probe"),
+})
+# Held-out seats withdrawn since #3495: a withdrawal moves the line to the
+# nightly file's sorted section and records the case here, in the same edit
+# that deletes its HELD_OUT_IN_PRESUBMIT entry.
+WITHDRAWN_TO_SORTED: list[str] = []
+# The pinned cases whose lines may sit in the sorted section rather than the
+# frozen part. Nothing else may leave the frozen part.
+ALLOWED_IN_THE_SORTED_SECTION = (
+    {case for case, follows in DEMOTED_AFTER_THE_SPLIT if follows is None} | set(WITHDRAWN_TO_SORTED))
+# Every case that was ever in the presubmit file before the nightly file was
+# frozen (#3495): the split's TASKS array plus the two promoted since. Written
+# out, so it doesn't grow with later promotions. A held-out seat among these
+# must have a pinned nightly line; a seat for a case registered later can't.
+EVER_IN_THE_PRESUBMIT_BEFORE_3495 = frozenset(PRESUBMIT_AT_SPLIT) | {
+    "incident-triage-oom-event-probe",
+    "pdb-remediation-pr",
+}
 
 
 def with_insertions(base, insertions):
     """``base`` with each (case, follows) pair inserted after its predecessor."""
     out = list(base)
     for case, follows in insertions:
+        if follows is None:  # its line is in the nightly file's sorted section
+            continue
         out.insert(out.index(follows) + 1, case)
     return out
 
@@ -326,6 +367,90 @@ class ParserTest(unittest.TestCase):
         self.assertTrue(eval_rosters.blocking_roster())
 
 
+class NightlySortedSectionTest(unittest.TestCase):
+    """The nightly file's last section, where new cases go (#3495).
+
+    Properties instead of a pinned list: a case pull request adds one line at
+    its place in case-id order, with its reason above it, and edits nothing a
+    second such pull request edits.
+    """
+
+    def setUp(self):
+        self.text = eval_rosters.NIGHTLY_CASES_FILE.read_text(encoding="utf-8")
+        self.frozen, self.sorted_section, self.tail = eval_rosters.split_nightly(self.text)
+
+    def test_the_section_is_in_case_id_order(self):
+        # Python's order, the same as `LC_ALL=C sort`; a UTF-8 locale's sort
+        # ignores the hyphens and can disagree.
+        self.assertEqual(self.sorted_section, sorted(self.sorted_section))
+
+    def test_no_case_is_listed_twice(self):
+        everything = self.frozen + self.sorted_section
+        self.assertEqual(len(everything), len(set(everything)))
+
+    def test_every_case_in_the_section_has_its_reason_above_it(self):
+        # The parser's own boundary rule keeps the marker's stanza from being
+        # anyone's reason: a comment separated from the next entry by a blank
+        # line isn't a reason (test_a_blank_line_follows_the_marker_stanza).
+        # It keys a reason by its entry, here a ./tasks/<id>/task.yaml path.
+        reasons = {
+            eval_rosters.CASE_ENTRY_RE.match(entry).group(1): reason
+            for entry, reason in eval_rosters.parse_lane_exclusions(self.tail).items()
+            if eval_rosters.CASE_ENTRY_RE.match(entry)
+        }
+        for case in self.sorted_section:
+            with self.subTest(case=case):
+                self.assertTrue(
+                    reasons.get(case),
+                    "each case in the sorted section needs its own # lines directly above its entry; "
+                    "a reason shared with the entry above it doesn't count")
+
+    def test_a_blank_line_follows_the_marker_stanza(self):
+        lines = self.tail.splitlines()
+        i = 0
+        while i < len(lines) and lines[i].lstrip().startswith("#"):
+            i += 1
+        if i < len(lines):  # an empty section ends at the stanza
+            self.assertEqual(
+                lines[i].strip(), "",
+                "leave a blank line between the sorted-section marker's comment block and the first "
+                "case's reason, so the marker's text isn't read as that case's reason")
+
+    def test_the_marker_must_appear_exactly_once(self):
+        entry = "./tasks/a-case/task.yaml\n"
+        marker = eval_rosters.NIGHTLY_SORTED_SECTION_MARKER + " ──\n"
+        with self.assertRaises(ValueError):
+            eval_rosters.split_nightly(entry)
+        with self.assertRaises(ValueError):
+            eval_rosters.split_nightly(marker + entry + marker)
+        self.assertEqual(eval_rosters.split_nightly(entry + marker + "# why\n" + entry)[:2],
+                         (["a-case"], ["a-case"]))
+
+    def test_the_command_prints_the_summary(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(eval_rosters.main(["--summary", "--repetitions", "2"]), 0)
+        got = dict(line.split(": ", 1) for line in out.getvalue().splitlines())
+        matrix = len(eval_rosters.presubmit_cases()) + len(eval_rosters.nightly_cases())
+        self.assertEqual(got["nightly matrix cases"], str(matrix))
+        self.assertEqual(got["nightly matrix units"], str(matrix * 2))
+
+    def test_the_command_refuses_no_flag_and_a_repetitions_below_one(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(eval_rosters.main([]), 2)
+        for bad in ("0", "-1", "x"):
+            with self.subTest(repetitions=bad), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    eval_rosters.main(["--summary", "--repetitions", bad])
+
+    def test_the_summary_counts_the_files(self):
+        got = eval_rosters.summary(repetitions=3)
+        matrix = len(eval_rosters.presubmit_cases()) + len(eval_rosters.nightly_cases())
+        self.assertEqual(got["nightly matrix cases"], matrix)
+        self.assertEqual(got["nightly matrix units"], matrix * 3)
+        self.assertEqual(got["nightly-only cases"], len(self.frozen) + len(self.sorted_section))
+
+
 class SplitLostNothingTest(unittest.TestCase):
     def test_the_presubmit_file_is_the_tasks_array_at_the_split_plus_the_promoted_less_the_held_out(self):
         expected = [
@@ -347,12 +472,14 @@ class SplitLostNothingTest(unittest.TestCase):
                 self.assertIn(case, eval_rosters.presubmit_cases())
                 self.assertNotIn(case, eval_rosters.blocking_roster())
                 self.assertNotIn(case, eval_rosters.nightly_cases())
-                self.assertIn(
-                    case,
+                pinned_nightly = (
                     NIGHTLY_AT_SPLIT + ADDED_AFTER_THE_SPLIT + MOVED_TO_NIGHTLY + ADDED_AFTER_THE_MOVED_BLOCK
-                    + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL + ADDED_AFTER_THE_MOVE,
-                    "a held-out seat's nightly line is what moved",
+                    + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL + ADDED_AFTER_THE_MOVE
                 )
+                if case in EVER_IN_THE_PRESUBMIT_BEFORE_3495:
+                    self.assertIn(case, pinned_nightly, "a pre-freeze seat's nightly line is what moved")
+                # A seat for a case registered after the freeze came from the
+                # sorted section, which pins no history; its seat cites its record.
         for case in HELD_OUT_TO_NIGHTLY:
             if case in seated:
                 continue
@@ -368,6 +495,10 @@ class SplitLostNothingTest(unittest.TestCase):
         )
 
     def test_the_nightly_file_is_the_nightly_array_plus_the_moved_cases_less_the_promoted_plus_the_held_out(self):
+        # The frozen part only: the sorted section below the marker is held by
+        # NightlySortedSectionTest (#3495).
+        frozen, sorted_section, _ = eval_rosters.split_nightly(
+            eval_rosters.NIGHTLY_CASES_FILE.read_text(encoding="utf-8"))
         promoted = {case for case, _ in PROMOTED_AFTER_THE_SPLIT}
         seated = {case for case, _ in HELD_OUT_IN_PRESUBMIT}
         expected = [
@@ -375,17 +506,30 @@ class SplitLostNothingTest(unittest.TestCase):
             for c in NIGHTLY_AT_SPLIT + ADDED_AFTER_THE_SPLIT + MOVED_TO_NIGHTLY + ADDED_AFTER_THE_MOVED_BLOCK
             if c not in promoted
         ]
-        self.assertEqual(
-            eval_rosters.nightly_cases(),
-            with_insertions(
-                [
-                    c
-                    for c in expected + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL + ADDED_AFTER_THE_MOVE
-                    if c not in seated and c not in PARKED_AFTER_THE_MOVE
-                ],
-                DEMOTED_AFTER_THE_SPLIT,
-            ),
+        pinned = with_insertions(
+            [
+                c
+                for c in expected + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL + ADDED_AFTER_THE_MOVE
+                if c not in seated and c not in PARKED_AFTER_THE_MOVE
+            ],
+            DEMOTED_AFTER_THE_SPLIT,
         )
+        # A demotion recorded with None, or a withdrawn seat, is held in the
+        # sorted section instead; nothing else may leave the frozen part.
+        self.assertEqual(
+            frozen,
+            [c for c in pinned if c not in ALLOWED_IN_THE_SORTED_SECTION],
+            "the nightly file's frozen part (every entry above the sorted-section marker) changed: "
+            "a new case goes in the sorted section at the foot of the file; a demotion is recorded "
+            "in DEMOTED_AFTER_THE_SPLIT with None and a withdrawn seat in WITHDRAWN_TO_SORTED",
+        )
+
+    def test_a_demotion_since_the_freeze_goes_in_the_sorted_section(self):
+        named = {(case, follows) for case, follows in DEMOTED_AFTER_THE_SPLIT if follows is not None}
+        self.assertLessEqual(
+            named, DEMOTED_INTO_THE_FROZEN_PART,
+            "a demotion since #3495 puts its line in the nightly file's sorted section and is "
+            "recorded in DEMOTED_AFTER_THE_SPLIT with None, not after a frozen-part predecessor")
 
     def test_a_demoted_case_is_in_the_nightly_only(self):
         for case in DEMOTED:
@@ -575,6 +719,17 @@ class InjectLaneExclusionsTest(unittest.TestCase):
 
     def test_the_file_is_the_pinned_set(self):
         self.assertEqual(list(eval_rosters.inject_lane_exclusions()), INJECT_LANE_EXCLUDED)
+
+    def test_the_blocking_roster_cases_it_excludes_are_the_pinned_set(self):
+        # The merge-blocking presubmit runs on the inject lane, so a roster
+        # case listed here leaves what can red a pull request: hack/ci-eval-pr.sh
+        # drops it from the matrix and from BOOTSTRAP_ADMITTED there. It keeps
+        # its seat on the today lane, which grades over the api transport but
+        # gates nothing. Adding another is that decision, made here and in
+        # docs/eval-gate-roster.md ("The inject lane"), not a side effect of an
+        # exclusion entry.
+        roster = set(eval_rosters.blocking_roster())
+        self.assertEqual([case for case in eval_rosters.inject_lane_exclusions() if case in roster], ["agent-kanban-smoke"])
 
     def test_every_exclusion_names_a_registered_case(self):
         registered = set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases())

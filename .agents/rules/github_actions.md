@@ -33,7 +33,9 @@ Two classes need no guard: a workflow reachable only through `workflow_call` is 
 (`reconcile-environment.yml`, `teardown-environment.yml`), and a `workflow_dispatch`-only one runs only when someone deliberately
 starts it (`rc-create-tag.yml`, `deploy-environment.yml`, `rc-tag-validated.yml`,
 `e2e-gchat-test.yml`). `docs-deploy.yml` is push-triggered and deliberately unguarded, so a fork
-can publish its own Pages site.
+can publish its own Pages site. `merge-gate.yml`'s `gate` job is unguarded too: it runs only on
+`merge_group`, which a fork never gets, and a skipped job reports success to a required check, so
+a guard that evaluated false on a queue commit would pass every group.
 
 ## Collapse superseded pull-request runs with a concurrency group
 

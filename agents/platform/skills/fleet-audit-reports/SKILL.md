@@ -12,8 +12,9 @@ owns both ends of that lifecycle.
 ## The store
 
 `/opt/data/fleet-audit/reports/<audit-id>/<owner>/<name>/`, one directory per stream and GitOps
-repository — a stream publishes one ledger per managed repository. On an install with no forge
-configured, the repository directory is `no_forge/local`:
+repository. A run publishes to the `role: gitops` repository, or to the repository a person gave
+with `--repo`, so a stream can have more than one directory. A run with no repository to publish
+to uses `no_forge/local`:
 
 - `latest.json` — the newest run's envelope.
 - `runs/<YYYYMMDDThhmmss.ffffffZ>.json` — one envelope per run, newest 14 kept. The only
@@ -23,13 +24,18 @@ An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`,
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, `unpublished_candidates`,
 `wholly_unpublished_checks`, `uncorroborated_findings`, `prs_opened`, `prs_still_open`, `prs_closed`, `silent_ok`,
 `ledger_held_open`, `delta_known`, `new_ids`, `resolved_ids`, `current_ids`, `id_scheme`, `ledger_body`,
-`document`, and sometimes `ledger_document`, `inspect_s`, `publish_s` and `collect_s`.
+`document`, and sometimes `ledger_document`, `silent_floor`, `inspect_s`, `publish_s` and `collect_s`.
 
 - `document` is this run's whole validated findings document — un-clipped, so it holds findings the
   issue body had no room to print.
-- `status` is `OPENED`, `UPDATED`, `CLEAN`, `HELD`, or `NO_FORGE`. `NO_FORGE` means no forge is
-  configured: the run wrote no ledger issue, `issue_number` and `issue_url` are null, and the
-  envelope is the only record of what it found. `ledger_held_open` true means a `CLEAN` or
+- `status` is `OPENED`, `UPDATED`, `CLEAN`, `HELD`, or `NO_FORGE`. `NO_FORGE` means the run had no
+  repository to publish to: it wrote no ledger issue, `issue_number` and `issue_url` are null, and
+  the envelope is the only record of what it found. A `NO_FORGE` envelope in a repository's
+  directory carries `unreachable_repo` (`repo`, `reason`): the run could not reach that repository.
+  One under `no_forge/local` can carry `no_repository_chosen` (`reason`): several repositories are
+  managed and none is the one `role: gitops` repository. For both, the new and resolved counts are
+  unknown; say so. An envelope with neither key is from an install with no forge.
+  `ledger_held_open` true means a `CLEAN` or
   `HELD` run left the issue open (partial, or over findings it did not account for) without
   rewriting it: the issue still lists the previous run's findings, `current` counts those, and this
   run's `findings: 0` and `critical: 0` do **not** mean the ledger is clear. `streams`, `show` and
@@ -40,8 +46,11 @@ An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`,
   delta: `new_ids` and `resolved_ids` are empty, and `new`/`resolved` 0, because nothing was claimed,
   not because nothing changed. Say the delta is unknown for that run. Envelopes written before the
   key existed lack it; read their counts as they are. `streams` and `show` carry it.
-- `current_ids` is exactly what the body's hidden block published: the findings the body rendered
-  plus the ids the collector held. Derive this run's full set from `document`.
+- `silent_floor` true means an earlier `finish` in the same run reported news or opened a pull
+  request, so this run's
+  `silent_ok` was kept `false` and its counts may be measured against that `finish`.
+- `current_ids` is exactly what the body's hidden block published: the findings the body named, in
+  full or on one line, plus the ids the collector held. Derive this run's full set from `document`.
 - `inspect_s`, `publish_s` and `collect_s` are seconds: from `start` to `finish`, for `finish` to
   publish, and for the collector to run. An envelope has only the ones `finish` could measure.
   `show` gives them, with null for the others; `streams` does not carry them.
@@ -151,7 +160,8 @@ python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_qu
 python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_query.py checks obtainability-audit --cluster prod-us-east
 ```
 
-The ledger drops its least-severe findings, then its evidence table whole, to stay inside GitHub's
+The ledger names findings it has no room to show in full on one line each, as far as the room left
+after the criticals' full blocks allows, then drops the least-severe ones and its evidence table whole, to stay inside GitHub's
 body limit, and says so in a notice that points here. `findings` lists every finding the run
 carried. `checks` is one row per check the run says it performed, with the command that performed
 it, plus each `checks_not_applicable` exclusion and its reason; filter by cluster or check — a

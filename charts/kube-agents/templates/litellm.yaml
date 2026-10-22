@@ -5,10 +5,33 @@
 {{- end }}
 {{- /* Per-provider default model names mirror install.defaults.env (DEFAULT_MODEL_*);
        a chart cannot source that file, and tests/test_installer_common.py pins the two equal. */}}
-{{- $defaultModels := dict "gemini" "gemini-3.5-flash" "anthropic" "claude-opus-5" "openai" "gpt-5.4" "vertex_ai" "gemini-3.5-flash" }}
-{{- /* openai_compatible has no default model, so it is allowed beside the table rather than in it. */}}
-{{- if and (not (hasKey $defaultModels $provider)) (ne $provider "openai_compatible") }}
-{{- fail (printf "litellm.modelProvider %q is not one of gemini, anthropic, openai, vertex_ai, openai_compatible — a typo here would otherwise fail only at runtime" $provider) }}
+{{- $defaultModels := dict "gemini" "gemini-3.5-flash" "anthropic" "claude-opus-5" "openai" "gpt-5.4" "vertex_ai" "gemini-3.5-flash" "sap" "anthropic--claude-4.5-sonnet" }}
+{{- /*
+  openai_compatible has no default model, so it is allowed beside the table
+  rather than in it. Any other value is taken as a LiteLLM provider slug
+  (azure, bedrock, databricks, ...) whose credentials arrive through
+  envFromSecret: the chart knows no default model for it, so modelDefaultName
+  is required, and the slug's shape is checked here so a typo fails the render
+  rather than the first model call.
+*/}}
+{{- $litellmSlugPattern := "^[a-z][a-z0-9_]*$" }}
+{{- $tableProvider := or (hasKey $defaultModels $provider) (eq $provider "openai_compatible") }}
+{{- if and (not $tableProvider) (not (regexMatch $litellmSlugPattern $provider)) }}
+{{- fail (printf "litellm.modelProvider %q is not one of gemini, anthropic, openai, vertex_ai, openai_compatible, sap, nor a LiteLLM provider slug (lowercase letters, digits and underscores) — a typo here would otherwise fail only at runtime" $provider) }}
+{{- end }}
+{{- if and (not $tableProvider) (empty .Values.litellm.modelDefaultName) }}
+{{- fail (printf "litellm.modelProvider %q is a LiteLLM provider slug outside the chart's table, so litellm.modelDefaultName must name the model it serves (there is no default); its credentials go in the Secret litellm.envFromSecret names." $provider) }}
+{{- end }}
+{{- /*
+  A Secret the operator creates, mounted whole into the gateway container as
+  environment variables (envFrom, below). Its name is checked here so a typo
+  fails the render rather than leaving a pod that never finds its credentials.
+*/}}
+{{- $envFromSecret := .Values.litellm.envFromSecret | default "" }}
+{{- $secretNamePattern := "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" }}
+{{- $secretNameMaxLength := 253 }}
+{{- if and $envFromSecret (or (gt (len $envFromSecret) $secretNameMaxLength) (not (regexMatch $secretNamePattern $envFromSecret))) }}
+{{- fail (printf "litellm.envFromSecret %q is not a valid Secret name (a lowercase DNS subdomain of at most %d characters)." $envFromSecret $secretNameMaxLength) }}
 {{- end }}
 {{- $rollingUpdate := include "kube-agents.rollingUpdateFenceposts" (dict "rollingUpdate" .Values.litellm.rollingUpdate "defaultSurge" 1 "defaultUnavailable" 1 "scope" "litellm.rollingUpdate") | fromYaml }}
 {{- $model := .Values.litellm.modelDefaultName | default (get $defaultModels $provider) }}
@@ -133,6 +156,23 @@
 {{- if $redactionEnabled }}
 {{- $callbackList = append $callbackList "litellm_redaction_callback.proxy_handler_instance" }}
 {{- end }}
+{{- /*
+  The OAuth2 client-credentials hook, for an openai_compatible gateway that
+  issues short-lived bearer tokens instead of taking a static key. Shipped
+  only when that provider has an env Secret to read the token URL and client
+  credentials from, so every other render, its checksum included, is what it
+  was; the hook itself stays idle until OPENAI_COMPATIBLE_OAUTH_TOKEN_URL is
+  set in that Secret.
+*/}}
+{{- $oauthHookEnabled := and (eq $provider "openai_compatible") (ne $envFromSecret "") }}
+{{- $oauthHookSource := "" }}
+{{- if $oauthHookEnabled }}
+{{- $oauthHookSource = .Files.Get "files/litellm_oauth2_callback.py" }}
+{{- if empty $oauthHookSource }}
+{{- fail "the chart's files/litellm_oauth2_callback.py is missing" }}
+{{- end }}
+{{- $callbackList = append $callbackList "litellm_oauth2_callback.proxy_handler_instance" }}
+{{- end }}
 {{- $quotedCallbacks := list }}
 {{- range $callbackList }}
 {{- $quotedCallbacks = append $quotedCallbacks (quote .) }}
@@ -151,9 +191,10 @@
   Every key the ConfigMap carries feeds the checksum: the thinking-replay
   hook, the rule file and the two redaction modules are subPath mounts too, so
   an edit to any of them has to roll the pods the same way an edit to
-  config.yaml does. With redaction off its three extras are empty strings.
+  config.yaml does. With redaction off its three extras are empty strings, as
+  is the OAuth2 hook's source while the hook is not shipped.
 */}}
-{{- $checksumInput := printf "%s%s%s%s%s" $config $thinkingReplaySource $redactionConfig $redactorSource $redactionCallbackSource }}
+{{- $checksumInput := printf "%s%s%s%s%s%s" $config $thinkingReplaySource $redactionConfig $redactorSource $redactionCallbackSource $oauthHookSource }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -174,6 +215,10 @@ data:
     {{- $redactorSource | nindent 4 }}
   litellm_redaction_callback.py: |
     {{- $redactionCallbackSource | nindent 4 }}
+  {{- end }}
+  {{- if $oauthHookEnabled }}
+  litellm_oauth2_callback.py: |
+    {{- $oauthHookSource | nindent 4 }}
   {{- end }}
 {{- if eq $provider "vertex_ai" }}
 ---
@@ -269,6 +314,17 @@ spec:
                 - ALL
           resources:
             {{- toYaml .Values.litellm.resources | nindent 12 }}
+          {{- with $envFromSecret }}
+          # A Secret the operator creates, read whole as environment variables
+          # by whichever LiteLLM provider is configured. Optional: the pod
+          # starts without it, and the first model call, not the rollout,
+          # reports a missing credential. A name set under env below wins over
+          # the same name here.
+          envFrom:
+            - secretRef:
+                name: {{ . | quote }}
+                optional: true
+          {{- end }}
           env:
             # See the pod securityContext above: the only writable directory.
             - name: HOME
@@ -386,6 +442,11 @@ spec:
             - name: config-volume
               mountPath: /app/litellm_thinking_replay_callback.py
               subPath: litellm_thinking_replay_callback.py
+            {{- if $oauthHookEnabled }}
+            - name: config-volume
+              mountPath: /app/litellm_oauth2_callback.py
+              subPath: litellm_oauth2_callback.py
+            {{- end }}
             {{- if $redactionEnabled }}
             # Beside config.yaml, because LiteLLM resolves a custom callback
             # module relative to the config file's directory and the callback

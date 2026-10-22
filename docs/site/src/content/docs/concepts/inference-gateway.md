@@ -9,14 +9,15 @@ The Platform Agent talks to an LLM through a **Completions API** proxy so provid
 
 ## Choosing a provider
 
-| You want                                            | Use                                                               | Why                                                                                                                                                               |
-| --------------------------------------------------- | ----------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Fastest path with a hosted frontier model           | **LiteLLM → Gemini** (default)                                    | One API key, no GPU node pool, no cluster egress beyond the LiteLLM pod.                                                                                          |
-| Provider redundancy or A/B                          | **LiteLLM → Gemini + Anthropic + OpenAI**                         | LiteLLM handles the router config; agent config is unchanged.                                                                                                     |
-| Inference billed to your own GCP project            | **LiteLLM → Vertex AI / Model Garden**                            | Workload Identity instead of an API key; Gemini plus Model Garden publishers. See [below](#vertex-ai-and-model-garden).                                           |
-| Free local prototyping with a consumer subscription | **LiteLLM → ChatGPT subscription** (OAuth device flow)            | See [`examples/litellm-chatgpt-subscription/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-chatgpt-subscription).                          |
-| Model traffic kept off hosted model providers       | **LiteLLM → your OpenAI-compatible server** (`openai_compatible`) | vLLM, TGI or an internal gateway, in the cluster or on your network. Google APIs stay required. See [below](#openai-compatible-endpoints-self-hosted-or-private). |
-| Deterministic demos / cheap tests                   | **Any of the above + inference-replay proxy**                     | Caches responses in a PVC; replays on cache hit.                                                                                                                  |
+| You want                                                           | Use                                                               | Why                                                                                                                                                                                                            |
+| ------------------------------------------------------------------ | ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Fastest path with a hosted frontier model                          | **LiteLLM → Gemini** (default)                                    | One API key, no GPU node pool, no cluster egress beyond the LiteLLM pod.                                                                                                                                       |
+| Provider redundancy or A/B                                         | **LiteLLM → Gemini + Anthropic + OpenAI**                         | LiteLLM handles the router config; agent config is unchanged.                                                                                                                                                  |
+| Inference billed to your own GCP project                           | **LiteLLM → Vertex AI / Model Garden**                            | Workload Identity instead of an API key; Gemini plus Model Garden publishers. See [below](#vertex-ai-and-model-garden).                                                                                        |
+| Free local prototyping with a consumer subscription                | **LiteLLM → ChatGPT subscription** (OAuth device flow)            | See [`examples/litellm-chatgpt-subscription/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-chatgpt-subscription).                                                                       |
+| Model traffic kept off hosted model providers                      | **LiteLLM → your OpenAI-compatible server** (`openai_compatible`) | vLLM, TGI or an internal gateway, in the cluster or on your network. Google APIs stay required. See [below](#openai-compatible-endpoints-self-hosted-or-private).                                              |
+| Model traffic through your SAP tenant, or another LiteLLM provider | **LiteLLM → SAP AI Core** (`sap`), or the provider's slug         | Credentials in a Secret you create, named with `--litellm-env-secret`; an OpenAI-compatible gateway behind OAuth2 client credentials uses the same Secret. See [below](#a-credentials-secret-for-the-gateway). |
+| Deterministic demos / cheap tests                                  | **Any of the above + inference-replay proxy**                     | Caches responses in a PVC; replays on cache hit.                                                                                                                                                               |
 
 ## LiteLLM (hosted models)
 
@@ -44,17 +45,19 @@ Two things have to name that alias, not one. The profile config covers Chat, whi
 
 The two substituted values come from the install (`MODEL_PROVIDER` and `MODEL_DEFAULT_NAME`, saved in `install.env` and carried into the chart values). Supported providers and their shipping defaults:
 
-| `MODEL_PROVIDER`    | Default `MODEL_DEFAULT_NAME` | Notes                                                                                                                                 |
-| ------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `gemini` (default)  | `gemini-3.5-flash`           | Uses `GEMINI_API_KEY`.                                                                                                                |
-| `anthropic`         | `claude-opus-5`              | Uses `ANTHROPIC_API_KEY`.                                                                                                             |
-| `openai`            | `gpt-5.4`                    | Uses `OPENAI_API_KEY`.                                                                                                                |
-| `vertex_ai`         | `gemini-3.5-flash`           | No API key — Workload Identity. See below.                                                                                            |
-| `openai_compatible` | none; required               | Optional `OPENAI_COMPATIBLE_API_KEY`. The base URL is required too. See [below](#openai-compatible-endpoints-self-hosted-or-private). |
+| `MODEL_PROVIDER`       | Default `MODEL_DEFAULT_NAME`   | Notes                                                                                                                                 |
+| ---------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `gemini` (default)     | `gemini-3.5-flash`             | Uses `GEMINI_API_KEY`.                                                                                                                |
+| `anthropic`            | `claude-opus-5`                | Uses `ANTHROPIC_API_KEY`.                                                                                                             |
+| `openai`               | `gpt-5.4`                      | Uses `OPENAI_API_KEY`.                                                                                                                |
+| `vertex_ai`            | `gemini-3.5-flash`             | No API key — Workload Identity. See below.                                                                                            |
+| `openai_compatible`    | none; required                 | Optional `OPENAI_COMPATIBLE_API_KEY`. The base URL is required too. See [below](#openai-compatible-endpoints-self-hosted-or-private). |
+| `sap`                  | `anthropic--claude-4.5-sonnet` | OAuth2 client credentials from a Secret you create. See [below](#sap-ai-core).                                                        |
+| any other LiteLLM slug | none; required                 | `azure`, `bedrock`, `databricks`, ...; credentials from the same Secret. See [below](#other-litellm-providers).                       |
 
 Any model string the chosen provider accepts is valid — there is no allow-list in the harness. For example, [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) pins `gemini-3.1-flash-lite`.
 
-For a Claude model (`anthropic`, or `vertex_ai` with a `claude-` model name) the chart adds `additional_drop_params: ["temperature", "top_p", "top_k"]` under every alias. Claude Opus 5 refuses all three with a `400`, and a caller can send them without knowing which model sits behind `model-default`, so the gateway removes them from every request before it reaches the provider. A caller therefore cannot set sampling on any Claude model through the gateway. The kustomize dev copy does not render the key.
+For a Claude model (`anthropic`, `vertex_ai` with a `claude-` model name, or `sap` with an `anthropic--` model name) the chart adds `additional_drop_params: ["temperature", "top_p", "top_k"]` under every alias. Claude Opus 5 refuses all three with a `400`, and a caller can send them without knowing which model sits behind `model-default`, so the gateway removes them from every request before it reaches the provider. A caller therefore cannot set sampling on any Claude model through the gateway. The kustomize dev copy does not render the key.
 
 To change the default on an installed system, re-run the installer with `--menu` (e.g. `./install.sh --menu` or `$HOME/kube-agents/install.sh --menu`) and use the model-provider entry followed by **Save & Apply** — one `terraform apply` rewrites the LiteLLM `ConfigMap` and rolls the gateway. On a dev cluster, set the variables and redeploy the dev copy:
 
@@ -125,13 +128,13 @@ The agent cannot do this itself, and that is the point of putting it here. It as
 
 The system prompt takes the 1h tier because it is the largest static span, every profile and cron tick shares it, and a read refreshes the TTL — so a half-hourly cron schedule keeps it warm instead of missing a 5-minute window every time. The two rolling points ride the conversation tail on the default 5-minute tier. Anthropic allows four breakpoints per request; LiteLLM counts any the caller supplied and never overwrites them, so a client with its own layout still wins.
 
-Any other model gets no breakpoints. On Gemini, LiteLLM turns these markers into Vertex explicit context caching: before every model call it lists the project's cached contents, and it creates a new cache whenever the cached prefix is new. A create that Vertex is slow to finish fails the whole turn: in one case it surfaced as a 401 after a stall of more than ten minutes. Gemini's implicit caching needs no markers and still serves a repeated prefix from cache. The chart applies the same rule as it does to the sampling keys above, so switching `MODEL_PROVIDER` re-renders the breakpoints with it. The kustomize dev copy adds them for `MODEL_PROVIDER=anthropic` only, in its `anthropic` overlay; `vertex_ai` with a `claude-` model gets them only through the chart.
+Any other model gets no breakpoints. On Gemini, LiteLLM turns these markers into Vertex explicit context caching: before every model call it lists the project's cached contents, and it creates a new cache whenever the cached prefix is new. A create that Vertex is slow to finish fails the whole turn: in one case it surfaced as a 401 after a stall of more than ten minutes. Gemini's implicit caching needs no markers and still serves a repeated prefix from cache. The chart reads the same provider and model name as the sampling-key drop above, with one difference: a Claude model behind `sap` gets the drop and no breakpoints. Switching `MODEL_PROVIDER` re-renders both. The kustomize dev copy adds them for `MODEL_PROVIDER=anthropic` only, in its `anthropic` overlay; `vertex_ai` with a `claude-` model gets them only through the chart.
 
 ### Replayed thinking on Gemini
 
-A client that turns thinking on, as Claude Code does in the session pods of an install on the unsupported `spec.mode: next` stack, sends each earlier turn's thinking back in the next request. LiteLLM passes that thinking to a Gemini model as ordinary text rather than as a thought, so Gemini reads its earlier thought summaries as things it said and opens its next answers with more of them: a bold step title and a line such as "I will now draft the report". No prompt reaches that text.
+A client that turns thinking on, as Claude Code does in the session pods of an install on the `spec.mode: next` stack, sends each earlier turn's thinking back in the next request. LiteLLM releases before v1.106.0 passed that thinking to a Gemini model as ordinary text rather than as a thought, so Gemini read its earlier thought summaries as things it said and opened its next answers with more of them: a bold step title and a line such as "I will now draft the report". No prompt reached that text. The release the install pins ([Container images](/kube-agents/deploy/docker-images/)) carries the upstream fix.
 
-Both the chart and the kustomize base therefore load a pre-call hook that drops replayed thinking blocks from earlier assistant turns before the request goes to a Gemini model. Thinking still streams back, and requests to any other model, Claude above all, go out as sent. The gateway log records each request it changed, as `kube_agents.litellm_thinking_replay INFO thinking replay: dropped N replayed thinking block(s)`.
+Both the chart and the kustomize base still load a pre-call hook that drops replayed thinking blocks from earlier assistant turns before the request goes to a Gemini model. It removes more than the upstream fix does. Thinking still streams back, and requests to any other model, Claude above all, go out as sent. The gateway log records each request it changed, as `kube_agents.litellm_thinking_replay INFO thinking replay: dropped N replayed thinking block(s)`.
 
 ### Redaction at the gateway
 
@@ -172,7 +175,7 @@ A pseudonym is the first twelve hex characters of an HMAC-SHA256 over the value,
 
 **Pseudonymisation is not reversible, and that limits what the agent can do with a pseudonymised value.** The model never sees `10.0.0.5`; it sees `[ip:3fa9c2d1e0b4]`, and a `kubectl` command or a chat answer it writes from that token names an address that does not exist, so the tool call fails or the answer is useless. Pseudonymise identifiers the agent only needs to reason _about_; keep the ones it must act on in `allowCidrs`, use `off`, or accept that those tasks degrade. Masking has the same limit without the correlation.
 
-What this covers is the request body on its way to the provider. It does not touch responses, so an identifier the model already knows from an earlier, unredacted turn can still come back. It does not touch what the agent writes to disk: conversation logs and the state databases still carry tool output verbatim, and what the image itself redacts on the agent's volume is listed under [Security and IAM](/kube-agents/reference/security-and-iam/#what-leaves-for-the-model-provider). And it does not touch chat egress. A rule that fails to load stops the gateway pod at startup rather than forwarding requests unredacted, and the render fails on a name, action or source it does not accept; an exception inside the hook fails that request. Each redacted request writes one line of substitution counts by rule name to the gateway pod's log, never the payload.
+What this covers is the request body on its way to the provider. It does not touch responses, so an identifier the model already knows from an earlier, unredacted turn can still come back. The same switch reaches the agent pod: the chart projects this rule file there at a fixed path, and the image applies the IP and operator-rule layers, after its own credential masking, to what the agent writes to its volume, `agent.log`, the terminal-output cache, the worker transcript, the session store (`state.db`) and the kanban board; [Security and IAM](/kube-agents/reference/security-and-iam/#what-leaves-for-the-model-provider) lists what that covers and what it does not. Each process reads the file once at start: a changed rule file reaches the gateway on its next roll, and in the agent pod a long-lived process keeps the rules it started with while each new worker process reads the current file, so roll the pod to move them all. The image parses the file with the grammar it shipped with, so keep the chart and the agent image at one version when this switch is on. It does not touch chat egress. A rule that fails to load stops the gateway pod at startup rather than forwarding requests unredacted, and the render fails on a name, action or source it does not accept; an exception inside the hook fails that request. Each redacted request writes one line of substitution counts by rule name to the gateway pod's log, never the payload.
 
 ### Vertex AI and Model Garden
 
@@ -196,6 +199,34 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 
 A re-run against an existing install reconciles the switch in one `terraform apply` — the gateway's IAM pair, its KSA, and the rolled ConfigMap land together.
 
+### A credentials Secret for the gateway
+
+`LITELLM_ENV_SECRET_NAME` (`--litellm-env-secret`, chart value `litellm.envFromSecret`, Terraform `litellm_env_secret_name`) names a Secret in the agent's namespace that the gateway container reads whole as environment variables. You create it with `kubectl`; the install only names it, so the credentials never pass through `install.env`, `terraform.tfvars` or Terraform state, and `upgrade.sh` never rewrites them. The mount is optional: the pod starts without the Secret, and the first model call, not the rollout, reports a missing credential. It is how the two provider shapes below, and an OAuth2 gateway, get their credentials.
+
+A variable the chart also sets from `platform-agent-secrets` (`GEMINI_API_KEY`, `HOSTED_VLLM_API_KEY` and the others) wins over the same name in this Secret. Changing the Secret does not roll the gateway: run `kubectl rollout restart deployment/litellm -n kubeagents-system` after rotating it.
+
+### SAP AI Core
+
+`MODEL_PROVIDER=sap` routes `model-default` through [SAP AI Core](https://help.sap.com/docs/sap-ai-core)'s orchestration service, for an organization whose model traffic has to go through its SAP tenant. SAP AI Core takes no static key: it issues a JSON service key, and LiteLLM's `sap/` driver exchanges the client id and secret in it at your tenant's token URL for a short-lived bearer token, caches it and renews it before it expires. The driver reads the service key from `AICORE_SERVICE_KEY` and the resource group that holds your orchestration deployment from `AICORE_RESOURCE_GROUP`, so the Secret carries those two keys:
+
+```bash
+kubectl create secret generic sap-aicore -n kubeagents-system \
+  --from-file=AICORE_SERVICE_KEY=./aicore-service-key.json \
+  --from-literal=AICORE_RESOURCE_GROUP=default
+
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
+  --model-provider=sap \
+  --litellm-env-secret=sap-aicore
+```
+
+The service key is the JSON the SAP BTP cockpit gives you when you [create a service key](https://help.sap.com/docs/sap-ai-core/sap-ai-core-service-guide/create-service-key) for the SAP AI Core instance. The driver also accepts the four discrete values `AICORE_CLIENT_ID`, `AICORE_CLIENT_SECRET`, `AICORE_AUTH_URL` and `AICORE_BASE_URL` in place of the service key; it reads the first source that has a value and does not merge them, so give one shape, not both. Before the first model call the gateway looks up your tenant's most recent deployment of the `orchestration` scenario in that resource group and sends every request there, so one must exist.
+
+Model names follow SAP's `<publisher>--<model>` form; the default is `anthropic--claude-4.5-sonnet`, and `MODEL_DEFAULT_NAME` picks another. A Claude model behind SAP has its sampling keys dropped like any other Claude model ([above](#setting-the-default-model)); prompt caching stays off, since the `cache_control` markers have not been shown to pass SAP's orchestration API. The token URL and the AI API URL are public SAP endpoints on port 443, which the gateway's NetworkPolicy already allows.
+
+### Other LiteLLM providers
+
+Any other [LiteLLM provider](https://docs.litellm.ai/docs/providers) works the same way: set `MODEL_PROVIDER` to the provider's slug (`azure`, `bedrock`, `databricks`, ...; lowercase letters, digits and underscores), `MODEL_DEFAULT_NAME` to the model, which is required because the install has no default for it, and put the variables that driver reads from the environment in the Secret. Nothing else is derived: the gateway's NetworkPolicy reaches public endpoints on 443 and nothing private, the provider's own cost table applies, and the installer offers the entry as the sixth choice of its provider menu.
+
 ## OpenAI-compatible endpoints (self-hosted or private)
 
 `MODEL_PROVIDER=openai_compatible` routes `model-default` to any server that speaks the OpenAI chat-completions API: vLLM, TGI or an internal gateway, in the cluster or on your own network. LiteLLM stays in front of it, so the agent and Hindsight keep calling `inference-gateway` and their config does not change. The provider has no defaults. The model name and the server's base URL are both required, and the render fails without either.
@@ -215,13 +246,14 @@ litellm:
 
 `install.sh` and the Terraform example carry the same settings. The installer checks them against the chart's rules before it creates anything, and its interactive provider menu and the `--menu` panel offer the provider as a fifth entry:
 
-| `install.env` key                  | Flag                                 | Chart value                                                                    |
-| ---------------------------------- | ------------------------------------ | ------------------------------------------------------------------------------ |
-| `OPENAI_COMPATIBLE_API_BASE`       | `--openai-compatible-api-base`       | `litellm.openaiCompatible.apiBase`                                             |
-| `OPENAI_COMPATIBLE_TARGET_PORT`    | `--openai-compatible-target-port`    | `litellm.openaiCompatible.targetPort`                                          |
-| `OPENAI_COMPATIBLE_EGRESS_CIDRS`   | `--openai-compatible-egress-cidrs`   | `litellm.openaiCompatible.egressCIDRs` (comma-separated in the installer)      |
-| `OPENAI_COMPATIBLE_CA_SECRET_NAME` | `--openai-compatible-ca-secret-name` | `litellm.openaiCompatible.caBundleSecretRef.name` (the key is always `ca.crt`) |
-| `OPENAI_COMPATIBLE_API_KEY`        | `--openai-compatible-api-key`        | key `OPENAI_COMPATIBLE_API_KEY` in `platform-agent-secrets`                    |
+| `install.env` key                  | Flag                                 | Chart value                                                                                  |
+| ---------------------------------- | ------------------------------------ | -------------------------------------------------------------------------------------------- |
+| `OPENAI_COMPATIBLE_API_BASE`       | `--openai-compatible-api-base`       | `litellm.openaiCompatible.apiBase`                                                           |
+| `OPENAI_COMPATIBLE_TARGET_PORT`    | `--openai-compatible-target-port`    | `litellm.openaiCompatible.targetPort`                                                        |
+| `OPENAI_COMPATIBLE_EGRESS_CIDRS`   | `--openai-compatible-egress-cidrs`   | `litellm.openaiCompatible.egressCIDRs` (comma-separated in the installer)                    |
+| `OPENAI_COMPATIBLE_CA_SECRET_NAME` | `--openai-compatible-ca-secret-name` | `litellm.openaiCompatible.caBundleSecretRef.name` (the key is always `ca.crt`)               |
+| `OPENAI_COMPATIBLE_API_KEY`        | `--openai-compatible-api-key`        | key `OPENAI_COMPATIBLE_API_KEY` in `platform-agent-secrets`                                  |
+| `LITELLM_ENV_SECRET_NAME`          | `--litellm-env-secret`               | `litellm.envFromSecret` (the OAuth2 client credentials, [below](#oauth2-client-credentials)) |
 
 The Terraform example's variables are the same names in lower case (`openai_compatible_api_base` and so on), with `model_provider = "openai_compatible"` and `model_default_name`. The install above, through the installer:
 
@@ -236,6 +268,27 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 ### The API key
 
 The key is optional. The gateway reads it from `OPENAI_COMPATIBLE_API_KEY` in the credentials Secret (`platform-agent-secrets`) and sends it as a bearer token. Without it, requests carry the placeholder `Bearer fake-api-key`, which a server that checks no key ignores. With this provider the gateway pod gets none of the Gemini, OpenAI or Anthropic keys, so no request to your server can carry one of them.
+
+### OAuth2 client credentials
+
+An enterprise AI gateway often takes no static key: it issues a client id and a client secret, which are exchanged at an OAuth2 token endpoint (`client_credentials` grant) for a bearer token that expires after minutes or hours. Put the three values in the [credentials Secret](#a-credentials-secret-for-the-gateway) and name it with `--litellm-env-secret`:
+
+```bash
+kubectl create secret generic ai-gateway-oauth -n kubeagents-system \
+  --from-literal=OPENAI_COMPATIBLE_OAUTH_TOKEN_URL=https://login.example.com/oauth/token \
+  --from-literal=OPENAI_COMPATIBLE_OAUTH_CLIENT_ID=<client id> \
+  --from-literal=OPENAI_COMPATIBLE_OAUTH_CLIENT_SECRET=<client secret>
+
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
+  --model-provider=openai_compatible \
+  --model-default-name=<model> \
+  --openai-compatible-api-base=https://ai-gateway.example.com/v1 \
+  --litellm-env-secret=ai-gateway-oauth
+```
+
+With that Secret named, the chart ships a pre-call hook into the gateway (`litellm_oauth2_callback.py`, beside `config.yaml`). While `OPENAI_COMPATIBLE_OAUTH_TOKEN_URL` is set, it fetches a token before the first request, sends it as the bearer on every request bound for the server, and renews it 60 seconds before the expiry the token endpoint stated (a response that states none is treated as 5 minutes, so it renews after 4); one fetch at a time, with the gateway's log recording each fetch and renewal. A failed exchange fails the request that needed it with the token endpoint's status, and the next request tries again. Two optional keys: `OPENAI_COMPATIBLE_OAUTH_SCOPE` is sent as `scope`, and `OPENAI_COMPATIBLE_OAUTH_CLIENT_AUTH=post` puts the client id and secret in the form body for a token endpoint that does not take them as HTTP basic authentication, the default. Without the token URL the hook is idle and `OPENAI_COMPATIBLE_API_KEY`, if set, is the bearer as before.
+
+The token request leaves the pod under the same [egress rules](#egress-to-the-server) as the model requests, which open the server's address and port and nothing else private. So the token endpoint has to be reachable where the server is: a public address on 443, an address inside `OPENAI_COMPATIBLE_EGRESS_CIDRS` on the same port as the base URL, or, for an in-cluster server, its namespace on `OPENAI_COMPATIBLE_TARGET_PORT`. For a server behind a [private CA](#a-server-behind-a-private-ca), the hook trusts that bundle beside the system roots when it calls the token URL, so the token endpoint can sit on the same private CA or on a public one. A gateway that is SAP AI Core itself does not need this: [`MODEL_PROVIDER=sap`](#sap-ai-core) carries the exchange in LiteLLM's own driver.
 
 ### How the gateway calls the server
 
@@ -255,7 +308,7 @@ The gateway pod also sets `LITELLM_LOCAL_MODEL_COST_MAP=True` for this provider,
 
 ### A server behind a private CA
 
-`litellm.openaiCompatible.caBundleSecretRef` names a Secret in the release namespace that holds the PEM bundle signing the server's certificate (under `key`, default `ca.crt`). The chart mounts that key read-only into the gateway pod at `/etc/litellm/openai-compatible-ca/` and points `ssl_verify` on this provider's entries at it. The bundle replaces the public roots for those entries, so it must hold every CA the server's chain needs. Nothing else trusts it: no other entry, no other pod, and no global `SSL_CERT_FILE`. Through the installer, create the Secret first and pass its name:
+`litellm.openaiCompatible.caBundleSecretRef` names a Secret in the release namespace that holds the PEM bundle signing the server's certificate (under `key`, default `ca.crt`). The chart mounts that key read-only into the gateway pod at `/etc/litellm/openai-compatible-ca/` and points `ssl_verify` on this provider's entries at it. The bundle replaces the public roots for those entries, so it must hold every CA the server's chain needs. Nothing else trusts it: no other entry, no other pod, and no global `SSL_CERT_FILE`; the one addition is the [OAuth2 hook](#oauth2-client-credentials), which trusts it beside the system roots for the token URL. Through the installer, create the Secret first and pass its name:
 
 ```bash
 kubectl create secret generic model-server-ca -n kubeagents-system --from-file=ca.crt=./ca.pem
@@ -281,7 +334,7 @@ A self-hosted server refuses a request whose prompt and `max_tokens` do not fit 
 
 ### What it does not cover
 
-- The kustomize dev copy (`make -C k8s-operator deploy-litellm`) does not carry the provider, and the admin console's provider catalog does not list it. Install through `install.sh`, the Terraform example or the chart.
+- The kustomize dev copy (`make -C k8s-operator deploy-litellm`) does not carry the provider, the credentials Secret or the OAuth2 hook, and the admin console's provider catalog does not list it. Install through `install.sh`, the Terraform example or the chart.
 - The installer does not deploy a model server. The [vLLM example](#vllm-local-models) is one you apply yourself.
 - A self-hosted model does not make the install offline. The agent still needs Google APIs, and some of its tools reach the internet on their own. [Security and IAM](/kube-agents/reference/security-and-iam/#egress-when-model-data-must-stay-off-hosted-providers) lists each destination, which ones are required, and how to turn off the rest. A fully disconnected cluster is not supported.
 

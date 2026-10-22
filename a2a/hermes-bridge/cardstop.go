@@ -68,7 +68,7 @@ const (
 	// whatever the board holds. A list cut short sets listsCut, never
 	// truncated, which is session-kv's word for cards left open. A title cut
 	// short is cardStopTitleMax runes with its "…".
-	cardStopListMax  = 200
+	cardStopListMax  = lib.CardStopListMax
 	cardStopTitleMax = 200
 	// cardStopUnavailable and cardStopUnsupported are the failed terminal's
 	// reason tokens: the stop could not be made, or this executor has no

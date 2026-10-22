@@ -148,6 +148,26 @@ class TestDomainCoverage(unittest.TestCase):
             "`meaning:` (one plain sentence):\n  " + "\n  ".join(missing),
         )
 
+    def test_every_domain_owner_and_backup_is_in_owners(self):
+        # A case with no `owner:` routes to its domain's owner, and a filer
+        # whose assignee is refused falls back to it, so it must be someone
+        # still here: listed in the root OWNERS file.
+        owners_data = yaml.safe_load((REPO_ROOT / "OWNERS").read_text())
+        listed = {str(login).lower() for key in ("approvers", "reviewers") for login in owners_data.get(key) or []}
+        domains, _ = load_domains()
+        departed = sorted(
+            f"{d.get('slug')}: {key} {d[key]}"
+            for d in domains
+            for key in ("owner", "backup")
+            if isinstance(d.get(key), str) and d[key].strip().lower() not in listed
+        )
+        self.assertEqual(
+            departed,
+            [],
+            "\n\nThese domain owners and backups are not in the root OWNERS "
+            "file. Name someone who is, in docs/designs/domains.yaml:\n  " + "\n  ".join(departed),
+        )
+
     def test_every_allowlist_entry_names_a_real_domain(self):
         domains, allowlist = load_domains()
         known = {d["slug"] for d in domains}
