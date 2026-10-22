@@ -48,6 +48,8 @@ _AUDIT_REPORT_MODULE_NAME = "kube_agents_audit_report"
 # seeded file rather than copying its rule.
 _COLLECT = _ROOT / "agents" / "platform" / "skills" / "fleet-audit" / "scripts" / "collect.py"
 _COLLECT_MODULE_NAME = "kube_agents_fleet_collect"
+_GITLAB_FORGE = _ROOT / "hack" / "ci_gitlab_forge.py"
+_GITLAB_FORGE_MODULE_NAME = "kube_agents_ci_gitlab_forge"
 # Every name the declared-intent check reads off the loaded module. Read once
 # at load, so a rename upstream is a loader failure (the check unverified with
 # the AttributeError named) and never a verdict on a repository's note.
@@ -121,6 +123,7 @@ CHECK_GITHUB_REPO_AND_APP = "github_repo_and_app"
 CHECK_GITOPS_DEFAULT_BRANCH = "gitops_default_branch"
 CHECK_GITOPS_DECLARATION = "gitops_declaration"
 CHECK_GITOPS_WORKLOAD_MANIFEST = "gitops_workload_manifest"
+CHECK_GITLAB_WORKLOAD_MANIFEST = "gitlab_workload_manifest"
 CHECK_LEDGER_READ_CREDENTIAL = "ledger_read_credential"
 CHECK_TOKEN_MINTER = "token_minter"
 # The KMS half of the minter check alone: the key, its versions, its shape,
@@ -141,6 +144,7 @@ CHECK_IDS = (
     CHECK_GITOPS_DEFAULT_BRANCH,
     CHECK_GITOPS_DECLARATION,
     CHECK_GITOPS_WORKLOAD_MANIFEST,
+    CHECK_GITLAB_WORKLOAD_MANIFEST,
     CHECK_LEDGER_READ_CREDENTIAL,
     CHECK_TOKEN_MINTER,
     CHECK_TOKEN_MINTER_KMS,
@@ -164,6 +168,7 @@ CHECK_DISPLAY_NAMES = {
     CHECK_GITOPS_DEFAULT_BRANCH: "GitOps Repo Default Branch",
     CHECK_GITOPS_DECLARATION: "GitOps Declared-Intent Note",
     CHECK_GITOPS_WORKLOAD_MANIFEST: "GitOps Workload Declaration",
+    CHECK_GITLAB_WORKLOAD_MANIFEST: "GitLab Workload Declaration",
     CHECK_LEDGER_READ_CREDENTIAL: "Ledger Read Credential",
     CHECK_TOKEN_MINTER: "Token Minter KMS & GSA",
     CHECK_TOKEN_MINTER_KMS: "Token Minter KMS & GSA",
@@ -173,6 +178,11 @@ CHECK_DISPLAY_NAMES = {
 # run of the minter or ledger checks, which read GitHub over urllib and KMS
 # over gcloud -- is not stopped at the door for a tool no selected check uses.
 GITHUB_CHECKS = frozenset({CHECK_GITHUB_REPO_AND_APP, CHECK_GITOPS_DECLARATION, CHECK_GITOPS_WORKLOAD_MANIFEST})
+# The GitLab lane's twin of the workload check reads gitlab.com over HTTPS
+# with a token (GITLAB_VERIFY_TOKEN, else the pool's ledger token from Secret
+# Manager), no `gh` and no project-level `gcloud` read, so it sits in neither
+# set: without a token it reports itself unread.
+GITLAB_CHECKS = frozenset({CHECK_GITLAB_WORKLOAD_MANIFEST})
 # The default-branch read is `gh` too, and is left out of GITHUB_CHECKS on
 # purpose: the pool-state scan selects it, and a toolchain blocker would turn
 # a job without a GitHub credential into "not checked" on all of the scan's
@@ -181,7 +191,7 @@ GITHUB_CHECKS = frozenset({CHECK_GITHUB_REPO_AND_APP, CHECK_GITOPS_DECLARATION, 
 # every check but the mapping, which reads the checkout and the remote ref,
 # the default-branch read, and the GitHub checks in GITHUB_CHECKS, whose reads
 # are all `gh`.
-GCP_CHECKS = frozenset(CHECK_IDS) - {CHECK_CODEBASE_MAPPING, CHECK_GITOPS_DEFAULT_BRANCH} - GITHUB_CHECKS
+GCP_CHECKS = frozenset(CHECK_IDS) - {CHECK_CODEBASE_MAPPING, CHECK_GITOPS_DEFAULT_BRANCH} - GITHUB_CHECKS - GITLAB_CHECKS
 # What the hourly pool-state scan runs: every read-only check on the project.
 # Not the fleet fixtures (the seeded-fleet scan already runs those), not the
 # GitHub-reading checks that need a credential the health bot must not hold
@@ -3080,6 +3090,151 @@ def check_gitops_workload_manifest(project_id: str) -> CheckResult:
     return CheckResult(name, True, f"{repo_slug} declares Deployment/checkout-gateway at {path}, where the audit's index keys it")
 
 
+GITLAB_VERIFY_TOKEN_ENV = "GITLAB_VERIFY_TOKEN"
+GITLAB_LEDGER_TOKEN_SECRET = "kube-agents-prow/gitlab-ledger-token"
+_GITLAB_TOKEN_CACHE: dict = {}
+
+
+def _load_gitlab_forge():
+    """hack/ci_gitlab_forge.py as a module: the GitLab reads and the seed, host and retries included.
+
+    It imports its sibling ci_reset_audit_ledgers by name, so hack/ joins
+    sys.path for the load, the way the sweep runs it.
+    """
+    import importlib.util
+
+    hack = str(_GITLAB_FORGE.parent)
+    if hack not in sys.path:
+        sys.path.append(hack)
+    spec = importlib.util.spec_from_file_location(_GITLAB_FORGE_MODULE_NAME, _GITLAB_FORGE)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {_GITLAB_FORGE}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    getattr(module, "repository_file")
+    return module
+
+
+def _gitlab_read_token() -> tuple[str, str]:
+    """(token, where it came from) for the GitLab reads, or ("", why there is none).
+
+    GITLAB_VERIFY_TOKEN first (a developer's own), else the pool's ledger
+    token in Secret Manager, which reads every pool project as the sweep
+    does; a machine that can read neither leaves the check unread.
+    """
+    if "token" in _GITLAB_TOKEN_CACHE:
+        return _GITLAB_TOKEN_CACHE["token"]
+    token = os.environ.get(GITLAB_VERIFY_TOKEN_ENV, "").strip()
+    if token:
+        found = (token, GITLAB_VERIFY_TOKEN_ENV)
+    else:
+        project, _, secret = GITLAB_LEDGER_TOKEN_SECRET.partition("/")
+        rc, out, err = run_cmd(["gcloud", "secrets", "versions", "access", "latest", f"--secret={secret}", f"--project={project}"])
+        if rc == 0 and out.strip():
+            found = (out.strip(), GITLAB_LEDGER_TOKEN_SECRET)
+        else:
+            found = ("", f"no token in {GITLAB_VERIFY_TOKEN_ENV} and {GITLAB_LEDGER_TOKEN_SECRET} could not be read ({(err or '').strip() or 'empty'})")
+    _GITLAB_TOKEN_CACHE["token"] = found
+    return found
+
+
+def gitlab_manifest_seed_command(project_path: str, host: str = "gitlab.com") -> str:
+    """The `seed-file` call that writes checkout-gateway's declaration to a GitLab project, with the group Owner's token."""
+    return (
+        f"printf '%s\\n' '{GITOPS_WORKLOAD_MANIFEST_CONTENT}' | GITLAB_SEED_TOKEN=<the gke-agentic Owner's token> "
+        f"python3 hack/ci_gitlab_forge.py seed-file --project {project_path} --path {GITOPS_WORKLOAD_MANIFEST_PATH} "
+        f"--message \"{GITOPS_WORKLOAD_MANIFEST_MESSAGE}\" --content-file - --host {host}"
+    )
+
+
+def check_gitlab_workload_manifest(project_id: str) -> CheckResult:
+    """Verify the pool project's GitLab project declares checkout-gateway where the remediation cases expect it.
+
+    The GitLab lane runs the same cases against `gke-agentic/<project>-infra`
+    on gitlab.com (docs/ci-pool-projects.md 5.6), so the same file has to be
+    there; the verdicts are check_gitops_workload_manifest's, read through
+    hack/ci_gitlab_forge.py instead of `gh`. A project the token cannot see
+    fails as the GitHub check's 404 does, naming both readings.
+    """
+    name = CHECK_DISPLAY_NAMES[CHECK_GITLAB_WORKLOAD_MANIFEST]
+    path = GITOPS_WORKLOAD_MANIFEST_PATH
+    cases = " and ".join(GITOPS_WORKLOAD_MANIFEST_CASES)
+
+    def unread(what: str, reason: str) -> CheckResult:
+        return CheckResult(name, True, "Not checked", warnings=[Unread(f"Not checked: {what}: {reason}")], read=False)
+
+    token, source = _gitlab_read_token()
+    if not token:
+        return unread("the GitLab project", source)
+    try:
+        gitlab = _load_gitlab_forge()
+        collect = _load_collect()
+    except Exception as exc:
+        return unread("the GitLab project (a module this check runs did not load)", f"{type(exc).__name__}: {exc}")
+    project_path = f"{gitlab.GROUP}/{project_id}{gitlab.PROJECT_SUFFIX}"
+    host = gitlab.DEFAULT_HOST
+    import urllib.error as _urlerr
+
+    try:
+        _, branch = gitlab.project_view(project_path, token, host=host)
+        state, body = gitlab.repository_file(project_path, path, token, host=host, ref=branch)
+        if state == gitlab.FILE_ABSENT:
+            return CheckResult(
+                name,
+                False,
+                f"{host}/{project_path} has no {path} on {branch}, or the token from {source} cannot read the project. "
+                f"If the project is readable, {cases} find no manifest to propose a budget beside and fail on this project "
+                f"on the GitLab lane until it is seeded: {gitlab_manifest_seed_command(project_path, host)}",
+            )
+        prefix = GITOPS_WORKLOAD_MANIFEST_TREE
+        wanted = [
+            p for p in gitlab.repository_blobs(project_path, prefix, token, host=host, ref=branch)
+            if p.endswith(GITOPS_YAML_SUFFIXES) and p != path
+        ]
+        if len(wanted) > GITOPS_WORKLOAD_MANIFEST_SIBLING_CAP:
+            return unread(f"the tree of {host}/{project_path} under {prefix}/", f"{len(wanted)} YAML files, over the {GITOPS_WORKLOAD_MANIFEST_SIBLING_CAP} this check reads")
+        siblings: dict = {}
+        for sibling in wanted:
+            sib_state, text = gitlab.repository_file(project_path, sibling, token, host=host, ref=branch)
+            if sib_state == gitlab.FILE_PRESENT:
+                siblings[sibling] = text
+    except _urlerr.HTTPError as exc:
+        if exc.code == 404:
+            return CheckResult(
+                name,
+                False,
+                f"{host}/{project_path} does not exist, or the token from {source} cannot see it (GitLab answers 404 to both). "
+                f"The GitLab lane leases this project and dies at its reset without it; onboard it as docs/ci-pool-projects.md 5.6 says, "
+                f"seed included: {gitlab_manifest_seed_command(project_path, host)}",
+            )
+        if exc.code == 401:
+            return unread(f"{host}/{project_path}", f"the token from {source} no longer authenticates (HTTP 401)")
+        return unread(f"{host}/{project_path}", f"HTTP {exc.code} from {host}")
+    except Exception as exc:
+        return unread(f"{host}/{project_path}", f"{type(exc).__name__}: {exc}")
+    try:
+        problem = _workload_manifest_problem(body, collect, siblings)
+    except OSError as exc:
+        return unread(path, f"no writable temporary directory to hand it to the audit's index: {type(exc).__name__}: {exc}")
+    if problem.startswith(DUPLICATE_DECLARATION_PREFIX):
+        return CheckResult(
+            name,
+            False,
+            f"{host}/{project_path} declares Deployment/checkout-gateway in seeded-reliability more than once under "
+            f"{prefix}/ ({problem}), so the audit's index resolves none of them and {cases} fail on this project on the "
+            f"GitLab lane. Remove every declaration but {path}.",
+        )
+    if problem:
+        return CheckResult(
+            name,
+            False,
+            f"{host}/{project_path} carries {path} but the audit's index does not key Deployment/checkout-gateway in "
+            f"seeded-reliability from it ({problem}), so {cases} fail on this project on the GitLab lane. Replace it with "
+            f"the seed's content (the files API's PUT, or delete it and run: {gitlab_manifest_seed_command(project_path, host)})",
+        )
+    return CheckResult(name, True, f"{host}/{project_path} declares Deployment/checkout-gateway at {path} on {branch}, where the audit's index keys it")
+
+
 def _load_collect():
     """The fleet-audit collector as a module, with the index this check queries.
 
@@ -4215,6 +4370,7 @@ def run_checks(
     run(CHECK_GITOPS_DEFAULT_BRANCH, lambda: check_gitops_default_branch(project_id))
     run(CHECK_GITOPS_DECLARATION, lambda: check_gitops_declaration(project_id))
     run(CHECK_GITOPS_WORKLOAD_MANIFEST, lambda: check_gitops_workload_manifest(project_id))
+    run(CHECK_GITLAB_WORKLOAD_MANIFEST, lambda: check_gitlab_workload_manifest(project_id))
     run(CHECK_LEDGER_READ_CREDENTIAL, lambda: check_ledger_read_credential(project_id))
     if CHECK_TOKEN_MINTER in wanted:
         run(CHECK_TOKEN_MINTER, lambda: check_token_minter(project_id, app_id, location))

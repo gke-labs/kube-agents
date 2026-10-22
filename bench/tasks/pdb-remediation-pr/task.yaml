@@ -82,7 +82,10 @@
 # Repository fixture required: that Deployment declared at
 # clusters/seeded-a/seeded-reliability/checkout-gateway.yaml in the leased
 # project's *-infra repository (GITOPS_WORKLOAD_MANIFEST_PATH, seeded by
-# scripts/provision_ci_pool_project.sh). The budget goes beside it; in a
+# scripts/provision_ci_pool_project.sh on GitHub and by hack/ci_gitlab_forge.py
+# seed-file on the GitLab lane's gitlab.com project, docs/ci-pool-projects.md
+# 5.6; a ghes run reads the GitHub repository, a gitlab-ce run seeds its
+# per-run project itself). The budget goes beside it; in a
 # repository with no manifest the agent finds nothing to fix and declines the
 # pull request, which is what collapsed this case on 2026-10-14 (every
 # repetition on #2971 and #3017).

@@ -2094,6 +2094,131 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
         self.assertIsNone(checker._note_declaration_problem(checker.GITOPS_INTENT_NOTE_CONTENT + "\n", "gke-agentic/x-infra"))
 
 
+class GitlabWorkloadManifestTest(unittest.TestCase):
+    """The GitLab lane's twin of the workload check reads gke-agentic/<project>-infra on gitlab.com (#3145, 3145-F1)."""
+
+    _PATH = "clusters/seeded-a/seeded-reliability/checkout-gateway.yaml"
+    _PROJECT = "gke-agentic/kube-agents-evals-3-infra"
+
+    class _Forge:
+        """What check_gitlab_workload_manifest uses of hack/ci_gitlab_forge.py, served from a dict of files."""
+
+        GROUP = "gke-agentic"
+        PROJECT_SUFFIX = "-infra"
+        DEFAULT_HOST = "gitlab.com"
+        FILE_PRESENT = "present"
+        FILE_ABSENT = "absent"
+
+        def __init__(self, files=None, project_status=None, default="main"):
+            self.files = dict(files or {})
+            self.project_status = project_status
+            self.default = default
+            self.calls = []
+
+        def _raise(self, code):
+            raise urllib.error.HTTPError("x", code, "", {}, io.BytesIO(b""))
+
+        def project_view(self, path, token, host="gitlab.com"):
+            self.calls.append(("project_view", path, token, host))
+            if self.project_status:
+                self._raise(self.project_status)
+            return 7, self.default
+
+        def repository_file(self, path, file_path, token, host="gitlab.com", ref=None):
+            self.calls.append(("repository_file", file_path, ref))
+            if file_path in self.files:
+                return self.FILE_PRESENT, self.files[file_path]
+            return self.FILE_ABSENT, ""
+
+        def repository_blobs(self, path, prefix, token, host="gitlab.com", ref=None):
+            self.calls.append(("repository_blobs", prefix, ref))
+            return sorted(p for p in self.files if p.startswith(prefix + "/"))
+
+    def _check(self, forge, token=("tok", "GITLAB_VERIFY_TOKEN")):
+        with mock.patch.object(checker, "_load_gitlab_forge", return_value=forge), \
+                mock.patch.object(checker, "_gitlab_read_token", return_value=token):
+            return checker.check_gitlab_workload_manifest("kube-agents-evals-3")
+
+    def test_a_project_with_the_declaration_passes_on_its_default_branch(self):
+        forge = self._Forge({self._PATH: checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n", "README.md": "x"}, default="trunk")
+        result = self._check(forge)
+        self.assertTrue(result.passed, result.message)
+        self.assertEqual([], result.warnings)
+        self.assertIn(f"gitlab.com/{self._PROJECT} declares Deployment/checkout-gateway at {self._PATH} on trunk", result.message)
+        self.assertEqual(("project_view", self._PROJECT, "tok", "gitlab.com"), forge.calls[0])
+        self.assertIn(("repository_file", self._PATH, "trunk"), forge.calls)
+        self.assertIn(("repository_blobs", "clusters/seeded-a", "trunk"), forge.calls)
+
+    def test_an_absent_file_fails_with_the_seed_command(self):
+        result = self._check(self._Forge({"README.md": "x"}))
+        self.assertFalse(result.passed)
+        self.assertIn(f"has no {self._PATH} on main", result.message)
+        self.assertIn("GitLab lane", result.message)
+        self.assertIn(f"seed-file --project {self._PROJECT} --path {self._PATH}", result.message)
+        self.assertIn("GITLAB_SEED_TOKEN=", result.message)
+        self.assertIn("--host gitlab.com", result.message)
+
+    def test_a_project_the_token_cannot_see_fails_naming_both_readings_and_the_onboarding(self):
+        result = self._check(self._Forge(project_status=404))
+        self.assertFalse(result.passed)
+        self.assertIn("does not exist, or the token from GITLAB_VERIFY_TOKEN cannot see it", result.message)
+        self.assertIn("5.6", result.message)
+
+    def test_a_token_that_no_longer_authenticates_leaves_the_check_unread(self):
+        result = self._check(self._Forge(project_status=401))
+        self.assertTrue(result.passed)
+        self.assertFalse(result.read)
+        self.assertIn("HTTP 401", result.warnings[0])
+
+    def test_no_token_leaves_the_check_unread_with_the_reason(self):
+        result = self._check(self._Forge(), token=("", "no token in GITLAB_VERIFY_TOKEN and kube-agents-prow/gitlab-ledger-token could not be read (denied)"))
+        self.assertTrue(result.passed)
+        self.assertFalse(result.read)
+        self.assertIn("gitlab-ledger-token could not be read", result.warnings[0])
+
+    def test_a_second_declaration_under_the_tree_fails_as_the_index_refuses_it(self):
+        good = checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n"
+        result = self._check(self._Forge({self._PATH: good, "clusters/seeded-a/apps/checkout-gateway-copy.yaml": good}))
+        self.assertFalse(result.passed)
+        self.assertIn("more than once", result.message)
+        self.assertIn("clusters/seeded-a/apps/checkout-gateway-copy.yaml", result.message)
+        self.assertIn(f"Remove every declaration but {self._PATH}", result.message)
+
+    def test_a_body_the_index_does_not_key_fails_with_the_replace_instruction(self):
+        result = self._check(self._Forge({self._PATH: "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: checkout-gateway\n  namespace: seeded-reliability\n"}))
+        self.assertFalse(result.passed)
+        self.assertIn("does not key Deployment/checkout-gateway", result.message)
+        self.assertIn("seed-file", result.message)
+
+    def test_the_token_comes_from_the_environment_before_secret_manager(self):
+        checker._GITLAB_TOKEN_CACHE.clear()
+        try:
+            with mock.patch.dict(os.environ, {checker.GITLAB_VERIFY_TOKEN_ENV: " mine "}), mock.patch.object(checker, "run_cmd") as run:
+                self.assertEqual(("mine", checker.GITLAB_VERIFY_TOKEN_ENV), checker._gitlab_read_token())
+                run.assert_not_called()
+            checker._GITLAB_TOKEN_CACHE.clear()
+            with mock.patch.dict(os.environ, {checker.GITLAB_VERIFY_TOKEN_ENV: ""}), mock.patch.object(checker, "run_cmd", return_value=(0, "ledger\n", "")) as run:
+                self.assertEqual(("ledger", checker.GITLAB_LEDGER_TOKEN_SECRET), checker._gitlab_read_token())
+                self.assertIn("--secret=gitlab-ledger-token", " ".join(run.call_args.args[0]))
+                self.assertIn("--project=kube-agents-prow", " ".join(run.call_args.args[0]))
+            checker._GITLAB_TOKEN_CACHE.clear()
+            with mock.patch.dict(os.environ, {checker.GITLAB_VERIFY_TOKEN_ENV: ""}), mock.patch.object(checker, "run_cmd", return_value=(1, "", "PERMISSION_DENIED")):
+                token, why = checker._gitlab_read_token()
+                self.assertEqual("", token)
+                self.assertIn("PERMISSION_DENIED", why)
+        finally:
+            checker._GITLAB_TOKEN_CACHE.clear()
+
+    def test_the_real_helper_loads_and_the_check_is_registered_outside_the_gh_and_gcloud_sets(self):
+        module = checker._load_gitlab_forge()
+        self.assertTrue(callable(module.seed_repository_file))
+        self.assertEqual(checker.GITOPS_REPO_ORG, module.GROUP)
+        self.assertEqual(checker.GITOPS_REPO_SUFFIX, module.PROJECT_SUFFIX)
+        self.assertIn(checker.CHECK_GITLAB_WORKLOAD_MANIFEST, checker.DEFAULT_CHECKS)
+        self.assertNotIn(checker.CHECK_GITLAB_WORKLOAD_MANIFEST, checker.GITHUB_CHECKS)
+        self.assertNotIn(checker.CHECK_GITLAB_WORKLOAD_MANIFEST, checker.GCP_CHECKS)
+
+
 class GitopsWorkloadManifestTest(unittest.TestCase):
     _PATH = "clusters/seeded-a/seeded-reliability/checkout-gateway.yaml"
     _REPO = "gke-agentic/kube-agents-evals-3-infra"
@@ -4778,6 +4903,7 @@ class RunChecksTest(unittest.TestCase):
              mock.patch.object(checker, "check_gitops_default_branch", return_value=checker.CheckResult("b", True)), \
              mock.patch.object(checker, "check_gitops_declaration", return_value=checker.CheckResult("n", True)), \
              mock.patch.object(checker, "check_gitops_workload_manifest", return_value=checker.CheckResult("w", True)), \
+             mock.patch.object(checker, "check_gitlab_workload_manifest", return_value=checker.CheckResult("gl", True)), \
              mock.patch.object(checker, "check_ledger_read_credential", return_value=checker.CheckResult("l", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
             results = checker.run_checks("kube-agents-evals-3")
@@ -4891,7 +5017,7 @@ class ChecksSelectionTest(unittest.TestCase):
         # check alone runs on a machine with neither tool.
         with mock.patch.object(checker, "run_cmd", side_effect=AssertionError("no tool was asked for")):
             self.assertEqual(checker.check_toolchain(needs_gh=False, needs_gcloud=False), [])
-        self.assertEqual(checker.GCP_CHECKS, frozenset(checker.CHECK_IDS) - {checker.CHECK_CODEBASE_MAPPING, checker.CHECK_GITOPS_DEFAULT_BRANCH} - checker.GITHUB_CHECKS)
+        self.assertEqual(checker.GCP_CHECKS, frozenset(checker.CHECK_IDS) - {checker.CHECK_CODEBASE_MAPPING, checker.CHECK_GITOPS_DEFAULT_BRANCH} - checker.GITHUB_CHECKS - checker.GITLAB_CHECKS)
         seen = {}
         with mock.patch.object(checker, "check_toolchain", side_effect=lambda **kw: seen.update(kw) or ["stop here"]), mock.patch("sys.stdout", io.StringIO()):
             checker.verify_project("kube-agents-evals-3", checks=[checker.CHECK_CODEBASE_MAPPING])

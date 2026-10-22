@@ -33,10 +33,12 @@ argv. `api` is the one network seam; the tests replace it.
 
 from __future__ import annotations
 
+import base64
 import datetime
 import http.client
 import json
 import os
+import pathlib
 import re
 import sys
 import time
@@ -487,6 +489,62 @@ def project_view(path: str, token: str, host: str = DEFAULT_HOST) -> tuple[int, 
     return int(payload["id"]), str(payload["default_branch"])
 
 
+FILE_PRESENT = "present"
+FILE_ABSENT = "absent"
+
+
+def repository_file(path: str, file_path: str, token: str, host: str = DEFAULT_HOST, ref: str | None = None) -> tuple[str, str]:
+    """(FILE_PRESENT, the file's text) or (FILE_ABSENT, "") at `ref`, the default branch when None.
+
+    Decoded as the audit's index reads a file (`errors="replace"`), so a stray
+    byte is the index's verdict, not a failure here. Every other answer raises.
+    """
+    branch = ref or project_view(path, token, host=host)[1]
+    try:
+        payload = call("GET", f"/projects/{encoded(path)}/repository/files/{encoded(file_path)}?ref={urllib.parse.quote(branch, safe='')}", token, host=host)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return FILE_ABSENT, ""
+        raise
+    if not isinstance(payload, dict) or payload.get("encoding") != "base64":
+        raise ResetError(f"GitLab answered the read of {file_path} in {path} without base64 content")
+    return FILE_PRESENT, base64.b64decode(payload.get("content") or "").decode("utf-8", errors="replace")
+
+
+def repository_blobs(path: str, prefix: str, token: str, host: str = DEFAULT_HOST, ref: str | None = None) -> list[str]:
+    """Every blob path under `prefix` at `ref` (the default branch when None), the recursive tree listing."""
+    branch = ref or project_view(path, token, host=host)[1]
+    entries = _pages(
+        f"/projects/{encoded(path)}/repository/tree",
+        {"path": prefix, "recursive": "true", "ref": branch},
+        token,
+        host,
+        f"the tree of {path} under {prefix}",
+    )
+    return sorted(str(e.get("path")) for e in entries if isinstance(e, dict) and e.get("type") == "blob")
+
+
+def seed_repository_file(path: str, file_path: str, message: str, content: str, token: str, host: str = DEFAULT_HOST) -> str:
+    """Write `file_path` on the default branch when it is absent; FILE_PRESENT when it is there already.
+
+    The create is a POST on the files API, which GitLab refuses with 400 when
+    the file exists, so a race with another seeder ends in that refusal and
+    not in a second commit over the first. Returns "created" after the write.
+    """
+    _, branch = project_view(path, token, host=host)
+    state, _ = repository_file(path, file_path, token, host=host, ref=branch)
+    if state == FILE_PRESENT:
+        return FILE_PRESENT
+    _write(
+        "POST",
+        f"/projects/{encoded(path)}/repository/files/{encoded(file_path)}",
+        token,
+        {"branch": branch, "content": content, "commit_message": message},
+        host,
+    )
+    return "created"
+
+
 def open_merge_requests(path: str, token: str, host: str = DEFAULT_HOST) -> list[dict]:
     found = _pages(f"/projects/{encoded(path)}/merge_requests", {"state": "opened"}, token, host, f"the merge-request listing for {path}")
     found.sort(key=lambda mr: int(mr.get("iid") or 0))
@@ -704,10 +762,50 @@ def whoami_main(argv: list[str] | None = None) -> int:
         return 1
 
 
+SEED_TOKEN_ENV = "GITLAB_SEED_TOKEN"
+
+
+def seed_file_main(argv: list[str] | None = None) -> int:
+    """`python3 ci_gitlab_forge.py seed-file --project P --path F --message M --content-file C [--host HOST]`:
+    write one file to a pool project when it is absent (docs/ci-pool-projects.md
+    5.6; the fixture the remediation cases read). The token arrives in
+    GITLAB_SEED_TOKEN, never on argv, and has to push to the default branch:
+    the group Owner's, not the bot's. `--content-file -` reads stdin."""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="ci_gitlab_forge.py seed-file")
+    parser.add_argument("--project", required=True, help="the project path, e.g. gke-agentic/kube-agents-evals-7-infra")
+    parser.add_argument("--path", required=True, help="the file's path in the repository")
+    parser.add_argument("--message", required=True, help="the commit message")
+    parser.add_argument("--content-file", required=True, help="the file's content, or - for stdin")
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    args = parser.parse_args(argv)
+    token = os.environ.get(SEED_TOKEN_ENV, "")
+    if not token:
+        print("seed-file: no token in %s" % SEED_TOKEN_ENV, file=sys.stderr)
+        return 2
+    content = sys.stdin.read() if args.content_file == "-" else pathlib.Path(args.content_file).read_text(encoding="utf-8")
+    if not content.strip():
+        print("seed-file: the content is empty; refusing to write an empty %s" % args.path, file=sys.stderr)
+        return 2
+    try:
+        outcome = seed_repository_file(args.project, args.path, args.message, content, token, host=args.host)
+    except urllib.error.HTTPError as exc:
+        print("seed-file: %s %s at %s: HTTP %d" % (args.project, args.path, args.host, exc.code), file=sys.stderr)
+        return 1
+    except (RateLimited, ResetError, OSError, http.client.HTTPException, ValueError) as exc:
+        print("seed-file: %s %s at %s: %s" % (args.project, args.path, args.host, exc), file=sys.stderr)
+        return 1
+    print("%s %s: %s" % (args.project, args.path, outcome))
+    return 0
+
+
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["seed-file"]:
+        sys.exit(seed_file_main(sys.argv[2:]))
     if sys.argv[1:2] == ["whoami"]:
         sys.exit(whoami_main(sys.argv[2:]))
     if sys.argv[1:2] == ["probe-ledger"]:
         sys.exit(probe_ledger_main(sys.argv[2:]))
-    print("usage: ci_gitlab_forge.py whoami [--host HOST] | probe-ledger --path P --project ID --build B [--host HOST]  (tokens in %s and %s)" % (PROBE_TOKEN_ENV, PROBE_LEDGER_TOKEN_ENV), file=sys.stderr)
+    print("usage: ci_gitlab_forge.py whoami [--host HOST] | probe-ledger --path P --project ID --build B [--host HOST] | seed-file --project P --path F --message M --content-file C [--host HOST]  (tokens in %s, %s and %s)" % (PROBE_TOKEN_ENV, PROBE_LEDGER_TOKEN_ENV, SEED_TOKEN_ENV), file=sys.stderr)
     sys.exit(2)
