@@ -4445,18 +4445,25 @@ def _drift_backlog_card_name(value: Any) -> str:
 
 
 def _drift_backlog_card_body(rows: Sequence[Dict[str, Any]]) -> str:
-    """The card's body: the digest's count by principal, then every row up to a cap."""
+    """The card's body: the digest's count by principal, then every row up to a cap.
+
+    Both lists are capped because the body travels as one argv element, which the
+    kernel limits to 128 KiB; an uncapped body would fail to file and retry forever.
+    """
     by_principal: Dict[str, int] = {}
     for row in rows:
-        principal = _drift_backlog_card_name(row["principal"])
+        principal = row["principal"] or DRIFT_UNKNOWN_FIELD
         by_principal[principal] = by_principal.get(principal, 0) + 1
     ranked = sorted(by_principal.items(), key=lambda item: (-item[1], item[0]))
+    principals = ", ".join(f"{_drift_backlog_card_name(p)} ({n})" for p, n in ranked[:DRIFT_BACKLOG_MAX_PRINCIPALS])
+    if len(ranked) > DRIFT_BACKLOG_MAX_PRINCIPALS:
+        principals += f", and {len(ranked) - DRIFT_BACKLOG_MAX_PRINCIPALS} more"
     lines = [
         f"{len(rows)} {'change' if len(rows) == 1 else 'changes'} reached drift detection late (they queued "
         f"before it started pulling, or waited over {DRIFT_BACKLOG_MAX_WAIT_TEXT}). This install has no chat "
-        "route, so this card is the digest. No agent acts on it: a person reads it and archives it.",
+        "platform enabled, so this card is the digest. No agent acts on it: a person reads it and archives it.",
         "",
-        "By principal: " + ", ".join(f"{p} ({n})" for p, n in ranked),
+        "By principal: " + principals,
         "",
         "Changes:",
     ]

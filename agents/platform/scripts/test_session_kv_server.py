@@ -7693,6 +7693,33 @@ class TestDriftBacklog(unittest.TestCase):
         self.assertNotIn("kubectl delete", body)
         self.assertIn("not shown", body)
 
+    @staticmethod
+    def _card_row(principal, name, created_at="2026-10-22 09:00:29"):
+        return {
+            "principal": principal,
+            "namespace": "prod",
+            "object_kind": "deployments",
+            "workload": name,
+            "cluster": "prod-a",
+            "created_at": created_at,
+        }
+
+    def test_two_names_that_fail_the_allowlist_with_the_same_length_count_apart(self):
+        rows = [self._card_row("ada smith", f"api-{i}") for i in range(3)]
+        rows += [self._card_row("bob jones", f"web-{i}") for i in range(3)]
+        body = session_kv_server._drift_backlog_card_body(rows)
+        self.assertIn("By principal: <name of 9 characters, not shown> (3), <name of 9 characters, not shown> (3)", body)
+        self.assertNotIn("(6)", body)
+
+    def test_a_card_with_many_long_principals_caps_the_principal_line_and_stays_under_the_argv_limit(self):
+        rows = [self._card_row(f"user-{i:04d}@" + "x" * 190, "n" * 200) for i in range(400)]
+        body = session_kv_server._drift_backlog_card_body(rows)
+        line = next(l for l in body.splitlines() if l.startswith("By principal: "))
+        self.assertEqual(line.count("@"), session_kv_server.DRIFT_BACKLOG_MAX_PRINCIPALS)
+        self.assertTrue(line.endswith(f", and {400 - session_kv_server.DRIFT_BACKLOG_MAX_PRINCIPALS} more"))
+        self.assertIn(f"- and {400 - session_kv_server.DRIFT_BACKLOG_CARD_MAX_ROWS} more", body)
+        self.assertLess(len(body.encode()), 128 * 1024)
+
     def test_a_failed_post_leaves_the_rows_pending_and_releases_the_lease(self):
         import sqlite3
 
