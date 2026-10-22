@@ -55,7 +55,7 @@ const (
 	noteTasksPartial     = "the TASKS read was partial, so tasks may be missing: %v"
 	noteTasksBusy        = "the TASKS read was skipped because this server's bus readers were busy; no tasks were read, try again in a few seconds"
 	noteTasksOldest      = "TASKS holds more than %d messages since the window began; the oldest were not read, so older tasks may be missing"
-	noteTasksBytes       = "the TASKS read kept its first %d KiB of messages; newer messages were not kept, so the newest tasks may be missing"
+	noteTasksBytes       = "the TASKS read kept only its newest %d KiB of task events; older events were let go, so older tasks may show an earlier state"
 	noteDroppedEntries   = "%d conversation entries in the request were dropped: an alias or token that is not valid"
 	noteNotConnected     = "not connected to the bus; no tasks were read"
 	noteCardsUnavailable = "the agent cards could not be read"
@@ -72,6 +72,18 @@ var swarmTaskLimit = maxTaskEvents
 // maxSwarmReadBytes bounds the message bytes one TASKS read keeps. A variable
 // for tests.
 var maxSwarmReadBytes = 32 << 20
+
+// maxSwarmPromptRunes caps the prompt kept of a submission; the projection
+// shortens it further for display.
+const maxSwarmPromptRunes = 4096
+
+// capRunes cuts s to at most n runes.
+func capRunes(s string, n int) string {
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	return string([]rune(s)[:n])
+}
 
 // swarmConversationEntry is one conversation in the bridge's shape
 // (#3689: a2a/mcpbridge/config.go ConversationEntry). The server reads Alias,
@@ -434,7 +446,8 @@ type swarmRead struct {
 	// found none older than the window, so the window held more than the
 	// read takes, and its oldest messages were not read.
 	oldestDropped bool
-	// bytesCapped: the read reached maxSwarmReadBytes and kept no more.
+	// bytesCapped: the read passed maxSwarmReadBytes and let its oldest
+	// events go to stay under it.
 	bytesCapped bool
 }
 
@@ -468,15 +481,26 @@ func (b *NATSBus) swarmTasks(ctx context.Context, since time.Time) (swarmRead, e
 		kept        int
 		read        swarmRead
 	)
-	// keep counts n bytes against maxSwarmReadBytes; past it, nothing more
-	// is kept, and the drain runs on to its end.
-	keep := func(n int) bool {
-		if read.bytesCapped || kept+n > maxSwarmReadBytes {
-			read.bytesCapped = true
-			return false
-		}
+	// keepEvent holds env for rd, counting n bytes against
+	// maxSwarmReadBytes. Past it, the oldest events held are let go, so the
+	// newest are what the read keeps, as the read itself takes the newest.
+	type heldEvent struct {
+		rd *swarmTaskRead
+		i  int
+		n  int
+	}
+	var held []heldEvent
+	keepEvent := func(rd *swarmTaskRead, env *lib.Envelope, n int) {
+		rd.events = append(rd.events, env)
+		held = append(held, heldEvent{rd, len(rd.events) - 1, n})
 		kept += n
-		return true
+		for kept > maxSwarmReadBytes && len(held) > 0 {
+			oldest := held[0]
+			held = held[1:]
+			oldest.rd.events[oldest.i] = nil
+			kept -= oldest.n
+			read.bytesCapped = true
+		}
 	}
 	_, derr := b.drainConsumer(ctx, s, jetstream.ConsumerConfig{
 		FilterSubject: taskSubjects,
@@ -513,9 +537,7 @@ func (b *NATSBus) swarmTasks(ctx context.Context, since time.Time) (swarmRead, e
 			order = append(order, rd)
 		}
 		if class != lib.TaskClassIn {
-			if keep(len(msg.Data())) {
-				rd.events = append(rd.events, env)
-			}
+			keepEvent(rd, env, len(msg.Data()))
 			return
 		}
 		// The first message on .in in the read is the conversation's; later
@@ -524,9 +546,12 @@ func (b *NATSBus) swarmTasks(ctx context.Context, since time.Time) (swarmRead, e
 			return
 		}
 		_, a, text, ok := submission(&nats.Msg{Subject: msg.Subject(), Data: msg.Data()})
-		if !ok || !keep(len(msg.Data())) {
+		if !ok {
 			return
 		}
+		// Only the prompt is kept of a submission, capped, so submissions
+		// don't count against the event cap.
+		text = capRunes(text, maxSwarmPromptRunes)
 		rd.submitted = true
 		rd.task.Conversation = a.Audience.Conversation
 		if a.Via != nil {
@@ -556,8 +581,9 @@ func (b *NATSBus) swarmTasks(ctx context.Context, since time.Time) (swarmRead, e
 			continue
 		}
 		t := rd.task
-		if len(rd.events) > 0 {
-			if folded, err := lib.FoldTask(rd.ref.TaskID, rd.events); err == nil {
+		events := slices.DeleteFunc(rd.events, func(e *lib.Envelope) bool { return e == nil })
+		if len(events) > 0 {
+			if folded, err := lib.FoldTask(rd.ref.TaskID, events); err == nil {
 				t.Task = folded
 			}
 		}

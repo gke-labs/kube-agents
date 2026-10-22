@@ -540,12 +540,42 @@ func TestTheSwarmRouteCapsTheBytesItKeeps(t *testing.T) {
 	}
 	maxSwarmReadBytes = 2048
 	resp, _ := askSwarm(t, h, map[string]any{"conversations": map[string]any{"triage": clientConv("triage", convTriage, time.Now())}})
-	if !hasNote(resp, "newer messages were not kept") {
+	if !hasNote(resp, "older events were let go") {
 		t.Errorf("notes = %q, want the byte cap reported", resp.Notes)
 	}
-	all := string(swarmJSON(t, resp.Snapshot))
-	if !strings.Contains(all, "`t-0`") || strings.Contains(all, "`t-3`") {
-		t.Errorf("want the first task kept and the last not:\n%s", boardTexts(resp.Snapshot))
+}
+
+// Past the byte cap the read lets its OLDEST events go, so the newest task
+// keeps its state and the oldest is shown by its submission alone.
+func TestTheSwarmReadKeepsTheNewestEventsUnderTheCap(t *testing.T) {
+	url, js := testBus(t)
+	for i := 0; i < 4; i++ {
+		id := fmt.Sprintf("t-%d", i)
+		publishSubmission(t, js, "s-triage", id, consoleConversationPrefix+convTriage, "turn "+id, "")
+		publishRun(t, js, "s-triage", id, "", false)
+	}
+	old := maxSwarmReadBytes
+	maxSwarmReadBytes = 2048
+	t.Cleanup(func() { maxSwarmReadBytes = old })
+	read, err := dial(t, url).swarmTasks(context.Background(), time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !read.bytesCapped {
+		t.Fatal("the read did not reach the cap; the test publishes too little")
+	}
+	byID := map[string]SwarmTask{}
+	for _, task := range read.tasks {
+		byID[task.TaskID] = task
+	}
+	if len(byID) != 4 {
+		t.Fatalf("read %d tasks, want all 4 by their submissions", len(byID))
+	}
+	if byID["t-3"].Task == nil {
+		t.Error("the newest task lost its events under the cap")
+	}
+	if byID["t-0"].Task != nil {
+		t.Error("the oldest task kept its events under the cap; the newest should have been kept instead")
 	}
 }
 
