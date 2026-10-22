@@ -155,7 +155,11 @@ CHECK_IDS = (
 # minter check, which CHECK_TOKEN_MINTER covers. The one definition, read by
 # run_checks and verify_project alike, so a --report's key set does not depend
 # on which of them decided.
-DEFAULT_CHECKS = tuple(c for c in CHECK_IDS if c != CHECK_TOKEN_MINTER_KMS)
+# The GitLab read is opt-in (`--checks gitlab_workload_manifest`): its project
+# is onboarded after provisioning (docs/ci-pool-projects.md 5.6, 8), so a
+# default run during provisioning would fail or go unverified over a project
+# nobody has created yet.
+DEFAULT_CHECKS = tuple(c for c in CHECK_IDS if c not in (CHECK_TOKEN_MINTER_KMS, CHECK_GITLAB_WORKLOAD_MANIFEST))
 # The console name each check reports under, for a result written on its
 # behalf before it ran (a deadline that passed, a blocked toolchain).
 CHECK_DISPLAY_NAMES = {
@@ -532,8 +536,12 @@ GITOPS_YAML_SUFFIXES = (".yaml", ".yml")
 # How _workload_manifest_problem names a duplicate declaration; the check
 # reads it to print the remedy for the siblings rather than for the seed.
 DUPLICATE_DECLARATION_PREFIX = "more than one file declares it ("
+# How it names an index raise that a sibling causes, the seed alone indexing
+# cleanly: the remedy is the sibling, not a replace of the seed.
+SIBLING_RAISE_PREFIX = "a file beside it under the tree makes the index raise ("
 # The cases that fail on a project whose repository lacks the declaration:
-# the roster case, and the #2228 case parked on this fixture. (The other
+# the nightly case (#3120 gates its roster return on this seed) and the #2228
+# case parked on this fixture. (The other
 # #2228 case, obtainability-refusal-direct-mutation, is nightly and only
 # loses its pull-request arm: its inline-proposal arm passes without the file.)
 GITOPS_WORKLOAD_MANIFEST_CASES = (
@@ -3081,6 +3089,17 @@ def check_gitops_workload_manifest(project_id: str) -> CheckResult:
             f"{GITOPS_WORKLOAD_MANIFEST_TREE}/ ({problem}), so the audit's index resolves none of them and {cases} fail on this "
             f"project. Remove every declaration but {path}.",
         )
+    if problem.startswith(SIBLING_RAISE_PREFIX):
+        # The seed is right; another YAML under the tree makes the index
+        # raise, and the audit's clone would hit the same file. Replacing
+        # the seed changes nothing: that file has to be found and fixed.
+        return CheckResult(
+            name,
+            False,
+            f"{repo_slug} carries {path}, which the audit's index keys on its own, but {problem}, so the audit's "
+            f"index fails over this cluster's tree and {cases} fail on this project. Find the YAML under "
+            f"{GITOPS_WORKLOAD_MANIFEST_TREE}/ that PyYAML's safe loader rejects and fix or remove it; the seed stands.",
+        )
     if problem:
         return CheckResult(
             name,
@@ -3144,7 +3163,12 @@ def _gitlab_read_token() -> tuple[str, str]:
     if "token" in _GITLAB_TOKEN_CACHE:
         return _GITLAB_TOKEN_CACHE["token"]
     token = os.environ.get(GITLAB_VERIFY_TOKEN_ENV, "").strip()
-    if token:
+    if token and any(ch.isspace() or not ch.isprintable() for ch in token):
+        # The same bar as `gitlab_secret`: a value with a line break inside
+        # would be refused by http.client with the value in the error text,
+        # and that text would reach the console and --report. Not echoed.
+        found = ("", f"{GITLAB_VERIFY_TOKEN_ENV} is not one token on one line (a header file with a second line, cut as the recipe cuts it, reads like this); export the bare token")
+    elif token:
         found = (token, GITLAB_VERIFY_TOKEN_ENV)
     else:
         try:
@@ -3243,6 +3267,14 @@ def check_gitlab_workload_manifest(project_id: str) -> CheckResult:
             f"{prefix}/ ({problem}), so the audit's index resolves none of them and {cases} fail on this project on the "
             f"GitLab lane. Remove every declaration but {path}.",
         )
+    if problem.startswith(SIBLING_RAISE_PREFIX):
+        return CheckResult(
+            name,
+            False,
+            f"{host}/{project_path} carries {path}, which the audit's index keys on its own, but {problem}, so the audit's "
+            f"index fails over this cluster's tree and {cases} fail on this project on the GitLab lane. Find the YAML under "
+            f"{prefix}/ that PyYAML's safe loader rejects and fix or remove it; the seed stands.",
+        )
     if problem:
         return CheckResult(
             name,
@@ -3333,17 +3365,30 @@ def _workload_manifest_problem(body: str, collect, siblings: dict[str, str] | No
     scalar, outside the YAMLError the index catches) is the file's verdict,
     not a traceback.
     """
-    with tempfile.TemporaryDirectory() as scratch:
-        tree = Path(scratch)
-        for rel, text in {GITOPS_WORKLOAD_MANIFEST_PATH: body, **(siblings or {})}.items():
-            target = tree / rel
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(text, encoding="utf-8")
-        try:
+    def index_of(files: dict[str, str]):
+        with tempfile.TemporaryDirectory() as scratch:
+            tree = Path(scratch)
+            for rel, text in files.items():
+                target = tree / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding="utf-8")
             with contextlib.redirect_stderr(io.StringIO()):
-                index = collect.workload_declarations(tree)
-        except Exception as exc:
-            return f"the index raises on it ({type(exc).__name__}: {exc})"
+                return collect.workload_declarations(tree)
+
+    try:
+        index = index_of({GITOPS_WORKLOAD_MANIFEST_PATH: body, **(siblings or {})})
+    except Exception as exc:
+        if siblings:
+            # PyYAML's message names no file. Index the seed alone to say
+            # which side is at fault: a clean seed makes the raise a sibling's,
+            # and a replace of the seed would change nothing.
+            try:
+                index_of({GITOPS_WORKLOAD_MANIFEST_PATH: body})
+            except Exception:
+                pass
+            else:
+                return f"{SIBLING_RAISE_PREFIX}{type(exc).__name__}: {exc}); the seed alone indexes"
+        return f"the index raises on it ({type(exc).__name__}: {exc})"
     paths = index.get(GITOPS_WORKLOAD_MANIFEST_KEY)
     if not paths:
         return "no document in it is keyed as " + "/".join(GITOPS_WORKLOAD_MANIFEST_KEY)

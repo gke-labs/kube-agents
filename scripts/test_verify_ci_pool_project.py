@@ -2184,6 +2184,14 @@ class GitlabWorkloadManifestTest(unittest.TestCase):
         self.assertIn("clusters/seeded-a/apps/checkout-gateway-copy.yaml", result.message)
         self.assertIn(f"Remove every declaration but {self._PATH}", result.message)
 
+    def test_an_index_raise_a_sibling_causes_names_the_sibling_not_a_replace(self):
+        good = checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n"
+        result = self._check(self._Forge({self._PATH: good, "clusters/seeded-a/apps/x.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\n  namespace: seeded-reliability\ndata:\n  n: !!int two\n"}))
+        self.assertFalse(result.passed)
+        self.assertIn("the seed stands", result.message)
+        self.assertIn("makes the index raise", result.message)
+        self.assertNotIn("seed-file", result.message)
+
     def test_a_body_the_index_does_not_key_fails_with_the_replace_instruction(self):
         result = self._check(self._Forge({self._PATH: "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: checkout-gateway\n  namespace: seeded-reliability\n"}))
         self.assertFalse(result.passed)
@@ -2210,6 +2218,13 @@ class GitlabWorkloadManifestTest(unittest.TestCase):
                 self.assertEqual("", token)
                 self.assertIn("PERMISSION_DENIED", why)
             checker._GITLAB_TOKEN_CACHE.clear()
+            with mock.patch.dict(os.environ, {checker.GITLAB_VERIFY_TOKEN_ENV: "tok1\ntok2"}), mock.patch.object(checker, "_load_gitlab_sweep") as load:
+                token, why = checker._gitlab_read_token()
+                self.assertEqual("", token, "a two-line value is refused as gitlab_secret refuses it")
+                self.assertNotIn("tok1", why, "and never echoed")
+                self.assertIn("one token on one line", why)
+                load.assert_not_called()
+            checker._GITLAB_TOKEN_CACHE.clear()
             with mock.patch.dict(os.environ, {checker.GITLAB_VERIFY_TOKEN_ENV: ""}), mock.patch.object(checker, "_load_gitlab_sweep", side_effect=FileNotFoundError("gcloud")):
                 token, why = checker._gitlab_read_token()
                 self.assertEqual("", token, "a machine without gcloud gets a reason, not a traceback")
@@ -2234,7 +2249,9 @@ class GitlabWorkloadManifestTest(unittest.TestCase):
         self.assertTrue(callable(module.seed_repository_file))
         self.assertEqual(checker.GITOPS_REPO_ORG, module.GROUP)
         self.assertEqual(checker.GITOPS_REPO_SUFFIX, module.PROJECT_SUFFIX)
-        self.assertIn(checker.CHECK_GITLAB_WORKLOAD_MANIFEST, checker.DEFAULT_CHECKS)
+        self.assertNotIn(checker.CHECK_GITLAB_WORKLOAD_MANIFEST, checker.DEFAULT_CHECKS, "opt-in: the GitLab project is onboarded after provisioning")
+        self.assertIn(checker.CHECK_GITLAB_WORKLOAD_MANIFEST, checker.CHECK_IDS)
+        self.assertEqual([checker.CHECK_GITLAB_WORKLOAD_MANIFEST], checker.parse_checks("gitlab_workload_manifest"))
         self.assertNotIn(checker.CHECK_GITLAB_WORKLOAD_MANIFEST, checker.GITHUB_CHECKS)
         self.assertNotIn(checker.CHECK_GITLAB_WORKLOAD_MANIFEST, checker.GCP_CHECKS)
 
@@ -4994,7 +5011,7 @@ class ChecksSelectionTest(unittest.TestCase):
         # run_checks and verify_project used to each compute "every check", and
         # differed by the KMS half, so a --report's key set depended on whether
         # the toolchain check passed.
-        self.assertEqual(set(checker.DEFAULT_CHECKS), set(checker.CHECK_IDS) - {checker.CHECK_TOKEN_MINTER_KMS})
+        self.assertEqual(set(checker.DEFAULT_CHECKS), set(checker.CHECK_IDS) - {checker.CHECK_TOKEN_MINTER_KMS, checker.CHECK_GITLAB_WORKLOAD_MANIFEST})
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "report.json"
             with mock.patch.object(checker, "check_toolchain", return_value=["gcloud has no active credential"]), mock.patch("builtins.print"):
@@ -5022,7 +5039,7 @@ class ChecksSelectionTest(unittest.TestCase):
                 never.assert_not_called()
             minter.assert_called_once_with("kube-agents-evals-3", checker.DEFAULT_GITHUB_APP_ID, "us-central1", probe_app=False)
             everything = checker.run_checks("kube-agents-evals-3")
-            self.assertEqual([r.check_id for r in everything], [c for c in checker.CHECK_IDS if c != checker.CHECK_TOKEN_MINTER_KMS])
+            self.assertEqual([r.check_id for r in everything], [c for c in checker.CHECK_IDS if c not in (checker.CHECK_TOKEN_MINTER_KMS, checker.CHECK_GITLAB_WORKLOAD_MANIFEST)])
             self.assertEqual(minter.call_args_list[-1], mock.call("kube-agents-evals-3", checker.DEFAULT_GITHUB_APP_ID, "us-central1"))
             # iam alone still needs the project number, and reports only iam.
             alone = checker.run_checks("kube-agents-evals-3", checks=[checker.CHECK_IAM])
