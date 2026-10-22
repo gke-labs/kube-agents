@@ -17,7 +17,7 @@ metadata:
 This reference guides creating Google Kubernetes Engine (GKE) clusters by
 providing a set of best-practice templates and guiding through mode selection
 and customization. The **golden path Autopilot** configuration is the default
-for all new clusters.
+for a new cluster whose workload states no requirement it cannot meet.
 
 > **MCP Tools:** `list_clusters`, `get_cluster`,
 > `list_operations`, `get_operation`
@@ -29,14 +29,23 @@ for all new clusters.
 2.  **Gather inputs**: `project_id`, `location` (region or zone),
     `cluster_name`, environment type. If missing essential details, ask the user
     before taking action.
-3.  **Select mode & explain trade-offs**: If the user hasn't specified a
-    template or mode, present the available templates (e.g., Autopilot, Standard
-    Regional, GPU Inference, AI Hypercompute) and explain key trade-offs (Cost
-    vs. Availability, Autopilot vs. Standard node management).
+3.  **Select mode & explain trade-offs**: When the request names a workload
+    the cluster is for ("with Agent Substrate installed"), read that
+    workload's install requirements before choosing anything (`SOUL.md` §3,
+    item 4.1): the Developer Knowledge MCP for what Google documents, the
+    project's own repository (**inspect-repository**) otherwise. A
+    requirement it states (Standard mode, a machine series, beta APIs, a node
+    label, a bucket or IAM binding it expects) overrides every template
+    default below, and the pull request body lists each one with its source.
+    Search-result snippets are not requirements. If the user hasn't specified
+    a template or mode, present the available templates (e.g., Autopilot,
+    Standard Regional, GPU Inference, AI Hypercompute) and explain key
+    trade-offs (Cost vs. Availability, Autopilot vs. Standard node
+    management).
 4.  **Configure networking**: auto-create subnet (default) or bring-your-own.
 5.  **Review golden path settings**: present the default configuration block
-    (the template's settings) as the configuration the pull request will
-    carry.
+    (the template's settings, with step 3's workload requirements applied over
+    them) as the configuration the pull request will carry.
 6.  **Propose**: Write the configuration as a pull request in the format the
     GitOps repository's `provisioning/` path already holds: Config Connector
     YAML through the `gcp-config-connector` skill. A Terraform repository, an
@@ -46,8 +55,8 @@ for all new clusters.
     `gcloud container clusters create`.
 7.  **Track**: Once the pull request merges and the reconciler starts the
     create, use `get_operation` to monitor its progress.
-8.  **Verify**: Use `get_cluster` with `readMask="*"` to confirm golden path
-    settings applied.
+8.  **Verify**: Use `get_cluster` with `readMask="*"` to confirm the
+    settings the pull request carried applied.
 
 ## Mode Selection
 
@@ -64,8 +73,11 @@ for all new clusters.
 | Best for           | Most production workloads | Kernel tuning, custom OS, |
 :                    :                           : privileged workloads      :
 
-> **Rule**: Default to Autopilot unless the customer has a specific requirement
-> that Autopilot cannot satisfy.
+> **Rule**: Default to Autopilot unless the customer, or the workload the
+> cluster is for, has a requirement Autopilot cannot satisfy. A workload's
+> stated requirement (from step 3) wins over this default, and over every
+> template value below: a template default applies only where the workload
+> sets nothing.
 
 ## Best Practices
 

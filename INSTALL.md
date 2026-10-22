@@ -141,7 +141,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
      cd terraform/examples/full-install
      KUBE_AGENTS_STATE_BUCKET="<project>-kube-agents-tfstate" KUBE_AGENTS_STATE_PREFIX="kube-agents/<cluster>" ./lifecycle.sh apply
      ```
-   - **Post-apply steps** (managed-OTel collection scope, on a cluster this install created).
+   - **Post-apply steps** (managed-OTel collection scope, on a cluster this install created; with Google Chat or Slack on, the commands that print the chat app's setup checklist).
 4. Exits with code `0` and writes `{"status": "GENERATE_ONLY_SUCCESS", ...}` to `/tmp/kube-agents-install-report.json`.
 
 On a GitLab install, the checks in step 2 skip the GitHub organization check. Generate-only never
@@ -529,8 +529,9 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
 - **Private Container Registry**: If your GKE clusters may only pull from an approved registry, see
   [Private container registry](#private-container-registry) below for the full recipe. Mirroring
   only the `kube-agents` images is not enough on its own: `image_registry` (or `install.sh`'s
-  `--registry-prefix`) covers the four images this project builds, and LiteLLM, fluent-bit, the
-  GitHub token minter and Hindsight need `third_party_image_registry` (or
+  `--registry-prefix`) covers the first-party images this project builds, the two AgentPlugin
+  images among them when their plugins are enabled, and LiteLLM, fluent-bit, the GitHub token
+  minter and Hindsight need `third_party_image_registry` (or
   `--third-party-registry-prefix`) as well; cert-manager is separate (see the composition README).
 
 - **Component stack (`--mode`)**: a first `install.sh` install runs `spec.mode: next`, which puts the NATS bus
@@ -598,7 +599,8 @@ When using the official release installer (`<RELEASE_VERSION>/install.sh`), the 
 
 The two flags are separate because the images fall into two groups. `--registry-prefix`
 (`image_registry` in tfvars) replaces `ghcr.io/gke-labs/kube-agents` for the images this project
-builds — the operator, the agent, and the credential proxy. `--third-party-registry-prefix`
+builds — the operator, the agent, the credential proxy, the shell sandbox, and the two AgentPlugin
+images when their plugins are enabled. `--third-party-registry-prefix`
 (`third_party_image_registry`) covers the ones it does not: the LiteLLM gateway, the fluent-bit
 sidecar, the GitHub token minter, and Hindsight. **Neither implies the other**, so an install
 that mirrors everything passes both, as above; empty leaves third-party images on their
@@ -645,7 +647,7 @@ If you enabled Google Chat or Slack during the install, perform the following re
      kubectl exec -it deploy/platform-agent-gateway -n kubeagents-system -- hermes pairing approve google_chat <PAIRING_CODE>
      ```
    - The A2A gateway under `spec.mode: next` has no pairing: it answers the addresses in `ALLOWED_USERS`, or everyone the app is visible to when that is empty.
-   - Re-display these instructions at any time from the repository root. When `install.env` records `PLATFORM_AGENT_MODE=next`, it prints the A2A gateway's checklist instead. This script takes the mode from `install.env` alone, while the checklist `install.sh` prints at the end of a run follows the mode it expects the PlatformAgent to be on after the apply, which can differ from the key when `spec.mode` was set by hand:
+   - Re-display these instructions at any time from the repository root. When `install.env` records `PLATFORM_AGENT_MODE=next`, it prints the A2A gateway's checklist instead. This script takes the mode from `install.env` alone, while the checklist `install.sh` prints after an apply (at the end of a run, and after Save & Apply in `--menu`) follows the mode it expects the PlatformAgent to be on after the apply, which can differ from the key when `spec.mode` was set by hand:
      ```bash
      ./scripts/installer/print_instructions_gchat.sh
      ```
@@ -679,7 +681,7 @@ If you enabled Google Chat or Slack during the install, perform the following re
 5. **Set or Move the Home Channel (if you left `SLACK_HOME_CHANNEL` empty)**:
    - If step 2's message was the install's first chat message, it set the home channel to the channel or DM it came from. If Google Chat received the first message instead, Slack has none, and scheduled audits have nowhere to post on Slack. Either way, run `/sethome` (or `/hermes sethome`) from the Slack channel you want. It takes effect immediately and persists across restarts.
 
-- Re-display these instructions at any time from the repository root. When `install.env` records `PLATFORM_AGENT_MODE=next` and Google Chat is off, it prints the A2A gateway's checklist from the [Slack app setup](docs/site/src/content/docs/install/slack-app.md) page instead. As for Google Chat, this script takes the mode from `install.env` alone, while the checklist `install.sh` prints follows the mode it expects after the apply:
+- Re-display these instructions at any time from the repository root. When `install.env` records `PLATFORM_AGENT_MODE=next` and Google Chat is off, it prints the A2A gateway's checklist from the [Slack app setup](docs/site/src/content/docs/install/slack-app.md) page instead. As for Google Chat, this script takes the mode from `install.env` alone, while the checklist `install.sh` prints after an apply follows the mode it expects after it:
   ```bash
   ./scripts/installer/print_instructions_slack.sh
   ```
@@ -1341,9 +1343,13 @@ kubectl exec deploy/platform-agent-gateway -n kubeagents-system -c platform-agen
 
 Each audit's report is a ledger issue in the GitOps repository, and its fixes are pull requests
 there, so those two need a GitOps repository, on GitHub or on GitLab. With no GitOps repository
-registered (none at all, rather than one the install cannot use), the audits still run: each keeps
-its findings in the report store on the agent's volume, and a run that changed something posts a
-summary to chat that says no forge is configured. With a repository, a
+registered, the audits still run: each keeps its findings in the report store on the agent's
+volume, and a run that changed something posts a summary to chat that says no forge is configured.
+A run whose repository the broker cannot reach, or a run on an install with several managed
+repositories and none with `role: gitops`, does the same, but it posts its summary on every run,
+with the reason and the fix. See
+[Which repository gets the ledger](docs/site/src/content/docs/concepts/declarative-workflow.md#which-repository-gets-the-ledger).
+With a repository, a
 run that changed something since the last one posts a one-line summary linking the issue to
 the home channel of each enabled chat platform (wherever `/sethome` last ran; otherwise the chat
 the install's first chat message came from; otherwise `SLACK_HOME_CHANNEL` or
@@ -1464,7 +1470,7 @@ When a Slack bot connects or is online in your workspace but never replies to me
   - The `*:history` scopes (`im:history`, `channels:history`, `groups:history`, `mpim:history`) are the most common cause of silent failures: without them, Socket Mode connects successfully, but Slack never forwards message contents to the bot.
   - Omitting `files:write` drops report artifact uploads quietly (logged as a warning).
   - Omitting `reactions:write` silently prevents reaction emoji from appearing on user messages.
-  - Under `spec.mode: next`, the reactions, a question's answered line, Working… and the suggested prompts also need `users:read`, `assistant:write`, the `assistant_thread_started` event (`app_home_opened` on an agent-view app) and interactivity, which the `hermes slack manifest` output carries unless generated with `--no-assistant`; without them the answers still arrive and only those go missing. The Home tab's fleet dashboard needs `home_tab_enabled` and the `app_home_opened` event, and with `spec.integration.slack.allowedUsers` left empty also `users:read`, which the workspace check behind it (`users.info`) needs; without that scope the tab stays blank ([ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack)).
+  - Under `spec.mode: next`, the reactions, a question's answered line, Working… and the suggested prompts also need `users:read`, `assistant:write`, the `assistant_thread_started` event (`app_home_opened` on an agent-view app) and interactivity, which the `hermes slack manifest` output carries unless generated with `--no-assistant`; without them the answers still arrive and only those go missing. The Home tab's fleet dashboard needs `home_tab_enabled` and the `app_home_opened` event, and with `spec.integration.slack.allowedUsers` left empty also `users:read`, which the workspace check behind it (`users.info`) needs; without that scope the tab stays blank ([ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack)). The message shortcut also needs the `commands` scope and a `features.shortcuts` entry ([Slack app setup](docs/site/src/content/docs/install/slack-app.md)).
   - For the complete manifest, instructions on generating it with `hermes slack manifest`, and event subscriptions, see [Step 5 §2 (Slack Configuration)](#2-slack-configuration-slack_enabledtrue) or run `./scripts/installer/print_instructions_slack.sh`; under `spec.mode: next` the manifest is on the [Slack app setup](docs/site/src/content/docs/install/slack-app.md#for-specmode-next-the-a2a-gateway) page.
 - **User Allowlist:** Check `spec.integration.slack.allowedUsers` on the `PlatformAgent` CR (or `SLACK_ALLOWED_USERS` in `install.env`). Under `mode: today` unlisted users are ignored without a reply; under `next` the A2A gateway answers once with a notice naming their member ID. An empty allowlist admits all members in the workspace. Under `spec.mode: next`, the A2A gateway refuses a message from a member of another workspace (a Slack Connect guest) before consulting the list; under `mode: today`, the legacy consumer has no such check: a guest in a shared channel is admitted by the allowlist alone, and under an empty list that is everyone. See the site's [ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack) and the [PlatformAgent CRD reference](docs/site/src/content/docs/operator/platformagent-crd.md#specintegration).
 - **Single-Workspace vs Multi-Workspace (`spec.mode: next`):** Under `spec.mode: next`, the A2A gateway takes a single workspace bot token. If your secret holds a comma-separated list of tokens (supported under `mode: today`), Slack rejects it at `auth.test`; the gateway pod stays Running and Ready, retrying the Slack backend on a backoff, and Slack has no consumer until the secret holds one workspace's token or the install goes back to `today`. Because the operator arms on the CR alone, the CR's `.status` does not surface this failure; the error appears only in the gateway pod's log.

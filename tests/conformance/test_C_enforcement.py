@@ -305,6 +305,66 @@ class C1IsolationIsStructural(unittest.TestCase):
         for prefix in (h.watcher_policy.WATCHER_GCP_PREFIX, h.watcher_policy.WATCHER_K8S_PREFIX):
             self.assertEqual(proxy.required_roles(prefix + "x"), (proxy.CALLER_ROLE_WATCHER,), prefix)
 
+    def test_C1_the_platform_pubsub_relay_reaches_only_the_configured_subscriptions(self) -> None:
+        """The gateway's Pub/Sub platform adapter pulls through the broker, and only its own subscriptions.
+
+        The gateway pod holds no Google credential (the identity tests above), so
+        the adapter's one path to a subscription is `/v1/pubsub/gcp/`, confined to
+        the set the operator rendered from the AgentPlugin configs. An empty set
+        refuses everything: an install with no Pub/Sub platform relays nothing.
+        """
+        policy = h.watcher_policy
+        configured = frozenset({"projects/kagents-dev/subscriptions/gke-stockout-alerts-sub"})
+        pull = "v1/projects/kagents-dev/subscriptions/gke-stockout-alerts-sub:pull"
+        self.assertTrue(policy.evaluate_pubsub("POST", policy.PUBSUB_HOST, pull, b'{"maxMessages":1}', configured).allowed)
+        for other in (
+            "projects/kagents-dev/subscriptions/platform-agent-drift-audit-sub",
+            "projects/elsewhere-1/subscriptions/gke-stockout-alerts-sub",
+        ):
+            decision = policy.evaluate_pubsub("POST", policy.PUBSUB_HOST, f"v1/{other}:pull", b"{}", configured)
+            self.assertFalse(decision.allowed, f"the platform relay pulls {other}")
+        self.assertFalse(policy.evaluate_pubsub("POST", policy.PUBSUB_HOST, pull, b"{}", frozenset()).allowed)
+        self.assertFalse(
+            policy.evaluate_pubsub("GET", policy.GKE_HOST, "v1/projects/p/locations/l/clusters/c", b"", configured).allowed,
+            "the platform relay reaches the GKE API",
+        )
+
+    def test_C1_only_the_chat_role_reaches_the_platform_pubsub_relay(self) -> None:
+        proxy = h.credential_proxy
+        prefix = h.watcher_policy.PLATFORM_PUBSUB_PREFIX
+        self.assertEqual(proxy.required_roles(prefix + "x"), (proxy.CALLER_ROLE_CHAT,), prefix)
+        self.assertNotIn(proxy.CALLER_ROLE_WATCHER, proxy.required_roles(prefix + "x"))
+
+    def test_C1_no_shipped_platform_adapter_holds_a_google_credential_path(self) -> None:
+        """A platform adapter runs in the gateway pod, which has no Google identity.
+
+        An adapter that imports a Google client library or reads a service
+        account key file is one that will call Google on a credential the pod
+        does not hold, and fail the way the Pub/Sub adapter failed when the
+        gateway lost Workload Identity. Every Google call goes through the broker.
+        """
+        forbidden_roots = {"google", "googleapiclient", "google_auth_httplib2"}
+        key_env = "GOOGLE_APPLICATION_CREDENTIALS"
+        adapters = sorted(h.REPO_ROOT.glob("agentplugins/*/files/platforms/*/*.py"))
+        self.assertTrue(adapters, "no shipped platform adapter found; the glob is stale")
+        for path in adapters:
+            source = path.read_text()
+            tree = ast.parse(source, filename=str(path))
+            for node in ast.walk(tree):
+                names: list[str] = []
+                if isinstance(node, ast.Import):
+                    names = [alias.name for alias in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    names = [node.module]
+                for name in names:
+                    self.assertNotIn(
+                        name.split(".")[0], forbidden_roots,
+                        f"{path.relative_to(h.REPO_ROOT)} imports {name}: a platform adapter calls Google through the broker",
+                    )
+            self.assertNotIn(key_env, source, f"{path.relative_to(h.REPO_ROOT)} reads {key_env}")
+        for manifest in sorted(h.REPO_ROOT.glob("agentplugins/*/files/platforms/*/plugin.yaml")):
+            self.assertNotIn(key_env, manifest.read_text(), f"{manifest.relative_to(h.REPO_ROOT)} asks for {key_env}")
+
     def test_C1_the_operator_pins_the_drift_detectors_own_default_subscription(self) -> None:
         """The broker refuses every subscription but the one the operator names.
 

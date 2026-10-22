@@ -77,9 +77,11 @@ _KUBECTL_SUBCOMMANDS: dict[str, frozenset[str]] = {
 # credential_proxy_client runs on import.
 from credential_proxy_client import (  # noqa: F401  (re-export)
     API_RELAY_PREFIX,
+    CONTEXT_FLAG,
     END_OF_FLAGS,
     KUBECONFIG_FLAG,
     ClusterTarget,
+    kubectl_context_flag,
     parse_gke_context,
     read_current_context,
 )
@@ -95,6 +97,65 @@ SLACK_ERROR_DIAGNOSTIC_FIELDS = ("ok", "error", "needed", "provided")
 # request that names no cluster resolves to this rather than to whatever the
 # base kubeconfig currently points at.
 HOST_CONTEXT_ENV = "KUBE_CONTEXT_NAME"
+
+# A kubectl read that names no cluster -- no `--context`, no `--kubeconfig`, no
+# KUBECONFIG forwarded by the shim -- runs on the host cluster through the
+# broker's default kubeconfig. When it finds nothing, the caller cannot tell
+# "absent" from "absent on the host": a worker read a namespace on the host and
+# reported it missing from the fleet (#3371, #3375). So a NotFound or an empty
+# answer to such a read gets one line naming the cluster it ran on. Appended to
+# stderr, so stdout -- often parsed as JSON -- is untouched; the exit code is
+# never changed; and any other result is returned as it came. The trigger is
+# the output's shape, not the cluster's state, so a partial NotFound
+# (`get ns a b`, one missing) or an existing pod with no logs gets the line too;
+# it only says where the read went, which is true either way.
+#
+# The wording is a plain statement of where the read went. It must stay clear
+# of what the refusal stop reads (deploy/docker/patches/permission_refusal_stop.py:
+# the action boundary notice, the `policy rule:`/`policy verb:` lines, and the
+# API-denial shapes), so the hint is never counted as a refusal or a halt.
+# test_credential_proxy.ContextlessKubectlHostHintTest holds it to that.
+KUBECTL_HOST_HINT_VERBS = frozenset({"get", "describe", "events", "logs", "top"})
+# kubectl's prefix for a server NotFound, the only "nothing there" a failed read
+# carries. A client-side "not found" (an unknown resource type, a context the
+# kubeconfig lacks) is a different fault and gets no hint.
+KUBECTL_NOT_FOUND_MARKER = "Error from server (NotFound)"
+# An empty list in `-o json`/`-o yaml` is a few hundred bytes; anything longer
+# has items and is not parsed at all.
+KUBECTL_EMPTY_LIST_PROBE_BYTES = 4096
+# Only kubectl's own list wrapper counts: `kubectl get <type>` prints
+# `apiVersion: v1, kind: List` for every resource type, built-in or custom. A
+# found object is never that pair -- the core group has no `List` resource, and
+# a custom kind (`AllowList`) carries its own group in `apiVersion` -- so an
+# object with an `items` field of its own is never read as an empty answer. A
+# typed list (`PodList`) only comes from `get --raw` and gets no line, which is
+# today's behaviour.
+KUBECTL_LIST_ITEMS_KEY = "items"
+KUBECTL_LIST_KIND_KEY = "kind"
+KUBECTL_LIST_API_VERSION_KEY = "apiVersion"
+KUBECTL_LIST_KIND = "List"
+KUBECTL_LIST_API_VERSION = "v1"
+KUBECTL_EMPTY_YAML_ITEMS_RE = re.compile(r"^items: \[\]\s*$", re.MULTILINE)
+KUBECTL_YAML_LIST_KIND_RE = re.compile(r"^kind: List\s*$", re.MULTILINE)
+KUBECTL_YAML_LIST_API_VERSION_RE = re.compile(r"^apiVersion: v1\s*$", re.MULTILINE)
+# `-o custom-columns` prints its header row even over an empty list, and the
+# generic printer it goes through prints no "No resources found", so a header
+# alone is the empty answer in that mode. Matched on the output flag's value,
+# in every spelling kubectl takes; the last one wins, as in kubectl.
+KUBECTL_OUTPUT_FLAGS = ("-o", "--output")
+KUBECTL_CUSTOM_COLUMNS_PREFIX = "custom-columns"
+KUBECTL_NO_HEADERS_FLAG = "--no-headers"
+KUBECTL_HOST_HINT_PREFIX = "[credential-proxy] "
+KUBECTL_HOST_HINT_NAMED = (
+    "This kubectl named no cluster, so it read the host cluster {cluster}"
+    " (the credential proxy's default kubeconfig). To read another cluster,"
+    " pass " + CONTEXT_FLAG + " <name>."
+)
+KUBECTL_HOST_HINT_UNNAMED = (
+    "This kubectl named no cluster, so it read this install's host cluster"
+    " (the credential proxy's default kubeconfig). To read another cluster,"
+    " pass " + CONTEXT_FLAG + " <name>."
+)
 
 # Bounds on a one-shot kubectl read. kubectl's own client default is 300s, so a
 # control plane that is down, private or firewalled parks a broker worker for
@@ -343,6 +404,15 @@ API_RELAY_DEADLINE_S = 120
 # smaller `pageSize`, which every listed endpoint supports. Read in chunks up
 # to the cap rather than with `.read()`, so the cap bounds memory too.
 API_RELAY_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+# Pub/Sub's largest message (10 MB of data), and the answer cap the platform
+# Pub/Sub relay carries instead of API_RELAY_MAX_RESPONSE_BYTES: a pull is a
+# lease, Pub/Sub has started the ack deadline and the ack ids are in the body
+# by the time the broker reads it, so an answer refused for size strands the
+# message until the deadline, forever for one that is always over. The adapter
+# pulls one message at a time; 16 MiB holds the largest one base64-encoded
+# (13.4 MiB) with its envelope.
+PUBSUB_MAX_MESSAGE_BYTES = 10 * 1024 * 1024
+PLATFORM_PUBSUB_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 API_RELAY_READ_CHUNK_BYTES = 64 * 1024
 # Query keys removed before forwarding. Each is a way to substitute a
 # credential for the broker's or to change the response class: an API key
@@ -1080,6 +1150,12 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # them holds the chat token and cannot present this one.
     (watcher_policy.WATCHER_GCP_PREFIX, (CALLER_ROLE_WATCHER,)),
     (watcher_policy.WATCHER_K8S_PREFIX, (CALLER_ROLE_WATCHER,)),
+    # The Pub/Sub platform adapter's four calls, on the subscriptions the
+    # AgentPlugins configure: the gateway's own, so the chat role, which is the
+    # token the Hermes container holds. Its own prefix rather than the
+    # watcher's with a second role: the two are confined to different
+    # subscription sets, and the prefix is what this table keys the role on.
+    (watcher_policy.PLATFORM_PUBSUB_PREFIX, (CALLER_ROLE_CHAT,)),
     ("/v1/github/", (CALLER_ROLE_SHELL,)),
     ("/v1/vcs/", (CALLER_ROLE_SHELL,)),
     ("/v1/workspace/", (CALLER_ROLE_SHELL,)),
@@ -1736,6 +1812,15 @@ SLACK_REMOVE_ALLOWLIST = frozenset({"reactions.remove"})
 # `chat.delete?x` and `chat.delete.` would pass it -- and slack_sdk joins the
 # string into the URL, where the fragment is dropped and the query ignored.
 SLACK_METHOD_SHAPE = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)+")
+# The subscriptions the platform Pub/Sub relay may reach, as the operator renders
+# them from the AgentPlugin configs; read by platform_pubsub_subscriptions().
+PLATFORM_PUBSUB_SUBSCRIPTIONS_ENV = "PLATFORM_PUBSUB_SUBSCRIPTIONS"
+# One fully qualified subscription, the shape watcher_policy matches on the
+# wire; an entry that is not one would never match a call and would read as a
+# configured subscription that silently refuses everything.
+_QUALIFIED_SUBSCRIPTION = re.compile(
+    rf"projects/{watcher_policy.PUBSUB_PROJECT}/subscriptions/{watcher_policy.SUBSCRIPTION}"
+)
 # The IAM permission a Pub/Sub pull spends on the subscription. A refused pull
 # names it in the log when the error's own ErrorInfo did not, so the line says
 # what to grant rather than only that something was refused.
@@ -2526,8 +2611,9 @@ class ApiRelayResponse:
     status: int
     content_type: str
     body: bytes
-    # True when the upstream body ran past API_RELAY_MAX_RESPONSE_BYTES; `body`
-    # is then empty, because a truncated JSON page is worse than no page.
+    # True when the upstream body ran past the call's cap (API_RELAY_MAX_RESPONSE_BYTES,
+    # or the family's own); `body` is then empty, because a truncated JSON page is
+    # worse than no page.
     over_cap: bool = False
 
 
@@ -2619,8 +2705,12 @@ class GoogleApiRelay:
         *,
         body: bytes | None = None,
         headers: tuple[tuple[str, str], ...] = (),
+        max_bytes: int | None = None,
     ) -> ApiRelayResponse:
         """One `GET https://{host}{target}` on the broker's credential, or a POST with `body`.
+
+        `max_bytes` is the answer cap, API_RELAY_MAX_RESPONSE_BYTES unless a
+        family carries its own (the platform Pub/Sub relay does).
 
         `target` is the path and query as the handler assembled them, already
         checked against the policy and stripped of the credential keys. Raises
@@ -2683,7 +2773,7 @@ class GoogleApiRelay:
                 if not chunk:
                     break
                 received += len(chunk)
-                if received > API_RELAY_MAX_RESPONSE_BYTES:
+                if received > (max_bytes if max_bytes is not None else API_RELAY_MAX_RESPONSE_BYTES):
                     return ApiRelayResponse(
                         response.status, response.getheader("Content-Type", ""), b"", True
                     )
@@ -3497,6 +3587,79 @@ def _is_get_credentials(argv: list[str]) -> bool:
     except ValueError:
         return False
     return argv[index + 1 : index + 3] == ["clusters", "get-credentials"]
+
+
+def _kubectl_output_format(argv: list[str]) -> str:
+    """The value of the last `-o`/`--output` in a kubectl argv, or ""."""
+    value = ""
+    index = 1
+    while index < len(argv):
+        argument = argv[index]
+        if argument == END_OF_FLAGS:
+            break
+        if argument in KUBECTL_OUTPUT_FLAGS and index + 1 < len(argv):
+            value = argv[index + 1]
+            index += 2
+            continue
+        for flag in KUBECTL_OUTPUT_FLAGS:
+            if argument.startswith(f"{flag}="):
+                value = argument.partition("=")[2]
+                break
+        else:
+            short = KUBECTL_OUTPUT_FLAGS[0]
+            if argument.startswith(short) and not argument.startswith("--"):
+                value = argument[len(short):]
+        index += 1
+    return value
+
+
+def _kubectl_no_headers(argv: list[str]) -> bool:
+    """Does argv turn off kubectl's header row? `--no-headers` is a boolean
+    flag, so `--no-headers=false` keeps the header and the last setting wins."""
+    no_headers = False
+    for arg in argv:
+        if arg == KUBECTL_NO_HEADERS_FLAG:
+            no_headers = True
+        elif arg.startswith(KUBECTL_NO_HEADERS_FLAG + "="):
+            no_headers = arg.split("=", 1)[1].strip().lower() not in ("false", "0", "f")
+    return no_headers
+
+
+def _kubectl_output_is_empty(argv: list[str], stdout: str) -> bool:
+    """Did a successful kubectl read print nothing, or a list with no items?
+
+    "No resources found" goes to stderr, leaving stdout empty; `-o json` and
+    `-o yaml` print kubectl's empty `List` instead, `-o jsonpath='{.items}'` a
+    bare `[]`, and `-o custom-columns` its header row alone. Anything longer
+    than an empty list can be is not parsed.
+    """
+    text = stdout.strip()
+    if not text:
+        return True
+    if len(text) > KUBECTL_EMPTY_LIST_PROBE_BYTES:
+        return False
+    if _kubectl_output_format(argv).startswith(KUBECTL_CUSTOM_COLUMNS_PREFIX):
+        # With --no-headers the one line is a found row, not a header; an
+        # empty read already returned above.
+        return not _kubectl_no_headers(argv) and len(text.splitlines()) == 1
+    if (
+        KUBECTL_EMPTY_YAML_ITEMS_RE.search(text)
+        and KUBECTL_YAML_LIST_KIND_RE.search(text)
+        and KUBECTL_YAML_LIST_API_VERSION_RE.search(text)
+    ):
+        return True
+    try:
+        document = json.loads(text)
+    except ValueError:
+        return False
+    if document == []:
+        return True
+    return (
+        isinstance(document, dict)
+        and document.get(KUBECTL_LIST_ITEMS_KEY) == []
+        and document.get(KUBECTL_LIST_KIND_KEY) == KUBECTL_LIST_KIND
+        and document.get(KUBECTL_LIST_API_VERSION_KEY) == KUBECTL_LIST_API_VERSION
+    )
 
 
 def _kubectl_runs_long(argv: list[str]) -> bool:
@@ -6163,7 +6326,7 @@ class CommandExecutor:
             kubeconfig_path = self._default_kubeconfig()
         else:
             kubeconfig_path = None
-        return self._execute(
+        result = self._execute(
             command,
             stdin=stdin,
             cwd=cwd,
@@ -6171,6 +6334,49 @@ class CommandExecutor:
             timeout_seconds=kubectl_deadline,
             caller=caller,
         )
+        # Read off the caller's argv, not `command`: the request timeout added
+        # above is not the caller's, and a rerouted `--kubeconfig` is already
+        # in `flag_kubeconfig`.
+        if (
+            executable == "kubectl"
+            and flag_kubeconfig is None
+            and not kubeconfig_context
+            # An empty value (`--context "$UNSET"`) names nothing: kubectl
+            # reads current-context, the host.
+            and not kubectl_context_flag(argv)
+        ):
+            return self._with_host_hint(argv, result)
+        return result
+
+    def _with_host_hint(self, argv: list[str], result: ExecutionResult) -> ExecutionResult:
+        """`result`, plus a line naming the host when a context-less read found nothing.
+
+        See KUBECTL_HOST_HINT_VERBS. Only a read verb, only a server NotFound or
+        an empty answer, and never a result that was cut, timed out or
+        abandoned: what those say about the cluster is unknown. stdout and the
+        exit code are returned as they came.
+        """
+        if result.truncated or result.timed_out or result.abandoned:
+            return result
+        verb, _ = command_policy._kubectl_verb_and_flag(argv)
+        if not verb or verb[0] not in KUBECTL_HOST_HINT_VERBS:
+            return result
+        if result.exit_code == 0:
+            found_nothing = _kubectl_output_is_empty(argv, result.stdout)
+        else:
+            found_nothing = KUBECTL_NOT_FOUND_MARKER in result.stderr
+        if not found_nothing:
+            return result
+        target = self._ambient_target()
+        hint = (
+            KUBECTL_HOST_HINT_NAMED.format(cluster=target.context_name)
+            if target is not None
+            else KUBECTL_HOST_HINT_UNNAMED
+        )
+        stderr = result.stderr
+        if stderr and not stderr.endswith("\n"):
+            stderr += "\n"
+        return replace(result, stderr=f"{stderr}{KUBECTL_HOST_HINT_PREFIX}{hint}\n")
 
     def execute_internal(
         self, argv: list[str], cwd: str | None = None
@@ -8609,6 +8815,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # one Pub/Sub target the watcher relay reaches. Empty: the detector is off
     # and every Pub/Sub call is refused.
     watcher_subscription: str = ""
+    # The subscriptions the gateway's Pub/Sub platform adapter may reach through
+    # `/v1/pubsub/gcp/`, each `projects/<p>/subscriptions/<s>`, as the operator
+    # rendered them from the AgentPlugin configs. Empty: no plugin route the
+    # operator could qualify, and every call is refused.
+    platform_pubsub_subscriptions: frozenset[str] = frozenset()
     # (project, location, cluster) -> (deadline, host, CA PEM or ""), for the
     # watcher's Kubernetes route. See `_watcher_cluster_endpoint`.
     watcher_endpoints: dict[tuple[str, str, str], tuple[float, str, str]] = {}
@@ -8772,6 +8983,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if self.path.startswith(watcher_policy.WATCHER_GCP_PREFIX):
             self._handle_watcher_gcp()
             return
+        if self.path.startswith(watcher_policy.PLATFORM_PUBSUB_PREFIX):
+            self._handle_platform_pubsub()
+            return
         if self.path.startswith(watcher_policy.WATCHER_K8S_PREFIX):
             self._handle_watcher_k8s()
             return
@@ -8853,6 +9067,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
         if self.path.startswith(watcher_policy.WATCHER_GCP_PREFIX):
             self._handle_watcher_gcp()
+            return
+        if self.path.startswith(watcher_policy.PLATFORM_PUBSUB_PREFIX):
+            self._handle_platform_pubsub()
             return
         if self.path.startswith(watcher_policy.WATCHER_K8S_PREFIX):
             # GET only; reaches the handler so the refusal names its rule.
@@ -9739,10 +9956,52 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         is the table; the forwarding is the Cloud API relay's, with a body for
         the Pub/Sub POSTs, and the status, Content-Type and body pass back.
         """
+        self._relay_google_call(
+            "watcher gcp",
+            watcher_policy.WATCHER_GCP_PREFIX,
+            lambda host, path, body: watcher_policy.evaluate_gcp(
+                self.command, host, path, body, self.watcher_subscription
+            ),
+        )
+
+    def _handle_platform_pubsub(self) -> None:
+        """`/v1/pubsub/gcp/<host>/<path>`: one Pub/Sub call for the gateway's platform adapter.
+
+        The adapter (agentplugins/pubsub-platform) used to pull its
+        subscriptions on the gateway pod's own Workload Identity, which the pod
+        no longer holds. `watcher_policy.evaluate_pubsub` is the table, pinned
+        to `platform_pubsub_subscriptions`; the forwarding is the watcher
+        family's, unchanged.
+        """
+        self._relay_google_call(
+            "platform pubsub",
+            watcher_policy.PLATFORM_PUBSUB_PREFIX,
+            lambda host, path, body: watcher_policy.evaluate_pubsub(
+                self.command, host, path, body, self.platform_pubsub_subscriptions
+            ),
+            family="platform Pub/Sub relay",
+            max_bytes=PLATFORM_PUBSUB_MAX_RESPONSE_BYTES,
+        )
+
+    def _relay_google_call(
+        self,
+        label: str,
+        prefix: str,
+        decide: Callable[[str, str, bytes], command_policy.Decision],
+        family: str = "watcher relay",
+        max_bytes: int | None = None,
+    ) -> None:
+        """Forward one `<prefix><host>/<path>` Google call that `decide` allows.
+
+        `label` is the first word of every audit line, naming the family; the
+        caller's role was already checked against ROUTE_ROLES by the time this
+        runs, so `decide` is the second gate, on the target. `max_bytes` is the
+        family's answer cap, the relay's own when None.
+        """
         request_id = str(uuid.uuid4())
         parts = urllib.parse.urlsplit(self.path)
-        host, _, path = parts.path[len(watcher_policy.WATCHER_GCP_PREFIX) :].partition("/")
-        self._log_watcher_request("watcher gcp", request_id, f"{host}/{path}")
+        host, _, path = parts.path[len(prefix) :].partition("/")
+        self._log_watcher_request(label, request_id, f"{host}/{path}")
         body = b""
         if self.command == watcher_policy.METHOD_POST:
             # The two answers /v1/exec and the MCP relay give: 400 for a length
@@ -9750,11 +10009,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
-                LOGGER.warning("watcher gcp rejected request_id=%s reason=content-length", request_id)
+                LOGGER.warning("%s rejected request_id=%s reason=content-length", label, request_id)
                 self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid content length"})
                 return
             if length < 0 or length > self.max_request_bytes:
-                LOGGER.warning("watcher gcp rejected request_id=%s reason=content-length", request_id)
+                LOGGER.warning("%s rejected request_id=%s reason=content-length", label, request_id)
                 self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "request body too large"})
                 return
             body = self.rfile.read(length)
@@ -9763,15 +10022,15 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         problem = api_relay_target_problem(host, path, parts.query)
         query = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
         if problem is None and not set(query) <= WATCHER_GCP_QUERY_KEYS:
-            problem = (API_RELAY_BAD_QUERY, "the watcher relay forwards no query keys but alt and prettyPrint")
+            problem = (API_RELAY_BAD_QUERY, f"the {family} forwards no query keys but alt and prettyPrint")
         if problem is not None:
             code, reason = problem
-            LOGGER.warning("watcher gcp rejected request_id=%s code=%s", request_id, code)
+            LOGGER.warning("%s rejected request_id=%s code=%s", label, request_id, code)
             self._json(HTTPStatus.BAD_REQUEST, {"error": reason, "code": code})
             return
-        decision = watcher_policy.evaluate_gcp(self.command, host, path, body, self.watcher_subscription)
+        decision = decide(host, path, body)
         if not decision.allowed:
-            LOGGER.warning("watcher gcp blocked request_id=%s rule=%s", request_id, decision.rule_id)
+            LOGGER.warning("%s blocked request_id=%s rule=%s", label, request_id, decision.rule_id)
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
@@ -9788,19 +10047,22 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 {"error": "Cloud API relay disabled", "code": "API_RELAY_DISABLED"},
             )
             return
-        authorization = self._relay_authorization("watcher gcp", request_id)
+        authorization = self._relay_authorization(label, request_id)
         if authorization is None:
             return
         target = f"/{path}?{parts.query}" if parts.query else f"/{path}"
         extra: dict[str, Any] = {}
         if self.command == watcher_policy.METHOD_POST:
             extra = {"body": body, "headers": (("Content-Type", WATCHER_GCP_CONTENT_TYPE),)}
-        upstream = self._relay_fetch("watcher gcp", request_id, host, target, authorization, **extra)
+        if max_bytes is not None:
+            extra["max_bytes"] = max_bytes
+        upstream = self._relay_fetch(label, request_id, host, target, authorization, **extra)
         if upstream is None:
             return
         if upstream.over_cap or HTTPStatus.MULTIPLE_CHOICES <= upstream.status < HTTPStatus.BAD_REQUEST:
             LOGGER.warning(
-                "watcher gcp upstream refused request_id=%s status=%d over_cap=%s",
+                "%s upstream refused request_id=%s status=%d over_cap=%s",
+                label,
                 request_id,
                 upstream.status,
                 upstream.over_cap,
@@ -9815,7 +10077,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # Only the fields the watchers read; never masterAuth's client key.
             projected = watcher_policy.project_cluster(upstream.body)
             if projected is None:
-                LOGGER.warning("watcher gcp unparseable cluster request_id=%s", request_id)
+                LOGGER.warning("%s unparseable cluster request_id=%s", label, request_id)
                 self._json(
                     HTTPStatus.BAD_GATEWAY,
                     {"error": "the upstream answer could not be relayed", "code": "UPSTREAM_UNRELAYABLE"},
@@ -9823,7 +10085,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 return
             relayed = projected
         LOGGER.info(
-            "watcher gcp forwarded request_id=%s rule=%s status=%d bytes=%d",
+            "%s forwarded request_id=%s rule=%s status=%d bytes=%d",
+            label,
             request_id,
             decision.rule_id,
             upstream.status,
@@ -9882,8 +10145,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     def _log_watcher_request(self, label: str, request_id: str, target: str) -> None:
         """The pre-decision audit line, naming the caller, as the other credentialed routes write it.
 
-        The broker makes every watcher call on its own credential, so this line
-        is the record of which ServiceAccount presented the watcher token.
+        The broker makes every relayed Google call, the watcher family's and the
+        platform Pub/Sub family's, on its own credential, so this line is the
+        record of which ServiceAccount presented the token.
         """
         principal = self.principal
         LOGGER.info(
@@ -11023,6 +11287,42 @@ def chat_relay_subscriptions(project_id: str) -> tuple[str, str]:
     return chat_subscription, a2a_subscription
 
 
+def platform_pubsub_subscriptions() -> frozenset[str]:
+    """The subscriptions the platform Pub/Sub relay may reach, from the environment.
+
+    `PLATFORM_PUBSUB_SUBSCRIPTIONS` is a comma-separated list of
+    `projects/<p>/subscriptions/<s>`, rendered by the operator from the
+    AgentPlugin configs; unset or empty means no plugin route the operator
+    could qualify, and the relay refuses every call. An entry of any other
+    shape is dropped
+    with a warning rather than refusing the boot: the operator renders the
+    list from user-authored AgentPlugin configs, and one typo in a route must
+    not take the broker, and with it every other route, off the air. A dropped
+    entry's route is refused by the policy, which the adapter logs with the
+    rule, so the typo is still loud where it was made.
+    """
+    raw = os.getenv(PLATFORM_PUBSUB_SUBSCRIPTIONS_ENV, "")
+    entries = [entry.strip() for entry in raw.split(",")]
+    kept: set[str] = set()
+    dropped = 0
+    for entry in entries:
+        if not entry:
+            continue
+        if _QUALIFIED_SUBSCRIPTION.fullmatch(entry):
+            kept.add(entry)
+        else:
+            dropped += 1
+    if dropped:
+        # The count, not the entries: the value is caller text from a CR.
+        LOGGER.warning(
+            "%s holds %d %s not a projects/<project>/subscriptions/<name> path; dropped",
+            PLATFORM_PUBSUB_SUBSCRIPTIONS_ENV,
+            dropped,
+            "entry that is" if dropped == 1 else "entries that are",
+        )
+    return frozenset(kept)
+
+
 def serve(args: argparse.Namespace) -> None:
     role = resolve_role()
     if role == "api-proxy":
@@ -11094,6 +11394,12 @@ def serve(args: argparse.Namespace) -> None:
     CredentialProxyHandler.api_relay = GoogleApiRelay()
     LOGGER.info("Cloud API relay enabled routes=%d", len(api_policy.API_READ_ROUTES))
     CredentialProxyHandler.watcher_subscription = os.getenv("WATCHER_PUBSUB_SUBSCRIPTION", "").strip()
+    CredentialProxyHandler.platform_pubsub_subscriptions = platform_pubsub_subscriptions()
+    if CredentialProxyHandler.platform_pubsub_subscriptions:
+        LOGGER.info(
+            "platform Pub/Sub relay enabled subscriptions=%d",
+            len(CredentialProxyHandler.platform_pubsub_subscriptions),
+        )
     CredentialProxyHandler.slack_max_request_bytes = int(
         os.getenv("SLACK_RELAY_MAX_REQUEST_BYTES", str(28 * 1024 * 1024))
     )

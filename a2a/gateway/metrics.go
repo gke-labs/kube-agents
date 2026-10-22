@@ -36,6 +36,10 @@ const (
 	metricsNamespace = "kubeagents"
 	metricsSubsystem = "a2a_gateway"
 
+	// taskTerminalsName counts every task terminal by state and source; the
+	// operator's usage poller reads it under failed and rejected as the
+	// next-mode half of status.usage's chatTurnsErroredTotal
+	// (docs/designs/usage-counters-producer.md).
 	taskTerminalsName       = "task_terminals_total"
 	gchatEventsReceivedName = "gchat_events_received_total"
 	gchatPullsName          = "gchat_pulls_total"

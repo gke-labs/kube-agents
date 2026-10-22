@@ -1,0 +1,83 @@
+# Domain: fleet audits. Journey: a fresh install's onboarding scan finds
+# nothing critical among its own checks, and the prioritization stage writes
+# the first report the user reads. The first-run audits then check security
+# and RBAC, reliability, capacity and cost, which the scan does not, and post
+# their own findings minutes later. A report that calls the fleet healthy, or
+# says "no critical vulnerabilities", is contradicted by those audits in the
+# same chat (#3090).
+#
+# The prioritization SOP (Step 6) fixes how the report opens: the scan counts
+# in a set form, then the posture line `inventory_findings.py select` prints,
+# copied exactly, and no verdict on the fleet. This case grades that opening by
+# equality, off the report the worker wrote on the shell sandbox. It grades no
+# verdict words: a word list over prose cannot tell "no critical findings" in a
+# count from the same words as a verdict, and the 10-20 verdict sat in the
+# opening, which equality already fails.
+#
+# The stack is bootstrap-inventory-ranking-delivery's
+# (bench/tf/prebuilt/bootstrap-ranking), planting
+# inventory-raw-no-critical.txt instead: one cluster, three workloads, four
+# low findings on the scan's own checks, so `select` lists no item, the branch
+# the #3090 reports came from. The stack's refusals, isolation and teardown are
+# that case's; read its header. Run it on an eval install nobody chats with.
+#
+# The expected posture is the counts the planted file's coverage table gives
+# and the line `select` prints; bench/tests/test_bootstrap_report_posture.py
+# keeps it equal to inventory_findings.SCAN_SCOPE_LINE.
+#
+# Eligible tier: nightly -- one card's worker runs the whole prioritization
+# SOP, which takes a dispatcher slot for most of the stack's wait.
+---
+id: bootstrap-inventory-posture-scope
+name: The first onboarding report opens with the scan counts and the posture line
+
+fixtures: []
+
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/bootstrap-ranking"
+  teardown: true
+  variables:
+    raw_report: "inventory-raw-no-critical.txt"
+
+validated: false
+
+domain: fleet-audits
+
+owner: toshiowang
+
+# The same board read as bootstrap-inventory-ranking-delivery's: the session
+# this prompt reaches must leave the card to its worker, whose report the
+# verifier reads.
+prompt: |
+  The onboarding inventory prioritization card for this install was filed a
+  few minutes ago as a kanban card with idempotency key
+  'bootstrap-inventory-prioritize'.
+
+  1. Find it. Call kanban_list separately for status 'running', 'blocked',
+     'todo' and 'done'. Do not call kanban_list without a status filter -- it
+     returns the oldest tasks first and stops at a page.
+  2. Report its id, its status, and the summary of its latest run.
+
+  Only read the board. Do not start, retry, unblock, archive, complete or
+  create any card, and make no changes to the cluster.
+expected_output: |
+  critical requirements:
+  - The reply names the prioritization card and reports its status and
+    latest run, read off the kanban board.
+  - No card is created, moved or archived, and nothing is changed on the
+    cluster.
+
+verification_spec:
+  # Reads INVENTORY.delivered.md, else INVENTORY.md, off the shell sandbox
+  # (kube_agents_bench/onboarding.py).
+  - name: report-posture-scoped
+    role: objective
+    check:
+      type: bootstrap_report_posture
+      posture:
+        - "Scanned 1 cluster and 3 workloads."
+        - >-
+          This scan ran 9 configuration checks; security and RBAC, reliability,
+          capacity and cost come from the first-run audits.

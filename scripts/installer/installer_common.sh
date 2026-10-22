@@ -94,6 +94,11 @@ readonly SCOPE_MAX_PROJECTS_MIN=1
 readonly SCOPE_MAX_PROJECTS_MAX=5000
 readonly SCOPE_MAX_PROJECTS_DEFAULT=100
 
+# ─── Data volume size ─────────────────────────────
+# The largest PLATFORM_AGENT_STORAGE_SIZE, in Mi: 64Ti, the largest persistent
+# disk, which the admission webhook and the chart also take as the limit.
+readonly PLATFORM_AGENT_STORAGE_SIZE_MAX_MI=67108864
+
 # ─── OpenAI-compatible model server ───────────────────────────────────────────
 # The ports a base URL without one is dialled on, and the TCP port range.
 readonly HTTP_DEFAULT_PORT=80
@@ -837,6 +842,24 @@ is_valid_platform_agent_mode() {
   [[ "${1:-}" =~ ^(today|next)$ ]]
 }
 
+# PLATFORM_AGENT_STORAGE_SIZE: a whole number of Mi, Gi or Ti above zero and at
+# most 64Ti, what the composition's platform_agent_storage_size validation
+# takes. The CRD's spec.storage.size takes any quantity; this is the narrower
+# subset a disk is sized in. A number with more digits than the limit in Mi is
+# over it in every unit, which keeps the multiply inside Bash's int64.
+is_valid_platform_agent_storage_size() {
+  [[ "${1:-}" =~ ^[1-9][0-9]*(Mi|Gi|Ti)$ ]] || return 1
+  local unit="${BASH_REMATCH[1]}" number mi_per_unit
+  number="${1%"$unit"}"
+  [ "${#number}" -le "${#PLATFORM_AGENT_STORAGE_SIZE_MAX_MI}" ] || return 1
+  case "$unit" in
+    Mi) mi_per_unit=1 ;;
+    Gi) mi_per_unit=1024 ;;
+    Ti) mi_per_unit=1048576 ;;
+  esac
+  [ $((number * mi_per_unit)) -le "$PLATFORM_AGENT_STORAGE_SIZE_MAX_MI" ]
+}
+
 # The PlatformAgent and its release, read once for the scope check and the
 # mode notice beside it. Each front door calls refuse_apply_over_undeclared_scope
 # and then announce_platform_agent_mode_for_apply against the same namespace,
@@ -1345,6 +1368,72 @@ print_next_home_channel_unset_summary() {
   print_info "$(next_home_channel_unset_remedy "$NEXT_HOME_CHANNEL_UNSET_KEY" "${1:-}")"
 }
 
+# Set by print_chat_setup_checklists: "true" when it printed a checklist.
+CHAT_SETUP_CHECKLIST_PRINTED="false"
+
+# The commands that print the chat setup checklist for each chat platform that
+# is on, one per line, for a reader to paste later. They name the run's
+# install.env, which need not be the checkout's; the front door has made
+# INSTALL_ENV_FILE absolute.
+print_chat_checklist_commands() {
+  local printers
+  printers="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if is_truthy "${GOOGLE_CHAT_ENABLED:-}"; then
+    printf '    KUBE_AGENTS_INSTALL_ENV=%q bash %q\n' "${INSTALL_ENV_FILE:-}" "${printers}/print_instructions_gchat.sh"
+  fi
+  if is_truthy "${SLACK_ENABLED:-}"; then
+    printf '    KUBE_AGENTS_INSTALL_ENV=%q bash %q\n' "${INSTALL_ENV_FILE:-}" "${printers}/print_instructions_slack.sh"
+  fi
+  return 0
+}
+
+# The chat setup checklists after an apply, and the closing summary's key: $1
+# the spec.mode the CR is on after it. The chat keys, NAMESPACE, PROJECT_NUMBER
+# and INSTALL_ENV_FILE are read from the environment the apply rendered from,
+# which every caller has exported by then; what the apply used wins over
+# install.env in the printers. Returns 0 whatever it printed, because the
+# front doors call it bare under set -e.
+# shellcheck disable=SC2034  # both globals are read by install.sh
+print_chat_setup_checklists() {
+  local mode="${1:-}" printers failed="false"
+  printers="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  CHAT_SETUP_CHECKLIST_PRINTED="false"
+  NEXT_HOME_CHANNEL_UNSET_KEY="$(next_home_channel_unset_key "$mode" "${SLACK_ENABLED:-}" \
+    "${GOOGLE_CHAT_ENABLED:-}" "${SLACK_HOME_CHANNEL:-}" "${GOOGLE_CHAT_HOME_CHANNEL:-}")"
+  # --dry-run: a printer changes nothing, yet load_state would otherwise ask
+  # for REGISTRY_PREFIX on a terminal when no file records it, and write it to
+  # vars.sh, which no front door writes.
+  if is_truthy "${GOOGLE_CHAT_ENABLED:-}"; then
+    echo ""
+    KUBE_AGENTS_INSTALL_ENV="${INSTALL_ENV_FILE:-}" \
+      GCHAT_STEPS_PLATFORM_AGENT_MODE="$mode" \
+      GCHAT_STEPS_GOOGLE_CHAT_ENABLED="${GOOGLE_CHAT_ENABLED:-}" \
+      GCHAT_STEPS_HOME_CHANNEL="${GOOGLE_CHAT_HOME_CHANNEL:-}" \
+      GCHAT_STEPS_ALLOWED_USERS="${ALLOWED_USERS:-}" \
+      GCHAT_STEPS_TOPIC_NAME="${CHAT_TOPIC_NAME:-}" \
+      GCHAT_STEPS_SUB_NAME="${CHAT_SUB_NAME:-}" \
+      GCHAT_STEPS_NAMESPACE="${NAMESPACE:-}" \
+      bash "${printers}/print_instructions_gchat.sh" --dry-run || failed="true"
+    CHAT_SETUP_CHECKLIST_PRINTED="true"
+  fi
+  if is_truthy "${SLACK_ENABLED:-}"; then
+    echo ""
+    KUBE_AGENTS_INSTALL_ENV="${INSTALL_ENV_FILE:-}" \
+      SLACK_STEPS_PLATFORM_AGENT_MODE="$mode" \
+      SLACK_STEPS_SLACK_ENABLED="${SLACK_ENABLED:-}" \
+      SLACK_STEPS_GOOGLE_CHAT_ENABLED="${GOOGLE_CHAT_ENABLED:-false}" \
+      SLACK_STEPS_HOME_CHANNEL="${SLACK_HOME_CHANNEL:-}" \
+      SLACK_STEPS_NAMESPACE="${NAMESPACE:-}" \
+      bash "${printers}/print_instructions_slack.sh" --dry-run || failed="true"
+    CHAT_SETUP_CHECKLIST_PRINTED="true"
+  fi
+  if [ "$failed" = "true" ]; then
+    print_warning "A chat setup checklist did not print in full. Show it again with:"
+    print_chat_checklist_commands
+  fi
+  return 0
+}
+
 # Said when a read the notice needs failed, so the run does not go on as if
 # the notice had been weighed and found nothing to say. $1 what could not be
 # read, $2 the key, $3 namespace.
@@ -1687,6 +1776,10 @@ load_install_env() {
   # switch the install's component stack for one run, and the next run from a
   # clean shell would switch it back and retire the A2A stack.
   unset PLATFORM_AGENT_MODE
+  # The data volume size too: an inherited PLATFORM_AGENT_STORAGE_SIZE would
+  # grow both data claims for one run, and the next run from a clean shell
+  # would drop the field again, leaving claims larger than the CR says.
+  unset PLATFORM_AGENT_STORAGE_SIZE
   # The GitOps forge keys too: an inherited GITOPS_FORGE=gitlab would render a
   # GitLab forge, and drop the GitHub alias and minter, for one run of an
   # install the file records as GitHub, and an inherited GITOPS_HOST would
@@ -4852,6 +4945,12 @@ write_tfvars_from_state() {
     print_error "PLATFORM_AGENT_MODE='${platform_agent_mode}' is not one of today, next. Fix it in install.env."
     return 1
   fi
+  # The data volume size, for the same reason.
+  local platform_agent_storage_size="${PLATFORM_AGENT_STORAGE_SIZE:-$DEFAULT_PLATFORM_AGENT_STORAGE_SIZE}"
+  if ! is_valid_platform_agent_storage_size "$platform_agent_storage_size"; then
+    print_error "PLATFORM_AGENT_STORAGE_SIZE='${platform_agent_storage_size}' is not a whole number of Mi, Gi or Ti above zero and at most 64Ti, for example 80Gi. Fix it in install.env, or on a first install, in the value this shell exports."
+    return 1
+  fi
 
   local old_umask
   old_umask="$(umask)"
@@ -4930,6 +5029,10 @@ write_tfvars_from_state() {
     echo "# The PlatformAgent's spec.mode (PLATFORM_AGENT_MODE in install.env). The"
     echo "# composition passes the chart nothing for \"today\", so its CR carries no mode."
     echo "platform_agent_mode = $(hcl_str "$platform_agent_mode")"
+    echo ""
+    echo "# The PlatformAgent's spec.storage.size (PLATFORM_AGENT_STORAGE_SIZE in"
+    echo "# install.env). The composition passes the chart nothing for the default."
+    echo "platform_agent_storage_size = $(hcl_str "$platform_agent_storage_size")"
     echo ""
     echo "# Gateway redaction (LITELLM_REDACTION_* in install.env). The composition"
     echo "# renders nothing into the chart while enabled is false."

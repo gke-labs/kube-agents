@@ -72,8 +72,10 @@ SANDBOX_PRINCIPAL = "hermes"
 # line rather than a second credential, and the separation the module docstring
 # describes is the only thing keeping them apart.
 #
-# Four writers pass it, all for the same reason: they have to write inside a
-# tree that is `agent:agent` to the leaves, which uid 1001 cannot do.
+# Five writers pass it, all for the same reason: they have to write inside a
+# tree that is `agent:agent` to the leaves, which uid 1001 cannot do
+# (`upgrade_readiness_review.py` places the weekly report's copy under the
+# sandbox's agent-owned /opt/data, where the agent reads it on request).
 # `kanban_workspace_gc.py` unlinks scratch workspaces; `cluster_agent_profile.py`
 # writes one profile's kubeconfig; `bootstrap_delivery.py` renames the delivered
 # onboarding report; `bootstrap_handoff.py` writes the raw onboarding report. The alternative in any case — loosening the modes so a
