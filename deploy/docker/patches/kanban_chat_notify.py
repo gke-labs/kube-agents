@@ -299,6 +299,12 @@ def resolve(runner: Any, platform: Any, adapter: Any, sub: Optional[dict] = None
         return None
     attr, cls = ((RUNNER_CONVERSATION_ATTR, ConversationNotifyAdapter) if conversation
                  else (RUNNER_ATTR, ChatNotifyAdapter))
+    # The conversation stand-ins are kept one per platform: a chat
+    # platform's and the console's are served side by side, and one shared
+    # slot would rebuild the stand-in, and re-probe the route, on every
+    # switch between them.
+    if conversation:
+        attr = f"{attr}_{name}"
     stand_in = getattr(runner, attr, None)
     if stand_in is None or stand_in.platform != platform:
         stand_in = cls(platform, runner)

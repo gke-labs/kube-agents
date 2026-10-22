@@ -120,8 +120,12 @@ const (
 	// that fits) PostTerminal takes when an encoded frame is still too big.
 	consoleResultShrinkNum = 9
 	consoleResultShrinkDen = 10
-	// consoleResultCutNote ends a cut answer.
+	// consoleResultCutNote ends a cut answer: a terminal frame's text is the
+	// task's result, which TASKS keeps whole.
 	consoleResultCutNote = "\n\n(cut here: the full answer is the task's result on the bus)"
+	// consoleNotifyCutNote ends a cut notify frame. A card's report is not
+	// on TASKS, so it points nowhere else.
+	consoleNotifyCutNote = "\n\n(cut here: the report was longer than a console frame carries)"
 	// consoleQueueFullNotice is posted once per fill when consoleQueueCap
 	// refuses a turn; %d is the cap.
 	consoleQueueFullNotice = "⚠️ %d messages are already waiting in this conversation, so new ones are dropped until it catches up"
@@ -507,7 +511,7 @@ func (a *ConsoleAdapter) PostTerminal(conversation string, t ConsoleTerminal) er
 	if !ok {
 		return fmt.Errorf("console adapter: malformed conversation id %q", conversation)
 	}
-	return a.publishBounded(token, ConsoleOutFrame{
+	return a.publishBounded(token, consoleResultCutNote, ConsoleOutFrame{
 		MessageID:    consoleResultIDPrefix + t.TaskID + "-" + string(t.State),
 		Text:         t.Text,
 		Kind:         consoleFrameKindResult,
@@ -532,7 +536,7 @@ func (a *ConsoleAdapter) PostNotifyFrame(conversation, messageID, text, replyTo 
 		messageID = fmt.Sprintf("%s%s-%d", consoleNotifyIDPrefix, a.bootID, a.nextID)
 		a.mu.Unlock()
 	}
-	err := a.publishBounded(token, ConsoleOutFrame{
+	err := a.publishBounded(token, consoleNotifyCutNote, ConsoleOutFrame{
 		MessageID: messageID, Text: text, Edit: edit, Kind: consoleFrameKindNotify, ReplyTo: replyTo,
 	})
 	if err != nil {
@@ -545,8 +549,8 @@ func (a *ConsoleAdapter) PostNotifyFrame(conversation, messageID, text, replyTo 
 // consoleResultTextCap, and cut again while the encoded frame is still past
 // the server's max_payload, since JSON escaping can grow a string up to six
 // times and the byte cap alone does not bound the frame.
-func (a *ConsoleAdapter) publishBounded(token string, f ConsoleOutFrame) error {
-	f.Text = cutConsoleResult(f.Text, consoleResultTextCap)
+func (a *ConsoleAdapter) publishBounded(token, note string, f ConsoleOutFrame) error {
+	f.Text = cutConsoleText(f.Text, consoleResultTextCap, note)
 	limit := a.nc.MaxPayload()
 	for {
 		data, err := json.Marshal(f)
@@ -559,20 +563,20 @@ func (a *ConsoleAdapter) publishBounded(token string, f ConsoleOutFrame) error {
 		// Shrink the text by the share of the frame that is over, and a
 		// tenth more, so the loop ends in a step or two.
 		keep := int(int64(len(f.Text)) * limit / int64(len(data)) * consoleResultShrinkNum / consoleResultShrinkDen)
-		if keep <= len(consoleResultCutNote) {
+		if keep <= len(note) {
 			return fmt.Errorf("console adapter: frame %s does not fit under max_payload %d", f.MessageID, limit)
 		}
-		f.Text = cutConsoleResult(f.Text, keep)
+		f.Text = cutConsoleText(f.Text, keep, note)
 	}
 }
 
-// cutConsoleResult cuts text to at most max bytes, ending with the cut note
+// cutConsoleText cuts text to at most max bytes, ending with note
 // and dropping a rune the cut would split. Text within max is returned as is.
-func cutConsoleResult(text string, max int) string {
+func cutConsoleText(text string, max int, note string) string {
 	if len(text) <= max {
 		return text
 	}
-	return strings.ToValidUTF8(text[:max-len(consoleResultCutNote)], "") + consoleResultCutNote
+	return strings.ToValidUTF8(text[:max-len(note)], "") + note
 }
 
 // Post publishes a new notice frame and returns its id.

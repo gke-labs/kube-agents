@@ -216,6 +216,24 @@ class ResolveTest(unittest.TestCase):
             self.assertIsNone(kanban_chat_notify.resolve(_Runner(), Platform.GOOGLE_CHAT, None,
                                                          {"thread_id": "gchat:spaces/A/threads/B", "chat_id": "a2a-ctx-1"}))
 
+    def test_a_chat_and_a_console_conversation_each_keep_their_stand_in(self):
+        # Served side by side, the two platforms' stand-ins are cached apart:
+        # alternating between them reuses each, rather than rebuilding (and
+        # re-probing the route) on every switch.
+        runner = _Runner()
+        console = types.SimpleNamespace(value="console")
+        chat_sub = {"thread_id": "gchat:spaces/A/threads/B", "chat_id": "a2a-ctx-1"}
+        console_sub = {"thread_id": "console:tab-1#task-7", "chat_id": "a2a-ctx-2"}
+        conv_only = {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "", kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat"}
+        with mock.patch.dict(os.environ, conv_only):
+            chat = kanban_chat_notify.resolve(runner, Platform.GOOGLE_CHAT, None, chat_sub)
+            cons = kanban_chat_notify.resolve(runner, console, None, console_sub)
+            self.assertIsInstance(chat, kanban_chat_notify.ConversationNotifyAdapter)
+            self.assertIsInstance(cons, kanban_chat_notify.ConversationNotifyAdapter)
+            self.assertIsNot(chat, cons)
+            self.assertIs(kanban_chat_notify.resolve(runner, Platform.GOOGLE_CHAT, None, chat_sub), chat)
+            self.assertIs(kanban_chat_notify.resolve(runner, console, None, console_sub), cons)
+
     def test_a_console_report_names_the_turn_it_answers(self):
         adapter = kanban_chat_notify.ConversationNotifyAdapter(types.SimpleNamespace(value="console"), _Runner())
         with mock.patch.object(kanban_chat_notify, "conversation_context", return_value="ctx-1"):

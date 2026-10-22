@@ -774,3 +774,28 @@ func TestConsoleRunReturnsWhenTheConnectionIsClosedForGood(t *testing.T) {
 		t.Errorf("a terminal close was not logged as terminal:\n%s", got)
 	}
 }
+
+// A notify frame cut to fit says the report was cut, not that the full text
+// is a task's result on the bus: a card's report is not on TASKS.
+func TestAConsoleNotifyFrameCutSaysTheReportWasCut(t *testing.T) {
+	r := startConsoleRig(t)
+	sub, err := r.browser.SubscribeSync("chat.console.tab-11.out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.browser.Flush()
+	if _, err := r.adapter.PostNotifyFrame("console:tab-11", "", strings.Repeat("<", consoleResultTextCap), "task-1", false); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := sub.NextMsg(5 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f ConsoleOutFrame
+	if err := json.Unmarshal(msg.Data, &f); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(f.Text, consoleNotifyCutNote) || strings.HasSuffix(f.Text, consoleResultCutNote) {
+		t.Errorf("cut notify text ends %q, want the notify note", f.Text[len(f.Text)-80:])
+	}
+}

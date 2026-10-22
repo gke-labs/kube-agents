@@ -652,3 +652,27 @@ func TestAConsoleGatewayDeclaredEndIsWordedBySource(t *testing.T) {
 		}
 	}
 }
+
+// The cards are usually filed in a delegated child's turn: the child's
+// handoff marks the chain's root, and the chain's one frame (the wake's end,
+// under the root) carries cardsPending.
+func TestAConsoleChainWhoseChildFiledCardsSaysSoOnItsFrame(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	r.adapter.setTakesTerminals()
+	conv := consoleKeyPrefix + "t-chain-cards"
+	origin, _, child := delegated(t, r, spawn, conv, "")
+	cexec := r.execFor(t, child, targetPlatform)
+	if err := cexec.PublishArtifact(context.Background(), lib.Artifact{Name: lib.ArtifactHandoff, Parts: []lib.Part{{Kind: "text", Text: lib.HandoffCards}}}); err != nil {
+		t.Fatal(err)
+	}
+	completeTask(t, cexec, "checking the fleet.")
+	waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
+	wakeSession := spawn.calls()[1].Session
+	wake := r.awaitTask(t, wakeSession)
+	completeTask(t, r.execFor(t, wake, wakeSession), "platform is checking the fleet; its report will follow.")
+	waitFor(t, "the chain's frame", func() bool { return len(r.adapter.terminalPosts()) > 0 })
+	got := r.adapter.terminalPosts()
+	if len(got) != 1 || got[0].TaskID != origin.TaskID || !got[0].CardsPending {
+		t.Fatalf("terminal frames = %+v, want one for %s with cardsPending", got, origin.TaskID)
+	}
+}
