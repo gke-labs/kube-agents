@@ -3,7 +3,7 @@ title: First prompts
 description: The first message to send a new install, what a healthy answer looks like and how long it takes, and five things to ask the agent next.
 ---
 
-Once the [quick start's verify step](/kube-agents/install/quickstart-gke/#verify-and-explore-your-install) shows the `PlatformAgent` `Ready`, the install is checked by talking to it. Send the messages below as chat messages to the app, in a Slack DM or a Google Chat space. An install with no chat platform reaches the agent over `kubectl exec` instead; [When no chat platform is enabled](/kube-agents/concepts/chatops/#when-no-chat-platform-is-enabled) gives the command and what that lane does not exercise.
+Once the [quick start](/kube-agents/install/quickstart-gke/) shows the `PlatformAgent` `Ready`, the install is checked by talking to it. Send the messages below as chat messages to the app, in a Slack DM or a Google Chat space. An install with no chat platform reaches the agent over `kubectl exec` instead; [When no chat platform is enabled](/kube-agents/concepts/chatops/#when-no-chat-platform-is-enabled) gives the command and what that lane does not exercise.
 
 ## The first message: which clusters, and can it reach them
 
@@ -11,7 +11,7 @@ Once the [quick start's verify step](/kube-agents/install/quickstart-gke/#verify
 Which GKE clusters do you manage, and can you reach each one?
 ```
 
-This is the install check. The answer shows that the agent has the scope it was given, a Cluster Agent profile for each cluster, and read access to every one of them.
+This is the install check. The answer shows that the agent has the scope it was given and read access to every cluster in it. It does not show whether each cluster has a Cluster Agent profile; the roster is covered below, under the five prompts.
 
 What the thread shows, in order:
 
@@ -19,7 +19,7 @@ What the thread shows, in order:
 2. **One short line naming what is being checked**, such as `checking all 5 clusters.` The Planning Agent has filed the work as a card for the Platform Agent; [how a chat question is answered under `next`](/kube-agents/concepts/chatops/#how-a-chat-question-is-answered-under-next) walks through the status line and the card.
 3. **The result, as its own message.** One bold sentence gives the verdict, then one row per cluster: name, location, status, whether the agent could reach it, control-plane version, node count. On a one-cluster install the table has one row, the cluster kube-agents runs on, because the scope includes the management cluster unless the `PlatformAgent` excludes it.
 
-An answer measured on a five-cluster install, with the cluster and project names replaced:
+An answer measured on a five-cluster install, with the cluster and project names replaced and two of its five rows shown:
 
 > **All 5 managed GKE clusters in project `<project>` are in RUNNING status and fully reachable via their Kubernetes control-plane APIs.**
 >
@@ -30,9 +30,9 @@ An answer measured on a five-cluster install, with the cluster and project names
 > | `cluster-a` | `us-east4`      | `RUNNING` | Reachable    | `1.35.8-gke.1439001`  | 6     |
 > | `cluster-b` | `us-central1-a` | `RUNNING` | Reachable    | `1.34.12-gke.1011000` | 2     |
 
-Slack renders the table. Google Chat does not render tables, so there the same rows arrive as plain lines.
+On Slack the gateway posts the table as a monospace block with aligned columns. Google Chat does not render tables, so the agent repeats each row as a bullet under the table, and those bullets are what Google Chat shows.
 
-To produce it the Platform Agent read the declared scope and the Cluster Agent roster, listed the clusters, and queried each one's Kubernetes version. On that run, with Gemini 3.8 Flash as the model, the acknowledgement arrived after 21 seconds and the result after a further 6.6 minutes. The acknowledgement is one model call and can take minutes when the model is slow; the result takes longer on a larger fleet. If nothing has arrived ten minutes after the message under `spec.mode: next`, [A Question Gets No Answer Under `spec.mode: next`](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#7-a-question-gets-no-answer-under-specmode-next) is the troubleshooting entry.
+To produce it the Platform Agent read the declared scope and the Cluster Agent roster, listed the clusters, and queried each one's Kubernetes version. On that run, with Gemini 3.8 Flash as the model, the acknowledgement arrived after 21 seconds and the result after a further 6.6 minutes. The acknowledgement is the short Planning Agent turn that files the card and replies, and it took between 21 seconds and 15 minutes across six prompts on that install while the model was slow; the result takes longer on a larger fleet. A long silence is therefore usually the model, not the install. Under `spec.mode: next`, the install is at fault when the task was never taken: on Google Chat the status line stays at `⏳ submitted…`, and on Slack, which has no status line, the bridge log shows no `task accepted` for the message. For that case, [A Question Gets No Answer Under `spec.mode: next`](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#7-a-question-gets-no-answer-under-specmode-next) is the troubleshooting entry.
 
 A cluster missing from the table is outside the scope the install declares: [`spec.scope`](/kube-agents/operator/platformagent-crd/) names the projects and the exclusions. A cluster listed as not reachable is an access problem: [Security and IAM](/kube-agents/reference/security-and-iam/) is canonical for what the agent's identity may read.
 
@@ -46,7 +46,7 @@ Each of these is a single chat message. The agent answers in the thread from rea
 4. **"Something in the `payments` namespace on `prod-east` stopped making progress without erroring. Find it."** — The work is delegated to the Cluster Agent for that cluster, which looks for controllers whose `observedGeneration` lags, progress conditions that stopped advancing, repeating warning events, and references to objects that do not exist. ([`gke-stall-detection`](https://github.com/gke-labs/kube-agents/blob/main/agents/cluster/skills/gke-stall-detection/SKILL.md))
 5. **"`checkout` on `prod-east` has been crash-looping since this morning. What happened?"** — The Cluster Agent for that cluster fixes the time window, reads the container's exit codes and the events around them, tells an OOM kill from an application crash, and proposes the manifest correction without applying it. ([`gke-workload-troubleshooting`](https://github.com/gke-labs/kube-agents/blob/main/agents/cluster/skills/gke-workload-troubleshooting/SKILL.md))
 
-In the last two, replace `prod-east`, `payments` and `checkout` with a cluster name from the first answer and a namespace and workload on it. A named cluster's question goes to that cluster's Cluster Agent once its profile exists; the hourly reconcile creates one for every cluster in scope within the first hour, and until then the Platform Agent answers it ([`cluster-agent-lifecycle`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/cluster-agent-lifecycle/SKILL.md)).
+In the last two, replace `prod-east`, `payments` and `checkout` with a cluster name from the first answer and a namespace and workload on it. A named cluster's question goes to that cluster's Cluster Agent once its profile exists. The first-run onboarding creates a profile for every cluster in scope within minutes of the install, and the hourly reconcile keeps the roster current; for a cluster that has no profile yet, the Platform Agent answers it ([`cluster-agent-lifecycle`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/cluster-agent-lifecycle/SKILL.md)).
 
 On an install running `spec.mode: next`, the agent still answers these in the thread, with a few differences in how the answer is delivered; [how a chat question is answered under `next`](/kube-agents/concepts/chatops/#how-a-chat-question-is-answered-under-next) walks through each step.
 
