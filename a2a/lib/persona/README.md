@@ -33,7 +33,8 @@ a server reached around the broker would be outside both.
 
 `Load` also refuses:
 
-- a `tier` in `persona.yaml`: a tier is authority, and it lives on the AgentProfile (`spec.allowedTiers`), never in the persona;
+- a `tier` in `persona.yaml`: a tier is authority, which the AgentProfile
+  grants, never the persona;
 - a symlink anywhere, and any top-level file the format does not define
   (a skill directory may hold any regular files);
 - a `SKILL.md` frontmatter key other than `name`, `description`, `license`
