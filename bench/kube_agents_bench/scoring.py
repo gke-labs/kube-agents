@@ -114,15 +114,28 @@ DEFAULT_CORRECTNESS_FLOOR = 1.0
 #: the seventh; once the outage-era lines leave the window and main sits
 #: near 0.94 it tolerates five and reds the sixth. Since 2026-10-14
 #: (pdb-remediation-pr on the roster) the side is 39 units, steps of 1/39 =
-#: 0.026: six failures still pass at 0.924 and at 0.94, five at 0.96. The worst green run in
-#: the sample had five (0.861 against 0.924, a deficit of 0.063, which the
-#: old 0.05 would have redded); the next worst had four. 0.10 leaves 0.037
-#: of headroom over that worst run, more than one unit of 36, and holds
-#: five failures until main's window rate passes 0.96. The two-proportion
+#: 0.026: six failures still pass at 0.924 and at 0.94, five at 0.96.
+#: Since 2026-10-17 (two demotions, #3269 and #3120) it is 33 units, steps
+#: of 1/33 = 0.030: five failures pass at 0.924 and at 0.94, four at 0.96,
+#: and five red once main's window rate passes about 0.948. Since
+#: 2026-10-21 (a third demotion, #3598) it is 30 units, steps of 1/30 =
+#: 0.033: five failures pass at 0.924, four at 0.94 and at 0.96, and five red
+#: once main's window rate passes about 0.933. The worst green
+#: run in the sample had five (0.861 against 0.924, a deficit of 0.063, which
+#: the old 0.05 would have redded); the next worst had four. 0.10 leaves
+#: 0.037 of headroom over that worst run, still more than one unit of 30
+#: (0.033), but a five-failure run like it now reds above 0.933. The two-proportion
 #: test at one-sided 5% reds none of the same runs either (its largest z
 #: was 1.26, on that five-failure run); it sits one failed repetition
 #: stricter than 0.10 at today's window. Revisit if main's window rate
-#: exceeds 0.96 or the roster leaves thirteen.
+#: exceeds 0.96 or the roster leaves ten (the three demoted cases' returns
+#: restore 39 units). At 30 units the side is exactly
+#: DEFAULT_AGGREGATE_MIN_SCORED below, so one infra or blocked repetition
+#: leaves the aggregate advisory on that run, and on the inject lane (nine
+#: roster cases, 27 units, agent-kanban-smoke excluded), which the presubmit
+#: runs since #3156, it cannot block at all. The aggregate is not armed by default
+#: (EVAL_AGGREGATE_ARMED); re-check these counts, and that floor, before
+#: arming it.
 DEFAULT_AGGREGATE_MARGIN = 0.10
 
 #: Scored repetitions the aggregate needs before it may BLOCK. Below this it

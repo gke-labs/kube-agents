@@ -39,13 +39,13 @@ LiteLLM configured to proxy a personal ChatGPT subscription via OAuth device flo
 
 [`examples/vllm-gemma/`](https://github.com/gke-labs/kube-agents/tree/main/examples/vllm-gemma)
 
-vLLM serving Gemma (`gemma-4-e2b-it`) on GKE GPU nodes, based on GKE's official inference tutorial. Ships the vLLM Deployment, Service, `PodDisruptionBudget`, `NetworkPolicy`, and `PodMonitoring`. It does not include a node pool spec or GPU driver installer — a cluster with GPU nodes is a prerequisite.
+vLLM's OpenAI-compatible server (`vllm serve`) serving Gemma 4 26B-A4B (`RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic`) on two L4 GPUs with a 128k-token context, for the `openai_compatible` model provider. Ships the vLLM Deployment, Service, `PodDisruptionBudget`, `NetworkPolicy`, and `PodMonitoring`. The README gives the GPU node-pool command and measured sizing for other Gemma 4 sizes and GPUs.
 
 **When to use:** data-locality, air-gapped, or open-model requirements. Provision a GPU node pool first (or use the `gke-compute-classes` skill to spec one).
 
 ## Layering
 
-Both LiteLLM examples speak OpenAI-compatible Completions. `vllm-gemma` as shipped runs vLLM's demo server, which does not serve the OpenAI API; to layer LiteLLM in front of vLLM, run vLLM's OpenAI-compatible server and set `MODEL_PROVIDER=openai_compatible` ([Inference gateway](/kube-agents/concepts/inference-gateway/#openai-compatible-endpoints-self-hosted-or-private)).
+Both LiteLLM examples speak OpenAI-compatible Completions. `vllm-gemma` serves the OpenAI API too; to put LiteLLM in front of it, set `MODEL_PROVIDER=openai_compatible` with the values in its README ([Inference gateway](/kube-agents/concepts/inference-gateway/#openai-compatible-endpoints-self-hosted-or-private)).
 
 ## Not shipped as examples (but reference-worthy)
 

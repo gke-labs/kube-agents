@@ -430,8 +430,9 @@ plugins:
     - incident_context
     - bootstrap_onboarding
     - legacy_slash_commands
-    # Counts every inbound message on pre_gateway_dispatch and serves the count on
-    # the listener the operator reads into status.usage.chatMessagesInboundTotal.
+    # Counts every inbound message on pre_gateway_dispatch, and the failed turns
+    # the gateway patch reports, and serves them on the listener the operator
+    # reads into status.usage.chatMessagesInboundTotal and chatTurnsErroredTotal.
     # Rewrites nothing, so its place in the order does not matter.
     - chat_metrics
     # Injects the routable-specialist roster into every turn, so choosing an

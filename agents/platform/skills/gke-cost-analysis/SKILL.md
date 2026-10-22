@@ -75,6 +75,8 @@ When handling a cost-related question:
 
 ## Live Cluster & Cost Monitoring
 
+> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
+
 Use read-only CLI commands to inspect current cluster budgets, node utilization,
 and pod resource consumption vs. requests:
 
@@ -82,10 +84,9 @@ and pod resource consumption vs. requests:
 # View billing budgets for an account (requires Cost Management API)
 gcloud billing budgets list --billing-account={billing_account} --quiet
 
-# Verify/Enable GKE cost allocation on a cluster for namespace-level billing tracking
-gcloud container clusters update {cluster_name} \
-    --enable-cost-allocation \
-    --region {region}
+# Verify GKE cost allocation on a cluster for namespace-level billing tracking
+gcloud container clusters describe {cluster_name} \
+    --region {region} --format="value(costManagementConfig.enabled)"
 
 # View live node resource utilization across the cluster
 kubectl top nodes
@@ -93,6 +94,10 @@ kubectl top nodes
 # View pod resource usage across namespaces (compare against requested limits to diagnose waste)
 kubectl top pods --all-namespaces --containers
 ```
+
+If cost allocation is off, it is enabled with `spec.costManagementConfig.enabled: true`
+on the cluster's `ContainerCluster`, as Config Connector YAML through
+`gcp-config-connector`.
 
 ## Applying Cost Optimizations
 

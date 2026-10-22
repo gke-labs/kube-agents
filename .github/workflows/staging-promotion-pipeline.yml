@@ -1,6 +1,7 @@
 name: "Staging: Promotion Pipeline"
 
-# Builds a nightly environment from nothing, runs the full E2E matrix on it,
+# Builds a nightly environment from nothing under `spec.mode: next`, the mode
+# a new install gets, runs the full E2E matrix on it,
 # rolls it back to the previous GA and forward again (reported, not gating),
 # and — if the matrix passes — promotes the candidate to staging. Promotion is
 # two rungs with an eval between them, and the eval is a gate:
@@ -164,6 +165,9 @@ jobs:
     with:
       github_environment: "nightly"
       rc_tag: ${{ needs.step-1-resolve-candidate.outputs.commit_sha }}
+      # The mode a new install gets (#2007). The RC pipeline's today leg keeps
+      # today covered; this matrix gates the nomination on next.
+      mode: "next"
     secrets: inherit
 
   step-3-run-e2e-matrix:
@@ -179,6 +183,7 @@ jobs:
     with:
       github_environment: "nightly"
       commit_sha: ${{ needs.step-1-resolve-candidate.outputs.commit_sha }}
+      mode: "next"
       # The gate is only what has already passed on a real cluster. `rc` — Agent
       # API health, the fleet-audit ledger across all streams, and stockout
       # scenario 04 — runs on every RC pipeline and passes there. Gating on a
@@ -194,9 +199,10 @@ jobs:
       optional_suites: "gchat,agent-plugin,stockout-full"
       # Up to 74m before the first test runs (see e2e-run.yml: ~5m setup, 64m of
       # wait_for_gke_readiness.sh gates paid twice, and 5m confirm_agent_image.sh),
-      # plus ~60m across all five test files rather than the RC gate's single suite.
+      # plus ~60m across all five test files rather than the RC gate's single suite,
+      # plus the 30m readiness gate `next` adds (e2e-run.yml's `mode` input).
       # Held by SiblingGatewayRolloutGatesTest in tests/test_gateway_rollout_budgets.py.
-      timeout_minutes: 135
+      timeout_minutes: 165
     secrets: inherit
 
   step-3b-rollback-leg:
@@ -208,7 +214,9 @@ jobs:
     # gateway rollout agree, then the same pair from the candidate checkout to
     # bring the environment back to the candidate. After the matrix, so what
     # the matrix graded is the fresh install and not an install that has been
-    # moved twice.
+    # moved twice. That install is step 2's, so the leg rolls a
+    # `spec.mode: next` install back to the previous GA: the path a new
+    # install on the next default takes when its owner rolls back.
     #
     # `continue-on-error` for the reason step 3's optional suites carry it: a
     # leg with no green run behind it cannot gate. Step 4 does not depend on

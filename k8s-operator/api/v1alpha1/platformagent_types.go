@@ -18,6 +18,7 @@ package v1alpha1
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -50,6 +51,27 @@ type PlatformAgentSpec struct {
 	// sharedVpcHosts and metricsScopes selectors, which resolve to explicit projects.
 	// +optional
 	Scope *ScopeSpec `json:"scope,omitempty"`
+
+	// Storage sizes the agent's /opt/data volume and the shell sandbox's
+	// matching data volume.
+	// +optional
+	Storage *PlatformAgentStorageSpec `json:"storage,omitempty"`
+}
+
+// PlatformAgentStorageSpec sizes the agent's persistent data volumes.
+type PlatformAgentStorageSpec struct {
+	// Size is the request of the <name>-data claim and of the shell sandbox's
+	// data claim. The operator requests the same size for both claims and grows
+	// the sandbox's claim first, so the sandbox mirror fits. A StorageClass or a
+	// quota that refuses the growth of one claim can leave the two claims at
+	// different sizes. Absent, the operator default applies (50Gi). Raising it
+	// expands both existing claims online where the StorageClass sets
+	// allowVolumeExpansion; where it does not, the claims keep their size and
+	// the DataVolumeNotExpanded condition says so. The admission webhook refuses
+	// a lower value and a value of zero or less, because a claim cannot shrink.
+	// Removing the field never shrinks a claim.
+	// +optional
+	Size *resource.Quantity `json:"size,omitempty"`
 }
 
 // ScopeSpec is the opt-in set of projects, folders and organisations, plus the Shared

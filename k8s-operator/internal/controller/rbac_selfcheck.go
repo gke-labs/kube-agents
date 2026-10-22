@@ -159,6 +159,8 @@ var requiredPermissions = []requiredPermission{
 	{Group: "batch", Resources: []string{"jobs"}, Verbs: rbacWriteVerbs},
 	{Group: "coordination.k8s.io", Resources: []string{"leases"}, Verbs: rbacWriteVerbs},
 	{Group: "node.k8s.io", Resources: []string{"runtimeclasses"}, Verbs: rbacReadVerbs},
+	// storageclasses: growDataClaim reads a data claim's class by name.
+	{Group: "storage.k8s.io", Resources: []string{"storageclasses"}, Verbs: []string{"get"}},
 	{Group: "networking.k8s.io", Resources: []string{"networkpolicies"}, Verbs: rbacWriteVerbs},
 	{Group: "networking.k8s.io", Resources: []string{"ingresses"}, Verbs: rbacReadVerbs},
 	{Group: "networking.gke.io", Resources: []string{"fqdnnetworkpolicies"}, Verbs: rbacWriteVerbs},
@@ -172,6 +174,12 @@ var requiredPermissions = []requiredPermission{
 	{Group: "rbac.authorization.k8s.io", Resources: []string{"clusterroles"}, Verbs: []string{"bind"}, Name: a2aAuthDelegatorRole},
 	{Group: "authentication.k8s.io", Resources: []string{"tokenreviews"}, Verbs: []string{"create"}},
 	{Group: "apiextensions.k8s.io", Resources: []string{"customresourcedefinitions"}, Verbs: rbacReadVerbs},
+	// The GitOps reconcilers' objects: held only so the agent's minimal role,
+	// which grants them, passes escalation prevention.
+	{Group: "argoproj.io", Resources: []string{"applications"}, Verbs: rbacReadVerbs},
+	{Group: "kustomize.toolkit.fluxcd.io", Resources: []string{"kustomizations"}, Verbs: rbacReadVerbs},
+	{Group: "source.toolkit.fluxcd.io", Resources: []string{"gitrepositories", "ocirepositories"}, Verbs: rbacReadVerbs},
+	{Group: "configsync.gke.io", Resources: []string{"rootsyncs", "reposyncs"}, Verbs: rbacReadVerbs},
 }
 
 // describePermission renders one (verb, resource, group) the way kubectl

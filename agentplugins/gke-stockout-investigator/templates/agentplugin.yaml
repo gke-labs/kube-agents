@@ -127,10 +127,9 @@ spec:
               - gkestockoutinvestigator:gke-stockout-investigator
               subscription: {{ .Values.pubsub.subscription | quote }}
               topic: {{ .Values.pubsub.topic | quote }}
-              # The log sink install.sh created. Recorded, not currently read: the
-              # adapter's startup presence check is disabled until it has a
-              # google-cloud-logging dependency to run on. Passed anyway because the name
-              # has to come from the installer — install.sh takes it from STOCKOUT_SINK,
-              # so nothing else knows it, and the check used to guess a name nothing
-              # creates and report a missing sink on every healthy start.
+              # The log sink install.sh created. Recorded, not read: the adapter
+              # has no sink check, and one would need a broker route for the
+              # Logging API, since the adapter reaches Google only through the
+              # credential broker. Passed anyway because the name cannot be
+              # derived, so a check added later has it.
               sink: {{ .Values.pubsub.sink | quote }}

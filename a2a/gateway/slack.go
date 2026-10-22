@@ -41,6 +41,21 @@ const slackSeenCap = 2048
 // grow the gateway forever.
 const slackThreadsCap = 2048
 
+// slackForeignNoticesCap bounds the once-per-sender memory of the notice a
+// refused member of another workspace gets (foreignSender); one entry per
+// such sender, evicted wholesale at the cap, which at worst repeats a notice.
+// A var so a test can lower it.
+var slackForeignNoticesCap = 2048
+
+// slackForeignNoticeKeySep joins the sender's workspace and member id in the
+// notice memory's key.
+const slackForeignNoticeKeySep = "/"
+
+// slackForeignNoticeText is what a refused member of another workspace is told,
+// with their member id, the one thing an admin needs to find the refusal in the log.
+const slackForeignNoticeText = "⛔ I only take asks from members of this Slack workspace, and you are " +
+	"posting from another workspace, so I can't answer you here. Your member id is %s."
+
 // slackTurnSubtypes are the message subtypes that are genuine user turns.
 // Plain messages have no subtype; thread_broadcast is a thread reply with
 // "also send to channel" checked (dropping it would eat a steer silently),
@@ -150,6 +165,7 @@ type slackAPI interface {
 	RemoveReaction(name string, item slack.ItemRef) error
 	GetUserInfo(user string, options ...slack.GetUserInfoOption) (*slack.User, error)
 	SetAssistantThreadsSuggestedPrompts(params slack.AssistantThreadsSetSuggestedPromptsParameters) error
+	PublishView(userID string, view slack.HomeTabViewRequest, hash string) (*slack.ViewResponse, error)
 }
 
 // SlackAdapter is the first real mapped-identity backend. Transport is
@@ -215,6 +231,10 @@ type SlackAdapter struct {
 	// seen and seenOrder are the at-least-once dedupe ring over (channel, ts).
 	seen      map[string]bool
 	seenOrder []string
+	// foreignNoticed records which members of other workspaces have been told
+	// they are refused, so the notice is once per sender, not once per
+	// message. Created on first use; bounded by slackForeignNoticesCap.
+	foreignNoticed map[string]bool
 
 	// sessionsAPI drives Agent Sessions (slack_sessions.go); nil in a test
 	// that does not fake it, which then sends no status. sessionStates holds
@@ -232,6 +252,12 @@ type SlackAdapter struct {
 	// ux is the click and question state (slack_interactive.go), made on
 	// first use.
 	ux *slackUX
+
+	// workspaceURL is the bot's workspace as auth.test names it
+	// ("https://acme.slack.com/"), the root of a message's permalink; home is
+	// the Home tab's state (slack_home.go).
+	workspaceURL string
+	home         slackHome
 }
 
 // slackLinkRE matches the markdown links the relay emits, for rewriteLinks
@@ -672,8 +698,11 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 					msg.Answer = s.answersOpenQuestion(msg)
 					handler(msg)
 				}
-			case *slackevents.AssistantThreadStartedEvent, *slackevents.AppHomeOpenedEvent:
+			case *slackevents.AssistantThreadStartedEvent:
 				s.suggestPrompts(inner)
+			case *slackevents.AppHomeOpenedEvent:
+				s.suggestPrompts(inner)
+				s.homeOpened(inner)
 			}
 		}
 	}()
@@ -902,7 +931,7 @@ func (s *SlackAdapter) EditMessage(conversation, messageID string, m OutMessage)
 		return fmt.Errorf("malformed conversation id %q", conversation)
 	}
 	opts, err := slackMessageOptions(m)
-	if line := s.answeredLine(channel, messageID); line != "" && (m.Chat == nil || len(m.Chat.Choices) == 0) {
+	if line := s.answeredLine(channel, messageID); line != "" && (m.Chat == nil || !asksQuestion(m.Chat.Choices)) {
 		// An answered question edited again without its choices (the card
 		// settling it on the notify route, laid out or as text) keeps the
 		// line that names who answered.
@@ -1218,6 +1247,7 @@ func (s *SlackAdapter) setMark(key string, isSession, force bool, until time.Tim
 func (s *SlackAdapter) connected(auth *slack.AuthTestResponse) {
 	s.botUserID = auth.UserID
 	s.teamID = auth.TeamID
+	s.workspaceURL = auth.URL
 	s.log.Info("slack connected", "user", auth.User, "botUserID", auth.UserID, "team", auth.TeamID)
 	if auth.TeamID == "" {
 		// foreignSender fails closed without it, so a message that names any
@@ -1236,11 +1266,13 @@ func (s *SlackAdapter) connected(auth *slack.AuthTestResponse) {
 // before the allowlist is consulted: the member id is the principal for an unmapped
 // sender, so admission must not reach past the install's own workspace, and
 // under allow-all nothing else would stop it. Fail-closed when auth.test
-// gave no team id. Silent to the sender, as a bot's or an edit's drop is;
-// logged at Info when it addressed the bot, so an admin can see why a guest
-// got no answer. Under Enterprise Grid a member of a sister workspace in a
-// shared channel is refused too, since the event does not carry the
-// sender's enterprise.
+// gave no team id. When the message addressed the bot (a DM, or a mention),
+// the refusal is logged at Info with the sender's member id, and the sender
+// is told once (noticeForeignSender), so a guest in a shared channel does not
+// meet a bot that seems broken. A message that addressed nobody is dropped
+// without a word, as a bot's or an edit's drop is. Under Enterprise Grid a
+// member of a sister workspace in a shared channel is refused too, since the
+// event does not carry the sender's enterprise.
 func (s *SlackAdapter) foreignSender(m *slackevents.MessageEvent) bool {
 	if !s.otherWorkspace(m.UserTeam) && (m.Message == nil || !s.otherWorkspace(m.Message.Team)) {
 		return false
@@ -1252,9 +1284,55 @@ func (s *SlackAdapter) foreignSender(m *slackevents.MessageEvent) bool {
 		}
 		// Both fields: either can be the one that named the other workspace.
 		s.log.Info("slack: ignoring a message from another workspace's member",
-			"userTeam", m.UserTeam, "messageTeam", messageTeam, "team", s.teamID, "channel", m.Channel)
+			"user", m.User, "userTeam", m.UserTeam, "messageTeam", messageTeam, "team", s.teamID, "channel", m.Channel)
+		team := m.UserTeam
+		if team == "" {
+			team = messageTeam
+		}
+		thread := m.ThreadTimeStamp
+		if thread == "" {
+			thread = m.TimeStamp
+		}
+		s.noticeForeignSender(m.Channel, thread, team, m.User)
 	}
 	return true
+}
+
+// noticeForeignSender tells a refused member of another workspace why the bot
+// will not answer, once per sender: a reply in thread, the thread of the
+// message they addressed the bot with or of the question whose button they
+// clicked. Keyed by their workspace and member id, so the same
+// id in two workspaces is two senders. The notice names only their own member
+// id, which they already know, and nothing about this workspace. Not posted
+// when auth.test gave no team id: then every message that names a workspace is
+// refused, our own members' included, and telling them they are in another
+// workspace would be false; connected has already warned the admin. Sent off
+// the event pump, as suggestPrompts is, so a slow Slack API does not hold the
+// acks behind it. A failed post is logged and not retried; the sender stays
+// counted as told, as the gateway's own drop notice does.
+func (s *SlackAdapter) noticeForeignSender(channel, thread, team, user string) {
+	if s.teamID == "" {
+		return
+	}
+	key := team + slackForeignNoticeKeySep + user
+	s.mu.Lock()
+	if s.foreignNoticed == nil || len(s.foreignNoticed) >= slackForeignNoticesCap {
+		s.foreignNoticed = map[string]bool{}
+	}
+	told := s.foreignNoticed[key]
+	s.foreignNoticed[key] = true
+	s.mu.Unlock()
+	if told {
+		return
+	}
+	s.goSession(func() {
+		if _, _, err := s.api.PostMessage(channel,
+			slack.MsgOptionText(fmt.Sprintf(slackForeignNoticeText, user), false),
+			slack.MsgOptionTS(thread)); err != nil {
+			s.log.Warn("slack: could not tell another workspace's member why they are refused",
+				"user", user, "channel", channel, "err", err)
+		}
+	})
 }
 
 // otherWorkspace reports a workspace id that is named and is not the bot's.

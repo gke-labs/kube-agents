@@ -145,6 +145,12 @@ the SOP and these references.
   finding degrades to `manual` with a note saying so, the run logs a `SECURITY:` line naming the
   path, and the report still publishes — but no pull request opens for that finding until the path
   is a real file inside the workspace.
+- **Never work around a refusal from the credential proxy or the broker.** When it refuses a
+  repository, route or verb, that is an answer: report it, say what an administrator would change
+  (for a repository the install does not manage, add it to the managed list in
+  `$GITOPS_STATE_CONFIGMAP`), and stop. A `BROKER UNAVAILABLE` line is not that: the proxy did not
+  answer, so re-run the same command once it does (step 1, `references/finish.md`). Never copy a
+  skill or script into a `*_override` directory, or edit or re-path it, to get past either.
 - **Never open a second ledger issue for a stream.** Do not run `vcs.py issue create`. If the stream
   already has an open ledger, `finish` rewrites it in place; that is the whole point.
 - **Never open a remediation pull request yourself**, and never for a non-`manifest` finding.
@@ -159,11 +165,13 @@ the SOP and these references.
   directory. For a finding the sweep would open, `finish` exits 2 listing each
   one whose file is missing, at the path it named, and each `manual` one the collector clears for
   the `major` sweep whose candidate carries a `declaration`, at the declared file. An edit to the object goes in that file; a new object, such
-  as a PodDisruptionBudget, goes in a new file in its directory, never over it. Write them, set
+  as a PodDisruptionBudget, goes in a new file in its directory, never over it (in a Kustomize root,
+  see the Kustomize rule below). Write them, set
   `kind: manifest` and `path`, and run `finish` again. A declared `no-pdb` finding is the exception:
   `finish` writes its PodDisruptionBudget from the collector's `pod_selector` if you did not, and a
   `--decline-fix` for it is ignored unless its reason carries the URL (`https://…/pull/<n>`) of the
-  pull request already carrying it:
+  pull request already carrying it. That URL rule applies only to a budget `finish` writes itself; in
+  a Kustomize root it writes none, so a decline that names the kustomization stands:
   leave it `manual`, and never name its declaration's file. One
   whose candidate carries `pod_selector_withheld` (its selector also reaches a DaemonSet's, Job's or
   CronJob's pods) is neither written nor refused: that budget would permit no evictions. A finding the SOP itself makes `manual`, or
@@ -179,6 +187,10 @@ the SOP and these references.
   (its clone, or through the broker in content mode) or in a context repo `start` still has checked
   out, it degrades the finding to `manual`, naming the file above the fenced command — because the
   command would be reverted on the next reconcile. A content-mode `--dry-run` does not preview it.
+- **Never write a `manifest` fix that adds a new file to a Kustomize root its kustomization does not
+  list.** A remediation carries one file, so it cannot add the `resources:` entry. Make it `manual`
+  with the file and the `resources:` line in `remediation.note`. What `finish` does with such a fix:
+  `references/remediation.md`, "Kustomize roots".
 - **Never report a cluster you could not read as clean.** Put it in `scope.skipped`, or name what
   did not run in that cluster's `limitations`. Both make the run `partial`, which is the mechanism
   that stops the harness from closing fixes and retiring the ledger on evidence it never gathered.

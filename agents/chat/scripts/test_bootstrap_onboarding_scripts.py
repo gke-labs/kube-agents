@@ -24,6 +24,7 @@ again.
 
 import contextlib
 import errno
+import importlib.util
 import http.server
 import io
 import json
@@ -33,11 +34,13 @@ import os
 import shutil
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 import types
+from datetime import datetime, timezone
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -52,6 +55,7 @@ CLUSTER_INVENTORY_SOP = Path(__file__).resolve().parents[2] / "platform" / "gove
 import bootstrap_delivery  # noqa: E402
 import bootstrap_handoff  # noqa: E402
 import bootstrap_scan_gate  # noqa: E402
+import chat_notify  # noqa: E402
 import cluster_agent_profile  # noqa: E402
 import findings_queue  # noqa: E402
 import inventory_findings  # noqa: E402
@@ -219,6 +223,430 @@ class DeliveryMainTest(unittest.TestCase):
         rc, out = self._run()
         self.assertEqual(rc, 0)
         self.assertEqual(out, delivered(report))
+
+
+# The plugin that writes what the conversation path reads, loaded from its file.
+PLUGIN_PATH = Path(__file__).resolve().parents[1] / "defaults" / "plugins" / "bootstrap_onboarding" / "plugin.py"
+CONVERSATION = {
+    "platform": "slack",
+    "conversation": "slack:D0DM/1792185148.859139",
+    "context_id": "ctx-21f41a7dc20859301d2307b8",
+    "bound_at": 1792185149.0,
+}
+NEXT_ENV = {
+    "A2A_NOTIFY_CONVERSATIONS": "slack",
+    "A2A_NOTIFY_PLATFORM": "",
+    "NATS_URL": "nats://nats.kubeagents-system:4222",
+    "A2A_BUS_USER": "agent-platform",
+    "KAGE_SLACK_UX": "false",
+}
+REFUSED = json.dumps({"error": "not a live conversation with that context"}) + "\n"
+POSTED_ANSWER = json.dumps({"message_id": "1792185200.000100", "thread_id": "1792185148.859139"}) + "\n"
+
+
+class DeliveryToConversationTest(unittest.TestCase):
+    """Under spec.mode next: the report goes into the conversation the plugin recorded."""
+
+    REPORT = "# GKE Environment Discovery Report\n\nTwo things need you.\n"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.d = Path(self._tmp.name)
+        (self.d / bootstrap_delivery.CONVERSATION_FILE).write_text(json.dumps(CONVERSATION), encoding="utf-8")
+        (self.d / bootstrap_delivery.CONVERSATION_ALIGNED_MARKER).touch()
+        (self.d / INVENTORY).write_text(self.REPORT, encoding="utf-8")
+        for patcher in (
+            mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False),
+            mock.patch.dict(os.environ, NEXT_ENV),
+            mock.patch.object(bootstrap_delivery.time, "sleep"),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.calls = []
+        self.answers = []
+
+    def _answer(self, returncode=0, stdout=POSTED_ANSWER, stderr=""):
+        self.answers.append((returncode, stdout, stderr))
+
+    def _fake_run(self, argv, **_kwargs):
+        self.calls.append(argv)
+        if "--chat-file" in argv:
+            with open(argv[argv.index("--chat-file") + 1], encoding="utf-8") as handle:
+                self.card = json.load(handle)
+        returncode, stdout, stderr = self.answers.pop(0) if self.answers else (0, POSTED_ANSWER, "")
+        if isinstance(returncode, BaseException):
+            raise returncode
+        return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+
+    def _run(self):
+        buf = io.StringIO()
+        with mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=self._fake_run), \
+                contextlib.redirect_stdout(buf):
+            rc = bootstrap_delivery.main(self.d)
+        self.assertEqual(buf.getvalue(), "", "the conversation path never prints the report")
+        return rc
+
+    def _attempts(self):
+        return bootstrap_delivery._read_attempts(self.d)
+
+    def test_the_plugin_and_delivery_name_the_same_files(self):
+        spec = importlib.util.spec_from_file_location("_bootstrap_onboarding_plugin", PLUGIN_PATH)
+        plugin = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(plugin)
+        self.assertEqual(plugin.CONVERSATION_FILE, bootstrap_delivery.CONVERSATION_FILE)
+        self.assertEqual(plugin.CONVERSATION_ALIGNED_MARKER, bootstrap_delivery.CONVERSATION_ALIGNED_MARKER)
+        self.assertEqual(plugin.CONVERSATION_ATTEMPTS_FILE, bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE)
+        self.assertEqual(plugin.CONVERSATION_DONE_FILE, bootstrap_delivery.CONVERSATION_DONE_FILE)
+
+    def test_the_report_and_its_note_post_into_the_conversation_once(self):
+        self.assertEqual(self._run(), 0)
+        (argv,) = self.calls
+        self.assertEqual(
+            argv[:9],
+            ["a2a", "notify", "--platform", "slack", "--conversation", CONVERSATION["conversation"],
+             "--context", CONVERSATION["context_id"], "--timeout"],
+        )
+        self.assertNotIn("--update", argv)
+        text = argv[argv.index("--") + 1]
+        self.assertTrue(text.startswith(self.REPORT.rstrip("\n")))
+        self.assertIn(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE, text)
+        self.assertNotIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, text)
+        self.assertTrue((self.d / COMPLETED).exists())
+        self.assertEqual((self.d / DELIVERED).read_text(encoding="utf-8"), self.REPORT)
+        # Kept as onboarding's destination after delivery.
+        self.assertTrue((self.d / bootstrap_delivery.CONVERSATION_FILE).exists())
+        self.assertEqual(self._run(), 0)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_a_gateway_with_a_home_channel_keeps_the_home_sentence(self):
+        with mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "slack"}):
+            self._run()
+        text = self.calls[0][self.calls[0].index("--") + 1]
+        self.assertIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, text)
+
+    def test_no_home_says_not_posted_once_when_summaries_are_listed(self):
+        ran = bootstrap_delivery.AUDITS_RAN_NOTE.format(audits="The security and RBAC audit", have="has")
+        undelivered = bootstrap_delivery.AUDITS_UNDELIVERED_NOTE.format(audits="`fleet-wide-cost-analysis`")
+        with mock.patch.object(bootstrap_delivery, "_audits_state_note", return_value=f"{ran} {undelivered}"):
+            note = bootstrap_delivery._audits_note(self.d, False, home=False)
+        self.assertNotIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, note)
+        self.assertNotIn(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE, note)
+        self.assertIn(undelivered, note)
+        with mock.patch.object(bootstrap_delivery, "_audits_state_note", return_value=ran):
+            note = bootstrap_delivery._audits_note(self.d, False, home=False)
+        self.assertIn(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE, note)
+
+    def test_both_home_notes_carry_the_sentence_that_is_replaced(self):
+        self.assertIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, bootstrap_delivery.AUDITS_RUNNING_NOTE)
+        self.assertIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, bootstrap_delivery.AUDITS_RAN_NOTE)
+
+    def test_the_card_posts_with_its_update_key_then_the_note(self):
+        import inventory_presenter
+
+        card = ({"schema": "kube-agents.chat/v1", "headline": "2 findings"}, "2 findings")
+        with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "true"}), \
+                mock.patch.object(inventory_presenter, "chat", return_value=card):
+            self._run()
+        report, note = self.calls
+        self.assertEqual(report[report.index("--update") + 1], bootstrap_delivery.CONVERSATION_REPORT_UPDATE)
+        self.assertIn("--chat-file", report)
+        self.assertEqual(self.card, card[0])
+        self.assertEqual(report[report.index("--") + 1], "2 findings")
+        self.assertNotIn("--chat-file", note)
+        self.assertNotIn("--update", note)
+        self.assertIn(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE, note[note.index("--") + 1])
+
+    def test_a_failed_note_after_the_card_keeps_the_report_delivered(self):
+        import inventory_presenter
+
+        card = ({"schema": "kube-agents.chat/v1"}, "2 findings")
+        self._answer()
+        self._answer(1, REFUSED)
+        with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "true"}), \
+                mock.patch.object(inventory_presenter, "chat", return_value=card):
+            self._run()
+        self.assertTrue((self.d / COMPLETED).exists())
+        self.assertEqual(self._attempts(), {})
+
+    def test_a_refusal_releases_the_claim_and_waits_before_the_next_post(self):
+        self._answer(1, REFUSED)
+        with mock.patch.object(bootstrap_delivery, "_mark_shown") as mark_shown:
+            self._run()
+        mark_shown.assert_not_called()
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertTrue((self.d / INVENTORY).exists())
+        attempts = self._attempts()
+        self.assertEqual(attempts["attempts"], 1)
+        self.assertIn("not a live conversation", attempts["last_reason"])
+        # Inside the wait: no post.
+        self._run()
+        self.assertEqual(len(self.calls), 1)
+        # Past it: posted, and onboarding is done.
+        attempts["last_at"] -= bootstrap_delivery.CONVERSATION_RETRY_WAITS_SECONDS[0] + 1
+        (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).write_text(json.dumps(attempts), encoding="utf-8")
+        self._run()
+        self.assertEqual(len(self.calls), 2)
+        self.assertTrue((self.d / COMPLETED).exists())
+
+    def test_past_the_last_attempt_the_report_waits(self):
+        record = {"attempts": bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS, "last_reason": "refused", "last_at": 0}
+        (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).write_text(json.dumps(record), encoding="utf-8")
+        self._run()
+        self.assertEqual(self.calls, [])
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertTrue((self.d / INVENTORY).exists())
+
+    def test_a_text_post_that_failed_is_retried(self):
+        # The text path accepts a possible second copy over a lost report.
+        for stdout, stderr in ((json.dumps({"error": "post failed: ratelimited"}) + "\n", ""),
+                               ("", "a2a: notify: flush: nats: connection closed"),
+                               ("", "a2a: notify: nats: authorization violation")):
+            with self.subTest(stderr=stderr or stdout):
+                (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).unlink(missing_ok=True)
+                self._answer(1, stdout, stderr)
+                with mock.patch.object(bootstrap_delivery, "_mark_shown") as mark_shown:
+                    self._run()
+                mark_shown.assert_not_called()
+                self.assertFalse((self.d / COMPLETED).exists())
+                self.assertTrue((self.d / INVENTORY).exists())
+                self.assertFalse((self.d / bootstrap_delivery.CONVERSATION_DONE_FILE).exists())
+                self.assertEqual(self._attempts()["attempts"], 1)
+
+    def test_a_text_post_that_may_have_landed_keeps_the_claim(self):
+        for answer in (subprocess.TimeoutExpired(["a2a"], 105), chat_notify.NOTIFY_OUTCOME_UNKNOWN, 2):
+            with self.subTest(answer=answer):
+                (self.d / COMPLETED).unlink(missing_ok=True)
+                if (self.d / DELIVERED).exists():
+                    (self.d / DELIVERED).replace(self.d / INVENTORY)
+                self._answer(answer, "", "no answer")
+                with mock.patch.object(bootstrap_delivery, "_mark_shown", return_value=True) as mark_shown:
+                    self._run()
+                mark_shown.assert_called_once()
+                self.assertTrue((self.d / COMPLETED).exists())
+                self.assertFalse((self.d / INVENTORY).exists())
+                self.assertEqual(self._attempts()["attempts"], 0)
+                self.assertIn("may have landed", self._attempts()["last_reason"])
+                self.assertEqual(
+                    (self.d / bootstrap_delivery.CONVERSATION_DONE_FILE).read_text(encoding="utf-8").strip(),
+                    bootstrap_delivery.MAYBE_POSTED,
+                )
+
+    def _card(self):
+        import inventory_presenter
+
+        card = ({"schema": "kube-agents.chat/v1", "headline": "2 findings"}, "2 findings")
+        return mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "true"}), \
+            mock.patch.object(inventory_presenter, "chat", return_value=card)
+
+    def test_a_card_that_may_have_landed_is_sent_again_with_its_key(self):
+        flag, chat = self._card()
+        with flag, chat:
+            for answer in (chat_notify.NOTIFY_OUTCOME_UNKNOWN, subprocess.TimeoutExpired(["a2a"], 105),
+                           1):
+                with self.subTest(answer=answer):
+                    self.calls.clear()
+                    (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).unlink(missing_ok=True)
+                    self._answer(answer, "", "no answer")
+                    self._run()
+                    self.assertFalse((self.d / COMPLETED).exists())
+                    self.assertTrue((self.d / INVENTORY).exists())
+                    self.assertEqual(self._attempts()["attempts"], 1)
+            # The next attempt carries the same key, so a card that landed is edited.
+            record = self._attempts()
+            record["last_at"] -= bootstrap_delivery.CONVERSATION_RETRY_WAITS_SECONDS[0] + 1
+            (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).write_text(json.dumps(record), encoding="utf-8")
+            self.calls.clear()
+            self._run()
+        report = self.calls[0]
+        self.assertEqual(report[report.index("--update") + 1], bootstrap_delivery.CONVERSATION_REPORT_UPDATE)
+        self.assertTrue((self.d / COMPLETED).exists())
+
+    def test_an_edit_that_failed_counts_as_posted(self):
+        # The gateway holds the key, so the card from an earlier attempt is in the chat.
+        flag, chat = self._card()
+        self._answer(1, json.dumps({"error": "edit failed: message_not_found"}) + "\n")
+        with flag, chat:
+            self._run()
+        self.assertTrue((self.d / COMPLETED).exists())
+        self.assertFalse((self.d / INVENTORY).exists())
+        self.assertEqual(
+            (self.d / bootstrap_delivery.CONVERSATION_DONE_FILE).read_text(encoding="utf-8").strip(),
+            bootstrap_delivery.POSTED,
+        )
+
+    def test_a_posted_report_records_its_outcome(self):
+        self._run()
+        self.assertEqual(
+            (self.d / bootstrap_delivery.CONVERSATION_DONE_FILE).read_text(encoding="utf-8").strip(),
+            bootstrap_delivery.POSTED,
+        )
+
+    def _claim(self, age):
+        (self.d / COMPLETED).touch()
+        then = time.time() - age
+        os.utime(self.d / COMPLETED, (then, then))
+
+    def test_a_claim_with_no_outcome_is_released_once_stale(self):
+        self._claim(bootstrap_delivery.STALE_CLAIM_SECONDS - 30)
+        self._run()
+        self.assertTrue((self.d / COMPLETED).exists(), "a run may still be posting")
+        self._claim(bootstrap_delivery.STALE_CLAIM_SECONDS + 1)
+        with mock.patch.object(bootstrap_delivery, "_retire_jobs") as retire:
+            self._run()
+        retire.assert_not_called()
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertEqual(self._attempts()["attempts"], 1)
+        self.assertEqual(self.calls, [])
+
+    def test_a_claim_with_an_outcome_retires_on_schedule(self):
+        (self.d / bootstrap_delivery.CONVERSATION_DONE_FILE).write_text("posted\n", encoding="utf-8")
+        self._claim(bootstrap_delivery.RETIRE_AFTER_SECONDS + 1)
+        with mock.patch.object(bootstrap_delivery, "_retire_jobs") as retire:
+            self._run()
+        retire.assert_called_once()
+        self.assertTrue((self.d / COMPLETED).exists())
+
+    def test_oobe_waits_for_the_outcome_before_it_retires(self):
+        oobe.write_state(self.d, {oobe.STATE_DONE: True})
+        self._claim(bootstrap_delivery.RETIRE_AFTER_SECONDS + 1)
+        self.assertFalse(oobe.finished(self.d, time.time()))
+        (self.d / bootstrap_delivery.CONVERSATION_DONE_FILE).write_text("posted\n", encoding="utf-8")
+        self.assertTrue(oobe.finished(self.d, time.time()))
+
+    def test_retirement_outlasts_the_report_and_the_note(self):
+        self.assertGreater(bootstrap_delivery.RETIRE_AFTER_SECONDS, 2 * bootstrap_delivery.CONVERSATION_POST_MAX_SECONDS)
+        self.assertGreater(bootstrap_delivery.STALE_CLAIM_SECONDS, bootstrap_delivery.CONVERSATION_POST_MAX_SECONDS)
+
+    def test_the_last_failed_attempt_is_logged_for_an_operator(self):
+        record = {"attempts": bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS - 1, "last_reason": "refused", "last_at": 0}
+        (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).write_text(json.dumps(record), encoding="utf-8")
+        self._answer(1, REFUSED)
+        self._run()
+        log = (self.d / oobe.STAGE_LOG).read_text(encoding="utf-8")
+        self.assertIn(f"not posted after {bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS} attempts", log)
+
+    def test_a_report_past_one_post_is_refused_before_the_claim(self):
+        (self.d / INVENTORY).write_text("x" * (bootstrap_delivery.CONVERSATION_REPORT_MAX_BYTES + 1), encoding="utf-8")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = bootstrap_delivery.main(self.d)
+        self.assertEqual(rc, 1)
+        self.assertEqual(buf.getvalue(), "")
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertIn("larger than", self._attempts()["last_reason"])
+
+    def test_the_size_limit_counts_undecodable_bytes_as_posted(self):
+        # Each invalid byte decodes to a three-byte U+FFFD on the way to argv.
+        (self.d / INVENTORY).write_bytes(b"\xff" * (bootstrap_delivery.CONVERSATION_REPORT_MAX_BYTES // 2))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bootstrap_delivery.main(self.d), 1)
+        self.assertFalse((self.d / COMPLETED).exists())
+
+    def test_the_gateway_answers_delivery_reads_are_the_gateway_s(self):
+        # The gateway and the agent ship in different images, so these texts cannot change.
+        source = (Path(__file__).resolve().parents[3] / "a2a" / "gateway" / "notify.go").read_text(encoding="utf-8")
+        self.assertIn(f'"{bootstrap_delivery.NOTIFY_EDIT_FAILED_PREFIX} "', source)
+
+    def test_a_stale_claim_after_a_recorded_attempt_is_not_counted_twice(self):
+        self._claim(bootstrap_delivery.STALE_CLAIM_SECONDS + 1)
+        record = {"attempts": 2, "last_reason": "refused", "last_at": time.time()}
+        (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).write_text(json.dumps(record), encoding="utf-8")
+        self._run()
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertEqual(self._attempts()["attempts"], 2)
+
+    def test_the_outcome_is_recorded_before_the_note_goes(self):
+        flag, chat = self._card()
+        seen = []
+
+        def run(argv, **kwargs):
+            if "--chat-file" not in argv:
+                seen.append((self.d / bootstrap_delivery.CONVERSATION_DONE_FILE).exists())
+            return self._fake_run(argv, **kwargs)
+
+        with flag, chat, mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=run), \
+                contextlib.redirect_stdout(io.StringIO()):
+            bootstrap_delivery.main(self.d)
+        self.assertEqual(seen, [True])
+
+    def test_an_absent_route_is_retried_then_released(self):
+        delays = bootstrap_delivery.time.sleep
+        for _ in range(len(chat_notify.NOTIFY_ROUTE_RETRY_DELAYS_SECONDS) + 1):
+            self._answer(chat_notify.NOTIFY_ROUTE_UNAVAILABLE, "", "no gateway")
+        self._run()
+        self.assertEqual(len(self.calls), len(chat_notify.NOTIFY_ROUTE_RETRY_DELAYS_SECONDS) + 1)
+        self.assertEqual([c.args[0] for c in delays.call_args_list], list(chat_notify.NOTIFY_ROUTE_RETRY_DELAYS_SECONDS))
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertEqual(self._attempts()["attempts"], 1)
+
+    def test_the_card_marks_findings_before_the_note_goes(self):
+        flag, chat = self._card()
+        order = []
+        real = self._fake_run
+
+        def run(argv, **kwargs):
+            order.append("card" if "--chat-file" in argv else "note")
+            return real(argv, **kwargs)
+
+        with flag, chat, mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=run), \
+                mock.patch.object(bootstrap_delivery, "_mark_shown", side_effect=lambda *a: order.append("mark") or True), \
+                contextlib.redirect_stdout(io.StringIO()):
+            bootstrap_delivery.main(self.d)
+        self.assertEqual(order, ["card", "mark", "note"])
+
+    def test_findings_are_marked_shown_only_after_the_post(self):
+        order = []
+        self.answers = []
+        with mock.patch.object(bootstrap_delivery, "_mark_shown", side_effect=lambda *a: order.append("mark") or True), \
+                mock.patch.object(bootstrap_delivery, "_notify_conversation",
+                                  side_effect=lambda *a, **k: order.append("post") or (bootstrap_delivery.POSTED, "")):
+            self._run()
+        self.assertEqual(order, ["post", "mark"])
+
+    def test_a_child_env_without_the_route_claims_nothing(self):
+        for name, value in (("A2A_NOTIFY_CONVERSATIONS", ""), ("A2A_NOTIFY_CONVERSATIONS", "google_chat"),
+                            ("NATS_URL", ""), ("A2A_BUS_USER", "")):
+            with self.subTest(name=name, value=value), mock.patch.dict(os.environ, {name: value, "NATS_USER": ""}):
+                self.assertEqual(self._run(), 0)
+                self.assertEqual(self.calls, [])
+                self.assertFalse((self.d / COMPLETED).exists())
+                self.assertEqual(self._attempts()["attempts"], 0)
+                self.assertIn("the report waits", self._attempts()["last_reason"])
+
+    def test_a_block_does_not_restart_the_wait_after_an_attempt(self):
+        record = {"attempts": 1, "last_reason": "refused", "last_at": 1000.0}
+        (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).write_text(json.dumps(record), encoding="utf-8")
+        with mock.patch.dict(os.environ, {"NATS_URL": ""}):
+            self._run()
+        self.assertEqual(self._attempts()["last_at"], 1000.0)
+        self.assertIn("NATS_URL", self._attempts()["last_reason"])
+
+    def test_the_same_block_is_not_rewritten_each_tick(self):
+        with mock.patch.dict(os.environ, {"NATS_URL": ""}):
+            self._run()
+            first = (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).stat().st_mtime_ns
+            with mock.patch.object(bootstrap_delivery.time, "time", return_value=time.time() + 60):
+                self._run()
+        self.assertEqual((self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).stat().st_mtime_ns, first)
+
+    def test_a_marker_without_its_conversation_never_prints_the_report(self):
+        (self.d / bootstrap_delivery.CONVERSATION_FILE).unlink()
+        self._run()
+        self.assertEqual(self.calls, [])
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertIn(bootstrap_delivery.CONVERSATION_FILE, self._attempts()["last_reason"])
+
+    def test_the_conversation_wins_over_a_job_origin_marker(self):
+        (self.d / ALIGNED).touch()
+        self._run()
+        self.assertEqual(len(self.calls), 1)
+
+    def test_gateway_error_reads_only_an_answer_that_posted_nothing(self):
+        self.assertEqual(bootstrap_delivery._gateway_error(REFUSED), "not a live conversation with that context")
+        self.assertEqual(bootstrap_delivery._gateway_error(json.dumps({"message_id": "1", "error": "partly"})), "")
+        self.assertEqual(bootstrap_delivery._gateway_error("not json"), "")
+        self.assertEqual(bootstrap_delivery._gateway_error(""), "")
 
 
 class DeliveryMarksShownTest(unittest.TestCase):
@@ -1750,7 +2178,40 @@ class FirstRunAuditsTest(unittest.TestCase):
 
     def test_the_not_covered_note_does_not_say_the_report_covers_them(self):
         self.assertNotIn("covers", bootstrap_delivery.AUDITS_NOT_COVERED_NOTE)
-        self.assertIn("does not cover", bootstrap_delivery.AUDITS_NOT_COVERED_NOTE)
+        # The skips come a day or more after the sweep, when the scheduled audits have usually run,
+        # so the note speaks for this report, not for what the audits have done.
+        self.assertIn(
+            f"This report does not cover {inventory_findings.AUDIT_FAMILY_WORDS}", bootstrap_delivery.AUDITS_NOT_COVERED_NOTE
+        )
+        for note in (bootstrap_delivery.AUDITS_UNCHECKED_SCHEDULED_NOTE, bootstrap_delivery.AUDITS_NONE_RAN_NOTE):
+            self.assertNotIn("nothing has checked", note.lower())
+            self.assertIn("this report", note.lower())
+
+    def test_the_covered_note_claims_only_the_older_scans_own_checks(self):
+        covered = bootstrap_delivery.AUDITS_COVERED_NOTE.split("so this report covers them", 1)[0]
+        self.assertNotIn("RBAC", covered)
+        self.assertIn(f"not the rest of {inventory_findings.AUDIT_FAMILY_WORDS}", bootstrap_delivery.AUDITS_COVERED_NOTE)
+
+    def test_no_other_note_names_a_check_outside_the_posture_lines_words(self):
+        # The current scan's report names its checks and the audits' areas; a note listing workload
+        # checks by name would be an exclusion list the scan's table and the audit rosters outgrow.
+        old_scan = ("probe", "requests and limits", "autoscaling", "NetworkPolicy", "pod security", "Workload checks")
+        notes = {
+            name: value
+            for name, value in vars(bootstrap_delivery).items()
+            if name.startswith("AUDITS_") and isinstance(value, str) and name != "AUDITS_COVERED_NOTE"
+        }
+        self.assertIn("AUDITS_RAN_NOTE", notes)
+        for name, value in notes.items():
+            for words in old_scan:
+                with self.subTest(note=name, words=words):
+                    self.assertNotIn(words, value)
+
+    def test_the_posture_lines_checks_are_the_slug_table(self):
+        self.assertEqual({slug for slug, _ in inventory_findings.SCAN_CHECKS}, self._slug_table())
+
+    def test_every_first_run_audit_has_an_area(self):
+        self.assertEqual(set(inventory_findings.AUDIT_FAMILIES), set(oobe.FIRST_RUN_AUDITS))
 
     def test_a_no_coverage_report_after_another_skip_points_at_the_schedules(self):
         self._skipped(oobe.SKIP_NOT_NEW)
@@ -1786,8 +2247,8 @@ class FirstRunAuditsTest(unittest.TestCase):
 
     def test_a_finished_chain_says_which_audits_ran(self):
         note = self._note({oobe.STATE_FIRED: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_DONE: True})
-        self.assertIn("which have started: `fleet-wide-cost-analysis`, `compliance-audit`, `obtainability-audit`, "
-                      "`stockout-prevention`.", note)
+        self.assertIn("The security and RBAC, reliability, capacity and cost audits have started.", note)
+        self.assertNotIn("`", note)
         self.assertIn("Each posts", note)
         self.assertNotIn("Not run", note)
 
@@ -1798,9 +2259,10 @@ class FirstRunAuditsTest(unittest.TestCase):
             oobe.STATE_GAVE_UP: ["obtainability-audit"],
             oobe.STATE_DONE: True,
         })
-        self.assertIn("which have started: `fleet-wide-cost-analysis`, `stockout-prevention`.", note)
+        self.assertIn("The capacity and cost audits have started.", note)
         self.assertTrue(note.endswith(
-            f"Not run: `compliance-audit` (disabled), `obtainability-audit` ({bootstrap_delivery.AUDITS_GAVE_UP_REASON})."
+            "Not run: the security and RBAC audit (disabled), "
+            f"the reliability audit ({bootstrap_delivery.AUDITS_GAVE_UP_REASON})."
         ))
 
     def test_a_chain_where_every_audit_was_held_or_given_up_says_none_ran(self):
@@ -1811,15 +2273,165 @@ class FirstRunAuditsTest(unittest.TestCase):
             with self.subTest(state=state):
                 note = self._note(state)
                 self.assertTrue(note.startswith(bootstrap_delivery.AUDITS_NONE_RAN_NOTE))
-                self.assertIn("Not run: `fleet-wide-cost-analysis` (", note)
+                self.assertIn("Not run: the security and RBAC audit (", note)
                 self.assertNotIn("now running", note)
-                self.assertNotIn("which have started", note)
+                self.assertNotIn("have started", note)
+
+    def _run(self, audit: str, claimed_at: float, outcome: str | None, columns: bool = True) -> None:
+        """A completed run of ``audit`` in the Platform Agent's cron store, ending a minute after its claim."""
+        cron = self.d / oobe.PROFILES_DIR / oobe.PLATFORM_PROFILE / oobe.CRON_DIR
+        cron.mkdir(parents=True, exist_ok=True)
+        extra = ", finished_at TEXT, delivery_outcome TEXT" if columns else ""
+        with sqlite3.connect(cron / oobe.EXECUTIONS_DB) as conn:
+            conn.execute(f"CREATE TABLE IF NOT EXISTS executions (job_id TEXT, status TEXT, claimed_at TEXT{extra})")
+            stamp = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat()  # noqa: E731
+            if columns:
+                conn.execute("INSERT INTO executions VALUES (?, 'completed', ?, ?, ?)",
+                             (audit, stamp(claimed_at), stamp(claimed_at + 60), outcome))
+            else:
+                conn.execute("INSERT INTO executions VALUES (?, 'completed', ?)", (audit, stamp(claimed_at)))
+
+    def _finished_chain(self, outcome: str | None) -> dict:
+        """All four audits marked and completed after their marks, each run's delivery ending ``outcome``."""
+        now = time.time()
+        marks = {a: now - 3600 + i * 600 for i, a in enumerate(oobe.FIRST_RUN_AUDITS)}
+        for audit in oobe.FIRST_RUN_AUDITS:
+            self._run(audit, marks[audit] + 30, outcome)
+        return {oobe.STATE_FIRED: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_MARKS: marks, oobe.STATE_DONE: True}
+
+    def test_audits_that_finished_before_a_home_channel_are_listed(self):
+        note = self._note(self._finished_chain(bootstrap_delivery.DELIVERY_FAILED))
+        self.assertIn("The security and RBAC, reliability, capacity and cost audits have run.", note)
+        self.assertNotIn("have started", note)
+        # The ran note promises no home-channel post while summaries are missing.
+        self.assertNotIn("Each posts a summary to the home channel", note)
+        self.assertIn("but their summaries were not posted to the chat: "
+                      "`fleet-wide-cost-analysis`, `compliance-audit`, `obtainability-audit`, `stockout-prevention`. "
+                      "Ask me for any of these reports.", note)
+
+    def test_a_run_going_at_the_mark_counts_by_its_finish(self):
+        now = time.time()
+        # Claimed before the mark, finished after it: the stage took it as the audit's answer.
+        self._run("compliance-audit", now - 960, bootstrap_delivery.DELIVERY_FAILED)
+        note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 930},
+                           oobe.STATE_DONE: True})
+        self.assertIn("The security and RBAC audit has run.", note)
+        self.assertIn("were not posted to the chat: `compliance-audit`", note)
+
+    def test_a_suppressed_acked_run_is_silent(self):
+        now = time.time()
+        self._run("compliance-audit", now - 1200, bootstrap_delivery.DELIVERY_FAILED)
+        self._run("compliance-audit", now - 600, "suppressed_acked")
+        note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 1300},
+                           oobe.STATE_DONE: True})
+        self.assertIn("were not posted to the chat: `compliance-audit`", note)
+
+    def test_a_mark_that_is_not_a_number_reads_as_no_mark(self):
+        now = time.time()
+        self._run("compliance-audit", now - 600, bootstrap_delivery.DELIVERY_FAILED)
+        for mark in ("1790000000", None, [1]):
+            with self.subTest(mark=mark):
+                note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": mark},
+                                   oobe.STATE_DONE: True})
+                self.assertIn("The security and RBAC audit has run.", note)
+                self.assertIn("were not posted to the chat: `compliance-audit`", note)
+
+    def test_a_later_silent_run_does_not_hide_the_lost_summary(self):
+        # Day 2: the first run's summary was refused; the next scheduled run found nothing new.
+        now = time.time()
+        self._run("compliance-audit", now - 86400, bootstrap_delivery.DELIVERY_FAILED)
+        for outcome in ("suppressed", None):
+            self._run("compliance-audit", now - 600, outcome)
+        note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 86400 - 60},
+                           oobe.STATE_DONE: True})
+        self.assertIn("were not posted to the chat: `compliance-audit`.", note)
+
+    def test_delivered_summaries_are_not_listed(self):
+        for outcome in ("delivered", "suppressed", None):
+            with self.subTest(outcome=outcome):
+                self._tmp.cleanup()
+                self.d.mkdir()
+                note = self._note(self._finished_chain(outcome))
+                self.assertIn("audits have run.", note)
+                self.assertNotIn("not posted", note)
+
+    def test_a_later_run_that_delivered_clears_an_earlier_failure(self):
+        state = self._finished_chain(bootstrap_delivery.DELIVERY_FAILED)
+        self._run("compliance-audit", time.time() - 10, "delivered")
+        note = self._note(state)
+        unposted = note.partition("not posted to the chat:")[2]
+        self.assertNotIn("`compliance-audit`", unposted)
+        self.assertIn("`stockout-prevention`", unposted)
+
+    def test_each_outcome_lists_the_audit_by_its_class(self):
+        # (listed when it is the only run, listed when it follows a refused run)
+        expected = {
+            "failed": (True, True),
+            "suppressed": (False, True),
+            "suppressed_acked": (False, True),
+            None: (False, True),
+            "delivered": (False, False),
+            "queued": (False, False),
+            "not_configured": (False, False),
+            # A value Hermes does not write today reads as lost, so a renamed failure still names the audit.
+            "a-value-hermes-added-later": (True, True),
+        }
+        for outcome, (alone, after_failed) in expected.items():
+            with self.subTest(outcome=outcome):
+                for runs, listed in (
+                    ([(1.0, 2.0, outcome)], alone),
+                    ([(1.0, 2.0, "failed"), (3.0, 4.0, outcome)], after_failed),
+                ):
+                    got = bootstrap_delivery._undelivered_audits(["compliance-audit"], {"compliance-audit": runs})
+                    self.assertEqual(got, ["`compliance-audit`"] if listed else [])
+
+    def test_a_run_from_before_the_mark_is_not_the_first_run(self):
+        now = time.time()
+        self._run("compliance-audit", now - 86400, bootstrap_delivery.DELIVERY_FAILED)
+        note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 900},
+                           oobe.STATE_DONE: True})
+        self.assertIn("The security and RBAC audit has started.", note)
+        self.assertNotIn("not posted", note)
+
+    def test_a_store_without_the_outcome_column_lists_nothing(self):
+        now = time.time()
+        self._run("compliance-audit", now - 600, None, columns=False)
+        note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 900},
+                           oobe.STATE_DONE: True})
+        self.assertIn("The security and RBAC audit has run.", note)
+        self.assertNotIn("not posted", note)
+        # The stage log says why no unposted summary can be named; stderr is dropped on exit 0.
+        self.assertIn("no delivery_outcome column", (self.d / oobe.STAGE_LOG).read_text())
+
+    def test_an_unreadable_store_keeps_the_note_it_had(self):
+        cron = self.d / oobe.PROFILES_DIR / oobe.PLATFORM_PROFILE / oobe.CRON_DIR
+        cron.mkdir(parents=True)
+        (cron / oobe.EXECUTIONS_DB).write_text("not a database", encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            note = self._note({oobe.STATE_FIRED: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_DONE: True})
+        self.assertIn("audits have started.", note)
+        self.assertNotIn("not posted", note)
+        self.assertIn("cannot read", (self.d / oobe.STAGE_LOG).read_text())
+
+    def test_the_text_delivery_carries_the_undelivered_summaries(self):
+        oobe.write_state(self.d, self._finished_chain(bootstrap_delivery.DELIVERY_FAILED))
+        (self.d / INVENTORY).write_text("# Report\n", encoding="utf-8")
+        (self.d / ALIGNED).touch()
+        (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n", encoding="utf-8")
+        out = io.StringIO()
+        with (
+            mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(bootstrap_delivery.main(self.d), 0)
+        self.assertIn("`stockout-prevention`. Ask me for any of these reports.", out.getvalue())
 
     def test_a_chain_under_way_names_a_held_audit_as_not_run(self):
         note = self._note({oobe.STATE_FIRED: ["fleet-wide-cost-analysis"],
                            oobe.STATE_HELD: {"compliance-audit": oobe.HOLD_MISSING}, oobe.STATE_DONE: False})
         self.assertEqual(
-            note, f"{bootstrap_delivery.AUDITS_RUNNING_NOTE} Not run: `compliance-audit` ({oobe.HOLD_MISSING})."
+            note, f"{bootstrap_delivery.AUDITS_RUNNING_NOTE} Not run: the security and RBAC audit ({oobe.HOLD_MISSING})."
         )
 
     def test_the_text_delivery_closes_with_the_skip(self):

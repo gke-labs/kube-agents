@@ -864,7 +864,8 @@ to run is refused. A fake provider cannot produce any of them.
 3. `--body-file` in `/tmp` names a file the sidecar cannot open — §4.
 4. **A card dispatch does not start in the profile directory.** Every skill here writes its script
    invocation `./skills/…/scripts/…`, and that has always worked because a cron turn starts in the
-   profile directory. A kanban worker starts in the task's workspace
+   profile directory. (Correction, #2989: it didn't. On the shell sandbox a cron turn started in the
+   unwritable `/home/agent`, and it now starts in a directory of its own under `cron/runs/`.) A kanban worker starts in the task's workspace
    (`…/kanban/workspaces/<task-id>`), so the first thing the worker did was
    `No such file or directory`, exit 127 — for `pr_conversation.py` and again for
    `submit_suggestion.py`, which the amend path depends on. It blocked the card `needs_input`.

@@ -142,6 +142,10 @@ type Config struct {
 	// calls no server it did not ask for. The daemon sets DefaultRouteURL.
 	RouteURL string
 	RouteKey string
+	// CardStopTimeout bounds a card stop's request to session-kv
+	// (cardstop.go); zero is DefaultCardStopTimeout. The wait for the
+	// session's turn before it is bounded apart (cardStopTurnWait).
+	CardStopTimeout time.Duration
 	// APIConnectRetry is how long a refused connection to the API server is
 	// retried before the task ends hermes-api-unreachable; zero is
 	// DefaultAPIConnectRetry.
@@ -237,6 +241,9 @@ func (c *Config) defaults() {
 	if c.APIURL == "" {
 		c.APIURL = DefaultAPIURL
 	}
+	if c.CardStopTimeout <= 0 {
+		c.CardStopTimeout = DefaultCardStopTimeout
+	}
 	if c.APIConnectRetry <= 0 {
 		c.APIConnectRetry = DefaultAPIConnectRetry
 	}
@@ -304,6 +311,11 @@ type taskRun struct {
 	// cancelReq ends the API executor's request (api.go); nil outside one.
 	// Under mu like proc, which it is the counterpart of.
 	cancelReq context.CancelFunc
+	// cancelCheck ends the capability check in flight for this run
+	// (checkContext); nil outside one. Under mu. The check can wait out
+	// capability.DefaultReachWindow for a verifier it cannot reach; a
+	// cancel ends that wait rather than leaving a worker on it.
+	cancelCheck context.CancelFunc
 
 	// steers are the follow-ups waiting for the current turn to end, oldest
 	// first. steersQueued counts every follow-up this run has queued, the
@@ -413,8 +425,9 @@ type Bridge struct {
 	// it while a cancel lands, without a bus that misbehaves on cue.
 	publishTurn func(ctx context.Context, run *taskRun, artifactID, text string) error
 	// resultPublish publishes a task's result artifact, publishResult by
-	// default; a field so a test can fail it. chat, when set, is the
-	// kube-agents.chat/v1 DataPart the last chunk carries (chat.go).
+	// default; a field so a test can fail it. chat, when set, is the data
+	// part the last chunk carries: the kube-agents.chat/v1 DataPart (chat.go)
+	// for a turn, or the cardStop result part (cardstop.go) for a control.
 	resultPublish func(ctx context.Context, run *taskRun, output string, chat []byte) error
 
 	// apiClient is the API executor's HTTP client (api.go).
@@ -484,8 +497,9 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 	// publishes on a2a.cap.verify.<profile> and subscribes to
 	// a2a.cap.reply.<profile>.*. NATS refuses either asynchronously, and nats.go
 	// delivers that -ERR only to the async handler -- with none installed it is
-	// dropped on the floor. Check then simply times out, and the bridge
-	// publishes "the verifier could not be reached" as the task's terminal
+	// dropped on the floor. Check then times out on every ask for its reach
+	// window, and the bridge publishes "the verifier could not be reached" as
+	// the task's terminal
 	// reason. So a bridge missing or mis-spelling one of its two verify grants
 	// refuses every task while every log line and every terminal event blames
 	// the verifier Deployment, which is the wrong team's pager and the wrong
@@ -509,7 +523,7 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 			cfg.Logger.Warn("nats async error", "err", err, "subject", subject)
 		}),
 	}, cfg.NATSOptions...)
-	b.nc, err = nats.Connect(cfg.NATSURL, natsOpts...)
+	b.nc, err = nats.Connect(cfg.NATSURL, append(natsOpts, lib.TLSOptions()...)...)
 	if err != nil {
 		b.c.Close()
 		return nil, fmt.Errorf("kv connection: %w", err)
@@ -561,6 +575,9 @@ func (b *Bridge) Run(ctx context.Context) error {
 		return fmt.Errorf("subscribe: %w", err)
 	}
 	b.cfg.Logger.Info("hermes bridge consuming", "profile", b.cfg.Profile, "executor", b.cfg.Executor)
+	if board := b.serveBoard(); board != nil {
+		defer board.Stop()
+	}
 	if b.cfg.Executor == ExecutorAPI && b.activityLn != nil && b.cfg.ActivitySecret == "" {
 		// The door is open but nothing can be attributed through it: the
 		// pod's hook signs with a secret this bridge was not given.
@@ -574,7 +591,11 @@ func (b *Bridge) Run(ctx context.Context) error {
 			"listen", b.activityLn.Addr().String(), "hook", DefaultActivityListen)
 	}
 	<-ctx.Done()
+	// Under b.mu: accept starts a card-stop goroutine (b.wg.Add) only after
+	// reading closing under the same lock, so none is added once Wait can run.
+	b.mu.Lock()
 	b.closing.Store(true)
+	b.mu.Unlock()
 	sub.Stop()
 	// The queue is never closed: Stop does not join an in-flight handler
 	// callback, and a handler mid-accept sending into a closed channel would
@@ -673,7 +694,8 @@ func (b *Bridge) handleMessage(ctx context.Context, env *lib.Envelope) {
 }
 
 // accept is the dispatcher half: register in-flight, publish submitted,
-// queue for a worker. KV before submitted, deliberately - a crash between
+// queue for a worker, or, for a card-stop control, start its own goroutine
+// (runCardStop). KV before submitted, deliberately - a crash between
 // the two leaves a key the sweep deletes harmlessly, where the opposite
 // order leaves a task the sweep cannot see.
 func (b *Bridge) accept(ctx context.Context, env *lib.Envelope) {
@@ -682,7 +704,10 @@ func (b *Bridge) accept(ctx context.Context, env *lib.Envelope) {
 		b.cfg.Logger.Error("rejecting malformed submission", "task", env.TaskID, "err", err)
 		return
 	}
-	run := &taskRun{origin: env, exec: x}
+	// A card-stop control (cardstop.go) answers no follow-up: its turns are
+	// closed from the start, so one is refused task-ending.
+	control := cardStopRequested(env.Payload)
+	run := &taskRun{origin: env, exec: x, turnsClosed: control}
 	if err := b.markInFlight(ctx, env.TaskID); err != nil {
 		b.cfg.Logger.Error("in-flight registry write failed; dropping submission",
 			"task", env.TaskID, "err", err)
@@ -699,6 +724,27 @@ func (b *Bridge) accept(ctx context.Context, env *lib.Envelope) {
 	b.mu.Unlock()
 
 	b.cfg.Logger.Info("task accepted", "task", env.TaskID, "correlation", env.CorrelationID, "from", env.From.Session)
+	if control {
+		// A card stop runs no turn, so it takes no worker slot: one behind
+		// Concurrency long turns would wait out the very work it stops.
+		// The Add and the closing check share b.mu with Run's closing store,
+		// so an Add either precedes Run's wg.Wait or does not happen. Once
+		// closing is set, shutdownTasks may already have read the table, so
+		// the control is ended here. A control accepted before it is in the
+		// table for shutdownTasks, and its goroutine sees ctx end.
+		b.mu.Lock()
+		closing := b.closing.Load()
+		if !closing {
+			b.wg.Add(1)
+		}
+		b.mu.Unlock()
+		if closing {
+			b.finalize(run, lib.StateFailed, shutdownReason, nil)
+			return
+		}
+		go b.runCardStop(ctx, run)
+		return
+	}
 	select {
 	case b.queue <- run:
 	default:
@@ -724,6 +770,9 @@ func (b *Bridge) handleCancel(ctx context.Context, env *lib.Envelope) {
 	}
 	if run.state == stateRunning && run.cancelReq != nil {
 		run.cancelReq()
+	}
+	if run.cancelCheck != nil {
+		run.cancelCheck()
 	}
 	run.mu.Unlock()
 	if pending {
@@ -909,11 +958,11 @@ func takeSteerLocked(run *taskRun, steer *lib.Envelope) bool {
 // none to run and the caller's answer is the deliverable; anything still
 // queued is refused task-ended by the caller's finalize.
 //
-// One call is one turn boundary, and it asks the verifier once per distinct
+// One call is one turn boundary, and it runs one check per distinct
 // capability reference (boundaryVerdicts): the follow-ups of a task usually
 // carry the same one, and the previous turn's answer waits unposted while
-// they are checked, so a verifier that hangs would otherwise cost one
-// timeout per queued follow-up. The verdicts die with the call, so the
+// they are checked, so a verifier that is away or hangs would otherwise cost
+// one reach window (capability.DefaultReachWindow) per queued follow-up. The verdicts die with the call, so the
 // follow-up that runs was still checked at the boundary just before its
 // own turn.
 func (b *Bridge) runnableSteer(ctx context.Context, run *taskRun) (*lib.Envelope, string) {
@@ -923,7 +972,9 @@ func (b *Bridge) runnableSteer(ctx context.Context, run *taskRun) (*lib.Envelope
 		if steer == nil {
 			return nil, ""
 		}
-		reason := verdicts.refusal(ctx, b, steer)
+		checkCtx, release := b.checkContext(ctx, run)
+		reason := verdicts.refusal(checkCtx, b, steer)
+		release()
 		if reason == "" {
 			if b.nextSteer(run) != steer {
 				// Canceled, past the deadline or stopping during the
@@ -934,9 +985,10 @@ func (b *Bridge) runnableSteer(ctx context.Context, run *taskRun) (*lib.Envelope
 			prompt, _ := promptFromMessage(steer.Payload) // text was checked when it was queued
 			return steer, prompt
 		}
-		if ctx.Err() != nil {
-			// Stopping, not refused (capabilityPermits says why the two
-			// differ): left queued, for finalize to refuse task-ended.
+		if ctx.Err() != nil || run.canceled.Load() {
+			// Stopping or canceled, not refused (capabilityPermits says
+			// why the two differ): left queued, for finalize to refuse
+			// task-ended.
 			return nil, ""
 		}
 		run.noticeMu.Lock()
@@ -1003,7 +1055,7 @@ func (b *Bridge) publishTurnAnswer(run *taskRun, turn int, text string) bool {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
-	err := b.publishTurn(ctx, run, fmt.Sprintf("artifact-%s-turn-%d", run.origin.TaskID, turn), text)
+	err := b.publishTurn(ctx, run, fmt.Sprintf("artifact-%s-turn-%d", run.origin.TaskID, turn), visibleOr(text))
 	cancel()
 	run.noticeMu.Unlock()
 	if err != nil {
@@ -1300,9 +1352,10 @@ func (b *Bridge) takeReplaySlot(ctx context.Context) (release func(opened bool),
 // is invoked and before a model is called, so nothing about what is refused
 // changes. What changes is who waits: accept runs on the bridge's one durable
 // consumer callback, which is serial and which also carries the KindCancel
-// envelopes for tasks that are already running. Check blocks for
-// capability.DefaultTimeout when nothing answers on the verify subject, so a
-// verifier outage made every cancel queue behind 5s per pending submission —
+// envelopes for tasks that are already running. Check blocks for up to
+// capability.DefaultReachWindow when nothing answers on the verify subject,
+// so on the callback a verifier outage would make every cancel queue behind
+// that much per pending submission —
 // a user unable to stop a running hermes subprocess because of an outage in
 // the thing that authorizes new ones. The session executor has always checked
 // in its own process for the same reason (a2a/worker-adapter/adapter.go).
@@ -1310,15 +1363,24 @@ func (b *Bridge) takeReplaySlot(ctx context.Context) (release func(opened bool),
 // The cost of the move: a submission now occupies a queue slot while it is
 // being verified, so a verifier outage long enough to queue taskQueueCapacity
 // of them ends in bridge-queue-overflow rather than capability-refused. At
-// Concurrency workers and one DefaultTimeout each that is thousands of
+// Concurrency workers and one DefaultReachWindow each that is thousands of
 // submissions inside one outage on a single-profile bridge, which is the
 // "fault, not load" the capacity already stands for.
 //
 // Returns false when it finalized the task; the caller must not run it.
 func (b *Bridge) capabilityPermits(ctx context.Context, run *taskRun) bool {
-	reason := b.capabilityRefusal(ctx, run.origin)
+	checkCtx, release := b.checkContext(ctx, run)
+	reason := b.capabilityRefusal(checkCtx, run.origin)
+	release()
 	if reason == "" {
 		return true
+	}
+	// A cancel that landed during the check ended it (checkContext), and
+	// handleCancel writes that terminal: canceled-before-start, which is
+	// what happened. Finalizing here would race it with a capability
+	// reason for a task its requester stopped.
+	if run.canceled.Load() {
+		return false
 	}
 	// "The verifier could not be reached" and "we stopped asking" are
 	// different facts, and Check cannot tell them apart: it turns any
@@ -1334,6 +1396,35 @@ func (b *Bridge) capabilityPermits(ctx context.Context, run *taskRun) bool {
 	}
 	b.finalize(run, lib.StateRejected, reason, nil)
 	return false
+}
+
+// checkContext is ctx for one capability check on run, ended early by a cancel
+// of the run. The check rides out an unreachable verifier for up to
+// capability.DefaultReachWindow. For a pending submission handleCancel writes
+// the terminal at once either way, so what this buys there is the worker: it
+// stops asking and takes the next task instead of holding its slot for the
+// rest of the window. At a turn boundary the terminal itself waits on the
+// worker, so there it is also the difference between a prompt cancel and one
+// the window holds back. release must be called when the check returns.
+//
+// handleCancel sets canceled before it takes mu to look for cancelCheck, and
+// this looks at canceled under mu, so a cancel either finds the check
+// registered or the check finds the cancel: none falls between the two.
+func (b *Bridge) checkContext(ctx context.Context, run *taskRun) (context.Context, func()) {
+	checkCtx, cancel := context.WithCancel(ctx)
+	run.mu.Lock()
+	if run.canceled.Load() {
+		cancel()
+	} else {
+		run.cancelCheck = cancel
+	}
+	run.mu.Unlock()
+	return checkCtx, func() {
+		run.mu.Lock()
+		run.cancelCheck = nil
+		run.mu.Unlock()
+		cancel()
+	}
 }
 
 func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
@@ -1398,6 +1489,7 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		return
 	}
 	run.act.Store(act)
+	started := time.Now()
 	if err := cmd.Start(); err != nil {
 		// No child, so no publisher to join and nothing to drain.
 		run.act.Store(nil)
@@ -1449,7 +1541,13 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 	switch {
 	case err == nil:
 		// A canceled task that finished anyway won the race: completed wins,
-		// per the payload spec's cancel mapping.
+		// per the payload spec's cancel mapping. The CLI reports no tokens,
+		// so the turn's usage is its wall time alone.
+		run.mu.Lock()
+		if run.state == stateRunning {
+			b.publishUsageLocked(run, lib.Usage{DurationMs: turnMillis(reaped.Sub(started))})
+		}
+		run.mu.Unlock()
 		out := stdout.String()
 		b.finalize(run, lib.StateCompleted, "", &out)
 	case run.deadlineHit.Load():
@@ -1463,6 +1561,13 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		// kill, so this arm wins only when the reap was quick.
 		b.finalize(run, lib.StateFailed, shutdownReason, nil)
 	default:
+		// A run that failed on its own still took its time; a killed one
+		// (the arms above) has no turn to account for.
+		run.mu.Lock()
+		if run.state == stateRunning {
+			b.publishUsageLocked(run, lib.Usage{DurationMs: turnMillis(reaped.Sub(started))})
+		}
+		run.mu.Unlock()
 		b.finalize(run, lib.StateFailed, failureReason(err, stdout.String(), stderr.String()), nil)
 	}
 }
@@ -1614,7 +1719,14 @@ func (b *Bridge) lookupTask(ctx context.Context, taskID string, maxAttempts int,
 // that fails to publish ends the task failed, because the result was the
 // only copy of the deliverable; finalizeCopy is the exception.
 func (b *Bridge) finalize(run *taskRun, state lib.TaskState, msg string, resultOutput *string) {
-	b.finalizeResult(run, state, msg, resultOutput, false)
+	b.finalizeResult(run, state, msg, resultOutput, nil, false)
+}
+
+// finalizeData is finalize for a result whose data part the caller made (a
+// card stop's): data rides the last chunk beside the text, in place of the
+// chat message finalize folds from the text.
+func (b *Bridge) finalizeData(run *taskRun, state lib.TaskState, msg string, resultOutput string, data []byte) {
+	b.finalizeResult(run, state, msg, &resultOutput, data, false)
 }
 
 // finalizeCopy is finalize for a result that is a copy of an answer already
@@ -1622,10 +1734,10 @@ func (b *Bridge) finalize(run *taskRun, state lib.TaskState, msg string, resultO
 // fails is logged and leaves state and msg as the cause set them, so a
 // cancel still ends canceled (payload spec assertion 13).
 func (b *Bridge) finalizeCopy(run *taskRun, state lib.TaskState, msg string, resultCopy string) {
-	b.finalizeResult(run, state, msg, &resultCopy, true)
+	b.finalizeResult(run, state, msg, &resultCopy, nil, true)
 }
 
-func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, resultOutput *string, copyOnly bool) {
+func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, resultOutput *string, data []byte, copyOnly bool) {
 	// noticeMu first and for the whole of it: no steer notice can be in
 	// flight past this, and a second finalizer waits here, then leaves on
 	// stateDone, as it always waited on mu.
@@ -1654,13 +1766,16 @@ func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, r
 	if resultOutput != nil {
 		// The answer folded for a chat renderer, on a completed task only:
 		// any other state's result is a copy beside the terminal's reason.
-		var chat []byte
-		if state == lib.StateCompleted {
+		// A caller's own data part (finalizeData) takes its place.
+		chat := data
+		if chat == nil && state == lib.StateCompleted {
 			if part, ok := resultChatPart(*resultOutput); ok {
 				chat = part.Data
 			}
 		}
-		if err := b.resultPublish(ctx, run, *resultOutput, chat); err != nil && copyOnly {
+		// The chat message is read from the answer as the agent wrote it; the text a
+		// person sees carries no step line (visibleText).
+		if err := b.resultPublish(ctx, run, visibleOr(*resultOutput), chat); err != nil && copyOnly {
 			b.cfg.Logger.Error("result publish failed; the answer is on the stream as a turn, so the terminal keeps its state",
 				"task", run.origin.TaskID, "state", state, "err", err)
 		} else if err != nil {
@@ -1668,6 +1783,7 @@ func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, r
 			state, msg = lib.StateFailed, resultPublishFailedReason(err)
 		}
 	}
+	b.publishHandoff(ctx, run, state)
 	err := b.publishTerminal(ctx, run, state, msg)
 	cancel()
 	run.mu.Unlock()
@@ -1717,6 +1833,53 @@ func cardsMark(run *taskRun, state lib.TaskState) (lib.Part, bool) {
 	}
 	part, err := chatmsg.MarkPart(chatmsg.Mark{Ask: run.askKind()})
 	return part, err == nil
+}
+
+// publishHandoff publishes lib.ArtifactHandoff ahead of the terminal of a
+// completed task any of whose turns filed kanban cards whose reports can
+// reach the conversation (the route was recorded): the same task-wide fact
+// cardsMark carries, so the wake's note reads the same on every route. cardsMark carries the same fact only where the cards also settle
+// the ask (Slack with KAGE_SLACK_UX on), so a Google Chat conversation, or
+// Slack with the flag off, would wake a delegating session with the
+// acknowledgement and no word that a card is still running (#3258).
+// Best-effort, like every artifact but the result, and on finalizeResult's
+// ctx, so a stalled bus can't spend time the terminal's publish budget
+// doesn't see.
+func (b *Bridge) publishHandoff(ctx context.Context, run *taskRun, state lib.TaskState) {
+	a := run.act.Load()
+	if state != lib.StateCompleted || a == nil || !a.cardsFiled.Load() || !run.routeRecorded.Load() {
+		return
+	}
+	b.publishArtifactPartsCtx(ctx, run, lib.ArtifactHandoff, lib.Part{Kind: "text", Text: lib.HandoffCards})
+}
+
+// publishUsageLocked publishes one finished turn's cost as a part on the
+// usage artifact (payload spec "Reserved artifact names"). The caller holds
+// run.mu with the run still running: a finalizer takes the same lock before
+// its terminal, so the part is on the stream ahead of the final event, never
+// after it. Best-effort, like every artifact but the result; a usage with no
+// figure publishes nothing, so a reader sees absence rather than zeroes.
+func (b *Bridge) publishUsageLocked(run *taskRun, u lib.Usage) {
+	part, err := lib.UsagePart(u)
+	if err != nil {
+		if u != (lib.Usage{Model: u.Model}) {
+			// A figure was there and the part was refused (a negative
+			// one): say so, since the turn's time and counts are not on
+			// the bus. A usage with no figure at all is the quiet case.
+			b.cfg.Logger.Warn("usage part refused; the turn's figures are not on the bus",
+				"task", run.origin.TaskID, "err", err)
+		}
+		return
+	}
+	if run.act.Load() == nil {
+		// No activity state means no turn was started through runTask or
+		// runTaskAPI (a turn driven by hand in a test); there is no
+		// append tracker to publish under, so there is no artifact.
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
+	defer cancel()
+	b.publishArtifactPartsCtx(ctx, run, lib.ArtifactUsage, part)
 }
 
 // cardsSettleTheAsk reports whether the cards of origin's conversation carry

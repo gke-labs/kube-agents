@@ -42,6 +42,7 @@ jobs:
   validate-title:
     name: Validate Conventional Commit PR Title
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Validate PR Title
         # A merge-queue run carries no pull request, so there is no title to

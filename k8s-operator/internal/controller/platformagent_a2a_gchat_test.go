@@ -224,8 +224,8 @@ func TestAnUnarmedGatewayRendersAsBefore(t *testing.T) {
 			for _, e := range c.Env {
 				names = append(names, e.Name)
 			}
-			want := []string{"NATS_URL", "NATS_USER", "NATS_PASSWORD", "DISCORD_TOKEN", "A2A_MAX_SESSIONS",
-				a2aBusyNoticeAtEnvVar, a2aGatewayMetricsPortEnvVar, "A2A_SPAWN_SESSIONS", "A2A_WORKER_IMAGE", a2aStrictEventsWriterEnvVar, a2aCapabilityRequiredEnvVar, "POD_NAMESPACE",
+			want := []string{"NATS_URL", a2aNATSCAFileEnv, a2aNATSCAConfigMapEnv, "NATS_USER", "NATS_PASSWORD", "DISCORD_TOKEN", "A2A_MAX_SESSIONS",
+				a2aBusyNoticeAtEnvVar, a2aGatewayMetricsPortEnvVar, "A2A_SPAWN_SESSIONS", "A2A_WORKER_IMAGE", a2aStrictEventsWriterEnvVar, a2aCapabilityRequiredEnvVar, a2aCardStopEnvVar, a2aCardStopTimeoutEnvVar, "POD_NAMESPACE",
 				"SESSION_KV_SALT", "A2A_OWNER_DEPLOYMENT", "A2A_SESSION_SERVICE_ACCOUNT", a2aPrincipalMapEnvVar}
 			// The delegation target allowlists render from the CR's lists
 			// whether or not Chat is armed; they are not the Chat adapter's
@@ -236,8 +236,8 @@ func TestAnUnarmedGatewayRendersAsBefore(t *testing.T) {
 			if strings.Join(names, ",") != strings.Join(want, ",") {
 				t.Errorf("unarmed env order %v, want %v", names, want)
 			}
-			if len(c.VolumeMounts) != 1 || c.VolumeMounts[0].Name != "principal-map" {
-				t.Errorf("unarmed mounts %v, want the principal map alone", c.VolumeMounts)
+			if len(c.VolumeMounts) != 2 || c.VolumeMounts[0].Name != "principal-map" || c.VolumeMounts[1].Name != a2aNATSCABundleVolumeName {
+				t.Errorf("unarmed mounts %v, want the principal map and the bus CA alone", c.VolumeMounts)
 			}
 		})
 	}
@@ -266,7 +266,7 @@ func TestTheBrokerArmsTheA2ARelayUnderNext(t *testing.T) {
 		t.Errorf("GOOGLE_CHAT_SUBSCRIPTION_NAME=%q rendered beside the A2A subscription: two relay instances would split one subscription, and the proxy refuses to start on the pair", value)
 	}
 	callers, _ := brokerEnvValue(env, "CREDENTIAL_PROXY_ALLOWED_CALLERS")
-	if callers != "system:serviceaccount:test-ns:test-agent,system:serviceaccount:test-ns:test-agent-shell,system:serviceaccount:test-ns:test-agent-a2a-gateway" {
+	if callers != "system:serviceaccount:test-ns:test-agent-gateway-agent,system:serviceaccount:test-ns:test-agent-shell,system:serviceaccount:test-ns:test-agent-a2a-gateway" {
 		t.Errorf("CREDENTIAL_PROXY_ALLOWED_CALLERS = %q, want the A2A gateway's ServiceAccount third", callers)
 	}
 }

@@ -599,6 +599,57 @@ func (stubConversations) Post(string, string) (string, error)                   
 func (stubConversations) PostMessage(string, gateway.OutMessage) (string, error)      { return "", nil }
 func (stubConversations) EditMessage(string, string, gateway.OutMessage) error        { return nil }
 
+// A chat backend with no home channel drops every proactive post while
+// conversations keep working, so the startup line saying so is a warning
+// (#3320): at Info it was the only trace, and nobody reads Info. With a home
+// channel the line is absent.
+func TestNoHomeChannelIsLoggedAsAWarning(t *testing.T) {
+	gchat, err := gateway.NewGoogleChatAdapter("http://relay.invalid", "/nonexistent/token", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	slackBackend, err := gateway.NewSlackAdapter("xoxb-stub", "xapp-stub", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversations := func(gateway.Adapter) gateway.NotifyConversations { return stubConversations{} }
+	for _, tc := range []struct {
+		name    string
+		backend gateway.Adapter
+		cfg     *gateway.Config
+		warned  bool
+	}{
+		{"chat with no home channel", gchat, &gateway.Config{}, true},
+		{"slack with no home channel", slackBackend, &gateway.Config{}, true},
+		{"chat with a home channel", gchat, &gateway.Config{GchatHomeChannel: "spaces/AAAA"}, false},
+		{"slack with a home channel", slackBackend, &gateway.Config{SlackHomeChannel: "C0HOME"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logged syncBuffer
+			chatNotifier(tc.cfg, tc.backend, conversations, slog.New(slog.NewJSONHandler(&logged, nil)))
+			var found map[string]any
+			for _, line := range strings.Split(strings.TrimSpace(logged.buf.String()), "\n") {
+				var rec map[string]any
+				if json.Unmarshal([]byte(line), &rec) == nil && strings.HasPrefix(fmt.Sprint(rec["msg"]), "chat.notify home posts not armed") {
+					found = rec
+				}
+			}
+			if !tc.warned {
+				if found != nil {
+					t.Fatalf("logged %v with a home channel set", found)
+				}
+				return
+			}
+			if found == nil {
+				t.Fatalf("no \"home posts not armed\" line; log: %s", logged.buf.String())
+			}
+			if found["level"] != "WARN" {
+				t.Errorf("level = %v, want WARN", found["level"])
+			}
+		})
+	}
+}
+
 // The chat.notify route arms for a Google Chat or Slack backend with or without a home
 // channel, always with the gateway's conversations behind it (a kanban
 // card's report back to its conversation needs them, and with no home channel

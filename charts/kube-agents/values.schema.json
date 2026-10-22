@@ -155,9 +155,16 @@
         "modelDefaultName": {
           "type": "string"
         },
+        "envFromSecret": {
+          "type": "string"
+        },
         "maxTokens": {
           "type": "integer",
           "minimum": 0
+        },
+        "reasoningEffort": {
+          "type": "string",
+          "enum": ["", "low", "medium", "high"]
         },
         "vertex": {
           "type": "object",
@@ -521,6 +528,16 @@
         "mode": {
           "enum": [null, "", "today", "next"]
         },
+        "storage": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "size": {
+              "type": ["string", "null"],
+              "pattern": "^$|^(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$"
+            }
+          }
+        },
         "annotations": {
           "type": "object"
         },
@@ -605,6 +622,53 @@
                 },
                 "gitopsManagers": {
                   "type": "string"
+                }
+              }
+            },
+            "stallWatch": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "excludeNamespaces": {
+                  "type": ["array", "null"],
+                  "maxItems": 100,
+                  "uniqueItems": true,
+                  "items": {
+                    "type": "string",
+                    "maxLength": 63,
+                    "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                  }
+                },
+                "minStallAgeMinutes": {
+                  "type": ["integer", "null"],
+                  "minimum": 0,
+                  "maximum": 1440
+                },
+                "kinds": {
+                  "type": ["array", "null"],
+                  "maxItems": 20,
+                  "uniqueItems": true,
+                  "not": {
+                    "anyOf": [
+                      {
+                        "allOf": [
+                          { "contains": { "const": "all" } },
+                          { "minItems": 2 }
+                        ]
+                      },
+                      {
+                        "contains": {
+                          "type": "string",
+                          "pattern": "^(secrets?|configmaps?|cm|events?|ev|endpoints?|ep|endpointslices?|controllerrevisions?|leases?)(\\.|$)"
+                        }
+                      }
+                    ]
+                  },
+                  "items": {
+                    "type": "string",
+                    "maxLength": 253,
+                    "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+                  }
                 }
               }
             },
@@ -1208,6 +1272,10 @@
             },
             "clusterName": {
               "type": "string"
+            },
+            "applyTuning": {
+              "type": "boolean",
+              "description": "Merge the plugin's execution limits into platformAgent.harness.tuning. false keeps the install's own tuning."
             },
             "image": {
               "type": "object",

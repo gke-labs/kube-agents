@@ -64,6 +64,25 @@ readonly KUBE_AGENTS_RELEASE_BUNDLE_MARKER=".release-bundle"
 # The schema the re-tag modes filter the release's recorded values against,
 # relative to the sources this run applies.
 readonly KUBE_AGENTS_VALUES_SCHEMA="charts/kube-agents/values.schema.json"
+# What marks a commit as a breaking change: a `type!:` subject or a BREAKING
+# CHANGE footer. The same patterns as commit_messages_have_breaking_change in
+# scripts/release/common.sh, which picks the version bump, held here because
+# the tree this run sources may be an older release's that predates that file's
+# helpers. tests/test_upgrade_script.py checks the two agree.
+readonly BREAKING_CHANGE_SUBJECT_REGEX='^[a-z]+(\([^)]+\))?!:'
+readonly BREAKING_CHANGE_FOOTER_REGEX='^[[:space:]]*BREAKING[ -]CHANGE:[[:space:]]+'
+# The downgrade check reads commit messages and ancestry only, so a history it
+# has to fetch carries commits and no trees or file contents.
+readonly DOWNGRADE_HISTORY_FETCH_FILTER="--filter=tree:0"
+readonly DOWNGRADE_HISTORY_DIR_TEMPLATE="kube-agents-history.XXXXXX"
+readonly DOWNGRADE_LOG_FILE_TEMPLATE="kube-agents-commits.XXXXXX"
+# Where the downgrade check reads the installed tags: the agent and operator
+# containers. The Deployment names default to installer_common.sh's, which the
+# check cannot rely on, since it reads them before or without that file.
+readonly DOWNGRADE_AGENT_DEPLOYMENT_DEFAULT="platform-agent-gateway"
+readonly DOWNGRADE_AGENT_CONTAINER="platform-agent"
+readonly DOWNGRADE_OPERATOR_DEPLOYMENT_DEFAULT="kube-agents-controller-manager"
+readonly DOWNGRADE_OPERATOR_CONTAINER="manager"
 
 # Default CLI Configuration
 PARAM_UPGRADE_MODE="full"
@@ -80,6 +99,10 @@ PARAM_KEEP_IMAGE_TAG="false"
 # renamed setting as a newer release's addition, and dropping it silently would
 # take the setting off the release. A rollback to an older release passes it.
 PARAM_DROP_UNDECLARED_VALUES="false"
+# Off by default: a commit marked breaking can leave state on the cluster that
+# the older release cannot read, so a rollback across one is refused unless
+# the operator has read the commits the refusal names and asks for it.
+PARAM_ALLOW_BREAKING_DOWNGRADE="false"
 PARAM_PROJECT_ID=""
 PARAM_CLUSTER_NAME=""
 PARAM_REGION=""
@@ -96,6 +119,8 @@ if [ -z "${IMAGE_TAG:-}" ] && [ -n "${BAKED_RELEASE_VERSION:-}" ]; then
   IMAGE_TAG_DEFAULTED_FROM_BAKED="true"
 fi
 TEMP_REPO_DIR=""
+DOWNGRADE_HISTORY_DIR=""
+DOWNGRADE_HISTORY_SOURCE=""
 # Set when this run detached the install's own checkout onto the target
 # release. Everything that can still refuse the upgrade — the configuration
 # load, the missing-project exit, the credentials fetch, the Helm release
@@ -218,6 +243,9 @@ cleanup() {
   if [ -n "$TEMP_REPO_DIR" ] && [ -d "$TEMP_REPO_DIR" ]; then
     rm -rf -- "$TEMP_REPO_DIR"
   fi
+  if [ -n "$DOWNGRADE_HISTORY_DIR" ] && [ -d "$DOWNGRADE_HISTORY_DIR" ]; then
+    rm -rf -- "$DOWNGRADE_HISTORY_DIR"
+  fi
 }
 trap cleanup EXIT
 
@@ -320,6 +348,11 @@ Options:
                            release's recorded values the target chart's schema
                            does not declare, instead of refusing the upgrade
                            over them. For a rollback to an older release.
+  --allow-breaking-downgrade
+                           Continue a move that leaves behind a commit marked
+                           as a breaking change: a rollback to an older release,
+                           or a commit build moved to a release that lacks it.
+                           Without it the move is refused and each commit named.
   --help, -h               Show this help message
 
 Examples:
@@ -1162,6 +1195,188 @@ fetch_source_ref() {
   fi
 }
 
+# ─── The downgrade check ──────────────────────────────────────────────────────
+
+is_ga_version() {
+  [[ "${1:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+# Succeeds when GA version $1 is older than GA version $2.
+ga_version_is_older() {
+  local a b i
+  local -a older_parts newer_parts
+  IFS='.' read -r -a older_parts <<<"$1"
+  IFS='.' read -r -a newer_parts <<<"$2"
+  for i in 0 1 2; do
+    a="$((10#${older_parts[$i]}))"
+    b="$((10#${newer_parts[$i]}))"
+    if [ "$a" -ne "$b" ]; then
+      [ "$a" -lt "$b" ]
+      return
+    fi
+  done
+  return 1
+}
+
+# Sets DOWNGRADE_HISTORY_SOURCE to a git directory holding the full history of
+# both refs. The sources this run applies are used when they already do (a full
+# checkout); otherwise a commit-only clone is made, since the fresh clone is one
+# commit deep and a release bundle has no history at all.
+downgrade_history_dir() {
+  local repo_dir="$1" older="$2" newer="$3" ref=""
+  if [ "$(git -C "$repo_dir" rev-parse --is-shallow-repository 2>/dev/null || echo "")" = "false" ] &&
+    git -C "$repo_dir" rev-parse --verify --quiet "${older}^{commit}" >/dev/null 2>&1 &&
+    git -C "$repo_dir" rev-parse --verify --quiet "${newer}^{commit}" >/dev/null 2>&1; then
+    DOWNGRADE_HISTORY_SOURCE="$repo_dir"
+    return 0
+  fi
+  # One clone per run: full mode checks two components, and cleanup removes
+  # only the directory this variable names.
+  if [ -z "$DOWNGRADE_HISTORY_DIR" ]; then
+    DOWNGRADE_HISTORY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/${DOWNGRADE_HISTORY_DIR_TEMPLATE}")"
+    git clone --quiet --no-checkout "$DOWNGRADE_HISTORY_FETCH_FILTER" "$KUBE_AGENTS_REPO_URL" "$DOWNGRADE_HISTORY_DIR" >/dev/null 2>&1 || return 1
+  fi
+  # A commit no branch or tag reaches (a pull request's build) is fetched by name.
+  for ref in "$older" "$newer"; do
+    git -C "$DOWNGRADE_HISTORY_DIR" rev-parse --verify --quiet "${ref}^{commit}" >/dev/null 2>&1 && continue
+    git -C "$DOWNGRADE_HISTORY_DIR" fetch --quiet origin "$ref" >/dev/null 2>&1 || return 1
+  done
+  DOWNGRADE_HISTORY_SOURCE="$DOWNGRADE_HISTORY_DIR"
+}
+
+# Prints "<short sha> <subject>" for each commit in older..newer that is marked
+# as a breaking change, judged one commit at a time on the same terms as
+# commit_messages_have_breaking_change: the subject line, then the body.
+# NUL-separated (`-z`), the one byte git keeps out of a commit message. Read
+# through a file, because command substitution drops NUL bytes.
+breaking_commits_between() {
+  local history_dir="$1" older="$2" newer="$3" log_file="" record="" header="" body=""
+  log_file="$(mktemp "${TMPDIR:-/tmp}/${DOWNGRADE_LOG_FILE_TEMPLATE}")" || return 1
+  if ! git -C "$history_dir" log -z --format='%h %s%n%b' "${older}..${newer}" >"$log_file" 2>/dev/null; then
+    rm -f -- "$log_file"
+    return 1
+  fi
+  while IFS= read -r -d '' record; do
+    record="${record#$'\n'}"
+    header="${record%%$'\n'*}"
+    body="${record#"$header"}"
+    if [[ "${header#* }" =~ $BREAKING_CHANGE_SUBJECT_REGEX ]] ||
+      { [ -n "$body" ] && grep -qE "$BREAKING_CHANGE_FOOTER_REGEX" <<<"$body"; }; then
+      printf '%s\n' "$header"
+    fi
+  done <"$log_file"
+  rm -f -- "$log_file"
+}
+
+# Prints the tag a Deployment's named container runs, or nothing when it cannot
+# be read or carries no tag (an untagged image, or a registry port's colon).
+deployment_image_tag() {
+  local namespace="$1" deployment="$2" container="$3" image=""
+  image="$(trap - ERR; kubectl get deployment "$deployment" -n "$namespace" \
+    -o jsonpath="{.spec.template.spec.containers[?(@.name==\"${container}\")].image}" 2>/dev/null)" || return 0
+  # A digest pin (`repo:tag@sha256:...`) keeps its tag before the `@`.
+  image="${image%%@*}"
+  case "${image##*:}" in
+    "$image"|*/*) return 0 ;;
+  esac
+  printf '%s\n' "${image##*:}"
+}
+
+# Checks the move to $3 against the tag of each component the mode moves: the
+# operator in operator mode, the agent in harness mode, both in full mode. The
+# two run different tags between the steps of a mode-by-mode move, so reading
+# only the agent would let an operator-mode rollback through unchecked.
+check_downgrade_for_mode() {
+  local namespace="$1" mode="$2" target="$3" repo_dir="$4"
+  local agent_deployment="${PLATFORM_AGENT_DEPLOYMENT:-$DOWNGRADE_AGENT_DEPLOYMENT_DEFAULT}"
+  local operator_deployment="${KUBE_AGENTS_OPERATOR_DEPLOYMENT:-$DOWNGRADE_OPERATOR_DEPLOYMENT_DEFAULT}"
+  local agent_tag=""
+  if [ "$mode" != "operator" ]; then
+    agent_tag="$(deployment_image_tag "$namespace" "$agent_deployment" "$DOWNGRADE_AGENT_CONTAINER")"
+    check_downgrade "$repo_dir" "$target" "$agent_tag" "deployment/${agent_deployment}"
+  fi
+  if [ "$mode" != "harness" ]; then
+    local operator_tag=""
+    operator_tag="$(deployment_image_tag "$namespace" "$operator_deployment" "$DOWNGRADE_OPERATOR_CONTAINER")"
+    if [ "$mode" = "operator" ] || [ "$operator_tag" != "$agent_tag" ]; then
+      check_downgrade "$repo_dir" "$target" "$operator_tag" "deployment/${operator_deployment}"
+    fi
+  fi
+}
+
+# Refuses a move that leaves behind a commit marked as a breaking change, naming
+# each one. A move is forward only when the installed commit is an ancestor of
+# the target; any other move between related commits leaves behind what the
+# target lacks. Ancestry alone decides it for commit builds, because a GA tag
+# sits on its release line and is never an ancestor of a main commit. Returns
+# 0 to let the run continue: the move leaves nothing behind, nothing it leaves
+# is marked, --allow-breaking-downgrade was given, or this is a --plan, which
+# reports the same finding as a warning.
+check_downgrade() {
+  local repo_dir="$1" target="$2" installed="$3" component="${4:-the install}"
+  local known_downgrade="false" history_dir="" target_commit="" installed_commit="" blocking="" count="" line=""
+  if [ -z "$installed" ]; then
+    print_warning "Could not read the tag ${component} runs, so the downgrade check is skipped for it."
+    return 0
+  fi
+  [ "$installed" != "$target" ] || return 0
+  if ! validate_immutable_ref "$installed" >/dev/null; then
+    print_info "${component} runs image tag '${installed}', which names no release or commit, so the downgrade check is skipped for it."
+    return 0
+  fi
+  if is_ga_version "$target" && is_ga_version "$installed"; then
+    ga_version_is_older "$target" "$installed" || return 0
+    known_downgrade="true"
+  fi
+
+  if ! downgrade_history_dir "$repo_dir" "$target" "$installed"; then
+    if [ "$known_downgrade" = "true" ] && [ "$PARAM_ALLOW_BREAKING_DOWNGRADE" != "true" ] && [ "$PARAM_PLAN" != "true" ]; then
+      print_error "${target} is older than the installed ${installed}, and the commits between them could not be read from ${KUBE_AGENTS_REPO_URL} to check for breaking changes."
+      print_info "Restore access to it and re-run, or pass --allow-breaking-downgrade to roll back without the check."
+      exit 1
+    fi
+    print_warning "Could not read the history between ${installed} and ${target} from ${KUBE_AGENTS_REPO_URL}; the downgrade check is skipped."
+    return 0
+  fi
+  history_dir="$DOWNGRADE_HISTORY_SOURCE"
+
+  target_commit="$(git -C "$history_dir" rev-parse "${target}^{commit}")"
+  installed_commit="$(git -C "$history_dir" rev-parse "${installed}^{commit}")"
+  [ "$target_commit" != "$installed_commit" ] || return 0
+  if git -C "$history_dir" merge-base --is-ancestor "$installed_commit" "$target_commit" 2>/dev/null ||
+    ! git -C "$history_dir" merge-base "$installed_commit" "$target_commit" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if ! blocking="$(trap - ERR; breaking_commits_between "$history_dir" "$target_commit" "$installed_commit")"; then
+    print_error "Could not read the commits between ${target} and the installed ${installed}."
+    exit 1
+  fi
+  if [ -z "$blocking" ]; then
+    print_success "Moving from ${installed} to ${target}: no commit it leaves behind is marked as a breaking change."
+    return 0
+  fi
+  count="$(printf '%s\n' "$blocking" | wc -l | tr -d '[:space:]')"
+  if [ "$PARAM_ALLOW_BREAKING_DOWNGRADE" = "true" ] || [ "$PARAM_PLAN" = "true" ]; then
+    print_warning "Moving from ${installed} to ${target} leaves behind ${count} commit(s) marked as a breaking change:"
+  else
+    print_error "Moving from ${installed} to ${target} leaves behind ${count} commit(s) marked as a breaking change:"
+  fi
+  while IFS= read -r line; do
+    echo "      ${line}"
+  done <<<"$blocking"
+  if [ "$PARAM_ALLOW_BREAKING_DOWNGRADE" = "true" ]; then
+    print_info "--allow-breaking-downgrade: continuing."
+    return 0
+  fi
+  if [ "$PARAM_PLAN" = "true" ]; then
+    print_info "A real run refuses this move unless it is given --allow-breaking-downgrade."
+    return 0
+  fi
+  print_info "Each can leave state on the cluster that ${target} cannot read. Read them, then re-run with --allow-breaking-downgrade to move anyway."
+  exit 1
+}
+
 # Move a clone left by an earlier install (or a plain `git clone`) to the
 # requested ref. Only the arm that runs without a checkout calls this: the two
 # arms that run this script from one never move it. A clean kube-agents
@@ -1303,6 +1518,7 @@ parse_args() {
       --plan) PARAM_PLAN="true"; shift ;;
       --keep-image-tag) PARAM_KEEP_IMAGE_TAG="true"; shift ;;
       --drop-undeclared-values) PARAM_DROP_UNDECLARED_VALUES="true"; shift ;;
+      --allow-breaking-downgrade) PARAM_ALLOW_BREAKING_DOWNGRADE="true"; shift ;;
       --dry-run) PARAM_DRY_RUN="true"; shift ;;
       --gcp-project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
       --gcp-project-id) PARAM_PROJECT_ID="$2"; shift 2 ;;
@@ -1766,6 +1982,11 @@ main() {
   local target_namespace="${PARAM_AGENT_NAMESPACE:-${NAMESPACE:-$DEFAULT_NAMESPACE}}"
   export NAMESPACE="$target_namespace"
 
+  # A tag read off the install below is not a move, so it is not checked as
+  # one: a tagless plan's state tag trails the running tag on an environment
+  # that tracks main, and checking it would report image lag as a rollback.
+  local target_named_by_run="false"
+  [ -z "$PARAM_IMAGE_TAG" ] || target_named_by_run="true"
   if [ -z "$PARAM_IMAGE_TAG" ] && [ "$PARAM_PLAN" = "true" ]; then
     # A PLAN's reference point is Terraform state, not the cluster, so the tag
     # it plans at has to be the one the last apply RECORDED. The two differ by
@@ -1807,6 +2028,11 @@ main() {
     # reason to trust it any further.
     validate_immutable_ref "$PARAM_IMAGE_TAG"
     print_success "Using the tag this install is running: ${PARAM_IMAGE_TAG}"
+  fi
+
+  # Before the Secret backfills, the first step that writes to the cluster.
+  if [ "$target_named_by_run" = "true" ]; then
+    check_downgrade_for_mode "$target_namespace" "$PARAM_UPGRADE_MODE" "$PARAM_IMAGE_TAG" "$repo_dir"
   fi
 
   if [ "$PARAM_PLAN" = "true" ]; then
@@ -1928,6 +2154,11 @@ main() {
     if declare -F refuse_next_slack_gateway_settings_from_env >/dev/null; then
       refuse_next_slack_gateway_settings_from_env "" "$SCOPE_CHECK_MODE_WARN"
     fi
+    # A chat backend the gateway holds with no home channel (#3320): warned
+    # on every run, applying or not, and again at the end.
+    if declare -F warn_next_home_channel_unset_from_env >/dev/null; then
+      warn_next_home_channel_unset_from_env
+    fi
     print_info "Comparing this checkout's composition against the install's Terraform state."
     local plan_status=0
     run_lifecycle "${repo_dir}/terraform/examples/full-install" \
@@ -1951,6 +2182,9 @@ main() {
         write_report "PLAN_FAILED"
         ;;
     esac
+    if declare -F print_next_home_channel_unset_summary >/dev/null; then
+      print_next_home_channel_unset_summary
+    fi
     exit "$plan_status"
   fi
 
@@ -2022,10 +2256,11 @@ main() {
       refuse_apply_over_undeclared_scope "$target_namespace" || exit 1
       # And a live GitHub minter this render would destroy: an install.env
       # that lacks the GitOps keys (install.sh's flags were not recorded
-      # before #3075) renders GitOps off. Guarded as above.
+      # before #3075) renders GitOps off. Over a minter this install did not
+      # make, the check guards the GitOps repository instead. Guarded as above.
       if declare -F refuse_apply_dropping_live_gitops >/dev/null; then
-        # A refusal removes the tfvars the generator just wrote, which render
-        # the minter off, as install.sh does and the Slack check below does.
+        # A refusal removes the tfvars the generator just wrote, as
+        # install.sh does and the Slack check below does.
         if ! refuse_apply_dropping_live_gitops "$target_namespace" "${install_env_file:-install.env}"; then
           rm -f "$tfvars_file"
           exit 1
@@ -2050,6 +2285,9 @@ main() {
           exit 1
         fi
       fi
+      if declare -F warn_next_home_channel_unset_from_env >/dev/null; then
+        warn_next_home_channel_unset_from_env
+      fi
       # The mode. A full apply carries PLATFORM_AGENT_MODE forward from
       # install.env, so a key edited since the last apply switches the install
       # here, and the run says so first, from the reads the scope check made.
@@ -2057,6 +2295,24 @@ main() {
       # Guarded, as at the plan's notice: an older target's helpers lack it.
       if declare -F announce_platform_agent_mode_for_apply >/dev/null; then
         announce_platform_agent_mode_for_apply "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"
+      fi
+      # A switch out of an install.env that names no mode was chosen by
+      # nobody: such a file (one copied from install.env.example onto a
+      # running install) reads as today here, and nothing asks before the
+      # apply, so a next install would move back. So the file must assign the
+      # key (load_install_env unset it, and assigned empty is a chosen today)
+      # unless the reads showed no install that runs next: a read that failed
+      # is not today, nor is a hand-deleted CR whose release records next,
+      # and the notice names neither as a switch. An older target's helpers
+      # define neither check.
+      if [ -z "${PLATFORM_AGENT_MODE+set}" ] && {
+        [ "${PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED:-false}" = "true" ] ||
+          { declare -F platform_agent_install_may_run_next >/dev/null && platform_agent_install_may_run_next; }
+      }; then
+        rm -f "$tfvars_file"
+        print_error "Refusing to render spec.mode today when install.env names no PLATFORM_AGENT_MODE and the install may run next: nothing asked for a switch."
+        print_info "Set PLATFORM_AGENT_MODE in install.env to the mode the install runs, or run install.sh once, which records it, and run again. To switch, set the mode you want there."
+        exit 1
       fi
       # And the container preflight: the apply binds a declared folder or
       # organisation with this identity and enables the Asset API in the host
@@ -2151,6 +2407,9 @@ main() {
   write_report "SUCCESS"
 
   print_step "🎉 Upgrade Complete!"
+  if declare -F print_next_home_channel_unset_summary >/dev/null; then
+    print_next_home_channel_unset_summary
+  fi
 }
 
 if [ "${KUBE_AGENTS_SOURCE_ONLY:-false}" != "true" ]; then

@@ -5,12 +5,12 @@ description: Create the Slack app, its tokens and its allowlist for a kube-agent
 
 kube-agents talks to Slack through one Slack app that you create in your workspace. The app connects over Socket Mode (an outbound websocket), so nothing on the cluster needs an inbound endpoint. Which process holds the connection depends on the install's `spec.mode`:
 
-- **`today`** (the default): the credential broker (the `platform-agent-credential-proxy` Deployment) holds the connection and relays each event to the Planning Agent's Hermes Slack listener in the `platform-agent-gateway` Deployment.
-- **`next`**: the A2A gateway, in the `platform-agent-a2a-gateway` Deployment. This needs release **0.9.0 or later**: earlier operators keep Slack on the `today` path even under `next`. If Google Chat is also enabled, Google Chat holds the A2A gateway and Slack stays on the `today` path.
+- **`today`**: the credential broker (the `platform-agent-credential-proxy` Deployment) holds the connection and relays each event to the Planning Agent's Hermes Slack listener in the `platform-agent-gateway` Deployment.
+- **`next`** (a first install's default): the A2A gateway, in the `platform-agent-a2a-gateway` Deployment. This needs release **0.9.0 or later**: earlier operators keep Slack on the `today` path even under `next`. If Google Chat is also enabled, Google Chat holds the A2A gateway and Slack stays on the `today` path.
 
 The two need different app settings, so follow the section for your mode. The tokens and the allowlist work the same way in both.
 
-To install with the `next` path, pass `--mode=next` to the installer (`./install.sh --mode=next`, with the Slack flags below). `next` is an unsupported development stack; `today` is the default. The `--mode` flag is in releases after 0.9.0 and on `main`. On 0.9.0 itself, patch the resource instead: `kubectl patch platformagent platform-agent -n kubeagents-system --type merge -p '{"spec":{"mode":"next"}}'`; a later upgrade renders the resource from `install.env`, which on that release has no mode key, so it puts the install back on `today`. The installer records the mode in `install.env` as `PLATFORM_AGENT_MODE`; to switch a running install later, edit that key and re-run the installer.
+A first install runs `next` unless you pass `--mode=today` (`./install.sh --mode=today`, with the Slack flags below) or mirror the third-party images ([quickstart](/kube-agents/install/quickstart-gke/#common-flags-and-toggles)); a cluster that already runs kube-agents keeps the mode it runs unless `--mode` or `install.env` names another. An install whose Slack bot token is a list for several workspaces must stay on `today`. The `--mode` flag is in releases after 0.9.0 and on `main`. On 0.9.0 itself, patch the resource instead: `kubectl patch platformagent platform-agent -n kubeagents-system --type merge -p '{"spec":{"mode":"next"}}'`; that patched mode survives later upgrades, because a release that renders no mode sends Helm no change; to have the installer record it, set `PLATFORM_AGENT_MODE=next` in `install.env`. The installer records the mode in `install.env` as `PLATFORM_AGENT_MODE`; to switch a running install later, edit that key and re-run the installer ([Switching `spec.mode`](/kube-agents/install/upgrade/#switching-specmode)).
 
 ## Before you start
 
@@ -29,6 +29,7 @@ To install with the `next` path, pass `--mode=next` to the installer (`./install
      name: kube-agents
    features:
      app_home:
+       home_tab_enabled: true
        messages_tab_enabled: true
        messages_tab_read_only_enabled: false
      bot_user:
@@ -54,6 +55,7 @@ To install with the `next` path, pass `--mode=next` to the installer (`./install
    settings:
      event_subscriptions:
        bot_events:
+         - app_home_opened
          - assistant_thread_started
          - message.channels
          - message.groups
@@ -71,17 +73,19 @@ What the manifest covers, so you can check an existing app instead:
 
 - **Events.** The gateway reads messages only: `message.im` for DMs, and `message.channels`, `message.groups` and `message.mpim` for public, private and group channels. Each event needs its history scope (`im:history`, `channels:history`, `groups:history`, `mpim:history`); without it the app connects normally and is never sent the message. In a channel the gateway answers only a message that mentions the app, or a reply in a thread it is already answering; it finds mentions in the message text, so `app_mention` is not needed.
 - **Scopes.** `chat:write` covers every post and edit the gateway makes. `channels:read`, `groups:read`, `im:read` and `mpim:read` read who is in a conversation. A reply goes into the conversation or thread the message came from, so no other scope is needed for it, in a DM either. `reactions:write` puts the reactions on your message, `users:read` names who answered a question, and `assistant:write` shows Working… on a thread, titles it and sets the suggested prompts; without them the answers still arrive and only those go missing ([ChatOps](/kube-agents/concepts/chatops/#slack)).
-- **Interactivity, the assistant view and `assistant_thread_started`.** The gateway answers a click on a question's buttons, so interactivity is on, and it offers suggested prompts when a member opens a new assistant thread. An app using agent view subscribes `app_home_opened` instead, which the gateway answers on the Messages tab.
+- **Interactivity, the assistant view and `assistant_thread_started`.** The gateway answers a click on a question's buttons, so interactivity is on, and it offers suggested prompts when a member opens a new assistant thread. On an app using agent view the gateway also answers `app_home_opened` on the Messages tab with the prompts.
 - **Messages tab.** Without it, members cannot DM the app.
+- **Home tab and `app_home_opened`.** The gateway draws the fleet dashboard ([the Slack Home tab](/kube-agents/concepts/chatops/#the-slack-home-tab)) when a member opens the tab. Without either, the tab is absent or blank and nothing else changes; neither needs a scope. With `allowedUsers` left empty, the gateway checks each member's workspace with `users.info`, so the tab also needs `users:read`; without it the tab stays blank.
 - **No slash commands.** The gateway does not acknowledge them, so a member who used one would see Slack's timeout error.
 
 ### Moving an existing app to `next`
 
-An app made for `today` from the `hermes slack manifest` output already has every scope and event the gateway needs, unless it was generated with `--no-assistant`, so it keeps its tokens and needs no new install. A `--no-assistant` app lacks `assistant:write`, the assistant view and `assistant_thread_started`: add them as in the manifest above and reinstall, or Working…, the thread titles and the suggested prompts do not appear. Edit it rather than pasting the manifest above, which would rename the app and drop the scopes `today` needs if you switch back:
+An app made for `today` from the `hermes slack manifest` output already has every scope and event the gateway needs to answer messages (the Home tab needs the two settings in step 3), unless it was generated with `--no-assistant`, so it keeps its tokens and needs no new install. A `--no-assistant` app lacks `assistant:write`, the assistant view and `assistant_thread_started`: add them as in the manifest above and reinstall, or Working…, the thread titles and the suggested prompts do not appear. Edit it rather than pasting the manifest above, which would rename the app and drop the scopes `today` needs if you switch back:
 
 1. After the switch, open the app's **App Manifest** page.
 2. Delete the `features.slash_commands` block. Leave interactivity on: the gateway answers button clicks.
-3. Save. The edit changes no scopes; if Slack still asks you to reinstall, do so.
+3. For the [Home tab](/kube-agents/concepts/chatops/#the-slack-home-tab), set `features.app_home.home_tab_enabled` to `true` and add `app_home_opened` to `settings.event_subscriptions.bot_events`.
+4. Save. The edit changes no scopes; if Slack still asks you to reinstall, do so.
 
 Do it after the switch rather than before, because the `today` listener answers slash commands until then. Until you do, a slash command under `next` shows the member Slack's timeout error. Switching back to `today` means putting the block back, which the full manifest from `hermes slack manifest` does.
 
@@ -100,9 +104,9 @@ Once the app is installed, invite it to any channel it should answer in, using t
 
 ## Home channel
 
-The home channel is where the agent posts unprompted: alerts, scheduled reports, and the fleet audit's report card.
+The home channel is where the agent posts unprompted: alerts, scheduled reports, and the fleet audit's report card. Under `next`, set one: without it, every one of those posts is dropped while conversations keep working, so nothing else shows it.
 
-- **`next`:** only the resource field counts, `spec.integration.slack.homeChannel`, which the installer sets from `SLACK_HOME_CHANNEL` (`--slack-home-channel`). It must be a channel ID (`C0123ABCD`, or `G…` for a private channel), not a name: open the channel's details and copy the **Channel ID** at the bottom. Invite the app to that channel, or its posts are refused. With the field unset, the agent posts nothing to Slack unprompted, though a delegated task's report still reaches the conversation that asked for it. Set to something that is not a channel ID, it turns off both. `/sethome` does not reach it.
+- **`next`:** only the resource field counts, `spec.integration.slack.homeChannel`, which the installer sets from `SLACK_HOME_CHANNEL` (`--slack-home-channel`). It must be a channel ID (`C0123ABCD`, or `G…` for a private channel), not a name: open the channel's details and copy the **Channel ID** at the bottom. Invite the app to that channel, or its posts are refused. With the field unset, the agent posts nothing to Slack unprompted, though a delegated task's report still reaches the conversation that asked for it; the installer warns before it applies that (and `install.sh`'s setup interview asks you to confirm), the gateway logs a warning at start, and the PlatformAgent carries the `HomeChannelUnset` condition until the field is set. Set to something that is not a channel ID, it turns off both. `/sethome` does not reach it.
 - **`today`:** the field, or `/sethome` (`/hermes sethome`) run in the channel you want, which writes the Planning Agent's profile. [`INSTALL.md` Step 5](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#2-slack-configuration-slack_enabledtrue) has the detail.
 
 A home channel set with `/sethome` under `today` does not carry over to `next`. Before or at the switch, set `SLACK_HOME_CHANNEL` in `install.env` to that channel's ID and re-run the installer.
@@ -118,7 +122,7 @@ The allowlist decides who may talk to the agent. It takes **Slack member IDs**, 
 
 What a member who is not on the list sees:
 
-- **`next`:** the gateway answers once per member with a notice that it cannot verify them, naming their member ID, so an admin can add them. Members of other workspaces get no reply.
+- **`next`:** the gateway answers once per member with a notice that it cannot verify them, naming their member ID, so an admin can add them. A member of another workspace in a Slack Connect channel is not served, even with an empty list. The first time they mention the bot, send it a direct message, or click one of its buttons, the bot replies once, in that thread, that it answers only its own workspace, and names their member ID. The reply is a public post in the thread, so in a Slack Connect channel members of both organizations can read it.
 - **`today`:** the message is ignored, with no reply.
 
 The pairing step in `INSTALL.md` applies only if you set the Hermes Slack DM policy to `pairing` yourself. A kube-agents install configures the allowlist instead, and the A2A gateway has no pairing.
@@ -154,5 +158,5 @@ The gateway reads the map when it starts, so restart it after every change. The 
    | none at all for your message                                                                           | A missing history scope or event subscription, or the messages tab is off | Compare the app with the manifest above, then reinstall it |
    | `dropping message from unverified sender`                                                              | Your member ID is not on the allowlist                                    | Add the member ID, not an email                            |
    | `slack allowlist is empty and allow-all is off; every inbound message will be dropped at verification` | The list has only blank entries                                           | Set real member IDs, or remove the list to admit everyone  |
-   | `slack: ignoring a message from another workspace's member`                                            | The sender is in another workspace                                        | Use the workspace the app is installed in                  |
+   | `slack: ignoring a message from another workspace's member`                                            | The sender (`user`) is in another workspace (`userTeam` or `messageTeam`) | Use the workspace the app is installed in                  |
    | `chat backend stopped; restarting it, the console stays up`                                            | The tokens were refused, for example a comma-separated bot token          | Pass one `xoxb-` bot token and one `xapp-` app token       |

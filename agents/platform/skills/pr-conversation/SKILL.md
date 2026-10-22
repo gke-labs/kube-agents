@@ -25,9 +25,10 @@ posting, and recording that a request has been handled — belongs to
 reasoning: understanding what was asked and producing the answer or the change.
 
 Every command below spells that path out in full. A relative `./skills/…` path
-works only from the profile directory, where a cron turn starts; a card dispatch
-starts you in the task's kanban workspace (`…/kanban/workspaces/<task-id>`), where
-the relative form is `No such file or directory`. `$HERMES_HOME` is the profile
+resolves in neither place you start from: a cron turn starts in a directory of its
+own (`<profile>/cron/runs/<job>_<run>`), and a card dispatch starts you in the task's
+kanban workspace (`…/kanban/workspaces/<task-id>`), where the relative form is
+`No such file or directory`. `$HERMES_HOME` is the profile
 directory in both contexts, so it is the form that works from either.
 
 ## Vocabulary
