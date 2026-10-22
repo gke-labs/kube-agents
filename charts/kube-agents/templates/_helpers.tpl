@@ -1981,8 +1981,10 @@ The defaults carry no ephemeral-storage request because the operator renders non
 {{- if .Values.platformAgent.enabled -}}
   {{- /* The agent pod is the one operator-rendered workload that scales: the gateway
          Deployment takes spec.replicas from availability.replicas, while the shell
-         StatefulSet and the credential proxy stay at 1 (see the platformagent-ha golden,
-         where the gateway goes to 3 and the other two do not). The footprint records one
+         StatefulSet and the credential proxy stay at 1. The operator now caps the gateway
+         at one replica (supportedGatewayReplicas in manifest_helpers.go), so above one
+         this multiply and the surge below over-count; that errs towards refusing a quota
+         rather than passing one the pods will not fit. The footprint records one
          pod's worth, so it is multiplied here — without this an HA install passes the
          check and then leaves its extra replicas Pending, which is the failure this
          whole template exists to prevent. An absent value means the operator's own
@@ -2105,10 +2107,10 @@ The defaults carry no ephemeral-storage request because the operator renders non
   {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" (include "kube-agents.satMul" (dict "a" $podReqEph "b" $agentReplicas))) | int64 -}}
   {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" (include "kube-agents.satMul" (dict "a" $podLimEph "b" $agentReplicas))) | int64 -}}
   {{- /* Only an HA gateway surges. The operator gives the gateway Deployment a
-         RollingUpdate strategy only when availability.replicas is above 1 and renders
+         RollingUpdate strategy only above one effective replica and renders
          `strategy: Recreate` otherwise (resolveDeploymentReplicasAndStrategy in
-         k8s-operator/internal/controller/manifest_helpers.go; the default-CR golden
-         platformagent.yaml shows Recreate, the platformagent-ha one RollingUpdate). A
+         k8s-operator/internal/controller/manifest_helpers.go), and it caps the count at
+         one, so every gateway it renders today is Recreate. A
          Recreate rollout deletes the old Pod before creating the new one, so it needs no
          extra room. Counting the agent pod here at one replica made it win the max on
          every default install — it is the largest workload in the release — and the
@@ -2159,6 +2161,21 @@ The defaults carry no ephemeral-storage request because the operator renders non
   {{- $storage := (index $op "storage") | default dict -}}
   {{- $reqPvc = add $reqPvc ($storage.persistentVolumeClaims | default 0 | int64) -}}
   {{- $reqStorage = add $reqStorage ($storage.storageBytesRequest | default 0 | int64) -}}
+  {{- /* platformAgent.storage.size resizes the agent's data claim and the sandbox's data
+         claim together, and footprint.yaml counts each of them at the operator default.
+         So each claim moves by (size - default): dataClaims x the difference, which is
+         negative for a size below the default. Absent keys mean a footprint.yaml from
+         before them, which would leave the claims at the default in silence.
+         satMul/satAdd, as above: parseBytes clamps an oversized size to MaxInt64,
+         and dataClaims times that would wrap the total negative. Both take a
+         negative delta. */ -}}
+  {{- with (.Values.platformAgent.storage | default dict).size -}}
+    {{- if not (and (hasKey $storage "dataClaims") (hasKey $storage "dataClaimBytesRequest")) -}}
+      {{- fail "quota preflight: footprint.yaml has no dataClaims or dataClaimBytesRequest, so platformAgent.storage.size cannot be counted. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
+    {{- end -}}
+    {{- $dataClaimDelta := sub (include "kube-agents.parseBytes" . | int64) ($storage.dataClaimBytesRequest | int64) -}}
+    {{- $reqStorage = include "kube-agents.satAdd" (dict "a" $reqStorage "b" (include "kube-agents.satMul" (dict "a" ($storage.dataClaims | int64) "b" $dataClaimDelta))) | int64 -}}
+  {{- end -}}
 {{- end -}}
 
 {{- dict

@@ -18,7 +18,7 @@ The lifecycle is the `fleet-audit` skill's (`/opt/data/profiles/platform/skills/
 
 What the skill does not say:
 
-- If multiple repositories are registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`), pass `--repo "<owner>/<repo>"` explicitly. **Interactive session:** if no `--repo` was specified, prompt the user to choose which repository to target before proceeding. **Scheduled / unattended cron:** iterate over all repositories in `managed_repos` in sequence, running `start`, the audit and `finish` for each repository with `--repo "<owner>/<repo>"`.
+- The audit targets the repository with `role: gitops`, which `start` and `finish` resolve without `--repo`, also when more than one repository is registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`). Do not loop over the managed repositories, and do not ask the user to choose one: run `start` and `finish` once. If `start` cannot find the `role: gitops` repository, it says so in its `no_forge` note and the run goes on with no forge; never choose a repository yourself. Pass `--repo "<owner>/<repo>"` only when a person names a repository for this one run, and pass the same `--repo` to `finish`.
 - Every id in `pending_remediation_requests` gets a `kind: manifest` file during §2 and §3, whether or not this SOP would have promoted it on its own.
 
 ### 1. Enumerate the target fleet
@@ -428,7 +428,7 @@ What `finish` validates, publishes and prints, its exit codes, partial coverage,
 - `status == "CLEAN"` with `partial: true` → the clean result and `coverage_gaps`.
 - `status == "HELD"` → the clean result, the held ids (`unaccounted`) and the issue URL. On the next run, report each one, or list it under `resolved_because` if you re-ran its check and saw it gone.
 - `status == "OPENED"`, or `"UPDATED"` with a non-zero `new` or `resolved` → `Security & RBAC posture audit: <new> new, <resolved> resolved across <count(scope.clusters)> clusters — <issue_url>`
-- `status == "NO_FORGE"` → no forge is configured, so there is no ledger URL: unless the run is silent by the rule above, your report is `summary` verbatim (the skill's "No forge configured" section, `/opt/data/profiles/platform/skills/fleet-audit/references/finish.md`).
+- `status == "NO_FORGE"` → no forge is configured, or the broker cannot reach the repository, so nothing was published and there is no ledger URL: unless the run is silent by the rule above, your report is `summary` verbatim (the skill's "No forge configured" section, `/opt/data/profiles/platform/skills/fleet-audit/references/finish.md`).
 
 ## Red Lines
 

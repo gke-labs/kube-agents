@@ -1,9 +1,14 @@
 import asyncio
+import base64
 import json
 import logging
 import os
 import re
+import socket
+import threading
 import time
+import urllib.error
+import urllib.request
 
 os.environ["PUBSUB_HOME_CHANNEL"] = "none"
 from typing import Any, Dict, List, Optional, Tuple
@@ -14,21 +19,69 @@ logger = logging.getLogger(__name__)
 # a registry entry written before entries recorded their own — see _entry_window.
 DEFAULT_DEDUP_WINDOW_SECONDS = 86400  # 24 hours
 
-# Ceiling on each preflight RPC (get_topic, get_subscription): the deadline of a single
-# attempt and of the retry loop around it, see _preflight_rpc_kwargs. connect() runs the
-# two checks synchronously on the event loop, before the gateway is marked connected, so
-# an unbounded call that stalled held the whole gateway down in silence until the
-# startup probe restarted it ten minutes later. Their results are only logged, so a
-# call that hits this bound is a warning and startup continues.
+# Ceiling on the preflight read of each subscription (a GET through the relay): connect()
+# runs it synchronously on the event loop, before the gateway is marked connected, so an
+# unbounded call that stalled held the whole gateway down in silence until the startup
+# probe restarted it ten minutes later. Its result is only logged, so a read that hits
+# this bound is a warning and startup continues.
 PREFLIGHT_RPC_TIMEOUT_SECONDS = 30
 
-# Lazy import helper to verify dependencies
+# The credential broker's Pub/Sub relay. The gateway pod holds no Google credential of
+# its own: the broker pulls on the install's identity, confined by its policy to the
+# subscriptions the operator rendered from the AgentPlugin configs, and this adapter
+# speaks the Pub/Sub REST API to it. The operator renders PUBSUB_RELAY_URL on every
+# gateway: the broker's address once a plugin route names a subscription it can qualify
+# (a full projects/<project>/subscriptions/<name> path, or a short name on an agent with
+# a harness project), empty otherwise. Empty, the adapter refuses to connect rather than
+# pull on a credential it cannot have, and the AgentPlugin's status says which route the
+# operator could not qualify.
+PUBSUB_RELAY_URL_ENV = "PUBSUB_RELAY_URL"
+# The projected token the broker authenticates the gateway by, read on every call
+# because the kubelet rotates it in place (the same file credential_proxy_client reads).
+CREDENTIAL_PROXY_TOKEN_FILE_ENV = "CREDENTIAL_PROXY_TOKEN_FILE"
+# Where the project of a short subscription name comes from, in order. The first is the
+# operator's, rendered beside PUBSUB_RELAY_URL from the same project it composed the
+# broker's subscription set with, and pinned, so this side cannot be made to ask for a
+# subscription the broker refuses; GCP_PROJECT_ID is a plugin's to override and is the
+# fallback for an install without the operator's variable.
+PROJECT_ID_ENVS = ("PUBSUB_RELAY_PROJECT", "GCP_PROJECT_ID", "GOOGLE_CLOUD_PROJECT")
+RELAY_PREFIX = "/v1/pubsub/gcp/"
+RELAY_PUBSUB_HOST = "pubsub.googleapis.com"
+# One pull asks for one message. A pull is a lease: by the time the broker reads the
+# answer, Pub/Sub has delivered the batch and started its ack deadline, and the ack ids
+# are in the body, so an answer the broker cannot relay (its response cap) strands every
+# message in it until the deadline. One message per pull keeps every answer under the
+# cap the broker gives this family, which covers Pub/Sub's largest message. Each message
+# here becomes an agent turn, so the round trip per message costs nothing that matters.
+PULL_MAX_MESSAGES = 1
+# Above the broker's own relay deadline (API_RELAY_DEADLINE_S, 120 s), so a pull that
+# the broker ends is answered by the broker rather than torn down by this side.
+PULL_REQUEST_TIMEOUT_SECONDS = 130
+# A settle (acknowledge, nack) is one short call.
+SETTLE_REQUEST_TIMEOUT_SECONDS = 20
+# The pause after a pull that returned nothing. Pub/Sub holds an empty synchronous
+# pull for a while on most answers (about twenty seconds through the relay on a live
+# install), but not on every answer, and a loop with no pause of its own spins against
+# the API and fills the broker's audit log when it does not. The drift detector pulls
+# through the same relay with the same pause (k8s-operator/cmd/drift-detector).
+PULL_IDLE_INTERVAL_SECONDS = 5
+# Back-off between failed pulls: doubles from the first value to the ceiling, so a
+# broker that is restarting is not hammered and a refused subscription logs a line
+# every half minute rather than a storm.
+PULL_BACKOFF_INITIAL_SECONDS = 2
+PULL_BACKOFF_MAX_SECONDS = 30
+# How long disconnect() waits for each pull thread to notice the stop flag.
+PULL_THREAD_JOIN_SECONDS = 5
+# The relay answer for a subscription that does not exist, as Pub/Sub gives it,
+# and the status string Pub/Sub's error body carries then; the broker's own 404
+# for a route it does not serve carries no such body.
+HTTP_NOT_FOUND = 404
+GOOGLE_NOT_FOUND_STATUS = "NOT_FOUND"
+
+# Hermes asks every platform plugin whether its dependencies are present. This one
+# speaks HTTP to the broker with the standard library and needs nothing installed.
 def check_requirements() -> bool:
-    try:
-        from google.cloud import pubsub_v1
-        return True
-    except ImportError:
-        return False
+    return True
 
 def validate_config(config) -> bool:
     return True
@@ -62,6 +115,153 @@ def _get_nested_value(payload: Any, path: str) -> Any:
 
 
 
+class RelayRefused(Exception):
+    """The broker answered a relayed call with an error status.
+
+    Carries what the broker said so the log line can name the rule that refused
+    a call (``SECURITY_POLICY_BLOCKED`` with its ``rule``) apart from an upstream
+    answer it merely relayed (a 404 for a subscription that does not exist).
+    """
+
+    def __init__(self, status: int, body: Any) -> None:
+        fields = body if isinstance(body, dict) else {}
+        self.status = status
+        self.code = str(fields.get("code") or "")
+        self.rule = str(fields.get("rule") or "")
+        error = fields.get("error")
+        self._error_status = str(error.get("status") or "") if isinstance(error, dict) else ""
+        detail = str(fields.get("error") or fields.get("message") or "")
+        super().__init__(f"status={status} code={self.code or 'none'} rule={self.rule or 'none'} {detail}".rstrip())
+
+    @property
+    def upstream_not_found(self) -> bool:
+        """True for Pub/Sub's own NOT_FOUND, relayed; False for a 404 the broker answered itself.
+
+        The broker answers ``{"status": "not_found"}`` for a route it does not
+        serve, which a broker image older than this adapter does; Pub/Sub's
+        answer carries ``error.status == "NOT_FOUND"``. The two want different
+        operators: one creates a subscription, the other upgrades the broker.
+        """
+        return self.status == HTTP_NOT_FOUND and self._error_status == GOOGLE_NOT_FOUND_STATUS
+
+
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """A 3xx from the relay is an error, not a place to re-send the token to."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
+
+
+class PubsubRelay:
+    """The Pub/Sub REST API, spoken to the credential broker's relay.
+
+    Four calls, the ones the broker's policy forwards for the platform adapter:
+    a read of the subscription, pull, acknowledge and modifyAckDeadline. The
+    broker adds the Google credential; this side presents the gateway's
+    projected token, read from CREDENTIAL_PROXY_TOKEN_FILE on every call, and
+    never follows a redirect with it (credential_proxy_client's guard, kept
+    here because this file is loaded by path with no sibling module).
+    """
+
+    def __init__(self, base_url: str, token_file: str) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.token_file = token_file
+        self._opener = urllib.request.build_opener(_NoRedirects)
+
+    def _headers(self) -> Dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self.token_file:
+            with open(self.token_file, encoding="utf-8") as handle:
+                token = handle.read().strip()
+            if not token:
+                raise RuntimeError(f"the broker token file {self.token_file} is empty")
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
+
+    def _url(self, subscription_path: str, verb: str) -> str:
+        return f"{self.base_url}{RELAY_PREFIX}{RELAY_PUBSUB_HOST}/v1/{subscription_path}{verb}"
+
+    def call(self, method: str, subscription_path: str, verb: str = "", body: Optional[dict] = None,
+             timeout: float = SETTLE_REQUEST_TIMEOUT_SECONDS) -> Any:
+        """One relayed call; the decoded JSON answer, or RelayRefused on an error status."""
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        request = urllib.request.Request(self._url(subscription_path, verb), data=data, method=method,
+                                         headers=self._headers())
+        try:
+            with self._opener.open(request, timeout=timeout) as response:
+                raw = response.read()
+        except urllib.error.HTTPError as exc:
+            try:
+                answer = json.loads(exc.read().decode("utf-8") or "{}")
+            except Exception:
+                answer = {}
+            raise RelayRefused(exc.code, answer) from None
+        return json.loads(raw.decode("utf-8") or "{}")
+
+    def get_subscription(self, subscription_path: str, timeout: float) -> Any:
+        return self.call("GET", subscription_path, timeout=timeout)
+
+    def pull(self, subscription_path: str, max_messages: int = PULL_MAX_MESSAGES) -> List[dict]:
+        answer = self.call("POST", subscription_path, ":pull", {"maxMessages": max_messages},
+                           timeout=PULL_REQUEST_TIMEOUT_SECONDS)
+        received = answer.get("receivedMessages") if isinstance(answer, dict) else None
+        return list(received or [])
+
+    def acknowledge(self, subscription_path: str, ack_ids: List[str]) -> None:
+        self.call("POST", subscription_path, ":acknowledge", {"ackIds": list(ack_ids)})
+
+    def nack(self, subscription_path: str, ack_ids: List[str]) -> None:
+        self.call("POST", subscription_path, ":modifyAckDeadline", {"ackIds": list(ack_ids), "ackDeadlineSeconds": 0})
+
+
+class RelayMessage:
+    """One pulled message, with the surface _process_message reads and settles.
+
+    ``data`` is the decoded payload, ``attributes`` and ``message_id`` as Pub/Sub
+    sent them. ``ack`` and ``nack`` settle through the relay, once: the second
+    call on a message already settled is a no-op, the way the client library's
+    is. The settle runs on its own thread so the event loop, which calls
+    ``ack()`` at the top of _process_message, is not held for the round trip;
+    a failed settle is logged and the message redelivers after its deadline.
+    """
+
+    def __init__(self, relay: PubsubRelay, subscription_path: str, received: dict) -> None:
+        message = received.get("message") or {}
+        self.data = base64.b64decode(message.get("data") or b"", validate=True)
+        self.attributes = dict(message.get("attributes") or {})
+        self.message_id = str(message.get("messageId") or "")
+        self._ack_id = str(received.get("ackId") or "")
+        self._relay = relay
+        self._subscription_path = subscription_path
+        self._settled = False
+        self._lock = threading.Lock()
+
+    def _settle(self, acknowledge: bool) -> None:
+        with self._lock:
+            if self._settled or not self._ack_id:
+                return
+            self._settled = True
+        verb = "acknowledge" if acknowledge else "nack"
+
+        def run() -> None:
+            try:
+                if acknowledge:
+                    self._relay.acknowledge(self._subscription_path, [self._ack_id])
+                else:
+                    self._relay.nack(self._subscription_path, [self._ack_id])
+            except Exception as exc:
+                logger.warning("PubSub: %s of message %s on '%s' failed: %s; it redelivers after its deadline",
+                               verb, self.message_id, self._subscription_path, exc)
+
+        threading.Thread(target=run, name=f"pubsub-{verb}-{self.message_id}", daemon=True).start()
+
+    def ack(self) -> None:
+        self._settle(True)
+
+    def nack(self) -> None:
+        self._settle(False)
+
+
 class PubSubAdapter(BasePlatformAdapter):
     """Google Cloud Pub/Sub pull subscriber adapter for Hermes Agent.
     
@@ -82,28 +282,33 @@ class PubSubAdapter(BasePlatformAdapter):
         super().__init__(config, Platform("pubsub"))
         extra = config.extra or {}
         self._subscriptions_config: Dict[str, dict] = extra.get("subscriptions", {})
-        self._subscriber: Optional[Any] = None
-        self._streaming_pull_futures: List[Any] = []
+        self._relay: Optional[PubsubRelay] = None
+        self._pull_threads: List[threading.Thread] = []
+        self._stop_pulling = threading.Event()
         self._delivery_info: Dict[str, dict] = {}
         self.gateway_runner = None
         self._locks: Dict[str, asyncio.Lock] = {}
         self._message_timestamps: Dict[str, List[float]] = {}
 
     def _get_project_id(self) -> Optional[str]:
-        """Detect GCP Project ID from auth credentials or environment variables."""
-        try:
-            import google.auth
-            _, project_id = google.auth.default()
-            if not project_id:
-                project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
-            return project_id
-        except Exception as e:
-            logger.warning("PubSub: Failed to detect GCP project ID: %s", e)
-            return None
+        """The project a short subscription name belongs to, from the gateway's environment.
+
+        PUBSUB_RELAY_PROJECT is the operator's, the project it composed the broker's
+        set with, rendered after the plugin env merge; GCP_PROJECT_ID is the fallback a
+        plugin can override. Not a credential's default project: the gateway pod holds
+        no Google credential, so there is nothing for it to read a project from.
+        """
+        for name in PROJECT_ID_ENVS:
+            value = os.environ.get(name, "").strip()
+            if value:
+                return value
+        return None
 
     def _parse_topic_config(self, sub_cfg: dict, project_id: str, name: str) -> Optional[tuple]:
         """Parse topic path and simple name from config."""
-        topic_input = sub_cfg.get("topic")
+        # Stripped, as the operator strips it when it renders the broker's set, so a
+        # quoted value with a stray space composes the same path on both sides.
+        topic_input = (sub_cfg.get("topic") or "").strip()
         if not topic_input:
             return None
         if topic_input.startswith("projects/"):
@@ -112,7 +317,7 @@ class PubSubAdapter(BasePlatformAdapter):
 
     def _parse_subscription_config(self, sub_cfg: dict, project_id: str, topic_name: Optional[str]) -> str:
         """Parse or generate subscription path based on topic or configured subscription name."""
-        sub_input = sub_cfg.get("subscription")
+        sub_input = (sub_cfg.get("subscription") or "").strip()
         if not sub_input:
             if not topic_name:
                 raise ValueError("Either 'topic' or 'subscription' must be configured.")
@@ -122,281 +327,235 @@ class PubSubAdapter(BasePlatformAdapter):
             return sub_input
         return f"projects/{project_id}/subscriptions/{sub_input}"
 
-    @staticmethod
-    def _preflight_rpc_kwargs() -> dict:
-        """Keyword arguments that end a preflight RPC within PREFLIGHT_RPC_TIMEOUT_SECONDS.
+    def _check_subscription_exists(self, sub_path: str) -> bool:
+        """Read the subscription through the relay and log clearly if it is not there.
 
-        `timeout=` on its own is the deadline of one gRPC attempt. The gapic method's
-        default Retry still wraps that attempt and retries UNAVAILABLE, ABORTED and UNKNOWN
-        until its own deadline, 600 s for get_topic, so an endpoint the pod cannot reach
-        (egress blocked, DNS failing) would still hold connect() for the whole startup-probe
-        budget. The retry is therefore replaced with one that keeps the library's predicate
-        and ends at the same bound; the loop then raises RetryError with the last transient
-        error as its cause. Without the library only the timeout is returned; no RPC can be
-        issued then.
+        Announced before the call and bounded by PREFLIGHT_RPC_TIMEOUT_SECONDS, so a
+        stall reads as "waiting on get_subscription" in the log rather than silence,
+        and ends in a warning rather than holding connect(). The topic is not checked:
+        the broker relays no topic read, and the install's identity holds the
+        subscriber role on the subscription alone.
         """
-        kwargs = {"timeout": PREFLIGHT_RPC_TIMEOUT_SECONDS}
-        try:
-            from google.api_core.exceptions import Aborted, ServiceUnavailable, Unknown
-            from google.api_core.retry import Retry, if_exception_type
-        except Exception:
-            return kwargs
-        kwargs["retry"] = Retry(
-            predicate=if_exception_type(Aborted, ServiceUnavailable, Unknown),
-            timeout=PREFLIGHT_RPC_TIMEOUT_SECONDS,
-        )
-        return kwargs
-
-    @staticmethod
-    def _preflight_exceptions() -> Tuple[type, Tuple[type, ...]]:
-        """(NotFound, the exceptions that mean the bound was hit).
-
-        DeadlineExceeded is one attempt running out of time; RetryError is the retry loop
-        running out with a transient error as its cause. Stand-ins are returned when the
-        library is absent so the except clauses still bind to something; no RPC can be
-        issued then, so none of them is ever raised.
-        """
-        try:
-            from google.api_core.exceptions import DeadlineExceeded, NotFound, RetryError
-            return NotFound, (DeadlineExceeded, RetryError)
-        except Exception:
-            class NotFound(Exception):
-                pass
-
-            class TimedOut(Exception):
-                pass
-            return NotFound, (TimedOut,)
-
-    def _check_topic_exists(self, publisher, topic_path: str) -> bool:
-        """Verify if the Pub/Sub topic exists and log clearly if not present.
-
-        Announces the call before issuing it and bounds it, attempt and retries, with
-        PREFLIGHT_RPC_TIMEOUT_SECONDS, so a stall reads as "waiting on get_topic" in the
-        log rather than silence, and ends in a warning rather than holding connect().
-        """
-        NotFound, timed_out = self._preflight_exceptions()
-        logger.info(
-            "PubSub: Checking topic '%s' exists (get_topic, %ss timeout)",
-            topic_path, PREFLIGHT_RPC_TIMEOUT_SECONDS,
-        )
-        started = time.monotonic()
-        try:
-            publisher.get_topic(request={"topic": topic_path}, **self._preflight_rpc_kwargs())
-            logger.info("PubSub: Topic '%s' exists (%.1fs)", topic_path, time.monotonic() - started)
-            return True
-        except timed_out as e:
-            logger.warning(
-                "PubSub: Timed out after %.1fs waiting on get_topic for topic '%s'"
-                " (bound %ss): %s. Continuing startup without verifying it.",
-                time.monotonic() - started, topic_path, PREFLIGHT_RPC_TIMEOUT_SECONDS, e,
-            )
-            return False
-        except NotFound:
-            logger.warning(
-                "PubSub: Topic '%s' is NOT present in GCP (%.1fs). Please ensure it is created prior to running.",
-                topic_path, time.monotonic() - started,
-            )
-            return False
-        except Exception as e:
-            logger.warning(
-                "PubSub: Could not verify topic '%s' (%.1fs): %s",
-                topic_path, time.monotonic() - started, e,
-            )
-            return False
-
-    def _check_subscription_exists(self, subscriber, sub_path: str) -> bool:
-        """Verify if the subscription exists and log clearly if not present.
-
-        Same shape as _check_topic_exists: announced before, bounded, warns on timeout.
-        """
-        NotFound, timed_out = self._preflight_exceptions()
         logger.info(
             "PubSub: Checking subscription '%s' exists (get_subscription, %ss timeout)",
             sub_path, PREFLIGHT_RPC_TIMEOUT_SECONDS,
         )
         started = time.monotonic()
         try:
-            subscriber.get_subscription(request={"subscription": sub_path}, **self._preflight_rpc_kwargs())
-            logger.info("PubSub: Subscription '%s' exists (%.1fs)", sub_path, time.monotonic() - started)
-            return True
-        except timed_out as e:
+            self._relay.get_subscription(sub_path, timeout=PREFLIGHT_RPC_TIMEOUT_SECONDS)
+        except RelayRefused as exc:
+            if exc.upstream_not_found:
+                logger.warning(
+                    "PubSub: Subscription '%s' is NOT present in GCP (%.1fs). Please ensure it is created prior to running.",
+                    sub_path, time.monotonic() - started,
+                )
+            elif exc.status == HTTP_NOT_FOUND:
+                logger.warning(
+                    "PubSub: the credential broker has no %s route (%.1fs): the broker image predates this adapter;"
+                    " upgrade the broker. Continuing startup; pulls retry with back-off.",
+                    RELAY_PREFIX, time.monotonic() - started,
+                )
+            else:
+                logger.warning(
+                    "PubSub: Could not verify subscription '%s' (%.1fs): the relay answered %s",
+                    sub_path, time.monotonic() - started, exc,
+                )
+            return False
+        except (TimeoutError, socket.timeout) as exc:
             logger.warning(
                 "PubSub: Timed out after %.1fs waiting on get_subscription for subscription '%s'"
                 " (bound %ss): %s. Continuing startup without verifying it.",
-                time.monotonic() - started, sub_path, PREFLIGHT_RPC_TIMEOUT_SECONDS, e,
+                time.monotonic() - started, sub_path, PREFLIGHT_RPC_TIMEOUT_SECONDS, exc,
             )
             return False
-        except NotFound:
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+                logger.warning(
+                    "PubSub: Timed out after %.1fs waiting on get_subscription for subscription '%s'"
+                    " (bound %ss): %s. Continuing startup without verifying it.",
+                    time.monotonic() - started, sub_path, PREFLIGHT_RPC_TIMEOUT_SECONDS, exc,
+                )
+            else:
+                logger.warning(
+                    "PubSub: Could not reach the credential broker's relay to verify subscription '%s' (%.1fs): %s."
+                    " Continuing startup; pulls retry with back-off.",
+                    sub_path, time.monotonic() - started, exc.reason,
+                )
+            return False
+        except OSError as exc:
             logger.warning(
-                "PubSub: Subscription '%s' is NOT present in GCP (%.1fs). Please ensure it is created prior to running.",
-                sub_path, time.monotonic() - started,
+                "PubSub: Could not verify subscription '%s' (%.1fs): %s. Continuing startup without verifying it.",
+                sub_path, time.monotonic() - started, exc,
             )
             return False
-        except Exception as e:
+        except Exception as exc:
             logger.warning(
                 "PubSub: Could not verify subscription '%s' (%.1fs): %s",
-                sub_path, time.monotonic() - started, e,
+                sub_path, time.monotonic() - started, exc,
             )
             return False
-
-    def _check_log_sink_exists(self, project_id: str, sink_name: str, topic_path: str, query: str) -> bool:
-        """Check if GCP Log Sink exists and log clearly if not present.
-
-        NOT CALLED at present — see the note in _check_resources. Kept, rather than
-        deleted, because the only thing missing is the google-cloud-logging dependency;
-        the logic below is correct and was verified against a real sink.
-
-        The name is configured, not derived. It used to be built as
-        ``hermes-pubsub-<route>-sink``, which nothing creates: the sink belongs to
-        whichever installer set the route up, and it names it whatever it likes. So a
-        perfectly healthy install logged "sink is NOT present" on every connect, and the
-        one check whose whole job is to spot a broken ingress path always cried wolf.
-        """
-        try:
-            from google.cloud import logging as gcp_logging
-            logging_client = gcp_logging.Client(project=project_id)
-            destination = f"pubsub.googleapis.com/{topic_path}"
-            sink = logging_client.sink(sink_name, filter_=query, destination=destination)
-            if sink.exists():
-                logger.info("PubSub: Log sink '%s' exists", sink_name)
-                return True
-            else:
-                logger.warning("PubSub: Log sink '%s' is NOT present in GCP.", sink_name)
-                return False
-        except Exception as e:
-            logger.warning("PubSub: Could not verify Log Sink '%s': %s", sink_name, e)
-            return False
-
-    def _check_resources(self, name: str, sub_cfg: dict, project_id: str) -> str:
-        """Check presence of GCP Pub/Sub topics, subscriptions, and log sinks without creating them."""
-        from google.cloud import pubsub_v1
-
-        topic_info = self._parse_topic_config(sub_cfg, project_id, name)
-        if not topic_info:
-            logger.info("PubSub: No 'topic' configured for route '%s'. Skipping resource checks.", name)
-            return self._parse_subscription_config(sub_cfg, project_id, None)
-
-        topic_path, topic_name = topic_info
-        sub_path = self._parse_subscription_config(sub_cfg, project_id, topic_name)
-
-        try:
-            publisher = pubsub_v1.PublisherClient()
-            subscriber = pubsub_v1.SubscriberClient()
-
-            self._check_topic_exists(publisher, topic_path)
-            self._check_subscription_exists(subscriber, sub_path)
-
-            # The log-sink presence check is deliberately NOT called. It needs
-            # google-cloud-logging, which the agent image does not carry, and the two ways
-            # to give it one are both on hold: adding it to the image, and letting Hermes
-            # lazy-install it at runtime, which needs an explicit decision on lazy installs
-            # that has not been made. Calling it without the library only produces
-            # "Could not verify Log Sink … cannot import name 'logging'" on every connect —
-            # the same cry-wolf this route was fixing, in a new dialect.
-            #
-            # To re-enable once the library is available, restore:
-            #
-            #     query = sub_cfg.get("query")
-            #     sink_name = sub_cfg.get("sink")
-            #     if query and sink_name:
-            #         self._check_log_sink_exists(project_id, sink_name, topic_path, query)
-            #
-            # `sink` is still plumbed end to end (installer, values, chart), so that is the
-            # whole change — no reinstall. See _check_log_sink_exists for why the name is
-            # configured rather than derived.
-        except Exception as e:
-            logger.warning("PubSub: Resource presence check failed for '%s': %s", name, e)
-
-        return sub_path
+        logger.info("PubSub: Subscription '%s' exists (%.1fs)", sub_path, time.monotonic() - started)
+        return True
 
     def _resolve_subscription_path(self, name: str, sub_cfg: dict, project_id: Optional[str]) -> Optional[str]:
-        """Resolve full GCP resource path for a configured subscription name/route."""
-        subscription_path = None
-        if project_id:
-            try:
-                subscription_path = self._check_resources(name, sub_cfg, project_id)
-            except Exception as e:
-                logger.warning("PubSub: Resource check failed for '%s': %s. Falling back to configured path.", name, e)
+        """The full subscription path a route names, or None when it names none.
 
-        if not subscription_path:
-            subscription_path = sub_cfg.get("subscription")
-            if subscription_path and not subscription_path.startswith("projects/") and project_id:
-                subscription_path = f"projects/{project_id}/subscriptions/{subscription_path}"
-        return subscription_path
+        A short name needs the project; without one the route is logged and skipped
+        rather than guessed. A route that names only a topic subscribes to
+        `<topic>-sub`, the name the installers create.
+        """
+        sub_input = (sub_cfg.get("subscription") or "").strip()
+        if sub_input.startswith("projects/"):
+            return sub_input
+        if not project_id:
+            logger.warning("PubSub: Route '%s' names a short subscription or topic and no project id is set in %s; "
+                           "name it as projects/<project>/subscriptions/<name>", name, "/".join(PROJECT_ID_ENVS))
+            return None
+        topic_info = self._parse_topic_config(sub_cfg, project_id, name)
+        try:
+            return self._parse_subscription_config(sub_cfg, project_id, topic_info[1] if topic_info else None)
+        except ValueError as exc:
+            logger.error("PubSub: Route '%s' is not usable: %s", name, exc)
+            return None
 
     def _subscribe_to_route(self, name: str, sub_cfg: dict, subscription_path: str, loop: asyncio.AbstractEventLoop) -> None:
-        """Initiate asynchronous background pull streaming subscription on the path."""
+        """Start the route's pull thread: pull through the relay, hand each message to the loop."""
         logger.info("PubSub: Subscribing to '%s' (route '%s')", subscription_path, name)
+        thread = threading.Thread(
+            target=self._pull_loop, args=(name, sub_cfg, subscription_path, loop, self._relay, self._stop_pulling),
+            name=f"pubsub-pull-{name}", daemon=True,
+        )
+        thread.start()
+        self._pull_threads.append(thread)
 
-        def make_callback(route_name=name, cfg=sub_cfg):
-            def callback(message):
-                logger.warning("PubSub: Callback entry received message on route '%s', msg_id=%s", route_name, getattr(message, 'message_id', 'unknown'))
+    def _pull_loop(self, route_name: str, sub_cfg: dict, subscription_path: str, loop: asyncio.AbstractEventLoop,
+                   relay: PubsubRelay, stop: threading.Event) -> None:
+        """Pull until disconnect; each message is processed on the event loop as the old callback was.
+
+        The relay and the stop event are the thread's own arguments, not read off
+        the adapter: a reconnect replaces both on the instance, and a thread still
+        parked in a long poll from before it must see its own generation's stop
+        and end, not the new generation's cleared one and pull on beside the new
+        thread. A failed pull backs off from PULL_BACKOFF_INITIAL_SECONDS to the
+        ceiling and logs what the relay said: a policy refusal names its rule, so a
+        subscription the operator did not render reads as that rather than as a
+        silent idle.
+        """
+        backoff = PULL_BACKOFF_INITIAL_SECONDS
+        while not stop.is_set():
+            try:
+                received = relay.pull(subscription_path)
+            except Exception as exc:
+                if stop.is_set():
+                    return
+                logger.warning("PubSub: pull on route '%s' failed (%s); retrying in %ss", route_name, exc, backoff)
+                stop.wait(backoff)
+                backoff = min(backoff * 2, PULL_BACKOFF_MAX_SECONDS)
+                continue
+            backoff = PULL_BACKOFF_INITIAL_SECONDS
+            if stop.is_set():
+                # A pull parked at the broker outlives the join a reconnect or a
+                # disconnect waits for; what it brings back belongs to the next
+                # generation, so hand it straight back rather than hold it to the
+                # ack deadline.
+                if received:
+                    self._return_to_subscription(route_name, subscription_path, relay, received)
+                return
+            if not received:
+                stop.wait(PULL_IDLE_INTERVAL_SECONDS)
+                continue
+            for item in received:
                 try:
-                    target_loop = getattr(self, "_main_loop", None) or loop
-                    if target_loop.is_closed():
-                        try:
-                            target_loop = asyncio.get_event_loop()
-                        except Exception:
-                            pass
-                    fut = asyncio.run_coroutine_threadsafe(
-                        self._process_message(route_name, cfg, message),
-                        target_loop
-                    )
-                    def _on_coro_done(f):
-                        exc = f.exception()
-                        if exc:
-                            logger.error("PubSub: _process_message failed for route '%s': %s", route_name, exc)
-                    fut.add_done_callback(_on_coro_done)
-                except Exception as e:
-                    logger.error("PubSub: Exception scheduling message callback for route '%s': %s", route_name, e)
-            return callback
+                    message = RelayMessage(relay, subscription_path, item)
+                except Exception as exc:
+                    logger.error("PubSub: a message on route '%s' could not be decoded and is left to redeliver: %s", route_name, exc)
+                    continue
+                self._schedule(route_name, sub_cfg, message, loop)
 
+    def _return_to_subscription(self, route_name: str, subscription_path: str, relay: "PubsubRelay",
+                                received: List[dict]) -> None:
+        ack_ids = [item.get("ackId") for item in received if item.get("ackId")]
         try:
-            future = self._subscriber.subscribe(
-                subscription_path,
-                callback=make_callback(name, sub_cfg)
-            )
-            def _on_future_done(f):
+            relay.nack(subscription_path, ack_ids)
+            logger.warning("PubSub: route '%s' stopped with %d message(s) in hand; returned them for redelivery",
+                           route_name, len(ack_ids))
+        except Exception as exc:
+            logger.warning("PubSub: route '%s' stopped with %d message(s) in hand and could not return them (%s); "
+                           "they redeliver at the ack deadline", route_name, len(ack_ids), exc)
+
+    def _schedule(self, route_name: str, cfg: dict, message: Any, loop: asyncio.AbstractEventLoop) -> None:
+        logger.warning("PubSub: Callback entry received message on route '%s', msg_id=%s", route_name, getattr(message, 'message_id', 'unknown'))
+        try:
+            target_loop = getattr(self, "_main_loop", None) or loop
+            if target_loop.is_closed():
+                try:
+                    target_loop = asyncio.get_event_loop()
+                except Exception:
+                    pass
+            fut = asyncio.run_coroutine_threadsafe(self._process_message(route_name, cfg, message), target_loop)
+
+            def _on_coro_done(f):
                 exc = f.exception()
                 if exc:
-                    logger.error("PubSub: StreamingPullFuture for route '%s' terminated with error: %s", name, exc)
-            future.add_done_callback(_on_future_done)
-            self._streaming_pull_futures.append(future)
+                    logger.error("PubSub: _process_message failed for route '%s': %s", route_name, exc)
+            fut.add_done_callback(_on_coro_done)
         except Exception as e:
-            logger.error("PubSub: Failed to subscribe to '%s': %s", subscription_path, e)
+            logger.error("PubSub: Exception scheduling message callback for route '%s': %s", route_name, e)
 
     async def connect(self, is_reconnect: bool = False, **kwargs) -> bool:
-        """Establish connection and start listening to all configured Pub/Sub subscriptions."""
+        """Connect to the broker's relay and start pulling every configured route."""
         self._main_loop = asyncio.get_running_loop()
         if not self._subscriptions_config:
             logger.warning("PubSub: No subscriptions configured in config.yaml under platforms.pubsub.extra.subscriptions")
             return True
 
-        if not check_requirements():
-            logger.error("PubSub: google-cloud-pubsub library is not installed")
-            self._set_fatal_error("dependencies_missing", "google-cloud-pubsub not installed", retryable=False)
+        relay_url = os.environ.get(PUBSUB_RELAY_URL_ENV, "").strip()
+        if not relay_url:
+            logger.error(
+                "PubSub: %s is empty. The gateway holds no Google credential, so this adapter pulls only "
+                "through the credential broker's relay. The operator fills the variable once a plugin route "
+                "names a subscription it can qualify: a full projects/<project>/subscriptions/<name> path, "
+                "or a short subscription or topic name on an agent whose spec.harness.projectId is set. "
+                "The AgentPlugin's status names a route it could not qualify.", PUBSUB_RELAY_URL_ENV,
+            )
+            self._set_fatal_error("relay_not_configured", f"{PUBSUB_RELAY_URL_ENV} not set", retryable=False)
             return False
-
-        from google.cloud import pubsub_v1
-
-        try:
-            self._subscriber = pubsub_v1.SubscriberClient()
-        except Exception as e:
-            logger.error("PubSub: Failed to initialize SubscriberClient: %s", e)
-            self._set_fatal_error("client_init_failed", str(e), retryable=True)
-            return False
+        # A reconnect that skipped disconnect() still ends the previous generation
+        # first: its event is set and its threads are waited for, so no new pull
+        # starts beside the new generation's. A thread still parked in a long poll
+        # at the broker outlives the join; it returns what that poll delivers to
+        # the subscription (the stop path in _pull_loop) instead of processing it.
+        if self._pull_threads:
+            self._stop_pulling.set()
+            previous, self._pull_threads = self._pull_threads, []
+            for thread in previous:
+                await asyncio.to_thread(thread.join, PULL_THREAD_JOIN_SECONDS)
+        self._relay = PubsubRelay(relay_url, os.environ.get(CREDENTIAL_PROXY_TOKEN_FILE_ENV, "").strip())
+        # A new event per generation; the previous one stays set for any thread
+        # still parked in a pull from before disconnect().
+        self._stop_pulling = threading.Event()
 
         project_id = self._get_project_id()
         loop = asyncio.get_running_loop()
-
+        started = 0
         for name, sub_cfg in self._subscriptions_config.items():
             self._warn_on_inert_config(name, sub_cfg)
             subscription_path = self._resolve_subscription_path(name, sub_cfg, project_id)
             if not subscription_path:
-                logger.error("PubSub: Route '%s' missing 'subscription' path", name)
+                logger.error("PubSub: Route '%s' skipped: it names no subscription this adapter can pull; the line above says why", name)
                 continue
+            self._check_subscription_exists(subscription_path)
             self._subscribe_to_route(name, sub_cfg, subscription_path, loop)
+            started += 1
 
+        # WARNING, not INFO: the gateway runs without -v, so INFO never reaches its log, and
+        # this line is what an operator (and the presubmit's deploy gate) reads to know the
+        # adapter is pulling through the broker rather than failing quietly.
+        if started == 0:
+            logger.error("PubSub: no route started; every configured route was skipped above, so nothing is pulled")
+            self._mark_connected()
+            return True
+        logger.warning("PubSub: connected through the credential broker relay at %s for %d route(s)", relay_url, started)
         self._mark_connected()
         return True
 
@@ -418,19 +577,13 @@ class PubSubAdapter(BasePlatformAdapter):
             )
 
     async def disconnect(self) -> None:
-        """Disconnect and clean up background subscription pulls."""
+        """Stop every pull thread and forget the relay."""
         self._running = False
-        for future in self._streaming_pull_futures:
-            try:
-                future.cancel()
-            except Exception:
-                pass
-        self._streaming_pull_futures.clear()
-        if self._subscriber:
-            try:
-                self._subscriber.close()
-            except Exception:
-                pass
+        self._stop_pulling.set()
+        threads, self._pull_threads = self._pull_threads, []
+        for thread in threads:
+            await asyncio.to_thread(thread.join, PULL_THREAD_JOIN_SECONDS)
+        self._relay = None
         self._mark_disconnected()
         logger.info("PubSub: Disconnected")
 
@@ -1180,7 +1333,7 @@ def register(ctx):
         check_fn=check_requirements,
         validate_config=validate_config,
         required_env=[],
-        install_hint="pip install google-cloud-pubsub",
+        install_hint="nothing to install: the adapter speaks to the credential broker's relay",
         max_message_length=0,
         emoji="🔔",
         pii_safe=True,

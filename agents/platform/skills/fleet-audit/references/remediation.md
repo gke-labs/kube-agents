@@ -11,7 +11,8 @@ to put in a diff otherwise. Three paths lead there:
   `MAJOR_SWEEP_CHECKS` (`no-pdb`, `unbound-sa-automount`, `ccc-no-ondemand-floor`) where the
   collector's candidate is at least `major` — that is a `manifest`, has no live pull request on its branch — and, on a run that passed
   `--manifest-file`, is neither uncorroborated nor triage-marked by the collector — is promoted
-  automatically by `finish` — **at most five per run**. Every other `major` finding is held to the `critical` floor:
+  automatically by `finish` — **at most five per run** — unless the install's
+  `KUBEAGENTS_AUDIT_AUTO_PROMOTE` switch is `false`, when `finish` opens only what `/remediate` named. Every other `major` finding is held to the `critical` floor:
   a SOP's grade says how bad the finding is, not whether its fix is safe to open unasked. The collector marks a fix that scales a controller to zero, writes a
   default-deny NetworkPolicy, resizes a `Guaranteed` pod, needs a new ComputeClass, owes its
   `major` to the Autopilot bump, turns off a namespace's default ServiceAccount token, rewrites
@@ -87,7 +88,10 @@ All of these are guarded by a hidden marker carrying the triggering comment's no
 A `/remediate` read on the ledger is never run through the subcommand — `finish` answers those on
 the comment's own timestamp, which is what lets a fresh post-close command revive a finding the
 subcommand would report as `superseded`. Run a direct ask's targets through it, `--finding` once
-per id:
+per id. Without `--repo` it acts on the repository with `role: gitops`. If the finding is from a run
+that a person ran with `--repo`, pass the same `--repo` here. With several managed repositories,
+none with `role: gitops`, and no `--repo`, it refuses (`FATAL: Multiple repositories configured …`,
+exit 1); report that message to the user, and do not choose a repository:
 
 ```bash
 /opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py remediate --audit <audit-id> \

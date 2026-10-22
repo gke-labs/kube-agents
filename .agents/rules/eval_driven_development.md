@@ -65,6 +65,15 @@ PLATFORM_AGENT_TOKEN=$(kubectl --context "$AGENT_CLUSTER_CONTEXT" get secret pla
 Without `GCP_PROJECT_ID` the judge fails to construct (`No API key was provided`); the eval
 still needs the judge even though only the deterministic checks decide.
 
+The blocking presubmit grades a `spec.mode: next` install through the A2A gateway's inject door,
+so that is the lane a case on its matrix goes red or green on. Against a next install, add the
+two exports `hack/ci-eval-pr.sh` makes there: `AGENT_TRANSPORT=inject`, and `AGENT_INJECT_TOKEN`
+from the `token` key of the `platform-agent-a2a-inject` Secret in the same namespace. A case on
+`hack/eval/inject-lane-exclusions.txt` is graded over the agent API instead (the today lane and
+the nightlies); run it without them. The lane also appends the GitHub-write safeguard in
+`hack/eval/inject-lane-safeguards.yaml` to every task, so a case that passes here can still trip
+it in CI.
+
 A case that reads the seeded fleet needs it in your dev project: run
 [`hack/fleet-kubeconfigs.sh`](../../hack/fleet-kubeconfigs.sh) and export
 `BENCH_FLEET_KUBECONFIG_DIR` first. The runner refuses to write kubeconfigs on your own
@@ -90,9 +99,10 @@ is the one that goes green: loosening the check in between is a new red, not a g
 run directories; the pull request cites them.
 
 **4. Register.** A new case is registered in `hack/eval/nightly-cases.txt` in the same pull
-request, with a `docs/designs/domains.yaml` slug (a new row there, with its owner, backup and
-meaning, when none describes the case); you may set `owner:` to yourself so the case's bugs
-reach you before the domain owner
+request: in that file's sorted section, at its place in case-id order, with its reason as the
+`#` lines above it. The case has a `docs/designs/domains.yaml` slug (a new row there, with its
+owner, backup and meaning, when none describes the case); you may set `owner:` to yourself so
+the case's bugs reach you before the domain owner
 ([`bench/CONTRIBUTING.md`](../../bench/CONTRIBUTING.md#ownership)). The nightly is where a
 new case lands ([`docs/designs/bench-case-format.md`](../../docs/designs/bench-case-format.md),
 "Registration"): it runs every night from the night it merges and builds its record; a

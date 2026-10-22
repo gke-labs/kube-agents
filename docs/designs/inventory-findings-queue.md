@@ -4,7 +4,13 @@
 > `agents/platform/scripts/findings_queue.py`, `inventory_findings.py` and the Session KV server:
 > the tables and their indexes (§3.1), the rubric and the severity it derives (§4), the upsert
 > rules (§5.2), the endpoints and MCP tools (§6.1), and the inventory sweep's registration
-> path (§5). Item 7 does not ship — nothing registers findings from `k8s-event-watcher`. Item 8
+> path (§5). A second writer ships beside the sweep: the Saturday `upgrade-readiness-weekly-review` job
+> (`agents/platform/scripts/upgrade_readiness_review.py`) registers the readiness report's blockers
+> and risks as `source: upgrade-readiness` rows under `upgrade-` check slugs of its own rather than the audit
+> streams' slugs (`pool-skew`, `blocking-exclusion`, `blocking-pdb`, which those streams file to their
+> ledgers, not to the queue): one problem must stay one row across weeks here, and the review also
+> reads objects no stream names (fail-closed webhooks, the readiness rules' rows); its completeness
+> claim names that family and its own source (`scope.check_prefix`, `scope.source`), so it lowers only its own rows in the family: no other family's, and not the `upgrade-` rows the audit streams (`upgrade-blocked`) or the retrospective write under their own sources. Item 7 does not ship — nothing registers findings from `k8s-event-watcher`. Item 8
 > ships in part: `agents/platform/scripts/findings_nudge.py` and the `findings-morning-nudge`
 > entry in `jobs.json` post a paced version of §7.2's message, hourly: at most two new criticals a
 > UTC day, a few non-criticals in the afternoon, nothing new while a non-critical it named waits for
@@ -129,8 +135,8 @@ Grain is one problem: one check, at one object, on one cluster.
 | column                                       | notes                                                                                                                                                                                                                      |
 | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `id`                                         | identity; primary key. Derived, never written by a model — see below                                                                                                                                                       |
-| `source`                                     | `inventory` \| `event-watcher` \| `audit`                                                                                                                                                                                  |
-| `check`                                      | the check slug; the same vocabulary the audit streams use (§10)                                                                                                                                                            |
+| `source`                                     | `inventory` \| `event-watcher` \| `audit` \| `upgrade-readiness`                                                                                                                                                           |
+| `check`                                      | the check slug; the audit streams' vocabulary (§10), and the `upgrade-` family the weekly readiness review writes                                                                                                          |
 | `project`, `cluster`, `namespace`, `object`  | the GCP project qualifies the cluster — a cluster name is only unique within one (a second project's `prod` must not overwrite the first's rows); `namespace` empty for cluster-scoped objects                             |
 | `severity`                                   | `critical` \| `major` \| `minor`. Derived from `rank_score`, not judged separately, with one floor for findings that are failing now (§4.2)                                                                                |
 | `rank_score`                                 | the ordering key. Every row has one, gated or not (§4.4). Written at registration, changed only by a named re-rank event                                                                                                   |
@@ -176,7 +182,7 @@ next sweep re-registers what the user already rejected and it reappears on the l
 ```sql
 CREATE TABLE IF NOT EXISTS findings (
     id               TEXT PRIMARY KEY,
-    source           TEXT NOT NULL,               -- inventory | event-watcher | audit
+    source           TEXT NOT NULL,               -- inventory | event-watcher | audit | upgrade-readiness
     check_slug       TEXT NOT NULL,
     project          TEXT NOT NULL,               -- the GCP project id; qualifies cluster
     cluster          TEXT NOT NULL,
@@ -690,7 +696,7 @@ So absence downgrades confidence rather than deciding anything: on a completed r
 `surfaced` row the run did not re-report has `C` lowered to 0.6 — the rubric's own value for "inferred from
 absence" — which re-ranks it down without asserting anything about it, and the definite answer comes
 from §7.4's verification the next time the row is named in a nudge. Only a run that reports its own scope as
-complete for that cluster may do even this much; a partial run touches nothing.
+complete for that cluster may do even this much; a partial run touches nothing. The claim's reach is decided in two steps: the rows whose check starts with `scope.check_prefix` when the scope names one (a run that reads one family of checks: whatever source wrote the rows, or, when `scope.source` names a source beside the prefix, that source's rows in the family alone); else the rows of the batch's own `source`, or of `scope.source`, which must be a known source and, for a batch that is not empty, one the batch wrote, so a hand re-run of the inventory sweep lowers no other writer's rows. An empty complete batch that names neither has no source of its own to claim for and is refused, so no caller lowers every row on a cluster by accident. The weekly upgrade readiness review writes under a source of its own, `upgrade-readiness`, so a prefix-less claim made under another writer's source never reaches its rows. The review's own claim names the `upgrade-` family and its source together, so it reaches only its own rows in the family, never an `upgrade-` row another writer filed. With a complete scope an empty batch that names a prefix or a source is accepted, since a sweep that found nothing is exactly the case the rule is for.
 
 The same run sets `absent_since` on each such row, keeping the first miss, including on a row
 already at 0.6, which is not re-ranked (the register response's `downgraded` counts only the rows
@@ -738,7 +744,7 @@ gets the same treatment, for two reasons that are not stylistic:
 | ------------------------------------------------ | --------------------------------- | -------------------------------------------------------------------------------------- |
 | `POST /v1/findings`                              | prioritize worker, watcher, audit | upsert a batch under §5.2's per-state rules; returns created/updated/suppressed per id |
 | `GET /v1/findings/ranked`                        | any publisher (§7)                | the open queue in the order below; the whole list, ordering in code                    |
-| `GET /v1/findings`                               | the `platform` worker             | the on-demand pull, filterable by project, cluster, state, severity                    |
+| `GET /v1/findings`                               | `platform` worker, weekly brief   | the on-demand pull, filterable by project, cluster, state, severity, check prefix      |
 | `POST /v1/findings/{id}/surfaced`                | any publisher                     | after the send: `surface_count`, `surfaced_at`, `chat_id`, `thread_id`                 |
 | `POST /v1/findings/{id}/surfaced` + `publisher`  | a paced publisher (§7.2)          | also `added_class`, `run`: `first_shown_at` on a first paced showing, and the addition |
 | `GET /v1/findings/additions?day=`                | the nudge                         | items added on a UTC day, by class, from `findings_additions` (§7.2)                   |
@@ -993,9 +999,11 @@ what makes that visible. An undecided critical holds every new non-critical back
 stays pending, while new criticals still arrive within the day's budget; the daily reminder names
 it only if it is in the day's top, and nothing says that non-criticals are waiting. On a standard
 install only a person's decision (dismiss, snooze or accept) releases a pending item: clearing one without a person needs §7.4's verification, which is not
-built, and the onboarding sweep runs once, so no recurring complete sweep lowers a fixed row's `C`.
-A shown row a later complete sweep stops reporting is not pending and is not reminded, but that
-happens only when someone re-runs the sweep by hand.
+built. The onboarding sweep runs once, so for its rows no recurring complete sweep lowers a fixed
+row's `C` unless someone re-runs the sweep by hand; the weekly upgrade readiness review is such a
+sweep for its own `upgrade-` rows, so a shown row of that family that a Saturday no longer reports
+is not pending and is not reminded from that Saturday on, and comes back at the confidence the
+review registers it with the Saturday it is found again.
 
 ### 7.3 What a dry run showed, and why there is no selection
 

@@ -257,7 +257,7 @@ class GitLabLaneTest(unittest.TestCase):
         result = load_matrix({"EVAL_FORGE": "gitlab", "EVAL_TIER": "presubmit"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(lines_tagged(result, "TASK"), self.lane_entries())
-        self.assertIn("EVAL_FORGE=gitlab: the GitLab lane runs 3 case(s) on the presubmit tier", result.stdout)
+        self.assertIn(f"EVAL_FORGE=gitlab: the GitLab lane runs {len(self.lane_entries())} case(s) on the presubmit tier", result.stdout)
         self.assertIn("presubmit cases left out: reliability-pdb-probe,", result.stdout)
         # pdb-remediation-pr was the lane's one roster case from 2026-10-14
         # (#2016) until its demotion to the nightly on 2026-10-17 (#3120), so
@@ -320,7 +320,7 @@ class GitLabLaneTest(unittest.TestCase):
         result = load_matrix({"EVAL_FORGE": "gitlab", "EVAL_TIER": "nightly"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(lines_tagged(result, "TASK"), self.lane_entries())
-        self.assertIn("the GitLab lane runs 3 case(s) on the nightly tier", result.stdout)
+        self.assertIn(f"the GitLab lane runs {len(self.lane_entries())} case(s) on the nightly tier", result.stdout)
         self.assertNotIn("nightly-only task(s) join the matrix", result.stdout)
         self.assertEqual(lines_tagged(result, "ROSTER"), [""])
         self.assertIn("rung 4 is disarmed on this lane", result.stdout)
@@ -341,7 +341,7 @@ class GitLabLaneTest(unittest.TestCase):
         """The recorder decision, lifted as written: a GitLab periodic reads
         the store like a presubmit and never records, since a case's record
         is per case and version key, not per forge."""
-        decision = lifted_block(r'^case "\$\{JOB_TYPE:-\}" in\n.*?^if \[ "\$\{EVAL_MODE_NEXT:-\}" = "1" \]; then\n  EVAL_IS_MAIN_RUN="false"\nfi$')
+        decision = lifted_block(r'^case "\$\{JOB_TYPE:-\}" in\n.*?^if \[ "\$\{EVAL_ROLLBACK_LANE:-\}" = "1" \]; then\n  EVAL_IS_MAIN_RUN="false"\nfi$')
         body = decision + '\necho "MAIN_RUN=${EVAL_IS_MAIN_RUN}"'
         self.assertIn("MAIN_RUN=true", run_bash(body, {"JOB_TYPE": "periodic", "EVAL_FORGE": "github"}).stdout)
         self.assertIn("MAIN_RUN=false", run_bash(body, {"JOB_TYPE": "periodic", "EVAL_FORGE": "gitlab"}).stdout)

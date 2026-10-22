@@ -930,6 +930,10 @@ func TestAPI_FollowUpIsASecondTurnInTheSameSession(t *testing.T) {
 	if ns := steerNotices(t, url, origin.TaskID); len(ns) != 1 {
 		t.Fatalf("notices %+v, want only the queued one", ns)
 	}
+	// One usage part per turn, each ahead of the final event.
+	if got := usageSeen(t, url, origin.TaskID); len(got) != 2 {
+		t.Fatalf("usage parts = %+v, want one per turn", got)
+	}
 }
 
 func TestAPISessionTurnKey(t *testing.T) {

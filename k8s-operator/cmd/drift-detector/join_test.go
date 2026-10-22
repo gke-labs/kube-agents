@@ -485,7 +485,7 @@ func TestJoinCountsStringAlwaysNamesEveryOutcome(t *testing.T) {
 	// A zero that is absent reads as a category that did not apply; a zero that
 	// is printed reads as one that did not happen.
 	got := joinCounts{}.String()
-	for _, outcome := range []joinOutcome{joinEnriched, joinNoObject, joinGone, joinUnreachable, joinFailed} {
+	for _, outcome := range []joinOutcome{joinEnriched, joinNoObject, joinGone, joinUnreachable, joinFailed, joinSkippedBacklog} {
 		if !strings.Contains(got, string(outcome)+"=") {
 			t.Errorf("joinCounts.String() = %q, want it to name %q", got, outcome)
 		}
@@ -1111,5 +1111,90 @@ func TestRenderOwnersQuotesAClaimContainingSpaces(t *testing.T) {
 	want := `"my tool(Update)=[spec.containers[name=my app].image]"`
 	if got != want {
 		t.Errorf("renderOwners = %q, want %q", got, want)
+	}
+}
+
+// A backlog record is not looked up when the join is told the daemon digests
+// backlog, and is looked up as before when it is not.
+func TestJoinSkipsTheLookupForABacklogRecordOnlyWhenTold(t *testing.T) {
+	record := joinRecord()
+	record.Backlog = true
+
+	getter := &stubGetter{obj: &unstructured.Unstructured{Object: map[string]any{}}}
+	var got DriftEvent
+	j := newJoiner(joinSet(getter), nil, nil, nil, func(_ context.Context, e DriftEvent) { got = e })
+	j.skipBacklog = true
+	j.Handle(context.Background(), record)
+	if got.Outcome != joinSkippedBacklog || len(getter.refs) != 0 {
+		t.Errorf("outcome=%s lookups=%d, want %s and none", got.Outcome, len(getter.refs), joinSkippedBacklog)
+	}
+	if c := j.Counts(); c.SkippedBacklog != 1 {
+		t.Errorf("Counts() = %+v, want skipped_backlog=1", c)
+	}
+	if !got.Digest {
+		t.Error("a backlog record bound for the digest route is not marked Digest")
+	}
+
+	getter = &stubGetter{obj: &unstructured.Unstructured{Object: map[string]any{}}}
+	j = newJoiner(joinSet(getter), nil, nil, nil, func(_ context.Context, e DriftEvent) { got = e })
+	j.Handle(context.Background(), record)
+	if got.Outcome != joinEnriched || len(getter.refs) != 1 {
+		t.Errorf("without skipBacklog: outcome=%s lookups=%d, want %s and one", got.Outcome, len(getter.refs), joinEnriched)
+	}
+	if got.Digest {
+		t.Error("a backlog record is marked Digest with no digest route")
+	}
+}
+
+// A backlog record from a cluster the join cannot read is still unreachable,
+// so the out-of-scope hold still applies to it.
+func TestJoinStillHoldsAnOutOfScopeBacklogRecord(t *testing.T) {
+	record := joinRecord()
+	record.Backlog = true
+	record.Cluster = "prod-b"
+
+	var got DriftEvent
+	j := newJoiner(joinSet(&stubGetter{}), nil, knownScope(), nil, func(_ context.Context, e DriftEvent) { got = e })
+	j.skipBacklog = true
+	j.Handle(context.Background(), record)
+	if got.Outcome != joinUnreachable || !got.OutOfScope || got.Digest {
+		t.Errorf("outcome=%s out_of_scope=%t digest=%t, want %s, held, and not digested", got.Outcome, got.OutOfScope, got.Digest, joinUnreachable)
+	}
+}
+
+// A live record still gets its lookup, and is not marked Digest, when the join
+// is told the daemon digests backlog.
+func TestJoinStillLooksUpALiveRecordWithTheDigestRouteOn(t *testing.T) {
+	getter := &stubGetter{obj: &unstructured.Unstructured{Object: map[string]any{}}}
+	var got DriftEvent
+	j := newJoiner(joinSet(getter), nil, nil, nil, func(_ context.Context, e DriftEvent) { got = e })
+	j.skipBacklog = true
+	j.Handle(context.Background(), joinRecord())
+	if got.Outcome != joinEnriched || len(getter.refs) != 1 || got.Digest {
+		t.Errorf("outcome=%s lookups=%d digest=%t, want %s, one lookup, not digested", got.Outcome, len(getter.refs), got.Digest, joinEnriched)
+	}
+}
+
+// A late record sent by kubectl is carded, not digested: it keeps its lookup
+// and is not marked Digest, so a person's edit made just before a restart
+// still gets its triage.
+func TestJoinCardsALateKubectlRecord(t *testing.T) {
+	record := joinRecord()
+	record.Backlog = true
+	record.UserAgent = "kubectl/v1.35.6 (darwin/arm64) kubernetes/abc"
+
+	getter := &stubGetter{obj: &unstructured.Unstructured{Object: map[string]any{}}}
+	var got DriftEvent
+	j := newJoiner(joinSet(getter), nil, nil, nil, func(_ context.Context, e DriftEvent) { got = e })
+	j.skipBacklog = true
+	j.Handle(context.Background(), record)
+	if got.Outcome != joinEnriched || len(getter.refs) != 1 || got.Digest {
+		t.Errorf("outcome=%s lookups=%d digest=%t, want %s, one lookup, not digested", got.Outcome, len(getter.refs), got.Digest, joinEnriched)
+	}
+
+	record.UserAgent = "Go-http-client/2.0"
+	j.Handle(context.Background(), record)
+	if !got.Digest {
+		t.Error("a late record from Helm's Go client was not digested")
 	}
 }

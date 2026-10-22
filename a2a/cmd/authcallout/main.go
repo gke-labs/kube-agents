@@ -27,6 +27,7 @@ import (
 	"k8s.io/client-go/rest"
 
 	"github.com/gke-labs/kube-agents/a2a/authcallout"
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 const (
@@ -279,7 +280,7 @@ func connectToBus(log *slog.Logger, onClosed func()) (*nats.Conn, error) {
 		return nil, fmt.Errorf("%s and %s are required", envNATSUser, envNATSPassword)
 	}
 
-	nc, err := nats.Connect(url,
+	nc, err := nats.Connect(url, append(lib.TLSOptions(),
 		nats.UserInfo(user, password),
 		nats.Name(natsClientName),
 		// The callout must survive a bus restart, and it is the component
@@ -303,7 +304,7 @@ func connectToBus(log *slog.Logger, onClosed func()) (*nats.Conn, error) {
 		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
 			log.Error("bus error", "error", err)
 		}),
-	)
+	)...)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to the bus: %w", err)
 	}

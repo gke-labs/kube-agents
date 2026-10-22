@@ -86,8 +86,9 @@ Each is a Kubernetes object in `defects-a.tf`, a role in `fixtures.json` with it
 catalogue entry. No dollar cost beyond the objects themselves — but two of the five are not free in
 effort, because the condition they plant is already true of `seeded-a` and has to be closed
 elsewhere before the planted one means anything. Note also that `seeded-a`'s headroom is finite:
-`main.tf` records that a single `e2-medium`'s allocatable CPU was fully claimed by system pods and
-every fixture went Pending, which is why its pool is two nodes with roughly 600m to spare.
+`main.tf` records that GKE's system pods take 700-860m of an `e2-medium`'s 940m allocatable CPU
+and that on two of them the busier node was within 2-47m of full, which is why its pool is two
+dedicated-core nodes (`e2-standard-2`) with about a core to spare on each.
 
 ### Tier 2 — on `seeded-d` (built)
 

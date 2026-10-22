@@ -76,9 +76,10 @@ class FakeAPI(rfc.GitHubAPI):
     """`GitHubAPI` with `get` and `post` faked, so the real pager runs over one pull request,
     paged lists and recorded posts."""
 
-    def __init__(self, pull=None, runs=(), checks=(), per_page=github_api.PER_PAGE, refusing=(), refusal_body=b""):
+    def __init__(self, pull=None, runs=(), checks=(), per_page=github_api.PER_PAGE, refusing=(), refusal_body=b"", failing=()):
         super().__init__("gke-labs/kube-agents", "x")
         self.refusal_body = refusal_body
+        self.failing = set(failing)  # paths that answer 502, as the API failing rather than refusing
         self.pull = pull or {"number": 3245, "state": "open", "head": PR_HEAD, "title": "ci: bump"}
         self.runs = list(runs)
         self.checks = list(checks)
@@ -107,6 +108,8 @@ class FakeAPI(rfc.GitHubAPI):
         raise AssertionError(f"unexpected call: {path}")
 
     def post(self, path, payload=None, tolerate=()):
+        if path in self.failing:
+            raise urllib.error.HTTPError(path, 502, "Bad Gateway", {}, io.BytesIO(b""))
         if path in self.refusing:
             raise urllib.error.HTTPError(path, 403, "Forbidden", {}, io.BytesIO(self.refusal_body))
         self.posts.append((path, payload))
@@ -360,6 +363,29 @@ class MainTest(unittest.TestCase):
         error = urllib.error.HTTPError("x", 403, "Forbidden", {}, io.BytesIO(b""))
         self.assertEqual("Forbidden", rfc.refusal_message(error))
 
+    def test_a_refused_reaction_is_a_warning_not_a_failure(self):
+        """The first live runs declined correctly, then exited red because the reaction got 403."""
+        reaction = "/repos/gke-labs/kube-agents/issues/comments/77/reactions"
+        api = FakeAPI(runs=[run(1, "success", 10)], checks=[check(1, "Tests", "success", 10)], refusing={reaction}, refusal_body=b'{"message": "Resource not accessible by integration"}')
+        code, out, err = self.run_main(api)
+        self.assertEqual(0, code, err)
+        self.assertEqual([], api.posts)
+        self.assertIn("Could not react", out)
+        self.assertIn("Resource not accessible by integration", out)
+
+        self.assertIn("Could not react", pathlib.Path(self.summary.name).read_text())
+
+        api = FakeAPI(runs=[run(1, "failure", 10)], checks=[check(1, "Tests", "failure", 10)], refusing={reaction})
+        code, out, err = self.run_main(api)
+        self.assertEqual(0, code, err)
+        self.assertEqual([("/repos/gke-labs/kube-agents/actions/runs/1/rerun-failed-jobs", None)], api.posts)
+
+    def test_the_api_failing_on_the_reaction_still_fails_the_run(self):
+        """Only a refusal is tolerated: a 5xx is the API failing, and the retries behind it exhausted."""
+        api = FakeAPI(runs=[run(1, "success", 10)], checks=[check(1, "Tests", "success", 10)], failing={"/repos/gke-labs/kube-agents/issues/comments/77/reactions"})
+        with self.assertRaises(urllib.error.HTTPError):
+            self.run_main(api)
+
     def test_dry_run_posts_nothing(self):
         api = FakeAPI(runs=[run(1, "failure", 10)], checks=[check(1, "Tests", "failure", 10)])
         code, out, err = self.run_main(api, "--dry-run")
@@ -388,8 +414,10 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn('["OWNER", "MEMBER", "COLLABORATOR"]', condition)
 
     def test_the_token_can_rerun_and_react_and_nothing_more(self):
+        """`pull-requests` is write, not read: a reaction on a pull request's comment is checked against
+        that scope too, and with `read` the first two live `/retest` comments got 403 on the reaction."""
         self.assertEqual({}, self.doc["permissions"])
-        self.assertEqual({"contents": "read", "actions": "write", "pull-requests": "read", "issues": "write"}, self.job["permissions"])
+        self.assertEqual({"contents": "read", "actions": "write", "pull-requests": "write", "issues": "write"}, self.job["permissions"])
 
     def test_the_checkout_is_the_default_branch_without_credentials(self):
         checkouts = [step for step in self.job["steps"] if str(step.get("uses", "")).startswith("actions/checkout@")]

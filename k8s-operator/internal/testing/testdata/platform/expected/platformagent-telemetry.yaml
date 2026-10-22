@@ -303,7 +303,7 @@ spec:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 10Gi
+      storage: 50Gi
 status: {}
 ---
 apiVersion: v1
@@ -373,6 +373,11 @@ data:
     KUBEAGENTS_SCOPE_FILE=/etc/kube-agents/scope.json
     RECONCILE_PROJECT=
     GKE_PROJECT_ID=example-project
+    STALL_WATCH_EXCLUDE_NAMESPACES=
+    STALL_WATCH_MIN_AGE_MINUTES=
+    STALL_WATCH_KINDS=
+    PUBSUB_RELAY_URL=
+    PUBSUB_RELAY_PROJECT=example-project
   profile-platform.overlay.yaml: |
     memory:
       provider: ""
@@ -818,7 +823,7 @@ spec:
           - ReadWriteOnce
         resources:
           requests:
-            storage: 10Gi
+            storage: 50Gi
       status: {}
     - metadata:
         name: sshd
@@ -1357,6 +1362,9 @@ spec:
               value: /var/run/secrets/kubeagents/credential-proxy/token
             - name: KUBE_AGENTS_MCP_RELAY_URL
               value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765/v1/mcp
+            - name: PUBSUB_RELAY_URL
+            - name: PUBSUB_RELAY_PROJECT
+              value: example-project
             - name: PATH
               value: /opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
             - name: PYTHONPATH

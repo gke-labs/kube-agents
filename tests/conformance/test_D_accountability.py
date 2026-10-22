@@ -18,6 +18,8 @@ from __future__ import annotations
 import re
 import unittest
 
+import yaml
+
 from . import _harness as h
 from ._harness import command_policy
 
@@ -48,6 +50,45 @@ class D1Attributable(unittest.TestCase):
         # The call gained a max_length argument on main; the sanitiser in
         # front of the principal is the property, not the arity.
         self.assertIn("_sanitize_for_logging(principal.describe()", body)
+
+    def test_D1_every_profile_records_its_tool_calls(self) -> None:
+        """A tool call the agent makes has to leave a record that names it.
+
+        The credential proxy records a brokered command by tool and verb, and
+        a `gke` MCP call by server and method, with no arguments and no task.
+        A local file edit does not reach the proxy. For those calls the
+        profile's own `tool_call_audit` record, which the fluent-bit sidecar
+        ships from `logs/audit.jsonl`, is the only record of what ran and for
+        which task. A profile that does not enable the plugin writes no record,
+        and nothing else notices.
+        """
+        names = ("chat_config", "platform_config", "cluster_config")
+        # Every profile config in the tree, so a new profile cannot ship
+        # without the plugin and still leave this test green.
+        shipped = {
+            str(path.relative_to(h.REPO_ROOT))
+            for path in h.REPO_ROOT.glob("agents/*/config.yaml")
+        }
+        self.assertEqual(
+            shipped,
+            {h.SOURCES[name].path for name in names},
+            "a profile config is not checked here; register it in _harness and add it",
+        )
+        for name in names:
+            config = yaml.safe_load(h.text(name)) or {}
+            enabled = (config.get("plugins") or {}).get("enabled") or []
+            # The entrypoint's back-fill turns a template's plugins on for an
+            # existing profile only from a list, so a string or a mapping here
+            # enables nothing, whatever its contents spell.
+            self.assertIsInstance(
+                enabled, list, f"{h.SOURCES[name].path}: plugins.enabled is not a list"
+            )
+            self.assertIn(
+                "tool_call_audit",
+                enabled,
+                f"{h.SOURCES[name].path} does not enable tool_call_audit, so that "
+                f"profile's tool calls leave no audit record",
+            )
 
     def test_D1_no_product_role_can_write_the_identity_table(self) -> None:
         """A write to the Slack principal map grants a principal.
