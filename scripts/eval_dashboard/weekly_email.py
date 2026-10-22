@@ -17,14 +17,15 @@ it. A night is dated as ``nightly.night_date`` dates it.
 **A counted night** ran to its verdict: none of its parts was cut off at
 the job deadline (``nightly.run_truncated``), it has a main part, and it
 is not a run-level event (``classify.is_run_event``: nearly every graded
-case failed). Two counted nights on one date are one night, the newer
-standing, as ``nightly_bugs`` reads them. A repetition the classifier
-calls infrastructure is never graded (``classify.rep_kind``).
+case failed). Two counted nights on one date are one night: per case the
+newer verdict stands, as ``nightly_bugs.graded_nights`` reads a re-run. A
+repetition the classifier calls infrastructure is never graded
+(``classify.rep_kind``).
 
 **The numbers** are graded repetitions: a pass rate is passes over graded
 repetitions, over the scenarios that were graded in both weeks -- the same
 set both weeks, and the count the email shows. A scenario graded in one
-week only is left out of every number and counted in the footer.
+week only is left out of every number and counted in the closing note.
 
 **The integrity checks** (#3440, "Integrity checks") run over the computed
 week and the rendered page; any failure refuses the render and prints every
@@ -41,9 +42,11 @@ reason:
    meets its rule (``claim_failures``);
 6. needs attention is computed: below NEEDS_ATTENTION_BELOW_PCT, or down
    NEEDS_ATTENTION_DROP_PTS points or more;
-7. bugs exist: an area with a scenario that failed every graded repetition
-   on its last ``nightly_bugs.STREAK_NIGHTS`` graded nights has an open
-   ``nightly-red`` issue, and every count shown was read from GitHub;
+7. bugs exist: every scenario the bug filer files for right now (failed
+   every graded repetition on its last ``nightly_bugs.STREAK_NIGHTS`` graded
+   nights) has a ``nightly-red`` issue tracking it, open or closed and still
+   tracking as the filer decides (``owed_bugs``), and every open-bug count
+   shown was read from GitHub;
 8. links are well-formed: every ``href`` and ``src`` is an https URL with
    nothing a mail client would cut it at;
 9. domains match: every domain in the data is a row in domains.yaml, and
@@ -78,13 +81,13 @@ except ImportError:  # the workflow installs pyyaml; main() says so if absent
 try:
     import case_owner
 
-    from eval_dashboard import classify, ghcli, nightly, nightly_bugs
+    from eval_dashboard import classify, ghcli, nightly, nightly_bugs, nightly_infra
     from eval_dashboard.post_health import DASHBOARD_URL
 except ImportError:  # run as a script: scripts/eval_dashboard/weekly_email.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
     import case_owner
 
-    from eval_dashboard import classify, ghcli, nightly, nightly_bugs
+    from eval_dashboard import classify, ghcli, nightly, nightly_bugs, nightly_infra
     from eval_dashboard.post_health import DASHBOARD_URL
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -119,16 +122,22 @@ TREND_STEADY = "steady"
 BUG_LABEL = nightly_bugs.LABEL
 DOMAIN_LABEL = nightly_bugs.DOMAIN_LABEL
 GRAPHQL_PATH = "graphql"
-# One page of the open issues carrying the bug label, with their labels.
-OPEN_BUGS_QUERY = """query($owner: String!, $name: String!, $label: String!, $after: String) {
+GRAPHQL_METHOD = "POST"
+# One page of the issues carrying the bug label in the given states, with
+# what the bug filer reads of each (``nightly_bugs.tracking_issue``,
+# ``still_tracks``); ``since`` bounds the closed ones by their last update,
+# as the filer's own read of closed issues does.
+BUGS_QUERY = """query($owner: String!, $name: String!, $label: String!, $states: [IssueState!], $since: DateTime, $after: String) {
   repository(owner: $owner, name: $name) {
-    issues(labels: [$label], states: OPEN, first: 100, after: $after) {
+    issues(labels: [$label], states: $states, filterBy: {since: $since}, first: 100, after: $after) {
       totalCount
       pageInfo { hasNextPage endCursor }
-      nodes { labels(first: 50) { nodes { name } } }
+      nodes { number title body createdAt closedAt stateReason labels(first: 50) { nodes { name } } }
     }
   }
 }"""
+STATES_OPEN = ["OPEN"]
+STATES_CLOSED = ["CLOSED"]
 ISSUES_SEARCH_URL = "https://github.com/{repo}/issues?q={query}"
 BUG_QUERY = "is:issue is:open label:{label} label:{domain_label}"
 # The robot, from the published docs site (docs/site/public/agent-icon.png).
@@ -168,8 +177,8 @@ CLAIM_NOT_ENOUGH = "not_enough_data"
 CLAIM_MODEL_CHANGE = "model_change"
 CLAIM_TEMPLATES = {
     CLAIM_LEAD: "Here is how kube-agents did in the nightly tests for {range}: {passed} of {graded} test runs passed "
-    "({pct}%) across {scenarios} scenarios, on the {nights} of {dates} nights that ran to completion.",
-    CLAIM_GREAT: "In great shape (85% or more, and not down): {names}.",
+    "({pct}%) across {scenarios} scenarios, counting {nights} of the week's {dates} nights (the note at the end says why any is left out).",
+    CLAIM_GREAT: f"In great shape ({GREAT_SHAPE_PCT}% or more, and not down): {{names}}.",
     CLAIM_HALF: "Passed less than half the time: {names}.",
     CLAIM_DOWN: "Down from last week: {items}.",
     CLAIM_NOT_ENOUGH: "Not enough data this week to show a trend: {why}.",
@@ -183,8 +192,8 @@ TITLE = "kube-agents weekly health, week of {day}"
 HEADER_KICKER = "kube-agents &middot; weekly health"
 HEADER_TITLE = "Week of {day}"
 TILE_RATE_LABEL = "of test runs passed"
-TILE_SCENARIOS_LABEL = "scenarios tested nightly"
-TILE_SCENARIOS_SUB = "same set both weeks"
+TILE_SCENARIOS_LABEL = "scenarios compared"
+TILE_SCENARIOS_SUB = "graded both weeks"
 TILE_TIME_LABEL = "typical task time"
 TILE_TIME_VALUE = "{minutes} min"
 TILE_TIME_SUB = "middle of {count} timed runs"
@@ -202,7 +211,8 @@ ROW_NO_TREND = "no trend this week"
 ATTENTION_TITLE = "Needs attention"
 ATTENTION_INTRO = (f"Areas below {NEEDS_ATTENTION_BELOW_PCT}% or down {NEEDS_ATTENTION_DROP_PTS} points or more. "
                    "Each links to its open nightly bugs.")
-ATTENTION_NONE = "Nothing this week: every area is at 65% or more and none is down 5 points or more."
+ATTENTION_NONE = (f"Nothing this week: every area is at {NEEDS_ATTENTION_BELOW_PCT}% or more and none is down "
+                  f"{NEEDS_ATTENTION_DROP_PTS} points or more.")
 ATTENTION_RATE = "{pct}%"
 ATTENTION_DOWN = "{pct}%, down {pts}"
 ATTENTION_FEW = "{pct}%, few scenarios"
@@ -310,9 +320,25 @@ FAIL_TRUNCATED = "truncated nights: {day} is counted but was cut off at the dead
 FAIL_NOT_ENOUGH = "not enough data: {counted} and {prev} counted nights, yet a trend is called for {what}"
 FAIL_FEW = "few scenarios: {name} has {count} scenarios, yet its change is called {trend}"
 FAIL_CLAIM = "claims: {what}"
+WHY_NOT_TEMPLATE = "{kind!r} is not a template"
+WHY_NO_ROW = "{kind} names {slug}, which has no row"
+WHY_GREAT = "'in great shape' for {name} at {pct}% ({trend})"
+WHY_HALF = "'less than half the time' for {name} at {pct}%"
+WHY_DOWN = "'down {pts} pts' for {name}: dropped {drop} pts over {count} scenarios"
+WHY_NOT_ENOUGH_FALSE = "'not enough data' on a week with enough"
+WHY_NOT_ENOUGH_MISSING = "the week has too few counted nights and the intro does not say 'not enough data'"
+WHY_TREND = "{name}'s change {change} is called {trend}"
+WHY_DOUBLE = "an area counts a scenario twice, or one not graded both weeks"
+WHY_TILE = "the tile shows {shown} scenarios but {count} were compared"
+WHY_NOT_COMMON = "the compared scenarios are not the ones graded in both weeks"
+WHY_SUM = "the overall {key} count is not the sum over the compared scenarios"
+NO_TREND = "no trend"
+KEY_SEP = "_"
+SPACE = " "
+THE_WEEK = "the week"
 FAIL_ATTENTION = "needs attention: computed {want}, rendered {got}"
-FAIL_BUGS_UNREAD = "bugs: the open nightly-red issues could not be read from GitHub"
-FAIL_BUGS_ZERO = "bugs: {name} has {cases} failing every run on {nights}+ nights in a row and no open nightly-red issue labelled {label}; the bug filer is not filing"
+FAIL_BUGS_UNREAD = "bugs: the nightly-red issues could not be read from GitHub"
+FAIL_BUGS_ZERO = "bugs: {name} has {cases} failing every run on {nights}+ nights in a row and no nightly-red issue tracking it; the bug filer has not filed"
 FAIL_BUG_COUNT = "bugs: {name} shows {shown} open bugs but GitHub has {count}"
 FAIL_LINK = "links: {url!r} is not a well-formed https link"
 FAIL_LINK_MISSING = "links: the open-bugs link for {name} is missing from the page"
@@ -378,33 +404,64 @@ def store_models(store: dict | None) -> dict[str, set[str]]:
     return out
 
 
-def open_bug_counts(gh: ghcli.Gh, slugs: list[str], owner_repo: str = ghcli.DEFAULT_REPO) -> dict[str, int] | None:
-    """``{slug: open nightly-red issues labelled domain:<slug>}``, or None
-    when GitHub could not be read. Read through GraphQL, whose
-    ``totalCount`` lets the count be checked against the issues listed: the
-    REST issue list has answered an empty page for a label that has open
-    issues, which would show every count as 0."""
+def read_issues(gh: ghcli.Gh, states: list[str], since: str | None, owner_repo: str) -> list[dict] | None:
+    """The ``nightly-red`` issues in ``states`` in the REST shape the bug
+    filer reads (``number, title, body, created_at, closed_at, state_reason,
+    labels``), or None when GitHub could not be read. GraphQL, whose
+    ``totalCount`` lets the read be checked: the REST issue list has
+    answered an empty page for a label that has open issues."""
     owner, name = owner_repo.split("/", 1)
-    counts = dict.fromkeys(slugs, 0)
-    seen, cursor = 0, None
+    out: list[dict] = []
+    cursor = None
     while True:
-        reply = gh.call("POST", GRAPHQL_PATH, {"query": OPEN_BUGS_QUERY, "variables": {
-            "owner": owner, "name": name, "label": BUG_LABEL, "after": cursor}})
+        reply = gh.call(GRAPHQL_METHOD, GRAPHQL_PATH, {"query": BUGS_QUERY, "variables": {
+            "owner": owner, "name": name, "label": BUG_LABEL, "states": states, "since": since, "after": cursor}})
         try:
             issues = reply["data"]["repository"]["issues"]
             total, nodes, page = issues["totalCount"], issues["nodes"], issues["pageInfo"]
         except (KeyError, TypeError):
             return None
         for node in nodes:
-            labels = {label.get("name") for label in (node.get("labels") or {}).get("nodes") or [] if isinstance(label, dict)}
-            for slug in slugs:
-                if DOMAIN_LABEL.format(slug=slug) in labels:
-                    counts[slug] += 1
-        seen += len(nodes)
+            labels = [{"name": label.get("name")} for label in (node.get("labels") or {}).get("nodes") or [] if isinstance(label, dict)]
+            out.append({"number": node.get("number"), "title": node.get("title"), "body": node.get("body"),
+                        "created_at": node.get("createdAt"), "closed_at": node.get("closedAt"),
+                        "state_reason": str(node.get("stateReason") or "").lower() or None, "labels": labels})
         if not page.get("hasNextPage"):
             break
-        cursor = page.get("endCursor")
-    return counts if seen == total else None
+        if not page.get("endCursor"):
+            return None
+        cursor = page["endCursor"]
+    return out if len(out) == total else None
+
+
+def read_bugs(gh: ghcli.Gh, data: dict, owner_repo: str = ghcli.DEFAULT_REPO) -> dict | None:
+    """``{open: [...], closed: [...]}``: the open ``nightly-red`` issues, and
+    the closed ones updated since the bug filer's horizon (the start of the
+    first night it reads); None when either read failed."""
+    horizon = filer_horizon(data)
+    opened = read_issues(gh, STATES_OPEN, None, owner_repo)
+    closed = read_issues(gh, STATES_CLOSED, horizon.strftime(nightly_bugs.GITHUB_TIME_FORMAT), owner_repo) if horizon else []
+    if opened is None or closed is None:
+        return None
+    return {"open": opened, "closed": closed}
+
+
+def filer_horizon(data: dict) -> datetime.datetime | None:
+    """The bug filer's horizon, computed as ``Filer.run`` computes it."""
+    parts = nightly_infra.part_nights(data, nightly_bugs.LOOKBACK_NIGHTS)
+    starts = [nightly.parse_iso(n.get("started")) for ns in parts.values() for n in ns]
+    return min((t for t in starts if t), default=None)
+
+
+def domain_counts(issues: list[dict], slugs: list[str]) -> dict[str, int]:
+    """``{slug: issues labelled domain:<slug>}``."""
+    counts = dict.fromkeys(slugs, 0)
+    for issue in issues:
+        labels = {label.get("name") for label in issue.get("labels") or []}
+        for slug in slugs:
+            if DOMAIN_LABEL.format(slug=slug) in labels:
+                counts[slug] += 1
+    return counts
 
 
 def bugs_url(repo: str, slug: str) -> str:
@@ -428,10 +485,10 @@ def night_status(night: dict[str, dict]) -> str | None:
     return None
 
 
-def nights_by_date(data: dict) -> tuple[dict[datetime.date, dict], dict[datetime.date, str]]:
-    """``({date: counted night}, {date: why left out})``: per date the newest
-    counted night; a date with none is left out with the newest night's reason."""
-    counted: dict[datetime.date, dict] = {}
+def nights_by_date(data: dict) -> tuple[dict[datetime.date, list[dict]], dict[datetime.date, str]]:
+    """``({date: [counted night, ...] oldest first}, {date: why left out})``;
+    a date with no counted night is left out with its newest night's reason."""
+    counted: dict[datetime.date, list[dict]] = {}
     left_out: dict[datetime.date, str] = {}
     for night in nightly.group_nights(nightly.sorted_nightly_runs(data)):
         day = nightly.night_date(nightly.night_parts(night)[0])
@@ -439,7 +496,7 @@ def nights_by_date(data: dict) -> tuple[dict[datetime.date, dict], dict[datetime
             continue
         why = night_status(night)
         if why is None:
-            counted[day] = night
+            counted.setdefault(day, []).append(night)
             left_out.pop(day, None)
         elif day not in counted:
             left_out[day] = why
@@ -465,22 +522,26 @@ def night_reps(night: dict[str, dict]) -> dict[str, dict]:
     return out
 
 
-def week_cases(counted: dict[datetime.date, dict], days: list[datetime.date]) -> dict[str, dict]:
-    """``{case: {passed, graded, agent_s}}`` summed over the week's counted nights."""
+def date_reps(nights: list[dict]) -> dict[str, dict]:
+    """One date's verdicts: per case, the newest counted night that graded
+    it stands, as ``nightly_bugs.graded_nights`` reads a re-run, so a main
+    re-run with no writers part keeps the writers cases of the cron night."""
+    out: dict[str, dict] = {}
+    for night in nights:
+        out.update(night_reps(night))
+    return out
+
+
+def week_cases(counted: dict[datetime.date, list[dict]], days: list[datetime.date]) -> dict[str, dict]:
+    """``{case: {passed, graded, agent_s}}`` summed over the week's counted dates."""
     out: dict[str, dict] = {}
     for day in days:
-        if day not in counted:
-            continue
-        for name, reps in night_reps(counted[day]).items():
+        for name, reps in date_reps(counted.get(day, [])).items():
             row = out.setdefault(name, {"passed": 0, "graded": 0, "agent_s": []})
             row["passed"] += reps["passed"]
             row["graded"] += reps["graded"]
             row["agent_s"] += reps["agent_s"]
     return out
-
-
-def night_builds(night: dict[str, dict]) -> list[str]:
-    return [run["build_id"] for run in nightly.night_parts(night) if isinstance(run.get("build_id"), str)]
 
 
 def week_models(counted: dict, days: list[datetime.date], models: dict[str, set[str]]) -> tuple[list[str], list[datetime.date]]:
@@ -490,29 +551,50 @@ def week_models(counted: dict, days: list[datetime.date], models: dict[str, set[
     for day in days:
         if day not in counted:
             continue
-        night_models = set().union(*(models.get(b, set()) for b in night_builds(counted[day])))
+        builds = [run["build_id"] for night in counted[day] for run in nightly.night_parts(night) if isinstance(run.get("build_id"), str)]
+        night_models = set().union(*(models.get(b, set()) for b in builds))
         if not night_models:
             missing.append(day)
         found |= night_models
     return sorted(found), missing
 
 
-def streak_cases(data: dict, repo_root: pathlib.Path) -> dict[str, list[str]]:
-    """``{domain: [case, ...]}``: the cases the bug filer owes a bug right now
-    -- failed every graded repetition on their last STREAK_NIGHTS graded
-    nights on record (``nightly_bugs.graded_nights``), on this checkout's
-    nightly matrix, not ``expected_fail`` -- under the domain their task.yaml
-    claims, which is the label the filer puts on the bug. Judged on every
-    night on record, as the filer judges it, not only the week's: a case red
-    through Sunday that passed Monday's night is owed nothing."""
+def streak_cases(data: dict, repo_root: pathlib.Path) -> dict[str, dict]:
+    """``{case: {domain, newest, passes}}``: the cases on a red streak the
+    bug filer files for right now -- failed every graded repetition on their
+    last STREAK_NIGHTS graded nights on record (``nightly_bugs.graded_nights``),
+    on this checkout's nightly matrix, not ``expected_fail`` -- with the
+    domain their task.yaml claims (the label the filer puts on the bug), the
+    streak's newest night and the passing nights, which ``owed_bugs`` reads
+    as the filer does. Judged on every night on record, not only the week's:
+    a case red through Sunday that passed Monday's night is owed nothing."""
     active = set(nightly.expected_cases(data))
-    out: dict[str, list[str]] = {}
+    out: dict[str, dict] = {}
     for case, verdicts in nightly_bugs.graded_nights(data).items():
+        streak = nightly_bugs.red_streak(verdicts)
         fields = nightly_bugs.task_fields(case, repo_root)
-        if not nightly_bugs.red_streak(verdicts) or fields is None or case not in active or fields["expected_fail"]:
+        if not streak or fields is None or case not in active or fields["expected_fail"]:
             continue
-        out.setdefault(fields["domain"] or nightly.DOMAIN_UNKNOWN, []).append(case)
-    return {domain: sorted(cases) for domain, cases in out.items()}
+        out[case] = {"domain": fields["domain"] or nightly.DOMAIN_UNKNOWN, "newest": streak[-1],
+                     "passes": [v for v in verdicts if v["outcome"] == classify.OUTCOME_PASSED]}
+    return out
+
+
+def owed_bugs(streaks: dict[str, dict], bugs: dict, horizon: datetime.datetime | None) -> dict[str, list[str]]:
+    """``{domain: [case, ...]}``: streak cases no issue tracks -- no open
+    ``nightly-red`` issue names the case, and no closed one still tracks it
+    (``nightly_bugs.still_tracks``: closed after the streak's newest night,
+    or handed off as not planned with no pass since). These are the bugs
+    the filer should have filed and has not."""
+    out: dict[str, list[str]] = {}
+    for case, info in sorted(streaks.items()):
+        if nightly_bugs.tracking_issue(bugs["open"], case):
+            continue
+        closed = [i for i in bugs["closed"] if nightly_bugs.still_tracks(i, info["newest"], info["passes"], horizon)]
+        if nightly_bugs.tracking_issue(closed, case):
+            continue
+        out.setdefault(info["domain"], []).append(case)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -559,7 +641,7 @@ def build_week(data: dict, store: dict | None, domain_rows: list[dict], week_end
         "data_domains": {}, "rows": [], "attention": [], "claims": [], "fatal": None,
         "footer": {"range": [prev_days[0].isoformat(), week_end.isoformat()], "models": this_models,
                    "prev_models": prev_models, "missing": [d.isoformat() for d in this_missing + prev_missing]},
-        "streaks": streak_cases(data, repo_root),
+        "streaks": streak_cases(data, repo_root), "horizon": filer_horizon(data),
     }
     for case in sorted(set(this_cases) | set(prev_cases)):
         week["data_domains"].setdefault(domain_of.get(case, nightly.DOMAIN_UNKNOWN), []).append(case)
@@ -657,32 +739,32 @@ def claim_failures(week: dict) -> list[str]:
     for claim in week["claims"]:
         kind = claim.get("kind")
         if kind not in CLAIM_TEMPLATES:
-            out.append(FAIL_CLAIM.format(what=f"{kind!r} is not a template"))
+            out.append(FAIL_CLAIM.format(what=WHY_NOT_TEMPLATE.format(kind=kind)))
             continue
         for slug in claim.get("subjects") or []:
             row = rows.get(slug)
             if row is None:
-                out.append(FAIL_CLAIM.format(what=f"{kind} names {slug}, which has no row"))
+                out.append(FAIL_CLAIM.format(what=WHY_NO_ROW.format(kind=kind, slug=slug)))
             elif kind == CLAIM_GREAT and not (row["pct"] >= GREAT_SHAPE_PCT and row["trend"] in (TREND_UP, TREND_STEADY)):
-                out.append(FAIL_CLAIM.format(what=f"'in great shape' for {row['name']} at {row['pct']}% ({row['trend'] or 'no trend'})"))
+                out.append(FAIL_CLAIM.format(what=WHY_GREAT.format(name=row["name"], pct=row["pct"], trend=row["trend"] or NO_TREND)))
             elif kind == CLAIM_HALF and not row["pct"] < LESS_THAN_HALF_PCT:
-                out.append(FAIL_CLAIM.format(what=f"'less than half the time' for {row['name']} at {row['pct']}%"))
+                out.append(FAIL_CLAIM.format(what=WHY_HALF.format(name=row["name"], pct=row["pct"])))
             elif kind == CLAIM_DOWN:
                 pts = (claim.get("values") or {}).get("pts", {}).get(slug)
                 drop = row["prev_pct"] - row["pct"]
                 if not (row["scenarios"] >= MIN_TREND_SCENARIOS and week["trend_ok"] and drop >= TREND_PTS and pts == drop):
-                    out.append(FAIL_CLAIM.format(what=f"'down {pts} pts' for {row['name']}: dropped {drop} pts over {row['scenarios']} scenarios"))
+                    out.append(FAIL_CLAIM.format(what=WHY_DOWN.format(pts=pts, name=row["name"], drop=drop, count=row["scenarios"])))
         if kind == CLAIM_NOT_ENOUGH and week["trend_ok"]:
-            out.append(FAIL_CLAIM.format(what="'not enough data' on a week with enough"))
+            out.append(FAIL_CLAIM.format(what=WHY_NOT_ENOUGH_FALSE))
     if not week["trend_ok"] and not any(c.get("kind") == CLAIM_NOT_ENOUGH for c in week["claims"]):
-        out.append(FAIL_CLAIM.format(what="the week has too few counted nights and the intro does not say 'not enough data'"))
+        out.append(FAIL_CLAIM.format(what=WHY_NOT_ENOUGH_MISSING))
     for row in week["rows"]:
         if row["trend"] != trend_of(row["change"]) or (row["change"] is not None and row["change"] != row["pct"] - row["prev_pct"]):
-            out.append(FAIL_CLAIM.format(what=f"{row['name']}'s change {row['change']} is called {row['trend']}"))
+            out.append(FAIL_CLAIM.format(what=WHY_TREND.format(name=row["name"], change=row["change"], trend=row["trend"])))
     return out
 
 
-def integrity_failures(week: dict, domain_rows: list[dict], bug_counts: dict[str, int] | None,
+def integrity_failures(week: dict, domain_rows: list[dict], bugs: dict | None,
                        data: dict, page: str | None = None) -> list[str]:
     """Every integrity check (module docstring) over the computed week and,
     when given, the rendered page. Empty means the email may be rendered."""
@@ -695,19 +777,19 @@ def integrity_failures(week: dict, domain_rows: list[dict], bug_counts: dict[str
     # 1. same cases
     shown = [c for r in rows for c in r["cases"]]
     if len(shown) != len(set(shown)) or not set(shown) <= common:
-        out.append(FAIL_SAME_CASES.format(what="an area counts a scenario twice, or one not graded both weeks"))
+        out.append(FAIL_SAME_CASES.format(what=WHY_DOUBLE))
     if week["overall"]["scenarios"] != len(common):
-        out.append(FAIL_SAME_CASES.format(what=f"the tile shows {week['overall']['scenarios']} scenarios but {len(common)} were compared"))
+        out.append(FAIL_SAME_CASES.format(what=WHY_TILE.format(shown=week["overall"]["scenarios"], count=len(common))))
     counted, _ = nights_by_date(data)
     this_cases = week_cases(counted, [datetime.date.fromisoformat(d) for d in week["days"]])
     prev_cases = week_cases(counted, [datetime.date.fromisoformat(d) for d in week["prev_days"]])
     if common != set(this_cases) & set(prev_cases):
-        out.append(FAIL_SAME_CASES.format(what="the compared scenarios are not the ones graded in both weeks"))
+        out.append(FAIL_SAME_CASES.format(what=WHY_NOT_COMMON))
     else:
         for key, source in (("passed", this_cases), ("graded", this_cases), ("prev_passed", prev_cases), ("prev_graded", prev_cases)):
             field = key.removeprefix("prev_")
             if week["overall"][key] != sum(source[c][field] for c in common):
-                out.append(FAIL_SAME_CASES.format(what=f"the overall {key.replace('_', ' ')} count is not the sum over the compared scenarios"))
+                out.append(FAIL_SAME_CASES.format(what=WHY_SUM.format(key=key.replace(KEY_SEP, SPACE))))
 
     # 2. truncated nights excluded
     for day in week["counted"] + week["prev_counted"]:
@@ -719,7 +801,7 @@ def integrity_failures(week: dict, domain_rows: list[dict], bug_counts: dict[str
     if not enough:
         called = [r["name"] for r in rows if r["trend"] is not None] + (["overall"] if week["overall"]["trend"] else [])
         if week["trend_ok"] or called:
-            out.append(FAIL_NOT_ENOUGH.format(counted=len(week["counted"]), prev=len(week["prev_counted"]), what=NAMES_JOIN.join(called) or "the week"))
+            out.append(FAIL_NOT_ENOUGH.format(counted=len(week["counted"]), prev=len(week["prev_counted"]), what=NAMES_JOIN.join(called) or THE_WEEK))
 
     # 4. few scenarios
     for row in rows:
@@ -736,16 +818,16 @@ def integrity_failures(week: dict, domain_rows: list[dict], bug_counts: dict[str
 
     # 7. bugs exist
     names = {r["slug"]: r["name"] for r in domain_rows}
-    if bug_counts is None:
+    if bugs is None:
         out.append(FAIL_BUGS_UNREAD)
     else:
-        for domain, cases in sorted(week["streaks"].items()):
-            if bug_counts.get(domain, 0) == 0:
-                out.append(FAIL_BUGS_ZERO.format(name=names.get(domain, domain), cases=NAMES_JOIN.join(cases),
-                                                 nights=nightly_bugs.STREAK_NIGHTS, label=DOMAIN_LABEL.format(slug=domain)))
+        for domain, cases in sorted(owed_bugs(week["streaks"], bugs, week["horizon"]).items()):
+            out.append(FAIL_BUGS_ZERO.format(name=names.get(domain, domain), cases=NAMES_JOIN.join(cases),
+                                             nights=nightly_bugs.STREAK_NIGHTS))
+        counts = domain_counts(bugs["open"], list(week.get("shown_bugs") or {}))
         for slug, shown_count in (week.get("shown_bugs") or {}).items():
-            if shown_count != bug_counts.get(slug):
-                out.append(FAIL_BUG_COUNT.format(name=names.get(slug, slug), shown=shown_count, count=bug_counts.get(slug)))
+            if shown_count != counts.get(slug):
+                out.append(FAIL_BUG_COUNT.format(name=names.get(slug, slug), shown=shown_count, count=counts.get(slug)))
 
     # 8. links
     if page is not None:
@@ -822,7 +904,7 @@ def change_label(trend: str | None, change: int | None) -> tuple[str, str]:
     return "", f"color:{MUTED};"
 
 
-def render(week: dict, bug_counts: dict[str, int], repo: str = ghcli.DEFAULT_REPO) -> str:
+def render(week: dict, bugs: dict, repo: str = ghcli.DEFAULT_REPO) -> str:
     """The email's HTML. Sets ``week['shown_bugs']`` to the counts it printed."""
     rows_by_slug = {r["slug"]: r for r in week["rows"]}
     day = datetime.date.fromisoformat(week["days"][0])
@@ -855,6 +937,7 @@ def render(week: dict, bug_counts: dict[str, int], repo: str = ghcli.DEFAULT_REP
 
     shown = {}
     items = []
+    bug_counts = domain_counts(bugs["open"], week["attention"])
     for slug in week["attention"]:
         row = rows_by_slug[slug]
         if row["few"]:
@@ -903,17 +986,17 @@ def render(week: dict, bug_counts: dict[str, int], repo: str = ghcli.DEFAULT_REP
 # ---------------------------------------------------------------------------
 
 
-def produce(data: dict, store: dict | None, domain_rows: list[dict], week_end: datetime.date, bug_counts: dict[str, int] | None,
+def produce(data: dict, store: dict | None, domain_rows: list[dict], week_end: datetime.date, bugs: dict | None,
             now: datetime.datetime, repo: str = ghcli.DEFAULT_REPO, repo_root: pathlib.Path = REPO_ROOT) -> tuple[str | None, list[str]]:
     """``(html, [])`` when every check passes, else ``(None, reasons)``."""
     week = build_week(data, store, domain_rows, week_end, repo_root)
     week["rendered"] = now.strftime(TIME_FORMAT)
-    failures = integrity_failures(week, domain_rows, bug_counts, data)
+    failures = integrity_failures(week, domain_rows, bugs, data)
     if failures:
         return None, failures
     failures = recheck_footer(week, data, store)
-    page = render(week, bug_counts, repo)
-    failures += integrity_failures(week, domain_rows, bug_counts, data, page)
+    page = render(week, bugs, repo)
+    failures += integrity_failures(week, domain_rows, bugs, data, page)
     return (None, sorted(set(failures), key=failures.index)) if failures else (page, [])
 
 
@@ -942,9 +1025,9 @@ def main(argv=None, gh_runner=None, now: datetime.datetime | None = None) -> int
         return 1
     domain_rows = load_domains(args.repo_root)
     gh = ghcli.Gh(args.repo, gh_runner) if gh_runner else ghcli.Gh(args.repo)
-    bug_counts = open_bug_counts(gh, [r["slug"] for r in domain_rows], args.repo)
+    bugs = read_bugs(gh, data if isinstance(data, dict) else {}, args.repo)
     week_end = args.week_end or default_week_end(now.date())
-    page, failures = produce(data if isinstance(data, dict) else {}, store, domain_rows, week_end, bug_counts, now, args.repo, args.repo_root)
+    page, failures = produce(data if isinstance(data, dict) else {}, store, domain_rows, week_end, bugs, now, args.repo, args.repo_root)
     if failures:
         log(f"weekly health email for the week ending {week_end}: NOT rendered; an integrity check failed:")
         for reason in failures:

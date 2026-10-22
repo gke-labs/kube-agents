@@ -91,20 +91,47 @@ class GhResult:
         self.returncode, self.stdout, self.stderr = rc, stdout, stderr
 
 
-class FakeGh:
-    """A `gh api graphql` runner answering the open nightly-red issues."""
+def bug(case, domain, number=4000, closed_at=None, state_reason=None):
+    """A nightly-red issue as the bug filer files it, in REST shape."""
+    return {"number": number, "title": f"Nightly: {case} fails every run, 3 nights in a row",
+            "body": f"<!-- kube-agents-bot:nightly-red case={case} -->\n", "created_at": "2026-10-16T12:00:00Z",
+            "closed_at": closed_at, "state_reason": state_reason,
+            "labels": [{"name": "nightly-red"}, {"name": f"domain:{domain}"}]}
 
-    def __init__(self, labels=(), fail=False):
-        self.issues = [{"labels": {"nodes": [{"name": "nightly-red"}, {"name": label}]}} for label in labels]
+
+def bugs_of(opened=None, closed=()):
+    """Default: one open bug, for obs-1, which fails every night."""
+    return {"open": [bug("obs-1", "obs")] if opened is None else list(opened), "closed": list(closed)}
+
+
+def node(issue):
+    return {"number": issue["number"], "title": issue["title"], "body": issue["body"], "createdAt": issue["created_at"],
+            "closedAt": issue["closed_at"], "stateReason": (issue["state_reason"] or "").upper() or None,
+            "labels": {"nodes": issue["labels"]}}
+
+
+class FakeGh:
+    """A `gh api graphql` runner answering the nightly-red issues by state,
+    ``page`` at a time."""
+
+    def __init__(self, opened=(), closed=(), fail=False, page=100):
+        self.issues = {"OPEN": [node(i) for i in opened], "CLOSED": [node(i) for i in closed]}
         self.fail = fail
+        self.page = page
         self.calls = []
 
     def __call__(self, argv, input=None, **kwargs):
-        self.calls.append((argv, json.loads(input) if input else None))
+        body = json.loads(input) if input else None
+        self.calls.append((argv, body))
         if self.fail:
             return GhResult(rc=1, stderr="HTTP 502")
-        reply = {"data": {"repository": {"issues": {"totalCount": len(self.issues), "nodes": self.issues,
-                                                     "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}
+        variables = body["variables"]
+        nodes = self.issues[variables["states"][0]]
+        start = int(variables["after"] or 0)
+        chunk = nodes[start:start + self.page]
+        more = start + self.page < len(nodes)
+        reply = {"data": {"repository": {"issues": {"totalCount": len(nodes), "nodes": chunk,
+                                                     "pageInfo": {"hasNextPage": more, "endCursor": str(start + self.page) if more else None}}}}}
         return GhResult(stdout=json.dumps(reply))
 
 
@@ -133,14 +160,13 @@ class Base(unittest.TestCase):
         return we.build_week(data, store, self.rows(), WEEK_END, self.root)
 
     def produce(self, data, store=None, bugs=None):
-        """``(html, failures)``; bugs default to one open bug for obs, whose
-        obs-1 fails every night (the filer owes it one)."""
+        """``(html, failures)``; bugs default to ``bugs_of()``."""
         store = store_of(data["runs"]) if store is None else store
-        bugs = {"chat": 0, "cost": 0, "obs": 1} if bugs is None else bugs
+        bugs = bugs_of() if bugs is None else bugs
         return we.produce(data, store, self.rows(), WEEK_END, bugs, NOW, REPO, self.root)
 
     def failures(self, week, data, bugs=None, page=None):
-        bugs = {"chat": 0, "cost": 0, "obs": 1} if bugs is None else bugs
+        bugs = bugs_of() if bugs is None else bugs
         return we.integrity_failures(week, self.rows(), bugs, data, page)
 
     def assertRefused(self, failures, needle):
@@ -168,7 +194,7 @@ class TheEmail(Base):
             (tmp / "data.json").write_text(json.dumps(data))
             (tmp / "store.json").write_text(json.dumps(store_of(data["runs"])))
             out = tmp / we.OUT_NAME
-            gh = FakeGh(labels=["domain:obs"])
+            gh = FakeGh(opened=[bug("obs-1", "obs")])
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 rc = we.main(["--data", str(tmp / "data.json"), "--store", str(tmp / "store.json"), "--out", str(out),
                               "--week-end", WEEK_END.isoformat(), "--repo-root", str(self.root)], gh_runner=gh, now=NOW)
@@ -185,7 +211,7 @@ class TheEmail(Base):
             err = io.StringIO()
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
                 rc = we.main(["--data", str(tmp / "data.json"), "--out", str(out), "--week-end", WEEK_END.isoformat(),
-                              "--repo-root", str(self.root)], gh_runner=FakeGh(labels=["domain:obs"]), now=NOW)
+                              "--repo-root", str(self.root)], gh_runner=FakeGh(opened=[bug("obs-1", "obs")]), now=NOW)
             self.assertEqual(rc, 1)
             self.assertFalse(out.exists())
             self.assertIn("NOT rendered", err.getvalue())
@@ -199,8 +225,38 @@ class TheEmail(Base):
     def test_the_workflow_renders_it_beside_data_json_and_sends_nothing(self):
         text = WORKFLOW.read_text()
         self.assertIn("scripts/eval_dashboard/weekly_email.py", text)
-        self.assertIn(f"--out work/site/{we.OUT_NAME}", text)
-        self.assertLess(text.index("weekly_email.py"), text.index("publish.py --out-dir work/site"))
+        self.assertIn(f"--out work/{we.OUT_NAME}", text)
+        self.assertIn(f'"$DASHBOARD_BUCKET/{we.OUT_NAME}"', text)
+        # After the bug filer, so a bug it files this tick counts.
+        self.assertLess(text.index("nightly_bugs.py --data"), text.index("weekly_email.py --data"))
+        self.assertNotIn("sendmail", text)
+
+
+class Nights(Base):
+    """How nights are read: run-level events left out, re-runs merged per case."""
+
+    def test_a_run_level_event_is_left_out_and_named(self):
+        runs = [r if not r["started"].startswith("2026-10-15") else run(15, [task(c, 0) for c in CASES]) for r in week_runs()]
+        week = self.week(data_of(runs), store_of(runs))
+        self.assertNotIn("2026-10-15", week["counted"])
+        self.assertEqual(week["left_out"]["2026-10-15"], we.WHY_RUN_EVENT)
+
+    def test_a_same_date_rerun_keeps_the_cases_it_did_not_run(self):
+        runs = week_runs()
+        rerun = run(18, [task("chat-1", 0), task("chat-2", 3), task("chat-3", 3)])
+        rerun.update(build_id="3000000000000189999", started="2026-10-18T05:00:00+00:00")
+        week = self.week(data_of(runs + [rerun]), store_of(runs + [rerun]))
+        clean = self.week(data_of(runs), store_of(runs))
+        # The re-run's chat-1 verdict replaces the cron night's; every other
+        # case keeps its cron-night verdict.
+        self.assertEqual(week["overall"]["graded"], clean["overall"]["graded"])
+        self.assertEqual(week["overall"]["passed"], clean["overall"]["passed"] - 3)
+
+    def test_rounding_and_dates(self):
+        self.assertEqual(we.pct_of(169, 200), 85)  # 84.5 rounds up
+        self.assertEqual(we.pct_of(1, 3), 33)
+        self.assertEqual(we.date_range(datetime.date(2026, 10, 26), datetime.date(2026, 11, 1)), "Oct 26 – Nov 1")
+        self.assertEqual(we.date_range(datetime.date(2026, 10, 12), datetime.date(2026, 10, 18)), "Oct 12–18")
 
 
 class SameCases(Base):
@@ -295,7 +351,7 @@ class FewScenarios(Base):
         obs = next(r for r in week["rows"] if r["slug"] == "obs")
         self.assertTrue(obs["few"])
         self.assertIsNone(obs["trend"])
-        page, failures = self.produce(data_of(runs), store_of(runs), bugs={"chat": 0, "cost": 0, "obs": 2})
+        page, failures = self.produce(data_of(runs), store_of(runs), bugs=bugs_of([bug("obs-1", "obs"), bug("obs-2", "obs", 4001)]))
         self.assertEqual(failures, [])
         self.assertIn("few scenarios", page)
         self.assertNotIn("Observability (down", page)
@@ -365,19 +421,39 @@ class BugsExist(Base):
     """Check 7: an area owed a bug has one open; counts come from GitHub."""
 
     def test_counts_shown_are_githubs(self):
-        page, failures = self.produce(data_of(week_runs()), bugs={"chat": 0, "cost": 2, "obs": 1})
+        opened = [bug("obs-1", "obs"), bug("cost-1", "cost", 4001), bug("cost-2", "cost", 4002)]
+        page, failures = self.produce(data_of(week_runs()), bugs=bugs_of(opened))
         self.assertEqual(failures, [])
         self.assertIn("Open bugs (2)", page)
         self.assertIn("Open bugs (1)", page)
 
-    def test_a_red_streak_with_no_open_bug_refuses(self):
-        _, failures = self.produce(data_of(week_runs()), bugs={"chat": 0, "cost": 0, "obs": 0})
+    def test_a_red_streak_with_no_issue_refuses(self):
+        _, failures = self.produce(data_of(week_runs()), bugs=bugs_of([]))
         self.assertRefused(failures, "bugs: Observability has obs-1 failing every run")
+
+    def test_a_bug_for_another_case_does_not_count(self):
+        _, failures = self.produce(data_of(week_runs()), bugs=bugs_of([bug("obs-2", "obs")]))
+        self.assertRefused(failures, "bugs: Observability has obs-1")
+
+    def test_a_closed_bug_that_still_tracks_counts(self):
+        # Handed off as not planned after the streak began, with no pass since.
+        handed_off = bug("obs-1", "obs", closed_at="2026-10-18T12:00:00Z", state_reason="not_planned")
+        _, failures = self.produce(data_of(week_runs()), bugs=bugs_of([], [handed_off]))
+        self.assertEqual(failures, [])
+        # A "completed" close before the streak's newest night does not.
+        fixed = bug("obs-1", "obs", closed_at="2026-10-16T12:00:00Z", state_reason="completed")
+        _, failures = self.produce(data_of(week_runs()), bugs=bugs_of([], [fixed]))
+        self.assertRefused(failures, "bugs: Observability has obs-1")
 
     def test_an_expected_fail_case_is_owed_nothing(self):
         path = self.root / "bench" / "tasks" / "obs-1" / "task.yaml"
         path.write_text(path.read_text() + "expected_fail: true\n")
-        _, failures = self.produce(data_of(week_runs()), bugs={"chat": 0, "cost": 0, "obs": 0})
+        _, failures = self.produce(data_of(week_runs()), bugs=bugs_of([]))
+        self.assertEqual(failures, [])
+
+    def test_a_case_that_passed_after_the_week_is_owed_nothing(self):
+        runs = week_runs() + [run(19, [task(c, 3) for c in CASES])]
+        _, failures = self.produce(data_of(runs), store_of(runs), bugs=bugs_of([]))
         self.assertEqual(failures, [])
 
     def test_github_unreadable_refuses(self):
@@ -385,16 +461,24 @@ class BugsExist(Base):
         _, failures = we.produce(data, store_of(data["runs"]), self.rows(), WEEK_END, None, NOW, REPO, self.root)
         self.assertRefused(failures, "could not be read from GitHub")
 
-    def test_a_count_that_does_not_add_up_reads_as_unreadable(self):
-        gh = we.ghcli.Gh(REPO, FakeGh(labels=["domain:obs"]))
-        self.assertEqual(we.open_bug_counts(gh, ["obs", "cost"], REPO), {"obs": 1, "cost": 0})
+    def test_the_read_pages_and_checks_the_total(self):
+        data = data_of(week_runs())
+        opened = [bug(f"c{i}", "obs", 5000 + i) for i in range(5)]
+        closed = [bug("obs-1", "obs", 4000, closed_at="2026-10-18T12:00:00Z", state_reason="not_planned")]
+        gh = FakeGh(opened=opened, closed=closed, page=2)
+        bugs = we.read_bugs(we.ghcli.Gh(REPO, gh), data, REPO)
+        self.assertEqual([i["number"] for i in bugs["open"]], [5000 + i for i in range(5)])
+        self.assertEqual(bugs["closed"][0]["state_reason"], "not_planned")
+        self.assertEqual(we.domain_counts(bugs["open"], ["obs", "cost"]), {"obs": 5, "cost": 0})
+        closed_call = next(b for _, b in gh.calls if b["variables"]["states"] == ["CLOSED"])
+        self.assertEqual(closed_call["variables"]["since"], "2026-10-05T00:00:30Z")
 
         def short(argv, input=None, **kwargs):
             reply = {"data": {"repository": {"issues": {"totalCount": 5, "nodes": [],
                                                          "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}
             return GhResult(stdout=json.dumps(reply))
-        self.assertIsNone(we.open_bug_counts(we.ghcli.Gh(REPO, short), ["obs"], REPO))
-        self.assertIsNone(we.open_bug_counts(we.ghcli.Gh(REPO, FakeGh(fail=True)), ["obs"], REPO))
+        self.assertIsNone(we.read_bugs(we.ghcli.Gh(REPO, short), data, REPO))
+        self.assertIsNone(we.read_bugs(we.ghcli.Gh(REPO, FakeGh(fail=True)), data, REPO))
 
 
 class LinksWellFormed(Base):
@@ -436,10 +520,12 @@ class DomainsMatch(Base):
 
     def test_a_domains_yaml_row_with_no_data_refuses_unless_new(self):
         self.domains = DOMAINS + [{"slug": "quiet", "name": "Quiet", "owner": "a", "backup": "b", "meaning": "m"}]
+        self.tearDown()
         self.setUp()
         _, failures = self.produce(data_of(week_runs()))
         self.assertRefused(failures, "domains: quiet is in docs/designs/domains.yaml")
         self.domains = DOMAINS + [{"slug": "quiet", "name": "Quiet", "owner": "a", "backup": "b", "meaning": "m", "new": True}]
+        self.tearDown()
         self.setUp()
         _, failures = self.produce(data_of(week_runs()))
         self.assertEqual(failures, [])

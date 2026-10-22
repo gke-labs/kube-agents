@@ -802,22 +802,23 @@ against any `data.json`; `--live` writes.
 ## The weekly health email
 
 `scripts/eval_dashboard/weekly_email.py` renders a one-page summary of the
-nightly tier for leadership and the team, and the render step publishes it as
-`health-email.html` beside `data.json`. Nothing sends it yet: the mail route,
+nightly tier for leadership and the team. Its step runs after the bug filer, so
+a bug filed that tick counts, and publishes it as `health-email.html` beside
+`data.json`. Nothing sends it yet: the mail route,
 the sending account and the chat line that links to it are still to be decided.
 
 The week is the seven nightly dates ending on the Sunday before the tick
 (`--week-end` overrides it), compared with the seven before. A night counts
 when none of its parts was cut off at the job deadline, it has a main part, and
-nearly every graded case did not fail; two counted nights on one date are one
-night, the newer standing. A pass rate is passes over graded repetitions
+it is not a night on which nearly every graded case failed; two counted nights
+on one date are one night, each case's newer verdict standing. A pass rate is passes over graded repetitions
 (infrastructure repetitions are never graded), over the scenarios graded in both
 weeks; a scenario graded in only one week is left out and counted in the
 closing note.
 
 The page carries the robot from the docs site, a one-paragraph intro, three
 tiles (pass rate and its change, scenarios compared, the median `agent_s` of
-the week's graded repetitions), a "Needs attention" box, one row per area with
+the compared scenarios' graded repetitions), a "Needs attention" box, one row per area with
 its `meaning:` from [`docs/designs/domains.yaml`](designs/domains.yaml) (no
 owners), how failures become bugs, and a footer naming the dates and the model
 the evidence store records for the counted nights' builds (`store.json`).
@@ -839,11 +840,13 @@ stays. The checks:
   A change under 3 points is "steady".
 - **Needs attention.** Exactly the areas below 65% or down 5 points or more.
   Each links to its open `nightly-red` + `domain:<slug>` issues with the count.
-- **Bugs exist.** The open `nightly-red` issues are read from GitHub (GraphQL,
-  checked against its total count); an area with a case the bug filer owes a
-  bug right now (failing every graded repetition on its last 3 graded nights,
-  on the nightly matrix, not `expected_fail`) and no open issue for its domain
-  blocks the render.
+- **Bugs exist.** The `nightly-red` issues are read from GitHub (GraphQL,
+  checked against its total count). A case the bug filer files for right now
+  (failing every graded repetition on its last 3 graded nights, on the nightly
+  matrix, not `expected_fail`) with no issue tracking it blocks the render: no
+  open issue names it, and no closed one still tracks it by the filer's rule
+  ([Nightly bugs](#nightly-bugs)). While the filer runs in dry run, every such
+  case blocks.
 - **Links.** Every `href` and `src` is a well-formed https URL. They are not
   fetched: the dashboard link answers a login redirect, not a 200.
 - **Domains.** Every domain in the data is a row in `domains.yaml`, and every
