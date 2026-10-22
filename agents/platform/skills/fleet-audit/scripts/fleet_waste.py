@@ -114,8 +114,8 @@ MAX_WORKERS = 4
 # What the manifest calls a target. A GKE name is unique only inside one
 # project and location, so every cluster is `<project>/<location>/<name>`, and
 # a failed or narrowed project discovery is one `project/UNENUMERATED_PROJECTS`
-# target. Copied from `collect.py` under the standalone-collector rule below;
-# `audit_report.py` reads both shapes, so keep them in step with it.
+# target. A copy of `collect.py`'s; `audit_report.py` reads both shapes, so
+# keep them in step with it.
 QUALIFIED_TARGET_SEPARATOR = "/"
 PROJECT_TARGET_PREFIX = "project/"
 # A cluster the collector never read: not running, or its credentials failed.
@@ -249,9 +249,10 @@ NO_TARGET_REASON = (
     "no project in scope recorded an error, so each holds no cluster and has neither the Compute Engine nor the Artifact Registry API on"
 )
 
-# `.git` holds packed objects, not manifests, so the walks skip it. The rest
-# of the GitOps layout, and the declaration index that reads it, are
-# `collect.py`'s (imported above).
+# Whether `--workspace` is a clone: `main` reads it to tell one from a
+# content-mode scratch directory, as `collect.indexed_workspace` does. The
+# GitOps layout, and the declaration index that walks it, are `collect.py`'s
+# (imported above).
 GIT_DIR_NAME = ".git"
 
 # How far back `fetch_usage_peaks` looks for a workload's peak. A week, to
@@ -3642,7 +3643,7 @@ def _controller_age_days(context: dict, kind: str, ns: str, name: str, *, now: d
 def _is_internal_load_balancer(meta: dict) -> bool:
     """Whether either GKE internal-load-balancer annotation is set on this Service.
 
-    A copy of collect.py's, as `release_declarations` is."""
+    A copy of collect.py's, as `reconciler_of` is."""
     annotations = meta.get("annotations") or {}
     return any(annotations.get(key) == INTERNAL_LB_ANNOTATION_VALUE for key in INTERNAL_LB_ANNOTATIONS)
 

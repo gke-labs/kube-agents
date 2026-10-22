@@ -7479,9 +7479,10 @@ class DeclarationIndexIsACopyTest(unittest.TestCase):
 
     def test_the_constants_it_reads_match_too(self):
         """An identical function over a different constant is a different
-        function. `reconciler_of` and `release_of` read these annotations and
-        labels, so a copy that drifted here would name a release differently
-        and still pass the two tests above.
+        function. `reconciler_of` and `release_of` read the five annotations
+        and labels, so a copy that drifted there would name a release
+        differently and still pass the two tests above; `main`'s clone check
+        and `collect`'s walks must agree on what `.git` is called.
         """
         import importlib
 
