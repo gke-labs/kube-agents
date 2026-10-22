@@ -3070,6 +3070,10 @@ unit_cost_hint() {
     # the worker to its retries after the refusal (#1948); priced at the
     # middle so it is not the last tier a deadline cut truncates.
     stop-on-permission-refusal) echo 1200 ;;
+    # Measured on ka-fleet-dev-1 for #3260: 916s for main's red run (the
+    # worker retries before it proposes), 169-468s for the nine branch runs.
+    # Priced like stop-on-permission-refusal's shape at the red's length.
+    stop-on-unknown-flag-write-refusal) echo 1000 ;;
     # The upgrade-failure catalogue's scenario cases: read-only chat prompts
     # over the seeded clusters (entries 1 and 2 one Cluster Agent card per
     # cluster; entries 6 and 16 one declared line per cluster; entry 5 one
