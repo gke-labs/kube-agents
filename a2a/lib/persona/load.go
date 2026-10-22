@@ -98,7 +98,12 @@ func (l *loader) load() *Persona {
 	}
 	p := &Persona{}
 	if data, ok := l.read(ManifestFile, true); ok {
-		if err := yaml.UnmarshalStrict(data, &p.Manifest); err != nil {
+		if hasTopLevelKey(data, "tier") {
+			// Its own problem rather than the strict decoder's "unknown
+			// field": a tier is authority, and authority is the
+			// AgentProfile's (spec.allowedTiers), never the persona's.
+			l.add(ManifestFile, "tier", "is not a persona field: the tasks a persona may run are the AgentProfile's spec.allowedTiers")
+		} else if err := yaml.UnmarshalStrict(data, &p.Manifest); err != nil {
 			l.add(ManifestFile, "", "%v", err)
 		}
 	}
@@ -537,3 +542,13 @@ func sortedKeys[V any](m map[string]V) []string {
 
 // SortedServers returns the names of p's MCP servers in order.
 func (p *Persona) SortedServers() []string { return sortedKeys(p.MCP.Servers) }
+
+// hasTopLevelKey reports whether the YAML mapping data has key at its top level.
+func hasTopLevelKey(data []byte, key string) bool {
+	var top map[string]any
+	if yaml.Unmarshal(data, &top) != nil {
+		return false
+	}
+	_, ok := top[key]
+	return ok
+}

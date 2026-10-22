@@ -94,8 +94,11 @@ func TestLoadRefuses(t *testing.T) {
 			replaceIn(t, d, ManifestFile, "v1alpha1", "v9")
 		}, "persona.yaml: apiVersion: is \"persona.kube-agents.x-k8s.io/v9\""},
 		{"unknown manifest field", func(t *testing.T, d string) {
-			replaceIn(t, d, ManifestFile, "tier:", "image: registry.example/x:1\ntier:")
+			replaceIn(t, d, ManifestFile, "model:", "image: registry.example/x:1\nmodel:")
 		}, "unknown field \"image\""},
+		{"a tier", func(t *testing.T, d string) {
+			replaceIn(t, d, ManifestFile, "model:", "tier: read\nmodel:")
+		}, "persona.yaml: tier: is not a persona field"},
 		{"missing instructions", func(t *testing.T, d string) {
 			_ = os.Remove(filepath.Join(d, InstructionsFile))
 		}, "instructions.md: is missing"},
