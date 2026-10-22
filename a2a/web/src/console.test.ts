@@ -12,6 +12,7 @@ import {
   mintConversation,
   mintMessageId,
   outSubject,
+  paneShows,
   parseOutFrame,
   textBytes,
   tokenOf,
@@ -95,6 +96,24 @@ describe("console frames", () => {
     });
     expect(parseOutFrame('{"messageId":"c-1","text":"x","edit":true}')?.edit).toBe(true);
     expect(parseOutFrame('{"messageId":"c-1","text":"x","edit":"yes"}')?.edit).toBe(false);
+  });
+
+  it("parses a terminal frame's kind and state", () => {
+    const frame = parseOutFrame(
+      '{"messageId":"r-task-1","text":"all green","kind":"result","state":"completed","addressee":"platform","taskId":"task-1"}',
+    );
+    expect(frame?.kind).toBe("result");
+    expect(frame?.state).toBe("completed");
+  });
+
+  it("keeps a completed answer's frame out of the pane and every other frame in", () => {
+    // The pane renders a completed answer from TASKS, so its frame would print it twice.
+    expect(paneShows(parseOutFrame('{"messageId":"r-t","text":"a","kind":"result","state":"completed"}')!)).toBe(false);
+    // A failed or canceled task's frame is the pane's only word that the task ended.
+    expect(paneShows(parseOutFrame('{"messageId":"r-t","text":"❌","kind":"result","state":"failed"}')!)).toBe(true);
+    expect(paneShows(parseOutFrame('{"messageId":"r-t","text":"🛑","kind":"result","state":"canceled"}')!)).toBe(true);
+    // A notice about a turn carries no kind.
+    expect(paneShows(parseOutFrame('{"messageId":"c-1","text":"⏳ submitted…"}')!)).toBe(true);
   });
 
   it("returns null for a frame it cannot use", () => {

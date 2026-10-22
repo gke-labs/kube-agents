@@ -24,9 +24,12 @@ import (
 // to chat.console.<token>.in; this adapter turns each into one InboundMessage
 // and the gateway handles it like any DM. The gateway's own notices (the
 // placeholder while a pod comes up, the rolling progress line, drop notices)
-// go back as ConsoleOutFrame JSON on chat.console.<token>.out. Answers never
-// travel here: they stream through TASKS, which the console page already
-// renders, so a lost .out frame costs a notice and never an answer.
+// go back as ConsoleOutFrame JSON on chat.console.<token>.out, and so does
+// each task's terminal, as a frame naming the task (PostTerminal). The page
+// renders answers from TASKS and skips a completed task's frame, so for the
+// page a lost .out frame still costs a notice and never an answer. A client
+// with no TASKS view (the MCP server) reads its answers here. .out is core
+// NATS, so that client has them live only.
 //
 // Identity is the grant. Only the `console` user may publish on
 // chat.console.*.in (the operator's consoleIdentity), so the sender IS
@@ -78,6 +81,24 @@ const (
 	// memory until the pod is killed. A person typing never has more than a
 	// couple of turns waiting.
 	consoleQueueCap = 8
+
+	// consoleFrameKindResult marks a frame carrying a task's terminal: its
+	// answer, or the failed, canceled or rejected notice. A notice about a
+	// turn (the placeholder, a refusal, a status answer) carries no kind, so
+	// a client waiting on a turn can tell the two apart.
+	consoleFrameKindResult = "result"
+	// consoleResultIDPrefix starts a terminal frame's messageId, which is
+	// the prefix and the task id, so a redelivered terminal repeats its id
+	// and a client can drop the repeat.
+	consoleResultIDPrefix = "r-"
+	// consoleResultTextCap bounds a terminal frame's text. The frame goes out
+	// whole, under the server's max_payload (1 MiB by default; the render
+	// sets none), and JSON escaping can grow the text on the way. An answer
+	// past the cap is cut and says so; the task's result artifact keeps it
+	// whole on TASKS.
+	consoleResultTextCap = 256 * bytesPerKiB
+	// consoleResultCutNote ends a cut answer.
+	consoleResultCutNote = "\n\n(cut here: the full answer is the task's result on the bus)"
 	// consoleQueueFullNotice is posted once per fill when consoleQueueCap
 	// refuses a turn; %d is the cap.
 	consoleQueueFullNotice = "⚠️ %d messages are already waiting in this conversation, so new ones are dropped until it catches up"
@@ -94,10 +115,39 @@ type ConsoleInFrame struct {
 
 // ConsoleOutFrame is what the gateway publishes back. Edit true means
 // MessageID names a frame already shown and Text replaces it.
+//
+// A terminal frame (Kind "result") also names its task (Addressee, TaskID)
+// and the state it ended in. The page reads a completed answer off TASKS and
+// skips that frame; a client with no TASKS view (the MCP server) reads it
+// here. Every other field is absent on a notice.
 type ConsoleOutFrame struct {
-	MessageID string `json:"messageId"`
-	Text      string `json:"text"`
-	Edit      bool   `json:"edit,omitempty"`
+	MessageID string        `json:"messageId"`
+	Text      string        `json:"text"`
+	Edit      bool          `json:"edit,omitempty"`
+	Kind      string        `json:"kind,omitempty"`
+	State     lib.TaskState `json:"state,omitempty"`
+	Addressee string        `json:"addressee,omitempty"`
+	TaskID    string        `json:"taskId,omitempty"`
+}
+
+// ConsoleTerminal is one task's end as a console conversation is told it.
+type ConsoleTerminal struct {
+	TaskID    string
+	Addressee string
+	State     lib.TaskState
+	Text      string
+}
+
+// errNoTerminalFrames is a conversation whose backend takes no terminal
+// frames; the relay posts the terminal as a notice.
+var errNoTerminalFrames = errors.New("the conversation's backend takes no terminal frames")
+
+// TerminalPoster is the optional adapter operation a console conversation's
+// terminals go through, so they reach .out as terminal frames rather than as
+// notices. The mux and the side door forward it to the backend that owns the
+// conversation.
+type TerminalPoster interface {
+	PostTerminal(conversation string, t ConsoleTerminal) error
 }
 
 // consoleConversationToken splits "console:<token>" and validates the token.
@@ -367,15 +417,35 @@ func (a *ConsoleAdapter) inbound(m *nats.Msg) (InboundMessage, string, bool) {
 }
 
 func (a *ConsoleAdapter) publish(conversation, messageID, text string, edit bool) error {
+	return a.publishFrame(conversation, ConsoleOutFrame{MessageID: messageID, Text: text, Edit: edit})
+}
+
+func (a *ConsoleAdapter) publishFrame(conversation string, f ConsoleOutFrame) error {
 	token, ok := consoleConversationToken(conversation)
 	if !ok {
 		return fmt.Errorf("console adapter: malformed conversation id %q", conversation)
 	}
-	data, err := json.Marshal(ConsoleOutFrame{MessageID: messageID, Text: text, Edit: edit})
+	data, err := json.Marshal(f)
 	if err != nil {
 		return err
 	}
 	return a.nc.Publish(consoleOutSubject(token), data)
+}
+
+// PostTerminal publishes one task's terminal frame (TerminalPoster).
+func (a *ConsoleAdapter) PostTerminal(conversation string, t ConsoleTerminal) error {
+	text := t.Text
+	if len(text) > consoleResultTextCap {
+		text = strings.ToValidUTF8(text[:consoleResultTextCap-len(consoleResultCutNote)], "") + consoleResultCutNote
+	}
+	return a.publishFrame(conversation, ConsoleOutFrame{
+		MessageID: consoleResultIDPrefix + t.TaskID,
+		Text:      text,
+		Kind:      consoleFrameKindResult,
+		State:     t.State,
+		Addressee: t.Addressee,
+		TaskID:    t.TaskID,
+	})
 }
 
 // Post publishes a new notice frame and returns its id.

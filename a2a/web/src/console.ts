@@ -50,7 +50,15 @@ export interface ConsoleOutFrame {
   text: string;
   /** True when this frame replaces the text of an earlier one with the same id. */
   edit: boolean;
+  /** "result" on a task's terminal frame; absent on a notice about a turn. */
+  kind?: string;
+  /** The A2A state a terminal frame's task ended in. */
+  state?: string;
 }
+
+/** The kind the gateway gives a task's terminal frame (a2a/gateway/console.go). */
+export const RESULT_FRAME_KIND = "result";
+const COMPLETED_STATE = "completed";
 
 export type Random = (buf: Uint8Array) => Uint8Array;
 
@@ -117,7 +125,20 @@ export function parseOutFrame(data: Uint8Array | string): ConsoleOutFrame | null
   const r = raw as Record<string, unknown>;
   if (typeof r.messageId !== "string" || r.messageId === "") return null;
   if (typeof r.text !== "string") return null;
-  return { messageId: r.messageId, text: r.text, edit: r.edit === true };
+  const frame: ConsoleOutFrame = { messageId: r.messageId, text: r.text, edit: r.edit === true };
+  if (typeof r.kind === "string") frame.kind = r.kind;
+  if (typeof r.state === "string") frame.state = r.state;
+  return frame;
+}
+
+/**
+ * Whether the chat pane shows a frame. A completed task's terminal frame
+ * carries the answer, which the pane already renders from TASKS, so showing
+ * it as a notice too would print the answer twice. Every other terminal
+ * (failed, canceled, rejected) is a notice the pane has no other source for.
+ */
+export function paneShows(frame: ConsoleOutFrame): boolean {
+  return !(frame.kind === RESULT_FRAME_KIND && frame.state === COMPLETED_STATE);
 }
 
 /** Mirrors Go's strings.TrimSpace (the unicode.IsSpace set). */

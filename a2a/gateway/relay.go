@@ -395,15 +395,11 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// A turn answer still assembling posts before the deliverable it led to.
 	g.flushTurn(rec, rs, taskID)
 	result := joinTextParts(rs.result)
-	// The console never posts the deliverable (see the StateCompleted arm), so
-	// replaying the stream to recover it would buy nothing. Checking here and
-	// not there is the difference between skipping the replay and paying for
-	// one whose result is then dropped.
-	// A child's result feeds its wake as well as the room, so a child on a
-	// console conversation still has it replayed.
+	// Every backend posts the deliverable now, the console as a terminal
+	// frame (postTerminal), so a result the render state lost is read back
+	// from the stream whatever the conversation.
 	ref, _ := rec.TaskRefFor(taskID)
-	needResult := result == "" && s.Status.State == lib.StateCompleted &&
-		(!isConsoleConversation(rec.Key) || ref.Role == taskRoleChild)
+	needResult := result == "" && s.Status.State == lib.StateCompleted
 	// A child's turn answers feed its wake too, however it ended. The render
 	// state holds them when this process relayed every event (local);
 	// otherwise a restart may have lost some, and the stream has them all. A
@@ -494,15 +490,13 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			answer.Chat = layoutOf(answerChat)
 		}
 		result = answer.Text
-		// The console renders answers straight off TASKS, so posting the
-		// deliverable here too would show it twice and put a burst of
-		// answer-sized frames on a subject documented to carry only notices
-		// (console.go and spec-chatops-gateway.md, "The console adapter").
-		// The other terminal arms below are notices, not answers, and go to
-		// every backend. Chat backends have no TASKS view, so for them this
-		// post IS the answer. The replay above is skipped for the same
-		// backends, so reaching here with an empty result costs nothing.
-		if !isConsoleConversation(rec.Key) {
+		// A console conversation takes the answer as a terminal frame: the
+		// page reads answers off TASKS and skips it, and a client with no
+		// TASKS view (the MCP server) reads it there. Chat backends have no
+		// TASKS view either, so for them this post IS the answer.
+		if isConsoleConversation(rec.Key) {
+			g.postTerminal(rec, taskID, s.Status.State, result)
+		} else {
 			if ref.TerminalObserved && result == completedNonTextResult {
 				// The heal already posted the status card; skip completedNonTextResult.
 			} else {
@@ -516,12 +510,12 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			reason = joinTextParts(s.Status.Message.Parts)
 		}
 		if reason != "" {
-			g.post(rec.Key, "❌ failed: "+reason)
+			g.postTerminal(rec, taskID, s.Status.State, "❌ failed: "+reason)
 		} else {
-			g.post(rec.Key, "❌ the task failed")
+			g.postTerminal(rec, taskID, s.Status.State, "❌ the task failed")
 		}
 	case lib.StateCanceled:
-		g.post(rec.Key, "🛑 canceled")
+		g.postTerminal(rec, taskID, s.Status.State, "🛑 canceled")
 	case lib.StateRejected:
 		// Same shape as failed above, and for the same reason. Both
 		// executors put the cause in the terminal message -- a capability
@@ -535,9 +529,9 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			reason = joinTextParts(s.Status.Message.Parts)
 		}
 		if reason != "" {
-			g.post(rec.Key, "🚫 the executor rejected the task: "+reason)
+			g.postTerminal(rec, taskID, s.Status.State, "🚫 the executor rejected the task: "+reason)
 		} else {
-			g.post(rec.Key, "🚫 the executor rejected the task")
+			g.postTerminal(rec, taskID, s.Status.State, "🚫 the executor rejected the task")
 		}
 	}
 	g.postSteerShortfall(rec, rs, taskID)
@@ -904,6 +898,29 @@ func terminalLine(state lib.TaskState, progress string) string {
 // post writes to the conversation, chunked under the backend cap, logging
 // rather than failing the relay — chat delivery is best-effort; the stream
 // is the record.
+// postTerminal posts a task's terminal: as a terminal frame on a console
+// conversation (TerminalPoster), and as a notice everywhere else. A console
+// frame that cannot go out falls back to the notice, except a completed
+// answer's, which the page already shows from TASKS.
+func (g *Gateway) postTerminal(rec *SessionRecord, taskID string, state lib.TaskState, text string) {
+	if isConsoleConversation(rec.Key) {
+		err := errNoTerminalFrames
+		if poster, ok := g.adapter.(TerminalPoster); ok {
+			err = poster.PostTerminal(rec.Key, ConsoleTerminal{
+				TaskID: taskID, Addressee: rec.AddresseeFor(taskID), State: state, Text: text,
+			})
+		}
+		if err == nil {
+			return
+		}
+		g.log.Error("console terminal frame failed", "conversation", rec.Key, "taskId", taskID, "err", err)
+		if state == lib.StateCompleted {
+			return
+		}
+	}
+	g.post(rec.Key, text)
+}
+
 func (g *Gateway) post(conversation, text string) {
 	if strings.TrimSpace(text) == "" {
 		return

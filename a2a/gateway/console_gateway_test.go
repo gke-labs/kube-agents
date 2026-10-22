@@ -172,8 +172,9 @@ func TestEmptyPrincipalMapWarningNamesTheBackend(t *testing.T) {
 	}
 }
 
-// The console renders answers off TASKS, so the terminal deliverable must not
-// also go out as a notice on chat.console.<token>.out.
+// The console page renders answers off TASKS, so the deliverable never goes
+// out as a notice on chat.console.<token>.out. Here the backend takes no
+// terminal frames, so the answer goes nowhere on the console subject at all.
 func TestConsoleTerminalAnswerStaysOffTheNoticeSubject(t *testing.T) {
 	r := startRig(t)
 	r.adapter.roster = []string{consoleAuthor}
@@ -206,8 +207,10 @@ func TestConsoleTerminalAnswerStaysOffTheNoticeSubject(t *testing.T) {
 	}
 }
 
-// Failures are notices, not answers, so suppressing the answer must not take
-// them with it: a console page has no other way to learn the task died.
+// Failures are notices, not answers, so keeping the answer off the notice
+// subject must not take them with it: a console page has no other way to
+// learn the task died. A backend that takes no terminal frames gets the
+// failure as a notice.
 func TestConsoleStillGetsTerminalNotices(t *testing.T) {
 	r := startRig(t)
 	r.adapter.roster = []string{consoleAuthor}
@@ -228,6 +231,114 @@ func TestConsoleStillGetsTerminalNotices(t *testing.T) {
 		}
 		return false
 	})
+}
+
+// A console conversation takes the answer as a terminal frame naming its
+// task, so a client with no TASKS view (the MCP server) reads it there. It is
+// still never a notice.
+func TestAConsoleAnswerIsATerminalFrame(t *testing.T) {
+	r := startRig(t)
+	r.adapter.setTakesTerminals()
+	r.adapter.roster = []string{consoleAuthor}
+	r.adapter.inbox <- InboundMessage{
+		Conversation: "console:tab-9", Kind: "dm", Backend: consoleBackend,
+		AuthorID: consoleAuthor, MessageID: "m1", Text: "how is the fleet",
+	}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	const answer = "the fleet is fine"
+	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: answer}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the terminal frame", func() bool { return len(r.adapter.terminalPosts()) > 0 })
+	got := r.adapter.terminalPosts()
+	want := fakeTerminal{"console:tab-9", ConsoleTerminal{TaskID: origin.TaskID, Addressee: "platform", State: lib.StateCompleted, Text: answer}}
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("terminal frames = %+v, want exactly %+v", got, want)
+	}
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, answer) {
+			t.Errorf("the answer was also posted as a console notice: %q", p)
+		}
+	}
+}
+
+// A failure on a console conversation is a terminal frame too, carrying the
+// notice text, and is not posted a second time as a plain notice.
+func TestAConsoleFailureIsATerminalFrame(t *testing.T) {
+	r := startRig(t)
+	r.adapter.setTakesTerminals()
+	r.adapter.roster = []string{consoleAuthor}
+	r.adapter.inbox <- InboundMessage{
+		Conversation: "console:tab-10", Kind: "dm", Backend: consoleBackend,
+		AuthorID: consoleAuthor, MessageID: "m1", Text: "how is the fleet",
+	}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateFailed, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the terminal frame", func() bool { return len(r.adapter.terminalPosts()) > 0 })
+	got := r.adapter.terminalPosts()
+	want := fakeTerminal{"console:tab-10", ConsoleTerminal{TaskID: origin.TaskID, Addressee: "platform", State: lib.StateFailed, Text: "❌ the task failed"}}
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("terminal frames = %+v, want exactly %+v", got, want)
+	}
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "the task failed") {
+			t.Errorf("the failure was also posted as a console notice: %q", p)
+		}
+	}
+}
+
+// A chat conversation's terminals are notices as before: the relay asks for
+// a terminal frame only on a console conversation.
+func TestAChatConversationGetsNoTerminalFrames(t *testing.T) {
+	r := startRig(t)
+	r.adapter.setTakesTerminals()
+	conv := "discord:g1/c-terminal"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", AuthorID: "1001", MessageID: "m1", Text: "how is the fleet"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	completeTask(t, exec, "the fleet is fine")
+	waitFor(t, "the answer posted", postedContaining(r, "the fleet is fine"))
+	if got := r.adapter.terminalPosts(); len(got) != 0 {
+		t.Fatalf("a chat conversation got terminal frames: %+v", got)
+	}
+}
+
+// A console answer relayed before a restart and completed after it is read
+// back from the stream: the render state that held it is gone, and the frame
+// carries the answer, not the non-text stand-in.
+func TestAConsoleAnswerSurvivesLostRenderState(t *testing.T) {
+	r, _ := startRigWithSpawner(t)
+	r.adapter.roster = []string{consoleAuthor}
+	conv := "console:tab-lost"
+	r.adapter.inbox <- InboundMessage{
+		Conversation: conv, Kind: "dm", Backend: consoleBackend,
+		AuthorID: consoleAuthor, MessageID: "m1", Text: "how is the fleet",
+	}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	r2, _ := restartRig(t, r, func() {
+		if err := exec.PublishArtifact(context.Background(), lib.Artifact{ArtifactID: "a-r", Name: lib.ArtifactResult,
+			Parts: []lib.Part{{Kind: "text", Text: "fleet is green"}}}); err != nil {
+			t.Fatal(err)
+		}
+		drainRelayDurable(t, r.url)
+	})
+	r2.adapter.setTakesTerminals()
+	if err := exec.PublishStatus(context.Background(), lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the terminal frame", func() bool { return len(r2.adapter.terminalPosts()) > 0 })
+	if got := r2.adapter.terminalPosts()[0]; got.Text != "fleet is green" || got.TaskID != origin.TaskID {
+		t.Fatalf("terminal frame = %+v, want the replayed answer for task %s", got, origin.TaskID)
+	}
 }
 
 // A console conversation with consoleQueueCap turns already waiting refuses
