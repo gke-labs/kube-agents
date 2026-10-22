@@ -302,10 +302,11 @@ KUBECTL_WEBHOOK_RESOURCES = "validatingwebhookconfigurations,mutatingwebhookconf
 # the namespaced kinds the per-entry rules read; the Pods on their own, since the pod list
 # is the one most likely to exceed the credential proxy's output cap and a cut read must
 # cost only the rules that need pods; the Nodes through a jsonpath template that keeps the
-# fields the rules use (name, labels, taints, whether the node is cordoned, nodeInfo,
-# allocatable, conditions) and drops the rest (`status.images`, the annotations), which is
-# what keeps a few hundred nodes under that cap (one line per node, tab-separated, each
-# field JSON as kubectl's jsonpath renders maps, lists and booleans, an absent field empty);
+# fields the rules use (name, its Pod CIDR, labels, taints, whether the node is cordoned,
+# nodeInfo, allocatable, conditions) and drops the rest (`status.images`, the annotations),
+# which is what keeps a few hundred nodes under that cap (one line per node, tab-separated,
+# the name and the Pod CIDR raw and each other field JSON as kubectl's jsonpath renders
+# maps, lists and booleans, an absent field empty);
 # and StorageClasses and PersistentVolumes as JSON. Each read fails on its own: a refused,
 # unparsable or cut read is recorded per kind in `read_errors`, costs only the rules that
 # need those kinds (each files `unknown` for itself), never the PDB rule, and sets no exit
@@ -329,11 +330,13 @@ LATER_READS = (
     (readiness_rules.CLUSTER_READ_KINDS, KUBECTL_CLUSTER_RESOURCES, READ_MODE_CLUSTER_JSON),
 )
 KUBECTL_READS_PER_MEMBER = 2 + len(LATER_READS)  # the PDB read, the webhook read, then LATER_READS
-KUBECTL_NODE_JSONPATH = '{range .items[*]}{.metadata.name}{"\\t"}{.metadata.labels}{"\\t"}{.spec.taints}{"\\t"}{.spec.unschedulable}{"\\t"}{.status.nodeInfo}{"\\t"}{.status.allocatable}{"\\t"}{.status.conditions}{"\\n"}{end}'
+KUBECTL_NODE_JSONPATH = '{range .items[*]}{.metadata.name}{"\\t"}{.spec.podCIDR}{"\\t"}{.metadata.labels}{"\\t"}{.spec.taints}{"\\t"}{.spec.unschedulable}{"\\t"}{.status.nodeInfo}{"\\t"}{.status.allocatable}{"\\t"}{.status.conditions}{"\\n"}{end}'
 JSONPATH_OUTPUT_FORMAT = "jsonpath={template}"
 NODE_FIELD_SEPARATOR = "\t"
 NODE_LINE_SEPARATOR = "\n"  # what the jsonpath template ends each node with; a NEL (U+0085) inside a field is not a line break
-NODE_FIELD_COUNT = 7
+NODE_FIELD_COUNT = 8
+NODE_RAW_FIELD_COUNT = 2  # the name and the Pod CIDR, which jsonpath renders raw; the fields after them are JSON
+NODE_POD_CIDR_KEY = "podCIDR"
 NODE_KIND = readiness_rules.KIND_NODE
 # The credential proxy caps each stream a brokered command returns; past the cap it writes
 # the cut stdout, prints a marker on stderr (readiness_rules.PROXY_TRUNCATION_MARKER, which
@@ -985,11 +988,15 @@ def parse_node_lines(stdout: str) -> tuple[list[dict] | None, str | None]:
         fields = line.split(NODE_FIELD_SEPARATOR)
         if len(fields) != NODE_FIELD_COUNT:
             return None, f"node line has {len(fields)} field(s), not {NODE_FIELD_COUNT}: {line[:NOTE_ERROR_CHARS]!r}"
+        name, pod_cidr = fields[:NODE_RAW_FIELD_COUNT]
         try:
-            labels, taints, unschedulable, info, allocatable, conditions = (json.loads(f) if f.strip() else None for f in fields[1:])
+            labels, taints, unschedulable, info, allocatable, conditions = (json.loads(f) if f.strip() else None for f in fields[NODE_RAW_FIELD_COUNT:])
         except ValueError as e:
             return None, f"node line unparsable: {e}"
-        nodes.append({"kind": NODE_KIND, "metadata": {"name": fields[0], "labels": labels or {}}, "spec": {"taints": taints or [], "unschedulable": bool(unschedulable)}, "status": {"nodeInfo": info or {}, "allocatable": allocatable or {}, "conditions": conditions or []}})
+        spec = {"taints": taints or [], "unschedulable": bool(unschedulable)}
+        if pod_cidr.strip():  # a node without a block (not yet registered) carries no key, as the API's object does not
+            spec[NODE_POD_CIDR_KEY] = pod_cidr.strip()
+        nodes.append({"kind": NODE_KIND, "metadata": {"name": name, "labels": labels or {}}, "spec": spec, "status": {"nodeInfo": info or {}, "allocatable": allocatable or {}, "conditions": conditions or []}})
     return nodes, None
 
 

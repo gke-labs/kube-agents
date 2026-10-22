@@ -163,6 +163,28 @@ class TheMapping(unittest.TestCase):
         self.assertEqual(by_check["upgrade-zonal-control-plane"]["object"], review.CLUSTER_OBJECT)
         self.assertIn("Replace deprecated labels", by_check["upgrade-removed-node-label"]["recommendation"]["action"])
 
+    def test_an_entry_2_rule_row_carries_the_rules_own_remedy(self):
+        # The surge rule's Pod-range and accelerator shapes end with their remedy after the last
+        # `; ` outside parentheses; the surge-settings shape carries none and keeps the entry's
+        # mitigation, which names the default surge settings it lacks.
+        pod_range = "pod range 10.4.0.0/23 has 0 free /24 block(s) (2 of 2 hold a node) and the 2 surge node(s) of pool(s) default-pool (maxSurge 1), gpu-pool (maxSurge 1) each need one: a surge node with no block never registers and the pool upgrade stalls between versions; lower max-surge or add a secondary Pod range"
+        accelerator = "pool gpu-pool (1 x nvidia-l4) surges (maxSurge 1) with no reservation affinity: each surge node needs accelerator capacity the zone may not have, and a pool upgrade that cannot create one stalls between versions; hold a reservation for the surge node, or, on a pool with a spare accelerator node for the drained pods, set the in-place strategy (max-surge 0, max-unavailable 1)"
+        self.assertEqual(review.rule_remedy(pod_range), "Lower max-surge or add a secondary Pod range")
+        self.assertTrue(review.rule_remedy(accelerator).startswith("Hold a reservation for the surge node, or, on a pool with a spare accelerator node"))
+        self.assertEqual(review.rule_remedy("pool no-surge-pool (maxSurge 0, maxUnavailable 1; 1 node) has no room for its displaced pods"), "")
+        m = member(
+            "seeded-b",
+            "blocked",
+            rules={"surge-capacity": {"entry": 2, "can_block": True, "blocking": 1, "risks": 1}},
+            rule_blocking=[{"rule": "surge-capacity", "entry": 2, "pool": "default-pool", "text": pod_range}],
+            risks=[{"rule": "surge-capacity", "entry": 2, "grade": "risk", "pool": "gpu-pool", "text": accelerator}],
+        )
+        actions = [f["recommendation"]["action"] for f in review.rule_findings(m)]
+        self.assertEqual(actions[0], "Lower max-surge or add a secondary Pod range")
+        self.assertTrue(actions[1].startswith("Hold a reservation for the surge node"), actions[1])
+        (settings,) = review.rule_findings(with_rules())[:1]
+        self.assertEqual(settings["recommendation"]["action"], review.ENTRY_MITIGATIONS[2])
+
     def test_every_payload_is_one_the_queue_accepts(self):
         for m in (seeded_b(), gemma(), with_rules()):
             for item in review.member_findings(m):

@@ -188,7 +188,8 @@ spec:
       {{- $stallWatchFields | nindent 6 }}
     {{- end }}
     {{- $tuning := deepCopy (.Values.platformAgent.harness.tuning | default dict) }}
-    {{- if and .Values.plugins (and .Values.plugins.stockoutInvestigator .Values.plugins.stockoutInvestigator.enabled) }}
+    {{- $stockout := (.Values.plugins | default dict).stockoutInvestigator | default dict }}
+    {{- if and $stockout.enabled (ne $stockout.applyTuning false) }}
     {{- $defaultStockoutTuning := dict "maxInProgress" 3 "platform" (dict "apiMaxRetries" 8 "maxTurns" 200) "cluster" (dict "apiMaxRetries" 8 "maxTurns" 150) }}
     {{- $tuning = merge $tuning $defaultStockoutTuning }}
     {{- end }}

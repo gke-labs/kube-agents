@@ -1,7 +1,7 @@
-"""Inbound chat messages and new sessions by platform, in the Prometheus text exposition.
+"""Inbound chat messages, new sessions and failed turns by platform, in the Prometheus text exposition.
 
 Hand-rolled, like the credential broker's registry: prometheus_client is not in
-the agent image, and two counters with one label do not justify a dependency
+the agent image, and three counters with one label do not justify a dependency
 in the container that holds the chat credentials. One lock, because the
 gateway's event loop writes while a scrape thread reads. Series appear on first
 increment and render in a fixed order, so two scrapes of an idle registry are
@@ -40,6 +40,13 @@ CHAT_INBOUND_METRIC = "kubeagents_chat_messages_inbound_total"
 # from (usage_counters_scrape.go's chatSessionsSeries): one per session the
 # session_store plugin first saw, under the same platform label.
 CHAT_SESSIONS_METRIC = "kubeagents_chat_sessions_total"
+# The series the operator reads status.usage.chatTurnsErroredTotal from
+# (usage_counters_scrape.go's chatTurnsErroredSeries): synchronous turns the
+# gateway failed to complete, by platform, counted by the gateway patch
+# chat_turn_metrics at the turn's exception path, its failed-result path (a
+# provider 429 or 5xx, a connection error, the gateway timeout) and the
+# provider-authentication failure.
+CHAT_TURNS_ERRORED_METRIC = "kubeagents_chat_turns_errored_total"
 PLATFORM_LABEL = "platform"
 LABEL_OTHER = "other"
 HERMES_PLATFORM_LABELS = {
@@ -69,12 +76,13 @@ def platform_label(hermes_platform: str) -> str:
 
 
 class ChatMetrics:
-    """Two counters, by platform: inbound messages and new sessions."""
+    """Three counters, by platform: inbound messages, new sessions and errored turns."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._inbound: dict[str, int] = {}
         self._sessions: dict[str, int] = {}
+        self._errored: dict[str, int] = {}
 
     def record_inbound(self, hermes_platform: str) -> None:
         label = platform_label(hermes_platform)
@@ -87,10 +95,17 @@ class ChatMetrics:
         with self._lock:
             self._sessions[label] = self._sessions.get(label, 0) + 1
 
+    def record_turn_error(self, hermes_platform: str) -> None:
+        """Count one synchronous turn the gateway failed to complete, under its platform."""
+        label = platform_label(hermes_platform)
+        with self._lock:
+            self._errored[label] = self._errored.get(label, 0) + 1
+
     def render(self) -> str:
         with self._lock:
             inbound = sorted(self._inbound.items())
             sessions = sorted(self._sessions.items())
+            errored = sorted(self._errored.items())
         lines = [
             f"# HELP {CHAT_INBOUND_METRIC} Chat messages that reached the gateway's dispatch hook, by platform.",
             f"# TYPE {CHAT_INBOUND_METRIC} counter",
@@ -103,6 +118,12 @@ class ChatMetrics:
         ]
         for label, count in sessions:
             lines.append(f'{CHAT_SESSIONS_METRIC}{{{PLATFORM_LABEL}="{label}"}} {count}')
+        lines += [
+            f"# HELP {CHAT_TURNS_ERRORED_METRIC} Synchronous chat turns the gateway failed to complete, by platform: an exception out of the turn, a result the agent marked failed (a provider 429 or 5xx, a connection error, the gateway timeout), or a provider authentication failure.",
+            f"# TYPE {CHAT_TURNS_ERRORED_METRIC} counter",
+        ]
+        for label, count in errored:
+            lines.append(f'{CHAT_TURNS_ERRORED_METRIC}{{{PLATFORM_LABEL}="{label}"}} {count}')
         lines += [
             f"# HELP {PROCESS_START_TIME_METRIC} Start time of the process since unix epoch in seconds, captured once at start.",
             f"# TYPE {PROCESS_START_TIME_METRIC} gauge",

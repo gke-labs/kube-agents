@@ -59,6 +59,37 @@ BROKEN_MAIN_WATCHED_WORKFLOWS = (
     "Python Unit Tests",
     "Validate Repo Structure",
 )
+# The release pipelines `release-stage-broken-notify.yml` must watch: the three
+# `workflow_dispatch` workflows the schedulers start, whose red run is
+# otherwise a row in the Actions tab and nothing more (gke-labs/kube-agents#1978).
+# The watched list is `WATCHED_WORKFLOWS` in
+# `scripts/release/notify_release_stage_broken.py`, which the sweep reads.
+RELEASE_STAGE_NOTIFIER = "release-stage-broken-notify.yml"
+RELEASE_STAGE_WATCHED_WORKFLOWS = (
+    "RC: Release Pipeline",
+    "Staging: Promotion Pipeline",
+    "Release & Publish (GA)",
+)
+# The compensation and non-gating jobs of those workflows, by `name:`: the
+# ones the notifier names as the failing stage only when nothing else failed,
+# because they run after a gating failure or fail inside green runs and are
+# skipped on an ordinary green night. The notifier knows them by the
+# substrings in `COMPENSATION_JOB_MARKERS`; this tuple is what those
+# substrings have to select, so a rename of any of them reds the test.
+RELEASE_STAGE_COMPENSATION_JOBS = (
+    "Step 5 - Tear Down RC Environment",
+    "Today mode (non-gating) - Step 6 - Provision RC Environment",
+    "Today mode (non-gating) - Step 7 - Run E2E Tests",
+    "Today mode (non-gating) - Step 8 - Tear Down RC Environment",
+    "Step 3b - Roll Back to the Previous GA and Forward Again",
+    "Step 5b - Withdraw an Unsettled Nomination",
+    "Step 7 - Tear Down Nightly Environment",
+)
+# What marks a job as one that runs regardless of, or without failing, the
+# run: job-level `continue-on-error`, or an `if:` that runs it after a
+# failure. Every job of the watched workflows that carries one has to be in
+# the tuple above.
+RELEASE_STAGE_ALWAYS_RUN_CONDITIONS = ("always()", "!cancelled()")
 # The flaky-check reporter's contract is the inverse of the broken-main one:
 # not a fixed list it must contain, but that every pull-request check is
 # either watched or named here as left out on purpose. The watched list is
@@ -100,6 +131,15 @@ def _flaky_check_reporter():
     finally:
         sys.path.remove(str(REPO_SCRIPTS))
     return notify_flaky_check
+
+
+def _release_stage_notifier():
+    sys.path.insert(0, str(REPO_SCRIPTS / "release"))
+    try:
+        import notify_release_stage_broken
+    finally:
+        sys.path.remove(str(REPO_SCRIPTS / "release"))
+    return notify_release_stage_broken
 
 
 class SpecToolRegistryTest(unittest.TestCase):
@@ -696,6 +736,79 @@ class WorkflowNameJoinTest(unittest.TestCase):
             "workflows, so a red on main from any of them files no issue: "
             + ", ".join(missing),
         )
+
+    def test_the_release_stage_notifier_watches_every_release_pipeline(self):
+        """A release pipeline missing from the watch list fails silently: its
+        red run is a row in the Actions tab, the next scheduler tick skips,
+        and nobody is told (gke-labs/kube-agents#1978). The notifier is a
+        sweep rather than a `workflow_run` consumer, so the list lives in the
+        script alone; this holds it to the roster above and to the workflows
+        that exist, since a rename would otherwise red every sweep."""
+        watched = tuple(_release_stage_notifier().WATCHED_WORKFLOWS)
+        self.assertEqual(
+            RELEASE_STAGE_WATCHED_WORKFLOWS,
+            watched,
+            f"{RELEASE_STAGE_NOTIFIER}'s script no longer watches the release pipelines named here",
+        )
+        documents = self._workflows()
+        self.assertIn(RELEASE_STAGE_NOTIFIER, documents)
+        display_names = {document.get("name") for document in documents.values() if document.get("name")}
+        missing = sorted(set(watched) - display_names)
+        self.assertEqual(
+            [],
+            missing,
+            "watched release workflows that match no workflow name (renamed?): " + ", ".join(missing),
+        )
+
+    def test_the_release_stage_notifier_finds_the_eval_wait_and_its_withdrawal(self):
+        """The notifier reads a promotion night red on the eval's RED verdict
+        alone as green, by job name: the eval wait failed and the withdrawal
+        was skipped, which the withdrawal's `if:` makes mean a settled
+        verdict. A rename of either job, or a withdrawal that no longer keys
+        on `settled`, would leave every RED night filing an issue again, with
+        every unit test green on the recorded names."""
+        notifier = _release_stage_notifier()
+        documents = self._workflows()
+        promotion = [document for document in documents.values() if document.get("name") == notifier.EVAL_PIPELINE]
+        self.assertEqual(len(promotion), 1, f"no workflow named {notifier.EVAL_PIPELINE!r}")
+        jobs = (promotion[0].get("jobs") or {}).values()
+        eval_waits = [job for job in jobs if notifier.EVAL_WAIT_JOB_MARKER in (job.get("name") or "")]
+        withdrawals = [job for job in jobs if notifier.WITHDRAWAL_JOB_MARKER in (job.get("name") or "")]
+        self.assertEqual(len(eval_waits), 1, "EVAL_WAIT_JOB_MARKER selects no job, or more than one, in the promotion pipeline")
+        self.assertEqual(len(withdrawals), 1, "WITHDRAWAL_JOB_MARKER selects no job, or more than one, in the promotion pipeline")
+        self.assertIn("settled != 'true'", str(withdrawals[0].get("if", "")), "the withdrawal no longer keys on the verdict having settled")
+
+    def test_the_release_stage_notifier_knows_every_compensation_job(self):
+        """The jobs API carries neither `if:` nor `continue-on-error`, so the
+        notifier tells a compensation job (a withdrawal that runs because the
+        eval did not settle, a teardown, a rollback leg, a non-gating next-mode
+        leg) from a gating stage by its name. The markers have to select
+        exactly the jobs named above, and every job the workflow files mark as
+        running after a failure or without failing the run has to be among
+        them, or a renamed leg is named as the stage and holds its issue open
+        for good."""
+        markers = tuple(_release_stage_notifier().COMPENSATION_JOB_MARKERS)
+        documents = self._workflows()
+        watched = [document for document in documents.values() if document.get("name") in RELEASE_STAGE_WATCHED_WORKFLOWS]
+        self.assertEqual(len(watched), len(RELEASE_STAGE_WATCHED_WORKFLOWS))
+        selected, always_run = set(), set()
+        for document in watched:
+            for job in (document.get("jobs") or {}).values():
+                name = (job or {}).get("name") or ""
+                if any(marker in name for marker in markers):
+                    selected.add(name)
+                condition = str((job or {}).get("if", ""))
+                if (job or {}).get("continue-on-error") is True or any(each in condition for each in RELEASE_STAGE_ALWAYS_RUN_CONDITIONS):
+                    always_run.add(name)
+        self.assertEqual(
+            set(RELEASE_STAGE_COMPENSATION_JOBS),
+            selected,
+            "COMPENSATION_JOB_MARKERS selects a different set of jobs than RELEASE_STAGE_COMPENSATION_JOBS names",
+        )
+        unmarked = sorted(always_run - selected)
+        self.assertEqual([], unmarked, "jobs that run after a failure or without failing the run, and no marker selects: " + ", ".join(unmarked))
+        unused = [marker for marker in markers if not any(marker in name for name in selected)]
+        self.assertEqual([], unused, "markers that select no job: " + ", ".join(unused))
 
     def test_the_required_python_job_runs_the_suite_in_strict_mode(self):
         """The gate is one flag on one line, and losing it fails open.

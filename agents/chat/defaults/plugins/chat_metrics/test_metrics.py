@@ -74,6 +74,29 @@ class RegistryTest(unittest.TestCase):
         self.assertEqual(text, self.registry.render(), "two renders of an idle registry differ")
 
 
+_ERRORED_LINE = re.compile(r'^kubeagents_chat_turns_errored_total\{platform="([a-z]+)"\} (\d+)$', re.M)
+
+
+class TurnErrorTest(unittest.TestCase):
+    """A synchronous turn the gateway failed to complete counts under its
+    platform, with the same spellings the inbound counter uses."""
+
+    def test_a_failed_turn_counts_under_its_platform(self):
+        registry = metrics.ChatMetrics()
+        registry.record_turn_error("slack")
+        registry.record_turn_error("google_chat")
+        registry.record_turn_error("google_chat")
+        registry.record_turn_error("made_up")
+        exposition = registry.render()
+        self.assertIn("# TYPE kubeagents_chat_turns_errored_total counter", exposition)
+        self.assertEqual([("googlechat", "2"), ("other", "1"), ("slack", "1")], _ERRORED_LINE.findall(exposition))
+
+    def test_an_idle_registry_renders_the_family_with_no_series(self):
+        exposition = metrics.ChatMetrics().render()
+        self.assertIn("# TYPE kubeagents_chat_turns_errored_total counter", exposition)
+        self.assertEqual([], _ERRORED_LINE.findall(exposition))
+
+
 class HookTest(unittest.TestCase):
     def setUp(self):
         self.registry = metrics.ChatMetrics()
