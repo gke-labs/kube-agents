@@ -8567,7 +8567,7 @@ _BUDGET_CASE = TASKS / "upgrades-retrospective-drained-budget" / "task.yaml"
 _BUDGET_SPEC = yaml.safe_load(_BUDGET_CASE.read_text(encoding="utf-8"))
 _BUDGET_OBJECTIVE = "slot-b-budget-is-catalogue-entry-1"
 _BUDGET_LINE = "seeded-b/seeded-upgrade/PodDisruptionBudget/pinned-batch-runner: entry 1"
-_BUDGET_REPORT_LINE = "Report: /opt/data/upgrade-retrospective/upgrade-retro-report.md"
+_BUDGET_REPORT_LINE = "Report: /opt/data/upgrade-retrospective/reports/upgrade-retro-report.md"
 _BUDGET_OTHER_LINE = "seeded-b/seeded-upgrade/Deployment/pinned-batch-runner: entry 1"
 
 
@@ -8664,7 +8664,7 @@ _SCRATCH_FILE_COMMANDS = [
     "cat /opt/data/scratch/manifest_upgrade-retrospective.json | grep -E 'check\": \"(upgrade-broke-workload)' -A 10",
 ]
 _CHAT_RECORD_PATH = "/opt/data/scratch/chat_report_upgrade-retrospective.json"
-_SAVED_REPORT_PATH = "/opt/data/upgrade-retrospective/upgrade-retro-report.md"
+_SAVED_REPORT_PATH = "/opt/data/upgrade-retrospective/reports/upgrade-retro-report.md"
 _DATED_REPORT_JSON_PATH = "/opt/data/upgrade-retrospective/reports/20261021T100016Z.json"
 _FINDINGS_PATH = "/opt/data/scratch/findings_upgrade-retrospective.json"
 _MANIFEST_PATH = "/opt/data/scratch/manifest_upgrade-retrospective.json"
@@ -8707,7 +8707,7 @@ def _stash_route(commands: list[str], reads: list[dict]) -> None:
         # the terminal: the chat record, the collector, the store
         (_ON_DEMAND_GREEN_COMMANDS, [], "pass"),
         (_COLLECTOR_COMMANDS, [], "pass"),
-        (["readlink /opt/data/upgrade-retrospective/upgrade-retro-report.md", "cat /opt/data/upgrade-retrospective/reports/20261020t204516z.json"], [], "pass"),
+        (["ls -l /opt/data/upgrade-retrospective/reports/", "readlink /opt/data/upgrade-retrospective/reports/upgrade-retro-report.md", "cat /opt/data/upgrade-retrospective/reports/20261020t204516z.json"], [], "pass"),
         # the same sources with read_file and no terminal command that names them
         ([], [_worker_read(_CHAT_RECORD_PATH)], "pass"),
         (["find /opt/data -type f -name '*retrospective*.json'"], [_worker_read(_CHAT_RECORD_PATH), _worker_read(_MANIFEST_PATH)], "pass"),
@@ -8743,6 +8743,8 @@ def test_retrospective_route_with_no_tagged_worker_call_is_an_error_not_a_fail(c
     "final_message, passes",
     [
         ("Checking the upgrade retrospective. Report: /opt/data/scratch/chat_report_upgrade-retrospective.json", True),
+        # the latest link where the collector writes it, and the root spelling the SOP once gave
+        ("Report: /opt/data/upgrade-retrospective/reports/upgrade-retro-report.md (produced 2026-10-21T10:00Z)", True),
         ("Report: /opt/data/upgrade-retrospective/upgrade-retro-report.md (produced 2026-10-20T20:45Z)", True),
         ("Report: /opt/data/upgrade-retrospective/reports/20261020T204516Z.md", True),
         ("Report: /opt/data/upgrade-retrospective/reports/20261020T204516Z-scoped.md", True),
@@ -8751,6 +8753,7 @@ def test_retrospective_route_with_no_tagged_worker_call_is_an_error_not_a_fail(c
         # the 2026-10-21 reds: the ledger document and the harness manifest are not the report
         ("Answered from:\n`/opt/data/scratch/findings_upgrade-retrospective.json`", False),
         ("**/opt/data/scratch/manifest_upgrade-retrospective.json**", False),
+        ("Source: /opt/data/scratch/run_upgrade-retrospective.json", False),
     ],
 )
 def test_retrospective_reply_names_the_report_or_the_chat_record(final_message, passes):

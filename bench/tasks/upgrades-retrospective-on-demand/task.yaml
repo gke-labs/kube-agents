@@ -4,7 +4,7 @@
 # kubectl. The route is agents/platform/CAPABILITIES.md and the platform persona's
 # delegation list (agents/platform/AGENTS.md), and the behaviour is the on-demand
 # section of governance/upgrade_retrospective_sop.md: when the latest saved report
-# (`/opt/data/upgrade-retrospective/upgrade-retro-report.md` on the shell volume) is
+# (`/opt/data/upgrade-retrospective/reports/upgrade-retro-report.md` on the shell volume) is
 # newer than the last upgrade operation on the clusters the question covers, the
 # worker answers from it and says when it was produced; otherwise it runs the
 # collector (`skills/fleet-audit/scripts/upgrade_retrospective.py`) first. Either way
@@ -150,8 +150,10 @@ verification_spec:
             path: '.*(?:upgrade-retrospective/|upgrade-retro-report\.md|chat_report_upgrade-retrospective).*'
           require_success: true
 
-  # The reply names the report it answered from: the latest link, a dated report
-  # (a `-scoped` one when the question named clusters), or the job's chat record.
+  # The reply names the report it answered from: the latest link (the collector
+  # writes it inside `reports/`; the root spelling the SOP once gave is kept), a
+  # dated report (a `-scoped` one when the question named clusters), or the job's
+  # chat record. The scratch manifest and findings files match nothing here.
   # Lowercase stamp letters: the verifier lowercases the reply before it matches,
   # and it drops underscores as Markdown emphasis, so the record's name is spelled
   # with each underscore optional.
@@ -161,7 +163,7 @@ verification_spec:
     check:
       type: report_contains
       any_of_patterns:
-        - 'upgrade-retrospective/(?:reports/\d{8}t\d{6}z(?:-scoped)?\.md|upgrade-retro-report\.md)|scratch/chat_?report_?upgrade-retrospective\.json'
+        - 'upgrade-retrospective/(?:reports/(?:\d{8}t\d{6}z(?:-scoped)?\.md|upgrade-retro-report\.md)|upgrade-retro-report\.md)|scratch/chat_?report_?upgrade-retrospective\.json'
 
   # One declared line per seeded slot. The accept is the whole line with every
   # value in its set; each forbid is the same anchor, any text, then one field
