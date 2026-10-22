@@ -511,8 +511,25 @@ type turnWatch struct {
 const maxTurnResults = 64
 
 // resultMessagePrefix is the gateway's message id prefix for a chain's
-// result frame: r-<root task id>.
+// result frame: r-<root task id>-<state> (r-<root task id> before the
+// gateway named the state in it). The frame's taskId field says the same
+// and is read first; the id is the fallback.
 const resultMessagePrefix = "r-"
+
+// resultIDTask is the task a result frame's message id names, with the
+// state suffix the gateway adds stripped.
+func resultIDTask(messageID string) (string, bool) {
+	id, ok := strings.CutPrefix(messageID, resultMessagePrefix)
+	if !ok {
+		return "", false
+	}
+	if i := strings.LastIndex(id, "-"); i > 0 && lib.TaskState(id[i+1:]).Terminal() {
+		id = id[:i]
+	} else if i := strings.LastIndex(id, "-input-required"); i > 0 && id[i:] == "-input-required" {
+		id = id[:i]
+	}
+	return id, lib.ValidSubjectToken(id)
+}
 
 // noteResult records a result frame heard on the conversation.
 func (w *turnWatch) noteResult(f ConsoleOutFrame) {
@@ -520,7 +537,7 @@ func (w *turnWatch) noteResult(f ConsoleOutFrame) {
 	if lib.ValidSubjectToken(f.TaskID) {
 		ids = append(ids, f.TaskID)
 	}
-	if id, ok := strings.CutPrefix(f.MessageID, resultMessagePrefix); ok && lib.ValidSubjectToken(id) {
+	if id, ok := resultIDTask(f.MessageID); ok && id != f.TaskID {
 		ids = append(ids, id)
 	}
 	w.mu.Lock()

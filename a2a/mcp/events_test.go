@@ -1083,6 +1083,9 @@ func TestAnotherTasksResultDoesNotCount(t *testing.T) {
 func TestTheRootsResultIsMatchedByTaskOrMessageID(t *testing.T) {
 	w := &turnWatch{results: map[string]bool{}, resultSeen: make(chan struct{}, 1)}
 	w.noteResult(ConsoleOutFrame{Kind: frameKindResult, MessageID: "r-task-a"})
+	// The gateway's current id names the state too: r-<task>-<state>.
+	w.noteResult(ConsoleOutFrame{Kind: frameKindResult, MessageID: "r-task-d-completed"})
+	w.noteResult(ConsoleOutFrame{Kind: frameKindResult, MessageID: "r-task-e-input-required", CardsPending: true})
 	w.noteResult(ConsoleOutFrame{Kind: frameKindResult, MessageID: "x-1", TaskID: "task-b", CardsPending: true})
 	w.noteResult(resultFrame("task-c", true))
 	w.noteResult(resultFrame("task-c", false))
@@ -1090,6 +1093,8 @@ func TestTheRootsResultIsMatchedByTaskOrMessageID(t *testing.T) {
 		"task-a": {true, false},
 		"task-b": {true, true},
 		"task-c": {true, true},
+		"task-d": {true, false},
+		"task-e": {true, true},
 		"task-z": {false, false},
 	} {
 		if seen, pending := w.rootResult(root); seen != want[0] || pending != want[1] {
