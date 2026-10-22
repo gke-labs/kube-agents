@@ -420,7 +420,7 @@ artifact, and nine names are reserved so renderers and audit tooling can rely on
 | `thinking` | Reasoning deltas. Debug views only                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `activity` | Tool-call trace, one entry per invocation. Always in the audit replay                                                                                                                                                                                                                                                                                                                                                                                             |
 | `progress` | Agent-authored milestones, renderable to chat at zero model cost. Stage 1 derives these from model narration; the subagent framework spec records the deviation. May carry a chat message (Chat messages, below), the live message's whole state, so `progress` is text plus at most one chat message DataPart per chunk; assertion 18's validator takes a data part there only when it is a chat message                                                         |
-| `delegate` | The session's request to the gateway to mint a child task: one `data` part `{"addressee", "text"}` on the session's own task events. Consumed by the gateway's relay, never rendered to chat; reserved 10/5, used from the delegation primitive onward                                                                                                                                                                                                            |
+| `delegate` | The session's request to the gateway to mint a child task: one `data` part `{"addressee", "text", "parameters"?}` on the session's own task events (`parameters`: the child's task parameters, below). Consumed by the gateway's relay, never rendered to chat; reserved 10/5, used from the delegation primitive onward                                                                                                                                          |
 | `turn`     | One finished turn's answer on a task with more turns queued (an executor that queues follow-ups). Chunked like `result`, posted by renderers as it completes, never the deliverable; the last turn's answer is the `result`.                                                                                                                                                                                                                                      |
 | `notice`   | A message the task posts on its own, beside its live message and its answer (a PR it opened, say): a TextPart, optionally with a chat message. Each `notice` artifact posts once and is never edited. Not the gateway's own notices. A gateway older than 10/8 drops it, so a fact that matters is in the result too; reserved 10/8                                                                                                                               |
 | `handoff`  | The task handed work to kanban cards, which report into its conversation themselves: one TextPart, `cards`. The Hermes bridge's API executor publishes it ahead of the terminal of such a task whenever the conversation route was recorded (Slack or Google Chat). Never rendered; a delegated child's wake reads it as the cards-pending signal beside the terminal's mark, which the bridge sets only on Slack with `KAGE_SLACK_UX` on (#3258). Reserved 10/16 |
@@ -703,6 +703,32 @@ and only its `mark` is validated. When the newest task ends with no mark on its 
 (including a supervisor terminal: `failed` for an executor that died or never ran,
 `canceled` completing a stop the requester sent), the `ask` comes off, a `blocked` settle lifts, and `failed` sets
 `settle: failed`. Any other message without `mark` changes nothing.
+
+### Task parameters and child results
+
+Added 10/22 for the profile dispatcher (`spec-profiles-dispatch.md`). Both are `data` parts.
+
+**Task parameters.** A profile task's submission carries
+`{"taskParameters": {"parameters": {"<name>": "<value>", …}}}`: the parameters its persona
+declares, such as the cluster persona's `project`, `location` and `cluster`. The gateway sets them
+from what the client or the parent task asked. They never ride the authority block. The dispatcher
+builds the verifier's resource from them (`project/<p>/location/<l>/cluster/<c>`) and passes each
+to the worker as `PROFILE_TASK_<NAME>`. The verifier refuses a target outside the grant's scope,
+and that check is what makes these message fields authoritative.
+
+- A name is a lower-case identifier of at most 32 characters. A value is one token of at most 128
+  characters, from letters, digits and `. _ : -`.
+- A value can't contain `/` or a space, because the dispatcher joins values into a resource path.
+- A set has at most 16 parameters.
+- A reader that finds the part and it breaks these bounds refuses the task rather than running it
+  without parameters (`lib.TaskParametersOf`).
+
+**Child results.** When a child task ends, the gateway publishes a `message` on its parent's `…in`
+carrying `{"childResult": {"childTaskId", "addressee", "state", "text"?}}`. The parent's per-task
+reader takes it as a new turn. `state` is the child's terminal state. `text` is its deliverable
+when it completed and its reason otherwise, at most 64 KiB and cut by the gateway; the child's own
+`result` artifact keeps it whole. Only a top-level task's end goes to its conversation. A parent
+that has already ended gets no child result: the gateway drops it and logs it.
 
 ### Card work after the task ends
 

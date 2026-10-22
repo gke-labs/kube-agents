@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"regexp"
 	"strings"
 )
 
@@ -179,15 +180,168 @@ func UsageTotal(turns []Usage) Usage {
 // hop is how the call gets from the harness's delegate tool to the adapter
 // that actually publishes the artifact), so it is named here, beside
 // ArtifactDelegate, rather than duplicated per caller.
+//
+// Parameters are the child task's parameters (TaskParameters), the target
+// cluster among them, which the gateway carries into the child's submission;
+// the gateway refuses a child whose target is not inside its parent's.
 type DelegateRequest struct {
-	Addressee string `json:"addressee"`
-	Text      string `json:"text"`
+	Addressee  string            `json:"addressee"`
+	Text       string            `json:"text"`
+	Parameters map[string]string `json:"parameters,omitempty"`
 }
 
 // DelegateTextCap bounds DelegateRequest.Text in bytes: the adapter refuses a
 // longer request before it reaches the bus and the gateway ignores one that
 // arrives anyway, so the two sides cannot disagree on the number.
 const DelegateTextCap = 16 * 1024
+
+// TaskParameters is the taskParameters data part on a profile task's
+// submission: the parameters its persona declares (the cluster persona's
+// project, location and cluster), set by the gateway from what the client
+// or the parent task asked. The dispatcher builds the verifier's resource
+// from them and hands each to the worker as PROFILE_TASK_<NAME>; the
+// verifier refuses a target outside the grant's scope, which is what makes
+// these message fields authoritative. They never ride the authority block.
+type TaskParameters struct {
+	Parameters map[string]string `json:"parameters"`
+}
+
+// The bounds ValidateTaskParameters holds a parameter set to. A name is a
+// lower-case identifier, as a persona declares it and as the worker's
+// PROFILE_TASK_<NAME> spells it upper-cased. A value is one token with no
+// '/' or space, because the dispatcher joins values into a verifier resource
+// path (project/<p>/location/<l>/cluster/<c>) and a '/' would let a value
+// name a different resource.
+const (
+	TaskParametersMax        = 16
+	TaskParameterNameMaxLen  = 32
+	TaskParameterValueMaxLen = 128
+)
+
+var (
+	taskParameterName  = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+	taskParameterValue = regexp.MustCompile(`^[A-Za-z0-9._:-]+$`)
+)
+
+// ValidateTaskParameters reports the first way params break the bounds
+// above, or nil. An empty or nil set is valid: a task with no parameters.
+func ValidateTaskParameters(params map[string]string) error {
+	if len(params) > TaskParametersMax {
+		return fmt.Errorf("task parameters: %d, at most %d", len(params), TaskParametersMax)
+	}
+	for name, value := range params {
+		if len(name) > TaskParameterNameMaxLen || !taskParameterName.MatchString(name) {
+			return fmt.Errorf("task parameter name %q is not a lower-case identifier of at most %d characters", name, TaskParameterNameMaxLen)
+		}
+		if len(value) > TaskParameterValueMaxLen || !taskParameterValue.MatchString(value) {
+			return fmt.Errorf("task parameter %s: the value is not one token (letters, digits, . _ : -) of at most %d characters", name, TaskParameterValueMaxLen)
+		}
+	}
+	return nil
+}
+
+const taskParametersKey = "taskParameters"
+
+// TaskParametersPart is p as a data part, refused when p breaks the bounds.
+func TaskParametersPart(p TaskParameters) (Part, error) {
+	if err := ValidateTaskParameters(p.Parameters); err != nil {
+		return Part{}, err
+	}
+	if p.Parameters == nil {
+		p.Parameters = map[string]string{}
+	}
+	data, err := json.Marshal(map[string]TaskParameters{taskParametersKey: p})
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// TaskParametersOf finds the taskParameters part among parts. A data part
+// that is not one is skipped. One that is but breaks the bounds is an
+// error rather than skipped, so a reader never runs a task as though it had
+// no parameters when its submission carried bad ones.
+func TaskParametersOf(parts []Part) (TaskParameters, bool, error) {
+	for _, p := range parts {
+		raw, ok := wrappedData(p, taskParametersKey)
+		if !ok {
+			continue
+		}
+		var tp TaskParameters
+		if err := json.Unmarshal(raw, &tp); err != nil {
+			return TaskParameters{}, true, fmt.Errorf("task parameters: %w", err)
+		}
+		if err := ValidateTaskParameters(tp.Parameters); err != nil {
+			return TaskParameters{}, true, err
+		}
+		return tp, true, nil
+	}
+	return TaskParameters{}, false, nil
+}
+
+// ChildResult is the childResult data part: a child task's end, which the
+// gateway delivers on its parent's .in as a message (a parent that waits by
+// staying open reads its children's results there). Only a top-level
+// task's end goes to the conversation; a child's comes here instead.
+type ChildResult struct {
+	ChildTaskID string    `json:"childTaskId"`
+	Addressee   string    `json:"addressee"`
+	State       TaskState `json:"state"`
+	// Text is the child's deliverable when it completed, and the reason it
+	// gave otherwise; at most ChildResultTextCap bytes, cut by the gateway.
+	Text string `json:"text,omitempty"`
+}
+
+// ChildResultTextCap bounds ChildResult.Text in bytes. The gateway cuts a
+// longer deliverable and says so; the child's own result artifact keeps it
+// whole on TASKS.
+const ChildResultTextCap = 64 * 1024
+
+const childResultKey = "childResult"
+
+// ChildResultPart is c as a data part, refused without a child task id or a
+// terminal state, or with text past ChildResultTextCap.
+func ChildResultPart(c ChildResult) (Part, error) {
+	if !ValidSubjectToken(c.ChildTaskID) || !c.State.Terminal() || len(c.Text) > ChildResultTextCap {
+		return Part{}, fmt.Errorf("child result: needs a task id, a terminal state and at most %d bytes of text", ChildResultTextCap)
+	}
+	data, err := json.Marshal(map[string]ChildResult{childResultKey: c})
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// ChildResultOf finds the childResult part among parts. A data part that is
+// not one, or one without a task id or a terminal state, is skipped.
+func ChildResultOf(parts []Part) (ChildResult, bool) {
+	for _, p := range parts {
+		raw, ok := wrappedData(p, childResultKey)
+		if !ok {
+			continue
+		}
+		var c ChildResult
+		if json.Unmarshal(raw, &c) != nil || !ValidSubjectToken(c.ChildTaskID) || !c.State.Terminal() {
+			continue
+		}
+		return c, true
+	}
+	return ChildResult{}, false
+}
+
+// wrappedData is a data part's payload under key, when p is a data part
+// wrapping one.
+func wrappedData(p Part, key string) (json.RawMessage, bool) {
+	if p.Kind != "data" || len(p.Data) == 0 {
+		return nil, false
+	}
+	var wrap map[string]json.RawMessage
+	if json.Unmarshal(p.Data, &wrap) != nil {
+		return nil, false
+	}
+	raw, ok := wrap[key]
+	return raw, ok
+}
 
 // SteerNotice is the data part an executor that queues follow-ups puts on
 // the non-final status-update it publishes for each follow-up message it
