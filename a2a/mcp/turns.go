@@ -740,9 +740,13 @@ func (b *NATSBus) WaitForTurn(ctx context.Context, w *turnWatch, root TaskRef, w
 	return out, nil
 }
 
-// delegated reports whether a finished task handed its work on.
+// delegated reports whether a finished task delegated its work to another
+// agent, whose answer comes back on TASKS through a wake task. A handoff to
+// kanban cards (lib.ArtifactHandoff) is not one: the cards report into the
+// conversation themselves, over the console door, and no task on TASKS
+// will carry their answer, so following one would wait out the whole wait.
 func delegated(t *lib.Task) bool {
-	return t.Artifact(lib.ArtifactDelegate) != nil || t.Artifact(lib.ArtifactHandoff) != nil
+	return t.Artifact(lib.ArtifactDelegate) != nil
 }
 
 func deadlineOf(ctx context.Context) time.Time {

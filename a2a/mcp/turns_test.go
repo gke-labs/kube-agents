@@ -23,6 +23,7 @@ const (
 	answerText    = "Three pods are crash-looping in `checkout`."
 	wakeAnswer    = "The cluster agent found the bad rollout."
 	forgedAnswer  = "FORGED: everything is fine."
+	ackText       = "checking the cluster."
 )
 
 var fakeGateway = lib.Party{Session: gatewaySupervisor, AgentType: "a2a-gateway"}
@@ -111,6 +112,7 @@ func publishRun(t *testing.T, js jetstream.JetStream, addressee, taskID, answer 
 type gatewayScenario struct {
 	finish   bool      // the root task completes with answerText
 	delegate bool      // the root delegates; a child runs and a wake task carries the answer
+	handoff  bool      // the root acknowledges and hands its work to kanban cards (no wake task ever)
 	decoys   bool      // before the root: another conversation's turn, a delegated child here, an earlier turn's late submission, and a cancel here
 	frames   *frameLog // when set, every frame the gateway reads is recorded
 }
@@ -203,6 +205,11 @@ func runFakeGateway(t *testing.T, url string, js jetstream.JetStream, sc gateway
 			wake := fmt.Sprintf("task-wake%d", i)
 			publishSubmission(t, js, fakeAddressee, wake, conv, "child finished", child)
 			publishRun(t, js, fakeAddressee, wake, wakeAnswer, true)
+		case sc.handoff:
+			publishRun(t, js, fakeAddressee, root, "", false)
+			publishArtifact(t, js, fakeAddressee, root, lib.ArtifactHandoff, lib.HandoffCards)
+			publishResult(t, js, fakeAddressee, root, ackText)
+			publishStatus(t, js, fakeAddressee, root, lib.StateCompleted, true)
 		default:
 			publishRun(t, js, fakeAddressee, root, answerText, sc.finish)
 		}
@@ -272,6 +279,24 @@ func TestADelegationsAnswerComesFromTheWakeTask(t *testing.T) {
 		t.Fatalf("send_message failed: %s", res.Content[0].Text)
 	}
 	mustContain(t, res.Content[0].Text, "answer came from a delegated task", fakeAddressee+"/task-wake1", wakeAnswer, "cluster-a/task-deleg1")
+}
+
+// A turn that hands its work to kanban cards completes with its
+// acknowledgement, and send_message returns at once rather than following
+// the handoff as if a wake task were coming: the cards report over the
+// console door, never on TASKS.
+func TestAHandoffToCardsIsNotFollowed(t *testing.T) {
+	s, _, _, _ := turnServer(t, gatewayScenario{handoff: true})
+	start := time.Now()
+	res := callTool(t, s, ToolSendMessage, map[string]any{"text": "check the cluster", "wait_seconds": 20})
+	if res.IsError {
+		t.Fatalf("send_message failed: %s", res.Content[0].Text)
+	}
+	if took := time.Since(start); took > 10*time.Second {
+		t.Errorf("a handed-off turn took %s; it was followed as a delegation", took)
+	}
+	mustContain(t, res.Content[0].Text, ackText, "completed")
+	mustNotContain(t, res.Content[0].Text, "delegated task")
 }
 
 func TestConversationsArePerName(t *testing.T) {
