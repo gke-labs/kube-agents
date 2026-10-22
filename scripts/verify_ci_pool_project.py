@@ -50,6 +50,8 @@ _COLLECT = _ROOT / "agents" / "platform" / "skills" / "fleet-audit" / "scripts" 
 _COLLECT_MODULE_NAME = "kube_agents_fleet_collect"
 _GITLAB_FORGE = _ROOT / "hack" / "ci_gitlab_forge.py"
 _GITLAB_FORGE_MODULE_NAME = "kube_agents_ci_gitlab_forge"
+_GITLAB_SWEEP = _ROOT / "hack" / "ci_sweep_agent_pulls.py"
+_GITLAB_SWEEP_MODULE_NAME = "kube_agents_ci_sweep_agent_pulls"
 # Every name the declared-intent check reads off the loaded module. Read once
 # at load, so a rename upstream is a loader failure (the check unverified with
 # the AttributeError named) and never a verdict on a repository's note.
@@ -3091,7 +3093,6 @@ def check_gitops_workload_manifest(project_id: str) -> CheckResult:
 
 
 GITLAB_VERIFY_TOKEN_ENV = "GITLAB_VERIFY_TOKEN"
-GITLAB_LEDGER_TOKEN_SECRET = "kube-agents-prow/gitlab-ledger-token"
 _GITLAB_TOKEN_CACHE: dict = {}
 
 
@@ -3115,12 +3116,30 @@ def _load_gitlab_forge():
     return module
 
 
+def _load_gitlab_sweep():
+    """hack/ci_sweep_agent_pulls.py as a module, for its Secret Manager read of the pool's GitLab tokens."""
+    import importlib.util
+
+    hack = str(_GITLAB_SWEEP.parent)
+    if hack not in sys.path:
+        sys.path.append(hack)
+    spec = importlib.util.spec_from_file_location(_GITLAB_SWEEP_MODULE_NAME, _GITLAB_SWEEP)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {_GITLAB_SWEEP}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    getattr(module, "gitlab_secret")
+    return module
+
+
 def _gitlab_read_token() -> tuple[str, str]:
     """(token, where it came from) for the GitLab reads, or ("", why there is none).
 
     GITLAB_VERIFY_TOKEN first (a developer's own), else the pool's ledger
-    token in Secret Manager, which reads every pool project as the sweep
-    does; a machine that can read neither leaves the check unread.
+    token read as the sweep reads it (`gitlab_secret`: one printable line
+    from Secret Manager, anything else refused); a machine that can read
+    neither leaves the check unread. Nothing here raises: a missing gcloud
+    or a refused read is the reason returned, not a traceback.
     """
     if "token" in _GITLAB_TOKEN_CACHE:
         return _GITLAB_TOKEN_CACHE["token"]
@@ -3128,21 +3147,21 @@ def _gitlab_read_token() -> tuple[str, str]:
     if token:
         found = (token, GITLAB_VERIFY_TOKEN_ENV)
     else:
-        project, _, secret = GITLAB_LEDGER_TOKEN_SECRET.partition("/")
-        rc, out, err = run_cmd(["gcloud", "secrets", "versions", "access", "latest", f"--secret={secret}", f"--project={project}"])
-        if rc == 0 and out.strip():
-            found = (out.strip(), GITLAB_LEDGER_TOKEN_SECRET)
-        else:
-            found = ("", f"no token in {GITLAB_VERIFY_TOKEN_ENV} and {GITLAB_LEDGER_TOKEN_SECRET} could not be read ({(err or '').strip() or 'empty'})")
+        try:
+            sweep = _load_gitlab_sweep()
+            secret = f"{sweep.GITLAB_SECRETS_PROJECT}/{sweep.GITLAB_LEDGER_SECRET}"
+            found = (sweep.gitlab_secret(sweep.GITLAB_LEDGER_SECRET), secret)
+        except Exception as exc:
+            found = ("", f"no token in {GITLAB_VERIFY_TOKEN_ENV}, and the pool's ledger token could not be read from Secret Manager: {type(exc).__name__}: {str(exc)[:200]}")
     _GITLAB_TOKEN_CACHE["token"] = found
     return found
 
 
-def gitlab_manifest_seed_command(project_path: str, host: str = "gitlab.com") -> str:
-    """The `seed-file` call that writes checkout-gateway's declaration to a GitLab project, with the group Owner's token."""
+def gitlab_manifest_seed_command(project_id: str, host: str = "gitlab.com") -> str:
+    """The `seed-file` call that writes checkout-gateway's declaration to a pool project's GitLab project, with the group Owner's token."""
     return (
         f"printf '%s\\n' '{GITOPS_WORKLOAD_MANIFEST_CONTENT}' | GITLAB_SEED_TOKEN=<the gke-agentic Owner's token> "
-        f"python3 hack/ci_gitlab_forge.py seed-file --project {project_path} --path {GITOPS_WORKLOAD_MANIFEST_PATH} "
+        f"python3 hack/ci_gitlab_forge.py seed-file --project-id {project_id} --path {GITOPS_WORKLOAD_MANIFEST_PATH} "
         f"--message \"{GITOPS_WORKLOAD_MANIFEST_MESSAGE}\" --content-file - --host {host}"
     )
 
@@ -3184,7 +3203,7 @@ def check_gitlab_workload_manifest(project_id: str) -> CheckResult:
                 False,
                 f"{host}/{project_path} has no {path} on {branch}, or the token from {source} cannot read the project. "
                 f"If the project is readable, {cases} find no manifest to propose a budget beside and fail on this project "
-                f"on the GitLab lane until it is seeded: {gitlab_manifest_seed_command(project_path, host)}",
+                f"on the GitLab lane until it is seeded: {gitlab_manifest_seed_command(project_id, host)}",
             )
         prefix = GITOPS_WORKLOAD_MANIFEST_TREE
         wanted = [
@@ -3205,7 +3224,7 @@ def check_gitlab_workload_manifest(project_id: str) -> CheckResult:
                 False,
                 f"{host}/{project_path} does not exist, or the token from {source} cannot see it (GitLab answers 404 to both). "
                 f"The GitLab lane leases this project and dies at its reset without it; onboard it as docs/ci-pool-projects.md 5.6 says, "
-                f"seed included: {gitlab_manifest_seed_command(project_path, host)}",
+                f"seed included: {gitlab_manifest_seed_command(project_id, host)}",
             )
         if exc.code == 401:
             return unread(f"{host}/{project_path}", f"the token from {source} no longer authenticates (HTTP 401)")
@@ -3230,7 +3249,7 @@ def check_gitlab_workload_manifest(project_id: str) -> CheckResult:
             False,
             f"{host}/{project_path} carries {path} but the audit's index does not key Deployment/checkout-gateway in "
             f"seeded-reliability from it ({problem}), so {cases} fail on this project on the GitLab lane. Replace it with "
-            f"the seed's content (the files API's PUT, or delete it and run: {gitlab_manifest_seed_command(project_path, host)})",
+            f"the seed's content (the files API's PUT, or delete it and run: {gitlab_manifest_seed_command(project_id, host)})",
         )
     return CheckResult(name, True, f"{host}/{project_path} declares Deployment/checkout-gateway at {path} on {branch}, where the audit's index keys it")
 

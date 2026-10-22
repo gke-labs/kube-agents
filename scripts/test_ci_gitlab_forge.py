@@ -229,19 +229,32 @@ class SeedFileTest(unittest.TestCase):
             self.assertEqual(gitlab.repository_file(PATH, "clusters/none.yaml", "tok"), (gitlab.FILE_ABSENT, ""))
             self.assertEqual(gitlab.repository_blobs(PATH, "clusters/seeded-a", "tok"), ["clusters/seeded-a/apps/x.yaml", self.FILE])
 
+    def test_a_listing_the_pager_cut_is_an_error_not_a_shorter_answer(self):
+        page = [{"path": f"clusters/seeded-a/apps/{i}.yaml", "type": "blob"} for i in range(gitlab.PER_PAGE)]
+        def full_pages(method, path, token, body=None, host=gitlab.DEFAULT_HOST):
+            if path == f"/projects/{ENC}":
+                return {"id": PROJECT_ID, "default_branch": "main"}
+            return list(page)
+        with mock.patch.object(gitlab, "api", full_pages), self.assertRaises(gitlab.ResetError) as raised:
+            gitlab.repository_blobs(PATH, "clusters/seeded-a", "tok")
+        self.assertIn("cut", str(raised.exception))
+
     def test_the_command_takes_the_token_from_the_environment_and_the_content_from_stdin(self):
         fake = FakeGitLab()
         err, out = io.StringIO(), io.StringIO()
         with mock.patch.dict(os.environ, {gitlab.SEED_TOKEN_ENV: ""}), redirect_stderr(err):
-            self.assertEqual(gitlab.seed_file_main(["--project", PATH, "--path", self.FILE, "--message", "m", "--content-file", "-"]), 2)
+            self.assertEqual(gitlab.seed_file_main(["--project-id", "kube-agents-evals-2", "--path", self.FILE, "--message", "m", "--content-file", "-"]), 2)
         self.assertIn(gitlab.SEED_TOKEN_ENV, err.getvalue())
         with mock.patch.dict(os.environ, {gitlab.SEED_TOKEN_ENV: "owner-tok"}), mock.patch.object(gitlab, "api", fake), mock.patch.object(gitlab, "pause"), \
                 mock.patch.object(sys, "stdin", io.StringIO("kind: Deployment\n")), redirect_stdout(out):
-            self.assertEqual(gitlab.seed_file_main(["--project", PATH, "--path", self.FILE, "--message", "m", "--content-file", "-"]), 0)
-        self.assertEqual(f"{PATH} {self.FILE}: created\n", out.getvalue())
+            self.assertEqual(gitlab.seed_file_main(["--project-id", "kube-agents-evals-2", "--path", self.FILE, "--message", "m", "--content-file", "-"]), 0)
+        self.assertEqual(f"{PATH} {self.FILE}: created\n", out.getvalue(), "the project path is derived from the id, the pool's layout")
         self.assertEqual({"owner-tok"}, set(fake.tokens))
         with mock.patch.dict(os.environ, {gitlab.SEED_TOKEN_ENV: "owner-tok"}), mock.patch.object(sys, "stdin", io.StringIO("  \n")), redirect_stderr(err):
-            self.assertEqual(gitlab.seed_file_main(["--project", PATH, "--path", self.FILE, "--message", "m", "--content-file", "-"]), 2, "empty content is refused")
+            self.assertEqual(gitlab.seed_file_main(["--project-id", "kube-agents-evals-2", "--path", self.FILE, "--message", "m", "--content-file", "-"]), 2, "empty content is refused")
+        with mock.patch.dict(os.environ, {gitlab.SEED_TOKEN_ENV: "owner-tok"}), mock.patch.object(gitlab, "api", fake), redirect_stderr(err):
+            self.assertEqual(gitlab.seed_file_main(["--project-id", "", "--path", self.FILE, "--message", "m", "--content-file", "-"]), 2, "the guard refuses an unnamed project before any call")
+        self.assertIn("unnamed lease", err.getvalue())
 
     def test_a_project_the_token_cannot_see_is_named_with_the_status(self):
         def gone(method, path, token, body=None, host=gitlab.DEFAULT_HOST):
@@ -249,7 +262,7 @@ class SeedFileTest(unittest.TestCase):
         err = io.StringIO()
         with mock.patch.dict(os.environ, {gitlab.SEED_TOKEN_ENV: "tok"}), mock.patch.object(gitlab, "api", gone), mock.patch.object(gitlab, "pause"), \
                 mock.patch.object(sys, "stdin", io.StringIO("x: 1\n")), redirect_stderr(err):
-            self.assertEqual(gitlab.seed_file_main(["--project", PATH, "--path", self.FILE, "--message", "m", "--content-file", "-"]), 1)
+            self.assertEqual(gitlab.seed_file_main(["--project-id", "kube-agents-evals-2", "--path", self.FILE, "--message", "m", "--content-file", "-"]), 1)
         self.assertIn("HTTP 404", err.getvalue())
 
 

@@ -402,9 +402,10 @@ curl -sS -H @"$HDR" -H 'Content-Type: application/json' -X POST "$API/projects" 
 BOT_ID=$(curl -sS -H @"$HDR" "$API/users?username=kube-agents-eval-bot" | jq '.[0].id')
 curl -sS -H @"$HDR" -X POST "$API/projects/gke-agentic%2F$NAME/members" \
   --data-urlencode "user_id=$BOT_ID" --data-urlencode access_level=30 | jq '{username, access_level}'
-# The fixture file, with the Owner's token (the bot is a Developer and cannot push to main):
-GITLAB_SEED_TOKEN="$(cut -d' ' -f2 "$HDR")" python3 scripts/verify_ci_pool_project.py --project-id "$PROJECT_ID" --checks gitlab_workload_manifest \
-  || echo "run the seed-file command the check printed"
+# The fixture file: the check reads with the Owner's token and, on a miss, prints the exact
+# `hack/ci_gitlab_forge.py seed-file --project-id "$PROJECT_ID" ...` command; run it with the same token in
+# GITLAB_SEED_TOKEN (the bot is a Developer and cannot push to main), then re-run the check.
+GITLAB_VERIFY_TOKEN="$(cut -d' ' -f2 "$HDR")" python3 scripts/verify_ci_pool_project.py --project-id "$PROJECT_ID" --checks gitlab_workload_manifest
 ```
 
 Done when the first call reports `private` with a `default_branch`, the second reports `kube-agents-eval-bot` at access level 30, the `GitLab Workload Declaration` check passes (it fails once with the exact `hack/ci_gitlab_forge.py seed-file` command to run), and the next sweep run names the project in `pull-sweep-gitlab.json` with no error. Nothing else: the token pair is the pool's, and the runners' Secret Manager grants are on the secrets, not on the project. Delete the Owner token when done.

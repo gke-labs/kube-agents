@@ -521,6 +521,11 @@ def repository_blobs(path: str, prefix: str, token: str, host: str = DEFAULT_HOS
         host,
         f"the tree of {path} under {prefix}",
     )
+    if len(entries) >= MAX_PAGES * PER_PAGE:
+        # `_pages` stops at MAX_PAGES full pages and says nothing; a reader
+        # judging a one-file rule from a cut listing would pass on what it
+        # did not see, so the cut is an error here, not a shorter answer.
+        raise ResetError(f"the tree of {path} under {prefix} has more than {MAX_PAGES * PER_PAGE} entries; the listing is cut and cannot be judged")
     return sorted(str(e.get("path")) for e in entries if isinstance(e, dict) and e.get("type") == "blob")
 
 
@@ -766,15 +771,18 @@ SEED_TOKEN_ENV = "GITLAB_SEED_TOKEN"
 
 
 def seed_file_main(argv: list[str] | None = None) -> int:
-    """`python3 ci_gitlab_forge.py seed-file --project P --path F --message M --content-file C [--host HOST]`:
-    write one file to a pool project when it is absent (docs/ci-pool-projects.md
-    5.6; the fixture the remediation cases read). The token arrives in
-    GITLAB_SEED_TOKEN, never on argv, and has to push to the default branch:
-    the group Owner's, not the bot's. `--content-file -` reads stdin."""
+    """`python3 ci_gitlab_forge.py seed-file --project-id ID --path F --message M --content-file C [--host HOST]`:
+    write one file to a pool project's GitLab project, `gke-agentic/<ID>-infra`,
+    when it is absent (docs/ci-pool-projects.md 5.6; the fixture the
+    remediation cases read). The path is derived, never typed, and
+    `expected_project` holds it to the pool's layout as every other write
+    here is held. The token arrives in GITLAB_SEED_TOKEN, never on argv, and
+    has to push to the default branch: the group Owner's, not the bot's.
+    `--content-file -` reads stdin."""
     import argparse
 
     parser = argparse.ArgumentParser(prog="ci_gitlab_forge.py seed-file")
-    parser.add_argument("--project", required=True, help="the project path, e.g. gke-agentic/kube-agents-evals-7-infra")
+    parser.add_argument("--project-id", required=True, help="the pool project, e.g. kube-agents-evals-7; its GitLab project is gke-agentic/<id>-infra")
     parser.add_argument("--path", required=True, help="the file's path in the repository")
     parser.add_argument("--message", required=True, help="the commit message")
     parser.add_argument("--content-file", required=True, help="the file's content, or - for stdin")
@@ -784,19 +792,25 @@ def seed_file_main(argv: list[str] | None = None) -> int:
     if not token:
         print("seed-file: no token in %s" % SEED_TOKEN_ENV, file=sys.stderr)
         return 2
+    project = f"{GROUP}/{args.project_id}{PROJECT_SUFFIX}"
+    try:
+        expected_project(project, args.project_id)
+    except ResetError as exc:
+        print("seed-file: %s" % exc, file=sys.stderr)
+        return 2
     content = sys.stdin.read() if args.content_file == "-" else pathlib.Path(args.content_file).read_text(encoding="utf-8")
     if not content.strip():
         print("seed-file: the content is empty; refusing to write an empty %s" % args.path, file=sys.stderr)
         return 2
     try:
-        outcome = seed_repository_file(args.project, args.path, args.message, content, token, host=args.host)
+        outcome = seed_repository_file(project, args.path, args.message, content, token, host=args.host)
     except urllib.error.HTTPError as exc:
-        print("seed-file: %s %s at %s: HTTP %d" % (args.project, args.path, args.host, exc.code), file=sys.stderr)
+        print("seed-file: %s %s at %s: HTTP %d" % (project, args.path, args.host, exc.code), file=sys.stderr)
         return 1
     except (RateLimited, ResetError, OSError, http.client.HTTPException, ValueError) as exc:
-        print("seed-file: %s %s at %s: %s" % (args.project, args.path, args.host, exc), file=sys.stderr)
+        print("seed-file: %s %s at %s: %s" % (project, args.path, args.host, exc), file=sys.stderr)
         return 1
-    print("%s %s: %s" % (args.project, args.path, outcome))
+    print("%s %s: %s" % (project, args.path, outcome))
     return 0
 
 
@@ -807,5 +821,5 @@ if __name__ == "__main__":
         sys.exit(whoami_main(sys.argv[2:]))
     if sys.argv[1:2] == ["probe-ledger"]:
         sys.exit(probe_ledger_main(sys.argv[2:]))
-    print("usage: ci_gitlab_forge.py whoami [--host HOST] | probe-ledger --path P --project ID --build B [--host HOST] | seed-file --project P --path F --message M --content-file C [--host HOST]  (tokens in %s, %s and %s)" % (PROBE_TOKEN_ENV, PROBE_LEDGER_TOKEN_ENV, SEED_TOKEN_ENV), file=sys.stderr)
+    print("usage: ci_gitlab_forge.py whoami [--host HOST] | probe-ledger --path P --project ID --build B [--host HOST] | seed-file --project-id ID --path F --message M --content-file C [--host HOST]  (tokens in %s, %s and %s)" % (PROBE_TOKEN_ENV, PROBE_LEDGER_TOKEN_ENV, SEED_TOKEN_ENV), file=sys.stderr)
     sys.exit(2)

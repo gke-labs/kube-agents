@@ -2154,7 +2154,7 @@ class GitlabWorkloadManifestTest(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertIn(f"has no {self._PATH} on main", result.message)
         self.assertIn("GitLab lane", result.message)
-        self.assertIn(f"seed-file --project {self._PROJECT} --path {self._PATH}", result.message)
+        self.assertIn(f"seed-file --project-id kube-agents-evals-3 --path {self._PATH}", result.message)
         self.assertIn("GITLAB_SEED_TOKEN=", result.message)
         self.assertIn("--host gitlab.com", result.message)
 
@@ -2190,24 +2190,44 @@ class GitlabWorkloadManifestTest(unittest.TestCase):
         self.assertIn("does not key Deployment/checkout-gateway", result.message)
         self.assertIn("seed-file", result.message)
 
-    def test_the_token_comes_from_the_environment_before_secret_manager(self):
+    def test_the_token_comes_from_the_environment_before_the_sweeps_secret_read_and_never_raises(self):
         checker._GITLAB_TOKEN_CACHE.clear()
         try:
-            with mock.patch.dict(os.environ, {checker.GITLAB_VERIFY_TOKEN_ENV: " mine "}), mock.patch.object(checker, "run_cmd") as run:
+            with mock.patch.dict(os.environ, {checker.GITLAB_VERIFY_TOKEN_ENV: " mine "}), mock.patch.object(checker, "_load_gitlab_sweep") as load:
                 self.assertEqual(("mine", checker.GITLAB_VERIFY_TOKEN_ENV), checker._gitlab_read_token())
-                run.assert_not_called()
+                load.assert_not_called()
             checker._GITLAB_TOKEN_CACHE.clear()
-            with mock.patch.dict(os.environ, {checker.GITLAB_VERIFY_TOKEN_ENV: ""}), mock.patch.object(checker, "run_cmd", return_value=(0, "ledger\n", "")) as run:
-                self.assertEqual(("ledger", checker.GITLAB_LEDGER_TOKEN_SECRET), checker._gitlab_read_token())
-                self.assertIn("--secret=gitlab-ledger-token", " ".join(run.call_args.args[0]))
-                self.assertIn("--project=kube-agents-prow", " ".join(run.call_args.args[0]))
+            sweep = checker._load_gitlab_sweep()
+            with mock.patch.dict(os.environ, {checker.GITLAB_VERIFY_TOKEN_ENV: ""}), mock.patch.object(sweep, "gitlab_secret", return_value="ledger") as read, \
+                    mock.patch.object(checker, "_load_gitlab_sweep", return_value=sweep):
+                self.assertEqual(("ledger", "kube-agents-prow/gitlab-ledger-token"), checker._gitlab_read_token())
+                read.assert_called_once_with(sweep.GITLAB_LEDGER_SECRET)
             checker._GITLAB_TOKEN_CACHE.clear()
-            with mock.patch.dict(os.environ, {checker.GITLAB_VERIFY_TOKEN_ENV: ""}), mock.patch.object(checker, "run_cmd", return_value=(1, "", "PERMISSION_DENIED")):
+            with mock.patch.dict(os.environ, {checker.GITLAB_VERIFY_TOKEN_ENV: ""}), \
+                    mock.patch.object(sweep, "gitlab_secret", side_effect=sweep.SweepError("gcloud could not read kube-agents-prow/gitlab-ledger-token: PERMISSION_DENIED")), \
+                    mock.patch.object(checker, "_load_gitlab_sweep", return_value=sweep):
                 token, why = checker._gitlab_read_token()
                 self.assertEqual("", token)
                 self.assertIn("PERMISSION_DENIED", why)
+            checker._GITLAB_TOKEN_CACHE.clear()
+            with mock.patch.dict(os.environ, {checker.GITLAB_VERIFY_TOKEN_ENV: ""}), mock.patch.object(checker, "_load_gitlab_sweep", side_effect=FileNotFoundError("gcloud")):
+                token, why = checker._gitlab_read_token()
+                self.assertEqual("", token, "a machine without gcloud gets a reason, not a traceback")
+                self.assertIn("FileNotFoundError", why)
         finally:
             checker._GITLAB_TOKEN_CACHE.clear()
+
+    def test_a_cut_tree_listing_leaves_the_check_unread(self):
+        forge = self._Forge({self._PATH: checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n"})
+        class Cut(Exception):
+            pass
+        def cut(*a, **k):
+            raise Cut("the tree of x under clusters/seeded-a has more than 2000 entries; the listing is cut and cannot be judged")
+        forge.repository_blobs = cut
+        result = self._check(forge)
+        self.assertTrue(result.passed)
+        self.assertFalse(result.read)
+        self.assertIn("listing is cut", result.warnings[0])
 
     def test_the_real_helper_loads_and_the_check_is_registered_outside_the_gh_and_gcloud_sets(self):
         module = checker._load_gitlab_forge()
@@ -4929,6 +4949,7 @@ class RunChecksTest(unittest.TestCase):
              mock.patch.object(checker, "check_gitops_default_branch", return_value=checker.CheckResult("b", True)), \
              mock.patch.object(checker, "check_gitops_declaration", return_value=checker.CheckResult("n", True)), \
              mock.patch.object(checker, "check_gitops_workload_manifest", return_value=checker.CheckResult("w", True)), \
+             mock.patch.object(checker, "check_gitlab_workload_manifest", return_value=checker.CheckResult("gl", True)), \
              mock.patch.object(checker, "check_ledger_read_credential", return_value=checker.CheckResult("l", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
             results = checker.run_checks("kube-agents-evals-6")
@@ -4947,7 +4968,7 @@ class ChecksSelectionTest(unittest.TestCase):
     def _mocks(self):
         return {
             name: mock.patch.object(checker, name, return_value=checker.CheckResult(name, True))
-            for name in ("check_codebase_mapping", "check_gke_and_state", "check_seeded_fleet_fixtures", "check_github_repo_and_app", "check_gitops_default_branch", "check_gitops_declaration", "check_gitops_workload_manifest", "check_ledger_read_credential", "check_warm_cache_readers")
+            for name in ("check_codebase_mapping", "check_gke_and_state", "check_seeded_fleet_fixtures", "check_github_repo_and_app", "check_gitops_default_branch", "check_gitops_declaration", "check_gitops_workload_manifest", "check_gitlab_workload_manifest", "check_ledger_read_credential", "check_warm_cache_readers")
         }
 
     def test_parse_checks_orders_and_refuses_unknown_ids(self):
@@ -4991,13 +5012,13 @@ class ChecksSelectionTest(unittest.TestCase):
              mock.patch.object(checker, "check_artifact_registry", return_value=checker.CheckResult("a", True)) as ar, \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)) as minter, \
              mocks["check_codebase_mapping"] as mapping, mocks["check_gke_and_state"] as gke, mocks["check_seeded_fleet_fixtures"] as fleet, \
-             mocks["check_github_repo_and_app"] as app, mocks["check_gitops_default_branch"] as branch, mocks["check_gitops_declaration"] as note, mocks["check_gitops_workload_manifest"] as manifest, mocks["check_ledger_read_credential"] as ledger, \
+             mocks["check_github_repo_and_app"] as app, mocks["check_gitops_default_branch"] as branch, mocks["check_gitops_declaration"] as note, mocks["check_gitops_workload_manifest"] as manifest, mocks["check_gitlab_workload_manifest"] as gitlab_manifest, mocks["check_ledger_read_credential"] as ledger, \
              mocks["check_warm_cache_readers"] as warm, mock.patch.object(checker, "run_cmd", side_effect=AssertionError("a check ran a real command")):
             results = checker.run_checks("kube-agents-evals-3", checks=list(checker.POOL_STATE_CHECKS))
             self.assertEqual(warm.call_count, 0, "the warm-cache check is not in the scan's set")
             branch.assert_called_once_with("kube-agents-evals-3")
             self.assertEqual([r.check_id for r in results], list(checker.POOL_STATE_CHECKS))
-            for never in (mapping, fleet, app, note, manifest, ledger):
+            for never in (mapping, fleet, app, note, manifest, gitlab_manifest, ledger):
                 never.assert_not_called()
             minter.assert_called_once_with("kube-agents-evals-3", checker.DEFAULT_GITHUB_APP_ID, "us-central1", probe_app=False)
             everything = checker.run_checks("kube-agents-evals-3")
