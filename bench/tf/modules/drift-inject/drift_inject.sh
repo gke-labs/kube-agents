@@ -389,11 +389,15 @@ drift_wait_for_card() {
   # Integers, checked before either loop rather than discovered inside one. A
   # non-integer bound makes `[ "$elapsed" -ge "$bound" ]` an error, and an error
   # in an `if` condition is false rather than fatal under errexit, so the loop
-  # would never reach its bound and would poll for ever.
+  # would never reach its bound and would poll for ever. A digit string too wide
+  # for the shell's integers does the same -- `[` reports it as "integer
+  # expression expected" and the comparison is false even against itself -- so
+  # the width is capped too: ten characters or more is refused, which is past
+  # any wait here and well inside what `[ -ge ]` can compare.
   finish_timeout="${drift_card_finish_timeout:-$DRIFT_DEFAULT_CARD_FINISH_TIMEOUT}"
   for bound in "$drift_card_wait_timeout" "$finish_timeout" "$drift_poll_interval"; do
     case "$bound" in
-      "" | *[!0-9]*)
+      "" | *[!0-9]* | ??????????*)
         echo "ERROR: drift_card_wait_timeout, drift_card_finish_timeout and drift_poll_interval must be whole seconds; got '$bound'." >&2
         exit 1
         ;;

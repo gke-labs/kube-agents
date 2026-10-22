@@ -234,7 +234,9 @@ class DriftShellTestBase(unittest.TestCase):
         lines = self.curl_log_file.read_text(encoding="utf-8").strip().splitlines()
         return [json.loads(line) for line in lines if line.strip()]
 
-    def run_bash(self, script: str, extra_env: dict | None = None) -> subprocess.CompletedProcess:
+    def run_bash(
+        self, script: str, extra_env: dict | None = None, timeout: float | None = None
+    ) -> subprocess.CompletedProcess:
         overrides = {
             "KUBECTL_LOG": str(self.log_file),
             "CURL_LOG": str(self.curl_log_file),
@@ -252,6 +254,7 @@ class DriftShellTestBase(unittest.TestCase):
             capture_output=True,
             text=True,
             env=env,
+            timeout=timeout,
         )
 
     def test_run_bash_isolates_ambient_drift_env_variables(self):
@@ -917,6 +920,10 @@ sys.stdout.write(reply + "\\n")
 """
 
 
+# How long one scripted wait may take before it counts as one that never ends.
+WAIT_TEST_CEILING_SECONDS = 30
+
+
 class DriftWaitForCardTests(DriftShellTestBase):
     """The two-stage wait: the card appears, then it finishes, then the turn starts.
 
@@ -934,7 +941,7 @@ class DriftWaitForCardTests(DriftShellTestBase):
         self.state = pathlib.Path(self.temp_dir.name) / "probe_reads"
         self.set_kubectl_config({})
 
-    def wait(self, replies, card_wait=30, finish=30, interval=0):
+    def wait(self, replies, card_wait=5, finish=5, interval=0):
         script = f"""\
 set -euo pipefail
 source "{SCRIPT}"
@@ -950,9 +957,13 @@ drift_exec_in_pod_stdin=(kubectl exec -i deploy/x -n ns -c c --)
 drift_wait_for_card
 echo "RETURNED $?"
 """
+        # A loop that stops reaching its bound must fail as a named test, not
+        # hold the bench job to its own deadline: every scripted wait here ends
+        # in a second or two, so this ceiling only ever fires on a regression.
         return self.run_bash(
             script,
             extra_env={"FAKE_PROBE_REPLIES": "|".join(replies), "FAKE_PROBE_STATE": str(self.state)},
+            timeout=WAIT_TEST_CEILING_SECONDS,
         )
 
     def reads(self):
@@ -1015,11 +1026,15 @@ echo "RETURNED $?"
         self.assertIn("The board probe's last run exited 1", proc.stderr)
 
     def test_a_non_integer_bound_fails_at_once_instead_of_polling_for_ever(self):
-        for field in ("card_wait", "finish", "interval"):
-            with self.subTest(bound=field):
+        # A digit string too wide for the shell's integers is as bad as a word:
+        # `[ -ge ]` errors on it, which reads as false, so the bound is never met.
+        cases = [(field, value) for field in ("card_wait", "finish", "interval")
+                 for value in ("abc", "99999999999999999999")]
+        for field, value in cases:
+            with self.subTest(bound=field, value=value):
                 if self.state.exists():
                     self.state.unlink()
-                proc = self.wait(["1 0"], **{field: "abc"})
+                proc = self.wait(["1 0"], **{field: value})
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertIn("must be whole seconds", proc.stderr)
                 self.assertEqual(self.reads(), 0)
