@@ -312,6 +312,8 @@ func TestTheDeletionReleasesOnlyOnAPersistentRefusal(t *testing.T) {
 		released bool
 	}{
 		{"forbidden", apierrors.NewForbidden(schema.GroupResource{Resource: "resourcequotas"}, "test-agent-profile-quota", fmt.Errorf("denied by a policy")), true},
+		// A webhook that sets no code (Kyverno's validate) comes back as 400.
+		{"webhook denial without a code", apierrors.NewBadRequest(`admission webhook "validate.kyverno.svc-fail" denied the request: protected`), true},
 		{"transient", apierrors.NewTooManyRequests("throttled", 1), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
