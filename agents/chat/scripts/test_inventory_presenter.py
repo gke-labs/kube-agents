@@ -134,6 +134,20 @@ class PresentTest(unittest.TestCase):
                     self.assertIn(json.dumps(sentence), json.dumps(blocks))
                     self.assertIn(json.dumps(sentence), json.dumps(message))
 
+    def test_the_posture_line_written_after_the_list_is_kept_once(self):
+        line = inventory_presenter.SCAN_SCOPE_LINE
+        report = REPORT.replace(
+            "I scanned 3 clusters and 41 workloads. Posture is mostly healthy.", "Scanned 3 clusters and 41 workloads."
+        ).replace("Also found:", f"{line}\n\nAlso found:")
+        out = inventory_presenter.present(report)
+        self.assertTrue(out.startswith(
+            "**I scanned 3 clusters and 41 workloads and found 22 things to look at.**\n"
+            f"{line} Two are worth fixing first:\n\n"
+        ), out)
+        self.assertEqual(out.count(line), 1)
+        message, _ = inventory_presenter.chat(report)
+        self.assertIn(json.dumps(line), json.dumps(message))
+
     def test_two_items_have_no_lead(self):
         report = "# Scan\n\nAll quiet. One thing stands out.\n\n1. **A (minor)**\n   Fix it.\n2. **B**\n   Fix that.\n"
         self.assertEqual(

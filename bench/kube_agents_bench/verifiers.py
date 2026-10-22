@@ -6704,7 +6704,6 @@ class BootstrapReportCriticalsVerifier(_OnboardingPollVerifier):
         return "pass", f"the report's {len(items)} numbered item(s) {counts}, the limit of {self.limit}: {named}", raw
 
 
-# A title written as a bold line rather than a heading, as the Slack presenter also drops it.
 # The report's one title line: a heading, or a bold line with no sentence end, as the Slack
 # presenter's title rule reads it. Only the first line can be the title.
 _TITLE_RE = re.compile(r"^\s*(?:#{1,6}\s.*|\*\*[^*\n]*[^*\n.!?\s]\s*\*\*)\s*$")
@@ -6729,7 +6728,7 @@ class BootstrapReportPostureVerifier(_OnboardingPollVerifier):
 
     The prioritization SOP (Step 6) has the worker open the report with what
     was scanned and then the posture line ``inventory_findings.py select``
-    prints, which names the scan's own checks and leaves the rest to the
+    prints, which counts the scan's own checks and leaves the rest to the
     first-run audits. A verdict on the fleet ("healthy", "no critical
     vulnerabilities") there contradicts those audits minutes later. This reads,
     off the shell sandbox (:mod:`kube_agents_bench.onboarding`), the report the

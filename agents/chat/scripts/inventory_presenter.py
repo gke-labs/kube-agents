@@ -652,9 +652,13 @@ class _Shape:
         self.closing = [p for p in tail if p is not rollup]
         # The posture line select prints counts the scan's checks; it is kept whole, since without
         # it the total reads as the whole fleet's: under the headline as text, under the rows on the
-        # card, whose line under the headline is clipped shorter than it.
+        # card, whose one line under the headline already carries the gap and the lead and is
+        # clipped at ROW_TEXT_MAX. Step 6 puts it before the list; one written after the list is
+        # lifted out of the closing lines.
         posture = " ".join(posture.split())
-        self.scope = SCAN_SCOPE_LINE if SCAN_SCOPE_LINE in posture else ""
+        after = next((p for p in self.closing if " ".join(p.split()) == SCAN_SCOPE_LINE), None)
+        self.closing = [p for p in self.closing if p is not after]
+        self.scope = SCAN_SCOPE_LINE if SCAN_SCOPE_LINE in posture or after is not None else ""
         posture = posture.replace(SCAN_SCOPE_LINE, " ")
         clauses = [c.strip() for c in CLAUSE_END.split(posture.replace(BOLD_MARK, "")) if c.strip()]
         split = [_split_gap(c) for c in clauses]
