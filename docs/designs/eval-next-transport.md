@@ -716,11 +716,14 @@ today-mode nightly on the same agent model, the GitLab lane's nightly under next
 release-candidate eval's postsubmit, which grades a candidate in the mode a new install gets), and
 refuses it on any other Prow run, so the flag
 mis-set on the today nightly or another postsubmit still stops the deploy before anything is built. A
-record of `next`'s own does not exist yet: the baseline key has no mode field, so a next-mode
-sample appended to the store would be today's once written, and the dashboard has no next lane to
-file a run under. Until both exist, `hack/ci-eval-pr.sh` keeps every flagged run out of the
-baseline recorder and the dashboard publisher on the flag alone, whatever its job type; a flagged
-run reads the store, when one is armed, and writes nothing shared.
+next-mode run has a record of its own: the baseline version key carries the mode, which
+`bench-gate` reads off the inject transport ([`bench/baselines/README.md`](../../bench/baselines/README.md)),
+so the next-mode nightly on `main` appends under a `next` key that today's window never reads, and
+rung 6 on the inject lane compares only with next-mode history at its own key (agent model
+included, so the presubmit, on another model than that nightly, has none yet). The today lane stays out of the
+recorder and the dashboard publisher (`EVAL_ROLLBACK_LANE=1`): its key reads `today`, but it grades
+a rolled-back install. The dashboard's Trend page keeps a series per mode, drawing today's; the
+next-mode nightly's Prow runs are not collected onto the dashboard's run pages yet.
 
 ## Open questions
 

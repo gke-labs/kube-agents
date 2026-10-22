@@ -784,6 +784,10 @@ def _inject_record(trajectory: list[Any]) -> bool:
     )
 
 
+#: The public name ``gate`` reads the version key's mode with.
+is_inject_record = _inject_record
+
+
 def _entry_failed(entry: dict[str, Any]) -> bool:
     """Whether a report entry records a fail, read the way ``_rollup`` reads
     it: the status word in any case, or, when no status was written, the

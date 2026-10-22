@@ -376,10 +376,14 @@ three = 30 on the today lane (the api-transport count: 30 since 2026-10-21, 33 f
 on 2026-10-16, 39 from 2026-10-14, 36 before), `infra` repetitions left out — against `main`'s rate over the same cases from the evidence store (the
 newest seven nightly lines per case, about 249 runs). It is the rule that can see a pull request
 which made several cases a little worse without making any one of them fail three times. The
-nightly that writes those lines grades `today` and the presubmit grades `next`, so the comparison
-is the pull request's `next` against `main`'s `today`; a window of `next`'s own needs the mode on
-the baseline's version key first ([`bench/baselines/README.md`](../bench/baselines/README.md)). The
-verdict prints it on every run today:
+version key carries the mode ([`bench/baselines/README.md`](../bench/baselines/README.md)), so the
+presubmit's `next` is compared only with lines a next-mode run on `main` recorded at its key, and
+the today lane's `today` only with today's; a case with no line at its key contributes nothing to
+`main`'s side, with one exception below. The next-mode nightly, the one next-mode run on `main` that records, runs a
+different agent model from the presubmit and so files under another key. A case with no line at its
+next key falls back, for this number only, to its today-mode lines at the same key otherwise, and
+the verdict names those cases in a note; rung 6 never falls back. The verdict prints it on every
+run:
 
 ```
 Admitted-case pass rate: 91.7% (main: 92.4%, margin 10.0%)
@@ -521,14 +525,16 @@ into the unit before.
 the set of requesting cases. The same approvers as the exclusion list: an entry is a rung 1 check
 on every pull request.
 
-Rung 6 does not compare on the inject lane. `main`'s judged record is the today-mode nightly's
-over the api transport, filed at a version key that carries neither the mode nor the transport,
-so an inject run's judged mean set against it measures the lane rather than the pull request:
-the next lane redded on rung 6 on four admitted cases at once on 2026-10-17 with nothing changed
-on its side. `bench-gate` skips the comparison under `AGENT_TRANSPORT=inject` and says so on
-each case it would have compared; main's mean is still printed beside the run's. Rungs 1 to 5
-are unchanged, and the today lane keeps rung 6. It comes back on the inject lane when the
-version key carries the mode ([`bench/baselines/README.md`](../bench/baselines/README.md)).
+Rung 6 compares an inject run only with next-mode history. The version key carries the mode
+([`bench/baselines/README.md`](../bench/baselines/README.md)), and `bench-gate` reads
+`AGENT_TRANSPORT=inject` as `next`, so an inject run's judged mean is set against the means a
+next-mode run on `main` recorded at the same key, never against the today-mode nightly's: that
+comparison measured the lane rather than the pull request, and redded four admitted cases at once
+on 2026-10-17 with nothing changed on their side. Where no next-mode line exists at the key, rung 6
+is quiet; a partial window is compared, as it is for `today`. The today lane reads today's history
+only. The key includes the agent model, and the next-mode nightly runs a different one from the
+presubmit, so on the presubmit rung 6 stays quiet until a next-mode run on `main` records at the
+presubmit's model.
 
 One thing about the lane's install differs too. That write safeguard
 (`no-github-writes-the-case-did-not-request`) charges every pull request opened in a repetition's
@@ -560,7 +566,7 @@ nightly runs the same list once a night on its own leased project
 case's record is per case, not per forge; nothing runs the cases this file leaves out against
 GitLab. `ci-kube-agents-eval-nightly-gitlab-next` runs the same list under `spec.mode: next`
 (`EVAL_MODE_NEXT=1`, through the inject door), so the forge is graded on both stacks; its runs
-show in Prow only, as the dashboard has no next lane.
+show in Prow only, as the dashboard collects no next-mode runs and the GitLab lane never records.
 
 The roster above is still the roster, intersected with the lane's list: a roster case in the
 lane arms rung 4 there, and a held-out seat runs and reports without arming it, exactly as on

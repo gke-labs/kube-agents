@@ -231,8 +231,8 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 #   - section 2b refuses it on a Prow
 #     run that is neither a pull request's nor one of the jobs
 #     named below (a mis-set variable on the nightly or another postsubmit would
-#     otherwise run that job in next mode, recording and publishing nothing,
-#     so main's window and dashboard would silently miss it), and refuses a
+#     otherwise run that job in next mode, so today's window and dashboard
+#     would silently miss it), and refuses a
 #     fan-out the bridge cannot be given as its concurrency, before anything
 #     is built;
 #   - step 4 also builds the A2A gateway, auth callout, worker and console
@@ -300,9 +300,10 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # the flag leaking into the today nightly's or another postsubmit's environment
 # still stops the deploy at second zero. The names are the jobs' own in
 # oss-test-infra (prow/prowjobs/gke-labs/kube-agents/); a rename there is a
-# one-line edit here. hack/ci-eval-pr.sh keeps such a run out of the baseline
-# recorder on the flag alone, so admitting a job here never lets it write
-# main's window.
+# one-line edit here. Admitting a job here never lets it write today's window:
+# a run graded through the inject door records under the version key's next
+# mode (bench-gate), and hack/ci-eval-pr.sh keeps the today lane, the GitLab
+# lane and a release candidate out of the recorder altogether.
 readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-today ci-kube-agents-eval-nightly-next-claude ci-kube-agents-eval-nightly-gitlab-next post-kube-agents-eval-rc"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
@@ -944,11 +945,12 @@ fi
 # request's, or one of the jobs EVAL_MODE_NEXT_JOB_NAMES lists (the today
 # lane's periodic and the next-mode nightlies on main, the blocking presubmit
 # in a Tide batch, and the release-candidate eval).
-# A flagged run appends nothing to main's baseline and publishes no dashboard
-# (hack/ci-eval-pr.sh keeps it out of both on the flag alone; bench-gate
-# separately refuses a pull request's sample, bench/baselines/README.md), so
-# what the flag mis-set on a job that is not the lane's -- the today nightly,
-# another postsubmit -- would do is run that job in next mode and leave main's
+# A flagged run on main records under the version key's next mode, never into
+# today's window (bench-gate reads the mode off the transport; hack/ci-eval-pr.sh
+# keeps the today lane out of the recorder, and bench-gate separately refuses
+# a pull request's sample, bench/baselines/README.md), so what the flag
+# mis-set on a job that is not the lane's -- the today nightly, another
+# postsubmit -- would do is run that job in next mode and leave today's
 # window and dashboard silently missing it, its verdict measuring the wrong
 # stack. Keyed on the job's name rather than on PULL_NUMBER, so the lane's
 # scheduled jobs are admitted by being named and every other Prow run without
@@ -964,13 +966,13 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ "${IS_PROW_RUN}" = "true" ] && [ -z "${P
     fi
   done
   if [ "${MODE_NEXT_JOB_ADMITTED}" = "true" ]; then
-    echo "EVAL_MODE_NEXT=1: accepted on ${JOB_NAME} (a job named in EVAL_MODE_NEXT_JOB_NAMES with no PULL_NUMBER; the baseline store is read, never written)"
+    echo "EVAL_MODE_NEXT=1: accepted on ${JOB_NAME} (a job named in EVAL_MODE_NEXT_JOB_NAMES with no PULL_NUMBER; a next-mode record files under the next key, never today's)"
   else
     echo "ERROR: EVAL_MODE_NEXT=1 is set on a Prow run with no PULL_NUMBER (JOB_NAME=${JOB_NAME:-})." >&2
     echo "       The flag is for a pull request's presubmit or a job named in" >&2
     echo "       EVAL_MODE_NEXT_JOB_NAMES (${EVAL_MODE_NEXT_JOB_NAMES}); any other periodic or" >&2
-    echo "       postsubmit under it would run in next mode and record nothing to main's" >&2
-    echo "       baseline or dashboard, leaving that run silently missing from both." >&2
+    echo "       postsubmit under it would run in next mode instead of today's, leaving" >&2
+    echo "       today's baseline and dashboard silently missing that run." >&2
     exit 1
   fi
 fi
