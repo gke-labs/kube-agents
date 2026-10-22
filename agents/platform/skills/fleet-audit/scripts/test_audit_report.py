@@ -830,6 +830,12 @@ class BaseTestCase(unittest.TestCase):
         self.addCleanup(audit_report.set_content_mode, False)
         audit_report._VIEWER_LOGINS.clear()
         self.addCleanup(audit_report._VIEWER_LOGINS.clear)
+        audit_report._CAPABILITIES.clear()
+        self.addCleanup(audit_report._CAPABILITIES.clear)
+        audit_report._LABELS.clear()
+        self.addCleanup(audit_report._LABELS.clear)
+        audit_report._LAST_REFUSAL.clear()
+        self.addCleanup(audit_report._LAST_REFUSAL.clear)
         gitops_workspace.forget_base_branch()
         self.addCleanup(gitops_workspace.forget_base_branch)
         # CREDENTIAL_PROXY_URL is emptied, not left alone: it is what decides
@@ -27887,6 +27893,284 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         [(_, text)] = self.entries()
         self.assertNotIn(audit_report.CHAT_REPORT_REFINISH_LABEL, text)
         self.assertNotEqual(self.chat_record()["run"], run)
+
+
+# What `capabilities` answers for the forges these tests describe. The verbs
+# are the broker's; Bitbucket's shape has proposals and neither issues nor labels.
+PROPOSAL_VERBS = [
+    "proposal-create", "proposal-list", "proposal-view", "proposal-comment",
+    "proposal-update", "proposal-close", "proposal-commits",
+]
+NO_ISSUES_NO_LABELS = {"forge": "stub", "verbs": PROPOSAL_VERBS, "labels": False}
+GITHUB_LIKE = {
+    "forge": "github",
+    "verbs": PROPOSAL_VERBS + list(audit_report.LEDGER_ISSUE_VERBS) + ["label-ensure"],
+    "labels": True,
+}
+GITLAB_LIKE = {**GITHUB_LIKE, "forge": "gitlab"}
+
+
+class TestForgeWithoutIssuesOrLabels(HarnessTestCase):
+    """A forge with proposals and no issue tracker and no labels: Bitbucket's shape.
+
+    The ledger moves to the report store (`forge_has_issue_verbs` is the
+    signal), and the remediation pull requests still open, found by branch
+    prefix and description marker instead of labels.
+    """
+
+    REPO = "acme/fleet"
+    BRANCH = f"platform-agent/fix-{AUDIT}-netpol-0123456789"
+
+    def forge_is(self, capabilities):
+        self.harness.replies["capabilities"] = capabilities
+
+    def proposal(self, number, *, source=None, body=None, author=Recorder.VIEWER,
+                 source_repo="acme/fleet", state="open"):
+        return {
+            "number": number,
+            "source": source or self.BRANCH,
+            "sourceRepo": source_repo,
+            "target": "main",
+            "state": state,
+            "author": author.removesuffix("[bot]"),
+            "url": f"https://forge.invalid/acme/fleet/pull-requests/{number}",
+            "labels": [],
+            "body": audit_report.delta_block(["a"]) + "\n" + audit_report.remediation_stream_marker(AUDIT)
+            if body is None else body,
+        }
+
+    # -- the signals ---------------------------------------------------------
+
+    def test_a_forge_without_issue_verbs_says_so(self):
+        self.forge_is(NO_ISSUES_NO_LABELS)
+        self.assertFalse(audit_report.forge_has_issue_verbs(self.REPO))
+        self.assertFalse(audit_report.forge_has_labels(self.REPO))
+
+    def test_github_and_gitlab_have_issue_verbs_and_labels(self):
+        for answer in (GITHUB_LIKE, GITLAB_LIKE):
+            with self.subTest(forge=answer["forge"]):
+                audit_report._CAPABILITIES.clear()
+                audit_report._LABELS.clear()
+                self.forge_is(answer)
+                self.assertTrue(audit_report.forge_has_issue_verbs(self.REPO))
+                self.assertTrue(audit_report.forge_has_labels(self.REPO))
+
+    def test_an_unreadable_answer_keeps_the_forge_path(self):
+        # A transient fault must not move a GitHub ledger into the store.
+        self.harness.failures["capabilities"] = 1
+        self.assertTrue(audit_report.forge_has_issue_verbs(self.REPO))
+        self.assertTrue(audit_report.forge_has_labels(self.REPO))
+
+    def test_an_unserved_host_is_not_a_forge_without_issues_or_labels(self):
+        self.forge_is({"forge": "gitlab", "verbs": [], "labels": False, "missing": ["no credential is configured for gitlab.com"]})
+        self.assertTrue(audit_report.forge_has_issue_verbs(self.REPO))
+        self.assertTrue(audit_report.forge_has_labels(self.REPO))
+
+    def test_a_broker_older_than_the_labels_field_reads_as_labels(self):
+        self.forge_is({"forge": "github", "verbs": GITHUB_LIKE["verbs"]})
+        self.assertTrue(audit_report.forge_has_labels(self.REPO))
+
+    def test_capabilities_are_asked_once_per_repository(self):
+        self.forge_is(NO_ISSUES_NO_LABELS)
+        for _ in range(3):
+            audit_report.forge_has_labels(self.REPO)
+            audit_report.forge_has_issue_verbs(self.REPO)
+        self.assertEqual(1, len(self.harness.forge_calls("capabilities")))
+
+    # -- labels are never sent -----------------------------------------------
+
+    def test_no_label_is_created_or_written(self):
+        self.forge_is(NO_ISSUES_NO_LABELS)
+        self.assertFalse(audit_report.forge_has_labels(self.REPO))
+        audit_report.ensure_labels(self.REPO, AUDIT)
+        audit_report.apply_severity_label(self.REPO, 42, [make_finding(fid="a")])
+        audit_report.sync_remediation_labels(self.REPO, "7", AUDIT, "major")
+        audit_report.sync_open_remediation_labels(
+            self.REPO, AUDIT, [make_finding(fid="a")], {"a": pr(7, self.BRANCH)}
+        )
+        self.assertEqual([], self.harness.forge_calls("label-ensure"))
+        self.assertEqual([], self.harness.forge_calls("*-update"))
+
+    def test_github_still_creates_every_label(self):
+        self.forge_is(GITHUB_LIKE)
+        audit_report.ensure_labels(self.REPO, AUDIT)
+        self.assertEqual(7, len(self.harness.forge_calls("label-ensure")))
+        # A label made proves labels, so nothing asks `capabilities`.
+        self.assertTrue(audit_report.forge_has_labels(self.REPO))
+        self.assertEqual([], self.harness.forge_calls("capabilities"))
+
+    def test_a_success_leaves_no_earlier_refusal_behind(self):
+        # Review: an earlier call's code outlived it, so a reader could take
+        # it for the reason a later call failed.
+        self.harness.failures["proposal-list"] = 1
+        self.assertIsNone(audit_report.try_forge("proposal-list", self.REPO, {}))
+        self.assertEqual("FORGE_REJECTED", audit_report._LAST_REFUSAL.get(self.REPO))
+        audit_report.try_forge("proposal-view", self.REPO, {"number": 1})
+        self.assertNotIn(self.REPO, audit_report._LAST_REFUSAL)
+
+    def test_an_earlier_labels_refusal_does_not_make_a_labelled_forge_unlabelled(self):
+        # A `LABELS_UNSUPPORTED` from some other call, then label calls that succeed.
+        def refuse_once(verb, payload, repository=None):
+            if verb == "proposal-list":
+                raise vcs_client.VcsError("no labels here", code="LABELS_UNSUPPORTED")
+            return self.forge_through_recorder(verb, payload, repository)
+
+        with patch.object(vcs_client, "forge", refuse_once):
+            audit_report.try_forge("proposal-list", self.REPO, {"labels": ["x"]})
+            audit_report.ensure_labels(self.REPO, AUDIT)
+        self.assertEqual(7, len(self.harness.forge_calls("label-ensure")))
+        self.assertTrue(audit_report.forge_has_labels(self.REPO))
+
+    def test_the_first_labels_refusal_stops_the_label_calls_and_is_remembered(self):
+        refused = []
+
+        def refuse(verb, payload, repository=None):
+            if verb == "label-ensure":
+                refused.append(payload)
+                raise vcs_client.VcsError("no labels here", code="LABELS_UNSUPPORTED")
+            return self.forge_through_recorder(verb, payload, repository)
+
+        with patch.object(vcs_client, "forge", refuse):
+            audit_report.ensure_labels(self.REPO, AUDIT)
+        self.assertEqual(1, len(refused))
+        self.assertFalse(audit_report.forge_has_labels(self.REPO))
+        self.assertEqual([], self.harness.forge_calls("capabilities"))
+
+    def test_the_ledger_issue_is_not_looked_up_by_a_label_that_cannot_exist(self):
+        # "none" would open a second ledger on every run.
+        self.forge_is(NO_ISSUES_NO_LABELS)
+        with self.assertRaises(audit_report.GitHubLookupError):
+            audit_report.find_existing_issue(self.REPO, AUDIT)
+        self.assertEqual([], self.harness.forge_calls("issue-list"))
+
+    # -- finding the stream's pull requests ------------------------------------
+
+    def test_remediation_prs_are_found_by_branch_marker_author_and_repository(self):
+        self.forge_is(NO_ISSUES_NO_LABELS)
+        other_audit = f"{AUDIT}-extra"
+        self.harness.replies["proposal-list"] = {
+            "proposals": [
+                self.proposal(1),
+                # Somebody else's pull request, with the same branch and marker.
+                self.proposal(2, author="a-stranger"),
+                # From a fork that copied the branch name and the marker.
+                self.proposal(3, source_repo="stranger/fleet"),
+                # Another audit whose id begins with this one's.
+                self.proposal(
+                    4,
+                    source=f"platform-agent/fix-{other_audit}-x-0123456789",
+                    body=audit_report.remediation_stream_marker(other_audit),
+                ),
+                # This audit's branch prefix with no marker.
+                self.proposal(5, body=audit_report.delta_block(["a"])),
+                # Not a remediation branch at all.
+                self.proposal(6, source="feature/x"),
+            ],
+            "count": 6,
+            "truncated": False,
+        }
+        prs = audit_report.list_remediation_prs(self.REPO, AUDIT)
+        self.assertEqual([1], [p["number"] for p in prs])
+        [sent] = self.harness.forge_calls("proposal-list")
+        self.assertNotIn("labels", sent)
+        self.assertEqual("all", sent["state"])
+
+    def test_a_close_the_harness_recorded_in_the_description_reads_as_its_own(self):
+        self.forge_is(NO_ISSUES_NO_LABELS)
+        body = (
+            audit_report.delta_block(["a"]) + "\n"
+            + audit_report.remediation_stream_marker(AUDIT) + "\n\n"
+            + audit_report.STALE_CLOSED_BODY_MARKER
+        )
+        self.harness.replies["proposal-list"] = {
+            "proposals": [
+                self.proposal(1, state="closed", body=body),
+                self.proposal(2, state="closed"),
+            ],
+            "truncated": False,
+        }
+        harness_closed, human_closed = audit_report.list_remediation_prs(self.REPO, AUDIT)
+        self.assertTrue(audit_report.pr_closed_by_harness(harness_closed))
+        self.assertFalse(audit_report.pr_closed_by_harness(human_closed))
+
+    def test_an_unknown_identity_refuses_rather_than_trusting_the_marker(self):
+        self.forge_is(NO_ISSUES_NO_LABELS)
+        self.harness.failures["identity"] = 1
+        self.harness.replies["proposal-list"] = {"proposals": [self.proposal(1)], "truncated": False}
+        with self.assertRaises(audit_report.GitHubLookupError):
+            audit_report.list_remediation_prs(self.REPO, AUDIT)
+
+    def test_a_repository_past_the_scan_limit_refuses(self):
+        self.forge_is(NO_ISSUES_NO_LABELS)
+        self.patch_attr("MAX_UNLABELLED_SCAN", 2)
+        self.harness.replies["proposal-list"] = {
+            "proposals": [self.proposal(1, source="feature/a"), self.proposal(2, source="feature/b")],
+            "truncated": True,
+        }
+        with self.assertRaises(audit_report.GitHubLookupError):
+            audit_report.list_remediation_prs(self.REPO, AUDIT)
+
+    def test_github_still_lists_by_label(self):
+        self.forge_is(GITHUB_LIKE)
+        audit_report.list_remediation_prs(self.REPO, AUDIT)
+        [sent] = self.harness.forge_calls("proposal-list")
+        self.assertEqual([f"audit:{AUDIT}", "audit:remediation"], sent["labels"])
+
+    # -- the body and the stale close ------------------------------------------
+
+    def test_the_body_carries_the_stream_marker_only_without_labels(self):
+        group = [make_finding(fid="a")]
+        plain = audit_report.render_remediation_pr_body(AUDIT, group, issue_number=None, generated_at=NOW)
+        marked = audit_report.render_remediation_pr_body(
+            AUDIT, group, issue_number=None, generated_at=NOW, unlabelled=True
+        )
+        self.assertNotIn(audit_report.remediation_stream_marker(AUDIT), plain)
+        self.assertIn(audit_report.remediation_stream_marker(AUDIT), marked)
+        self.assertEqual(["a"], audit_report.parse_delta_block(marked))
+
+    def close(self, prs):
+        return audit_report.close_stale_remediation_prs(
+            self.REPO, AUDIT, prs, set(), {"a": "Old title"}, {}, NOW
+        )
+
+    def test_a_stale_close_records_itself_in_the_description_first(self):
+        self.forge_is(NO_ISSUES_NO_LABELS)
+        current = audit_report.delta_block(["a"]) + "\n\nA reviewer's note."
+        self.harness.replies["proposal-view"] = {"proposal": {"number": 8, "body": current}}
+        stale = pr(8, self.BRANCH, body=audit_report.delta_block(["a"]))
+        self.assertEqual([stale["url"]], self.close([stale]))
+        [update] = self.harness.forge_calls("proposal-update")
+        self.assertNotIn("labelsAdd", update)
+        # Written onto the description as it is now, not the listing's copy.
+        self.assertEqual(f"{current}\n\n{audit_report.STALE_CLOSED_BODY_MARKER}\n", update["body"])
+        verbs = [call[1] for call in self.harness.calls if call[0] == "forge"]
+        self.assertLess(verbs.index("proposal-update"), verbs.index("proposal-close"))
+        comment = "".join(self.harness.bodies_for("proposal-comment"))
+        self.assertIn("description records that the audit closed it", comment)
+        self.assertNotIn(audit_report.STALE_CLOSED_LABEL, comment)
+
+    def test_a_stale_close_that_cannot_record_itself_does_not_close(self):
+        self.forge_is(NO_ISSUES_NO_LABELS)
+        self.harness.failures["proposal-update"] = 1
+        stale = pr(8, self.BRANCH, body=audit_report.delta_block(["a"]))
+        self.assertEqual([], self.close([stale]))
+        self.assertEqual([], self.harness.forge_calls("proposal-close"))
+
+    def test_a_stale_close_that_cannot_read_the_description_does_not_close(self):
+        self.forge_is(NO_ISSUES_NO_LABELS)
+        self.harness.failures["proposal-view"] = 1
+        stale = pr(8, self.BRANCH, body=audit_report.delta_block(["a"]))
+        self.assertEqual([], self.close([stale]))
+        self.assertEqual([], self.harness.forge_calls("proposal-update"))
+        self.assertEqual([], self.harness.forge_calls("proposal-close"))
+
+    def test_github_still_labels_before_it_closes(self):
+        self.forge_is(GITHUB_LIKE)
+        stale = pr(8, self.BRANCH, body=audit_report.delta_block(["a"]))
+        self.close([stale])
+        [update] = self.harness.forge_calls("proposal-update")
+        self.assertEqual([audit_report.STALE_CLOSED_LABEL], update["labelsAdd"])
+        self.assertNotIn("body", update)
 
 
 def _repo_entries(*urls, kind="github"):

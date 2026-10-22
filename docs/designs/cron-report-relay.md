@@ -842,7 +842,8 @@ privilege the pod does not already hold.
   token already holds `issues: write`.
   The issue resolver's search excludes the label, so the agent never triages its
   own ledger. With no repository to use, the job falls back to the log line
-  alone. Two installs that manage one repository would share one issue; the
+  alone. A forge with no issue verbs, or no labels, keeps no ledger either: the
+  ALERT line says `ledger=log-only`, and that is not a fault. Two installs that manage one repository would share one issue; the
   fleet-audit ledgers have the same property, and an install-specific ledger
   repository is the answer for both.
 - An **`ALERT chat_delivery_watch` line** appended to

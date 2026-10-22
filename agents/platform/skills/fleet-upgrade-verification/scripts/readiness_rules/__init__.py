@@ -32,7 +32,10 @@ the Nodes in one through a jsonpath template, the StorageClasses and PersistentV
 one. A read the credential proxy cut at its output cap is that kind's read error, naming the
 cap. A rule that needs a kind asks `read_error(read, kind)` and files one `unknown` naming the
 reason when the kind was not read, grading what it has; a refused or cut read never costs a
-rule that does not need it.
+rule that does not need it. A rule that grades the PDB read's Deployments and StatefulSets
+and the namespaced read's DaemonSets and CronJobs files `workloads_unread_detail(read, kinds)`
+when one of its reads failed: the text names the kinds not read, the PDB read's included when
+`items` is None, and the kinds graded, or says nothing was.
 
 `context` carries `project`, `location` and `cluster_name` (for a log filter), `run_cmd`
 (the report's runner) with `timeout_seconds` (the per-call cap a rule passes to it), `at`
@@ -63,8 +66,11 @@ rule's `CAN_BLOCK`, so the per-rule record and its entries never disagree. A rul
 runs no command of its own except through `context["run_cmd"]`.
 
 This file holds what the modules share: the result shape, the read kinds and context keys,
-the quantity parser, a pod's owner and requests, node helpers, pod templates with their
-selectors and node-pool pins, image tags, the cgroup transition, and `shell_forks(script)`,
+the quantity parser, a pod's owner and requests (CPU and memory, and the extended resources
+such as `nvidia.com/gpu` by name), node helpers, pod templates with their
+selectors and node-pool pins, image tags, the cgroup transition, `shell_scripts(command)`,
+the scripts a container's command hands a shell through `-c`, `shell_words(script)`, the
+programs such a script names, and `shell_forks(script)`,
 whether a `sh -c` script puts a command in the background (True or False; None when the
 script cannot be read: an unterminated quote, heredoc or expansion, which a rule reports as
 unknown).
@@ -117,6 +123,15 @@ READ_KINDS = NAMESPACED_READ_KINDS + (POD_READ_KIND, NODE_READ_KIND) + CLUSTER_R
 # own terms and graded beside these kinds.
 NO_READ_RAN_REASON = "the member's kubeconfig was not written, so no read ran"
 LATER_READS_SKIPPED_REASON = "the PDB read failed, so the reads after the webhook read were skipped"
+# What a rule that grades the PDB read's workloads and some of the namespaced read's kinds says
+# when a read it needs failed: the kinds not read, then the kinds graded. The PDB read's
+# workload kinds are unread exactly when `items` is None, and then nothing was graded.
+PDB_WORKLOAD_KINDS = ("deploy", "statefulset")
+READ_KIND_NAMES = {"deploy": "Deployments", "statefulset": "StatefulSets", "daemonset": "DaemonSets", "cronjob": "CronJobs"}
+WORKLOADS_UNREAD_FORMAT = "{unread} not read ({reason}); {graded}"
+WORKLOADS_GRADED_FORMAT = "{kinds} graded"
+WORKLOADS_NOTHING_GRADED = "nothing graded"
+KIND_LIST_LAST_SEPARATOR = " and "
 
 # The per-member context keys (the module docstring says what each holds).
 CONTEXT_PROJECT = "project"
@@ -194,6 +209,11 @@ CPU_FORMAT = "{millis}m"
 MEMORY_FORMAT = "{mebibytes}Mi"
 CPU_KEY = "cpu"
 MEMORY_KEY = "memory"
+# An extended resource (`nvidia.com/gpu`, `google.com/tpu`, a device plugin's) carries a
+# domain in its name; the scheduler counts it as it counts CPU and memory, per pod against
+# the node's allocatable, so a placement that ignores it lands a GPU pod on a node whose GPU
+# is taken.
+EXTENDED_RESOURCE_SEPARATOR = "/"
 # A restartable init container (a native sidecar) runs alongside the app containers and
 # every init container started after it; `overhead` is what the RuntimeClass reserves on top.
 RESTART_POLICY_FIELD = "restartPolicy"
@@ -286,6 +306,20 @@ SHELL_FORK_MARK = " & "
 # a crafted container command from costing the report more than a bounded walk.
 SHELL_NESTING_CAP = 64
 PATH_SEPARATOR = "/"
+# A shell reads options until its first non-option word; `-c` (or `-ec`, `-lc`: any short
+# flag group carrying `c`, SHELL_COMMAND_FLAG_RE) makes the word after the options the
+# script, so `["bash", "-o", "pipefail", "-c", "a && b"]` and `["sh", "-e", "-c", "a && b"]`
+# carry a script too. An option word starts with `-` or `+` (bash's `+O`); the ones that take
+# the next word as their argument (`-o pipefail`, `+O extglob`, `--rcfile FILE`, and a short
+# group ending in `o` or `O`, `-eo pipefail`) are stepped over with it. A script's words, for a
+# rule that asks which programs it runs, are what is left between whitespace, the operator
+# characters, the quotes and the backtick (a command substitution's delimiter, which the
+# scanner below reads as a span), each word's last path component, so a quoted path names its
+# program too.
+SHELL_OPTION_PREFIXES = ("-", "+")
+SHELL_OPTIONS_WITH_ARGUMENT = ("-o", "+o", "-O", "+O", "--rcfile", "--init-file")
+SHELL_OPTION_ARGUMENT_GROUP_RE = re.compile(r"^[-+][a-zA-Z]*[oO]$")
+SHELL_WORD_SPLIT_RE = re.compile("[" + re.escape(SHELL_OPERATOR_CHARS + SHELL_QUOTES + SHELL_BACKTICK) + r"\s]+")
 
 
 # -------------------------------------------------------------------- results and reads
@@ -350,6 +384,29 @@ def read_error(read, kind: str) -> str | None:
 def unread_kinds(read, kinds) -> dict:
     """{kind: error} for the kinds among `kinds` that were not read."""
     return {kind: error for kind in kinds if (error := read_error(read, kind))}
+
+
+def kind_list(names: list) -> str:
+    """`Deployments, StatefulSets and DaemonSets`."""
+    if len(names) <= 1:
+        return "".join(names)
+    return LIST_SEPARATOR.join(names[:-1]) + KIND_LIST_LAST_SEPARATOR + names[-1]
+
+
+def workloads_unread_detail(read, kinds) -> str | None:
+    """For a rule that grades the PDB read's Deployments and StatefulSets and the namespaced
+    read's `kinds`: None when every one was read, else which kinds were not read, with the
+    first such read's error, and which were graded (`DaemonSets and CronJobs not read (...);
+    Deployments and StatefulSets graded`), or that nothing was, when `items` is None and the
+    PDB read's workloads are unread too."""
+    unread = unread_kinds(read, kinds)
+    if not unread:
+        return None
+    pdb_unread = not read or read.get("items") is None
+    unread_names = [READ_KIND_NAMES.get(kind, kind) for kind in (PDB_WORKLOAD_KINDS if pdb_unread else ()) + tuple(unread)]
+    graded_names = [READ_KIND_NAMES.get(kind, kind) for kind in (() if pdb_unread else PDB_WORKLOAD_KINDS) + tuple(kind for kind in kinds if kind not in unread)]
+    graded = WORKLOADS_GRADED_FORMAT.format(kinds=kind_list(graded_names)) if graded_names else WORKLOADS_NOTHING_GRADED
+    return WORKLOADS_UNREAD_FORMAT.format(unread=kind_list(unread_names), reason=next(iter(unread.values())), graded=graded)
 
 
 def items_of_kind(items, kind: str) -> list[dict]:
@@ -463,6 +520,53 @@ def _slots_add(a: tuple, b: tuple) -> tuple:
 
 def _slots_max(a: tuple, b: tuple) -> tuple:
     return tuple(None if x is None or y is None else max(x, y) for x, y in zip(a, b))
+
+
+def _extended(requests: dict) -> dict | None:
+    """{resource: quantity} for the extended resources among `requests`; None when one does not parse."""
+    out = {}
+    for key, value in (requests or {}).items():
+        if EXTENDED_RESOURCE_SEPARATOR not in str(key):
+            continue
+        quantity = parse_quantity(value)
+        if quantity is None:
+            return None
+        out[str(key)] = quantity
+    return out
+
+
+def _extended_add(a: dict, b: dict) -> dict:
+    return {key: a.get(key, 0) + b.get(key, 0) for key in set(a) | set(b)}
+
+
+def _extended_max(a: dict, b: dict) -> dict:
+    return {key: max(a.get(key, 0), b.get(key, 0)) for key in set(a) | set(b)}
+
+
+def pod_extended_requests(spec: dict) -> dict | None:
+    """{resource: quantity} of the extended resources a pod spec asks for, counted as
+    `pod_requests` counts CPU and memory (containers plus native sidecars, or an init
+    container's peak, plus the overhead); None when a quantity does not parse."""
+    app: dict = {}
+    for container in spec.get("containers") or []:
+        requests = _extended(((container.get("resources") or {}).get("requests")) or {})
+        if requests is None:
+            return None
+        app = _extended_add(app, requests)
+    sidecars: dict = {}
+    init_peak: dict = {}
+    for container in spec.get("initContainers") or []:
+        requests = _extended(((container.get("resources") or {}).get("requests")) or {})
+        if requests is None:
+            return None
+        if container.get(RESTART_POLICY_FIELD) == RESTART_POLICY_ALWAYS:
+            sidecars = _extended_add(sidecars, requests)
+        else:
+            init_peak = _extended_max(init_peak, _extended_add(requests, sidecars))
+    overhead = _extended(spec.get(OVERHEAD_FIELD) or {})
+    if overhead is None:
+        return None
+    return _extended_add(_extended_max(_extended_add(app, sidecars), init_peak), overhead)
 
 
 def pod_requests(spec: dict) -> tuple[int | None, int | None]:
@@ -595,6 +699,11 @@ def node_allocatable(node: dict) -> tuple[int | None, int | None]:
     return cpu_millis(allocatable.get("cpu")), memory_bytes(allocatable.get("memory"))
 
 
+def node_extended_allocatable(node: dict) -> dict | None:
+    """{resource: quantity} of the extended resources a node offers; None when one does not parse."""
+    return _extended((node.get("status") or {}).get("allocatable") or {})
+
+
 def node_pool(node: dict) -> str:
     return ((node.get("metadata") or {}).get("labels") or {}).get(tables.NODEPOOL_LABEL, "")
 
@@ -683,6 +792,45 @@ def image_repository_and_tag(image: str) -> tuple[str, str]:
 
 
 # ------------------------------------------------------------------------ shell scripts
+
+
+def shell_scripts(command: list) -> list[str]:
+    """The scripts a command list hands a shell: after every shell program in it (SHELL_PROGRAMS,
+    by last path component) the option words are walked, before and after the flag group
+    carrying `c` alike (`-e`, `-o pipefail`, `--norc`, the fused `-ec`, each argument-taking
+    option with its argument), and the first word after them is the script when a group
+    carried `c` (SHELL_COMMAND_FLAG_RE). `["tini", "--", "bash", "-o", "pipefail", "-c",
+    "nginx & php-fpm"]` and `["bash", "-c", "-o", "pipefail", "nginx & php-fpm"]` ->
+    `["nginx & php-fpm"]`; a shell with no `c` flag hands back none."""
+    words = [str(w) for w in command or []]
+    scripts = []
+    for index, word in enumerate(words):
+        if word.rsplit(PATH_SEPARATOR, 1)[-1] not in tables.SHELL_PROGRAMS:
+            continue
+        j, carried = index + 1, False
+        while j < len(words) and words[j].startswith(SHELL_OPTION_PREFIXES):
+            option = words[j]
+            j += 1
+            if tables.SHELL_COMMAND_FLAG_RE.match(option):
+                carried = True
+            if option in SHELL_OPTIONS_WITH_ARGUMENT or SHELL_OPTION_ARGUMENT_GROUP_RE.match(option):
+                j += 1
+        if carried and j < len(words):
+            scripts.append(words[j])
+    return scripts
+
+
+def shell_words(script) -> list[str]:
+    """The programs and arguments a `-c` script names, by last path component: the words between
+    whitespace, the shell's operator characters, its quotes and its backticks, so `'/sbin/modprobe' x`,
+    `exec "$BIN/modprobe" x`, a nested `bash -c 'modprobe x'` and ``MOD=`which modprobe` `` all
+    name `modprobe`.
+    `"/sbin/modprobe br_netfilter && exec /agent"` -> `["modprobe", "br_netfilter", "exec",
+    "agent"]`. Quoting is read no further: a program named inside a quoted string counts as
+    named."""
+    if not isinstance(script, str):
+        return []
+    return [word.rsplit(PATH_SEPARATOR, 1)[-1] for word in SHELL_WORD_SPLIT_RE.split(script) if word]
 
 
 def shell_forks(script) -> bool | None:

@@ -868,6 +868,86 @@ class HandlePollTest(ResolverTest):
         self.assertIn("acme/one", payload["errors"]["acme/one"])
 
 
+class NoIssueTrackerForge(FakeForge):
+    """A repository on a forge with proposals and no issue tracker or labels.
+
+    Every issue and label verb on `untracked` is refused as the broker refuses
+    a verb its forge does not serve, and `capabilities` says what it has.
+    """
+
+    def __init__(self, untracked, capabilities=None, **kwargs):
+        super().__init__(**kwargs)
+        self.untracked = set(untracked)
+        self.answer = capabilities or {"forge": "bitbucket", "verbs": ["proposal-list"], "labels": False, "missing": []}
+
+    def __call__(self, verb, payload):
+        repo = payload.get("repository")
+        if repo in self.untracked and (verb.startswith("issue-") or verb == "label-ensure"):
+            self.calls.append((verb, payload))
+            raise vcs_client.VcsError(f"no {verb} here", code="FORGE_UNSUPPORTED")
+        return super().__call__(verb, payload)
+
+    def _capabilities(self, repo, payload):
+        return dict(self.answer) if repo in self.untracked else {"verbs": ["issue-list", "issue-view", "issue-comment", "issue-update"], "labels": True}
+
+
+class UntrackedRepositoryTest(ResolverTest):
+    """A forge with no issue tracker has nothing to poll, and that is not a fault."""
+
+    def setUp(self):
+        resolver._NO_TRACKER.clear()
+        self.addCleanup(resolver._NO_TRACKER.clear)
+
+    def test_the_stale_sweep_prints_no_fault_for_an_untracked_repository(self):
+        forge = NoIssueTrackerForge({"ws/infra"})
+        self.poll(forge=forge, repos=("ws/infra",))
+        self.assertNotIn("sweep skipped", self.stderr)
+        self.assertEqual(1, self.forge.verbs().count("capabilities"))
+
+    def test_a_mixed_fleet_that_refused_says_which_repositories_had_no_tracker(self):
+        forge = NoIssueTrackerForge(
+            {"ws/infra"}, refuse={"a/one": "FORGE_NOT_FOUND", "b/two": "FORGE_FORBIDDEN"}
+        )
+        payload, code = self.poll(forge=forge, repos=("a/one", "b/two", "ws/infra"))
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["untracked_repos"], ["ws/infra"])
+        self.assertIn("with an issue tracker", payload["error"])
+
+    def test_a_repository_with_no_tracker_is_named_and_not_refused(self):
+        forge = NoIssueTrackerForge(
+            {"ws/infra"}, issues={"acme/toolkit": [issue(12, title="work", body="d")]}
+        )
+        payload, code = self.poll(forge=forge, repos=("ws/infra", "acme/toolkit"))
+        self.assertIsNone(code)
+        self.assertEqual(payload["status"], "FOUND")
+        self.assertEqual(payload["unreachable_repos"], [])
+        self.assertEqual(payload["untracked_repos"], ["ws/infra"])
+
+    def test_only_untracked_repositories_is_a_quiet_poll(self):
+        forge = NoIssueTrackerForge({"ws/infra"})
+        payload, code = self.poll(forge=forge, repos=("ws/infra",))
+        self.assertIsNone(code)
+        self.assertEqual(payload["status"], "NO_ISSUES")
+        self.assertEqual(payload["untracked_repos"], ["ws/infra"])
+
+    def test_an_unserved_host_stays_a_refusal(self):
+        forge = NoIssueTrackerForge({"gitlab.com/acme/infra"}, capabilities={"forge": "gitlab", "verbs": [], "labels": False, "missing": ["no credential is configured for gitlab.com"]})
+        payload, code = self.poll(forge=forge, repos=("gitlab.com/acme/infra",))
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["reason"], "FORGE_UNSUPPORTED")
+
+    def test_capabilities_that_cannot_be_read_keep_the_refusal(self):
+        forge = NoIssueTrackerForge({"ws/infra"}, refuse={"capabilities": "FORGE_CALL_FAILED"})
+        payload, code = self.poll(forge=forge, repos=("ws/infra",))
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["reason"], "FORGE_UNSUPPORTED")
+
+    def test_a_forge_with_a_tracker_answers_exactly_as_before(self):
+        payload, _ = self.poll()
+        self.assertNotIn("untracked_repos", payload)
+        self.assertNotIn("capabilities", self.forge.verbs())
+
+
 class SweepStaleIssuesTest(ResolverTest):
     """The sweep that unsticks investigations which claimed and went quiet."""
 

@@ -1038,6 +1038,115 @@
 # presubmit seat is a later pull request that cites its record.
 ./tasks/upgrades-exclusion-end-date-named/task.yaml
 
+# Catalogue entry 14 through the readiness report's cgroup-v2-runtime rule:
+# cgroup-blind-jvm on slot a (role cgroup-blind-runtime) runs a JDK 8u302
+# image, below the cgroup v2 floor, on a pool already on cgroup v2, so the
+# report carries it in its note, never as a blocker. Read-only chat prompt
+# graded on the planted object's declared line: its verdict and the rule's
+# cell. Nightly from its first merge.
+./tasks/upgrades-fleet-readiness-cgroup-blind-runtime/task.yaml
+
+# Catalogue entry 18 through the readiness report's gpu-driver rule: cuda-
+# pinned-trainer on slot a (role cuda-pinned-gpu-job) requests a GPU with a
+# CUDA 12.2 image on a cluster with no accelerator pool, so the report names
+# the unchecked pin as a risk, never a blocker. Read-only chat prompt graded
+# on the planted object's declared line: its verdict and the rule's cell.
+# Nightly from its first merge.
+./tasks/upgrades-fleet-readiness-cuda-pinned-gpu-job/task.yaml
+
+# Catalogue entry 12 through the readiness report's removed-node-label rule:
+# arch-pinned-worker on slot a (role deprecated-label-selector) selects on
+# beta.kubernetes.io/arch, deprecated in favour of kubernetes.io/arch, so the
+# report names it as a risk with the GA replacement, never a blocker. Read-
+# only chat prompt graded on the planted object's declared line: its verdict
+# and the rule's cell. Nightly from its first merge.
+./tasks/upgrades-fleet-readiness-deprecated-node-label/task.yaml
+
+# Catalogue entry 15 through the readiness report's group-oom-kill rule:
+# multi-process-worker on slot a (role multi-process-container) forks two
+# workers under one shell on a pool that already group-kills, so the report
+# carries it in its note, never as a blocker. Read-only chat prompt graded on
+# the planted object's declared line: its verdict and the rule's cell. Nightly
+# from its first merge.
+./tasks/upgrades-fleet-readiness-multi-process-container/task.yaml
+
+# Catalogue entry 17 through the readiness report's node-image-coupled-agent
+# rule: cni-shaped-agent on slot a (role node-image-coupled-agent), a host-
+# network DaemonSet mounting /etc/cni/net.d, is a risk naming the pools the
+# upgrade re-images, never a blocker. Read-only chat prompt graded on the
+# planted object's declared line: its verdict and the rule's cell. Nightly
+# from its first merge.
+./tasks/upgrades-fleet-readiness-node-image-coupled-agent/task.yaml
+
+# Catalogue entry 4 through the readiness report's data-on-the-node rule:
+# cache-on-emptydir on slot a (role node-local-state), a Deployment keeping
+# its queue on an emptyDir, is carried in the report's note as scratch, never
+# as a blocker. Read-only chat prompt graded on the planted object's declared
+# line: its verdict and the rule's cell. Nightly from its first merge.
+./tasks/upgrades-fleet-readiness-node-local-state/task.yaml
+
+# Catalogue entry 20 through the readiness report's retired-registry rule:
+# legacy-registry-pull on slot a (role retired-registry-image) pulls
+# k8s.gcr.io/pause:3.9 from a retired host, so the report names it as a risk,
+# never a blocker. Read-only chat prompt graded on the planted object's
+# declared line: its verdict and the rule's cell. Nightly from its first
+# merge.
+./tasks/upgrades-fleet-readiness-retired-registry-image/task.yaml
+
+# Upgrade-failure catalogue entry 8 through the readiness report's
+# changed-defaults rule: the seeded-defaults namespace on slot a (role
+# moving-admission-default) enforces baseline at enforce-version latest, so
+# its rule set follows the running minor; the report counts it in a note on
+# the fleet as it stands and names it as a risk when a crossed minor tightens
+# baseline, never as a blocker. Read-only chat prompt graded on declared lines
+# per seeded cluster (the three slot roles beside the planted one tell a
+# missed cluster from an absent one). Nightly from its first merge.
+./tasks/upgrades-readiness-changed-defaults/task.yaml
+
+# Catalogue entry 10 through the readiness report's client-addon-skew rule:
+# stale-kubectl-client on slot a (role stale-client-skew) runs kubectl v1.29.0
+# against a control plane several minors ahead, so the report names it as a
+# risk, never a blocker. Read-only chat prompt graded on the planted object's
+# declared line: its verdict and the rule's cell. Nightly from its first merge.
+./tasks/upgrades-readiness-client-addon-skew/task.yaml
+
+# Catalogue entry 13 through the readiness report's container-runtime rule:
+# node-runtime-probe on slot a mounts the containerd socket (role
+# containerd-socket-agent) and no pool's containerd major changes at the
+# channel default, so the report names it in a note, never as a blocker.
+# Read-only chat prompt graded on declared lines. Nightly from its first merge.
+./tasks/upgrades-readiness-containerd-socket/task.yaml
+
+# Upgrade-failure catalogue entry 9 (a feature is deprecated but still served)
+# through the readiness report's deprecated-api-callers rule: seeded-a's
+# legacy-endpoints-writer (role deprecated-api-caller) patches Endpoints v1
+# every ten minutes, and the rule names it from the audit log's
+# k8s.io/deprecated stamps as a risk; graded on a declared line per seeded
+# cluster that quotes the rule's cell. deployer: noop; reads the role and the
+# three slot roles beside it, mutates nothing. Nightly from its first merge; a
+# presubmit seat is a later pull request that cites its record.
+./tasks/upgrades-readiness-deprecated-api-callers/task.yaml
+
+# Catalogue entry 19 through the readiness report's in-tree-volumes rule:
+# intree-pd on slot a is an in-tree gcePersistentDisk volume (role
+# intree-pd-volume) on a cluster whose PD CSI driver add-on is on, so the report
+# grades it a risk, never a blocker. Read-only chat prompt graded on declared
+# lines. Nightly from its first merge.
+./tasks/upgrades-readiness-intree-volume/task.yaml
+
+# Catalogue entry 16 through the readiness report's network-dataplane rule: the
+# seeded clusters' legacy dataplane with the network policy add-on off and
+# default-deny policies that apply nowhere until enforcement turns on. Read-only;
+# the fleet's own shape, no planted fixture. Nightly from its first merge.
+./tasks/upgrades-readiness-legacy-dataplane/task.yaml
+
+# Upgrade-failure catalogue entry 2 through the readiness report's surge-capacity
+# rule: no-surge-pool on slot b removes its only node before a replacement exists
+# and pinned-batch-runner can run nowhere else. Read-only chat prompt over the
+# seeded fleet's readiness-surge-blocked and readiness-pinned-workload roles,
+# graded on declared lines. Nightly from its first merge.
+./tasks/upgrades-readiness-surge-capacity/task.yaml
+
 # Catalogue entry 20 (images on a retired registry): seeded-a's
 # seeded-shapes/legacy-registry-pull (retired-registry-image),
 # k8s.gcr.io/pause:3.9 with imagePullPolicy Always, a retired hostname
