@@ -740,7 +740,16 @@ triager picks when handing an infra failure to the infra issue, keeps
 tracking the case until it passes on a night after the close; a red streak
 after that pass files a new issue. A hand-off closed before the 14 nights on
 record holds nothing back: the record can no longer show whether the case
-passed since. When the issues cannot be listed, nothing is written that tick. When a case with an open issue passes every graded
+passed since. When the issues cannot be listed, nothing is written that tick.
+Nor when the same issues read through GraphQL disagree with the listing:
+GraphQL names an open (or recently closed) `nightly-red` issue the listing
+lacks, counts more of them than the listing holds, or cannot be read. The REST
+listing, and GitHub's issue search with it, have answered with no issues while
+the issues existed, and a dedupe that reads an empty list files every case
+again. The step reads both listings again, up to 4 times in one pass, and
+when none agrees it logs why, writes nothing, and the next tick retries. When a comment read
+returns fewer comments than the issue listing counts, the step skips that
+issue for the tick, so a recovery or night comment is not posted twice. When a case with an open issue passes every graded
 repetition on a graded night after its last failing one, and that night
 finished after the issue was opened, the bot comments with that night's run link, keyed on the night so it comments once per recovery. It
 never closes an issue; the triager does.
