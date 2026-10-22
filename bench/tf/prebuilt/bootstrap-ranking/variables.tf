@@ -13,8 +13,9 @@
 # limitations under the License.
 
 # The deployer drops an injected variable this stack does not declare and
-# raises on a task.yaml variable it does not declare, so this file and
-# bench/tasks/bootstrap-inventory-ranking-delivery/task.yaml are a matched pair.
+# raises on a task.yaml variable it does not declare, so this file and the
+# task.yaml of each case on this stack (bootstrap-inventory-ranking-delivery,
+# bootstrap-inventory-posture-scope) are a matched set.
 
 variable "host_cluster_name" {
   type        = string
@@ -63,4 +64,17 @@ variable "sandbox_container" {
   type        = string
   description = "Container inside the shell sandbox pods"
   default     = "shell"
+}
+
+# Which planted report, beside main.tf, the case ranks. Each has a cards file
+# beside it that bench/tests/test_bootstrap_ranking.py composes it from.
+variable "raw_report" {
+  type        = string
+  description = "File name, beside main.tf, of the INVENTORY.raw.md this case plants"
+  default     = "inventory-raw.txt"
+  # The teardown resolves, and the fixture test composes, only files matching this.
+  validation {
+    condition     = can(regex("^inventory-raw[^/]*\\.txt$", var.raw_report))
+    error_message = "raw_report must name an inventory-raw*.txt file beside main.tf."
+  }
 }

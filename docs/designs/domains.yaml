@@ -143,10 +143,10 @@ domains:
     meaning: Works with issues, pull requests, review feedback and branches on the code forge.
     journey: An issue, pull request, review comment or branch is read and written through the version-control verbs, never a credentialed clone or a forge CLI in the sandbox
 
-# Known-uncovered. Six entries; empty is Phase 2's exit criterion. The two
-# kanban probes cover chat-and-routing; cluster-debugging came off first
+# Known-uncovered; empty is Phase 2's exit criterion. agent-kanban-smoke
+# covers chat-and-routing; cluster-debugging came off first
 # among the Phase 2 domains, in #939. Reliability, capacity, security and
-# cost are covered by four domain probes (upgrades' probe was demoted to the
+# cost are covered by domain probes (upgrades' probe was demoted to the
 # nightly on 2026-10-16, #3269, and consistency's on 2026-10-21, #3598,
 # both below) --
 # see the header above for why probes rather than six full audits.

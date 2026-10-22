@@ -318,6 +318,14 @@ ENTRY_WEBHOOK = 7
 ENTRY_SKEW = 10
 DEFAULT_ENTRY_TITLE = "Upgrade readiness rule"
 DEFAULT_MITIGATION = "Read the finding's text and the catalogue entry it names, and fix the object before the upgrade."
+# Entries whose rule carries its own remedy in the finding text, after the last `; ` outside
+# parentheses (the surge-capacity rule's Pod-range and accelerator shapes): the action is that
+# clause, not the entry's one-size mitigation, which for entry 2 names the surge settings a
+# pool on GKE's defaults already has.
+RULE_REMEDY_ENTRIES = frozenset({2})
+REMEDY_SEPARATOR = "; "
+PAREN_OPEN = "("
+PAREN_CLOSE = ")"
 
 REMEDIATION_KIND = "manual"
 VERIFICATION_KIND = "manual"
@@ -463,6 +471,33 @@ def entry_title(entry: int | None) -> str:
 
 def entry_mitigation(entry: int | None) -> str:
     return ENTRY_MITIGATIONS.get(entry or 0, DEFAULT_MITIGATION)
+
+
+def rule_remedy(text: str) -> str:
+    """The remedy clause a rule's text ends with: what follows the last `; ` outside
+    parentheses, capitalised; empty when the text carries none."""
+    depth, cut = 0, -1
+    for index, char in enumerate(text):
+        if char == PAREN_OPEN:
+            depth += 1
+        elif char == PAREN_CLOSE:
+            depth = max(0, depth - 1)
+        elif depth == 0 and text.startswith(REMEDY_SEPARATOR, index):
+            cut = index
+    if cut < 0:
+        return ""
+    clause = text[cut + len(REMEDY_SEPARATOR) :].strip()
+    return clause[:1].upper() + clause[1:] if clause else ""
+
+
+def rule_action(entry: int | None, text: str) -> str:
+    """A rule row's action: the rule's own remedy for the entries that carry one, else
+    the entry's mitigation."""
+    if entry in RULE_REMEDY_ENTRIES:
+        remedy = rule_remedy(text)
+        if remedy:
+            return remedy
+    return entry_mitigation(entry)
 
 
 def cluster_fields(member: dict) -> tuple[str, str, str]:
@@ -703,7 +738,7 @@ def rule_findings(member: dict) -> list[dict]:
                     title=f"{entry or '-'}. {entry_title(entry)}: {object_name if object_name != CLUSTER_OBJECT else 'this cluster'} {lead}",
                     detail=text,
                     rubric_values=values,
-                    action=entry_mitigation(entry),
+                    action=rule_action(entry, text),
                     rationale=f"The readiness rule {rule} (catalogue entry {entry or 'unnumbered'}) read: {text}",
                     verify=f"re-run the readiness report ({rule}) for this cluster",
                     still_failing_when=f"the readiness rule {rule} still names {object_name}.",
