@@ -494,15 +494,18 @@ def parse_manifests(path: str, data: bytes) -> tuple[list[Document], str | None]
         return [], REASON_ENCODING
     docs: list[Document] = []
     is_json = path.lower().endswith(JSON_SUFFIX)
-    # Anything the loader raises is this file's problem, not the repository's.
-    # PyYAML's YAMLError is not the whole set: its timestamp constructor raises a
-    # bare ValueError for a date that does not exist, and a pathologically nested
-    # document raises RecursionError.
+    # Anything the loader or the walk raises is this file's problem, not the
+    # repository's. PyYAML's YAMLError is not the whole set: its timestamp
+    # constructor raises a bare ValueError for a date that does not exist, and a
+    # pathologically nested document raises RecursionError, from the loader or,
+    # where the loader accepts the depth, from the walk below it.
     try:
         if is_json:
             parsed = [json.loads(text)] if text.strip() else []
         else:
             parsed = list(yaml.safe_load_all(text))
+        for node in parsed:
+            _documents_of(node, path, docs)
     except Exception as e:  # noqa: BLE001 - a file that does not parse is listed, never fatal
         if is_json:
             return [], REASON_JSON.format(error=e)
@@ -510,8 +513,6 @@ def parse_manifests(path: str, data: bytes) -> tuple[list[Document], str | None]
             return [], REASON_TEMPLATE
         first_line = str(e).splitlines()[0] if str(e) else ""
         return [], REASON_YAML.format(error=f"{type(e).__name__}: {first_line}" if first_line else type(e).__name__)
-    for node in parsed:
-        _documents_of(node, path, docs)
     return docs, None
 
 
