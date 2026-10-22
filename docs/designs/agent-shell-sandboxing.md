@@ -1454,9 +1454,9 @@ Sizing the two volumes together has an upgrade cost, because `volumeClaimTemplat
 immutable and the template sizes only the claims it creates. An install that predates it
 therefore needs both halves done to it: the operator widens the existing claim in place
 (online, with the volume still mounted) and recreates the StatefulSet with Orphan
-propagation so the pod and its disk survive the swap. Both are in `reconcileShellSandbox`;
-the widening is `growDataClaim`, which `reconcilePVC` also runs on the agent's own claim,
-and both are best-effort in the direction that matters — a StorageClass without
+propagation so the pod and its disk survive the swap. The recreate is in
+`reconcileShellSandbox`; the widening is `growShellSandboxDataClaim`, which `reconcilePVC` runs
+through `growDataClaim` before it grows the agent's own claim, and both are best-effort in the direction that matters — a StorageClass without
 `allowVolumeExpansion` leaves a smaller volume and a bounded migration rather than a failed
 reconcile that would take the agent down with it.
 
@@ -2841,6 +2841,8 @@ The Slack relay holds a socket-mode WebSocket. Two replicas means two connection
 duplicate event delivery, so the broker Deployment pins `replicas: 1`. The credential
 broker cannot be made highly available while it is fused with an inbound event pump, and
 splitting the two is the obvious follow-up.
+[`credential-proxy-single-pod.md`](credential-proxy-single-pod.md) owns the replica decision
+and the other state that keeps the broker at one pod.
 
 ### The proxy image is not the agent image
 

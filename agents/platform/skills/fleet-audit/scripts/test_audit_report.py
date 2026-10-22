@@ -17154,15 +17154,17 @@ class TestDispatchAndHandover(unittest.TestCase):
         # (2026-09-24), and the operator's release lives in the cron README,
         # which the worker does not read. The guard paragraph promises what
         # the TTL delivers (a dead run costs at most the ticks inside two
-        # hours), not "never", and says what the lease spans: one pair, so a
-        # multi-repo loop reclaims per repository and a mid-loop refusal is
-        # a partial run, not "already running".
+        # hours), not "never", and says what the lease spans: one pair, and a
+        # run publishes to one repository, so there is no loop over the managed
+        # repositories; a refusal between two repositories a person asked for
+        # leaves the rest not audited.
         self.assertNotIn("takeover", text.lower())
         self.assertNotIn("never blocks", section)
         self.assertIn("at most the ticks", section)
         self.assertIn("operator's action", section)
         self.assertIn("one `start`-`finish` pair", section)
-        self.assertIn("taken between repositories", section)
+        self.assertIn("do not loop over the managed", section)
+        self.assertIn("another run took the stream", section)
         # The exit-code paragraph tells a `START REFUSED` and a
         # `BROKER UNAVAILABLE` apart from a rejected document: neither has a
         # file to fix.
@@ -25108,6 +25110,10 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     the same way: `finish` asks git in one `ls-tree` a run if each
     `manifest` fix's file and each possible kustomization for it are at the
     audited commit. That adds one git call to the findings transcript.
+    The reachability check is recorded the same way: before it publishes,
+    `finish` lists one open issue in the repository (`unreachable_reason`).
+    That adds one `forge issue-list` call, and its trace line, at the start
+    of every transcript that publishes.
     Nothing else moved.
 
     The move from `gh` to the broker's forge verbs is recorded the same way,
@@ -25657,6 +25663,37 @@ class TestReportStore(HarnessTestCase):
         stored = self.stored()
         self.assertEqual((stored["issue_number"], stored["ledger_body"]), (42, previous))
         self.assertIs(stored["ledger_held_open"], True)
+
+    def test_a_store_of_only_unreachable_runs_is_seeded_from_the_ledger(self):
+        """A run that could not reach the repository stored a marked envelope
+        in its directory. That is not a published memory, so the next run that
+        reaches the repository still seeds once from the ledger's block."""
+        previous = published_body(make_doc(), generated_at=NOW)
+        self.harness.replies = {"issue-list": self.listing(previous)}
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        diverted = {
+            "repo": "acme/fleet", "issue_number": None, "status": audit_report.NO_FORGE_STATUS,
+            audit_report.UNREACHABLE_REPO_KEY: {"repo": "acme/fleet", "reason": "r"},
+        }
+        audit_report.write_report(AUDIT, diverted, NOW)
+        self.assertEqual(self.run_finish_unseeded(make_doc(findings=[])), 0, self.err)
+        self.assertEqual(self.harness.forge_calls("issue-close"), [])
+        self.assertEqual(self.stdout_json()["status"], "HELD")
+        self.assertIn("seeding this run's memory once", self.err)
+        self.assertEqual(self.stored()["ledger_body"], previous)
+
+    def test_a_store_with_a_published_run_is_not_seeded_again(self):
+        """A published envelope in the ring is a memory: a marked `latest.json`
+        on top of it does not make the store look never written."""
+        directory = audit_report.reports_dir_for(AUDIT, "acme/fleet")
+        audit_report.write_report(AUDIT, self.envelope(), NOW)
+        diverted = {
+            "repo": "acme/fleet", "issue_number": None, "status": audit_report.NO_FORGE_STATUS,
+            audit_report.UNREACHABLE_REPO_KEY: {"repo": "acme/fleet", "reason": "r"},
+        }
+        audit_report.write_report(AUDIT, diverted, NOW + timedelta(hours=1))
+        self.assertTrue(audit_report.is_diverted(json.loads((directory / "latest.json").read_text())))
+        self.assertFalse(audit_report.store_never_published(directory))
 
     def test_a_held_open_run_after_a_seed_carries_no_empty_document(self):
         """Seeded off the block, then held open twice: neither memory wrote
@@ -27056,17 +27093,23 @@ class TestNoForge(BaseTestCase):
         holder = gitops_workspace.lease_dir(audit_report.GITOPS_WORKSPACE, AUDIT)
         holder.mkdir(parents=True)
         gitops_workspace.write_lease(holder, AUDIT, "acme/gitops", owner=f"fleet-audit:{AUDIT}")
-        self.assertEqual(audit_report.resolve_repo(audit_id=AUDIT), "acme/gitops")
+        # No run is in flight, so the lease is an earlier run's and is not used.
+        with self.assertRaises(RuntimeError):
+            audit_report.resolve_repo(audit_id=AUDIT)
 
         self.assertEqual(self.start()["mode"], audit_report.NO_FORGE_MODE)
         self.assertEqual(self.recorder.calls, [])
 
-    def test_several_repositories_keep_the_resolvers_error(self):
+    def test_several_repositories_with_none_chosen_report_the_reason(self):
         self.managed_text = '[{"type": "github", "url": "https://github.com/acme/a"}, {"type": "github", "url": "https://github.com/acme/b"}]'
         with patch("gitops_workspace.get_managed_repos", return_value=["acme/a", "acme/b"]):
-            self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 1)
-        self.assertIn("Multiple repositories configured", self.err)
+            out = self.start()
+        self.assertEqual(out["mode"], audit_report.NO_FORGE_MODE)
+        self.assertIsNone(out["repo"])
+        self.assertIn("Multiple repositories configured", out["no_forge"])
+        self.assertIn(audit_report.NO_REPOSITORY_CHOSEN_KEY, out)
         self.assertNotIn("cannot use", self.err)
+        self.assertEqual(self.recorder.calls, [])
 
     def test_an_empty_list_is_nothing_registered(self):
         self.managed_text = "[]"
@@ -27834,6 +27877,477 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         [(_, text)] = self.entries()
         self.assertNotIn(audit_report.CHAT_REPORT_REFINISH_LABEL, text)
         self.assertNotEqual(self.chat_record()["run"], run)
+
+
+def _repo_entries(*urls, kind="github"):
+    """A `managed_repos` value: one `{type, url}` entry per URL."""
+    return json.dumps([{"type": kind, "url": url} for url in urls])
+
+
+class TestLedgerRepositoryChoice(BaseTestCase):
+    """Which repository gets the ledger issue and the fixes (#3536).
+
+    The order is `--repo`, the workspace, the lease record, the repository
+    with role gitops (the operator's `gitops_repo` key), and then the one
+    repository in `managed_repos`. Several repositories and no gitops role is
+    a refusal that says how to fix it: the audit never chooses one itself.
+    """
+
+    GITOPS = "https://github.com/acme/gitops"
+    TERRAFORM = "https://github.com/acme/terraform"
+
+    def setUp(self):
+        super().setUp()
+        self.state = self.tmp_path / "state"
+        self.state.mkdir()
+        env = patch.dict(os.environ, {"GITOPS_STATE_PATH": str(self.state / "managed_repos")})
+        env.start()
+        self.addCleanup(env.stop)
+        self.patch_attr("GITOPS_WORKSPACE", str(self.tmp_path / "gitops"))
+        no_remote = type(sys)("github_token_refresh")
+        no_remote.get_current_git_repo = lambda cwd=None: None
+        modules = patch.dict(sys.modules, {"github_token_refresh": no_remote})
+        modules.start()
+        self.addCleanup(modules.stop)
+
+    def register(self, managed, gitops=None):
+        (self.state / "managed_repos").write_text(managed, encoding="utf-8")
+        if gitops is not None:
+            (self.state / "gitops_repo").write_text(gitops, encoding="utf-8")
+
+    def gitops_key(self, url, kind="github"):
+        return json.dumps({"type": kind, "url": url})
+
+    def test_the_gitops_role_chooses_among_several_repositories(self):
+        # Declared second, so the first-entry rule would not find it either.
+        self.register(_repo_entries(self.TERRAFORM, self.GITOPS), self.gitops_key(self.GITOPS))
+        self.assertEqual(audit_report.resolve_repo(audit_id=AUDIT), "acme/gitops")
+        self.assertEqual(audit_report.resolve_repo_or_no_forge(AUDIT), "acme/gitops")
+
+    def test_a_gitlab_gitops_repository_is_named_with_its_host(self):
+        gitlab = "https://gitlab.example.com/platform/infra/gitops"
+        self.register(
+            _repo_entries(gitlab, "https://gitlab.example.com/platform/terraform", kind="gitlab"),
+            self.gitops_key(gitlab, kind="gitlab"),
+        )
+        self.assertEqual(
+            audit_report.resolve_repo(audit_id=AUDIT), "gitlab.example.com/platform/infra/gitops"
+        )
+
+    def test_several_repositories_and_no_gitops_role_refuse_with_the_fix(self):
+        self.register(_repo_entries(self.GITOPS, self.TERRAFORM))
+        with self.assertRaises(RuntimeError) as caught:
+            audit_report.resolve_repo(audit_id=AUDIT)
+        message = str(caught.exception)
+        self.assertIn("acme/gitops, acme/terraform", message)
+        self.assertIn("role: gitops", message)
+        self.assertIn("--repo", message)
+        # And the run does not take it for an install with no repository.
+        with self.assertRaises(RuntimeError):
+            audit_report.resolve_repo_or_no_forge(AUDIT)
+
+    def test_a_key_naming_an_unregistered_repository_is_ignored(self):
+        stale = self.gitops_key("https://github.com/acme/removed")
+        self.register(_repo_entries(self.GITOPS, self.TERRAFORM), stale)
+        with self.assertRaises(RuntimeError) as caught:
+            audit_report.resolve_repo(audit_id=AUDIT)
+        self.assertIn("names no repository in that list", str(caught.exception))
+        self.assertNotIn("none has role gitops", str(caught.exception))
+        self.assertNotIn("acme/removed", str(caught.exception))
+        # One registered repository: the one-repository rule, not the key.
+        self.register(_repo_entries(self.TERRAFORM), stale)
+        self.assertEqual(audit_report.resolve_repo(audit_id=AUDIT), "acme/terraform")
+
+    def test_explicit_repo_comes_before_the_gitops_role(self):
+        self.register(_repo_entries(self.GITOPS, self.TERRAFORM), self.gitops_key(self.GITOPS))
+        self.assertEqual(
+            audit_report.resolve_repo(audit_id=AUDIT, repo="acme/terraform"), "acme/terraform"
+        )
+
+    def test_the_workspace_comes_before_the_gitops_role(self):
+        self.register(_repo_entries(self.GITOPS, self.TERRAFORM), self.gitops_key(self.GITOPS))
+        workspace = self.tmp_path / "ws"
+        real = gitops_workspace.resolve_repo
+
+        def from_workspace(workspace=None):
+            return "acme/terraform" if workspace is not None else real()
+
+        with patch("gitops_workspace.resolve_repo", from_workspace):
+            self.assertEqual(
+                audit_report.resolve_repo(audit_id=AUDIT, workspace=workspace), "acme/terraform"
+            )
+
+    def test_an_unreadable_key_is_not_called_a_missing_role(self):
+        self.register(_repo_entries(self.GITOPS, self.TERRAFORM))
+        unreadable = RuntimeError("Failed to read ConfigMap platform-agent-gitops-state")
+        with patch("gitops_workspace.gitops_repo_key_text", side_effect=unreadable):
+            with self.assertRaises(RuntimeError) as caught:
+                audit_report.resolve_repo(audit_id=AUDIT)
+        self.assertIn("gitops_repo key could not be read", str(caught.exception))
+        self.assertIn("Failed to read ConfigMap", str(caught.exception))
+        self.assertNotIn("none has role gitops", str(caught.exception))
+
+    def lease(self, repo, refreshed_at=None):
+        holder = gitops_workspace.lease_dir(audit_report.GITOPS_WORKSPACE, AUDIT)
+        holder.mkdir(parents=True, exist_ok=True)
+        record = gitops_workspace.write_lease(holder, AUDIT, repo, owner=f"fleet-audit:{AUDIT}")
+        if refreshed_at is not None:
+            record["refreshed_at"] = refreshed_at
+            (holder / gitops_workspace.LEASE_FILENAME).write_text(json.dumps(record), encoding="utf-8")
+
+    def claim(self):
+        """Take this stream's in-flight note, as `start` does first."""
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        self.real_claim_in_flight(AUDIT)
+        self.addCleanup(audit_report.release_in_flight, AUDIT)
+
+    def test_a_lease_from_an_earlier_run_does_not_override_the_gitops_key(self):
+        self.register(_repo_entries(self.GITOPS, self.TERRAFORM), self.gitops_key(self.GITOPS))
+        # An earlier `--repo` run left its lease, and no run is in flight.
+        self.lease("acme/terraform")
+        self.assertEqual(audit_report.resolve_repo(audit_id=AUDIT), "acme/gitops")
+        # A run is in flight, but the lease is older than its note.
+        self.claim()
+        self.lease("acme/terraform", refreshed_at="2020-01-01T00:00:00Z")
+        self.assertEqual(audit_report.resolve_repo(audit_id=AUDIT), "acme/gitops")
+
+    def test_this_runs_lease_comes_before_the_gitops_role(self):
+        self.register(_repo_entries(self.GITOPS, self.TERRAFORM), self.gitops_key(self.GITOPS))
+        self.claim()
+        self.lease("acme/terraform")
+        self.assertEqual(audit_report.resolve_repo(audit_id=AUDIT), "acme/terraform")
+
+    def test_within_one_run_finish_follows_starts_repo(self):
+        self.register(_repo_entries(self.GITOPS, self.TERRAFORM), self.gitops_key(self.GITOPS))
+        recorder = Recorder()
+        self.patch_attr("run_cmd", recorder)
+        # `start --repo acme/terraform`: the note, then the lease and the record.
+        self.claim()
+        self.lease("acme/terraform")
+        audit_report.write_run_record(AUDIT, "acme/terraform", [])
+        self.assertEqual(audit_report.finish_target(AUDIT, None), ("acme/terraform", None))
+        self.assertEqual(audit_report.finish_target(AUDIT, "acme/terraform"), ("acme/terraform", None))
+        # It follows the decision; it does not probe again.
+        self.assertEqual(recorder.calls, [])
+        # A record from an earlier run is not this run's.
+        audit_report.release_in_flight(AUDIT)
+        self.assertEqual(audit_report.finish_target(AUDIT, None), ("acme/gitops", None))
+
+    def test_finish_with_another_repo_than_start_resolves_and_probes_it(self):
+        self.register(_repo_entries(self.GITOPS, self.TERRAFORM), self.gitops_key(self.GITOPS))
+        recorder = Recorder()
+        self.patch_attr("run_cmd", recorder)
+        # `start` chose acme/terraform; `finish --repo acme/gitops` names another repository.
+        self.claim()
+        self.lease("acme/terraform")
+        audit_report.write_run_record(AUDIT, "acme/terraform", [])
+        self.assertEqual(audit_report.finish_target(AUDIT, "acme/gitops"), ("acme/gitops", None))
+        # It probes the repository it names, and only that one.
+        self.assertEqual(
+            [(call, payload.get("repository")) for call, payload in zip(recorder.calls, recorder.payloads)],
+            [(["forge", "issue-list"], "acme/gitops")],
+        )
+
+    def test_one_repository_needs_no_gitops_role(self):
+        self.register(_repo_entries(self.TERRAFORM))
+        self.assertEqual(audit_report.resolve_repo(audit_id=AUDIT), "acme/terraform")
+
+
+class _UnreachableRecorder(Recorder):
+    """A Recorder whose forge refuses every call with one broker code."""
+
+    def __init__(self, code):
+        super().__init__()
+        self.code = code
+
+    def forge(self, verb, payload, repository=None):
+        super().forge(verb, payload, repository=repository)
+        raise vcs_client.VcsError(f"simulated {self.code}", code=self.code)
+
+
+class TestUnreachableRepository(BaseTestCase):
+    """A repository the broker cannot reach is reported, not published to (#3536).
+
+    The run does not choose another repository: it takes the path of a run
+    with no repository, with the reason in its note.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.state = self.tmp_path / "state"
+        self.state.mkdir()
+        (self.state / "managed_repos").write_text(
+            _repo_entries("https://github.com/acme/terraform", "https://github.com/acme/gitops"),
+            encoding="utf-8",
+        )
+        (self.state / "gitops_repo").write_text(
+            json.dumps({"type": "github", "url": "https://github.com/acme/gitops"}), encoding="utf-8"
+        )
+        env = patch.dict(os.environ, {"GITOPS_STATE_PATH": str(self.state / "managed_repos")})
+        env.start()
+        self.addCleanup(env.stop)
+        self.patch_attr("GITOPS_WORKSPACE", str(self.tmp_path / "gitops"))
+        self.patch_attr("refresh_credentials", lambda repo=None: None)
+        self.recorder = _UnreachableRecorder("FORGE_NOT_FOUND")
+        self.patch_attr("run_cmd", self.recorder)
+
+    def store(self):
+        return self.reports_dir / AUDIT / "no_forge" / "local"
+
+    def test_start_and_finish_take_the_no_forge_path_with_the_reason(self):
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        started = self.stdout_json()
+        self.assertEqual(started["mode"], audit_report.NO_FORGE_MODE)
+        self.assertIsNone(started["repo"])
+        self.assertIn("acme/gitops could not be reached", started["no_forge"])
+        self.assertIn("FORGE_NOT_FOUND", started["no_forge"])
+        self.assertIn("did not choose another repository", started["no_forge"])
+
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        self.assertEqual(
+            self.run_main(["finish", "--audit", AUDIT, "--findings-file", path]), 0, self.err
+        )
+        out = self.stdout_json()
+        self.assertEqual(out["status"], audit_report.NO_FORGE_STATUS)
+        self.assertIsNone(out["issue_url"])
+        self.assertEqual(out[audit_report.UNREACHABLE_REPO_KEY]["repo"], "acme/gitops")
+        self.assertIn("FORGE_NOT_FOUND", out[audit_report.UNREACHABLE_REPO_KEY]["reason"])
+        self.assertEqual(out["summary"].splitlines()[-1], out["no_forge"])
+        self.assertIn("acme/gitops could not be reached", out["no_forge"])
+        # Stored under the repository's own directory, marked; not under no_forge/local.
+        latest = json.loads(
+            (audit_report.reports_dir_for(AUDIT, "acme/gitops") / "latest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(latest["repo"], "acme/gitops")
+        self.assertEqual(latest[audit_report.UNREACHABLE_REPO_KEY]["repo"], "acme/gitops")
+        self.assertFalse(self.store().exists())
+        # No in-flight note here (claim_in_flight is stubbed), so `finish` has
+        # no record of this run and probes on its own: one probe for each
+        # command, to the gitops repository, and nothing else.
+        self.assertEqual(
+            [(call, payload.get("repository")) for call, payload in zip(self.recorder.calls, self.recorder.payloads)],
+            [(["forge", "issue-list"], "acme/gitops")] * 2,
+        )
+
+    def test_a_refusal_that_is_not_about_the_repository_does_not_divert(self):
+        self.patch_attr("run_cmd", _UnreachableRecorder("FORGE_RATE_LIMITED"))
+        self.assertIsNone(audit_report.unreachable_reason("acme/gitops"))
+        self.assertEqual(audit_report.resolve_reachable_repo(AUDIT), ("acme/gitops", None))
+
+    def test_each_repository_code_diverts(self):
+        self.assertEqual(
+            audit_report.unreachable_repo_codes(),
+            {"FORGE_NOT_FOUND", "FORGE_FORBIDDEN", "FORGE_UNAUTHENTICATED", "REPOSITORY_NOT_MANAGED"},
+        )
+        for code in sorted(audit_report.unreachable_repo_codes()):
+            with self.subTest(code=code):
+                self.patch_attr("run_cmd", _UnreachableRecorder(code))
+                repo, unreachable = audit_report.resolve_reachable_repo(AUDIT)
+                self.assertEqual(repo, audit_report.NO_FORGE_REPO)
+                self.assertEqual(unreachable[0], "acme/gitops")
+                self.assertIn(code, unreachable[1])
+
+    def test_a_lost_broker_is_still_broker_unavailable(self):
+        import urllib.error
+
+        class LostBroker(Recorder):
+            def forge(self, verb, payload, repository=None):
+                super().forge(verb, payload, repository=repository)
+                raise vcs_client.VcsError("no answer") from urllib.error.URLError("refused")
+
+        self.patch_attr("run_cmd", LostBroker())
+        with self.assertRaises(audit_report.BrokerUnavailable):
+            audit_report.resolve_reachable_repo(AUDIT)
+
+    def test_a_reachable_repository_keeps_the_forge_path(self):
+        self.patch_attr("run_cmd", Recorder())
+        self.assertEqual(audit_report.resolve_reachable_repo(AUDIT), ("acme/gitops", None))
+
+    def claim_for_real(self):
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.addCleanup(audit_report.release_in_flight, AUDIT)
+
+    def run_once(self, findings=THREE_SEVERITIES):
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=findings)), encoding="utf-8")
+        self.assertEqual(
+            self.run_main(["finish", "--audit", AUDIT, "--findings-file", path]), 0, self.err
+        )
+        return self.stdout_json()
+
+    def test_an_unreachable_repository_is_never_silent(self):
+        self.claim_for_real()
+        first = self.run_once()
+        second = self.run_once()
+        for out in (first, second):
+            self.assertEqual(out["status"], audit_report.NO_FORGE_STATUS)
+            self.assertFalse(out["silent_ok"])
+            self.assertIn("FORGE_NOT_FOUND", out[audit_report.UNREACHABLE_REPO_KEY]["reason"])
+            self.assertIn("acme/gitops could not be reached", out["summary"])
+        # The second run is not compared with the first: its delta is unknown.
+        self.assertEqual((second["new"], second["resolved"]), (0, 0))
+
+    def test_finish_follows_starts_unreachable_decision(self):
+        self.claim_for_real()
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        # The repository answers by the time of `finish`; the run stays on
+        # the decision `start` made.
+        reachable = Recorder()
+        self.patch_attr("run_cmd", reachable)
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        self.assertEqual(
+            self.run_main(["finish", "--audit", AUDIT, "--findings-file", path]), 0, self.err
+        )
+        out = self.stdout_json()
+        self.assertEqual(out["status"], audit_report.NO_FORGE_STATUS)
+        self.assertEqual(out[audit_report.UNREACHABLE_REPO_KEY]["repo"], "acme/gitops")
+        self.assertEqual(reachable.calls, [])
+
+    def test_finish_follows_starts_reachable_decision(self):
+        # `start` reached the repository; a probe at `finish` would fail, and
+        # `finish` does not make one.
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        self.real_claim_in_flight(AUDIT)
+        self.addCleanup(audit_report.release_in_flight, AUDIT)
+        audit_report.write_run_record(AUDIT, "acme/gitops", [])
+        self.assertEqual(audit_report.finish_target(AUDIT, None), ("acme/gitops", None))
+        self.assertEqual(self.recorder.calls, [])
+
+    def test_a_repository_the_broker_does_not_manage_says_to_register_it(self):
+        self.patch_attr("run_cmd", _UnreachableRecorder("REPOSITORY_NOT_MANAGED"))
+        _repo, unreachable = audit_report.resolve_reachable_repo(AUDIT)
+        note = audit_report.unreachable_note(unreachable)
+        self.assertIn("Register the repository", note)
+        self.assertNotIn("Make sure that the repository exists", note)
+        self.patch_attr("run_cmd", _UnreachableRecorder("FORGE_NOT_FOUND"))
+        _repo, unreachable = audit_report.resolve_reachable_repo(AUDIT)
+        self.assertIn("Make sure that the repository exists", audit_report.unreachable_note(unreachable))
+
+
+    def test_report_query_reads_the_one_repository_after_an_unreachable_run(self):
+        self.claim_for_real()
+        self.run_once()
+        reports_scripts = Path(__file__).resolve().parents[2] / "fleet-audit-reports" / "scripts"
+        sys.path.insert(0, str(reports_scripts))
+        self.addCleanup(sys.path.remove, str(reports_scripts))
+        import report_query
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = report_query.main(["show", AUDIT, "--root", str(self.reports_dir)])
+        self.assertEqual(code, 0, out.getvalue())
+        answer = json.loads(out.getvalue())
+        self.assertIsNone(answer.get("error"))
+        self.assertEqual(answer["repo"], "acme/gitops")
+        self.assertEqual(answer["envelope"][audit_report.UNREACHABLE_REPO_KEY]["repo"], "acme/gitops")
+
+    def test_a_true_no_forge_run_does_not_use_a_marked_envelope_as_its_baseline(self):
+        directory = audit_report.reports_dir_for(AUDIT, audit_report.NO_FORGE_REPO)
+        directory.mkdir(parents=True)
+        (directory / "latest.json").write_text(
+            json.dumps({
+                "status": audit_report.NO_FORGE_STATUS,
+                "repo": audit_report.NO_FORGE_REPO,
+                "id_scheme": audit_report.ID_SCHEME,
+                "current_ids": ["a.b.c"],
+                audit_report.NO_REPOSITORY_CHOSEN_KEY: {"reason": "several"},
+            }),
+            encoding="utf-8",
+        )
+        self.assertIsNone(audit_report.previous_no_forge_ids(AUDIT))
+
+    def test_a_failed_store_write_keeps_the_published_memory(self):
+        """The diverted run wrote nothing to the ledger, so the record of the
+        last published run still describes it exactly."""
+        directory = audit_report.reports_dir_for(AUDIT, "acme/gitops")
+        directory.mkdir(parents=True)
+        published = {"repo": "acme/gitops", "issue_number": 7, "ledger_body": "body", "current_ids": ["x"]}
+        (directory / "latest.json").write_text(json.dumps(published), encoding="utf-8")
+        with patch.object(audit_report, "_atomic_write", side_effect=OSError("disk full")):
+            self.run_once()
+        self.assertIn("report store write", self.err)
+        self.assertEqual(audit_report.read_report_memory(AUDIT, 7, "acme/gitops")["current_ids"], ["x"])
+
+    def test_the_forge_memory_skips_an_unreachable_envelope(self):
+        directory = audit_report.reports_dir_for(AUDIT, "acme/gitops")
+        runs = directory / audit_report.REPORT_RUNS_DIR
+        runs.mkdir(parents=True)
+        published = {"repo": "acme/gitops", "issue_number": 7, "ledger_body": "body", "current_ids": ["x"]}
+        diverted = {"repo": "acme/gitops", "issue_number": None, "status": audit_report.NO_FORGE_STATUS,
+                    audit_report.UNREACHABLE_REPO_KEY: {"repo": "acme/gitops", "reason": "r"}}
+        (runs / "20260101T000000Z.json").write_text(json.dumps(published), encoding="utf-8")
+        (runs / "20260102T000000Z.json").write_text(json.dumps(diverted), encoding="utf-8")
+        (directory / "latest.json").write_text(json.dumps(diverted), encoding="utf-8")
+        memory = audit_report.read_report_memory(AUDIT, 7, "acme/gitops")
+        self.assertEqual(memory["current_ids"], ["x"])
+
+    def test_a_refused_listing_says_issues_must_be_enabled(self):
+        self.patch_attr("run_cmd", _UnreachableRecorder("FORGE_FORBIDDEN"))
+        _repo, unreachable = audit_report.resolve_reachable_repo(AUDIT)
+        self.assertIn("issues enabled", audit_report.unreachable_note(unreachable))
+
+
+class TestNoRepositoryChosen(BaseTestCase):
+    """Several managed repositories and none chosen: the chat path, never a pick (#3536)."""
+
+    def setUp(self):
+        super().setUp()
+        self.state = self.tmp_path / "state"
+        self.state.mkdir()
+        (self.state / "managed_repos").write_text(
+            _repo_entries("https://github.com/acme/terraform", "https://github.com/acme/gitops"),
+            encoding="utf-8",
+        )
+        env = patch.dict(os.environ, {"GITOPS_STATE_PATH": str(self.state / "managed_repos")})
+        env.start()
+        self.addCleanup(env.stop)
+        self.patch_attr("GITOPS_WORKSPACE", str(self.tmp_path / "gitops"))
+        self.recorder = Recorder()
+        self.patch_attr("run_cmd", self.recorder)
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.addCleanup(audit_report.release_in_flight, AUDIT)
+
+    def test_the_run_reports_to_chat_and_the_store_with_the_remedy(self):
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        started = self.stdout_json()
+        start_err = self.err
+        self.assertEqual(started["mode"], audit_report.NO_FORGE_MODE)
+        self.assertIn("role: gitops", started["no_forge"])
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        self.assertEqual(
+            self.run_main(["finish", "--audit", AUDIT, "--findings-file", path]), 0, self.err
+        )
+        out = self.stdout_json()
+        self.assertEqual(out["status"], audit_report.NO_FORGE_STATUS)
+        self.assertFalse(out["silent_ok"])
+        reason = out[audit_report.NO_REPOSITORY_CHOSEN_KEY]["reason"]
+        self.assertIn("role: gitops", reason)
+        self.assertIn("--repo", reason)
+        self.assertEqual(out["summary"].splitlines()[-1], out["no_forge"])
+        # The operator reads the summary, so the instruction to the agent is
+        # only on the agent's own stderr line.
+        agent_note = "Do not choose a repository yourself"
+        for text in (started["no_forge"], reason, out["summary"]):
+            self.assertNotIn(agent_note, text)
+        self.assertIn("NO REPOSITORY CHOSEN: ", start_err)
+        self.assertIn(agent_note, start_err)
+        # The chat relay has the summary, and no repository was used.
+        record = json.loads(Path(audit_report.chat_report_path_for(AUDIT)).read_text(encoding="utf-8"))
+        self.assertEqual([part["text"] for part in record["parts"]], [out["summary"]])
+        self.assertEqual(self.recorder.calls, [])
+        latest = json.loads(
+            (audit_report.reports_dir_for(AUDIT, audit_report.NO_FORGE_REPO) / "latest.json").read_text(encoding="utf-8")
+        )
+        self.assertIn(audit_report.NO_REPOSITORY_CHOSEN_KEY, latest)
+
+    def test_an_unregistered_repo_is_still_a_hard_error(self):
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--repo", "acme/other"]), 1)
+        self.assertIn("not in the managed repositories list", self.err)
+        self.assertEqual(self.out, "")
 
 
 if __name__ == "__main__":

@@ -104,10 +104,12 @@ const (
 	// records today, so turning an emitter on for a profile needs no change here.
 	fluentBitAuditTailPath = fluentBitDataMount + "/logs/" + auditFileName + "," +
 		fluentBitDataMount + "/profiles/*/logs/" + auditFileName
-	// agentDataStorageSize sizes the agent's own /opt/data claim, and through
-	// shell_sandbox_manifests.go the sandbox's claim at the same path.
+	// agentDataStorageSize is the default size of the agent's own /opt/data
+	// claim and, through shell_sandbox_manifests.go, of the sandbox's claim at
+	// the same path. spec.storage.size overrides it; ResolveDataStorageSize is
+	// the one place that decides, and every reader of the size calls it.
 	//
-	// The two are one constant on purpose. sandbox_mirror.py copies a subset of
+	// The two claims share one value on purpose. sandbox_mirror.py copies a subset of
 	// the agent's volume into the sandbox's on upgrade, so destination >= source
 	// makes the copy fit by construction and there is nothing left for a byte
 	// budget to decide. Sized apart, the sandbox was 5Gi against the agent's
@@ -118,9 +120,9 @@ const (
 	// Every cluster in scope gets a scaffolded profile under /opt/data/profiles,
 	// and at 10Gi a 209-cluster scope filled the volume in under two hours; the
 	// board's SQLite then failed every write while the CR stayed Ready. On an
-	// existing install growDataClaim widens both claims to this size, online,
-	// where the StorageClass allows expansion. A spec field and a full-volume
-	// condition are the lasting fix.
+	// existing install growDataClaim widens both claims to the resolved size,
+	// online, where the StorageClass allows expansion. install.defaults.env and
+	// the Terraform variable carry the same default, and a test pins them equal.
 	agentDataStorageSize = "50Gi"
 	credentialProxyPort  = 8765
 	// The Chat consumers' broker env: the project id both carry, the legacy
@@ -1722,6 +1724,9 @@ func buildGitopsStateConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.Confi
 			if host := resolved.GitHubHost(); host != agentv1alpha1.DefaultGitHubHost {
 				data[gitopsStateGitHubHostKey] = host
 			}
+			if repo, ok := declaredGitOpsRepo(agent); ok && repo != "" {
+				data[gitopsStateGitOpsRepoKey] = repo
+			}
 			for key, entries := range map[string][]agentv1alpha1.ManagedRepoEntry{
 				gitopsStateManagedReposKey: managed,
 				gitopsStateContextReposKey: seedEntries(resolved.Accepted(agentv1alpha1.RepositoryRoleContext)),
@@ -2176,11 +2181,23 @@ func buildPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim 
 			StorageClassName: storageClassName,
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: resource.MustParse(agentDataStorageSize),
+					corev1.ResourceStorage: ResolveDataStorageSize(agent),
 				},
 			},
 		},
 	}
+}
+
+// ResolveDataStorageSize is the size of the agent's data claim and of the
+// sandbox's data claim: spec.storage.size when it is set and above zero, and
+// agentDataStorageSize otherwise. The admission webhook refuses a value of zero
+// or less, but the chart ships the webhook off; the fallback keeps such a CR on
+// the default rather than on a claim the API server refuses to create.
+func ResolveDataStorageSize(agent *agentv1alpha1.PlatformAgent) resource.Quantity {
+	if storage := agent.Spec.Storage; storage != nil && storage.Size != nil && storage.Size.Sign() > 0 {
+		return storage.Size.DeepCopy()
+	}
+	return resource.MustParse(agentDataStorageSize)
 }
 
 func buildSystemPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim {

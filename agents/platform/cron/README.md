@@ -550,7 +550,8 @@ written and stores the full report against its thread, so the user's reply there
 Chat Agent with the report attached. A fleet-audit job the image ships is the
 exception: its scheduled delivery posts the report the run's `finish` rendered,
 not the final message,
-which holds whatever else the model wrote in its last turn. A run over several
+which holds whatever else the model wrote in its last turn. A run publishes to
+one repository, the one with `role: gitops`; a run that a person ran for several
 repositories posts each finished repository's report, then a line naming any it
 did not finish. A failed run posts the scheduler's failure line, which says why,
 and a run that finished no repository without failing posts a one-line notice

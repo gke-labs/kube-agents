@@ -61,6 +61,12 @@ install without the interview.
   the agent. `install.sh` sets it from `PLATFORM_AGENT_MODE` in `install.env`,
   which a first install records as `"next"`. Changing it on a running install is a mode switch
   ([`docs/designs/spec-mode-switch.md`](../../../docs/designs/spec-mode-switch.md)).
+  `platform_agent_storage_size` (default `"50Gi"`, which passes the chart nothing,
+  so the CR carries no `storage` field) sets the `PlatformAgent`'s
+  `spec.storage.size`, the size of the agent's data volume and the shell
+  sandbox's. A raise grows both claims where the StorageClass allows it, and a
+  lower value is refused. `install.sh` sets it from `PLATFORM_AGENT_STORAGE_SIZE`
+  in `install.env`.
   `alert_daily_limits` (default `{}`) sets the daily alert ceilings, and
   `install.sh` sets it from the `ALERT_DAILY_LIMIT_*` keys in `install.env`.
   A key that is not set keeps the default in the agent image. Each apply that

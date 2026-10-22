@@ -25,6 +25,7 @@ their own copies:
 | `DEFAULT_CLUSTER_MODE`                                                    | Shape a fresh install creates (`autopilot`); a live cluster's probed shape always wins |
 | `DEFAULT_PLATFORM_AGENT_MODE`                                             | What an `install.env` with no mode, and a CR with none, resolve to (`today`)           |
 | `DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE`                               | A first install's `spec.mode` (`next`); `install.sh` alone applies it                  |
+| `DEFAULT_PLATFORM_AGENT_STORAGE_SIZE`                                     | The data volume size (`50Gi`), the operator's default; it renders no `spec.storage`    |
 | `DEFAULT_VERTEX_LOCATION`                                                 | Vertex AI serving location (`global`)                                                  |
 | `DEFAULT_VERTEX_MANAGE_SERVING_PROJECT`                                   | Enable the API and grant the gateway's role in the serving project (`true`)            |
 | `DEFAULT_MODEL_PROVIDER`                                                  | Model provider (`gemini`)                                                              |
@@ -608,6 +609,17 @@ refuses `PLATFORM_AGENT_MODE=next` in `install.env` for the same reason. An olde
 the release rollback runbook's route, has no such refusal and drops it with its generic
 "Dropping" line, so roll a `next` install back only after switching it to `today` on purpose. A value outside the enum stops every front door but `uninstall.sh`, which exports it empty
 before it regenerates.
+
+`PLATFORM_AGENT_STORAGE_SIZE` is the `PlatformAgent`'s `spec.storage.size`, the size of the
+agent's data claim and of the shell sandbox's. Empty takes `DEFAULT_PLATFORM_AGENT_STORAGE_SIZE`,
+which equals the operator's own default. The generator writes `platform_agent_storage_size` on
+every run, and the composition passes the chart nothing for the default, so the CR carries no
+`storage` field. A first install records a value it inherits from the shell; after that, the file
+is the only way in, because `bootstrap_install_env` and `load_install_env` drop an inherited
+value: one run at a raised size followed by a run from a clean shell would drop the field again,
+leaving the claims larger than the CR says. A value that is not a whole number of `Mi`, `Gi` or
+`Ti` above zero and at most `64Ti` stops every front door but `uninstall.sh`, which exports it empty before it
+regenerates.
 
 When `next` hands Slack to the A2A gateway (Slack on, Google Chat off: the operator's
 `a2aSlackArmed`), `install.sh`, the menu's apply and a full upgrade refuse, before their apply,

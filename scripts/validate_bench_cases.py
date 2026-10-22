@@ -162,23 +162,21 @@ SCENARIO_BATCH_WAIT = (
 )
 
 KNOWN_UNREGISTERED = {
-    # The two CUJ 1 cases (#2889), held out for the same infra-lock budget
-    # as the stack cases below: a `stack:` case runs alone on lock-infra
-    # whatever EVAL_TASK_PARALLELISM is, and the main nightly part's serial
-    # chain is already at or past the 480m deadline on cost hints alone.
-    "gitops-drift-deleted-policy-triage": (
-        "#2889: stack case held out of the nightly until the infra-lock "
-        "chain has room"
-    ),
-    "gitops-drift-load-bearing-change-triage": (
-        "#2889: stack case held out of the nightly until the infra-lock "
-        "chain has room"
-    ),
     # Provisions its own cluster, so registering it costs every pull request
     # a second multi-minute provision. Whether it belongs in presubmit or
     # nightly is a tier decision nobody has made; this entry is the record
     # that the omission is known rather than accidental.
     "cluster-provision-kanban": "cluster-scoped provisioning task, tier decision pending",
+    # Has its fixture (its own stack) and its eval record (#3467: red on main,
+    # three greens on the fix, on a dev install), and belongs in the nightly.
+    # The pool runners hold no role that creates a Cloud Monitoring alert
+    # policy, so every apply of its stack would fail with 403; #3632 grants
+    # roles/monitoring.alertPolicyEditor. The entry goes when the case joins
+    # hack/eval/nightly-cases.txt.
+    "monitoring-alert-policy-read": (
+        "#3632: stack case held out of the nightly until the pool runners can "
+        "create a Cloud Monitoring alert policy"
+    ),
     # Has its fixture (its own stack) and its eval record (#2468: red on main,
     # three greens on the fix), and belongs in the nightly. #2755 lists what it
     # still needs first: Compute network permission for the CI runners,
@@ -352,6 +350,13 @@ FIXTURE_NOT_READY = {
         "spec.integration); every CI eval install has a GitHub forge, so no CI tier "
         "can run it; run it by hand against such an install"
     ),
+    "fleet-audit-ledger-goes-to-the-gitops-repository": (
+        "#3536: needs an install whose PlatformAgent declares a second managed "
+        "repository beside the gitops one; every CI eval install declares one, and "
+        "a case cannot add one to a shared install, since the operator never removes "
+        "it from managed_repos and every other fleet-audit case on main would then "
+        "refuse; run it by hand against such an install"
+    ),
     "gitops-drift-no-repository-triage": (
         "#3313: needs an install with no usable GitOps repository (a PlatformAgent "
         "whose spec.integration.repositories is empty); every CI eval install "
@@ -483,6 +488,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # No assertion field: "the gateway would post nothing" is the assertion; `reply` only picks
     # which reply is graded.
     "reply_is_silent": (),
+    # No field: "every evidence block in the reply is a worker's command with its real output"
+    # is the assertion; `min_blocks` only sets how many blocks a reply needs.
+    "verified_claims_backed": (),
     # This repository, agent-disk-reading: the discovery sweep a cron job filed.
     "bootstrap_fanout": ("require",),
     # This repository, sandbox-reading: the findings the onboarding

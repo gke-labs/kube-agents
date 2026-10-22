@@ -315,7 +315,7 @@ executed with the platform service account: metric data from Monitoring and Mana
 Prometheus, and every trace and span from Cloud Trace that the account can read. A
 prompt-injected turn can read any project's metrics and traces that the account can read. It
 could already read the same clusters' objects through proxied `kubectl` and the same projects'
-resources through proxied `gcloud`; this adds Monitoring and Trace to that set. The
+resources through proxied `gcloud`; this adds Monitoring metric data and Trace to that set. The
 Trace-console writes `roles/cloudtrace.user` carries (analysis-report tasks, trace scopes) are
 not in it: the method check refuses everything but `GET` before the host is read.
 
@@ -338,6 +338,10 @@ not in it: the method check refuses everything but `GET` before the host is read
 | Exhaust the broker with a huge response, or hand it a page cut short | `API_RELAY_MAX_RESPONSE_BYTES`, read in chunks with a cap rather than `.read()`; a body short of its `Content-Length` is `UPSTREAM_TRUNCATED`, none of it relayed                                                  |
 | Park a broker thread on a stalled upstream                           | `API_RELAY_CONNECT_TIMEOUT_S` on the connect; `API_RELAY_DEADLINE_S` re-armed on the socket before every `read1`                                                                                                   |
 | Redirect the broker somewhere else                                   | Redirects are not followed; a 3xx is returned to the caller as a 502 with no `Location`                                                                                                                            |
+
+The relay refuses `alertPolicies` because no table entry names it, not because the read is forbidden.
+The broker serves the same read through `/v1/exec` as `gcloud monitoring policies list` or `describe`
+(`GCLOUD_READ_COMMANDS` in `command_policy.py`). The table row above shows only the relay's path check.
 
 **Residual, stated.** The broker forwards with a `cloud-platform` token because narrowing is
 unavailable; a table entry added carelessly is therefore a project-wide read of whatever it

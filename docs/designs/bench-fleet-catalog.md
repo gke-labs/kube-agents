@@ -385,7 +385,7 @@ A project without it does not read the fleet at all: `hack/fleet-kubeconfigs.sh`
 runner's own credential.
 
 What is not narrowed is the harness. `hack/ci-eval-pr.sh` runs as
-`prowjob-default-sa@kube-agents-prow`, which holds `container.admin` and eleven other
+`prowjob-default-sa@kube-agents-prow`, which holds `container.admin` and twelve other
 project roles in every pool project (`PROW_RUNNER_ROLES` in
 `scripts/verify_ci_pool_project.py`), with no RBAC narrowing it inside the clusters. That
 is the credential the reader replaces; the runner refuses to write a role kubeconfig that
