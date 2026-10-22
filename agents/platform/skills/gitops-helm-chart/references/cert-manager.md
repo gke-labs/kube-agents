@@ -14,8 +14,9 @@ cluster, which makes it the first chart to try this skill on.
   cert-manager install guide or the `release-<minor>` branch's chart
   (**inspect-repository** on `cert-manager/cert-manager`). Chart versions
   carry the `v`: `version: v1.21.2`, not `1.21.2`.
-- Values: `deploy/charts/cert-manager/values.yaml` in `cert-manager/cert-manager`
-  at that release branch, read with **inspect-repository**.
+- Values: the chart's `values.yaml`, under the deploy/charts directory of the
+  `cert-manager/cert-manager` repository at that release branch, read with
+  **inspect-repository**.
 
 ## Values
 
