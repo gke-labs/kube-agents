@@ -2196,9 +2196,14 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
 
 def _unresolved(rule: dict) -> bool:
     """A rule that fires, or a scan rule with no full reading to clear on: no
-    document, a stale one, one that could check no project, or a hand run
-    over a few named projects."""
-    return bool(rule["fires"]) or rule.get("known") is False or any(bool(rule.get(key)) for key in ("stale", "unknown", "partial"))
+    document, a stale one, one that could check no project or skipped some
+    (the incident's may be among them, as _scan_hold's `waiting` guards),
+    or a hand run over a few named projects."""
+    if rule["fires"] or rule.get("known") is False:
+        return True
+    if rule.get("known") and rule.get("checked", 0) < rule.get("total", 0):
+        return True
+    return any(bool(rule.get(key)) for key in ("stale", "unknown", "partial"))
 
 
 def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime | None, roster: Roster, last_lost_pod: datetime | None = None, last_deadline_kill: datetime | None = None) -> bool:

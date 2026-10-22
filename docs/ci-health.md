@@ -650,9 +650,10 @@ in `health-state.json` and in `health.json`'s `issue` field (`{number, url, cond
 `--posted-state`), and the recovery comments on it: "Healthy again after Xh;
 closing" on an issue the bot filed, which it closes, or "bot will not close it"
 on an adopted one. `issue` is the current condition's; every issue the
-incident filed or adopted stays in `health-state.json`'s `issues` list until
-GREEN, so an outage that gives way to a storm or to lost pods before it clears
-still gets its recovery comment, and the recovery message names them all.
+incident filed or adopted rides in `health-state.json`'s `issues` list until
+the recovery or until the bot settles it below, so an outage that gives way
+to a storm or to lost pods before it clears still gets its recovery comment,
+and the recovery message names the ones still carried.
 
 Each tick re-reads every carried issue. One a human closed is dropped rather
 than cited; if its condition still fires (`health.json`'s `open_conditions`,

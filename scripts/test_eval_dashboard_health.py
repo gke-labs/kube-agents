@@ -3285,6 +3285,8 @@ class OpenConditions(unittest.TestCase):
         for unread in (None, scan(at=T0 - timedelta(hours=4)), scan(checked=set())):
             self.assertEqual(self.judge(green, unread, pool_scan())["open_conditions"], ["fixture_drift"])
         self.assertEqual(self.judge(green, scan(), None)["open_conditions"], ["pool_drift"])
+        skipped = scan(checked={project(i) for i in range(1, 30)})
+        self.assertEqual(self.judge(green, skipped, pool_scan())["open_conditions"], ["fixture_drift"], "a project the scan skipped may be the incident's")
         selected = pool_scan()
         selected[health.POOL_SCAN.module.KEY_SCOPE] = health.POOL_SCAN.module.SCOPE_SELECTED
         self.assertEqual(self.judge(green, scan(), selected)["open_conditions"], ["pool_drift"], "a hand run over a few projects clears nothing")

@@ -267,7 +267,10 @@ class FakeGh:
             if one:
                 number = int(one.group(1))
                 return GhResult(stdout=json.dumps(self.lookups.get(number, {"number": number, "state": "open", "user": {"login": "github-actions[bot]"}})))
-            return GhResult(stdout="\n".join(json.dumps(issue) for issue in self.open_issues))
+            # A `labels=` filter in the list path narrows the answer as GitHub would.
+            wanted = re.search(r"labels=([^&]+)", path)
+            listed = [issue for issue in self.open_issues if not wanted or wanted.group(1) in {label.get("name") if isinstance(label, dict) else label for label in issue.get("labels") or []}]
+            return GhResult(stdout="\n".join(json.dumps(issue) for issue in listed))
         if self.fail_writes:
             return GhResult(rc=1, stderr="gh: Resource not accessible by integration (HTTP 403)")
         number = self.next_number
@@ -3036,6 +3039,22 @@ class IssueLifecycle(RunHarness):
         self.gh.open_issues = [dict(roster, labels=[{"name": "presubmit-gate"}])]
         self.tick(outage(cases=TRIO), T0, environ=self.environ())
         self.assertEqual((self.recorded()["issue"]["number"], self.gh.writes()), (2242, []))
+
+    def test_the_recovery_leaves_an_adopted_human_issue_open(self):
+        self.gh.open_issues = [human(1290, f"{DRIFT_ROLE} sits Pending on the fleet again")]
+        self.gh.lookups[1290] = {"number": 1290, "state": "open", "user": {"login": "alice"}}
+        self.tick(self.drifting(), T14, environ=self.environ())
+        green = health("GREEN")
+        green["fixture_state"] = fixture_block()
+        self.tick(green, T14 + timedelta(hours=2), environ=self.environ())
+        self.assertEqual(self.gh.writes()[-1], ("POST", "repos/gke-labs/kube-agents/issues/1290/comments"))
+        self.assertEqual(self.gh.calls[-1][2], {"body": "Healthy again after 2h 30m; bot will not close it."})
+        self.assertNotIn("PATCH", [m for m, _ in self.gh.writes()])
+
+    def test_a_skill_issue_about_the_deadline_is_not_the_kills_tracker(self):
+        self.gh.open_issues = [human(3001, "skill: review-preflight should respect the job deadline"), human(3002, "Smoke runs killed at the 360-minute deadline again")]
+        self.tick(deadline_kill(), T0.replace(day=22, hour=20, minute=5), environ=self.environ())
+        self.assertEqual((self.recorded()["issue"]["number"], self.gh.writes()), (3002, [("POST", "repos/gke-labs/kube-agents/issues/3002/labels")]))
 
     def test_the_open_issue_list_is_read_once_per_tick(self):
         self.gh.open_issues = [human(1290, "x", body=f"{DRIFT_ROLE}", labels=("presubmit-gate",))]

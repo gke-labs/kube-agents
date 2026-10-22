@@ -131,6 +131,8 @@ RECOVERY_RUNS = 3
 # "smoke": a feature request about the smoke gate's deadline (#2873) was
 # adopted as the tracker of the kills.
 DEADLINE_KILL_NAMES = ("deadline", "kill")
+# How a name is found in a title or body: not preceded by a letter or digit.
+NAME_START_RE = r"(?<![a-z0-9]){name}"
 # The other direction: the deadline body quotes only the deadline evidence
 # lines. health.py's evidence also carries per-case collapse lines whenever a
 # case clears the shared-break floors, and a body naming those cases would
@@ -319,8 +321,11 @@ def infra_addressees(path: pathlib.Path = DOMAINS_FILE) -> tuple[str | None, str
 
 
 def names_all(text: str, names: list[str]) -> bool:
+    """Every name appears in the text, each starting on its own: not inside
+    a longer word ("kill" in "skill") while still matching a longer form
+    ("killed", or a case name as the stem of a sibling's)."""
     lowered = (text or "").lower()
-    return bool(names) and all(name.lower() in lowered for name in names)
+    return bool(names) and all(re.search(NAME_START_RE.format(name=re.escape(name.lower())), lowered) for name in names)
 
 
 def label_names(payload: dict) -> set[str]:
