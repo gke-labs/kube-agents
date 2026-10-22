@@ -3818,6 +3818,11 @@ func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent 
 			}
 			// Absent: the callout gate is holding it (or the API server has
 			// not served the apply back yet), and it counts as not ready.
+			// The render confirmed a waking gateway live, so a miss here is
+			// this read's lag, and the condition stays.
+			if a2a.gatewayWaking {
+				gatewayCond = a2aGatewayWakingMessage
+			}
 			workloads = append(workloads, splitWorkloadStatus{name: gatewayName, kind: "Deployment", ready: 0})
 		} else {
 			// Coming back from dark (an upgraded install): the condition

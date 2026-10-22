@@ -167,7 +167,7 @@ A first install runs `spec.mode: next` unless you pass `--mode=today`, or mirror
 
    It prints `next`. An empty line means `today`, and nothing below applies.
 
-2. **Wait for `Ready`.** Under `next`, `Ready` also waits for the NATS StatefulSet, the auth callout, the first completion of the bus provisioning Job and, once a chat backend is configured, the A2A gateway. A first boot can take over fifteen minutes.
+2. **Wait for `Ready`.** Under `next`, `Ready` also waits for the NATS StatefulSet, the auth callout, the first completion of the bus provisioning Job and the A2A gateway, which every `next` install runs (on the console door alone when no chat backend is configured). A first boot can take over fifteen minutes.
 
    ```bash
    kubectl wait platformagent/platform-agent -n kubeagents-system --for=condition=Ready --timeout=25m

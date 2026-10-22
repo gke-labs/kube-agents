@@ -5380,13 +5380,22 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// until that replica is ready the CR keeps the condition (as
 	// WaitingForReplica) rather than clearing it over a pod that is not
 	// serving yet. The ready count is the informer's, and the Ready writer
-	// re-reads it before keeping the condition. The read goes through the
-	// informer rather than a2aReader: a stale answer costs at most one pass
-	// of the condition, and the requeue comes back.
+	// re-reads it before keeping the condition. A stale hit on the ready
+	// count costs at most one pass, and the requeue comes back. A stale
+	// miss would cost the condition for good (the writer would remove it,
+	// and nothing re-arms the way back), so while the legacy condition
+	// stands a miss is confirmed through a2aReader: one GET, only on the
+	// passes of an upgraded install whose cache misses its gateway.
 	liveGateway := &appsv1.Deployment{}
 	getErr := r.Get(ctx, client.ObjectKeyFromObject(dep), liveGateway)
 	if getErr != nil && !errors.IsNotFound(getErr) {
 		return state, getErr
+	}
+	if errors.IsNotFound(getErr) && a2aGatewayConditionStands(agent) {
+		getErr = r.a2aReader().Get(ctx, client.ObjectKeyFromObject(dep), liveGateway)
+		if getErr != nil && !errors.IsNotFound(getErr) {
+			return state, getErr
+		}
 	}
 	gatewayExists := getErr == nil
 	if gatewayExists && liveGateway.Status.ReadyReplicas < 1 && a2aGatewayConditionStands(agent) {

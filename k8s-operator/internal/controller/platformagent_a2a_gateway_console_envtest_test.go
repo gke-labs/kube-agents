@@ -25,8 +25,10 @@ package controller
 // Older operators darkened a gateway with no backend (#1660, #2481): withheld,
 // or applied at zero replicas, with the A2AGateway condition (NoChatBackend).
 // An install upgraded from one of those comes back through the ordinary
-// apply: one replica on the same object, the condition kept as
-// WaitingForReplica until that replica is ready, and then cleared.
+// apply. A gateway that was at zero gets one replica on the same object,
+// with the condition kept as WaitingForReplica until that replica is ready,
+// and then cleared. A gateway that was withheld is created, and its legacy
+// condition clears on that first pass while Ready waits on the new gateway.
 //
 // envtest runs no Deployment controller, no kubelet and no garbage collector,
 // so these tests read what those would act on: spec.replicas, the
@@ -651,4 +653,25 @@ func TestTheReplicaCountComesBackUnderTheOperatorsFieldManagerEnvtest(t *testing
 	}
 	// This operator's render, replicas as buildA2AGatewayDeployment sets them.
 	check("rendered after a foreign scale", apply(nil), 1, uid)
+}
+
+// TestAStaleMissOnTheUpgradedGatewayKeepsTheWayBackEnvtest: on the first pass
+// over a gateway an older operator left at zero replicas, a cache that misses
+// it (an informer that has not caught up) must not drop the legacy condition
+// for good. The render confirms the miss live while that condition stands,
+// and the status writer keeps the condition, as WaitingForReplica, on a miss
+// of its own.
+func TestAStaleMissOnTheUpgradedGatewayKeepsTheWayBackEnvtest(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	t.Setenv(a2aAgentDoorEnvVar, "")
+	g := newGatewayRig(t, "console-stale-miss", nil)
+	g.settle()
+	g.darkenLikeAnOlderOperator()
+	g.r.Client = staleDeploymentClient{Client: g.cl, key: types.NamespacedName{Name: a2aGatewayName(g.agent), Namespace: g.agent.Namespace}}
+
+	g.pass()
+	if got := g.replicas(); got != 1 {
+		t.Errorf("stale miss: the gateway asks for %d replicas, want 1", got)
+	}
+	g.assertWaking("stale miss, no replica ready")
 }

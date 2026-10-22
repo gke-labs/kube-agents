@@ -1142,12 +1142,12 @@ class PlatformAgentModeTest(unittest.TestCase):
 
     def test_the_gate_always_waits_on_the_a2a_gateway(self):
         # Every next install runs the gateway (on the console door alone with
-        # no chat backend), so no condition can make the gate skip its
-        # rollout; the last thing the gate waits on is that rollout.
+        # no chat backend), so the gate reads no condition that could make it
+        # skip the rollout, and the last thing it waits on is that rollout.
         proc, calls = self._run({"PLATFORM_AGENT_MODE": "next"})
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self._normalise(calls)[-1], self._expected_gate()[-1])
-        self.assertIn("a2a-gateway", self._expected_gate()[-1])
+        self.assertFalse(any("A2AGateway" in c for c in calls), calls)
         self.assertNotIn("no chat backend", proc.stdout)
 
     def test_a_mode_that_is_not_a_mode_is_refused_before_the_teardown(self):
