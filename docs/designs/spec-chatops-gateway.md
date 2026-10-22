@@ -1694,7 +1694,9 @@ names no task, keyed on the thread's conversation, with `IntentCancel`, which no
 carries, so the gateway tells the button from the word. Only a requester the conversation's record
 holds (a task's requester or steer author, or a session author) may press it; anyone else's press
 cancels nothing and posts nothing (`stopgate.go`), while typed `stop` keeps its rule. A record that
-holds no requester (nothing ran, or every copy aged out past `AskTTL`) gates nobody. With the card
+cannot tell who asked gates nobody: nothing ran, a requester was cleared past `AskTTL`, a steer or
+session author was dropped past its cap, or the history is at its cap (`cannotTellWhoAsked`). With
+the card
 stop armed the button cancels the turn without the `🛑` lines and sends the same control, and the
 gateway words the result as the Slack Stop's one reply (`slack_stop.go`); unarmed, it is a typed
 `stop`.

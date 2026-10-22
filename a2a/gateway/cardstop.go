@@ -372,7 +372,7 @@ func (g *Gateway) finishCardStop(ctx context.Context, rec *SessionRecord, rs *re
 		if ok {
 			outcome, stopped = cardStopOutcomeAnswered, len(result.Stopped)
 			if run.SlackStop {
-				answer = slackStopReply(result, run.TurnCancelled)
+				answer = slackStopReply(result, run.TurnCancelled, rec.ActiveTask != nil && !rec.ActiveTask.Detached)
 			} else {
 				answer = cardStopReply(result, rec.ActiveTask != nil && !rec.ActiveTask.Detached)
 			}

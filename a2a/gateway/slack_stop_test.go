@@ -112,3 +112,32 @@ func TestMayStopOffSlackAndOnAnEmptyConversation(t *testing.T) {
 		t.Error("a thread whose requesters all aged out locked everyone out")
 	}
 }
+
+// When the record cannot tell who asked, anyone the gateway answers may press
+// Stop (the maintainer's decision, 2026-10-22).
+func TestMayStopFailsOpenWhenTheRecordCannotTellWhoAsked(t *testing.T) {
+	bob := TaskRequester{Backend: slackBackend, Subject: "h-bob"}
+	alice := TaskRequester{Backend: slackBackend, Subject: "h-alice"}
+	full := make([]TaskRef, taskHistoryCap)
+	for i := range full {
+		full[i] = TaskRef{ID: "task", Requester: &bob}
+	}
+	for name, rec := range map[string]*SessionRecord{
+		// Alice's ask aged out past AskTTL; Bob's newer one is still held.
+		"one requester pruned": {Tasks: []TaskRef{{ID: "task-1"}, {ID: "task-2", Requester: &bob}}},
+
+		"steer authors overflowed": {Tasks: []TaskRef{{ID: "task-1", Requester: &bob, SteerAuthorsOverflow: true}}},
+
+		"session authors unknown": {Tasks: []TaskRef{{ID: "task-1", Requester: &bob}}, SessionAuthorsUnknown: true},
+
+		"history at its cap": {Tasks: full},
+	} {
+		if !mayStop(rec, slackBackend, alice) {
+			t.Errorf("%s: the requester whose copy may be gone was refused", name)
+		}
+	}
+	// A record that can tell still gates.
+	if mayStop(&SessionRecord{Tasks: []TaskRef{{ID: "task-1", Requester: &bob}}}, slackBackend, alice) {
+		t.Error("a complete record let a non-requester stop the thread")
+	}
+}

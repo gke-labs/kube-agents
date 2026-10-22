@@ -43,6 +43,9 @@ const (
 	slackStopExceptReplyFormat = "Stopped, except one task that didn't respond: %s."
 	slackStopNothingReply      = "Nothing was running."
 	slackStopCouldntReply      = "I couldn't stop the work in this thread. Press Stop again."
+	// slackStopNewerTurnReply answers a stop that found nothing to stop while
+	// a newer question is running (approved 2026-10-22).
+	slackStopNewerTurnReply = "No tasks were running yet. I'm still answering your latest question."
 )
 
 // isSlackStop reports a stop from the Slack Stop button rather than the word:
@@ -97,12 +100,13 @@ func (run CardStopRun) unconfirmed() string {
 
 // slackStopReply words a completed control's result as the Slack Stop's one
 // reply. A stop that cancelled no turn and stopped no card says nothing was
-// running, unless something it found would not stop; anything the stop
-// could not promise is the couldn't-stop reply, except exactly one card that
-// did not stop beside work that did, which is named. Titles are cleaned as
-// the card stop's are (cardStopTitle), so a title can mention no one and link
-// nowhere.
-func slackStopReply(r *lib.CardStopResult, turnCancelled bool) string {
+// running, or, with a newer question running by then (newerTurnRunning),
+// that no tasks were running yet; unless something it found would not stop.
+// Anything the stop could not promise is the couldn't-stop reply, except
+// exactly one card that did not stop beside work that did, which is named.
+// Titles are cleaned as the card stop's are (cardStopTitle), so a title can
+// mention no one and link nowhere.
+func slackStopReply(r *lib.CardStopResult, turnCancelled, newerTurnRunning bool) string {
 	unpromised := r.Failed + r.Pending + r.Unresolved
 	stoppedSome := turnCancelled || len(r.Stopped) > 0
 	switch {
@@ -110,6 +114,8 @@ func slackStopReply(r *lib.CardStopResult, turnCancelled bool) string {
 		return fmt.Sprintf(slackStopExceptReplyFormat, cardStopTitle(r.NotStopped[0].Title))
 	case unpromised > 0 || r.Deadline || r.Truncated:
 		return slackStopCouldntReply
+	case !stoppedSome && newerTurnRunning:
+		return slackStopNewerTurnReply
 	case !stoppedSome:
 		return slackStopNothingReply
 	}

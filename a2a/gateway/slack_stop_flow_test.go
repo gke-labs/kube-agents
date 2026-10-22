@@ -34,15 +34,44 @@ func TestSlackStopReplyWording(t *testing.T) {
 		{"truncated", lib.CardStopResult{Stopped: stopped, Truncated: true}, false, slackStopCouldntReply},
 	} {
 		r := tc.r
-		if got := slackStopReply(&r, tc.turn); got != tc.want {
+		if got := slackStopReply(&r, tc.turn, false); got != tc.want {
 			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
 		}
 	}
 }
 
+// A stop that found nothing while a newer question runs says so (approved
+// 2026-10-22); one that stopped work, or could not promise, is unchanged.
+func TestSlackStopReplyWhileANewerQuestionRuns(t *testing.T) {
+	stopped := []lib.CardStopCard{{ID: "t_1", Title: "check pods"}}
+	for name, tc := range map[string]struct {
+		r    lib.CardStopResult
+		turn bool
+		want string
+	}{
+		"nothing found": {lib.CardStopResult{}, false, slackStopNewerTurnReply},
+
+		"only finished cards": {lib.CardStopResult{Settled: stopped}, false, slackStopNewerTurnReply},
+
+		"a card stopped": {lib.CardStopResult{Stopped: stopped}, false, slackStopStoppedReply},
+
+		"a turn cancelled": {lib.CardStopResult{}, true, slackStopStoppedReply},
+
+		"could not promise": {lib.CardStopResult{Pending: 1}, false, slackStopCouldntReply},
+	} {
+		r := tc.r
+		if got := slackStopReply(&r, tc.turn, true); got != tc.want {
+			t.Errorf("%s: got %q, want %q", name, got, tc.want)
+		}
+	}
+	if slackStopNewerTurnReply != "No tasks were running yet. I'm still answering your latest question." {
+		t.Fatalf("the approved line changed: %q", slackStopNewerTurnReply)
+	}
+}
+
 func TestSlackStopReplyCleansTheTitle(t *testing.T) {
 	r := lib.CardStopResult{Failed: 1, NotStopped: []lib.CardStopCard{{ID: "t_2", Title: "audit <@U1> [x](https://e.vil)"}}}
-	got := slackStopReply(&r, true)
+	got := slackStopReply(&r, true, false)
 	if strings.Contains(got, "<@") || strings.Contains(got, "](") {
 		t.Fatalf("a title could mention or link: %q", got)
 	}
