@@ -185,6 +185,13 @@ CONVERSATION_ASK_TOKEN = re.compile(r"[a-z0-9-]{1,16}")
 # answers. Kept only when it is a task id's shape: one DNS-1123 label, as the
 # gateway's lib.ValidSubjectToken requires of a task id.
 CONVERSATION_ROUTE_TASK_KEY = "task_id"
+# A console card's subscription thread is "console:<token>#<taskId>": the
+# conversation key and the turn's task, joined by this separator
+# (kanban_event_routing.CONSOLE_THREAD_TASK_SEP and
+# kanban_chat_notify.CONSOLE_THREAD_TASK_SEP spell it too). The card stop
+# matches such a thread to its conversation by the key before it.
+CONSOLE_CONVERSATION_PREFIX = "console:"
+CONSOLE_THREAD_TASK_SEP = "#"
 CONVERSATION_TASK_ID_TOKEN = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
 
 # Hermes' managed scope, the administrator-pinned layer `load_hermes_dotenv`
@@ -5676,12 +5683,19 @@ def _collect_card_tree(
 
     frontier = reach([r[0] for r in _ids_where_in(conn, "SELECT id FROM tasks WHERE session_id IN ({marks})", sessions)], "session")
     if conversation and _has_table(conn, "kanban_notify_subs"):
+        # A console card's thread carries its turn's task after the key
+        # (CONSOLE_THREAD_TASK_SEP), so it is matched by that prefix too.
+        thread_match, thread_args = "s.thread_id = ?", [conversation]
+        if conversation.startswith(CONSOLE_CONVERSATION_PREFIX):
+            prefix = conversation + CONSOLE_THREAD_TASK_SEP
+            thread_match = "(s.thread_id = ? OR substr(s.thread_id, 1, ?) = ?)"
+            thread_args = [conversation, len(prefix), prefix]
         subscribed = conn.execute(
             "SELECT s.task_id FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
-            "WHERE s.chat_id = ? AND s.thread_id = ? AND t.session_id IS NULL "
+            f"WHERE s.chat_id = ? AND {thread_match} AND t.session_id IS NULL "
             "AND NOT EXISTS (SELECT 1 FROM task_links l JOIN kanban_notify_subs p ON p.task_id = l.parent_id "
             "                WHERE l.child_id = s.task_id AND p.chat_id = s.chat_id AND p.thread_id = s.thread_id)",
-            (session_id, conversation),
+            (session_id, *thread_args),
         )
         frontier += reach([r[0] for r in subscribed], "subscription")
     children_table = _has_table(conn, CARD_STOP_CHILDREN_TABLE)

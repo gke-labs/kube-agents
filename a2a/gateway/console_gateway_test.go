@@ -606,3 +606,24 @@ func TestTheConsoleStashEvictsOneEntryAtTheCap(t *testing.T) {
 		t.Fatalf("re-putting a held key changed the size to %d", len(c.m))
 	}
 }
+
+// A card filed in a delegated child's turn names the child in its reply_to;
+// the console client was told of the chain only under its root, so the
+// report's replyTo is mapped to the root. A task the record does not hold
+// passes through unchanged.
+func TestAConsoleReportFromADelegatedChildRepliesToTheRoot(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := consoleKeyPrefix + "t-replyto"
+	origin, _, child := delegated(t, r, spawn, conv, "")
+	conversations := r.g.Conversations(r.adapter).(gatewayConversations)
+	ctx := context.Background()
+	if got := conversations.ReplyToRoot(ctx, conv, child.TaskID); got != origin.TaskID {
+		t.Errorf("the child's reply_to maps to %q, want the root %q", got, origin.TaskID)
+	}
+	if got := conversations.ReplyToRoot(ctx, conv, "task-unknown"); got != "task-unknown" {
+		t.Errorf("an unknown task maps to %q, want it unchanged", got)
+	}
+	if got := conversations.ReplyToRoot(ctx, conv, origin.TaskID); got != origin.TaskID {
+		t.Errorf("the root maps to %q, want itself", got)
+	}
+}

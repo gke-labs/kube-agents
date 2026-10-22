@@ -228,6 +228,13 @@ func NewSlackNotifier(poster notifyPoster, home string, log *slog.Logger) (*Noti
 	return n, nil
 }
 
+// replyToRooter maps a report's reply_to to the task a console client knows
+// it by (gatewayConversations.ReplyToRoot). Optional: conversations without
+// it pass reply_to through.
+type replyToRooter interface {
+	ReplyToRoot(ctx context.Context, conversation, taskID string) string
+}
+
 // consoleFramePoster is what the console notifier posts through: one frame
 // per request, a keyed request's later post editing it, with the task the
 // report answers. The console adapter implements it (PostNotifyFrame).
@@ -658,6 +665,13 @@ func (n *Notifier) postConsole(job notifyJob) {
 		n.log.Warn("notify: reply_to dropped: not a task id", "conversation", conversation, "bytes", len(replyTo))
 		replyTo = ""
 	}
+	// A card filed in a delegated child's turn names the child, which the
+	// console client was never told of; it knows the chain by its root.
+	if rooter, ok := n.conv.(replyToRooter); ok && replyTo != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), notifyLookupTimeout)
+		replyTo = rooter.ReplyToRoot(ctx, conversation, replyTo)
+		cancel()
+	}
 	message, err := n.frames.PostNotifyFrame(conversation, messageID, job.req.Text, replyTo, edit)
 	if err != nil {
 		n.log.Error("notify post failed", "conversation", conversation, "update", key, "err", err)
@@ -1038,6 +1052,22 @@ func (c gatewayConversations) ConversationContext(ctx context.Context, key strin
 		return "", err
 	}
 	return rec.ContextID, nil
+}
+
+// ReplyToRoot is the task a console client knows taskID by: the root of its
+// delegation chain (observedAs), since a client is told of a chain only
+// under its root. A task the conversation's record does not hold, or a
+// record that cannot be read, gives taskID back unchanged.
+func (c gatewayConversations) ReplyToRoot(ctx context.Context, conversation, taskID string) string {
+	rec, err := c.g.reg.Get(ctx, conversation)
+	if err != nil || rec == nil {
+		return taskID
+	}
+	if _, ok := rec.TaskRefFor(taskID); !ok {
+		return taskID
+	}
+	root, _ := rec.observedAs(taskID)
+	return root
 }
 
 func (c gatewayConversations) Post(conversation, text string) (string, error) {

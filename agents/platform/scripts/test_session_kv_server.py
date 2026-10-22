@@ -6747,6 +6747,22 @@ class TestCardStop(unittest.TestCase):
         for task_id in ("t_other_thread", "t_other_session", "t_explicit"):
             self.assertEqual(self.status(task_id), "running", task_id)
 
+    def test_a_console_card_whose_thread_names_its_turn_is_found(self):
+        # A console card's thread is the conversation key plus its turn's
+        # task ("console:<token>#<taskId>"), so the seed matches it by the key
+        # before the separator; another console conversation's, or a key
+        # that merely starts the same, is left alone.
+        conversation = "console:tab-1"
+        self.card("t_console", "running", session=None)
+        self.subscribe("t_console", thread_id=conversation + "#task-7")
+        self.card("t_console_bare", "running", session=None)
+        self.subscribe("t_console_bare", thread_id=conversation)
+        self.card("t_other_tab", "running", session=None)
+        self.subscribe("t_other_tab", thread_id="console:tab-10#task-8")
+        body = self.stop(conversation=conversation).json()
+        self.assertEqual(self.stopped_ids(body), ["t_console", "t_console_bare"])
+        self.assertEqual(self.status("t_other_tab"), "running")
+
     def test_link_children_that_inherited_our_subscription_are_left_alone(self):
         """Hermes copies our card's subscription onto every link child, from
         create_task(parents=...) and from link_tasks; the copy does not make a

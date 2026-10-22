@@ -236,3 +236,26 @@ func TestRouteFor_OnlyAConsoleRouteCarriesItsTask(t *testing.T) {
 		}
 	}
 }
+
+// A console route's task is what its card's report names: when the PUT for
+// a later turn fails, the earlier turn's record would make that turn's card
+// report under the wrong task, so the route is lost (the answer says so)
+// rather than standing. The same turn again still stands.
+func TestRecordRoute_AConsoleRouteForAnotherTurnIsNotTheSame(t *testing.T) {
+	store := newRouteStore(t, http.StatusOK)
+	b := &Bridge{cfg: Config{RouteURL: store.srv.URL, RouteKey: "kv-key", Logger: discardLogger()}, routeClient: http.DefaultClient}
+	turn1 := routeEnvelope(t, "ctx-c", "console:tab-1")
+	turn1.TaskID = "task-1"
+	if err := b.recordRoute(testCtx(t), "a2a-ctx-c", turn1); err != nil {
+		t.Fatalf("first record: %v", err)
+	}
+	store.setStatus(http.StatusInternalServerError)
+	if err := b.recordRoute(testCtx(t), "a2a-ctx-c", turn1); err != nil {
+		t.Fatalf("a failed PUT for the same turn = %v, want nil: the earlier record stands", err)
+	}
+	turn2 := routeEnvelope(t, "ctx-c", "console:tab-1")
+	turn2.TaskID = "task-2"
+	if err := b.recordRoute(testCtx(t), "a2a-ctx-c", turn2); err == nil {
+		t.Fatal("a failed PUT for another turn = nil, want the error: its card would report under task-1")
+	}
+}

@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"strings"
 	"sync"
 	"testing"
@@ -115,5 +116,29 @@ func TestTheConsoleNotifierRefusesWhatIsNotItsConversation(t *testing.T) {
 				t.Fatalf("reply = %+v, frames = %+v, want a refusal containing %q and no frame", got, frames.frames, tc.want)
 			}
 		})
+	}
+}
+
+// rootingConversations answers ReplyToRoot with a fixed root.
+type rootingConversations struct {
+	*fakeConversations
+	root string
+}
+
+func (r rootingConversations) ReplyToRoot(context.Context, string, string) string { return r.root }
+
+// The console notifier asks the conversations for the root a client knows
+// the reply_to task by, and the frame carries that.
+func TestTheConsoleNotifierRepliesToTheChainsRoot(t *testing.T) {
+	frames := &fakeFrames{}
+	n := NewConsoleNotifier(frames, nil)
+	n.SetConversations(rootingConversations{
+		fakeConversations: &fakeConversations{contexts: map[string]string{testConsoleConversation: testConsoleContext}},
+		root:              "task-root",
+	})
+	got := serveJSON(t, n, lib.NotifyRequest{Text: "report", Conversation: testConsoleConversation,
+		ContextID: testConsoleContext, ReplyTo: "task-child"})
+	if got.Error != "" || len(frames.frames) != 1 || frames.frames[0].replyTo != "task-root" {
+		t.Fatalf("reply = %+v, frames = %+v, want replyTo task-root", got, frames.frames)
 	}
 }
