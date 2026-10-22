@@ -114,6 +114,10 @@ type SwarmTask struct {
 	// fold keeps only the final status message (lib.Task.FinalMessage), so
 	// the caller reads this off the event. Untrusted; nil when it has none.
 	Question *lib.Message
+	// QuestionSeq is the TASKS stream sequence of that input-required
+	// status-update, 0 when the caller does not have it. It keys the
+	// input-required post, so each new ask posts once.
+	QuestionSeq uint64
 }
 
 // SwarmInput is everything BuildSwarmState reads. Now is the only clock.
@@ -264,13 +268,15 @@ type swarmTaskView struct {
 	progress, step      string
 	prompt              string // the submission's text, sanitised first line
 	question            string // the input-required question, sanitised first line
-	asks                int    // input-required transitions in the status history
+	questionSeq         uint64 // stream sequence of the input-required status-update, or 0
+	asks                int    // input-required entries in the status history
 }
 
-// activeStep is what a running task is doing: its newest tool call, its
-// progress line, or its prompt (Adam's latestActiveStepTitle fallbacks).
+// activeStep is what a running task is doing: the question it is waiting on,
+// when it asked one, else its newest tool call, its progress line, or its
+// prompt (Adam's latestActiveStepTitle fallbacks).
 func (t *swarmTaskView) activeStep() string {
-	return swarmText(firstNonEmptyString(t.step, t.progress, t.prompt), maxSwarmStepChars)
+	return swarmText(firstNonEmptyString(t.question, t.step, t.progress, t.prompt), maxSwarmStepChars)
 }
 
 type candidateBoardEvent struct {
@@ -1134,27 +1140,34 @@ func normalizeConversations(in []SwarmConversation, liveTokens map[string]bool, 
 	return out
 }
 
-// maxConversationIDRunes bounds a client conversation id echoed onto a member.
-const maxConversationIDRunes = 128
+// maxConversationIDBytes bounds a client conversation id echoed onto a member.
+const maxConversationIDBytes = 128
 
-// safeConversationID returns id when it is a safe opaque identifier: at most
-// maxConversationIDRunes runes, no control, format or space characters, and
-// no path separator or dot-segment, since the client joins it into paths
-// (Antigravity's per-conversation directories). Anything else is "", so the
-// member simply carries no link.
+// safeConversationID returns id (trimmed) when it is a safe opaque
+// identifier, since the client joins it into paths (Antigravity's
+// per-conversation directories): at most maxConversationIDBytes bytes of
+// [A-Za-z0-9._-] only, not starting with '.' (so never "." or ".."), no
+// "..", and not a Windows reserved device name (CON, PRN, AUX, NUL, COM0-9,
+// LPT0-9, in any case and with any extension), which opens a device rather
+// than a file there. Anything else is "", so the member simply carries no
+// link.
 func safeConversationID(id string) string {
 	id = strings.TrimSpace(id)
-	if id == "" || !utf8.ValidString(id) || utf8.RuneCountInString(id) > maxConversationIDRunes {
+	if id == "" || len(id) > maxConversationIDBytes || id[0] == '.' || strings.Contains(id, "..") {
 		return ""
 	}
-	if id == "." || id == ".." || strings.Contains(id, "..") {
-		return ""
-	}
-	for _, r := range id {
-		if r == '/' || r == '\\' || unicode.IsControl(r) || unicode.IsSpace(r) || unicode.Is(unicode.Cf, r) ||
-			r == '\u2028' || r == '\u2029' {
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '.' || c == '_' || c == '-') {
 			return ""
 		}
+	}
+	base, _, _ := strings.Cut(strings.ToUpper(id), ".")
+	switch {
+	case base == "CON" || base == "PRN" || base == "AUX" || base == "NUL":
+		return ""
+	case len(base) == 4 && (strings.HasPrefix(base, "COM") || strings.HasPrefix(base, "LPT")) && base[3] >= '0' && base[3] <= '9':
+		return ""
 	}
 	return id
 }
@@ -1255,8 +1268,11 @@ func normalizeTasks(in []SwarmTask, now time.Time) []*swarmTaskView {
 				}
 			}
 		}
-		if tv.state == lib.StateInputRequired && st.Question != nil {
-			tv.question = swarmLine(boundedText(st.Question.Parts, false), maxBoardEventTextChars)
+		if tv.state == lib.StateInputRequired {
+			if st.Question != nil {
+				tv.question = swarmLine(boundedText(st.Question.Parts, false), maxBoardEventTextChars)
+			}
+			tv.questionSeq = st.QuestionSeq
 		}
 		list = append(list, tv)
 	}
@@ -1289,11 +1305,19 @@ func normalizeTasks(in []SwarmTask, now time.Time) []*swarmTaskView {
 }
 
 // inputKey is the ledger key of t's current input request. A task resumed
-// after input-required can ask again on the same id, so the n-th ask (n > 1,
-// counted in the status history) gets its own key and posts again; an
-// unchanged ask keeps its key and stays deduped. '#' is not a task id
-// character, so the keys of two tasks never collide.
+// after input-required can ask again on the same id, so each ask needs its
+// own key: an unchanged ask keeps its key and stays deduped, a new one posts.
+// The key is the stream sequence of the input-required status-update
+// (task-input:<id>@<seq>). Only when the caller has no sequence (0) does it
+// fall back to counting input-required entries in the status history
+// (task-input:<id>, then task-input:<id>#<n> from the second); that count
+// can fall when TASKS drops a task's oldest events, so a later ask can then
+// reuse a key already posted and be suppressed. '@' and '#' are not task id
+// characters, so the keys of two tasks never collide.
 func inputKey(t *swarmTaskView) string {
+	if t.questionSeq > 0 {
+		return fmt.Sprintf("task-input:%s@%d", t.id, t.questionSeq)
+	}
 	if t.asks > 1 {
 		return fmt.Sprintf("task-input:%s#%d", t.id, t.asks)
 	}
@@ -1316,6 +1340,9 @@ func taskLess(a, b *swarmTaskView) bool {
 		if p[0] != p[1] {
 			return p[0] < p[1]
 		}
+	}
+	if a.questionSeq != b.questionSeq {
+		return a.questionSeq < b.questionSeq
 	}
 	if a.asks != b.asks {
 		return a.asks < b.asks

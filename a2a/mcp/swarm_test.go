@@ -967,14 +967,15 @@ func TestBuildSwarmStateMemberCarriesTheClientConversationID(t *testing.T) {
 		"ctrl":     "abc\x07def",
 		"bidi":     "abc‮def",
 		"space":    "a b",
-		"long":     strings.Repeat("x", maxConversationIDRunes+1),
-		"atlimit":  strings.Repeat("y", maxConversationIDRunes),
+		"long":     strings.Repeat("x", maxConversationIDBytes+1),
+		"atlimit":  strings.Repeat("y", maxConversationIDBytes),
 		"unicode":  "会话-1",
 		"empty":    "",
 		"badutf8":  "a\xffb",
 		"zerowide": "a​b",
+		"padded":   "  conv-7  ",
 	}
-	want := map[string]string{"good": ids["good"], "atlimit": ids["atlimit"], "unicode": ids["unicode"]}
+	want := map[string]string{"good": ids["good"], "atlimit": ids["atlimit"], "padded": "conv-7"}
 	for alias, id := range ids {
 		in.Conversations = append(in.Conversations, SwarmConversation{
 			Alias: alias, Token: "tok-" + alias, AGYConversationID: id, LastUsed: now.Add(-time.Minute),
@@ -1135,5 +1136,118 @@ func TestBuildSwarmStateConversationCapKeepsRunning(t *testing.T) {
 	}
 	if strings.Contains(texts, "done-1") {
 		t.Errorf("a stale finished conversation survived the cap:\n%s", texts)
+	}
+}
+
+// safeConversationID is an allowlist: [A-Za-z0-9._-], at most 128 bytes, no
+// leading '.', no "..", no Windows reserved device name; surrounding space is
+// trimmed.
+func TestSafeConversationID(t *testing.T) {
+	for id, want := range map[string]string{
+		"3f2b9c1e-7a4d":          "3f2b9c1e-7a4d",
+		"A.b_c-9":                "A.b_c-9",
+		"  trimmed\t":            "trimmed",
+		strings.Repeat("y", 128): strings.Repeat("y", 128),
+		strings.Repeat("y", 129): "",
+		"会话-1":                   "",
+		".":                      "",
+		"..":                     "",
+		".hidden":                "",
+		"a..b":                   "",
+		"a:b":                    "",
+		"a%2fb":                  "",
+		"a*b":                    "",
+		"a?b":                    "",
+		"a|b":                    "",
+		`a"b`:                    "",
+		"a/b":                    "",
+		`a\b`:                    "",
+		"a b":                    "",
+		"CON":                    "",
+		"con":                    "",
+		"Nul.txt":                "",
+		"com1":                   "",
+		"LPT9.log":               "",
+		"console":                "console",
+		"com10":                  "com10",
+		"conx.y":                 "conx.y",
+		"":                       "",
+	} {
+		if got := safeConversationID(id); got != want {
+			t.Errorf("safeConversationID(%q) = %q, want %q", id, got, want)
+		}
+	}
+}
+
+// Two copies of a task that differ only in the question, or only in the
+// question's sequence, dedupe to the same one whatever the input order.
+func TestNormalizeTasksQuestionTiebreak(t *testing.T) {
+	base := func(q string, seq uint64) SwarmTask {
+		return SwarmTask{Addressee: "platform", TaskID: "dup", Submitted: swarmNow, Task: &lib.Task{State: lib.StateInputRequired},
+			Question: &lib.Message{Parts: []lib.Part{{Kind: "text", Text: q}}}, QuestionSeq: seq}
+	}
+	for _, pair := range [][2]SwarmTask{{base("alpha?", 7), base("beta?", 7)}, {base("same?", 7), base("same?", 9)}} {
+		x := normalizeTasks([]SwarmTask{pair[0], pair[1]}, swarmNow)
+		y := normalizeTasks([]SwarmTask{pair[1], pair[0]}, swarmNow)
+		if len(x) != 1 || len(y) != 1 || x[0].question != y[0].question || x[0].questionSeq != y[0].questionSeq {
+			t.Errorf("duplicate pick depends on input order: %q@%d vs %q@%d", x[0].question, x[0].questionSeq, y[0].question, y[0].questionSeq)
+		}
+	}
+}
+
+// With QuestionSeq the input post is keyed on the ask's stream sequence: the
+// same seq never re-posts, a new seq re-posts even when the history count is
+// unchanged (TASKS dropped the oldest events).
+func TestBuildSwarmStateInputRequiredQuestionSeq(t *testing.T) {
+	call := func(seq uint64, history ...lib.TaskState) SwarmInput {
+		return SwarmInput{Now: swarmNow, Tasks: []SwarmTask{{Addressee: "platform", TaskID: "s-1", Submitted: swarmNow.Add(-time.Minute),
+			Task: inputRequiredTask("s-1", history...), QuestionSeq: seq,
+			Question: &lib.Message{Parts: []lib.Part{{Kind: "text", Text: fmt.Sprintf("Ask %d?", seq)}}}}}}
+	}
+	posts := func(s SwarmSnapshot) int {
+		n := 0
+		for _, m := range s.NewMessages {
+			if strings.Contains(m.Text, "input required") {
+				n++
+			}
+		}
+		return n
+	}
+	ir := lib.StateInputRequired
+	s1, l := BuildSwarmState(call(40, ir, lib.StateWorking, ir), freshLedger())
+	s2, l := BuildSwarmState(call(40, ir, lib.StateWorking, ir), l)
+	s3, l := BuildSwarmState(call(90, ir, lib.StateWorking, ir), l) // same count, new ask
+	if got := []int{posts(s1), posts(s2), posts(s3)}; !reflect.DeepEqual(got, []int{1, 0, 1}) {
+		t.Errorf("input-required posts per call = %v, want [1 0 1]", got)
+	}
+	if _, ok := l.EventSeqs["task-input:s-1@90"]; !ok {
+		t.Errorf("ledger lacks the seq key: %v", l.EventSeqs)
+	}
+	if !strings.HasSuffix(s3.NewMessages[0].Text, "`Ask 90?`") {
+		t.Errorf("second ask = %q", s3.NewMessages[0].Text)
+	}
+}
+
+// An input-required member's step line and workstream note show the
+// question, not the progress line.
+func TestBuildSwarmStateInputRequiredMemberShowsQuestion(t *testing.T) {
+	in := SwarmInput{Now: swarmNow,
+		Conversations: []SwarmConversation{{Alias: "ops", Token: "tok-ops", LastUsed: swarmNow}},
+		Tasks: []SwarmTask{{Addressee: "session-ops-pod", TaskID: "m-1", Conversation: "console:tok-ops", Submitted: swarmNow.Add(-time.Minute),
+			Task:     inputRequiredTask("m-1", lib.StateInputRequired),
+			Question: &lib.Message{Parts: []lib.Part{{Kind: "text", Text: "Scale `orders` to <3>?"}}}}},
+	}
+	snap, _ := BuildSwarmState(in, freshLedger())
+	if m := snap.Members["session-ops"].Model; !strings.HasSuffix(m, "⚡ Scale 'orders' to ‹3›?") {
+		t.Errorf("member model = %q, want the question", m)
+	}
+	var note string
+	for _, w := range snap.View.Workstreams {
+		if w.Title == "Conversation: ops" {
+			note = w.Note
+		}
+	}
+	if !strings.HasPrefix(note, "⚡ Scale 'orders' to ‹3›? — ") {
+		t.Errorf("workstream note = %q, want the question", note)
 	}
 }
