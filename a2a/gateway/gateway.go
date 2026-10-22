@@ -2011,10 +2011,13 @@ func (g *Gateway) consoleFrame(rec *SessionRecord, taskID string, state lib.Task
 	if !isPoster {
 		return
 	}
+	// A backend that takes no frames (errNoTerminalFrames, the test rig's
+	// default) is told nothing, as MarkChanged is told nothing by one
+	// without a mark; only a frame that failed to go out is logged.
 	if err := poster.PostTerminal(rec.Key, ConsoleTerminal{
 		TaskID: taskID, Addressee: rec.AddresseeFor(taskID), State: state, Text: text,
 		CardsPending: cardsPending && state == lib.StateCompleted,
-	}); err != nil {
+	}); err != nil && !errors.Is(err, errNoTerminalFrames) {
 		g.log.Error("console terminal frame failed", "conversation", rec.Key, "taskId", taskID, "err", err)
 	}
 }
@@ -2065,7 +2068,12 @@ func (g *Gateway) observeDelivered(rec *SessionRecord, taskID, result string) {
 		return
 	}
 	if id, ends := rec.observedAs(taskID); ends {
-		g.observeTaskDelivered(rec, id, result)
+		// The console's stash is taken by the observeTaskTerminal that
+		// follows; a task whose terminal was already observed (the heal got
+		// there first, and the relay's terminal arrives after) gets no
+		// second one, so nothing is put that nothing would take.
+		ref, known := rec.TaskRefFor(taskID)
+		g.observeTaskDelivered(rec, id, result, !known || !ref.TerminalObserved)
 	}
 }
 
@@ -2087,11 +2095,11 @@ func (g *Gateway) observeCancel(rec *SessionRecord, taskID string) {
 
 // observeTaskDelivered hands a DeliverableObserver the completed task's
 // result whole, before the relay posts it in chunks. See the interface.
-func (g *Gateway) observeTaskDelivered(rec *SessionRecord, taskID, result string) {
+func (g *Gateway) observeTaskDelivered(rec *SessionRecord, taskID, result string, stash bool) {
 	if observer, ok := g.adapter.(DeliverableObserver); ok {
 		observer.TaskDelivered(rec.Key, taskID, result)
 	}
-	if isConsoleConversation(rec.Key) {
+	if stash && isConsoleConversation(rec.Key) {
 		g.consoleResults.put(taskID, result)
 	}
 }

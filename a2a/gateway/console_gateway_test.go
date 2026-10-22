@@ -567,3 +567,42 @@ func TestAnUnaddressedMessageFromAnUnverifiedSenderPostsNoNotice(t *testing.T) {
 		return false
 	})
 }
+
+// The console's stash gets an entry only when a terminal will take it: a
+// task whose terminal was already observed (the heal reached it before the
+// relay) puts nothing, so the relay's late delivery leaves nothing behind.
+func TestAConsoleDeliveryAfterAnObservedTerminalIsNotStashed(t *testing.T) {
+	g := &Gateway{}
+	for _, tc := range []struct {
+		observed bool
+		want     bool
+	}{{false, true}, {true, false}} {
+		rec := &SessionRecord{Key: "console:t-stash", Tasks: []TaskRef{{ID: "task-1", TerminalObserved: tc.observed}}}
+		g.observeDelivered(rec, "task-1", "the answer")
+		if _, got := g.consoleResults.take("task-1"); got != tc.want {
+			t.Errorf("terminal observed %v: stashed %v, want %v", tc.observed, got, tc.want)
+		}
+	}
+}
+
+// At the cap the stash makes room by evicting one entry, not by clearing
+// every deliverable another worker may be about to take.
+func TestTheConsoleStashEvictsOneEntryAtTheCap(t *testing.T) {
+	var c consoleResultStash
+	for i := 0; i < consoleResultStashCap; i++ {
+		c.put(fmt.Sprintf("task-%d", i), "r")
+	}
+	c.put("task-new", "r")
+	if len(c.m) != consoleResultStashCap {
+		t.Fatalf("stash holds %d after a put at the cap, want %d", len(c.m), consoleResultStashCap)
+	}
+	if _, ok := c.take("task-new"); !ok {
+		t.Fatal("the new entry was not kept")
+	}
+	// Putting a key already held at the cap evicts nothing.
+	c.put("task-new", "r")
+	c.put("task-new", "r2")
+	if len(c.m) != consoleResultStashCap {
+		t.Fatalf("re-putting a held key changed the size to %d", len(c.m))
+	}
+}

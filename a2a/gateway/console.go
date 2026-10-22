@@ -107,9 +107,10 @@ const (
 	consoleResultTextCap = 256 * bytesPerKiB
 	// consoleResultStashCap bounds the deliverables consoleResultStash
 	// holds. Each is taken by the terminal that follows it on the same
-	// worker, so the stash holds one per conversation mid-terminal; past the
-	// cap it is cleared, and a terminal whose deliverable went with it says
-	// the result is on the stream (completedNonTextResult).
+	// worker (observeDelivered puts only when one will follow), so the
+	// stash holds about one per conversation mid-terminal; past the cap one
+	// entry is evicted, and a terminal whose deliverable went says the
+	// result is on the stream (completedNonTextResult).
 	consoleResultStashCap = 1024
 	// consoleResultShrinkNum/Den is the extra cut (nine tenths of the share
 	// that fits) PostTerminal takes when an encoded frame is still too big.
@@ -175,8 +176,17 @@ type consoleResultStash struct {
 func (c *consoleResultStash) put(taskID, result string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.m == nil || len(c.m) >= consoleResultStashCap {
+	if c.m == nil {
 		c.m = make(map[string]string)
+	}
+	// At the cap one other entry goes, not the whole map: clearing it
+	// would drop a deliverable another worker put a moment ago and is
+	// about to take.
+	if _, have := c.m[taskID]; !have && len(c.m) >= consoleResultStashCap {
+		for k := range c.m {
+			delete(c.m, k)
+			break
+		}
 	}
 	c.m[taskID] = result
 }
@@ -190,7 +200,10 @@ func (c *consoleResultStash) take(taskID string) (string, bool) {
 }
 
 // errNoTerminalFrames is a conversation whose backend takes no terminal
-// frames; the relay posts the terminal as a notice.
+// frames. Nothing is posted in the frame's place: the relay's notices for a
+// failed, canceled or rejected task go out whatever PostTerminal answers,
+// and a completed answer reaches such a backend through its own path, if
+// any.
 var errNoTerminalFrames = errors.New("the conversation's backend takes no terminal frames")
 
 // TerminalPoster is the optional adapter operation a console conversation's

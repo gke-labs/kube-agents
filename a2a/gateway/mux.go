@@ -223,8 +223,8 @@ func (m *MultiAdapter) MarkChanged(conversation, ask, settle string) {
 }
 
 // PostTerminal goes to the backend that owns the conversation
-// (TerminalPoster); one that does not implement it is an error, and the
-// caller posts the terminal as a notice instead.
+// (TerminalPoster); one that does not implement it answers
+// errNoTerminalFrames, which the caller treats as nothing to do.
 func (m *MultiAdapter) PostTerminal(conversation string, t ConsoleTerminal) error {
 	a, err := m.pick(conversation)
 	if err != nil {
