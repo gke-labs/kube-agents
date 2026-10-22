@@ -12,10 +12,11 @@ holds the field names this module writes). No model is in the loop:
 - prs: the newest ``pr_opened`` events (``agents/platform/plugins/pr_opened``);
 - audit: the most recent fleet-audit run to finish, from the report store
   (``skills/fleet-audit/scripts/report_status.py``);
-- first_report_pending: onboarding's first report is not delivered yet
-  (no ``.bootstrap_completed``) and the findings queue holds no row, so a
-  cluster with no open finding has not been checked yet; first_message_pending
-  adds that nobody has written yet (no ``.bootstrap_greeted``).
+- first_report_pending: onboarding's first report is not yet claimed for
+  delivery (no ``.bootstrap_completed``) and the findings queue holds no row,
+  so a cluster with no open finding has not been checked yet;
+  first_message_pending adds that no message has primed onboarding yet (no
+  ``.bootstrap_greeted``).
 
 Every list is capped here, so the answer stays a few kilobytes. A source that
 cannot be read is an error on the whole snapshot, never an empty list: an
