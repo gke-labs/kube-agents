@@ -2281,6 +2281,23 @@ type AgentUsageStatus struct {
 	// through the relay is not the agent at work.
 	// +optional
 	BrokerFailuresTotal int64 `json:"brokerFailuresTotal,omitempty"`
+	// ChatTurnsErroredTotal is the cumulative count of synchronous chat turns
+	// the gateway failed to complete: on the Hermes gateway, an exception out
+	// of the turn, a result the agent marked failed (a provider 429 or 5xx, a
+	// connection error, the gateway timeout) or a provider authentication
+	// failure, counted by the chat_metrics plugin's
+	// kubeagents_chat_turns_errored_total on the gateway pod that runs
+	// Hermes; and on a next-mode install, an A2A task that ended failed or
+	// rejected, read from the A2A gateway's
+	// kubeagents_a2a_gateway_task_terminals_total under those two states.
+	// That family carries no platform, so on next it counts every A2A task's
+	// terminal, a door's program-to-program task included, not chat alone;
+	// rejected is a task the executor refused, counted as the design asks.
+	// Read every five minutes and kept monotonic the same way as
+	// ToolExecutionsTotal. Does not move LastActiveTime: the message that
+	// started the turn already did.
+	// +optional
+	ChatTurnsErroredTotal int64 `json:"chatTurnsErroredTotal,omitempty"`
 
 	// ClustersRegistered is the number of clusters the event watcher built a
 	// client for at its last start: the management cluster and the Cluster
@@ -2327,7 +2344,7 @@ type AgentUsageStatus struct {
 	// LastActiveTime is the time of the last poll in which a counter above
 	// moved: a brokered command ran or was refused, a proposal was opened or
 	// merged, a chat message reached the gateway, or an event was accepted
-	// for triage; BrokerFailuresTotal alone leaves it where it was.
+	// for triage; BrokerFailuresTotal and ChatTurnsErroredTotal alone leave it where it was.
 	// Scheduled maintenance jobs that run brokered commands move it too --
 	// the Controller Stall Watch cron runs some every 30 minutes by default
 	// -- so it marks agent activity of any origin, not human or operator use

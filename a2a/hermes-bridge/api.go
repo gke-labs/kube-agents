@@ -415,6 +415,8 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	var steer *lib.Envelope // the follow-up this turn runs; nil on turn 1
 	var prev string         // the turn before's answer, published as a turn artifact
 	for turn := 1; ; turn++ {
+		// A follow-up's synthesis step needs work of its own (beginTurn).
+		act.beginTurn()
 		text, ok := b.apiTurn(run, taskCtx, sessionID, prompt, steer, turn, prev)
 		if !ok {
 			return

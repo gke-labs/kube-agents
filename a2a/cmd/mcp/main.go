@@ -51,8 +51,15 @@ const (
 	// has to revisit this.
 	writeTimeout  = 30 * time.Second
 	shutdownGrace = 5 * time.Second
-	// dialTimeout bounds the first connect to the bus.
+	// dialTimeout bounds one attempt at the first connect to the bus.
 	dialTimeout = 30 * time.Second
+	// The first connect is retried, from dialBackoff doubling to
+	// maxDialBackoff, rather than exiting: on a fresh install the bus comes
+	// up after this pod, and a crash loop says nothing a log line does not.
+	// The pod's startup probe bounds how long it may retry before it is
+	// restarted.
+	dialBackoff    = time.Second
+	maxDialBackoff = 30 * time.Second
 )
 
 func main() {
@@ -132,9 +139,11 @@ func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string)
 		return err
 	}
 	s.bus.Logger = log
-	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
-	bus, err := mcp.DialBus(dialCtx, s.bus)
-	cancel()
+	bus, err := dialWithRetry(ctx, log, dialBackoff, func(ctx context.Context) (*mcp.NATSBus, error) {
+		dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
+		defer cancel()
+		return mcp.DialBus(dialCtx, s.bus)
+	})
 	if err != nil {
 		log.Error("mcp bus", "err", err)
 		return err
@@ -151,6 +160,26 @@ func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string)
 		return err
 	}
 	return serve(ctx, log, ln, mcp.Handler(srv, s.tokenFile, log))
+}
+
+// dialWithRetry calls dial until it succeeds or ctx is done, waiting backoff
+// after the first failure and doubling it to maxDialBackoff, and logs each
+// failure with the wait before the next attempt.
+func dialWithRetry[B any](ctx context.Context, log *slog.Logger, backoff time.Duration, dial func(context.Context) (B, error)) (B, error) {
+	for {
+		b, err := dial(ctx)
+		if err == nil {
+			return b, nil
+		}
+		log.Warn("the bus is not reachable yet; retrying", "in", backoff, "err", err)
+		select {
+		case <-ctx.Done():
+			var zero B
+			return zero, ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff = min(2*backoff, maxDialBackoff)
+	}
 }
 
 // serve runs until ctx is done or the server fails.

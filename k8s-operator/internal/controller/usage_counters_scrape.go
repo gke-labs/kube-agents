@@ -86,6 +86,14 @@ const (
 	// brokerFailuresSeries is the broker's failure counter, summed over its
 	// kind label into brokerFailuresTotal; the kinds stay in Prometheus.
 	brokerFailuresSeries = "kubeagents_broker_execution_failures_total"
+	// chatTurnsErroredSeries is the chat plugin's count of synchronous turns
+	// the Hermes gateway failed to complete, summed over its platform label
+	// into chatTurnsErroredTotal; on a next-mode install the A2A gateway's
+	// task terminals under a2aErroredTerminalStates join it, as the
+	// counter's sibling on that pod.
+	chatTurnsErroredSeries = "kubeagents_chat_turns_errored_total"
+	a2aTaskTerminalsSeries = "kubeagents_a2a_gateway_task_terminals_total"
+	a2aTerminalStateLabel  = "state"
 	// a2aMessagesInboundSeries is the A2A gateway's counter of the chat
 	// messages it accepted as turns, by platform: the same counter on a
 	// next-mode install, where Chat ingress is the A2A gateway's rather than
@@ -153,6 +161,24 @@ var (
 	toolInvocationsRefusedStatuses = map[string]bool{"blocked": true, "busy": true, "abandoned": true}
 )
 
+// a2aErroredTerminalStates are the A2A task terminals that are a failed turn:
+// failed, and rejected, which is a task the executor refused; not completed
+// and not canceled.
+var a2aErroredTerminalStates = map[string]bool{"failed": true, "rejected": true}
+
+// usageSibling is another family a counter is read from on a pod whose body
+// carries it in place of the counter's own, with the filter that family takes.
+type usageSibling struct {
+	family string
+	filter usageLabelFilter
+}
+
+// usageRead is one counter a family feeds and the filter it is read through.
+type usageRead struct {
+	counter string
+	filter  usageLabelFilter
+}
+
 // usageLabelFilter is, per label name, the values a metric must carry to be
 // summed into a counter; a nil filter sums every label set.
 type usageLabelFilter map[string]map[string]bool
@@ -183,21 +209,27 @@ func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 		return toolInvocationsSeries, usageLabelFilter{toolInvocationsStatusLabel: toolInvocationsRefusedStatuses}
 	case usageCounterBrokerFailures:
 		return brokerFailuresSeries, nil
+	case usageCounterChatTurnsErrored:
+		return chatTurnsErroredSeries, nil
 	default:
 		return toolInvocationsSeries, usageLabelFilter{toolInvocationsStatusLabel: toolInvocationsCountedStatuses}
 	}
 }
 
-// usageSiblingFamiliesFor is the other families a counter is read from, on
-// pods whose body carries one of them in place of the family usageSeriesFor
-// names: the chat counter comes from the chat_metrics plugin on a gateway pod
-// and from the A2A gateway on its own pod, under the same label set.
-func usageSiblingFamiliesFor(counter string) []string {
+// usageSiblingsFor is the other families a counter is read from, on pods
+// whose body carries one of them in place of the family usageSeriesFor names,
+// each with its own filter: the chat counter and the chat sessions come from
+// the chat_metrics plugin on a gateway pod and from the A2A gateway on its own
+// pod, under the same label set; the errored counter comes from the plugin
+// whole and from the A2A gateway's task terminals under the errored states.
+func usageSiblingsFor(counter string) []usageSibling {
 	switch counter {
 	case usageCounterChatMessagesInbound:
-		return []string{a2aMessagesInboundSeries}
+		return []usageSibling{{family: a2aMessagesInboundSeries}}
 	case usageCounterSessionsChat:
-		return []string{a2aSessionsSeries}
+		return []usageSibling{{family: a2aSessionsSeries}}
+	case usageCounterChatTurnsErrored:
+		return []usageSibling{{family: a2aTaskTerminalsSeries, filter: usageLabelFilter{a2aTerminalStateLabel: a2aErroredTerminalStates}}}
 	}
 	return nil
 }
@@ -351,22 +383,22 @@ func foldUsageBody(body io.Reader, counters []string) (usageReading, error) {
 	// each through its own filter: the broker's tool counter is read into
 	// two, over disjoint statuses.
 	var clusters *usageClusterGauges
-	countersOf := make(map[string][]string, len(counters))
-	filters := make(map[string]usageLabelFilter, len(counters))
+	// readsOf is every (counter, filter) pair a family feeds, so a sibling
+	// family takes its own filter, not the one its counter's own family takes.
+	readsOf := make(map[string][]usageRead, len(counters))
 	wanted := []string{processStartTimeSeries}
-	want := func(family, counter string) {
-		countersOf[family] = append(countersOf[family], counter)
+	want := func(family, counter string, filter usageLabelFilter) {
+		readsOf[family] = append(readsOf[family], usageRead{counter: counter, filter: filter})
 		if !slices.Contains(wanted, family) {
 			wanted = append(wanted, family)
 		}
 	}
 	for _, counter := range counters {
 		family, filter := usageSeriesFor(counter)
-		filters[counter] = filter
 		sums[counter] = 0
-		want(family, counter)
-		for _, sibling := range usageSiblingFamiliesFor(counter) {
-			want(sibling, counter)
+		want(family, counter, filter)
+		for _, sibling := range usageSiblingsFor(counter) {
+			want(sibling.family, counter, sibling.filter)
 		}
 		if family == eventsInjectedSeries {
 			clusters = &usageClusterGauges{}
@@ -437,9 +469,9 @@ func foldUsageBody(body io.Reader, counters []string) (usageReading, error) {
 						}
 						continue
 					}
-					for _, counter := range countersOf[name] {
-						if usageLabelsMatch(metric, filters[counter]) {
-							sums[counter] += value
+					for _, read := range readsOf[name] {
+						if usageLabelsMatch(metric, read.filter) {
+							sums[read.counter] += value
 						}
 					}
 				}

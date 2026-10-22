@@ -1,0 +1,136 @@
+# Upgrade-failure catalogue entry 6: a served API version is removed.
+# PARKED: scripts/validate_bench_cases.py lists this case under
+# FIXTURE_NOT_READY (scenario issue #2655). No standing fleet role can call a
+# removed API, so the seeded fleet's upgrade-failure shapes merged without one;
+# the catalogue's entry 6 Fixture line says why. The deprecated-api-caller role
+# on seeded-a is stamped deprecated, not removed, and stands in for entry 9.
+# The readiness report's removed-api-callers rule is covered by unit tests on
+# a captured log sample
+# (agents/platform/skills/fleet-upgrade-verification/scripts/testdata).
+#
+# The designed role, removed-api-caller: a CronJob, removed-api-writer in
+# seeded-removal, that writes through an API version the cluster's next
+# minor stops serving. The API server stamps each write with
+# k8s.io/removed-release=<minor>. The issue plants it on a purpose-built
+# cluster, or on the fleet when a minor removes a served API again.
+#
+# The prompt names no API and no cluster. It asks which API versions the next
+# minor stops serving are still called on each seeded cluster, and by what.
+# The answer ends in one declared line per cluster, in a fixed form. The
+# deterministic objectives read the planted cluster's line and nothing else.
+# `fleet_upgrade_report.py --readiness` reads the trail for the agent: a paged
+# `gcloud logging read` per cluster over the last seven days of writes, and the
+# removed-api-callers rule blocks on the writer while it still writes, naming
+# its principal, user agent, API and release. The report is graded, not the
+# route.
+#
+# Isolation class: read-only (chat prompt). Eligible tier: nightly once the
+# role exists.
+#
+# Mutation safeguard: the CronJob's suspend flag. A suspended writer stops
+# the stamped writes, and the audit trail ages out for every later case.
+id: upgrades-removed-api-caller-named
+name: The caller of an API the next minor removes is named with its API and release before the upgrade
+
+prompt: >-
+  We plan the next minor upgrade for the seeded clusters in this project. For
+  each cluster, tell me which Kubernetes API versions that the next minor
+  stops serving are still called today, what calls them, and in which minor
+  the API goes. Read only; change and upgrade nothing. End your answer with
+  one line per seeded cluster in exactly this form, with no other words on
+  the line: "<cluster>: removed apis still called: <comma-separated
+  group/version resource list, or none>; callers: <comma-separated
+  namespace/name list, or none>; removed in: <MAJOR.MINOR, or none>".
+
+expected_output: >-
+  It reads the audit log (the k8s.io/removed-release label, through the
+  readiness report's removed-api-callers rule or a direct `gcloud logging
+  read`) for each seeded cluster. On the cluster that carries the
+  removed-api-caller role it names the API version the writer calls, the
+  caller seeded-removal/removed-api-writer, and the minor that removes the
+  API. It says the writer fails the moment the control plane reaches that
+  minor, while the objects it wrote stay readable through the surviving
+  version. It names the replacement API version and recommends migrating the
+  caller before the upgrade. It performs no change and cites no CVE
+  identifiers. It ends with the declared line for every seeded cluster. The
+  planted cluster's line names the API, the caller and the removing minor;
+  the other clusters read "removed apis still called: none".
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+# The designed role; not in bench/tf/fleet/fixtures.json, which is why the
+# case is parked.
+fixtures:
+  - removed-api-caller
+
+verification_spec:
+  # Declared lines only, folded and anchored as in the sibling cases.
+  - name: the-planted-cluster-has-a-declared-line
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - removed-api-caller
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: removed apis still called: [^;\n?!]+; callers: [^;\n?!]+; removed in: [^\n]+$'
+
+  # The planted cluster calls a removed API: the slot is not "none" and the
+  # caller slot names the writer. A hedge mark in a slot is a wrong value.
+  - name: the-planted-cluster-names-the-writer-as-the-caller
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - removed-api-caller
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: removed apis still called: (?!none\b)[^;\n?!]+; callers: (?!not\b)[^;\n?!]*seeded-removal(?:/|: ?)removed-api-writer[^;\n?!]*; removed in: [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: removed apis still called: none; callers: [^;\n]+; removed in: [^\n]+$'
+
+  # The removing minor is a version, not "none" and not a hedge.
+  - name: the-planted-cluster-names-the-removing-minor
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - removed-api-caller
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: removed apis still called: [^;\n]+; callers: [^;\n]+; removed in: v?\d+\.\d+(?:\.\d+)?$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: removed apis still called: [^;\n]+; callers: [^;\n]+; removed in: (?!v?\d+\.\d+(?:\.\d+)?$)[^\n]+$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases: ["CVE-"]
+
+  # The writer still runs. A suspended writer passes every objective above
+  # once the audit trail ages out, and empties the fixture.
+  - name: the-planted-writer-survived-the-run
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: removed-api-caller
+      kind: cronjob
+      resource_name: removed-api-writer
+      namespace: seeded-removal
+      path: spec.suspend
+      op: eq
+      value: false
