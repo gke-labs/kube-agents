@@ -12,12 +12,12 @@ holds the field names this module writes). No model is in the loop:
 - prs: the newest ``pr_opened`` events (``agents/platform/plugins/pr_opened``);
 - audit: the most recent fleet-audit run to finish, from the report store
   (``skills/fleet-audit/scripts/report_status.py``);
-- first_report_pending: onboarding has filed its sweep (``.bootstrap_scan_filed``)
-  and its first report is not yet claimed for delivery (no
-  ``.bootstrap_completed``), so a cluster with no open finding has not been
-  checked yet; first_message_pending adds that no message has primed
-  onboarding yet (no ``.bootstrap_greeted``). The same two markers gate the
-  findings nudge's first-report hold (``findings_nudge.first_report_hold``).
+- first_report_pending: onboarding has filed its sweep and its first report is
+  not out yet, read with the findings nudge's own marker pair
+  (``findings_nudge.first_report_markers``), so a cluster with no open
+  finding has not been checked yet; first_message_pending adds that no
+  message has primed onboarding yet (no ``.bootstrap_greeted``) and that the
+  sweep is young enough for a message to prime it.
 
 Every list is capped here, so the answer stays a few kilobytes. A source that
 cannot be read is an error on the whole snapshot, never an empty list: an
@@ -35,15 +35,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import findings_nudge
 import findings_queue
 
 HERMES_HOME = os.environ.get("HERMES_HOME") or "/opt/data"
 PROFILES_DIR = Path(HERMES_HOME) / "profiles"
-# Onboarding's markers in the same home (agents/chat/scripts/bootstrap_scan_gate.py,
-# bootstrap_delivery.py and the bootstrap_onboarding plugin write them).
-SCAN_FILED_MARKER = ".bootstrap_scan_filed"
-FIRST_REPORT_CLAIMED_MARKER = ".bootstrap_completed"
+# The onboarding plugin's marker for a message that primed onboarding, in the
+# same home as the nudge's pair. Past FIRST_MESSAGE_MAX_AGE_SECONDS after the
+# sweep was filed, the plugin primes nothing (its SCAN_MAX_AGE_SECONDS), so
+# the tab stops asking for a message then.
 FIRST_MESSAGE_MARKER = ".bootstrap_greeted"
+FIRST_MESSAGE_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 # The fleet-audit skill's scripts, scaffolded into the platform profile; the
 # report store's reader (report_status) and the stream titles (audit_report)
 # live there.
@@ -291,9 +293,12 @@ def snapshot(
         except sqlite3.Error as exc:
             raise BoardError(f"the kanban board could not be read: {exc}") from None
     home = (profiles_dir or PROFILES_DIR).parent
-    if (home / SCAN_FILED_MARKER).exists() and not (home / FIRST_REPORT_CLAIMED_MARKER).exists():
+    filed, out = findings_nudge.first_report_markers(home)
+    if filed.exists() and not out.exists():
         board["first_report_pending"] = True
-        if not (home / FIRST_MESSAGE_MARKER).exists():
+        stamp = findings_nudge._filed_at(filed)
+        young = stamp is not None and (now - stamp[0]).total_seconds() <= FIRST_MESSAGE_MAX_AGE_SECONDS
+        if young and not (home / FIRST_MESSAGE_MARKER).exists():
             board["first_message_pending"] = True
     if audit is None:
         audit = default_audit
