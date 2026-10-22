@@ -877,3 +877,26 @@ func TestACutShortSwarmReadIsNotCached(t *testing.T) {
 		t.Errorf("the cut-short read was cached:\n%s", b)
 	}
 }
+
+// A session member carries its conversation's Antigravity id, from the
+// request entry, as the bridge's local fallback does.
+func TestTheSwarmRouteGivesSessionMembersTheirConversationID(t *testing.T) {
+	h, js, _ := swarmServer(t)
+	publishSubmission(t, js, "s-triage", "t-1", consoleConversationPrefix+convTriage, "turn", "")
+	publishRun(t, js, "s-triage", "t-1", "", false)
+	entry := clientConv("triage", convTriage, time.Now())
+	entry["agyConversationId"] = "agy-sub-1"
+	resp, _ := askSwarm(t, h, map[string]any{"rootConversationId": "agy-root", "conversations": map[string]any{"triage": entry}})
+	found := false
+	for name, m := range resp.Snapshot.Members {
+		if m.ConversationID == "agy-sub-1" {
+			found = true
+			if name == swarmMemberCoordinator || name == swarmMemberPlatform {
+				t.Errorf("the session's id landed on %s", name)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("no member carries the session's conversation id: %+v", resp.Snapshot.Members)
+	}
+}

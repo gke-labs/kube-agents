@@ -392,6 +392,8 @@ func swarmConversations(entries []swarmConversationEntry, subagents map[string]s
 		}
 		out = append(out, SwarmConversation{
 			Alias: e.Alias, Token: e.Token, Description: e.Description, Parent: parent, LastUsed: e.LastUsedAt,
+			// The projection validates it again before a member carries it.
+			AGYConversationID: e.AGYConversationID,
 		})
 	}
 	return out
