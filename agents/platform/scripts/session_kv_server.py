@@ -14,12 +14,10 @@ import threading
 import sqlite3
 import subprocess
 import tempfile
-import socket
 import sys
 import threading
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime, timezone
@@ -806,20 +804,6 @@ DRIFT_BACKLOG_FEED_COMMAND = (
     "sh -c 'curl -s -H \"Authorization: Bearer $SESSION_KV_API_KEY\" "
     "\"http://127.0.0.1:8699/v1/intercepted-events?limit=200\"'"
 )
-# The gateway API the triage turns are created on, when PLATFORM_API_URL does
-# not say otherwise, and the host and ports the probe assumes when the URL
-# leaves them out.
-DEFAULT_PLATFORM_API_URL = "http://127.0.0.1:8642"
-DEFAULT_PLATFORM_API_HOST = "127.0.0.1"
-HTTPS_SCHEME = "https"
-HTTPS_DEFAULT_PORT = 443
-HTTP_DEFAULT_PORT = 80
-# A late row of a principal with few of them gets its own card through a
-# gateway turn. At a cold start the gateway is not up yet and that turn stops
-# with no retry, so on an install with no chat route, where nothing else names
-# the change, the daemon checks the gateway first and digests such rows when it
-# is down. One connect with a short timeout, so it adds no wait when it is up.
-DRIFT_BACKLOG_GATEWAY_PROBE_TIMEOUT_SECONDS = 3.0
 DRIFT_BACKLOG_MAX_OBJECTS = 5
 DRIFT_BACKLOG_EMOJI = "🗂️"
 # How many times the digest tries to mark its rows after a post, and the pause
@@ -4450,18 +4434,6 @@ def _drift_backlog_digest_text(rows: Sequence[Dict[str, Any]]) -> str:
     )
 
 
-def _gateway_is_up() -> bool:
-    """Whether the gateway API accepts connections, by one TCP connect."""
-    parts = urllib.parse.urlsplit(os.environ.get("PLATFORM_API_URL", DEFAULT_PLATFORM_API_URL))
-    host = parts.hostname or DEFAULT_PLATFORM_API_HOST
-    port = parts.port or (HTTPS_DEFAULT_PORT if parts.scheme == HTTPS_SCHEME else HTTP_DEFAULT_PORT)
-    try:
-        with socket.create_connection((host, port), timeout=DRIFT_BACKLOG_GATEWAY_PROBE_TIMEOUT_SECONDS):
-            return True
-    except OSError:
-        return False
-
-
 def _drift_backlog_card_name(value: Any) -> str:
     """A name for the card body: shown when it matches the allowlist, else a placeholder."""
     text = str(value or "")
@@ -4704,11 +4676,7 @@ def _post_drift_backlog_digest() -> bool:
     max_id = rows[-1]["id"] if rows else None
     outcome: Optional[int] = None
     try:
-        if headless and not _gateway_is_up():
-            logger.warning("Drift backlog: the gateway is not up, so every late record goes into the digest card")
-            rows = list(rows)
-        else:
-            rows = _card_drift_backlog_minorities(rows)
+        rows = _card_drift_backlog_minorities(rows)
         if not rows:
             return True
         if headless:

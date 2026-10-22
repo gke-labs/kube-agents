@@ -122,8 +122,7 @@ What the drift branch does differently:
   starts no turn. A worker thread posts one digest per burst, after 60 seconds with no new backlog
   row or 10 minutes after the oldest, and marks the rows `2` (posted) or `3` (filed as one board card,
   on an install with no chat platform enabled: unassigned and blocked, so no agent turn files or
-  reads it, and it stays in view until a person acts; at a cold start, while the gateway is not up,
-  the lone-principal rows go into that card too). A
+  reads it, and it stays in view until a person acts). A
   principal with fewer than three late rows is not digested: each of its rows gets a session, a quota
   claim and a card, as a live record does, rebuilt from the payload the row stores, and is marked
   `4`. A row the ceiling refuses stays in the digest. A row without a usable stored payload is

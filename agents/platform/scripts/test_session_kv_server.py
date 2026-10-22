@@ -7573,12 +7573,9 @@ class TestDriftBacklog(unittest.TestCase):
         # A failed post pushes the wait back.
         self.assertEqual(wait(max_wait, quiet, 120), 120)
 
-    def _headless(self, gateway_up=True):
-        """An install with no chat route, with the gateway probe answered by the test."""
+    def _headless(self):
+        """An install with no chat platform enabled."""
         self._chat(platforms=(session_kv_server.DEFAULT_CHAT_PLATFORM,), disabled=True)
-        probe = patch.object(session_kv_server, "_gateway_is_up", return_value=gateway_up)
-        self.gateway_probe = probe.start()
-        self.addCleanup(probe.stop)
 
     @staticmethod
     def _card_created(task_id="t_digest1"):
@@ -7665,19 +7662,8 @@ class TestDriftBacklog(unittest.TestCase):
                 self.assertFalse(session_kv_server._post_drift_backlog_digest())
             self.assertEqual({r["backlog"] for r in self._rows()}, {session_kv_server.DRIFT_BACKLOG_PENDING})
 
-    def test_with_the_gateway_down_a_lone_late_row_goes_into_the_card(self):
-        self._headless(gateway_up=False)
-        self._burst()
-        self._post(insert_id="lone", principal="ada@example.com")
-        with patch.object(session_kv_server.subprocess, "run", return_value=self._card_created()) as run:
-            self.assertTrue(session_kv_server._post_drift_backlog_digest())
-        body = run.call_args.args[0][run.call_args.args[0].index("--body") + 1]
-        self.assertIn("ada@example.com (1)", body)
-        self.assertEqual({r["backlog"] for r in self._rows()}, {session_kv_server.DRIFT_BACKLOG_HEADLESS})
-        self.trigger.assert_not_called()
-
-    def test_with_the_gateway_up_a_lone_late_row_still_gets_its_own_card(self):
-        self._headless(gateway_up=True)
+    def test_a_lone_late_row_on_an_install_with_no_chat_platform_still_gets_its_own_card(self):
+        self._headless()
         self._burst()
         self._post(insert_id="lone", principal="ada@example.com")
         with patch.object(session_kv_server.subprocess, "run", return_value=self._card_created()):
@@ -7685,34 +7671,6 @@ class TestDriftBacklog(unittest.TestCase):
         by_principal = {r["principal"]: r["backlog"] for r in self._rows()}
         self.assertEqual(by_principal["ada@example.com"], session_kv_server.DRIFT_BACKLOG_CARDED)
         self.assertEqual(by_principal["installer@example.com"], session_kv_server.DRIFT_BACKLOG_HEADLESS)
-
-    def test_an_install_with_chat_does_not_probe_the_gateway(self):
-        self._chat()
-        probe = patch.object(session_kv_server, "_gateway_is_up", return_value=False)
-        probe.start()
-        self.addCleanup(probe.stop)
-        self._burst()
-        with patch.object(session_kv_server.subprocess, "run") as run:
-            self.assertTrue(session_kv_server._post_drift_backlog_digest())
-        probe_mock = session_kv_server._gateway_is_up
-        probe_mock.assert_not_called()
-        self.assertNotIn("kanban", run.call_args.args[0])
-        self.assertEqual({r["backlog"] for r in self._rows()}, {session_kv_server.DRIFT_BACKLOG_DIGESTED})
-
-    def test_the_gateway_probe_reads_the_url_and_answers_false_when_nothing_listens(self):
-        import socket as sk
-
-        with patch.object(session_kv_server.socket, "create_connection") as connect:
-            connect.return_value.__enter__ = lambda s: s
-            connect.return_value.__exit__ = lambda s, *a: None
-            with patch.dict(os.environ, {"PLATFORM_API_URL": "https://gateway.example"}):
-                self.assertTrue(session_kv_server._gateway_is_up())
-            self.assertEqual(connect.call_args.args[0], ("gateway.example", 443))
-            with patch.dict(os.environ, {"PLATFORM_API_URL": "http://10.0.0.5:8642"}):
-                session_kv_server._gateway_is_up()
-            self.assertEqual(connect.call_args.args[0], ("10.0.0.5", 8642))
-        with patch.object(session_kv_server.socket, "create_connection", side_effect=sk.gaierror("no such host")):
-            self.assertFalse(session_kv_server._gateway_is_up())
 
     def test_a_long_card_lists_rows_up_to_the_cap(self):
         self._headless()
