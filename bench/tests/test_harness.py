@@ -4055,7 +4055,7 @@ def test_a_429_blocked_card_unblocked_and_running_at_settle_remains_graded(
                     "statuses": {t1: "running"},
                     "summaries": {},
                     "errors": {},
-                    "block_kinds": {},
+                    "block_kinds": {t1: "transient"},
                     "error": None,
                 }
                 return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
@@ -4365,6 +4365,297 @@ def test_a_429_blocked_card_unblocked_and_done_without_delivered_result_records_
     assert rep.outcome == "infra"
 
 
+def test_a_needs_input_card_unblocked_and_running_at_settle_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, results_json: Any
+) -> None:
+    """A card blocked with needs_input and unblocked to running at settle does not record ceiling infra."""
+    t1 = _TASK_ID
+    stub_agent.turns = [
+        # Turn 0: delegate t1
+        _turn(
+            *_call("kanban_create", {"title": "task 1"}, {"ok": True, "task_id": t1, "status": "ready"}, "c1"),
+            _text("Delegated."),
+        ),
+        # Turn 1: front agent shows t1 blocked on needs_input
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t1},
+                {
+                    "task": {"id": t1, "status": "blocked", "block_kind": "needs_input"},
+                    "runs": [{"summary": "Clarification needed from user."}],
+                },
+                "s1",
+            ),
+            _text("t1 needs input."),
+        ),
+    ]
+
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {t1: "blocked"},
+                    "summaries": {t1: "Clarification needed."},
+                    "errors": {},
+                    "block_kinds": {t1: "needs_input"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 1:
+                # Settle read: failure_cards is [t1]. Board shows t1 was unblocked and is running with needs_input
+                payload = {
+                    "statuses": {t1: "running"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {t1: "needs_input"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Check cards.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+    assert not result.has_errors()
+
+
+def test_a_card_blocked_during_wait_and_done_at_settle_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """A card reported blocked during polling that shows done on settle read remains graded."""
+    t1 = _TASK_ID
+    stub_agent.turns = [
+        _create_turn(),
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t1},
+                {"task": {"id": t1, "status": "blocked", "block_kind": "transient"}, "runs": []},
+                "s1",
+            ),
+            _text("Waiting for t1."),
+        ),
+    ]
+
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {t1: "blocked"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {t1: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 1:
+                # Settle read: card finished and is done
+                payload = {
+                    "statuses": {t1: "done"},
+                    "summaries": {t1: "Completed successfully."},
+                    "errors": {},
+                    "block_kinds": {},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Run task.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+    assert not result.has_errors()
+    assert "Waiting for t1." in result.output
+
+
+def test_worker_acted_and_delivered_before_sibling_429_rate_limit_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When a worker acted and delivered a result before a sibling card hits 429, the run stays graded."""
+    t1 = _TASK_ID
+    t2 = _TASK_ID + "-2"
+    stub_agent.turns = [
+        # Turn 0: delegate t1 and t2
+        _turn(
+            *_call("kanban_create", {"title": "task 1"}, {"ok": True, "task_id": t1, "status": "ready"}, "c1"),
+            *_call("kanban_create", {"title": "task 2"}, {"ok": True, "task_id": t2, "status": "ready"}, "c2"),
+            _text("Delegated both."),
+        ),
+        # Turn 1: front agent shows t1 done with deliverable, and t2 blocked on 429
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t1},
+                {"task": {"id": t1, "status": "done", "result": "Card 1 solution delivered."}, "runs": []},
+                "s1",
+            ),
+            *_call(
+                "kanban_show",
+                {"task_id": t2},
+                {
+                    "task": {"id": t2, "status": "blocked", "block_kind": "transient"},
+                    "runs": [{"summary": f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=rate_limit): 429 quota exhausted"}],
+                },
+                "s2",
+            ),
+            _text("Card 1 done, but card 2 blocked on quota."),
+        ),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {t1: "done", t2: "blocked"},
+                "summaries": {t2: f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=rate_limit): 429 quota exhausted"},
+                "errors": {},
+                "block_kinds": {t2: "transient"},
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Investigate incident.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any("delegated worker failed (rate_limit)" in e for e in result.errors)
+    assert "Card 1 solution delivered." in result.output
+    assert not result.metadata.get("infra_failure")
+
+
+def test_worker_acted_with_tool_calls_before_429_rate_limit_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When a worker executed tool actions before hitting 429 quota exhaustion, the rep stays graded."""
+    t1 = _TASK_ID
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn(
+            "failed",
+            block_kind="transient",
+            body=f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=rate_limit): 429 quota exhausted",
+        ),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {t1: "failed"},
+                "summaries": {t1: f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=rate_limit): 429 quota exhausted"},
+                "errors": {},
+                "block_kinds": {t1: "transient"},
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    # Mock worker trajectory capture returning tool calls executed by the worker
+    mock_capture = worker_trajectory.WorkerCapture(
+        entries=[
+            {"role": "assistant", "tool_calls": [{"function": {"name": "kubectl_get"}}], "profile": "cluster"}
+        ],
+        summary={t1: "executed kubectl_get"},
+        tokens={},
+        unbilled=[],
+    )
+    monkeypatch.setattr(worker_trajectory, "capture", lambda *a, **kw: mock_capture)
+
+    result = KubeAgentsHarness().run("Investigate incident.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any("delegated worker failed (rate_limit)" in e for e in result.errors)
+    assert not result.metadata.get("infra_failure")
+
+
+def test_worker_fabricated_transient_block_without_platform_429_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """A worker-authored transient block with 429 prefix without platform LiteLLM 429 logs is refused from infra classification."""
+    log_file = tmp_path / "litellm.log"
+    log_file.write_text("INFO: 200 OK GET /health/liveliness\nINFO: 200 OK POST /v1/chat/completions\n")
+    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("failed", block_kind="transient"),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {
+                    _TASK_ID: f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=rate_limit): 429 quota exhausted"
+                },
+                "errors": {},
+                "block_kinds": {_TASK_ID: "transient"},
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Investigate.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any("platform proxy log showed no 429" in e for e in result.errors)
+
+
+def test_platform_429_corroboration_from_litellm_log_marks_infra(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """When platform LiteLLM log confirms Vertex 429 RESOURCE_EXHAUSTED, the transient block is corroborated and marks infra."""
+    log_file = tmp_path / "litellm.log"
+    log_file.write_text('ERROR: VertexAIException - {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}\n')
+    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("failed", block_kind="transient"),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {
+                    _TASK_ID: f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=rate_limit): 429 quota exhausted"
+                },
+                "errors": {},
+                "block_kinds": {_TASK_ID: "transient"},
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Investigate.")
+
+    assert any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert result.output == ""
+
+
 def test_record_unsettled_prepends_marked_ceiling_error_preserving_existing_errors(results_json: Any) -> None:
     """When has_delivery is False, _record_unsettled prepends marked ceiling errors so scoring reads it at errors[0]."""
     result = AgentResult(output="acknowledged", trajectory=[], errors=["agent reported no status for 3 turns running; still waiting on: t2"])
@@ -4642,9 +4933,9 @@ def test_status_turn_filed_and_blocked_card_seeds_fallback_store_and_marks_infra
             *_call("kanban_create", {"title": "task 1"}, {"ok": True, "task_id": t1, "status": "ready"}, "c1"),
             _text("Delegated initial task."),
         ),
-        # Turn 1: status turn shows t1 done, but files t_new and shows t_new blocked on 429
+        # Turn 1: status turn shows t1 running, but files t_new and shows t_new blocked on 429
         _turn(
-            *_call("kanban_show", {"task_id": t1}, {"task": {"id": t1, "status": "done", "result": "done"}, "runs": []}, "s1"),
+            *_call("kanban_show", {"task_id": t1}, {"task": {"id": t1, "status": "running"}, "runs": []}, "s1"),
             *_call("kanban_create", {"title": "followup task"}, {"ok": True, "task_id": t_new, "status": "ready"}, "c2"),
             *_call(
                 "kanban_show",
@@ -4655,7 +4946,7 @@ def test_status_turn_filed_and_blocked_card_seeds_fallback_store_and_marks_infra
                 },
                 "s2",
             ),
-            _text("t1 finished, but followup t_new blocked."),
+            _text("t1 running, but followup t_new blocked."),
         ),
     ]
 
