@@ -2190,6 +2190,13 @@ class ServiceAccountAuthenticator:
     is non-empty, the session audience is refused to anyone not named in it.
     Empty leaves the audience alone deciding, which is the pre-binding
     behaviour an older operator's rendering still gets.
+
+    ``mcp_callers`` binds the mcp role the same way, for the same reason: a
+    caller named there may present only the mcp audience, and the mcp audience
+    is refused to anyone not named. Unlike the session binding, empty does not
+    leave the audience deciding: the mcp role postdates its binding, so no
+    operator renders the audience without the callers, and an empty set
+    confers the mcp role to nobody.
     """
 
     authenticates = True
@@ -2205,6 +2212,7 @@ class ServiceAccountAuthenticator:
         timeout_seconds: float = 10.0,
         cache_seconds: float = 60.0,
         session_callers: frozenset[str] = frozenset(),
+        mcp_callers: frozenset[str] = frozenset(),
     ) -> None:
         if not audience_roles or not all(audience_roles):
             raise ValueError("an audience is required to authenticate callers")
@@ -2215,6 +2223,7 @@ class ServiceAccountAuthenticator:
         self.audience_roles = dict(audience_roles)
         self.allowed_callers = allowed_callers
         self.session_callers = session_callers
+        self.mcp_callers = mcp_callers
         self.api_host = api_host
         self.api_port = api_port
         self.ca_file = ca_file
@@ -2346,6 +2355,12 @@ class ServiceAccountAuthenticator:
             raise AuthenticationError("a session caller may present only the session audience")
         if role == CALLER_ROLE_SESSION and self.session_callers and username not in self.session_callers:
             raise AuthenticationError("the session audience is only for session callers")
+        if username in self.mcp_callers and role != CALLER_ROLE_MCP:
+            raise AuthenticationError("an mcp caller may present only the mcp audience")
+        # No emptiness guard, unlike the session check above: with no mcp
+        # callers named the mcp audience confers nothing.
+        if role == CALLER_ROLE_MCP and username not in self.mcp_callers:
+            raise AuthenticationError("the mcp audience is only for mcp callers")
         groups = user.get("groups") or []
         extra = user.get("extra") or {}
         pod_names = (extra.get(TOKEN_REVIEW_POD_NAME_EXTRA) or []) if isinstance(extra, dict) else []
@@ -2406,6 +2421,14 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
         for caller in os.getenv("CREDENTIAL_PROXY_SESSION_CALLERS", "").split(",")
         if caller.strip()
     )
+    # The ServiceAccounts the mcp role is bound to, read the same way. Unset
+    # here is not a pre-binding rendering: it means the mcp role is conferred
+    # to nobody (see ServiceAccountAuthenticator).
+    mcp_callers = frozenset(
+        caller.strip()
+        for caller in os.getenv("CREDENTIAL_PROXY_MCP_CALLERS", "").split(",")
+        if caller.strip()
+    )
     if chat_audience and chat_audience != shell_audience:
         audience_roles = {
             shell_audience: CALLER_ROLE_SHELL,
@@ -2464,6 +2487,12 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
             )
         elif mcp_audience:
             audience_roles[mcp_audience] = CALLER_ROLE_MCP
+            if not mcp_callers:
+                LOGGER.warning(
+                    "CREDENTIAL_PROXY_MCP_AUDIENCE is set but CREDENTIAL_PROXY_MCP_CALLERS "
+                    "is not; the mcp role is bound to the callers named there, so every "
+                    "caller presenting the mcp audience is refused"
+                )
     else:
         audience_roles = {shell_audience: ""}
         if os.getenv("CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE", "").strip():
@@ -2490,6 +2519,7 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
         audience_roles=audience_roles,
         allowed_callers=allowed,
         session_callers=session_callers,
+        mcp_callers=mcp_callers,
         api_host=os.getenv("KUBERNETES_SERVICE_HOST", "").strip(),
         api_port=os.getenv("KUBERNETES_SERVICE_PORT", "443").strip() or "443",
         ca_file=os.getenv(

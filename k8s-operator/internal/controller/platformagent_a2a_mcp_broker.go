@@ -42,13 +42,21 @@ import (
 // A2A gateway's (credentialProxyA2AChatAudience): a projected token, an
 // audience the broker names in its env, the caller's ServiceAccount on
 // CREDENTIAL_PROXY_ALLOWED_CALLERS, and the caller's pod on the broker's
-// ingress fence.
+// ingress fence. Like the session pod's, the ServiceAccount is also bound to
+// the audience both ways (CREDENTIAL_PROXY_MCP_CALLERS).
 const (
 	// credentialProxyMCPAudience is the MCP pod's audience. Spelled
 	// identically in credential_proxy.py, whose default it is.
 	credentialProxyMCPAudience = "kubeagents-credential-proxy-mcp" // #nosec G101 -- Token audience name, not a credential
 	// credentialProxyMCPAudienceEnvVar names it to the broker.
 	credentialProxyMCPAudienceEnvVar = "CREDENTIAL_PROXY_MCP_AUDIENCE" // #nosec G101 -- Environment variable name, not a credential
+	// credentialProxyMCPCallersEnvVar binds the mcp role to the MCP pod's
+	// ServiceAccount in both directions, as CREDENTIAL_PROXY_SESSION_CALLERS
+	// does the session role: the broker refuses that account every audience
+	// but the mcp one, and the mcp audience to every other caller. Unlike the
+	// session binding, unset does not leave the audience alone deciding: the
+	// broker confers the mcp role to nobody without it.
+	credentialProxyMCPCallersEnvVar = "CREDENTIAL_PROXY_MCP_CALLERS" // #nosec G101 -- Environment variable name, not a credential
 
 	// a2aMCPBrokerURLEnvVar and a2aMCPBrokerTokenFileEnvVar tell the MCP
 	// binary (a2a/cmd/mcp) where the broker is and which token to present.
@@ -157,12 +165,18 @@ func a2aMCPBrokerPeers(agent *agentv1alpha1.PlatformAgent) []networkingv1.Networ
 }
 
 // a2aMCPBrokerEnv is the broker's side: the audience it confers the mcp role
-// by, only when enabled.
+// by, and the ServiceAccount bound to it both ways, only when enabled. The
+// role comes from the audience and a pod picks the audience it projects, so
+// without the binding a token minted for the MCP account with the shell
+// audience would get the shell role.
 func a2aMCPBrokerEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 	if !a2aMCPBrokerEnabled(agent) {
 		return nil
 	}
-	return []corev1.EnvVar{{Name: credentialProxyMCPAudienceEnvVar, Value: credentialProxyMCPAudience}}
+	return []corev1.EnvVar{
+		{Name: credentialProxyMCPAudienceEnvVar, Value: credentialProxyMCPAudience},
+		{Name: credentialProxyMCPCallersEnvVar, Value: a2aMCPBrokerCaller(agent)},
+	}
 }
 
 // newA2AMCPServiceAccount is the MCP pod's identity. It holds no RBAC: its

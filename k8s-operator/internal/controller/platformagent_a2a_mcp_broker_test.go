@@ -127,6 +127,9 @@ func TestTheMCPBrokerAccessIsInertOutsideModeNext(t *testing.T) {
 	if _, found := brokerEnvValue(broker.Env, credentialProxyMCPAudienceEnvVar); found {
 		t.Error("MCP audience rendered on a today install")
 	}
+	if _, found := brokerEnvValue(broker.Env, credentialProxyMCPCallersEnvVar); found {
+		t.Error("MCP callers rendered on a today install")
+	}
 }
 
 func TestTheBrokerConfersTheMCPAudienceOnlyUnderTheFlag(t *testing.T) {
@@ -141,6 +144,9 @@ func TestTheBrokerConfersTheMCPAudienceOnlyUnderTheFlag(t *testing.T) {
 	if _, found := brokerEnvValue(off.Env, credentialProxyMCPAudienceEnvVar); found {
 		t.Fatal("the MCP audience is rendered with the flag unset")
 	}
+	if _, found := brokerEnvValue(off.Env, "CREDENTIAL_PROXY_MCP_CALLERS"); found {
+		t.Fatal("the MCP callers are rendered with the flag unset")
+	}
 
 	t.Setenv(a2aMCPDoorEnvVar, "true")
 	if got := allowedBrokerCallers(agent); !strings.HasSuffix(got, ","+caller) {
@@ -152,6 +158,12 @@ func TestTheBrokerConfersTheMCPAudienceOnlyUnderTheFlag(t *testing.T) {
 	on := buildCredentialProxyDeployment(agent, "policy-hash").Spec.Template.Spec.Containers[0]
 	if v, _ := brokerEnvValue(on.Env, "CREDENTIAL_PROXY_MCP_AUDIENCE"); v != "kubeagents-credential-proxy-mcp" {
 		t.Fatalf("CREDENTIAL_PROXY_MCP_AUDIENCE = %q, want kubeagents-credential-proxy-mcp", v)
+	}
+	// The account the broker admits is the one it binds to the audience,
+	// and nothing else: the broker refuses that account every other
+	// audience, and the mcp audience to every other caller.
+	if v, found := brokerEnvValue(on.Env, "CREDENTIAL_PROXY_MCP_CALLERS"); !found || v != caller {
+		t.Fatalf("CREDENTIAL_PROXY_MCP_CALLERS = %q (found %v), want %q", v, found, caller)
 	}
 	for _, other := range []string{credentialProxyAudience, credentialProxyChatAudience, credentialProxyA2AChatAudience, credentialProxySessionAudience, credentialProxyWatcherAudience} {
 		if credentialProxyMCPAudience == other {
@@ -218,11 +230,12 @@ func TestTheBrokerFenceAdmitsTheMCPPodOnlyUnderTheFlag(t *testing.T) {
 func TestTheReservedListNamesTheMCPBrokerVariables(t *testing.T) {
 	merged := mergeCredentialProxyEnv(nil, []corev1.EnvVar{
 		{Name: "CREDENTIAL_PROXY_MCP_AUDIENCE", Value: "kubeagents-credential-proxy"},
+		{Name: "CREDENTIAL_PROXY_MCP_CALLERS", Value: "system:serviceaccount:ns:theirs"},
 		{Name: "A2A_MCP_BROKER_URL", Value: "http://theirs"},
 		{Name: "A2A_MCP_BROKER_TOKEN_FILE", Value: "/tmp/theirs"},
 		{Name: "HARMLESS_PLUGIN_SETTING", Value: "kept"},
 	})
-	for _, name := range []string{"CREDENTIAL_PROXY_MCP_AUDIENCE", "A2A_MCP_BROKER_URL", "A2A_MCP_BROKER_TOKEN_FILE"} {
+	for _, name := range []string{"CREDENTIAL_PROXY_MCP_AUDIENCE", "CREDENTIAL_PROXY_MCP_CALLERS", "A2A_MCP_BROKER_URL", "A2A_MCP_BROKER_TOKEN_FILE"} {
 		if _, count := envValueCount(merged, name); count != 0 {
 			t.Errorf("%s survived the merge from spec.deployment.env", name)
 		}

@@ -12130,6 +12130,114 @@ class BuildAuthenticatorTest(unittest.TestCase):
         self.assertTrue(any("CREDENTIAL_PROXY_SESSION_CALLERS" in line for line in logs.output))
 
 
+class MCPCallerBindingTest(unittest.TestCase):
+    """The mcp role is bound to the MCP pod's ServiceAccount in both directions.
+
+    The session binding's shape (SessionCallerBindingTest), with one
+    difference: no mcp callers named means the mcp audience confers nothing,
+    rather than the audience alone deciding.
+    """
+
+    SHELL = "kubeagents-credential-proxy"
+    CHAT = "kubeagents-credential-proxy-chat"
+    WATCHER = "kubeagents-credential-proxy-watcher"
+    MCP = "kubeagents-credential-proxy-mcp"
+    AGENT = "system:serviceaccount:kubeagents-system:agent"
+    MCP_SA = "system:serviceaccount:kubeagents-system:agent-a2a-mcp"
+
+    def _authenticator(self, mcp_callers=frozenset({MCP_SA})):
+        return credential_proxy.ServiceAccountAuthenticator(
+            audience_roles={
+                self.SHELL: credential_proxy.CALLER_ROLE_SHELL,
+                self.CHAT: credential_proxy.CALLER_ROLE_CHAT,
+                self.WATCHER: credential_proxy.CALLER_ROLE_WATCHER,
+                self.MCP: credential_proxy.CALLER_ROLE_MCP,
+            },
+            allowed_callers=frozenset({self.AGENT, self.MCP_SA}),
+            mcp_callers=mcp_callers,
+            api_host="10.0.0.1",
+            api_port="443",
+            ca_file="",
+            token_file="/nonexistent",
+            cache_seconds=0.0,
+        )
+
+    def _review(self, username, audience):
+        return {
+            "status": {
+                "authenticated": True,
+                "audiences": [audience],
+                "user": {"username": username, "uid": "sa-uid", "groups": []},
+            }
+        }
+
+    def test_an_mcp_caller_presenting_any_other_audience_is_refused(self):
+        for audience in (self.SHELL, self.CHAT, self.WATCHER):
+            with self.subTest(audience=audience):
+                with self.assertRaisesRegex(
+                    credential_proxy.AuthenticationError, "only the mcp audience"
+                ):
+                    self._authenticator()._principal_from(self._review(self.MCP_SA, audience))
+
+    def test_an_mcp_caller_presenting_the_mcp_audience_is_the_mcp_role(self):
+        principal = self._authenticator()._principal_from(self._review(self.MCP_SA, self.MCP))
+        self.assertEqual(credential_proxy.CALLER_ROLE_MCP, principal.role)
+
+    def test_another_caller_presenting_the_mcp_audience_is_refused(self):
+        with self.assertRaisesRegex(
+            credential_proxy.AuthenticationError, "only for mcp callers"
+        ):
+            self._authenticator()._principal_from(self._review(self.AGENT, self.MCP))
+
+    def test_the_shell_caller_keeps_the_shell_role(self):
+        principal = self._authenticator()._principal_from(self._review(self.AGENT, self.SHELL))
+        self.assertEqual(credential_proxy.CALLER_ROLE_SHELL, principal.role)
+
+    def test_with_no_mcp_callers_named_the_mcp_audience_confers_nothing(self):
+        # Not the session binding's upgrade case: no operator renders the mcp
+        # audience without its callers, so unset is "never conferred".
+        for caller in (self.AGENT, self.MCP_SA):
+            with self.subTest(caller=caller):
+                with self.assertRaisesRegex(
+                    credential_proxy.AuthenticationError, "only for mcp callers"
+                ):
+                    self._authenticator(frozenset())._principal_from(self._review(caller, self.MCP))
+
+    def test_the_mcp_callers_are_read_from_the_environment(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": f"{self.AGENT},{self.MCP_SA}",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            "CREDENTIAL_PROXY_MCP_AUDIENCE": "aud-mcp",
+            "CREDENTIAL_PROXY_MCP_CALLERS": f" {self.MCP_SA} , ",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(frozenset({self.MCP_SA}), authenticator.mcp_callers)
+        # And the binding holds end to end through the built authenticator.
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator._principal_from(
+                self._review(self.MCP_SA, credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE)
+            )
+        with self.assertRaises(credential_proxy.AuthenticationError):
+            authenticator._principal_from(self._review(self.AGENT, "aud-mcp"))
+
+    def test_an_mcp_audience_without_mcp_callers_warns(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": self.AGENT,
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            "CREDENTIAL_PROXY_MCP_AUDIENCE": "aud-mcp",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(frozenset(), authenticator.mcp_callers)
+        self.assertTrue(any("CREDENTIAL_PROXY_MCP_CALLERS" in line for line in logs.output))
+
+
 class MCPAudienceTest(unittest.TestCase):
     """The A2A MCP server's audience, and the role it alone confers.
 
@@ -12163,13 +12271,23 @@ class MCPAudienceTest(unittest.TestCase):
         )
 
     def test_a_token_validated_for_the_mcp_audience_is_the_mcp_role(self):
-        authenticator = self._build(
-            CREDENTIAL_PROXY_CHAT_AUDIENCE="aud-chat", CREDENTIAL_PROXY_MCP_AUDIENCE="aud-mcp"
-        )
+        mcp = "system:serviceaccount:ns:agent-a2a-mcp"
+        with mock.patch.dict(
+            os.environ,
+            {
+                **self.BASE,
+                "CREDENTIAL_PROXY_ALLOWED_CALLERS": f"system:serviceaccount:ns:agent,{mcp}",
+                "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+                "CREDENTIAL_PROXY_MCP_AUDIENCE": "aud-mcp",
+                "CREDENTIAL_PROXY_MCP_CALLERS": mcp,
+            },
+            clear=True,
+        ):
+            authenticator = credential_proxy.build_authenticator()
         status = {
             "authenticated": True,
             "audiences": ["aud-mcp"],
-            "user": {"username": "system:serviceaccount:ns:agent", "uid": "u", "groups": []},
+            "user": {"username": mcp, "uid": "u", "groups": []},
         }
         self.assertEqual(
             credential_proxy.CALLER_ROLE_MCP, authenticator._principal_from({"status": status}).role

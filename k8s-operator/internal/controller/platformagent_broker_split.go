@@ -233,6 +233,8 @@ func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent) string {
 	}
 	// The MCP server's own ServiceAccount, under its flag
 	// (a2aMCPBrokerEnabled), never the namespace default it ran as before.
+	// Held to the mcp role by CREDENTIAL_PROXY_MCP_CALLERS, which
+	// a2aMCPBrokerEnv renders beside it, the same way the session caller is.
 	if a2aMCPBrokerEnabled(agent) {
 		callers = append(callers, a2aMCPBrokerCaller(agent))
 	}

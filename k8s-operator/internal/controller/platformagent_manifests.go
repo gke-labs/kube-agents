@@ -4601,6 +4601,9 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// at all; reserved here as well so no broker-side container can be
 		// handed a name the MCP client reads.
 		credentialProxyMCPAudienceEnvVar,
+		// And one that could set the MCP callers could unbind the MCP
+		// ServiceAccount from its audience, or bind another to it.
+		credentialProxyMCPCallersEnvVar,
 		a2aMCPBrokerURLEnvVar,
 		a2aMCPBrokerTokenFileEnvVar,
 		// One that could set the watcher audience would decide who holds the
