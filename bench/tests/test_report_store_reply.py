@@ -34,7 +34,7 @@ import pytest
 import yaml
 
 from kube_agents_bench import onboarding, report_store_reply, transcript
-from kube_agents_bench.report_store_reply import ReportStoreReplyVerifier, mentioned_audits
+from kube_agents_bench.report_store_reply import ReportStoreReplyVerifier, cites, mentioned_audits
 
 REPO = Path(__file__).resolve().parents[2]
 SCRIPTS = REPO / "agents" / "platform" / "skills" / "fleet-audit" / "scripts"
@@ -134,6 +134,24 @@ def test_a_url_counts_wherever_the_reply_puts_it(root):
         f"| Security | {URL_COMPLIANCE} |\n| Cost | {URL_COST} |\n"
     )
     assert _verify(reply).status == "pass"
+
+
+def test_a_gitlab_work_item_url_is_cited_as_the_store_holds_it(root):
+    url = "https://gitlab.com/acme/platform/gitops/-/work_items/4"
+    _write(COMPLIANCE, issue_url=url, issue_number=4, written=BEFORE, repo="gitlab.com/acme/platform/gitops")
+    assert _verify(f"compliance-audit: UPDATED, ledger {url}", audits=(COMPLIANCE,)).status == "pass"
+    assert _verify("compliance-audit: UPDATED.", audits=(COMPLIANCE,)).status == "fail"
+
+
+def test_a_trailing_slash_or_fragment_after_the_url_still_cites_it(root):
+    _write(COMPLIANCE, issue_url=URL_COMPLIANCE, issue_number=12, written=BEFORE)
+    for tail in ("/", "/#issuecomment-1", ")", "."):
+        assert _verify(f"compliance-audit: {URL_COMPLIANCE}{tail}", audits=(COMPLIANCE,)).status == "pass", tail
+
+
+def test_a_longer_issue_number_does_not_cite_a_shorter_one():
+    assert not cites("see https://github.com/acme/gitops/issues/120", "https://github.com/acme/gitops/issues/12")
+    assert cites("see HTTPS://GitHub.com/Acme/GitOps/issues/12/", "https://github.com/acme/gitops/issues/12")
 
 
 def test_an_audit_the_reply_never_mentions_fails(root):
@@ -275,6 +293,10 @@ def test_a_reader_the_agent_container_does_not_give_is_an_error(root, monkeypatc
 def test_an_id_is_mentioned_in_any_case_and_with_any_separators():
     reply = "Fleet wide cost analysis: fine. COMPLIANCE_AUDIT: fine."
     assert mentioned_audits(reply, [COMPLIANCE, COST]) == {COMPLIANCE, COST}
+
+
+def test_underscore_emphasis_around_an_id_is_still_a_mention():
+    assert mentioned_audits("_compliance-audit_: UPDATED", [COMPLIANCE]) == {COMPLIANCE}
 
 
 def test_an_id_inside_a_longer_name_is_not_a_mention():

@@ -74,8 +74,11 @@ from kube_agents_bench.verifiers import (
 READER_PATH = "/opt/platform-template/skills/fleet-audit/scripts/report_status.py"
 READER_READ = "__REPORT_STATUS_SOURCE__"
 STORE_READ = "__REPORT_STORE_REPLY__"
-# A ledger issue's URL on any forge: GitHub's /issues/<n>, GitLab's /-/issues/<n>.
-ISSUE_URL_RE = re.compile(r"https?://[^\s<>()\[\]|\"'`]+?/issues/\d+(?![\d/])")
+# A reply cites a stored ledger URL when the URL appears in it with no digit right after, so
+# /issues/12 is not found inside /issues/120. Nothing else about the URL's shape is read here: the
+# store holds whatever the forge handed back (GitHub's /issues/<n>, GitLab's /-/work_items/<n>), and
+# a reply may add a trailing slash or a fragment.
+CITATION_SUFFIX = r"(?!\d)"
 
 # Runs report_status.py's helpers under a module name that is not __main__, so its CLI does not
 # run, then prints, per audit and repository, the envelopes the check needs: every file's write
@@ -188,13 +191,20 @@ def sandbox_pod_exists(timeout: float) -> bool | None:
 
 
 def _mention_re(audit: str) -> re.Pattern[str]:
-    """The audit's id, case-insensitive, with any run of `-`, `_` or spaces between its words."""
+    """The audit's id, case-insensitive, with any run of `-`, `_` or spaces between its words.
+
+    The boundary is a letter, digit or hyphen, not the word class: `_` is a Markdown emphasis mark, so
+    `_compliance-audit_` is a mention and `security-patch-orchestrator-v2` is not.
+    """
     words = audit.split("-")
-    return re.compile(r"(?<![\w-])" + r"[-_\s]+".join(map(re.escape, words)) + r"(?![\w-])", re.IGNORECASE)
+    return re.compile(
+        r"(?<![A-Za-z0-9-])" + r"[-_\s]+".join(map(re.escape, words)) + r"(?![A-Za-z0-9-])", re.IGNORECASE
+    )
 
 
-def _normalize(url: str) -> str:
-    return url.rstrip(".,;:!?*_~").lower()
+def cites(reply: str, url: str) -> bool:
+    """True when ``reply`` carries ``url`` (case-insensitive, a trailing slash on either side ignored)."""
+    return re.search(re.escape(url.rstrip("/")) + CITATION_SUFFIX, reply, re.IGNORECASE) is not None
 
 
 def mentioned_audits(reply: str, audits: list[str]) -> set[str]:
@@ -248,24 +258,23 @@ class ReportStoreReplyVerifier(_OnboardingPollVerifier):
                 return "error", f"{audit}: an envelope has no issue_url key", {"store": store}
             accepted[audit] = repos
         urls = {
-            audit: {_normalize(str(row["issue_url"])) for rows in repos.values() for row in rows if row.get("issue_url")}
+            audit: {str(row["issue_url"]) for rows in repos.values() for row in rows if row.get("issue_url")}
             for audit, repos in accepted.items()
         }
         reply = snap.final_message or ""
-        in_reply = {_normalize(m.group(0)) for m in ISSUE_URL_RE.finditer(reply)}
         mentioned = mentioned_audits(reply, audits)
         failures = []
         for audit in audits:
             if audit not in mentioned:
                 failures.append(f"{audit}: the reply does not mention it")
                 continue
-            if in_reply & urls[audit]:
+            if any(cites(reply, url) for url in urls[audit]):
                 continue
             # A repository whose newest envelope before the turn has a ledger, and that wrote no
             # envelope without one since, needs that ledger: a null one in another repository's
             # store does not stand in for it.
             needed = {
-                _normalize(str(row["issue_url"]))
+                str(row["issue_url"])
                 for rows in accepted[audit].values()
                 if any(row["before"] and row.get("issue_url") for row in rows)
                 and not any(row.get("issue_url") is None for row in rows)
@@ -275,7 +284,7 @@ class ReportStoreReplyVerifier(_OnboardingPollVerifier):
             if needed:
                 expected = sorted(needed)[:REASON_URLS_SHOWN]
                 failures.append(f"{audit}: no ledger URL of its latest report; expected one of {expected}")
-        raw = {"accepted": accepted, "urls_in_reply": sorted(in_reply)}
+        raw = {"accepted": accepted}
         if failures:
             return "fail", "; ".join(failures), raw
         return "pass", f"each of the {len(audits)} audits has its latest report from the store", raw
