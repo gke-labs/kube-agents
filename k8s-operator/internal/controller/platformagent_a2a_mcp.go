@@ -87,6 +87,11 @@ const (
 	a2aMCPReadinessFailure = 3
 	a2aMCPLivenessPeriod   = 10
 	a2aMCPLivenessFailure  = 6
+	// The startup probe holds liveness off while the server retries its
+	// first connect to the bus (five minutes), which on a fresh install
+	// comes up after this pod.
+	a2aMCPStartupPeriod  = 5
+	a2aMCPStartupFailure = 60
 
 	// Sized like the console: GKE Autopilot raises a CPU request under 50m.
 	a2aMCPCPURequest    = "50m"
@@ -226,6 +231,7 @@ func buildA2AMCPDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploymen
 						},
 						// /healthz is unauthenticated and says nothing but
 						// that the process serves.
+						StartupProbe:   probe(a2aMCPStartupPeriod, a2aMCPStartupFailure),
 						ReadinessProbe: probe(a2aMCPReadinessPeriod, a2aMCPReadinessFailure),
 						LivenessProbe:  probe(a2aMCPLivenessPeriod, a2aMCPLivenessFailure),
 						Resources: corev1.ResourceRequirements{

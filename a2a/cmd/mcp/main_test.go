@@ -1,9 +1,14 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func env(m map[string]string) func(string) string {
@@ -67,5 +72,28 @@ func TestConfigFromEnvRefusesToStartWithoutWhatItNeeds(t *testing.T) {
 				t.Errorf("started with %s", name)
 			}
 		})
+	}
+}
+
+// The first connect is retried until it succeeds, not given up on: on a fresh
+// install the bus comes up after this pod.
+func TestTheFirstDialIsRetried(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	calls := 0
+	got, err := dialWithRetry(context.Background(), log, time.Millisecond, func(context.Context) (string, error) {
+		if calls++; calls < 3 {
+			return "", errors.New("connection refused")
+		}
+		return "bus", nil
+	})
+	if err != nil || got != "bus" || calls != 3 {
+		t.Fatalf("got %q, %v after %d calls; want the bus on the third", got, err, calls)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := dialWithRetry(ctx, log, time.Millisecond, func(context.Context) (string, error) {
+		return "", errors.New("connection refused")
+	}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("a dial that never succeeds ended with %v, want the context's end", err)
 	}
 }

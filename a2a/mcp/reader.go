@@ -66,6 +66,12 @@ func (b *NATSBus) drainConsumer(ctx context.Context, s jetstream.Stream, cfg jet
 			break
 		}
 	}
+	// A fetch that came back empty with messages still to read is a read
+	// that stalled, not an empty stream: say so rather than report what
+	// was read as all there is.
+	if seen < want {
+		return int(seen), fmt.Errorf("read %d of %d pending messages before a fetch came back empty", seen, want)
+	}
 	if pending > want {
 		return int(seen), fmt.Errorf("more than %d messages to read; read the first %d", limit, limit)
 	}
