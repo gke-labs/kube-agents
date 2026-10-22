@@ -9,7 +9,9 @@ project access token, or, on gitlab.com's Free tier where those do not exist,
 a personal access token of an account that exists for this install. The
 mechanism is the same for all three; what differs is how far the token
 reaches, which is why `allowed_paths` is enforced here before a credential is
-spent and the broker's managed list is enforced before that.
+spent and the broker's managed list is enforced before that. A second,
+read-only token in the same Secret, when there is one, is what a context
+repository clones with (`read_credential`).
 
 What GitLab's API does differently from the shapes every caller expects, and
 where it is absorbed:
@@ -34,7 +36,7 @@ from urllib.parse import quote
 import repo_ref
 
 from ..base import COLLABORATION_VERBS, Forge, WorkspaceError, listing
-from ..credentials import StaticFileCredential
+from ..credentials import Credential, NoCredential, StaticFileCredential
 from ..validate import (
     MAX_CONVERSATION_SIZE,
     MAX_PAGE_SIZE,
@@ -58,6 +60,9 @@ DEVELOPER_ACCESS = 30
 #: The username git is given beside the token. GitLab reads the token and
 #: accepts any non-empty username for an access token over HTTPS.
 GIT_USERNAME = "oauth2"
+
+#: The header GitLab's API reads an access token from.
+TOKEN_HEADER = "PRIVATE-TOKEN"
 
 #: The colour a label is created with when the caller names none. GitLab
 #: requires one; GitHub picks one itself.
@@ -108,6 +113,7 @@ class GitLabForge(Forge):
     transport = "http"
     error_overrides = ERROR_OVERRIDES
     acknowledges = True
+    labels = True
     whoami_route = ("user", "username")
     # What an install that has not configured GitLab answers for gitlab.com: a
     # named gap rather than "not a forge this install serves".
@@ -125,6 +131,7 @@ class GitLabForge(Forge):
         allowed_paths: Iterable[str] = (),
         ca_file: str = "",
         ca_source: str = "",
+        read_token_path: str = "",
     ) -> None:
         super().__init__()
         # gitlab.com presents a certificate the public CAs sign, and a private
@@ -140,9 +147,12 @@ class GitLabForge(Forge):
         # are built from it.
         self.hosts = (host, "www.gitlab.com") if host == "gitlab.com" else (host,)
         self.api_url = f"https://{host}/api/v4"
-        self.credential = StaticFileCredential(
-            token_path, host, header="PRIVATE-TOKEN", username=GIT_USERNAME
-        )
+        self.credential = self._stored(token_path)
+        self.read_token_path = read_token_path
+        if read_token_path:
+            # Built once here, so a path git may not be handed stops the build
+            # as a bad tokenPath does, and not the first context clone.
+            self._stored(read_token_path)
         prefixes = []
         for path in allowed_paths:
             trimmed = path.strip("/")
@@ -156,6 +166,12 @@ class GitLabForge(Forge):
                 )
             prefixes.append(self._prefix(host, path, trimmed))
         self.allowed_paths = tuple(prefixes)
+
+    def _stored(self, token_path: str) -> StaticFileCredential:
+        """A token file on this host, as git and the API are handed it."""
+        return StaticFileCredential(
+            token_path, self.hosts[0], header=TOKEN_HEADER, username=GIT_USERNAME
+        )
 
     @staticmethod
     def _prefix(host: str, path: str, trimmed: str) -> tuple[str, ...]:
@@ -228,9 +244,30 @@ class GitLabForge(Forge):
                     allowed,
                     str(entry.get("ca_file") or ""),
                     str(entry.get("ca_source") or ""),
+                    str(entry.get("read_token_path") or ""),
                 )
             )
         return tuple(built)
+
+    def read_credential(self, repo: str) -> Credential:
+        """The read-only token stored beside the write one, for one clone.
+
+        The optional key `read-token` in the forge's credentials Secret, which
+        the operator projects next to `token`. The file is checked on each
+        call: a Secret without the key mounts no file, and a key added later
+        appears with no restart. With no file, an empty one, or one that
+        does not hold a token, there is nothing to present, and a context repository clones with no
+        credential, as it did before the key existed. Never the write token:
+        `credential` is a different file.
+        """
+        if not self.read_token_path:
+            return NoCredential()
+        credential = self._stored(self.read_token_path)
+        # The credential's own rule, the one the git helper applies: a token
+        # with a space, a byte-order mark or a second line is no token.
+        if not credential.holds_token():
+            return NoCredential()
+        return credential
 
     #: How many pages of the token account's projects `reach` reads: enough
     #: for an account that belongs to a thousand projects, which is already the

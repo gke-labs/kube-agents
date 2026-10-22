@@ -476,7 +476,7 @@ func TestGatewayConsumersSurviveABusRestart(t *testing.T) {
 	// The lib's reconnect posture (MaxReconnects -1), with a short wait so
 	// the test is not paced by backoff.
 	reconnected := make(chan struct{}, 4)
-	gateway, err := nats.Connect(url,
+	gateway, err := nats.Connect(url, a2aTestBusTLS(t),
 		nats.UserInfo("gateway", gatewayPW), nats.CustomInboxPrefix("_INBOX.gateway"), nats.Name("gateway"),
 		nats.MaxReconnects(-1), nats.ReconnectWait(200*time.Millisecond),
 		nats.ReconnectHandler(func(*nats.Conn) { reconnected <- struct{}{} }),
@@ -532,7 +532,7 @@ func TestGatewayConsumersSurviveABusRestart(t *testing.T) {
 
 	eventAsBridge := func(body string) {
 		t.Helper()
-		nc, err := nats.Connect(url, nats.UserInfo("bridge", bridgePW), nats.CustomInboxPrefix("_INBOX.bridge"))
+		nc, err := nats.Connect(url, a2aTestBusTLS(t), nats.UserInfo("bridge", bridgePW), nats.CustomInboxPrefix("_INBOX.bridge"))
 		if err != nil {
 			t.Fatal(err)
 		}

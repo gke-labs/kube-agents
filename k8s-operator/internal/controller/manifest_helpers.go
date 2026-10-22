@@ -69,6 +69,20 @@ const (
 
 	defaultSurgePercent = "25%"
 
+	// supportedGatewayReplicas is the most replicas the operator runs the
+	// gateway at. spec.deployment.availability.replicas above it is rendered
+	// at this count, with the ReplicasLimited condition saying so, because a
+	// multi-replica gateway does not start today. Above one replica the
+	// platform-agent container runs leader_elect.py, which loads an in-cluster
+	// ServiceAccount token that container deliberately does not have (the Pod
+	// sets automountServiceAccountToken: false and only agent-api-auth mounts
+	// one), so it exits at startup. And the data volumes an install creates at
+	// one replica are ReadWriteOnce, so a replica scheduled on another node
+	// never attaches them. A cap rather than an admission refusal so an install
+	// that already applied a higher count keeps reconciling; the redesign is
+	// gke-labs/kube-agents#3016.
+	supportedGatewayReplicas = int32(1)
+
 	// fieldOwner identifies this controller in Server-Side Apply managedFields.
 	fieldOwner = "platformagent-controller"
 
@@ -442,62 +456,90 @@ func mergeAnnotations(defaults map[string]string, custom map[string]string) map[
 	return merged
 }
 
+// requestedGatewayReplicas is spec.deployment.availability.replicas as the
+// author wrote it, or 1 when it is unset. It is what the spec asks for, not
+// what the operator renders; resolveDeploymentReplicasAndStrategy caps it.
+func requestedGatewayReplicas(deployment *agentv1alpha1.DeploymentSpec) int32 {
+	if deployment != nil && deployment.Availability != nil && deployment.Availability.Replicas != nil {
+		return *deployment.Availability.Replicas
+	}
+	return 1
+}
+
+// gatewayReplicasCapped reports whether the spec asks for more gateway
+// replicas than supportedGatewayReplicas, and so is rendered at fewer than it
+// asks for. The ReplicasLimited condition and its log line key on it.
+func gatewayReplicasCapped(deployment *agentv1alpha1.DeploymentSpec) bool {
+	return requestedGatewayReplicas(deployment) > supportedGatewayReplicas
+}
+
 // resolveDeploymentReplicasAndStrategy determines the replica count and deployment strategy
 // based on Availability and ScaleToZero settings in the DeploymentSpec.
+//
+// The requested count is capped at supportedGatewayReplicas before anything
+// else reads it. Every replica-dependent part of the render (the leader_elect.py
+// args and LEADER_ELECTION env, the RollingUpdate strategy, the is-leader
+// Service selector, the leader Role's pods get/patch rule, the RWX default
+// storage and the StatefulSet switch over RWO custom storage) asks this
+// function, so capping here renders exactly the single-replica shape. See
+// supportedGatewayReplicas for why.
 func resolveDeploymentReplicasAndStrategy(deployment *agentv1alpha1.DeploymentSpec) (int32, appsv1.DeploymentStrategy) {
-	replicas := int32(1)
+	if deployment == nil {
+		return replicasAndStrategyFor(1, false)
+	}
+	scaleToZero := deployment.ScaleToZero != nil && *deployment.ScaleToZero
+	return replicasAndStrategyFor(min(requestedGatewayReplicas(deployment), supportedGatewayReplicas), scaleToZero)
+}
+
+// replicasAndStrategyFor is the replica count and strategy for a gateway meant
+// to run at intendedReplicas. Above one replica it returns the RollingUpdate
+// shape, which no caller reaches while supportedGatewayReplicas is 1; it stays
+// here, with its tests, for the multi-replica redesign to pick up.
+func replicasAndStrategyFor(intendedReplicas int32, scaleToZero bool) (int32, appsv1.DeploymentStrategy) {
+	replicas := intendedReplicas
 	strategy := appsv1.DeploymentStrategy{
 		Type: appsv1.RecreateDeploymentStrategyType,
 	}
+	if scaleToZero {
+		replicas = 0
+	}
 
-	if deployment != nil {
-		intendedReplicas := int32(1)
-		if deployment.Availability != nil && deployment.Availability.Replicas != nil {
-			intendedReplicas = *deployment.Availability.Replicas
+	if intendedReplicas > 1 {
+		// maxUnavailable is resolved here rather than handed to Kubernetes as a
+		// percentage, and it never lands below 1. Kubernetes rounds a maxSurge
+		// percentage up and a maxUnavailable percentage down, so
+		// defaultSurgePercent on both sides rendered maxSurge 1 /
+		// maxUnavailable 0 at 2 and 3 replicas — the shape that cannot roll at
+		// all under a namespace ResourceQuota with no room for one more gateway
+		// Pod. The old ReplicaSet may not shrink, the surge Pod is refused with
+		// FailedCreate, and the rollout stalls until progressDeadlineSeconds,
+		// including the rollout carrying the fix for whatever prompted it
+		// (#749).
+		//
+		// Scaling defaultSurgePercent rather than hard-coding its arithmetic
+		// keeps one source for the percentage: change the constant and both
+		// sides move together. roundUp=false is what Kubernetes itself would
+		// have applied; the floor is the only added behaviour, and it binds
+		// only at 2 and 3 replicas, where the percentage had no representable
+		// answer other than "make no progress".
+		// An error here means defaultSurgePercent is not a parseable
+		// percentage, which is a constant in this file rather than input; the
+		// floor below then supplies 1 and the rollout still makes progress.
+		scaled, err := intstr.GetScaledValueFromIntOrPercent(
+			ptr.To(intstr.FromString(defaultSurgePercent)), int(intendedReplicas), false)
+		if err != nil {
+			scaled = 0
 		}
-
-		replicas = intendedReplicas
-		if deployment.ScaleToZero != nil && *deployment.ScaleToZero {
-			replicas = 0
+		maxUnavailable := int32(scaled) // #nosec G115 -- bounded by intendedReplicas
+		if maxUnavailable < 1 {
+			maxUnavailable = 1
 		}
-
-		if intendedReplicas > 1 {
-			// maxUnavailable is resolved here rather than handed to Kubernetes as a
-			// percentage, and it never lands below 1. Kubernetes rounds a maxSurge
-			// percentage up and a maxUnavailable percentage down, so
-			// defaultSurgePercent on both sides rendered maxSurge 1 /
-			// maxUnavailable 0 at 2 and 3 replicas — the shape that cannot roll at
-			// all under a namespace ResourceQuota with no room for one more gateway
-			// Pod. The old ReplicaSet may not shrink, the surge Pod is refused with
-			// FailedCreate, and the rollout stalls until progressDeadlineSeconds,
-			// including the rollout carrying the fix for whatever prompted it
-			// (#749).
-			//
-			// Scaling defaultSurgePercent rather than hard-coding its arithmetic
-			// keeps one source for the percentage: change the constant and both
-			// sides move together. roundUp=false is what Kubernetes itself would
-			// have applied; the floor is the only added behaviour, and it binds
-			// only at 2 and 3 replicas, where the percentage had no representable
-			// answer other than "make no progress".
-			// An error here means defaultSurgePercent is not a parseable
-			// percentage, which is a constant in this file rather than input; the
-			// floor below then supplies 1 and the rollout still makes progress.
-			scaled, err := intstr.GetScaledValueFromIntOrPercent(
-				ptr.To(intstr.FromString(defaultSurgePercent)), int(intendedReplicas), false)
-			if err != nil {
-				scaled = 0
-			}
-			maxUnavailable := int32(scaled) // #nosec G115 -- bounded by intendedReplicas
-			if maxUnavailable < 1 {
-				maxUnavailable = 1
-			}
-			strategy = appsv1.DeploymentStrategy{
-				Type: appsv1.RollingUpdateDeploymentStrategyType,
-				RollingUpdate: &appsv1.RollingUpdateDeployment{
-					MaxSurge:       &intstr.IntOrString{Type: intstr.String, StrVal: defaultSurgePercent},
-					MaxUnavailable: &intstr.IntOrString{Type: intstr.Int, IntVal: maxUnavailable},
-				},
-			}
+		strategy = appsv1.DeploymentStrategy{
+			Type: appsv1.RollingUpdateDeploymentStrategyType,
+			RollingUpdate: &appsv1.RollingUpdateDeployment{
+				MaxSurge:       &intstr.IntOrString{Type: intstr.String, StrVal: defaultSurgePercent},
+				MaxUnavailable: &intstr.IntOrString{Type: intstr.Int, IntVal: maxUnavailable},
+			},
 		}
 	}
 	return replicas, strategy

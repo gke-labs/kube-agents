@@ -5,11 +5,13 @@
 #
 # PLATFORM_AGENT_MODE is the install.env key the install's --mode flag reads
 # and records, so the release path spells it the same way, and an exported
-# `next` reaches install.sh as well. Unset or `today` is the default and changes nothing:
+# `next` reaches install.sh as well. Unset or `today` is the default:
 # platform_agent_mode_resolve unsets the variable, so a release script and
-# everything it runs see exactly the environment they saw before the mode
-# existed, and render_install_env.sh writes no key for it (an absent spec.mode
-# is `today` to the CRD). Only `next` adds anything.
+# everything it runs see the environment they saw before the mode existed,
+# and render_install_env.sh writes no key for it (an absent spec.mode is
+# `today` to the CRD). provision_environment.sh still names the mode to
+# install.sh with --mode, whose own first-install default is `next`. Only
+# `next` adds a patch and a gate.
 #
 # `next` is for the ephemeral rc and nightly clusters only.
 # platform_agent_mode_refuse_long_lived says why.

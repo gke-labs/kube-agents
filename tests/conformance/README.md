@@ -68,7 +68,7 @@ ownership check, and pinning it would have encoded that gap as an intention.
 
 ## Known violations are expected failures
 
-Eleven assertions currently fail. They are decorated `@known_violation`, which
+Ten assertions currently fail. They are decorated `@known_violation`, which
 is `unittest.expectedFailure` plus a registration, so CI is green and the gap
 still has a name, a line number and a citation. Fixing the control turns the
 expected failure into an _unexpected success_, which unittest reports as a
@@ -161,6 +161,7 @@ currently fails.
 | A3  | the executor's derived grant does not reach its own `…in`                                 | 1        | `test_A3_the_executors_grant_does_not_reach_its_own_in_subject`                                     | the per-task wildcard `a2a.tasks.{addressee}.{taskId}.>`, which lets a worker steer and cancel itself as if from the user                                                                                                                                |
 | A3  | `…events` has no rendered writer (the executor's is derived)                              | 1        | `test_A3_the_events_subject_has_no_rendered_writer`                                                 | static `worker` held `a2a.tasks.*.*.events` for every addressee (gke-labs/kube-agents#1316). Closed by A5: the static half is `bridge`, whose grant names one addressee literally, and the callout half is `agent`, which holds no task-plane publish    |
 | A3  | the chat.notify subject has one writer, its reply namespace one                           | 1        | `test_A3_a_notify_has_one_writer_and_its_answer_has_one`                                            | a second principal able to make the install's bot speak in the home channel, or anyone, the agent included, forging the gateway's answer on where a post landed                                                                                          |
+| A3  | the chat.board subject has one writer, its reply namespace one                            | 1        | `test_A3_a_board_request_has_one_writer_and_its_answer_has_one`                                     | a second principal putting words on an admitted member's Home tab, or making the bridge read session-kv for it                                                                                                                                           |
 | A4  | the operator cannot escalate its own grants                                               | 1        | `test_A4_the_operator_cannot_escalate_its_own_grants`                                               | a controller with RBAC CRUD and `escalate` makes every ceiling advisory                                                                                                                                                                                  |
 | A4  | the chart grants the same ceiling as the kustomize role                                   | 1        | `test_A4_the_chart_grants_the_same_ceiling_as_the_kustomize_role`                                   | a ceiling asserted on one install path only                                                                                                                                                                                                              |
 | A4  | triggering is delegation                                                                  | 1        | `test_A4_triggering_is_covered_by_the_A3_inject_finding`                                            | see A3 above — the one instance in this codebase                                                                                                                                                                                                         |
@@ -178,7 +179,7 @@ currently fails.
 | B1  | only the gateway reaches the MCP relay                                                    | 1        | `test_B1_only_the_gateway_reaches_the_mcp_relay`                                                    | the shell sandbox or a session pod gaining a GKE read path through the relay                                                                                                                                                                             |
 | B1  | the operator's relay URL is the route the policy guards                                   | 1        | `test_B1_the_operator_points_the_relay_url_at_the_brokers_mcp_route`                                | the route renamed on one side, leaving every `gke` call failing with no policy refusal to read                                                                                                                                                           |
 | B2  | no workflow approves or merges a pull request                                             | 1        | `test_B2_no_workflow_approves_or_merges_a_pull_request`                                             | a model verdict causing a merge                                                                                                                                                                                                                          |
-| B2  | `pull-requests: write` has exactly six holders                                            | 1        | `test_B2_no_workflow_grants_a_bot_the_ability_to_approve`                                           | —                                                                                                                                                                                                                                                        |
+| B2  | `pull-requests: write` has exactly eight holders                                          | 1        | `test_B2_no_workflow_grants_a_bot_the_ability_to_approve`                                           | —                                                                                                                                                                                                                                                        |
 | B2  | no script merges, bar the label-gated enqueue sweep                                       | 1        | `test_B2_no_script_merges_except_the_enqueue_sweep`                                                 | a merge call moved into a script the workflow scan cannot read                                                                                                                                                                                           |
 | B2  | the enqueue sweep assents only on `lgtm` + `approved`                                     | 1        | `test_B2_the_enqueue_sweep_assents_only_on_both_human_labels`                                       | a held or half-approved pull request enqueued                                                                                                                                                                                                            |
 | B2  | App-token write grants are pinned                                                         | 1        | `test_B2_app_token_write_grants_are_pinned`                                                         | a workflow minting Pull requests or Contents write that no `permissions:` block shows                                                                                                                                                                    |
@@ -203,7 +204,7 @@ currently fails.
 | C1  | the executor refuses an executable it does not ship                                       | 1        | `test_C1_the_executor_refuses_an_executable_it_does_not_ship`                                       | `sh -c` as the landing pad for the two above                                                                                                                                                                                                             |
 | C1  | `git` in the broker cannot execute arbitrary code                                         | 1        | `test_C1_git_in_the_broker_cannot_execute_arbitrary_code`                                           | **slice 2b 1.1, closed on main**: was `git -c protocol.ext.allow=always clone "ext::sh -c"` — RCE in the credential holder — until the git hardening landed                                                                                              |
 | C1  | the rendered egress policy is default-deny                                                | 1 **KV** | `test_C1_the_rendered_egress_policy_is_default_deny`                                                | **slice 2b 1.3, and back**: `0.0.0.0/0 except 169.254.169.254/32` adds the internet rather than subtracting the address — #676 gave the gateway policy exactly that rule, so this is a violation again                                                   |
-| C1  | the rendered egress policy reaches no metadata address                                    | 1 **KV** | `test_C1_the_rendered_egress_policy_reaches_no_metadata_address`                                    | a guard written against one of the three spellings; a violation again since #676 for the same reason as the row above                                                                                                                                    |
+| C1  | the rendered egress policy reaches no metadata address                                    | 1        | `test_C1_the_rendered_egress_policy_reaches_no_metadata_address`                                    | closed when the gateway lost its Workload Identity: its policy carries no metadata rule; a rule restored on 80 or 988 is the regression                                                                                                                  |
 | C1  | every operator-supplied CIDR reaches the refusal guards                                   | 1        | `test_C1_every_operator_supplied_cidr_reaches_the_refusal_guards`                                   | a new CRD field that accepts a CIDR and never calls the guard                                                                                                                                                                                            |
 | C1  | the gateway redactor matches the leaked credential shapes                                 | 1        | `test_C1_the_gateway_redactor_matches_the_leaked_credential_shapes`                                 | #603: a 200-character `ya29.` token, a projected-token JWT, an `AIza` key, a PEM block and a Secret `data:` block, each measured in the clear in a durable artifact; the gateway hook runs this module at egress                                         |
 | C1  | the gateway redactor leaves ordinary manifest content alone                               | 1        | `test_C1_the_gateway_redactor_leaves_ordinary_manifest_content_alone`                               | the over-eager redactor that eats every IAM principal and gets switched off — the service-account exemption's anchored lookahead is the control                                                                                                          |
@@ -241,6 +242,7 @@ currently fails.
 | C5  | the admission binding names a policy that exists                                          | 1        | `test_C5_the_admission_binding_names_a_policy_that_exists`                                          | **slice 2b 1.2**: `namePrefix` rewriting `metadata.name` and not `spec.policyName`                                                                                                                                                                       |
 | C5  | the admission policy fails closed                                                         | 1        | `test_C5_the_admission_policy_fails_closed`                                                         | `failurePolicy: Fail` → `Ignore`                                                                                                                                                                                                                         |
 | D1  | the exec route records a principal                                                        | 1        | `test_D1_the_exec_route_records_a_principal`                                                        | unattributed actions                                                                                                                                                                                                                                     |
+| D1  | every profile config enables the tool-call audit                                          | 1        | `test_D1_every_profile_records_its_tool_calls`                                                      | a profile whose terminal and `gke` MCP calls leave no record of what ran or for which task; the Cluster Agent template shipped that way                                                                                                                  |
 | D1  | a log hint cannot forge a record                                                          | 1        | `test_D1_a_log_hint_cannot_forge_a_record`                                                          | agent-controlled bytes in the audit trail                                                                                                                                                                                                                |
 | D1  | the refusal log hint names no caller-supplied value                                       | 1 **KV** | `test_D1_the_refusal_log_hint_names_no_caller_supplied_value`                                       | **new, found writing this suite** — `gcloud projects delete X` logs `projects.delete.X`. See `overnight-b/findings.md` 2.1                                                                                                                               |
 | D1  | a read through the agent names both principals                                            | 2        | `Scenario7AuditAttribution`                                                                         | the two-principal audit trail asserted rather than verified; how GKE represents `impersonatedUser` is undocumented                                                                                                                                       |
@@ -295,36 +297,28 @@ deleted with its suite byte-identical, and only a dedicated task caught it.
 how it stays true:
 
 ```
-python3 hack/conformance-mutations.py          # every mutation
+python3 hack/conformance-mutations.py            # every mutation
 python3 hack/conformance-mutations.py --list
-python3 hack/conformance-mutations.py -k C1    # substring filter on the id
+python3 hack/conformance-mutations.py --summary  # counts, nothing run
+python3 hack/conformance-mutations.py -k C1      # substring filter on the id
 ```
 
-115 mutations: 89 KILLED, 24 NOISY, two `must_survive` controls (one on the
-harness itself, one pinning a deliberate redundancy in the shorthand
-handling), zero genuine survivors, zero stale — measured 2026-09-25 against
-this branch on `main` at `525b37e7`, plus `A3-slack-click-authorization`,
-KILLED when it was added on 2026-09-30, `D1-platform-role-reaches-secrets`,
-KILLED when it was added on 2026-10-05, the four `C1-a2a-gateway-*` mutations and
-the three `B1-slack-*` mutations, all KILLED when they were added on 2026-10-06,
-`B1-slack-method-shape-dropped`, KILLED when it was added on 2026-10-07,
-`A3-agent-answers-its-own-notify` (KILLED) and
-`A3-bridge-sends-a-notify` (NOISY: it also trips the served-config precondition) when
-they were added on 2026-10-07, and `A3-session-sends-a-notify` (KILLED) on 2026-10-08, and
-`C4-skills-unchecked`, `C4-skills-check-silenced`, `C4-skills-check-skips-lock` and
-`C4-skills-make-noop`, all KILLED when they were added on 2026-10-07, and
-`C4-skills-check-blank-line-escape` and `C4-skills-check-comment-escape`, both KILLED when they were added on 2026-10-13, and
-`B2-script-merge`, `B2-enqueue-predicate-ignores-holds`,
-`B2-app-token-grants-pull-requests` and `B2-app-token-scopes-dropped`, all KILLED
-when they were added on 2026-10-13 and 2026-10-14;
-re-run the harness rather than trusting these numbers, which is the sentence this
-paragraph exists to make cheap.
-Note that the summary line the harness prints accounts for 113 of the 115: a
-`must_survive` control's verdict is `SURVIVED (expected)`, which is neither
-killed, noisy, nor a survivor. Each mutation names the control it removes,
+This page doesn't keep a count. `--summary` prints how many mutations there
+are and which are `must_survive` controls, straight from the table, and a full
+run ends with its own `killed= noisy= survived= stale=` line. Those last
+numbers are true only of the commit they ran on, so a pull request that runs
+the harness puts its result line in its own description. (Until #3553 this
+paragraph restated them by hand, and every pull request that added a mutation
+conflicted with every other one over it.) A full run's last line doesn't count
+a `must_survive` control that passes: its verdict is `SURVIVED (expected)`,
+which is neither killed, noisy nor a survivor. A control that goes red is
+`OVERSHOT` and counts as survived, and one whose anchor moved counts as stale. Each mutation names the control it removes,
 the test that must notice, and the plausible bad change it imitates. It is
 not run in CI — it edits tracked files in place — so it is a thing to run
-when adding a test, which step 4 below says to do.
+when adding a test, which step 4 below says to do. Its STALE check needs no
+edit, so that part does run on every pull request:
+`test_every_mutation_still_finds_the_text_it_edits` fails when a refactor
+moves the text a mutation edits, naming the mutation to rewrite.
 
 **The coverage of that set is checked by the suite, because it rotted once.**
 The first version of this file claimed every test had been mutation-verified
@@ -366,7 +360,7 @@ suite once at the end: a run that ends red says so and exits non-zero.
 3. Assert the _refusal_, never the presence of the control. Twice in this
    project an object's existence has been mistaken for its enforcement.
 4. Add a mutation that removes the control, confirm your test goes red, and
-   record the verdict. This is not optional and not on the honour system —
+   put the verdict line in your pull request's description. This is not optional and not on the honour system —
    the suite fails until the mutation exists.
 5. If it fails against current code, decorate it `@known_violation` with the
    invariant and the document that records the finding — and give its class a

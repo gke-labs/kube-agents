@@ -334,7 +334,7 @@ class CheckToggleTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 1)
         self.assertIn(
-            "a mirrored install with githubMinter enabled: with global.imageRegistry set, "
+            "a mirrored install with githubMinter enabled: with global.imageRegistry and global.thirdPartyImageRegistry set, "
             "the chart still renders 'public.invalid/minter:v1' outside the mirror",
             result.stderr,
         )
@@ -345,7 +345,7 @@ class CheckToggleTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 1)
         self.assertIn(
-            "a mirrored install with githubMinter enabled: with global.imageRegistry set, "
+            "a mirrored install with githubMinter enabled: with global.imageRegistry and global.thirdPartyImageRegistry set, "
             f"the chart renders '{_MIRROR}/minter-server:v1', but no images.json entry "
             "is named 'minter-server'",
             result.stderr,

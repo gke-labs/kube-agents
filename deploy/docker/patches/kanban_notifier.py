@@ -1537,8 +1537,19 @@ def completion_text(head: str, title: str, handoff: str, platform: object = None
     """
     upstream = COMPLETION_HEAD.format(head=head, title=title) + (handoff or "")
     if not slack_ux_on(platform):
-        return upstream
+        # No Slack presenter reads this one, so the declared step's line, plumbing, comes off here.
+        return _visible(upstream)
     return str(handoff or "").strip() or upstream
+
+
+def _visible(text: str) -> str:
+    """``slack_moments.visible_text``: ``text`` without a declared step's line at its end, which no
+    surface shows as text; ``text`` as written when nothing else is left or the module is absent."""
+    try:
+        import slack_moments
+    except ImportError:  # the scripts directory is not on PYTHONPATH
+        return text
+    return slack_moments.visible_text(text) or text
 
 
 def explained_by_wake(

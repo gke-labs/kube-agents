@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // setBaseEnv pins the required env plus empty values for every optional
@@ -23,6 +24,8 @@ import (
 func setBaseEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("NATS_URL", "nats://127.0.0.1:4222")
+	t.Setenv(lib.EnvNATSCAFile, "")
+	t.Setenv(EnvNATSCAConfigMap, "")
 	t.Setenv("NATS_PASSWORD", "pw")
 	t.Setenv("DISCORD_TOKEN", "x")
 	t.Setenv("SLACK_BOT_TOKEN", "")
@@ -33,6 +36,8 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("A2A_ASK_TTL", "")
 	t.Setenv("A2A_SESSION_TTL", "")
 	t.Setenv("A2A_FIRST_EVENT_GRACE", "")
+	t.Setenv("A2A_CARD_STOP", "")
+	t.Setenv("A2A_CARD_STOP_TIMEOUT", "")
 	t.Setenv("A2A_OWNER_DEPLOYMENT", "")
 	t.Setenv("A2A_MAX_SESSIONS", "")
 	t.Setenv("A2A_DELEGATION_DEPTH_MAX", "")
@@ -495,6 +500,36 @@ func TestFromEnvFirstEventGrace(t *testing.T) {
 		t.Setenv("A2A_FIRST_EVENT_GRACE", bad)
 		if _, err := FromEnv(); err == nil {
 			t.Fatalf("A2A_FIRST_EVENT_GRACE=%q accepted", bad)
+		}
+	}
+}
+
+// TestFromEnvCardStop: the card stop is off unless exactly "true" (a rollout
+// switch, so a typo leaves the old reply), and its bound is 75s by default,
+// a Go duration, and never under the floor the bridge's own turn wait sets.
+func TestFromEnvCardStop(t *testing.T) {
+	setBaseEnv(t)
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CardStop || cfg.CardStopTimeout != 75*time.Second {
+		t.Fatalf("defaults: CardStop %v, CardStopTimeout %v; want off and 75s", cfg.CardStop, cfg.CardStopTimeout)
+	}
+	for value, want := range map[string]bool{"true": true, "TRUE": false, "1": false, "false": false} {
+		t.Setenv("A2A_CARD_STOP", value)
+		if cfg, err = FromEnv(); err != nil || cfg.CardStop != want {
+			t.Errorf("A2A_CARD_STOP=%q: CardStop %v (err %v), want %v", value, cfg.CardStop, err, want)
+		}
+	}
+	t.Setenv("A2A_CARD_STOP_TIMEOUT", "2m")
+	if cfg, err = FromEnv(); err != nil || cfg.CardStopTimeout != 2*time.Minute {
+		t.Fatalf("A2A_CARD_STOP_TIMEOUT=2m: %v (err %v)", cfg.CardStopTimeout, err)
+	}
+	for _, bad := range []string{"29s", "75", "junk"} {
+		t.Setenv("A2A_CARD_STOP_TIMEOUT", bad)
+		if _, err := FromEnv(); err == nil {
+			t.Errorf("A2A_CARD_STOP_TIMEOUT=%q accepted", bad)
 		}
 	}
 }
@@ -982,5 +1017,28 @@ func TestDelegationDepthMaxFromEnv(t *testing.T) {
 		} else if !strings.Contains(err.Error(), "A2A_DELEGATION_DEPTH_MAX") {
 			t.Fatalf("A2A_DELEGATION_DEPTH_MAX=%q: error %q does not name the variable", bad, err)
 		}
+	}
+}
+
+// The CA file and its ConfigMap come as a pair: the gateway would connect on
+// the file alone while every session pod it spawned got no CA.
+func TestFromEnvRefusesHalfTheBusTrust(t *testing.T) {
+	for _, tc := range []struct{ file, cm string }{{"/etc/a2a-nats-ca/ca.crt", ""}, {"", "agent-a2a-nats-ca-bundle"}} {
+		setBaseEnv(t)
+		t.Setenv(lib.EnvNATSCAFile, tc.file)
+		t.Setenv(EnvNATSCAConfigMap, tc.cm)
+		if _, err := FromEnv(); err == nil {
+			t.Errorf("FromEnv accepted %s=%q with %s=%q", lib.EnvNATSCAFile, tc.file, EnvNATSCAConfigMap, tc.cm)
+		}
+	}
+	setBaseEnv(t)
+	t.Setenv(lib.EnvNATSCAFile, "/etc/a2a-nats-ca/ca.crt")
+	t.Setenv(EnvNATSCAConfigMap, "agent-a2a-nats-ca-bundle")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatalf("FromEnv refused the pair: %v", err)
+	}
+	if cfg.NATSCAFile != "/etc/a2a-nats-ca/ca.crt" || cfg.NATSCAConfigMap != "agent-a2a-nats-ca-bundle" {
+		t.Errorf("cfg = %q / %q", cfg.NATSCAFile, cfg.NATSCAConfigMap)
 	}
 }

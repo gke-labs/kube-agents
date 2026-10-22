@@ -1102,9 +1102,12 @@ spec:
                             node's labels for the pod to be scheduled
                           type: object
                         replicas:
-                          description:
-                            Replicas specifies the desired number of pod
-                            replicas. If omitted, defaults to 1.
+                          description: |-
+                            Replicas specifies the desired number of gateway pod replicas. If omitted, defaults to 1.
+                            The operator runs the gateway as a single replica: a value above 1 is rendered as 1, and
+                            the ReplicasLimited status condition says so. A multi-replica gateway does not start yet,
+                            because its leader election has no in-cluster ServiceAccount token to use and the data
+                            volumes an install creates at one replica are ReadWriteOnce.
                           format: int32
                           minimum: 0
                           type: integer
@@ -1536,8 +1539,9 @@ spec:
                         ExtraVolumes specifies custom volumes to mount for the main container.
                         The same reserved names and reserved sources as SidecarVolumes are refused
                         at admission -- a ServiceAccount token projection for the "a2a-bus"
-                        audience, or a reference to <agent>-a2a-nats-creds, <agent>-a2a-nats-config
-                        or <agent>-a2a-callout-keys -- and dropped from the render on an install
+                        audience, or a reference to <agent>-a2a-nats-creds, <agent>-a2a-nats-config,
+                        <agent>-a2a-callout-keys, <agent>-a2a-nats-tls or <agent>-a2a-nats-ca -- and
+                        dropped from the render on an install
                         running the A2A surface.
                       items:
                         description:
@@ -5417,7 +5421,8 @@ spec:
                         its source is one of the routes to the agent's A2A bus credentials: a
                         ServiceAccount token projection for the "a2a-bus" audience, or a reference
                         to one of the Secrets the operator renders bus credentials into
-                        (<agent>-a2a-nats-creds, <agent>-a2a-nats-config, <agent>-a2a-callout-keys),
+                        (<agent>-a2a-nats-creds, <agent>-a2a-nats-config, <agent>-a2a-callout-keys,
+                        <agent>-a2a-nats-tls, <agent>-a2a-nats-ca),
                         as either a secret volume or a projected secret source. The refusal is on
                         the name and the shape of the source, not on what a given Secret happens to
                         hold at the time. Reading those Secrets through env is not refused here. On
@@ -9561,6 +9566,70 @@ spec:
                         Omitting it leaves every kubectl call in the sidecar pointed at
                         localhost:8080. See buildCredentialProxyEnv.
                       type: string
+                    stallWatch:
+                      description: |-
+                        StallWatch tunes the controller stall watch — the stall-watch cron job on the
+                        Platform Agent's roster that sweeps the fleet for controllers that stopped
+                        making progress and raises an alert for each new stall. Absent keeps the
+                        watch's built-in behaviour.
+                      properties:
+                        excludeNamespaces:
+                          description: |-
+                            ExcludeNamespaces names namespaces the watch never reads, on every cluster,
+                            in addition to the system namespaces it always skips. Matched exactly. An
+                            open alert in a namespace added here is closed with a note that the
+                            namespace was excluded.
+                          items:
+                            maxLength: 63
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                            type: string
+                          maxItems: 100
+                          type: array
+                          x-kubernetes-list-type: set
+                        kinds:
+                          description: |-
+                            Kinds replaces the watch's default list of resources to scan (Deployments,
+                            StatefulSets, DaemonSets, Jobs, Gateway API Gateways and HTTPRoutes, and
+                            cert-manager Certificates). Each item is a kubectl resource name such as
+                            `deployments` or `gateways.gateway.networking.k8s.io`. The single item `all`
+                            scans every namespaced kind the cluster serves, one read per kind per
+                            namespace, which is slow on a large fleet. Absent or empty keeps the
+                            default list. Secrets, ConfigMaps, Events, Endpoints, EndpointSlices,
+                            ControllerRevisions and Leases are refused: the scan reports nothing from
+                            them, and a Secret listing would carry every body.
+                          items:
+                            maxLength: 253
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                            type: string
+                          maxItems: 20
+                          type: array
+                          x-kubernetes-list-type: set
+                          x-kubernetes-validations:
+                            - message: "kinds: all must be the only item"
+                              rule: "!self.exists(k, k == 'all') || self.size() == 1"
+                            - message:
+                                "kinds: secrets, configmaps, events, endpoints,
+                                endpointslices, controllerrevisions and leases are never
+                                scanned"
+                              rule:
+                                "!self.exists(k, k.split('.')[0] in ['secrets',
+                                'secret', 'configmaps', 'configmap', 'cm', 'events',
+                                'event', 'ev', 'endpoints', 'endpoint', 'ep',
+                                'endpointslices', 'endpointslice', 'controllerrevisions',
+                                'controllerrevision', 'leases', 'lease'])"
+                        minStallAgeMinutes:
+                          description: |-
+                            MinStallAgeMinutes holds a new alert until one of the namespace's stalls has
+                            lasted at least this long. The age is the longer of what stall_report.py
+                            measures on the object and how long the watch has seen it. A stall that is
+                            younger stays in the watch's ledger and is checked again on each run; an
+                            object that joins a namespace with an open alert is not held. Absent or 0
+                            alerts on the first run that sees the stall.
+                          format: int32
+                          maximum: 1440
+                          minimum: 0
+                          type: integer
+                      type: object
                     tuning:
                       description: |-
                         Tuning sets per-persona execution limits. Unset values keep the defaults
@@ -9856,7 +9925,9 @@ spec:
                               group or project access token, or a dedicated account's personal access
                               token where the tier offers neither. It is mounted into the credential
                               broker's pod only, never the agent's or the sandbox's, and read on every
-                              call, so rotating the token is updating the Secret.
+                              call, so rotating the token is updating the Secret. The Secret may also
+                              hold a read-only token under the key `read-token`; the broker presents it
+                              only to clone the forge's context repositories, never on a write.
                             properties:
                               name:
                                 description:
@@ -10523,7 +10594,7 @@ spec:
                       properties:
                         endpoint:
                           description: |-
-                            Endpoint is the daemon IP. "" (explicitly set) suppresses rule 3 entirely;
+                            Endpoint is the daemon IP. "" (explicitly set) suppresses that rule entirely;
                             the empty alternative in the pattern is required because the API server
                             validates an explicitly-set "", which omitempty does not suppress.
                           maxLength: 45
@@ -10739,10 +10810,8 @@ spec:
                             chose at creation time or at a public address, and the in-cluster
                             "kubernetes" Service is translated to that address before policy is
                             evaluated. Leaving this empty is allowed and is the stricter choice. It
-                            costs the agent container its API-server connection, which matters at
-                            spec.deployment.replicas above 1, where the container runs
-                            leader_elect.py and holds a Lease, and to any sidecar or plugin you
-                            added that talks to the API. Find the range with
+                            costs the agent container its API-server connection, which matters to
+                            any sidecar or plugin you added that talks to the API. Find the range with
                             `gcloud container clusters describe CLUSTER --format='value(privateClusterConfig.masterIpv4CidrBlock,endpoint)'`.
                             On a cluster with a public endpoint that command emits a bare address;
                             paste it as-is and it is widened to a single-host prefix.
@@ -10997,22 +11066,19 @@ spec:
                         What the gateway policy already permits, and therefore what this cannot
                         take away:
 
-                          - 169.254.169.254/32 on TCP 80, plus the discovered metadata-daemon port (988 by default) to both link-local
-                            metadata addresses — the pre- and post-DNAT forms of a metadata
-                            request (the 988 rule is suppressed when the resolved metadata
-                            daemon IP is empty). So the metadata path stays open. The same
-                            address is also permitted on port 53, where it is the Cloud DNS for
-                            GKE resolver rather than a credential path.
+                          - 169.254.169.254/32 on port 53 only, where it is the Cloud DNS for
+                            GKE resolver rather than a credential path. The gateway policy opens
+                            no metadata credential port: the gateway Pod holds no Google identity
+                            (it runs as its own unannotated ServiceAccount), so there is no
+                            metadata path left for this field to close.
                           - TCP 443 to 0.0.0.0/0 minus the private ranges, unless the
                             FQDNNetworkPolicy annotation is set. So every HTTPS destination on
                             the public internet stays open, and with it the exfiltration half of
                             what this control is meant to be.
 
-                        The overlap is deliberate rather than an oversight. Workload Identity
-                        needs the metadata path, and <name>-gateway-netpol still permits it to
-                        the agent Pod. Narrowing that allowance to the broker Pod, which is the
-                        only one that mints a cloud token, is the work that turns this field into
-                        a control.
+                        The overlap is deliberate rather than an oversight. Narrowing
+                        <name>-gateway-netpol's internet rule is the work that turns this field
+                        into a control.
 
                         So what is this for today? Two things, and they are worth having, but
                         neither is enforcement. It renders an auditable statement of the
@@ -11060,11 +11126,9 @@ spec:
                             disables;
                           - github.com reached directly from the sandbox, though not the gh and
                             git wrappers, which go through the broker;
-                          - the metadata lookup in cluster_agent_reconcile.py, which finds that
-                            script's project id. It fails soft after a five-second timeout and
-                            falls back to a broker gcloud call. RECONCILE_PROJECT, the old override, is
-                            pinned empty in the managed .env (a project other than the pod's belongs in
-                            spec.scope.projects, the management project still has to resolve).
+                          - nothing in cluster_agent_reconcile.py, which reads its management
+                            project from GKE_PROJECT_ID (pinned in the managed .env, beside
+                            RECONCILE_PROJECT pinned empty) and asks no metadata server.
 
                         Those would not be accidental casualties. A headless browser with
                         unrestricted egress is the exfiltration path, so the capabilities this
@@ -11247,6 +11311,29 @@ spec:
                           type: string
                       type: object
                   type: object
+                storage:
+                  description: |-
+                    Storage sizes the agent's /opt/data volume and the shell sandbox's
+                    matching data volume.
+                  properties:
+                    size:
+                      anyOf:
+                        - type: integer
+                        - type: string
+                      description: |-
+                        Size is the request of the <name>-data claim and of the shell sandbox's
+                        data claim. The operator requests the same size for both claims and grows
+                        the sandbox's claim first, so the sandbox mirror fits. A StorageClass or a
+                        quota that refuses the growth of one claim can leave the two claims at
+                        different sizes. Absent, the operator default applies (50Gi). Raising it
+                        expands both existing claims online where the StorageClass sets
+                        allowVolumeExpansion; where it does not, the claims keep their size and
+                        the DataVolumeNotExpanded condition says so. The admission webhook refuses
+                        a lower value and a value of zero or less, because a claim cannot shrink.
+                        Removing the field never shrinks a claim.
+                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                      x-kubernetes-int-or-string: true
+                  type: object
                 telemetry:
                   description: Telemetry configures OpenTelemetry export for this agent.
                   properties:
@@ -11388,8 +11475,8 @@ spec:
                       type: boolean
                     metadataDaemonIP:
                       description:
-                        MetadataDaemonIP is the post-NAT daemon IP in rule
-                        3, empty when suppressed.
+                        MetadataDaemonIP is the post-NAT daemon IP in the
+                        LiteLLM policy's metadata rule, empty when suppressed.
                       type: string
                     metadataDaemonIPSource:
                       description:
@@ -11399,7 +11486,7 @@ spec:
                       type: string
                     metadataDaemonPort:
                       description: |-
-                        MetadataDaemonPort is the post-NAT daemon port in rule 3, resolved from the live
+                        MetadataDaemonPort is the post-NAT daemon port in the LiteLLM policy's metadata rule, resolved from the live
                         DaemonSet when metadataDaemonIPSource is Discovered, else the documented default (988).
                       format: int32
                       type: integer
@@ -11468,6 +11555,31 @@ spec:
                         type: string
                       type: array
                       x-kubernetes-list-type: set
+                    brokerFailuresTotal:
+                      description: |-
+                        BrokerFailuresTotal is the cumulative count of brokered work the
+                        credential broker took on and could not carry out for a reason that is
+                        its own or its upstream's: a command that ran past its deadline (exit
+                        124), a broker fault on the exec route (a 500), a git failure on the
+                        version-control route (a 500 or 502), a failed forge token mint (a
+                        502), or any 5xx on the Cloud API, MCP and watcher relays, whose
+                        upstream status passes through. A command's own non-zero exit is not
+                        one (that is ToolExecutionsTotal's error outcome), nor is a policy
+                        refusal or the broker's own busy (a 403 or 503; the version-control
+                        route's 503 for an unreadable managed-repository list is a fault and
+                        does count), nor a chat or Slack post the forge refused for the
+                        caller's channel or scope; the broker's own chat event pull failing,
+                        its Pub/Sub subscription or its credential to it, does count. Read from the
+                        broker's kubeagents_broker_execution_failures_total, summed over its
+                        kind label, every five minutes and kept monotonic the same way as
+                        ToolExecutionsTotal; a timed-out command counts here and as an error
+                        there. A rising share of this against ToolExecutionsTotal says the
+                        broker, its credentials or its upstreams are failing, where a policy
+                        refusal is the tool counter's blocked outcome in Prometheus. Does not
+                        move LastActiveTime: a watcher retrying an unreachable fleet cluster
+                        through the relay is not the agent at work.
+                      format: int64
+                      type: integer
                     chatMessagesInboundTotal:
                       description: |-
                         ChatMessagesInboundTotal is the cumulative count of chat messages that
@@ -11484,7 +11596,27 @@ spec:
                         kubeagents_a2a_gateway_messages_inbound_total as well, since Chat
                         ingress is that gateway's there; kept monotonic the same way as
                         ToolExecutionsTotal. Moves LastActiveTime, so a chat turn that runs no
-                        brokered command is activity.
+                        brokered command is activity, and LastHumanActiveTime, which nothing
+                        else moves.
+                      format: int64
+                      type: integer
+                    chatTurnsErroredTotal:
+                      description: |-
+                        ChatTurnsErroredTotal is the cumulative count of synchronous chat turns
+                        the gateway failed to complete: on the Hermes gateway, an exception out
+                        of the turn, a result the agent marked failed (a provider 429 or 5xx, a
+                        connection error, the gateway timeout) or a provider authentication
+                        failure, counted by the chat_metrics plugin's
+                        kubeagents_chat_turns_errored_total on the gateway pod that runs
+                        Hermes; and on a next-mode install, an A2A task that ended failed or
+                        rejected, read from the A2A gateway's
+                        kubeagents_a2a_gateway_task_terminals_total under those two states.
+                        That family carries no platform, so on next it counts every A2A task's
+                        terminal, a door's program-to-program task included, not chat alone;
+                        rejected is a task the executor refused, counted as the design asks.
+                        Read every five minutes and kept monotonic the same way as
+                        ToolExecutionsTotal. Does not move LastActiveTime: the message that
+                        started the turn already did.
                       format: int64
                       type: integer
                     clustersMonitored:
@@ -11535,12 +11667,29 @@ spec:
                     lastActiveTime:
                       description: |-
                         LastActiveTime is the time of the last poll in which a counter above
-                        moved: a brokered command ran, a proposal was opened or merged, a chat
-                        message reached the gateway, or an event was accepted for triage.
+                        moved: a brokered command ran or was refused, a proposal was opened or
+                        merged, a chat message reached the gateway, or an event was accepted
+                        for triage; BrokerFailuresTotal and ChatTurnsErroredTotal alone leave it where it was.
                         Scheduled maintenance jobs that run brokered commands move it too --
                         the Controller Stall Watch cron runs some every 30 minutes by default
                         -- so it marks agent activity of any origin, not human or operator use
-                        alone. Advances at most once per five minutes.
+                        alone; LastHumanActiveTime is the one that does. Advances at most once
+                        per five minutes.
+                      format: date-time
+                      type: string
+                    lastHumanActiveTime:
+                      description: |-
+                        LastHumanActiveTime is the time of the last poll in which the one
+                        counter only a person moves advanced: ChatMessagesInboundTotal, a chat
+                        message that reached the gateway, counted before the sender allowlist,
+                        so an unlisted sender is still a person. Nothing else moves it. Brokered
+                        commands and accepted events come from the stall-watch cron and the
+                        event watcher on their own, proposals from the fleet audits, which open
+                        them with nobody asking, and a merge can be a forge rule; all of those
+                        move LastActiveTime and leave this alone, so an install nobody has
+                        talked to in a month shows it. Absent until a person has sent a message
+                        since the operator that writes it started. Advances at most once per
+                        five minutes.
                       format: date-time
                       type: string
                     remediationsAppliedTotal:
@@ -11581,8 +11730,33 @@ spec:
                       type: integer
                     sessionsTotal:
                       description: |-
-                        SessionsTotal is the cumulative number of interactive sessions handled.
-                        Nothing writes it yet.
+                        SessionsTotal is the cumulative count of sessions the agent opened: the
+                        triage sessions the event watcher opened for events the daemon
+                        delivered (its k8s_event_watcher_triage_sessions_total; a session
+                        whose inject was filtered, suppressed or failed is not counted) plus
+                        the chat conversations the gateway opened a session for (the session_store
+                        plugin's kubeagents_chat_sessions_total on a today install, the A2A
+                        gateway's kubeagents_a2a_gateway_sessions_total on a next install). A
+                        chat conversation that resumes after the session store's retention
+                        window (seven days by default) counts again. Read every five minutes
+                        and kept monotonic across restarts, like toolExecutionsTotal.
+                      format: int64
+                      type: integer
+                    toolExecutionsBlockedTotal:
+                      description: |-
+                        ToolExecutionsBlockedTotal is the cumulative count of requests the
+                        credential broker did not run to an exit: its blocked outcome
+                        (a policy refusal), its busy outcome (the broker's command slots or its
+                        child memory budget held the request for the whole wait) and its
+                        abandoned outcome (the caller hung up while the request was queued or
+                        running). Read from the same kubeagents_tool_invocations_total as
+                        ToolExecutionsTotal, over the other three statuses, every five minutes
+                        and kept monotonic the same way; the two together are every request the
+                        broker's exec route took as far as its policy; a request it
+                        rejected as malformed before that reaches neither. A rising share of this against
+                        ToolExecutionsTotal says the agent keeps asking for what its mode or
+                        policy refuses, or that the broker is saturated. Moves LastActiveTime:
+                        a refused command is still the agent at work.
                       format: int64
                       type: integer
                     toolExecutionsTotal:
@@ -11592,7 +11766,8 @@ spec:
                         it rejected or failed on before running: its success and error outcomes.
                         Read from the broker's kubeagents_tool_invocations_total every five
                         minutes and kept monotonic the same way; commands refused by policy,
-                        busy and abandoned are not counted.
+                        busy and abandoned are not counted here but in
+                        ToolExecutionsBlockedTotal.
                       format: int64
                       type: integer
                   type: object

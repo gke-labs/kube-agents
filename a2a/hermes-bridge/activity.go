@@ -1416,6 +1416,15 @@ func (b *Bridge) publishArtifactPart(run *taskRun, name string, part lib.Part) b
 // publishArtifactParts is publishArtifactPart for one chunk of several parts:
 // a heartbeat's text and the chat message beside it.
 func (b *Bridge) publishArtifactParts(run *taskRun, name string, parts ...lib.Part) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), activityPublishTimeout)
+	defer cancel()
+	return b.publishArtifactPartsCtx(ctx, run, name, parts...)
+}
+
+// publishArtifactPartsCtx is publishArtifactParts on the caller's context,
+// for a publish that has to share a budget (publishHandoff, inside
+// finalizeResult's result+terminal budget).
+func (b *Bridge) publishArtifactPartsCtx(ctx context.Context, run *taskRun, name string, parts ...lib.Part) bool {
 	a := run.act.Load()
 	payload, err := json.Marshal(lib.ArtifactUpdate{
 		TaskID:    run.origin.TaskID,
@@ -1441,8 +1450,6 @@ func (b *Bridge) publishArtifactParts(run *taskRun, name string, parts ...lib.Pa
 	// the next part a non-append that replaces the artifact in every fold.
 	// A lost first part costs one entry; a reset costs the whole trace.
 	a.appended[name] = true
-	ctx, cancel := context.WithTimeout(context.Background(), activityPublishTimeout)
-	defer cancel()
 	if err := b.c.Publish(ctx, lib.TaskEventsSubject(b.cfg.Profile, run.origin.TaskID), env); err != nil {
 		b.cfg.Logger.Warn("artifact publish failed", "task", run.origin.TaskID, "name", name, "err", err)
 		return false

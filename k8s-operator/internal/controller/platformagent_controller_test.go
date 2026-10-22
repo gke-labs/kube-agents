@@ -1629,8 +1629,8 @@ func TestBuildNetworkPolicy(t *testing.T) {
 		scrape.From[0].PodSelector != nil {
 		t.Errorf("expected the collector ingress rule to admit every pod in gke-gmp-system, got %v", scrape.From)
 	}
-	if len(netpol.Spec.Egress) != 12 {
-		t.Errorf("expected 12 Egress rules (DNS, GCP Metadata port 80, GCP Metadata port 988, LiteLLM Gateway, vLLM Gemma, K8s Control Plane, External HTTPS, GKE OTel Collector, GitHub Token Minter, Hindsight API, shell sandbox sshd, credential broker), got %d", len(netpol.Spec.Egress))
+	if len(netpol.Spec.Egress) != 10 {
+		t.Errorf("expected 10 Egress rules (DNS, LiteLLM Gateway, vLLM Gemma, K8s Control Plane, External HTTPS, GKE OTel Collector, GitHub Token Minter, Hindsight API, shell sandbox sshd, credential broker), got %d", len(netpol.Spec.Egress))
 	}
 
 	findEgressRule := func(port int32, peerCheck func(networkingv1.NetworkPolicyPeer) bool) *networkingv1.NetworkPolicyEgressRule {
@@ -1663,19 +1663,15 @@ func TestBuildNetworkPolicy(t *testing.T) {
 		t.Error("the DNS rule does not name 169.254.169.254, so a Cloud DNS for GKE cluster " +
 			"cannot resolve and every named destination below becomes unreachable")
 	}
-	ruleMeta80 := findEgressRule(80, func(p networkingv1.NetworkPolicyPeer) bool {
-		return p.IPBlock != nil && p.IPBlock.CIDR == "169.254.169.254/32"
-	})
-	if ruleMeta80 == nil || len(ruleMeta80.To) != 1 {
-		t.Errorf("expected 1 peer in GCP Workload Identity egress rule (port 80)")
-	}
-	// Port 988 is the post-DNAT destination, so it carries the metadata daemon's own
-	// address as well as the link-local one even when the cluster has no nodes.
-	ruleMeta988 := findEgressRule(988, func(p networkingv1.NetworkPolicyPeer) bool {
-		return p.IPBlock != nil && p.IPBlock.CIDR == "169.254.169.252/32"
-	})
-	if ruleMeta988 == nil || len(ruleMeta988.To) != 2 {
-		t.Errorf("expected 2 peers in GCP Workload Identity egress rule (port 988)")
+	// The gateway pod holds no Google identity, so the metadata server's token
+	// paths are closed: nothing admits 169.254.169.254 on 80 (pre-NAT) or the WI
+	// daemon on 988 (post-NAT). Only the DNS rule above may name the address.
+	for _, port := range []int32{80, 988} {
+		if rule := findEgressRule(port, func(p networkingv1.NetworkPolicyPeer) bool {
+			return p.IPBlock != nil && (p.IPBlock.CIDR == "169.254.169.254/32" || p.IPBlock.CIDR == "169.254.169.252/32")
+		}); rule != nil {
+			t.Errorf("the gateway policy admits the metadata server on port %d, a Workload Identity token path", port)
+		}
 	}
 	ruleLiteLLM := findEgressRule(4000, func(p networkingv1.NetworkPolicyPeer) bool {
 		return p.PodSelector != nil && p.PodSelector.MatchLabels["app"] == "litellm"
@@ -1756,20 +1752,19 @@ func TestBuildNetworkPolicy_FQDNEnabled(t *testing.T) {
 	}
 
 	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), true, "", false)
-	// Expected 11 Egress rules when FQDN is enabled (external HTTPS 0.0.0.0/0:443 is omitted):
+	// Expected 9 Egress rules when FQDN is enabled (external HTTPS 0.0.0.0/0:443 is
+	// omitted, and the gateway policy carries no metadata-server rule):
 	// 1. Cluster DNS (53)
-	// 2. GCP WI / Metadata server (80)
-	// 3. GKE WI Host Network Daemon (988)
-	// 4. LiteLLM Gateway (80, 4000, 8080)
-	// 5. vLLM Gemma Server (80, 8000)
-	// 6. Kubernetes API Server (443, 6443, 8443)
-	// 7. GKE Managed OpenTelemetry Collector (4317, 4318)
-	// 8. GitHub Token Minter (8080)
-	// 9. Hindsight memory API (8888)
-	// 10. The shell sandbox's sshd (2222)
-	// 11. The credential broker, which hosts the chat relay (8765)
-	if len(netpol.Spec.Egress) != 11 {
-		t.Errorf("expected 11 Egress rules when FQDN is enabled (external HTTPS omitted), got %d", len(netpol.Spec.Egress))
+	// 2. LiteLLM Gateway (80, 4000, 8080)
+	// 3. vLLM Gemma Server (80, 8000)
+	// 4. Kubernetes API Server (443, 6443, 8443)
+	// 5. GKE Managed OpenTelemetry Collector (4317, 4318)
+	// 6. GitHub Token Minter (8080)
+	// 7. Hindsight memory API (8888)
+	// 8. The shell sandbox's sshd (2222)
+	// 9. The credential broker, which hosts the chat relay (8765)
+	if len(netpol.Spec.Egress) != 9 {
+		t.Errorf("expected 9 Egress rules when FQDN is enabled (external HTTPS omitted), got %d", len(netpol.Spec.Egress))
 	}
 	for _, egress := range netpol.Spec.Egress {
 		for _, peer := range egress.To {
@@ -2090,39 +2085,17 @@ func TestBuildNetworkPolicy_ProfileDrivenRules(t *testing.T) {
 		}
 	})
 
-	t.Run("EmptyMetadataDaemonIPSuppressesRule3", func(t *testing.T) {
-		profile := defaultTestNetpolProfile()
-		profile.MetadataDaemonIP = ""
-		profile.MetadataDaemonSource = netpolSourceSuppressed
+	t.Run("TheMetadataDaemonSettingOpensNothing", func(t *testing.T) {
+		// The gateway policy carries no metadata-server rule, so the daemon
+		// address the profile discovers or suppresses changes nothing in it.
+		suppressed := defaultTestNetpolProfile()
+		suppressed.MetadataDaemonIP = ""
+		suppressed.MetadataDaemonSource = netpolSourceSuppressed
 
-		netpol := buildNetworkPolicy(agent, nil, profile, false, "", false)
-		for _, rule := range netpol.Spec.Egress {
-			for _, p := range rule.Ports {
-				if p.Port != nil && p.Port.IntValue() == 988 {
-					t.Fatalf("rule 3 (port 988) survived metadataDaemon.endpoint suppression")
-				}
-			}
-		}
-
-		// The pre-DNAT rule 2 is a separate rule and must NOT go with it.
-		withDaemon := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
-		if len(netpol.Spec.Egress) != len(withDaemon.Spec.Egress)-1 {
-			t.Errorf("suppression removed %d rules, want exactly 1", len(withDaemon.Spec.Egress)-len(netpol.Spec.Egress))
-		}
-		found80 := false
-		for _, rule := range netpol.Spec.Egress {
-			for _, p := range rule.Ports {
-				if p.Port != nil && p.Port.IntValue() == 80 {
-					for _, peer := range rule.To {
-						if peer.IPBlock != nil && peer.IPBlock.CIDR == metadataLinkLocalIP+"/32" {
-							found80 = true
-						}
-					}
-				}
-			}
-		}
-		if !found80 {
-			t.Errorf("rule 2 (link-local metadata on port 80) was removed along with rule 3")
+		without := buildNetworkPolicy(agent, nil, suppressed, false, "", false)
+		with := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
+		if !reflect.DeepEqual(without.Spec.Egress, with.Spec.Egress) {
+			t.Errorf("the metadata daemon setting changed the gateway policy; it should open nothing")
 		}
 	})
 }
@@ -2137,37 +2110,22 @@ func TestBuildNetworkPolicy_MetadataDaemonPeers(t *testing.T) {
 
 	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
 
-	// The pre-NAT target belongs on port 80.
-	got80 := egressCIDRsForPort(netpol, 80)
-	want80 := []string{"169.254.169.254/32"}
-	if !reflect.DeepEqual(got80, want80) {
-		t.Errorf("expected port 80 metadata peers %v, got %v", want80, got80)
+	// The gateway pod holds no Google identity, so neither token path is open: not
+	// the pre-NAT link-local address on 80, not the WI daemon on 988.
+	for _, port := range []int32{80, 988} {
+		for _, cidr := range egressCIDRsForPort(netpol, port) {
+			if cidr == "169.254.169.254/32" || cidr == "169.254.169.252/32" {
+				t.Errorf("the gateway policy admits the metadata server at %s on port %d", cidr, port)
+			}
+		}
 	}
 
-	// Port 988 is the post-DNAT destination on Dataplane V1, carrying the metadata
-	// daemon's link-local address (169.254.169.252) and the link-local alias.
-	got988 := egressCIDRsForPort(netpol, 988)
-	want988 := []string{
-		"169.254.169.252/32",
-		"169.254.169.254/32",
-	}
-	if !reflect.DeepEqual(got988, want988) {
-		t.Errorf("expected metadata daemon peers %v, got %v", want988, got988)
-	}
-
-	// Every port the metadata server is reachable on, across all egress rules. 8080 —
-	// the pre-NAT ALTS handshaker port — must not be among them: Dataplane V2 evaluates
-	// policy pre-NAT at the socket layer, so pairing 8080 with the link-local address
-	// reopens the DirectPath route the sandbox refuses. Asserted here rather than left
-	// to the platform goldens, which are snapshots that `go test -update` re-blesses
-	// from whatever the code emits.
-	//
-	// 53 is on the list and is not a credential port: under Cloud DNS for GKE the node
-	// answers DNS at this address, and the DNS rule names it for that and nothing else.
-	// This assertion is the guard on that — a change that widened the DNS rule to carry
-	// 80, or the port-80 rule to carry 53, fails here rather than in review.
+	// Every port the metadata address is reachable on, across all egress rules: 53
+	// only. Under Cloud DNS for GKE the node answers DNS at this address, and the DNS
+	// rule names it for that and nothing else; a change that adds any other port
+	// here reopens a token path and fails rather than passing review.
 	gotPorts := egressPortsForCIDR(netpol, metadataLinkLocalIP+"/32")
-	wantPorts := []int32{53, 80, 988}
+	wantPorts := []int32{53}
 	if !reflect.DeepEqual(gotPorts, wantPorts) {
 		t.Errorf("expected the metadata server reachable on ports %v, got %v", wantPorts, gotPorts)
 	}
@@ -2184,20 +2142,12 @@ func TestBuildNetworkPolicy_CustomMetadataDaemonPort(t *testing.T) {
 	profile.MetadataDaemonPort = 1988
 
 	netpol := buildNetworkPolicy(agent, nil, profile, false, "", false)
-
-	got1988 := egressCIDRsForPort(netpol, 1988)
-	want1988 := []string{
-		"169.254.169.252/32",
-		"169.254.169.254/32",
+	if got := egressCIDRsForPort(netpol, 1988); len(got) != 0 {
+		t.Errorf("a custom metadata daemon port opened %v in the gateway policy", got)
 	}
-	if !reflect.DeepEqual(got1988, want1988) {
-		t.Errorf("expected custom metadata daemon peers %v, got %v", want1988, got1988)
-	}
-
 	gotPorts := egressPortsForCIDR(netpol, metadataLinkLocalIP+"/32")
-	wantPorts := []int32{53, 80, 1988}
-	if !reflect.DeepEqual(gotPorts, wantPorts) {
-		t.Errorf("expected the metadata server reachable on ports %v, got %v", wantPorts, gotPorts)
+	if !reflect.DeepEqual(gotPorts, []int32{53}) {
+		t.Errorf("expected the metadata server reachable on port 53 only, got %v", gotPorts)
 	}
 }
 
@@ -2252,6 +2202,11 @@ func egressPortsForCIDR(netpol *networkingv1.NetworkPolicy, cidr string) []int32
 		for _, p := range netpol.Spec.Egress[i].Ports {
 			if p.Port != nil {
 				seen[p.Port.IntVal] = true
+			}
+			// A range's upper end too: {Port: 53, EndPort: 988} opens the
+			// post-NAT token port while Port still reads 53 (see ruleIsDNSOnly).
+			if p.EndPort != nil {
+				seen[*p.EndPort] = true
 			}
 		}
 	}
@@ -2551,6 +2506,39 @@ func TestIsImageVolumeSupported(t *testing.T) {
 	}
 	if !isImageVolumeSupported(nil, agentWithAnnotation) {
 		t.Errorf("expected annotation override 'true' to return true")
+	}
+}
+
+func TestUpdatePluginStatuses_NamesAPubsubRouteTheOperatorCannotQualify(t *testing.T) {
+	// The adapter's fatal line points the reader at this status; the wiring
+	// that puts the route there has to hold at the level the other status
+	// tests check.
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "target-agent", Namespace: "test-ns"},
+	}
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "stockout", Namespace: "test-ns"},
+		Spec: agentv1alpha1.AgentPluginSpec{
+			AgentRef: "target-agent", Image: "gcr.io/plugin:v1",
+			Config: "platforms:\n  pubsub:\n    enabled: true\n    extra:\n      subscriptions:\n        gke_stockout_alerts:\n          subscription: gke-stockout-alerts-sub\n",
+		},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(plugin).WithStatusSubresource(plugin).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	r.updatePluginStatuses(ctx, agent, []*agentv1alpha1.AgentPlugin{plugin}, true)
+
+	var updated agentv1alpha1.AgentPlugin
+	if err := cl.Get(ctx, types.NamespacedName{Name: plugin.Name, Namespace: plugin.Namespace}, &updated); err != nil {
+		t.Fatalf("failed to fetch updated plugin: %v", err)
+	}
+	cond := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+	if cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("expected a Ready=True condition, got %+v", cond)
+	}
+	if !strings.Contains(cond.Message, "spec.harness.projectId is empty") {
+		t.Errorf("the refused route is not on the plugin's status: %q", cond.Message)
 	}
 }
 
@@ -4570,8 +4558,8 @@ func TestReconcileNetworkPolicy_FQDNCRDNotPresentFallback(t *testing.T) {
 		t.Fatalf("failed to get reconciled NetworkPolicy: %v", err)
 	}
 
-	if len(netpol.Spec.Egress) != 12 {
-		t.Errorf("expected 12 Egress rules when FQDN CRD is not present (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
+	if len(netpol.Spec.Egress) != 10 {
+		t.Errorf("expected 10 Egress rules when FQDN CRD is not present (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
 	}
 	foundBlanketHTTPS := false
 	for _, egress := range netpol.Spec.Egress {
@@ -4633,8 +4621,8 @@ func TestReconcileNetworkPolicy_FQDNCRDWrappedErrorFallback(t *testing.T) {
 		t.Fatalf("failed to get reconciled NetworkPolicy: %v", err)
 	}
 
-	if len(netpol.Spec.Egress) != 12 {
-		t.Errorf("expected 12 Egress rules when FQDN CRD returns wrapped restmapping error (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
+	if len(netpol.Spec.Egress) != 10 {
+		t.Errorf("expected 10 Egress rules when FQDN CRD returns wrapped restmapping error (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
 	}
 }
 
@@ -7411,8 +7399,10 @@ func TestARefusedGitHubScopeKeepsTheLiveGitHubOrg(t *testing.T) {
 		t.Errorf("heldGitHubOrg() = %q, %v with no live gateway, expected nothing", held, err)
 	}
 
-	// A storage switch renders the other workload kind while the old one still
-	// runs: the old one is what holds the value.
+	// A switch renders the other workload kind while the old one still runs:
+	// the old one is what holds the value. The switch that remains is the
+	// replica cap: a StatefulSet a pre-cap release rendered for replicas > 1
+	// over RWO storage, under a spec that now renders the Deployment.
 	switched := agentWith("https://github.com:gke-labs/infra")
 	switched.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
 		Availability: &agentv1alpha1.AvailabilitySpec{Replicas: ptr.To(int32(2))},
@@ -7422,11 +7412,16 @@ func TestARefusedGitHubScopeKeepsTheLiveGitHubOrg(t *testing.T) {
 			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 		}},
 	}
-	if !useStatefulSet(switched) {
-		t.Fatal("test setup: the switched agent does not select a StatefulSet")
+	if useStatefulSet(switched) {
+		t.Fatal("test setup: the switched agent still selects a StatefulSet past the replica cap")
 	}
-	if held, err := r.heldGitHubOrg(ctx, switched); held != "gke-labs" || err != nil {
-		t.Errorf("heldGitHubOrg() = %q, %v across a storage switch, expected the live gke-labs", held, err)
+	liveSts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-gateway", Namespace: "test-ns"},
+		Spec:       appsv1.StatefulSetSpec{Template: live.Spec.Template},
+	}
+	stsOnly := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(liveSts).Build(), Scheme: scheme}
+	if held, err := stsOnly.heldGitHubOrg(ctx, switched); held != "gke-labs" || err != nil {
+		t.Errorf("heldGitHubOrg() = %q, %v across a workload-kind switch, expected the live gke-labs", held, err)
 	}
 
 	// A read that fails is returned, never taken for "nothing live": the render
@@ -7438,5 +7433,239 @@ func TestARefusedGitHubScopeKeepsTheLiveGitHubOrg(t *testing.T) {
 	})}
 	if held, err := failing.heldGitHubOrg(ctx, agentWith("https://github.com:gke-labs/infra")); err == nil {
 		t.Errorf("heldGitHubOrg() = %q with a failing read, expected an error", held)
+	}
+}
+
+// TestReconcileGitopsStateGitOpsRepo covers the gitops_repo key: the fleet
+// audit reads it to choose the repository for its ledger issue when several
+// repositories are managed. Each forge gets the key, in the form of its
+// managed_repos entry, and the key goes away when no repository has role
+// gitops.
+func TestReconcileGitopsStateGitOpsRepo(t *testing.T) {
+	gitlabToken := &agentv1alpha1.ForgeCredentialsRef{Name: "gitlab-token"}
+	cases := []struct {
+		name   string
+		forges []agentv1alpha1.ForgeSpec
+		want   string
+	}{
+		{
+			name:   "github.com",
+			forges: []agentv1alpha1.ForgeSpec{{Name: "vcs", Provider: "github", Namespace: "acme"}},
+			want:   `{"type":"github","url":"https://github.com/acme/infra"}`,
+		},
+		{
+			name:   "GitLab",
+			forges: []agentv1alpha1.ForgeSpec{{Name: "vcs", Provider: "gitlab", Host: "gitlab.example.com", Namespace: "acme", CredentialsRef: gitlabToken}},
+			want:   `{"type":"gitlab","url":"https://gitlab.example.com/acme/infra"}`,
+		},
+		{
+			name:   "GitHub Enterprise Server",
+			forges: []agentv1alpha1.ForgeSpec{{Name: "vcs", Provider: "github", Host: "ghe.example.com", Namespace: "acme"}},
+			want:   `{"type":"github","url":"https://ghe.example.com/acme/infra"}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := setupScheme()
+			cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8)}
+			ctx := context.Background()
+			agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "repo-agent", Namespace: "test-ns"}}
+			declare := func(gitopsRole string) {
+				agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					Forges: tc.forges,
+					Repositories: []agentv1alpha1.RepositorySpec{
+						{Forge: "vcs", Repository: "infra", Role: gitopsRole},
+						{Forge: "vcs", Repository: "terraform", Role: agentv1alpha1.RepositoryRoleManaged},
+					},
+				}}
+			}
+			read := func() (string, bool) {
+				var cm corev1.ConfigMap
+				if err := cl.Get(ctx, client.ObjectKey{Name: "repo-agent-gitops-state", Namespace: "test-ns"}, &cm); err != nil {
+					t.Fatalf("get: %v", err)
+				}
+				value, ok := cm.Data[gitopsStateGitOpsRepoKey]
+				return value, ok
+			}
+
+			// Created with the key.
+			declare(agentv1alpha1.RepositoryRoleGitOps)
+			if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+				t.Fatal(err)
+			}
+			if got, _ := read(); got != tc.want {
+				t.Errorf("gitops_repo on create = %q, expected %q", got, tc.want)
+			}
+
+			// Removed when the role goes away.
+			declare(agentv1alpha1.RepositoryRoleManaged)
+			if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+				t.Fatal(err)
+			}
+			if got, ok := read(); ok {
+				t.Errorf("gitops_repo = %q stayed after no repository has role gitops", got)
+			}
+
+			// Written again on an update, and not only on create.
+			declare(agentv1alpha1.RepositoryRoleGitOps)
+			if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+				t.Fatal(err)
+			}
+			if got, _ := read(); got != tc.want {
+				t.Errorf("gitops_repo on update = %q, expected %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBuildGitopsStateConfigMapGitOpsRepo(t *testing.T) {
+	gh := []agentv1alpha1.ForgeSpec{{Name: "github", Provider: "github", Namespace: "acme"}}
+	cases := []struct {
+		name string
+		list []agentv1alpha1.RepositorySpec
+		want string
+	}{
+		{
+			name: "one gitops repository among managed and context ones",
+			list: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "apps", Role: agentv1alpha1.RepositoryRoleManaged},
+				{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleGitOps},
+				{Forge: "github", Repository: "docs", Role: agentv1alpha1.RepositoryRoleContext},
+			},
+			want: `{"type":"github","url":"https://github.com/acme/infra"}`,
+		},
+		{
+			name: "no gitops repository",
+			list: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "apps", Role: agentv1alpha1.RepositoryRoleManaged},
+				{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleManaged},
+			},
+		},
+		{
+			// The CRD refuses this; past it, neither one is the GitOps repository.
+			name: "two gitops repositories",
+			list: []agentv1alpha1.RepositorySpec{
+				{Forge: "github", Repository: "apps", Role: agentv1alpha1.RepositoryRoleGitOps},
+				{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleGitOps},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "repo-agent", Namespace: "test-ns"},
+				Spec: agentv1alpha1.PlatformAgentSpec{Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+					IntegrationSpec: agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: tc.list},
+				}},
+			}
+			got, ok := buildGitopsStateConfigMap(agent).Data[gitopsStateGitOpsRepoKey]
+			if tc.want == "" && ok {
+				t.Errorf("gitops_repo = %q, expected no key", got)
+			}
+			if tc.want != "" && got != tc.want {
+				t.Errorf("gitops_repo = %q, expected %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestReconcileGitopsStateGitOpsRepoHeldOrRemoved covers the gitops_repo key
+// on an existing ConfigMap: a declaration that does not resolve, or a gitops
+// repository that validation refuses, keeps the key as it is; two gitops
+// repositories remove it.
+func TestReconcileGitopsStateGitOpsRepoHeldOrRemoved(t *testing.T) {
+	const want = `{"type":"github","url":"https://github.com/acme/infra"}`
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(16)}
+	ctx := context.Background()
+	gh := []agentv1alpha1.ForgeSpec{{Name: "github", Provider: "github", Namespace: "acme"}}
+	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "held-agent", Namespace: "test-ns"}}
+	declare := func(spec agentv1alpha1.IntegrationSpec) {
+		agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: spec}
+	}
+	read := func() (string, bool) {
+		var cm corev1.ConfigMap
+		if err := cl.Get(ctx, client.ObjectKey{Name: "held-agent-gitops-state", Namespace: "test-ns"}, &cm); err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		value, ok := cm.Data[gitopsStateGitOpsRepoKey]
+		return value, ok
+	}
+	reconcile := func(step string) {
+		if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+			t.Fatalf("%s: %v", step, err)
+		}
+	}
+
+	declare(agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+		{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleGitOps},
+		{Forge: "github", Repository: "terraform", Role: agentv1alpha1.RepositoryRoleManaged},
+	}})
+	reconcile("create")
+	if got, _ := read(); got != want {
+		t.Fatalf("gitops_repo = %q, expected %q", got, want)
+	}
+
+	// Both spellings at once: the declaration does not resolve.
+	declare(agentv1alpha1.IntegrationSpec{
+		Forges:       gh,
+		Repositories: []agentv1alpha1.RepositorySpec{{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleGitOps}},
+		GitHub:       &agentv1alpha1.GitHubSpec{Org: "acme", GitRepo: "other"},
+	})
+	reconcile("unresolved")
+	if got, _ := read(); got != want {
+		t.Errorf("gitops_repo = %q after a declaration that does not resolve, expected it kept at %q", got, want)
+	}
+
+	// A gitops repository that validation refuses.
+	declare(agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+		{Forge: "github", Repository: "acme/in fra", Role: agentv1alpha1.RepositoryRoleGitOps},
+		{Forge: "github", Repository: "terraform", Role: agentv1alpha1.RepositoryRoleManaged},
+	}})
+	reconcile("refused")
+	if got, _ := read(); got != want {
+		t.Errorf("gitops_repo = %q after a refused gitops repository, expected it kept at %q", got, want)
+	}
+
+	// Two gitops repositories: neither one is the GitOps repository.
+	declare(agentv1alpha1.IntegrationSpec{Forges: gh, Repositories: []agentv1alpha1.RepositorySpec{
+		{Forge: "github", Repository: "infra", Role: agentv1alpha1.RepositoryRoleGitOps},
+		{Forge: "github", Repository: "terraform", Role: agentv1alpha1.RepositoryRoleGitOps},
+	}})
+	reconcile("two gitops")
+	if got, ok := read(); ok {
+		t.Errorf("gitops_repo = %q with two gitops repositories, expected no key", got)
+	}
+	reconcile("two gitops again")
+	if got, ok := read(); ok {
+		t.Errorf("gitops_repo = %q on the second reconcile with two gitops repositories, expected no key", got)
+	}
+}
+
+// TestReconcileGitopsStateGitOpsRepoFromTheDeprecatedAlias covers a
+// github.com install that install.sh renders through the deprecated github
+// alias: its gitRepo is the gitops repository.
+func TestReconcileGitopsStateGitOpsRepoFromTheDeprecatedAlias(t *testing.T) {
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8)}
+	ctx := context.Background()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "alias-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+			IntegrationSpec: agentv1alpha1.IntegrationSpec{GitHub: &agentv1alpha1.GitHubSpec{Org: "acme", GitRepo: "infra"}},
+		}},
+	}
+	if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	var cm corev1.ConfigMap
+	if err := cl.Get(ctx, client.ObjectKey{Name: "alias-agent-gitops-state", Namespace: "test-ns"}, &cm); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := cm.Data[gitopsStateGitOpsRepoKey], `{"type":"github","url":"https://github.com/acme/infra"}`; got != want {
+		t.Errorf("gitops_repo = %q, expected %q", got, want)
 	}
 }

@@ -624,8 +624,16 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
     def test_B2_no_workflow_grants_a_bot_the_ability_to_approve(self) -> None:
         """`pull-requests: write` is the permission an approval needs.
 
-        Six workflows hold it, and none can give an approval:
+        Eight workflows hold it, and none can give an approval:
 
+        - auto-enqueue: `schedule`, `workflow_dispatch` and
+          `pull_request_target: labeled, unlabeled`, `permissions: {}` at the
+          top, job-gated on `github.repository`, the grant job-scoped, checkout
+          pinned to the default branch with `persist-credentials: false`. Its
+          `GITHUB_TOKEN` pull-request write is one comment on a pull request
+          removed from the merge queue, saying why and how to put it back. Its
+          auto-merge calls run on a GitHub App token, which the tests below
+          pin; the comment explains a removal and cannot approve or merge.
         - auto_request_review, which requests reviewers and does not give them.
         - auto-assign-milestone: triggers on `pull_request_target: closed`
           gated on `merged == true`, so it runs only after the merge decision
@@ -648,10 +656,19 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
           write is one comment on a pull request whose smoke run went red,
           edited in place on later runs. It explains a red; it cannot approve,
           label, or merge anything.
+        - retest-actions: `issue_comment` on a `/retest` that opens the
+          comment, from an owner, member or collaborator; `permissions: {}`
+          at the top, the grant job-scoped, checkout of the default branch
+          with `persist-credentials: false`, the two event fields passed as
+          integers through the environment. Its one pull-request write is a
+          reaction on the comment that asked; its other writes are re-runs of
+          the pull request's own failed workflow runs, under `actions: write`,
+          which execute with their original actor's privileges. It re-runs a
+          check; it cannot approve, label, or merge anything.
 
         The list is an allowlist of holders, not of intents: the permission is
         a capability, and this asserts membership rather than absence so a
-        seventh holder is a red test and a conversation rather than a silent
+        ninth holder is a red test and a conversation rather than a silent
         addition. Adding a name here means someone read the workflow. A GitHub
         App token minted with Pull requests write is not a `permissions:`
         grant; `test_B2_app_token_write_grants_are_pinned` holds those.
@@ -670,10 +687,12 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
         self.assertEqual(
             [
                 "auto-assign-milestone.yml",
+                "auto-enqueue.yml",
                 "auto_request_review.yml",
                 "ci-health.yml",
                 "coverage-comment.yml",
                 "hold-unresolved-threads.yml",
+                "retest-actions.yml",
                 "risk_classify.yml",
             ],
             sorted(set(holders)),
@@ -693,9 +712,9 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
         `lgtm` and `approved` with no `do-not-merge` label, the predicate Tide
         merges on today, and Prow sets those two labels only for accounts the
         `OWNERS` files name. No model verdict is an input. The call runs on a
-        GitHub App token, not on a `pull-requests: write` grant, so the holder
-        list above does not show it; the App-token test below pins who mints
-        one. The next test pins the predicate; any other script under
+        GitHub App token, not on a `pull-requests: write` grant: the holder
+        list above shows `auto-enqueue.yml` only for its left-out comment, and
+        the App-token test below pins who mints one. The next test pins the predicate; any other script under
         `scripts/` making one of these calls is a red.
         """
         merging = (
@@ -731,7 +750,9 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
         Auto-merge goes on only for a pull request that is not a draft, carries
         both `lgtm` and `approved`, and carries none of the `do-not-merge`
         labels Tide's query excludes. Every other combination must leave it
-        off.
+        off. That holds on each removal path too: never removed, removed with
+        the one retry after a `failed_checks` removal due, and removed with it
+        spent, which stays out.
         """
         scripts = h.REPO_ROOT / "scripts"
         if str(scripts) not in sys.path:
@@ -751,13 +772,21 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
                         labels = {"size/S"} | ({"lgtm"} if lgtm else set()) | ({"approved"} if approved else set())
                         if hold:
                             labels.add(hold)
-                        pull = {"draft": draft, "labels": labels, "auto_merge": False, "queue_entry": None}
-                        expected = lgtm and approved and not hold and not draft
-                        with self.subTest(labels=sorted(labels), draft=draft):
-                            self.assertEqual(
-                                expected,
-                                merge_gate.enqueue_action(pull) == merge_gate.ENABLE,
-                            )
+                        for removed, retry in ((False, False), (True, True), (True, False)):
+                            pull = {
+                                "draft": draft,
+                                "labels": labels,
+                                "auto_merge": False,
+                                "queue_entry": None,
+                                "removed_since_push": removed,
+                                "retry": retry,
+                            }
+                            expected = lgtm and approved and not hold and not draft and (retry or not removed)
+                            with self.subTest(labels=sorted(labels), draft=draft, removed=removed, retry=retry):
+                                self.assertEqual(
+                                    expected,
+                                    merge_gate.enqueue_action(pull) == merge_gate.ENABLE,
+                                )
 
 
     def test_B2_app_token_write_grants_are_pinned(self) -> None:

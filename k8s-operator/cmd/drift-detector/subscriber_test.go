@@ -905,3 +905,252 @@ func equalStrings(got, want []string) bool {
 	}
 	return true
 }
+
+// recordCollector gathers the records a loop running on another goroutine
+// hands its handler, and runs that loop until it has handed over want.
+type recordCollector struct {
+	mu      sync.Mutex
+	records []AuditRecord
+}
+
+func (c *recordCollector) handle(_ context.Context, r AuditRecord) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.records = append(c.records, r)
+}
+
+func (c *recordCollector) runUntil(t *testing.T, sub *subscriber, want int) []AuditRecord {
+	t.Helper()
+	sub.idleWait = time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- sub.Run(ctx) }()
+	for {
+		c.mu.Lock()
+		n := len(c.records)
+		c.mu.Unlock()
+		if n >= want || ctx.Err() != nil {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	<-done
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]AuditRecord(nil), c.records...)
+}
+
+// The first-pull rule: a message published before this process first pulled
+// successfully is backlog, whatever its age, and one published after is not.
+func TestRunMarksRecordsPublishedBeforeTheFirstPullAsBacklog(t *testing.T) {
+	firstPull := time.Date(2026, 10, 16, 20, 48, 15, 0, time.UTC)
+	source := &fakeSource{batches: [][]receivedMessage{
+		{
+			{AckID: "install-tail", Data: []byte(humanPatchEntry), PublishTime: firstPull.Add(-3 * time.Minute)},
+			{AckID: "just-before", Data: []byte(humanPatchEntry), PublishTime: firstPull.Add(-time.Second)},
+			{AckID: "after", Data: []byte(humanPatchEntry), PublishTime: firstPull.Add(time.Second)},
+			{AckID: "no-publish-time", Data: []byte(humanPatchEntry)},
+		},
+	}}
+	collector := &recordCollector{}
+	sub := newSubscriber(source, collector.handle, defaultMaxMessages, defaultBatchJoinBudget)
+	sub.now = func() time.Time { return firstPull }
+
+	want := []bool{true, true, false, false}
+	handled := collector.runUntil(t, sub, len(want))
+	if len(handled) != len(want) {
+		t.Fatalf("handled %d record(s), want %d", len(handled), len(want))
+	}
+	for i, w := range want {
+		if handled[i].Backlog != w {
+			t.Errorf("record %d: Backlog = %t, want %t (publish time %s, first pull %s)", i, handled[i].Backlog, w, handled[i].PublishTime, firstPull)
+		}
+	}
+	if !handled[0].PublishTime.Equal(firstPull.Add(-3 * time.Minute)) {
+		t.Errorf("PublishTime = %s, want it carried from the message", handled[0].PublishTime)
+	}
+}
+
+// A failed pull is not the first pull. A detector whose first attempts fail
+// (an IAM grant still propagating) must start the first-pull clock at the
+// pull that worked, or the records queued during the failures would be live.
+func TestRunStartsTheFirstPullClockAtTheFirstSuccessfulPull(t *testing.T) {
+	start := time.Date(2026, 10, 16, 20, 48, 0, 0, time.UTC)
+	clock := start
+	var mu sync.Mutex
+	failing := &failingThenSource{fakeSource: fakeSource{batches: [][]receivedMessage{
+		{{AckID: "queued", Data: []byte(humanPatchEntry), PublishTime: start.Add(30 * time.Second)}},
+	}}, failures: 1, onPull: func() {
+		mu.Lock()
+		clock = clock.Add(time.Minute)
+		mu.Unlock()
+	}}
+	collector := &recordCollector{}
+	sub := newSubscriber(failing, collector.handle, defaultMaxMessages, defaultBatchJoinBudget)
+	sub.now = func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return clock
+	}
+	handled := collector.runUntil(t, sub, 1)
+
+	if len(handled) != 1 {
+		t.Fatalf("handled %d record(s), want 1", len(handled))
+	}
+	if !handled[0].Backlog {
+		t.Error("a record published between a failed pull and the first successful one was not marked backlog")
+	}
+}
+
+// failingThenSource fails its first failures pulls, then behaves as fakeSource.
+type failingThenSource struct {
+	fakeSource
+	failures int
+	onPull   func()
+}
+
+func (f *failingThenSource) Pull(ctx context.Context, maxMessages int64) ([]receivedMessage, error) {
+	if f.onPull != nil {
+		f.onPull()
+	}
+	if f.failures > 0 {
+		f.failures--
+		f.pulls++
+		return nil, errors.New("permission denied")
+	}
+	return f.fakeSource.Pull(ctx, maxMessages)
+}
+
+// The age rule: after the first pull, a message that waited longer than
+// backlogAge is backlog, and one that waited less is not.
+func TestBacklogMarksAMessageThatWaitedPastTheMaxWait(t *testing.T) {
+	firstPull := time.Date(2026, 10, 16, 20, 48, 0, 0, time.UTC)
+	sub := newSubscriber(&fakeSource{}, func(context.Context, AuditRecord) {}, defaultMaxMessages, defaultBatchJoinBudget)
+	sub.firstPullAt = firstPull
+	sub.pulledAt = firstPull.Add(2 * time.Hour)
+	if sub.backlogAge != backlogMaxWait {
+		t.Fatalf("backlogAge = %s, want backlogMaxWait (%s)", sub.backlogAge, backlogMaxWait)
+	}
+
+	published := sub.pulledAt.Add(-backlogMaxWait - time.Second)
+	if !sub.backlog(published) {
+		t.Errorf("a message that waited %s was not backlog", sub.pulledAt.Sub(published))
+	}
+	// The field, not the constant, is what the rule reads.
+	sub.backlogAge = 3 * time.Hour
+	if sub.backlog(published) {
+		t.Errorf("a message that waited %s was backlog under a %s max wait", sub.pulledAt.Sub(published), sub.backlogAge)
+	}
+	sub.backlogAge = backlogMaxWait
+	published = sub.pulledAt.Add(-backlogMaxWait + time.Second)
+	if sub.backlog(published) {
+		t.Errorf("a message that waited %s was backlog", sub.pulledAt.Sub(published))
+	}
+}
+
+// Before any pull has succeeded nothing is backlog, so a test or caller that
+// drives processBatch directly sees records exactly as before.
+func TestBacklogIsFalseBeforeTheFirstPull(t *testing.T) {
+	sub := newSubscriber(&fakeSource{}, func(context.Context, AuditRecord) {}, defaultMaxMessages, defaultBatchJoinBudget)
+	if sub.backlog(time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Error("backlog before the first pull")
+	}
+}
+
+// The REST source carries the message's publishTime through, and a malformed
+// one becomes zero rather than failing the message.
+func TestPubsubSourcePullCarriesPublishTime(t *testing.T) {
+	const subscriptionID = "projects/example-project/subscriptions/drift-audit-sub"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"receivedMessages":[`+
+			`{"ackId":"a1","message":{"messageId":"m1","data":"e30=","publishTime":"2026-10-16T20:43:34.607524Z"}},`+
+			`{"ackId":"a2","message":{"messageId":"m2","data":"e30=","publishTime":"not a time"}}]}`)
+	}))
+	defer srv.Close()
+
+	service, err := pubsub.NewService(context.Background(), option.WithEndpoint(srv.URL), option.WithoutAuthentication())
+	if err != nil {
+		t.Fatalf("pubsub.NewService: %v", err)
+	}
+	source := &pubsubSource{service: service, subscription: subscriptionID}
+	got, err := source.Pull(context.Background(), defaultMaxMessages)
+	if err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d message(s), want 2", len(got))
+	}
+	want := time.Date(2026, 10, 16, 20, 43, 34, 607524000, time.UTC)
+	if !got[0].PublishTime.Equal(want) {
+		t.Errorf("PublishTime = %s, want %s", got[0].PublishTime, want)
+	}
+	if !got[1].PublishTime.IsZero() {
+		t.Errorf("malformed publishTime parsed to %s, want zero", got[1].PublishTime)
+	}
+}
+
+// Run's two clocks across two pulls: the first-pull time is set once and
+// kept, and the current pull's time moves, so the age rule fires on the second
+// pull and the first-pull rule does not re-fire on it.
+func TestRunKeepsTheFirstPullAndMovesTheCurrentPull(t *testing.T) {
+	first := time.Date(2026, 10, 16, 20, 48, 0, 0, time.UTC)
+	second := first.Add(time.Hour)
+	var mu sync.Mutex
+	clock := first
+	source := &clockedSource{fakeSource: fakeSource{batches: [][]receivedMessage{
+		{
+			{AckID: "queued", Data: []byte(humanPatchEntry), PublishTime: first.Add(-time.Minute)},
+			{AckID: "live-1", Data: []byte(humanPatchEntry), PublishTime: first.Add(time.Second)},
+		},
+		{
+			{AckID: "stalled", Data: []byte(humanPatchEntry), PublishTime: first.Add(2 * time.Minute)},
+			{AckID: "live-2", Data: []byte(humanPatchEntry), PublishTime: second.Add(-time.Minute)},
+		},
+	}}, afterPull: func(pulls int) {
+		mu.Lock()
+		defer mu.Unlock()
+		if pulls == 1 {
+			clock = second
+		}
+	}}
+	collector := &recordCollector{}
+	sub := newSubscriber(source, collector.handle, defaultMaxMessages, defaultBatchJoinBudget)
+	sub.now = func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return clock
+	}
+
+	want := []bool{true, false, true, false}
+	handled := collector.runUntil(t, sub, len(want))
+	if len(handled) != len(want) {
+		t.Fatalf("handled %d record(s), want %d", len(handled), len(want))
+	}
+	for i, w := range want {
+		if handled[i].Backlog != w {
+			t.Errorf("record %d (published %s): Backlog = %t, want %t", i, handled[i].PublishTime, handled[i].Backlog, w)
+		}
+	}
+}
+
+// clockedSource is fakeSource with a hook run after each pull that returned
+// a batch, so a test can move the clock between batches.
+type clockedSource struct {
+	fakeSource
+	afterPull func(pulls int)
+	delivered int
+}
+
+func (c *clockedSource) Pull(ctx context.Context, maxMessages int64) ([]receivedMessage, error) {
+	batch, err := c.fakeSource.Pull(ctx, maxMessages)
+	if len(batch) > 0 {
+		c.delivered++
+		if c.afterPull != nil {
+			c.afterPull(c.delivered)
+		}
+	}
+	return batch, err
+}

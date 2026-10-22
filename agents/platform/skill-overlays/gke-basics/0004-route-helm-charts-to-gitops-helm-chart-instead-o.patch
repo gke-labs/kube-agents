@@ -1,0 +1,22 @@
+Subject: Route Helm charts to gitops-helm-chart instead of helm
+
+Why: the agent's shell holds no cluster credential and reaches no chart repository, so a helm install or upgrade it is told to run fails, and the next move observed was asking the broker for an access token to hand to helm. A chart change here goes into the GitOps repository as a pull request through gitops-helm-chart, a skill this repository has and upstream does not, so the helm lines and the table's Helm mentions are replaced with that route.
+Local-Issue: #2938
+Upstream-Issue: none (specific to this repository)
+Retire-When: never; gitops-helm-chart is this repository's skill and the read-only shell is this repository's design
+
+diff --git a/references/cli-reference.md b/references/cli-reference.md
+--- a/references/cli-reference.md
++++ b/references/cli-reference.md
+@@ -207,8 +207,9 @@ kubectl top nodes
+ `kubectl exec`, `kubectl port-forward` and `kubectl cp` reach into a running pod, and the
+ broker refuses them; when a task needs one, give the user the command to run.
+ 
+-Scaling a Deployment (its `replicas`) or installing a Helm chart is a manifest change,
+-proposed as a pull request through `submit-suggestion`.
++Scaling a Deployment (its `replicas`) is a manifest change, proposed as a pull request
++through `submit-suggestion`. A Helm chart is never installed or upgraded with `helm`:
++declare it in the GitOps repository with the `gitops-helm-chart` skill.
+ 
+ ## `parent` / `name` Format Quick Reference
+ 

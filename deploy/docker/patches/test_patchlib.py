@@ -764,5 +764,61 @@ hook(top_handle, free)
         call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "hook")
         self.assertEqual(patchlib.unbound(tree, call), ["free", "hook"])
 
+CLASS_SOURCE = """\
+import os
+
+
+class SessionMessagesMixin:
+    def _message_row_params(self, session_id, role, msg, tool_calls,
+        message_timestamp, *, keep_reasoning):
+        \"\"\"Bind values.\"\"\"
+        return (session_id, role)
+
+    def other(self):
+        return 1
+
+
+def _message_row_params():
+    return 0
+"""
+
+
+class FindMethodTest(unittest.TestCase):
+    def test_a_method_is_found_inside_its_class(self):
+        p, _ = patch(CLASS_SOURCE)
+        site = p.find_method("SessionMessagesMixin", "_message_row_params", label="binder")
+        self.assertIsInstance(site, patchlib.Definition)
+        self.assertEqual(site.body_indent, "        ")
+        self.assertEqual(p.source[site.body_start:].split("\n")[0], "        return (session_id, role)")
+
+    def test_a_missing_class_fails_loudly(self):
+        p, _ = patch(CLASS_SOURCE)
+        with self.assertRaises(SystemExit) as ctx:
+            p.find_method("SessionsMixin", "_message_row_params", label="binder")
+        self.assertIn("class SessionsMixin", str(ctx.exception))
+        self.assertIn("binder", str(ctx.exception))
+
+    def test_a_missing_method_fails_loudly(self):
+        p, _ = patch(CLASS_SOURCE)
+        with self.assertRaises(SystemExit) as ctx:
+            p.find_method("SessionMessagesMixin", "_row_params", label="binder")
+        self.assertIn("_row_params", str(ctx.exception))
+
+
+class ExpectParametersTest(unittest.TestCase):
+    def test_present_parameters_of_any_kind_pass(self):
+        p, _ = patch(CLASS_SOURCE)
+        site = p.find_method("SessionMessagesMixin", "_message_row_params", label="binder")
+        site.expect_parameters("msg", "tool_calls", "keep_reasoning")
+
+    def test_a_missing_parameter_fails_loudly(self):
+        p, _ = patch(CLASS_SOURCE)
+        site = p.find_method("SessionMessagesMixin", "_message_row_params", label="binder")
+        with self.assertRaises(SystemExit) as ctx:
+            site.expect_parameters("msg", "messages")
+        self.assertIn("messages", str(ctx.exception))
+        self.assertNotIn("msg,", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

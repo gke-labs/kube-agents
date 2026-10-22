@@ -547,7 +547,7 @@ The two labels are the two people:
 - **`approved` is an `OWNERS` approver's.** `/approve`, from someone in the `OWNERS` file governing
   the changed paths — [`OWNERS`](../OWNERS) at the root and [`hack/OWNERS`](../hack/OWNERS) for the
   presubmit eval rosters (`hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt`)
-  alone, with [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `eval-crew`. The last names only
+  and the inject lane's exclusions and safeguards under `hack/eval/` alone, with [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `eval-crew`. The last names only
   `eval-crew` and sets `no_parent_owners`, so a root approver's `/approve` does not clear a change
   to what the presubmit runs or what blocks; the nightly file and the case directories under
   `bench/tasks/` fall through to the root approvers (#1546). An approver's
@@ -626,12 +626,14 @@ Those contexts are not the whole required set either. Tide also requires every P
 (GoogleCloudPlatform/oss-test-infra#2677), so the behavioural presubmit gates every merge from that
 date. The command below therefore answers part of the question, and the two lists together still do
 not answer all of it: they say which contexts must be _present_ and green, but Tide also refuses any
-posted context that is not green, required or not, unless Prow marks it `optional`: Tide always
-reads a cancelled or failed check run as a failing context, and with no Tide context policy for this
-repository an unknown context is not optional. A `classify` run cancelled
-by a superseding event held #1364 unmerged with `lgtm` and `approved` on it, though `classify` is in
-neither list. `tide`'s own status names the offending context; `gh run rerun <run-id> --job <job-id>`
-clears it — by job ID, since `--failed` (below) re-runs failed jobs and a cancelled one is not failed.
+posted context that is not green, required or not, unless Prow marks it `optional`: Tide reads a
+check name whose every check run is cancelled or failed as a failing context (one success under the
+same name clears it; one still running holds it as pending), and with no Tide context policy for this repository
+an unknown context is not optional. A `classify` run cancelled by a superseding event held #1364
+unmerged with `lgtm` and `approved` on it, though `classify` is in neither list. `tide`'s own status
+names the offending context; `/retest` ([below](#re-running-a-check-that-failed)) re-runs such a
+run whole, and with Write access `gh run rerun <run-id> --job <job-id>` clears it by job ID, since
+`--failed` re-runs failed jobs and a cancelled one is not failed.
 
 ```bash
 gh api repos/gke-labs/kube-agents/branches/main/protection \
@@ -669,11 +671,13 @@ sync, and the sweep sometimes loses it; when it does, Tide starts the retest as 
 batch, when two or more qualify), crier's `pending` is then the newer status, and the sweep leaves
 it alone. That retest is what [`hack/ci-revalidate.sh`](../hack/ci-revalidate.sh), the job's step 0,
 makes cheap: before the job leases an evaluation project it looks for a green build of this job — at
-the pull request's head, or at an earlier head from which every change since is inert — attested by
-the Prow-posted success status, or failing both an admin `/override` of this job at the pull
+the pull request's head, at an earlier head with the same tree, or at an earlier head from which every
+change since is inert — attested by the Prow-posted success status, or failing all three an admin
+`/override` of this job at the pull
 request's current head, and reuses that verdict whatever `main` has done since — a batch pull by pull, every one or none — so a lost race
 costs the minutes of a pod start and a clone rather than the 1.5 to 3.5 hours of the matrix. A push
-still starts a fresh run, and a run it is: step 0 reuses an earlier head's green only when
+still starts a fresh run, and a run it is: step 0 reuses an earlier head's green only when that head
+has the same tree (an empty commit, or a message-only rewrite), whatever `main` did since, or when
 everything since, on the pull request's side and on `main`'s, is inert.
 `/test pull-kube-agents-smoke-test` on the same head posts `pending`, which wins until that run
 reports (`/retest` does not, because it reruns only failed contexts), and that run too reuses the
@@ -694,6 +698,18 @@ reads the key so that such a run is never itself taken for a green. What this tr
 away, on every retest and not only when the sweep wins: the combination of a head with the `main`
 it lands on, and in a batch with the other pulls, is not tested before the merge; the nightly eval
 on `main` is what finds a bad combination, as is the next smoke run that actually starts after it.
+Neither carries a verdict across a change to what the job grades. When the blocking job's
+`spec.mode` changes in `oss-test-infra` (the swap to `next`, or a rollback to `today`), set the
+repository variable `SMOKE_PIN_NOT_BEFORE` right after it merges, to that merge time plus the job's
+360-minute timeout (a run in flight at the change reports afterwards; later only costs retests),
+then dispatch `smoke-test-sticky.yml` by hand: the re-pin then never pins an older green, and makes
+one Tide still credits stale, which the change itself would not, as it moves nothing on `main`.
+Then move `main` once, with a docs-only pull request the job skips: Tide also credits a live
+ProwJob at `main`'s head, and a retest that started under the old mode stays credited that way
+until `main` moves. Ship the change with `EVAL_SKIP_REVALIDATION=1` on the job, so the retests Tide then starts run the
+matrix instead of reusing the old green. The follow-up that drops that lever sets
+`EVAL_REVALIDATION_NOT_BEFORE` on the job to the same time as the variable, so step 0 never reuses
+a green first reported before it, however long its pull request sat.
 Prow's own form of the re-pin — a `[prow:skip-retest]` sentinel written by `/override-sticky` — is
 upstream but not in the Prow build this repository merges through; `scripts/pin_smoke_status.py`
 says when to switch.
@@ -727,7 +743,24 @@ gh pr view <number> --repo gke-labs/kube-agents --json labels --jq '[.labels[].n
 ## Re-running a check that failed
 
 A GitHub Actions check that fails on a pull request whose diff cannot have caused it is worth one
-re-run, from the run's page or with `gh run rerun <run-id> --failed`. That re-run is also a report.
+re-run. Comment `/retest` on the pull request, as the first thing in the comment: Prow re-runs its
+failed jobs, and [`retest-actions.yml`](../.github/workflows/retest-actions.yml) re-runs the GitHub
+Actions runs behind the red checks at the head commit (a cancelled or timed-out run whole, since
+Tide blocks on it the same way) for any owner, member or collaborator. Prow also reads the command
+at the start of a later line; the Actions re-run, like `/request-review`, reads the start of the
+comment only, so a `/retest` under a line of explanation re-runs the Prow jobs alone. It re-runs
+only the pull request's own runs: a head commit that is also a commit on `main` or a release line
+carries that line's push runs too, and a red one of those is named and left alone. It reads the checks as Tide does, the best
+state per check name, so a run a newer success superseded or one cancelled while still queued is
+not re-run: neither blocks anything. GitHub's own re-run button needs Write access, which most
+collaborators here do not hold. The comment gets 👀 when something was re-run and 😕 when nothing
+was, with the reason on the workflow run (a `Retest Actions Checks` run in the Actions tab; it is
+red, carrying GitHub's message, when GitHub refused every re-run, which is what a token that cannot
+re-run looks like). A green run whose comment got no reaction at all means GitHub refused the
+reaction; the run's warning and summary say so, and the re-run or the decline reason is still there. A run already on its third attempt is left alone (the
+second attempt is for a run that a lost runner or a superseding event cancelled on the way to the
+one re-run the flake is worth); someone with Write access reads its log and decides, re-running from
+the run's page or with `gh run rerun <run-id> --failed`. Either re-run is also a report.
 [`flaky-check-notify.yml`](../.github/workflows/flaky-check-notify.yml) sweeps the recent runs
 of the checks it watches every fifteen minutes, and when a run's latest attempt passed on the same
 commit an earlier attempt failed on, it opens a `ci:flaky` issue per failing test class

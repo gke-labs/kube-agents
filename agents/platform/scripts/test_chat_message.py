@@ -127,6 +127,38 @@ class AnswerTest(unittest.TestCase):
         self.assertNotIn("choices", chat)
 
 
+class NextStepTest(unittest.TestCase):
+    def test_mock_07(self):
+        """The declared step is the one choice, not primary, and its line is not in the detail."""
+        chat = cm.answer_message(_case("answer-declares-next-step")["input"]["markdown"])
+        self.assertEqual(chat["choices"], [{"text": "upgrade plan for seeded-c", "next": True}])
+        self.assertTrue(chat["detail"].endswith("are current."))
+
+    def test_a_long_rest_folds_and_keeps_the_step(self):
+        long = "X" + "x" * cm.DETAIL_MAX
+        chat = cm.answer_message(f"Behind. {long}\n\n[next: upgrade plan for seeded-c]")
+        self.assertEqual((chat["fold"]["text"], chat["choices"]),
+                         (long, [{"text": "upgrade plan for seeded-c", "next": True}]))
+
+    def test_options_win_over_a_step(self):
+        chat = cm.answer_message("Two ways.\n\n1. **Raise it**\n2. **Roll back**\n\nWhich do you want?\n\n[next: raise it]")
+        self.assertEqual(chat["choices"], [{"text": "Raise it"}, {"text": "Roll back"}])
+
+    def test_a_command_word_step_is_no_button_and_no_text(self):
+        self.assertEqual(cm.answer_message("Running.\n\n[next: stop]"), {"schema": cm.SCHEMA, "headline": "Running."})
+
+    def test_a_refused_step_is_not_laid_out_as_text(self):
+        chat = cm.answer_message("seeded-c is behind.\n\n[next: a]\n[next: b]")
+        self.assertNotIn("choices", chat)
+        self.assertNotIn("[next:", str(chat))
+
+    def test_a_failure_reply_offers_its_step_in_place_of_try_again(self):
+        self.assertEqual(cm.failure_message("I couldn't. Check it there?", True, "check seeded-a")["choices"],
+                         [{"text": "check seeded-a", "next": True}])
+        self.assertEqual(cm.failure_message("I couldn't. Retry?", True)["choices"], [{"text": cm.OFFER_LABEL}])
+        self.assertNotIn("choices", cm.failure_message("I couldn't. Retry?", False, "check seeded-a"))
+
+
 class PlanTest(unittest.TestCase):
     def test_mark_follows_the_rows(self):
         running, pending = _row("a", "in_progress"), _row("b", "pending")

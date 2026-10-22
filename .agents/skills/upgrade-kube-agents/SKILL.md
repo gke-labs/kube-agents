@@ -51,6 +51,11 @@ that is not the release being asked for is refused by name.
 - `--upgrade-mode=operator`: applies the chart's CRDs with `kubectl` first (Helm never touches `crds/` on upgrade), then the same `helm upgrade` re-tagging only the operator image. Both modes stop before any of the new release is applied, naming each recorded key the chart's `values.schema.json` refuses as undeclared; on an upgrade that is a renamed or removed setting, so use `--upgrade-mode=full`. `--drop-undeclared-values` drops and names those keys instead, for a rollback to a release that predates them; a later release that declares a dropped key renders it from that chart's default until a full-mode run there.
 - `--upgrade-mode=full` (Default): applies the CRDs, then runs a full `terraform apply` at the new `--image-tag` through the install engine — both image tags move and every setting in `install.env` is re-rendered. This mode additionally requires the `terraform` CLI.
 
+Every mode stops before the Secret backfills when the move leaves behind a commit marked as a
+breaking change (`type!:` or a `BREAKING CHANGE:` footer), as a rollback to an older release
+usually does, and names each one; `--plan` only warns. Show the user the named commits and get
+their consent before re-running with `--allow-breaking-downgrade`.
+
 A GitLab install needs nothing extra. The upgrade reads the forge, host, project and Secret names
 from `install.env`, needs no token and no CA file, and keeps both Secrets.
 
@@ -118,3 +123,12 @@ plans at the installed tag):
 When `--keep-image-tag` (or a tagless `--plan` whose state records no tag) reads the running tag off the
 agent Deployment, it validates it exactly as a passed one, so an install serving a mutable ref stops the
 run rather than writing that ref into the composition.
+
+## After the Upgrade, and Switching `spec.mode`
+
+- On an install with Slack, check that Slack answers before reporting success: the log line and
+  the DM test (ask a person to send it) in the Upgrade page's
+  [Checking the result → Slack](../../../docs/site/src/content/docs/install/upgrade.md#slack).
+- To switch `spec.mode` (`PLATFORM_AGENT_MODE`), follow the Upgrade page's
+  [Switching `spec.mode`](../../../docs/site/src/content/docs/install/upgrade.md#switching-specmode)
+  step by step. Of `upgrade.sh`'s modes only `--upgrade-mode=full` applies the key.

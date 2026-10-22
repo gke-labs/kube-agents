@@ -1022,6 +1022,244 @@
           }
         ]
       }
+    },
+    {
+      "in": "I couldn't find seeded-z. The fleet has seeded-a, -b and -c. checkout-gateway runs on seeded-a. Check it there?\n\n[next: check seeded-a]",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "I couldn't find seeded-z.",
+        "detail": "The fleet has seeded-a, -b and -c. checkout-gateway runs on seeded-a. Check it there?",
+        "choices": [
+          {
+            "text": "check seeded-a",
+            "next": true
+          }
+        ]
+      }
+    },
+    {
+      "in": "**seeded-c is one minor version behind (1.32.9 vs 1.33.4).** a and b are current.\n\n[next: upgrade plan for seeded-c]",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "seeded-c is one minor version behind (1.32.9 vs 1.33.4). a and b are current.",
+        "choices": [
+          {
+            "text": "upgrade plan for seeded-c",
+            "next": true
+          }
+        ]
+      }
+    },
+    {
+      "in": "**seeded-c is one minor version behind.** It runs 1.32.9 while stable is 1.33.4;\nseeded-a and seeded-b are current.\n[Next:   upgrade plan for   seeded-c ]  \n\n",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "seeded-c is one minor version behind.",
+        "detail": "It runs 1.32.9 while stable is 1.33.4; seeded-a and seeded-b are current.",
+        "choices": [
+          {
+            "text": "upgrade plan for seeded-c",
+            "next": true
+          }
+        ]
+      }
+    },
+    {
+      "in": "seeded-c is behind its channel default.\n[next: upgrade plan for seeded-c]",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "seeded-c is behind its channel default.",
+        "choices": [
+          {
+            "text": "upgrade plan for seeded-c",
+            "next": true
+          }
+        ]
+      }
+    },
+    {
+      "in": "seeded-c is behind.\n\n[next: upgrade plan for seeded-c]\n[next: check seeded-b]",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "seeded-c is behind."
+      }
+    },
+    {
+      "in": "seeded-c is behind.\n\n[next: check seeded-b]\n\nOr upgrade it.\n\n[next: upgrade plan for seeded-c]",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "seeded-c is behind.",
+        "detail": "[next: check seeded-b]\n\nOr upgrade it."
+      }
+    },
+    {
+      "in": "seeded-c is behind.\n\n[next: upgrade upgrade upgrade upgrade upgrade upgrade upgrade upgrade upgrade upgrade seeded-c]",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "seeded-c is behind."
+      }
+    },
+    {
+      "in": "seeded-c is behind.\n\n[next: upgrade `seeded-c`]",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "seeded-c is behind.",
+        "choices": [
+          {
+            "text": "upgrade seeded-c",
+            "next": true
+          }
+        ]
+      }
+    },
+    {
+      "in": "seeded-c is behind.\n\n[next: ask <@U123> about seeded-c]",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "seeded-c is behind."
+      }
+    },
+    {
+      "in": "seeded-c is behind.\n\n[next: ]",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "seeded-c is behind."
+      }
+    },
+    {
+      "in": "seeded-c is behind.\n\n[next: upgrade plan for seeded-c]\n\nAnything else?",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "seeded-c is behind.",
+        "detail": "[next: upgrade plan for seeded-c]\n\nAnything else?"
+      }
+    },
+    {
+      "in": "The upgrade is running.\n\n[next: stop]",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "The upgrade is running."
+      }
+    },
+    {
+      "in": "The upgrade is running.\n\n[next: what's happening?]",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "The upgrade is running."
+      }
+    },
+    {
+      "in": "There are two ways to fix it.\n\n1. **Raise the limit**\n2. **Roll back**\n\nWhich do you want?\n\n[next: raise the limit]",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "There are two ways to fix it.",
+        "detail": "Which do you want?",
+        "choices": [
+          {
+            "text": "Raise the limit"
+          },
+          {
+            "text": "Roll back"
+          }
+        ]
+      }
+    },
+    {
+      "in": "seeded-c is behind its channel default. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. \n\n[next: upgrade plan for seeded-c]",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "seeded-c is behind its channel default.",
+        "fold": {
+          "title": "why",
+          "text": "It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4. It runs 1.32.9 while stable is 1.33.4."
+        },
+        "choices": [
+          {
+            "text": "upgrade plan for seeded-c",
+            "next": true
+          }
+        ]
+      }
+    },
+    {
+      "in": "Two ways.\n\n1. **Raise it**\n2. **Roll back**\n\nWhich do you want?\n\n[next: stop]",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Two ways.",
+        "detail": "Which do you want?",
+        "choices": [
+          {
+            "text": "Raise it"
+          },
+          {
+            "text": "Roll back"
+          }
+        ]
+      }
+    },
+    {
+      "in": "seeded-c is behind.\r\n[next: check seeded-b]\r\n[next: upgrade plan for seeded-c]\r\n",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "seeded-c is behind."
+      }
+    },
+    {
+      "in": "seeded-c is behind.\r\n\r\n[next: upgrade plan for seeded-c]\r\n",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "seeded-c is behind.",
+        "choices": [
+          {
+            "text": "upgrade plan for seeded-c",
+            "next": true
+          }
+        ]
+      }
+    },
+    {
+      "in": "seeded-c is behind.\n[next: check seeded-b]\f\n[next: upgrade plan for seeded-c]",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "seeded-c is behind."
+      }
+    },
+    {
+      "in": "Five pods match.\n\n[next: **delete pods matching** `app=web-*`]",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Five pods match.",
+        "choices": [
+          {
+            "text": "delete pods matching app=web-*",
+            "next": true
+          }
+        ]
+      }
+    },
+    {
+      "in": "Five pods match.\n\n[next: scale app=web-* to 3]",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Five pods match.",
+        "choices": [
+          {
+            "text": "scale app=web-* to 3",
+            "next": true
+          }
+        ]
+      }
+    },
+    {
+      "in": "Five pods match.\n\n[next: **]",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Five pods match."
+      }
+    },
+    {
+      "in": "```\nkubectl get nodes\n```\n\n[next: check seeded-a]",
+      "chat": null
     }
   ]
 }
