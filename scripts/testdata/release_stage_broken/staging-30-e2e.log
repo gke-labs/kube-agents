@@ -1,0 +1,11 @@
+2026-10-21T03:37:38.9098530Z 
+2026-10-21T03:37:38.9098740Z tests/e2e/test_stockout_investigation.py:899: AssertionError
+2026-10-21T03:37:38.9099172Z =========================== short test summary info ============================
+2026-10-21T03:37:38.9099956Z FAILED tests/e2e/test_stockout_investigation.py::test_stockout_ingress_alert_smoke - AssertionError: Stockout ingress alert verify.sh failed with exit code 1:
+2026-10-21T03:37:38.9100629Z   STDOUT:
+2026-10-21T03:37:38.9100864Z   ============================================================
+2026-10-21T03:37:38.9101208Z   Verifying GKE Stockout Investigator Extension
+2026-10-21T03:37:38.9348153Z 
+2026-10-21T03:37:38.9349561Z ✓ Using established kubectl cluster connection for 'platform-agent-host' (gke_kube-agents-nightly_us-central1_platform-agent-host).
+2026-10-21T03:37:38.9427450Z ##[error]Process completed with exit code 1.
+2026-10-21T03:37:38.9544146Z Post job cleanup.
