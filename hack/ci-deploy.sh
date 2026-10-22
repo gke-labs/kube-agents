@@ -81,7 +81,8 @@ readonly EVAL_ALERT_DAILY_LIMIT_DRIFT="0"
 # is seconds. And it must stay shorter than the gap between two repetitions of
 # a case that re-plants the same workload in the same namespace and then waits
 # for that repetition's own card (autoops-warning-event-triage,
-# autoops-crashloop-config-triage): their turn waits for the card to finish, a
+# autoops-crashloop-config-triage, autoops-warning-event-no-action-triage, whose
+# plant also fails on any answer but `injected`): their turn waits for the card to finish, a
 # median of ~7 minutes, and a window longer than the gap folds repetition 2's
 # incident into repetition 1's, so the case waits out its timeout for a card
 # nobody files. incident-triage-workload-fold's own repetitions can run ~4

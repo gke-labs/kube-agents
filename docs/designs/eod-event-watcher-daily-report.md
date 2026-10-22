@@ -309,6 +309,11 @@ grades 🟢, and what bounds that claim is the qualifier line rather than the em
 cannot do is any of the above to a ceiling drop or a failed delivery, which is the property that
 matters and is the paragraph above.
 
+A third `Critical` or `Warning` row that never reached chat is neither named nor counted: one folded
+into its workload's open incident (`duplicate_of` set, with `INCIDENT_WORKLOAD_DEDUP_SECONDS` on). An
+alert for that workload did reach chat, so the row is grouped with its anchor and adds to the
+headline's forwarded total only.
+
 ## Running it by hand
 
 ```bash

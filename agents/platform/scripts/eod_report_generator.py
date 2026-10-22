@@ -500,7 +500,12 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         # holding one delivered row and one withheld row can be neither: keyed
         # without it, the two merge and the pair is listed as two withheld
         # events or as none, while the 📉 total counts one.
-        group_key = f"{cluster}/{ns}/{workload}/{reason}/{severity}/{int(bool(event.get('notified')))}"
+        #
+        # A folded row takes its anchor's outcome: it is one more sighting of
+        # an alert that went out, not a second, withheld one, and keyed on its
+        # own `notified = 0` one folded workload would read as two groups.
+        went_out = bool(event.get("notified")) or event.get("duplicate_of") is not None
+        group_key = f"{cluster}/{ns}/{workload}/{reason}/{severity}/{int(went_out)}"
         if cap_row:
             uid = event.get("object_uid", "") or ""
             stored_workload = event.get("workload", "") or ""
@@ -544,7 +549,7 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
                 # decided by the key: the namespace settles `excluded`, and
                 # `notified` is a key field in its own right.
                 "excluded": excluded,
-                "notified": bool(event.get("notified")),
+                "notified": went_out,
                 "count": count,
                 "message": msg,
             }

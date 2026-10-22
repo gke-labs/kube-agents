@@ -52,6 +52,9 @@ ROW_FIELDS = ("id", "timestamp", "namespace", "kind", "name", "reason", "status"
 # headless), or posted and then refused by chat. session_kv_server.py anchors a
 # workload's window on exactly these.
 ADMITTED_STATUSES = frozenset({"injected", "undelivered"})
+# Rows of the workload a verdict carries in its raw output, newest first: a
+# repetition's burst and the one before it, without the whole day.
+RAW_ROWS = 50
 # `intercepted_events.created_at`, SQLite's CURRENT_TIMESTAMP: UTC, no zone.
 LEDGER_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -195,7 +198,7 @@ class WorkloadIncidentFoldedVerifier(_OnboardingPollVerifier):
         workload = f"{self.namespace}/{self.name}"
         admitted = [row for row in rows if row.get("status") in ADMITTED_STATUSES]
         recent = [row for row in admitted if (_ledger_time(row.get("timestamp")) or since) > since]
-        raw = {"rows": rows[:50]}
+        raw = {"rows": rows[:RAW_ROWS]}
         if not admitted:
             return "fail", f"the ledger holds no admitted incident for {workload}", raw
         anchor = admitted[0]

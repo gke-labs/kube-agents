@@ -263,6 +263,8 @@ class TestEODWatcherRecap(unittest.TestCase):
         self.assertEqual(summary["alerts_posted"], 1)
         self.assertEqual(summary["cap_dropped"], 0)
         self.assertNotIn("withheld by the daily", report)
+        # One workload, one reason: one group, as before folding existed.
+        self.assertEqual(summary["unique_incidents"], 1)
 
     def test_a_cap_dropped_alert_is_not_an_informational_event(self):
         """`notified = 0` covers two outcomes; counting them as one hides alerts.

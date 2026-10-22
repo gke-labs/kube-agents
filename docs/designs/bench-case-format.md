@@ -325,7 +325,7 @@ to is the judge's to grade. `oobe_audits_started`, in its own module
 of the four first-run audits as marked due and each has a run claimed since the stage marked it
 that got going (running, completed, or ended after its start), each starting only after the one before it in the chain ended.
 `workload_incident_folded`, in its own module (`bench/kube_agents_bench/incidents.py`), reads a
-workload's rows from the Session KV server's event ledger in the agent pod and passes when at least
+workload's rows of one object `kind` (default `Pod`) from the Session KV server's event ledger in the agent pod and passes when at least
 `min_folded` of them were folded into its newest admitted incident, which must be newer than the
 run's start less `max_age_sec`; it keys on that incident rather than a time window because the stack
 plants its burst before the turn starts.

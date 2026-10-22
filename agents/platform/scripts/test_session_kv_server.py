@@ -2096,6 +2096,7 @@ class TestWorkloadIncidentFold(unittest.TestCase):
         patcher = patch.dict(session_kv_server.ALERT_DAILY_LIMITS, {"Warning": 0, "Critical": 0})
         patcher.start()
         self.addCleanup(patcher.stop)
+        self.real_trigger = session_kv_server.trigger_agent_troubleshooter
         trigger = patch.object(session_kv_server, "trigger_agent_troubleshooter")
         self.trigger = trigger.start()
         self.addCleanup(trigger.stop)
@@ -2237,6 +2238,76 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             )
             status = self._inject("drifted-api", kind="Deployment", reason="ProgressDeadlineExceeded")["status"]
         self.assertEqual(status, "injected")
+
+    @patch.object(session_kv_server, "_create_gateway_session", return_value=False)
+    @patch.object(session_kv_server, "_register_session_routing")
+    @patch.object(session_kv_server, "_post_initial_alert", return_value="spaces/A/threads/B")
+    def test_an_anchor_whose_triage_never_started_does_not_fold_its_siblings(self, *_):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            self._inject("aborted-api-6cfdb6b98b-aaaaa")
+            anchor_id = self._rows("aborted-api")[0][0]
+            # What the background task does when the gateway session fails.
+            self.real_trigger("sess-aborted", "msg", {}, anchor_id)
+            self.assertEqual(self._inject("aborted-api-6cfdb6b98b-bbbbb")["status"], "injected")
+
+    def test_a_refused_turn_releases_the_anchor_and_a_transport_error_does_not(self):
+        import urllib.error
+        refused = urllib.error.HTTPError("http://gw", 503, "busy", {}, None)
+        with patch("urllib.request.urlopen", side_effect=refused):
+            self.assertFalse(session_kv_server._start_agent_turn("http://gw", "s", "q", {}))
+        with patch("urllib.request.urlopen", side_effect=TimeoutError("read timed out")):
+            self.assertTrue(session_kv_server._start_agent_turn("http://gw", "s", "q", {}))
+
+    def test_only_a_deployments_pods_and_whole_objects_fold(self):
+        key = session_kv_server._fold_key
+        self.assertEqual(key("Pod", "checkout-6cfdb6b98b-zwv24"), "checkout")
+        # A bare pod's last segment is not a replica suffix, and a StatefulSet
+        # ordinal is not stripped: neither folds.
+        self.assertEqual(key("Pod", "api-cache"), "")
+        self.assertEqual(key("Pod", "web-0"), "")
+        self.assertEqual(key("Deployment", "checkout"), "checkout")
+
+    def test_two_bare_pods_that_clean_to_one_name_are_two_incidents(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            statuses = [
+                self._inject("bare-api-cache")["status"],
+                self._inject("bare-api-proxy")["status"],
+                # A Deployment named `bare-api` cleans to the same workload and
+                # does not fold into either.
+                self._inject("bare-api-6cfdb6b98b-aaaaa")["status"],
+            ]
+        self.assertEqual(statuses, ["injected"] * 3)
+
+    def test_replicas_arriving_together_open_one_incident(self):
+        import threading
+        from fastapi import BackgroundTasks
+
+        real_claim = session_kv_server._claim_alert_quota
+
+        def slow_claim(severity):
+            # Widens the gap between the anchor lookup and the insert, which is
+            # where two unlocked injects both find no anchor.
+            time.sleep(0.3)
+            return real_claim(severity)
+
+        statuses = []
+
+        def inject(pod):
+            payload = {"reason": "BackOff", "namespace": "fold-ns", "kind_of_object": "Pod", "name": pod,
+                       "uid": f"uid-{pod}", "message": "m", "type": "Warning", "cluster": "c1"}
+            reply = session_kv_server.inject_message(
+                f"sess-{pod}", {"message": json.dumps(payload)}, BackgroundTasks(), x_watcher_features="policy-filtered"
+            )
+            statuses.append(reply["status"])
+
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_claim_alert_quota", side_effect=slow_claim):
+            threads = [threading.Thread(target=inject, args=(f"race-api-6cfdb6b98b-{c * 5}",)) for c in "ab"]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(sorted(statuses), ["folded", "injected"])
 
     def test_the_feed_lists_a_folded_row_as_folded(self):
         with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
