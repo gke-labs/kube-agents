@@ -109,11 +109,11 @@ Every registered project was provisioned before the script ran this step. Measur
 - **Reader on the cache images**, in the Prow project's Artifact Registry repository that holds `hack/ci-deploy.sh`'s default `CACHE_IMAGE` and the `:buildcache` manifests beside it — a repository at location `us`, not `us-central1`, and not in the pool project. Both identities need `roles/artifactregistry.reader` there, and the verifier fails the project if either is missing:
   - `${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com`
   - `${PROJECT_NUMBER}-compute@developer.gserviceaccount.com`
-- **The runners' access to the project.** Most grants on this page are for an identity inside the project. These are not: the presubmit runs on the Prow build cluster as the Prow runner's service account (`PROW_RUNNER_SA` in `scripts/provision_ci_pool_project.sh`, `PROW_RUNNER_MEMBER` in the verifier), and the nightly periodic runs the same `hack/ci-eval-pr.sh` as its own (`NIGHTLY_RUNNER_SA` / `NIGHTLY_RUNNER_MEMBER`; why it is a separate account is in [`designs/eval-scorer.md`](designs/eval-scorer.md)). Each leases the project and reaches in to fetch cluster credentials, apply the chart, submit the build and read the logs back. Nothing in the project's own configuration implies either, which is how projects 4 to 6 were provisioned, verified green and registered without the first — until a lease of `kube-agents-evals-6` died on `Required "container.clusters.get" permission(s)` ([#966](https://github.com/gke-labs/kube-agents/pull/966)) — and how the whole pool stood without the second until the nightly's second run leased `kube-agents-evals-10` and died on the same denial ([#1491](https://github.com/gke-labs/kube-agents/issues/1491)). Grant all twelve to both:
+- **The runners' access to the project.** Most grants on this page are for an identity inside the project. These are not: the presubmit runs on the Prow build cluster as the Prow runner's service account (`PROW_RUNNER_SA` in `scripts/provision_ci_pool_project.sh`, `PROW_RUNNER_MEMBER` in the verifier), and the nightly periodic runs the same `hack/ci-eval-pr.sh` as its own (`NIGHTLY_RUNNER_SA` / `NIGHTLY_RUNNER_MEMBER`; why it is a separate account is in [`designs/eval-scorer.md`](designs/eval-scorer.md)). Each leases the project and reaches in to fetch cluster credentials, apply the chart, submit the build and read the logs back. Nothing in the project's own configuration implies either, which is how projects 4 to 6 were provisioned, verified green and registered without the first — until a lease of `kube-agents-evals-6` died on `Required "container.clusters.get" permission(s)` ([#966](https://github.com/gke-labs/kube-agents/pull/966)) — and how the whole pool stood without the second until the nightly's second run leased `kube-agents-evals-10` and died on the same denial ([#1491](https://github.com/gke-labs/kube-agents/issues/1491)). Grant all thirteen to both:
 
   ```bash
   # The members scripts/provision_ci_pool_project.sh grants. The nightly needs
-  # the same twelve, not a subset: it runs the same script end to end, so a
+  # the same thirteen, not a subset: it runs the same script end to end, so a
   # partial grant fails at a later step on a later night instead of here.
   PROW_RUNNER_SA="$(sed -n 's/^PROW_RUNNER_SA="\(.*\)"$/\1/p' scripts/provision_ci_pool_project.sh)"
   NIGHTLY_RUNNER_SA="$(sed -n 's/^NIGHTLY_RUNNER_SA="\(.*\)"$/\1/p' scripts/provision_ci_pool_project.sh)"
@@ -121,6 +121,7 @@ Every registered project was provisioned before the script ran this step. Measur
               roles/container.admin roles/container.developer \
               roles/iam.serviceAccountAdmin roles/iam.serviceAccountUser \
               roles/logging.logWriter roles/logging.viewer \
+              roles/monitoring.alertPolicyEditor \
               roles/resourcemanager.projectIamAdmin \
               roles/serviceusage.serviceUsageConsumer \
               roles/storage.admin roles/viewer; do

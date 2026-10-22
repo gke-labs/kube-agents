@@ -80,6 +80,11 @@ _AGENT_API_AUTH_CONTAINER = "agent-api-auth"
 _SANDBOX_CLEANUP_CONTAINER = "sandbox-credential-cleanup"
 _SANDBOX_SSH_KEY_CONTAINER = "sandbox-ssh-key"
 _PREPARE_IMAGE_TREES_CONTAINER = "prepare-image-trees"
+# The two claims spec.storage.size sizes: the agent's own data claim, a standalone claim
+# named after the golden CR (platformagent), and the shell StatefulSet's data template.
+# The chart's preflight moves each of them from the default to the value it is given.
+_AGENT_DATA_CLAIM = "platformagent-data"
+_SHELL_DATA_CLAIM_TEMPLATE = "data"
 
 _KIND_STATEFULSET = "StatefulSet"
 _KIND_DEPLOYMENT = "Deployment"
@@ -150,6 +155,9 @@ _STORAGE_SECTION = "storage"
 _PERSISTENT_VOLUME_CLAIMS = "persistentVolumeClaims"
 _STORAGE_REQUEST = "storageRequest"
 _STORAGE_BYTES_REQUEST = "storageBytesRequest"
+_DATA_CLAIMS = "dataClaims"
+_DATA_CLAIM_REQUEST = "dataClaimRequest"
+_DATA_CLAIM_BYTES_REQUEST = "dataClaimBytesRequest"
 _CPU_MILLIS_REQUEST = "cpuMillisRequest"
 _CPU_MILLIS_LIMIT = "cpuMillisLimit"
 _MEMORY_BYTES_REQUEST = "memoryBytesRequest"
@@ -486,6 +494,9 @@ def extract_footprint() -> dict:
     pod_workloads = {}
     pvc_count = 0
     storage_bytes = 0
+    # The size of each claim spec.storage.size sizes, one entry per claim, so the check
+    # below can refuse a golden where the two claims differ or one of them is gone.
+    data_claim_bytes = []
 
     for doc in docs:
         if not doc or not isinstance(doc, dict):
@@ -501,6 +512,8 @@ def extract_footprint() -> dict:
             # Standalone claims: one object each, and they do not scale with replicas.
             pvc_count += 1
             storage_bytes += _claim_storage(doc)
+            if name == _AGENT_DATA_CLAIM:
+                data_claim_bytes.append(_claim_storage(doc))
             continue
 
         if kind in _POD_BEARING_KINDS:
@@ -531,6 +544,9 @@ def extract_footprint() -> dict:
             for claim in (doc.get(_SPEC_FIELD) or {}).get(_VOLUME_CLAIM_TEMPLATES_FIELD) or []:
                 pvc_count += replicas
                 storage_bytes += _claim_storage(claim) * replicas
+                claim_name = (claim.get(_METADATA_FIELD) or {}).get(_NAME_FIELD)
+                if name == _SHELL_WORKLOAD and claim_name == _SHELL_DATA_CLAIM_TEMPLATE:
+                    data_claim_bytes.extend([_claim_storage(claim)] * replicas)
 
     required = [
         (shell_containers, _SHELL_CONTAINER, _SHELL_WORKLOAD),
@@ -545,6 +561,22 @@ def extract_footprint() -> dict:
             raise ValueError(
                 f"container {container_name!r} not found in {workload} in the golden"
             )
+
+    # Found by name, like the containers: a renamed claim must fail here rather than leave
+    # the preflight moving one claim, or none, when platformAgent.storage.size is set.
+    agent_data_claims = 1
+    if len(data_claim_bytes) != agent_data_claims + shell_replicas:
+        raise ValueError(
+            f"expected the {_AGENT_DATA_CLAIM} claim and {shell_replicas} {_SHELL_WORKLOAD}"
+            f" {_SHELL_DATA_CLAIM_TEMPLATE!r} claim(s) in the golden, found"
+            f" {len(data_claim_bytes)}"
+        )
+    if len(set(data_claim_bytes)) != 1:
+        raise ValueError(
+            f"the data claims in the golden request different sizes"
+            f" ({', '.join(format_bytes(b) for b in data_claim_bytes)}); the operator sizes"
+            " them from one value, so the preflight's data-claim delta assumes they agree"
+        )
 
     if gateway_replicas != 1:
         raise ValueError(
@@ -600,6 +632,12 @@ def extract_footprint() -> dict:
                 _PERSISTENT_VOLUME_CLAIMS: pvc_count,
                 _STORAGE_REQUEST: format_bytes(storage_bytes),
                 _STORAGE_BYTES_REQUEST: storage_bytes,
+                # The claims spec.storage.size sizes, and the default size each of them
+                # has in the totals above. The preflight adds dataClaims x (size -
+                # dataClaimBytesRequest) when platformAgent.storage.size is set.
+                _DATA_CLAIMS: len(data_claim_bytes),
+                _DATA_CLAIM_REQUEST: format_bytes(data_claim_bytes[0]),
+                _DATA_CLAIM_BYTES_REQUEST: data_claim_bytes[0],
             },
         }
     }

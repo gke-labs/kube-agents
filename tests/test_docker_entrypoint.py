@@ -2635,6 +2635,64 @@ class TirithCleanupTest(unittest.TestCase):
         self.assertTrue((tmp / "elsewhere" / "tirith").exists())
 
 
+_NPM_CACHE_SHARE_OPENER = 'if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$SCAFFOLD" ]; then'
+_PROFILE_SCAFFOLD = _REPO / "agents" / "platform" / "scripts" / "profile_scaffold.py"
+
+
+class NpmCacheShareTest(unittest.TestCase):
+    """Step 4.4b points npm in every home on the volume at one cache (gke-labs#3376).
+
+    The block runs extracted, with SCAFFOLD at the repository's scaffolder and
+    INSTALL_DIR at a stub venv whose python3 is this interpreter.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._BLOCK = _extract_shell_block(_NPM_CACHE_SHARE_OPENER)
+
+    def _run(self, primary="1"):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        target = tmp / "srv" / "agent-home"
+        homes = [target / "home", target / "profiles" / "cluster-a" / "home"]
+        for home in homes:
+            home.mkdir(parents=True)
+        # The cache npm kept in a profile's home before step 4.4b.
+        (homes[1] / ".npm" / "_cacache").mkdir(parents=True)
+        python = tmp / "hermes" / ".venv" / "bin" / "python3"
+        python.parent.mkdir(parents=True)
+        python.symlink_to(sys.executable)
+        proc = subprocess.run(
+            ["sh", "-c", f"set -e\n{self._BLOCK}\necho REACHED-EXEC\n"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={
+                **os.environ,
+                "TARGET_DIR": str(target),
+                "HERMES_HOME": str(target),
+                "INSTALL_DIR": str(tmp / "hermes"),
+                "SCAFFOLD": str(_PROFILE_SCAFFOLD),
+                "IS_BOOTSTRAP_PRIMARY": primary,
+            },
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+        return target, homes
+
+    def test_the_primary_links_every_home_and_reclaims_the_old_cache(self):
+        target, homes = self._run()
+        for home in homes:
+            self.assertEqual((home / ".npm").resolve(), (target / ".cache" / "npm").resolve())
+        self.assertFalse((target / ".cache" / "npm" / "_cacache").exists())
+
+    def test_a_non_primary_replica_writes_nothing(self):
+        target, homes = self._run(primary="0")
+        self.assertFalse(homes[0].joinpath(".npm").exists())
+        self.assertTrue(homes[1].joinpath(".npm", "_cacache").is_dir())
+        self.assertFalse((target / ".cache").exists())
+
+
 class A2AModeProbeTest(unittest.TestCase):
     """Step 2.6a-bis gates the A2A skill overlay on runtime_mode.is_next().
 

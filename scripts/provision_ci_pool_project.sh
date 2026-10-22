@@ -378,7 +378,7 @@ done
 # (docs/designs/eval-scorer.md). In the pool the two need the same set: a
 # project granting only the presubmit's account leases fine and dies at
 # get-credentials the first night it is drawn, as kube-agents-evals-10 did on
-# 2026-09-16 (gke-labs/kube-agents#1491). The same twelve, not a subset -- the
+# 2026-09-16 (gke-labs/kube-agents#1491). The same thirteen, not a subset -- the
 # run is the same script end to end, so a partial grant fails at a later step
 # on a later night instead.
 #
@@ -386,6 +386,9 @@ done
 # Artifact Registry role: AR_REPO and CACHE_IMAGE reach hack/ci-deploy.sh's
 # `gcloud builds submit` as substitutions, so Cloud Build does the push and the
 # GKE nodes do the pull. This account touches the registry at no point.
+# monitoring.alertPolicyEditor: the monitoring-alert-policy-read case's fixture
+# stack plants one alert policy per lease and deletes it on teardown; no other
+# role here carries alertPolicies.create.
 PROW_RUNNER_SA="serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com"
 NIGHTLY_RUNNER_SA="serviceAccount:eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
 echo "Granting the Prow and nightly runners access to ${PROJECT_ID}..."
@@ -398,6 +401,7 @@ for role in \
   roles/iam.serviceAccountUser \
   roles/logging.logWriter \
   roles/logging.viewer \
+  roles/monitoring.alertPolicyEditor \
   roles/resourcemanager.projectIamAdmin \
   roles/serviceusage.serviceUsageConsumer \
   roles/storage.admin \

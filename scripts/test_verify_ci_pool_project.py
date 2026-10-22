@@ -3951,7 +3951,7 @@ class PlatformGsaRolesMatchTerraformTest(unittest.TestCase):
 class ProwRunnerRolesMatchGrantersTest(unittest.TestCase):
     """PROW_RUNNER_ROLES and RUNNERS must equal what the two granting sites grant.
 
-    The twelve roles and the two members are written here, in the provisioning
+    The thirteen roles and the two members are written here, in the provisioning
     script's loop, and in the repair block on the prerequisites page, and none
     reads another. Drift is silent the worst way round: a role dropped from the
     script leaves a project the verifier still passes, registered, dying on its

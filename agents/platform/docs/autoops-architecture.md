@@ -272,6 +272,9 @@ lettered label asks the reader to pick from a list of one — so that `What to d
 - **Proposed fix (<Action Title>):** <1-sentence GitOps fix>
 - **To authorize:** reply **'apply'** to open a GitOps Pull Request with this fix.
 
+The prompt also says that when no manifest change is warranted and nothing is left for anyone to do,
+`What to do` is one `No action needed:` bullet with no option and no call to action.
+
 **Who acts on this:**
 A human reads your options and the agent that holds the GitOps write path opens the Pull
 Request ... the fix ships as a Pull Request against the GitOps repository, and nothing is
@@ -309,7 +312,9 @@ written to the live cluster directly.
   option, because it sits in the same list as Option A and Option B and gets numbered alongside them
   otherwise. The bullet carries a second job on the single-option shape: with no lettered option
   under the heading, it is what `kanban_notifier.actionable_report` recognises a report by, so
-  reword it and those reports stop earning the row they invite a reply to.
+  reword it and those reports stop earning the row they invite a reply to. A report with no
+  manifest change to propose carries no bullet and so earns no row, by design: there is nothing to
+  apply.
 - **The write boundary** — the fix ships as a Pull Request; nothing is written to the live cluster. The
   triaging agent does not open that PR itself — the reply arrives as chat ingress on the front door, and
   the agent holding the GitOps write path acts on it — which is why the prompt asks for options named

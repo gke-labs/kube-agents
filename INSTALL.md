@@ -141,7 +141,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
      cd terraform/examples/full-install
      KUBE_AGENTS_STATE_BUCKET="<project>-kube-agents-tfstate" KUBE_AGENTS_STATE_PREFIX="kube-agents/<cluster>" ./lifecycle.sh apply
      ```
-   - **Post-apply steps** (managed-OTel collection scope, on a cluster this install created).
+   - **Post-apply steps** (managed-OTel collection scope, on a cluster this install created; with Google Chat or Slack on, the commands that print the chat app's setup checklist).
 4. Exits with code `0` and writes `{"status": "GENERATE_ONLY_SUCCESS", ...}` to `/tmp/kube-agents-install-report.json`.
 
 On a GitLab install, the checks in step 2 skip the GitHub organization check. Generate-only never
@@ -645,7 +645,7 @@ If you enabled Google Chat or Slack during the install, perform the following re
      kubectl exec -it deploy/platform-agent-gateway -n kubeagents-system -- hermes pairing approve google_chat <PAIRING_CODE>
      ```
    - The A2A gateway under `spec.mode: next` has no pairing: it answers the addresses in `ALLOWED_USERS`, or everyone the app is visible to when that is empty.
-   - Re-display these instructions at any time from the repository root. When `install.env` records `PLATFORM_AGENT_MODE=next`, it prints the A2A gateway's checklist instead. This script takes the mode from `install.env` alone, while the checklist `install.sh` prints at the end of a run follows the mode it expects the PlatformAgent to be on after the apply, which can differ from the key when `spec.mode` was set by hand:
+   - Re-display these instructions at any time from the repository root. When `install.env` records `PLATFORM_AGENT_MODE=next`, it prints the A2A gateway's checklist instead. This script takes the mode from `install.env` alone, while the checklist `install.sh` prints after an apply (at the end of a run, and after Save & Apply in `--menu`) follows the mode it expects the PlatformAgent to be on after the apply, which can differ from the key when `spec.mode` was set by hand:
      ```bash
      ./scripts/installer/print_instructions_gchat.sh
      ```
@@ -679,7 +679,7 @@ If you enabled Google Chat or Slack during the install, perform the following re
 5. **Set or Move the Home Channel (if you left `SLACK_HOME_CHANNEL` empty)**:
    - If step 2's message was the install's first chat message, it set the home channel to the channel or DM it came from. If Google Chat received the first message instead, Slack has none, and scheduled audits have nowhere to post on Slack. Either way, run `/sethome` (or `/hermes sethome`) from the Slack channel you want. It takes effect immediately and persists across restarts.
 
-- Re-display these instructions at any time from the repository root. When `install.env` records `PLATFORM_AGENT_MODE=next` and Google Chat is off, it prints the A2A gateway's checklist from the [Slack app setup](docs/site/src/content/docs/install/slack-app.md) page instead. As for Google Chat, this script takes the mode from `install.env` alone, while the checklist `install.sh` prints follows the mode it expects after the apply:
+- Re-display these instructions at any time from the repository root. When `install.env` records `PLATFORM_AGENT_MODE=next` and Google Chat is off, it prints the A2A gateway's checklist from the [Slack app setup](docs/site/src/content/docs/install/slack-app.md) page instead. As for Google Chat, this script takes the mode from `install.env` alone, while the checklist `install.sh` prints after an apply follows the mode it expects after it:
   ```bash
   ./scripts/installer/print_instructions_slack.sh
   ```
@@ -1341,9 +1341,13 @@ kubectl exec deploy/platform-agent-gateway -n kubeagents-system -c platform-agen
 
 Each audit's report is a ledger issue in the GitOps repository, and its fixes are pull requests
 there, so those two need a GitOps repository, on GitHub or on GitLab. With no GitOps repository
-registered (none at all, rather than one the install cannot use), the audits still run: each keeps
-its findings in the report store on the agent's volume, and a run that changed something posts a
-summary to chat that says no forge is configured. With a repository, a
+registered, the audits still run: each keeps its findings in the report store on the agent's
+volume, and a run that changed something posts a summary to chat that says no forge is configured.
+A run whose repository the broker cannot reach, or a run on an install with several managed
+repositories and none with `role: gitops`, does the same, but it posts its summary on every run,
+with the reason and the fix. See
+[Which repository gets the ledger](docs/site/src/content/docs/concepts/declarative-workflow.md#which-repository-gets-the-ledger).
+With a repository, a
 run that changed something since the last one posts a one-line summary linking the issue to
 the home channel of each enabled chat platform (wherever `/sethome` last ran; otherwise the chat
 the install's first chat message came from; otherwise `SLACK_HOME_CHANNEL` or
