@@ -71,6 +71,44 @@ spec:
   {{- with .Values.platformAgent.mode }}
   mode: {{ . | quote }}
   {{- end }}
+  {{- /*
+    `with`, as for mode: the null default renders no field, and the operator
+    sizes both data claims from its own default. The schema checks the
+    quantity's grammar only, so the range fails here, as the webhook (off by
+    default) would refuse it. Zero passes the grammar, and the operator would
+    ignore it for its default while the CR said 0. parseBytes truncates to
+    whole bytes, so a size below one byte, such as 0.5, fails here too, where
+    the webhook would admit it. A size above 64Ti, the largest persistent
+    disk (70368744177664 bytes), is a unit typo that would patch both claims
+    to a size no disk reaches, and a claim cannot shrink back. The CRD guard
+    is the scoped pool's: `helm upgrade` never applies crds/, an API server
+    serving a CRD from before spec.storage prunes the block, and the claims
+    stay at the default while the release record carries the size. `lookup`
+    is empty under `helm template`, so the guard fires only against a live
+    install.
+  */}}
+  {{- with (.Values.platformAgent.storage | default dict).size }}
+  {{- if le (include "kube-agents.parseBytes" . | int64) 0 }}
+  {{- fail (printf "platformAgent.storage.size is %s, which reads as zero whole bytes; the data volume size must be at least one byte. Leave it null to keep the operator default" .) }}
+  {{- end }}
+  {{- if gt (include "kube-agents.parseBytes" . | int64) 70368744177664 }}
+  {{- fail (printf "platformAgent.storage.size is %s; the data volume size must be at most 64Ti, the largest persistent disk size" .) }}
+  {{- end }}
+  {{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
+  {{- if $crd }}
+  {{- $specProps := dict }}
+  {{- range $crd.spec.versions }}
+  {{- if eq .name "v1alpha1" }}
+  {{- $specProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" (dict) . }}
+  {{- end }}
+  {{- end }}
+  {{- if not (hasKey $specProps "storage") }}
+  {{- fail "platformAgent.storage.size needs a PlatformAgent CRD that has spec.storage, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
+  {{- end }}
+  {{- end }}
+  storage:
+    size: {{ . | quote }}
+  {{- end }}
   harness:
     clusterName: {{ required "platformAgent.harness.clusterName is required" .Values.platformAgent.harness.clusterName | quote }}
     location: {{ required "platformAgent.harness.location is required" .Values.platformAgent.harness.location | quote }}
@@ -150,7 +188,8 @@ spec:
       {{- $stallWatchFields | nindent 6 }}
     {{- end }}
     {{- $tuning := deepCopy (.Values.platformAgent.harness.tuning | default dict) }}
-    {{- if and .Values.plugins (and .Values.plugins.stockoutInvestigator .Values.plugins.stockoutInvestigator.enabled) }}
+    {{- $stockout := (.Values.plugins | default dict).stockoutInvestigator | default dict }}
+    {{- if and $stockout.enabled (ne $stockout.applyTuning false) }}
     {{- $defaultStockoutTuning := dict "maxInProgress" 3 "platform" (dict "apiMaxRetries" 8 "maxTurns" 200) "cluster" (dict "apiMaxRetries" 8 "maxTurns" 150) }}
     {{- $tuning = merge $tuning $defaultStockoutTuning }}
     {{- end }}
@@ -255,6 +294,26 @@ spec:
     {{- $env = append $env (dict "name" $name "value" ($limit | int64 | toString)) }}
     {{- end }}
     {{- end }}
+    {{- /*
+      litellm.redaction.enabled hands the gateway's rule file to the agent pod
+      as well: below the env block, one read-only projection of the
+      redaction.yaml key out of the gateway's ConfigMap, at the fixed path the
+      image looks for (DEFAULT_RULE_FILE in
+      deploy/docker/patches/credential_redaction.py): a directory of its own,
+      not under the operator's read-only /etc/kube-agents mount, because runc
+      cannot create a mountpoint through a read-only parent. The file's presence is
+      the switch; no env entry, because the operator admits no path-valued
+      variable through spec.deployment.env into the agent container. The image
+      then applies the same rules to what it writes to its volume: agent.log,
+      the terminal-output cache, the worker transcript, state.db and the kanban
+      board. Nothing is rendered while the switch is off or the chart does not
+      render the gateway, so a default render is unchanged. Each process reads
+      the file once at start: a long-lived process keeps the rules it started
+      with while a new worker process reads the current file, so roll the pod
+      to move them all.
+    */}}
+    {{- $redaction := (.Values.litellm | default dict).redaction | default dict }}
+    {{- $diskRedaction := and .Values.litellm .Values.litellm.enabled ($redaction.enabled | default false) }}
     {{- with concat $env $userEnv }}
     env:
       {{- /*
@@ -273,6 +332,19 @@ spec:
           {{- toYaml . | nindent 10 }}
         {{- end }}
       {{- end }}
+    {{- end }}
+    {{- if $diskRedaction }}
+    extraVolumes:
+      - name: redaction-rules
+        configMap:
+          name: litellm-config
+          items:
+            - key: redaction.yaml
+              path: redaction.yaml
+    extraVolumeMounts:
+      - name: redaction-rules
+        mountPath: /etc/kube-agents-redaction
+        readOnly: true
     {{- end }}
     {{- /*
       Checked here, on the operator's defaults with the override merged over

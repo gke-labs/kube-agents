@@ -109,6 +109,45 @@ class PresentTest(unittest.TestCase):
             with self.subTest(absent=absent):
                 self.assertNotIn(absent, out)
 
+    def test_the_scans_posture_line_is_kept_whole_under_the_headline(self):
+        line = inventory_presenter.SCAN_SCOPE_LINE
+        # SOP Step 6 writes it as its own paragraph; a wrapped copy is the same line.
+        wrapped = line.replace("; ", ";\n")
+        self.assertNotEqual(wrapped, line)
+        for posture in (line, wrapped):
+            with self.subTest(wrapped=posture != line):
+                report = REPORT.replace(
+                    "I scanned 3 clusters and 41 workloads. Posture is mostly healthy.",
+                    f"Scanned 3 clusters and 41 workloads.\n\n{posture}",
+                )
+                self.assertNotEqual(report, REPORT)
+                out = inventory_presenter.present(report)
+                self.assertTrue(out.startswith(
+                    "**I scanned 3 clusters and 41 workloads and found 22 things to look at.**\n"
+                    f"{line} Two are worth fixing first:\n\n"
+                ), out)
+                # The card's line under the headline is clipped shorter than the line, so the card
+                # carries it under the rows, a sentence a line, unclipped.
+                blocks, _ = inventory_presenter.blocks(report)
+                message, _ = inventory_presenter.chat(report)
+                for sentence in inventory_presenter.SCAN_SCOPE_SENTENCES:
+                    self.assertIn(json.dumps(sentence), json.dumps(blocks))
+                    self.assertIn(json.dumps(sentence), json.dumps(message))
+
+    def test_the_posture_line_written_after_the_list_is_kept_once(self):
+        line = inventory_presenter.SCAN_SCOPE_LINE
+        report = REPORT.replace(
+            "I scanned 3 clusters and 41 workloads. Posture is mostly healthy.", "Scanned 3 clusters and 41 workloads."
+        ).replace("Also found:", f"{line}\n\nAlso found:")
+        out = inventory_presenter.present(report)
+        self.assertTrue(out.startswith(
+            "**I scanned 3 clusters and 41 workloads and found 22 things to look at.**\n"
+            f"{line} Two are worth fixing first:\n\n"
+        ), out)
+        self.assertEqual(out.count(line), 1)
+        message, _ = inventory_presenter.chat(report)
+        self.assertIn(json.dumps(line), json.dumps(message))
+
     def test_two_items_have_no_lead(self):
         report = "# Scan\n\nAll quiet. One thing stands out.\n\n1. **A (minor)**\n   Fix it.\n2. **B**\n   Fix that.\n"
         self.assertEqual(

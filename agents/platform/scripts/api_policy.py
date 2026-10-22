@@ -120,7 +120,8 @@ API_READ_ROUTES: tuple[ApiRoute, ...] = (
         re.compile(rf"^v3/projects/{PROJECT}/metricDescriptors$"),
         "gcp.api.monitoring.metricdescriptors-list",
     ),
-    # Managed Prometheus, for the PromQL the AI-workload skills already print.
+    # Managed Prometheus, for the PromQL the AI-workload skills already print
+    # and the fleet health sweep (skills/fleet-audit/scripts/fleet_health.py).
     ApiRoute(
         "monitoring.googleapis.com",
         API_READ_METHOD,

@@ -341,7 +341,7 @@ class GitLabLaneTest(unittest.TestCase):
         """The recorder decision, lifted as written: a GitLab periodic reads
         the store like a presubmit and never records, since a case's record
         is per case and version key, not per forge."""
-        decision = lifted_block(r'^case "\$\{JOB_TYPE:-\}" in\n.*?^if \[ "\$\{EVAL_MODE_NEXT:-\}" = "1" \]; then\n  EVAL_IS_MAIN_RUN="false"\nfi$')
+        decision = lifted_block(r'^case "\$\{JOB_TYPE:-\}" in\n.*?^if \[ "\$\{EVAL_ROLLBACK_LANE:-\}" = "1" \]; then\n  EVAL_IS_MAIN_RUN="false"\nfi$')
         body = decision + '\necho "MAIN_RUN=${EVAL_IS_MAIN_RUN}"'
         self.assertIn("MAIN_RUN=true", run_bash(body, {"JOB_TYPE": "periodic", "EVAL_FORGE": "github"}).stdout)
         self.assertIn("MAIN_RUN=false", run_bash(body, {"JOB_TYPE": "periodic", "EVAL_FORGE": "gitlab"}).stdout)

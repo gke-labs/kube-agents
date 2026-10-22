@@ -376,6 +376,29 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         # link and unlink a monitored project, stay refused, and the tests hold
         # that door.
         ("beta", "monitoring", "metrics-scopes", "describe"),
+        # Cloud Monitoring alert policy reads: whether a policy exists, is
+        # enabled, and which notification channels it names. Without them a
+        # Cluster Agent asked about alert status can report only in-cluster
+        # substitutes (GMP replica counts, Warning events), after a refused
+        # turn. roles/monitoring.viewer already grants alertPolicies.list and
+        # .get; this table was the only block. gcloud has the group on all
+        # three tracks, and the allowlist matches the track word as typed, so
+        # each spelling is its own entry: the imported gke-alert-configuration
+        # skill spells the call with `alpha`, and imported skills are not
+        # edited here. The six are kept together, out of alphabetical order,
+        # so this reason covers all of them. Output is condition filters,
+        # thresholds, documentation text, user labels, channel resource names
+        # and the mutatedBy principals, which `projects get-iam-policy` already
+        # shows. It carries no credentials. The writes one word away
+        # (`create`, `update`, `delete`, `migrate`, `conditions ...`) stay
+        # refused, and so does `monitoring channels`: a channel label can hold
+        # a webhook URL with a token in it. The tests hold both doors.
+        ("alpha", "monitoring", "policies", "describe"),
+        ("alpha", "monitoring", "policies", "list"),
+        ("beta", "monitoring", "policies", "describe"),
+        ("beta", "monitoring", "policies", "list"),
+        ("monitoring", "policies", "describe"),
+        ("monitoring", "policies", "list"),
         # Budget reads for the cost skills. list only: budgets are written
         # by humans, and `billing accounts list` is deliberately absent --
         # the skills take the account id from configuration, not discovery.

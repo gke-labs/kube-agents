@@ -861,6 +861,15 @@ locals {
   alert_daily_limits = { for bucket, limit in var.alert_daily_limits : bucket => limit if limit != null }
 }
 
+# The operator's own data volume size (agentDataStorageSize), which is also the
+# platform_agent_storage_size default. That value passes the chart nothing, so
+# the CR carries no spec.storage and the operator default applies.
+# tests/test_platform_agent_storage_size_defaults.py pins this local, the
+# variable default and install.defaults.env to the operator constant.
+locals {
+  platform_agent_default_storage_size = "50Gi"
+}
+
 resource "helm_release" "kube_agents" {
   name             = "kube-agents"
   chart            = "${path.module}/../../../charts/kube-agents"
@@ -971,7 +980,9 @@ resource "helm_release" "kube_agents" {
     )
     # merge(), so "today" adds no key and the values this composition hands the
     # chart stay what they were before platform_agent_mode existed; the chart
-    # leaves spec.mode out of the CR while its value is null.
+    # leaves spec.mode out of the CR while its value is null. The storage size
+    # works the same way: the default adds no key, and the CR carries no
+    # spec.storage.
     platformAgent = merge({
       # The durable record of an adoption that accepted a cluster with no
       # NetworkPolicy enforcement. Derived from what the module read, not from
@@ -1094,6 +1105,8 @@ resource "helm_release" "kube_agents" {
         data   = local.credentials
       }
       integration = local.platform_agent_integration
+      }, var.platform_agent_storage_size == local.platform_agent_default_storage_size ? {} : {
+      storage = { size = var.platform_agent_storage_size }
       }, var.platform_agent_mode == "today" ? {} : {
       mode = var.platform_agent_mode
     })

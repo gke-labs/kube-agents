@@ -528,6 +528,16 @@
         "mode": {
           "enum": [null, "", "today", "next"]
         },
+        "storage": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "size": {
+              "type": ["string", "null"],
+              "pattern": "^$|^(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$"
+            }
+          }
+        },
         "annotations": {
           "type": "object"
         },
@@ -1186,6 +1196,10 @@
             },
             "clusterName": {
               "type": "string"
+            },
+            "applyTuning": {
+              "type": "boolean",
+              "description": "Merge the plugin's execution limits into platformAgent.harness.tuning. false keeps the install's own tuning."
             },
             "image": {
               "type": "object",
