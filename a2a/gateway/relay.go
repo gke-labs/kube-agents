@@ -419,9 +419,12 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// The console never posts the deliverable as a notice (see the
 	// StateCompleted arm), but its terminal frame carries it (observeEnded,
 	// consoleFrame), so a result the render state lost is read back from the
-	// stream whatever the conversation.
+	// stream whatever the conversation, except for a console task whose
+	// terminal the heal already observed: it gets no second frame, so the
+	// replay would buy nothing.
 	ref, _ := rec.TaskRefFor(taskID)
-	needResult := result == "" && s.Status.State == lib.StateCompleted
+	needResult := result == "" && s.Status.State == lib.StateCompleted &&
+		!(isConsoleConversation(rec.Key) && ref.TerminalObserved)
 	// A child's turn answers feed its wake too, however it ended. The render
 	// state holds them when this process relayed every event (local);
 	// otherwise a restart may have lost some, and the stream has them all. A
@@ -513,13 +516,12 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		}
 		result = answer.Text
 		// The console renders answers straight off TASKS, so posting the
-		// deliverable here too would show it twice and put a burst of
-		// answer-sized frames on a subject documented to carry only notices
+		// deliverable here as a notice would show it twice; its terminal
+		// frame carries it instead (consoleFrame), which the page skips
 		// (console.go and spec-chatops-gateway.md, "The console adapter").
 		// The other terminal arms below are notices, not answers, and go to
 		// every backend. Chat backends have no TASKS view, so for them this
-		// post IS the answer. The replay above is skipped for the same
-		// backends, so reaching here with an empty result costs nothing.
+		// post IS the answer.
 		if !isConsoleConversation(rec.Key) {
 			if ref.TerminalObserved && result == completedNonTextResult {
 				// The heal already posted the status card; skip completedNonTextResult.

@@ -2033,18 +2033,20 @@ the adapter posts the gateway's own notices back as `{"messageId","text","edit"}
 protocol, and the payload spec's agreement rules do not apply to it. Each task's end goes out
 on `.out` too (added 10/22), as every observer is told it (`observeTaskTerminal`): once per
 delegation chain, under the task the turn started, with the hand-off rule applied. It is one
-frame with `"kind": "result"`, the A2A `state`, the task as `addressee` and `taskId`, and
-`messageId` `r-<taskId>`, so a repeated end (a redelivery, a heal) repeats its id. A completed
+frame with `"kind": "result"`, the A2A `state`, the task the turn started as `taskId` and the
+agent that turn was addressed to as `addressee` (not whichever agent answered at the chain's end),
+and `messageId` `r-<taskId>`, so a repeated end (a redelivery, a heal) repeats its id. A completed
 task that handed work to kanban cards (the bridge's `handoff` artifact) carries `"cardsPending":
 true`, so a client waits for the cards' notify frames; without it, no handoff was seen and the
-client need not wait. Its text
-is the deliverable for a completed task and the gateway's notice otherwise. A kanban card's
-report into the conversation is a frame too, with `"kind": "notify"` and the turn it answers as
-`replyTo` ("Proactive posts: the chat.notify route", the console's route). A notice carries
-none of those fields, so a client waiting on a turn can tell the three apart. The page reads
-answers from TASKS and gets the notices, so it skips the result frames, and a lost result frame
-costs it nothing. It shows the notify frames, which it has no other source for. A card's report
-is not on TASKS, so a notify frame published while no client holds the conversation's `.out`
+client need not wait. Its text is the deliverable for a completed task and the gateway's notice
+otherwise. A chain that ends at a child with no wake (the session could not take one) ends failed,
+carrying the notice: a console client with no TASKS view reads the child's answer from TASKS or not
+at all. A kanban card's report into the conversation is a frame too, with `"kind": "notify"` and the
+turn it answers as `replyTo` ("Proactive posts: the chat.notify route", the console's route). A
+notice carries none of those fields, so a client waiting on a turn can tell the three apart. The
+page reads answers from TASKS and gets the notices, so it skips the result frames, and a lost result
+frame costs it nothing. It shows the notify frames, which it has no other source for. A card's
+report is not on TASKS, so a notify frame published while no client holds the conversation's `.out`
 subscription (the tab closed, a page reconnecting, the MCP server restarting) is lost: core NATS
 keeps nothing, and the notifier answers the card as posted. This is a known limit of the
 kanban-era route; card reports become bus child results with the profile dispatcher. A console client

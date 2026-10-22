@@ -209,8 +209,8 @@ func TestConsoleTerminalAnswerStaysOffTheNoticeSubject(t *testing.T) {
 
 // Failures are notices, not answers, so keeping the answer off the notice
 // subject must not take them with it: a console page has no other way to
-// learn the task died. A backend that takes no terminal frames gets the
-// failure as a notice.
+// learn the task died. The notice goes out whatever the backend does with
+// terminal frames; this one takes none.
 func TestConsoleStillGetsTerminalNotices(t *testing.T) {
 	r := startRig(t)
 	r.adapter.roster = []string{consoleAuthor}
