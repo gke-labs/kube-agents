@@ -56,7 +56,9 @@ def kanban_db():
 class BoardSnapshotTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.profiles = Path(self.tmp.name)
+        # The profiles directory sits in the gateway home, where onboarding's markers are.
+        self.profiles = Path(self.tmp.name) / "profiles"
+        self.profiles.mkdir()
         for profile, cluster in (("platform", None), ("ca-seeded-a", "seeded-a"), ("ca-seeded-c", "seeded-c")):
             home = self.profiles / profile
             home.mkdir()
@@ -117,6 +119,27 @@ class BoardSnapshotTest(unittest.TestCase):
         findings_queue.register_findings(self.session, [finding("seeded-a", "gone", "critical")])
         self.session.execute("UPDATE findings SET state = 'resolved'")
         self.assertEqual(self.snap()["clusters"][0], {"name": "seeded-a", "findings": 0})
+
+    def test_before_the_first_report_the_board_says_so(self):
+        home = self.profiles.parent
+        board = self.snap()
+        self.assertTrue(board["first_report_pending"])
+        self.assertTrue(board["first_message_pending"])
+        (home / board_snapshot.FIRST_MESSAGE_MARKER).touch()
+        board = self.snap()
+        self.assertTrue(board["first_report_pending"])
+        self.assertNotIn("first_message_pending", board)
+
+    def test_a_delivered_report_or_a_queued_row_ends_the_pending_state(self):
+        home = self.profiles.parent
+        (home / board_snapshot.FIRST_REPORT_CLAIMED_MARKER).touch()
+        self.assertNotIn("first_report_pending", self.snap())
+        (home / board_snapshot.FIRST_REPORT_CLAIMED_MARKER).unlink()
+        findings_queue.register_findings(self.session, [finding("seeded-a", "gone", "critical")])
+        self.session.execute("UPDATE findings SET state = 'resolved'")
+        board = self.snap()
+        self.assertNotIn("first_report_pending", board)
+        self.assertNotIn("first_message_pending", board)
 
     def test_running_cards_carry_their_assignee_cluster(self):
         kb = kanban_db()

@@ -11,7 +11,11 @@ holds the field names this module writes). No model is in the loop:
   assignee profile is scoped to beside each;
 - prs: the newest ``pr_opened`` events (``agents/platform/plugins/pr_opened``);
 - audit: the most recent fleet-audit run to finish, from the report store
-  (``skills/fleet-audit/scripts/report_status.py``).
+  (``skills/fleet-audit/scripts/report_status.py``);
+- first_report_pending: onboarding's first report is not delivered yet
+  (no ``.bootstrap_completed``) and the findings queue holds no row, so a
+  cluster with no open finding has not been checked yet; first_message_pending
+  adds that nobody has written yet (no ``.bootstrap_greeted``).
 
 Every list is capped here, so the answer stays a few kilobytes. A source that
 cannot be read is an error on the whole snapshot, never an empty list: an
@@ -33,6 +37,10 @@ import findings_queue
 
 HERMES_HOME = os.environ.get("HERMES_HOME") or "/opt/data"
 PROFILES_DIR = Path(HERMES_HOME) / "profiles"
+# Onboarding's markers in the same home (agents/chat/scripts/bootstrap_delivery.py
+# and the bootstrap_onboarding plugin write them).
+FIRST_REPORT_CLAIMED_MARKER = ".bootstrap_completed"
+FIRST_MESSAGE_MARKER = ".bootstrap_greeted"
 # The fleet-audit skill's scripts, scaffolded into the platform profile; the
 # report store's reader (report_status) and the stream titles (audit_report)
 # live there.
@@ -260,6 +268,7 @@ def snapshot(
     """The whole board. ``kanban`` is None before the board's first card, which is an empty board."""
     try:
         findings = findings_queue.ranked_findings(session_db)
+        queue_empty = session_db.execute("SELECT 1 FROM findings LIMIT 1").fetchone() is None
     except sqlite3.Error as exc:
         raise BoardError(f"the findings queue could not be read: {exc}") from None
     identities = cluster_identities(profiles_dir)
@@ -279,6 +288,11 @@ def snapshot(
             board["prs"] = prs(kanban)
         except sqlite3.Error as exc:
             raise BoardError(f"the kanban board could not be read: {exc}") from None
+    home = (profiles_dir or PROFILES_DIR).parent
+    if queue_empty and not (home / FIRST_REPORT_CLAIMED_MARKER).exists():
+        board["first_report_pending"] = True
+        if not (home / FIRST_MESSAGE_MARKER).exists():
+            board["first_message_pending"] = True
     if audit is None:
         audit = default_audit
     last = audit()
