@@ -529,8 +529,9 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
 - **Private Container Registry**: If your GKE clusters may only pull from an approved registry, see
   [Private container registry](#private-container-registry) below for the full recipe. Mirroring
   only the `kube-agents` images is not enough on its own: `image_registry` (or `install.sh`'s
-  `--registry-prefix`) covers the four images this project builds, and LiteLLM, fluent-bit, the
-  GitHub token minter and Hindsight need `third_party_image_registry` (or
+  `--registry-prefix`) covers the first-party images this project builds, the two AgentPlugin
+  images among them when their plugins are enabled, and LiteLLM, fluent-bit, the GitHub token
+  minter and Hindsight need `third_party_image_registry` (or
   `--third-party-registry-prefix`) as well; cert-manager is separate (see the composition README).
 
 - **Component stack (`--mode`)**: a first `install.sh` install runs `spec.mode: next`, which puts the NATS bus
@@ -598,7 +599,8 @@ When using the official release installer (`<RELEASE_VERSION>/install.sh`), the 
 
 The two flags are separate because the images fall into two groups. `--registry-prefix`
 (`image_registry` in tfvars) replaces `ghcr.io/gke-labs/kube-agents` for the images this project
-builds — the operator, the agent, and the credential proxy. `--third-party-registry-prefix`
+builds — the operator, the agent, the credential proxy, the shell sandbox, and the two AgentPlugin
+images when their plugins are enabled. `--third-party-registry-prefix`
 (`third_party_image_registry`) covers the ones it does not: the LiteLLM gateway, the fluent-bit
 sidecar, the GitHub token minter, and Hindsight. **Neither implies the other**, so an install
 that mirrors everything passes both, as above; empty leaves third-party images on their

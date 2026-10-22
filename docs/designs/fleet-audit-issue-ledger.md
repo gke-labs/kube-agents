@@ -1202,6 +1202,18 @@ reaches the channel. The ledger stays the record in both cases.
 | `audit:stale-closed` | PRs only    | The harness closed this, not a human (§3.3)  |
 | `severity:*`         | issue + PRs | Highest live severity, mutually exclusive    |
 
+A forge with no labels (Bitbucket; `capabilities` answers `labels: false`) gets none of these.
+There, a remediation PR is found by its branch prefix `platform-agent/fix-<audit-id>-`, the marker
+`<!-- audit-remediation: <audit-id> -->` in its description, its author (this install) and its
+source repository (this one, not a fork). A harness close adds `<!-- audit:stale-closed -->` to the
+description before the close, under the same rule as the label: no close without it.
+
+A forge with no issue verbs, or no labels, cannot hold the ledger issue. The design for it is in
+[`version-control-support.md`](version-control-support.md) §8, "The ledger without issues": the
+ledger goes to the report store and to chat, and remediation PRs still open on the forge. The
+harness does not make that decision yet. Until it does, a run against such a repository refuses at
+`start`, because the ledger lookup refuses rather than answer "none".
+
 ## 9. Red lines (carried forward, plus new)
 
 Unchanged: read-only against clusters; never `git add .` or `-A`; never force-push a protected

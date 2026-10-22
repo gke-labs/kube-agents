@@ -513,6 +513,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # This repository, sandbox-reading: how many of the batch's critical
     # findings the onboarding report lists, against `limit`.
     "bootstrap_report_criticals": ("limit",),
+    # This repository, sandbox-reading: the paragraphs the onboarding report
+    # opens with, and the verdicts it must not write.
+    "bootstrap_report_posture": ("posture",),
     # This repository, sandbox-reading. No field, like pull_request_opened:
     # the diff against the image is the assertion. It reads the agent's own
     # shell sandbox pod, not a seeded-fleet fixture, so it is not in

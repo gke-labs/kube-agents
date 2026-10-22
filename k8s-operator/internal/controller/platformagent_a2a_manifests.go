@@ -1481,13 +1481,14 @@ func a2aCredsSecretName(agent *agentv1alpha1.PlatformAgent) string {
 
 // a2aNATSAddress is the bus's in-cluster host:port. a2aNATSClientURL is the
 // same thing as a client URL; both exist because the nats CLI takes the first
-// and the Go client takes the second.
+// and the Go client takes the second. The URL is tls://: the bus requires TLS
+// of every client, and the host is the Service name its certificate carries.
 func a2aNATSAddress(agent *agentv1alpha1.PlatformAgent) string {
 	return fmt.Sprintf("%s.%s.svc:%d", a2aNATSName(agent), agent.Namespace, a2aNATSClientPort)
 }
 
 func a2aNATSClientURL(agent *agentv1alpha1.PlatformAgent) string {
-	return "nats://" + a2aNATSAddress(agent)
+	return a2aNATSTLSScheme + a2aNATSAddress(agent)
 }
 
 // The provision Job's pods run as their own ServiceAccount so the auth callout
@@ -2066,6 +2067,17 @@ server_name: ` + a2aNATSName(agent) + `
 port: ` + strconv.Itoa(a2aNATSClientPort) + `
 http: ` + strconv.Itoa(a2aNATSMonitorPort) + `
 
+# TLS on the client listener, required of every connection: the server
+# advertises tls_required, so a client that dials nats:// is told to upgrade
+# and one that cannot verify this certificate is refused. The serving pair is
+# the operator-minted one in the ` + agentv1alpha1.A2ANATSTLSSecretName(agent.Name) + ` Secret,
+# mounted as a directory (platformagent_a2a_tls.go). The monitoring port above
+# stays plain HTTP: it carries health and stats, not payloads or tokens.
+tls {
+  cert_file: "` + a2aNATSTLSMountDir + `/` + a2aNATSTLSCertKey + `"
+  key_file: "` + a2aNATSTLSMountDir + `/` + a2aNATSTLSKeyKey + `"
+}
+
 # A ServiceAccount token travels inside the client's CONNECT frame, and the
 # default max_control_line of 4096 bounds that whole frame - measured, the
 # usable room for the token itself is around 3920 bytes once the rest of the
@@ -2088,8 +2100,8 @@ max_control_line: 65536
 # it forwards the websocket here with the browser's headers intact. It is not
 # an in-cluster door for anything else. A port-forward straight to 9222 still
 # works for local tooling and the live tests, because it enters from the
-# node, which NetworkPolicy does not govern. Production still terminates TLS
-# in front of the bus, which is not a toggle that exists yet.
+# node, which NetworkPolicy does not govern. The client listener above is
+# TLS; this one is still plain.
 #
 # The origin allow-list is the console server's origin as the browser sees it
 # through the documented port-forward. The proxy forwards Origin unchanged,
@@ -2277,11 +2289,18 @@ func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.
 // (stampSecretEnvHash in reconcileA2A), which moves when its password's value
 // does, within secretEnvReprobeInterval. The provision Job holds no password: it
 // authenticates with its projected bus token (a2aBusTokenVolumeSource).
-func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys) string {
+//
+// The serving certificate's fingerprint is the third input, for the same
+// reason as the conf: nats-server reads its certificate at boot, so a renewed
+// one that the kubelet has already written into the mounted directory is not
+// served until the pod restarts. Until a reloader sends the reload signal
+// instead, a renewal rolls the bus once a year.
+func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys, servingFingerprint string) string {
 	redacted := renderA2ANATSConf(agent, func(key string) string {
 		return fmt.Sprintf(a2aConfigHashPlaceholder, key)
 	}, keys)
-	sum := sha256.Sum256([]byte(redacted + a2aConfigHashRotationSeparator + creds.ResourceVersion))
+	sum := sha256.Sum256([]byte(redacted + a2aConfigHashRotationSeparator + creds.ResourceVersion +
+		a2aConfigHashRotationSeparator + servingFingerprint))
 	return hex.EncodeToString(sum[:])[:a2aConfigHashLength]
 }
 
@@ -2351,6 +2370,7 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 						},
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "config", MountPath: "/etc/nats", ReadOnly: true},
+							{Name: a2aNATSTLSVolume, MountPath: a2aNATSTLSMountDir, ReadOnly: true},
 							{Name: a2aNATSDataClaim, MountPath: "/data"},
 						},
 						SecurityContext: hardenedSecurityContext(),
@@ -2365,6 +2385,11 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 						Name: "config",
 						VolumeSource: corev1.VolumeSource{
 							Secret: &corev1.SecretVolumeSource{SecretName: a2aNATSConfigSecretName(agent)},
+						},
+					}, {
+						Name: a2aNATSTLSVolume,
+						VolumeSource: corev1.VolumeSource{
+							Secret: &corev1.SecretVolumeSource{SecretName: agentv1alpha1.A2ANATSTLSSecretName(agent.Name)},
 						},
 					}},
 				},
@@ -2859,7 +2884,7 @@ BUS_TOKEN="$(cat ` + a2aBusTokenPath + `/` + a2aBusTokenFile + `)"
 # lands on an inbox, and this principal may only subscribe under
 # _INBOX.provision.> — the CLI's default _INBOX.<nuid> would be refused and
 # every call would time out.
-NATS="nats --server ` + server + ` --user ${BUS_USER} --password ${BUS_TOKEN} --inbox-prefix=_INBOX.provision"
+NATS="nats --server ` + a2aNATSTLSScheme + server + ` --tlsca ` + a2aNATSCAFile() + ` --user ${BUS_USER} --password ${BUS_TOKEN} --inbox-prefix=_INBOX.provision"
 
 # max_consumers caps each stream. Consumer durability is a request-body
 # field, so no permission list can hold web to ephemeral ones (see the web user
@@ -3252,7 +3277,7 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 					// The nats CLI wants a writable HOME for its context
 					// directory even when every call passes --server, so the
 					// hardened read-only root needs somewhere to point it.
-					Volumes: []corev1.Volume{a2aBusTokenVolumeSource(), {
+					Volumes: []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent), {
 						Name:         "tmp",
 						VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 					}},
@@ -3295,6 +3320,7 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "tmp", MountPath: a2aProvisionWritablePath},
 							a2aBusTokenVolumeMount(),
+							a2aNATSCABundleMount(),
 						},
 					}},
 				},
@@ -4655,6 +4681,10 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	// settings, then the Chat backend's and the inject door's additions.
 	env := []corev1.EnvVar{
 		{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
+		a2aNATSCAFileEnvVar(),
+		// The bundle's ConfigMap as well as its file: the gateway mounts the
+		// same ConfigMap into each session pod it spawns.
+		{Name: a2aNATSCAConfigMapEnv, Value: a2aNATSCABundleName(agent)},
 		{Name: "NATS_USER", Value: "gateway"},
 		{Name: "NATS_PASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
 			LocalObjectReference: corev1.LocalObjectReference{Name: a2aCredsSecretName(agent)},
@@ -4813,10 +4843,10 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						}),
 						VolumeMounts: append(append([]corev1.VolumeMount{{
 							Name: a2aPrincipalMapVolume, MountPath: a2aPrincipalMapDir, ReadOnly: true,
-						}}, chatMounts...), injectMounts...),
+						}, a2aNATSCABundleMount()}, chatMounts...), injectMounts...),
 						SecurityContext: hardenedSecurityContext(),
 					}},
-					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource(agent)}, chatVolumes...), injectVolumes...),
+					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource(agent), a2aNATSCABundleVolume(agent)}, chatVolumes...), injectVolumes...),
 				},
 			},
 		},
@@ -5035,6 +5065,14 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		return state, fmt.Errorf("failed to ensure A2A callout keys: %w", err)
 	}
 
+	// Before the config and every client: the server mounts the serving pair
+	// and each client mounts the bundle, and a pod started against a Secret
+	// or ConfigMap that does not exist yet waits in ContainerCreating.
+	natsTLS, err := r.ensureA2ANATSTLS(ctx, agent)
+	if err != nil {
+		return state, fmt.Errorf("failed to ensure A2A NATS TLS: %w", err)
+	}
+
 	// The identity map before the server that will be authorizing against
 	// it: the callout refuses connections until it is serving a map, so
 	// rendering the map first shortens the window in which a restarting bus
@@ -5066,7 +5104,7 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		return state, fmt.Errorf("failed to apply A2A NATS config: %w", err)
 	}
 
-	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys))
+	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys, natsTLS.ServingFingerprint))
 	if err := ctrl.SetControllerReference(agent, sts, r.Scheme); err != nil {
 		return state, err
 	}
@@ -6100,6 +6138,13 @@ func (r *PlatformAgentReconciler) a2aBusTeardown(agent *agentv1alpha1.PlatformAg
 		// wait this reconcile has no reason to block on.
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSConfigSecretName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		// The TLS material goes with the bus, unlike the creds Secret: a CA
+		// reissued on the next flip to next costs nothing, since every client
+		// is re-rendered with the new bundle in the same pass, while a CA key
+		// left behind is a signing key for a bus that no longer exists.
+		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: agentv1alpha1.A2ANATSTLSSecretName(agent.Name), Namespace: agent.Namespace}}, r.a2aReader()},
+		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: agentv1alpha1.A2ANATSCASecretName(agent.Name), Namespace: agent.Namespace}}, r.a2aReader()},
+		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSCABundleName(agent), Namespace: agent.Namespace}}, r.Client},
 		// ResourceQuota is not a watched kind, so the read goes through
 		// a2aReader like the Secrets. Deleting it here is safe even with
 		// session pods still draining (see the function comment): a quota

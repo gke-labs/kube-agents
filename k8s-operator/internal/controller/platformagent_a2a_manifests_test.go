@@ -595,8 +595,8 @@ func TestHandleDeletionReapsOnlyTheLabeledJetStreamPVC(t *testing.T) {
 	})
 }
 
-// The web read surface: a websocket listener (plain ws is the stated
-// playground posture; production terminates TLS in front), a ClusterIP port
+// The web read surface: a websocket listener (still plain ws, unlike the TLS
+// client listener), a ClusterIP port
 // for it, and a `web` user that can watch everything and say nothing —
 // subscribe on a2a.>, the JetStream read API, its own inbox, and no publish
 // reach beyond those. The read-only web rail is the consumer; kubectl
@@ -2282,8 +2282,9 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnFullRender(t *testing.T) {
 }
 
 // TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender pins Shape 2 of #2216:
-// A render that died on write 4 (after writing calloutKeys Secret and authMap
-// ConfigMap, before writing config Secret or StatefulSet), followed by a
+// A render that died on write 7 (after writing the calloutKeys Secret, the
+// TLS Secrets and bundle, and the authMap ConfigMap, before writing the config
+// Secret or StatefulSet), followed by a
 // cleanup pass that deletes calloutKeys Secret and dies on deleting authMap
 // ConfigMap.
 func TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender(t *testing.T) {
@@ -2293,7 +2294,7 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender(t *testing.T) {
 	today.Spec.Mode = nil
 
 	writes := 0
-	stopAt := 4
+	stopAt := 7
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(next.DeepCopy()).
@@ -3120,7 +3121,7 @@ func TestBuildPodTemplateSpecBusEnvGatedOnMode(t *testing.T) {
 	}
 
 	nextEnv := agentEnv(a2aTestAgent())
-	if v := find(nextEnv, "NATS_URL"); v == nil || v.Value != "nats://test-agent-a2a-nats.test-ns.svc:4222" {
+	if v := find(nextEnv, "NATS_URL"); v == nil || v.Value != "tls://test-agent-a2a-nats.test-ns.svc:4222" {
 		t.Errorf("NATS_URL = %+v, want the rendered NATS Service address", v)
 	}
 	if v := find(nextEnv, a2aBusUserEnv); v == nil || v.Value != a2aAgentBusUser {
@@ -3197,6 +3198,7 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 		Spec: agentv1alpha1.AgentPluginSpec{
 			Env: []corev1.EnvVar{
 				{Name: "NATS_URL", Value: "nats://attacker.example:443"},
+				{Name: a2aNATSCAFileEnv, Value: "/opt/data/attacker/ca.crt"},
 				{Name: a2aBusUserEnv, Value: "gateway"},
 				{Name: a2aBusTokenFileEnv, Value: "/opt/data/attacker/token"},
 				{Name: a2aNotifyPlatformEnvVar, Value: "google_chat"},
@@ -3224,7 +3226,7 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 	// Exactly one entry per bus name: a duplicate would not be "last value
 	// wins" at the kubelet — server-side apply refuses the whole Deployment,
 	// wedging reconcile with no Degraded status to say why.
-	for _, name := range []string{"NATS_URL", a2aBusUserEnv} {
+	for _, name := range []string{"NATS_URL", a2aNATSCAFileEnv, a2aBusUserEnv} {
 		if counts[name] != 1 {
 			t.Errorf("%s appears %d times in the agent env; a duplicate key is refused by "+
 				"server-side apply and freezes the reconcile", name, counts[name])
@@ -3250,8 +3252,13 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 			t.Errorf("a plugin's %s survived into the agent env under next", name)
 		}
 	}
-	if got := values["NATS_URL"].Value; got != "nats://test-agent-a2a-nats.test-ns.svc:4222" {
+	if got := values["NATS_URL"].Value; got != "tls://test-agent-a2a-nats.test-ns.svc:4222" {
 		t.Errorf("a plugin redirected the bus: NATS_URL = %q", got)
+	}
+	// The trust half of the same redirect: a plugin's CA would let a server
+	// it signed pass as the bus.
+	if got := values[a2aNATSCAFileEnv].Value; got != a2aNATSCAFile() {
+		t.Errorf("a plugin replaced the bus CA: %s = %q", a2aNATSCAFileEnv, got)
 	}
 	if got := values[a2aBusUserEnv].Value; got != a2aAgentBusUser {
 		t.Errorf("a plugin changed the bus identity: %s = %q", a2aBusUserEnv, got)
@@ -3259,7 +3266,7 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 	if counts["PLUGIN_OWN_KEY"] != 1 || values["PLUGIN_OWN_KEY"].Value != "kept" {
 		t.Error("the bus-name reservation dropped a plugin variable it has no claim on")
 	}
-	for _, name := range []string{"NATS_URL", a2aBusUserEnv, a2aBusTokenFileEnv, a2aNotifyPlatformEnvVar, a2aNotifyConversationsEnvVar, "NATS_USER", "NATS_PASSWORD"} {
+	for _, name := range []string{"NATS_URL", a2aNATSCAFileEnv, a2aBusUserEnv, a2aBusTokenFileEnv, a2aNotifyPlatformEnvVar, a2aNotifyConversationsEnvVar, "NATS_USER", "NATS_PASSWORD"} {
 		if _, sensitive := agentv1alpha1.SensitiveEnvVars[name]; !sensitive {
 			t.Errorf("%s is not in SensitiveEnvVars; the drop above covers plugin env only, and membership "+
 				"is what keeps the name out of the sidecar containers, which take spec.deployment.env "+
@@ -3563,11 +3570,11 @@ func TestA2AConfigRolloutHashOmitsCredentialsAndTracksRotation(t *testing.T) {
 		t.Fatal("the two creds Secrets render the same nats.conf; the omission check below is inert")
 	}
 
-	hashA := a2aConfigRolloutHash(agent, credsA, keys)
+	hashA := a2aConfigRolloutHash(agent, credsA, keys, "serving-a")
 	if len(hashA) != a2aConfigHashLength {
 		t.Errorf("rollout hash is %d characters, want %d", len(hashA), a2aConfigHashLength)
 	}
-	if hashB := a2aConfigRolloutHash(agent, credsB, keys); hashA != hashB {
+	if hashB := a2aConfigRolloutHash(agent, credsB, keys, "serving-a"); hashA != hashB {
 		t.Errorf("the rollout hash still tracks the password bytes: %q vs %q", hashA, hashB)
 	}
 
@@ -3575,14 +3582,14 @@ func TestA2AConfigRolloutHashOmitsCredentialsAndTracksRotation(t *testing.T) {
 	// Update on the same Secret, so the UID does not move and the
 	// resourceVersion is the only thing that says a credential changed.
 	rotated := a2aFullCreds("b", "4712")
-	if hashRotated := a2aConfigRolloutHash(agent, rotated, keys); hashA == hashRotated {
+	if hashRotated := a2aConfigRolloutHash(agent, rotated, keys, "serving-a"); hashA == hashRotated {
 		t.Error("a credential rotation does not roll the bus: the hash ignores resourceVersion")
 	}
 
 	// A config change: the agent's name is rendered into server_name.
 	other := a2aTestAgent()
 	other.Name = "other-agent"
-	if hashOther := a2aConfigRolloutHash(other, credsA, keys); hashA == hashOther {
+	if hashOther := a2aConfigRolloutHash(other, credsA, keys, "serving-a"); hashA == hashOther {
 		t.Error("a config change does not roll the bus: the hash ignores the render")
 	}
 
@@ -3591,8 +3598,15 @@ func TestA2AConfigRolloutHashOmitsCredentialsAndTracksRotation(t *testing.T) {
 	// what the new callout signs. If this does not move the hash, the
 	// StatefulSet is never rolled and the bus rejects every authorization.
 	rotatedKeys := a2aTestCalloutKeys(t)
-	if hashKeys := a2aConfigRolloutHash(agent, credsA, rotatedKeys); hashA == hashKeys {
+	if hashKeys := a2aConfigRolloutHash(agent, credsA, rotatedKeys, "serving-a"); hashA == hashKeys {
 		t.Error("a callout keypair rotation does not roll the bus: the hash ignores the public keys")
+	}
+
+	// A serving-certificate renewal: the kubelet updates the mounted files in
+	// place, but nats-server reads its certificate at boot, so the bus has to
+	// roll or it keeps serving the old one until it expires.
+	if hashRenewed := a2aConfigRolloutHash(agent, credsA, keys, "serving-b"); hashA == hashRenewed {
+		t.Error("a serving-certificate renewal does not roll the bus: the hash ignores the fingerprint")
 	}
 }
 
@@ -6700,13 +6714,18 @@ func TestUserAuthoredContainersCannotMountTheBusTokenByName(t *testing.T) {
 			"is the retired `worker` credential rebuilt", a2aBusTokenVolume, slices.Sorted(maps.Keys(holders)))
 	}
 
-	// The sidecar keeps everything it is entitled to.
+	// The sidecar keeps everything it is entitled to, plus the bus CA bundle
+	// the operator adds to every declared sidecar.
 	for _, c := range spec.Containers {
 		if c.Name != "hermes-bridge" {
 			continue
 		}
-		if len(c.VolumeMounts) != 1 || c.VolumeMounts[0].Name != "agent-data" {
-			t.Errorf("the strip took a mount it has no claim on: %+v", c.VolumeMounts)
+		var names []string
+		for _, m := range c.VolumeMounts {
+			names = append(names, m.Name)
+		}
+		if !slices.Equal(names, []string{"agent-data", a2aNATSCABundleVolumeName}) {
+			t.Errorf("the strip took a mount it has no claim on, or kept one: %+v", c.VolumeMounts)
 		}
 	}
 

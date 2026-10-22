@@ -906,6 +906,12 @@
 # autoops-warning-event-triage).
 ./tasks/autoops-warning-event-no-action-triage/task.yaml
 
+# #3090: the first onboarding report opens with the scan counts and the line
+# `inventory_findings.py select` prints, graded by equality. The
+# bootstrap-ranking stack with a planted report that has no critical finding;
+# the onboarding lock, like bootstrap-inventory-ranking-delivery.
+./tasks/bootstrap-inventory-posture-scope/task.yaml
+
 # "/feedback <text>" is written up and shown for a yes before anything is
 # filed (docs/designs/chat-feedback-command.md): the Planning Agent's reply
 # carries the composed submission, the public-issue warning and a question,

@@ -76,7 +76,7 @@ func (vl *violationLog) sawViolationFor(subject string) bool {
 func connectStatic(t *testing.T, h *harness, user, password string) (*nats.Conn, chan error) {
 	t.Helper()
 	violations := make(chan error, 16)
-	nc, err := nats.Connect(h.url,
+	nc, err := nats.Connect(h.url, h.tls,
 		nats.UserInfo(user, password),
 		nats.CustomInboxPrefix("_INBOX."+user),
 		nats.Name(user),

@@ -230,7 +230,7 @@ func NewConsoleAdapter(url string, natsOpts []nats.Option, log *slog.Logger) (*C
 				"console", consoleConnName, "err", nc.LastError())
 		}),
 	)
-	nc, err := nats.Connect(url, opts...)
+	nc, err := nats.Connect(url, append(opts, lib.TLSOptions()...)...)
 	if err != nil {
 		return nil, fmt.Errorf("console adapter: connect: %w", err)
 	}
