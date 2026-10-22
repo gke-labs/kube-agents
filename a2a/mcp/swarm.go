@@ -88,12 +88,17 @@ const (
 // SwarmConversation is one console conversation the client holds. Every
 // field is client-supplied. Parent is the parent conversation's Alias, a name
 // only: one not in the input, or one that forms a cycle, is ignored.
+// AGYConversationID is the client's own id for the subagent conversation
+// behind it, echoed onto the session member's conversation_id so the client
+// can link the two; one that is not a safe id (see safeConversationID) is
+// dropped.
 type SwarmConversation struct {
-	Alias       string
-	Token       string
-	Description string
-	Parent      string
-	LastUsed    time.Time
+	Alias             string
+	Token             string
+	Description       string
+	Parent            string
+	AGYConversationID string
+	LastUsed          time.Time
 }
 
 // SwarmTask is one task on TASKS, as the gateway found it.
@@ -239,6 +244,7 @@ type swarmConv struct {
 	working            bool
 	step               string
 	member             string // roster name, "" when not on the roster
+	agyConversationID  string // validated client conversation id, or ""
 }
 
 // swarmTaskView is one task after validation.
@@ -395,6 +401,7 @@ func BuildSwarmState(in SwarmInput, prev BoardLedger) (SwarmSnapshot, BoardLedge
 		members[name] = SwarmMember{
 			Name: name, Role: swarmRoleWorker, Model: model,
 			WakeMode: wake, JoinedAt: joined.UTC().Format(time.RFC3339), ManagedBy: swarmManagedByTag,
+			ConversationID: c.agyConversationID,
 		}
 	}
 
@@ -1062,6 +1069,9 @@ func normalizeConversations(in []SwarmConversation, now time.Time) []*swarmConv 
 		if a.Parent != b.Parent {
 			return a.Parent < b.Parent
 		}
+		if a.AGYConversationID != b.AGYConversationID {
+			return a.AGYConversationID < b.AGYConversationID
+		}
 		return a.Description < b.Description
 	})
 	out := make([]*swarmConv, 0, len(list))
@@ -1076,6 +1086,8 @@ func normalizeConversations(in []SwarmConversation, now time.Time) []*swarmConv 
 			aliasLabel: swarmText(c.Alias, maxViewTitleChars),
 			parent:     strings.TrimSpace(c.Parent),
 			lastUsed:   clampNotAfter(c.LastUsed.UTC(), now),
+
+			agyConversationID: safeConversationID(c.AGYConversationID),
 		})
 	}
 	if len(out) > maxSwarmInputConvs {
@@ -1084,6 +1096,31 @@ func normalizeConversations(in []SwarmConversation, now time.Time) []*swarmConv 
 		sort.Slice(out, func(i, j int) bool { return out[i].alias < out[j].alias })
 	}
 	return out
+}
+
+// maxConversationIDRunes bounds a client conversation id echoed onto a member.
+const maxConversationIDRunes = 128
+
+// safeConversationID returns id when it is a safe opaque identifier: at most
+// maxConversationIDRunes runes, no control, format or space characters, and
+// no path separator or dot-segment, since the client joins it into paths
+// (Antigravity's per-conversation directories). Anything else is "", so the
+// member simply carries no link.
+func safeConversationID(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" || !utf8.ValidString(id) || utf8.RuneCountInString(id) > maxConversationIDRunes {
+		return ""
+	}
+	if id == "." || id == ".." || strings.Contains(id, "..") {
+		return ""
+	}
+	for _, r := range id {
+		if r == '/' || r == '\\' || unicode.IsControl(r) || unicode.IsSpace(r) || unicode.Is(unicode.Cf, r) ||
+			r == '\u2028' || r == '\u2029' {
+			return ""
+		}
+	}
+	return id
 }
 
 // resolveLineage sets each conversation's parent and root. Parent is only a
