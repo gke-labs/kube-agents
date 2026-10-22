@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	lib "github.com/gke-labs/kube-agents/a2a/lib"
@@ -55,6 +56,15 @@ func TestAPI_OversizeAnswerIsRefusedWithTheLimitNamed(t *testing.T) {
 	}
 }
 
+// atCapTerminalWait is the at-cap test's own terminal budget. An answer of
+// apiResponseCap bytes takes about 10 s to its terminal under the race
+// detector on an idle machine (0.6 s to read and parse, 6.4 s in the chat
+// fold scanning one 8 MiB line, 3 s publishing the result chunks; 1.3 s
+// without -race), so the shared terminalWait is crossed on a busy CI runner
+// at a two-fold slowdown. The task deadline bounds only the HTTP turn and
+// the publish has its own bound, so this budget is the one that decides.
+const atCapTerminalWait = 60 * time.Second
+
 // The boundary's other side: an answer of exactly apiResponseCap bytes is
 // read whole and completes, so the one-byte look-ahead refuses nothing the
 // cap admits.
@@ -63,7 +73,7 @@ func TestAPI_AnswerAtTheCapCompletes(t *testing.T) {
 	startAPIBridge(t, url, newAPIStub(t, completionOfSize(t, apiResponseCap)), nil)
 	c := gatewayClient(t, url)
 	submitIn(t, c, "task-atcap", "ctx-atcap", "write something large")
-	task := waitTerminal(t, c, "task-atcap")
+	task := waitTerminalFor(t, c, "task-atcap", atCapTerminalWait)
 	if task.State != lib.StateCompleted {
 		reason := ""
 		if task.FinalMessage != nil && len(task.FinalMessage.Parts) > 0 {
