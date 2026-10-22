@@ -2743,13 +2743,26 @@ def test_a_card_unblocked_and_claimed_running_on_inject_records_ceiling(
             "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
             'HTTP 429 ... "TPM quota exhausted"'
         ),
+        error=(
+            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+            'HTTP 429 ... "TPM quota exhausted"'
+        ),
         block_kind="transient",
     )
 
     def _on_read(n: int) -> None:
         if n == 2:
             # On deliverable read (want_cards), card was unblocked and re-claimed running with fresh run row
-            set_card(tmp_path, CARD_A, "running", block_kind="transient")
+            set_card(
+                tmp_path,
+                CARD_A,
+                "running",
+                block_kind="transient",
+                error=(
+                    "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                    'HTTP 429 ... "TPM quota exhausted"'
+                ),
+            )
             conn = sqlite3.connect(tmp_path / board.BOARD_FILE)
             conn.execute(
                 "INSERT INTO task_runs (task_id, profile, status) VALUES (?, 'platform', 'running')",
@@ -2910,7 +2923,7 @@ def test_a_triage_card_with_transient_rate_limit_summary_on_inject_is_infrastruc
     assert result.output == ""
     assert result.errors == [
         f"{harness.INFRA_FAILURE_MARKER}: delegated worker hit infrastructure failure (rate_limit): "
-        'card on board recorded rate_limit: provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429 ... "TPM quota exhausted"',
+        'card on board recorded rate_limit: provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429 ... "TPM quota exhausted" (platform proxy log unavailable at settle; not corroborated)',
         f"{harness.DELEGATION_CEILING_MARKER}: delegated tasks did not finish within 1s: {CARD_A} (triage)",
     ]
 

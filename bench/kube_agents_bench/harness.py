@@ -645,12 +645,15 @@ _LITELLM_429_PATTERN = re.compile(
 )
 
 
-def _scan_log_for_429(path: Path) -> bool:
+def _scan_log_for_429(path: Path) -> bool | None:
     try:
         with path.open("r", encoding="utf-8", errors="replace") as f:
-            return bool(_LITELLM_429_PATTERN.search(f.read()))
+            content = f.read()
+            if content.startswith("note: no LiteLLM log for this run"):
+                return None
+            return bool(_LITELLM_429_PATTERN.search(content))
     except OSError:
-        return False
+        return None
 
 
 def _extract_infra_failure_reason(text: str | None) -> str | None:
@@ -672,11 +675,14 @@ def _corroborate_platform_rate_limit() -> bool | None:
     Returns:
         True: Telemetry log was read and confirmed a 429 status code or RESOURCE_EXHAUSTED event.
         False: Telemetry log was read and showed no 429 event (refusing infra classification).
-        None: Telemetry log was unavailable at settle time (telemetry not pre-collected).
+        None: Telemetry log was unreadable, placeholder, or unavailable at settle time (telemetry not pre-collected).
     """
     path = os.environ.get("LITELLM_LOG_PATH")
     if path:
-        return _scan_log_for_429(Path(path))
+        p = Path(path)
+        if not p.is_file():
+            return None
+        return _scan_log_for_429(p)
 
     artifacts = os.environ.get(_ARTIFACTS_ENV)
     if artifacts:
@@ -1344,6 +1350,8 @@ def _record_ceiling(
     outstanding: list[str],
     statuses: dict[str, str],
     delegation_timeout: float,
+    *,
+    opening_turn: bool = True,
 ) -> None:
     """Record that ``outstanding`` cards outran the delegation budget.
 
@@ -1361,7 +1369,7 @@ def _record_ceiling(
         f"{delegation_timeout:.0f}s: "
         + ", ".join(f"{t} ({statuses.get(t, 'unknown')})" for t in outstanding)
     )
-    if not delivered_results(observed, awaited):
+    if not delivered_results(observed, awaited) and opening_turn:
         report = f"{DELEGATION_CEILING_MARKER}: {report}"
     result.errors.append(report)
 
@@ -1373,6 +1381,7 @@ def _record_unsettled(
     live_statuses: Mapping[str, str],
     *,
     has_delivery: bool = False,
+    opening_turn: bool = True,
 ) -> None:
     """Record that failure cards unblocked to non-terminal at settle delivered no result."""
     marked: list[str] = []
@@ -1383,7 +1392,7 @@ def _record_unsettled(
         report = (
             f"delegated task {t} was reported {last} during wait but {live} at settle; nothing delivered"
         )
-        if not has_delivery:
+        if not has_delivery and opening_turn:
             marked.append(f"{DELEGATION_CEILING_MARKER}: {report}")
         else:
             plain.append(report)
@@ -2712,6 +2721,7 @@ class KubeAgentsHarness(AgentHarness):
         statuses: Mapping[str, str],
         fallback_messages: Mapping[str, Sequence[str]] | None = None,
         unsettled: list[str] | None = None,
+        discrepancies: list[str] | None = None,
         live_statuses: dict[str, str] | None = None,
     ) -> list[str]:
         """Read summary and error from the board for any awaited cards in failure statuses.
@@ -2735,10 +2745,16 @@ class KubeAgentsHarness(AgentHarness):
         bblock_kinds = final_bstate[3] if len(final_bstate) > 3 else {}
         for t in failure_cards:
             live_status = final_bstate[0].get(t)
+            card_fallback = (fallback_messages.get(t) or []) if fallback_messages else []
+            has_rate_limit = any(_extract_infra_failure_reason(m) for m in card_fallback)
             if live_status is not None and live_status not in _TERMINAL_STATUSES:
                 if bblock_kinds.get(t) == "transient":
-                    if unsettled is not None:
-                        unsettled.append(t)
+                    if has_rate_limit:
+                        if unsettled is not None:
+                            unsettled.append(t)
+                    else:
+                        if discrepancies is not None:
+                            discrepancies.append(t)
                 if live_statuses is not None:
                     live_statuses[t] = live_status
                 if isinstance(statuses, dict):
@@ -2919,12 +2935,22 @@ class KubeAgentsHarness(AgentHarness):
                 {t: _status(t) for t in outstanding},
                 delegation_timeout,
             )
-        unsettled = [
-            t for t in poll_failure_statuses
-            if _status(t) not in _TERMINAL_STATUSES
-            and t not in outstanding
-            and read.cards.get(t, {}).get("block_kind") == "transient"
-        ]
+        unsettled = []
+        discrepancies = []
+        for t in poll_failure_statuses:
+            if _status(t) not in _TERMINAL_STATUSES and t not in outstanding:
+                card_data = read.cards.get(t, {})
+                if card_data.get("block_kind") == "transient":
+                    summary_text = str(card_data.get("summary") or "")
+                    error_text = str(card_data.get("error") or "")
+                    has_rate_limit = bool(
+                        _extract_infra_failure_reason(summary_text)
+                        or _extract_infra_failure_reason(error_text)
+                    )
+                    if has_rate_limit:
+                        unsettled.append(t)
+                    else:
+                        discrepancies.append(t)
         if unsettled:
             has_delivery = bool(
                 delivered_results(observed, [t for t in awaited if t not in unsettled])
@@ -2935,6 +2961,14 @@ class KubeAgentsHarness(AgentHarness):
                 poll_failure_statuses,
                 {t: _status(t) for t in unsettled},
                 has_delivery=has_delivery,
+            )
+        if discrepancies:
+            _record_unsettled(
+                result,
+                discrepancies,
+                poll_failure_statuses,
+                {t: _status(t) for t in discrepancies},
+                has_delivery=True,
             )
         # The scorer reads an inject record with no activity marker and
         # nothing outside the envelope as one whose door showed no trace, and
@@ -3057,6 +3091,7 @@ class KubeAgentsHarness(AgentHarness):
             )
         if not outstanding:
             unsettled: list[str] = []
+            discrepancies: list[str] = []
             live_statuses: dict[str, str] = {}
             prior_statuses = dict(statuses)
             board_messages = self._final_board_failures(
@@ -3064,6 +3099,7 @@ class KubeAgentsHarness(AgentHarness):
                 statuses,
                 poll_failure_messages,
                 unsettled=unsettled,
+                discrepancies=discrepancies,
                 live_statuses=live_statuses,
             )
             if unsettled:
@@ -3076,6 +3112,15 @@ class KubeAgentsHarness(AgentHarness):
                     prior_statuses,
                     live_statuses,
                     has_delivery=has_delivery,
+                    opening_turn=opening_turn,
+                )
+            if discrepancies:
+                _record_unsettled(
+                    result,
+                    discrepancies,
+                    prior_statuses,
+                    live_statuses,
+                    has_delivery=True,
                 )
             self._settle(
                 result,
@@ -3286,8 +3331,17 @@ class KubeAgentsHarness(AgentHarness):
         # the budget is untouched, and claiming it ran out would misreport why
         # the run stopped.
         if outstanding and timed_out:
-            _record_ceiling(result, observed, awaited, outstanding, latest, delegation_timeout)
+            _record_ceiling(
+                result,
+                observed,
+                awaited,
+                outstanding,
+                latest,
+                delegation_timeout,
+                opening_turn=opening_turn,
+            )
         unsettled: list[str] = []
+        discrepancies: list[str] = []
         live_statuses: dict[str, str] = {}
         prior_statuses = dict(latest)
         board_messages = self._final_board_failures(
@@ -3295,10 +3349,12 @@ class KubeAgentsHarness(AgentHarness):
             latest,
             poll_failure_messages,
             unsettled=unsettled,
+            discrepancies=discrepancies,
             live_statuses=live_statuses,
         )
         if outstanding:
             unsettled = [t for t in unsettled if t not in outstanding]
+            discrepancies = [t for t in discrepancies if t not in outstanding]
         if unsettled:
             has_delivery = bool(
                 delivered_results(observed, [t for t in awaited if t not in unsettled])
@@ -3309,6 +3365,15 @@ class KubeAgentsHarness(AgentHarness):
                 prior_statuses,
                 live_statuses,
                 has_delivery=has_delivery,
+                opening_turn=opening_turn,
+            )
+        if discrepancies:
+            _record_unsettled(
+                result,
+                discrepancies,
+                prior_statuses,
+                live_statuses,
+                has_delivery=True,
             )
         # Only the deadline path leaves transcripts behind: a card still
         # outstanding after a transport failure or a mute agent did not stall,
@@ -3395,6 +3460,8 @@ class KubeAgentsHarness(AgentHarness):
                     else:
                         infra_reason = reason
                         infra_detail = f"card on board recorded {reason}: {text[:200]}"
+                        if corroborated is None:
+                            infra_detail += " (platform proxy log unavailable at settle; not corroborated)"
                         result.metadata["platform_rate_limit_corroborated"] = (corroborated is True)
                         break
 
