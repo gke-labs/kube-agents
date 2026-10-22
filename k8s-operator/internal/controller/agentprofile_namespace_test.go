@@ -180,8 +180,10 @@ func TestAgentNamespaceOfProfileFence(t *testing.T) {
 	}
 }
 
-// Deleting the PlatformAgent removes its quota and fence from the profile
-// namespace, which nothing else would reclaim.
+// Deleting the PlatformAgent removes its quota from the profile namespace,
+// which nothing else would reclaim, and leaves its fence: the bus fence that
+// admits the namespace goes to the garbage collector after the CR, and a
+// fence left behind only restricts.
 func TestDeletingTheAgentRemovesItsProfileObjects(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()
@@ -200,8 +202,8 @@ func TestDeletingTheAgentRemovesItsProfileObjects(t *testing.T) {
 		t.Errorf("the profile quota survived the agent's deletion (err %v)", err)
 	}
 	var np networkingv1.NetworkPolicy
-	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "test-ns-profiles", Name: fence.Name}, &np); !apierrors.IsNotFound(err) {
-		t.Errorf("the profile fence survived the agent's deletion (err %v)", err)
+	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "test-ns-profiles", Name: fence.Name}, &np); err != nil {
+		t.Errorf("the profile fence was deleted with the agent, ahead of the bus fence that admits the namespace (err %v)", err)
 	}
 }
 

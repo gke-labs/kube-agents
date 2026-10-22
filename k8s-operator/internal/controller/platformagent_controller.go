@@ -1216,14 +1216,16 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		if err := r.deleteA2ACalloutClusterRoleBinding(ctx, agent); err != nil {
 			return ctrl.Result{}, err
 		}
-		// The profile namespace's quota and fence carry no owner reference
-		// either (agentprofile_namespace.go), so deleting the CR is the other
-		// way they'd be left behind; a stale quota would cap a successor
-		// agent's profile pods. The fence goes last.
+		// The profile namespace's quota carries no owner reference either
+		// (agentprofile_namespace.go), so deleting the CR is the other way it
+		// would be left behind, and a stale quota would cap a successor
+		// agent's profile pods. The profile fence stays: the bus fence that
+		// admits that namespace is owned by this CR and goes with it to the
+		// garbage collector after this returns, so deleting the profile fence
+		// here would leave the bus admitting an unfenced namespace in
+		// between. A fence left behind only restricts, and the chart's
+		// uninstall removes the namespace with it.
 		if err := r.deleteProfileQuota(ctx, agent); err != nil {
-			return ctrl.Result{}, err
-		}
-		if err := r.deleteProfileFence(ctx, agent); err != nil {
 			return ctrl.Result{}, err
 		}
 
