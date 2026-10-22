@@ -295,10 +295,13 @@ Already served (see Scope). The additions:
 - An automated control-plane upgrade, resize or repair needs compute capacity when it fires, and
   the provider does not check it first. `control-plane-upgrade-history` reads the operations list
   for an `UPGRADE_MASTER`, `UPGRADE_NODES` or `REPAIR_CLUSTER` that failed on capacity in the
-  last 90 days and files it as a risk with the cluster's maintenance window; the action is a
-  window in an off-peak hour for the region, the upgrade retried in it, and the upgrade
-  notifications consumed so the next failed attempt is a message the same day. A lagging signal
-  by nature: it explains the last failure and lowers the odds of the next.
+  last 90 days and files it with the cluster's maintenance window: a risk when the cluster has
+  no window or its window opens in the region's busy hours (06:00 to 21:00 in the region's
+  standard local time), whose action is a window in an off-peak hour for the region and the
+  upgrade retried in it, and a note whose action is the retry in the window when the window
+  already opens off-peak; either way the upgrade notifications are consumed so the next failed
+  attempt is a message the same day. A lagging signal by nature: it explains the last failure
+  and lowers the odds of the next.
 - Each family gets a target version and a date, taken from the GKE release calendar by the
   operator, and every run reports the days remaining. The point is to catch a family falling
   behind **its own plan**, which happens long before it falls behind what GKE still supports.

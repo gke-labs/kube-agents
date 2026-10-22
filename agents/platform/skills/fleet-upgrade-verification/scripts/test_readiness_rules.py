@@ -692,6 +692,11 @@ def seeded_b():
     return recorded("cluster_seeded_b.json")
 
 
+def dev_host():
+    """The dev project's platform-agent-host as the clusters list spells it, without a maintenance window: the one cluster whose recorded operations carry a capacity failure."""
+    return {"name": "platform-agent-host", "location": "us-central1", "status": "RUNNING", "currentMasterVersion": "1.35.8-gke.1439001", "releaseChannel": {"channel": "REGULAR"}, "nodePools": []}
+
+
 def context_for(record, target_text=None, at=RECORDED_AT, reads=None):
     member = {"project": DEV_PROJECT, "location": record["location"], "cluster": record["name"], "target_version": target_text}
     context = report.readiness_context(member, at, [record], [], parse_version(record.get("currentMasterVersion")), False, project_reads() if reads is None else reads)
@@ -1224,7 +1229,17 @@ class TargetPatchValidRuleTest(unittest.TestCase):
 
 class ControlPlaneUpgradeHistoryRuleTest(unittest.TestCase):
     def host(self):
-        return {"name": "platform-agent-host", "location": "us-central1", "status": "RUNNING", "currentMasterVersion": "1.35.8-gke.1439001", "releaseChannel": {"channel": "REGULAR"}, "nodePools": []}
+        return dev_host()
+
+    def capacity_failure_at(self, location, name="capacity-test"):
+        """A cluster at `location` with no window and one UPGRADE_MASTER on it that failed on capacity three days before RECORDED_AT, as the operations list spells them."""
+        record = {**dev_host(), "name": name, "location": location}
+        scope = "locations" if location.count("-") == 1 else "zones"
+        operation = {"name": f"operation-{name}", "operationType": "UPGRADE_MASTER", "status": "DONE", "startTime": (RECORDED_AT - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%S.000000Z"), "targetLink": f"https://container.googleapis.com/v1/projects/196584622296/{scope}/{location}/clusters/{name}", "error": {"message": f"Google Compute Engine does not have enough resources available to fulfill request: {location}."}}
+        return record, project_reads(**{shared.PROJECT_READ_OPERATIONS: [operation]})
+
+    def with_window(self, record, window):
+        return {**record, "maintenancePolicy": {"window": window}}
 
     def test_the_recorded_capacity_failure_is_a_risk_with_the_window(self):
         record = self.host()
@@ -1236,9 +1251,14 @@ class ControlPlaneUpgradeHistoryRuleTest(unittest.TestCase):
         # Nine operations: the host's control-plane upgrades and the UPGRADE_NODES on its pools, which name the pool.
         self.assertEqual(result["notes"], ["1 capacity failure(s) among 9 upgrade or repair operation(s) in the last 90 days; maintenance window none"])
         self.assertEqual(result["blocking"], [])
-        # A window set: named. Outside the lookback: not counted.
-        windowed = {**record, "maintenancePolicy": {"window": {"recurringWindow": {"window": {"startTime": "2026-01-03T01:00:00Z", "endTime": "2026-01-03T05:00:00Z"}, "recurrence": "FREQ=WEEKLY;BYDAY=SA,SU"}}}}
-        self.assertEqual(control_plane_upgrade_history.evaluate(windowed, {}, None, None, context_for(windowed))["risks"][0]["window"], "recurring FREQ=WEEKLY;BYDAY=SA,SU from 2026-01-03T01:00:00Z")
+        self.assertEqual((finding["placement"], finding["window_opens"], finding["placement_text"]), ("none", None, None))
+        # A window set in the region's busy hours (01:00 UTC is 19:00 in Iowa's standard time): still a risk, the window named and placed. Outside the lookback: not counted.
+        windowed = self.with_window(record, {"recurringWindow": {"window": {"startTime": "2026-01-03T01:00:00Z", "endTime": "2026-01-03T05:00:00Z"}, "recurrence": "FREQ=WEEKLY;BYDAY=SA,SU"}})
+        result = control_plane_upgrade_history.evaluate(windowed, {}, None, None, context_for(windowed))
+        self.assertEqual((result["risks"][0]["window"], result["risks"][0]["placement"], result["risks"][0]["window_opens"]), ("recurring FREQ=WEEKLY;BYDAY=SA,SU from 2026-01-03T01:00:00Z", "busy", "19:00"))
+        self.assertIn("; maintenance window: recurring FREQ=WEEKLY;BYDAY=SA,SU from 2026-01-03T01:00:00Z, which opens at 19:00 in us-central1 standard time, inside the busy hours 06:00 to 21:00; set a maintenance window in an off-peak hour for the region and retry the upgrade in it; keep upgrade notifications consumed so a failed attempt is a message the same day", control_plane_upgrade_history.describe(result["risks"][0]))
+        self.assertEqual(result["unknown"], [])
+        self.assertEqual(result["notes"], ["1 capacity failure(s) among 9 upgrade or repair operation(s) in the last 90 days; maintenance window recurring FREQ=WEEKLY;BYDAY=SA,SU from 2026-01-03T01:00:00Z"])
         later = control_plane_upgrade_history.evaluate(record, {}, None, None, context_for(record, at=RECORDED_AT + timedelta(days=91)))
         self.assertEqual(later["notes"], ["0 capacity failure(s) among 0 upgrade or repair operation(s) in the last 90 days; maintenance window none"])
 
@@ -1248,19 +1268,82 @@ class ControlPlaneUpgradeHistoryRuleTest(unittest.TestCase):
         self.assertEqual(result["risks"], [])
         # Two operations: the UPGRADE_MASTER on the cluster and the UPGRADE_NODES on default-pool.
         self.assertEqual(result["notes"], ["0 capacity failure(s) among 2 upgrade or repair operation(s) in the last 90 days; maintenance window daily at 03:00 UTC for PT4H0M0S"])
-        # The recorded capacity message on a node-pool upgrade: a surge node needs the capacity too, and the finding names the pool.
+        # The recorded capacity message on a node-pool upgrade: a surge node needs the capacity too, and the finding names the pool. seeded-b's
+        # daily window opens at 03:00 UTC, 21:00 in Iowa's standard time, which is off-peak: the failure is a note asking for the retry in that
+        # window, not a risk asking for a window the cluster has; the count line still counts it.
         stockout = {"name": "operation-pool-stockout", "operationType": "UPGRADE_NODES", "status": "DONE", "startTime": (RECORDED_AT - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%S.000000Z"), "targetLink": "https://container.googleapis.com/v1/projects/196584622296/zones/us-central1-a/clusters/seeded-b/nodePools/default-pool", "error": {"message": "Try a different location, or try again later: Google Compute Engine does not have enough resources available to fulfill request: us-central1-a."}}
         reads = project_reads(**{shared.PROJECT_READ_OPERATIONS: recorded("project_operations.json") + [stockout]})
         result = control_plane_upgrade_history.evaluate(record, {}, None, None, context_for(record, reads=reads))
-        self.assertEqual([(f["operation"], f["operation_type"], f["pool"], f["date"]) for f in result["risks"]], [("operation-pool-stockout", "UPGRADE_NODES", "default-pool", "2026-10-17")])
+        self.assertEqual(result["risks"], [])
+        self.assertEqual(result["unknown"], [])
+        self.assertEqual(result["notes"], [
+            "1 capacity failure(s) among 3 upgrade or repair operation(s) in the last 90 days; maintenance window daily at 03:00 UTC for PT4H0M0S",
+            "UPGRADE_NODES on default-pool on 2026-10-17 failed on compute capacity in us-central1-a (Try a different location, or try again later: Google Compute Engine does not have enough resources available to fulfill request: us-central1-a.); retry the upgrade in the maintenance window (daily at 03:00 UTC for PT4H0M0S, which opens at 21:00 in us-central1 standard time, off-peak); keep upgrade notifications consumed so a failed attempt is a message the same day",
+        ])
+        # The same stockout under a window that opens in the busy hours (14:00 UTC is 08:00 in Iowa's standard time) is the risk, placed.
+        busy = self.with_window(record, {"dailyMaintenanceWindow": {"startTime": "14:00", "duration": "PT4H0M0S"}})
+        result = control_plane_upgrade_history.evaluate(busy, {}, None, None, context_for(busy, reads=reads))
+        self.assertEqual([(f["operation"], f["operation_type"], f["pool"], f["date"], f["placement"], f["window_opens"]) for f in result["risks"]], [("operation-pool-stockout", "UPGRADE_NODES", "default-pool", "2026-10-17", "busy", "08:00")])
         self.assertTrue(control_plane_upgrade_history.describe(result["risks"][0]).startswith("UPGRADE_NODES on default-pool on 2026-10-17 failed on compute capacity in us-central1-a (Try a different location"))
-        self.assertEqual(result["notes"], ["1 capacity failure(s) among 3 upgrade or repair operation(s) in the last 90 days; maintenance window daily at 03:00 UTC for PT4H0M0S"])
+        self.assertTrue(control_plane_upgrade_history.describe(result["risks"][0]).endswith("; maintenance window: daily at 14:00 UTC for PT4H0M0S, which opens at 08:00 in us-central1 standard time, inside the busy hours 06:00 to 21:00; set a maintenance window in an off-peak hour for the region and retry the upgrade in it; keep upgrade notifications consumed so a failed attempt is a message the same day"))
+        self.assertEqual(result["notes"], ["1 capacity failure(s) among 3 upgrade or repair operation(s) in the last 90 days; maintenance window daily at 14:00 UTC for PT4H0M0S"])
         for message in ("ZONE_RESOURCE_POOL_EXHAUSTED", "Stockout in zone", "Insufficient quota"):
             self.assertTrue(control_plane_upgrade_history.names_capacity(message), message)
         self.assertFalse(control_plane_upgrade_history.names_capacity("operation aborted by the user"))
         failed = project_reads(**{shared.PROJECT_READ_OPERATIONS: failed_read("operations list failed (1): forbidden")})
         self.assertEqual(control_plane_upgrade_history.evaluate(record, {}, None, None, context_for(record, reads=failed))["unknown"], ["the operations were not read (operations list failed (1): forbidden), so the upgrade history is unknown"])
         self.assertEqual((control_plane_upgrade_history.RULE_ID, control_plane_upgrade_history.ENTRY, control_plane_upgrade_history.CAN_BLOCK), ("control-plane-upgrade-history", 23, False))
+
+    def test_the_window_is_placed_in_the_region_s_standard_time(self):
+        rule = control_plane_upgrade_history
+        self.assertEqual((rule.region_of("us-central1-a"), rule.region_of("us-central1"), rule.region_of("europe-west1-b")), ("us-central1", "us-central1", "europe-west1"))
+        self.assertEqual((rule.BUSY_HOURS_START, rule.BUSY_HOURS_END, rule.BUSY_HOURS_TEXT), (6, 21, "06:00 to 21:00"))
+        # Every table row is a region (no zone letter) with a plausible standard offset.
+        for region, offset in rule.REGION_UTC_OFFSET_HOURS.items():
+            self.assertEqual(rule.region_of(region), region, region)
+            self.assertTrue(-12 <= offset <= 14 and (offset * 2) == int(offset * 2), (region, offset))
+
+        def grade(location, window):
+            record, reads = self.capacity_failure_at(location)
+            record = self.with_window(record, window) if window is not None else record
+            result = rule.evaluate(record, {}, None, None, context_for(record, reads=reads))
+            self.assertEqual(result["blocking"], [])
+            finding = result["risks"][0] if result["risks"] else None
+            return (finding["placement"], finding["window_opens"]) if finding else ("note", result["notes"][1]), result
+
+        daily = lambda start: {"dailyMaintenanceWindow": {"startTime": start, "duration": "PT4H0M0S"}}  # noqa: E731
+        # Tokyo: 03:00 UTC is noon, a busy hour; 15:00 UTC is midnight, off-peak. The same window is graded by the region it serves.
+        self.assertEqual(grade("asia-northeast1-a", daily("03:00"))[0], ("busy", "12:00"))
+        self.assertEqual(grade("asia-northeast1", daily("15:00"))[0][0], "note")
+        # A half-hour offset (Mumbai, +5:30) and the band's edges: 20:30 is busy, 21:00 is not, 05:59 is not, 06:00 is.
+        self.assertEqual(grade("asia-south1", daily("15:00"))[0], ("busy", "20:30"))
+        self.assertEqual(grade("asia-south1", daily("15:30"))[0][0], "note")
+        self.assertEqual(grade("europe-west2", daily("05:59"))[0][0], "note")
+        self.assertEqual(grade("europe-west2", daily("06:00"))[0], ("busy", "06:00"))
+        # Oregon (-8) wraps past midnight: 06:00 UTC is 22:00 the evening before, off-peak; 03:00 UTC is 19:00, busy.
+        self.assertEqual(grade("us-west1-b", daily("06:00"))[0][0], "note")
+        self.assertEqual(grade("us-west1-b", daily("03:00"))[0], ("busy", "19:00"))
+        # A recurring window's start in another offset is read as the instant it is: 22:00 at -05:00 is 03:00 UTC, 21:00 in Iowa, off-peak; the window prints as the record spells it.
+        placement, result = grade("us-central1", {"recurringWindow": {"window": {"startTime": "2026-10-22T22:00:00-05:00", "endTime": "2026-10-23T02:00:00-05:00"}, "recurrence": "FREQ=DAILY"}})
+        self.assertEqual(placement[0], "note")
+        self.assertIn("retry the upgrade in the maintenance window (recurring FREQ=DAILY from 2026-10-22T22:00:00-05:00, which opens at 21:00 in us-central1 standard time, off-peak); keep upgrade notifications", placement[1])
+        # A region the table does not list: the window is not placed, the failure stays a risk with the set-window action, and one unknown names the gap.
+        placement, result = grade("nowhere-east1-c", daily("03:00"))
+        self.assertEqual(placement, ("unplaced", None))
+        self.assertTrue(rule.describe(result["risks"][0]).endswith("; maintenance window: daily at 03:00 UTC for PT4H0M0S, which is not placed against the busy hours 06:00 to 21:00 (no standard-time offset is known for region nowhere-east1); set a maintenance window in an off-peak hour for the region and retry the upgrade in it; keep upgrade notifications consumed so a failed attempt is a message the same day"), rule.describe(result["risks"][0]))
+        self.assertEqual(result["unknown"], ["the maintenance window (daily at 03:00 UTC for PT4H0M0S) is not placed against the busy hours 06:00 to 21:00: no standard-time offset is known for region nowhere-east1; its capacity failure(s) stay risks with the set-window action"])
+        # A start the rule cannot read is the same gap with its own reason; a window with no failure to grade costs no unknown.
+        placement, result = grade("us-central1", daily("soon"))
+        self.assertEqual(placement, ("unplaced", None))
+        self.assertIn("which is not placed against the busy hours 06:00 to 21:00 (its start time 'soon' could not be read); set a maintenance window", rule.describe(result["risks"][0]))
+        self.assertEqual(len(result["unknown"]), 1)
+        clean = self.with_window({**dev_host(), "location": "nowhere-east1"}, daily("03:00"))
+        result = rule.evaluate(clean, {}, None, None, context_for(clean))
+        self.assertEqual((result["risks"], result["unknown"], result["notes"]), ([], [], ["0 capacity failure(s) among 0 upgrade or repair operation(s) in the last 90 days; maintenance window daily at 03:00 UTC for PT4H0M0S"]))
+        # No window: no placement, the set-window action.
+        placement, result = grade("us-central1", None)
+        self.assertEqual(placement, ("none", None))
+        self.assertIn("; maintenance window: none; set a maintenance window in an off-peak hour", rule.describe(result["risks"][0]))
 
 
 class KnownIssuesMatrixRuleTest(unittest.TestCase):

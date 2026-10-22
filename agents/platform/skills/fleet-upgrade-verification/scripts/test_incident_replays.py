@@ -18,13 +18,15 @@ sys.path.insert(0, os.path.dirname(__file__))
 import readiness_rules as shared  # noqa: E402
 import upgrade_readiness as r  # noqa: E402
 from readiness_rules import cluster_status_age, control_plane_upgrade_history, known_issues_matrix, lb_connection_draining, orphan_node_objects, target_patch_valid  # noqa: E402
-from test_readiness_rules import DEV_PROJECT, RECORDED_AT, context_for, project_reads, recorded, seeded_b, seeded_b_read  # noqa: E402
+from test_readiness_rules import DEV_PROJECT, RECORDED_AT, context_for, dev_host, project_reads, recorded, seeded_b, seeded_b_read  # noqa: E402
 
 CLUSTER_TARGET = "https://container.googleapis.com/v1/projects/196584622296/zones/us-central1-a/clusters/seeded-b"
 PAGE = "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues"
 DRAIN_SECONDS = 36000  # the fleet's TCP backend services drained for ten hours; GKE waits 600 s per node
 CAPACITY_MESSAGE_FORMAT = "Try a different location, or try again later: Google Compute Engine does not have enough resources available to fulfill request: {location}."
 OFF_PEAK_ACTION = "set a maintenance window in an off-peak hour for the region and retry the upgrade in it; keep upgrade notifications consumed so a failed attempt is a message the same day"
+# How the rule places a window that opens in the busy hours of us-central1, the region seeded-b stands in for: UTC less six hours, standard time.
+BUSY_PLACEMENT_FORMAT = "opens at {opens} in us-central1 standard time, inside the busy hours 06:00 to 21:00"
 DESCRIBE_COMMAND = ["gcloud", "container", "clusters", "describe", "seeded-b", "--location", "us-central1-a", "--project", DEV_PROJECT, "--format=json(status,statusMessage)"]
 RELIST_COMMAND = ["gcloud", "container", "operations", "list", f"--project={DEV_PROJECT}", "--location=us-central1-a", "--filter=targetLink~/clusters/seeded-b($|/nodePools/)", "--format=json(name,operationType,status,startTime,endTime,targetLink)"]
 
@@ -62,8 +64,10 @@ def capacity_failure(kind, started, location="us-central1-a", name="operation-ca
     return {"name": name, "operationType": kind, "status": "DONE", "startTime": started, "endTime": started, "targetLink": CLUSTER_TARGET, "zone": location, "statusMessage": message, "error": {"code": 14, "message": message}}
 
 
-def capacity_text(kind, date, window, location="us-central1-a"):
-    return f"{kind} on {date} failed on compute capacity in {location} ({CAPACITY_MESSAGE_FORMAT.format(location=location)}); maintenance window: {window}; {OFF_PEAK_ACTION}"
+def capacity_text(kind, date, window, location="us-central1-a", placement=None):
+    """The risk's text: the window as the record spells it and, for one that exists, the clause that places its opening against the region's busy hours."""
+    placed = window if placement is None else f"{window}, which {placement}"
+    return f"{kind} on {date} failed on compute capacity in {location} ({CAPACITY_MESSAGE_FORMAT.format(location=location)}); maintenance window: {placed}; {OFF_PEAK_ACTION}"
 
 
 def with_window(record, window):
@@ -159,11 +163,12 @@ class StuckClusterReplay(unittest.TestCase):
 
 
 class ControlPlaneCapacityReplays(unittest.TestCase):
-    def replay(self, kind, started, window, at):
+    def replay(self, kind, started, window, at, risk=True):
         record = with_window(seeded_b(), window)
         folded = fold(control_plane_upgrade_history, record, at=at, reads=project_reads(**{shared.PROJECT_READ_OPERATIONS: [capacity_failure(kind, started)]}))
         self.assertEqual(folded["blocking"], [])  # a lagging signal: never a blocker
-        self.assertEqual([row["rule"] for row in folded["risks"]], ["control-plane-upgrade-history"])
+        self.assertEqual([row["rule"] for row in folded["risks"]], ["control-plane-upgrade-history"] if risk else [])
+        self.assertEqual(folded["unknown"], [])
         return folded
 
     def test_2025_06_19_control_plane_upgrade_failed_on_capacity_with_no_window(self):
@@ -173,22 +178,38 @@ class ControlPlaneCapacityReplays(unittest.TestCase):
         self.assertEqual(folded["risks"][0]["action"], OFF_PEAK_ACTION)
         self.assertEqual(folded["notes"], ["control-plane-upgrade-history: 1 capacity failure(s) among 1 upgrade or repair operation(s) in the last 90 days; maintenance window none"])
 
-    def test_2026_04_15_control_plane_upgrade_failed_on_capacity_in_an_afternoon_window(self):
-        """The same failure under a daily maintenance window set in the region's busy afternoon; the risk names that window so the operator moves it off-peak before the retry."""
+    def test_2026_04_15_control_plane_upgrade_failed_on_capacity_in_a_busy_hour_window(self):
+        """The same failure under a daily maintenance window set in the region's busy hours (14:00 UTC opens at 08:00 in us-central1 standard time); the risk names that window and places it so the operator moves it off-peak before the retry."""
         window = {"dailyMaintenanceWindow": {"startTime": "14:00", "duration": "PT4H0M0S"}}
         folded = self.replay("UPGRADE_MASTER", "2026-04-15T14:41:07.000000Z", window, datetime(2026, 4, 15, 22, 0, tzinfo=timezone.utc))
-        self.assertEqual(folded["risks"][0]["text"], capacity_text("UPGRADE_MASTER", "2026-04-15", "daily at 14:00 UTC for PT4H0M0S"))
+        self.assertEqual(folded["risks"][0]["text"], capacity_text("UPGRADE_MASTER", "2026-04-15", "daily at 14:00 UTC for PT4H0M0S", placement=BUSY_PLACEMENT_FORMAT.format(opens="08:00")))
+        self.assertEqual((folded["risks"][0]["placement"], folded["risks"][0]["window_opens"], folded["risks"][0]["action"]), ("busy", "08:00", OFF_PEAK_ACTION))
 
     def test_2026_10_05_control_plane_upgrade_failed_on_capacity_in_a_weekday_window(self):
-        """The same failure under a weekday recurring window that opens mid-afternoon; the risk quotes the recurrence and its start so the window is the thing changed, not the version."""
+        """The same failure under a weekday recurring window that opens in the busy hours (15:00 UTC is 09:00 in us-central1 standard time); the risk quotes the recurrence and its start and places it, so the window is the thing changed, not the version."""
         window = {"recurringWindow": {"window": {"startTime": "2026-01-05T15:00:00Z", "endTime": "2026-01-05T19:00:00Z"}, "recurrence": "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"}}
         folded = self.replay("UPGRADE_MASTER", "2026-10-05T15:20:33.000000Z", window, datetime(2026, 10, 6, 9, 0, tzinfo=timezone.utc))
-        self.assertEqual(folded["risks"][0]["text"], capacity_text("UPGRADE_MASTER", "2026-10-05", "recurring FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR from 2026-01-05T15:00:00Z"))
+        self.assertEqual(folded["risks"][0]["text"], capacity_text("UPGRADE_MASTER", "2026-10-05", "recurring FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR from 2026-01-05T15:00:00Z", placement=BUSY_PLACEMENT_FORMAT.format(opens="09:00")))
+        self.assertEqual((folded["risks"][0]["placement"], folded["risks"][0]["window_opens"]), ("busy", "09:00"))
 
     def test_2026_01_14_a_control_plane_resize_failed_on_the_same_capacity_message(self):
         """A control-plane repair that resized it failed on the same capacity message outside any window; the rule counts a repair as it counts an upgrade, so the next window is set off-peak before the retry."""
         folded = self.replay("REPAIR_CLUSTER", "2026-01-14T13:12:50.000000Z", None, datetime(2026, 1, 14, 18, 0, tzinfo=timezone.utc))
         self.assertEqual(folded["risks"][0]["text"], capacity_text("REPAIR_CLUSTER", "2026-01-14", "none"))
+
+    def test_2026_10_22_the_window_the_risk_asked_for_turns_the_failure_into_a_note(self):
+        """The dev project's own instance, read on 2026-10-22: platform-agent-host (us-central1) carries an UPGRADE_MASTER of 2026-10-09 that failed on capacity, and the risk's action, a maintenance window in an off-peak hour, had been applied as a daily window from 03:00 UTC, 21:00 in the region's standard time. The rule filed the same risk with the same action, so the finding could not be addressed; now the failure is a note asking for the retry in that window, the risk is gone, and the count line still counts it."""
+        window = {"recurringWindow": {"window": {"startTime": "2026-10-22T03:00:00Z", "endTime": "2026-10-22T07:00:00Z"}, "recurrence": "FREQ=DAILY"}}
+        record = with_window(dev_host(), window)
+        folded = fold(control_plane_upgrade_history, record, at=datetime(2026, 10, 22, 0, 31, tzinfo=timezone.utc))
+        self.assertEqual((folded["blocking"], folded["risks"], folded["unknown"]), ([], [], []))
+        self.assertEqual(folded["notes"], [
+            "control-plane-upgrade-history: 1 capacity failure(s) among 9 upgrade or repair operation(s) in the last 90 days; maintenance window recurring FREQ=DAILY from 2026-10-22T03:00:00Z",
+            "control-plane-upgrade-history: UPGRADE_MASTER on 2026-10-09 failed on compute capacity in us-central1 (Try a different location, or try again later: Google Compute Engine does not have enough resources available to fulfill request: us-central1.); retry the upgrade in the maintenance window (recurring FREQ=DAILY from 2026-10-22T03:00:00Z, which opens at 21:00 in us-central1 standard time, off-peak); keep upgrade notifications consumed so a failed attempt is a message the same day",
+        ])
+        # The same cluster with the window cleared again, as the dev project keeps it: the risk with the set-window action, as read before the window was set.
+        folded = fold(control_plane_upgrade_history, dev_host(), at=datetime(2026, 10, 22, 0, 28, tzinfo=timezone.utc))
+        self.assertEqual([row["text"] for row in folded["risks"]], [capacity_text("UPGRADE_MASTER", "2026-10-09", "none", location="us-central1")])
 
 
 class WithdrawnPatchReplay(unittest.TestCase):
