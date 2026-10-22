@@ -402,6 +402,11 @@ if out["error"] is None:
                         row = board.execute(
                             "SELECT summary, error FROM task_runs WHERE task_id = ? "
                             "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+                        if not row or (not row[0] and not row[1]):
+                            row = board.execute(
+                                "SELECT summary, error FROM task_runs WHERE task_id = ? "
+                                "AND status IN ('blocked', 'triage', 'failed') "
+                                "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
                         if row:
                             if row[0]:
                                 out["cards"][tid]["summary"] = str(row[0])
@@ -412,6 +417,11 @@ if out["error"] is None:
                         row = board.execute(
                             "SELECT summary FROM task_runs WHERE task_id = ? "
                             "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+                        if not row or not row[0]:
+                            row = board.execute(
+                                "SELECT summary FROM task_runs WHERE task_id = ? "
+                                "AND status IN ('blocked', 'triage', 'failed') "
+                                "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
                         if row and row[0]:
                             out["cards"][tid]["summary"] = str(row[0])
                 elif has_err:
@@ -419,6 +429,11 @@ if out["error"] is None:
                         row = board.execute(
                             "SELECT error FROM task_runs WHERE task_id = ? "
                             "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+                        if not row or not row[0]:
+                            row = board.execute(
+                                "SELECT error FROM task_runs WHERE task_id = ? "
+                                "AND status IN ('blocked', 'triage', 'failed') "
+                                "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
                         if row and row[0] and not out["cards"][tid]["error"]:
                             out["cards"][tid]["error"] = str(row[0])
         board.close()

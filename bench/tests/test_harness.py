@@ -4212,7 +4212,7 @@ def test_a_429_blocked_card_unblocked_at_settle_with_nothing_delivered_records_c
                 {"task_id": t2},
                 {
                     "task": {"id": t2, "status": "blocked", "block_kind": "needs_input"},
-                    "runs": [{"error": "worker failed"}],
+                    "runs": [{"summary": "worker failed"}],
                 },
                 "s2",
             ),
@@ -4236,7 +4236,15 @@ def test_a_429_blocked_card_unblocked_at_settle_with_nothing_delivered_records_c
                 }
                 return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
             elif idx == 1:
-                return ""
+                # Clamped read for t1: card unblocked to ready; poll_failure_messages.pop fires but rate_limited_cards preserves it
+                payload = {
+                    "statuses": {t1: "ready"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {t1: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
             elif idx == 2:
                 payload = {
                     "statuses": {t2: "blocked"},
@@ -4315,7 +4323,7 @@ def test_a_worker_authored_transient_block_with_need_a_moment_unblocked_at_settl
                 {"task_id": t2},
                 {
                     "task": {"id": t2, "status": "blocked", "block_kind": "needs_input"},
-                    "runs": [{"error": "worker failed"}],
+                    "runs": [{"summary": "worker failed"}],
                 },
                 "s2",
             ),
@@ -4360,6 +4368,114 @@ def test_a_worker_authored_transient_block_with_need_a_moment_unblocked_at_settl
                 return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
             elif idx == 4:
                 # Settle read: board shows t1 was unblocked to running; t2 remains blocked.
+                payload = {
+                    "statuses": {t1: "running", t2: "blocked"},
+                    "summaries": {t2: "worker failed"},
+                    "errors": {},
+                    "block_kinds": {t1: "transient", t2: "needs_input"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Check cards.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+    assert result.errors == [
+        f"delegated task {t1} was reported blocked during wait but running at settle; nothing delivered"
+    ]
+    rep = _classify(results_json(result), "helm")
+    assert rep.outcome != "infra"
+
+
+def test_a_429_blocked_card_unblocked_at_settle_refused_by_platform_telemetry_does_not_record_ceiling(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, results_json: Any, tmp_path: Path
+) -> None:
+    """When platform telemetry is present and shows no 429, an unblocked transient card is refused and routed to discrepancies."""
+    ok_log = tmp_path / "litellm.log"
+    ok_log.write_text("INFO: 200 OK POST /v1/chat/completions\n")
+    monkeypatch.setenv("LITELLM_LOG_PATH", str(ok_log))
+
+    t1 = _TASK_ID
+    t2 = _TASK_ID + "-2"
+    stub_agent.turns = [
+        _turn(
+            *_call("kanban_create", {"title": "task 1"}, {"ok": True, "task_id": t1, "status": "ready"}, "c1"),
+            *_call("kanban_create", {"title": "task 2"}, {"ok": True, "task_id": t2, "status": "ready"}, "c2"),
+        ),
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t1},
+                {
+                    "task": {"id": t1, "status": "blocked", "block_kind": "transient"},
+                    "runs": [{"summary": f"{harness._RATE_LIMIT_REASON_PREFIX}: 429 quota exhausted"}],
+                },
+                "s1",
+            ),
+            _text("t1 is blocked, waiting on t2."),
+        ),
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t2},
+                {
+                    "task": {"id": t2, "status": "blocked", "block_kind": "needs_input"},
+                    "runs": [{"summary": "worker failed"}],
+                },
+                "s2",
+            ),
+            _text("Both blocked."),
+        ),
+    ]
+
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {t1: "blocked", t2: "running"},
+                    "summaries": {t1: f"{harness._RATE_LIMIT_REASON_PREFIX}: 429 quota exhausted"},
+                    "errors": {},
+                    "block_kinds": {t1: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 1:
+                payload = {
+                    "statuses": {t1: "ready"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {t1: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 2:
+                payload = {
+                    "statuses": {t2: "blocked"},
+                    "summaries": {t2: "worker failed"},
+                    "errors": {},
+                    "block_kinds": {t2: "needs_input"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 3:
+                payload = {
+                    "statuses": {t2: "blocked"},
+                    "summaries": {t2: "worker failed"},
+                    "errors": {},
+                    "block_kinds": {t2: "needs_input"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 4:
                 payload = {
                     "statuses": {t1: "running", t2: "blocked"},
                     "summaries": {t2: "worker failed"},
@@ -4867,6 +4983,21 @@ def test_scan_log_for_429_returns_none_on_os_error_or_placeholder(tmp_path: Path
     err_log = tmp_path / "429.log"
     err_log.write_text('ERROR: 429 Too Many Requests: {"code": 429, "message": "RateLimitError: RESOURCE_EXHAUSTED"}\n')
     assert harness._scan_log_for_429(err_log) is True
+
+    # Empty log -> None
+    empty_log = tmp_path / "empty.log"
+    empty_log.write_text("")
+    assert harness._scan_log_for_429(empty_log) is None
+
+    # Stderr-only log without traffic lines -> None
+    stderr_log = tmp_path / "stderr.log"
+    stderr_log.write_text("No resources found in default namespace.\n")
+    assert harness._scan_log_for_429(stderr_log) is None
+
+    # Log with string-coded "code": "429" -> True
+    str_code_log = tmp_path / "str_code_429.log"
+    str_code_log.write_text('{"error": {"message": "Rate limit reached", "type": null, "param": null, "code": "429"}}\n')
+    assert harness._scan_log_for_429(str_code_log) is True
 
 
 def test_record_unsettled_prepends_marked_ceiling_error_preserving_existing_errors(results_json: Any) -> None:
@@ -6488,6 +6619,44 @@ def test_card_wake_answer_turn_with_unsettled_card_preserves_wake_reply_without_
     assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
     assert any(f"delegated task {_TASK_ID} was reported blocked during wait but running at settle; nothing delivered" in e for e in result.errors)
+    assert result.output == _FINAL_TEXT
+    assert _archived(scripts)
+
+
+def test_card_wake_answer_turn_timing_out_preserves_wake_reply_without_ceiling_marker(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    """A card-wake answer turn (opening_turn=False) timing out does not record delegation ceiling marker."""
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0.05")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.03")
+    scripts: list[str] = []
+    base_shell = _replay_shell(scripts)
+
+    def shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "running"},
+                "summaries": {},
+                "errors": {},
+                "block_kinds": {},
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}"
+        return base_shell(script, timeout)
+
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    stub_agent.turns = [
+        _turn(_text(_FINAL_TEXT)),
+        _create_turn(),
+        _show_turn("running"),
+    ]
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert result.has_errors()
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any("did not finish within" in e for e in result.errors)
     assert result.output == _FINAL_TEXT
     assert _archived(scripts)
 

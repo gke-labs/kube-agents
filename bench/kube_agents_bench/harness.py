@@ -640,7 +640,11 @@ _FAILURE_STATUSES = frozenset({"blocked", "triage", "failed"})
 _RATE_LIMIT_REASON_PREFIX = "provider rate limit: API retries exhausted"
 _FAILURE_REASON_PATTERN = re.compile(r"\bfailure_reason=([a-zA-Z0-9_]+)\b")
 _LITELLM_429_PATTERN = re.compile(
-    r'(?:"(?:code|status)":\s*429\b|status_code=429\b|HTTP/\d\.\d"\s+429\b|\bRESOURCE_EXHAUSTED\b|\bRateLimitError\b)',
+    r'(?:"(?:code|status)":\s*"?429"?\b|status_code=429\b|HTTP/\d\.\d"\s+429\b|\bRESOURCE_EXHAUSTED\b|\bRateLimitError\b)',
+    re.IGNORECASE,
+)
+_LITELLM_TRAFFIC_PATTERN = re.compile(
+    r'(?:HTTP/\d\.\d|\b(?:POST|GET|PUT|DELETE)\s+/\S*|status_code=\d{3}\b|"(?:code|status)":\s*"?\d{3}"?|\blitellm\b|\bRESOURCE_EXHAUSTED\b|\bRateLimitError\b)',
     re.IGNORECASE,
 )
 
@@ -649,7 +653,11 @@ def _scan_log_for_429(path: Path) -> bool | None:
     try:
         with path.open("r", encoding="utf-8", errors="replace") as f:
             content = f.read()
-            if content.startswith("note: no LiteLLM log for this run"):
+            if (
+                not content.strip()
+                or content.startswith("note: no LiteLLM log for this run")
+                or not _LITELLM_TRAFFIC_PATTERN.search(content)
+            ):
                 return None
             return bool(_LITELLM_429_PATTERN.search(content))
     except OSError:
@@ -1341,6 +1349,21 @@ def _pending_first(task_ids: list[str], statuses: dict[str, str]) -> list[str]:
     """
     pending = [t for t in task_ids if statuses.get(t) not in _TERMINAL_STATUSES]
     return pending + [t for t in task_ids if t not in set(pending)]
+
+
+def _has_successful_delivery(
+    observed: list[dict[str, Any]],
+    task_ids: Sequence[str],
+) -> bool:
+    """Return whether any of the task_ids has a successful delivery in observed.
+
+    Filters out cards reported in _FAILURE_STATUSES or carrying an infra failure reason.
+    """
+    reported = reported_statuses(observed)
+    return any(
+        reported.get(tid) not in _FAILURE_STATUSES and not _extract_infra_failure_reason(text)
+        for tid, text in delivered_results(observed, list(task_ids)).items()
+    )
 
 
 def _record_ceiling(
@@ -2723,6 +2746,7 @@ class KubeAgentsHarness(AgentHarness):
         unsettled: list[str] | None = None,
         discrepancies: list[str] | None = None,
         live_statuses: dict[str, str] | None = None,
+        rate_limited_cards: set[str] | None = None,
     ) -> list[str]:
         """Read summary and error from the board for any awaited cards in failure statuses.
 
@@ -2746,10 +2770,14 @@ class KubeAgentsHarness(AgentHarness):
         for t in failure_cards:
             live_status = final_bstate[0].get(t)
             card_fallback = (fallback_messages.get(t) or []) if fallback_messages else []
-            has_rate_limit = any(_extract_infra_failure_reason(m) for m in card_fallback)
+            has_rate_limit = (
+                (rate_limited_cards is not None and t in rate_limited_cards)
+                or any(_extract_infra_failure_reason(m) for m in card_fallback)
+            )
             if live_status is not None and live_status not in _TERMINAL_STATUSES:
                 if bblock_kinds.get(t) == "transient":
-                    if has_rate_limit:
+                    corroborated = _corroborate_platform_rate_limit() if has_rate_limit else None
+                    if has_rate_limit and corroborated is not False:
                         if unsettled is not None:
                             unsettled.append(t)
                     else:
@@ -2885,6 +2913,20 @@ class KubeAgentsHarness(AgentHarness):
             awaited = [t for t in awaited if t not in gone]
             return [t for t in awaited if _status(t) not in _TERMINAL_STATUSES]
 
+        rate_limited_cards: set[str] = set()
+
+        def _track_rate_limits(cards_map: Mapping[str, Mapping[str, Any]]) -> None:
+            for tid, c in cards_map.items():
+                if str(c.get("status")) in _FAILURE_STATUSES and c.get("block_kind") == "transient":
+                    sum_text = str(c.get("summary") or "")
+                    err_text = str(c.get("error") or "")
+                    if _extract_infra_failure_reason(sum_text) or _extract_infra_failure_reason(err_text):
+                        rate_limited_cards.add(tid)
+                    elif sum_text or err_text:
+                        rate_limited_cards.discard(tid)
+
+        _track_rate_limits(read.cards)
+
         outstanding = _merge()
         deadline = time.monotonic() + delegation_timeout
         timed_out = False
@@ -2899,6 +2941,7 @@ class KubeAgentsHarness(AgentHarness):
             if fresh is None:
                 raise _exhausted(outstanding)
             read = fresh
+            _track_rate_limits(read.cards)
             outstanding = _merge()
 
         # Only a card the board shows terminal is read back, as the status-turn
@@ -2917,6 +2960,7 @@ class KubeAgentsHarness(AgentHarness):
                 raise _exhausted(outstanding)
             final.cards = {**read.cards, **{t: c for t, c in final.cards.items() if t in want_cards}}
             read = final
+            _track_rate_limits(final.cards)
         observed: list[dict[str, Any]] = list(result.trajectory)
         observed.extend(
             e
@@ -2943,17 +2987,21 @@ class KubeAgentsHarness(AgentHarness):
                 if card_data.get("block_kind") == "transient":
                     summary_text = str(card_data.get("summary") or "")
                     error_text = str(card_data.get("error") or "")
-                    has_rate_limit = bool(
-                        _extract_infra_failure_reason(summary_text)
-                        or _extract_infra_failure_reason(error_text)
+                    has_rate_limit = (
+                        t in rate_limited_cards
+                        or bool(
+                            _extract_infra_failure_reason(summary_text)
+                            or _extract_infra_failure_reason(error_text)
+                        )
                     )
-                    if has_rate_limit:
+                    corroborated = _corroborate_platform_rate_limit() if has_rate_limit else None
+                    if has_rate_limit and corroborated is not False:
                         unsettled.append(t)
                     else:
                         discrepancies.append(t)
         if unsettled:
-            has_delivery = bool(
-                delivered_results(observed, [t for t in awaited if t not in unsettled])
+            has_delivery = _has_successful_delivery(
+                observed, [t for t in awaited if t not in unsettled]
             )
             _record_unsettled(
                 result,
@@ -3089,6 +3137,10 @@ class KubeAgentsHarness(AgentHarness):
             poll_failure_messages.update(
                 self._extract_trajectory_failure_summaries(result.trajectory, failure_awaited)
             )
+        rate_limited_cards: set[str] = {
+            t for t, msgs in poll_failure_messages.items()
+            if any(_extract_infra_failure_reason(m) for m in msgs)
+        }
         if not outstanding:
             unsettled: list[str] = []
             discrepancies: list[str] = []
@@ -3101,10 +3153,11 @@ class KubeAgentsHarness(AgentHarness):
                 unsettled=unsettled,
                 discrepancies=discrepancies,
                 live_statuses=live_statuses,
+                rate_limited_cards=rate_limited_cards,
             )
             if unsettled:
-                has_delivery = bool(
-                    delivered_results(observed, [t for t in awaited if t not in unsettled])
+                has_delivery = _has_successful_delivery(
+                    observed, [t for t in awaited if t not in unsettled]
                 )
                 _record_unsettled(
                     result,
@@ -3180,6 +3233,10 @@ class KubeAgentsHarness(AgentHarness):
                         msgs = self._extract_board_card_messages(bstate, t)
                         if msgs:
                             poll_failure_messages[t] = msgs
+                            if any(_extract_infra_failure_reason(m) for m in msgs):
+                                rate_limited_cards.add(t)
+                            else:
+                                rate_limited_cards.discard(t)
                         else:
                             poll_failure_messages.pop(t, None)
                 if all(t in on_board for t in outstanding) and not any(
@@ -3296,6 +3353,10 @@ class KubeAgentsHarness(AgentHarness):
                         msgs = self._extract_board_card_messages(cstate, t)
                         if msgs:
                             poll_failure_messages[t] = msgs
+                            if any(_extract_infra_failure_reason(m) for m in msgs):
+                                rate_limited_cards.add(t)
+                            else:
+                                rate_limited_cards.discard(t)
                         else:
                             poll_failure_messages.pop(t, None)
                 else:
@@ -3304,6 +3365,11 @@ class KubeAgentsHarness(AgentHarness):
                     self._extract_trajectory_failure_summaries(
                         turn_new_calls, needed_read, store=poll_failure_messages
                     )
+                    for t in needed_read:
+                        if any(_extract_infra_failure_reason(m) for m in poll_failure_messages.get(t, [])):
+                            rate_limited_cards.add(t)
+                        elif poll_failure_messages.get(t):
+                            rate_limited_cards.discard(t)
             _fold_status_turn(
                 result,
                 status_turn,
@@ -3351,13 +3417,14 @@ class KubeAgentsHarness(AgentHarness):
             unsettled=unsettled,
             discrepancies=discrepancies,
             live_statuses=live_statuses,
+            rate_limited_cards=rate_limited_cards,
         )
         if outstanding:
             unsettled = [t for t in unsettled if t not in outstanding]
             discrepancies = [t for t in discrepancies if t not in outstanding]
         if unsettled:
-            has_delivery = bool(
-                delivered_results(observed, [t for t in awaited if t not in unsettled])
+            has_delivery = _has_successful_delivery(
+                observed, [t for t in awaited if t not in unsettled]
             )
             _record_unsettled(
                 result,
