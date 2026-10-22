@@ -88,6 +88,11 @@ class InstallGuidesAreReadNotSearchedTest(unittest.TestCase):
     def test_gitops_helm_chart_reads_the_guide_through_tools_that_fetch(self):
         content = HELM_CHART_SKILL.read_text(encoding="utf-8")
         self.assertIn("mcp__developer_knowledge__search_documents", content)
+        # Deferred tools: the worker reaches them only through the dispatcher,
+        # and read the page (get_documents), not a chunk (#3678's e2e runs).
+        self.assertIn('tool_search("developer_knowledge")', content)
+        self.assertIn("mcp__developer_knowledge__get_documents", content)
+        self.assertIn("inspect_repository.py clone", content)
         self.assertIn("inspect-repository", content)
         self.assertIn("A search result is never a source", content)
         self.assertNotIn("read with `web_extract`", content)

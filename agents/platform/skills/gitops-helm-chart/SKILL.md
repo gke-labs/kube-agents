@@ -159,24 +159,39 @@ ahead without it."
 ### Step 3: Pin the source and the version
 
 - **Source.** Take the chart repository URL and chart name from the
-  project's own install guide, read in full, in this order:
-  1. the Developer Knowledge MCP, for anything Google documents:
-     `mcp__developer_knowledge__search_documents(query=...)` finds the page,
-     `mcp__developer_knowledge__get_documents(names=[...])` reads it, and the
-     page is the source (never `answer_query`);
-  2. the project's own repository through **inspect-repository** (its
-     README, install docs and chart directory), for a third-party chart;
+  project's own install guide, read in full. Do these steps in order before
+  deciding on a source; skipping to a search is the failure this rule
+  exists for:
+  1. **The Developer Knowledge MCP, always first.** Its tools are deferred:
+     run `tool_search("developer_knowledge")`, then call them through
+     `tool_call`:
+     - `mcp__developer_knowledge__search_documents` with
+       `query: "<project> install"`. Each result's `parent` names a page.
+     - `mcp__developer_knowledge__get_documents` with
+       `names: ["<parent>"]` reads that page. The page you read is the
+       source; a search result's chunk is not. Never `answer_query`.
+
+     An empty result (`{}`) means it does not cover the project: go to 2.
+
+  2. **The project's own repository, through inspect-repository.** Open it
+     and read its README, install docs and chart directory:
+
+     ```bash
+     python3 /opt/data/profiles/platform/skills/inspect-repository/scripts/inspect_repository.py clone --repo "<owner>/<repo>" --depth 1
+     ```
+
+     The repository's name may come from a search result; its files, not
+     the result, are the source.
+
   3. `web_extract`, only where it returns page text: on an install whose
      web backend is search-only it never does.
 
   A search result is never a source: its snippets name forks, mirrors and
-  personal repositories as readily as the project. It may point you to the
-  project's repository or guide; read that through one of the tools above,
-  never the snippet. A chart found by search
+  personal repositories as readily as the project. A chart found by search
   on a mirror, a fork or a personal registry is not the project's chart;
   when the guide and other sources disagree, the guide wins, and the PR body
-  says which sources you read. No guide you could read that names a chart:
-  stop and ask for the source.
+  names the document or repository path you read. Steps 1 and 2 gave no
+  guide that names a chart: stop and ask for the source.
 
 - **No chart at all.** When the project's documented install is an installer
   script or CLI that fills in values and renders manifests itself (Agent
