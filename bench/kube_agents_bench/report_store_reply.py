@@ -23,9 +23,10 @@ ledger to give.
 
 The store is read after the reply with the install's own reader: ``report_status.py`` from the
 agent image (root-owned, so the model cannot have edited the grader's reader), run in the shell
-sandbox, where the audits' shell writes the store. The agent container is read instead only when
-``kubectl`` answers that there is no sandbox pod, because it does not mount the sandbox's volume;
-a ``kubectl`` that cannot answer is an error, not a fallback.
+sandbox, where the audits' shell writes the store. The sandbox is not optional on this operator
+(``ShellSandboxSpec``), so there is nowhere else to read: a sandbox pod that cannot be read is an
+error, never a fallback, and a store root absent in the sandbox is a store nothing has written to
+yet, which the pass reason and ``raw`` say.
 
 Which envelopes count is decided by when each file was written, not by its ``finished_at``:
 ``finish`` stamps a run before it publishes and writes the store after, so a run stamped before
@@ -51,10 +52,8 @@ Its own module rather than a section of ``verifiers.py``, registered through the
 from __future__ import annotations
 
 import json
-import os
 import re
 import shlex
-import subprocess
 from typing import Any, Literal
 
 from devops_bench.verification.base import VERIFIERS, VerificationStatus
@@ -171,25 +170,6 @@ def read_store(shell, source: str, since: float, audits: list[str], timeout: flo
     return document if isinstance(document, dict) and isinstance(document.get("audits"), dict) else None
 
 
-def sandbox_pod_exists(timeout: float) -> bool | None:
-    """True when ``kubectl get`` finds the sandbox pod, False when it answers that there is none,
-    None when it could not answer: the agent container holds no sandbox store, so only a definite
-    "none" may send the read there."""
-    cmd = ["kubectl", "get", f"pod/{onboarding.sandbox_pod()}", "-n",
-           os.environ.get("AGENT_NAMESPACE", onboarding.DEFAULT_AGENT_NAMESPACE), "-o", "name",
-           "--ignore-not-found"]
-    context = os.environ.get("AGENT_CLUSTER_CONTEXT")
-    if context:
-        cmd.extend(["--context", context])
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if proc.returncode != 0:
-        return None
-    return bool(proc.stdout.strip())
-
-
 def _mention_re(audit: str) -> re.Pattern[str]:
     """The audit's id, case-insensitive, with any run of `-`, `_` or spaces between its words.
 
@@ -217,10 +197,9 @@ class ReportStoreReplyVerifier(_OnboardingPollVerifier):
     """Checks that the reply gives each audit's latest report from the fleet-audit report store.
 
     ``audits``: the audits the request names, each graded as the module docstring says. A reply
-    that does not mention an audit fails it. A run with no start time, a ``kubectl`` that cannot
-    say whether the sandbox pod exists, a store pod that cannot be read, a reader that cannot be
-    fetched, or an envelope with no ``issue_url`` key at all (a store format this check does not
-    know) is ``status="error"``.
+    that does not mention an audit fails it. A run with no start time, a sandbox pod that cannot
+    be read, a reader that cannot be fetched, or an envelope with no ``issue_url`` key at all (a
+    store format this check does not know) is ``status="error"``.
     """
 
     type: Literal["report_store_reply"]
@@ -238,16 +217,10 @@ class ReportStoreReplyVerifier(_OnboardingPollVerifier):
             return "error", f"could not read {READER_PATH} from the agent container", None
         since = snap.started_at - self.max_clock_skew_sec
         audits = list(dict.fromkeys(self.audits))
-        exists = sandbox_pod_exists(read_timeout)
-        if exists is None:
-            return "error", f"could not tell whether {onboarding.sandbox_pod()} exists", None
-        if exists:
-            shell, where = onboarding.sandbox_shell, "the shell sandbox"
-        else:
-            shell, where = onboarding.agent_shell, "the agent container"
-        store = read_store(shell, source, since, audits, read_timeout)
+        pod = onboarding.sandbox_pod()
+        store = read_store(onboarding.sandbox_shell, source, since, audits, read_timeout)
         if store is None:
-            return "error", f"could not read the report store in {where}", None
+            return "error", f"could not read the report store in the shell sandbox pod {pod}", None
         accepted: dict[str, dict[str, list[dict[str, Any]]]] = {}
         for audit in audits:
             entry = store["audits"].get(audit) or {}
@@ -284,7 +257,11 @@ class ReportStoreReplyVerifier(_OnboardingPollVerifier):
             if needed:
                 expected = sorted(needed)[:REASON_URLS_SHOWN]
                 failures.append(f"{audit}: no ledger URL of its latest report; expected one of {expected}")
-        raw = {"accepted": accepted}
+        root_exists = bool(store.get("root_exists"))
+        raw = {"accepted": accepted, "pod": pod, "root_exists": root_exists}
         if failures:
             return "fail", "; ".join(failures), raw
-        return "pass", f"each of the {len(audits)} audits has its latest report from the store", raw
+        reason = f"each of the {len(audits)} audits has its latest report from the store in {pod}"
+        if not root_exists:
+            reason += " (the store root is absent there: nothing stored yet, so no link was required)"
+        return "pass", reason, raw

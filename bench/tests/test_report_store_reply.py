@@ -75,7 +75,6 @@ def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("FLEET_AUDIT_REPORTS_DIR", str(store))
     monkeypatch.setattr(report_store_reply, "REPORT_STORE_ROOT", str(store))
     monkeypatch.setattr(report_store_reply, "READER_PATH", str(SCRIPTS / "report_status.py"))
-    monkeypatch.setattr(report_store_reply, "sandbox_pod_exists", lambda timeout: True)
     monkeypatch.setattr(onboarding, "sandbox_shell", _local_shell)
     monkeypatch.setattr(onboarding, "agent_shell", _local_shell)
     yield store
@@ -252,35 +251,15 @@ def test_an_unreadable_store_pod_is_an_error(root, monkeypatch):
     monkeypatch.setattr(onboarding, "sandbox_shell", _silent_shell)
     result = _verify(f"compliance-audit: {URL_COMPLIANCE}", audits=(COMPLIANCE,))
     assert result.status == "error"
-    assert "the shell sandbox" in result.reason
+    assert f"shell sandbox pod {onboarding.sandbox_pod()}" in result.reason
 
 
-def test_a_kubectl_that_cannot_answer_is_an_error_not_a_fallback(root, monkeypatch):
-    _write(COMPLIANCE, issue_url=URL_COMPLIANCE, issue_number=12, written=BEFORE)
-    monkeypatch.setattr(report_store_reply, "sandbox_pod_exists", lambda timeout: None)
-    result = _verify("compliance-audit: fine.", audits=(COMPLIANCE,))
-    assert result.status == "error"
-    assert "could not tell" in result.reason
-
-
-@pytest.mark.parametrize(
-    ("returncode", "stdout", "expected"),
-    [(0, "pod/platform-agent-shell-0\n", True), (0, "", False), (1, "", None)],
-)
-def test_sandbox_pod_exists_reads_kubectls_answer(monkeypatch, returncode, stdout, expected):
-    def run(cmd, **kwargs):
-        assert "--ignore-not-found" in cmd
-        return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr="")
-
-    monkeypatch.setattr(report_store_reply.subprocess, "run", run)
-    assert report_store_reply.sandbox_pod_exists(1.0) is expected
-
-
-def test_no_sandbox_pod_reads_the_agent_container(root, monkeypatch):
-    _write(COMPLIANCE, issue_url=URL_COMPLIANCE, issue_number=12, written=BEFORE)
-    monkeypatch.setattr(report_store_reply, "sandbox_pod_exists", lambda timeout: False)
-    monkeypatch.setattr(onboarding, "sandbox_shell", _silent_shell)
-    assert _verify(f"compliance-audit: {URL_COMPLIANCE}", audits=(COMPLIANCE,)).status == "pass"
+def test_an_absent_store_root_passes_on_mentions_and_the_record_says_so(root):
+    result = _verify("compliance-audit: never ran.\nfleet-wide-cost-analysis: never ran.")
+    assert result.status == "pass", result.reason
+    assert result.raw["root_exists"] is False
+    assert "nothing stored yet" in result.reason
+    assert result.raw["pod"] == onboarding.sandbox_pod()
 
 
 def test_a_reader_the_agent_container_does_not_give_is_an_error(root, monkeypatch):
