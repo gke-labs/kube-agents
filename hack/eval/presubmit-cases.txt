@@ -49,10 +49,12 @@
 # truncating this list's tail. A case known to be slow gets a unit_cost_hint
 # entry in the script, not a position here.
 #
-# BUDGET. Eleven cases, thirty-three units at the script's EVAL_REPETITIONS
-# of 3: four domain probes, one reliability prompt variation, three
-# cluster-debugging cases, the incident-triage probe, the kanban smoke, and
-# one held-out seat (the compliance canary, ~1000-2000s a repetition; its
+# BUDGET. How many cases and units this file comes to at the script's
+# EVAL_REPETITIONS of 3 is `python3 scripts/eval_rosters.py --summary`
+# ("presubmit cases", "presubmit units"); no count is written here, so a seat
+# change edits only its own entry. The mix: domain probes, a reliability
+# prompt variation, cluster-debugging cases, the incident-triage probe, the
+# kanban smoke, and one held-out seat (the compliance canary, ~1000-2000s a repetition; its
 # three repetitions serialize on the task lock). upgrades-lagging-master-probe
 # left for the nightly 2026-10-16 (#3269), putting upgrades on the
 # docs/designs/domains.yaml allowlist, and consistency-authorized-networks-probe
@@ -75,8 +77,7 @@
 # was a nightly case 2026-09-22 to 2026-09-29 and is seated held out below
 # since (#2013); fleet-audits stays on the docs/designs/domains.yaml
 # allowlist until its roster line lands. The comment above EVAL_REPETITIONS
-# in the script carries the measured history of that budget; recount the
-# entries here rather than trusting any count in prose.
+# in the script carries the measured history of that budget.
 
 # ── The domain probes ────────────────────────────────────────────────────────
 ./tasks/reliability-pdb-probe/task.yaml
