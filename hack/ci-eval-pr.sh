@@ -2411,7 +2411,7 @@ infra_lock_exempt() { # <task-name>
 # from the others, so this lock does.
 unit_state_lock() { # <task-name>
   case "$1" in
-    oobe-first-run-audits | bootstrap-discovery-fanout | bootstrap-inventory-ranking-delivery) echo "onboarding" ;;
+    oobe-first-run-audits | bootstrap-discovery-fanout | bootstrap-inventory-ranking-delivery | bootstrap-inventory-posture-scope) echo "onboarding" ;;
   esac
 }
 
@@ -2951,6 +2951,8 @@ unit_cost_hint() {
     # and the agent turn is a board read. Unmeasured; priced below the band
     # above because one card's worker is the whole of the wait.
     bootstrap-inventory-ranking-delivery) echo 600 ;;
+    # The same stack and wait, planting the report with no critical finding.
+    bootstrap-inventory-posture-scope) echo 600 ;;
     # A stack, but off the infra lock (infra_lock_exempt): the unit waits for
     # the previous repetition's audits to finish (wait_platform_runs), then the
     # stack waits for the stage to run the four one after another (1-15 min

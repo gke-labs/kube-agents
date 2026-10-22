@@ -404,6 +404,15 @@ API_RELAY_DEADLINE_S = 120
 # smaller `pageSize`, which every listed endpoint supports. Read in chunks up
 # to the cap rather than with `.read()`, so the cap bounds memory too.
 API_RELAY_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+# Pub/Sub's largest message (10 MB of data), and the answer cap the platform
+# Pub/Sub relay carries instead of API_RELAY_MAX_RESPONSE_BYTES: a pull is a
+# lease, Pub/Sub has started the ack deadline and the ack ids are in the body
+# by the time the broker reads it, so an answer refused for size strands the
+# message until the deadline, forever for one that is always over. The adapter
+# pulls one message at a time; 16 MiB holds the largest one base64-encoded
+# (13.4 MiB) with its envelope.
+PUBSUB_MAX_MESSAGE_BYTES = 10 * 1024 * 1024
+PLATFORM_PUBSUB_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 API_RELAY_READ_CHUNK_BYTES = 64 * 1024
 # Query keys removed before forwarding. Each is a way to substitute a
 # credential for the broker's or to change the response class: an API key
@@ -1141,6 +1150,12 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # them holds the chat token and cannot present this one.
     (watcher_policy.WATCHER_GCP_PREFIX, (CALLER_ROLE_WATCHER,)),
     (watcher_policy.WATCHER_K8S_PREFIX, (CALLER_ROLE_WATCHER,)),
+    # The Pub/Sub platform adapter's four calls, on the subscriptions the
+    # AgentPlugins configure: the gateway's own, so the chat role, which is the
+    # token the Hermes container holds. Its own prefix rather than the
+    # watcher's with a second role: the two are confined to different
+    # subscription sets, and the prefix is what this table keys the role on.
+    (watcher_policy.PLATFORM_PUBSUB_PREFIX, (CALLER_ROLE_CHAT,)),
     ("/v1/github/", (CALLER_ROLE_SHELL,)),
     ("/v1/vcs/", (CALLER_ROLE_SHELL,)),
     ("/v1/workspace/", (CALLER_ROLE_SHELL,)),
@@ -1797,6 +1812,15 @@ SLACK_REMOVE_ALLOWLIST = frozenset({"reactions.remove"})
 # `chat.delete?x` and `chat.delete.` would pass it -- and slack_sdk joins the
 # string into the URL, where the fragment is dropped and the query ignored.
 SLACK_METHOD_SHAPE = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)+")
+# The subscriptions the platform Pub/Sub relay may reach, as the operator renders
+# them from the AgentPlugin configs; read by platform_pubsub_subscriptions().
+PLATFORM_PUBSUB_SUBSCRIPTIONS_ENV = "PLATFORM_PUBSUB_SUBSCRIPTIONS"
+# One fully qualified subscription, the shape watcher_policy matches on the
+# wire; an entry that is not one would never match a call and would read as a
+# configured subscription that silently refuses everything.
+_QUALIFIED_SUBSCRIPTION = re.compile(
+    rf"projects/{watcher_policy.PUBSUB_PROJECT}/subscriptions/{watcher_policy.SUBSCRIPTION}"
+)
 # The IAM permission a Pub/Sub pull spends on the subscription. A refused pull
 # names it in the log when the error's own ErrorInfo did not, so the line says
 # what to grant rather than only that something was refused.
@@ -2587,8 +2611,9 @@ class ApiRelayResponse:
     status: int
     content_type: str
     body: bytes
-    # True when the upstream body ran past API_RELAY_MAX_RESPONSE_BYTES; `body`
-    # is then empty, because a truncated JSON page is worse than no page.
+    # True when the upstream body ran past the call's cap (API_RELAY_MAX_RESPONSE_BYTES,
+    # or the family's own); `body` is then empty, because a truncated JSON page is
+    # worse than no page.
     over_cap: bool = False
 
 
@@ -2680,8 +2705,12 @@ class GoogleApiRelay:
         *,
         body: bytes | None = None,
         headers: tuple[tuple[str, str], ...] = (),
+        max_bytes: int | None = None,
     ) -> ApiRelayResponse:
         """One `GET https://{host}{target}` on the broker's credential, or a POST with `body`.
+
+        `max_bytes` is the answer cap, API_RELAY_MAX_RESPONSE_BYTES unless a
+        family carries its own (the platform Pub/Sub relay does).
 
         `target` is the path and query as the handler assembled them, already
         checked against the policy and stripped of the credential keys. Raises
@@ -2744,7 +2773,7 @@ class GoogleApiRelay:
                 if not chunk:
                     break
                 received += len(chunk)
-                if received > API_RELAY_MAX_RESPONSE_BYTES:
+                if received > (max_bytes if max_bytes is not None else API_RELAY_MAX_RESPONSE_BYTES):
                     return ApiRelayResponse(
                         response.status, response.getheader("Content-Type", ""), b"", True
                     )
@@ -8786,6 +8815,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # one Pub/Sub target the watcher relay reaches. Empty: the detector is off
     # and every Pub/Sub call is refused.
     watcher_subscription: str = ""
+    # The subscriptions the gateway's Pub/Sub platform adapter may reach through
+    # `/v1/pubsub/gcp/`, each `projects/<p>/subscriptions/<s>`, as the operator
+    # rendered them from the AgentPlugin configs. Empty: no plugin route the
+    # operator could qualify, and every call is refused.
+    platform_pubsub_subscriptions: frozenset[str] = frozenset()
     # (project, location, cluster) -> (deadline, host, CA PEM or ""), for the
     # watcher's Kubernetes route. See `_watcher_cluster_endpoint`.
     watcher_endpoints: dict[tuple[str, str, str], tuple[float, str, str]] = {}
@@ -8949,6 +8983,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if self.path.startswith(watcher_policy.WATCHER_GCP_PREFIX):
             self._handle_watcher_gcp()
             return
+        if self.path.startswith(watcher_policy.PLATFORM_PUBSUB_PREFIX):
+            self._handle_platform_pubsub()
+            return
         if self.path.startswith(watcher_policy.WATCHER_K8S_PREFIX):
             self._handle_watcher_k8s()
             return
@@ -9030,6 +9067,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
         if self.path.startswith(watcher_policy.WATCHER_GCP_PREFIX):
             self._handle_watcher_gcp()
+            return
+        if self.path.startswith(watcher_policy.PLATFORM_PUBSUB_PREFIX):
+            self._handle_platform_pubsub()
             return
         if self.path.startswith(watcher_policy.WATCHER_K8S_PREFIX):
             # GET only; reaches the handler so the refusal names its rule.
@@ -9916,10 +9956,52 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         is the table; the forwarding is the Cloud API relay's, with a body for
         the Pub/Sub POSTs, and the status, Content-Type and body pass back.
         """
+        self._relay_google_call(
+            "watcher gcp",
+            watcher_policy.WATCHER_GCP_PREFIX,
+            lambda host, path, body: watcher_policy.evaluate_gcp(
+                self.command, host, path, body, self.watcher_subscription
+            ),
+        )
+
+    def _handle_platform_pubsub(self) -> None:
+        """`/v1/pubsub/gcp/<host>/<path>`: one Pub/Sub call for the gateway's platform adapter.
+
+        The adapter (agentplugins/pubsub-platform) used to pull its
+        subscriptions on the gateway pod's own Workload Identity, which the pod
+        no longer holds. `watcher_policy.evaluate_pubsub` is the table, pinned
+        to `platform_pubsub_subscriptions`; the forwarding is the watcher
+        family's, unchanged.
+        """
+        self._relay_google_call(
+            "platform pubsub",
+            watcher_policy.PLATFORM_PUBSUB_PREFIX,
+            lambda host, path, body: watcher_policy.evaluate_pubsub(
+                self.command, host, path, body, self.platform_pubsub_subscriptions
+            ),
+            family="platform Pub/Sub relay",
+            max_bytes=PLATFORM_PUBSUB_MAX_RESPONSE_BYTES,
+        )
+
+    def _relay_google_call(
+        self,
+        label: str,
+        prefix: str,
+        decide: Callable[[str, str, bytes], command_policy.Decision],
+        family: str = "watcher relay",
+        max_bytes: int | None = None,
+    ) -> None:
+        """Forward one `<prefix><host>/<path>` Google call that `decide` allows.
+
+        `label` is the first word of every audit line, naming the family; the
+        caller's role was already checked against ROUTE_ROLES by the time this
+        runs, so `decide` is the second gate, on the target. `max_bytes` is the
+        family's answer cap, the relay's own when None.
+        """
         request_id = str(uuid.uuid4())
         parts = urllib.parse.urlsplit(self.path)
-        host, _, path = parts.path[len(watcher_policy.WATCHER_GCP_PREFIX) :].partition("/")
-        self._log_watcher_request("watcher gcp", request_id, f"{host}/{path}")
+        host, _, path = parts.path[len(prefix) :].partition("/")
+        self._log_watcher_request(label, request_id, f"{host}/{path}")
         body = b""
         if self.command == watcher_policy.METHOD_POST:
             # The two answers /v1/exec and the MCP relay give: 400 for a length
@@ -9927,11 +10009,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
-                LOGGER.warning("watcher gcp rejected request_id=%s reason=content-length", request_id)
+                LOGGER.warning("%s rejected request_id=%s reason=content-length", label, request_id)
                 self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid content length"})
                 return
             if length < 0 or length > self.max_request_bytes:
-                LOGGER.warning("watcher gcp rejected request_id=%s reason=content-length", request_id)
+                LOGGER.warning("%s rejected request_id=%s reason=content-length", label, request_id)
                 self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "request body too large"})
                 return
             body = self.rfile.read(length)
@@ -9940,15 +10022,15 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         problem = api_relay_target_problem(host, path, parts.query)
         query = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
         if problem is None and not set(query) <= WATCHER_GCP_QUERY_KEYS:
-            problem = (API_RELAY_BAD_QUERY, "the watcher relay forwards no query keys but alt and prettyPrint")
+            problem = (API_RELAY_BAD_QUERY, f"the {family} forwards no query keys but alt and prettyPrint")
         if problem is not None:
             code, reason = problem
-            LOGGER.warning("watcher gcp rejected request_id=%s code=%s", request_id, code)
+            LOGGER.warning("%s rejected request_id=%s code=%s", label, request_id, code)
             self._json(HTTPStatus.BAD_REQUEST, {"error": reason, "code": code})
             return
-        decision = watcher_policy.evaluate_gcp(self.command, host, path, body, self.watcher_subscription)
+        decision = decide(host, path, body)
         if not decision.allowed:
-            LOGGER.warning("watcher gcp blocked request_id=%s rule=%s", request_id, decision.rule_id)
+            LOGGER.warning("%s blocked request_id=%s rule=%s", label, request_id, decision.rule_id)
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
@@ -9965,19 +10047,22 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 {"error": "Cloud API relay disabled", "code": "API_RELAY_DISABLED"},
             )
             return
-        authorization = self._relay_authorization("watcher gcp", request_id)
+        authorization = self._relay_authorization(label, request_id)
         if authorization is None:
             return
         target = f"/{path}?{parts.query}" if parts.query else f"/{path}"
         extra: dict[str, Any] = {}
         if self.command == watcher_policy.METHOD_POST:
             extra = {"body": body, "headers": (("Content-Type", WATCHER_GCP_CONTENT_TYPE),)}
-        upstream = self._relay_fetch("watcher gcp", request_id, host, target, authorization, **extra)
+        if max_bytes is not None:
+            extra["max_bytes"] = max_bytes
+        upstream = self._relay_fetch(label, request_id, host, target, authorization, **extra)
         if upstream is None:
             return
         if upstream.over_cap or HTTPStatus.MULTIPLE_CHOICES <= upstream.status < HTTPStatus.BAD_REQUEST:
             LOGGER.warning(
-                "watcher gcp upstream refused request_id=%s status=%d over_cap=%s",
+                "%s upstream refused request_id=%s status=%d over_cap=%s",
+                label,
                 request_id,
                 upstream.status,
                 upstream.over_cap,
@@ -9992,7 +10077,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # Only the fields the watchers read; never masterAuth's client key.
             projected = watcher_policy.project_cluster(upstream.body)
             if projected is None:
-                LOGGER.warning("watcher gcp unparseable cluster request_id=%s", request_id)
+                LOGGER.warning("%s unparseable cluster request_id=%s", label, request_id)
                 self._json(
                     HTTPStatus.BAD_GATEWAY,
                     {"error": "the upstream answer could not be relayed", "code": "UPSTREAM_UNRELAYABLE"},
@@ -10000,7 +10085,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 return
             relayed = projected
         LOGGER.info(
-            "watcher gcp forwarded request_id=%s rule=%s status=%d bytes=%d",
+            "%s forwarded request_id=%s rule=%s status=%d bytes=%d",
+            label,
             request_id,
             decision.rule_id,
             upstream.status,
@@ -10059,8 +10145,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     def _log_watcher_request(self, label: str, request_id: str, target: str) -> None:
         """The pre-decision audit line, naming the caller, as the other credentialed routes write it.
 
-        The broker makes every watcher call on its own credential, so this line
-        is the record of which ServiceAccount presented the watcher token.
+        The broker makes every relayed Google call, the watcher family's and the
+        platform Pub/Sub family's, on its own credential, so this line is the
+        record of which ServiceAccount presented the token.
         """
         principal = self.principal
         LOGGER.info(
@@ -11200,6 +11287,42 @@ def chat_relay_subscriptions(project_id: str) -> tuple[str, str]:
     return chat_subscription, a2a_subscription
 
 
+def platform_pubsub_subscriptions() -> frozenset[str]:
+    """The subscriptions the platform Pub/Sub relay may reach, from the environment.
+
+    `PLATFORM_PUBSUB_SUBSCRIPTIONS` is a comma-separated list of
+    `projects/<p>/subscriptions/<s>`, rendered by the operator from the
+    AgentPlugin configs; unset or empty means no plugin route the operator
+    could qualify, and the relay refuses every call. An entry of any other
+    shape is dropped
+    with a warning rather than refusing the boot: the operator renders the
+    list from user-authored AgentPlugin configs, and one typo in a route must
+    not take the broker, and with it every other route, off the air. A dropped
+    entry's route is refused by the policy, which the adapter logs with the
+    rule, so the typo is still loud where it was made.
+    """
+    raw = os.getenv(PLATFORM_PUBSUB_SUBSCRIPTIONS_ENV, "")
+    entries = [entry.strip() for entry in raw.split(",")]
+    kept: set[str] = set()
+    dropped = 0
+    for entry in entries:
+        if not entry:
+            continue
+        if _QUALIFIED_SUBSCRIPTION.fullmatch(entry):
+            kept.add(entry)
+        else:
+            dropped += 1
+    if dropped:
+        # The count, not the entries: the value is caller text from a CR.
+        LOGGER.warning(
+            "%s holds %d %s not a projects/<project>/subscriptions/<name> path; dropped",
+            PLATFORM_PUBSUB_SUBSCRIPTIONS_ENV,
+            dropped,
+            "entry that is" if dropped == 1 else "entries that are",
+        )
+    return frozenset(kept)
+
+
 def serve(args: argparse.Namespace) -> None:
     role = resolve_role()
     if role == "api-proxy":
@@ -11271,6 +11394,12 @@ def serve(args: argparse.Namespace) -> None:
     CredentialProxyHandler.api_relay = GoogleApiRelay()
     LOGGER.info("Cloud API relay enabled routes=%d", len(api_policy.API_READ_ROUTES))
     CredentialProxyHandler.watcher_subscription = os.getenv("WATCHER_PUBSUB_SUBSCRIPTION", "").strip()
+    CredentialProxyHandler.platform_pubsub_subscriptions = platform_pubsub_subscriptions()
+    if CredentialProxyHandler.platform_pubsub_subscriptions:
+        LOGGER.info(
+            "platform Pub/Sub relay enabled subscriptions=%d",
+            len(CredentialProxyHandler.platform_pubsub_subscriptions),
+        )
     CredentialProxyHandler.slack_max_request_bytes = int(
         os.getenv("SLACK_RELAY_MAX_REQUEST_BYTES", str(28 * 1024 * 1024))
     )
