@@ -58,7 +58,10 @@ cannot express comes back as a warning, never an error.
 `render.For(harness)` picks the adapter by the harness value the worker is
 started with (`claude-code` or `antigravity`).
 
-- **`claude-code`** (`claudecode`): `CLAUDE.md` and `skills/` for the
+- **`claude-code`** (`claudecode`): the built-ins map to Claude Code's
+  tools as `read_file` → `Read`, `Glob`, `Grep`, `LS`, `NotebookRead`;
+  `shell` → `Bash`, `BashOutput`, `KillShell`; `web_search` → `WebSearch`.
+  It renders `CLAUDE.md` and `skills/` for the
   worker to write into a per-task `CLAUDE_CONFIG_DIR`, and the flags to
   pass:
   - `--allowedTools` for what the persona grants, plus `Skill` when it has

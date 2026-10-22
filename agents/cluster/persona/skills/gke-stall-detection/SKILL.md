@@ -32,13 +32,13 @@ A single run reads one snapshot, so `repeating-warnings` cannot watch a count mo
 
 ```bash
 # Every namespaced kind in one namespace (kubectl api-resources decides which):
-python3 <this skill's directory>/scripts/stall_report.py --namespace <namespace>
+python3 scripts/stall_report.py --namespace <namespace>
 
 # One or more kinds, as kubectl names them:
-python3 <this skill's directory>/scripts/stall_report.py --namespace <namespace> --kind gateways.gateway.networking.k8s.io,httproutes.gateway.networking.k8s.io
+python3 scripts/stall_report.py --namespace <namespace> --kind gateways.gateway.networking.k8s.io,httproutes.gateway.networking.k8s.io
 
 # A different horizon, or machine-readable output:
-python3 <this skill's directory>/scripts/stall_report.py --namespace <namespace> --threshold-minutes 60 --json
+python3 scripts/stall_report.py --namespace <namespace> --threshold-minutes 60 --json
 ```
 
 The table has one row per object and heuristic — `OBJECT`, `HEURISTIC`, `DETAIL`, `STALLED_FOR` — and always ends with `stalled resources: <count>`, the number of distinct objects with at least one row. A healthy namespace prints the header and `stalled resources: 0`. The scan reads one kind per `kubectl get`, so a kind whose listing is too large for the shell's output cap or that the identity cannot list is left out on its own: a `warning:` line on stderr names it and says its objects are missing from the count. A `warning:` line also names a referent kind the identity cannot list; references to it are then never reported missing. Only a scan that could read no kind at all exits non-zero.
@@ -48,7 +48,7 @@ The table has one row per object and heuristic — `OBJECT`, `HEURISTIC`, `DETAI
 A Gateway whose HTTPS listener names a TLS Secret that certificate automation was never going to create stays `Accepted=True` forever. The GKE Gateway controller sets `Programmed=False Invalid` on the Gateway and `ResolvedRefs=False InvalidCertificateRef` on the listener, emits a `Warning SYNC` event naming the Secret every few minutes, and never assigns an address; the HTTPRoutes behind it are accepted and never programmed, and nothing goes red. (Rows abridged: the `Ready=False NotReady` conditions on the Gateway and the listener, and the listener's own `Programmed=False`, appear too.)
 
 ```
-$ python3 <this skill's directory>/scripts/stall_report.py --namespace edge --kind gateways.gateway.networking.k8s.io
+$ python3 scripts/stall_report.py --namespace edge --kind gateways.gateway.networking.k8s.io
 OBJECT        HEURISTIC           DETAIL                                                                                          STALLED_FOR
 Gateway/edge  dangling-reference  listeners[0].tls.certificateRefs -> Secret/edge-tls not found                                   6h12m
 Gateway/edge  stale-condition     Programmed=False Invalid                                                                        6h11m

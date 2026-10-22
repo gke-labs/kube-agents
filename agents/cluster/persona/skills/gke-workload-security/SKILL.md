@@ -29,7 +29,7 @@ script.
 **Command:**
 
 ```bash
-<this skill's directory>/scripts/audit_cluster.sh <cluster-name> <region> <project-id>
+bash scripts/audit_cluster.sh <cluster-name> <region> <project-id>
 ```
 
 ### 2. Configure Workload Identity

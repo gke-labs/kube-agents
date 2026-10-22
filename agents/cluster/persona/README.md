@@ -3,14 +3,23 @@
 The cluster agent written in the [persona format](../../../a2a/lib/persona/README.md):
 a read-only SRE for one GKE cluster, which each task names through the
 `project`, `cluster` and `location` parameters. It is the example persona for
-#3656, and the profile dispatcher (#3655) runs it.
+#3656, for the profile dispatcher (#3655) to run.
 
-Today's install does not read it. The Hermes cluster profiles still come from
-`agents/cluster/` (`SOUL.md`, `AGENTS.md`, `config.yaml`, `skills/`); this
-directory is the generic version of the same agent, with the kanban loop, the
-per-cluster stamping and the pinned kubeconfig taken out. Its skills are copies
-of `agents/cluster/skills`, without the `get-credentials` step and the kanban
-reporting, plus the two scripts they run.
+Today's install does not run it. The image builds it into
+`/opt/cluster-template/persona` with the rest of `agents/cluster/`, but it is
+not scaffolded: `OVERLAY_ITEMS` in `agents/platform/scripts/cluster_agent_profile.py`
+leaves it out, so the Hermes cluster profiles still come from `agents/cluster/`
+(`SOUL.md`, `AGENTS.md`, `config.yaml`, `skills/`). This directory is the
+generic version of the same agent, with the kanban loop, the per-cluster
+stamping and the pinned kubeconfig taken out: credentials for the task's target
+come from the credential proxy under the task's grant.
+
+Its skills are copies of `agents/cluster/skills` with only the edits
+`a2a/lib/persona/claudecode/cluster_persona_test.go` lists, and they call their
+scripts by skill-relative paths (`scripts/...`). The scripts are byte-identical
+copies of `agents/platform/scripts/stall_report.py` and
+`agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh`; the
+same test checks both.
 
 What it holds:
 
