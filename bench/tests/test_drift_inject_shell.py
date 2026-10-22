@@ -892,9 +892,6 @@ printf "AT=%s\\n" "$drift_changed_at"
         self.assertIsNotNone(m_at, f"Invalid changed_at in: {proc.stdout}")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 # A stand-in for the pod's interpreter. drift_wait_for_card runs
 # `"$pod_python" - "$insert_id" < board_probe.py` through kubectl exec, and the
@@ -1026,3 +1023,7 @@ echo "RETURNED $?"
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertIn("must be whole seconds", proc.stderr)
                 self.assertEqual(self.reads(), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
