@@ -837,6 +837,14 @@ Consequences:
   `${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_<project>_<cluster>_<location>.yaml`,
   and prints the `export KUBECONFIG=` and `--context` lines that reach that
   cluster from later commands.
+- A `kubectl` read that names no cluster that way and comes back empty or with
+  a server NotFound says where it looked. For `get`, `describe`, `events`,
+  `logs` and `top`, the broker appends one `[credential-proxy]` line to stderr
+  naming the host cluster and saying `--context <name>` reads another one.
+  Without it, a worker read a namespace on the host, got NotFound, and
+  reported it missing from the fleet (#3375). stdout and the exit code are
+  unchanged, any other result comes back as it was, and the line avoids the
+  words the refusal stop reads, so it's never counted as a refusal.
 - Proxied `kubectl` reads get `--request-timeout=30s` and a 60-second deadline,
   so an unreachable control plane fails in seconds rather than holding a broker
   worker for `kubectl`'s 300-second client default. Commands that are meant to

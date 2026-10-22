@@ -624,8 +624,16 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
     def test_B2_no_workflow_grants_a_bot_the_ability_to_approve(self) -> None:
         """`pull-requests: write` is the permission an approval needs.
 
-        Seven workflows hold it, and none can give an approval:
+        Eight workflows hold it, and none can give an approval:
 
+        - auto-enqueue: `schedule`, `workflow_dispatch` and
+          `pull_request_target: labeled, unlabeled`, `permissions: {}` at the
+          top, job-gated on `github.repository`, the grant job-scoped, checkout
+          pinned to the default branch with `persist-credentials: false`. Its
+          `GITHUB_TOKEN` pull-request write is one comment on a pull request
+          removed from the merge queue, saying why and how to put it back. Its
+          auto-merge calls run on a GitHub App token, which the tests below
+          pin; the comment explains a removal and cannot approve or merge.
         - auto_request_review, which requests reviewers and does not give them.
         - auto-assign-milestone: triggers on `pull_request_target: closed`
           gated on `merged == true`, so it runs only after the merge decision
@@ -660,7 +668,7 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
 
         The list is an allowlist of holders, not of intents: the permission is
         a capability, and this asserts membership rather than absence so a
-        seventh holder is a red test and a conversation rather than a silent
+        ninth holder is a red test and a conversation rather than a silent
         addition. Adding a name here means someone read the workflow. A GitHub
         App token minted with Pull requests write is not a `permissions:`
         grant; `test_B2_app_token_write_grants_are_pinned` holds those.
@@ -679,6 +687,7 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
         self.assertEqual(
             [
                 "auto-assign-milestone.yml",
+                "auto-enqueue.yml",
                 "auto_request_review.yml",
                 "ci-health.yml",
                 "coverage-comment.yml",
@@ -703,9 +712,9 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
         `lgtm` and `approved` with no `do-not-merge` label, the predicate Tide
         merges on today, and Prow sets those two labels only for accounts the
         `OWNERS` files name. No model verdict is an input. The call runs on a
-        GitHub App token, not on a `pull-requests: write` grant, so the holder
-        list above does not show it; the App-token test below pins who mints
-        one. The next test pins the predicate; any other script under
+        GitHub App token, not on a `pull-requests: write` grant: the holder
+        list above shows `auto-enqueue.yml` only for its left-out comment, and
+        the App-token test below pins who mints one. The next test pins the predicate; any other script under
         `scripts/` making one of these calls is a red.
         """
         merging = (

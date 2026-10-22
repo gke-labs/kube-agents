@@ -1042,6 +1042,11 @@
 # record.
 ./tasks/upgrades-retired-registry-image-named/task.yaml
 
+# The weekly upgrade readiness brief's on-request route: a brief in the SOP's shape
+# whose Decide-now lines name slot b's singleton budget and keep the webhook outage
+# under Also-this-week. deployer: noop, read-only, one readiness report.
+./tasks/upgrades-weekly-brief-decisions-named/task.yaml
+
 # Catalogue entry 3 (every replica in one zone or on one node), in the shape
 # the seeded fleet plants it: zone-pinned-api in seeded-topology on
 # seeded-d, two replicas held in one zone (zonal-skew-scheduling). Read-only

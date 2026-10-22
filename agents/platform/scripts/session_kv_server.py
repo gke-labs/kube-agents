@@ -6277,7 +6277,14 @@ def register_findings(body: Dict[str, Any]) -> Dict[str, Any]:
     `scope` is how a source says its run was complete for one cluster, which is
     the only condition under which absence may lower a row's confidence. A
     partial run must omit it: a sweep that died halfway looks exactly like a
-    fleet that got healthier.
+    fleet that got healthier. `scope.check_prefix` narrows the claim to one
+    family of checks (ending with `-`; a batch with findings must belong to
+    it), whatever wrote the rows, or, with `scope.source` beside it, that
+    source's rows in the family; without a prefix, a batch's
+    sources (or `scope.source`, a known source the batch wrote) narrow it to
+    their rows; with a complete scope an empty `findings` list is accepted as a
+    complete run that found nothing when it names `check_prefix` or `source`,
+    and refused otherwise.
     """
     return _findings_write(findings_queue.register_findings, body.get("findings"), body.get("scope"))
 
@@ -6308,11 +6315,11 @@ def get_ranked_findings() -> Dict[str, Any]:
 
 @app.get("/v1/findings", dependencies=[Depends(verify_api_key)])
 def get_findings(
-    cluster: str = "", state: str = "", severity: str = "", limit: int = 200, project: str = ""
+    cluster: str = "", state: str = "", severity: str = "", limit: int = 200, project: str = "", check_prefix: str = ""
 ) -> Dict[str, Any]:
     try:
         with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
-            findings = findings_queue.list_findings(conn, cluster, state, severity, limit, project)
+            findings = findings_queue.list_findings(conn, cluster, state, severity, limit, project, check_prefix)
     except findings_queue.FindingError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
     return {"findings": findings}

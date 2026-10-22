@@ -5651,6 +5651,79 @@ class BootstrapRecordsIdentityKeysOnlyWhenSetTest(unittest.TestCase):
         self.assertRegex(out, re.compile(r"^GKE_DB_KMS_KEY=key-two$", re.MULTILINE))
 
 
+class PlatformAgentStorageSizePersistsThroughInstallEnvTest(unittest.TestCase):
+    """A size a first install inherits from the shell is recorded in install.env.
+
+    Every later run drops an inherited PLATFORM_AGENT_STORAGE_SIZE and reads
+    the file alone, so a size the first run applied but did not record would
+    read as the default on the next run, which drops the field and leaves
+    the claims larger than the CR says. Unset, nothing is recorded, so later
+    runs follow the default.
+    """
+
+    def _bootstrap_with_export(self, tmp, export_line):
+        dest = pathlib.Path(tmp) / "new.install.env"
+        loaded = pathlib.Path(tmp) / "loaded.install.env"
+        loaded.write_text("")
+        loaded.chmod(0o600)
+        proc = subprocess.run(
+            ["bash", "-c",
+             f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+             'source scripts/installer/installer_common.sh\n'
+             'resolve_shared_defaults\n'
+             'PARAM_DRY_RUN=false; PARAM_MEMORY=file\n'
+             f'{export_line}\n'
+             f'bootstrap_install_env_file "{dest}" some-tag >/dev/null'],
+            capture_output=True, text=True,
+            env=self._env({
+                "KUBE_AGENTS_INSTALL_ENV": str(loaded),
+                "PROJECT_ID": "p", "CLUSTER_NAME": "c", "REGION": "us-central1",
+            }),
+            cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertTrue(dest.exists(), proc.stderr + proc.stdout)
+        return dest
+
+    @staticmethod
+    def _env(overrides):
+        env = get_isolated_test_env(overrides=overrides)
+        env.pop("PLATFORM_AGENT_STORAGE_SIZE", None)
+        env.update(overrides)
+        return env
+
+    def test_an_inherited_size_is_recorded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(tmp, 'export PLATFORM_AGENT_STORAGE_SIZE="80Gi"')
+            self.assertIn("PLATFORM_AGENT_STORAGE_SIZE=80Gi\n", dest.read_text())
+
+    def test_an_unset_size_records_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for export_line in ("unset PLATFORM_AGENT_STORAGE_SIZE", 'export PLATFORM_AGENT_STORAGE_SIZE=""'):
+                with self.subTest(export_line=export_line):
+                    dest = self._bootstrap_with_export(tmp, export_line)
+                    self.assertNotIn("PLATFORM_AGENT_STORAGE_SIZE", dest.read_text())
+                    dest.unlink()
+
+    def test_a_later_run_drops_an_inherited_size(self):
+        # Sourcing install.sh over an install.env that exists unsets the
+        # inherited value, as it does PLATFORM_AGENT_MODE.
+        with tempfile.TemporaryDirectory() as tmp:
+            loaded = pathlib.Path(tmp) / "loaded.install.env"
+            loaded.write_text("PROJECT_ID=p\n")
+            loaded.chmod(0o600)
+            proc = subprocess.run(
+                ["bash", "-c",
+                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                 'echo "SIZE=[${PLATFORM_AGENT_STORAGE_SIZE:-}]"'],
+                capture_output=True, text=True,
+                env=self._env({"KUBE_AGENTS_INSTALL_ENV": str(loaded), "PLATFORM_AGENT_STORAGE_SIZE": "80Gi"}),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertIn("SIZE=[]", proc.stdout)
+
+
 class ModelMaxTokensPersistsThroughInstallEnvTest(unittest.TestCase):
     """The flag on the first run, the file on every later one.
 

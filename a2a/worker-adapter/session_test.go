@@ -195,6 +195,9 @@ if [ "$n" = 2 ]; then echo "$$" > "$dir/pid.2"; exec sleep 60; fi`)
 	publishIn(t, c, session, "task-s-1", "")
 	submit(t, c, session, "task-s-2", "second")
 	waitState(t, c, session, "task-s-2", lib.StateWorking)
+	// Run 2 has counted itself once its argv record exists; a cancel
+	// landing earlier would leave task-s-3 to run as the stub's second.
+	waitRun(t, dir, "argv", 2)
 
 	// A stop aimed at the ended task leaves this one running.
 	publishIn(t, c, session, "task-s-1", "")
@@ -683,14 +686,7 @@ if [ "$n" = 2 ]; then while [ ! -e "$dir/go" ]; do sleep 0.1; done; fi`)
 	}
 
 	submit(t, c, session, "task-s-2", "second")
-	deadline := time.Now().Add(waitDeadline)
-	for readRunIfAny(dir, "sock", 2) == "" {
-		if time.Now().After(deadline) {
-			t.Fatal("the second turn's harness never started")
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	second := strings.TrimSpace(readRun(t, dir, "sock", 2))
+	second := waitRun(t, dir, "sock", 2)
 	if second == first || second == sock {
 		t.Fatalf("second turn's socket = %q, the same as an earlier or the configured path", second)
 	}
@@ -715,6 +711,24 @@ if [ "$n" = 2 ]; then while [ ! -e "$dir/go" ]; do sleep 0.1; done; fi`)
 func readRunIfAny(dir, what string, n int) string {
 	b, _ := os.ReadFile(filepath.Join(dir, fmt.Sprintf("%s.%d", what, n)))
 	return strings.TrimSpace(string(b))
+}
+
+// waitRun is readRun for a record the stub may not have written yet: it
+// polls until what.<n> holds something, bounded by waitDeadline, and fails
+// naming the record that never came. A record's presence also means the
+// stub has counted the run, since it writes n before any record.
+func waitRun(t *testing.T, dir, what string, n int) string {
+	t.Helper()
+	deadline := time.Now().Add(waitDeadline)
+	for {
+		if v := readRunIfAny(dir, what, n); v != "" {
+			return v
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("harness run %d never wrote %s", n, what)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // withDelegateSocket rewrites the delegate server's socket inside the
@@ -851,6 +865,12 @@ func TestAReusedPodKeepsItsSessionWhenAResumedTurnIsStoppedBeforeInit(t *testing
 	waitState(t, c, session, "task-k-1", lib.StateCompleted)
 	submit(t, c, session, "task-k-2", "second")
 	waitState(t, c, session, "task-k-2", lib.StateWorking)
+	// working is published before the harness is launched, so the cancel
+	// waits for run 2's record: a SIGTERM that lands before the stub has
+	// counted itself leaves no run 2, and task-k-3 would then become it.
+	// The turn is still stopped before any init line, since noinit.2 is
+	// planted.
+	waitRun(t, dir, "argv", 2)
 	publishIn(t, c, session, "task-k-2", "")
 	waitState(t, c, session, "task-k-2", lib.StateCanceled)
 

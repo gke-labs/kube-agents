@@ -95,7 +95,7 @@ func TestAgentUsageStatusSerialisesOnlyWhatIsSet(t *testing.T) {
 		SessionsTotal: 3, EventsIngestedTotal: 4, ToolExecutionsTotal: 5,
 		RemediationsProposedTotal: 6, RemediationsAppliedTotal: 7, RemediationsMergedTotal: 10, ChatMessagesInboundTotal: 11, ToolExecutionsBlockedTotal: 12, BrokerFailuresTotal: 13,
 		ClustersRegistered: ptr.To(int64(8)), ClustersMonitored: ptr.To(int64(9)),
-		ActiveInterfaces: []string{"googlechat"}, LastActiveTime: &now,
+		ActiveInterfaces: []string{"googlechat"}, LastActiveTime: &now, LastHumanActiveTime: &now,
 	}
 	got, err = json.Marshal(full)
 	if err != nil {
@@ -108,14 +108,14 @@ func TestAgentUsageStatusSerialisesOnlyWhatIsSet(t *testing.T) {
 	for _, key := range []string{
 		"sessionsTotal", "eventsIngestedTotal", "toolExecutionsTotal",
 		"remediationsProposedTotal", "remediationsAppliedTotal", "remediationsMergedTotal", "chatMessagesInboundTotal",
-		"toolExecutionsBlockedTotal", "brokerFailuresTotal", "clustersRegistered", "clustersMonitored", "activeInterfaces", "lastActiveTime",
+		"toolExecutionsBlockedTotal", "brokerFailuresTotal", "clustersRegistered", "clustersMonitored", "activeInterfaces", "lastActiveTime", "lastHumanActiveTime",
 	} {
 		if _, ok := decoded[key]; !ok {
 			t.Errorf("serialised form lacks %q: %s", key, got)
 		}
 	}
-	if len(decoded) != 13 {
-		t.Errorf("serialised form has %d keys, want 13: %s", len(decoded), got)
+	if len(decoded) != 14 {
+		t.Errorf("serialised form has %d keys, want 14: %s", len(decoded), got)
 	}
 }
 

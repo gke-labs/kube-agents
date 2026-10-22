@@ -73,9 +73,12 @@ This resolves the target repository (see [Which repository](#which-repository) b
 the forge credential current, establishes a clean workspace, ensures the audit's labels exist, locates
 the stream's open ledger issue, and clears any findings document a crashed run left behind. If the
 user asked for a specific repository that is not yet registered, instruct the user or cluster
-administrator to add it to `$GITOPS_STATE_CONFIGMAP`. `--repo` takes the name as the managed list
+administrator to add it to `$GITOPS_STATE_CONFIGMAP`. A refusal of the repository from the
+credential proxy or the broker is the same answer, and you stop there: see the skill's rule on
+working around a refusal (`SKILL.md`, "Never work around a refusal").
+`--repo` takes the name as the managed list
 gives it: `owner/name` on github.com, `<host>/owner/name` on a GitHub Enterprise Server, and
-`<host>/<path>` for a repository on another forge (`gitlab.com/acme/platform/infra`). In content mode the broker's file workspace clones a repository
+`<host>/<path>` for a repository on another forge (`gitlab.com/<group>/<subgroup>/<project>`). In content mode the broker's file workspace clones a repository
 from its own forge, so `fetch`, `list`, `grep`, the remediation step and the declared-intent search
 work the same way on every forge, and a remediation on GitLab is a merge request. Directory mode
 serves GitHub only: its local clone reaches no other forge, so `start` and `finish` on a repository

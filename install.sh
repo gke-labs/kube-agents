@@ -338,6 +338,10 @@ bootstrap_install_env() {
   # clean shell would switch it back. --mode is refused for the same reason
   # when it disagrees with this file (check_flags_against_install_env).
   unset PLATFORM_AGENT_MODE
+  # The data volume size too: an inherited PLATFORM_AGENT_STORAGE_SIZE would
+  # grow both data claims for one run, and the next run from a clean shell
+  # would drop the field again, leaving claims larger than the CR says.
+  unset PLATFORM_AGENT_STORAGE_SIZE
   # The GitOps forge keys likewise: an inherited GITOPS_FORGE=gitlab would
   # switch a recorded GitHub install's forge for this run. --gitops-forge is
   # the per-run way in.
@@ -2827,6 +2831,12 @@ bootstrap_install_env_file() {
   # (adopt_live_platform_agent_mode): the next run that can read it settles it.
   if [ "${PLATFORM_AGENT_MODE_GUESSED:-false}" != "true" ] || [ -n "${PARAM_PLATFORM_AGENT_MODE:-}" ]; then
     write_env_var "$tmp" PLATFORM_AGENT_MODE "${PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}"
+  fi
+  # Only when set: a first install that inherits a size records it, because
+  # every later run reads the file alone, and a size missing there would read
+  # as the lower default. Unset, later runs follow the default.
+  if [ -n "${PLATFORM_AGENT_STORAGE_SIZE:-}" ]; then
+    write_env_var "$tmp" PLATFORM_AGENT_STORAGE_SIZE "$PLATFORM_AGENT_STORAGE_SIZE"
   fi
   write_env_var "$tmp" MODEL_PROVIDER "${MODEL_PROVIDER:-}"
   write_env_var "$tmp" MODEL_DEFAULT_NAME "${MODEL_DEFAULT_NAME:-}"

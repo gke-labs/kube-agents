@@ -400,7 +400,7 @@ sidecar validates across a trust boundary and must not pull in a module that she
   `credential_proxy.is_valid_repository` and the inline check in
   `github_token_refresh.refresh_git_credentials` are calls to it, and
   `gitops_workspace.is_valid_repo_slug` starts with it and then admits a host-qualified name
-  (`gitlab.com/acme/platform/infra`, or `github.com/owner/name`) on the same rule. All three answer
+  (`gitlab.com/<group>/<subgroup>/<project>`, or `github.com/owner/name`) on the same rule. All three answer
   about a string their caller then passes on verbatim — so a predicate that said yes about a value
   it had quietly trimmed would be answering about a string nobody holds.
 - `forge._parse_repo` was the sixth. #504 removed the `SETTINGS.md` path that called it, so it is

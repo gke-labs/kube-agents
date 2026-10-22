@@ -94,6 +94,11 @@ readonly SCOPE_MAX_PROJECTS_MIN=1
 readonly SCOPE_MAX_PROJECTS_MAX=5000
 readonly SCOPE_MAX_PROJECTS_DEFAULT=100
 
+# ─── Data volume size ─────────────────────────────
+# The largest PLATFORM_AGENT_STORAGE_SIZE, in Mi: 64Ti, the largest persistent
+# disk, which the admission webhook and the chart also take as the limit.
+readonly PLATFORM_AGENT_STORAGE_SIZE_MAX_MI=67108864
+
 # ─── OpenAI-compatible model server ───────────────────────────────────────────
 # The ports a base URL without one is dialled on, and the TCP port range.
 readonly HTTP_DEFAULT_PORT=80
@@ -835,6 +840,24 @@ is_valid_redaction_ip_action() {
 # chart's platformAgent.mode and the composition's platform_agent_mode take too.
 is_valid_platform_agent_mode() {
   [[ "${1:-}" =~ ^(today|next)$ ]]
+}
+
+# PLATFORM_AGENT_STORAGE_SIZE: a whole number of Mi, Gi or Ti above zero and at
+# most 64Ti, what the composition's platform_agent_storage_size validation
+# takes. The CRD's spec.storage.size takes any quantity; this is the narrower
+# subset a disk is sized in. A number with more digits than the limit in Mi is
+# over it in every unit, which keeps the multiply inside Bash's int64.
+is_valid_platform_agent_storage_size() {
+  [[ "${1:-}" =~ ^[1-9][0-9]*(Mi|Gi|Ti)$ ]] || return 1
+  local unit="${BASH_REMATCH[1]}" number mi_per_unit
+  number="${1%"$unit"}"
+  [ "${#number}" -le "${#PLATFORM_AGENT_STORAGE_SIZE_MAX_MI}" ] || return 1
+  case "$unit" in
+    Mi) mi_per_unit=1 ;;
+    Gi) mi_per_unit=1024 ;;
+    Ti) mi_per_unit=1048576 ;;
+  esac
+  [ $((number * mi_per_unit)) -le "$PLATFORM_AGENT_STORAGE_SIZE_MAX_MI" ]
 }
 
 # The PlatformAgent and its release, read once for the scope check and the
@@ -1687,6 +1710,10 @@ load_install_env() {
   # switch the install's component stack for one run, and the next run from a
   # clean shell would switch it back and retire the A2A stack.
   unset PLATFORM_AGENT_MODE
+  # The data volume size too: an inherited PLATFORM_AGENT_STORAGE_SIZE would
+  # grow both data claims for one run, and the next run from a clean shell
+  # would drop the field again, leaving claims larger than the CR says.
+  unset PLATFORM_AGENT_STORAGE_SIZE
   # The GitOps forge keys too: an inherited GITOPS_FORGE=gitlab would render a
   # GitLab forge, and drop the GitHub alias and minter, for one run of an
   # install the file records as GitHub, and an inherited GITOPS_HOST would
@@ -4852,6 +4879,12 @@ write_tfvars_from_state() {
     print_error "PLATFORM_AGENT_MODE='${platform_agent_mode}' is not one of today, next. Fix it in install.env."
     return 1
   fi
+  # The data volume size, for the same reason.
+  local platform_agent_storage_size="${PLATFORM_AGENT_STORAGE_SIZE:-$DEFAULT_PLATFORM_AGENT_STORAGE_SIZE}"
+  if ! is_valid_platform_agent_storage_size "$platform_agent_storage_size"; then
+    print_error "PLATFORM_AGENT_STORAGE_SIZE='${platform_agent_storage_size}' is not a whole number of Mi, Gi or Ti above zero and at most 64Ti, for example 80Gi. Fix it in install.env, or on a first install, in the value this shell exports."
+    return 1
+  fi
 
   local old_umask
   old_umask="$(umask)"
@@ -4930,6 +4963,10 @@ write_tfvars_from_state() {
     echo "# The PlatformAgent's spec.mode (PLATFORM_AGENT_MODE in install.env). The"
     echo "# composition passes the chart nothing for \"today\", so its CR carries no mode."
     echo "platform_agent_mode = $(hcl_str "$platform_agent_mode")"
+    echo ""
+    echo "# The PlatformAgent's spec.storage.size (PLATFORM_AGENT_STORAGE_SIZE in"
+    echo "# install.env). The composition passes the chart nothing for the default."
+    echo "platform_agent_storage_size = $(hcl_str "$platform_agent_storage_size")"
     echo ""
     echo "# Gateway redaction (LITELLM_REDACTION_* in install.env). The composition"
     echo "# renders nothing into the chart while enabled is false."

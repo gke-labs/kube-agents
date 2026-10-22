@@ -23,7 +23,8 @@ name: Auto Enqueue
 # unless the token can write workflows).
 # `GITHUB_TOKEN` cannot do them: an event it causes starts no workflow run, so
 # its queue entries could get no `merge_group` runs. The job's own
-# `GITHUB_TOKEN` only reads and posts the gate statuses.
+# `GITHUB_TOKEN` reads, posts the gate statuses, and posts one comment on a
+# pull request removed from the queue, with the reason and the re-add command.
 #
 # Two triggers, as in `hold-unresolved-threads.yml`. The schedule is the
 # guarantee; the label fast path enqueues the moment the last label lands and
@@ -82,7 +83,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read # check out the default branch: the script
-      pull-requests: read # the open pull requests, their labels and queue state
+      pull-requests: write # read the open pull requests; post the left-out comment
       statuses: write # re-post the gate statuses
     steps:
       # The default branch, never a pull request head: this job holds a

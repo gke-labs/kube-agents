@@ -67,6 +67,8 @@ get no `merge_group` runs, and turning on auto-merge needs `contents: write`
 A pull request the queue removed, or that someone took out by hand, stays out
 until its head moves (its first check suite is newer than the removal): its head checks are still green, so turning auto-merge on
 again would put the same failing tree back in the queue every five minutes.
+The sweep posts one comment on such a pull request, with the reason and the
+command a write user runs to put it back.
 """
 
 import argparse
@@ -109,6 +111,9 @@ HOLD_LABELS = (
     "do-not-merge/invalid-owners-file",
     "do-not-merge/work-in-progress",
 )
+#: `trusted_team_for_sticky_lgtm` for this repository (`prow/oss/plugins.yaml` in oss-test-infra):
+#: Prow keeps `lgtm` across a push only for its members.
+STICKY_LGTM_TEAM = "gke-labs/Googlers"
 #: `skip_if_only_changed` of `pull-kube-agents-smoke-test` in oss-test-infra
 #: `prow/prowjobs/gke-labs/kube-agents/kube-agents-presubmits.yaml`. Keep the two identical.
 SMOKE_SKIP_RE = re.compile(
@@ -136,6 +141,26 @@ DISABLE = "disable"
 LEFT_OUT = "left out"
 #: What a left-out line says when the removal event carries no reason or actor.
 UNKNOWN_REMOVAL_FIELD = "unknown"
+#: Opens the comment that tells the author why the sweep left the pull request out. Keyed on the
+#: removal's time, so each removal gets one comment and a later removal gets a new one.
+LEFT_OUT_MARKER = "<!-- merge-queue-left-out {removed} -->"
+LEFT_OUT_COMMENT = """{marker}
+This pull request was removed from the merge queue. The enqueue sweep does not put it back until \
+a new push. The sweep logged:
+
+```text
+{line}
+```
+
+If the removal was a flake, ask a write user to run this command:
+
+```shell
+gh api graphql -f query='{enable}'
+```
+
+If a check found a real problem, push a fix. If a person removed it on purpose, add a hold label \
+so that it stays out after the next push.
+"""
 #: The sweep's own login when `--actor` names no App: `GITHUB_TOKEN`'s, which makes no queue
 #: call. A write run always passes the App's slug, whose own dequeue of a held pull request does
 #: not keep it out; a dry run has no App token, so it may report that dequeue as a removal.
@@ -438,8 +463,34 @@ def left_out_line(pull):
     return (
         f"#{pull['number']}: left out, removed {when} by {who} (reason: {why}). "
         f"To re-add (a write user): gh api graphql -f query='{enable}', "
-        "or push a fix (a push drops lgtm unless the author is in gke-labs/Googlers)."
+        f"or push a fix (a push drops lgtm unless the author is in {STICKY_LGTM_TEAM})."
     )
+
+
+def comment_left_out(api, pull, line, dry_run=False):
+    """Post `line` once as a comment on a pull request the sweep leaves out. Returns a log line.
+
+    One comment per removal: the sweep runs every five minutes, so it reads the
+    comments since the removal first and skips a pull request that already has
+    this removal's marker. The read happens only for pull requests the sweep
+    leaves out. A failed read or post is logged and not counted as a failure:
+    the left-out line is already in the log, and a red every five minutes for
+    a notice would hide real failures.
+    """
+    removed = (pull.get("removal") or {}).get("createdAt")
+    marker = LEFT_OUT_MARKER.format(removed=removed or UNKNOWN_REMOVAL_FIELD)
+    path = f"/repos/{api.repo}/issues/{pull['number']}/comments"
+    try:
+        # The marker comment is newer than the removal, so only comments since then can hold it.
+        since = f"{path}?since={removed}" if removed else path
+        if any((comment.get("body") or "").startswith(marker) for comment in api.get_all(since)):
+            return f"#{pull['number']}: left-out comment already posted"
+        if not dry_run:
+            body = LEFT_OUT_COMMENT.format(marker=marker, line=line, enable=ENABLE_COMMAND_QUERY.format(id=pull["id"]))
+            api.post(path, {"body": body})
+    except Exception as error:  # a notice that fails must not turn every sweep red
+        return f"#{pull['number']}: left-out comment not posted: {error}"
+    return f"#{pull['number']}: {'would post' if dry_run else 'posted'} the left-out comment"
 
 
 def parse_time(stamp):
@@ -479,8 +530,8 @@ def graphql_pulls(api, base=BASE, actor=SWEEP_ACTOR):
 def sweep(api, base=BASE, enqueuer=None, actor=SWEEP_ACTOR, dry_run=False, not_before=None):
     """Re-post head statuses and reconcile auto-merge for every pull request. (lines, failures).
 
-    `api` reads and posts statuses; `enqueuer`, the App token, makes the
-    auto-merge and dequeue calls.
+    `api` reads, posts statuses, and posts the left-out comment; `enqueuer`,
+    the App token, makes the auto-merge and dequeue calls.
 
     Statuses are refreshed only for pull requests that pass the label test:
     those are the ones the queue can take, and refreshing every open pull
@@ -504,7 +555,9 @@ def sweep(api, base=BASE, enqueuer=None, actor=SWEEP_ACTOR, dry_run=False, not_b
                     enqueuer.graphql(DISABLE_MUTATION, {"id": pull["id"]})
             if action:
                 if action == LEFT_OUT:
-                    lines.append(left_out_line(pull))
+                    line = left_out_line(pull)
+                    lines.append(line)
+                    lines.append(comment_left_out(api, pull, line, dry_run=dry_run))
                 else:
                     verb = {ENABLE: "auto-merge on", DISABLE: "auto-merge off and out of the queue"}[action]
                     lines.append(f"#{pull['number']}: {'would turn ' if dry_run else ''}{verb}")
