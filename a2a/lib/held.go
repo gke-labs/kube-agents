@@ -2,6 +2,7 @@ package lib
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -52,6 +53,14 @@ const DefaultHeldAckWait = 2 * time.Minute
 // delivery back at once, for another worker to take.
 const abandonedNakDelay = time.Second
 
+// heartbeatsPerAckWait is how many in-progress acks a holder sends per
+// AckWait, so two can be lost before the server redelivers.
+const heartbeatsPerAckWait = 3
+
+// minHeartbeat is the heartbeat interval used if the computed one is not
+// positive.
+const minHeartbeat = time.Second
+
 // heldMarkerKey is the consumer metadata EnsureHeldConsumer stamps and
 // SubscribeHeld requires, so a worker binds only to a durable the operator
 // made for this mode: a server-default MaxAckPending (1000) looks exactly
@@ -101,7 +110,15 @@ func (c *Client) EnsureHeldConsumer(ctx context.Context, cfg HeldConsumerConfig)
 	if js == nil {
 		return fmt.Errorf("EnsureHeldConsumer: not connected")
 	}
-	if existing, err := js.Consumer(ctx, cfg.Stream, cfg.Durable); err == nil {
+	// Only a durable that is known not to exist is created. Any other lookup
+	// error leaves its state unknown, and an update could move it under bound
+	// workers, so it is returned.
+	existing, err := js.Consumer(ctx, cfg.Stream, cfg.Durable)
+	switch {
+	case errors.Is(err, jetstream.ErrConsumerNotFound):
+	case err != nil:
+		return fmt.Errorf("held consumer %s on %s: look it up: %w", cfg.Durable, cfg.Stream, err)
+	default:
 		old := existing.CachedInfo().Config
 		switch {
 		case old.FilterSubject != cfg.FilterSubject || len(old.FilterSubjects) > 0:
@@ -112,7 +129,7 @@ func (c *Client) EnsureHeldConsumer(ctx context.Context, cfg HeldConsumerConfig)
 				cfg.Durable, old.AckWait, cfg.ackWait())
 		}
 	}
-	_, err := js.CreateOrUpdateConsumer(ctx, cfg.Stream, jetstream.ConsumerConfig{
+	_, err = js.CreateOrUpdateConsumer(ctx, cfg.Stream, jetstream.ConsumerConfig{
 		Durable:       cfg.Durable,
 		FilterSubject: cfg.FilterSubject,
 		AckPolicy:     jetstream.AckExplicitPolicy,
@@ -266,9 +283,9 @@ func (h *heldState) beat() time.Duration {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.ackWait <= 0 {
-		return DefaultHeldAckWait / 3
+		return DefaultHeldAckWait / heartbeatsPerAckWait
 	}
-	return h.ackWait / 3
+	return h.ackWait / heartbeatsPerAckWait
 }
 
 // dispatch hands one delivery to the handler on its own goroutine, or gives
@@ -400,7 +417,7 @@ func (d *heldDelivery) heartbeat(interval func() time.Duration) (stop func()) {
 		if iv := interval(); iv > 0 {
 			return iv
 		}
-		return time.Second
+		return minHeartbeat
 	}
 	done := make(chan struct{})
 	go func() {

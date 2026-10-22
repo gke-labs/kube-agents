@@ -377,9 +377,7 @@ func TestSubscribeHeldLeavesTheConsumerAsTheOperatorMadeIt(t *testing.T) {
 		t.Fatalf("SubscribeHeld: %v", err)
 	}
 	sub.Stop()
-	h.req.mu.Lock()
-	js := h.req.js
-	h.req.mu.Unlock()
+	_, js := h.req.conn()
 	cons, err := js.Consumer(h.ctx, "TASKS", h.cfg().Durable)
 	if err != nil {
 		t.Fatalf("consumer info: %v", err)
@@ -620,9 +618,7 @@ func TestHeldDeliveryOutlastingAckWaitIsRedelivered(t *testing.T) {
 // session that isn't the intake's addressee.
 func TestSubscribeHeldRefusesADurableItCannotGate(t *testing.T) {
 	h, worker := newHeldHarness(t, "uncapped")
-	h.req.mu.Lock()
-	js := h.req.js
-	h.req.mu.Unlock()
+	_, js := h.req.conn()
 	c := h.cfg()
 	if _, err := js.CreateOrUpdateConsumer(h.ctx, c.Stream, jetstream.ConsumerConfig{
 		Durable: c.Durable, FilterSubject: c.Subject, AckPolicy: jetstream.AckExplicitPolicy, MaxAckPending: -1,
@@ -738,9 +734,7 @@ func TestAFailedDispositionCanBeRetried(t *testing.T) {
 // from a chosen one, so the bind requires EnsureHeldConsumer's marker.
 func TestSubscribeHeldRefusesAServerDefaultDurable(t *testing.T) {
 	h, worker := newHeldHarness(t, "default")
-	h.req.mu.Lock()
-	js := h.req.js
-	h.req.mu.Unlock()
+	_, js := h.req.conn()
 	c := h.cfg()
 	if _, err := js.CreateOrUpdateConsumer(h.ctx, c.Stream, jetstream.ConsumerConfig{
 		Durable: c.Durable, FilterSubject: c.Subject, AckPolicy: jetstream.AckExplicitPolicy,
@@ -806,5 +800,63 @@ func TestEnsureHeldConsumerOnlyChangesMaxAckPendingInPlace(t *testing.T) {
 	}
 	if err := ensure(c.Subject, 4, 90*time.Second); err != nil {
 		t.Errorf("refused a MaxAckPending change: %v", err)
+	}
+}
+
+// A lookup that fails for any reason but not-found leaves the durable's
+// state unknown, so EnsureHeldConsumer returns the error rather than update
+// a live durable past its guards. The operator here may create the consumer
+// but not look it up, so only the lookup fails.
+func TestEnsureHeldConsumerRefusesWhenTheLookupFails(t *testing.T) {
+	const durable = "profile-blind"
+	allow := func(subjects ...string) *natsserver.SubjectPermission {
+		return &natsserver.SubjectPermission{Allow: subjects}
+	}
+	s := runJetStreamServer(t, -1, t.TempDir(), func(o *natsserver.Options) {
+		o.Users = []*natsserver.User{
+			{Username: "operator", Password: "op"},
+			{Username: "blind", Password: "bl", Permissions: &natsserver.Permissions{
+				Publish: allow(
+					"$JS.API.CONSUMER.CREATE.TASKS."+durable,
+					"$JS.API.CONSUMER.CREATE.TASKS."+durable+".>",
+				),
+				Subscribe: allow("_INBOX.>"),
+			}},
+		}
+	})
+	t.Cleanup(s.Shutdown)
+	url := func(user, pass string) string { return fmt.Sprintf("nats://%s:%s@%s", user, pass, s.Addr().String()) }
+	provisionTasksStream(t, url("operator", "op"))
+	ctx := testCtx(t)
+	op, err := Connect(ctx, url("operator", "op"), WithName("operator"))
+	if err != nil {
+		t.Fatalf("Connect operator: %v", err)
+	}
+	t.Cleanup(op.Close)
+	h := &heldHarness{t: t, ctx: ctx, req: op, profile: "blind"}
+	h.ensure(1, 90*time.Second)
+
+	blind, err := Connect(ctx, url("blind", "bl"), WithName("blind"))
+	if err != nil {
+		t.Fatalf("Connect blind: %v", err)
+	}
+	t.Cleanup(blind.Close)
+	c := h.cfg()
+	// No deadline: the denied lookup then fails at the library's default API
+	// timeout and leaves the create its own, as a reconciler's call would.
+	nodeadline, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := blind.EnsureHeldConsumer(nodeadline, HeldConsumerConfig{
+		Stream: c.Stream, Durable: c.Durable, FilterSubject: c.Subject, MaxAckPending: 1, AckWait: 30 * time.Second,
+	}); err == nil || !strings.Contains(err.Error(), "look it up") {
+		t.Errorf("EnsureHeldConsumer with a failing lookup = %v, want the lookup's error", err)
+	}
+	_, js := op.conn()
+	cons, err := js.Consumer(ctx, c.Stream, c.Durable)
+	if err != nil {
+		t.Fatalf("consumer info: %v", err)
+	}
+	if w := cons.CachedInfo().Config.AckWait; w != 90*time.Second {
+		t.Errorf("after a failed lookup the durable's AckWait is %v, want 90s unchanged", w)
 	}
 }
