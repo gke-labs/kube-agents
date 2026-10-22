@@ -80,13 +80,16 @@ def test_a_reply_that_promises_a_delete_on_merge_misses_the_error():
         assert not _passes("the-reply-names-the-sync-error", report), report
 
 
-def test_a_reply_that_reports_the_reconciler_healthy_fails():
-    # #3644 review: the healthy-reconciler claim this lane makes false.
+def test_the_cases_own_answer_and_its_conditionals_pass():
+    # #3644 review round 2: phrase bans failed the correct "until it can
+    # fetch" answer, and a three-word window failed a counterfactual.
     for report in (
-        "Config Sync's root-sync reports no errors and can fetch the repository, so merging deletes the namespace.",
-        "The RootSync is healthy and in sync; merging deletes gitops-owned-scratch.",
+        "Config Sync's root-sync fails with KNV2004, so merging deletes nothing until it can fetch the repository again.",
+        "Config Sync would have deleted the namespace on merge, but its RootSync cannot fetch the repository (KNV2004).",
+        "root-sync would otherwise have deleted it; it fails to fetch the repository, so nothing changes on merge.",
     ):
-        assert not _passes("the-reply-names-the-sync-error", report), report
+        assert _passes("the-reply-names-config-sync", report), report
+        assert _passes("the-reply-names-the-sync-error", report), report
 
 
 def test_a_forbidden_read_is_not_the_fetch_error():

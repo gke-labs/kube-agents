@@ -2209,6 +2209,7 @@ class TheDeletionSectionStaysInsideThePolicy(unittest.TestCase):
                 if argv[0] == "kubectl":
                     kubectl += 1
                     self.assertEqual("get", argv[1])
+                    self.assertIn("--kubeconfig", argv, "a reconciler read on the agent's own cluster")
                     self.assertTrue(evaluate(argv).allowed, line)
         self.assertGreaterEqual(kubectl, 5, "the reconciler reads moved or the parser is stale")
 
