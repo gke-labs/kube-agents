@@ -257,7 +257,9 @@ and a manifest you add declares its object, so merging it keeps the object.
      `Application`: with its resources finalizer, deleting it deletes
      everything it deploys.
 
-   Then continue with Step 3.
+   Then continue with Step 3. A delete's pull request body ends with what
+   step 5 read about the reconciler, in place of the template's closing line
+   about triggering a rollout.
 
 4. **The repository does not declare it.** Stop with: "`<repo>` does not
    declare `<kind>/<name>`, so a pull request cannot delete it: removing a
@@ -294,7 +296,7 @@ and a manifest you add declares its object, so merging it keeps the object.
    - A Flux `Kustomization` prunes only with `spec.prune: true`.
    - Config Sync deletes the objects it applied when their file goes.
    - Pruning skips an object that opts out, so read the live object's
-     annotations (`kubectl get <kind> <name> -o yaml`) before saying it will
+     annotations (`kubectl get <kind> <name> -o yaml --kubeconfig "<target kubeconfig>"`) before saying it will
      be deleted: `argocd.argoproj.io/sync-options: Prune=false`,
      `kustomize.toolkit.fluxcd.io/prune: disabled`,
      `configmanagement.gke.io/managed: disabled` or
@@ -313,7 +315,7 @@ and a manifest you add declares its object, so merging it keeps the object.
    and fall back to their CRDs, which this agent's role can read:
 
    ```bash
-   kubectl get crd applications.argoproj.io kustomizations.kustomize.toolkit.fluxcd.io rootsyncs.configsync.gke.io reposyncs.configsync.gke.io
+   kubectl get crd applications.argoproj.io kustomizations.kustomize.toolkit.fluxcd.io rootsyncs.configsync.gke.io reposyncs.configsync.gke.io --kubeconfig "<target kubeconfig>"
    ```
 
    Name a reconciler in the reply or the pull request body only if you found

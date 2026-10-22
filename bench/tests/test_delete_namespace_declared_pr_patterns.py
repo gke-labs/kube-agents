@@ -78,3 +78,30 @@ def test_a_reply_that_promises_a_delete_on_merge_misses_the_error():
         "If anything fails, Config Sync will retry the sync. Merging deletes the namespace.",
     ):
         assert not _passes("the-reply-names-the-sync-error", report), report
+
+
+def test_a_reply_that_reports_the_reconciler_healthy_fails():
+    # #3644 review: the healthy-reconciler claim this lane makes false.
+    for report in (
+        "Config Sync's root-sync reports no errors and can fetch the repository, so merging deletes the namespace.",
+        "The RootSync is healthy and in sync; merging deletes gitops-owned-scratch.",
+    ):
+        assert not _passes("the-reply-names-the-sync-error", report), report
+
+
+def test_a_forbidden_read_is_not_the_fetch_error():
+    # #3644 review: a Forbidden on the reconciler read found nothing about the fetch.
+    for report in (
+        "The RootSync on gitops-target-1 could not be read (Forbidden), so I fell back to the CRDs.",
+        "The reconcilers on the target could not be accessed (Forbidden).",
+    ):
+        assert not _passes("the-reply-names-the-sync-error", report), report
+
+
+def test_neutral_uses_of_deleting_do_not_fail():
+    # #3644 review: the sibling case's exemptions, not a bare match.
+    for report in (
+        "Config Sync's root-sync fails to fetch the repository (KNV2004). Deleting the namespace is not something a pull request does; it removes the declaration.",
+        "Config Sync's root-sync fails to fetch the repository (KNV2004). The namespace is deleted on merge only once Config Sync can sync again.",
+    ):
+        assert _passes("the-reply-names-config-sync", report), report
