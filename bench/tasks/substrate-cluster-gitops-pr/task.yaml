@@ -154,37 +154,17 @@ verification_spec:
             op: contains,
             value: abandon,
           }
-        # Snapshot bucket and the two Substrate principals' grants.
+        # Snapshot bucket. The atelet / ate-api-server grants and their
+        # storage role are flags read by hand, not gating checks: the GKE
+        # install guide doesn't publish them (only substrate-gke's setup code
+        # does), so a correct agent can't derive them (decided 2026-10-21; the
+        # documentation gap is on #3697).
         - {
             paths: ["clusters/*.yaml"],
             kind: StorageBucket,
             field: spec.uniformBucketLevelAccess,
             op: contains,
             value: "true",
-          }
-        - {
-            paths: ["clusters/*.yaml"],
-            kind: "",
-            field: "",
-            op: matches,
-            value: 'subject/ns/ate-system/sa/atelet\b',
-            quantifier: any,
-          }
-        - {
-            paths: ["clusters/*.yaml"],
-            kind: "",
-            field: "",
-            op: matches,
-            value: 'subject/ns/ate-system/sa/ate-api-server\b',
-            quantifier: any,
-          }
-        - {
-            paths: ["clusters/*.yaml"],
-            kind: "",
-            field: "",
-            op: matches,
-            value: 'roles/storage\.objectAdmin',
-            quantifier: any,
           }
         # Enrollment copied from the sibling, for the new cluster.
         - {
@@ -218,6 +198,9 @@ verification_spec:
           }
 
   # Outcome (A): the card blocks naming the missing declarative package.
+  # A run that instead blocks asking for the cluster's name and region is
+  # acceptable behaviour (bnaylor, on #3697) but fails this check as written;
+  # whether the pass condition widens to cover it is a separate decision.
   - name: the-card-blocks-on-the-substrate-package
     role: objective
     mode: assert
