@@ -365,7 +365,7 @@ except Exception:
 # Not on the title: the front door composes that and could reword it, and it
 # carries no id.
 drift_wait_for_card() {
-  local board_probe pod_python candidate elapsed found finished out probe_rc probe_err finish_timeout
+  local board_probe pod_python candidate elapsed started bound found finished out probe_rc probe_err finish_timeout
 
   board_probe="$DRIFT_MODULE_DIR/$DRIFT_BOARD_PROBE"
   probe_err="$drift_kubeconfig_dir/$DRIFT_PROBE_STDERR"
@@ -386,22 +386,37 @@ drift_wait_for_card() {
     exit 1
   fi
 
-  elapsed=0
+  # Integers, checked before either loop rather than discovered inside one. A
+  # non-integer bound makes `[ "$elapsed" -ge "$bound" ]` an error, and an error
+  # in an `if` condition is false rather than fatal under errexit, so the loop
+  # would never reach its bound and would poll for ever.
+  finish_timeout="${drift_card_finish_timeout:-$DRIFT_DEFAULT_CARD_FINISH_TIMEOUT}"
+  for bound in "$drift_card_wait_timeout" "$finish_timeout" "$drift_poll_interval"; do
+    case "$bound" in
+      "" | *[!0-9]*)
+        echo "ERROR: drift_card_wait_timeout, drift_card_finish_timeout and drift_poll_interval must be whole seconds; got '$bound'." >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  # Elapsed time is the clock's, not the sum of the sleeps. Each poll is a
+  # kubectl exec that starts an interpreter in the pod, which is not free, so
+  # counting only the sleeps would let a bound run several times its value and
+  # would misreport how long the card took.
+  started=$SECONDS
   while :; do
     drift_probe_board
+    elapsed=$((SECONDS - started))
     if [ "$found" -ge 1 ]; then
       break
     fi
     if [ "$elapsed" -ge "$drift_card_wait_timeout" ]; then
       echo "ERROR: the daemon accepted the record but no kanban card carrying insert_id=$drift_insert_id appeared within ${elapsed}s. The front-door turn the daemon queued either never ran or filed nothing, so there is no triage for the agent to read." >&2
-      if [ "$probe_rc" -ne 0 ] || [ -s "$probe_err" ]; then
-        echo "The board probe's last run exited $probe_rc and said:" >&2
-        cat "$probe_err" >&2
-      fi
+      drift_report_probe_error
       exit 1
     fi
     sleep "$drift_poll_interval"
-    elapsed=$((elapsed + drift_poll_interval))
   done
   echo "Triage card for $drift_insert_id appeared after ${elapsed}s."
 
@@ -416,14 +431,18 @@ drift_wait_for_card() {
   # card it had not seen finish -- two of them CUJ 1's, after 12 and 14 polls,
   # where every repetition that passed had needed at least 15. The cases grade
   # the triage, not the polling, so the wait moves here and the agent's turn
-  # becomes the read it was meant to be. The runtime gap is filed separately.
+  # becomes the read it was meant to be. The runtime gap is #3761.
   #
-  # Inside the unit either way, so it costs the infra-lock chain nothing: the
-  # repetitions that passed already spent this wait in the agent's turn.
-  finish_timeout="${drift_card_finish_timeout:-$DRIFT_DEFAULT_CARD_FINISH_TIMEOUT}"
-  elapsed=0
+  # Inside the unit either way: a repetition that would have passed already
+  # spent this wait in the agent's turn, so the typical case costs the
+  # infra-lock chain nothing. A card still running at the ceiling adds up to
+  # that ceiling on top of whatever the agent then waits.
+  #
+  # The appearance loop's last read already carries `finished`, so it is
+  # judged before the first sleep rather than re-probed straight away.
+  started=$SECONDS
   while :; do
-    drift_probe_board
+    elapsed=$((SECONDS - started))
     if [ "$finished" -eq "$DRIFT_FINISHED_UNKNOWN" ]; then
       echo "WARNING: the board has no status column to read, so this run cannot wait for the card to finish; the agent's turn starts with the card in whatever state it is in." >&2
       return 0
@@ -433,32 +452,54 @@ drift_wait_for_card() {
       return 0
     fi
     if [ "$elapsed" -ge "$finish_timeout" ]; then
-      echo "WARNING: the triage card for $drift_insert_id was still running ${elapsed}s after it appeared. Handing it to the agent's turn unfinished; the case's prompt tells the agent to wait for it." >&2
+      echo "WARNING: the triage card for $drift_insert_id was not seen to finish within ${elapsed}s of appearing. Handing it to the agent's turn as it is; the case's prompt tells the agent to wait for it." >&2
+      drift_report_probe_error
       return 0
     fi
     sleep "$drift_poll_interval"
-    elapsed=$((elapsed + drift_poll_interval))
+    drift_probe_board
   done
 }
 
-# One read of the board into `found` and `finished`, shape-checked.
+# One read of the board into `found` and `finished`. Internal to
+# drift_wait_for_card: it reads and writes that function's locals through
+# bash's dynamic scope, so called from anywhere else it would set globals and
+# read names nobody set.
 #
-# Both are checked for shape before `-ge` sees them. `[ "" -ge 1 ]` is a syntax
-# error under errexit, and a kubectl exec that fails halfway can return partial
-# output as easily as none, so anything that is not two integers reads as
-# "nothing yet" and the caller keeps polling. The exec's stderr is kept for the
-# appearance timeout to report, so a refused exec is not taken for a verdict
-# about the front door.
+# Only a reply of exactly two integers counts. `[ "" -ge 1 ]` is a syntax error
+# under errexit, and a kubectl exec that fails halfway can return partial output
+# as easily as none -- including a single token, which a naive split would read
+# as both numbers at once. Anything else reads as "nothing yet" and the caller
+# keeps polling. The exec's stderr is kept for drift_report_probe_error, so a
+# refused exec is not taken for a verdict about the front door or the card.
 drift_probe_board() {
   probe_rc=0
   out="$("${drift_exec_in_pod_stdin[@]}" "$pod_python" - "$drift_insert_id" < "$board_probe" 2>"$probe_err")" || probe_rc=$?
+  found=0
+  finished=0
+  case "$out" in
+    *" "*" "*) return 0 ;;
+    *" "*) ;;
+    *) return 0 ;;
+  esac
+  case "${out%% *}" in
+    "" | *[!0-9]*) return 0 ;;
+  esac
+  case "${out#* }" in
+    "$DRIFT_FINISHED_UNKNOWN") ;;
+    "" | *[!0-9]*) return 0 ;;
+  esac
   found="${out%% *}"
   finished="${out#* }"
-  case "$found" in
-    "" | *[!0-9]*) found=0 ;;
-  esac
-  case "$finished" in
-    "$DRIFT_FINISHED_UNKNOWN") ;;
-    "" | *[!0-9]*) finished=0 ;;
-  esac
+}
+
+# Say what the last board read failed with, if it failed. Internal to
+# drift_wait_for_card, for the same reason as drift_probe_board. Without it a
+# pod that rolled or an exec that was refused would read as a card that never
+# appeared, or one that never finished.
+drift_report_probe_error() {
+  if [ "$probe_rc" -ne 0 ] || [ -s "$probe_err" ]; then
+    echo "The board probe's last run exited $probe_rc and said:" >&2
+    cat "$probe_err" >&2
+  fi
 }

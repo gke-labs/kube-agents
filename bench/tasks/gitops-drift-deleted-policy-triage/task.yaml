@@ -48,8 +48,9 @@
 # The fixture brings its own drift. bench/tf/prebuilt/gitops-drift-deleted-policy
 # plants the namespace, the workload, the policy applied by a GitOps field
 # manager and then deleted, hands the daemon the audit record that deletion
-# would have produced, and does not return until the resulting card is on the
-# board. Its header explains why the record is planted rather than observed.
+# would have produced, and does not return until the resulting card has
+# finished, or a ceiling passes. Its header explains why the record is planted
+# rather than observed.
 #
 # The cluster is the one the Platform Agent pod runs in, not a per-run one,
 # because the daemon binds loopback inside that pod and the planted namespace

@@ -2911,8 +2911,8 @@ unit_cost_hint() {
     gpu-stress-test-diagnosis | autoops-warning-event-triage) echo 900 ;;
     # The third tofu case, nightly-only from the start (#1827). Unmeasured:
     # priced with the two above it because it is the same shape -- infra lock,
-    # a plant that blocks on a card appearing, then an agent turn that waits on
-    # that card finishing. A wrong hint costs packing, not correctness.
+    # a plant that blocks on a card appearing and then finishing, then an agent
+    # turn that reads it. A wrong hint costs packing, not correctness.
     gitops-drift-out-of-band-triage) echo 900 ;;
     # Another of the same shape: infra lock, a plant that publishes a burst and
     # then waits out the human record's card, then an agent turn that is a

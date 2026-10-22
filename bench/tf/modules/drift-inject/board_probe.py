@@ -12,13 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Count the kanban cards carrying a run's insert id, and how many have finished.
+"""Count the kanban cards carrying a run's insert id, and say whether the newest has finished.
 
 Run inside the agent container by `drift_wait_for_card`, which pipes this file
 to the pod's interpreter on stdin and passes the insert id as argv[1]. It prints
 one line, `<matching> <finished>`, and nothing else; the caller polls it.
-`<finished>` is -1 when the board has no `status` column to read, so the caller
-can tell "not finished" from "cannot tell".
+`<finished>` is 1 when the newest matching card is in a terminal status and 0
+when it is not, and -1 when the board has no `status` column to read, so the
+caller can tell "not finished" from "cannot tell".
+
+The newest card rather than any of them, because that is the one the drift
+cases' prompts send the agent to. If more than one card carries the id, a
+re-queued front-door turn say, the first to finish is not necessarily the one
+the agent reads.
 
 Read out of the board's SQLite file rather than from a log line, which is the
 one place the drift stacks are coupled to an internal path. There is no external
@@ -42,9 +48,14 @@ BOARD = os.environ.get("DRIFT_BOARD_URI", "file:/opt/data/kanban.db?mode=ro")
 TEXT_COLUMN_TYPE = "TEXT"
 TASKS_TABLE = "tasks"
 STATUS_COLUMN = "status"
-# The statuses after which a card's result will not change: the same three the
-# drift cases' prompts wait for before reproducing a card.
-FINISHED_STATUSES = ("done", "blocked", "archived")
+# The statuses after which a card's result will not change: Hermes' terminal
+# set, the same five bench/kube_agents_bench/harness.py's _TERMINAL_STATUSES
+# and agents/platform/scripts/kanban_workspace_gc.py name. failed and cancelled
+# matter as much as done: a card that failed and is left out of this set is
+# waited on to the ceiling and then reported as still running.
+FINISHED_STATUSES = ("done", "blocked", "archived", "failed", "cancelled")
+# Orders matching cards so the newest is read; absent, any row stands for all.
+CREATED_COLUMN = "created_at"
 UNKNOWN = -1
 
 
@@ -60,14 +71,16 @@ def probe(insert_id):
         where = " OR ".join(f'"{c}" LIKE ?' for c in columns)
         params = [needle] * len(columns)
         matching = conn.execute(f"SELECT COUNT(*) FROM {TASKS_TABLE} WHERE {where}", params).fetchone()[0]
-        if STATUS_COLUMN not in {row[1] for row in info}:
+        names = {row[1] for row in info}
+        if STATUS_COLUMN not in names:
             return matching, UNKNOWN
-        marks = ",".join("?" for _ in FINISHED_STATUSES)
-        finished = conn.execute(
-            f'SELECT COUNT(*) FROM {TASKS_TABLE} WHERE ({where}) AND "{STATUS_COLUMN}" IN ({marks})',
-            params + list(FINISHED_STATUSES),
+        if not matching:
+            return 0, 0
+        order = f'ORDER BY "{CREATED_COLUMN}" DESC' if CREATED_COLUMN in names else ""
+        newest = conn.execute(
+            f'SELECT "{STATUS_COLUMN}" FROM {TASKS_TABLE} WHERE {where} {order} LIMIT 1', params
         ).fetchone()[0]
-        return matching, finished
+        return matching, 1 if newest in FINISHED_STATUSES else 0
     except sqlite3.Error:
         return 0, 0
 

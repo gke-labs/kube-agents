@@ -15,12 +15,12 @@
 # The scenario brings its own drift. bench/tf/prebuilt/gitops-drift plants one
 # Deployment whose replica count was taken out of band, hands the daemon the
 # audit record that change would have produced, and does not return until the
-# resulting triage card is on the board. Its header explains why the record is
-# planted rather than observed -- the short form is that the detector correctly
-# drops automation principals, and every principal a bench fixture can
-# authenticate as is one, so a change this case made with kubectl would be
-# dropped by design and the case would time out waiting for a card the pipeline
-# was right not to file.
+# resulting triage card has finished, or a ceiling passes. Its header explains
+# why the record is planted rather than observed -- the short form is that the
+# detector correctly drops automation principals, and every principal a bench
+# fixture can authenticate as is one, so a change this case made with kubectl
+# would be dropped by design and the case would time out waiting for a card the
+# pipeline was right not to file.
 #
 # The cluster is the one the Platform Agent pod runs in, not a per-run one,
 # because the daemon binds loopback inside that pod and the planted object has

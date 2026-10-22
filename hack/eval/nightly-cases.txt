@@ -188,8 +188,9 @@
 # takes the infra lock, plants a Deployment whose replica count was taken out
 # of band, hands the Session KV daemon the audit record that change would have
 # produced, and blocks until the resulting triage card is on the board
-# (bounded at 5 minutes) -- then the agent turn waits on the card itself, as
-# autoops does. Hinted at 900s with them, unmeasured.
+# (bounded at 5 minutes) and then until it finishes (bounded at 15), so the
+# agent turn reads a finished card rather than polling a running one. Hinted
+# at 900s with them, unmeasured.
 #
 # The daemon also has a drift alert ceiling that the other two do not have.
 # It allows ALERT_DAILY_LIMIT_DRIFT drift alerts a day per install and

@@ -848,6 +848,8 @@ class DriftInjectModuleStructureTests(DriftShellTestBase):
         "drift_build_payload",
         "drift_inject_record",
         "drift_wait_for_card",
+        "drift_probe_board",
+        "drift_report_probe_error",
     )
 
     def test_sourcing_drift_inject_sh_runs_no_commands_and_defines_constants(self):
@@ -892,3 +894,135 @@ printf "AT=%s\\n" "$drift_changed_at"
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# A stand-in for the pod's interpreter. drift_wait_for_card runs
+# `"$pod_python" - "$insert_id" < board_probe.py` through kubectl exec, and the
+# kubectl stub above runs whatever follows `--` locally, so this is what answers
+# each board read. It replies with the next line of FAKE_PROBE_REPLIES each time
+# and repeats the last one when they run out; a reply of `FAIL` exits non-zero
+# with a message on stderr, the shape of an exec into a pod that has gone.
+_FAKE_POD_PYTHON = """\
+#!/usr/bin/env python3
+import os, sys
+if len(sys.argv) > 1 and sys.argv[1] == "-c":
+    sys.exit(0)
+sys.stdin.read()
+replies = os.environ["FAKE_PROBE_REPLIES"].split("|")
+state = os.environ["FAKE_PROBE_STATE"]
+n = int(open(state).read()) if os.path.exists(state) else 0
+open(state, "w").write(str(n + 1))
+reply = replies[min(n, len(replies) - 1)]
+if reply == "FAIL":
+    sys.stderr.write("error: unable to upgrade connection: pod does not exist\\n")
+    sys.exit(1)
+sys.stdout.write(reply + "\\n")
+"""
+
+
+class DriftWaitForCardTests(DriftShellTestBase):
+    """The two-stage wait: the card appears, then it finishes, then the turn starts.
+
+    The finish half exists because an agent left to poll a running card is
+    stopped by the runtime's repetition filter (#3761), so what these pin is
+    that the fixture does not hand over early, does not wait for ever, and does
+    not misreport an exec failure as a slow card.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.fake_python = self.bin_dir / "fake-pod-python"
+        self.fake_python.write_text(_FAKE_POD_PYTHON, encoding="utf-8")
+        self.fake_python.chmod(self.fake_python.stat().st_mode | stat.S_IXUSR)
+        self.state = pathlib.Path(self.temp_dir.name) / "probe_reads"
+        self.set_kubectl_config({})
+
+    def wait(self, replies, card_wait=30, finish=30, interval=0):
+        script = f"""\
+set -euo pipefail
+source "{SCRIPT}"
+DRIFT_POD_PYTHON_CANDIDATES="{self.fake_python}"
+drift_kubeconfig_dir="{self.temp_dir.name}"
+drift_agent_container=platform-agent
+drift_insert_id=eval-drift-1-2
+drift_card_wait_timeout={card_wait}
+drift_card_finish_timeout={finish}
+drift_poll_interval={interval}
+drift_exec_in_pod=(kubectl exec deploy/x -n ns -c c --)
+drift_exec_in_pod_stdin=(kubectl exec -i deploy/x -n ns -c c --)
+drift_wait_for_card
+echo "RETURNED $?"
+"""
+        return self.run_bash(
+            script,
+            extra_env={"FAKE_PROBE_REPLIES": "|".join(replies), "FAKE_PROBE_STATE": str(self.state)},
+        )
+
+    def reads(self):
+        return int(self.state.read_text()) if self.state.exists() else 0
+
+    def test_waits_through_appearance_and_running_until_finished(self):
+        proc = self.wait(["0 0", "1 0", "1 0", "1 1"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("appeared after", proc.stdout)
+        self.assertIn("finished after a further", proc.stdout)
+        self.assertIn("RETURNED 0", proc.stdout)
+        self.assertEqual(self.reads(), 4)
+
+    def test_a_card_already_finished_when_it_appears_is_not_probed_twice(self):
+        """The appearance read carries `finished`; re-probing it would cost an exec."""
+        proc = self.wait(["1 1"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("finished after a further", proc.stdout)
+        self.assertEqual(self.reads(), 1)
+
+    def test_a_single_token_is_not_read_as_found_and_finished(self):
+        """A reply cut off mid-line must read as nothing yet, not as `1 1`."""
+        proc = self.wait(["1", "1 0", "1 1"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.reads(), 3)
+
+    def test_malformed_replies_read_as_nothing_yet(self):
+        for bad in ("", "x y", "1 x", "1 2 3", "-1 1"):
+            with self.subTest(reply=bad):
+                if self.state.exists():
+                    self.state.unlink()
+                proc = self.wait([bad, "1 1"])
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(self.reads(), 2)
+
+    def test_a_board_without_status_hands_over_at_once_with_a_warning(self):
+        proc = self.wait(["1 -1"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("no status column", proc.stderr)
+        self.assertEqual(self.reads(), 1)
+
+    def test_a_card_still_running_at_the_ceiling_is_handed_over_not_failed(self):
+        proc = self.wait(["1 0"], finish=0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("not seen to finish", proc.stderr)
+        self.assertIn("RETURNED 0", proc.stdout)
+
+    def test_an_exec_failure_at_the_finish_ceiling_is_reported_not_taken_for_a_slow_card(self):
+        """A pod that rolled mid-wait must say so, not read as a card that never finished."""
+        proc = self.wait(["1 0", "FAIL"], finish=1, interval=1)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("not seen to finish", proc.stderr)
+        self.assertIn("The board probe's last run exited 1", proc.stderr)
+        self.assertIn("pod does not exist", proc.stderr)
+
+    def test_an_exec_failure_at_the_appearance_ceiling_is_reported_and_fails(self):
+        proc = self.wait(["FAIL"], card_wait=0)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("no kanban card carrying insert_id", proc.stderr)
+        self.assertIn("The board probe's last run exited 1", proc.stderr)
+
+    def test_a_non_integer_bound_fails_at_once_instead_of_polling_for_ever(self):
+        for field in ("card_wait", "finish", "interval"):
+            with self.subTest(bound=field):
+                if self.state.exists():
+                    self.state.unlink()
+                proc = self.wait(["1 0"], **{field: "abc"})
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("must be whole seconds", proc.stderr)
+                self.assertEqual(self.reads(), 0)

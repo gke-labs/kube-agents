@@ -285,9 +285,10 @@ resource "null_resource" "drift" {
 
       # ---- 3. Wait for the card ---------------------------------------------
       # The inject returns as soon as the daemon has queued the front-door turn;
-      # the card appears when that turn runs. Without this wait the agent turn
-      # starts first, finds an empty board, and the case grades a correct agent
-      # on a fixture that had not finished.
+      # the card appears when that turn runs, and then takes minutes to finish.
+      # This waits for both, so the agent turn reads a finished card -- left to
+      # poll a running one, the agent is stopped by the runtime's repetition
+      # filter (#3761) and reports a card it never saw finish.
       drift_wait_for_card
     EOT
   }

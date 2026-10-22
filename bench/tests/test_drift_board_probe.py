@@ -77,7 +77,7 @@ class BoardProbe(unittest.TestCase):
         self.assertEqual(self.probe(), "1 0")
 
     def test_each_terminal_status_counts_as_finished(self):
-        for status in ("done", "blocked", "archived"):
+        for status in ("done", "blocked", "archived", "failed", "cancelled"):
             with self.subTest(status=status):
                 if self.db.exists():
                     self.db.unlink()
@@ -91,6 +91,24 @@ class BoardProbe(unittest.TestCase):
                     self.db.unlink()
                 self.board([self.card(status)])
                 self.assertEqual(self.probe(), "1 0")
+
+    def test_a_failed_card_ends_the_wait_rather_than_sitting_out_the_ceiling(self):
+        """failed and cancelled are Hermes' terminal failures, as harness.py names them."""
+        self.board([self.card("failed")])
+        self.assertEqual(self.probe(), "1 1")
+
+    def test_only_the_newest_matching_card_decides(self):
+        """The prompt sends the agent to the newest card, so that is the one waited on."""
+        conn = sqlite3.connect(self.db)
+        conn.execute("CREATE TABLE tasks (id TEXT, title TEXT, body TEXT, status TEXT, created_at INTEGER)")
+        body = f"... insertId={RUN} ..."
+        conn.executemany(
+            "INSERT INTO tasks VALUES (?, ?, ?, ?, ?)",
+            [("t_old", "Triage", body, "done", 100), ("t_new", "Triage", body, "running", 200)],
+        )
+        conn.commit()
+        conn.close()
+        self.assertEqual(self.probe(), "2 0")
 
     def test_another_runs_finished_card_does_not_satisfy_this_run(self):
         """The board is shared across runs; only this run's insert id may count."""
