@@ -75,7 +75,7 @@ _INTERPOLATIONS = {
     "var.host_cluster_location": "us-central1",
     "var.agent_deployment": "platform-agent-gateway",
     "var.agent_namespace": "kubeagents-system",
-    "var.agent_container": "envoy-credential-proxy",
+    "var.agent_container": "agent-api-auth",
     "var.allocate_mib": "96",
     "var.memory_limit_mib": "64",
 }
@@ -89,9 +89,12 @@ _OWNER_LABEL = "kube-agents-bench"
 #: healthy path: no leftover namespace, debounce already cleared, watcher fires.
 #: `NS_OWNER` uses `${VAR-default}` rather than `${VAR:-default}` so a test can
 #: set it empty to mean "the namespace carries no managed-by label".
+#: `POD_CONTAINERS` is the gateway pod's container list as step 0a reads it:
+#: the native sidecars first, then the regular containers.
 _KUBECTL_STUB = """#!/bin/bash
 echo "kubectl $*" >> "$CALLS"
 case "$*" in
+  *"get deployment"*jsonpath*)  echo "${POD_CONTAINERS-agent-api-auth platform-agent}"; exit 0 ;;
   *"get namespace"*jsonpath*)   echo "${NS_OWNER-%(owner)s}"; exit 0 ;;
   *"get namespace"*"-o yaml"*)  echo "kind: Namespace"; exit 0 ;;
   *"get namespace"*)            exit "${NS_EXISTS_RC:-1}" ;;
@@ -368,6 +371,23 @@ class AutoopsIncidentPlantTest(unittest.TestCase):
             [],
             "the plant ran kubectl against the ambient context after failing "
             f"to fetch the host cluster's credentials:\n{chr(10).join(calls)}",
+        )
+
+    def test_a_container_the_pod_lacks_fails_before_anything_is_planted(self):
+        # #3681: the watcher moved out of envoy-credential-proxy (#913) while
+        # this stack kept reading that container's log with stderr discarded,
+        # so every run spent the 300s watcher wait and blamed the watcher. The
+        # pod here carries the post-#913 layout minus agent-api-auth.
+        completed, calls = self._run(
+            POD_CONTAINERS="platform-agent platform-agent-dashboard fluent-bit"
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("has no container 'agent-api-auth'", completed.stderr)
+        self.assertEqual(
+            self._indices(calls, "apply -f -") + self._indices(calls, "logs "),
+            [],
+            "the plant went on to plant and poll against a container the pod "
+            f"does not have:\n{chr(10).join(calls)}",
         )
 
     def test_a_wedged_leftover_namespace_fails_with_its_own_message(self):
