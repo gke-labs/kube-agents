@@ -102,6 +102,7 @@ class GitHubForge(Forge):
     cli = "gh"
     error_overrides = ERROR_OVERRIDES
     acknowledges = True
+    labels = True
 
     def __init__(
         self,

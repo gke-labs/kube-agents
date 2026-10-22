@@ -1544,8 +1544,10 @@ var a2aCredsKeys = []string{
 	a2aBridgeActivityKey,
 }
 
-// a2aActivityHookEvents are the hook events the door reads.
-var a2aActivityHookEvents = []string{"pre_tool_call", "post_tool_call"}
+// a2aActivityHookEvents are the hook events the door reads: the tool calls
+// for the activity trace, and each model request for the plan steps it
+// stands for.
+var a2aActivityHookEvents = []string{"pre_tool_call", "post_tool_call", "post_api_request"}
 
 // a2aWildcardListenHosts are the listen hosts that bind every interface, the
 // hook's loopback address included: the empty host (":8651") and the IPv4
@@ -4049,16 +4051,18 @@ func buildA2AGatewayServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.S
 	}
 }
 
-// buildA2AGatewayRole carries exactly what the gateway's boot and its session
-// spawning need, and nothing else. Both rules arrive with their consumer: the
-// owner read shipped with the Deployment that reads it, and the pod verbs ship
-// here, with the worker image and the A2A_SPAWN_SESSIONS that make the gateway
-// use them. A pod-lifecycle grant with nothing spawning pods would be a
-// standing grant nobody can point at a caller for.
+// buildA2AGatewayRole carries exactly what the gateway's boot, its session
+// spawning and its "/feedback summary" answer need, and nothing else. Each
+// rule arrives with its consumer: the owner read shipped with the Deployment
+// that reads it, the pod verbs ship here with the worker image and the
+// A2A_SPAWN_SESSIONS that make the gateway use them, and the PlatformAgent
+// read with the gateway code that renders the summary from it. A grant with
+// nothing calling it would be a standing grant nobody can point at a caller
+// for.
 //
-// Namespaced, and pods only. The gateway creates and reaps one pod per
-// delegated task in its own namespace; it reads no Secret, no ConfigMap and no
-// other namespace.
+// Namespaced: pods, its own Deployment and its own PlatformAgent, the last two
+// pinned by name. The gateway creates and reaps one pod per delegated task in
+// its own namespace; it reads no Secret, no ConfigMap and no other namespace.
 //
 // What it does NOT bound, stated because the next reader will otherwise take
 // this rule for a ceiling: `create` on pods is a privilege-escalation
@@ -4096,6 +4100,16 @@ func buildA2AGatewayRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 				APIGroups:     []string{"apps"},
 				Resources:     []string{"deployments"},
 				ResourceNames: []string{a2aGatewayName(agent)},
+				Verbs:         []string{"get"},
+			},
+			// One more read, on one named object: "/feedback summary" prints
+			// the PlatformAgent's status.usage counters, mode, tag and age
+			// (a2a/gateway/feedback_summary.go). resourceNames pins it to this
+			// agent's resource; the gateway cannot list or write any.
+			{
+				APIGroups:     []string{agentv1alpha1.GroupVersion.Group},
+				Resources:     []string{"platformagents"},
+				ResourceNames: []string{agent.Name},
 				Verbs:         []string{"get"},
 			},
 		},

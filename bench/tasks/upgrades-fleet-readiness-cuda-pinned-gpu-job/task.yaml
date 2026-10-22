@@ -1,0 +1,229 @@
+# The readiness report names a GPU job with a CUDA pin and says which driver check it could not make
+#
+# One of the upgrade-failure catalogue's scenario cases
+# (docs/designs/upgrade-failure-catalogue.md, entry 18: GPU driver mismatch).
+# It grades the readiness report's `gpu-driver` rule in the
+# fleet-upgrade-verification skill (scripts/readiness_rules/gpu_driver_mismatch.py),
+# through the agent's answer to the fleet readiness question.
+#
+# The rule reads every template requesting nvidia.com/gpu: the CUDA version
+# from the image tag or a CUDA-named env value, and the driver from the pools
+# carrying the accelerator the template selects, at the target's minor in
+# GKE's driver table. A driver below the CUDA major's floor blocks; one below
+# the toolkit's own minimum is a risk; a Standard template whose accelerator
+# no pool carries is a risk, since the target driver cannot be read. The
+# seeded fleet has no nvidia-l4 pool, so cuda-pinned-trainer is that risk: the
+# pin image docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04 stays unchecked, and
+# the report says so. The declared line therefore reads `blocks the upgrade:
+# no`, and the case grades that the agent names the CronJob from the report
+# and does not call it a blocker or invent a driver version. The blocking
+# path, a GPU pool whose target driver is below the CUDA major's floor, is
+# covered by the rule's unit tests; this fleet cannot show it.
+#
+# What the deterministic checks read, and what they leave to the judge. The
+# prompt asks for one fixed-form line per seeded cluster, "<cluster>:
+# gpu-driver: <object kind namespace/name|none>; blocks the upgrade:
+# <yes|no|none>; cell: <the rule's text for that cluster|none>", the shape the
+# per-cluster readiness cases use (upgrades-readiness-surge-capacity), and the
+# checks read those lines and nothing else; the prose, the reason the rule
+# gives, and the recommended remedy are the judge's, against
+# `expected_output`. The case first asked for one line per object the report
+# names ("<cluster>/<object name>: kind ...; blocks the upgrade: ...; cell:
+# ..."), anchored on the object's name, and nine runs on the dev install
+# passed none of them: the agent read "<cluster>/<object name>" as
+# "<project>/<cluster>" and wrote the object's name after "; blocks the
+# upgrade:", where the anchor could not find it, or left a note-column object
+# out of a list it built from the risks. A line per cluster, anchored on the
+# cluster's name with the object as one slot of the line, has no such reading.
+# Slot a's line must name the planted CronJob and read `blocks the upgrade:
+# no`, and its cell slot must carry the rule's own text, wording only the rule
+# produces (`gpu-driver: CronJob seeded-shapes/cuda-pinned-trainer: requests
+# nvidia.com/gpu on accelerator nvidia-l4 and no pool in the cluster carries
+# that accelerator`), which the skill paraphrases and a hand kubectl survey
+# cannot supply; a report whose rule is missing prints no such entry, so the
+# slot reads `none` or another rule's text and the line fails there whatever
+# the verdict says. The other three slots read `none` in every slot: the
+# fleet's only nvidia.com/gpu request is cuda-pinned-trainer's
+# (bench/tf/fleet/defects-*.tf), so the rule prints nothing for them and a
+# line naming an object, a verdict or a cell there is a wrong read. The cell
+# carries a `;`, which keeps the verifier's value-wrap fold from removing a
+# quote or angle bracket the agent kept around it, so the cell patterns admit
+# any prefix before the rule's text, a note column's other entries included; a
+# pod of the workload may stand in for it in the object slot (the name plus
+# one or two hash suffixes), as the agent sometimes renders it. Every pattern
+# is read after the harness's trail fold (`fold_decoration`) and matches the
+# whole line, anchored at both ends; each forbid is the same frame with any
+# other value, so a second line about a slot that contradicts the first fails
+# whatever the right line says. The patterns name the slots through
+# `{cluster:<slot>}`, which the verifier expands to the cluster the runner
+# recorded for the slot, so a fleet applied with another prefix is graded on
+# its own names; a slot the runner did not reach is an `error` about the
+# environment, never a `fail` charged to the agent, so the case adds no role
+# per slot to `fixtures:`.
+#
+# Planted defect required: on slot a, the suspended CronJob
+# cuda-pinned-trainer in seeded-shapes, requesting one nvidia.com/gpu,
+# selecting the nvidia-l4 accelerator, with an image pinned to CUDA 12.2 (role
+# `cuda-pinned-gpu-job` in bench/tf/fleet/fixtures.json). The safeguard reads
+# that the CronJob is still suspended after the run, so an agent that changed
+# the planted object fails the case whatever its answer says. No
+# `worker_commands` objective: it reads delegated workers' terminals only and
+# errors on a run the router answered itself, so the report's own output is
+# graded through the cell slot instead, as
+# upgrades-readiness-zonal-control-plane does.
+#
+# Isolation class: read-only (chat prompt; the readiness script reads with
+# gcloud container and kubectl get and writes only its own record and
+# per-member kubeconfig files). Eligible tier: nightly from its first merge.
+id: upgrades-fleet-readiness-cuda-pinned-gpu-job
+name: Fleet upgrade readiness names the CUDA-pinned GPU job
+prompt: >-
+  Check every cluster in this project for its readiness to upgrade to its
+  release channel's default version. For each cluster, report what blocks the
+  upgrade and what is at risk. Read only: do not change, upgrade or remove
+  anything. End your answer with one line per seeded cluster in exactly this
+  form, no other words on the line: "<cluster>: gpu-driver: <object kind
+  namespace/name|none>; blocks the upgrade: <yes|no|none>; cell: <the rule's
+  text for that cluster copied as printed|none>". The cell is the gpu-driver
+  rule's text for that cluster, copied from the readiness report's risks
+  column (or its other blockers or note column) or from the member's row in
+  the report's JSON (readiness.risks, readiness.notes), as printed and not
+  paraphrased; a cluster the rule prints nothing for reads none in every slot.
+  Write the object as the report names it, with no brackets, quotes or
+  parentheses around it, and put any aside on a line of its own.
+expected_output: >-
+  A per-cluster readiness report read during this run. For seeded-a it names
+  the CronJob cuda-pinned-trainer in seeded-shapes: it requests nvidia.com/gpu
+  on the accelerator nvidia-l4 with an image pinned to CUDA 12.2. With no
+  nvidia-l4 pool in the cluster the report lists it under the risks: the
+  driver the target node image ships for it cannot be read and the pin stays
+  unchecked; with such a pool it names the driver GKE installs at the target
+  and says it serves CUDA 12.2, or that the driver table does not cover the
+  target. It does not call the CronJob a blocker and does not invent a driver
+  version. It recommends checking the pin against GKE's driver table when a
+  GPU pool exists, and a canary GPU pool first. Other clusters' blockers and
+  risks come from the same run. It ends with one declared line per seeded
+  cluster: for seeded-a "seeded-a: gpu-driver: CronJob
+  seeded-shapes/cuda-pinned-trainer; blocks the upgrade: no; cell: gpu-driver:
+  CronJob seeded-shapes/cuda-pinned-trainer: requests nvidia.com/gpu on
+  accelerator nvidia-l4 and no pool in the cluster carries that accelerator;
+  the target driver cannot be read, and the pin image
+  docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04 stays unchecked", the cell
+  copied from the report's risks column, and for seeded-b, seeded-c and
+  seeded-d "gpu-driver: none; blocks the upgrade: none; cell: none". It cites
+  no CVE identifiers and changes nothing.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+# Named by ROLE, not cluster: bench/tf/fleet/fixtures.json;
+# docs/designs/bench-fleet-catalog.md is the rule.
+fixtures:
+  - cuda-pinned-gpu-job
+
+verification_spec:
+  # One line per seeded cluster, fixed vocabulary, the cluster named at the
+  # start of the line; every pattern matches the whole declared frame,
+  # anchored at both ends, with the line's decoration folded first
+  # (`fold_decoration: true`); a parenthetical after the cluster's name is
+  # allowed.
+  - name: every-seeded-cluster-has-a-declared-line
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - cuda-pinned-gpu-job
+      any_of_patterns:
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: gpu-driver: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: gpu-driver: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: gpu-driver: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: gpu-driver: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]+$)'
+
+  # The verdict this case exists for: slot a's line names cuda-pinned-trainer
+  # and reads no; the forbid is the same frame with any other object or
+  # verdict, so a line that promotes it, leaves it out or reads none fails
+  # here whatever the prose says. A pod of the workload may stand in for it
+  # (the name plus one or two hash suffixes).
+  - name: the-planted-object-is-named-and-does-not-block
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - cuda-pinned-gpu-job
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: gpu-driver: cronjob seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}; blocks the upgrade: no; cell: [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: gpu-driver: (?!cronjob seeded-shapes/cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}; blocks the upgrade: no; cell: )[^\n]*$'
+
+  # The report's own wording: the entry the risks column prints for the object
+  # is the rule's text, which the skill paraphrases and a cluster listing
+  # cannot supply. A report whose rule is missing prints no such entry, so the
+  # slot reads `none` or something else and the line fails here, whatever the
+  # verdict says. Any prefix is admitted before the rule's text: a quote or
+  # angle bracket the agent kept around the cell (the `;` inside it keeps the
+  # value-wrap fold from removing one), or a note column's other entries. The
+  # required text stops after the request and the start of the rule's reading
+  # (the accelerator no pool carries, or the pin on a pool), so a fleet with a
+  # GPU pool is still graded on the rule's own text.
+  - name: the-planted-objects-line-quotes-the-reports-cell
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - cuda-pinned-gpu-job
+      # The `gpu-driver: ` prefix is the table's; report.json carries the bare text, so it is optional.
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: gpu-driver: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]*?(?:gpu-driver: )?cronjob seeded-shapes/cuda-pinned-trainer:? requests nvidia\.com/gpu (?:on accelerator nvidia-l4 and no pool in the cluster carries that accelerator|with image docker\.io/nvidia/cuda:12\.2\.0-base-ubuntu22\.04 on )[^\n]*$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: gpu-driver: [^;\n]+; blocks the upgrade: [^;\n]+; cell: (?![^\n]*?(?:gpu-driver: )?cronjob seeded-shapes/cuda-pinned-trainer:? requests nvidia\.com/gpu (?:on accelerator nvidia-l4 and no pool in the cluster carries that accelerator|with image docker\.io/nvidia/cuda:12\.2\.0-base-ubuntu22\.04 on ))[^\n]*$'
+
+  # The fleet's only nvidia.com/gpu request is cuda-pinned-trainer's, so the
+  # rule prints nothing for slots b, c and d and each reads none in every
+  # slot; a line naming an object, a verdict or a cell there is a wrong read,
+  # the planted finding copied onto another cluster included.
+  - name: the-other-clusters-read-none
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - cuda-pinned-gpu-job
+      any_of_patterns:
+        - '(?ms)\A(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: gpu-driver: none; blocks the upgrade: none; cell: none$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: gpu-driver: none; blocks the upgrade: none; cell: none$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: gpu-driver: none; blocks the upgrade: none; cell: none$)'
+      forbidden_patterns:
+        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: gpu-driver: (?!none; blocks the upgrade: none; cell: none$)[^\n]*$'
+
+  # The prompt's "read only", grounded: the planted object is as the fixture
+  # declares it after the run.
+  - name: the-planted-cronjob-survived
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: cuda-pinned-gpu-job
+      kind: cronjob
+      resource_name: cuda-pinned-trainer
+      namespace: seeded-shapes
+      path: spec.suspend
+      op: eq
+      value: true
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # No vulnerability feed; a CVE id in a readiness report is an invention.
+      forbidden_phrases: ["CVE-"]

@@ -1,0 +1,269 @@
+# The readiness report names the kubectl client outside the skew window and does not call it a blocker
+#
+# One of the upgrade-failure catalogue's scenario cases
+# (docs/designs/upgrade-failure-catalogue.md, entry 10: add-on and client skew).
+# It grades the readiness report's `client-addon-skew` rule in the
+# fleet-upgrade-verification skill (scripts/readiness_rules/client_addon_skew.py),
+# through the agent's answer to the fleet readiness question.
+#
+# The rule reads kubectl versions from the audit log's user agents and from the
+# image tags of workloads that run a kubectl binary, and grades each against
+# the target minor: kubectl is supported within one minor of kube-apiserver
+# (the Kubernetes version skew policy), so a client further out is a risk
+# naming the version and the workload. The seeded fleet plants
+# stale-kubectl-client in seeded-shapes on slot a, a CronJob running
+# registry.k8s.io/kubectl:v1.29.0 every ten minutes against a control plane
+# several minors ahead; its calls still succeed, because /version answers any
+# authenticated caller, which is why the rule grades the image rather than a
+# failure. A skewed client breaks after the upgrade, not the upgrade, so the
+# rule never blocks: the declared line reads `blocks the upgrade: no`, and the
+# case grades that the agent names the CronJob from the report and does not
+# call it a blocker. The gap the cell states (how many minors behind which
+# target) moves with the fleet's channel default, so the cell pattern stops
+# after the image.
+#
+# What the deterministic checks read, and what they leave to the judge. The
+# prompt asks for one fixed-form line per seeded cluster, "<cluster>:
+# client-addon-skew: <the client or add-on the rule files as a risk|none>;
+# blocks the upgrade: <yes|no|none>; cell: <the rule's cell for it|none>", the
+# shape the per-cluster readiness cases use (upgrades-readiness-surge-capacity),
+# and the checks read those lines and nothing else; the prose, the reason the
+# rule gives, and the recommended remedy are the judge's, against
+# `expected_output`. The case first asked for one line per object the report
+# names ("<cluster>/<object name>: kind ...; blocks the upgrade: ...; cell:
+# ..."), anchored on the object's name, and its two green runs on the dev
+# install passed neither: the agent wrote such lines for a dozen other objects
+# and left the planted CronJob out, although the tool output carried the
+# rule's cell for it. A line per cluster, anchored on the cluster's name with
+# the object as one slot of the line, leaves no object to drop: slot a's line
+# must name the planted CronJob and read `blocks the upgrade: no`, and its cell
+# slot must carry the rule's own text, wording only the rule produces
+# (`client-addon-skew: kubectl v1.29 from CronJob
+# seeded-shapes/stale-kubectl-client (image registry.k8s.io/kubectl:v1.29.0)`),
+# which the skill paraphrases and a hand kubectl survey cannot supply; a report
+# whose rule is missing prints no such entry, so the slot reads `none` or
+# another rule's text and the line fails there whatever the verdict says.
+#
+# What the other slots read, and the decisions behind it. The line is about
+# the rule's findings (its risks), not its notes: the rule prints a note for
+# every cluster (the GKE add-ons that are on, the kubectl clients within one
+# minor, the client-go callers it does not grade), so "the rule prints
+# nothing" is true of no cluster, and the prompt says that a cluster for which
+# the rule files no client or add-on risk reads none in every slot. No add-on
+# finding exists on the seeded fleet today: the rule recognises third-party
+# add-ons by image repository (upgrade_shape_tables.ADDON_IMAGES: cert-manager,
+# istio, ingress-nginx and the like) and the fleet runs none of them
+# (bench/tf/fleet/defects-*.tf), while GKE's own add-ons from addonsConfig are
+# a note and never graded; the planted CronJob is the fleet's only kubectl
+# image. A kubectl client can still appear on any slot: the rule also grades
+# the `kubectl/vX.Y` user agents in the cluster's Admin Activity log over the
+# last seven days, so a human's or an agent's kubectl write to seeded-b, -c or
+# -d from a binary further than one minor from that cluster's target is a real
+# finding there, one the fleet does not plant and recent activity decides. So
+# slots b, c and d admit either the none-line or a finding line in the rule's
+# own wording (`kubectl vX.Y from principal ...: N minors behind the target
+# ...; kubectl is supported within 1 minor of kube-apiserver`, or an add-on's
+# `... supports Kubernetes X to Y ...`) with `blocks the upgrade: no`, since
+# the rule never blocks; they forbid the planted CronJob named there, any
+# other verdict, and any other cell text. A cluster with more than one
+# finding, the planted CronJob and such a principal on slot a included, keeps
+# one line: the object slot lists the findings separated by ", " with a
+# workload before a principal, so the planted CronJob comes first, and the
+# cell slot carries their cells in the same order separated by "; "; slot a's
+# patterns admit the continuation after the CronJob, and the cell patterns
+# admit any prefix and suffix around the CronJob's cell. The cell carries a
+# `;`, which keeps the verifier's value-wrap fold from removing a quote or
+# angle bracket the agent kept around it; the fold also spaces the image's tag
+# colon (`kubectl: v1.29.0`), which the patterns admit. A Job or pod of the
+# CronJob may stand in for it in the object slot (the name plus one or two
+# hash suffixes). Every pattern is read after the harness's trail fold
+# (`fold_decoration`) and matches the whole line, anchored at both ends; each
+# forbid is the same frame with a value outside the vocabulary, so a second
+# line about a slot that contradicts the first fails whatever the right line
+# says. The patterns name the slots through `{cluster:<slot>}`, which the
+# verifier expands to the cluster the runner recorded for the slot, so a fleet
+# applied with another prefix is graded on its own names; a slot the runner
+# did not reach is an `error` about the environment, never a `fail` charged to
+# the agent, so the case adds no role per slot to `fixtures:`.
+#
+# Planted defect required: on slot a, the CronJob stale-kubectl-client in
+# seeded-shapes running registry.k8s.io/kubectl:v1.29.0 (role
+# `stale-client-skew` in bench/tf/fleet/fixtures.json). The safeguard reads
+# that the CronJob still runs that image after the run, so an agent that
+# changed the planted object fails the case whatever its answer says. No
+# `worker_commands` objective: it reads delegated workers' terminals only and
+# errors on a run the router answered itself, so the report's own output is
+# graded through the cell slot instead, as
+# upgrades-readiness-zonal-control-plane does.
+#
+# Isolation class: read-only (chat prompt; the readiness script reads with
+# gcloud container, gcloud logging read and kubectl get and writes only its
+# own record and per-member kubeconfig files). Eligible tier: nightly from
+# its first merge.
+id: upgrades-readiness-client-addon-skew
+name: Upgrade readiness names the kubectl client outside the skew window
+prompt: >-
+  Check every cluster in this project for its readiness to upgrade to its
+  release channel's default version. For each cluster, report what blocks the
+  upgrade and what is at risk. Read only: do not change, upgrade or remove
+  anything. End your answer with one line per seeded cluster in exactly this
+  form, no other words on the line: "<cluster>: client-addon-skew: <the client
+  or add-on the rule files as a risk or blocker for that cluster, its workload
+  as kind namespace/name or its principal|none>; blocks the upgrade:
+  <yes|no|none>; cell: <the rule's cell for that finding copied as
+  printed|none>". The cell is the client-addon-skew rule's text for that
+  finding, copied from the readiness report's risks column (or its other
+  blockers column) or from the member's row in the report's JSON
+  (readiness.risks), as printed and not paraphrased. The rule's notes (the GKE
+  add-ons that are on, clients within one minor of the target) are not
+  findings: a cluster for which the rule files no risk or blocker reads none
+  in every slot. When the rule files several findings for one cluster, keep
+  one line: list them in the object slot separated by ", ", a workload before
+  a principal, and their cells in the cell slot in the same order separated by
+  "; ". Write each object as the report names it, with no brackets, quotes or
+  parentheses around it, and put any aside on a line of its own.
+expected_output: >-
+  A per-cluster readiness report read during this run. For seeded-a it names
+  the CronJob stale-kubectl-client in seeded-shapes: it runs kubectl v1.29.0
+  (the registry.k8s.io/kubectl:v1.29.0 image) against a control plane several
+  minors ahead of it, outside the one-minor window the Kubernetes version
+  skew policy supports, and the target minor moves it one further out. It
+  says the client still succeeds today because /version answers any
+  authenticated caller, that the first request shape the old client cannot
+  follow turns a Job red, and that the report carries it as a risk, not a
+  blocker. It recommends a kubectl tag within one minor of the target. Other
+  clusters' blockers and risks come from the same run. It ends with one
+  declared line per seeded cluster: for seeded-a "seeded-a:
+  client-addon-skew: CronJob seeded-shapes/stale-kubectl-client; blocks the
+  upgrade: no; cell: client-addon-skew: kubectl v1.29 from CronJob
+  seeded-shapes/stale-kubectl-client (image registry.k8s.io/kubectl:v1.29.0):
+  <gap> minors behind the target <target>; kubectl is supported within 1 minor
+  of kube-apiserver (https://kubernetes.io/releases/version-skew-policy/#kubectl)",
+  the cell copied from the report's risks column, and for seeded-b, seeded-c
+  and seeded-d "client-addon-skew: none; blocks the upgrade: none; cell:
+  none", unless the report files a kubectl client from that cluster's audit
+  log, whose line then names the principal and copies its cell. It cites no
+  CVE identifiers and changes nothing.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+# Named by ROLE, not cluster: bench/tf/fleet/fixtures.json;
+# docs/designs/bench-fleet-catalog.md is the rule.
+fixtures:
+  - stale-client-skew
+
+verification_spec:
+  # One line per seeded cluster, fixed vocabulary, the cluster named at the
+  # start of the line; every pattern matches the whole declared frame,
+  # anchored at both ends, with the line's decoration folded first
+  # (`fold_decoration: true`); a parenthetical after the cluster's name is
+  # allowed.
+  - name: every-seeded-cluster-has-a-declared-line
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - stale-client-skew
+      any_of_patterns:
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: client-addon-skew: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: client-addon-skew: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: client-addon-skew: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: client-addon-skew: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]+$)'
+
+  # The verdict this case exists for: slot a's line names stale-kubectl-client
+  # first and reads no; the forbid is the same frame with any other object or
+  # verdict, so a line that promotes it, leaves it out, puts another finding
+  # before it or reads none fails here whatever the prose says. A Job or pod
+  # of the CronJob may stand in for it (the name plus one or two hash
+  # suffixes), and a second finding the rule files for the cluster may follow
+  # it after ", ".
+  - name: the-planted-object-is-named-and-does-not-block
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - stale-client-skew
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: client-addon-skew: cronjob seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}(?:, [^;\n]+)?; blocks the upgrade: no; cell: [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: client-addon-skew: (?!cronjob seeded-shapes/stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}(?:, [^;\n]+)?; blocks the upgrade: no; cell: )[^\n]*$'
+
+  # The report's own wording: the entry the risks column prints for the
+  # CronJob is the rule's text, which the skill paraphrases and a cluster
+  # listing cannot supply. A report whose rule is missing prints no such
+  # entry, so the slot reads `none` or something else and the line fails
+  # here, whatever the verdict says. Any prefix and suffix are admitted
+  # around the rule's text: a quote or angle bracket the agent kept around the
+  # cell (the `;` inside it keeps the value-wrap fold from removing one), a
+  # column's other entries, or a second finding's cell after it. The pattern
+  # stops after the image: the gap and the target are the fleet's.
+  - name: the-planted-objects-line-quotes-the-reports-cell
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - stale-client-skew
+      # The `client-addon-skew: ` prefix is the table's; report.json carries the bare text, so it is optional.
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: client-addon-skew: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]*?(?:client-addon-skew: )?kubectl v1\.29 from cronjob seeded-shapes/stale-kubectl-client \(image registry\.k8s\.io/kubectl:\s?v1\.29\.0\)[^\n]*$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: client-addon-skew: [^;\n]+; blocks the upgrade: [^;\n]+; cell: (?![^\n]*?(?:client-addon-skew: )?kubectl v1\.29 from cronjob seeded-shapes/stale-kubectl-client \(image registry\.k8s\.io/kubectl:\s?v1\.29\.0\))[^\n]*$'
+
+  # The fleet plants no kubectl image and no add-on on slots b, c and d, so
+  # each reads none in every slot unless the rule files a kubectl client from
+  # that cluster's audit log (a write in the last seven days from a binary
+  # further than one minor from the target), a finding recent activity
+  # decides and the fleet does not plant. Such a line is admitted only in the
+  # rule's own wording, with `blocks the upgrade: no` (the rule never blocks)
+  # and an object that is not the planted CronJob; the first forbid is the
+  # planted finding copied onto another cluster, the second is any other line
+  # outside the two forms: a verdict where the rule filed nothing, a cell that
+  # is not the rule's text, or an object with a `yes`.
+  - name: the-other-clusters-read-none-or-the-reports-own-finding
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - stale-client-skew
+      any_of_patterns:
+        - '(?ms)\A(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: client-addon-skew: (?:none; blocks the upgrade: none; cell: none|(?!none;)[^;\n]+; blocks the upgrade: no; cell: [^\n]*?(?:client-addon-skew: )?(?:kubectl v[0-9]+\.[0-9]+ from [^\n]*?: (?:[0-9]+ minors? (?:behind|ahead of) the target [0-9.]+; kubectl is supported within 1 minor of kube-apiserver|major version differs from the target)|[a-z0-9-]+ v[0-9]+\.[0-9]+ at [^\n]*?: [a-z0-9-]+ v[0-9]+\.[0-9]+ supports kubernetes [0-9.]+ to [0-9.]+ \()[^\n]*)$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: client-addon-skew: (?:none; blocks the upgrade: none; cell: none|(?!none;)[^;\n]+; blocks the upgrade: no; cell: [^\n]*?(?:client-addon-skew: )?(?:kubectl v[0-9]+\.[0-9]+ from [^\n]*?: (?:[0-9]+ minors? (?:behind|ahead of) the target [0-9.]+; kubectl is supported within 1 minor of kube-apiserver|major version differs from the target)|[a-z0-9-]+ v[0-9]+\.[0-9]+ at [^\n]*?: [a-z0-9-]+ v[0-9]+\.[0-9]+ supports kubernetes [0-9.]+ to [0-9.]+ \()[^\n]*)$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: client-addon-skew: (?:none; blocks the upgrade: none; cell: none|(?!none;)[^;\n]+; blocks the upgrade: no; cell: [^\n]*?(?:client-addon-skew: )?(?:kubectl v[0-9]+\.[0-9]+ from [^\n]*?: (?:[0-9]+ minors? (?:behind|ahead of) the target [0-9.]+; kubectl is supported within 1 minor of kube-apiserver|major version differs from the target)|[a-z0-9-]+ v[0-9]+\.[0-9]+ at [^\n]*?: [a-z0-9-]+ v[0-9]+\.[0-9]+ supports kubernetes [0-9.]+ to [0-9.]+ \()[^\n]*)$)'
+      forbidden_patterns:
+        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: client-addon-skew: (?=[^;\n]*cronjob seeded-shapes/stale-kubectl-client)[^\n]*$'
+        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: client-addon-skew: (?!none; blocks the upgrade: none; cell: none$)(?!(?!none;)[^;\n]+; blocks the upgrade: no; cell: [^\n]*?(?:client-addon-skew: )?(?:kubectl v[0-9]+\.[0-9]+ from [^\n]*?: (?:[0-9]+ minors? (?:behind|ahead of) the target [0-9.]+; kubectl is supported within 1 minor of kube-apiserver|major version differs from the target)|[a-z0-9-]+ v[0-9]+\.[0-9]+ at [^\n]*?: [a-z0-9-]+ v[0-9]+\.[0-9]+ supports kubernetes [0-9.]+ to [0-9.]+ \())[^\n]*$'
+
+  # The prompt's "read only", grounded: the planted object is as the fixture
+  # declares it after the run.
+  - name: the-planted-cronjob-survived
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: stale-client-skew
+      kind: cronjob
+      resource_name: stale-kubectl-client
+      namespace: seeded-shapes
+      path: spec.jobTemplate.spec.template.spec.containers[0].image
+      op: eq
+      value: registry.k8s.io/kubectl:v1.29.0
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # No vulnerability feed; a CVE id in a readiness report is an invention.
+      forbidden_phrases: ["CVE-"]

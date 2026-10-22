@@ -43,6 +43,14 @@ var consolePublish = []string{
 
 var consoleSubscribe = []string{"a2a.>", "chat.console.*.out", "_INBOX.console.>"}
 
+// consolePublishDeny and consoleSubscribeDeny are the console's deny lists as
+// rendered: none today. A deny the operator adds must be mirrored here, or the
+// test server would grant what the cluster refuses.
+var (
+	consolePublishDeny   []string
+	consoleSubscribeDeny []string
+)
+
 // renderedConf is the operator's render the callout suite starts from.
 const renderedConf = "../authcallout/testdata/rendered-nats.conf"
 
@@ -57,32 +65,60 @@ func TestTheGrantsAreTheRenderedOnes(t *testing.T) {
 		t.Fatal("the rendered conf has no console user")
 	}
 	block := conf[start:]
-	// allowList returns the quoted entries of the first `<kind> { allow = [`
-	// list in block, in order.
-	allowList := func(kind string) []string {
+	// The console user's block ends where the next user's begins.
+	if next := strings.Index(block[len("user:"):], "user:"); next >= 0 {
+		block = block[:len("user:")+next]
+	}
+	// kindBlock returns the console's `<kind> { ... }` permissions block.
+	kindBlock := func(kind string) string {
 		t.Helper()
 		i := strings.Index(block, kind+" {")
 		if i < 0 {
 			t.Fatalf("the console user has no %s block", kind)
 		}
-		rest := block[i:]
-		open := strings.Index(rest, "allow = [")
-		end := strings.Index(rest, "]")
-		if open < 0 || end < open {
-			t.Fatalf("the console user's %s block has no allow list", kind)
+		rest := block[i+len(kind+" {"):]
+		depth := 1
+		for j, r := range rest {
+			switch r {
+			case '{':
+				depth++
+			case '}':
+				if depth--; depth == 0 {
+					return rest[:j]
+				}
+			}
 		}
+		t.Fatalf("the console user's %s block is not closed", kind)
+		return ""
+	}
+	// list returns the quoted entries of the `<field> = [` list in a kind
+	// block, in order, or nil when the block has no such list.
+	list := func(kb, field string) []string {
+		open := strings.Index(kb, field+" = [")
+		if open < 0 {
+			return nil
+		}
+		rest := kb[open+len(field+" = ["):]
 		var out []string
-		for _, f := range strings.Split(rest[open+len("allow = ["):end], ",") {
+		for _, f := range strings.Split(rest[:strings.Index(rest, "]")], ",") {
 			if f = strings.Trim(strings.TrimSpace(f), `"`); f != "" {
 				out = append(out, f)
 			}
 		}
 		return out
 	}
-	for kind, want := range map[string][]string{"publish": consolePublish, "subscribe": consoleSubscribe} {
-		got := allowList(kind)
-		if strings.Join(got, "\n") != strings.Join(want, "\n") {
-			t.Errorf("the rendered console %s list is\n  %v\nthe test has\n  %v\nupdate the test's copy", kind, got, want)
+	for _, c := range []struct {
+		kind, field string
+		want        []string
+	}{
+		{"publish", "allow", consolePublish},
+		{"subscribe", "allow", consoleSubscribe},
+		{"publish", "deny", consolePublishDeny},
+		{"subscribe", "deny", consoleSubscribeDeny},
+	} {
+		got := list(kindBlock(c.kind), c.field)
+		if strings.Join(got, "\n") != strings.Join(c.want, "\n") {
+			t.Errorf("the rendered console %s %s list is\n  %v\nthe test has\n  %v\nupdate the test's copy", c.kind, c.field, got, c.want)
 		}
 	}
 }
@@ -103,8 +139,8 @@ func testBus(t *testing.T) (string, jetstream.JetStream) {
 	opts := &natsserver.Options{Host: "127.0.0.1", Port: -1, JetStream: true, StoreDir: t.TempDir(), NoLog: true, NoSigs: true}
 	opts.Users = []*natsserver.User{
 		{Username: testUser, Password: testPass, Permissions: &natsserver.Permissions{
-			Publish:   &natsserver.SubjectPermission{Allow: consolePublish},
-			Subscribe: &natsserver.SubjectPermission{Allow: consoleSubscribe},
+			Publish:   &natsserver.SubjectPermission{Allow: consolePublish, Deny: consolePublishDeny},
+			Subscribe: &natsserver.SubjectPermission{Allow: consoleSubscribe, Deny: consoleSubscribeDeny},
 		}},
 		{Username: "admin", Password: "admin"},
 	}

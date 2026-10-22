@@ -24,6 +24,7 @@ the items path pointed into a temporary directory.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import tomllib
@@ -42,6 +43,9 @@ REPO = Path(__file__).resolve().parents[2]
 RAW = REPO / "bench" / "tf" / "prebuilt" / "bootstrap-ranking" / "inventory-raw.txt"
 EXTRACT = REPO / "agents" / "platform" / "scripts" / "inventory_findings.py"
 TASK = REPO / "bench" / "tasks" / "bootstrap-inventory-ranking-delivery" / "task.yaml"
+HANDOFF_DIR = REPO / "agents" / "chat" / "scripts"
+# 2026-10-20 12:00 UTC, the stamp the planted reports carry.
+PLANTED_AT = 1792497600
 
 
 def _objective() -> dict[str, Any]:
@@ -93,7 +97,25 @@ def test_the_expected_pairs_are_what_extract_writes_from_the_planted_report(tmp_
 
 def test_the_stack_plants_the_report_the_tests_read() -> None:
     main_tf = (RAW.parent / "main.tf").read_text()
-    assert 'file("${path.module}/inventory-raw.txt")' in main_tf
+    variables = (RAW.parent / "variables.tf").read_text()
+    assert 'file("${path.module}/${var.raw_report}")' in main_tf
+    assert re.search(r'variable "raw_report" \{[^}]*default\s*=\s*"inventory-raw.txt"', variables)
+
+
+@pytest.mark.parametrize("raw", sorted(RAW.parent.glob("inventory-raw*.txt")), ids=lambda p: p.name)
+def test_each_planted_report_is_what_the_hand_off_writes_from_its_cards(raw: Path) -> None:
+    # A hand-written copy drifts from the writer's layout; the cards file beside
+    # each report is the sweep it stands for, composed at PLANTED_AT.
+    state = json.loads(raw.with_suffix(".cards.json").read_text())
+    # compose imports inventory_findings when it runs, so the path stays until it returns.
+    sys.path[:0] = [str(HANDOFF_DIR), str(EXTRACT.parent)]
+    try:
+        import bootstrap_handoff
+
+        composed = bootstrap_handoff.compose(state, timed_out=False, now=PLANTED_AT)
+    finally:
+        del sys.path[:2]
+    assert raw.read_text() == composed
 
 
 def test_the_stack_and_the_reader_spell_the_items_file_as_the_script_does() -> None:
@@ -189,7 +211,7 @@ def test_a_missing_finding_is_named(items: Path) -> None:
     items.write_text(json.dumps(written))
     result = _verify()
     assert result.status == "fail"
-    assert "missing [('probes-readiness', 'gift-cards')]" in result.reason
+    assert "missing [('readonly-root-fs', 'gift-cards')]" in result.reason
 
 
 def test_a_finding_the_report_does_not_carry_is_named(items: Path) -> None:
@@ -207,7 +229,7 @@ def test_a_duplicated_finding_fails(items: Path) -> None:
     items.write_text(json.dumps(written))
     result = _verify()
     assert result.status == "fail"
-    assert "('sa-key-in-secret', 'invoice-worker')" in result.reason
+    assert "('static-sa-key', 'invoice-worker')" in result.reason
 
 
 def test_a_file_that_is_not_json_fails(items: Path) -> None:
@@ -218,7 +240,7 @@ def test_a_file_that_is_not_json_fails(items: Path) -> None:
 
 
 def test_json_without_an_items_list_fails(items: Path) -> None:
-    items.write_text(json.dumps([{"check": "sa-key-in-secret", "object": "invoice-worker"}]))
+    items.write_text(json.dumps([{"check": "static-sa-key", "object": "invoice-worker"}]))
     result = _verify()
     assert result.status == "fail"
     assert "no list of items" in result.reason

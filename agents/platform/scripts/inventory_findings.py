@@ -49,6 +49,45 @@ POST_TIMEOUT_SECONDS = 30
 
 SOURCE = "inventory"
 
+# What the onboarding scan checks: the slug table in
+# governance/cluster_inventory_audit_sop.md, in its order, with the words the
+# report uses for each. The posture line counts them and names the audits'
+# areas rather than an exclusion list it cannot keep complete; the raw file
+# lists them by name.
+SCAN_CHECKS = (
+    ("probes-startup", "startup probes"),
+    ("no-resourcequota", "ResourceQuota and LimitRange"),
+    ("readonly-root-fs", "read-only root filesystems"),
+    ("shielded-nodes", "Shielded Nodes"),
+    ("datapath-provider", "Dataplane V2"),
+    ("managed-prometheus", "Managed Service for Prometheus"),
+    ("no-autoupgrade", "node auto-upgrade"),
+    ("static-sa-key", "static Google Cloud keys in pods"),
+    ("added-capabilities", "added capabilities"),
+)
+# The area each first-run audit (oobe.FIRST_RUN_AUDITS) reports on, in the
+# order the report names them.
+AUDIT_FAMILIES = {
+    "compliance-audit": "security and RBAC",
+    "obtainability-audit": "reliability",
+    "stockout-prevention": "capacity",
+    "fleet-wide-cost-analysis": "cost",
+}
+
+_FAMILY_LIST = list(AUDIT_FAMILIES.values())
+AUDIT_FAMILY_WORDS = f"{', '.join(_FAMILY_LIST[:-1])} and {_FAMILY_LIST[-1]}"
+# The report's posture line, which `select` prints and the SOP copies verbatim.
+# It names no state of the audits (running, finished, held): this terminal
+# cannot see it, and the delivery job's note says it.
+SCAN_SCOPE_SENTENCES = (
+    f"This scan ran {len(SCAN_CHECKS)} configuration checks; {AUDIT_FAMILY_WORDS} come from the first-run audits.",
+)
+SCAN_SCOPE_LINE = " ".join(SCAN_SCOPE_SENTENCES)
+# The checks by name, for the raw file.
+SCAN_CHECKS_SENTENCE = (
+    f"The {len(SCAN_CHECKS)} checks: {', '.join(words for _, words in SCAN_CHECKS[:-1])} and {SCAN_CHECKS[-1][1]}."
+)
+
 # ```findings ... ``` -- CommonMark's leading indent and long closing fence are
 # both accepted: bootstrap_handoff.py writes a bare fence, but a raw file typed
 # by a model, as earlier sweeps did, may indent it inside a list.
@@ -505,6 +544,7 @@ def describe_selection(
         out = [f"first report: list no item; the limit is {limits.first_report_criticals}"]
     else:
         out = ["first report: list no item; there are no critical findings"]
+    out.append(f"posture: {SCAN_SCOPE_LINE}")
     for index, members in enumerate(shown, 1):
         best = members[0]
         objects = _plural(len(members), "object", "objects")
@@ -526,19 +566,16 @@ def describe_selection(
         if not limits.daily_criticals:
             out.append("pace: the critical items not listed are not added in chat; the daily limit is 0")
         else:
-            start = " the day after the report arrives" if len(shown) >= limits.daily_criticals else ""
+            # No hour: the report states the pace, and a UTC time is noise to the reader.
+            start = " starting the day after the report arrives," if len(shown) >= limits.daily_criticals else ""
             out.append(
-                f"pace: the critical items not listed are added in chat from {fq.REMIND_HOUR}:00 UTC{start}, "
-                f"at most {limits.daily_criticals} a day"
+                f"pace: the critical items not listed are added in chat{start} at most {limits.daily_criticals} a day"
             )
     elif not shown and others:
         if not limits.noncritical_max:
             out.append("pace: non-critical items are not added in chat; the daily limit is 0")
         else:
-            out.append(
-                f"pace: non-critical items are added in chat from {limits.noncritical_after_hour}:00 UTC, "
-                f"at most {limits.noncritical_max} a day"
-            )
+            out.append(f"pace: non-critical items are added in chat, at most {limits.noncritical_max} a day")
     return "\n".join(out)
 
 

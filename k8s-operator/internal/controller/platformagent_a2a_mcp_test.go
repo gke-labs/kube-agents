@@ -136,6 +136,17 @@ func TestBuildA2AMCPDeployment(t *testing.T) {
 			t.Errorf("%s = %q is not under any mount %v", key, env[key], mounts)
 		}
 	}
+
+	// The server retries its first connect to the bus rather than exiting,
+	// and the startup probe holds liveness off for that long: a fresh
+	// install's bus comes up after this pod.
+	sp := c.StartupProbe
+	if sp == nil || sp.HTTPGet == nil || sp.HTTPGet.Path != a2aMCPHealthPath {
+		t.Fatalf("startup probe = %+v, want one on %s", sp, a2aMCPHealthPath)
+	}
+	if window := sp.PeriodSeconds * sp.FailureThreshold; window < 120 {
+		t.Errorf("the startup probe allows %ds for the first bus connect, want minutes", window)
+	}
 }
 
 // The creds Secret holds every static user's password. The MCP pod gets the
