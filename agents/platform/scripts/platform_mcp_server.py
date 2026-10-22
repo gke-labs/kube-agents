@@ -1207,7 +1207,8 @@ def register_findings(findings: list, scope: dict | None = None) -> str:
     cluster name alone is ambiguous across projects. A finding the user
     dismissed stays dismissed and is reported back as 'suppressed'.
 
-    Each finding needs: source ('inventory' | 'event-watcher' | 'audit'), check
+    Each finding needs: source ('inventory' | 'event-watcher' | 'audit' |
+    'upgrade-readiness'), check
     (the audit stream's own slug), project, cluster, namespace (omit for
     cluster-scoped), object, title, rubric, recommendation {action, rationale,
     risk}, remediation {kind, path, note} and verification {kind, command,
@@ -1224,7 +1225,15 @@ def register_findings(findings: list, scope: dict | None = None) -> str:
         scope: Pass {'project': '<id>', 'cluster': '<name>', 'complete': true}
             only when this run covered that cluster in full. It lowers the
             confidence of queued rows the run did not re-report. Omit it for a
-            partial or failed run.
+            partial or failed run. The claim reaches the rows whose check
+            starts with 'check_prefix' when the scope names one (a run that
+            reads one family of checks, such as 'upgrade-'; a family ends with
+            '-', and a batch with findings must belong to it), whatever wrote
+            them, or, with 'source' beside it, that source's rows in the family;
+            else the rows of the batch's own sources, or of 'source',
+            which must be a known source and one the batch wrote. An empty
+            findings list with a complete scope is a complete run that found
+            nothing; it must name 'check_prefix' or 'source', or it is refused.
     """
     return _findings_call("POST", "/v1/findings", {"findings": findings, "scope": scope})
 

@@ -200,8 +200,8 @@ func credentialProxyBaseURL(agent *agentv1alpha1.PlatformAgent) string {
 // fourth under the cluster-view flag. The sandbox's is the caller that matters —
 // the shell is where every credentialed command runs, so a broker that served
 // only the gateway's identity would answer 401 to all of them. The gateway's
-// is there because its chat relays and its watchers go through the same
-// listener.
+// is there because its chat relays, its Pub/Sub platform adapter and its
+// watchers go through the same listener.
 //
 // Two identities rather than one is not a widening of who may call: both Pods
 // belong to this agent, and neither could reach the broker without a token this
@@ -244,9 +244,9 @@ func a2aSessionBrokerCaller(agent *agentv1alpha1.PlatformAgent) string {
 // the broker. Audience-bound and one hour long, so a copy that escapes the Pod
 // is worth an hour of broker access and nothing else.
 //
-// credentialProxyChatAudience, not credentialProxyAudience: the chat relays and
-// the remote MCP servers' mcp-remote children are the only things in this Pod
-// that call the broker, and minting for the chat audience is what stops this
+// credentialProxyChatAudience, not credentialProxyAudience: the chat relays,
+// the Pub/Sub platform adapter's relay and the remote MCP servers' mcp-remote
+// children are the only things in this Pod that call the broker, and minting for the chat audience is what stops this
 // token opening the shell's routes if it does escape. The sandbox's equivalent is in buildShellSandboxTokenVolume.
 func buildAgentCredentialProxyTokenVolume() corev1.Volume {
 	return corev1.Volume{

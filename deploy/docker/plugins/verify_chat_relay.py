@@ -175,6 +175,7 @@ def main() -> None:
         "A2A_NOTIFY_CONVERSATIONS",
         "A2A_NOTIFY_PLATFORM",
         "NATS_URL",
+        "NATS_CA_FILE",
         "A2A_BUS_USER",
         "STALL_WATCH_EXCLUDE_NAMESPACES",
         "STALL_WATCH_MIN_AGE_MINUTES",

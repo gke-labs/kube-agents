@@ -255,6 +255,38 @@
       "deliver": "chat"
     },
     {
+      "id": "upgrade-readiness-weekly-review",
+      "name": "Upgrade Readiness Weekly Review",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 6 * * 6",
+        "display": "0 6 * * 6"
+      },
+      "prompt": "",
+      "skills": [],
+      "no_agent": true,
+      "script": "upgrade_readiness_review.py",
+      "risk": "high",
+      "enabled": true,
+      "deliver": "chat"
+    },
+    {
+      "id": "upgrade-readiness-weekly-brief",
+      "name": "Upgrade Readiness Weekly Brief",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 7 * * 6",
+        "display": "0 7 * * 6"
+      },
+      "prompt": "Write this week's upgrade readiness brief. Read the SOP at '/opt/data/profiles/platform/governance/upgrade_readiness_brief_sop.md' \u2014 all 205 lines of it, before you write anything. Its composing rules are section 3, lines 91-153, so a read that stops early writes a brief in the wrong shape. The review job has already graded every cluster and registered its findings on the findings queue, and this job's pre-run script has read the queue: its output is above. Your turn reads the review's summary and that output and composes the one message a person reads: what needs their decision now, what else the week found, and where the full report is. Follow the shape and the ceiling in section 3 exactly. Never [SILENT]: the brief is owed every week. This turn is read-only: register nothing, decide nothing, upgrade nothing.",
+      "skills": [],
+      "script": "upgrade_readiness_brief_queue.py",
+      "enabled_toolsets": ["terminal", "no_mcp"],
+      "risk": "high",
+      "enabled": true,
+      "deliver": "chat"
+    },
+    {
       "id": "sa-role-watch",
       "name": "Service Account Role Watch",
       "schedule": {

@@ -31,7 +31,7 @@ partial window for it (`collecting`), that evidence feeds both. A case not named
 red a pull request on a graded failure, whatever its record says — and since 2026-09-22 it does
 not run on one either: the eval crew decided that the presubmit runs the blocking roster only
 ([#1023](https://github.com/gke-labs/kube-agents/issues/1023)), so `presubmit-cases.txt` holds
-the roster's eleven cases plus, since 2026-09-29, one documented exception: the held-out seat a
+the roster's cases plus, since 2026-09-29, one documented exception: the held-out seat a
 coverage tracker puts in the presubmit file without a roster line, one per tracker
 ([#2013](https://github.com/gke-labs/kube-agents/issues/2013) for the compliance canary;
 [#2016](https://github.com/gke-labs/kube-agents/issues/2016)'s seat for pdb-remediation-pr took
@@ -82,11 +82,10 @@ The variable is comma- or whitespace-separated task ids; `_bootstrap_admitted()`
 
 ## The admission bar, and who clears it
 
-Eleven of the twelve presubmit cases are admitted; the other one, the compliance canary,
-is the held-out seat described above (recount the entries of
-`hack/eval/presubmit-cases.txt` and
-`blocking-roster.txt` rather than trusting this sentence — an earlier copy of it miscounted
-twice). The bar a case clears to
+Every presubmit case without a roster line is a held-out seat as described above, and the rest
+are admitted (`python3 scripts/eval_rosters.py --summary` counts
+`hack/eval/presubmit-cases.txt` and `blocking-roster.txt`; this page writes no count, so a seat
+change doesn't edit it). The bar a case clears to
 get there: its recent record shows failures only on its own regressions or on infra classes
 the harness already excludes from the verdict.
 
@@ -161,6 +160,23 @@ with a filed issue naming the exit condition:
   Enters again when [#3145](https://github.com/gke-labs/kube-agents/pull/3145), which seeds
   checkout-gateway's manifest into every pool's `*-infra` repository, has merged and the case's
   record holds (#3120).
+- **consistency-authorized-networks-probe** —
+  [#3598](https://github.com/gke-labs/kube-agents/issues/3598): demoted 2026-10-21 after it
+  failed about 30% of repetitions on the Gemini setup, on unrelated pull requests (#2997,
+  #3255, #3321, #3392, #3395 and others) and on `main`'s eval-next, red on this case alone on
+  2026-10-20: 37 of 126 repetitions across 42 runs, the store's record at 18/21,
+  `would-demote`. 15 of the 37 were Vertex 429s
+  ([#3399](https://github.com/gke-labs/kube-agents/issues/3399), fix open in
+  [#3448](https://github.com/gke-labs/kube-agents/pull/3448)). The other 22 were the agent
+  being wrong, not a narrow reference: seeded-c, which never enabled authorized networks,
+  still returns `masterAuthorizedNetworksConfig: {gcpPublicCidrsAccessEnabled: true}` with no
+  `enabled`, and the agent read that leftover block as configured or open and said seeded-c
+  matches its peers, or named the wrong facet (NetworkPolicies, Pod Security, database
+  encryption), or once, a tool error (a grep that missed seeded-c in its own saved cluster
+  list). The rung-4 collapses include #2997 at 0/3; `main`'s red was rung 6. The Claude nightlies passed every scored repetition. Its removal leaves
+  `consistency` with no presubmit case, so the domain is on the `domains.yaml` allowlist until
+  it returns. Enters again when #3448 has merged, the agent-side fix (#3605) has landed, and the
+  case passes the roster's bar, 90% over 20 runs, on the Gemini nightly (#3598).
 
 **autoops-warning-event-triage** is no longer in the presubmit at all (tofu wall clock,
 [#1218](https://github.com/gke-labs/kube-agents/pull/1218)); it runs and accrues its
@@ -332,7 +348,7 @@ blocking for every case by design, admitted or not: `grade_case` evaluates them 
 reads admission. Those classes signal a broken case or install, not flake, and the fix is
 on that side rather than on the roster.
 
-Since 2026-09-22 those rungs reach only the cases the presubmit runs: the roster's eleven and,
+Since 2026-09-22 those rungs reach only the cases the presubmit runs: the roster's cases and,
 since 2026-09-29, the held-out seat. The seats of 2026-09-29 put both GitHub-writing paths back on
 every pull request — the canary's (the minted token, the cloned `*-infra` workspace, the ledger
 write, the `ledger_issue_contains` verifier) and pdb-remediation-pr's (submit-suggestion opening
@@ -353,16 +369,20 @@ say what it ran by hand.
 ## The whole-suite rate
 
 Beside the per-case rungs the verdict carries one number for the whole pull request: the pooled
-pass rate of every roster case's scored repetitions — on the presubmit ten cases × three = 30
-units, since `agent-kanban-smoke` is off the inject lane ([below](#the-inject-lane)), and eleven ×
-three = 33 on the today lane (the api-transport count: 33 since 2026-10-17, 36 on 2026-10-16, 39
-from 2026-10-14, 36 before), `infra` repetitions left out — against `main`'s rate over the same cases from the evidence store (the
-newest seven nightly lines per case, about 249 runs). It is the rule that can see a pull request
+pass rate of every roster case's scored repetitions — on the presubmit, the roster less
+`agent-kanban-smoke`, which is off the inject lane ([below](#the-inject-lane)), and on the today
+lane the whole roster, each case at three repetitions (`python3 scripts/eval_rosters.py --summary`
+has the roster's count), `infra` repetitions left out — against `main`'s rate over the same cases from the evidence store (the
+newest seven nightly lines per case). It is the rule that can see a pull request
 which made several cases a little worse without making any one of them fail three times. The
-nightly that writes those lines grades `today` and the presubmit grades `next`, so the comparison
-is the pull request's `next` against `main`'s `today`; a window of `next`'s own needs the mode on
-the baseline's version key first ([`bench/baselines/README.md`](../bench/baselines/README.md)). The
-verdict prints it on every run today:
+version key carries the mode ([`bench/baselines/README.md`](../bench/baselines/README.md)), so the
+presubmit's `next` is compared only with lines a next-mode run on `main` recorded at its key, and
+the today lane's `today` only with today's; a case with no line at its key contributes nothing to
+`main`'s side, with one exception below. The next-mode nightly, the one next-mode run on `main` that records, runs a
+different agent model from the presubmit and so files under another key. A case with no line at its
+next key falls back, for this number only, to its today-mode lines at the same key otherwise, and
+the verdict names those cases in a note; rung 6 never falls back. The verdict prints it on every
+run:
 
 ```
 Admitted-case pass rate: 91.7% (main: 92.4%, margin 10.0%)
@@ -504,14 +524,16 @@ into the unit before.
 the set of requesting cases. The same approvers as the exclusion list: an entry is a rung 1 check
 on every pull request.
 
-Rung 6 does not compare on the inject lane. `main`'s judged record is the today-mode nightly's
-over the api transport, filed at a version key that carries neither the mode nor the transport,
-so an inject run's judged mean set against it measures the lane rather than the pull request:
-the next lane redded on rung 6 on four admitted cases at once on 2026-10-17 with nothing changed
-on its side. `bench-gate` skips the comparison under `AGENT_TRANSPORT=inject` and says so on
-each case it would have compared; main's mean is still printed beside the run's. Rungs 1 to 5
-are unchanged, and the today lane keeps rung 6. It comes back on the inject lane when the
-version key carries the mode ([`bench/baselines/README.md`](../bench/baselines/README.md)).
+Rung 6 compares an inject run only with next-mode history. The version key carries the mode
+([`bench/baselines/README.md`](../bench/baselines/README.md)), and `bench-gate` reads
+`AGENT_TRANSPORT=inject` as `next`, so an inject run's judged mean is set against the means a
+next-mode run on `main` recorded at the same key, never against the today-mode nightly's: that
+comparison measured the lane rather than the pull request, and redded four admitted cases at once
+on 2026-10-17 with nothing changed on their side. Where no next-mode line exists at the key, rung 6
+is quiet; a partial window is compared, as it is for `today`. The today lane reads today's history
+only. The key includes the agent model, and the next-mode nightly runs a different one from the
+presubmit, so on the presubmit rung 6 stays quiet until a next-mode run on `main` records at the
+presubmit's model.
 
 One thing about the lane's install differs too. That write safeguard
 (`no-github-writes-the-case-did-not-request`) charges every pull request opened in a repetition's
@@ -543,7 +565,7 @@ nightly runs the same list once a night on its own leased project
 case's record is per case, not per forge; nothing runs the cases this file leaves out against
 GitLab. `ci-kube-agents-eval-nightly-gitlab-next` runs the same list under `spec.mode: next`
 (`EVAL_MODE_NEXT=1`, through the inject door), so the forge is graded on both stacks; its runs
-show in Prow only, as the dashboard has no next lane.
+show in Prow only, as the dashboard collects no next-mode runs and the GitLab lane never records.
 
 The roster above is still the roster, intersected with the lane's list: a roster case in the
 lane arms rung 4 there, and a held-out seat runs and reports without arming it, exactly as on

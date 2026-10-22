@@ -331,20 +331,17 @@ resource "google_container_node_pool" "seeded_a_default" {
   node_count = 2
 
   node_config {
-    # e2-medium, two of them (2026-09-08, #1278). Cluster A hosts the defect
-    # workloads (checkout-gateway, payments-api) alongside GKE's system pods,
-    # and the binding constraint is CPU *requests*, not memory: one
-    # e2-medium's 940m allocatable is fully claimed by system pods alone
-    # (kube-proxy, kube-dns, metadata-server, fluentbit, konnectivity, ...).
-    # The fixtures only ever ran because they scheduled before the system
-    # set filled in; the weekend auto-upgrade rebuilt the node, system-
-    # critical pods scheduled first, and every fixture went Pending on all
-    # 30 pool projects. A second node holds the fixtures plus the Pending
-    # system deployments with ~600m to spare, and survives the next node
-    # rebuild (surge upgrades rotate one node at a time). Matches the live
-    # `gcloud container clusters resize` applied during the incident, so
-    # the next apply is a no-op, not a pool replacement.
-    machine_type    = "e2-medium"
+    # e2-standard-2, two of them (2026-10-20, #3607; two e2-mediums since
+    # #1278, one before). The binding constraint is CPU *requests*: GKE's
+    # system pods (kube-dns at 270m a replica, kube-proxy, metadata-server,
+    # fluentbit, konnectivity, ...) take 700-860m of an e2-medium's 940m
+    # allocatable, the fixtures are 10m each, and the busier node was within
+    # 2-47m of full on every pool project, so each new fixture strands a pod
+    # somewhere. A dedicated-core size allocates 1930m, about a core spare
+    # per node. The provider updates machine_type in place (plan: one
+    # update, no replace), so GKE recreates the two nodes one at a time
+    # under the pool's surge settings; no reconcile-allow.json entry.
+    machine_type    = "e2-standard-2"
     disk_size_gb    = 20
     resource_labels = local.fleet_labels
     service_account = google_service_account.fleet_nodes.email

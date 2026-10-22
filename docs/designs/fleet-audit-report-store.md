@@ -38,9 +38,11 @@ no-forge run uses the reserved one below):
 - `latest.json` — a byte-identical copy of the newest envelope. A copy rather than a symlink, so the
   store asks nothing of the mount.
 
-The repository is part of the path because every SOP walks its `managed_repos` and runs `finish`
-once per entry: one stream publishes one ledger per repository, and a directory per stream would
-hold whichever repository finished last, so each run would find the other's memory and read it as
+The repository is part of the path because a stream can publish to more than one repository over
+time. One run publishes to one repository: the `role: gitops` repository, or the one a person gave
+with `--repo`. But a `--repo` run, or a `role: gitops` that moved to another repository, gives the
+stream a second ledger. A directory per stream would then hold whichever repository published last,
+and the next run on the other repository would find a memory for the wrong ledger and read it as
 lost. `repo` must be exactly `owner/name` with no `.` or `..` segment before it becomes a path; a
 run whose repository fails that stores nothing. The path is lower-cased, because GitHub's names are
 not case-sensitive: an on-demand `--repo Acme/GitOps` and a ConfigMap's `acme/gitops` are one
@@ -59,6 +61,17 @@ repository's store. With no public body to check it against, the next no-forge r
 that passes them, since a failed write drops `latest.json` and leaves the ring. A store with no
 envelope is a first run, and one whose envelopes all fail is a lost memory, as in §4. A previous id the collector still flags is held in `current_ids` and not
 counted as resolved, as the ledger holds it.
+
+Two runs have a repository setting but take the no-forge path, and they store marked envelopes. A run
+that could not reach its repository (the broker or the forge refused it) writes `status: NO_FORGE`
+under that repository's own directory, with `unreachable_repo` (`repo`, `reason`). A run on an
+install with several managed repositories and no `role: gitops` repository writes under
+`no_forge/local`, with `no_repository_chosen` (`reason`). Both are reported to chat on every run, and
+their new and resolved counts are unknown. No reader takes a marked envelope as a memory: the
+no-forge path does not use one as its baseline, and the forge path reads its memory from the newest
+envelope in the ring that is not marked. A directory that holds only marked envelopes is a store
+that no published run wrote, so the next run that reaches the repository seeds its memory once from
+the open ledger, as in §4.
 
 Both writes are atomic (`os.replace` from a temp file in the same directory). The envelope carries
 `audit_id`, `repo` and `finished_at`, the run's outcome (`status`, `issue_number`, `issue_url`,
@@ -201,7 +214,8 @@ same words as the real run. A missing or unreadable store keeps the model's word
 The issue body is used as the memory once, where the store has never held this ledger (every run
 still reads it, but only for the check above): no directory for the stream
 and repository at all, as on the first run after an upgrade that introduces the store or after the
-volume is replaced. That run would otherwise have no previous ids, so the guard that refuses to
+volume is replaced, or a directory that holds only marked envelopes from runs that could not reach
+the repository (§2). That run would otherwise have no previous ids, so the guard that refuses to
 close over findings the document does not account for would have nothing to check, and an empty
 document would close the ledger and its pull requests. The body's hidden block is the id set the
 last run published, so it stands in for the store this once; the run writes the store, and every

@@ -21,7 +21,7 @@
 # k8s-event-watcher is guaranteed to be watching while the case runs.
 #
 # It is not a single-cluster watcher. It runs as a peer process inside that
-# pod's envoy-credential-proxy container, started by
+# pod's agent-api-auth sidecar, started by
 # deploy/shared/start-services.sh with BOTH --in-cluster and --profiles-dir,
 # and those sources are additive: the host cluster, plus every Cluster Agent
 # profile on the PVC naming a cluster the direct entry does not already cover
@@ -232,6 +232,25 @@ resource "null_resource" "incident" {
       gcloud container clusters get-credentials "${var.host_cluster_name}" \
         --location "${var.host_cluster_location}" --project "$project" --quiet
 
+      # ---- 0a. Check the pod has the watcher's container --------------------
+      # Step 3 polls the watcher's log with kubectl's stderr discarded, so a
+      # container the pod no longer carries reads as "the watcher logged no
+      # fire" 300s later, not as kubectl's own error. That is how #913's move
+      # of the watcher out of envoy-credential-proxy hid in the nightly (#3681).
+      # Checked before anything is touched, so a wrong name costs seconds and
+      # plants nothing. agent-api-auth is a native sidecar, listed under
+      # initContainers, so both lists are read.
+      pod_containers="$(kubectl get deployment "${var.agent_deployment}" \
+        -n "${var.agent_namespace}" \
+        -o jsonpath='{.spec.template.spec.initContainers[*].name} {.spec.template.spec.containers[*].name}')"
+      case " $pod_containers " in
+        *" ${var.agent_container} "*) ;;
+        *)
+          echo "ERROR: deployment/${var.agent_deployment} in ${var.agent_namespace} has no container '${var.agent_container}', which is where this stack reads k8s-event-watcher's log (agent_container). Its containers: $pod_containers" >&2
+          exit 1
+          ;;
+      esac
+
       # ---- 0b. Clear what an earlier run left behind ------------------------
       # A leftover ${local.ns} does not just sit there, it silently defeats the
       # whole scenario, and it does so through the plant appearing to succeed.
@@ -368,8 +387,10 @@ resource "null_resource" "incident" {
       # log line is the same seam observed one layer earlier, and `kubectl logs`
       # is all it costs.
       #
-      # k8s-event-watcher is a peer process inside the credential proxy
-      # container, not a container of its own, which is why -c names that one.
+      # k8s-event-watcher is a peer process inside the agent-api-auth sidecar,
+      # not a container of its own, which is why -c names that one. Step 0a
+      # has already proved the pod has it, so the 2>/dev/null below cannot
+      # hide a missing container behind this timeout again.
       #
       # --since-time, not --since: the namespace name is static, so a wall-clock
       # window would also match the `fire` line from an earlier run against a
