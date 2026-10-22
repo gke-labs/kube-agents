@@ -79,7 +79,7 @@ func TestSendMessageReturnsTheCardsReport(t *testing.T) {
 	}})
 	text := send(t, s, map[string]any{"text": "restart checkout", "wait_seconds": turnWaitSecs})
 	mustContain(t, text, answerText, "Card reports on this turn (1)", "Report from a card", "`n-boot-1`", "on task `task-root1`",
-		cardReport, "The turn's tasks ended. Stopped gathering after", "poll_events")
+		cardReport, noResultLine, "Stopped gathering after", "poll_events")
 	if err := b.client.Conn().LastError(); err != nil {
 		t.Errorf("the connection reports %v", err)
 	}
@@ -184,7 +184,7 @@ func TestTheWaitEndsGathering(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 8*time.Second {
 		t.Errorf("gathering outlasted the wait: %s", elapsed)
 	}
-	mustContain(t, text, answerText, "The turn's tasks ended, and the wait ended while reports were still being gathered")
+	mustContain(t, text, answerText, "The wait ended while reports were still being gathered")
 }
 
 func eventsServer(t *testing.T) (*Server, *NATSBus, *nats.Conn, *Conversations) {
@@ -936,14 +936,24 @@ func TestReportsDoNotCrowdOutTheTurnsNotice(t *testing.T) {
 	data, _ := json.Marshal(ConsoleOutFrame{MessageID: "n1", Text: "Working on it…"})
 	_ = nc.Publish(fmt.Sprintf(consoleOutSubject, "tok-burst"), data)
 	_ = nc.Flush()
-	deadline := time.After(3 * time.Second)
+	// Nothing reads the channel until delivery is over, as a turn busy
+	// elsewhere would not: the channel's length holding still for a while
+	// is the burst delivered.
+	for prev, deadline := -1, time.Now().Add(5*time.Second); time.Now().Before(deadline); {
+		time.Sleep(200 * time.Millisecond)
+		n := len(w.notices)
+		if n == prev && n > 0 {
+			break
+		}
+		prev = n
+	}
 	for {
 		select {
 		case m := <-w.notices:
 			if noticeText(m) == "Working on it…" {
 				return
 			}
-		case <-deadline:
+		default:
 			t.Fatal("the turn's notice was crowded out by reports")
 		}
 	}
@@ -981,7 +991,7 @@ func TestAReportAfterTheChainSettledIsGathered(t *testing.T) {
 	}})
 	start := time.Now()
 	text := send(t, s, map[string]any{"text": "delegate check the rollout", "wait_seconds": 20})
-	mustContain(t, text, wakeAnswer, childReport, "The turn's tasks ended. Stopped gathering after")
+	mustContain(t, text, wakeAnswer, childReport, noResultLine, "Stopped gathering after")
 	if elapsed := time.Since(start); elapsed > 15*time.Second {
 		t.Errorf("the turn took %s; gathering should end with the quiet period", elapsed)
 	}
@@ -995,4 +1005,101 @@ func TestARunningTurnSaysItsReportsAreIncomplete(t *testing.T) {
 	}})
 	text := send(t, s, map[string]any{"text": "long job", "wait_seconds": 2})
 	mustContain(t, text, "an early plan", "still running when the wait ended, so the card reports shown are only those that had arrived by then (1)")
+}
+
+// noResultLine is what a turn says when no result frame for its root came.
+const noResultLine = "The turn's tasks ended; no result from the gateway said whether work was handed to cards, so gathering waited for a quiet period."
+
+// resultFrame is the gateway's result frame for a chain's root (#3731, with
+// #3740's cardsPending).
+func resultFrame(root string, pending bool) ConsoleOutFrame {
+	return ConsoleOutFrame{MessageID: "r-" + root, Text: "the chain's answer", Kind: frameKindResult, TaskID: root, State: "completed",
+		CardsPending: pending}
+}
+
+// The root's result without cardsPending ends gathering at once: no quiet
+// period.
+func TestAResultWithoutCardsEndsGatheringAtOnce(t *testing.T) {
+	setReportQuiet(t, 5*time.Second)
+	s, _, _, _ := turnServer(t, gatewayScenario{finish: true, after: func(nc *nats.Conn, token string, turn int32) {
+		// Late enough that gathering is already waiting when it comes.
+		time.Sleep(time.Second)
+		publishNotify(nc, token, resultFrame(fmt.Sprintf("task-root%d", turn), false))
+	}})
+	start := time.Now()
+	text := send(t, s, map[string]any{"text": "a plain question", "wait_seconds": turnWaitSecs})
+	if elapsed := time.Since(start); elapsed >= 4*time.Second {
+		t.Errorf("the turn took %s; a result without cards pending should end gathering at once", elapsed)
+	}
+	mustContain(t, text, answerText, "the gateway's result for task `task-root1` said no work was handed to cards, so gathering stopped at once")
+}
+
+// The root's result with cardsPending gathers the card's report that comes
+// after it.
+func TestAResultWithCardsPendingGathersTheReport(t *testing.T) {
+	setReportQuiet(t, time.Second)
+	s, _, _, _ := turnServer(t, gatewayScenario{finish: true, after: func(nc *nats.Conn, token string, turn int32) {
+		publishNotify(nc, token, resultFrame(fmt.Sprintf("task-root%d", turn), true))
+		time.Sleep(2 * reportDelay)
+		publishNotify(nc, token, notifyFrame("n-boot-1", fmt.Sprintf("task-root%d", turn), cardReport))
+	}})
+	text := send(t, s, map[string]any{"text": "restart checkout", "wait_seconds": turnWaitSecs})
+	mustContain(t, text, cardReport, "The turn's tasks ended, and the gateway's result said work was handed to cards.", "Stopped gathering after")
+}
+
+// With no result frame for the root (an older gateway), gathering waits for
+// the quiet period, as before the flag.
+func TestNoResultFallsBackToTheQuietPeriod(t *testing.T) {
+	setReportQuiet(t, time.Second)
+	s, _, _, _ := turnServer(t, gatewayScenario{finish: true, after: func(nc *nats.Conn, token string, turn int32) {
+		time.Sleep(2 * reportDelay)
+		publishNotify(nc, token, notifyFrame("n-boot-1", fmt.Sprintf("task-root%d", turn), cardReport))
+	}})
+	start := time.Now()
+	text := send(t, s, map[string]any{"text": "restart checkout", "wait_seconds": turnWaitSecs})
+	if elapsed := time.Since(start); elapsed < time.Second {
+		t.Errorf("the turn took %s, less than the quiet period", elapsed)
+	}
+	mustContain(t, text, cardReport, noResultLine, "Stopped gathering after")
+}
+
+// A result frame for another task is not the root's: gathering waits for the
+// quiet period.
+func TestAnotherTasksResultDoesNotCount(t *testing.T) {
+	setReportQuiet(t, time.Second)
+	s, _, _, _ := turnServer(t, gatewayScenario{finish: true, after: func(nc *nats.Conn, token string, turn int32) {
+		publishNotify(nc, token, resultFrame("task-other", false))
+		time.Sleep(2 * reportDelay)
+		publishNotify(nc, token, notifyFrame("n-boot-1", fmt.Sprintf("task-root%d", turn), cardReport))
+	}})
+	text := send(t, s, map[string]any{"text": "restart checkout", "wait_seconds": turnWaitSecs})
+	mustContain(t, text, cardReport, noResultLine)
+	mustNotContain(t, text, "said no work was handed to cards")
+}
+
+// A result frame names its root by taskId or by its r-<task> message id; a
+// later result without the flag does not undo cardsPending; and a turn
+// records a bounded number of them.
+func TestTheRootsResultIsMatchedByTaskOrMessageID(t *testing.T) {
+	w := &turnWatch{results: map[string]bool{}, resultSeen: make(chan struct{}, 1)}
+	w.noteResult(ConsoleOutFrame{Kind: frameKindResult, MessageID: "r-task-a"})
+	w.noteResult(ConsoleOutFrame{Kind: frameKindResult, MessageID: "x-1", TaskID: "task-b", CardsPending: true})
+	w.noteResult(resultFrame("task-c", true))
+	w.noteResult(resultFrame("task-c", false))
+	for root, want := range map[string][2]bool{
+		"task-a": {true, false},
+		"task-b": {true, true},
+		"task-c": {true, true},
+		"task-z": {false, false},
+	} {
+		if seen, pending := w.rootResult(root); seen != want[0] || pending != want[1] {
+			t.Errorf("%s: seen %v pending %v, want %v", root, seen, pending, want)
+		}
+	}
+	for i := 0; i < 2*maxTurnResults; i++ {
+		w.noteResult(resultFrame(fmt.Sprintf("task-n%d", i), false))
+	}
+	if len(w.results) > maxTurnResults {
+		t.Errorf("a turn recorded %d results, cap %d", len(w.results), maxTurnResults)
+	}
 }

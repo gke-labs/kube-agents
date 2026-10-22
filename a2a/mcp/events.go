@@ -29,6 +29,7 @@ import (
 // or before a restart, is lost.
 const (
 	frameKindNotify = "notify"
+	frameKindResult = "result"
 
 	// maxEventsPerConversation and maxEventBytesPerConversation bound one
 	// conversation's buffer; past either the oldest frames are dropped, and

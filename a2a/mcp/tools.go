@@ -148,17 +148,29 @@ func writeReports(sb *strings.Builder, out TurnOutcome, token string) {
 	case reportsRunning:
 		fmt.Fprintf(sb, "\nThe turn's tasks were still running when the wait ended, so the card reports shown are only those that "+
 			"had arrived by then (%d); %s.\n", len(out.Reports), later)
+	case reportsNoCards:
+		fmt.Fprintf(sb, "\nThe turn's tasks ended, and the gateway's result for task %s said no work was handed to cards, "+
+			"so gathering stopped at once; %s.\n", cell(out.Root.TaskID), later)
 	case reportsQuiet:
 		if len(out.Reports) == 0 {
-			fmt.Fprintf(sb, "\nThe turn's tasks ended. No card report came within %s of the end; a card's report can take minutes: %s.\n",
-				reportQuiet, later)
+			fmt.Fprintf(sb, "\n%s No card report came within %s of the end; a card's report can take minutes: %s.\n",
+				cardsLine(out), reportQuiet, later)
 		} else {
-			fmt.Fprintf(sb, "\nThe turn's tasks ended. Stopped gathering after %s with no new report; %s.\n", reportQuiet, later)
+			fmt.Fprintf(sb, "\n%s Stopped gathering after %s with no new report; %s.\n", cardsLine(out), reportQuiet, later)
 		}
 	case reportsWaitOver:
-		fmt.Fprintf(sb, "\nThe turn's tasks ended, and the wait ended while reports were still being gathered, so the reports "+
-			"shown are those that had arrived by then; %s, or wait longer with a larger wait_seconds.\n", later)
+		fmt.Fprintf(sb, "\n%s The wait ended while reports were still being gathered, so the reports shown are those that "+
+			"had arrived by then; %s, or wait longer with a larger wait_seconds.\n", cardsLine(out), later)
 	}
+}
+
+// cardsLine says the turn's tasks ended, and what the gateway's result said
+// about cards, which is why gathering went on.
+func cardsLine(out TurnOutcome) string {
+	if out.Cards == cardsPending {
+		return "The turn's tasks ended, and the gateway's result said work was handed to cards."
+	}
+	return "The turn's tasks ended; no result from the gateway said whether work was handed to cards, so gathering waited for a quiet period."
 }
 
 // writeEventHead is a buffered frame's heading line: label, then its message

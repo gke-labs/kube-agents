@@ -82,7 +82,9 @@ type ConsoleInFrame struct {
 // proactive notification) and is not a notice about the turn being sent.
 // A result names its task, addressee and state; a notification names, in
 // ReplyTo, the task whose turn filed the work it reports on, and an edit
-// re-sends a notification's message id with Edit set.
+// re-sends a notification's message id with Edit set. A chain's completed
+// result sets CardsPending when the turn handed work to kanban cards (a
+// gateway that predates the flag never sets it).
 type ConsoleOutFrame struct {
 	MessageID string `json:"messageId"`
 	Text      string `json:"text"`
@@ -92,6 +94,8 @@ type ConsoleOutFrame struct {
 	Addressee string `json:"addressee,omitempty"`
 	TaskID    string `json:"taskId,omitempty"`
 	ReplyTo   string `json:"replyTo,omitempty"`
+	// CardsPending is set on a result whose chain handed work to cards.
+	CardsPending bool `json:"cardsPending,omitempty"`
 }
 
 // submissionAuthority is the part of a submission's authority block that says
@@ -487,6 +491,8 @@ type turnWatch struct {
 	// unpin releases the conversation's buffer, which the turn holds while
 	// it gathers from it.
 	unpin func()
+	// resultSeen is signalled on each result frame recorded in results.
+	resultSeen chan struct{}
 
 	// mu guards followed and known, which the follower goroutine fills
 	// from the conversation's submissions once the turn's task is known.
@@ -494,6 +500,51 @@ type turnWatch struct {
 	followed []TaskRef
 	known    map[string]bool
 	stop     chan struct{}
+	// results is the result frames heard on the conversation, by the task
+	// each names (its taskId, or the r-<task> of its message id): whether
+	// any said cards are pending. Bounded by maxTurnResults.
+	results map[string]bool
+}
+
+// maxTurnResults bounds the result frames one turn records; past it a new
+// task's is not recorded, and the turn falls back to its quiet period.
+const maxTurnResults = 64
+
+// resultMessagePrefix is the gateway's message id prefix for a chain's
+// result frame: r-<root task id>.
+const resultMessagePrefix = "r-"
+
+// noteResult records a result frame heard on the conversation.
+func (w *turnWatch) noteResult(f ConsoleOutFrame) {
+	var ids []string
+	if lib.ValidSubjectToken(f.TaskID) {
+		ids = append(ids, f.TaskID)
+	}
+	if id, ok := strings.CutPrefix(f.MessageID, resultMessagePrefix); ok && lib.ValidSubjectToken(id) {
+		ids = append(ids, id)
+	}
+	w.mu.Lock()
+	for _, id := range ids {
+		if _, ok := w.results[id]; ok || len(w.results) < maxTurnResults {
+			// Once any result said cards are pending, a later one without
+			// the flag does not undo it.
+			w.results[id] = w.results[id] || f.CardsPending
+		}
+	}
+	w.mu.Unlock()
+	select {
+	case w.resultSeen <- struct{}{}:
+	default:
+	}
+}
+
+// rootResult reports whether a result frame for root was heard, and whether
+// one said cards are pending.
+func (w *turnWatch) rootResult(root string) (seen, pending bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	pending, seen = w.results[root]
+	return seen, pending
 }
 
 // openTurn subscribes to the conversation's submissions and notices, live on
@@ -508,6 +559,8 @@ func (b *NATSBus) openTurn(token string, texts []string, submissions bool) (*tur
 		notices:      make(chan *nats.Msg, 64),
 		known:        map[string]bool{},
 		stop:         make(chan struct{}),
+		results:      map[string]bool{},
+		resultSeen:   make(chan struct{}, 1),
 	}
 	// Submissions are every addressee's .in traffic, drained by the turn's
 	// matcher and then its follower. A settled turn has neither, and an
@@ -523,10 +576,19 @@ func (b *NATSBus) openTurn(token string, texts []string, submissions bool) (*tur
 	// Notices are read only until the turn's task appears, and a card's
 	// posts can come in bursts while the turn is followed (Events keeps
 	// those), so a notice that finds the channel full is dropped rather
-	// than left to back up into a slow consumer. A frame that is not a
-	// notice (a card's report, a result) never takes a slot: a burst of
-	// them must not crowd out the turn's notice.
+	// than left to back up into a slow consumer. A result frame is
+	// recorded, for whether the chain handed work to cards. Nothing but a
+	// notice takes a slot: a burst of reports must not crowd out the
+	// turn's notice.
 	nsub, err := nc.Subscribe(fmt.Sprintf(consoleOutSubject, token), func(m *nats.Msg) {
+		var f ConsoleOutFrame
+		if json.Unmarshal(m.Data, &f) != nil {
+			return
+		}
+		if f.Kind == frameKindResult {
+			w.noteResult(f)
+			return
+		}
 		if noticeText(m) == "" {
 			return
 		}
@@ -804,7 +866,24 @@ type TurnOutcome struct {
 	Reports      []EventFrame
 	ReportsEnd   reportsEnd
 	ReportCursor uint64
+	// Cards is what the gateway's result for the root said about cards,
+	// as last read while gathering.
+	Cards cardsSignal
 }
+
+// cardsSignal is what the gateway's result frame for a turn's root said
+// about work handed to kanban cards.
+type cardsSignal int
+
+const (
+	// cardsUnknown: no result frame for the root was heard (a gateway that
+	// predates the flag, or one whose heal path missed it).
+	cardsUnknown cardsSignal = iota
+	// cardsNone: the root's result came without cardsPending.
+	cardsNone
+	// cardsPending: the root's result said work was handed to cards.
+	cardsPending
+)
 
 // reportsEnd is why a turn's report gathering stopped.
 type reportsEnd int
@@ -818,6 +897,8 @@ const (
 	reportsQuiet
 	// reportsWaitOver: the wait ended while gathering.
 	reportsWaitOver
+	// reportsNoCards: the root's result said no work went to cards.
+	reportsNoCards
 )
 
 // reportQuiet is how long, once a turn's tasks have ended, gathering waits
@@ -920,13 +1001,15 @@ func (b *NATSBus) waitForChain(ctx context.Context, w *turnWatch, root TaskRef) 
 }
 
 // gatherReports collects the cards' posts on the turn: notify frames heard
-// since the turn was sent whose ReplyTo is one of its tasks (a card filed on
-// the default route answers the root; through a session pod, the platform
-// task it delegated to). When the turn's tasks ended, it keeps gathering
-// until reportQuiet passes with no new post on the turn, or the wait ends;
-// a card's post says nothing reliable about whether it is the last, so
-// nothing in its text ends the gathering. Otherwise it takes what is
-// already here.
+// since the turn was sent whose ReplyTo is one of its tasks (a current
+// gateway names the root; an older one, through a session pod, the platform
+// task it delegated to). When the turn's tasks ended, the gateway's result
+// frame for the root decides: without cardsPending, gathering stops at once;
+// with it, or when no result was heard, gathering goes on until reportQuiet
+// passes with no new post on the turn, or the wait ends. A card's post says
+// nothing reliable about whether it is the last, so nothing in its text ends
+// the gathering. When the tasks had not ended, it takes what is already
+// here.
 func (b *NATSBus) gatherReports(ctx context.Context, w *turnWatch, out *TurnOutcome, ended bool) {
 	if b.events == nil {
 		return
@@ -950,9 +1033,20 @@ func (b *NATSBus) gatherReports(ctx context.Context, w *turnWatch, out *TurnOutc
 			last = newest
 			quiet.Reset(reportQuiet)
 		}
-		switch {
-		case !ended:
+		if !ended {
 			out.ReportsEnd = reportsRunning
+			return
+		}
+		// The root's result says whether the chain handed work to cards:
+		// without it nothing more is coming, with it a card's report may
+		// take a while. With no result heard, the quiet period decides.
+		seen, pending := w.rootResult(out.Root.TaskID)
+		if pending {
+			out.Cards = cardsPending
+		}
+		switch {
+		case seen && !pending:
+			out.Cards, out.ReportsEnd = cardsNone, reportsNoCards
 			return
 		case ctx.Err() != nil:
 			out.ReportsEnd = reportsWaitOver
@@ -960,6 +1054,7 @@ func (b *NATSBus) gatherReports(ctx context.Context, w *turnWatch, out *TurnOutc
 		}
 		select {
 		case <-changed:
+		case <-w.resultSeen:
 		case <-quiet.C:
 			out.ReportsEnd = reportsQuiet
 			return
