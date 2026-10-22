@@ -769,7 +769,7 @@ the shell sandbox on, the sandbox pod's own data volume, which is not the gatewa
 streams). The root is fixed at `/opt/data/upgrade-retrospective/`, overridable by an environment
 variable, rather than under `$HERMES_HOME`, because a cron worker and a chat session resolve that
 variable to different directories and a store rooted there is written at one path and read from
-another. Under the root: `reports/<timestamp>.md`, `upgrade-retro-report.md` beside `reports/` pointing
+another. Under the root: `reports/<timestamp>.md`, `reports/upgrade-retro-report.md` beside them pointing
 at the latest full run, the same report as `.json`, `ledger.json` and `guards.json`. The volume survives a
 pod restart, every session's tools can read it, and the on-demand route finds the Sunday report
 there. Three triggers write the same files, so one run holds an exclusive lock on `.lock` under the
