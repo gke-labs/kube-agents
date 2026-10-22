@@ -2998,6 +2998,9 @@ unit_cost_hint() {
     # same tofu stack shape as ai-security-planted-model-audit; that case's
     # hint until this one has a record.
     ai-security-chat-request-runs-collector) echo 1450 ;;
+    # A general fleet health question that runs the health sweep (#3302): one
+    # card and a sweep of seconds; the drift chat route's band.
+    health-chat-request-runs-collector) echo 400 ;;
     # Presubmit again since 2026-09-29, held out (#2013 step 2); nightly-only
     # 2026-09-22 to then (#1023; held out on #1171, closed 2026-09-08, the
     # bar now on #2013 step 3). The canary measured 1002s median, 2074s p90,

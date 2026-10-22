@@ -981,6 +981,13 @@
 # closed. Its first nightly is its first observation outside a dev install.
 ./tasks/gitops-drift-load-bearing-change-triage/task.yaml
 
+# A general fleet health question ("check if my clusters are all healthy") runs
+# fleet_health.py once and files no per-cluster cards (#3302): on a 209-cluster
+# fleet the per-cluster fan-out queued behind the board's five user slots for
+# over thirty minutes. Reads the crashloop-workload role; read-only; requests
+# no pull request. Nightly from its first merge.
+./tasks/health-chat-request-runs-collector/task.yaml
+
 # Catalogue entry 12 (a node label is removed): seeded-a's
 # seeded-shapes/arch-pinned-worker (deprecated-label-selector), a
 # nodeSelector on beta.kubernetes.io/arch, deprecated and still set.
@@ -1041,6 +1048,11 @@
 # first merge; a presubmit seat is a later pull request that cites its
 # record.
 ./tasks/upgrades-retired-registry-image-named/task.yaml
+
+# The weekly upgrade readiness brief's on-request route: a brief in the SOP's shape
+# whose Decide-now lines name slot b's singleton budget and keep the webhook outage
+# under Also-this-week. deployer: noop, read-only, one readiness report.
+./tasks/upgrades-weekly-brief-decisions-named/task.yaml
 
 # Catalogue entry 3 (every replica in one zone or on one node), in the shape
 # the seeded fleet plants it: zone-pinned-api in seeded-topology on

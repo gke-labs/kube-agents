@@ -338,6 +338,7 @@ type usageHarness struct {
 	pruningBlocked  bool
 	pruningFailures bool
 	pruningHuman    bool
+	pruningErrored  bool
 }
 
 func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...client.Object) *usageHarness {
@@ -351,8 +352,8 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 			// the echo, so the store is stripped with a second patch the poller
 			// never sees, and the echo the poller reads is stripped the same way.
 			pa, isAgent := obj.(*agentv1alpha1.PlatformAgent)
-			if err == nil && isAgent && (h.pruning || h.pruningGauges || h.pruningMerged || h.pruningChat || h.pruningBlocked || h.pruningFailures || h.pruningHuman) {
-				strip := `{"status":{"usage":{"clustersRegistered":null,"clustersMonitored":null,"remediationsMergedTotal":null,"chatMessagesInboundTotal":null,"toolExecutionsBlockedTotal":null,"brokerFailuresTotal":null,"lastHumanActiveTime":null}}}`
+			if err == nil && isAgent && (h.pruning || h.pruningGauges || h.pruningMerged || h.pruningChat || h.pruningBlocked || h.pruningFailures || h.pruningHuman || h.pruningErrored) {
+				strip := `{"status":{"usage":{"clustersRegistered":null,"clustersMonitored":null,"remediationsMergedTotal":null,"chatMessagesInboundTotal":null,"toolExecutionsBlockedTotal":null,"brokerFailuresTotal":null,"lastHumanActiveTime":null,"chatTurnsErroredTotal":null}}}`
 				if h.pruningMerged {
 					strip = `{"status":{"usage":{"remediationsMergedTotal":null}}}`
 				}
@@ -367,6 +368,9 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 				}
 				if h.pruningHuman {
 					strip = `{"status":{"usage":{"lastHumanActiveTime":null}}}`
+				}
+				if h.pruningErrored {
+					strip = `{"status":{"usage":{"chatTurnsErroredTotal":null}}}`
 				}
 				if h.pruning {
 					strip = `{"status":{"usage":null}}`
@@ -395,6 +399,9 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 			}
 			if isAgent && (h.pruningGauges || h.pruningHuman) {
 				pa.Status.Usage.LastHumanActiveTime = nil
+			}
+			if isAgent && (h.pruningGauges || h.pruningErrored) {
+				pa.Status.Usage.ChatTurnsErroredTotal = 0
 			}
 			return err
 		},
@@ -689,7 +696,7 @@ func TestUsagePoller_RepairsAStatusBehindTheConfigMap(t *testing.T) {
 		Version:       usageDocumentVersion,
 		AgentUID:      usageTestAgentUID,
 		FirstRecorded: metav1.NewTime(usageClock(1)),
-		Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4, usageCounterRemediationsProposed: 0, usageCounterRemediationsMerged: 0, usageCounterChatMessagesInbound: 0, usageCounterSessionsTriage: 0, usageCounterSessionsChat: 0, usageCounterToolExecutionsBlocked: 0, usageCounterBrokerFailures: 0},
+		Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4, usageCounterRemediationsProposed: 0, usageCounterRemediationsMerged: 0, usageCounterChatMessagesInbound: 0, usageCounterSessionsTriage: 0, usageCounterSessionsChat: 0, usageCounterToolExecutionsBlocked: 0, usageCounterBrokerFailures: 0, usageCounterChatTurnsErrored: 0},
 		LastMoved:     &moved,
 		Pods: map[string]*usagePodEntry{
 			usagePodEntryKey("gw-a", usageCounterEventsIngested):            {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterEventsIngested, Sample: 4, Marker: moved},
@@ -701,6 +708,7 @@ func TestUsagePoller_RepairsAStatusBehindTheConfigMap(t *testing.T) {
 			usagePodEntryKey("gw-a", usageCounterSessionsChat):              {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterSessionsChat, Sample: 0, Marker: moved},
 			usagePodEntryKey("broker-b", usageCounterToolExecutionsBlocked): {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterToolExecutionsBlocked, Sample: 0, Marker: moved},
 			usagePodEntryKey("broker-b", usageCounterBrokerFailures):        {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterBrokerFailures, Sample: 0, Marker: moved},
+			usagePodEntryKey("gw-a", usageCounterChatTurnsErrored):          {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterChatTurnsErrored, Sample: 0, Marker: moved},
 		},
 	})
 	h.stub.set(gatewayAddr(), 4, nil)
@@ -1146,8 +1154,8 @@ func TestUsagePoller_ProposalsCountBesideToolExecutions(t *testing.T) {
 		t.Fatalf("the first poll wrote a counter: %+v", status)
 	}
 	doc := h.document()
-	if len(doc.Pods) != 9 {
-		t.Fatalf("the document holds %d entries, want 9 (gateway events, triage sessions, chat and chat sessions; broker tools, refusals, proposals, merged and failures): %+v", len(doc.Pods), doc.Pods)
+	if len(doc.Pods) != 10 {
+		t.Fatalf("the document holds %d entries, want 10 (gateway events, triage sessions, chat, chat sessions and turns errored; broker tools, refusals, proposals, merged and failures): %+v", len(doc.Pods), doc.Pods)
 	}
 
 	// A proposal opened and no command run: the proposals counter moves alone.
@@ -1889,6 +1897,67 @@ func TestUsagePoller_ReseedsADocumentWithATimeOutsideTheCRsLife(t *testing.T) {
 				t.Fatalf("the planted time survived the re-seed: lastMoved=%v lastHumanMoved=%v", doc.LastMoved, doc.LastHumanMoved)
 			}
 		})
+	}
+}
+
+// Failed turns count into chatTurnsErroredTotal from the chat listener and
+// nowhere else, and a failed turn alone is not activity.
+func TestUsagePoller_ChatTurnsErroredCount(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, nil)
+	h.stub.set(chatAddr(), 0, ptr.To(1.0))
+	h.stub.setSample(chatAddr(), usageCounterChatTurnsErrored, 1)
+	h.poll(5)
+	h.stub.setSample(chatAddr(), usageCounterChatTurnsErrored, 4)
+	h.poll(10)
+	status := h.status()
+	if status.ChatTurnsErroredTotal != 3 || status.ChatMessagesInboundTotal != 0 || status.ToolExecutionsTotal != 0 {
+		t.Fatalf("after three failed turns: %+v, want 3 and nothing else", status)
+	}
+	if status.LastActiveTime != nil {
+		t.Fatalf("a failed turn alone moved lastActiveTime: %v", status.LastActiveTime)
+	}
+	if doc := h.document(); doc.Totals[usageCounterChatTurnsErrored] != 3 {
+		t.Fatalf("document totals = %v, want 3", doc.Totals)
+	}
+}
+
+// A served CRD from the release before this one prunes chatTurnsErroredTotal
+// alone: its absence is recorded against it, the others keep landing, and a
+// poll with it alone behind does not re-patch while the record is fresh.
+func TestUsagePoller_AChatServingCRDWithoutTheErroredCounterKeepsTheOthersFlowing(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
+	h.pruningErrored = true
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(chatAddr(), 1, ptr.To(1.0))
+	h.stub.set(brokerAddr(), 10, nil)
+	h.stub.setSample(chatAddr(), usageCounterChatTurnsErrored, 1)
+	h.poll(5)
+	h.stub.set(chatAddr(), 3, ptr.To(1.0))
+	h.stub.setSample(chatAddr(), usageCounterChatTurnsErrored, 2)
+	h.poll(10)
+	if status := h.status(); status.ChatMessagesInboundTotal != 2 || status.ChatTurnsErroredTotal != 0 {
+		t.Fatalf("after a message and a failed turn: %+v, want 2 messages and no errored counter", status)
+	}
+	if h.p.newerFieldPruned(agent, usageCounterChatMessagesInbound) || !h.p.newerFieldPruned(agent, usageCounterChatTurnsErrored) {
+		t.Fatal("the errored counter's absence was not recorded against it alone")
+	}
+	patches := h.patches
+	h.poll(12)
+	if h.patches != patches {
+		t.Fatal("a poll with the errored counter alone behind re-patched the status while its record was fresh")
+	}
+	h.stub.set(chatAddr(), 5, ptr.To(1.0))
+	h.poll(14)
+	if got := h.status().ChatMessagesInboundTotal; got != 4 {
+		t.Fatalf("a message waited on the errored counter's record: %d, want 4", got)
+	}
+	if h.r.usageStatusPruned(agent) {
+		t.Fatal("the errored counter's absence was recorded as the counters' pruning")
 	}
 }
 

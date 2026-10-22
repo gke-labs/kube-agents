@@ -30,10 +30,12 @@ _BROKER_PY = _REPO_ROOT / "agents" / "platform" / "scripts" / "credential_proxy.
 _CHAT_METRICS_PY = _REPO_ROOT / "agents" / "chat" / "defaults" / "plugins" / "chat_metrics" / "metrics.py"
 _MANIFESTS_GO = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_manifests.go"
 _A2A_METRICS_GO = _REPO_ROOT / "a2a" / "gateway" / "metrics.go"
+_A2A_LIB_PAYLOAD_GO = _REPO_ROOT / "a2a" / "lib" / "payload.go"
 
 
 def _go_const(path, name):
-    match = re.search(rf'^\s*(?:const\s+)?{name}\s*=\s*"([^"]+)"', path.read_text(), re.M)
+    # A bare constant or a typed one (`StateFailed TaskState = "failed"`).
+    match = re.search(rf'^\s*(?:const\s+)?{name}(?:\s+\w+)?\s*=\s*"([^"]+)"', path.read_text(), re.M)
     assert match, f"{name} not found in {path}"
     return match.group(1)
 
@@ -168,6 +170,24 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         vocabulary = set(re.findall(r'^TOOL_STATUS_(?!LABEL\b)\w+(?:\s*:[^=\n]+)?\s*=\s*["\']([^"\']+)["\']', _BROKER_PY.read_text(), re.M))
         self.assertTrue(vocabulary, "no TOOL_STATUS_* constants found in the broker")
         self.assertEqual(vocabulary, sets)
+
+    def test_the_chat_plugins_errored_family_and_the_a2a_terminals_are_the_errored_counters_families(self):
+        self.assertEqual(_py_const("CHAT_TURNS_ERRORED_METRIC", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "chatTurnsErroredSeries"))
+        name = "_".join(_go_const(_A2A_METRICS_GO, c) for c in ("metricsNamespace", "metricsSubsystem", "taskTerminalsName"))
+        self.assertEqual(name, _go_const(_SCRAPE_GO, "a2aTaskTerminalsSeries"))
+        self.assertEqual(_go_const(_A2A_METRICS_GO, "labelState"), _go_const(_SCRAPE_GO, "a2aTerminalStateLabel"))
+
+    def test_the_errored_states_the_poller_filters_on_are_the_a2a_libs_failed_and_rejected(self):
+        """The state values are the A2A library's constants; the gateway emits them
+        through its terminal list, and the operator's map is the second copy."""
+        match = re.search(r"a2aErroredTerminalStates\s*=\s*map\[string\]bool\{([^}]*)\}", _SCRAPE_GO.read_text())
+        self.assertIsNotNone(match, "a2aErroredTerminalStates not found")
+        states = set(re.findall(r'"([^"]+)":\s*true', match.group(1)))
+        self.assertEqual({_go_const(_A2A_LIB_PAYLOAD_GO, "StateFailed"), _go_const(_A2A_LIB_PAYLOAD_GO, "StateRejected")}, states)
+        terminals = re.search(r"metricsTerminalStates\s*=\s*\[\]lib\.TaskState\{([^}]*)\}", _A2A_METRICS_GO.read_text())
+        self.assertIsNotNone(terminals, "metricsTerminalStates not found")
+        for name in ("StateFailed", "StateRejected"):
+            self.assertIn(f"lib.{name}", terminals.group(1))
 
     def test_the_status_label_key_the_broker_writes_is_the_one_the_poller_filters_on(self):
         self.assertEqual(_py_const("TOOL_STATUS_LABEL"), _go_const(_SCRAPE_GO, "toolInvocationsStatusLabel"))

@@ -671,7 +671,11 @@ Three small items to fold back into the payload spec rather than fork here (fold
   management section.
 - ~~**Persona packaging.**~~ Decided 8/24: OCI-only. One versioned path; dev friction is
   a tooling problem (a push target is seconds), not a second mechanism. Revisit only if
-  the iteration friction proves real.
+  the iteration friction proves real. **Amended 10/21 (#3656):** what the image carries is
+  a harness-neutral persona directory (`persona.yaml`, `instructions.md`, `skills/`,
+  `mcp.yaml`; [`a2a/lib/persona`](../../a2a/lib/persona/README.md)), and an adapter per
+  harness renders it into that harness's config inside the pod. MCP servers are named on the
+  broker's relay only, so a persona cannot route a tool call around the broker's policy.
 - ~~**Per-task bus credentials.**~~ Decided 8/24: lands with the authority work - it is
   the same attenuation machinery, and that stream owns it. Stays reserved as a named
   tightening; stage 3 ships profile-level credentials. **Amended 9/9:** the authority

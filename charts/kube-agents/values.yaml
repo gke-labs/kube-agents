@@ -847,7 +847,8 @@ platformAgent:
     # Execution limits per agent persona. Empty omits the field so CRD/Hermes
     # defaults apply. When plugins.stockoutInvestigator.enabled=true, the chart
     # automatically applies tuning (maxInProgress: 3, platform.maxTurns: 200,
-    # cluster.maxTurns: 150) unless overridden here.
+    # cluster.maxTurns: 150) unless overridden here, or unless
+    # plugins.stockoutInvestigator.applyTuning is false.
     tuning: {}
       # maxInProgress: 3
       # maxSessions caps the A2A session pods a "next" install runs at once;
@@ -1360,6 +1361,12 @@ plugins:
       repository: ghcr.io/gke-labs/kube-agents/gke-stockout-investigator
       tag: "" # defaults to Chart.appVersion
       pullPolicy: IfNotPresent
+    # The plugin's execution limits (maxInProgress: 3, platform.maxTurns: 200,
+    # platform.apiMaxRetries: 8, cluster.maxTurns: 150, cluster.apiMaxRetries: 8)
+    # are merged into platformAgent.harness.tuning when the plugin is enabled.
+    # false keeps the agent at the tuning the install set, for an install that
+    # runs the plugin only to prove its ingress, such as the presubmit's.
+    applyTuning: true
     pubsub:
       topic: gke-stockout-alerts-topic
       subscription: gke-stockout-alerts-sub
