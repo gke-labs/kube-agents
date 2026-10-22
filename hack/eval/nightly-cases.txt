@@ -981,6 +981,13 @@
 # closed. Its first nightly is its first observation outside a dev install.
 ./tasks/gitops-drift-load-bearing-change-triage/task.yaml
 
+# A general fleet health question ("check if my clusters are all healthy") runs
+# fleet_health.py once and files no per-cluster cards (#3302): on a 209-cluster
+# fleet the per-cluster fan-out queued behind the board's five user slots for
+# over thirty minutes. Reads the crashloop-workload role; read-only; requests
+# no pull request. Nightly from its first merge.
+./tasks/health-chat-request-runs-collector/task.yaml
+
 # Twenty image-pull Warnings at once: every alert the daemon admits starts its
 # triage turn within the product's 20-minute queue limit, graded by the
 # triage_starts check on the session store (#3583). A tofu stack on the infra

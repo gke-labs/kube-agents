@@ -31,9 +31,11 @@ holds them to that.
 kube-agents/
 ├── README.md, INSTALL.md, CONTRIBUTING.md,        project front door, install
 │   AGENTS.md, CLAUDE.md                           guide, contributor/agent rules
-├── a2a/                                           A2A bus: the persona README +
-│                                                  the mode-gated a2a-topics skill
-│                                                  and the session agent's persona
+├── a2a/                                           A2A bus. a2a/persona/: the bus
+│                                                  persona content (a2a-topics skill,
+│                                                  the session agent's persona);
+│                                                  a2a/lib/persona/: the persona
+│                                                  format (+ cmd/persona)
 ├── agents/                                        agent blueprints (runtime docs)
 │   ├── chat/                                      Planning Agent front door: persona
 │   │                                              docs, onboarding templates,
@@ -268,7 +270,7 @@ identifier appears, add its source here.
 | PR evidence screenshots: publish branch, file-name provenance, caption format | `scripts/pr_evidence_screenshot.sh` |
 | Unresolved-thread hold: the label, the pool condition, the sweep interval, the ownership rule | `scripts/hold_unresolved_threads.py` and `.github/workflows/hold-unresolved-threads.yml` |
 | Merge queue gate checks: the two contexts, what each reads, the smoke skip list it copies from Prow | `scripts/merge_gate.py` and `.github/workflows/merge-gate.yml` |
-| Merge queue enqueue sweep: the label predicate, the `MERGE_QUEUE` switch, the sweep interval | `scripts/merge_gate.py` (`sweep`) and `.github/workflows/auto-enqueue.yml` |
+| Merge queue enqueue sweep: the label predicate, the `MERGE_QUEUE` switch, the sweep interval, the one retry after a `failed_checks` removal | `scripts/merge_gate.py` (`sweep`) and `.github/workflows/auto-enqueue.yml` |
 | Issue triage queue: the `needs-triage` label, the `priority:` label prefix it mirrors, and when each event adds or removes it | `.github/workflows/needs-triage.yml` |
 | Flaky-check tracking: the `ci:flaky` label, the watched checks and the exclusions, the sweep window and interval, the one-issue-per-container key, the never-close rule | `scripts/notify_flaky_check.py` (`WATCHED_WORKFLOWS`, `SWEEP_WINDOW_DAYS`) and `.github/workflows/flaky-check-notify.yml`; the exclusion list the contract test enforces is `FLAKY_CHECK_EXCLUDED_WORKFLOWS` in `scripts/test_integration_contracts.py` |
 | Reviewer auto-assign: the skip reasons, the self-approval test that widens the verdict rule and narrows the draw, the robot-account exclusion, the `/request-review` reactions, the third-round hand-off and its marker | `scripts/request_reviewers.py`, `.github/workflows/auto_request_review.yml` and `reviewers.groups` and `options.robot_accounts` in `.github/auto_request_review.yml` |

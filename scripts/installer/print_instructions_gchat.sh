@@ -22,8 +22,9 @@ the Google Chat path the install uses: the A2A gateway under
 PLATFORM_AGENT_MODE=next, the Hermes listener otherwise. It reads
 the install.env at the root of the checkout it sits in ($KUBE_AGENTS_INSTALL_ENV
 instead, when set) and scripts/installer/vars.sh, and prints the checklist
-only when GOOGLE_CHAT_ENABLED is on there (true, yes, 1 or on). install.sh runs it at the end of an install
-with Google Chat enabled; run it again at any time. It changes nothing on the
+only when GOOGLE_CHAT_ENABLED is on there (true, yes, 1 or on). install.sh runs it
+after every apply that leaves Google Chat on, --menu's Save & Apply included;
+run it again at any time. It changes nothing on the
 cluster, but like every installer step it records REGISTRY_PREFIX in
 vars.sh (not under --dry-run), asking for it first on a terminal when
 nothing sets it.
@@ -57,6 +58,14 @@ if [ -n "${GCHAT_STEPS_PLATFORM_AGENT_MODE+set}" ]; then
   ALLOWED_USERS="${GCHAT_STEPS_ALLOWED_USERS:-}"
   CHAT_TOPIC_NAME="${GCHAT_STEPS_TOPIC_NAME:-}"
   CHAT_SUB_NAME="${GCHAT_STEPS_SUB_NAME:-}"
+  # load_state takes NAMESPACE from the files alone; --agent-namespace sets
+  # it for the run.
+  NAMESPACE="${GCHAT_STEPS_NAMESPACE:-${NAMESPACE:-}}"
+fi
+# An empty subscription name is one the tfvars generator derives from the
+# topic, as an install.env that turned Google Chat on in the Day-2 menu has.
+if [ -n "${CHAT_TOPIC_NAME:-}" ] && [ -z "${CHAT_SUB_NAME:-}" ]; then
+  CHAT_SUB_NAME="$(derive_chat_sub_name "$CHAT_TOPIC_NAME")"
 fi
 
 # Google Chat on the A2A gateway: no pairing, and a home channel that only
@@ -137,4 +146,8 @@ if is_truthy "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}"; then
   echo -e "       ${C_CYAN}(Only required for first-time bot deployments. If the bot responds instantly, skip this!)${C_RESET}"
   echo -e "       ${C_WHITE}kubectl exec -it deploy/${PLATFORM_AGENT_DEPLOYMENT} -n ${NAMESPACE:-$DEFAULT_NAMESPACE} -- hermes pairing approve google_chat <PAIRING_CODE>${C_RESET}"
   echo -e ""
+else
+  # On stderr: a pipe still gets nothing, but a reader who expected the
+  # checklist learns which file and key decided there is none.
+  print_info "GOOGLE_CHAT_ENABLED is not on in $(install_env_file_for_state), so there is no Google Chat checklist. Set it there and run this again." >&2
 fi

@@ -818,6 +818,7 @@ is a hand-authored dotenv and a hand may well write `export`.
   `install.sh` can source it standalone before any checkout exists.
 - **[print_instructions_gchat.sh](print_instructions_gchat.sh)** /
   **[print_instructions_slack.sh](print_instructions_slack.sh)**: post-install manual-step
-  instructions, printed by `install.sh` when the integration is enabled.
+  instructions, printed by `install.sh` after every apply that leaves the integration on,
+  `--menu`'s Save & Apply included.
 - **[../dev/dev_rebuild_agent.sh](../dev/dev_rebuild_agent.sh)**: fast local development utility
   that builds, pushes, and redeploys agent container images.
