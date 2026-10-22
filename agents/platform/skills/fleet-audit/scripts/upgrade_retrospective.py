@@ -1124,7 +1124,7 @@ MITIGATIONS = {
     10: {
         "title": "Add-on and client skew",
         "before": "Installed add-on versions against their support matrices for the target minor; a node pool further behind the control plane than the skew policy allows.",
-        "read_today": "the readiness mode grades node-pool skew, and the security-patch orchestrator's `pool-skew` check flags a pool too far behind its control plane every Monday; add-on and client skew are unread",
+        "read_today": "the readiness mode grades node-pool skew, and the security-patch orchestrator's `pool-skew` check flags a pool too far behind its control plane every Monday; the operator add-ons (cert-manager, Istio, the GPU operator) and the clients are unread",
         "mitigate_before": "Upgrade add-ons to a version whose matrix includes the target before the cluster moves; keep node pools inside the skew window.",
         "mitigate_after": "Upgrade the add-on.",
     },
