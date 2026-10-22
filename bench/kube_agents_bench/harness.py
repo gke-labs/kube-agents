@@ -639,6 +639,10 @@ _INFRA_FAILURE_REASONS = frozenset({"rate_limit", "billing"})
 _FAILURE_STATUSES = frozenset({"blocked", "triage", "failed"})
 _RATE_LIMIT_REASON_PREFIX = "provider rate limit: API retries exhausted"
 _FAILURE_REASON_PATTERN = re.compile(r"\bfailure_reason=([a-zA-Z0-9_]+)\b")
+_LITELLM_429_PATTERN = re.compile(
+    r"429|RESOURCE_EXHAUSTED|Too Many Requests|RateLimitError|quota exceeded|API retries exhausted",
+    re.IGNORECASE,
+)
 
 
 def _extract_infra_failure_reason(text: str | None) -> str | None:
@@ -652,6 +656,34 @@ def _extract_infra_failure_reason(text: str | None) -> str | None:
             return match.group(1) if match.group(1) == "rate_limit" else None
         return "rate_limit"
     return None
+
+
+def _corroborate_platform_rate_limit(timeout: float = 10.0) -> bool:
+    """Verify provider quota exhaustion against the platform inference gateway (LiteLLM) log.
+
+    A worker outside goal mode can invoke ``kanban_block`` with ``kind="transient"``
+    and the rate limit prefix directly. To prevent worker-fabricated 429 blocks from
+    escaping evaluation, board-reported rate limits are corroborated against the
+    platform's LiteLLM proxy log (which records Vertex AI 429 RESOURCE_EXHAUSTED events)
+    when proxy telemetry is available.
+    """
+    path = os.environ.get("LITELLM_LOG_PATH")
+    if path:
+        try:
+            return bool(_LITELLM_429_PATTERN.search(Path(path).read_text(errors="replace")))
+        except OSError:
+            return False
+
+    artifacts = os.environ.get(_ARTIFACTS_ENV)
+    if artifacts:
+        art_path = Path(artifacts) / "litellm.log"
+        if art_path.is_file():
+            try:
+                return bool(_LITELLM_429_PATTERN.search(art_path.read_text(errors="replace")))
+            except OSError:
+                return False
+
+    return True
 
 
 def _mark_result_infra_failure(result: AgentResult, detail: str) -> None:
@@ -2590,10 +2622,12 @@ class KubeAgentsHarness(AgentHarness):
         if status in _FAILURE_STATUSES:
             # A card a block landed in ``blocked`` (or, on the loop breaker's second
             # block, ``triage``) must carry block_kind == "transient" to be recognized
-            # as infra. ``transient`` is the signature stamped by Hermes's patched
-            # 429 exit (deploy/docker/patches/kanban_guardrail_exit.py: RATE_LIMIT_BLOCK_KIND);
-            # non-transient blocks (e.g. worker-authored needs_input or capability per
-            # SOUL.md §0) are refused from admitting summaries into infra failure reasons.
+            # as an infra candidate. Note that while Hermes's patched 429 exit stamps
+            # RATE_LIMIT_BLOCK_KIND ("transient"), upstream's kanban_block tool also
+            # accepts "transient" outside goal mode (hermes_cli/kanban_db.py:93).
+            # Non-transient blocks (e.g. worker-authored needs_input or capability per
+            # SOUL.md §0) are excluded here, and transient board messages are further
+            # corroborated against platform inference gateway telemetry in _settle.
             if status in ("blocked", "triage") and bblock_kinds.get(task_id) != "transient":
                 return []
             if task_id in bsummaries:
@@ -2696,11 +2730,13 @@ class KubeAgentsHarness(AgentHarness):
                         board_messages.extend(fallback_messages[t])
             return board_messages
 
+        bblock_kinds = final_bstate[3] if len(final_bstate) > 3 else {}
         for t in failure_cards:
             live_status = final_bstate[0].get(t)
             if live_status is not None and live_status not in _TERMINAL_STATUSES:
-                if unsettled is not None:
-                    unsettled.append(t)
+                if bblock_kinds.get(t) == "transient":
+                    if unsettled is not None:
+                        unsettled.append(t)
                 if live_statuses is not None:
                     live_statuses[t] = live_status
                 if isinstance(statuses, dict):
@@ -2883,7 +2919,9 @@ class KubeAgentsHarness(AgentHarness):
             )
         unsettled = [
             t for t in poll_failure_statuses
-            if _status(t) not in _TERMINAL_STATUSES and t not in outstanding
+            if _status(t) not in _TERMINAL_STATUSES
+            and t not in outstanding
+            and read.cards.get(t, {}).get("block_kind") == "transient"
         ]
         if unsettled:
             has_delivery = bool(
@@ -3347,14 +3385,28 @@ class KubeAgentsHarness(AgentHarness):
             for text in board_messages:
                 reason = _extract_infra_failure_reason(text)
                 if reason:
-                    infra_reason = reason
-                    infra_detail = f"card on board recorded {reason}: {text[:200]}"
-                    break
+                    if _corroborate_platform_rate_limit():
+                        infra_reason = reason
+                        infra_detail = f"card on board recorded {reason}: {text[:200]}"
+                        break
+                    else:
+                        result.errors.append(
+                            f"card on board recorded {reason} ({text[:200]}) but platform proxy log showed no 429"
+                        )
 
         _purge_card_state(awaited, _EXEC_TIMEOUT)
 
+        reported = reported_statuses(observed)
+        successful_deliveries = {
+            tid: text
+            for tid, text in delivered_results(observed, awaited).items()
+            if reported.get(tid) not in _FAILURE_STATUSES and not _extract_infra_failure_reason(text)
+        }
+        worker_acted = bool(
+            successful_deliveries or (captured is not None and bool(captured.entries))
+        )
         if infra_reason:
-            if opening_turn:
+            if opening_turn and not worker_acted:
                 _mark_result_infra_failure(
                     result,
                     f"delegated worker hit infrastructure failure ({infra_reason}): {infra_detail}",

@@ -2770,6 +2770,33 @@ def test_a_card_unblocked_and_claimed_running_on_inject_records_ceiling(
     assert result.metadata.get("final_message") == ACK
 
 
+def test_a_needs_input_card_unblocked_and_running_on_inject_does_not_record_ceiling(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card blocked with needs_input unblocked to running on deliverable read does not record ceiling."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(
+        tmp_path,
+        CARD_A,
+        "blocked",
+        summary="User input needed.",
+        block_kind="needs_input",
+    )
+
+    def _on_read(n: int) -> None:
+        if n == 2:
+            set_card(tmp_path, CARD_A, "running", block_kind="needs_input")
+
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch, on_read=_on_read))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert not infra(result)
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+    assert not result.has_errors()
+
+
 def test_a_failed_card_with_rate_limit_error_on_inject_is_infrastructure(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
