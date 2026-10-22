@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -13,6 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -244,9 +246,11 @@ func TestAnUnmarkedNamespaceIsNotTheProfileNamespace(t *testing.T) {
 	}
 }
 
-// The flip back to today removes the agent's quota and fence from the
-// profile namespace, and leaves an object of the same name that isn't its.
-func TestTheFlipToTodayRemovesTheProfileObjects(t *testing.T) {
+// The delete helpers the flip and the deletion use remove the agent's quota
+// and fence from the profile namespace, and leave an object of the same name
+// that isn't its. (The flip's call sites are in
+// TestTheProfileFenceAloneDrivesTheTeardown, which runs cleanupA2A.)
+func TestTheProfileDeleteHelpersTakeOnlyTheAgentsOwn(t *testing.T) {
 	c, scheme := startEnvtest(t)
 	ctx := context.Background()
 	agent := a2aTestAgent()
@@ -330,5 +334,97 @@ func TestProfileFencedChecksTheNamespaceAndTheFencesOwner(t *testing.T) {
 	}
 	if fenced, err := r.profileFenced(ctx, agent); err != nil || fenced {
 		t.Errorf("the agent's fence in a namespace that lost its markers: profileFenced = %v, %v, want false", fenced, err)
+	}
+}
+
+// A terminating profile namespace is absent, and a failure confined to the
+// profile namespace doesn't cost the agent namespace its fences.
+func TestATerminatingProfileNamespaceWithholdsNoOtherFence(t *testing.T) {
+	c, scheme := startEnvtest(t)
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{
+		ProjectID: envtestHarnessProject, Location: envtestHarnessLocation, ClusterName: envtestHarnessCluster,
+	}
+	if err := c.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: agent.Namespace}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Create(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	ns := chartProfileNamespace(agent)
+	ns.Finalizers = []string{"kubeagents.x-k8s.io/test-pin"}
+	if err := c.Create(ctx, ns); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Delete(ctx, ns); err != nil {
+		t.Fatal(err)
+	}
+	r := &PlatformAgentReconciler{Client: c, Scheme: scheme}
+	if exists, err := r.profileNamespaceExists(ctx, agent); err != nil || exists {
+		t.Errorf("a terminating profile namespace: exists=%v err=%v, want absent", exists, err)
+	}
+	if _, fenced, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil || fenced {
+		t.Fatalf("fences with a terminating profile namespace: fenced=%v err=%v, want unfenced and no error", fenced, err)
+	}
+	var nats networkingv1.NetworkPolicy
+	if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: buildA2ANATSNetworkPolicy(agent).Name}, &nats); err != nil {
+		t.Fatalf("the NATS fence was not applied: %v", err)
+	}
+	for _, peer := range nats.Spec.Ingress[0].From {
+		if peer.NamespaceSelector != nil && peer.NamespaceSelector.MatchLabels[corev1.LabelMetadataName] == profileNamespaceName(agent) {
+			t.Error("the NATS fence admits a terminating profile namespace")
+		}
+	}
+	// Unpin it so the API server can finish.
+	var live corev1.Namespace
+	if err := c.Get(ctx, types.NamespacedName{Name: ns.Name}, &live); err == nil {
+		live.Finalizers = nil
+		_ = c.Update(ctx, &live)
+	}
+}
+
+// A profile-fence write that fails still lets the other fences land, and
+// the error comes back after them.
+func TestAProfileFenceFailureStillAppliesTheOtherFences(t *testing.T) {
+	cfg, scheme := startEnvtestConfig(t)
+	c, err := client.NewWithWatch(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{
+		ProjectID: envtestHarnessProject, Location: envtestHarnessLocation, ClusterName: envtestHarnessCluster,
+	}
+	if err := c.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: agent.Namespace}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Create(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Create(ctx, chartProfileNamespace(agent)); err != nil {
+		t.Fatal(err)
+	}
+	failing := interceptor.NewClient(c, interceptor.Funcs{
+		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if obj.GetNamespace() == profileNamespaceName(agent) {
+				return fmt.Errorf("refused in the profile namespace")
+			}
+			return cl.Patch(ctx, obj, patch, opts...)
+		},
+	})
+	r := &PlatformAgentReconciler{Client: failing, Scheme: scheme}
+	if _, fenced, err := r.reconcileA2ANetworkFences(ctx, agent); err == nil || fenced {
+		t.Fatalf("fences with a failing profile write: fenced=%v err=%v, want unfenced and the error", fenced, err)
+	}
+	var nats networkingv1.NetworkPolicy
+	if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: buildA2ANATSNetworkPolicy(agent).Name}, &nats); err != nil {
+		t.Fatalf("the NATS fence was withheld by a failure in the profile namespace: %v", err)
+	}
+	for _, peer := range nats.Spec.Ingress[0].From {
+		if peer.NamespaceSelector != nil && peer.NamespaceSelector.MatchLabels[corev1.LabelMetadataName] == profileNamespaceName(agent) {
+			t.Error("the NATS fence admits the profile namespace though its fence failed to apply")
+		}
 	}
 }

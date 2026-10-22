@@ -5004,9 +5004,13 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 	dnsClusterIPs := r.a2aSessionDNSClusterIPs(ctx, agent)
 	// The profile namespace's fence goes first, and the bus admits that
 	// namespace only once the fence is in place (agentprofile_namespace.go).
-	profileFenced, err = r.reconcileProfileFence(ctx, agent, dnsClusterIPs)
-	if err != nil {
-		return false, false, err
+	// A failure confined to the profile namespace (a terminating namespace,
+	// a policy there refusing the write) must not cost the agent namespace
+	// its fences: the peer is withheld and the rest are applied before the
+	// error is returned.
+	profileFenced, profileErr := r.reconcileProfileFence(ctx, agent, dnsClusterIPs)
+	if profileErr != nil {
+		profileFenced = false
 	}
 	nats := buildA2ANATSNetworkPolicy(agent)
 	if !profileFenced {
@@ -5058,6 +5062,9 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 		if err := r.applyManaged(ctx, agent, np); err != nil {
 			return false, false, fmt.Errorf("failed to apply A2A NetworkPolicy %s: %w", np.Name, err)
 		}
+	}
+	if profileErr != nil {
+		return gatewayFenced, false, profileErr
 	}
 	return gatewayFenced, profileFenced, nil
 }
@@ -6263,7 +6270,8 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// -- the shape a next CR deleted and re-created under the same name in
 	// today mode takes, while its old fences still carry the old UID.
 	// Ownership is read off the fetched object, so the exit stays at ten
-	// Gets.
+	// Gets, plus one for the profile namespace's fence below, which carries
+	// no owner reference and is tested by this agent's labels instead.
 	//
 	// Adding an object to reconcileA2A ahead of the keys Secret, or to
 	// reconcileA2ANetworkFences ahead of the NATS fence, means adding it here.

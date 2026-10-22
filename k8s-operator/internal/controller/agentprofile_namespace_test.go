@@ -209,14 +209,16 @@ func TestDeletingTheAgentRemovesItsProfileObjects(t *testing.T) {
 
 // A today install whose only A2A residue is the profile fence (a guardrail
 // pass that died after it and before the NATS fence) still runs the
-// teardown, and the fence goes.
+// teardown, and cleanupA2A removes the fence and the quota.
 func TestTheProfileFenceAloneDrivesTheTeardown(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 	agent.Spec.Mode = ptr.To("today")
 	fence := buildProfileNetworkPolicy(agent, nil)
 	withCommonLabels(fence, agent)
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, fence).Build()
+	quota := buildProfileQuota(agent, nil)
+	withCommonLabels(quota, agent)
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, fence, quota).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	if err := r.cleanupA2A(context.Background(), agent); err != nil {
 		t.Fatalf("cleanupA2A: %v", err)
@@ -224,6 +226,10 @@ func TestTheProfileFenceAloneDrivesTheTeardown(t *testing.T) {
 	var np networkingv1.NetworkPolicy
 	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "test-ns-profiles", Name: fence.Name}, &np); !apierrors.IsNotFound(err) {
 		t.Errorf("the profile fence survived a teardown it was the only residue of (err %v)", err)
+	}
+	var q corev1.ResourceQuota
+	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "test-ns-profiles", Name: quota.Name}, &q); !apierrors.IsNotFound(err) {
+		t.Errorf("the profile quota survived the flip to today (err %v)", err)
 	}
 }
 

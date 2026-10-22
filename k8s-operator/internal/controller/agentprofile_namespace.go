@@ -207,6 +207,11 @@ func (r *PlatformAgentReconciler) profileNamespaceExists(ctx context.Context, ag
 		}
 		return false, fmt.Errorf("read the profile namespace %s: %w", profileNamespaceName(agent), err)
 	}
+	// A namespace being deleted is absent: nothing can be created in it, and
+	// the bus and LiteLLM shouldn't admit a namespace whose fence is going.
+	if ns.DeletionTimestamp != nil {
+		return false, nil
+	}
 	if ns.Labels[profileNamespaceComponentLabel] != profileNamespaceComponent || ns.Annotations[helmReleaseNamespaceAnnotation] != agent.Namespace {
 		logf.FromContext(ctx).Info("a namespace has the profile namespace's name without the chart's markers; treating it as absent",
 			"namespace", ns.Name, "want label", profileNamespaceComponentLabel+"="+profileNamespaceComponent,
@@ -286,8 +291,8 @@ func withoutProfilePeer(np *networkingv1.NetworkPolicy, agent *agentv1alpha1.Pla
 }
 
 // reconcileProfileQuota renders the quota into the profile namespace, when
-// this pass fenced it (reconcileA2ANetworkFences' answer, so the namespace
-// is read once per pass). profiles is the list reconcileA2A already holds,
+// this pass fenced it (reconcileA2ANetworkFences' answer, so the quota adds
+// no read of its own; LiteLLM's apply site reads the namespace once more). profiles is the list reconcileA2A already holds,
 // under its agentProfilesUnreadable guard; nil sizes the quota for the
 // ceiling alone.
 func (r *PlatformAgentReconciler) reconcileProfileQuota(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, fenced bool) error {
