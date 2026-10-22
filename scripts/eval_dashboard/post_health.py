@@ -48,17 +48,19 @@ the same cases -- gate_issue.py files one with the workflow's GitHub token
 (`gh api`, GH_TOKEN), the "broken" message says "Tracking #NNN", and the
 recovery comments on it. A new `lost_pods` condition (the build cluster lost
 the nodes under running jobs, #1478) files one the same way, addressed to
-the cluster owner, unless an open `presubmit-gate` issue already names the
-lost nodes. A new `fixture_drift` condition (a seeded fixture out of its
+the cluster owner, unless an open issue already names the lost nodes. A new `fixture_drift` condition (a seeded fixture out of its
 designed state on two consecutive hourly scans or on three pool projects at
 once, #1550) files one for the fleet owner the same way, unless an open
-`presubmit-gate` issue already names the drifted roles. A new `pool_drift`
+issue already names the drifted roles. A new `pool_drift`
 condition (#1967) files one for the pool owner, with the repair per project,
-unless an open `presubmit-gate` issue's title names every finding. A new `deadline_kill`
+unless an open issue's title names every finding. A new `deadline_kill`
 OUTAGE (runs killed at the job timeout with no verdict, #1894) files one for
-whoever owns the gate, unless an open `presubmit-gate` issue's title already
-names the deadline kills. It never closes an issue. A GitHub failure is a warning: the message goes out with "no issue
-yet" and the next change asks again.
+whoever owns the gate, unless an open issue's title already names the
+deadline kills. The dedupe reads every open issue, whatever its labels, and
+labels the adopted one. An issue a human closed is dropped, not cited; the
+bot's own issue is closed when its condition stops firing or at the
+recovery (#3664). A GitHub failure is a warning: the message goes out with
+"no issue yet" and the next change asks again.
 
 Delivery is the Google Chat REST API with the job's service account acting
 as a Chat app: POST https://chat.googleapis.com/v1/{space}/messages with an
@@ -153,6 +155,15 @@ DEADLINE_MINUTES = int(PROW_JOB_TIMEOUT.total_seconds() // SECONDS_PER_MINUTE)
 # health.json's summary of the hourly seeded-fleet scan (health.py,
 # fixture_state_block); absent before the scan has ever published.
 FIXTURE_STATE_KEY = "fixture_state"
+# health.py's list of the conditions whose rule still fires (or whose scan
+# could not say) this tick, whatever condition the gate reports.
+OPEN_CONDITIONS_KEY = "open_conditions"
+# The conditions whose bot-filed issue is closed as soon as the condition
+# leaves `open_conditions` while the gate reports another: the four with
+# evidence of their own (a scan, a window of losses or kills). A shared
+# break's issue waits for the recovery: a storm's reds can take rule 1 under
+# its majority while the break is live.
+MID_EPISODE_CLOSE_CONDITIONS = (CONDITION_LOST_PODS, CONDITION_FIXTURE_DRIFT, CONDITION_POOL_DRIFT, CONDITION_DEADLINE_KILL)
 # The same for the hourly pool-state scan (health.py, scan_block).
 POOL_STATE_KEY = "pool_state"
 # The 24h window health.py reports metrics over, for a health.json that
@@ -696,6 +707,35 @@ def pool_state_unknown(health: dict) -> bool | None:
     if not block or block.get("stale"):
         return None
     return bool(block.get("unknown"))
+
+
+def condition_open(health: dict, condition: str | None) -> bool | None:
+    """Whether `condition`'s rule still fires on this tick's evidence
+    (health.py's `open_conditions`); None for a health.json without the key,
+    which closes nothing and files as before."""
+    listed = health.get(OPEN_CONDITIONS_KEY)
+    if not isinstance(listed, list):
+        return None
+    return condition in listed
+
+
+def evidence_after(health: dict, condition: str | None, when: datetime | None) -> bool:
+    """Whether the evidence `condition` fires on is newer than `when`, a
+    human's close of its issue: the scan for a scan condition, the last loss
+    or kill for lost pods and deadline kills. A human who closes the bot's
+    issue once the repair is in is not handed a new one on the reading that
+    predates it. A shared break has no such clock; its re-file waits for the
+    next change."""
+    if when is None:
+        return True
+    if condition in (CONDITION_FIXTURE_DRIFT, CONDITION_POOL_DRIFT):
+        block = fixture_state_of(health) if condition == CONDITION_FIXTURE_DRIFT else pool_state_of(health)
+        observed = parse_iso(block.get("scanned_at"))
+    elif condition in (CONDITION_LOST_PODS, CONDITION_DEADLINE_KILL):
+        observed = parse_iso((health.get("incident") or {}).get("window_end"))
+    else:
+        return False
+    return observed is not None and observed > when
 
 
 def plural(count: int, one: str, many: str | None = None) -> str:
@@ -1662,7 +1702,12 @@ def run(
     lost-pods condition lacks before the message is rendered (so it can say
     "Tracking #NNN") and comments on it after a recovery goes out. An issue
     filed for one condition is never cited for another (issue_for): the
-    outage's issue is not the cluster owner's, nor the reverse."""
+    outage's issue is not the cluster owner's, nor the reverse. Each tick it
+    re-reads every carried issue: one a human closed is dropped (and the
+    current condition, if it still fires on evidence newer than the close,
+    adopts or files again), and an infrastructure one the bot filed whose own
+    condition has stopped firing while the gate reports another is commented
+    on and closed; the recovery closes every one the bot filed."""
     kinds = decide(health, prev, now, digest_hour, tz)
     before = prev or {}
     condition = health.get("condition")
@@ -1674,9 +1719,35 @@ def run(
     carried = episode_issues(before)
     if issue_tag(health.get("issue")) and health["issue"] not in carried:
         carried.append(health["issue"])
-    issue = next((candidate for candidate in [health.get("issue"), *carried] if issue_for(candidate, condition)), None)
+    # Re-read each carried issue (#3664). A closed one is dropped before it
+    # is cited again, and its tag scrubbed from the tracking list health.py
+    # built around it; `reopen` is set when the current condition still fires
+    # on evidence newer than the close, so a human's close of the wrong issue
+    # (#2877, a different fixture) hands the condition back to adopt-or-file.
+    # A bot-filed infrastructure issue whose own condition no longer fires
+    # while the gate reports another is settled here; at GREEN the recovery
+    # below settles every one.
+    reopen = False
+    if tracker is not None and carried:
+        kept = []
+        for each in carried:
+            if tracker.is_open(each) is False:
+                log(f"tracking issue: #{each['number']} is closed; dropped")
+                health = dict(health, tracking_issues=[tag for tag in health.get("tracking_issues") or [] if tag != issue_tag(each)])
+                if issue_for(each, condition) and condition_open(health, condition) is not False and evidence_after(health, condition, tracker.closed_at(each)):
+                    reopen = True
+                continue
+            filed_for = each.get("condition") or CONDITION_SHARED_BREAK
+            if health.get("state") != GREEN and filed_for in MID_EPISODE_CLOSE_CONDITIONS and filed_for != condition and condition_open(health, filed_for) is False:
+                log(f"tracking issue: #{each['number']}'s condition {filed_for} cleared; commenting")
+                # A comment that did not go through keeps the issue for the next tick.
+                if tracker.cleared(each, clock(now, weekday=True)):
+                    continue
+            kept.append(each)
+        carried = kept
+    issue = next((candidate for candidate in carried if issue_for(candidate, condition)), None)
     wants_issue = (
-        KIND_CHANGE in kinds
+        (KIND_CHANGE in kinds or reopen)
         and (health.get("state") == OUTAGE or condition in (CONDITION_LOST_PODS, CONDITION_FIXTURE_DRIFT, CONDITION_POOL_DRIFT))
         and not issue
         and not health.get("tracking_issues")
@@ -1701,7 +1772,7 @@ def run(
     sent = [kind for kind in kinds if kind not in failed]
     if tracker is not None and KIND_RECOVERY in sent:
         began = parse_iso(before.get("since"))
-        for each in episode_issues(before):
+        for each in carried:
             tracker.recovered(each, duration_text(now - began) if began else "a while")
 
     # The state file records what the space was last TOLD, kind by kind,

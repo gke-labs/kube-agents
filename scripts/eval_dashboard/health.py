@@ -2183,7 +2183,22 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
         "roster": roster,
         "fixture": r3c,
         "pool_state": r3e,
+        # Every condition whose rule still fires, or whose scan could not say,
+        # whatever condition won above: the poster closes a bot-filed tracking
+        # issue when its condition leaves this list (#3664).
+        "open_conditions": [
+            name
+            for name, rule in ((SHARED_BREAK, r1), (DEADLINE_KILL, r3d), (LOST_PODS, r3b), (STORM, r2), (DELEGATION_CEILING, r2b), (SETUP_DEATHS, r3), (FIXTURE_DRIFT, r3c), (POOL_DRIFT, r3e))
+            if _unresolved(rule)
+        ],
     }
+
+
+def _unresolved(rule: dict) -> bool:
+    """A rule that fires, or a scan rule with no full reading to clear on: no
+    document, a stale one, one that could check no project, or a hand run
+    over a few named projects."""
+    return bool(rule["fires"]) or rule.get("known") is False or any(bool(rule.get(key)) for key in ("stale", "unknown", "partial"))
 
 
 def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime | None, roster: Roster, last_lost_pod: datetime | None = None, last_deadline_kill: datetime | None = None) -> bool:
@@ -2596,6 +2611,7 @@ def adjudicate(
         "evidence": evidence,
         "advice": advice,
         "recovering": decided["recovering"],
+        "open_conditions": assessed["open_conditions"],
         "stale": stale,
         "fixture_state": fixture_state_block(assessed["fixture"]),
         "pool_state": scan_block(assessed["pool_state"]),

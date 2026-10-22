@@ -637,22 +637,35 @@ comments instead.
 ## The tracking issue
 
 When the state becomes OUTAGE and no issue tracks it — `case-notes.yaml` names
-none for the failing cases, and no open issue labelled `presubmit-gate` names
+none for the failing cases, and no open issue, whatever its labels, names
 every failing case in its title or body — the poster files one, labelled
 `presubmit-gate`: `Smoke gate outage: 3 cases failing on every PR since Sun
 7:30 AM ET`, with the cases, the window, the class, the incident brief link,
 and the line "Filed automatically by the smoke health bot; edit freely. Fix
 PRs: reference this issue." A human's issue that already names the cases is
-adopted instead. The Chat message then reads `Tracking #NNN`, the issue rides
+adopted instead and labelled `presubmit-gate`; the bot's own `nightly-red`
+issues are never adopted. The Chat message then reads `Tracking #NNN`, the issue rides
 in `health-state.json` and in `health.json`'s `issue` field (`{number, url, condition}`,
 `null` outside an incident; `health.py` reads it back through
 `--posted-state`), and the recovery comments on it: "Healthy again after Xh;
-bot will not close it." `issue` is the current condition's; every issue the
+closing" on an issue the bot filed, which it closes, or "bot will not close it"
+on an adopted one. `issue` is the current condition's; every issue the
 incident filed or adopted stays in `health-state.json`'s `issues` list until
 GREEN, so an outage that gives way to a storm or to lost pods before it clears
-still gets its recovery comment, and the recovery message names them all. The
-bot never closes an issue. A GitHub failure leaves
-the message at "no issue yet — file one with the presubmit-gate label" and the
+still gets its recovery comment, and the recovery message names them all.
+
+Each tick re-reads every carried issue. One a human closed is dropped rather
+than cited; if its condition still fires (`health.json`'s `open_conditions`,
+every condition whose rule fires or whose scan could not read the whole pool,
+whatever condition the gate reports) on evidence newer than the close — a
+scan after it for a scan condition, a loss or kill after it for lost pods and
+deadline kills — the adopt-or-file path runs again at once; a shared break's
+re-file waits for its next change message. A bot-filed issue for one of the
+four infrastructure shapes whose own condition has left `open_conditions`
+while the gate reports another is commented on ("The fixture drift cleared at
+…; closing") and closed; a bot-filed outage issue waits for the recovery; an
+adopted one gets the comment and stays open. A GitHub failure leaves the
+message at "no issue yet — file one with the presubmit-gate label" and the
 next change asks again.
 
 A new `lost_pods` condition files one the same way, for the cluster owner:
@@ -662,8 +675,8 @@ to their shared prefix; past GitHub's 256-character title limit they become a
 count), with the nodes and how many runs each lost, the window, the affected
 pull requests, the evidence, the advice for authors, and the line "Filed
 automatically by the smoke health bot; the cluster owner should check the node
-events and autorepair; the bot will not close it." An open `presubmit-gate`
-issue that already names every lost node is adopted instead. The Chat message
+events and autorepair; the bot closes it when the condition clears." An open issue that already
+names every lost node is adopted instead. The Chat message
 reads `Tracking #NNN`; the issue rides in the state the same way and is filed
 once per event. Each issue records the condition it was filed for (`{number,
 url, condition}`): an outage's issue is never cited as the lost pods' tracking,
@@ -677,10 +690,11 @@ requests, the deadline evidence lines (not the per-case ones: a body naming
 cases would be adopted as a later break's tracker), the advice for authors
 (don't retest until the space reports the gate healthy), where to look (each killed run's `build-log.txt`
 and the eval project's Cloud Logging), and the recovery bar of 3 runs with a
-verdict. An open `presubmit-gate` issue whose **title** carries "deadline" and
-"smoke" is adopted instead — the title only, because every bot-filed body
-names the job and quotes the evidence, which mentions deadline kills whenever
-one sits in the window. The Chat message reads `Tracking #NNN`, the issue
+verdict. An open issue whose **title** carries "deadline" and "kill" is
+adopted instead — the title only, because every bot-filed body names the job
+and quotes the evidence, which mentions deadline kills whenever one sits in
+the window; "kill" rather than "smoke" so a feature request about the gate's
+deadline is not. The Chat message reads `Tracking #NNN`, the issue
 rides in the state the same way, and the recovery comments on it.
 
 The four infrastructure shapes (`lost_pods`, `fixture_drift`, `pool_drift`,
@@ -912,9 +926,9 @@ same exception beside the re-apply paragraph, since a re-apply of a stack that i
 applied changes nothing) — and the
 line "Filed automatically by the smoke health bot; the daily reconcile re-applies
 the stack in the projects named, and the bot comments here when a scan reads
-them healthy; the bot will not close it." An open
-`presubmit-gate` issue that already names every drifted role is adopted
-instead. The recovery comments on it as on any other.
+them healthy; the bot closes it when the condition clears." An open issue that already names
+every drifted role is adopted instead. The recovery comments on it as on any
+other.
 The daily `ci-kube-agents-fleet-reconcile-daily` run re-applies the stack in
 the projects the scan names (`docs/ci-pool-projects.md` §6.2) at 08:30 UTC, and the
 recovery comment follows the first scan after that apply. No recovery by then
@@ -1044,7 +1058,7 @@ After `health.json` is uploaded, the same object is appended as one line to
 record per tick, oldest first, nothing trimmed). Each record is the
 `health.json` document verbatim — `schema_version`, `state`, `condition`,
 `since`, `cause`, `failing_cases`, `tracking_issues`, `issue`, `incident`,
-`evidence`, `advice`, `recovering`, `stale`, `slow`, `pool`, `fixture_state`,
+`evidence`, `advice`, `recovering`, `open_conditions`, `stale`, `slow`, `pool`, `fixture_state`,
 `pool_state`, `periodics`, `periodics_read`, `periodics_runs`, `periodics_streaks`,
 `periodics_since`, `metrics`, `dashboard_url`,
 `generated_at` — plus `tick`, the ISO 8601 UTC time the line
