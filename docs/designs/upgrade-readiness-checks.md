@@ -253,7 +253,9 @@ unreachable backend in the upgrade's path or able to refuse the control plane's 
 writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in `kube-system` and
 `kube-public`), maintenance exclusions, skew and the per-entry rules registered in
 `upgrade_readiness.EXTRA_RULES`, each a module of its `readiness_rules/` package and each a
-blocker or a risk that the Scope table credits as it lands. Two
+blocker or a risk that the Scope table credits as it lands, then the plan-level
+`rollout-sequence-precheck`, which lists the fleet host project's RolloutSequences once per run
+and carries an existing one as a risk, since the platform refuses a second. Two
 things are missing — the verdict is per cluster, not per family, and it reads a subset of the
 checks here, not every one. It is on the schedule three ways: the upgrade audit's `upgrade-blocked`
 check runs it weekly for the clusters that are behind and files the join, the daily

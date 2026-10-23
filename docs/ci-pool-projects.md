@@ -30,12 +30,13 @@ gcloud services enable \
   logging.googleapis.com \
   monitoring.googleapis.com \
   cloudtrace.googleapis.com \
+  gkehub.googleapis.com \
   iam.googleapis.com \
   cloudkms.googleapis.com \
   --project="${PROJECT_ID}"
 ```
 
-`cloudkms.googleapis.com` is for the GitHub token minter's signing key (section 5); the `ci-pool-minter` composition enables it too, so it is listed here only so a project provisioned by hand does not miss it. `cloudtrace.googleapis.com` is for the observability nightly case, which reads the install's own traces through the credential broker; the full-install composition enables it too. `compute.googleapis.com` is for the seeded fleet (section 6), which declares the orphan `google_compute_disk` the cost audit looks for and so depends on Compute directly rather than only transitively through GKE.
+`cloudkms.googleapis.com` is for the GitHub token minter's signing key (section 5); the `ci-pool-minter` composition enables it too, so it is listed here only so a project provisioned by hand does not miss it. `cloudtrace.googleapis.com` is for the observability nightly case, which reads the install's own traces through the credential broker; the full-install composition enables it too. `gkehub.googleapis.com` is for the readiness report's rollout-sequence precheck, which lists the fleet host project's RolloutSequences on `roles/gkehub.viewer`; the full-install composition enables it too, and the role joined the platform GSA's set with it, so a project registered before that needs the binding by hand, in the same idempotent form as the `roles/cloudtrace.user` repair in section 3, plus `gcloud services enable gkehub.googleapis.com`. `compute.googleapis.com` is for the seeded fleet (section 6), which declares the orphan `google_compute_disk` the cost audit looks for and so depends on Compute directly rather than only transitively through GKE.
 
 This list and `REQUIRED_APIS` in `scripts/verify_ci_pool_project.py` must agree — the verifier fails a project for an API this block does not mention, and passes one that is missing an API only this block names.
 

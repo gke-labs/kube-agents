@@ -541,6 +541,18 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         # also how a Cluster Agent points itself at its target cluster, so
         # refusing it would break the read path this module is protecting.
         ("container", "clusters", "get-credentials"),
+        # Fleet rollout sequencing, the reads the readiness report's
+        # rollout-sequence precheck (fleet-upgrade-verification's
+        # readiness_rules/rollout_sequence_precheck.py) and the upgrade SOP's
+        # stage check make: a host project's RolloutSequences, one of them, and
+        # the Rollouts under them. Pure reads of the GKE Hub API; the writes
+        # that drive a train -- `rolloutsequences create`, `upgrade` and
+        # `delete`, `rollouts pause`, `resume`, `cancel`,
+        # `force-complete-stage` and `delete` -- stay refused, and the tests
+        # hold that door.
+        ("container", "fleet", "rolloutsequences", "describe"),
+        ("container", "fleet", "rolloutsequences", "list"),
+        ("container", "fleet", "rollouts", "list"),
         ("container", "get-server-config"),
         ("container", "node-pools", "describe"),
         ("container", "node-pools", "list"),
