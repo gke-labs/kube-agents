@@ -60,13 +60,14 @@ const (
 
 	// The counters the document keeps, named for the status fields they
 	// project to, so the JSON reads beside the status.
-	usageCounterToolExecutions       = "toolExecutionsTotal"
-	usageCounterEventsIngested       = "eventsIngestedTotal"
-	usageCounterRemediationsProposed = "remediationsProposedTotal"
-	usageCounterRemediationsMerged   = "remediationsMergedTotal"
-	usageCounterChatMessagesInbound  = "chatMessagesInboundTotal"
-	usageCounterBrokerFailures       = "brokerFailuresTotal"
-	usageCounterChatTurnsErrored     = "chatTurnsErroredTotal"
+	usageCounterToolExecutions        = "toolExecutionsTotal"
+	usageCounterEventsIngested        = "eventsIngestedTotal"
+	usageCounterRemediationsProposed  = "remediationsProposedTotal"
+	usageCounterRemediationsMerged    = "remediationsMergedTotal"
+	usageCounterChatMessagesInbound   = "chatMessagesInboundTotal"
+	usageCounterBrokerFailures        = "brokerFailuresTotal"
+	usageCounterChatTurnsErrored      = "chatTurnsErroredTotal"
+	usageCounterBackgroundTasksGaveUp = "backgroundTasksGaveUpTotal"
 	// sessionsTotal is two document counters, because its halves aggregate
 	// differently (usageAggregationFor): the sessions the watcher opens for
 	// triage, read on every gateway replica over the same event stream, and
@@ -91,16 +92,22 @@ var (
 	// counters each pod group's body feeds, in the order the stub source hands
 	// samples out.
 	usageGatewayCounters = []string{usageCounterEventsIngested, usageCounterSessionsTriage}
-	usageChatCounters    = []string{usageCounterChatMessagesInbound, usageCounterSessionsChat, usageCounterChatTurnsErrored}
+	usageChatCounters    = []string{usageCounterChatMessagesInbound, usageCounterSessionsChat, usageCounterChatTurnsErrored, usageCounterBackgroundTasksGaveUp}
+	// usageA2AChatCounters are the counters the A2A gateway's body feeds: the
+	// chat counter, the chat sessions and the errored turns through its own
+	// families, and not the board's gave_up cards, which the chat_metrics
+	// listener alone serves.
+	usageA2AChatCounters = []string{usageCounterChatMessagesInbound, usageCounterSessionsChat, usageCounterChatTurnsErrored}
 	usageBrokerCounters  = []string{usageCounterToolExecutions, usageCounterRemediationsProposed, usageCounterRemediationsMerged, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures}
 	// usageCounters is every counter the document keeps and the status seeds.
-	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterRemediationsMerged, usageCounterChatMessagesInbound, usageCounterSessionsTriage, usageCounterSessionsChat, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures, usageCounterChatTurnsErrored}
+	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterRemediationsMerged, usageCounterChatMessagesInbound, usageCounterSessionsTriage, usageCounterSessionsChat, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures, usageCounterChatTurnsErrored, usageCounterBackgroundTasksGaveUp}
 	// usageQuietCounters are the counters whose advance is not activity and
 	// leaves LastMoved alone: the broker's failures, which a watcher retrying
 	// an unreachable fleet cluster through the relay produces every poll on
-	// an install nobody is using; and the failed turns, each a failure whose
-	// message already moved the time.
-	usageQuietCounters = map[string]bool{usageCounterBrokerFailures: true, usageCounterChatTurnsErrored: true}
+	// an install nobody is using; the failed turns, each a failure whose
+	// message already moved the time; and a background card giving up, a
+	// failure, not the agent at work.
+	usageQuietCounters = map[string]bool{usageCounterBrokerFailures: true, usageCounterChatTurnsErrored: true, usageCounterBackgroundTasksGaveUp: true}
 	// usageSessionsCounters is the pair that projects to usageStatusFieldSessions.
 	usageSessionsCounters = []string{usageCounterSessionsTriage, usageCounterSessionsChat}
 	// usageHumanCounters is the counter only a person moves: a chat message.

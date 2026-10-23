@@ -4819,6 +4819,13 @@ class PullRequestOpenedVerifier(BaseVerifier):
     # meant to protect. Listed from `/pulls/{n}/files`, so the credential needs
     # `pull_requests: read`.
     unchanged_paths: list[str] = Field(default_factory=list)
+    # Repository paths, as `fnmatch` globs, the pull request must delete: each
+    # glob is matched by at least one file the pull request lists as
+    # `removed`. A delete reaches review as the removal of the manifest that
+    # declares the object; a pull request that adds a marker or edits the
+    # manifest in place leaves the declaration, and merging it keeps the
+    # object. Listed from `/pulls/{n}/files`, as `unchanged_paths` is.
+    removed_paths: list[str] = Field(default_factory=list)
     # Assertions over what the pull request writes (see PullRequestContentCheck):
     # the object a provisioning case expects, with the fields it must carry,
     # rather than only that some file changed. Read from `/pulls/{n}/files`,
@@ -4879,16 +4886,12 @@ class PullRequestOpenedVerifier(BaseVerifier):
             )
         return texts, None
 
-    def _changed_paths(
+    def _file_entries(
         self, owner: str, repo: str, number: int, token: str, budget: float
-    ) -> tuple[list[str], str | None]:
-        """``(paths the pull request changes, unevaluable reason)``.
-
-        A rename counts under both names: moving the declaration away is as
-        much a change to it as rewriting it.
-        """
+    ) -> tuple[list[dict], str | None]:
+        """``(the entries of /pulls/{n}/files, unevaluable reason)``."""
         base = f"{forges.github_api_root()}/repos/{owner}/{repo}/pulls/{number}/files"
-        paths: list[str] = []
+        entries: list[dict] = []
         for page in range(1, _PR_FILES_MAX_PAGES + 1):
             status, files = _http_get_json(
                 f"{base}?per_page={_PR_FILES_PAGE_SIZE}&page={page}", token, budget
@@ -4899,12 +4902,43 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     "the token needs `pull_requests: read` to check which paths the "
                     "fix changes, so this check could not be evaluated"
                 )
-            for entry in files:
-                if isinstance(entry, dict):
-                    paths += [str(entry[key]) for key in ("filename", "previous_filename") if entry.get(key)]
+            entries += [entry for entry in files if isinstance(entry, dict)]
             if len(files) < _PR_FILES_PAGE_SIZE:
                 break
-        return paths, None
+        return entries, None
+
+    def _changed_paths(
+        self, owner: str, repo: str, number: int, token: str, budget: float
+    ) -> tuple[list[str], str | None]:
+        """``(paths the pull request changes, unevaluable reason)``.
+
+        A rename counts under both names: moving the declaration away is as
+        much a change to it as rewriting it.
+        """
+        entries, unevaluable = self._file_entries(owner, repo, number, token, budget)
+        paths = [
+            str(entry[key])
+            for entry in entries
+            for key in ("filename", "previous_filename")
+            if entry.get(key)
+        ]
+        return paths, unevaluable
+
+    def _removed_paths(
+        self, owner: str, repo: str, number: int, token: str, budget: float
+    ) -> tuple[list[str], str | None]:
+        """``(paths the pull request deletes, unevaluable reason)``.
+
+        Only status `removed` counts. A rename moves the declaration rather
+        than deleting it, so a renamed file's old name is not a removal.
+        """
+        entries, unevaluable = self._file_entries(owner, repo, number, token, budget)
+        removed = [
+            str(entry["filename"])
+            for entry in entries
+            if entry.get("status") == "removed" and entry.get("filename")
+        ]
+        return removed, unevaluable
 
     def _spent_before(
         self,
@@ -5582,6 +5616,15 @@ class PullRequestOpenedVerifier(BaseVerifier):
                         "files and are not implemented for GitLab, so this check could not be evaluated"
                     )
                     continue
+                if verdict == "pass" and self.removed_paths:
+                    # removed_paths reads GitHub's file listing too; a merge request
+                    # that adds a marker passes every other clause, so ungraded on
+                    # what it removes it is not a pass either.
+                    unresolved.append(
+                        f"{full}!{number}: `removed_paths` reads GitHub's pull request "
+                        "files and is not implemented for GitLab, so this check could not be evaluated"
+                    )
+                    continue
                 if verdict == "pass":
                     return done(True, reason, raw=raw)
                 (rejected if verdict == "reject" else unresolved).append(reason)
@@ -5703,6 +5746,26 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     continue
                 if rejection:
                     rejected.append(rejection)
+                    continue
+            if self.removed_paths:
+                try:
+                    removed, unevaluable = self._removed_paths(owner, repo, number, token, budget)
+                except OSError as exc:
+                    unresolved.append(f"could not reach the GitHub API for {slug}: {exc}")
+                    continue
+                if unevaluable:
+                    unresolved.append(unevaluable)
+                    continue
+                kept = [
+                    pattern for pattern in self.removed_paths
+                    if not any(fnmatch.fnmatchcase(path, pattern) for path in removed)
+                ]
+                if kept:
+                    rejected.append(
+                        f"{slug}: does not remove {', '.join(kept)}, which this case "
+                        "requires the pull request to delete (`removed_paths`) -- a "
+                        "delete that leaves the declaration keeps the object"
+                    )
                     continue
             if self.unchanged_paths:
                 try:

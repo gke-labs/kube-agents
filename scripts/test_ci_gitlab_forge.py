@@ -27,6 +27,7 @@ the shell lifted out of hack/ci-eval-pr.sh):
 
 import datetime
 import importlib.util
+import base64
 import io
 import json
 import os
@@ -106,6 +107,7 @@ class FakeGitLab:
         self.unmarked_notes = False  # notes come back without the reset marker, as a human's close would read
         self.naive_stamp = False  # the description comes back with a stamp that carries no UTC offset
         self.empty_issue_read = False  # GET /issues/<iid> answers an empty body (None) instead of the issue
+        self.files = {}  # repository files by path, what GET /repository/files/<path> and the tree listing answer
 
     def __call__(self, method, path, token, body=None, host=gitlab.DEFAULT_HOST):
         self.calls.append((method, path, body))
@@ -138,6 +140,15 @@ class FakeGitLab:
                 if name not in self.branches:
                     raise urllib.error.HTTPError(path, 404, "Not Found", {}, io.BytesIO(b""))
                 return {"name": name}
+            if bare.startswith(f"/projects/{ENC}/repository/files/"):
+                name = urllib.parse.unquote(bare.rsplit("/", 1)[1])
+                if name not in self.files:
+                    raise urllib.error.HTTPError(path, 404, "Not Found", {}, io.BytesIO(b""))
+                return {"file_path": name, "encoding": "base64", "content": base64.b64encode(self.files[name].encode()).decode()}
+            if bare == f"/projects/{ENC}/repository/tree":
+                prefix = urllib.parse.parse_qs(path.split("?", 1)[1]).get("path", [""])[0]
+                blobs = [{"path": p, "type": "blob"} for p in sorted(self.files) if p.startswith(prefix.rstrip("/") + "/")]
+                return blobs if page == 1 else []
             if bare == "/user":
                 return {"username": self.login}
             if bare == gitlab.TOKEN_SELF_PATH:
@@ -173,6 +184,12 @@ class FakeGitLab:
             self.detail[iid] = created
             self.issues.append(dict(created))
             return dict(created)
+        if method == "POST" and bare.startswith(f"/projects/{ENC}/repository/files/"):
+            name = urllib.parse.unquote(bare.rsplit("/", 1)[1])
+            if name in self.files:
+                raise urllib.error.HTTPError(path, 400, "A file with this name already exists", {}, io.BytesIO(b""))
+            self.files[name] = body["content"]
+            return {"file_path": name, "branch": body["branch"]}
         if method == "POST" and bare.endswith("/notes") and "/issues/" in bare:
             self.notes.setdefault(int(bare.split("/")[-2]), []).append({"body": body.get("body", "")})
             return {}
@@ -186,6 +203,77 @@ class FakeGitLab:
 
 
 import urllib.parse  # noqa: E402  (used by FakeGitLab)
+
+
+class SeedFileTest(unittest.TestCase):
+    """`seed-file` writes a pool project's fixture file once, on the default branch (#3145)."""
+
+    FILE = "clusters/seeded-a/seeded-reliability/checkout-gateway.yaml"
+
+    def test_an_absent_file_is_created_on_the_default_branch_and_a_present_one_is_left(self):
+        fake = FakeGitLab(default="trunk")
+        with mock.patch.object(gitlab, "api", fake), mock.patch.object(gitlab, "pause"):
+            self.assertEqual(gitlab.seed_repository_file(PATH, self.FILE, "Declare it", "kind: Deployment\n", "tok"), "created")
+            self.assertEqual(gitlab.seed_repository_file(PATH, self.FILE, "Declare it", "other\n", "tok"), gitlab.FILE_PRESENT)
+        posts = [(p, b) for m, p, b in fake.calls if m == "POST"]
+        self.assertEqual(1, len(posts), fake.calls)
+        self.assertEqual({"branch": "trunk", "content": "kind: Deployment\n", "commit_message": "Declare it"}, posts[0][1])
+        self.assertEqual(fake.files[self.FILE], "kind: Deployment\n", "the second call wrote nothing over the first")
+        self.assertIn("ref=trunk", [p for m, p, b in fake.calls if "/repository/files/" in p and m == "GET"][0])
+
+    def test_reads_decode_the_file_and_list_the_blobs_under_a_prefix(self):
+        fake = FakeGitLab()
+        fake.files = {self.FILE: "a: 1\n", "clusters/seeded-a/apps/x.yaml": "b: 2\n", "README.md": "hi\n"}
+        with mock.patch.object(gitlab, "api", fake):
+            self.assertEqual(gitlab.repository_file(PATH, self.FILE, "tok"), (gitlab.FILE_PRESENT, "a: 1\n"))
+            self.assertEqual(gitlab.repository_file(PATH, "clusters/none.yaml", "tok"), (gitlab.FILE_ABSENT, ""))
+            self.assertEqual(gitlab.repository_blobs(PATH, "clusters/seeded-a", "tok"), ["clusters/seeded-a/apps/x.yaml", self.FILE])
+
+    def test_a_listing_the_pager_cut_is_an_error_not_a_shorter_answer(self):
+        page = [{"path": f"clusters/seeded-a/apps/{i}.yaml", "type": "blob"} for i in range(gitlab.PER_PAGE)]
+        def full_pages(method, path, token, body=None, host=gitlab.DEFAULT_HOST):
+            if path == f"/projects/{ENC}":
+                return {"id": PROJECT_ID, "default_branch": "main"}
+            return list(page)
+        with mock.patch.object(gitlab, "api", full_pages), self.assertRaises(gitlab.ResetError) as raised:
+            gitlab.repository_blobs(PATH, "clusters/seeded-a", "tok")
+        self.assertIn("cut", str(raised.exception))
+
+    def test_the_command_takes_the_token_from_the_environment_and_the_content_from_stdin(self):
+        fake = FakeGitLab()
+        err, out = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {gitlab.SEED_TOKEN_ENV: ""}), redirect_stderr(err):
+            self.assertEqual(gitlab.seed_file_main(["--project-id", "kube-agents-evals-2", "--path", self.FILE, "--message", "m", "--content-file", "-"]), 2)
+        self.assertIn(gitlab.SEED_TOKEN_ENV, err.getvalue())
+        with mock.patch.dict(os.environ, {gitlab.SEED_TOKEN_ENV: "owner-tok"}), mock.patch.object(gitlab, "api", fake), mock.patch.object(gitlab, "pause"), \
+                mock.patch.object(sys, "stdin", io.StringIO("kind: Deployment\n")), redirect_stdout(out):
+            self.assertEqual(gitlab.seed_file_main(["--project-id", "kube-agents-evals-2", "--path", self.FILE, "--message", "m", "--content-file", "-"]), 0)
+        self.assertEqual(f"{PATH} {self.FILE}: created\n", out.getvalue(), "the project path is derived from the id, the pool's layout")
+        self.assertEqual({"owner-tok"}, set(fake.tokens))
+        with mock.patch.dict(os.environ, {gitlab.SEED_TOKEN_ENV: "owner-tok"}), mock.patch.object(sys, "stdin", io.StringIO("  \n")), redirect_stderr(err):
+            self.assertEqual(gitlab.seed_file_main(["--project-id", "kube-agents-evals-2", "--path", self.FILE, "--message", "m", "--content-file", "-"]), 2, "empty content is refused")
+        with mock.patch.dict(os.environ, {gitlab.SEED_TOKEN_ENV: "owner-tok"}), mock.patch.object(gitlab, "api", fake), redirect_stderr(err):
+            self.assertEqual(gitlab.seed_file_main(["--project-id", "", "--path", self.FILE, "--message", "m", "--content-file", "-"]), 2, "the guard refuses an unnamed project before any call")
+        self.assertIn("unnamed lease", err.getvalue())
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {gitlab.SEED_TOKEN_ENV: "tok1\ntok2"}), mock.patch.object(gitlab, "api", fake), \
+                mock.patch.object(sys, "stdin", io.StringIO("x: 1\n")), redirect_stderr(err):
+            self.assertEqual(gitlab.seed_file_main(["--project-id", "kube-agents-evals-2", "--path", self.FILE, "--message", "m", "--content-file", "-"]), 2, "a two-line token is refused before any call")
+        self.assertIn("one token on one line", err.getvalue())
+        self.assertNotIn("tok1", err.getvalue(), "and never printed")
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {gitlab.SEED_TOKEN_ENV: "owner-tok"}), mock.patch.object(gitlab, "api", fake), redirect_stderr(err):
+            self.assertEqual(gitlab.seed_file_main(["--project-id", "kube-agents-evals-2", "--path", self.FILE, "--message", "m", "--content-file", "/nonexistent/seed.yaml"]), 2, "an unreadable content file is a usage error, not a traceback")
+        self.assertIn("cannot read --content-file", err.getvalue())
+
+    def test_a_project_the_token_cannot_see_is_named_with_the_status(self):
+        def gone(method, path, token, body=None, host=gitlab.DEFAULT_HOST):
+            raise urllib.error.HTTPError(path, 404, "Not Found", {}, io.BytesIO(b""))
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {gitlab.SEED_TOKEN_ENV: "tok"}), mock.patch.object(gitlab, "api", gone), mock.patch.object(gitlab, "pause"), \
+                mock.patch.object(sys, "stdin", io.StringIO("x: 1\n")), redirect_stderr(err):
+            self.assertEqual(gitlab.seed_file_main(["--project-id", "kube-agents-evals-2", "--path", self.FILE, "--message", "m", "--content-file", "-"]), 1)
+        self.assertIn("HTTP 404", err.getvalue())
 
 
 class ProjectGuardTest(unittest.TestCase):

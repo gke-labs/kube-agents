@@ -289,7 +289,8 @@ client is handed so it can set its inbox prefix - is `platformagent_a2a_identiti
 before the callout those three lived in a config string, a Secret and a container env
 block with nothing but review connecting them. The one static block not in that file is
 the callout's own, rendered in the AUTH account template in
-`platformagent_a2a_manifests.go`.
+`platformagent_a2a_manifests.go` from `a2aCalloutConfIdentity` in
+`platformagent_a2a_confusers.go`.
 
 Those credentials belong in Secret data and nowhere else in the render: no rendered
 object name, label, or annotation may carry a password or a digest of one, truncated or

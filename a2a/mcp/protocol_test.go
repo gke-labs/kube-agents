@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -241,5 +242,36 @@ func TestABatchIsAnsweredMemberByMember(t *testing.T) {
 	}
 	if raw := s.HandleJSONRPC(context.Background(), []byte(`[{"jsonrpc":"2.0","method":"notifications/initialized"}]`)); raw != nil {
 		t.Errorf("a batch of notifications answered %s, want nothing", raw)
+	}
+}
+
+// A batch is bounded: at the cap it is answered member by member; past it, a
+// whole body of tiny malformed members (the shape that would be answered
+// tens of times over its size) gets one small error, without holding a copy
+// of every member first.
+func TestABatchIsBounded(t *testing.T) {
+	s := mustServer(t)
+	batch := func(n int) string {
+		return "[" + strings.TrimSuffix(strings.Repeat(`{"jsonrpc":"2.0","id":1,"method":"ping"},`, n), ",") + "]"
+	}
+	var answers []map[string]any
+	if err := json.Unmarshal(s.HandleJSONRPC(context.Background(), []byte(batch(maxBatchFrames))), &answers); err != nil || len(answers) != maxBatchFrames {
+		t.Fatalf("a batch at the cap: %d answers, err %v", len(answers), err)
+	}
+	if out := rpc(t, s, batch(maxBatchFrames+1)); out["error"] == nil || out["error"].(map[string]any)["code"] != float64(rpcErrInvalidRequest) {
+		t.Errorf("a batch past the cap = %v, want one invalid-request error", out)
+	}
+
+	huge := "[" + strings.TrimSuffix(strings.Repeat("7,", (maxBodyBytes-2)/2), ",") + "]"
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	raw := s.HandleJSONRPC(context.Background(), []byte(huge))
+	runtime.ReadMemStats(&after)
+	if len(raw) > 256 {
+		t.Errorf("a 4 MiB batch of bare numbers was answered with %d bytes, want one error", len(raw))
+	}
+	if grew := after.TotalAlloc - before.TotalAlloc; grew > 8<<20 {
+		t.Errorf("answering it allocated %d MiB; it must stop at the cap, not hold every member", grew>>20)
 	}
 }
