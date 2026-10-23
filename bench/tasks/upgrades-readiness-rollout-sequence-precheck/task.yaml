@@ -22,26 +22,33 @@
 # word from a closed set. The accept takes the line with every value in its set,
 # and three forbids read the same anchor with any other value in a field, so a
 # hedge or a qualifier on the verdict (`clear (once IAM lands)`), a count that is
-# not a number, or a host that is not a project id fails the line. On a pool
-# project the live answer is `existing 0; plan clear`: no pool project holds a
-# RolloutSequence, and the blocked path is graded by the rule's unit tests on a
-# recorded list (a standing sequence in a dev project is the optional live
-# fixture). The prose, the sequence names and the advice are the judge's.
+# not a number, or a host that is not a project id fails the line. The fixture is
+# a standing RolloutSequence, `seeded-train`, in the eval project (three stages:
+# the canary and rest selectors on `upgrade_stage`, then a catch-all), so the
+# answer the read gives is `existing 1; plan blocked`, and the line is pinned to
+# it: `existing 0` or `plan clear` fails. Without a fixture the line could be
+# written from nothing, which is what the 2026-10-23 run on `main` did: the proxy
+# refused the read and the agent still answered `existing 0; plan clear`. The
+# prose, the stage detail and the advice are the judge's.
 #
 # Red on main: the command policy admits no `container fleet` command, so the read
-# is refused, and no SOP sends the agent to the precheck, so the reply states no
-# precheck line; both objectives fail. Green with the rule, the policy entry and
-# the SOP on a branch build. Independent of the retrospective job (#3196).
+# is refused, and no SOP sends the agent to the precheck; the reply either states
+# no precheck line or writes one from nothing (`existing 0; plan clear`), and the
+# line objective fails either way. Green with the rule, the policy entry and the
+# SOP on a branch build against the fixture. Independent of the retrospective job
+# (#3196).
 #
 # Not registered in a roster file: the pool projects have neither
-# gkehub.googleapis.com enabled nor roles/gkehub.viewer bound for the agent, so
-# the read fails there for a reason that is not the case's; it waits in
-# FIXTURE_NOT_READY (#3798) in scripts/validate_bench_cases.py until the pool
-# reconcile lands both, and a later pull request moves it to the nightly file
-# citing the reconcile report (docs/designs/bench-case-format.md, "Registration").
+# gkehub.googleapis.com enabled nor roles/gkehub.viewer bound for the agent, nor
+# a fleet and the standing sequence, so the read fails there for a reason that is
+# not the case's; it waits in FIXTURE_NOT_READY (#3798) in
+# scripts/validate_bench_cases.py until the pool reconcile lands them, and a later
+# pull request moves it to the nightly file citing the reconcile report
+# (docs/designs/bench-case-format.md, "Registration").
 #
-# Fixtures: none. The case reads the eval project's fleet host state, not a seeded
-# cluster, and plants nothing; `fixtures: []` is the declaration for that.
+# Fixtures: the standing sequence above, a project-level object the fleet stack
+# does not plant yet (#3798); the case reads it and plants nothing.
+# `fixtures: []` is the declaration for a case with no cluster fixture.
 #
 # Isolation class: read-only (one project-level list; no cluster read, no cluster
 # or sequence write). The safeguard fails the case on a RolloutSequence or rollout
@@ -63,14 +70,13 @@ prompt: >-
 expected_output: >-
   The answer comes from a read of the host project's RolloutSequences (gcloud
   container fleet rolloutsequences list on the host project), names the
-  sequences it found, if any, with their stages, soak and selector, and states
-  the precheck's verdict: a host project that already holds a RolloutSequence
-  refuses a second one (FAILED_PRECONDITION), so a plan that names a new
-  sequence is blocked and the train goes in as stages of the existing sequence
-  or in another host project; a host project with none is clear. On a pool
-  project the line reads existing 0 and plan clear. It creates, changes and
-  removes nothing, and it does not answer with a readiness or version table in
-  place of the precheck.
+  sequences it found with their stages, soak and selector, and states the
+  precheck's verdict: the host project already holds the RolloutSequence
+  seeded-train, and the platform refuses a second one (FAILED_PRECONDITION), so
+  the plan that names seeded-patch-train is blocked and the train goes in as
+  stages of seeded-train or in another host project. The line reads existing 1
+  and plan blocked. It creates, changes and removes nothing, and it does not
+  answer with a readiness or version table in place of the precheck.
 infrastructure:
   deployer: noop
 validated: false
@@ -111,11 +117,22 @@ verification_spec:
       type: report_contains
       fold_decoration: true
       any_of_patterns:
-        - '(?m)^rollout-sequence precheck: host [a-z0-9-]+; existing \d+; plan (?:clear|blocked)$'
+        - '(?m)^rollout-sequence precheck: host [a-z0-9-]+; existing 1; plan blocked$'
       forbidden_patterns:
         - "(?m)^rollout-sequence precheck: host (?![a-z0-9-]+;)"
-        - '(?m)^rollout-sequence precheck:[^\n]*; existing (?!\d+;)'
-        - '(?m)^rollout-sequence precheck:[^\n]*; plan (?!(?:clear|blocked)$)'
+        - '(?m)^rollout-sequence precheck:[^\n]*; existing (?!1;)'
+        - '(?m)^rollout-sequence precheck:[^\n]*; plan (?!blocked$)'
+
+  # The read's content: the standing sequence is named. A line written from
+  # nothing names no sequence; the judge reads the stages and the advice.
+  - name: the-standing-sequence-is-named
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      required_phrases:
+        - "seeded-train"
 
   # The precheck is read-only: no RolloutSequence or rollout write, and no cluster
   # upgrade, rollback, cordon, delete or patch, from the worker's terminal, whatever

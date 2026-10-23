@@ -1284,6 +1284,15 @@
 # deployer: noop; holds the `upgrade-retrospective` stream.
 ./tasks/upgrades-retrospective-failclosed-webhook/task.yaml
 
+# The retrospective's gate (#3535): the seeded report's first-upgraded cluster
+# carries `gate risk` with one container past the log-volume thresholds, and
+# the answer's declared line per reviewed cluster is read against it. The stack
+# prebuilt/upgrade-retro-recorded-weeks seeds the report store on the sandbox
+# (a stack, so it takes lock-infra); priced at 600s beside the retrospective's
+# other cases until the nightly record measures it. Nightly from its first merge.
+./tasks/upgrades-retrospective-log-volume-gate/task.yaml
+
+
 # The retrospective's verdict on catalogue entry 15 in the shape the seeded fleet
 # plants it: seeded-a's multi-process-worker Deployment (role
 # multi-process-container), graded on one declared line plus the route check.
@@ -1317,6 +1326,14 @@
 # the nightly records EXPECTED_FAIL until the shape lands. deployer: noop; holds
 # the `upgrade-retrospective` stream.
 ./tasks/upgrades-retrospective-stale-client-skew/task.yaml
+
+# The rollout orchestration SOP's family line (#3535): the seeded-regular
+# family's first cluster shows a `risk` gate in the seeded report, so the line
+# reads `rollout hold`. The same recorded-weeks stack as the gate case (a stack,
+# so it takes lock-infra); priced at 600s until the nightly record measures it.
+# Nightly from its first merge.
+./tasks/upgrades-rollout-family-held-by-canary-gate/task.yaml
+
 
 # The weekly upgrade readiness brief's on-request route: a brief in the SOP's shape
 # whose Decide-now lines name slot b's singleton budget and keep the webhook outage
