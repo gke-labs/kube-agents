@@ -64,9 +64,10 @@ OVERLAY_ITEMS = ("SOUL.md", "AGENTS.md", "CAPABILITIES.md", "config.yaml", "skil
 MAX_NAME_LEN = 63
 
 # Non-cluster profiles that live under $HERMES_HOME/profiles but are never
-# managed as Cluster Agents: the front-door router (`default`) and the Platform
-# Agent itself (`platform`). Reconciliation must never touch these.
-RESERVED_PROFILES = frozenset({"default", "platform"})
+# managed as Cluster Agents: the front-door router (`default`), the Platform
+# Agent itself (`platform`), and the optional GKE Support Agent (`tse`).
+# Reconciliation must never touch these.
+RESERVED_PROFILES = frozenset({"default", "platform", "tse"})
 
 # How the scaffold checks that gcloud's kubeconfig exists on the side that will
 # read it. An absolute path because a builtin `test` would be the sandbox
@@ -716,7 +717,9 @@ def list_profiles() -> list[str]:
     if not PROFILES_BASE.is_dir():
         return []
     return sorted(
-        p.name for p in PROFILES_BASE.iterdir() if p.is_dir() and p.name not in RESERVED_PROFILES
+        p.name
+        for p in PROFILES_BASE.iterdir()
+        if p.is_dir() and not p.name.startswith(".") and p.name not in RESERVED_PROFILES
     )
 
 
@@ -739,7 +742,10 @@ def list_ready_profiles() -> list[str]:
     return sorted(
         p.name
         for p in PROFILES_BASE.iterdir()
-        if p.is_dir() and p.name not in RESERVED_PROFILES and is_ready_profile(p)
+        if p.is_dir()
+        and not p.name.startswith(".")
+        and p.name not in RESERVED_PROFILES
+        and is_ready_profile(p)
     )
 
 

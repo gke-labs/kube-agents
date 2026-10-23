@@ -12,6 +12,7 @@ import re
 import signal
 import threading
 import sqlite3
+import shlex
 import subprocess
 import tempfile
 import sys
@@ -598,11 +599,11 @@ _WORKLOAD_FOLD_LOCK = threading.Lock()
 # Every other caller of that route is the event watcher, which stamps its own
 # `kind` (`injectKindEvent`/`injectKindFollowup` in
 # k8s-operator/cmd/k8s-event-watcher/types.go, "k8s-event" and
-# "k8s-event-followup"). The dispatch is an equality test against this string
-# rather than a match against those, so anything that is not drift -- their
-# kinds, a kind a future producer invents, or no kind at all -- takes the event
-# path, which is the behaviour the event watcher had before this route learned
-# to dispatch.
+# "k8s-event-followup"). The dispatch is an equality test against this string,
+# the stall kind and the follow-up kind, so anything that is none of those --
+# `k8s-event`, a kind a future producer invents, or no kind at all -- takes the
+# event path, which is the behaviour the event watcher had before this route
+# learned to dispatch.
 INJECT_KIND_DRIFT = "gitops-drift"
 
 # The `kind` a stall producer stamps on a new stall episode
@@ -637,10 +638,46 @@ INJECT_KIND_STALL = "controller-stall"
 # signal: an old daemon returns `{"status": "ok"}` and nothing else, so a
 # producer that requires its kind here fails closed against one.
 #
-# Add a kind to this list only when the dispatch actually handles it. The
-# watcher's two are here because the event path is what "not drift" means, and
-# that is a real answer for them rather than a fallback.
-INJECT_KINDS_SUPPORTED = ["k8s-event", "k8s-event-followup", INJECT_KIND_DRIFT, INJECT_KIND_STALL]
+# Add a kind to this list only when the dispatch actually handles it.
+# `k8s-event` is here because the event path is what "not drift" means, a
+# real answer for it rather than a fallback; `k8s-event-followup` has a branch
+# of its own (`_inject_followup`).
+# The `kind` the event watcher stamps on a quiet follow-up for an incident it
+# already alerted (`injectKindFollowup` in
+# k8s-operator/cmd/k8s-event-watcher/types.go): the object has emitted no new
+# event for the watcher's --quiet-after since the last sighting. It arrives on
+# the alert's own session, which is how `_inject_followup` finds the thread.
+INJECT_KIND_FOLLOWUP = "k8s-event-followup"
+INJECT_KINDS_SUPPORTED = ["k8s-event", INJECT_KIND_FOLLOWUP, INJECT_KIND_DRIFT, INJECT_KIND_STALL]
+# What this daemon does with an event's session beyond posting the alert,
+# advertised twice: on the event path's `injected` answer, which the watcher
+# records per session (injectResponse.Features in injector.go), and under
+# `features` on /healthz beside the drift backlog's (DAEMON_FEATURES below),
+# which the watcher's sweep reads again before each tick's follow-ups, so an
+# agent image rolled back to a build without the follow-up branch is never
+# sent one (it would take the kind down the event path and post a second
+# alert). `inject_kinds` cannot carry the promise: it listed
+# `k8s-event-followup` before this branch existed.
+INJECT_FEATURE_FOLLOWUP = "followup"
+INJECT_RESPONSE_FEATURES = [INJECT_FEATURE_FOLLOWUP]
+# The quiet follow-up's line, and the watchdog's.
+FOLLOWUP_EMOJI = "💤"
+WATCHDOG_EMOJI = "⏱️"
+SECONDS_PER_MINUTE = 60
+# How long after an alert posts the watchdog looks for a triage card on its
+# session and, finding none and no report in the thread, says so there. The
+# front door files the card inside a minute when its turn runs; an hour is
+# past any card's normal run, so a thread silent that long has no card coming.
+# An in-process timer, so a daemon restart inside the hour drops the check for
+# the alerts posted before it (the stall watch's day-later retry is the
+# durable form; this is the cheap one). 0 switches it off. Read through the
+# integer-knob reader the ceilings use, so a value that is not an integer
+# falls back to the default with a log line instead of failing the import and
+# taking the whole server down with it.
+DEFAULT_TRIAGE_WATCHDOG_SECONDS = 3600
+TRIAGE_WATCHDOG_SECONDS = _alert_daily_limit("TRIAGE_WATCHDOG_SECONDS", DEFAULT_TRIAGE_WATCHDOG_SECONDS)
+# The busy timeout of the sqlite connects the follow-up and the watchdog open.
+SQLITE_BUSY_TIMEOUT_SECONDS = 5.0
 
 # Drift is graded `Warning` rather than given a severity of its own, and this
 # is now a statement about wording alone. Display and billing were the same
@@ -791,7 +828,7 @@ DRIFT_MAX_RENDERED_PATHS = 12
 # Advertised in `/healthz` `features`, so a detector reading an older daemon
 # keeps sending every record as a card.
 DRIFT_BACKLOG_FEATURE = "drift-backlog"
-DAEMON_FEATURES = [DRIFT_BACKLOG_FEATURE]
+DAEMON_FEATURES = [DRIFT_BACKLOG_FEATURE, INJECT_FEATURE_FOLLOWUP]
 # `intercepted_events.backlog`. Zero for every row that is not backlog, which
 # includes every row written before the column existed. A pending row is owed a
 # digest or a card; the other three are terminal.
@@ -2122,22 +2159,35 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
                    or os.environ.get("GCP_PROJECT") or "")
     workloads_project_query = f"?project={gcp_project}" if gcp_project else ""
     logs_project_query = f";project={gcp_project}" if gcp_project else ""
+    last_seen = _hhmm_utc(payload.get("last_seen")) or "a few minutes ago"
+    object_ref = f"{namespace}/{object_kind}/{object_name}"
 
     return (
         f"Analyze the following Kubernetes event warning on GKE cluster '{cluster_name}'.\n\n"
         f"**Event Details:**\n"
-        f"- **Resource:** {namespace}/{object_kind}/{object_name}\n"
+        f"- **Resource:** {object_ref}\n"
         f"- **Event Reason:** {event_reason}\n"
-        f"- **Warning Message:** {message}\n\n"
+        f"- **Warning Message:** {message}\n"
+        f"- **Last seen by the watcher:** {last_seen}\n\n"
+        f"**Read the object's current state before you conclude anything.** The watcher saw this event at "
+        f"{last_seen}; only a fresh read says whether it still stands. Run `kubectl get` and `kubectl describe` "
+        f"on {object_ref} (and `kubectl get events` for it) before you write, and open the 'What's wrong' "
+        f"sentence with `State at HH:MM UTC:` where HH:MM is the time of that read, so a reader hours later "
+        f"knows what was true when. Change nothing in the cluster.\n\n"
+        f"**If the object has recovered** — Running and ready, no restart or warning since the event, or gone "
+        f"because its controller replaced it — say so in 'What's wrong', quote the read that shows it in 'Why', "
+        f"make 'What to do' the single bullet '**No action needed:** {object_ref} has recovered', and leave the "
+        f"'To authorize:' bullet off entirely. Do not invent a fix to fill the section.\n\n"
         f"**Finish by calling `kanban_complete(result=<your full report>, summary=<one line>)`.** "
         f"Pass the entire report as `result`, not a summary of it: this card is subscribed to the chat thread where the "
         f"alert was raised, and `result` is what gets posted there. A card completed with a one-line `result` delivers "
         f"one line to the person waiting for the diagnosis.\n\n"
-        f"**Done when:** the root cause is named with the evidence that proves it; at least one GitOps remediation option is proposed, "
+        f"**Done when:** the 'What's wrong' sentence opens with the literal words `State at HH:MM UTC:` (HH:MM being the time of "
+        f"your own read of {object_ref}); the root cause is named with the evidence that proves it; at least one GitOps remediation option is proposed, "
         f"or the report says explicitly that no manifest change is warranted and why; and the whole report is recorded with `kanban_complete`. "
-        f"Nothing else is a condition of finishing. The shape below is how to present that work, not a fourth requirement: "
-        f"once you have those three things, complete the card — never `kanban_block` over formatting. "
-        f"State those three things in `summary`'s one line as well: a judge that grades this card reads `summary` before `result`.\n\n"
+        f"Nothing else is a condition of finishing. The shape below is how to present that work, not a fifth requirement: "
+        f"once you have those four things, complete the card — never `kanban_block` over formatting. "
+        f"State those things in `summary`'s one line as well: a judge that grades this card reads `summary` before `result`.\n\n"
         f"**Do this yourself. Do not delegate the diagnosis to another agent, and do not open child cards for it** — "
         f"you are the agent scoped to the cluster that is failing, and the report has to be this card's own result to be delivered.\n\n"
         f"Propose as many GitOps remediation options as the root cause genuinely warrants — one is fine if there is only one sound fix; do not invent filler alternatives to pad the list.\n\n"
@@ -2161,7 +2211,8 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
         f"Format the report you pass to `kanban_complete`'s `result` exactly like this — "
         f"these three `##` sections are the only ones, and there is no fourth:\n\n"
         f"## What's wrong\n\n"
-        f"<Short 1-sentence description of the problem>\n\n"
+        f"State at <HH:MM> UTC: <Short 1-sentence description of the problem>\n\n"
+        f"(The words `State at`, the time of your read and ` UTC:` open that sentence, exactly so; a report without them is not finished.)\n\n"
         f"## Why\n\n"
         f"- <Key constraint mismatch or log finding in 1-2 sentences, with the evidence that proves it>\n\n"
         f"## What to do\n\n"
@@ -3023,6 +3074,12 @@ def _trigger_agent_troubleshooter(
             _register_session_routing(session_id, active_platform, thread_id)
             if alert_title and active_platform == SLACK_PLATFORM:
                 _record_alert_title(session_id, alert_title)
+            # Armed here, before the gateway is contacted: an alert whose turn
+            # never starts (session creation refused, the turn's POST failing)
+            # is the case the watchdog exists for, and the steps below return
+            # early on exactly those failures.
+            routed_platform, routed_chat, routed_thread = _lookup_session_routing(session_id)
+            _schedule_triage_watchdog(session_id, routed_platform, routed_chat, routed_thread)
         else:
             # The ledger row already says this alert was announced; it was written
             # before the post was attempted. Correct it now, or the daily recap
@@ -4894,7 +4951,7 @@ def inject_message(
     request_data: Dict[str, Any],
     background_tasks: BackgroundTasks,
     x_watcher_features: str = Header(default=""),
-) -> Dict[str, str]:
+) -> Dict[str, Any]:
     """Receive the event payload and notify the Platform Agent via Google Chat.
 
     Three producers reach this route and they send different records. The event
@@ -4903,10 +4960,10 @@ def inject_message(
     audit-log record of a change someone made; a stall producer
     (docs/designs/stall-watch-inject.md) sends `kind: controller-stall` and the
     objects it saw stop making progress. The
-    dispatch is an equality test against `INJECT_KIND_DRIFT` and
-    `INJECT_KIND_STALL`, not a match against the watcher's kinds, so everything
-    else — those two, a kind a future producer invents, or no kind at all —
-    takes the event path.
+    dispatch is an equality test against `INJECT_KIND_DRIFT`, `INJECT_KIND_STALL`
+    and `INJECT_KIND_FOLLOWUP` (the watcher's quiet follow-up, `_inject_followup`),
+    so everything else — `k8s-event`, a kind a future producer invents, or no
+    kind at all — takes the event path.
 
     Everything below the dispatch is that event path, unchanged, and the fields
     it reads exist on nothing else — `payload.get("kind_of_object") or "Pod"`
@@ -4929,6 +4986,8 @@ def inject_message(
         return _inject_drift(session_id, payload, background_tasks)
     if payload.get("kind") == INJECT_KIND_STALL:
         return _inject_stall(session_id, payload, background_tasks)
+    if payload.get("kind") == INJECT_KIND_FOLLOWUP:
+        return _inject_followup(session_id, payload, background_tasks)
 
     event_reason = payload.get("reason") or "Unknown"
     namespace = payload.get("namespace") or "default"
@@ -5105,7 +5164,165 @@ def inject_message(
         alert_title=_alert_session_title(clean_name, event_cluster, event_reason, message),
     )
 
-    return {"status": "injected"}
+    return {"status": "injected", "features": INJECT_RESPONSE_FEATURES}
+
+
+def _hhmm_utc(stamp: Any) -> str:
+    """``HH:MM UTC`` for an ISO-8601 stamp, or "" when it cannot be read."""
+    if not stamp:
+        return ""
+    try:
+        text = str(stamp).replace("Z", "+00:00")
+        return datetime.fromisoformat(text).astimezone(timezone.utc).strftime("%H:%M UTC")
+    except (TypeError, ValueError):
+        return ""
+
+
+def _thread_has_report(chat_id: str, thread_id: str) -> bool:
+    """Whether a triage report has been stored for the thread (``POST /v1/incidents``)."""
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)) as conn:
+            return conn.execute(
+                "SELECT 1 FROM incidents WHERE chat_id = ? AND thread_id = ?", (chat_id, thread_id)
+            ).fetchone() is not None
+    except sqlite3.Error as exc:
+        logger.error(f"Failed to read incidents for thread {thread_id}: {exc}")
+        return False
+
+
+# What `_card_for_alert_session` answers when the board cannot be read: not
+# "no card", which the watchdog would announce, and not a card id.
+BOARD_UNREADABLE = "unreadable"
+
+
+def _card_for_alert_session(session_id: str) -> Optional[str]:
+    """The card the alert's session filed, read off the board the way the stall
+    watch reads it; None when the board has none for the session (a board file
+    not yet created counts as that, as `card_for_session` reads it);
+    BOARD_UNREADABLE when the board cannot say (locked past its busy timeout,
+    unreadable), which a caller must treat as unknown rather than as absence."""
+    try:
+        from stall_watch import card_for_session  # lazy: the board path is the gateway's
+
+        return card_for_session(session_id)
+    except Exception as exc:  # noqa: BLE001 - reported; the caller decides what unknown means
+        logger.warning(f"Could not look up the card for session {session_id}: {exc}")
+        return BOARD_UNREADABLE
+
+
+def _comment_alert_card(session_id: str, text: str) -> bool:
+    """Leave ``text`` as a comment on the alert's card, so the board carries the
+    follow-up beside the report. False when there is no card or the board refused."""
+    card = _card_for_alert_session(session_id)
+    if not card or card == BOARD_UNREADABLE:
+        return False
+    try:
+        from stall_watch import kanban  # lazy: the in-process board API is the gateway venv's
+
+        kanban(f"comment {shlex.quote(card)} {shlex.quote(text)}")
+        return True
+    except Exception as exc:  # noqa: BLE001 - reported; the chat line is the delivery that matters
+        logger.warning(f"Could not comment on card {card} for session {session_id}: {exc}")
+        return False
+
+
+def _followup_message(session_id: str, payload: Dict[str, Any], now: Optional[datetime] = None) -> str:
+    """The quiet follow-up's one line: what went quiet, since when, and that
+    silence is all the watcher knows. The object comes from the payload: the
+    watcher binds it on the entry when the alert goes out, and sends a
+    follow-up for no entry that lacks it."""
+    namespace = payload.get("namespace") or ""
+    name = payload.get("name") or ""
+    cluster = payload.get("cluster") or os.environ.get("GKE_CLUSTER_NAME", "")
+    reason = payload.get("reason") or "warning"
+    subject = f"`{namespace}/{name}`" if namespace and name else (f"`{name}`" if name else "the object")
+    where = f" on `{cluster}`" if cluster else ""
+    since = _hhmm_utc(payload.get("last_seen"))
+    first = _hhmm_utc(payload.get("first_seen"))
+    quiet_for = ""
+    try:
+        last = datetime.fromisoformat(str(payload.get("last_seen")).replace("Z", "+00:00"))
+        minutes = int(((now or datetime.now(timezone.utc)) - last).total_seconds() // SECONDS_PER_MINUTE)
+        if minutes > 0:
+            quiet_for = f" for {minutes} min"
+    except (TypeError, ValueError):
+        pass
+    count = payload.get("count")
+    seen = f", {count} seen" if isinstance(count, int) and count > 1 else ""
+    first_text = f" (first at {first}{seen})" if first else ""
+    head = f"{FOLLOWUP_EMOJI} **Quiet since {since}:**" if since else f"{FOLLOWUP_EMOJI} **Quiet:**"
+    return (
+        f"{head} no new `{clean_reason_label(reason)}` events from {subject}{where}{quiet_for}{first_text}. "
+        "Read off events alone: the object was not re-read, so a recovered pod and a deleted one look the same. "
+        "The triage above says what was true when it was written."
+    )
+
+
+def _post_followup(session_id: str, platform: str, chat_id: str, thread_id: str, text: str) -> None:
+    """Deliver a follow-up line into the alert's thread and onto its card."""
+    if _send_to_chat(platform, text, chat_id, thread_id) is None:
+        logger.error(f"Follow-up for session {session_id} did not reach {platform} thread {thread_id}")
+    _comment_alert_card(session_id, text)
+
+
+def _inject_followup(
+    session_id: str,
+    payload: Dict[str, Any],
+    background_tasks: BackgroundTasks,
+) -> Dict[str, str]:
+    """The `k8s-event-followup` half of `inject_message`.
+
+    The watcher sends one when an incident it alerted on has emitted no new
+    event for its quiet period (dispatcher.Sweep in the watcher). It arrives on
+    the alert's own session, so the thread is the one `_register_session_routing`
+    recorded; the line goes there as a reply, and onto the card the session
+    filed as a comment, so a reader of either sees that the object went quiet
+    and when. No ledger row, no quota, no agent turn: nothing new happened in
+    the cluster, something stopped happening. A session nothing routed (the
+    alert never reached chat) gets `unrouted` and nothing is posted; the
+    watcher marks the incident notified either way, which is right, since
+    there is no thread to tell.
+
+    A reply, not an edit of the alert: the gateway edits by update key only
+    inside a conversation request (a2a/gateway/notify.go, postConversation),
+    and the alert was a home-channel post whose key was never bound, so a
+    keyed send here would post anew at best and at worst overwrite whatever
+    message had taken that key since, the triage report included.
+    """
+    platform, chat_id, thread_id = _lookup_session_routing(session_id)
+    if not platform or not thread_id:
+        logger.info(f"Follow-up for session {session_id}: no chat thread is routed to it; nothing posted")
+        return {"status": "unrouted"}
+    text = _followup_message(session_id, payload)
+    background_tasks.add_task(_post_followup, session_id, platform, chat_id, thread_id, text)
+    return {"status": "followup"}
+
+
+def _triage_watchdog(session_id: str, platform: str, chat_id: str, thread_id: str) -> None:
+    """Say so in the thread when, an hour on, the alert has no card and no report.
+
+    A board that cannot be read is unknown, not empty: the line is posted only
+    on a board that answered and had no card for the session. The line states
+    the two facts it checked and no cause: the turn may have failed to start,
+    or run and filed nothing, and this check cannot tell which.
+    """
+    if _thread_has_report(chat_id, thread_id) or _card_for_alert_session(session_id) is not None:
+        return
+    text = (
+        f"{WATCHDOG_EMOJI} **No triage for this alert in {TRIAGE_WATCHDOG_SECONDS // SECONDS_PER_MINUTE} min.** "
+        "No card was filed for it and no report has reached this thread. The alert stands as posted."
+    )
+    if _send_to_chat(platform, text, chat_id, thread_id) is None:
+        logger.error(f"Watchdog line for session {session_id} did not reach {platform} thread {thread_id}")
+
+
+def _schedule_triage_watchdog(session_id: str, platform: str, chat_id: str, thread_id: str) -> None:
+    """Arm `_triage_watchdog` for the alert, on a daemon thread the process does not wait for."""
+    if TRIAGE_WATCHDOG_SECONDS <= 0 or not thread_id:
+        return
+    timer = threading.Timer(TRIAGE_WATCHDOG_SECONDS, _triage_watchdog, args=(session_id, platform, chat_id, thread_id))
+    timer.daemon = True
+    timer.start()
 
 
 def _conversation_session_id(context_id: str) -> str:

@@ -2322,6 +2322,19 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 		return err
 	}
 	opts.heldGitHubOrg = held
+	if a2aStackRendering(agent) && !r.agentProfilesUnreadable {
+		profiles, err := boundAgentProfiles(ctx, r.Client, agent)
+		if err != nil {
+			return err
+		}
+		opts.enabledProfiles = enabledAgentProfileNames(agent, profiles)
+	} else if a2aAgentSurface(agent) {
+		heldProfiles, err := r.heldEnabledProfiles(ctx, agent)
+		if err != nil {
+			return err
+		}
+		opts.enabledProfiles = heldProfiles
+	}
 
 	// The replica cap is applied inside the render (resolveDeploymentReplicasAndStrategy);
 	// this only says so in the operator log, once per spec generation. The
@@ -2403,6 +2416,42 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 	return r.applyManaged(ctx, agent, dep)
 }
 
+// heldGatewayEnvValue returns the literal value of envName on the live
+// gateway's platform-agent container. The workload kind the CR selects is read
+// first, then the other one, because a storage switch renders the new kind
+// while the old one still carries the value. Neither existing holds nothing,
+// as on a first install.
+func (r *PlatformAgentReconciler) heldGatewayEnvValue(ctx context.Context, agent *agentv1alpha1.PlatformAgent, envName, errSuffix string) (string, error) {
+	if r.Client == nil {
+		return "", nil
+	}
+	kinds := []client.Object{&appsv1.Deployment{}, &appsv1.StatefulSet{}}
+	if useStatefulSet(agent) {
+		kinds[0], kinds[1] = kinds[1], kinds[0]
+	}
+	key := client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + gatewayAppSuffix}
+	for _, live := range kinds {
+		if err := r.Get(ctx, key, live); err != nil {
+			if errors.IsNotFound(err) {
+				continue
+			}
+			return "", fmt.Errorf("reading the live gateway's %s to hold it%s: %w", envName, errSuffix, err)
+		}
+		for _, container := range podTemplateOf(live).Spec.Containers {
+			if container.Name != appNamePlatformAgent {
+				continue
+			}
+			for _, env := range container.Env {
+				if env.Name == envName && env.ValueFrom == nil {
+					return env.Value, nil
+				}
+			}
+		}
+		return "", nil
+	}
+	return "", nil
+}
+
 // heldGitHubOrg returns the GITHUB_ORG the live gateway carries, read only
 // while the declaration cannot name the organisation: it does not resolve, or
 // validation refuses something the organisation is read from. The minter sync
@@ -2425,31 +2474,20 @@ func (r *PlatformAgentReconciler) heldGitHubOrg(ctx context.Context, agent *agen
 	if err == nil && !resolved.ScopeRefused(agentv1alpha1.GitProviderGitHub) {
 		return "", nil
 	}
-	kinds := []client.Object{&appsv1.Deployment{}, &appsv1.StatefulSet{}}
-	if useStatefulSet(agent) {
-		kinds[0], kinds[1] = kinds[1], kinds[0]
+	return r.heldGatewayEnvValue(ctx, agent, "GITHUB_ORG", " while the git declaration is refused")
+}
+
+// heldEnabledProfiles returns the KUBE_AGENTS_ENABLED_PROFILES value the live
+// gateway carries when the A2A agent surface is kept (`a2aAgentSurface`) but
+// the AgentProfile list cannot be freshly rendered (version skew or
+// `agentProfilesUnreadable`), so the gateway pod is not rolled and an already
+// enabled optional Hermes profile (`tse`) is not archived during skew.
+func (r *PlatformAgentReconciler) heldEnabledProfiles(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]string, error) {
+	val, err := r.heldGatewayEnvValue(ctx, agent, enabledProfilesEnvVar, "")
+	if err != nil || val == "" {
+		return nil, err
 	}
-	key := client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}
-	for _, live := range kinds {
-		if err := r.Get(ctx, key, live); err != nil {
-			if errors.IsNotFound(err) {
-				continue
-			}
-			return "", fmt.Errorf("reading the live gateway's GITHUB_ORG to hold it while the git declaration is refused: %w", err)
-		}
-		for _, container := range podTemplateOf(live).Spec.Containers {
-			if container.Name != appNamePlatformAgent {
-				continue
-			}
-			for _, env := range container.Env {
-				if env.Name == "GITHUB_ORG" && env.ValueFrom == nil {
-					return env.Value, nil
-				}
-			}
-		}
-		return "", nil
-	}
-	return "", nil
+	return strings.Split(val, ","), nil
 }
 
 // deleteLegacyCredentialIsolationResources removes the workload objects left

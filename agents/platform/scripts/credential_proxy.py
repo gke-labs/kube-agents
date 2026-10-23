@@ -607,9 +607,13 @@ VCS_REQUESTS_METRIC = "kubeagents_vcs_requests_total"
 VCS_VERB_LABEL = "verb"
 # Proposals this install opened that the forge reports merged, counted once
 # each per broker process as the broker's reads show them
-# (vcs_broker.VcsBroker._count_merges); the series the operator reads
+# (vcs_broker.VcsBroker._count_outcomes); the series the operator reads
 # `status.usage.remediationsMergedTotal` from. No labels.
 VCS_MERGED_METRIC = "kubeagents_vcs_proposals_merged_total"
+# Proposals this install opened that the forge reports closed without a merge,
+# counted the same way beside the merged series; the series the operator reads
+# `status.usage.remediationsClosedUnmergedTotal` from. No labels.
+VCS_CLOSED_UNMERGED_METRIC = "kubeagents_vcs_proposals_closed_unmerged_total"
 # The broker's own failures, by kind: work it took on and could not carry out
 # for a reason that is its own or its upstream's, never the command's exit
 # code and never a refusal. A second count beside the tool counter rather
@@ -7993,6 +7997,7 @@ def build_vcs_broker(
         # Looked up at call time: the handler's registry is a class attribute
         # a test replaces per case, and this broker outlives none of them.
         merge_observer=lambda count: CredentialProxyHandler.metrics.record_merged(count),
+        close_observer=lambda count: CredentialProxyHandler.metrics.record_closed_unmerged(count),
         started_at=PROCESS_START_TIME_SECONDS,
     )
     LOGGER.info(
@@ -8466,6 +8471,7 @@ class ProxyMetrics:
         self._requests: dict[tuple[str, str], int] = {}
         self._vcs: dict[tuple[str, str], int] = {}
         self._merged = 0
+        self._closed_unmerged = 0
         self._failures: dict[str, int] = {}
         # Per tool: cumulative bucket counts (one per TOOL_DURATION_BUCKETS
         # bound, the +Inf bucket being the count), the sum, and the count.
@@ -8560,6 +8566,10 @@ class ProxyMetrics:
         with self._lock:
             self._merged += count
 
+    def record_closed_unmerged(self, count: int) -> None:
+        with self._lock:
+            self._closed_unmerged += count
+
     def record_failure(self, kind: str) -> None:
         kind = kind if kind in BROKER_FAILURE_KINDS else BROKER_FAILURE_OTHER_FAILED
         with self._lock:
@@ -8571,6 +8581,7 @@ class ProxyMetrics:
             requests = sorted(self._requests.items())
             vcs = sorted(self._vcs.items())
             merged = self._merged
+            closed_unmerged = self._closed_unmerged
             failures = sorted(self._failures.items())
             durations = {
                 tool: (list(self._duration_buckets[tool]), self._duration_sum[tool], self._duration_count[tool])
@@ -8649,6 +8660,9 @@ class ProxyMetrics:
             f"# HELP {VCS_MERGED_METRIC} Proposals this install opened that the forge reported merged, counted once each per process.",
             f"# TYPE {VCS_MERGED_METRIC} counter",
             f"{VCS_MERGED_METRIC} {merged}",
+            f"# HELP {VCS_CLOSED_UNMERGED_METRIC} Proposals this install opened that the forge reported closed without a merge, counted once each per process.",
+            f"# TYPE {VCS_CLOSED_UNMERGED_METRIC} counter",
+            f"{VCS_CLOSED_UNMERGED_METRIC} {closed_unmerged}",
         ]
         lines += [
             f"# HELP {BROKER_FAILURES_METRIC} Brokered work the broker could not carry out, by kind: a command past its deadline, a broker fault, a git failure, a failed token mint or an upstream relay error.",

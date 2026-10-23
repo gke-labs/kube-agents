@@ -721,7 +721,7 @@ def roster_projects() -> set[str]:
         return set()
     projects: set[str] = set()
     for home in base.iterdir():
-        if home.name in RESERVED_PROFILES or not home.is_dir():
+        if home.name in RESERVED_PROFILES or home.name.startswith(".") or not home.is_dir():
             continue
         try:
             identity = read_cluster_identity(home)

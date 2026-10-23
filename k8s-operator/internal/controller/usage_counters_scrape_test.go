@@ -247,6 +247,8 @@ func TestPodUsageSource_CountsTheBrokersProposals(t *testing.T) {
 		`kubeagents_vcs_requests_total{verb="issue-create",status="success"} 5`,
 		"# TYPE kubeagents_vcs_proposals_merged_total counter",
 		"kubeagents_vcs_proposals_merged_total 2",
+		"# TYPE kubeagents_vcs_proposals_closed_unmerged_total counter",
+		"kubeagents_vcs_proposals_closed_unmerged_total 1",
 		"# TYPE kubeagents_broker_execution_failures_total counter",
 		`kubeagents_broker_execution_failures_total{kind="exec_timeout"} 3`,
 		`kubeagents_broker_execution_failures_total{kind="vcs_failed"} 1`,
@@ -259,8 +261,8 @@ func TestPodUsageSource_CountsTheBrokersProposals(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scrape: %v", err)
 	}
-	if reading.Samples[usageCounterToolExecutions] != 6 || reading.Samples[usageCounterToolExecutionsBlocked] != 9 || reading.Samples[usageCounterRemediationsProposed] != 3 || reading.Samples[usageCounterRemediationsMerged] != 2 || reading.Samples[usageCounterBrokerFailures] != 4 {
-		t.Fatalf("samples = %v, want 6 tool executions, 9 refused, 3 proposals, 2 merged and 4 broker failures over every kind", reading.Samples)
+	if reading.Samples[usageCounterToolExecutions] != 6 || reading.Samples[usageCounterToolExecutionsBlocked] != 9 || reading.Samples[usageCounterRemediationsProposed] != 3 || reading.Samples[usageCounterRemediationsMerged] != 2 || reading.Samples[usageCounterBrokerFailures] != 4 || reading.Samples[usageCounterRemediationsClosedUnmerged] != 1 {
+		t.Fatalf("samples = %v, want 6 tool executions, 9 refused, 3 proposals, 2 merged, 4 broker failures over every kind and 1 closed unmerged", reading.Samples)
 	}
 	if reading.StartTime == nil || *reading.StartTime != 1759400000.25 {
 		t.Errorf("start time = %v", reading.StartTime)
