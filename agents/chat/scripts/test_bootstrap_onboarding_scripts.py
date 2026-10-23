@@ -2626,7 +2626,7 @@ class FirstRunAuditsTest(unittest.TestCase):
         self.assertIn("The security and RBAC, reliability, capacity, cost and upgrade retrospective audits started as part of onboarding.", note)
         self.assertIn("I could not read the audit run records", note)
         self.assertIn("report store: fleet-wide-cost-analysis, compliance-audit, obtainability-audit, "
-                      "stockout-prevention, security-patch-orchestrator, fleet-consistency-drift, ai-security-audit, "
+                      "stockout-prevention, upgrade-retrospective, security-patch-orchestrator, fleet-consistency-drift, ai-security-audit, "
                       "gcp-networking-fabric-audit, gce-compute-fleet-audit.`", note)
         self.assertIn("cannot read", (self.d / oobe.STAGE_LOG).read_text())
 
