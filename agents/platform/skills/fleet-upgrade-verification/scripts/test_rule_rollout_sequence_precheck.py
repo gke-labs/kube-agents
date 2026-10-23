@@ -238,5 +238,27 @@ class HelpersTest(unittest.TestCase):
         self.assertEqual(rule.stage_record("not a stage"), {"fleet_projects": [], "selector": None, "soak": None})
 
 
+ORCHESTRATION_SOP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "governance", "upgrade_rollout_orchestration_sop.md")
+SOP_LIST_COMMAND = "gcloud container fleet rolloutsequences list --project <host project> --format=json"
+SOP_PRECHECK_LINE = "rollout-sequence precheck: host <project>; existing <n>; plan <clear|blocked>"
+
+
+class OrchestrationSopQuotesTheRule(unittest.TestCase):
+    """The rollout orchestration SOP's precheck step is this rule's read: it names the rule,
+    runs the exact command, and writes the declared line the bench case grades."""
+
+    def setUp(self):
+        with open(ORCHESTRATION_SOP_PATH, encoding="utf-8") as f:
+            self.sop = f.read()
+
+    def test_the_sop_names_the_rule_and_its_command(self):
+        self.assertIn(f"`{rule.RULE_ID}`", self.sop)
+        self.assertIn(SOP_LIST_COMMAND, self.sop)
+        self.assertIn(" ".join(rule.LIST_ARGV), SOP_LIST_COMMAND)
+
+    def test_the_sop_carries_the_declared_precheck_line(self):
+        self.assertIn(SOP_PRECHECK_LINE, self.sop)
+
+
 if __name__ == "__main__":
     unittest.main()
