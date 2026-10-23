@@ -296,7 +296,7 @@ class TrackingTest(Harness):
         # case-red was red three nights, then kept from running last night;
         # the filer (just armed, or after an outage) files it this morning.
         nights = [night(day, [green("case-green"), red("case-red") if day in (17, 18, 19) else green("case-red"),
-                              red("case-maint") if day in (16, 17, 18) else green("case-maint")]) for day in range(15, 20)]
+                              red("case-maint") if day in (17, 18, 19) else green("case-maint")]) for day in range(15, 20)]
         nights.append(night(20, [green("case-green"), infra("case-red"), infra("case-maint")]))
         filed = issue(4001, "case-red", "2026-10-20T02:00:00Z", assignee="alice")
         # One filed before last night ended was news yesterday, not today.
@@ -428,6 +428,12 @@ class SkipTest(Harness):
         writers_only.update(job="ci-kube-agents-eval-nightly-writers", build_id="3000000000000020002")
         with self.assertRaisesRegex(nightly_digest.Skipped, "main part is missing"):
             self.build(data(night(19, [green("case-green")]), writers_only))
+        # The main part ran as two jobs on the 19th; on the 20th main-b never
+        # landed, so the section would cover half the matrix.
+        half = night(19, [green("case-b")])
+        half.update(job="ci-kube-agents-eval-nightly-main-b", build_id="3000000000000019003")
+        with self.assertRaisesRegex(nightly_digest.Skipped, "^last night's main-b part is missing"):
+            self.build(data(night(19, [green("case-green")]), half, night(20, [green("case-green")]), extra_cases=(("case-b", "capacity"),)))
         bad = [issue(4001, "case-red", "2026-10-20T02:00:00Z", url="https://github.com/elsewhere/repo/issues/4001")]
         with self.assertRaisesRegex(nightly_digest.Skipped, "malformed"):
             self.build(doc, bad)

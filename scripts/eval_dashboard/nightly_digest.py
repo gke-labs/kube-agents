@@ -136,7 +136,7 @@ SKIP_NO_GITHUB = "no GitHub token to read the nightly-red issues"
 SKIP_NO_NIGHT = f"no nightly run started in the last {nightly.LAST_NIGHT_MAX_AGE // datetime.timedelta(hours=1)} hours"
 SKIP_RUNNING = "last night's main part is still running"
 SKIP_NIGHT_RUNNING = "last night's run is still running"
-SKIP_NO_MAIN = "last night's main part is missing, so its numbers would be the writers part's alone"
+SKIP_NO_MAIN = "last night's {part} part is missing, so its numbers would cover only the parts that ran"
 SKIP_BAD_LINK = "a link it would carry is malformed ({url})"
 SKIP_BAD_COUNT = "its counts do not add up ({passed} passed of {recorded} recorded)"
 
@@ -281,10 +281,11 @@ class Builder:
             # In flight with no part recorded yet (a late start, a re-run):
             # the one-line summary above says "still running" too.
             raise Skipped(SKIP_NIGHT_RUNNING if nightly.running_nights(self.data, self.now) else SKIP_NO_NIGHT)
-        if nightly.PART_MAIN in (night.get("running_parts") or []):
+        if any(p in (night.get("running_parts") or []) for p in nightly.MAIN_PARTS):
             raise Skipped(SKIP_RUNNING)
-        if nightly.PART_MAIN in (night.get("missing_parts") or []):
-            raise Skipped(SKIP_NO_MAIN)
+        missing = [p for p in nightly.MAIN_PARTS if p in (night.get("missing_parts") or [])]
+        if missing:
+            raise Skipped(SKIP_NO_MAIN.format(part=missing[0]))
         parts = night.get("parts") or []
         day = nightly.night_day(nightly.parse_iso(parts[0].get("started"))) if parts else None
         if day is None:

@@ -902,8 +902,8 @@ plain text. A mentioned person must be a member of the space.
 
 The section is skipped, and the digest carries its one-line nightly summary
 plus the reason, when it cannot be built truthfully: `data.json` unreadable, no
-night started in the last 36 hours, last night's run or its main part still
-running, the main part missing, no GitHub token, the issues unreadable or their
+night started in the last 36 hours, last night's run or either main half
+(main or main-b) still running or missing, no GitHub token, the issues unreadable or their
 listing not trusted (GraphQL disagreed on every read, as for the filer), pyyaml missing, a count that does not
 add up, or a link that is not a well-formed `https` URL (an issue link must
 point into this repository). Links are checked for form, not fetched: the
