@@ -11,18 +11,14 @@
     },
     "stages": [
       {
-        "fleetProjects": [
-          "projects/acme-fleet-host"
-        ],
+        "fleetProjects": ["projects/acme-fleet-host"],
         "clusterSelector": {
           "labelSelector": "resource.labels.env=='canary'"
         },
         "soakDuration": "604800s"
       },
       {
-        "fleetProjects": [
-          "projects/acme-fleet-host"
-        ]
+        "fleetProjects": ["projects/acme-fleet-host"]
       }
     ],
     "computedReleaseChannel": "REGULAR",

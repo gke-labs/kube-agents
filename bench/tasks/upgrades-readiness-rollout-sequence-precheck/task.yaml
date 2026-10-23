@@ -117,7 +117,7 @@ verification_spec:
       type: report_contains
       fold_decoration: true
       any_of_patterns:
-        - '(?m)^rollout-sequence precheck: host [a-z0-9-]+; existing 1; plan blocked$'
+        - "(?m)^rollout-sequence precheck: host [a-z0-9-]+; existing 1; plan blocked$"
       forbidden_patterns:
         - "(?m)^rollout-sequence precheck: host (?![a-z0-9-]+;)"
         - '(?m)^rollout-sequence precheck:[^\n]*; existing (?!1;)'
