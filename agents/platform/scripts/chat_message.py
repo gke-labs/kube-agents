@@ -479,8 +479,8 @@ def report_message(
     ``replies`` gives a choice, by its label, the longer turn its click posts;
     a reply :func:`_choice` refuses leaves the choice's label as its turn.
     """
-    # Keyed as `kept` spells the labels: clipped to a button label.
-    replies = {_presenter._clip(_line(label), _presenter.BUTTON_TEXT_MAX): reply for label, reply in (replies or {}).items()}
+    # Keyed as `kept` spells the labels, by the same function, so a lookup by a kept label finds its reply.
+    replies = {spelled: reply for label, reply in (replies or {}).items() for spelled in _presenter._choice_labels([label])}
     shown = _presenter._shown(rows)[:ROWS_MAX]
     kept, left = _usable(choices)
     detail_line = _presenter._clip(_line(_presenter._plain(detail or "")), _presenter.ROW_TEXT_MAX)

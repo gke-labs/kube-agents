@@ -65,8 +65,14 @@ MORE_ITEMS_NOUN = ("more item is", "more items are")
 SMALLER_ITEMS_NOUN = ("smaller item is", "smaller items are")
 QUEUED_CRITICAL = "{more} queued, {deferred} of them critical."
 QUEUED = "{more} queued."
+#: The pace, for a remainder of one kind. ``PacingLimits`` paces each kind on its
+#: own limit, and ``fq.pace`` adds no other item while a critical waits, so a mixed
+#: remainder names the critical pace first, then the others'.
 PACE = "I'll bring up to {count} a day."
 PACE_NONE = "They wait in the queue until you ask."
+PACE_BOTH = "I'll bring up to {criticals} critical a day, then up to {others} of the others."
+PACE_CRITICALS_OTHERS_WAIT = "I'll bring up to {count} critical a day. The others wait until you ask."
+PACE_CRITICALS_WAIT_OTHERS = "The critical ones wait until you ask. I'll bring up to {count} of the others a day."
 FOLD_TITLE = "What the scan checked"
 SEE_ALL = "See all {count}"
 FINDING_NOUN = ("finding", "findings")
@@ -179,7 +185,10 @@ def _listed(
 
 
 def _row(members: list[dict]) -> dict:
-    best = members[0]
+    # The line's most severe row, the first in ranked order among equals: the
+    # queue ranks an actionable or higher-scoring major ahead of a floored
+    # critical, and the row under a critical tag must name the critical finding.
+    best = min(members, key=lambda row: fq.SEVERITIES.index(row["severity"]))
     title = best["title"]
     if len(members) > 1:
         more = len(members) - 1
@@ -208,18 +217,29 @@ def _detail(rows: int, deferred: int, complete: set[str]) -> str:
     return DETAIL_SEPARATOR.join(parts)
 
 
+def _pace(deferred: int, others: int, limits: fq.PacingLimits) -> str:
+    criticals, smaller = limits.daily_criticals, limits.noncritical_max
+    if not (deferred and others):
+        daily = criticals if deferred else smaller
+        return PACE.format(count=daily) if daily else PACE_NONE
+    if criticals and smaller:
+        return PACE_BOTH.format(criticals=criticals, others=smaller)
+    if criticals:
+        return PACE_CRITICALS_OTHERS_WAIT.format(count=criticals)
+    if smaller:
+        return PACE_CRITICALS_WAIT_OTHERS.format(count=smaller)
+    return PACE_NONE
+
+
 def _queue_line(deferred: int, others: int, limits: fq.PacingLimits) -> str:
     remaining = deferred + others
     if not remaining:
         return ""
     if deferred:
         queued = QUEUED_CRITICAL.format(more=_plural(remaining, MORE_ITEMS_NOUN), deferred=deferred)
-        daily = limits.daily_criticals
     else:
         queued = QUEUED.format(more=_plural(remaining, SMALLER_ITEMS_NOUN))
-        daily = limits.noncritical_max
-    pace = PACE.format(count=daily) if daily else PACE_NONE
-    return f"{queued} {pace}"
+    return f"{queued} {_pace(deferred, others, limits)}"
 
 
 def _fix_reply(label: str, title: str) -> str:
