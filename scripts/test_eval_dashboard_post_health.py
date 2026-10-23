@@ -1668,7 +1668,7 @@ class LostPods(RunHarness):
         self.assertEqual(len(self.opener.requests), 1)
 
     def test_a_human_issue_naming_the_nodes_is_adopted(self):
-        human = {"number": 1478, "html_url": "https://github.com/gke-labs/kube-agents/issues/1478", "title": "Build-cluster nodes went NotReady", "body": "nodes gke-kube-agents-prow-default-pool-eb220b2a-pe72 and gke-kube-agents-prow-default-pool-eb220b2a-sgnk"}
+        human = {"number": 1478, "html_url": "https://github.com/gke-labs/kube-agents/issues/1478", "title": "Build-cluster nodes went NotReady", "body": "nodes gke-kube-agents-prow-default-pool-eb220b2a-pe72 and gke-kube-agents-prow-default-pool-eb220b2a-sgnk went NotReady"}
         gh = FakeGh(open_issues=[human])
         doc = lost_pods(prs=(1, 2, 3, 4, 5, 6, 7, 8), nodes={"gke-kube-agents-prow-default-pool-eb220b2a-pe72": 5, "gke-kube-agents-prow-default-pool-eb220b2a-sgnk": 3})
         self.tick(doc, T0.replace(day=11, hour=14, minute=30), environ=self.environ(), gh=gh)
@@ -2801,11 +2801,16 @@ class DeadlineKillMessages(RunHarness):
         self.assertIn("The rest of the evidence (any case collapsing underneath the kills) is in the brief.", body["body"])
 
     def test_a_humans_issue_titled_for_the_deadline_kills_is_adopted(self):
-        human = {"number": 1894, "html_url": "https://github.com/gke-labs/kube-agents/issues/1894", "title": "Smoke Health bot stayed GREEN through a 12 h gate outage: deadline-killed runs with no verdict match no condition", "body": ""}
+        human = {"number": 1894, "html_url": "https://github.com/gke-labs/kube-agents/issues/1894", "title": "Smoke Health bot stayed GREEN through a 12 h gate outage: deadline-killed runs with no verdict match no condition", "body": "", "labels": [{"name": "presubmit-gate"}]}
         gh = FakeGh(open_issues=[human])
         self.tick(deadline_kill(), T0.replace(day=22, hour=20, minute=5), environ=self.environ(), gh=gh)
-        self.assertEqual(gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/1894/labels")], "labelled, nothing filed")
+        self.assertEqual(gh.writes(), [], "nothing filed")
         self.assertIn("Tracking #1894.", self.opener.texts[0])
+        # The pair has no identifier: without the label the same title is not the tracker.
+        self.setUp()
+        unlabelled = FakeGh(open_issues=[dict(human, labels=[])])
+        self.tick(deadline_kill(), T0.replace(day=22, hour=20, minute=5), environ=self.environ(), gh=unlabelled)
+        self.assertEqual(unlabelled.writes(), [("POST", "repos/gke-labs/kube-agents/issues")])
 
     def test_a_break_issue_whose_body_quotes_the_kills_is_not_adopted(self):
         # Every bot-filed body names the job and quotes the evidence block,
@@ -2897,7 +2902,7 @@ class IssueLifecycle(RunHarness):
     def test_the_open_issue_naming_the_role_is_adopted_instead_whatever_its_labels(self):
         self.tick(self.drifting(), T14, environ=self.environ())
         self.gh.lookups[1300] = closed(1300, "2026-09-14T13:30:00+00:00")
-        self.gh.open_issues = [human(3607, "fleet: seeded-a's default pool has no CPU headroom", body=f"the {DRIFT_ROLE} pod is stranded")]
+        self.gh.open_issues = [human(3607, "fleet: seeded-a's default pool has no CPU headroom", body=f"one of the {DRIFT_ROLE} pods has been pending since 03:16Z")]
         self.tick(self.drifting(scanned="2026-09-14T14:00:00+00:00"), T14 + timedelta(hours=1), environ=self.environ())
         self.assertEqual(self.gh.writes()[-1], ("POST", "repos/gke-labs/kube-agents/issues/3607/labels"))
         self.assertEqual(self.gh.calls[-1][2], {"labels": ["presubmit-gate"]})
@@ -3053,9 +3058,9 @@ class IssueLifecycle(RunHarness):
         self.assertNotIn("PATCH", [m for m, _ in self.gh.writes()])
 
     def test_a_skill_issue_about_the_deadline_is_not_the_kills_tracker(self):
-        self.gh.open_issues = [human(3001, "skill: review-preflight should respect the job deadline"), human(3003, "health.py: deadline_kill OUTAGE never recovers"), human(3002, "Smoke runs killed at the 360-minute deadline again")]
+        self.gh.open_issues = [human(3001, "skill: review-preflight should respect the job deadline", labels=("presubmit-gate",)), human(3003, "health.py: deadline_kill OUTAGE never recovers", labels=("presubmit-gate",)), human(3004, "gate_comment: deadline-kill verdict text is wrong"), human(3002, "Smoke runs killed at the 360-minute deadline again", labels=("presubmit-gate",))]
         self.tick(deadline_kill(), T0.replace(day=22, hour=20, minute=5), environ=self.environ())
-        self.assertEqual((self.recorded()["issue"]["number"], self.gh.writes()), (3002, [("POST", "repos/gke-labs/kube-agents/issues/3002/labels")]))
+        self.assertEqual((self.recorded()["issue"]["number"], self.gh.writes()), (3002, []))
 
     def test_the_episodes_own_fixture_issue_is_not_the_breaks_tracker(self):
         # The bot's fixture issue quotes the evidence, case lines included,
@@ -3138,6 +3143,7 @@ class IssueLifecycle(RunHarness):
         self.assertIn("tracking issue: #1300 is closed; dropped", err)
         self.assertEqual([path for _, path in self.gh.writes() if "/1300" in path], [])
         self.assertTrue(self.opener.texts[-1].startswith("🟢"))
+        self.assertNotIn("#1300", self.opener.texts[-1])
 
     def test_a_dry_run_prints_the_close(self):
         self.tick(self.drifting(), T14, environ=self.environ())
@@ -3148,6 +3154,65 @@ class IssueLifecycle(RunHarness):
         self.assertIn("would POST repos/gke-labs/kube-agents/issues/1300/comments", err)
         self.assertIn("would PATCH repos/gke-labs/kube-agents/issues/1300", err)
         self.assertEqual(len(self.gh.writes()), 1, "nothing written by the dry run")
+
+    def test_a_passing_mention_of_the_role_in_an_unlabelled_body_is_not_the_tracker(self):
+        self.gh.open_issues = [human(3700, "bench: add a second case over the fleet", body=f"the case reads {DRIFT_ROLE} on seeded-b like the first one")]
+        self.tick(self.drifting(), T14, environ=self.environ())
+        self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues")], "filed; no drift word beside the name")
+
+    def test_an_unreadable_issue_is_neither_settled_nor_dropped(self):
+        # Mid-episode: the condition cleared but the issue could not be read.
+        doc = self.lost_after_drift(["lost_pods", "fixture_drift"])
+        self.tick(doc, T14 + timedelta(hours=1), environ=self.environ())
+        doc["open_conditions"] = ["lost_pods"]
+        self.gh.lookups[1300] = {}
+        self.tick(doc, T14 + timedelta(hours=2), environ=self.environ())
+        self.assertEqual([path for _, path in self.gh.writes() if "/1300" in path], [], "nothing written on a failed read")
+        self.assertEqual([i["number"] for i in self.recorded()["issues"]], [1300, 1301], "kept")
+        # At the recovery: kept past GREEN, retried when readable.
+        green = health("GREEN")
+        green["fixture_state"] = fixture_block()
+        self.tick(green, T14 + timedelta(hours=3), environ=self.environ())
+        self.assertEqual([path for _, path in self.gh.writes() if "/1300" in path], [])
+        self.assertEqual([(i["number"], i["unsettled"]) for i in self.recorded()["issues"]], [(1300, "2h 30m")], "the lost-pods episode began at 14:00Z")
+        del self.gh.lookups[1300]
+        self.tick(green, T14 + timedelta(hours=3, minutes=10), environ=self.environ())
+        self.assertEqual(self.gh.writes()[-2:], [("POST", "repos/gke-labs/kube-agents/issues/1300/comments"), ("PATCH", "repos/gke-labs/kube-agents/issues/1300")])
+        self.assertEqual(self.gh.calls[-2][2]["body"], "Healthy again after 2h 30m; closing (filed by the bot; reopen if the cause is still live).")
+        self.assertEqual(self.recorded()["issues"], [])
+
+    def test_a_failed_close_at_the_recovery_is_retried_and_never_cited(self):
+        self.tick(self.drifting(), T14, environ=self.environ())
+        green = health("GREEN")
+        green["fixture_state"] = fixture_block()
+        self.gh.fail_patch = True
+        self.tick(green, T14 + timedelta(hours=2), environ=self.environ())
+        self.assertEqual([(i["number"], i["unsettled"]) for i in self.recorded()["issues"]], [(1300, "2h 30m")])
+        # A new episode never cites the leftover.
+        self.gh.fail_patch = False
+        again = self.drifting(scanned="2026-09-14T16:00:00+00:00")
+        again["since"] = "2026-09-14T16:00:00+00:00"
+        self.tick(again, T14 + timedelta(hours=3), environ=self.environ())
+        self.assertEqual(self.gh.writes()[-3:-1], [("POST", "repos/gke-labs/kube-agents/issues/1300/comments"), ("PATCH", "repos/gke-labs/kube-agents/issues/1300")], "retried")
+        self.assertEqual(self.gh.writes()[-1], ("POST", "repos/gke-labs/kube-agents/issues"), "the new episode files its own")
+        self.assertEqual([(i["number"] != 1300, i.get("unsettled")) for i in self.recorded()["issues"]], [(True, None)])
+
+    def test_a_closed_issue_is_not_refiled_on_a_blind_or_short_scan(self):
+        self.tick(self.drifting(), T14, environ=self.environ())
+        self.gh.lookups[1300] = closed(1300, "2026-09-14T13:30:00+00:00")
+        for block in (fixture_block(scanned="2026-09-14T14:00:00+00:00", checked=0, unknown=True), fixture_block(drifted={p: [DRIFT_ROLE] for p in DRIFT_PROJECTS}, scanned="2026-09-14T14:00:00+00:00", checked=29)):
+            with self.subTest(block=block):
+                doc = self.drifting()
+                doc["fixture_state"] = block
+                self.tick(doc, T14 + timedelta(hours=1), environ=self.environ())
+                self.assertEqual(len(self.gh.writes()), 1, "no filing on a scan that read nothing or not everything")
+
+    def test_a_failed_label_write_still_adopts(self):
+        self.gh.open_issues = [human(3607, "fleet: seeded-a's default pool has no CPU headroom", body=f"the {DRIFT_ROLE} pods are pending")]
+        self.gh.fail_writes = True
+        self.tick(self.drifting(), T14, environ=self.environ())
+        self.assertEqual(self.recorded()["issue"]["number"], 3607)
+        self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/3607/labels")], "the label was tried, nothing filed")
 
     def test_the_open_issue_list_is_read_once_per_tick(self):
         self.gh.open_issues = [human(1290, "x", body=f"{DRIFT_ROLE}", labels=("presubmit-gate",))]

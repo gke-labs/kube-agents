@@ -2676,6 +2676,7 @@ def scan_block(scan_result: dict) -> dict | None:
         "reds_runs_projects": scan_result.get("reds_runs_projects", []),
         "unknown": scan_result["unknown"],
         "stale": scan_result["stale"],
+        "partial": bool(scan_result.get("partial")),
         "reason": scan_result["reason"],
     }
 

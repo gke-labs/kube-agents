@@ -164,6 +164,9 @@ OPEN_CONDITIONS_KEY = "open_conditions"
 # break's issue waits for the recovery: a storm's reds can take rule 1 under
 # its majority while the break is live.
 MID_EPISODE_CLOSE_CONDITIONS = (CONDITION_LOST_PODS, CONDITION_FIXTURE_DRIFT, CONDITION_POOL_DRIFT, CONDITION_DEADLINE_KILL)
+# On a carried issue record: the recovery's "lasted" text it is still owed
+# because its comment or close did not land; retried each tick, never cited.
+UNSETTLED_KEY = "unsettled"
 # The same for the hourly pool-state scan (health.py, scan_block).
 POOL_STATE_KEY = "pool_state"
 # The 24h window health.py reports metrics over, for a health.json that
@@ -729,7 +732,11 @@ def evidence_after(health: dict, condition: str | None, when: datetime | None) -
     if when is None:
         return True
     if condition in (CONDITION_FIXTURE_DRIFT, CONDITION_POOL_DRIFT):
+        # A scan that was stale, blind, hand-scoped or short of a project is
+        # no reading the rule fired on; it holds the condition, it files nothing.
         block = fixture_state_of(health) if condition == CONDITION_FIXTURE_DRIFT else pool_state_of(health)
+        if block.get("stale") or block.get("unknown") or block.get("partial") or block.get("checked") != block.get("projects"):
+            return False
         observed = parse_iso(block.get("scanned_at"))
     elif condition in (CONDITION_LOST_PODS, CONDITION_DEADLINE_KILL):
         observed = parse_iso((health.get("incident") or {}).get("window_end"))
@@ -1728,14 +1735,22 @@ def run(
     # while the gate reports another is settled here; at GREEN the recovery
     # below settles every one.
     reopen = False
+    dropped: list[str] = []
     if tracker is not None and carried:
         kept = []
         for each in carried:
             if tracker.is_open(each) is False:
                 log(f"tracking issue: #{each['number']} is closed; dropped")
+                dropped.append(issue_tag(each))
                 health = dict(health, tracking_issues=[tag for tag in health.get("tracking_issues") or [] if tag != issue_tag(each)])
                 if issue_for(each, condition) and condition_open(health, condition) is not False and evidence_after(health, condition, tracker.closed_at(each)):
                     reopen = True
+                continue
+            if each.get(UNSETTLED_KEY):
+                # A recovery's comment or close that did not land: retried
+                # until it does, and never cited again.
+                if not tracker.recovered(each, each[UNSETTLED_KEY]):
+                    kept.append(each)
                 continue
             filed_for = each.get("condition") or CONDITION_SHARED_BREAK
             if health.get("state") != GREEN and filed_for in MID_EPISODE_CLOSE_CONDITIONS and filed_for != condition and condition_open(health, filed_for) is False:
@@ -1745,7 +1760,10 @@ def run(
                     continue
             kept.append(each)
         carried = kept
-    issue = next((candidate for candidate in carried if issue_for(candidate, condition)), None)
+    issue = next((candidate for candidate in carried if issue_for(candidate, condition) and not candidate.get(UNSETTLED_KEY)), None)
+    # What the readers were told, less the issues this tick found closed:
+    # the recovery names the ones still carried.
+    told = prev if prev is None else dict(prev, issues=carried, issue=None if issue_tag(prev.get("issue")) in dropped else prev.get("issue"), tracking_issues=[tag for tag in prev.get("tracking_issues") or [] if tag not in dropped])
     wants_issue = (
         (KIND_CHANGE in kinds or reopen)
         and (health.get("state") == OUTAGE or condition in (CONDITION_LOST_PODS, CONDITION_FIXTURE_DRIFT, CONDITION_POOL_DRIFT))
@@ -1763,7 +1781,7 @@ def run(
             issue = tracker.ensure(health, now, clock(since, weekday=True), incident_link(health), skip=skip)
         if issue and issue not in carried:
             carried.append(issue)
-    messages = [(kind, render(kind, health, prev, now, issue, data)) for kind in kinds]
+    messages = [(kind, render(kind, health, told, now, issue, data)) for kind in kinds]
     failed = []
     for kind, text in messages:
         if dry_run:
@@ -1773,8 +1791,10 @@ def run(
     sent = [kind for kind in kinds if kind not in failed]
     if tracker is not None and KIND_RECOVERY in sent:
         began = parse_iso(before.get("since"))
-        for each in carried:
-            tracker.recovered(each, duration_text(now - began) if began else "a while")
+        lasted = duration_text(now - began) if began else "a while"
+        # An issue the recovery could not settle (a failed read or write)
+        # rides on past GREEN with the text it is owed, and is retried.
+        carried = [dict(each, **{UNSETTLED_KEY: lasted}) for each in carried if not tracker.recovered(each, lasted)]
 
     # The state file records what the space was last TOLD, kind by kind,
     # so the next tick asks its questions -- did the state change, did a new
@@ -1888,7 +1908,7 @@ def run(
         "tracking_issues": source.get("tracking_issues") or [],
         "since": source.get("since"),
         "issue": issue if source.get("state") not in (None, GREEN) else None,
-        "issues": carried if source.get("state") not in (None, GREEN) else [],
+        "issues": carried if source.get("state") not in (None, GREEN) else [each for each in carried if each.get(UNSETTLED_KEY)],
         "stale": bool(health.get("stale")) if told_stale else bool(before.get("stale")),
         "fixture_unknown": fixture_unknown(health) if told_fixture else bool(before.get("fixture_unknown")),
         "pool_state_unknown": (

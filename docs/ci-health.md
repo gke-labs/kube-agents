@@ -643,8 +643,13 @@ every failing case in its title or body — the poster files one, labelled
 7:30 AM ET`, with the cases, the window, the class, the incident brief link,
 and the line "Filed automatically by the smoke health bot; edit freely. Fix
 PRs: reference this issue." A human's issue that already names the cases is
-adopted instead and labelled `presubmit-gate`; the bot's own `nightly-red`
-issues are never adopted. The Chat message then reads `Tracking #NNN`, the issue rides
+adopted instead and labelled `presubmit-gate`. One rule for a title: any open
+issue. One rule for a body: a `presubmit-gate` issue, or an unlabelled one
+whose body also carries a word the condition's own evidence uses ("drift" or
+"pending" beside a fixture role, "NotReady" or "lost" beside a node), so an
+issue that mentions a role or node in passing is not the tracker; case names
+never match an unlabelled body, since a roster tracker lists them all. The
+bot's own `nightly-red` issues are never adopted. The Chat message then reads `Tracking #NNN`, the issue rides
 in `health-state.json` and in `health.json`'s `issue` field (`{number, url, condition}`,
 `null` outside an incident; `health.py` reads it back through
 `--posted-state`), and the recovery comments on it: "Healthy again after Xh;
@@ -653,14 +658,16 @@ on an adopted one. `issue` is the current condition's; every issue the
 incident filed or adopted rides in `health-state.json`'s `issues` list until
 the recovery or until the bot settles it below, so an outage that gives way
 to a storm or to lost pods before it clears still gets its recovery comment,
-and the recovery message names the ones still carried.
+and the recovery message names the ones still carried. A recovery comment or
+close that did not land, or an issue the bot could not read that tick, rides
+on past GREEN and is retried each tick until it does.
 
 Each tick re-reads every carried issue. One a human closed is dropped rather
 than cited; if its condition still fires (`health.json`'s `open_conditions`,
 every condition whose rule fires or whose scan could not read the whole pool,
 whatever condition the gate reports) on evidence newer than the close — a
-scan after it for a scan condition, a loss or kill after it for lost pods and
-deadline kills — the adopt-or-file path runs again at once; a shared break's
+full, fresh scan after it for a scan condition, a loss or kill after it for
+lost pods and deadline kills — the adopt-or-file path runs again at once; a shared break's
 re-file waits for its next change message. A bot-filed issue for one of the
 four infrastructure shapes whose own condition has left `open_conditions`
 while the gate reports another is commented on ("The fixture drift cleared at
@@ -691,11 +698,13 @@ requests, the deadline evidence lines (not the per-case ones: a body naming
 cases would be adopted as a later break's tracker), the advice for authors
 (don't retest until the space reports the gate healthy), where to look (each killed run's `build-log.txt`
 and the eval project's Cloud Logging), and the recovery bar of 3 runs with a
-verdict. An open issue whose **title** carries "deadline" and "kill" is
-adopted instead — the title only, because every bot-filed body names the job
-and quotes the evidence, which mentions deadline kills whenever one sits in
-the window; "kill" rather than "smoke" so a feature request about the gate's
-deadline is not. The Chat message reads `Tracking #NNN`, the issue
+verdict. An open `presubmit-gate` issue whose **title** carries "deadline"
+and "kill" is adopted instead — the title only, because every bot-filed body
+names the job and quotes the evidence, which mentions deadline kills whenever
+one sits in the window; "kill" rather than "smoke" so a feature request about
+the gate's deadline is not; and the label, because the pair has no identifier
+and a bug report about the `deadline-kill` classifier would otherwise be the
+tracker. The Chat message reads `Tracking #NNN`, the issue
 rides in the state the same way, and the recovery comments on it.
 
 The four infrastructure shapes (`lost_pods`, `fixture_drift`, `pool_drift`,

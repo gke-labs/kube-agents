@@ -32,7 +32,7 @@ verdict, 3+ on 2+ pull requests in 2 hours, so nothing is graded and nobody
 can pass. So:
 
     the condition becomes `deadline_kill`
-    and no OPEN issue has "deadline" and "kill" in its TITLE
+    and no OPEN `presubmit-gate` issue has "deadline" and "kill" in its TITLE
     -> create one for whoever owns the gate, and say "Tracking #NNN"
 
 The fifth shape (#1967): the hourly pool-state scan finds the same finding on
@@ -45,10 +45,16 @@ the same pool project two scans running, or on three projects at once. So:
 The dedupe is against people: a human who filed first, with the case names
 (or the node names, or the role names) in the title or body -- or, for the
 deadline kills and the pool findings, in the title -- wins and the bot adopts
-their issue, whatever its labels, and labels it `presubmit-gate` (#3664: the
-open issue for a drifted fixture carried `bug`/`Infra` and was never found).
-The bot's own `nightly-red` issues are never adopted: a case's bug is not the
-gate's tracker. The four infrastructure shapes -- lost pods, fixture drift,
+their issue and labels it `presubmit-gate` (#3664: the open issue for a
+drifted fixture carried `bug`/`Infra` and was never found). One rule for a
+title: any open issue. One rule for a body: a `presubmit-gate` issue, or an
+unlabelled one whose body also carries a word the condition's own evidence
+uses ("drift", "pending" for a fixture; "NotReady", "lost" for a node), so a
+passing mention of a role or node elsewhere is not the tracker; case names
+never match an unlabelled body (a roster tracker lists them all), and the
+deadline pair, having no identifier, needs the label. The bot's own
+`nightly-red` issues are never adopted: a case's bug is not the gate's
+tracker. The four infrastructure shapes -- lost pods, fixture drift,
 pool drift, deadline kills -- are assigned to `infra_owner` in
 docs/designs/domains.yaml and end with a line mentioning `infra_backup`; an
 OUTAGE's issue (a shared break, which may be any case's code) is not.
@@ -131,6 +137,13 @@ RECOVERY_RUNS = 3
 # "smoke": a feature request about the smoke gate's deadline (#2873) was
 # adopted as the tracker of the kills.
 DEADLINE_KILL_NAMES = ("deadline", "kill")
+# What an unlabelled body must say beside the name for a body match to count:
+# the words the condition's own evidence uses (#3607's body: "drift",
+# "pending"), so an issue that mentions a role or a node in passing is not
+# adopted. None (the cases, the deadline pair) means the body counts only on a
+# labelled issue.
+FIXTURE_DRIFT_BODY_WORDS = ("drift", "pending", "out of designed state")
+LOST_PODS_BODY_WORDS = ("notready", "not ready", "lost")
 # How a name is found in a title or body: not preceded by a letter, digit or
 # underscore ("kill" is not in "skill" nor in "deadline_kill").
 NAME_START_RE = r"(?<![a-z0-9_]){name}"
@@ -623,18 +636,21 @@ class Tracker:
             created = self.gh.call("POST", self.gh.path(ISSUES_PATH), self.addressed(payload, refused=True))
         return created
 
-    def existing(self, names: list[str], title_only: bool = False, marker: re.Pattern | None = None, body_needs_label: bool = False) -> dict | None:
-        """An open issue, whatever its labels, whose title or body names
-        every one of `names` (the failing cases, or the lost nodes) -- a human
-        got there first; it is labelled `presubmit-gate` on adoption.
-        `title_only` for names too common in bot-filed bodies; `marker` for
-        the bot's own issue of one kind, matched on the ids its marker
-        carries and nothing else in the body; `body_needs_label` for names
-        common in bodies that are not trackers (case names: a performance
-        tracker lists the whole roster), so a body match counts only on a
-        `presubmit-gate` issue and a title match on any."""
+    def existing(
+        self, names: list[str], title_only: bool = False, marker: re.Pattern | None = None, body_words: tuple[str, ...] | None = None, labelled_only: bool = False
+    ) -> dict | None:
+        """An open issue whose title or body names every one of `names` (the
+        failing cases, or the lost nodes) -- a human got there first; it is
+        labelled `presubmit-gate` on adoption. A title match counts on any
+        issue (`labelled_only`: on a `presubmit-gate` one, for names that are
+        plain words); a body match on a `presubmit-gate` issue, or on an
+        unlabelled one whose body also carries one of `body_words`, the
+        condition's own vocabulary (None: never). `title_only` for names too
+        common in bot-filed bodies; `marker` for the bot's own issue of one
+        kind, matched on the ids its marker carries and nothing else."""
         for issue in self.open_issues():
-            if issue.get("number") in self._skip or NEVER_ADOPT_LABELS & label_names(issue):
+            labelled = LABEL in label_names(issue)
+            if issue.get("number") in self._skip or NEVER_ADOPT_LABELS & label_names(issue) or (labelled_only and not labelled):
                 continue
             title, body = issue.get("title", ""), issue.get("body") or ""
             if marker is not None:
@@ -644,7 +660,9 @@ class Tracker:
                 continue
             if names_all(title, names):
                 return self.adopt(issue)
-            if title_only or (body_needs_label and LABEL not in label_names(issue)):
+            if title_only:
+                continue
+            if not labelled and not (body_words and any(word in body.lower() for word in body_words)):
                 continue
             if names_all(f"{title}\n{body}", names):
                 return self.adopt(issue)
@@ -679,7 +697,7 @@ class Tracker:
         cases = list(health.get("failing_cases") or [])
         if not cases:
             return None
-        found = self.existing(cases, body_needs_label=True)
+        found = self.existing(cases)
         if found:
             log(f"tracking issue: adopting open #{found['number']} (names every failing case)")
             return dict(found, condition=condition) if condition else found
@@ -691,7 +709,7 @@ class Tracker:
 
     def _ensure_lost_pods(self, health: dict, when_text: str, window_text: str, brief_link: str) -> dict | None:
         nodes = sorted((health.get("incident") or {}).get("nodes") or {})
-        found = self.existing(nodes) if nodes else None
+        found = self.existing(nodes, body_words=LOST_PODS_BODY_WORDS) if nodes else None
         if found:
             log(f"tracking issue: adopting open #{found['number']} (names every lost node)")
             return dict(found, condition=CONDITION_LOST_PODS)
@@ -706,7 +724,7 @@ class Tracker:
         return created
 
     def _ensure_deadline_kill(self, health: dict, since_text: str, window_text: str, brief_link: str) -> dict | None:
-        found = self.existing(list(DEADLINE_KILL_NAMES), title_only=True)
+        found = self.existing(list(DEADLINE_KILL_NAMES), title_only=True, labelled_only=True)
         if found:
             log(f"tracking issue: adopting open #{found['number']} (its title names the deadline kills)")
             return dict(found, condition=CONDITION_DEADLINE_KILL)
@@ -722,7 +740,7 @@ class Tracker:
 
     def _ensure_fixture_drift(self, health: dict, since_text: str, brief_link: str) -> dict | None:
         roles = sorted((health.get("incident") or {}).get("roles") or [])
-        found = self.existing(roles) if roles else None
+        found = self.existing(roles, body_words=FIXTURE_DRIFT_BODY_WORDS) if roles else None
         if found:
             log(f"tracking issue: adopting open #{found['number']} (names every drifted role)")
             return dict(found, condition=CONDITION_FIXTURE_DRIFT)
@@ -759,13 +777,19 @@ class Tracker:
 
     def recovered(self, issue: dict, lasted: str) -> bool:
         """The recovery's comment on every issue of the episode; the bot's
-        own are closed with it."""
+        own are closed with it. False, with nothing written, when the issue
+        could not be read this tick: whose it is decides the close."""
+        if self.lookup(issue) is None:
+            return False
         close = self.bot_filed(issue)
         return self._settle(issue, (RECOVERY_CLOSE_COMMENT if close else RECOVERY_COMMENT).format(lasted=lasted), close)
 
     def cleared(self, issue: dict, when_text: str) -> bool:
         """The comment when the issue's own condition stopped firing while the
-        gate reports another; the bot's own are closed with it."""
+        gate reports another; the bot's own are closed with it. False, with
+        nothing written, when the issue could not be read this tick."""
+        if self.lookup(issue) is None:
+            return False
         close = self.bot_filed(issue)
         what = CONDITION_WORDS.get((issue or {}).get("condition"), CONDITION_WORDS_DEFAULT)
         return self._settle(issue, (CLEARED_CLOSE_COMMENT if close else CLEARED_COMMENT).format(what=what, when=when_text), close)
