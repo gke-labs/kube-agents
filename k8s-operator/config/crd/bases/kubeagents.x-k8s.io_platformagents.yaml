@@ -9842,6 +9842,31 @@ spec:
                               minimum: 1
                               type: integer
                           type: object
+                        profiles:
+                          description: |-
+                            Profiles sizes AgentProfile work (#3655): the install-wide ceiling on
+                            concurrent profile tasks and the warm workers kept per interactive
+                            (profile, tier). Until the sizing budget exists these are fixed,
+                            conservative defaults.
+                          properties:
+                            ceiling:
+                              description: |-
+                                Ceiling is the most profile tasks running at once across every profile
+                                on the install. The dispatcher enforces it, reserving max(1,
+                                ceil(Ceiling/3)) of it for interactive tiers so unattended work can't
+                                starve people, and the profile namespace's pod quota is derived from it.
+                                Absent means DefaultProfileCeiling.
+                              maximum: 1000
+                              minimum: 1
+                              type: integer
+                            warmReplicas:
+                              description: |-
+                                WarmReplicas is how many warm worker pods each interactive (profile,
+                                tier) keeps running. Absent means DefaultProfileWarmReplicas.
+                              maximum: 100
+                              minimum: 0
+                              type: integer
+                          type: object
                       type: object
                   required:
                     - clusterName

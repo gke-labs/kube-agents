@@ -531,8 +531,12 @@ spec:
               - key: {{ $openaiCompatibleCA.key | quote }}
                 path: {{ $openaiCompatibleCA.key | quote }}
         {{- end }}
+        # 1Gi: HOME and the tokenizer caches; 4 KiB peak measured over seven days
+        # on the dev installs (2026-10-22), and the floor for a directory a process
+        # writes into.
         - name: tmp
-          emptyDir: {}
+          emptyDir:
+            sizeLimit: 1Gi
 ---
 apiVersion: v1
 kind: Service

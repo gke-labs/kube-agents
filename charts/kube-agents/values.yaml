@@ -442,13 +442,21 @@ litellm:
   # smaller request to meet it, so there this 2Gi request is billed at roughly
   # 315m of CPU per replica whatever this line says; that is accepted rather
   # than fought with a request Standard does not need.
+  # Ephemeral storage is the tmp emptyDir's 1Gi sizeLimit (templates/litellm.yaml)
+  # plus 256Mi for the container's logs, twice the 86 MiB peak measured over seven
+  # days on the dev installs (2026-10-22). Stated, because a namespace quota on
+  # requests.ephemeral-storage refuses a pod without one and Autopilot bills it;
+  # the limit equals it, because a LimitRange defaulting a smaller limit would
+  # refuse a request with none.
   resources:
     requests:
       cpu: 100m
       memory: 2Gi
+      ephemeral-storage: 1280Mi
     limits:
       cpu: 500m
       memory: 3Gi
+      ephemeral-storage: 1280Mi
   # NetworkPolicy and GKE managed-Prometheus PodMonitoring for the gateway;
   # when platformAgent.enabled and operator.enabled are true (the default), litellm-policy is managed
   # dynamically by the operator with cluster-discovered DNS VIPs. When either
@@ -580,13 +588,18 @@ hindsight:
       repository: docker.io/pgvector/pgvector
       tag: "0.8.6-pg15@sha256:a947c45cdc5906a1bc951f20a8709e321256343ee0f251e4ae00b5e7def4e6da"
       pullPolicy: IfNotPresent
+    # Ephemeral storage is the run and tmp emptyDirs' sizeLimits (64Mi and 1Gi,
+    # templates/hindsight.yaml) plus 64Mi for the container's logs; the limit
+    # equals the request, as LiteLLM's does.
     resources:
       requests:
         cpu: 250m
         memory: 256Mi
+        ephemeral-storage: 1152Mi
       limits:
         cpu: "1"
         memory: 1Gi
+        ephemeral-storage: 1152Mi
     # volumeClaimTemplate size. Immutable once the StatefulSet exists.
     storage: 8Gi
   # Disable podMonitoring off-GKE, same caveat as litellm.podMonitoring.
@@ -879,6 +892,14 @@ platformAgent:
       # maxSessions caps the A2A session pods a "next" install runs at once;
       # the operator's default applies when it is unset, and "today" ignores it.
       # maxSessions: 10
+      # profiles sizes AgentProfile work on a "next" install: ceiling is the most
+      # profile tasks running at once across every profile (default 8), and
+      # warmReplicas the warm workers kept per interactive (profile, tier)
+      # (default 1). The <release namespace>-profiles namespace's pod quota is
+      # the warm workers, a surge pod per warm pool, and the ceiling.
+      # profiles:
+      #   ceiling: 8
+      #   warmReplicas: 1
       # platform:
       #   apiMaxRetries: 8
       #   maxTurns: 200
@@ -1340,7 +1361,14 @@ platformAgent:
       mode: default
     slack:
       # Bot/app tokens are read from credentials.secretName under the
-      # SLACK_BOT_TOKEN / SLACK_APP_TOKEN keys.
+      # SLACK_BOT_TOKEN / SLACK_APP_TOKEN keys by default.
+      # Custom Secret references can be specified if tokens live in separate Secrets:
+      # botTokenSecretRef:
+      #   name: ""    # defaults to credentials.secretName
+      #   key: ""     # defaults to SLACK_BOT_TOKEN
+      # appTokenSecretRef:
+      #   name: ""    # defaults to credentials.secretName
+      #   key: ""     # defaults to SLACK_APP_TOKEN
       enabled: false
       # Slack member IDs (U0123ABCD), not emails. Empty list = all users allowed.
       allowedUsers: []
@@ -1349,7 +1377,14 @@ platformAgent:
     teams:
       # Microsoft Teams ChatOps integration via Microsoft Bot Framework / Entra ID.
       # App ID and App Password are read from credentials.secretName under
-      # TEAMS_APP_ID and TEAMS_APP_PASSWORD.
+      # TEAMS_APP_ID and TEAMS_APP_PASSWORD by default.
+      # Custom Secret references can be specified if credentials live in separate Secrets:
+      # appIdSecretRef:
+      #   name: ""    # defaults to credentials.secretName
+      #   key: ""     # defaults to TEAMS_APP_ID
+      # appPasswordSecretRef:
+      #   name: ""    # defaults to credentials.secretName
+      #   key: ""     # defaults to TEAMS_APP_PASSWORD
       enabled: false
       # Microsoft Entra ID Tenant ID for single-tenant enterprise lock-down.
       tenantId: ""

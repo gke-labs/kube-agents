@@ -2,7 +2,7 @@
 
 A status dashboard and a chat pane over the a2a bus. The top strip and the dashboard panels show what the bus knows: sessions and their liveness, recent tasks and why they failed, conversations by backend, blackboard topics, stream capacity and protocol anomalies. The chat pane at the bottom talks to the chatops gateway through its console door, the same way a Discord or Google Chat user would, `/session` included. Only the page's own commands stay local.
 
-The page connects to the bus's websocket listener as the `console` NATS user. That user has the read grants the old `web` view had, plus one publish (`chat.console.*.in`) and one subscribe (`chat.console.*.out`). It can't write anywhere on `a2a.>`, and the verify button in the footer shows the server refusing it. Answers never come back on the console subjects. They arrive through the TASKS stream like every other backend's.
+The page connects to the bus's websocket listener as the `console` NATS user. That user has the read grants the old `web` view had, plus one publish (`chat.console.*.in`) and one subscribe (`chat.console.*.out`). It can't write anywhere on `a2a.>`, and the verify button in the footer shows the server refusing it. The page reads answers from the TASKS stream like every other backend's. The gateway also puts each task's end on `chat.console.<token>.out` as a frame with `"kind": "result"`, for a console client that would rather not read TASKS, and the page skips those frames. A frame a client missed while not subscribed is recovered from TASKS.
 
 ## Posture
 

@@ -540,6 +540,49 @@ directory for the stream; a run with no repository never uses a marked envelope 
 the forge path reads its memory from the newest envelope that is not marked. A broker that does not answer is `BrokerUnavailable`, as on every
 other forge call, and any other refusal leaves the run on its forge path.
 
+Before that listing, `start` asks the forge's `capabilities` where the ledger goes
+([`version-control-support.md`](version-control-support.md#the-ledger-without-issues) §8). A forge
+with no issue verbs, or with issues and no labels, keeps the ledger in the report store, and its
+remediation pull requests still open on the forge. `start` then clones the repository, looks up no
+ledger issue, prints `"ledger": "store"` and a note with the reason, reads `carried` from the ledger
+body the previous such run stored, and lists one open pull request instead of one open issue. On a
+forge with no labels it creates no label; on a forge with labels and no issues it ensures the labels
+as the forge path does, because the remediation pull requests carry them. An answer that cannot be
+read keeps the forge path, so a transient fault never moves a ledger. The run record carries the
+decision as `ledger`, `remediation` and `reason`; a record without them reads as the forge path for
+a repository, and as the no-forge path for `no_forge/local` or an `unreachable` pair. For an
+`unreachable` pair the record also keeps `probe`, the listing that found the repository unreachable,
+and the note follows it with no broker call: only a refused issue listing tells the operator to
+enable issues. A record without `probe` reads as the issue listing.
+
+`finish` on such a run applies every guard the forge path applies before it publishes (the
+declaration, missing-file, Config Connector and Kustomize passes, and the unwritten-fix refusal),
+then opens, syncs and stale-closes the remediation pull requests as steps 2, 7 and 8 below do,
+with the same cap and switch, through the label-free paths on a forge with no labels. It writes no
+ledger and reads no `/remediate` comment: a person asks in chat, and `remediate` opens the fix with
+no ledger link. A clean run closes a stale pull request only over complete coverage and with every
+finding of the stored ledger accounted for, as step 5 requires: a finding that the collector still
+flags is not accounted for, whatever `resolved_because` says. A refused listing of the remediation
+pull requests (the scan cap of a forge with no labels, or an unknown login) does not stop the run:
+the store is its only record, so it stores the findings, opens, syncs and closes no pull request,
+and names the refusal under `remediation_refused` in its JSON line, its envelope and its summary. The previous ledger is read as the
+forge path reads the stored body of the issue, with no issue to check it against
+([`fleet-audit-report-store.md`](fleet-audit-report-store.md) §2): the held set and the carried held
+rows come from its body, a body from an earlier identity scheme is re-spelled and withholds
+`resolved` on a findings run, and the held findings render on the stored body. A store whose last
+write failed or whose record cannot be read has lost the previous ledger. A store that does not
+exist, or that holds only records of runs that could not reach the repository in a ring that is not
+full, has no previous ledger when no remediation pull request of the stream is open, and the run is
+first; with one open, it has lost the previous ledger, because the store is its only copy. A clean run over a store that lost
+the previous ledger closes nothing, holds the ledger open, and stores an envelope with
+`ledger_held_open` true and `delta_known` false; the next run reads that envelope as a lost memory
+again, as the forge path's next run does when the envelope names no issue, until a run that reports
+findings stores the ledger again. Its status is
+`STORE_LEDGER`; the report store holds the ledger
+([`fleet-audit-report-store.md`](fleet-audit-report-store.md) §2), and the chat summary names the
+findings, the pull request links and the reason. `silent_ok` follows §7.5: nothing is wrong with
+the repository, so a scheduled run with nothing new is silent.
+
 `start` is also the **only** subcommand that scrubs the working tree — see the note under
 `remediate`. Note the removed behaviour: it no longer resets a report branch. There is no report
 branch.

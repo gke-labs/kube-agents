@@ -192,8 +192,9 @@ domain: incident-triage
 #
 # The three instructions are the sibling cases', each arrived at the hard way:
 # the status filter on kanban_list (a bare call pages oldest-first and misses
-# the newest card), the instruction to keep waiting (the stack returns when the
-# card is FILED, not when it is finished), and verbatim reproduction (a summary
+# the newest card), the instruction to keep waiting (the stack now waits for
+# the card to finish, up to a ceiling, so this is the fallback for a card
+# handed over still running), and verbatim reproduction (a summary
 # drops exactly the "What to do" section the delivery objective reads).
 #
 # It names the namespace, because that is how the card is found, and nothing

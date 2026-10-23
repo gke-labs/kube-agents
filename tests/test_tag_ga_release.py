@@ -4,16 +4,13 @@ Tests argument validation, pure numeric SemVer enforcement, Git tag creation,
 and idempotency on mock repositories.
 """
 
-import os
 import pathlib
 import subprocess
-import tempfile
 import unittest
 
 from tests.testing.common import (
     INVALID_GA_RELEASE_TAGS,
     MOCK_SAMPLE_COMMIT_SHA,
-    VALID_GA_RELEASE_TAGS,
     create_mock_git_repo,
     get_isolated_test_env,
 )

@@ -235,8 +235,42 @@ func TestSlackHomeBoardErrorIsNotACleanFleet(t *testing.T) {
 	a, api, _ := homeAdapter(t, nil, errors.New("nothing answers"))
 	a.homeOpened(&slackevents.AppHomeOpenedEvent{User: "U1", Tab: "home"})
 	got := viewText(t, api.views[0].view)
-	if !strings.Contains(got, "Could not read the board at") || strings.Contains(got, "no open findings") || strings.Contains(got, "clusters") {
+	if !strings.Contains(got, "Could not read the board at") || strings.Contains(got, "no open findings") || strings.Contains(got, "clusters") ||
+		strings.Contains(got, slackHomeFirstReport) {
 		t.Errorf("view = %s", got)
+	}
+}
+
+// Before the first report a cluster with no open finding has not been checked,
+// so it is not drawn green; the note says how to get the report until someone
+// writes.
+func TestSlackHomeBeforeTheFirstReportIsNotAHealthyFleet(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		reportPending, first bool
+		line                 string
+		note                 bool
+	}{
+		{"nobody has written", true, true, "section: ⚪ *seeded-c*  no findings registered yet", true},
+		{"written, report not delivered", true, false, "section: ⚪ *seeded-c*  no findings registered yet", false},
+		{"report delivered on a clean fleet", false, false, "section: 🟢 *seeded-c*  no open findings", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			board := homeBoardFixture()
+			board.FirstReportPending, board.FirstMessagePending = tc.reportPending, tc.first
+			a, api, _ := homeAdapter(t, board, nil)
+			a.homeOpened(&slackevents.AppHomeOpenedEvent{User: "U1", Tab: "home"})
+			got := viewText(t, api.views[0].view)
+			if !strings.Contains(got, tc.line) {
+				t.Errorf("view lacks %q; got:\n%s", tc.line, got)
+			}
+			if strings.Contains(got, slackHomeFirstReport) != tc.note {
+				t.Errorf("first-report note shown = %v, want %v; got:\n%s", !tc.note, tc.note, got)
+			}
+			if !strings.Contains(got, "section: 🔴 *seeded-a*") {
+				t.Errorf("a cluster with findings lost its dot; got:\n%s", got)
+			}
+		})
 	}
 }
 

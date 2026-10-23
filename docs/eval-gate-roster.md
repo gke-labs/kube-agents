@@ -465,7 +465,7 @@ graded there, but neither job blocks a merge.
 A check the transport blinds is the scorer's business. The door's trace carries no card ids,
 no worker's entries and no results. The delegation wait now reads the cards and the workers from the pod
 when the turn ran under the bridge's `api` executor, but the scorer still treats
-`worker_commands`, `worker_agents`, `report_times_in_window`, a `tool_called` in the `workers` or `all` scope, and a
+`worker_commands`, `worker_agents`, `worker_budget`, `report_times_in_window`, a `tool_called` in the `workers` or `all` scope, and a
 `tool_called` with a `result` pattern as blind on
 every inject record, and a door that shows no tool-call trace leaves a `tool_called` in its
 default `router` scope nothing to read; `bench-gate` sets

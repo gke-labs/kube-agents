@@ -638,12 +638,23 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
 - **Slack** — `platformAgent.integration.slack.enabled=true`; the bot/app
   tokens are read from the credentials Secret's `SLACK_BOT_TOKEN` /
   `SLACK_APP_TOKEN` keys (the CRD requires both refs when Slack is enabled).
+  Custom Secret references can be configured via `botTokenSecretRef` and
+  `appTokenSecretRef` (`name` and `key`) if tokens are kept in a separate Secret.
+  On an installer-managed install (`upgrade.sh` full mode), custom refs can
+  be preserved across upgrades by specifying them via `TF_VAR_extra_helm_values`
+  in `install.env` (e.g.
+  `TF_VAR_extra_helm_values='{platformAgent={integration={slack={botTokenSecretRef={name="custom-slack-secret"},appTokenSecretRef={name="custom-slack-secret"}}}}}'`).
+  Note: installer recovery heuristics and front-door flag validation for split
+  Secrets are decoupled and deferred to follow-up work; the installer expects
+  the tokens in `install.env` or the shared Secret until that lands.
 - **Microsoft Teams** — `platformAgent.integration.teams.enabled=true`; the bot
   credentials are read from the credentials Secret's `TEAMS_APP_ID` and
-  `TEAMS_APP_PASSWORD` keys. Optional single-tenant lock-down is set via
-  `tenantId`, and user authorization is configured via `allowedUsers` (or
-  `allowAllUsers: true`). Supports Microsoft Adaptive Cards v1.5 with markdown
-  fallback.
+  `TEAMS_APP_PASSWORD` keys. Custom Secret references can be configured via
+  `appIdSecretRef` and `appPasswordSecretRef` (`name` and `key`). Optional
+  single-tenant lock-down is set via `tenantId`, and user authorization is
+  configured via `allowedUsers` (or `allowAllUsers: true`). Supports Microsoft
+  Adaptive Cards v1.5 with markdown fallback. Custom refs can likewise be
+  preserved across `upgrade.sh` upgrades via `TF_VAR_extra_helm_values`.
 - **Git forges and repositories** — `platformAgent.integration.forges` lists
   the forges the agent talks to (`name`, `provider`, optional `host`,
   `namespace` and `credentialsRef`), and
@@ -1057,10 +1068,11 @@ stall, from an object this check never looks at. Check it separately with
 Conversely, a ResourceQuota that restricts compute resources (`requests.cpu`, `limits.cpu`,
 `requests.memory`, `limits.memory`, `requests.ephemeral-storage`, `limits.ephemeral-storage`)
 requires every container in the namespace to declare that request or limit unless a
-`LimitRange` provides a default. All chart-rendered workloads (operator, LiteLLM, minter,
-Hindsight, cleanup Job) and several operator containers (such as the shell sandbox, dashboard,
-and agent container) set no ephemeral storage, and pruning a workload's limits leaves it
-without them; the preflight checks total headroom against what is declared, not whether every
+`LimitRange` provides a default. LiteLLM, Hindsight's Postgres and the cleanup Job declare an
+ephemeral-storage request and an equal limit by default (each emptyDir's sizeLimit plus its
+logs), as do the a2a session pods; the operator, the minter and the Hindsight API do not, nor
+do several operator containers (such as the shell sandbox, dashboard, and agent container),
+and pruning a workload's requests leaves it without them; the preflight checks total headroom against what is declared, not whether every
 individual container declares every resource the quota constrains. A namespace quota constraining
 ephemeral storage therefore additionally requires a `LimitRange` defaulting it, or the API
 server will reject pod creation.

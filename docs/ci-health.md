@@ -38,7 +38,11 @@ turn's p50 and p95 as advice beside the p95 < 10 s target
 `spec.mode: next`, because the harness times the opening turn on the agent API only),
 and the wall clock, or that the night was cut short, still running or missing),
 a link to the dashboard's Nightly report (`nightly.html`), and a line saying why
-the section was skipped. `scripts/eval_dashboard/nightly.py` derives that line
+the section was skipped. A night can be the builds of up to three periodics
+(the main job, the main-b job when the main part runs as two halves, and the
+writers job), reported as one night: the line names a part that is missing,
+still running or cut short, and the night counts as cut short when its main or
+main-b part is. `scripts/eval_dashboard/nightly.py` derives that line
 and the report from the same nightly runs.
 The same tick reads the eval evidence store (`gs://kube-agents-evals-bench/evidence`,
 the records the nightly appends; `scripts/eval_dashboard/store.py`, best-effort
