@@ -3750,7 +3750,16 @@ def _read_chat_report_record(job_id: str) -> dict | None:
     Raises ChatReportUnreadable when the read itself failed, which says
     nothing about whether the run finished.
     """
-    path = os.path.join(FLEET_AUDIT_SCRATCH_DIR, CHAT_REPORT_FILE.format(audit=job_id))
+    # `job_id` is caller-supplied, and a record is only ever under the scratch
+    # directory: a path that leaves it names no record. abspath (a relative
+    # root resolves against the working directory, as the open would) followed
+    # by startswith is the containment check CodeQL recognises (py/path-injection).
+    root = os.path.abspath(FLEET_AUDIT_SCRATCH_DIR)
+    path = os.path.normpath(os.path.join(root, CHAT_REPORT_FILE.format(audit=job_id)))
+    prefix = root if root.endswith(os.sep) else root + os.sep  # a root of "/" already ends in one
+    if not path.startswith(prefix):
+        logger.warning(f"Relay for {job_id}: chat report path leaves {root}")
+        return None
     try:
         import sandbox_exec
 
@@ -3825,8 +3834,21 @@ def _delivering_run_start(profile: str, job_id: str) -> float | None:
     """
     from gitops_workspace import agent_home
 
-    base = agent_home() if profile == DEFAULT_PROFILE else os.path.join(agent_home(), PROFILES_DIR, profile)
-    path = os.path.join(base, *RUN_LEDGER)
+    # `profile` is caller-supplied, and a ledger is only ever under the agent
+    # home (the default profile) or the profiles directory (the rest): a path
+    # that leaves its root is no ledger. abspath (a relative home resolves
+    # against the working directory, as the open would) followed by startswith
+    # is the containment check CodeQL recognises (py/path-injection).
+    home = os.path.abspath(agent_home())
+    if profile == DEFAULT_PROFILE:
+        root, base = home, home
+    else:
+        root = os.path.join(home, PROFILES_DIR)
+        base = os.path.join(root, profile)
+    path = os.path.normpath(os.path.join(base, *RUN_LEDGER))
+    prefix = root if root.endswith(os.sep) else root + os.sep  # a root of "/" already ends in one
+    if not path.startswith(prefix):
+        return None
     if not os.path.exists(path):
         return None
     try:
@@ -6430,8 +6452,10 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
         try:
             return action()
         except sqlite3.Error as exc:
+            # The message stays in this log; the body names the error's class
+            # only (py/stack-trace-exposure).
             logger.error("card stop: %s failed: %s", step, exc)
-            result["errors"].append(f"{step}: {exc}")
+            result["errors"].append(f"{step}: {type(exc).__name__}")
             return None
 
     def sweep_late(conn: sqlite3.Connection, ids: Sequence[str]) -> None:

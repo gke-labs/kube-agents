@@ -77,6 +77,7 @@ class RegistryTest(unittest.TestCase):
 
 
 _ERRORED_LINE = re.compile(r'^kubeagents_chat_turns_errored_total\{platform="([a-z]+)"\} (\d+)$', re.M)
+_NEGATIVE_LINE = re.compile(r'^kubeagents_chat_feedback_negative_total\{platform="([a-z]+)"\} (\d+)$', re.M)
 
 
 class TurnErrorTest(unittest.TestCase):
@@ -341,6 +342,55 @@ class ListenerTest(unittest.TestCase):
         self.addCleanup(server.shutdown)
         self.addCleanup(server.server_close)
         self.assertTrue(any(t.daemon and t.name.startswith(metrics.LISTENER_THREAD_NAME) for t in threading.enumerate()))
+
+class _Platform:
+    def __init__(self, value):
+        self.value = value
+
+
+class _Adapter:
+    def __init__(self, bot, teams=None):
+        self._bot_user_id = bot
+        self._team_bot_user_ids = dict(teams or {})
+
+
+class _Gateway:
+    def __init__(self, adapters):
+        self.adapters = adapters
+
+
+class NegativeFeedbackTest(unittest.TestCase):
+    """A thumbs-down a person put on the bot's message counts under its
+    platform; the bot's own Slack identities come from the gateway the inbound
+    hook noted, so the reaction hook can tell the bot's messages from a person's."""
+
+    def tearDown(self):
+        metrics.note_gateway(None)
+
+    def test_a_negative_reaction_counts_under_its_platform(self):
+        registry = metrics.ChatMetrics()
+        registry.record_negative_feedback("slack")
+        registry.record_negative_feedback("slack")
+        registry.record_negative_feedback("google_chat")
+        exposition = registry.render()
+        self.assertIn("# TYPE kubeagents_chat_feedback_negative_total counter", exposition)
+        self.assertEqual([("googlechat", "1"), ("slack", "2")], _NEGATIVE_LINE.findall(exposition))
+
+    def test_an_idle_registry_renders_the_family_with_no_series(self):
+        exposition = metrics.ChatMetrics().render()
+        self.assertIn("# TYPE kubeagents_chat_feedback_negative_total counter", exposition)
+        self.assertEqual([], _NEGATIVE_LINE.findall(exposition))
+
+    def test_the_slack_bot_ids_come_from_the_noted_gateway(self):
+        gateway = _Gateway({_Platform("slack"): _Adapter("U1", {"T1": "U2"}), _Platform("discord"): _Adapter("U9")})
+        metrics.note_gateway(gateway)
+        self.assertEqual(frozenset({"U1", "U2"}), metrics.slack_bot_user_ids())
+
+    def test_without_a_gateway_the_bot_ids_are_empty(self):
+        metrics.note_gateway(None)
+        self.assertEqual(frozenset(), metrics.slack_bot_user_ids())
+        metrics.note_gateway(object())
+        self.assertEqual(frozenset(), metrics.slack_bot_user_ids())
 
 
 if __name__ == "__main__":
