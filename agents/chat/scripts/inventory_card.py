@@ -34,6 +34,8 @@ from inventory_presenter import ACTION_ID_PREFIX, COUNT_WORDS, FIX_FIRST, FIX_ON
 #: The files' top-level keys, as bootstrap_delivery.py names them (its test holds the copies equal).
 ITEMS_KEY = "items"
 SCORES_KEY = "scores"
+#: The scores file's cluster names, the key ``inventory_findings.complete_clusters`` reads.
+COMPLETE_KEY = "complete_clusters"
 #: The files, as the reasons name them.
 ITEMS_FILE = "the items file"
 SCORES_FILE = "the scores file"
@@ -75,7 +77,7 @@ PACE_CRITICALS_OTHERS_WAIT = "I'll bring up to {count} critical a day. The other
 PACE_CRITICALS_WAIT_OTHERS = "The critical ones wait until you ask. I'll bring up to {count} of the others a day."
 FOLD_TITLE = "What the scan checked"
 SEE_ALL = "See all {count}"
-FINDING_NOUN = ("finding", "findings")
+ITEM_NOUN = ("item", "items")
 #: A fix button's reply names the finding, so the turn it posts carries it;
 #: the title is clipped so the reply stays one the spec accepts.
 FIX_REPLY = "{label}: {title}"
@@ -87,6 +89,7 @@ NO_SCORES = "no scores file beside the items"
 NOT_AN_OBJECT = "{name} is not a JSON object"
 NO_LIST = "{name} has no `{key}` list"
 NO_SCORES_MAP = "the scores file has no `scores` map"
+NO_NAME_LIST = "the scores file's `{key}` is not a list of cluster names"
 SHOWN_DIFFERS = "the listed items differ from the shown file: select chose {shown}, the recompute {recomputed}"
 SELECT_FAILED = "the selection could not be recomputed: {errors}"
 ERROR_JOIN = "; "
@@ -126,10 +129,14 @@ def _inputs(items: Any, scores: Any, shown: Any) -> tuple[list, dict, set[str], 
     if item_list:
         if scores is None:
             raise CardUnavailable(NO_SCORES)
-        score_map = _mapping(scores, SCORES_FILE).get(SCORES_KEY)
+        score_file = _mapping(scores, SCORES_FILE)
+        score_map = score_file.get(SCORES_KEY)
         if not isinstance(score_map, dict):
             raise CardUnavailable(NO_SCORES_MAP)
-        complete = inventory_findings.complete_clusters(scores)
+        names = score_file.get(COMPLETE_KEY)
+        if names is not None and not (isinstance(names, list) and all(isinstance(name, str) for name in names)):
+            raise CardUnavailable(NO_NAME_LIST.format(key=COMPLETE_KEY))
+        complete = inventory_findings.complete_clusters(score_file)
     else:
         # A clean fleet has nothing to score, so the SOP writes no scores file for it.
         score_map, complete = {}, set()
@@ -156,39 +163,44 @@ def _ids(chosen: list[list[dict]]) -> list[list[str]]:
     return [[row["id"] for row in members] for members in chosen]
 
 
+def _best(members: list[dict]) -> dict:
+    """The line's most severe row, the first in ranked order among equals.
+
+    The queue ranks an actionable or higher-scoring major ahead of a floored
+    critical, so a line's severity, and the row under its tag, come from this
+    row and not from its first.
+    """
+    return min(members, key=lambda row: fq.SEVERITIES.index(row["severity"]))
+
+
 def _listed(
     item_list: list, score_map: dict, limit: int, shown_ids: list[list[str]], suppressed: frozenset[str]
 ) -> tuple[list[list[dict]], int, int]:
-    """The items the card lists, and the deferred and other counts, from the recompute.
+    """The lines the card lists, and the deferred and other counts.
 
-    ``select`` ran either with no exclusions (the shell sandbox kept it from
-    the queue) or with ``--exclude`` for every id ``register`` named suppressed
-    (the SOP's Step 5), so the shown file must equal one recompute or the
-    other. The rows are the shown items with the suppressed rows dropped and
-    nothing promoted in their place, since only the shown items are marked
-    shown; a critical item so left out stays queued, and the counts come from
-    the recompute without the suppressed rows, which the roll-up must not
-    count.
+    ``select`` ran either with ``--exclude`` for every id ``register`` named
+    suppressed (the SOP's Step 5) or with no exclusions (the shell sandbox
+    kept it from the queue), so the shown file must equal one recompute or
+    the other. The counts come from the excluded recompute, the fleet less
+    the dismissed rows. The lines are the shown ones less those rows, and a
+    line is listed only while a critical row is left in it: a line that lost
+    its last critical is among the recompute's others, and nothing is
+    promoted into a dismissed row's place, since only the shown items are
+    marked shown.
     """
-    chosen, deferred, others = _select(item_list, score_map, limit, frozenset())
-    if not suppressed:
-        if _ids(chosen) != shown_ids:
-            raise CardUnavailable(SHOWN_DIFFERS.format(shown=shown_ids, recomputed=_ids(chosen)))
-        return chosen, deferred, others
     excluded, deferred, others = _select(item_list, score_map, limit, suppressed)
-    if _ids(excluded) == shown_ids:
-        return excluded, deferred, others
-    if _ids(chosen) != shown_ids:
+    shown = excluded
+    if suppressed and _ids(shown) != shown_ids:
+        shown = _select(item_list, score_map, limit, frozenset())[0]
+    if _ids(shown) != shown_ids:
         raise CardUnavailable(SHOWN_DIFFERS.format(shown=shown_ids, recomputed=_ids(excluded)))
-    kept = [members for members in ([row for row in members if row["id"] not in suppressed] for members in chosen) if members]
-    return kept, deferred + len(excluded) - len(kept), others
+    remaining = ([row for row in members if row["id"] not in suppressed] for members in shown)
+    listed = [members for members in remaining if members and _best(members)["severity"] == CRITICAL]
+    return listed, deferred + len(excluded) - len(listed), others
 
 
 def _row(members: list[dict]) -> dict:
-    # The line's most severe row, the first in ranked order among equals: the
-    # queue ranks an actionable or higher-scoring major ahead of a floored
-    # critical, and the row under a critical tag must name the critical finding.
-    best = min(members, key=lambda row: fq.SEVERITIES.index(row["severity"]))
+    best = _best(members)
     title = best["title"]
     if len(members) > 1:
         more = len(members) - 1
@@ -196,7 +208,7 @@ def _row(members: list[dict]) -> dict:
     recommendation = best["recommendation"]
     risk = slack_presenter._clip(chat_message._line(recommendation["risk"]), RISK_MAX)
     action = slack_presenter._clip(chat_message._line(recommendation["action"]), ACTION_MAX)
-    return {"severity": CRITICAL, "text": title, "detail": SENTENCE_JOIN.join(part for part in (risk, action) if part)}
+    return {"severity": best["severity"], "text": title, "detail": SENTENCE_JOIN.join(part for part in (risk, action) if part)}
 
 
 def _headline(rows: int, deferred: int) -> str:
@@ -271,7 +283,7 @@ def build(
         choices.append(label)
         replies[label] = _fix_reply(label, rows[0]["text"])
     if total > len(rows):
-        choices.append(SEE_ALL.format(count=_plural(total, FINDING_NOUN)))
+        choices.append(SEE_ALL.format(count=_plural(total, ITEM_NOUN)))
     return Card(
         headline=_headline(len(rows), deferred),
         detail=_detail(len(rows), deferred, complete),

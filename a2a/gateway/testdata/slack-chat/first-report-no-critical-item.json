@@ -144,11 +144,11 @@
             "style": "primary",
             "text": {
               "emoji": true,
-              "text": "See all 4 findings",
+              "text": "See all 4 items",
               "type": "plain_text"
             },
             "type": "button",
-            "value": "See all 4 findings"
+            "value": "See all 4 items"
           }
         ],
         "type": "actions"

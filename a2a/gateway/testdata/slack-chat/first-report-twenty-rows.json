@@ -725,11 +725,11 @@
             "action_id": "kage.choice.1",
             "text": {
               "emoji": true,
-              "text": "See all 25 findings",
+              "text": "See all 25 items",
               "type": "plain_text"
             },
             "type": "button",
-            "value": "See all 25 findings"
+            "value": "See all 25 items"
           }
         ],
         "type": "actions"

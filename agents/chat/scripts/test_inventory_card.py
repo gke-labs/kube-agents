@@ -210,7 +210,7 @@ class TwoCriticalsTest(unittest.TestCase):
         )
 
     def test_the_buttons_and_the_fix_reply(self):
-        self.assertEqual(self.card.choices, ["Fix the first one", "See all 7 findings"])
+        self.assertEqual(self.card.choices, ["Fix the first one", "See all 7 items"])
         self.assertEqual(self.card.replies, {"Fix the first one": "Fix the first one: " + self.card.rows[0]["text"]})
 
     def test_the_fold_lists_the_checks(self):
@@ -220,7 +220,7 @@ class TwoCriticalsTest(unittest.TestCase):
     def test_one_critical_item_says_one_thing_and_fix_it(self):
         card = build(criticals_items(), criticals_scores(), pacing=limits(first_report_criticals=1))
         self.assertEqual(card.headline, "First look at your fleet: one thing to fix first")
-        self.assertEqual(card.choices, ["Fix it", "See all 7 findings"])
+        self.assertEqual(card.choices, ["Fix it", "See all 7 items"])
         self.assertEqual(
             card.after, "6 more items are queued, 3 of them critical. I'll bring up to 2 critical a day, then up to 3 of the others."
         )
@@ -307,7 +307,7 @@ class DoneTest(unittest.TestCase):
         self.assertEqual(card.headline, "First look at your fleet: done")
         self.assertEqual(card.detail, "1 cluster scanned in full · no critical item in this scan's 9 checks")
         self.assertEqual(card.after, "4 smaller items are queued. I'll bring up to 3 a day.")
-        self.assertEqual(card.choices, ["See all 4 findings"])
+        self.assertEqual(card.choices, ["See all 4 items"])
 
     def test_a_zero_noncritical_limit_says_the_items_wait(self):
         card = build(no_critical_items(), no_critical_scores(), pacing=limits(noncritical_max=0))
@@ -319,7 +319,7 @@ class DoneTest(unittest.TestCase):
         scores["scores"] = {items[0]["id"]: scores["scores"][items[0]["id"]]}
         card = build(items, scores)
         self.assertEqual(card.after, "1 smaller item is queued. I'll bring up to 3 a day.")
-        self.assertEqual(card.choices, ["See all 1 finding"])
+        self.assertEqual(card.choices, ["See all 1 item"])
 
 
 class DismissedTest(unittest.TestCase):
@@ -330,7 +330,7 @@ class DismissedTest(unittest.TestCase):
         card = build(items, scores, shown, suppressed=frozenset({dismissed}))
         self.assertEqual(card.headline, "First look at your fleet: one thing to fix first")
         self.assertEqual([row["text"][:11] for row in card.rows], ["log-shipper"])
-        self.assertEqual(card.choices, ["Fix it", "See all 6 findings"])
+        self.assertEqual(card.choices, ["Fix it", "See all 6 items"])
 
     def test_a_dismissed_row_is_not_counted_in_the_queue(self):
         items, scores = criticals_items(), criticals_scores()
@@ -352,7 +352,7 @@ class DismissedTest(unittest.TestCase):
         self.assertEqual(
             card.after, "5 more items are queued, 2 of them critical. I'll bring up to 2 critical a day, then up to 3 of the others."
         )
-        self.assertEqual((card.rows, card.choices), ([], ["See all 5 findings"]))
+        self.assertEqual((card.rows, card.choices), ([], ["See all 5 items"]))
 
     def test_a_shown_file_select_wrote_with_exclusions_matches(self):
         # The SOP's path: register reached the queue, so select ran with --exclude for the dismissed id
@@ -369,7 +369,27 @@ class DismissedTest(unittest.TestCase):
         self.assertEqual(
             card.after, "4 more items are queued, 1 of them critical. I'll bring up to 2 critical a day, then up to 3 of the others."
         )
-        self.assertEqual(card.choices, ["Fix the first one", "See all 6 findings"])
+        self.assertEqual(card.choices, ["Fix the first one", "See all 6 items"])
+
+    def test_a_dismissed_critical_row_takes_its_gathered_line_off_the_card(self):
+        # The sandboxed select wrote the plain recompute, and the user had dismissed the
+        # line's only critical row: what is left is a major, so it is no row, and it counts
+        # among the others, not the queued criticals.
+        items = criticals_items()
+        extra = dict(items[0], id="f008", object="payout-worker", title="payout-worker mounts the same key")
+        items.append(extra)
+        scores = criticals_scores()
+        scores["scores"]["f008"] = _score(MAJOR_RUBRIC, "Rotate the key.", "The key is old.")
+        shown = shown_for(items, scores)
+        dismissed, _ = shown["items"][0]["ids"]
+        self.assertTrue(dismissed.endswith(items[0]["object"]), dismissed)
+        card = build(items, scores, shown, suppressed=frozenset({dismissed}))
+        self.assertEqual(card.headline, "First look at your fleet: one thing to fix first")
+        self.assertEqual([(row["severity"], row["text"][:11]) for row in card.rows], [("critical", "log-shipper")])
+        self.assertEqual(
+            card.after, "6 more items are queued, 2 of them critical. I'll bring up to 2 critical a day, then up to 3 of the others."
+        )
+        self.assertEqual(card.choices, ["Fix it", "See all 7 items"])
 
     def test_a_dismissed_id_with_a_shown_file_matching_neither_recompute(self):
         items, scores = criticals_items(), criticals_scores()
@@ -387,7 +407,7 @@ class ListTurnedOffTest(unittest.TestCase):
         self.assertEqual(
             card.after, "7 more items are queued, 4 of them critical. I'll bring up to 2 critical a day, then up to 3 of the others."
         )
-        self.assertEqual((card.rows, card.choices), ([], ["See all 7 findings"]))
+        self.assertEqual((card.rows, card.choices), ([], ["See all 7 items"]))
 
 
 class RowCapTest(unittest.TestCase):
@@ -396,7 +416,7 @@ class RowCapTest(unittest.TestCase):
         self.assertEqual(len(card.rows), chat_message.ROWS_MAX)
         self.assertEqual(card.headline, f"First look at your fleet: {chat_message.ROWS_MAX} things to fix first")
         self.assertEqual(card.after, "5 more items are queued, 5 of them critical. I'll bring up to 2 a day.")
-        self.assertEqual(card.choices, ["Fix the first one", f"See all {MANY} findings"])
+        self.assertEqual(card.choices, ["Fix the first one", f"See all {MANY} items"])
         message = inventory_card.chat(card)[0]
         self.assertEqual(len(message["rows"]), chat_message.ROWS_MAX)
 
@@ -421,6 +441,13 @@ class UnavailableTest(unittest.TestCase):
         self.assertUnavailable("no `items` list", {"items": []}, None, limits(), {})
         self.assertUnavailable("no `items` list", {"items": []}, None, limits(), {"items": [{"class": "critical"}]})
         self.assertUnavailable("no `scores` map", {"items": criticals_items()}, {"complete_clusters": []}, limits(), {"items": []})
+
+    def test_complete_clusters_that_is_not_a_list_of_names(self):
+        items = criticals_items()
+        for value in ("onboarding-criticals-prod/prod-central", 1, ["onboarding-criticals-prod/prod-central", 1]):
+            with self.subTest(value=value):
+                scores = dict(criticals_scores(), complete_clusters=value)
+                self.assertUnavailable("`complete_clusters`", {"items": items}, scores, limits(), shown_for(items, scores))
 
     def test_an_unscored_item_cannot_be_selected(self):
         scores = criticals_scores()
@@ -450,7 +477,7 @@ class LayoutsTest(unittest.TestCase):
             message["choices"],
             [
                 {"text": "Fix the first one", "reply": self.card.replies["Fix the first one"], "primary": True},
-                {"text": "See all 7 findings"},
+                {"text": "See all 7 items"},
             ],
         )
         self.assertTrue(text.startswith("**First look at your fleet: two things to fix first**\n1 cluster scanned"))
@@ -464,7 +491,7 @@ class LayoutsTest(unittest.TestCase):
         fold = next(block for block in blocks if block.get("is_collapsible"))
         self.assertEqual(fold["title"]["text"], "What the scan checked")
         actions = next(block for block in blocks if block["type"] == "actions")
-        self.assertEqual([button["text"]["text"] for button in actions["elements"]], ["Fix the first one", "See all 7 findings"])
+        self.assertEqual([button["text"]["text"] for button in actions["elements"]], ["Fix the first one", "See all 7 items"])
         self.assertEqual(actions["elements"][0]["action_id"], "kage_inventory.choice.0")
         self.assertEqual(actions["elements"][0]["style"], "primary")
         self.assertTrue(text.startswith("*First look at your fleet: two things to fix first 1 cluster scanned in full"))
