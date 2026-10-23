@@ -497,6 +497,12 @@ def read_bytes(path: str, *, max_bytes: int, principal: str = TERMINAL_PRINCIPAL
     of a 2 GB core dump moves 32 KiB. Pass one byte more than the real ceiling
     to tell "at the limit" from "over it", the way a local capped read does.
 
+    `path` is rendered into the script through `shlex.quote`, which is the
+    right escaping for the remote shell and not a sanitizer CodeQL's
+    `py/command-line-injection` query recognises. A caller whose path derives
+    from a request body passes an allowlisted copy of the value instead, as
+    `session_kv_server._shipped_audit_job` does.
+
     `principal` defaults to `TERMINAL_PRINCIPAL`, which is NOT this module's
     default and is deliberate. The other callers that name it pass it to
     write inside an `agent`-owned tree; this one passes it to read with no more

@@ -119,7 +119,6 @@ Test: cd scripts && python3 -m unittest test_notify_broken_main
 """
 
 import argparse
-import json
 import os
 import re
 import sys
@@ -134,7 +133,6 @@ from github_api import (
     PER_PAGE,
     REQUEST_ATTEMPTS,
     REQUEST_RETRY_CEILING,
-    REQUEST_RETRY_SECONDS,
     GitHubAPI as BaseGitHubAPI,
     _retry_delay,
     is_refusal,

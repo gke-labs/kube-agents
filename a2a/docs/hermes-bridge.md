@@ -665,7 +665,7 @@ count: a task past it is accepted and `submitted` and then queued with no subpro
 worker frees, and the harness classifies a repetition that reaches its budget still
 `submitted` as infrastructure rather than a graded case - it cancels the task and the bridge
 answers `canceled-before-start`. The presubmit fans units out at `EVAL_TASK_PARALLELISM`,
-default 4, the nightly at 8, so the install gives the bridge a `BRIDGE_CONCURRENCY` at or above
+default 4, the next-mode nightlies at 6, so the install gives the bridge a `BRIDGE_CONCURRENCY` at or above
 that value; at the defaults two of every four concurrent units wait for as long as the two ahead
 of them run. The queue behind the workers is fixed at `taskQueueCapacity`, 1024 in `bridge.go`,
 and a submission past it is finalized `failed` with `reason: bridge-queue-overflow`, also

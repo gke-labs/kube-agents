@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -234,5 +235,26 @@ func TestSideDoorHandsTheProbeToTheDoor(t *testing.T) {
 	if !report.Active || report.TaskID != want.TaskID || report.ExecutorState != string(want.ExecutorState) ||
 		report.Backend != gchatBackend || report.InjectOnly {
 		t.Fatalf("the door answered %+v, want the probe the composite was handed", report)
+	}
+}
+
+// A door's conversation takes no terminal frames (its caller reads results
+// through the observer calls); the primary's does when the primary takes them.
+func TestSideDoorForwardsTerminalsToThePrimaryOnly(t *testing.T) {
+	primary, _, composite := newSideDoorRig(t)
+	primary.setTakesTerminals()
+	poster, ok := composite.(TerminalPoster)
+	if !ok {
+		t.Fatal("the side-door composite does not forward terminals")
+	}
+	term := ConsoleTerminal{TaskID: "task-1", State: lib.StateFailed, Text: "❌ the task failed"}
+	if err := poster.PostTerminal("console:tab-1", term); err != nil {
+		t.Fatal(err)
+	}
+	if got := primary.terminalPosts(); len(got) != 1 {
+		t.Errorf("primary terminals = %+v, want one", got)
+	}
+	if err := poster.PostTerminal(injectKeyPrefix+"case-1", term); !errors.Is(err, errNoTerminalFrames) {
+		t.Errorf("door terminal err = %v, want errNoTerminalFrames", err)
 	}
 }

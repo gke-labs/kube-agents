@@ -368,6 +368,12 @@ def _push_sandbox_layout(name: str) -> None:
     entrypoint's job and has a marker of its own. A brand new profile has no
     files to move.
 
+    ``--profile``: this profile's home, plus the machine home and the platform
+    profile (the mirror's FIXED_HOMES, which the sandbox creates as bare roots).
+    Every other cluster home is left to its own scaffold or the entrypoint's
+    start-time pass; re-sending every home on every scaffold made onboarding N
+    clusters O(N^2) (#3701).
+
     Never fatal. An install with no sandbox exits 0 from the script itself, and
     a sandbox that is down leaves a profile whose shell starts in the machine
     home -- which is where it starts anyway.
@@ -377,7 +383,8 @@ def _push_sandbox_layout(name: str) -> None:
     try:
         subprocess.run(
             [sys.executable, str(SANDBOX_MIRROR),
-             "--agent-home", str(HERMES_HOME), "--skeleton-only", "--wait", "30"],
+             "--agent-home", str(HERMES_HOME), "--skeleton-only", "--profile", name,
+             "--wait", "30"],
             check=True,
             capture_output=True,
             text=True,

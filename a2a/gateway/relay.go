@@ -387,6 +387,27 @@ func (g *Gateway) applyArtifact(ctx context.Context, rec *SessionRecord, rs *rel
 // text, in the room and in a wake.
 const completedNonTextResult = "(completed with a non-text result; see the stream)"
 
+// terminalNotice is the line a conversation is told when a task ends other
+// than completed, with the executor's reason when it gave one: the relay's
+// notice, and the text of a console conversation's terminal frame.
+func terminalNotice(state lib.TaskState, reason string) string {
+	switch state {
+	case lib.StateFailed:
+		if reason != "" {
+			return "❌ failed: " + reason
+		}
+		return "❌ the task failed"
+	case lib.StateCanceled:
+		return "🛑 canceled"
+	case lib.StateRejected:
+		if reason != "" {
+			return "🚫 the executor rejected the task: " + reason
+		}
+		return "🚫 the executor rejected the task"
+	}
+	return string(state)
+}
+
 // relayTerminal posts the deliverable (or the failure), releases the
 // session's serialization, and retires the task's index — the stream is
 // the durable record; the index only exists to route live events. source is
@@ -395,15 +416,15 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// A turn answer still assembling posts before the deliverable it led to.
 	g.flushTurn(rec, rs, taskID)
 	result := joinTextParts(rs.result)
-	// The console never posts the deliverable (see the StateCompleted arm), so
-	// replaying the stream to recover it would buy nothing. Checking here and
-	// not there is the difference between skipping the replay and paying for
-	// one whose result is then dropped.
-	// A child's result feeds its wake as well as the room, so a child on a
-	// console conversation still has it replayed.
+	// The console never posts the deliverable as a notice (see the
+	// StateCompleted arm), but its terminal frame carries it (observeEnded,
+	// consoleFrame), so a result the render state lost is read back from the
+	// stream whatever the conversation, except for a console task whose
+	// terminal the heal already observed: it gets no second frame, so the
+	// replay would buy nothing.
 	ref, _ := rec.TaskRefFor(taskID)
 	needResult := result == "" && s.Status.State == lib.StateCompleted &&
-		(!isConsoleConversation(rec.Key) || ref.Role == taskRoleChild)
+		!(isConsoleConversation(rec.Key) && ref.TerminalObserved)
 	// A child's turn answers feed its wake too, however it ended. The render
 	// state holds them when this process relayed every event (local);
 	// otherwise a restart may have lost some, and the stream has them all. A
@@ -495,13 +516,12 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		}
 		result = answer.Text
 		// The console renders answers straight off TASKS, so posting the
-		// deliverable here too would show it twice and put a burst of
-		// answer-sized frames on a subject documented to carry only notices
+		// deliverable here as a notice would show it twice; its terminal
+		// frame carries it instead (consoleFrame), which the page skips
 		// (console.go and spec-chatops-gateway.md, "The console adapter").
 		// The other terminal arms below are notices, not answers, and go to
 		// every backend. Chat backends have no TASKS view, so for them this
-		// post IS the answer. The replay above is skipped for the same
-		// backends, so reaching here with an empty result costs nothing.
+		// post IS the answer.
 		if !isConsoleConversation(rec.Key) {
 			if ref.TerminalObserved && result == completedNonTextResult {
 				// The heal already posted the status card; skip completedNonTextResult.
@@ -510,18 +530,12 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			}
 		}
 		g.markFrom(rec, taskID, answerChat)
-	case lib.StateFailed:
+	case lib.StateFailed, lib.StateCanceled:
 		reason := ""
 		if s.Status.Message != nil {
 			reason = joinTextParts(s.Status.Message.Parts)
 		}
-		if reason != "" {
-			g.post(rec.Key, "❌ failed: "+reason)
-		} else {
-			g.post(rec.Key, "❌ the task failed")
-		}
-	case lib.StateCanceled:
-		g.post(rec.Key, "🛑 canceled")
+		g.post(rec.Key, terminalNotice(s.Status.State, reason))
 	case lib.StateRejected:
 		// Same shape as failed above, and for the same reason. Both
 		// executors put the cause in the terminal message -- a capability
@@ -534,11 +548,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if s.Status.Message != nil {
 			reason = joinTextParts(s.Status.Message.Parts)
 		}
-		if reason != "" {
-			g.post(rec.Key, "🚫 the executor rejected the task: "+reason)
-		} else {
-			g.post(rec.Key, "🚫 the executor rejected the task")
-		}
+		g.post(rec.Key, terminalNotice(s.Status.State, reason))
 	}
 	g.postSteerShortfall(rec, rs, taskID)
 	g.flushNotices(rec.Key, rs)
@@ -710,7 +720,8 @@ func steerNotTakenNotice(reason string) string {
 }
 
 // flushTurn posts the assembled turn answer, once. Console conversations
-// read answers off TASKS (relayTerminal says why) and get no post.
+// get no post: the page reads turn answers off TASKS, and a console client's
+// terminal frame carries only the task's end (consoleFrame).
 func (g *Gateway) flushTurn(rec *SessionRecord, rs *relayState, taskID string) {
 	if !rs.turnPending {
 		return

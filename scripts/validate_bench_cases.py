@@ -317,6 +317,12 @@ FIXTURE_NOT_READY = {
         "fleet question reaches the ten-card fan-out bound; the seeded fleet and "
         "every dev install have five or fewer"
     ),
+    "upgrades-readiness-lb-drain-timeout": (
+        "#3524: needs bench/tf/fleet's drain-timeout backend service on seeded-b's default "
+        "pool (the readiness-lb-drain-timeout role) applied to every pool project (fleet "
+        "re-apply); no pool project has a backend service draining longer than the 600 s "
+        "GKE waits per node"
+    ),
     "scope-excluded-cluster-not-listed": (
         "#3213: needs an eval install whose PlatformAgent spec.scope.exclude.clusters "
         "names seeded-b (seeded-a and seeded-c in scope); no pool install declares a "
@@ -366,6 +372,13 @@ FIXTURE_NOT_READY = {
         "#2419: needs an install with no forge (a PlatformAgent with no "
         "spec.integration); every CI eval install has a GitHub forge, so no CI tier "
         "can run it; run it by hand against such an install"
+    ),
+    "fleet-audit-forge-without-issues-keeps-the-ledger-in-the-store": (
+        "#1154: needs an install whose forge's capabilities declare no issue verbs "
+        "and labels: false (an install whose forge declares no issue tracker, as a "
+        "Bitbucket provider does), and the no-pdb-workload declaration of #2228; "
+        "every CI eval install has a GitHub forge, so no CI tier can run it; run it "
+        "by hand against such an install"
     ),
     "fleet-audit-ledger-goes-to-the-gitops-repository": (
         "#3536: needs an install whose PlatformAgent declares a second managed "
@@ -524,6 +537,7 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     "tool_called": ("tool_names",),
     "worker_commands": ("required_patterns", "forbidden_patterns", "required_runs", "forbidden_runs", "forbidden_result_patterns"),
     "worker_agents": ("required_agents",),
+    "worker_budget": ("budget",),
     "replay_card": ("status_in", "status_not_in", "comment_phrases", "decoy_status_in"),
     # No assertion field: "the gateway would post nothing" is the assertion; `reply` only picks
     # which reply is graded.
