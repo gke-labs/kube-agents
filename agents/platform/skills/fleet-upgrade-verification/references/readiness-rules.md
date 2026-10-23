@@ -14,7 +14,9 @@ column does.
 
 One entry per rule, in catalogue-entry order: its id and name, the catalogue entry, the highest
 grade it files, what it reads and how it grades, and what the cell tells the operator to do. A
-new rule adds its entry in that order.
+new rule adds its entry in that order. A plan-level rule, one with no catalogue entry (its
+`ENTRY` is None), grades the upgrade plan rather than a scenario, is registered after every
+numbered rule, and is listed last here.
 
 - `surge-capacity` (Surge capacity), entry 2, blocker. Reads: A pool whose upgrade settings take a
   node away before its replacement exists (`maxUnavailable` above 0 on the surge strategy, or a
@@ -234,3 +236,17 @@ new rule adds its entry in that order.
   pools below the target, whose nodes this upgrade rebuilds, or says no pool is below it yet.
   Action: Mirror the image into a registry you own and retag the reference; keep egress allowlists
   in step.
+- `rollout-sequence-precheck` (Rollout-sequence precheck), plan-level (no catalogue entry), risk.
+  Reads: A member's `fleet` block in the cluster record names its fleet host project
+  (`fleet.project`; absent for a cluster that is not a fleet member, which is a note: no
+  RolloutSequence can carry it, so an upgrade of it is the manual path). The host project's
+  RolloutSequences are listed once per run, with
+  `gcloud container fleet rolloutsequences list --project <host> --format=json` on
+  `roles/gkehub.viewer` with `gkehub.googleapis.com` enabled there, filed on the host's first
+  member in the listing (by project, location and name); the host's other members carry a note
+  saying where. One existing sequence is one `risk` naming its stages, each with its
+  fleet projects, cluster selector and soak, because the platform allows one sequence per host
+  project and refuses a plan that creates a second (FAILED_PRECONDITION); no sequence is a note. A
+  refused, failed, cut or unparsable read is unknown and, since the rule can never block, goes in
+  the note and leaves the verdict to the other rules. Action: Add the train as stages of the existing
+  sequence, or plan it in a separate host project.
