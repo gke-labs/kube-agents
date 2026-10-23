@@ -1004,6 +1004,51 @@ func TestBuildSwarmStateMemberCarriesTheClientConversationID(t *testing.T) {
 // A delegated child that sorts before its skipped parent (same submission
 // time, smaller id; or a parent stamped Now for a missing time) is skipped
 // all the same: propagation does not depend on visit order.
+// A delegated child whose parent is not in the input (past the task cap or
+// TASKS retention) is posted from, and its completion answers, the owner its
+// ViaAddressee names; with no ViaAddressee it keeps the conversation-member /
+// coordinator fallback.
+func TestBuildSwarmStateDelegatedParentAbsent(t *testing.T) {
+	for _, tc := range []struct{ via, wantFrom, wantTo string }{
+		{"platform", swarmMemberPlatform, swarmMemberPlatform},
+		{"", "session-triage", swarmMemberCoordinator},
+		{"no-such-member", "session-triage", swarmMemberCoordinator},
+	} {
+		in := SwarmInput{Now: swarmNow,
+			Conversations: []SwarmConversation{{Alias: "triage", Token: "tok-triage", LastUsed: swarmNow.Add(-time.Minute)}},
+			Tasks: []SwarmTask{
+				{Addressee: "session-triage-pod", TaskID: "turn-1", Conversation: "console:tok-triage", Submitted: swarmNow.Add(-5 * time.Minute),
+					Task: runningTask("turn-1")},
+				{Addressee: "db-specialist", TaskID: "child-1", Conversation: "console:tok-triage", ViaAddressee: tc.via, ViaTaskID: "gone-parent",
+					Submitted: swarmNow.Add(-4 * time.Minute), Prompt: "Check lag", Task: finishedTask("child-1", lib.StateCompleted, "Lag 2s.")},
+			},
+		}
+		snap, _ := BuildSwarmState(in, freshLedger())
+		if _, ok := snap.Members["session-triage"]; !ok {
+			t.Fatalf("via %q: no session-triage member: %v", tc.via, snap.Members)
+		}
+		var del, done *SwarmBoardMessage
+		for i := range snap.NewMessages {
+			m := &snap.NewMessages[i]
+			switch {
+			case strings.Contains(m.Text, "delegated task `child-1`"):
+				del = m
+			case strings.Contains(m.Text, "(`child-1`)"):
+				done = m
+			}
+		}
+		if del == nil || done == nil {
+			t.Fatalf("via %q: missing posts:\n%s", tc.via, boardTexts(snap))
+		}
+		if del.Agent != tc.wantFrom {
+			t.Errorf("via %q: delegation posted by %q, want %q", tc.via, del.Agent, tc.wantFrom)
+		}
+		if !strings.HasPrefix(done.Text, "@"+tc.wantTo+" `completed`") {
+			t.Errorf("via %q: completion = %q, want it to mention @%s", tc.via, done.Text, tc.wantTo)
+		}
+	}
+}
+
 func TestBuildSwarmStateSkippedParentSortedAfterChild(t *testing.T) {
 	in := SwarmInput{Now: swarmNow,
 		Conversations: []SwarmConversation{{Alias: "old", Token: "tok-old", LastUsed: swarmNow.Add(-3 * time.Hour)}},
