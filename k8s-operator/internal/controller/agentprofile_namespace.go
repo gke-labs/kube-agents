@@ -313,7 +313,8 @@ func (r *PlatformAgentReconciler) reconcileProfileQuota(ctx context.Context, age
 }
 
 // deleteProfileQuota and deleteProfileFence remove what this agent rendered
-// into the profile namespace, for the flip back to today. Those objects
+// into the profile namespace, for the flip back to today (deleting the
+// PlatformAgent doesn't remove them yet: #3827). Those objects
 // carry no owner reference, so nothing else reclaims them, and an install
 // that isn't running next should look like it never did. An object of that
 // name that this agent's labels don't mark as its own is left to its owner,

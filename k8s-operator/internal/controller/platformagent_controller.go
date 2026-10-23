@@ -1216,30 +1216,11 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		if err := r.deleteA2ACalloutClusterRoleBinding(ctx, agent); err != nil {
 			return ctrl.Result{}, err
 		}
-		// The profile namespace's quota carries no owner reference either
-		// (agentprofile_namespace.go), so deleting the CR is the other way it
-		// would be left behind, and a stale quota would cap a successor
-		// agent's profile pods. The profile fence stays: the bus fence that
-		// admits that namespace is owned by this CR and goes with it to the
-		// garbage collector after this returns, so deleting the profile fence
-		// here would leave the bus admitting an unfenced namespace in
-		// between. A fence left behind only restricts, and the chart's
-		// uninstall removes the namespace with it.
-		if err := r.deleteProfileQuota(ctx, agent); err != nil {
-			// A persistent refusal (RBAC, or an admission policy in the
-			// profile namespace: Gatekeeper answers 403, a
-			// ValidatingAdmissionPolicy 422, and a webhook that sets no
-			// code, Kyverno's validate among them, 400) never holds the
-			// finalizer: a stale quota
-			// only caps a successor of another name, and the chart's
-			// uninstall removes the namespace. Anything else (a timeout, a
-			// throttle) is retried, since no later pass would come back
-			// for the quota once the finalizer is gone.
-			if !errors.IsForbidden(err) && !errors.IsInvalid(err) && !errors.IsBadRequest(err) {
-				return ctrl.Result{}, err
-			}
-			r.profileNamespaceFailure(ctx, agent, "delete the quota on deletion", err)
-		}
+		// The profile namespace's quota and fence carry no owner reference
+		// (agentprofile_namespace.go) and are not removed here yet: they stay
+		// until the chart's uninstall deletes the namespace. Removing the
+		// quota on deletion, and what a refused delete should do to the
+		// finalizer, is #3827.
 
 		// Delete managed litellm-policy during finalizer teardown only if Deployment/litellm
 		// is absent or terminating. litellm-policy is owned by Deployment/litellm (via OwnerReference)

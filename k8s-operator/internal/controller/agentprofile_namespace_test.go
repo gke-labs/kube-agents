@@ -4,12 +4,10 @@ import (
 	"context"
 	"fmt"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/tools/record"
 	"reflect"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
-	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -189,33 +187,6 @@ func TestAgentOfProfileFence(t *testing.T) {
 	}
 }
 
-// Deleting the PlatformAgent removes its quota from the profile namespace,
-// which nothing else would reclaim, and leaves its fence: the bus fence that
-// admits the namespace goes to the garbage collector after the CR, and a
-// fence left behind only restricts.
-func TestDeletingTheAgentRemovesItsProfileObjects(t *testing.T) {
-	scheme := setupScheme()
-	agent := a2aTestAgent()
-	agent.Finalizers = []string{platformAgentFinalizer}
-	quota := buildProfileQuota(agent, nil)
-	fence := buildProfileNetworkPolicy(agent, nil)
-	withCommonLabels(quota, agent)
-	withCommonLabels(fence, agent)
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, quota, fence).Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	if _, err := r.handleDeletion(context.Background(), agent); err != nil {
-		t.Fatalf("handleDeletion: %v", err)
-	}
-	var q corev1.ResourceQuota
-	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "test-ns-profiles", Name: quota.Name}, &q); !apierrors.IsNotFound(err) {
-		t.Errorf("the profile quota survived the agent's deletion (err %v)", err)
-	}
-	var np networkingv1.NetworkPolicy
-	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "test-ns-profiles", Name: fence.Name}, &np); err != nil {
-		t.Errorf("the profile fence was deleted with the agent, ahead of the bus fence that admits the namespace (err %v)", err)
-	}
-}
-
 // A today install whose only A2A residue is the profile fence (a guardrail
 // pass that died after it and before the NATS fence) still runs the
 // teardown, and cleanupA2A removes the fence and the quota.
@@ -300,60 +271,6 @@ func TestWithoutProfilePeer(t *testing.T) {
 	}
 }
 
-// A persistent refusal of the quota delete (Forbidden) releases the
-// finalizer and writes the Warning Event; a transient failure is returned so
-// the workqueue retries it, since nothing would come back for the quota once
-// the finalizer is gone.
-func TestTheDeletionReleasesOnlyOnAPersistentRefusal(t *testing.T) {
-	scheme := setupScheme()
-	for _, tc := range []struct {
-		name     string
-		err      error
-		released bool
-	}{
-		{"forbidden", apierrors.NewForbidden(schema.GroupResource{Resource: "resourcequotas"}, "test-agent-profile-quota", fmt.Errorf("denied by a policy")), true},
-		// A webhook that sets no code (Kyverno's validate) comes back as 400.
-		{"webhook denial without a code", apierrors.NewBadRequest(`admission webhook "validate.kyverno.svc-fail" denied the request: protected`), true},
-		{"transient", apierrors.NewTooManyRequests("throttled", 1), false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			agent := a2aTestAgent()
-			agent.Finalizers = []string{platformAgentFinalizer}
-			quota := buildProfileQuota(agent, nil)
-			withCommonLabels(quota, agent)
-			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, quota).WithInterceptorFuncs(interceptor.Funcs{
-				Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
-					if obj.GetNamespace() == "test-ns-profiles" {
-						return tc.err
-					}
-					return c.Delete(ctx, obj, opts...)
-				},
-			}).Build()
-			events := record.NewFakeRecorder(8)
-			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: events}
-			_, err := r.handleDeletion(context.Background(), agent)
-			var got agentv1alpha1.PlatformAgent
-			getErr := cl.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name}, &got)
-			stillHeld := getErr == nil && len(got.Finalizers) > 0
-			if tc.released {
-				if err != nil || stillHeld {
-					t.Errorf("a forbidden quota delete: err=%v, finalizer held=%v; want it released", err, stillHeld)
-				}
-				select {
-				case ev := <-events.Events:
-					if !strings.Contains(ev, "Warning "+reasonProfileNamespaceFailed) {
-						t.Errorf("event %q, want a %s Warning", ev, reasonProfileNamespaceFailed)
-					}
-				default:
-					t.Error("no Warning Event for the refused delete")
-				}
-			} else if err == nil || !stillHeld {
-				t.Errorf("a transient quota delete failure: err=%v, finalizer held=%v; want it returned and the finalizer kept for the retry", err, stillHeld)
-			}
-		})
-	}
-}
-
 // The flip deletes the profile fence after the bus fence that admits the
 // namespace, so no pass leaves the bus admitting a namespace nothing
 // confines; and a pass whose quota delete fails keeps the fence, the
@@ -418,8 +335,8 @@ func TestTheFlipDeletesTheProfileFenceAfterTheBusFence(t *testing.T) {
 	}
 }
 
-// A refused delete in the profile namespace holds neither the finalizer nor
-// the flip's teardown: both carry on and log it.
+// A refused delete in the profile namespace doesn't hold the flip's
+// teardown: it carries on and logs it.
 func TestAProfileDeleteRefusalHoldsNothing(t *testing.T) {
 	scheme := setupScheme()
 	refuse := interceptor.Funcs{
@@ -430,36 +347,13 @@ func TestAProfileDeleteRefusalHoldsNothing(t *testing.T) {
 			return c.Delete(ctx, obj, opts...)
 		},
 	}
-	// Deletion: the finalizer comes off.
-	agent := a2aTestAgent()
-	agent.Finalizers = []string{platformAgentFinalizer}
-	quota := buildProfileQuota(agent, nil)
-	withCommonLabels(quota, agent)
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, quota).WithInterceptorFuncs(refuse).Build()
-	events := record.NewFakeRecorder(8)
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: events}
-	if _, err := r.handleDeletion(context.Background(), agent); err != nil {
-		t.Fatalf("handleDeletion with a refused profile delete = %v, want it logged", err)
-	}
-	select {
-	case ev := <-events.Events:
-		if !strings.Contains(ev, "Warning "+reasonProfileNamespaceFailed) || !strings.Contains(ev, "test-ns-profiles") {
-			t.Errorf("event %q, want a %s Warning naming the profile namespace", ev, reasonProfileNamespaceFailed)
-		}
-	default:
-		t.Error("no Warning Event for the refused profile delete")
-	}
-	var got agentv1alpha1.PlatformAgent
-	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name}, &got); err == nil && len(got.Finalizers) > 0 {
-		t.Errorf("the finalizer is still on the agent (%v) after a refused profile delete", got.Finalizers)
-	}
 	// The flip to today: cleanupA2A returns nothing for it.
 	today := a2aTestAgent()
 	today.Spec.Mode = ptr.To("today")
 	fence := buildProfileNetworkPolicy(today, nil)
 	withCommonLabels(fence, today)
-	cl = fake.NewClientBuilder().WithScheme(scheme).WithObjects(today, fence).WithInterceptorFuncs(refuse).Build()
-	r = &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(today, fence).WithInterceptorFuncs(refuse).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	if err := r.cleanupA2A(context.Background(), today); err != nil {
 		t.Errorf("cleanupA2A with a refused profile delete = %v, want it logged", err)
 	}
