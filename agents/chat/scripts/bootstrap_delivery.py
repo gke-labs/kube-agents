@@ -307,11 +307,6 @@ SESSION_KV_DB_ENV = "SESSION_KV_DB_PATH"
 DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 # SQLite's CURRENT_TIMESTAMP, which is UTC.
 RELAY_POSTED_AT_FORMAT = "%Y-%m-%d %H:%M:%S"
-# The row's `run`: the stamp the audit's `start` gave the report record the relay marked posted
-# (audit_report.REPORT_STAMP_FORMAT, UTC; a test holds the two equal). A run's own stamp falls inside
-# its claim and finish, which is what ties the row to a run once a later post has replaced `posted_at`.
-# A crash after `start` leaves its own stamp in the row, which then lies inside no earlier run.
-RELAY_RUN_STAMP_FORMAT = "%Y%m%dT%H%M%S.%fZ"
 
 # One ended run: (claimed_at, finished_at, delivery_outcome, status).
 AuditRun = tuple[float, float | None, str | None, str]
@@ -1080,11 +1075,11 @@ def _audit_runs(data_dir: Path, jobs: tuple[str, ...]) -> dict[str, list[AuditRu
     return runs
 
 
-def _relay_posts(data_dir: Path) -> dict[str, tuple[float, float | None]] | None:
-    """``job -> (when the chat relay last posted for it, the stamp of the record it marked posted)``.
+def _relay_posts(data_dir: Path) -> dict[str, float] | None:
+    """``job -> when the chat relay last posted for it``.
 
     From session-kv's database; None when unreadable, which leaves each run's delivery outcome to
-    decide alone, and the stage log says why. The stamp is None when the row's ``run`` is not one.
+    decide alone, and the stage log says why.
     """
     db = Path(os.environ.get(SESSION_KV_DB_ENV) or DEFAULT_SESSION_KV_DB_PATH)
     if not db.is_file():
@@ -1094,7 +1089,7 @@ def _relay_posts(data_dir: Path) -> dict[str, tuple[float, float | None]] | None
         conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=bootstrap_handoff.SQLITE_BUSY_TIMEOUT_SECONDS)
         try:
             rows = conn.execute(
-                "SELECT job_id, posted_at, run FROM audit_report_runs WHERE profile = ?", (oobe.PLATFORM_PROFILE,)
+                "SELECT job_id, posted_at FROM audit_report_runs WHERE profile = ?", (oobe.PLATFORM_PROFILE,)
             ).fetchall()
         finally:
             conn.close()
@@ -1102,21 +1097,17 @@ def _relay_posts(data_dir: Path) -> dict[str, tuple[float, float | None]] | None
         _stage_note(data_dir, f"cannot read {db}, so the audits note takes each run's delivery outcome as it is: {e}")
         return None
     posts = {}
-    for job_id, posted_at, run in rows:
+    for job_id, posted_at in rows:
         try:
             posted = datetime.strptime(posted_at, RELAY_POSTED_AT_FORMAT).replace(tzinfo=timezone.utc)
         except (TypeError, ValueError):
             continue
-        try:
-            record = datetime.strptime(run, RELAY_RUN_STAMP_FORMAT).replace(tzinfo=timezone.utc).timestamp()
-        except (TypeError, ValueError):
-            record = None
-        posts[job_id] = (posted.timestamp(), record)
+        posts[job_id] = posted.timestamp()
     return posts
 
 
 def _lost_audits(audits: tuple[str, ...], runs: dict[str, list[AuditRun]], windows: dict[str, float],
-                 posts: dict[str, tuple[float, float | None]] | None) -> list[tuple[str, bool]]:
+                 posts: dict[str, float] | None) -> list[tuple[str, bool]]:
     """``(audit, its run failed)`` for each audit whose newest run in its window with something to post did not post it.
 
     A run that ends before anyone has opened the chat finds no home channel, the relay refuses
@@ -1127,17 +1118,14 @@ def _lost_audits(audits: tuple[str, ...], runs: dict[str, list[AuditRun]], windo
     that the relay has no post for posted nothing, and is passed over too; with no relay record to ask,
     its outcome stands. A run that crashed wrote no report, so it does not stand in for an earlier run
     whose report is in the store: the audit is named for both. Its posted failure notice replaces the
-    relay's one row per job, so the post is read as the crashed run's and the row's record stamp then
-    settles an earlier delivered run the stamp falls in as posted: that run wrote the record, and the
-    relay posted it. A lost run the stamp falls in stays lost: the failure path marks the record on
-    disk posted without posting it. A stamp inside no earlier run (a crash after ``start`` stamps its
-    own record) settles nothing, and the walk goes on; where that names a summary that did post, the
-    user asks one question instead of missing a report.
+    relay's one row per job, so the post is read as the crashed run's, and nothing left in the row says
+    whether an earlier run posted: the walk goes on, and each earlier run is judged by its outcome.
+    Where that names a summary that did post, the user asks one question instead of missing a report.
     """
     lost = []
     for audit in audits:
         since = windows.get(audit, 0)
-        posted, record = posts.get(audit, (None, None)) if posts is not None else (None, None)
+        posted = posts.get(audit) if posts is not None else None
         crashed = False
         for claimed, ended, outcome, status in reversed(runs.get(audit, ())):
             if (ended if ended is not None else claimed) < since:
@@ -1152,8 +1140,6 @@ def _lost_audits(audits: tuple[str, ...], runs: dict[str, list[AuditRun]], windo
                     break
                 posted = None
                 continue
-            if kind == OUTCOME_TRIED and record is not None and record >= claimed and ended is not None and record <= ended:
-                break
             if kind == OUTCOME_LOST and status == RUN_FAILED_STATUS:
                 if not crashed:
                     lost.append((audit, True))

@@ -2311,7 +2311,8 @@ class FirstRunAuditsTest(unittest.TestCase):
     def _relay(self, audit: str, posted_at: float, run: str = "r1") -> None:
         """The chat relay's record that it posted ``audit``'s report at ``posted_at``, as session-kv writes it.
 
-        ``run`` is the stamp of the report record it marked posted (``_stamp``), or a placeholder.
+        ``run`` is the stamp of the report record it marked posted (``_stamp``), or a placeholder: the
+        note does not read it.
         """
         with sqlite3.connect(self.relay_db) as conn:
             conn.execute("CREATE TABLE IF NOT EXISTS audit_report_runs (profile TEXT NOT NULL, job_id TEXT NOT NULL, "
@@ -2323,7 +2324,12 @@ class FirstRunAuditsTest(unittest.TestCase):
     @staticmethod
     def _stamp(at: float) -> str:
         """The ``run`` stamp the audit's ``start`` gives a report record written at ``at``."""
-        return datetime.fromtimestamp(at, timezone.utc).strftime(bootstrap_delivery.RELAY_RUN_STAMP_FORMAT)
+        sys.path.insert(0, str(FLEET_AUDIT_SCRIPTS))
+        try:
+            import audit_report
+        finally:
+            sys.path.remove(str(FLEET_AUDIT_SCRIPTS))
+        return datetime.fromtimestamp(at, timezone.utc).strftime(audit_report.REPORT_STAMP_FORMAT)
 
     def _filed(self, at: float) -> None:
         (self.d / SCAN_FILED).write_text(f"task_id=t_sweep\nfiled_at={at}\n", encoding="utf-8")
@@ -2456,41 +2462,18 @@ class FirstRunAuditsTest(unittest.TestCase):
         self.assertEqual(self._lost(note), " `compliance-audit`")
         self.assertNotIn("failure notices", note)
 
-    def test_a_posted_failure_notice_keeps_the_proof_that_the_run_before_it_posted(self):
-        # Oldest first: a lost summary, a delivered run the relay posted, a crash whose notice posted.
-        # The notice replaced the relay's row, whose `run` is still the delivered run's record stamp.
+    def test_a_consumed_failure_notice_settles_no_earlier_run(self):
+        # Oldest first: a lost summary, a delivered run that posted nothing (a silence marker the scheduler
+        # let through) after its `start` wrote the record, a crash before `start` whose notice posted. The
+        # notice replaced the relay's one row for the job with the record's stamp and its own time, which
+        # says nothing about the run between, so the lost summary is named. The same row is left when the
+        # delivered run did post; naming it then costs one question, not a report.
         now = time.time()
         self._filed(now - 7200)
         self._run("compliance-audit", now - 3000, bootstrap_delivery.DELIVERY_FAILED)
         self._run("compliance-audit", now - 2000, "delivered")
         self._run("compliance-audit", now - 1000, bootstrap_delivery.DELIVERY_FAILED, status="failed")
         self._relay("compliance-audit", now - 940, run=self._stamp(now - 1990))
-        self._skipped(oobe.SKIP_NOT_NEW)
-        self.assertNotIn("not posted", self._note())
-
-    def test_a_posted_failure_notice_that_marked_a_lost_runs_record_does_not_settle_it(self):
-        # The delivered run in between posted nothing (a silence marker), so the record on disk is the
-        # lost run's, and the failure path marked that record posted without posting it.
-        now = time.time()
-        self._filed(now - 7200)
-        self._run("compliance-audit", now - 3000, bootstrap_delivery.DELIVERY_FAILED)
-        self._run("compliance-audit", now - 2000, "delivered")
-        self._run("compliance-audit", now - 1000, bootstrap_delivery.DELIVERY_FAILED, status="failed")
-        self._relay("compliance-audit", now - 940, run=self._stamp(now - 2990))
-        self._skipped(oobe.SKIP_NOT_NEW)
-        note = self._note()
-        self.assertEqual(self._lost(note), " `compliance-audit`")
-        self.assertNotIn("failure notices", note)
-
-    def test_a_posted_failure_notice_that_marked_the_crashs_own_record_settles_no_earlier_run(self):
-        # The crash came after `start`, so the row's `run` is the crashed run's own stamp, inside no
-        # earlier run: the delivered run in between is not settled by it, and the lost run before is named.
-        now = time.time()
-        self._filed(now - 7200)
-        self._run("compliance-audit", now - 3000, bootstrap_delivery.DELIVERY_FAILED)
-        self._run("compliance-audit", now - 2000, "delivered")
-        self._run("compliance-audit", now - 1000, bootstrap_delivery.DELIVERY_FAILED, status="failed")
-        self._relay("compliance-audit", now - 940, run=self._stamp(now - 990))
         self._skipped(oobe.SKIP_NOT_NEW)
         note = self._note()
         self.assertEqual(self._lost(note), " `compliance-audit`")
@@ -2507,14 +2490,6 @@ class FirstRunAuditsTest(unittest.TestCase):
         note = self._note()
         self.assertEqual(self._lost(note), " `compliance-audit`")
         self.assertNotIn("failure notices", note)
-
-    def test_the_relay_run_stamp_format_is_the_report_records(self):
-        sys.path.insert(0, str(FLEET_AUDIT_SCRIPTS))
-        try:
-            import audit_report
-        finally:
-            sys.path.remove(str(FLEET_AUDIT_SCRIPTS))
-        self.assertEqual(bootstrap_delivery.RELAY_RUN_STAMP_FORMAT, audit_report.REPORT_STAMP_FORMAT)
 
     def test_a_scheduled_run_in_flight_does_not_hide_an_earlier_lost_summary(self):
         # The running row is not an ended run; the completed one before it still lost its summary.
