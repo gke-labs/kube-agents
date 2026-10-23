@@ -327,16 +327,17 @@ func (r *PlatformAgentReconciler) ensureA2AMCPToken(ctx context.Context, agent *
 // The server trims the token file and refuses an empty one, so a
 // whitespace-only value is empty here too; and it compares the rest byte for
 // byte with an Authorization header's value, which cannot carry a control
-// byte (a CR or LF ends the header line, and Go's server refuses the rest),
-// so a value holding one inside, from a two-line file given to --from-file,
-// is a token nobody can present. Either is minted over.
+// byte other than a tab (a CR or LF ends the header line, and Go's server
+// refuses the rest), so a value holding one inside, from a two-line file
+// given to --from-file, is a token nobody can present. Either is minted over.
 func a2aMCPTokenUsable(v []byte) bool {
 	v = bytes.TrimSpace(v)
 	if len(v) == 0 {
 		return false
 	}
 	for _, c := range v {
-		if c < 0x20 || c == 0x7f {
+		// A tab is the one control byte a header value carries.
+		if (c < 0x20 && c != '\t') || c == 0x7f {
 			return false
 		}
 	}

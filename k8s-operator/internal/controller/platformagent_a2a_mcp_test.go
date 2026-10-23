@@ -266,7 +266,7 @@ func TestTheMCPTokenIsMintedOnceAndNeverAdopted(t *testing.T) {
 	// is minted over; a printable value a person wrote is kept, its ends
 	// trimmed by the server.
 	for value, kept := range map[string]bool{
-		"ab\ncd": false, "ab\rcd": false, "ab\x00cd": false, "ab\x7fcd": false, "ab\tcd": false,
+		"ab\ncd": false, "ab\rcd": false, "ab\x00cd": false, "ab\x7fcd": false, "ab\tcd": true,
 		" valid-token \n": true, "with space inside": true,
 	} {
 		t.Run(fmt.Sprintf("an owned Secret holding %q is kept: %v", value, kept), func(t *testing.T) {
