@@ -1688,6 +1688,32 @@ and the chart's own replicaCount keys take one too. Only an absent value default
 {{- end }}
 
 {{/*
+The chart's standing pods in the release namespace: the operator, LiteLLM, Hindsight's two
+and the GitHub minter, at their replica counts, as kube-agents.quotaRequirements sums them,
+less the pre-delete cleanup hook, which runs only at uninstall. platform-agent-cr.yaml stamps
+it on the PlatformAgent as kubeagents.x-k8s.io/a2a-quota-chart-pods, and the operator sizes
+the next-mode namespace pod quota above the session cap from it (#3848): those pods share
+the quota, and only the chart knows which of them it renders. tests/test_quota_preflight.py
+keeps the two counts equal.
+*/}}
+{{- define "kube-agents.chartStandingPods" -}}
+{{- $pods := 0 -}}
+{{- if .Values.operator.enabled -}}
+  {{- $pods = add $pods (include "kube-agents.replicaCount" .Values.operator.replicaCount | int64) -}}
+{{- end -}}
+{{- if .Values.litellm.enabled -}}
+  {{- $pods = add $pods (include "kube-agents.replicaCount" .Values.litellm.replicaCount | int64) -}}
+{{- end -}}
+{{- if include "kube-agents.hindsightEnabled" . -}}
+  {{- $pods = add $pods 2 -}}
+{{- end -}}
+{{- if .Values.githubMinter.enabled -}}
+  {{- $pods = add $pods (include "kube-agents.replicaCount" .Values.githubMinter.replicaCount | int64) -}}
+{{- end -}}
+{{- $pods -}}
+{{- end }}
+
+{{/*
 Preflight validation against namespace ResourceQuotas (#749).
 
 Split into three templates so the parts that need no cluster can be tested without one:

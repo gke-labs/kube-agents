@@ -813,6 +813,55 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertEqual(res.returncode, 0, f"an operator-owned quota should be skipped:\n{res.stderr}")
         res = self._render({"probe": {"quotas": [self._quota({"pods": "2"})]}}, ["platformAgent.mode=next"])
         self.assertNotEqual(res.returncode, 0, "the same quota, unowned, must still be checked")
+    def _chart_pods_and_requirements(self, sets: list[str]) -> tuple[int, dict]:
+        """The chart-pods annotation on the PlatformAgent, and the preflight's totals."""
+        res = self._render({"probe": {"emitRequirements": True}}, sets)
+        self.assertEqual(res.returncode, 0, f"render failed:\n{res.stderr}")
+        chart_pods, required = None, None
+        for doc in yaml.safe_load_all(res.stdout):
+            if not doc:
+                continue
+            if doc.get("metadata", {}).get("name") == "probe-requirements":
+                required = json.loads(doc["data"]["requirements"])
+            if doc.get("kind") == "PlatformAgent":
+                annotations = doc["metadata"].get("annotations") or {}
+                if "kubeagents.x-k8s.io/a2a-quota-chart-pods" in annotations:
+                    chart_pods = int(annotations["kubeagents.x-k8s.io/a2a-quota-chart-pods"])
+        self.assertIsNotNone(chart_pods, "the PlatformAgent carries no a2a-quota-chart-pods annotation")
+        self.assertIsNotNone(required, "probe ConfigMap not found")
+        return chart_pods, required
+
+    def test_the_operator_is_told_the_charts_standing_pods(self) -> None:
+        """The chart-pods annotation is the preflight's pod total less what the operator
+        renders and the uninstall-only cleanup hook, so the two counts cannot drift (#3848).
+        With operator.enabled=false the operator runs elsewhere, and neither counts it."""
+        op = yaml.safe_load(_FOOTPRINT.read_text())["operatorRendered"]
+        operator_pods = (
+            op["agentPod"]["base"]["pods"] + op["shellSandbox"]["pods"] + op["credentialProxy"]["pods"]
+        )
+        for sets in (
+            [],
+            ["hindsight.enabled=true", "githubMinter.enabled=true",
+             "githubMinter.org=o", "githubMinter.repo=r"],
+            ["litellm.enabled=false"],
+            ["operator.replicaCount=3", "litellm.replicaCount=1"],
+            ["platformAgent.cleanupHook.enabled=false"],
+            ["operator.enabled=false", "hindsight.enabled=true"],
+        ):
+            with self.subTest(sets=sets):
+                chart_pods, required = self._chart_pods_and_requirements(sets)
+                hook = 0 if "platformAgent.cleanupHook.enabled=false" in sets else 1
+                self.assertEqual(chart_pods, required["pods"] - operator_pods - hook)
+
+    def test_the_operators_fallback_is_the_charts_default(self) -> None:
+        """An install without the chart gets a2aDefaultChartPods, which must be what a
+        default chart render says."""
+        chart_pods, _ = self._chart_pods_and_requirements([])
+        src = _A2A_MANIFESTS.read_text()
+        m = re.search(r"a2aDefaultChartPods\s*=\s*(\d+)", src)
+        self.assertIsNotNone(m, "a2aDefaultChartPods not found in the operator source")
+        assert m is not None
+        self.assertEqual(int(m.group(1)), chart_pods)
 
     def test_mode_next_without_a_next_mode_footprint_fails_loudly(self) -> None:
         """A footprint without nextMode must not count the A2A stack as zero."""
@@ -1841,11 +1890,38 @@ class DocumentedFootprintTest(unittest.TestCase):
                 "defaultA2AMaxSessions",
             )
         )
-        headroom = int(
+        # The quota's headroom is derived (#3848): the operator's standing pods,
+        # summed here from the footprint for both modes, plus the chart's pods (the
+        # operator's default stands in for a chart that says nothing) and the margin.
+        # Written as its named parts (surges + Job + overshoot), so sum them.
+        margin = sum(
+            int(part)
+            for part in self._extract_match(
+                r'a2aQuotaTransientMargin\s*=\s*(\d+(?:\s*\+\s*\d+)*)\s*$',
+                manifests_src,
+                "a2aQuotaTransientMargin",
+                flags=re.MULTILINE,
+            ).split("+")
+        )
+        # Hindsight's two pods and the minter at its default replicas.
+        values = yaml.safe_load(_VALUES.read_text())
+        extras = 2 + int(values["githubMinter"]["replicaCount"])
+        chart_default = int(
             self._extract_match(
-                r'a2aQuotaHeadroom\s*=\s*(\d+)', manifests_src, "a2aQuotaHeadroom"
+                r'a2aDefaultChartPods\s*=\s*(\d+)', manifests_src, "a2aDefaultChartPods"
             )
         )
+        today = yaml.safe_load(_FOOTPRINT.read_text())["operatorRendered"]
+        operator_standing = (
+            today["agentPod"]["base"]["pods"]
+            + today["shellSandbox"]["pods"]
+            + today["credentialProxy"]["pods"]
+            + sum(
+                w["pods"] for k, w in following.items()
+                if k not in ("agentPod", "storage", "a2aProvision")
+            )
+        )
+        headroom = operator_standing + chart_default + margin
 
         page = " ".join(self._PREREQUISITES.read_text().split())
         gib = 1024**3
@@ -1946,8 +2022,11 @@ class DocumentedFootprintTest(unittest.TestCase):
 
         # Assert namespace-wide ResourceQuota capping pods:
         quota_clause = (
-            rf"renders a namespace-wide `ResourceQuota` on `pods` of "
-            rf"`maxSessions \+ {headroom}` \({max_sessions + headroom} pods by default"
+            rf"renders a namespace-wide `ResourceQuota` on `pods` of `maxSessions` plus a "
+            rf"headroom it derives: .*?; {chart_default} without the chart\), and {margin} for "
+            rf".*?\({max_sessions + headroom} pods by default, from "
+            rf"`spec\.harness\.tuning\.maxSessions: {max_sessions}`, "
+            rf"{max_sessions + headroom + extras} with Hindsight and the GitHub minter\)"
         )
         self.assertRegex(page, quota_clause)
 

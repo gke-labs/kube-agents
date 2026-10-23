@@ -1013,7 +1013,9 @@ in `A2A_BRIDGE_RESOURCES`. The chart bounds the operator's reading of those valu
 rather than re-implementing it, so it can over-count; it never fails the render on them. The mode is read from the values, so a mode set
 on the `PlatformAgent` by hand while `platformAgent.mode` stays null is counted as `today`.
 The session pods a next install spawns on demand are not counted; the operator caps those with
-a `ResourceQuota` of its own.
+a `ResourceQuota` of its own, sized above the session cap by the pods it runs, the chart's own
+standing pods (which the chart stamps on the `PlatformAgent` as
+`kubeagents.x-k8s.io/a2a-quota-chart-pods`; 3 for a CR without it) and a margin of 7.
 The one value it will not guess is `hindsight.postgresql.storage`: the schema permits
 `null`, a claim sized from it would be counted as zero, so an empty one fails the check
 by name.

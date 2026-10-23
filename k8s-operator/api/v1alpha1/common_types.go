@@ -773,7 +773,7 @@ type TuningSpec struct {
 	// A2A_MAX_SESSIONS env carries it as a usability control: at the cap the
 	// gateway first evicts the longest-idle session pod (its conversation is
 	// told); only with none idle is a new turn refused with a chat reply naming
-	// the numbers, never queued, never dropped. The namespace ResourceQuota is rendered a fixed headroom
+	// the numbers, never queued, never dropped. The namespace ResourceQuota is rendered a headroom
 	// ABOVE it as the enforcement control: a compromised or buggy gateway
 	// ignores its own cap and cannot ignore the quota, and keeping the quota
 	// above the cap is what makes users hit the honest refusal rather than an
@@ -781,8 +781,10 @@ type TuningSpec struct {
 	// hostile pod-creator cannot dodge - so its headroom above the cap also
 	// bounds everything else in the namespace: an install whose namespace
 	// carries many non-session pods can see unrelated pod creation refused at
-	// admission before sessions reach this cap, and the headroom is an
-	// operator constant, not a CR field. The third is the bus: the TASKS
+	// admission before sessions reach this cap. The headroom is derived,
+	// not a CR field: the pods the operator renders for the agent, the chart's
+	// standing pods (stamped on the CR by the chart), and a fixed margin for
+	// surges, the provisioning Job and the gateway's overshoot. The third is the bus: the TASKS
 	// stream's max_consumers is provisioned from this number, because each
 	// session pod creates three named consumers there and a stream that
 	// cannot hold the configured concurrency refuses a legitimate session's
