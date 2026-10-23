@@ -3053,8 +3053,9 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
             self.assertIn(
                 "**Who acts on this:**\n"
                 "A human reads your options and the agent that holds the GitOps write path opens the Pull Request — not you, and not from this card. "
-                "Your job is to make that possible: name the manifest change each option needs precisely enough that someone can open the Pull Request from your report alone. "
-                "Two things are true whoever acts on it — the fix ships as a Pull Request against the GitOps repository, and nothing is written to the live cluster directly "
+                "Your job is to make that possible: name the change each option needs precisely enough that someone can open the Pull Request from your report alone. "
+                + session_kv_server.TRIAGE_FIX_AGAINST_LIVE_OBJECT
+                + "Two things are true whoever acts on it — the fix ships as a Pull Request against the GitOps repository, and nothing is written to the live cluster directly "
                 "(no `kubectl scale`, `patch`, or `apply`).",
                 body,
             )
