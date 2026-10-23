@@ -332,7 +332,7 @@ whether it can block, and a count of its blocking, risk, unknown and note entrie
 `rule_blocking`, `risks` and `unknown` (the findings across rules, once, each with its `rule`,
 `entry` and the `text` the cell or the note prints; an unknown entry with its `reason` and
 `can_block`), `notes`, `addons` (the add-on inventory rows), `read_errors` (per kind) and `audit_log` (per read); the top-level
-`readiness` block counts the members with risks (`members_with_risks`). A failed
+`readiness` block counts the members with risks (`members_with_risks`). `notes[]` are strings, each already prefixed `<rule id>: <text>`, while `rule_blocking[]`, `risks[]` and `unknown[]` are objects with `rule` and `text`, so a `jq` that indexes `.rule` or `.text` on a note fails with `Cannot index string with string`. A failed
 `get-credentials`, PDB read or webhook read is listed under the table as a read failure for that
 member and sets exit code 1, like a failed gcloud read. A failed `get-credentials` or PDB read
 leaves the PDB rule and every per-entry rule that needs an object ungraded (the webhook read is
