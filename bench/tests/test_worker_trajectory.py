@@ -45,7 +45,7 @@ _BOARD_DDL = (
     " created_by TEXT, created_at INTEGER)",
     "CREATE TABLE task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT,"
     " profile TEXT, status TEXT, started_at INTEGER, ended_at INTEGER, summary TEXT,"
-    " metadata TEXT)",
+    " metadata TEXT, outcome TEXT, error TEXT)",
     "CREATE TABLE task_links (parent_id TEXT, child_id TEXT, PRIMARY KEY (parent_id, child_id))",
 )
 _CHILDREN_DDL = (
@@ -336,6 +336,34 @@ def test_parents_ignores_a_predecessor_link_when_the_creator_table_is_there(data
     cards = {c["task"]: c for c in payload["cards"]}
     assert cards[FRONT]["children"] == [CHILD] and cards[FRONT]["fanned_out"] == []
     assert worker_trajectory.parents(payload) == {}
+
+
+def test_each_run_comes_back_with_how_it_ended(data_root: Path) -> None:
+    # A retry that ran out of its turn budget: the dispatcher closes the run
+    # timed_out with the cap in its error, and that is what a budget check reads.
+    exhausted = "Iteration budget exhausted (90/90) — task could not complete within the allowed iterations"
+    with sqlite3.connect(data_root / "kanban.db") as conn:
+        conn.execute(
+            "UPDATE task_runs SET status = 'timed_out', outcome = 'timed_out', error = ? WHERE task_id = ?",
+            (exhausted, CHILD),
+        )
+    summary = _payload(_run_script(data_root, [FRONT]))
+    by_task = {c["task"]: c for c in summary["cards"]}
+    assert by_task[FRONT]["run_outcomes"] == [
+        {"profile": "platform", "status": "done", "outcome": None, "error": None}
+    ]
+    assert by_task[CHILD]["run_outcomes"] == [
+        {"profile": "cluster-abc", "status": "timed_out", "outcome": "timed_out", "error": exhausted}
+    ]
+    rows = worker_trajectory.runs(summary)
+    assert [(r["task"], r["outcome"]) for r in rows] == [(FRONT, None), (CHILD, "timed_out")]
+    assert rows[1]["error"] == exhausted
+
+
+def test_runs_is_none_when_the_read_did_not_run() -> None:
+    assert worker_trajectory.runs(None) is None
+    # The inject transport's summary lists card ids, not card records: no rows.
+    assert worker_trajectory.runs({"cards": ["t_1", "t_2"]}) == []
 
 
 def test_parents_reads_only_the_fanned_out_edges() -> None:

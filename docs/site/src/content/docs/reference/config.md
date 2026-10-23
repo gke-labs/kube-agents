@@ -98,7 +98,7 @@ toolsets:
   - kanban
 
 agent:
-  max_turns: 250
+  max_turns: 150
   disabled_toolsets:
     - browser
     - computer_use
@@ -171,7 +171,7 @@ A second, top-level gate distinct from `platform_toolsets`: listing `kanban` her
 
 ### `agent`
 
-`max_turns` is the per-turn tool-calling iteration budget. Hermes defaults to 90, which the fleet audits outgrow — the cost audit runs fourteen checks across every cluster and project and the drift audit twenty — so this profile raises it to 250. It is set here rather than in the operator's generated root config because both dispatch paths read the profile's `config.yaml`: kanban workers are spawned with `HERMES_HOME` pinned to the profile, and the cron scheduler resolves `agent.max_turns` from `$HERMES_HOME/config.yaml`. Scoping it to this profile leaves the Planning Agent and the Cluster Agents on the default. The comment in the file itself records the runs that motivated the number.
+`max_turns` is the per-turn tool-calling iteration budget of the runs this profile spawns without one of their own: the kanban workers, which is every delegated chat request and every issue-resolver card. It is pinned rather than left unset because an unset key is not a smaller default on the pinned Hermes: a worker is a `hermes chat` process whose own defaults cap it at 500, and a gateway turn reads no cap at all. 150 is 1.4 times the most tool calls a worker was seen to make across a full presubmit run and a full nightly run; the largest was an upgrades audit requested through chat, which runs inside a card and has no budget of its own. The fleet audits need more — the cost audit runs fourteen checks across every cluster and project and the drift audit twenty — so each audit carries `max_turns: 250` on its roster entry in `agents/platform/cron/jobs.json`, which the image's cron scheduler reads ahead of this value ([the patch](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/apply_cron_job_max_turns.py)); before that patch the profile carried 250 and every worker ran with it. It is set here rather than in the operator's generated root config because both dispatch paths read the profile's `config.yaml`: kanban workers are spawned with `HERMES_HOME` pinned to the profile, and the cron scheduler falls back to `agent.max_turns` from `$HERMES_HOME/config.yaml`. The operator's `spec.harness.tuning.platform.maxTurns` overlays this value; a roster entry's own `max_turns` raises its job above whichever is in force and never lowers it, so an operator value above 250 reaches the audits too. The Planning Agent and the Cluster Agents leave the key unset, which on the pinned Hermes means no cap on a gateway turn and the chat CLI's 500 on a kanban worker. The comment in the file itself records the runs that motivated both numbers.
 
 ### `context_file_max_chars`
 

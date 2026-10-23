@@ -65,6 +65,7 @@ Two ways a skill enters the model's context:
   "skills": [
     "fleet-audit"
   ],
+  "max_turns": 250,
   "risk": "low",
   "enabled": true,
   "deliver": "chat"
