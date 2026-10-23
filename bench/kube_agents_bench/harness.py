@@ -666,15 +666,21 @@ def _find_log_until(content: str, since: float | None) -> float | None:
     if since is None:
         return None
     since_dt = datetime.fromtimestamp(since, tz=timezone.utc)
+    pod_tails: dict[str | None, float] = {}
     for line in reversed(content.splitlines()):
         clean = _ANSI_ESCAPE_PATTERN.sub("", line)
+        m_pod = _POD_PREFIX_PATTERN.match(clean)
+        pod_key = m_pod.group("pod") if m_pod else None
+        if pod_key in pod_tails:
+            continue
         dt_match = _LOG_TIMESTAMP_PATTERN.search(clean)
         if dt_match:
             try:
                 iso_str = dt_match.group("ts").replace(" ", "T").replace(",", ".")
                 if not iso_str.endswith("Z") and "+" not in iso_str and "-" not in iso_str[10:]:
                     iso_str += "Z"
-                return datetime.fromisoformat(iso_str.replace("Z", "+00:00")).timestamp() + 5.0
+                pod_tails[pod_key] = datetime.fromisoformat(iso_str.replace("Z", "+00:00")).timestamp() + 5.0
+                continue
             except ValueError:
                 pass
         t_match = _LOG_TIME_ONLY_PATTERN.search(clean)
@@ -692,10 +698,14 @@ def _find_log_until(content: str, since: float | None) -> float | None:
                 )
                 if cand_same.timestamp() < since - 5.0:
                     cand_next = cand_same + timedelta(days=1)
-                    return cand_next.timestamp() + 5.0
-                return cand_same.timestamp() + 5.0
+                    pod_tails[pod_key] = cand_next.timestamp() + 5.0
+                else:
+                    pod_tails[pod_key] = cand_same.timestamp() + 5.0
+                continue
             except ValueError:
                 pass
+    if pod_tails:
+        return max(pod_tails.values())
     return None
 
 
@@ -775,7 +785,7 @@ def _scan_log_content_for_429(
         log_until = _find_log_until(content, since)
         if log_until is not None:
             if abs(time.time() - since) < 24 * 3600:
-                until = min(time.time() + 5.0, log_until)
+                until = max(time.time() + 5.0, log_until)
             else:
                 until = log_until
         else:
@@ -1648,11 +1658,11 @@ def _record_unsettled(
             f"delegated task {t} was reported {last} during wait but {live} at settle; nothing delivered"
         )
         if not has_delivery and opening_turn:
-            marked.append(f"{INFRA_FAILURE_MARKER}: {report}")
+            marked.append(report)
         else:
             plain.append(report)
     if marked:
-        result.errors = [*marked, *result.errors]
+        _mark_result_infra_failure(result, "; ".join(marked))
     if plain:
         result.errors.extend(plain)
 
@@ -3833,6 +3843,9 @@ class KubeAgentsHarness(AgentHarness):
                 result.errors.append(
                     f"delegated worker failed ({infra_reason}): {infra_detail}"
                 )
+        elif result.metadata.get("infra_failure"):
+            result.output = ""
+            result.metadata.pop("final_message", None)
 
     @staticmethod
     def _capped(task_ids: list[str], result: AgentResult | None) -> list[str]:

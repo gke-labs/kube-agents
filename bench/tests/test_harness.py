@@ -4198,10 +4198,11 @@ def test_a_429_blocked_card_unblocked_at_settle_with_nothing_delivered_records_c
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, results_json: Any, tmp_path: Path
 ) -> None:
     """A run where all cards were blocked and one is unblocked at settle with nothing delivered records ceiling infra."""
-    log_file = tmp_path / "litellm.log"
-    now_iso = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
-    log_file.write_text(f'{now_iso} ERROR: VertexAIException - {{"error": {{"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}}}\n')
-    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+    _corroborate_429(tmp_path, monkeypatch)
+    called: list[bool] = []
+    import kube_agents_bench.gitops as gitops
+
+    monkeypatch.setattr(gitops, "await_fix_cycle", lambda *args, **kwargs: called.append(True))
 
     t1 = _TASK_ID
     t2 = _TASK_ID + "-2"
@@ -4307,6 +4308,9 @@ def test_a_429_blocked_card_unblocked_at_settle_with_nothing_delivered_records_c
     assert result.errors == [
         f"{harness.INFRA_FAILURE_MARKER}: delegated task {t1} was reported blocked during wait but running at settle; nothing delivered"
     ]
+    assert result.metadata.get("infra_failure")
+    assert result.output == ""
+    assert not called
     rep = _classify(results_json(result), "helm")
     assert rep.outcome == "infra"
 
@@ -4807,10 +4811,7 @@ def test_worker_with_tool_calls_before_429_rate_limit_is_infrastructure(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
     """When a worker executed tool actions before hitting 429 quota exhaustion without delivery, the rep is marked infra."""
-    log_file = tmp_path / "litellm.log"
-    now_iso = datetime.now(timezone.utc).isoformat()
-    log_file.write_text(f'{now_iso} ERROR: VertexAIException - {{"error": {{"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}}}\n')
-    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+    _corroborate_429(tmp_path, monkeypatch)
 
     t1 = _TASK_ID
     stub_agent.turns = [
@@ -4939,10 +4940,7 @@ def test_platform_429_corroboration_from_litellm_log_marks_infra(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
     """When platform LiteLLM log confirms Vertex 429 RESOURCE_EXHAUSTED, the transient block is corroborated and marks infra."""
-    log_file = tmp_path / "litellm.log"
-    now_iso = datetime.now(timezone.utc).isoformat()
-    log_file.write_text(f'{now_iso} ERROR: VertexAIException - {{"error": {{"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}}}\n')
-    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+    _corroborate_429(tmp_path, monkeypatch)
 
     stub_agent.turns = [
         _create_turn(),
@@ -5012,7 +5010,7 @@ def test_litellm_log_with_429_from_prior_rep_does_not_corroborate(
 ) -> None:
     """A LiteLLM log containing a 429 from an earlier repetition when current rep traffic is present is refused."""
     log_file = tmp_path / "litellm.log"
-    now_str = datetime.now(timezone.utc).isoformat()
+    now_str = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
     log_file.write_text(f"{now_str} INFO: 200 OK GET /health\n2026-10-18 10:00:00 - RateLimitError: 429 RESOURCE_EXHAUSTED\n")
     monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
 
@@ -5185,6 +5183,10 @@ def test_record_unsettled_prepends_marked_infra_error_preserving_existing_errors
         f"{harness.INFRA_FAILURE_MARKER}: delegated task t1 was reported blocked during wait but running at settle; nothing delivered"
     )
     assert result.errors[1] == "agent reported no status for 3 turns running; still waiting on: t2"
+    assert result.output == ""
+    assert result.metadata.get("infra_failure") == (
+        "delegated task t1 was reported blocked during wait but running at settle; nothing delivered"
+    )
     rep = _classify(results_json(result), "helm")
     assert rep.outcome == "infra"
 
@@ -5441,10 +5443,7 @@ def test_status_turn_filed_and_blocked_card_seeds_fallback_store_and_marks_infra
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
     """A card filed and shown blocked in the same status turn joins awaited and seeds fallback store."""
-    log_file = tmp_path / "litellm.log"
-    now_iso = datetime.now(timezone.utc).isoformat()
-    log_file.write_text(f'{now_iso} ERROR: VertexAIException - {{"error": {{"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}}}\n')
-    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+    _corroborate_429(tmp_path, monkeypatch)
 
     t1 = _TASK_ID
     t_new = _TASK_ID + "-new"
@@ -7226,6 +7225,18 @@ def test_time_only_log_line_before_since_on_same_day_does_not_roll_into_tomorrow
     assert ts is not None
     parsed_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
     assert parsed_dt == datetime(2026, 10, 19, 10, 0, 0, tzinfo=timezone.utc)
+
+
+def test_multi_replica_time_only_log_line_out_of_order_tails_corroborates_true() -> None:
+    """When kubectl logs prints a quiet replica last whose tail timestamp is earlier than another replica's 429, the 429 is not misdated to yesterday."""
+    since = datetime(2026, 10, 19, 10, 0, 0, tzinfo=timezone.utc).timestamp()
+    log = (
+        "[pod/litellm-replica-a] 10:00:00 INFO: 200 OK GET /health\n"
+        "[pod/litellm-replica-a] 10:05:00 - RateLimitError: 429 RESOURCE_EXHAUSTED\n"
+        "[pod/litellm-replica-b] 10:00:00 INFO: 200 OK GET /health\n"
+        "[pod/litellm-replica-b] 10:04:00 INFO: 200 OK GET /health\n"
+    )
+    assert harness._scan_log_content_for_429(log, since=since) is True
 
 
 def test_fetch_live_litellm_log_command_and_options(monkeypatch: pytest.MonkeyPatch) -> None:

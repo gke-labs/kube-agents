@@ -2789,7 +2789,8 @@ def test_a_card_unblocked_and_claimed_running_on_inject_records_infra(
     assert result.errors == [
         f"{harness.INFRA_FAILURE_MARKER}: delegated task {CARD_A} was reported blocked during wait but running at settle; nothing delivered"
     ]
-    assert result.metadata.get("final_message") == ACK
+    assert "final_message" not in result.metadata
+    assert result.metadata.get("infra_failure")
 
 
 def test_a_needs_input_card_unblocked_and_running_on_inject_does_not_record_ceiling(
