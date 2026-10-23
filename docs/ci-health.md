@@ -37,8 +37,9 @@ target ([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md); empty since the nightl
 since the day before yesterday, says so instead of numbers. A night can be
 the builds of up to three periodics (the main job, the main-b job when the
 main part runs as two halves, and the writers job), reported as one night:
-the line names a part that is missing, still running or cut short, and the
-night counts as cut short when its main or main-b part is.
+the line names a part that is missing, still running or cut short, the
+night counts as cut short when its main or main-b part is, and a night
+without its main or main-b part gives no verdict on what is newly failing.
 `scripts/eval_dashboard/nightly.py` derives the line and the report from the
 same nightly runs.
 The same tick reads the eval evidence store (`gs://kube-agents-evals-bench/evidence`,
