@@ -288,7 +288,7 @@ func (r *AgentProfileReconciler) finalize(ctx context.Context, p *agentv1alpha1.
 
 func (r *AgentProfileReconciler) cards() cardPublisher {
 	if r.Cards == nil {
-		r.Cards = newNATSCardPublisher()
+		r.Cards = newNATSCardPublisher(r.Client)
 	}
 	return r.Cards
 }

@@ -94,7 +94,27 @@ const (
 	// as such from that line alone, or every unreachable DRIFT line in a run
 	// reads as a card that was sent.
 	injectHeldOutOfScopeMarker = "inject=held_out_of_scope"
+
+	// backlogMarker is appended to the DRIFT line of a backlog record, for the
+	// same reason as injectHeldOutOfScopeMarker: the line an operator greps
+	// for has to say that this record is not getting a card of its own.
+	backlogMarker = "backlog=true"
+
+	// kubectlUserAgentPrefix starts the user agent kubectl sends. A backlog
+	// record from kubectl is carded rather than digested: an install's own
+	// writes come from Helm's Go client, so a late kubectl write is far more
+	// likely a person's edit made just before a restart. The user agent is
+	// self-declared; the rule only routes such a record the way a live one
+	// goes.
+	kubectlUserAgentPrefix = "kubectl/"
 )
+
+// digestible reports whether a record goes to the daemon's digest rather than
+// a card, when the daemon takes the digest route: a backlog record not sent by
+// kubectl. See kubectlUserAgentPrefix.
+func digestible(record AuditRecord) bool {
+	return record.Backlog && !strings.HasPrefix(record.UserAgent, kubectlUserAgentPrefix)
+}
 
 // joinOutcome says what happened when the detector tried to enrich a record
 // with the live object's field ownership. Every outcome except joinEnriched is
@@ -145,6 +165,14 @@ const (
 	// joinFailed is any other lookup error: RBAC, a network fault, a timeout,
 	// an API group the cluster does not serve.
 	joinFailed joinOutcome = "failed"
+
+	// joinSkippedBacklog is a backlog record (AuditRecord.Backlog) the join
+	// did not look up, because it goes to the daemon's digest rather than to
+	// a triage card and nothing reads its ownership. Skipped so a large
+	// backlog does not spend the batch's join budget on lookups and leave its
+	// tail to fail open. Only when the daemon takes the digest route: against
+	// one that does not, the record is injected as a card and keeps its join.
+	joinSkippedBacklog joinOutcome = "skipped_backlog"
 )
 
 // joinCounts tallies outcomes for the shutdown report, so a run that enriched
@@ -162,14 +190,17 @@ type joinCounts struct {
 	// held every unreachable record and one that forwarded them all print the
 	// same Unreachable.
 	OutOfScope int
+
+	// SkippedBacklog is records not looked up because they are backlog.
+	SkippedBacklog int
 }
 
 // String renders the tally for the shutdown line, always printing every
 // outcome. A zero that is absent reads as a category that did not apply; a zero
 // that is printed reads as one that did not happen, and those differ.
 func (c joinCounts) String() string {
-	return fmt.Sprintf("enriched=%d no_object=%d gone=%d unreachable=%d out_of_scope=%d failed=%d",
-		c.Enriched, c.NoObject, c.Gone, c.Unreachable, c.OutOfScope, c.Failed)
+	return fmt.Sprintf("enriched=%d no_object=%d gone=%d unreachable=%d out_of_scope=%d failed=%d skipped_backlog=%d",
+		c.Enriched, c.NoObject, c.Gone, c.Unreachable, c.OutOfScope, c.Failed, c.SkippedBacklog)
 }
 
 // DriftEvent is an audit record plus what the live object says about it. It is
@@ -234,6 +265,13 @@ type DriftEvent struct {
 	// joins its own cluster and so always has one; what separates a scope
 	// boundary from a misconfiguration is whether a profile names the cluster.
 	OutOfScope bool
+
+	// Digest is set by the joiner on a backlog record that goes to the daemon's
+	// digest route rather than a card: the daemon advertises the route and the
+	// record is not held out of scope. It is what the DRIFT line's backlog
+	// marker reports, so a backlog record that is still carded (an older
+	// daemon) is not logged as one that is not.
+	Digest bool
 }
 
 // driftEventHandler consumes an enriched record. logDriftEvent is one; with
@@ -375,6 +413,11 @@ type joiner struct {
 	// counted under unreachableOverflowLabel.
 	unreachable map[string]int
 	held        map[string]int
+
+	// skipBacklog turns on joinSkippedBacklog. Set by realMain when the daemon
+	// advertises the digest route, because that is when a backlog record is
+	// not going to a card.
+	skipBacklog bool
 }
 
 // newJoiner builds the handler. An empty or nil cluster set is legal and
@@ -444,7 +487,10 @@ func (j *joiner) Handle(ctx context.Context, record AuditRecord) {
 		}
 	case joinFailed:
 		j.counts.Failed++
+	case joinSkippedBacklog:
+		j.counts.SkippedBacklog++
 	}
+	event.Digest = j.skipBacklog && digestible(record) && !event.OutOfScope
 
 	j.next(ctx, event)
 }
@@ -559,6 +605,13 @@ func (j *joiner) join(ctx context.Context, record AuditRecord) DriftEvent {
 	getter, ok := j.clusters[identity]
 	if !ok || !identity.complete() {
 		event.Outcome = joinUnreachable
+		return event
+	}
+
+	// After the routing check, so a backlog record from a cluster this process
+	// cannot read is still unreachable, and still held when it is out of scope.
+	if j.skipBacklog && digestible(record) {
+		event.Outcome = joinSkippedBacklog
 		return event
 	}
 
@@ -803,11 +856,15 @@ func logDriftEvent(_ context.Context, event DriftEvent) {
 		line += fmt.Sprintf(" lookup_error=%q", event.LookupError)
 	}
 	// Appended here, where the DRIFT line is built, rather than by the inject
-	// handler that acts on the flag: the line is identical with the inject on
-	// and off, and the marker says what the handler will do with the record,
-	// which is the fact an operator reading only DRIFT lines needs.
+	// handler that acts on the flag: the marker says what the handler will do
+	// with the record, which is the fact an operator reading only DRIFT lines
+	// needs. The out-of-scope marker reads the same with the inject on and off;
+	// the backlog marker appears only with a daemon that takes the digest.
 	if event.OutOfScope {
 		line += " " + injectHeldOutOfScopeMarker
+	}
+	if event.Digest {
+		line += fmt.Sprintf(" %s publish_time=%s", backlogMarker, record.PublishTime.Format(time.RFC3339))
 	}
 
 	log.Print(line)

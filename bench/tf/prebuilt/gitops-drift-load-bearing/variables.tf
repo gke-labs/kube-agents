@@ -136,7 +136,7 @@ variable "drift_principal" {
   default     = "eval-operator@example.com"
   validation {
     condition     = !can(regex("[\"$\\\\`[:cntrl:]]", var.drift_principal))
-    error_message = "drift_principal must not contain a double quote, dollar sign, backslash, backtick or a control character (a newline or tab included): it is spliced into the unquoted PAYLOAD heredoc, which is JSON built by the shell. A quote makes the inner payload unparseable and the daemon's 400 is then reported as 'the request did not reach the drift route'; a $name is expanded by bash at run time."
+    error_message = "drift_principal must not contain a double quote, dollar sign, backslash, backtick or a control character (a newline or tab included): it is spliced into a double-quoted bash word in the drift_build_payload call, so a quote or a backtick ends or re-opens that word and a $name is expanded by bash before the value reaches the builder. The JSON itself is safe -- build_payload.py places every argument with json.dumps -- so what this guards is the shell layer in front of it."
   }
 }
 

@@ -21,9 +21,9 @@ kubectl -n kubeagents-system port-forward svc/platform-agent-a2a-console 8080:80
 
 Use local port 8080. The bus only accepts the page from `http://localhost:8080` and `http://127.0.0.1:8080`, so the console server refuses any other port up front with a 421 that says so.
 
-Type into the chat pane. A turn shows as pending and attaches in place once its submission shows up on TASKS; a `delegate` turn attaches to the stripped task the gateway submits. A stop word, a bare `/session`, `/session off` and `/session stop` never become a task, so they show as sent at once and the gateway answers with a notice. A turn with no task after 30s gets a note saying so: status questions and refused turns get a gateway notice instead of a task, and if no notice came, the gateway may be slow or may have dropped it. After 10 minutes a pending turn stops waiting. `/help` lists the local commands, which are never published; any other slash line is sent.
+Type into the chat pane. A turn shows as pending and attaches in place once its submission shows up on TASKS; a `delegate` turn attaches to the stripped task the gateway submits. A stop word, a bare `/session`, `/session off`, `/session stop` and a bare `/feedback` or `/feedback summary` never become a task, so they show as sent at once and the gateway answers with a notice. A turn with no task after 30s gets a note saying so: status questions and refused turns get a gateway notice instead of a task, and if no notice came, the gateway may be slow or may have dropped it. After 10 minutes a pending turn stops waiting. `/help` lists the local commands, which are never published; any other slash line is sent.
 
-The read-only view still works: port-forward the bus itself (`svc/platform-agent-a2a-nats 9222:9222`) and open the page with `?ws=ws://localhost:9222&user=web&pass=<web-password>`. It has no input box. That page has to come from the console server too (`http://localhost:8080/?ws=...`), for the origin reason above.
+The read-only view still works, through the same port-forward: open `http://localhost:8080/?ws=ws://localhost:8080/bus&user=web&pass=<web-password>`. It has no input box. The console server's `/bus` passes the page's own credential through, so the bus sees `web`. A port-forward straight to the bus (`svc/platform-agent-a2a-nats 9222`) no longer serves a browser: the install's websocket listener serves TLS under the bus's own CA, which no browser trusts, and its certificate names the Service, not `localhost`.
 
 Origin is browser-asserted and non-browser clients omit it, so the allow-list is a second fence. The boundary is the grant list.
 
@@ -49,18 +49,20 @@ With no gateway running, a sent turn stays pending and gets the 30s note.
 ```sh
 npm test          # unit: protocol, reducer, derived views, commands, components
 npx tsc --noEmit  # strict, browser-shaped
-# live, against a real server over real ws:
+# live, against the local dev server over real ws:
 A2A_WS_URL=ws://localhost:9222 npm test -- livebus
+# live, against the install, through the console server's port-forward:
+A2A_WS_URL=ws://localhost:8080/bus npm test -- livebus
 ```
 
 The live suite has two cases. The read-only one: all four taps attach, seeded history replays as non-live, a fresh publish arrives exactly once, and the `web` probe is refused. The console one: a sent turn gets a notice and a submission, the pending line attaches, a durable that doesn't exist reads as not-found, TASKS stream info comes back, and the `console` probe is refused. Locally a fake gateway answers the turn.
 
-Against the install, set `A2A_SKIP_SEED=1` (no seed user in hand), `A2A_WEB_PASS` and `A2A_CONSOLE_PASS` from the creds Secret, and `A2A_FAKE_GATEWAY=0` so the real gateway answers. That sends one real turn to the agent.
+Against the install, port-forward the console server (`svc/platform-agent-a2a-console 8080:8080`) and use its `/bus` as above, set `A2A_SKIP_SEED=1` (no seed user in hand), `A2A_WEB_PASS` and `A2A_CONSOLE_PASS` from the creds Secret, and `A2A_FAKE_GATEWAY=0` so the real gateway answers. That sends one real turn to the agent.
 
 `livesequence` watches a new task run somewhere on the install and asserts the event sequence the page renders: submission first, `working` before terminal, exactly one `final` with nothing after it, a non-empty `result`. Drive the task from chat while it waits.
 
 ```sh
-A2A_WS_URL=ws://localhost:9222 A2A_WEB_PASS=... npm test -- livesequence
+A2A_WS_URL=ws://localhost:8080/bus A2A_WEB_PASS=... npm test -- livesequence
 ```
 
 ## Shape notes, for whoever touches this next
@@ -68,7 +70,7 @@ A2A_WS_URL=ws://localhost:9222 A2A_WEB_PASS=... npm test -- livesequence
 - **The grants dictate the client.** `_INBOX.<user>` must be the inbox prefix or every JS API reply is unsubscribable. Consumers are ephemeral ordered pull consumers because the grant enumerates `$JS.API.CONSUMER.CREATE.<stream>.>` and `MSG.NEXT.<stream>.*` per stream and nothing wider. Four attach loops, one per stream, each retrying on its own so a fresh install lights up as provisioning runs. A stream that won't attach says which one and the last error.
 - **Liveness is CONSUMER.INFO.** Nothing publishes heartbeats. The page polls the durables it can name (`gateway-relay`, `bridge-<profile>`, `<session>-in`) every 5s. A pull outstanding or a recent delivery means a live process. A worker's `-in` consumer only exists while it runs a task, so a missing one with nothing in flight reads as idle, not gone.
 - **Capacity is STREAM.INFO.** Bytes against `max_bytes` and consumers against `max_consumers`, whichever is fuller. KV sizes aren't shown: the only read that returns them also lists every key.
-- **Spend is tbd on purpose.** The worker adapter drops `usage`, `total_cost_usd` and `duration_ms` from the harness result line (`a2a/worker-adapter/harness.go`), so none of it reaches the bus. The tiles and the cost column say so.
+- **Spend is the `usage` artifact.** Each executor publishes one data part per finished turn (`model`, `inputTokens`, `outputTokens`, `costUsd`, `durationMs`, all optional; payload spec "Reserved artifact names"): the worker adapter from the harness result line, the hermes-bridge from the API turn's answer and the turn's wall time, the bridge's CLI executor the wall time alone. The task keeps the sum; the cost column shows it, the spend panel and tile sum the tasks that reported and say "over N of M tasks" when a cost or token sum covers fewer tasks than reported, and an absent figure reads as unknown, never as zero: only the counts a turn sent are printed. Each answer in the transcript carries the parts published since the last answer as its footer, summed, so the steered turns one answer settles show one figure. Cost appears only when a harness priced its own turns: Hermes behind the gateway never does.
 - **The trim and the cap match the gateway's.** The input trims with Go's `strings.TrimSpace` set, not JS `trim()`, and refuses over 16384 bytes before publishing, so the page never shows a turn as sent that the gateway would drop.
 - **Retirement is data-driven.** A session that answers as the addressee of its own task subject (the session worker pods) retires to `done` on terminal. A standing service answering for a profile under its own name (the bridge: addressee `platform`, session `platform-bridge`) does not.
 - **The transcript is the reserved artifact names.** `result` chunks merge into one answer entry, and so do each turn's `turn` chunks (an earlier turn's answer on a task that ran follow-ups), each answer its own entry ahead of the result. `progress` lines go in the transcript, and `thinking`/`activity` stay off it but count toward the type's activity LED.

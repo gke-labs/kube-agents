@@ -93,7 +93,7 @@ the contract for why.
 
 A case whose spec reads live cluster state must declare it. A check that reads the
 agent's own install rather than the seeded fleet (the `bootstrap_*` checks,
-`sandbox_tree_matches_image`, `findings_item_state`, `oobe_audits_started`, `relay_posted_as_written`, `audit_chat_report_posted`, `audit_report_stored`) is not a fixture read, and a case carrying only those needs
+`sandbox_tree_matches_image`, `findings_item_state`, `oobe_audits_started`, `relay_posted_as_written`, `audit_chat_report_posted`, `audit_report_stored`, `report_store_reply`, `workload_incident_folded`) is not a fixture read, and a case carrying only those needs
 no `fixtures:`. `fixtures: []` is the declaration for a case that plants its own state — `gpu-stress-test-diagnosis` brings up
 its own Terraform stack and depends on no fixture — and an absent key on such a case is a
 finding, because a grep that returns one case for a role has to mean one case uses it. A
@@ -102,11 +102,10 @@ say) names one role per slot it reads and grounds the objective that needs every
 `report_contains`'s `fixture_roles`, saying in a comment that the roles stand for their
 slots; the grep then still finds it when a slot's cluster is replaced.
 
-`owner` is who answers for the case when it flakes: a GitHub login written without the at
-sign, or the literal `maintainers` for a case the repository's `OWNERS` approvers own. It is
-the field the demotion mechanic in `docs/eval-gate-roster.md` addresses its issue to, and
-`bench/CONTRIBUTING.md` is where the commitment, and the reason the login is bare, are
-spelled out.
+`owner` is optional: the person whose bugs the case is first, falling back to the domain's
+owner. The demotion mechanic in `docs/eval-gate-roster.md` addresses its issue to that
+effective owner, and [`bench/CONTRIBUTING.md`](../../bench/CONTRIBUTING.md#ownership) states
+the rule.
 
 `expected_fail` is the eval-driven-development marker, for a case whose fix is not yours: the
 case lands red so the gap is on record, and `bench-gate` reads it inverted — failing is the
@@ -207,7 +206,7 @@ deployment's ready replicas land in a range). A fourth, `fleet_resource_property
 this repository's `resource_property` against the seeded-fleet cluster that carries a
 fixture role, named by `fixture_role:` rather than by cluster.
 
-Eleven read what the run produced, from this repository
+Twelve read what the run produced, from this repository
 (`bench/kube_agents_bench/verifiers.py`, registered through the
 `devops_bench.verifiers` entry-point group in `bench/pyproject.toml`):
 `report_contains` (phrases in the agent's answer; its `forbidden_patterns`, `required_patterns` and
@@ -240,11 +239,14 @@ before any role on it is confirmed), and a slot the runner did not reach returns
 it opens on one bold sentence, has no heading, stays
 under its character and sentence caps, and no later sentence matches a
 `recap_patterns` regex; each of the case's `lead_terms` appears in at least one result's
-lead), `tool_called` (calls in the
+lead), `report_times_in_window` (every date and time on a report line one of its
+`label_patterns` regexes matches falls between the run's start and the check, each widened by
+`max_clock_skew_sec`, and its minute must be one some tool output in the trajectory shows,
+the workers' included; a report that states none passes), `tool_called` (calls in the
 trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
 published), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier
-repetition's, unless the case sets `accepts_stream_pull_request` and runs on an audit stream, which also admits one an earlier run on its audit stream opened in the job's GitOps repository on that audit's remediation branch; `unchanged_paths` also fails one whose diff changes a listed path, and `content` asserts over the YAML or text in the files it adds), `github_writes` (every pull request or branch under the agent's
+repetition's, unless the case sets `accepts_stream_pull_request` and runs on an audit stream, which also admits one an earlier run on its audit stream opened in the job's GitOps repository on that audit's remediation branch; `unchanged_paths` also fails one whose diff changes a listed path, `removed_paths` one that does not delete every listed path, and `content` asserts over the YAML or text in the files it adds), `github_writes` (every pull request or branch under the agent's
 prefix written to the case's GitOps repository since the repetition started; it
 passes on a write, so a case wraps it in `none` to say the agent wrote nothing
 it was not asked for, and the inject lane appends exactly that entry to every
@@ -260,9 +262,17 @@ follow it on the same shell segment, read from the command's argv as the shell s
 it, so a quoted mention of the invocation is one word and not a run, and a run made through a script file or a shell's standard input is not read, since the argv names the file or the shell; each flag is read as the exact word, so the script named is built with `allow_abbrev=False`; `word_patterns` are regular expressions each of which some later word of the segment must match on its own, and `forbidden_runs` is the same shape for a run no worker may make, such as a `kubectl get` of the objects a script grades; with `after_result_pattern` the commands come from the workers' tagged `terminal` and `execute_code` calls in the trajectory instead, with their results as the record stores them, a JSON string with newlines escaped, and the forbidden set applies only to the calls after the first whose result matched, failed or not, one window per delegated card and the cards its worker fanned out; `forbidden_result_patterns` then grade the later results too; a trajectory with no tagged call at all, none readable (every code-tool argument withheld), a call with no numeric time, or a capture with gaps and no hit, is `status: "error"`, where a worker whose tagged calls are all MCP calls grades as zero commands), `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
 workers' trajectory entries), `replay_card` (the status and comments of the card a
-card-wake replay planted, read before the harness archives it), and `reply_is_silent`
+card-wake replay planted, read before the harness archives it), `reply_is_silent`
 (whether the gateway would post the closing message, or with `reply: answer` a question
-replay's reply to the answer turn, at all, by its own silence rule).
+replay's reply to the answer turn, at all, by its own silence rule), and
+`verified_claims_backed` (at least `min_blocks` evidence blocks in the answer, each a `$` command
+fence and then an output fence, as `kanban_complete` renders `verified_claims`; each command must
+be a worker's tagged `terminal` or `execute_code` call and each excerpt must be in that call's output, compared with
+escapes undone, addresses masked and whitespace collapsed, on word edges, and an excerpt under
+8 characters must be the whole output; an excerpt past the pod's clip or in an output it redacted
+is not checked, and a missing command is
+`status: "error"` when the capture has gaps, the pod withheld the workers' arguments, or the
+trajectory holds no worker terminal call).
 
 Eleven read the install under test, nine of them from that file. `bootstrap_fanout` compares the
 cluster cards filed for the onboarding discovery sweep, read from the agent pod's board, against the
@@ -294,17 +304,31 @@ agent pod's `cron/executions.db` instead and passes when the delivery job's run 
 the report completed, which is the condition for the scheduler to post what it printed.
 `sandbox_tree_matches_image` execs into the agent's shell sandbox Pod and diffs the image's
 staged skills, scripts and governance against the copies the sandbox runs, so a case can
-grade an edit to them by its effect. `findings_item_state` reads the findings queue through the
+grade an edit to them by its effect. A stack that runs Python in the sandbox does it as
+root (`kubectl exec`), so the image sets `PYTHONDONTWRITEBYTECODE=1` and such a run leaves
+no `__pycache__` in the reference tree for this check to read as an edit. The check
+still flags a cache file that appears anyway, since a `.pyc` is code. `findings_item_state` reads the findings queue through the
 Session KV server in the agent pod and passes when every row in `finding_ids`, under `project`,
 is in `state`. A listed row the queue does not hold is `status: "error"`, since it means the
 case's plant is missing. `audit_report_stored` reads the fleet-audit report store in the shell
 sandbox, then in the agent container, and passes when a `latest.json` for its `audit` finished since
 the run started, with `status` when it gives one and, for each `required_finding_phrases` entry, a
-finding in its `document` whose id contains it. `oobe_audits_started`, in its own module
+finding in its `document` whose id contains it. `report_store_reply`, in its own module
+(`bench/kube_agents_bench/report_store_reply.py`), reads the same store after the reply with the
+install's own `report_status.py`, and passes when each of its `audits` is mentioned in `final_message`
+and the reply carries the ledger URL of one of the audit's envelopes written before the turn (the
+newest, per repository store) or during it. An audit whose stores need no URL (a clean run with no
+open ledger, or no record before the turn) passes on the mention alone; which audit a URL is given
+to is the judge's to grade. `oobe_audits_started`, in its own module
 (`bench/kube_agents_bench/oobe.py`), reads the stack's state file and the Platform Agent's
 `cron/executions.db` in the agent pod, and passes when the stage's `.oobe_audits_fired` lists each
 of the four first-run audits as marked due and each has a run claimed since the stage marked it
 that got going (running, completed, or ended after its start), each starting only after the one before it in the chain ended.
+`workload_incident_folded`, in its own module (`bench/kube_agents_bench/incidents.py`), reads a
+workload's rows of one object `kind` (default `Pod`) from the Session KV server's event ledger in the agent pod and passes when at least
+`min_folded` of them were folded into its newest admitted incident, which must be newer than the
+run's start less `max_age_sec`; it keys on that incident rather than a time window because the stack
+plants its burst before the turn starts.
 `relay_posted_as_written`, in its own module (`bench/kube_agents_bench/relay.py`), reads the
 `relay-report` stack's state file and what the Session KV server stored for the report's threads,
 and passes when the route answered `delivered` and every stored post is the report exactly; a
@@ -445,7 +469,10 @@ the suite reports green around it — which is how `agent-kanban-smoke`, a case 
 purpose is to smoke the deployed pipeline, sat unregistered while the presubmit ran one
 case for months.
 
-A new case lands in the nightly file (decided 2026-09-15,
+A new case lands in the nightly file's sorted section, the last one, at its place in
+case-id order with its reason as the `#` lines directly above its entry (#3495; the roster
+test checks both, so two case pull requests don't edit the same lines). It lands there by
+decision (2026-09-15,
 [#1546](https://github.com/gke-labs/kube-agents/issues/1546),
 [#1564](https://github.com/gke-labs/kube-agents/issues/1564)). It runs every night from
 the night it merges, its record accrues in the evidence store, and a presubmit seat is a
@@ -485,8 +512,8 @@ statement of the rule; `bench/CUSTOM-TASKS.md`, `bench/CONTRIBUTING.md` and
 id that disagrees with its directory, a `domain:` that is missing or not in
 `domains.yaml`, a `fixtures:` role the fleet catalog does not define (outside a `FIXTURE_NOT_READY` case, which names the role its issue plants), a cluster-reading
 case that declares no `fixtures:` at all, a missing, empty or inline `verification_spec`,
-a check that carries no assertion and so can only pass, a missing `owner:` or one written
-as a mention or as something other than a login, an `expected_fail:` or `tool_calls_optional:`
+a check that carries no assertion and so can only pass, an `owner:` that is `maintainers`,
+written as a mention or not a login, an `expected_fail:` or `tool_calls_optional:`
 that is not a bare YAML boolean, an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
 does not have, a case that is registered nowhere, and a file that writes one key twice in
 the same mapping, which PyYAML would load with the last value and devops-bench's loader
@@ -495,8 +522,8 @@ also applies the entry vocabulary above — role, the severity pairing, the reje
 mode, a positive weight — which devops-bench enforces too, at spec-load time, after the
 lease.
 
-It also scans what the case brings with it: every text file under `bench/tasks/` and
-`bench/tf/prebuilt/`, for an IPv4 literal outside the RFC 5737 documentation ranges or a
+It also scans what the case brings with it: every text file under `bench/tasks/`,
+`bench/tf/prebuilt/` and `bench/tf/modules/`, for an IPv4 literal outside the RFC 5737 documentation ranges or a
 string matching the token-shaped subset of `AuditRedactor`'s patterns, with
 `sanitizer: allow <reason>` as the per-line escape. `bench/CONTRIBUTING.md` is the home of
 that rule — the ranges, the shapes, the skip list, the marker, and what review covers that

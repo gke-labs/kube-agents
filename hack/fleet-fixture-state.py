@@ -26,7 +26,12 @@ each role the runner published it reads the `state` assertions the catalog
 OOMKilled termination, the healthy workloads are Ready, the idle pool's node is
 Ready and tainted, slot b's control plane is still one minor behind its
 channel -- and reports the roles whose fixture is there but not in the shape
-the cases depend on.
+the cases depend on. One role asserts the room the others schedule into:
+`default-pool-headroom` reads seeded-a's default-pool nodes and every pod
+bound to them and fails when the busier node drops below the headroom margin
+the scan keeps for the next fixtures, ten of them at 10m (#3607: a 10m
+DaemonSet pod stranded for three days and read as drift on its own role,
+which a re-apply cannot fix).
 
 It runs in two places. `scripts/verify_ci_pool_project.py` runs it after the
 presence pass and fails a project whose fixtures have drifted. The CI health
@@ -81,6 +86,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -141,9 +147,33 @@ OP_NONE_EQ = "none_eq"
 OP_ABSENT = "absent"
 OP_AFTER_NOW = "after_now"
 OP_MINOR_BEHIND = "minor_behind_channel_default"
-OPS_WITH_VALUE = frozenset({OP_EQ, OP_GE, OP_ANY_EQ, OP_ANY_GE, OP_NONE_EQ, OP_MINOR_BEHIND})
+# `node_cpu_spare_ge` reads the matched nodes whole plus the pods bound to each
+# (one all-namespaces pod read per role per pass) and wants every node to keep
+# at least `value` millicores of allocatable CPU unrequested, counting a pod
+# the way the scheduler does: the larger of its containers' sum (restartable
+# init containers included) and its biggest ordinary init container, plus the
+# pod's overhead; Succeeded and Failed pods excluded. No node matched fails it;
+# a matched node that reports no allocatable yet (still registering) leaves the
+# role not checked for the pass rather than drifted.
+OP_NODE_CPU_SPARE = "node_cpu_spare_ge"
+OPS_WITH_VALUE = frozenset({OP_EQ, OP_GE, OP_ANY_EQ, OP_ANY_GE, OP_NONE_EQ, OP_MINOR_BEHIND, OP_NODE_CPU_SPARE})
 OPS_WITHOUT_VALUE = frozenset({OP_ABSENT, OP_AFTER_NOW})
 OPS = OPS_WITH_VALUE | OPS_WITHOUT_VALUE
+# Ops that read the subject's objects whole and therefore take no path.
+OPS_WITHOUT_PATH = frozenset({OP_ABSENT, OP_NODE_CPU_SPARE})
+# Ops whose subject must be a `node?<selector>`.
+NODE_SELECTOR_ONLY_OPS = frozenset({OP_NODE_CPU_SPARE})
+NODE_KIND = "node"
+POD_KIND = "pod"
+ALL_NAMESPACES_FLAG = "-A"
+# A pod in a terminal phase holds no CPU on its node.
+POD_PHASES_RELEASED = frozenset({"Succeeded", "Failed"})
+# An init container with this restartPolicy is a sidecar: it keeps running
+# beside the containers, so its request adds to theirs.
+INIT_RESTART_SIDECAR = "Always"
+# Kubernetes CPU quantity suffixes, as millicores per unit; a bare number is cores.
+CPU_SUFFIX_MILLICORES = {"m": 1.0, "u": 1e-3, "n": 1e-6}
+MILLICORES_PER_CORE = 1000.0
 # Only the cluster subject can be compared against its channel's default.
 CLUSTER_ONLY_OPS = frozenset({OP_MINOR_BEHIND})
 
@@ -287,15 +317,19 @@ def load_assertions(catalog_path: Path) -> dict[str, dict]:
                 raise CatalogError(f"{where} names unknown op {op!r} (known: {sorted(OPS)})")
             if op in CLUSTER_ONLY_OPS and subject != CLUSTER_SUBJECT:
                 raise CatalogError(f"{where}: op {op!r} applies to the cluster subject only")
+            if op in NODE_SELECTOR_ONLY_OPS and not str(subject).startswith(f"{NODE_KIND}?"):
+                raise CatalogError(f"{where}: op {op!r} applies to a `{NODE_KIND}?<selector>` subject only")
             if (op in OPS_WITH_VALUE) != ("value" in entry):
                 raise CatalogError(
                     f"{where}: op {op!r} {'takes' if op in OPS_WITH_VALUE else 'takes no'} value"
                 )
             path = entry.get("path")
             if path is None:
-                if op != OP_ABSENT:
+                if op not in OPS_WITHOUT_PATH:
                     raise CatalogError(f"{where}: op {op!r} needs a path")
                 steps = None
+            elif op in NODE_SELECTOR_ONLY_OPS:
+                raise CatalogError(f"{where}: op {op!r} reads the nodes whole and takes no path")
             elif isinstance(path, str):
                 steps = parse_path(path)
             else:
@@ -371,6 +405,21 @@ def read_kubectl(kubeconfig: Path, namespace: str | None, subject: str) -> list[
         if named and NOT_FOUND_RE.search(err):
             return []
         raise Unreadable(f"kubectl get {kind} failed ({rc}): {err.strip().splitlines()[-1] if err.strip() else 'no output'}")
+    return _objects(kind, out)
+
+
+def read_pods_all_namespaces(kubeconfig: Path) -> list[dict]:
+    """Every pod in the cluster, the read behind `node_cpu_spare_ge`: a node's
+    requested CPU is the sum over the pods bound to it in any namespace."""
+    cmd = ["kubectl", f"--kubeconfig={kubeconfig}", f"--request-timeout={KUBECTL_REQUEST_TIMEOUT}", "get", POD_KIND, ALL_NAMESPACES_FLAG, "-o", "json"]
+    rc, out, err = _run(cmd, KUBECTL_TIMEOUT_SECONDS)
+    if rc != 0:
+        raise Unreadable(f"kubectl get {POD_KIND} {ALL_NAMESPACES_FLAG} failed ({rc}): {err.strip().splitlines()[-1] if err.strip() else 'no output'}")
+    return _objects(POD_KIND, out)
+
+
+def _objects(kind: str, out: str) -> list[dict]:
+    """The object or the items of a list kubectl printed as JSON."""
     try:
         doc = json.loads(out)
     except ValueError as exc:
@@ -473,6 +522,64 @@ def _minor(version) -> int | None:
     return int(m.group(2)) if m else None
 
 
+def _millicores(quantity) -> float:
+    """A Kubernetes CPU quantity in millicores; 0 for anything that is not one."""
+    text = str(quantity if quantity is not None else "").strip()
+    if not text:
+        return 0.0
+    # float() admits "inf", "NaN" and an overflowing exponent, none of which
+    # the API server serialises; they count as nothing rather than taking the
+    # pass down when the difference is converted to an integer.
+    for suffix, factor in CPU_SUFFIX_MILLICORES.items():
+        if text.endswith(suffix):
+            n = _number(text[: -len(suffix)])
+            return n * factor if n is not None and math.isfinite(n) else 0.0
+    n = _number(text)
+    return n * MILLICORES_PER_CORE if n is not None and math.isfinite(n) else 0.0
+
+
+def _pod_cpu_request(pod: dict) -> float:
+    """What the scheduler reserves for a pod: the larger of its containers' sum
+    (sidecars included) and the biggest ordinary init container (plus the
+    sidecars started before it), plus the pod's overhead."""
+    spec = pod.get("spec") or {}
+
+    def request(container) -> float:
+        resources = container.get("resources") if isinstance(container, dict) else None
+        return _millicores(((resources or {}).get("requests") or {}).get("cpu"))
+
+    sidecars = 0.0
+    init_peak = 0.0
+    for init in spec.get("initContainers") or []:
+        if isinstance(init, dict) and init.get("restartPolicy") == INIT_RESTART_SIDECAR:
+            sidecars += request(init)
+        else:
+            init_peak = max(init_peak, request(init) + sidecars)
+    containers = sum(request(c) for c in spec.get("containers") or []) + sidecars
+    overhead = _millicores((spec.get("overhead") or {}).get("cpu"))
+    return max(containers, init_peak) + overhead
+
+
+def _spare_by_node(nodes: list, pods_by_node: dict) -> dict[str, int]:
+    """Per matched node, allocatable CPU minus what the pods bound to it request, in millicores, by node name."""
+    spare: dict[str, int] = {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        name = str((node.get("metadata") or {}).get("name") or "")
+        allocatable_cpu = ((node.get("status") or {}).get("allocatable") or {}).get("cpu")
+        if allocatable_cpu is None:
+            raise Unreadable(f"node {name or '(unnamed)'} reports no allocatable CPU yet; still registering")
+        allocatable = _millicores(allocatable_cpu)
+        requested = sum(
+            _pod_cpu_request(pod)
+            for pod in pods_by_node.get(name, [])
+            if isinstance(pod, dict) and (pod.get("status") or {}).get("phase") not in POD_PHASES_RELEASED
+        )
+        spare[name] = int(round(allocatable - requested))
+    return dict(sorted(spare.items()))
+
+
 def _describe(values: list) -> str:
     if not values:
         return "observed nothing"
@@ -480,12 +587,15 @@ def _describe(values: list) -> str:
     return f"observed {shown}"
 
 
-def evaluate(entry: dict, objects: list, *, channel_default=None) -> str | None:
+def evaluate(entry: dict, objects: list, *, channel_default=None, pods_by_node=None) -> str | None:
     """None when the assertion holds; otherwise one line saying what was seen.
 
     `channel_default` is a callable returning the channel default version for
     the cluster document, used by the minor-behind operator only; it is
     resolved lazily so a role that never needs server-config never pays for it.
+    `pods_by_node` is a callable returning {node name: [pod, ...]} for every
+    bound pod in the cluster, used by `node_cpu_spare_ge` only, lazy for the
+    same reason.
     """
     op, expected = entry["op"], entry["value"]
     label = " ".join(part for part in (entry["subject"], entry["path"], op) if part)
@@ -533,6 +643,13 @@ def evaluate(entry: dict, objects: list, *, channel_default=None) -> str | None:
             ok = want is not None and current == _minor(default) - int(want)
             if not ok:
                 return f"{label}: {_describe(values)} against channel default {default}"
+    elif op == OP_NODE_CPU_SPARE:
+        if pods_by_node is None:  # pragma: no cover - check_role always supplies it
+            raise CatalogError(f"op {op!r} needs the pod reader")
+        want = _number(expected)
+        spare = _spare_by_node(objects, pods_by_node()) if objects else {}
+        ok = bool(spare) and want is not None and all(v >= want for v in spare.values())
+        return None if ok else f"{label}: {_describe([spare] if spare else [])}"
     else:  # pragma: no cover - load_assertions rejects unknown ops
         raise CatalogError(f"unknown op {op!r}")
     return None if ok else f"{label}: {_describe(values)}"
@@ -554,6 +671,7 @@ class Reader:
         self.project = project
         self.context = context
         self._defaults: dict[tuple[str, str], str | None] = {}
+        self._pods: dict[Path, dict[str, list]] = {}
 
     def objects_for(self, role: str, spec: dict, subject: str) -> list:
         kubeconfig = self.directory / f"{role}{KUBECONFIG_SUFFIX}"
@@ -583,6 +701,22 @@ class Reader:
 
         return lookup
 
+    def pods_by_node_for(self, role: str):
+        """The cluster's bound pods grouped by node, read once per role per pass."""
+        kubeconfig = self.directory / f"{role}{KUBECONFIG_SUFFIX}"
+
+        def lookup() -> dict[str, list]:
+            if kubeconfig not in self._pods:
+                grouped: dict[str, list] = {}
+                for pod in read_pods_all_namespaces(kubeconfig):
+                    node = (pod.get("spec") or {}).get("nodeName")
+                    if node:
+                        grouped.setdefault(str(node), []).append(pod)
+                self._pods[kubeconfig] = grouped
+            return self._pods[kubeconfig]
+
+        return lookup
+
 
 def check_role(reader: Reader, role: str, spec: dict) -> tuple[list[str], list[str]]:
     """(drift lines, unreadable lines) for one role in one pass.
@@ -607,7 +741,7 @@ def check_role(reader: Reader, role: str, spec: dict) -> tuple[list[str], list[s
             unreadable.append(f"{subject}: {objects}")
             continue
         try:
-            problem = evaluate(entry, objects, channel_default=reader.channel_default_for(spec))
+            problem = evaluate(entry, objects, channel_default=reader.channel_default_for(spec), pods_by_node=reader.pods_by_node_for(role))
         except Unreadable as exc:
             unreadable.append(f"{subject}: {exc}")
             continue

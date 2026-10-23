@@ -574,3 +574,41 @@ func TestSplitAnswerStaysLinear(t *testing.T) {
 		plainLine(line)
 	}
 }
+
+// visibleText takes off every step-shaped line at an answer's end, refused or
+// not: the line is plumbing no surface shows as text.
+func TestVisibleText(t *testing.T) {
+	for in, want := range map[string]string{
+		"Up.\n\n[next: check seeded-a]":                  "Up.",
+		"Up.\n[next: a]\n[next: b]\n":                    "Up.",
+		"Up.\r\n\r\n[next: check seeded-a]\r\n":          "Up.",
+		"Up.\n\n[next: " + strings.Repeat("x", 80) + "]": "Up.",
+		"Up. [next: inline]":                             "Up. [next: inline]",
+		"Up.\n[next: a]\x0c\n[next: b]":                  "Up.",
+		"Up.\n\u00a0[next: b]":                           "Up.",
+		"Up.":                                            "Up.",
+		"[next: check]":                                  "",
+	} {
+		if got := visibleText(in); got != want {
+			t.Errorf("visibleText(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// withNote puts a note above a declared step's line, which has to stay last,
+// and after the answer when it declares none.
+func TestWithNote(t *testing.T) {
+	note := "\n\n(note)"
+	for in, want := range map[string]string{
+		"Up.\n\n[next: check seeded-a]": "Up.\n\n(note)\n\n[next: check seeded-a]",
+		"Up.":                           "Up.\n\n(note)",
+	} {
+		got := withNote(in, note)
+		if got != want {
+			t.Errorf("withNote(%q) = %q, want %q", in, got, want)
+		}
+		if _, step := nextStep(got); strings.Contains(in, "[next:") && step != "check seeded-a" {
+			t.Errorf("withNote(%q) lost the step: nextStep = %q", in, step)
+		}
+	}
+}

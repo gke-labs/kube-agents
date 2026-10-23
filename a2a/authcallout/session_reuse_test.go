@@ -30,7 +30,10 @@ const (
 	// for one that completes. Under a three-second grant every party in the
 	// fixture (the verifier and the gateway too) reconnects every few
 	// seconds, so a turn whose capability check lands in one of those
-	// reconnects is rejected as "the verifier could not be reached". That is
+	// reconnects could be rejected as "the verifier could not be reached".
+	// The capability client now asks again for its reach window
+	// (capability.DefaultReachWindow), which rides out one such reconnect;
+	// the attempts and the gap below predate it and stay as margin. That is
 	// the fixture's churn, not the pod's: what the test needs from every
 	// turn is that the pod took it. So it does not show that a turn landing
 	// inside the pod's own reconnect is never rejected; that is for the live

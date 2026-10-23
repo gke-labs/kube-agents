@@ -247,11 +247,15 @@ def healthy_world(*projects):
             "deployment/token-sidecar": {"status": {"readyReplicas": 1, "replicas": 1}},
             "serviceaccount/default": {"automountServiceAccountToken": True},
             "namespace/seeded-headroom": {"metadata": {"name": "seeded-headroom"}},
+            "namespace/seeded-qos": {"metadata": {"name": "seeded-qos"}},
             "deployment/burst-ingest": {"status": {"readyReplicas": 2, "replicas": 2}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "128Mi"}}}]}}}},
+            "deployment/ledger-writer": {"status": {"readyReplicas": 2, "replicas": 2}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "32Mi"}, "limits": {"cpu": "10m", "memory": "32Mi"}}}]}}}},
             "poddisruptionbudget?": {"items": []},
             "networkpolicy?": {"items": []},
             "clusterrolebinding/debug-binding": {"roleRef": {"name": "cluster-admin"}, "subjects": [{"kind": "ServiceAccount", "name": "default", "namespace": "seeded-security"}]},
             "node?cloud.google.com/gke-nodepool=idle-batch-pool": {"items": [{"spec": {"taints": [{"key": "seeded-role", "value": "idle-batch", "effect": "NoSchedule"}]}, "status": {"conditions": [{"type": "Ready", "status": "True"}]}}]},
+            "node?cloud.google.com/gke-nodepool=default-pool": {"items": [{"metadata": {"name": "gke-seeded-a-default-pool-0r0x"}, "status": {"allocatable": {"cpu": "1930m"}}}, {"metadata": {"name": "gke-seeded-a-default-pool-z7br"}, "status": {"allocatable": {"cpu": "1930m"}}}]},
+            "pod?": {"items": [{"spec": {"nodeName": "gke-seeded-a-default-pool-0r0x", "containers": [{"resources": {"requests": {"cpu": "800m"}}}]}, "status": {"phase": "Running"}}, {"spec": {"nodeName": "gke-seeded-a-default-pool-z7br", "containers": [{"resources": {"requests": {"cpu": "900m"}}}]}, "status": {"phase": "Running"}}]},
             "namespace/seeded-stall": {"metadata": {"name": "seeded-stall"}},
             "deployment/inventory-api": {
                 "status": {
@@ -433,10 +437,10 @@ class HealthyScan(ScanHarness):
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
         self.assertEqual(set(self.states(doc)), set(self.roles))
         entry = doc["projects"][PROJECT]
-        self.assertEqual(entry["summary"], {"healthy": 30, "drifted": 0, "absent": 0, "not_checked": 0})
+        self.assertEqual(entry["summary"], {"healthy": 32, "drifted": 0, "absent": 0, "not_checked": 0})
         self.assertEqual(entry["reader"], "seeded-fleet-reader@kube-agents-evals-2.iam.gserviceaccount.com")
         self.assertNotIn("error", entry)
-        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 30, "drifted": 0, "absent": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 32, "drifted": 0, "absent": 0, "not_checked": 0})
         self.assertEqual(doc["previous"], {"scanned_at": None, "drifted": {}})
         self.assertEqual(err, "")
 
@@ -490,7 +494,7 @@ class Drift(ScanHarness):
         doc, _ = self.scan(world, projects=(PROJECT, OTHER))
         self.assertEqual(set(self.states(doc, PROJECT).values()), {"healthy"})
         self.assertEqual(self.states(doc, OTHER)["crashloop-workload"], "drifted")
-        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 59, "drifted": 1, "absent": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 63, "drifted": 1, "absent": 0, "not_checked": 0})
 
 
 class NotChecked(ScanHarness):

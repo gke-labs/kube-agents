@@ -40,6 +40,17 @@ LEDGER_INSTALLATION_ID="157029058"
 # a Prow periodic on main). Step 4 grants it signer on this project's copy of
 # the App key, which is the whole reach it has here.
 PULL_SWEEP_SA="serviceAccount:eval-pull-sweeper@kube-agents-prow.iam.gserviceaccount.com"
+# The identity the Compute plant sweep runs as (hack/ci_sweep_compute_plants.py,
+# a Prow periodic on main). Step 1, after the reconciler's grants,
+# creates one custom role on this project with exactly these permissions and
+# grants it, which is the whole reach the identity has here. The reason for
+# each permission is beside COMPUTE_SWEEP_PERMISSIONS in
+# scripts/verify_ci_pool_project.py, whose tests keep the two copies equal.
+readonly COMPUTE_SWEEP_SA="serviceAccount:eval-compute-sweeper@kube-agents-prow.iam.gserviceaccount.com"
+readonly COMPUTE_SWEEP_ROLE_ID="kubeAgentsComputePlantSweeper"
+readonly COMPUTE_SWEEP_ROLE_TITLE="kube-agents Compute plant sweeper"
+readonly COMPUTE_SWEEP_ROLE_STAGE="GA"
+readonly COMPUTE_SWEEP_PERMISSIONS="compute.addresses.delete,compute.addresses.deleteInternal,compute.addresses.list,compute.globalAddresses.delete,compute.globalAddresses.deleteInternal,compute.globalAddresses.list,compute.globalOperations.get,compute.networks.delete,compute.networks.list,compute.regionOperations.get,compute.subnetworks.delete,compute.subnetworks.list"
 # The identity the seeded-fleet reconcile runs as (hack/fleet_reconcile.py, a
 # postsubmit and a daily on main). The IAM step before 1.3 grants it what re-applying
 # bench/tf/fleet needs on the project; step 2 grants it the state bucket.
@@ -97,6 +108,53 @@ the weekly audit. `burst-ingest` in `seeded-headroom` requests far more memory t
 design: it is sized for an ingest burst the measured week does not show. The obtainability,
 compliance, upgrade readiness and waste audits list the five postures under Declared intent rather
 than as findings.'
+# checkout-gateway's declaration, the file the remediation cases propose a
+# PodDisruptionBudget beside (GITOPS_WORKLOAD_MANIFEST_CASES in the verifier).
+# With no manifest in the repository the agent finds nothing to fix and refuses
+# to open a pull request. It is bench/tf/fleet/defects-a.tf's Deployment as
+# YAML, at the path collect.py's workload_declarations reads a cluster off
+# (clusters/<cluster>/...), which is also the tie #2228's cases wait for. No
+# word about the budget: a note saying it is missing on purpose reads as
+# declared intent and silences the finding.
+readonly GITOPS_WORKLOAD_MANIFEST_PATH="clusters/seeded-a/seeded-reliability/checkout-gateway.yaml"
+readonly GITOPS_WORKLOAD_MANIFEST_MESSAGE="Declare seeded-a's checkout-gateway Deployment in seeded-reliability"
+readonly GITOPS_WORKLOAD_MANIFEST_CONTENT='apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout-gateway
+  namespace: seeded-reliability
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: checkout-gateway
+  template:
+    metadata:
+      labels:
+        app: checkout-gateway
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: checkout-gateway
+      containers:
+        - name: gateway
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 32Mi'
 
 # The host cluster's name is not a preference: scripts/verify_ci_pool_project.py
 # asserts it, hack/ci-env.sh selects it, and the Boskos lease resolves to it.
@@ -367,7 +425,7 @@ done
 # (docs/designs/eval-scorer.md). In the pool the two need the same set: a
 # project granting only the presubmit's account leases fine and dies at
 # get-credentials the first night it is drawn, as kube-agents-evals-10 did on
-# 2026-09-16 (gke-labs/kube-agents#1491). The same twelve, not a subset -- the
+# 2026-09-16 (gke-labs/kube-agents#1491). The same thirteen, not a subset -- the
 # run is the same script end to end, so a partial grant fails at a later step
 # on a later night instead.
 #
@@ -375,6 +433,9 @@ done
 # Artifact Registry role: AR_REPO and CACHE_IMAGE reach hack/ci-deploy.sh's
 # `gcloud builds submit` as substitutions, so Cloud Build does the push and the
 # GKE nodes do the pull. This account touches the registry at no point.
+# monitoring.alertPolicyEditor: the monitoring-alert-policy-read case's fixture
+# stack plants one alert policy per lease and deletes it on teardown; no other
+# role here carries alertPolicies.create.
 PROW_RUNNER_SA="serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com"
 NIGHTLY_RUNNER_SA="serviceAccount:eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
 echo "Granting the Prow and nightly runners access to ${PROJECT_ID}..."
@@ -387,6 +448,7 @@ for role in \
   roles/iam.serviceAccountUser \
   roles/logging.logWriter \
   roles/logging.viewer \
+  roles/monitoring.alertPolicyEditor \
   roles/resourcemanager.projectIamAdmin \
   roles/serviceusage.serviceUsageConsumer \
   roles/storage.admin \
@@ -417,6 +479,27 @@ for role in \
     --role="${role}" \
     --quiet >/dev/null
 done
+
+# A custom role, not roles/compute.networkAdmin: that role holds almost a
+# thousand permissions, and the sweep needs twelve. `update` on a re-run keeps the
+# role's permissions equal to the list above. On a project already registered,
+# run the commands in docs/ci-pool-projects.md section 5.7 by hand rather than
+# the script (section 8).
+echo "Granting the Compute plant sweeper its custom role on ${PROJECT_ID}..."
+COMPUTE_SWEEP_ROLE_VERB="create"
+if gcloud iam roles describe "${COMPUTE_SWEEP_ROLE_ID}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  COMPUTE_SWEEP_ROLE_VERB="update"
+fi
+gcloud iam roles "${COMPUTE_SWEEP_ROLE_VERB}" "${COMPUTE_SWEEP_ROLE_ID}" \
+  --project="${PROJECT_ID}" \
+  --title="${COMPUTE_SWEEP_ROLE_TITLE}" \
+  --permissions="${COMPUTE_SWEEP_PERMISSIONS}" \
+  --stage="${COMPUTE_SWEEP_ROLE_STAGE}" \
+  --quiet >/dev/null
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member="${COMPUTE_SWEEP_SA}" \
+  --role="projects/${PROJECT_ID}/roles/${COMPUTE_SWEEP_ROLE_ID}" \
+  --quiet >/dev/null
 
 # ─── Artifact Registry Creation & Cleanup Policy ──────────────────────────────
 echo -e "\n==> [Step 1.3] Creating Regional Docker Artifact Registry & Cleanup Policy..."
@@ -488,22 +571,27 @@ if [ -z "${GITOPS_DEFAULT_BRANCH}" ]; then
     -f content="$(printf '%s\n' "${GITOPS_SEED_CONTENT}" | base64 | tr -d '\n')" >/dev/null
 fi
 
-# The declaration the declared-intent eval case reads. A PUT without `sha` on a
-# path that exists fails, so the read comes first, and only a 404 means
-# "absent": any other failure stops the step, as the branch read above does,
-# rather than PUT over a note that may be there. A note someone edited by
-# hand is left as it is.
-if GITOPS_INTENT_NOTE_READ_ERROR="$(gh api "repos/${GITOPS_REPO}/contents/${GITOPS_INTENT_NOTE_PATH}" 2>&1 >/dev/null)"; then
-  :
-elif printf '%s' "${GITOPS_INTENT_NOTE_READ_ERROR}" | grep -q "${GITOPS_NOTE_ABSENT_PATTERN}"; then
-  echo "Seeding ${GITOPS_REPO} with ${GITOPS_INTENT_NOTE_PATH} (the declared-intent note)..."
-  gh api -X PUT "repos/${GITOPS_REPO}/contents/${GITOPS_INTENT_NOTE_PATH}" \
-    -f message="${GITOPS_INTENT_NOTE_MESSAGE}" \
-    -f content="$(printf '%s\n' "${GITOPS_INTENT_NOTE_CONTENT}" | base64 | tr -d '\n')" >/dev/null
-else
-  echo "ERROR: could not read ${GITOPS_INTENT_NOTE_PATH} in ${GITOPS_REPO} (${GITOPS_INTENT_NOTE_READ_ERROR}); not seeding it blind." >&2
-  exit 1
-fi
+# The two files the eval cases read: the declared-intent note and
+# checkout-gateway's declaration. A PUT without `sha` on a path that exists
+# fails, so the read comes first, and only a 404 means "absent": any other
+# failure stops the step, as the branch read above does, rather than PUT over
+# a file that may be there. A file someone edited by hand is left as it is.
+seed_gitops_file() {
+  local path="$1" message="$2" content="$3" what="$4" read_error
+  if read_error="$(gh api "repos/${GITOPS_REPO}/contents/${path}" 2>&1 >/dev/null)"; then
+    return 0
+  elif printf '%s' "${read_error}" | grep -q "${GITOPS_NOTE_ABSENT_PATTERN}"; then
+    echo "Seeding ${GITOPS_REPO} with ${path} (${what})..."
+    gh api -X PUT "repos/${GITOPS_REPO}/contents/${path}" \
+      -f message="${message}" \
+      -f content="$(printf '%s\n' "${content}" | base64 | tr -d '\n')" >/dev/null
+  else
+    echo "ERROR: could not read ${path} in ${GITOPS_REPO} (${read_error}); not seeding it blind." >&2
+    exit 1
+  fi
+}
+seed_gitops_file "${GITOPS_INTENT_NOTE_PATH}" "${GITOPS_INTENT_NOTE_MESSAGE}" "${GITOPS_INTENT_NOTE_CONTENT}" "the declared-intent note"
+seed_gitops_file "${GITOPS_WORKLOAD_MANIFEST_PATH}" "${GITOPS_WORKLOAD_MANIFEST_MESSAGE}" "${GITOPS_WORKLOAD_MANIFEST_CONTENT}" "checkout-gateway's declaration"
 
 INST_JSON="$(gh api /orgs/gke-agentic/installations --jq ".installations[] | select(.app_id==${APP_ID})" 2>/dev/null || echo "")"
 if [ -n "${INST_JSON}" ]; then

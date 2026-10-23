@@ -31,25 +31,19 @@ them on their public defaults. Takes the root context.
 {{- end }}
 
 {{/*
-The same for images this project does not build (LiteLLM, fluent-bit). Falls
-back to imageRegistry, since a single-prefix mirror is the common case and a
-chart that mirrored only its own images would render a half-mirrored install —
-the operator handing its managed pods public references after `helm install`
-reported success.
-
-This deliberately does NOT match third_party_registry_prefix in
-scripts/installer/common.sh, which requires THIRD_PARTY_REGISTRY_PREFIX
-explicitly. The asymmetry is about history, not preference: REGISTRY_PREFIX
-shipped before this inventory existed and has always meant "the registry
-holding the images this project builds", so widening it would redirect working
-installs to images their mirror was never given. global.imageRegistry is new
-here and carries no such promise, so it can take the safer default.
+The same for images this project does not build (LiteLLM, fluent-bit, the
+GitHub token minter, Hindsight, the cleanup hook). Empty leaves them on their
+upstream registries; it does NOT fall back to imageRegistry. That matches
+third_party_registry_prefix in scripts/installer/common.sh and
+local.third_party_registry in terraform/examples/full-install/main.tf, so an
+empty third-party prefix means "upstream" at every layer, and an install that
+mirrors everything sets both.
 
 Takes the root context.
 */}}
 {{- define "kube-agents.thirdPartyImageRegistry" -}}
 {{- $g := .Values.global | default dict -}}
-{{- $g.thirdPartyImageRegistry | default $g.imageRegistry | default "" | trimSuffix "/" -}}
+{{- ($g.thirdPartyImageRegistry | default "") | trimSuffix "/" -}}
 {{- end }}
 
 {{/*
@@ -730,9 +724,9 @@ neither key), which only openai_compatible passes.
 {{- define "kube-agents.litellmConfig" -}}
 {{- /*
   max_tokens on every alias when .maxTokens is above zero, and no key at all
-  otherwise, so the default render matches the kustomize base
-  (k8s-operator/config/integrations/litellm/base/config.yaml), which carries
-  no such key on purpose. One value for all three aliases: they are one
+  otherwise, so the default render adds no key the kustomize base
+  (k8s-operator/config/integrations/litellm/base/config.yaml) lacks beyond the
+  Gemini thinking key below; the base carries no max_tokens on purpose. One value for all three aliases: they are one
   upstream model, and the budget is the backend's property, not the alias's.
   LiteLLM's router spreads litellm_params underneath the request's own
   arguments, so this is what a request that names no max_tokens gets, not a
@@ -752,6 +746,38 @@ neither key), which only openai_compatible passes.
   deploy/shared/defaults/config.yaml).
 */}}
 {{- /*
+  thinking: {type: enabled} on every alias for a Gemini model that thinks, so
+  its thoughts come back as thought parts (reasoning_content) rather than not
+  at all. Gemini thinks by default but returns its thoughts only when the
+  request sets thinkingConfig.includeThoughts. With that off, Gemini 3.x has
+  been seen writing its reasoning into the answer instead, under a first line
+  `thought`, where nothing downstream can tell it from the answer; asking for
+  the thoughts gives them a channel of their own. Of the
+  settings LiteLLM maps to includeThoughts, this is the one that changes
+  nothing else: with no budget_tokens, LiteLLM v1.106.0
+  (VertexGeminiConfig._map_thinking_param) sends includeThoughts alone on
+  Gemini 3.x, no thinkingLevel, so the model keeps its own depth; on 2.5 it
+  sends no thinkingBudget either.
+
+  Only for a Gemini model that thinks: 2.5, 3.x on, and the -latest aliases
+  LiteLLM counts as 3.x, through gemini or vertex_ai, the name read from its
+  last path segment so a Model Garden path counts. LiteLLM refuses thinking on
+  a model it does not treat as a reasoning model (gemini-2.0-flash, gemma-*;
+  also the 2.5 TTS and computer-use previews, which nobody runs an agent on)
+  and on Claude it would turn thinking on, so every other render stays
+  byte-identical. Left out when .reasoningEffort is set: LiteLLM maps that to
+  includeThoughts as well, and the two on one deployment fail every Gemini 3.x
+  request (thinkingLevel beside a thinking param); on 2.5 the thinking key
+  would drop the effort's thinkingBudget. A request that names its own reasoning_effort gets this key dropped
+  by LiteLLM's router (_deployment_params_with_request_reasoning_override),
+  and its effort maps to includeThoughts too. The kustomize base carries no
+  such key: it picks an overlay by provider alone and also serves openai,
+  which refuses the parameter.
+*/}}
+{{- $geminiThinkingModelPattern := "^gemini-(2[.]5|[3-9]|(pro|flash|flash-lite)-latest$)" -}}
+{{- $geminiThinkingModel := regexMatch $geminiThinkingModelPattern (base .model) -}}
+{{- $geminiThoughts := and (or (eq .provider "gemini") (eq .provider "vertex_ai")) $geminiThinkingModel (not .reasoningEffort) -}}
+{{- /*
   Recent Claude models (Opus 5 among them) answer temperature, top_p and top_k
   with a 400 ("`temperature` is deprecated for this model"), and LiteLLM
   refuses a temperature other than 1 for them before the request leaves the
@@ -764,10 +790,15 @@ neither key), which only openai_compatible passes.
   model, not only the ones that refuse: a name test that tracked which do
   would break on each new release, and an older Claude losing a caller's
   sampling override is a quieter failure than a 400. Claude only: anthropic
-  serves nothing else, vertex_ai serves Claude under claude-* names, and a
-  Gemini or OpenAI render stays byte-identical.
+  serves nothing else, vertex_ai serves Claude under claude-* names, sap (SAP
+  AI Core) under anthropic--* names and forwards temperature and top_p into
+  its orchestration request, and a Gemini or OpenAI render stays
+  byte-identical. $claudeDrop is that set; $claude, which also gates prompt
+  caching below, leaves sap out, because the cache_control markers have not
+  been shown to pass SAP's orchestration API.
 */}}
 {{- $claude := or (eq .provider "anthropic") (and (eq .provider "vertex_ai") (hasPrefix "claude-" .model)) -}}
+{{- $claudeDrop := or $claude (and (eq .provider "sap") (hasPrefix "anthropic--" .model)) -}}
 {{- /*
   openai_compatible goes through LiteLLM's hosted_vllm handler, which speaks the
   same OpenAI chat-completions API, rather than through openai/. Read from
@@ -794,7 +825,10 @@ model_list:
       {{- with .reasoningEffort }}
       reasoning_effort: {{ . | quote }}
       {{- end }}
-      {{- if $claude }}
+      {{- if $geminiThoughts }}
+      thinking: {"type": "enabled"}
+      {{- end }}
+      {{- if $claudeDrop }}
       additional_drop_params: ["temperature", "top_p", "top_k"]
       {{- end }}
   - model_name: hermes-agent
@@ -812,7 +846,10 @@ model_list:
       {{- with .reasoningEffort }}
       reasoning_effort: {{ . | quote }}
       {{- end }}
-      {{- if $claude }}
+      {{- if $geminiThoughts }}
+      thinking: {"type": "enabled"}
+      {{- end }}
+      {{- if $claudeDrop }}
       additional_drop_params: ["temperature", "top_p", "top_k"]
       {{- end }}
   - model_name: {{ .model }}
@@ -830,14 +867,17 @@ model_list:
       {{- with .reasoningEffort }}
       reasoning_effort: {{ . | quote }}
       {{- end }}
-      {{- if $claude }}
+      {{- if $geminiThoughts }}
+      thinking: {"type": "enabled"}
+      {{- end }}
+      {{- if $claudeDrop }}
       additional_drop_params: ["temperature", "top_p", "top_k"]
       {{- end }}
 litellm_settings:
   callbacks: {{ .callbacks }}
 {{- /*
-  Prompt caching, for Anthropic-family models only: the same $claude gate as
-  additional_drop_params above. On Gemini, LiteLLM turns these markers into
+  Prompt caching, for Anthropic-family models only: the $claude gate, which
+  leaves sap out, where additional_drop_params above uses $claudeDrop. On Gemini, LiteLLM turns these markers into
   Vertex explicit context caching: a cachedContents list before every call,
   and a create whenever the cached prefix is new. A create that Vertex holds
   past its request credential's life fails the whole turn (a 401 after a
@@ -1982,8 +2022,10 @@ The defaults carry no ephemeral-storage request because the operator renders non
 {{- if .Values.platformAgent.enabled -}}
   {{- /* The agent pod is the one operator-rendered workload that scales: the gateway
          Deployment takes spec.replicas from availability.replicas, while the shell
-         StatefulSet and the credential proxy stay at 1 (see the platformagent-ha golden,
-         where the gateway goes to 3 and the other two do not). The footprint records one
+         StatefulSet and the credential proxy stay at 1. The operator now caps the gateway
+         at one replica (supportedGatewayReplicas in manifest_helpers.go), so above one
+         this multiply and the surge below over-count; that errs towards refusing a quota
+         rather than passing one the pods will not fit. The footprint records one
          pod's worth, so it is multiplied here — without this an HA install passes the
          check and then leaves its extra replicas Pending, which is the failure this
          whole template exists to prevent. An absent value means the operator's own
@@ -2106,10 +2148,10 @@ The defaults carry no ephemeral-storage request because the operator renders non
   {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" (include "kube-agents.satMul" (dict "a" $podReqEph "b" $agentReplicas))) | int64 -}}
   {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" (include "kube-agents.satMul" (dict "a" $podLimEph "b" $agentReplicas))) | int64 -}}
   {{- /* Only an HA gateway surges. The operator gives the gateway Deployment a
-         RollingUpdate strategy only when availability.replicas is above 1 and renders
+         RollingUpdate strategy only above one effective replica and renders
          `strategy: Recreate` otherwise (resolveDeploymentReplicasAndStrategy in
-         k8s-operator/internal/controller/manifest_helpers.go; the default-CR golden
-         platformagent.yaml shows Recreate, the platformagent-ha one RollingUpdate). A
+         k8s-operator/internal/controller/manifest_helpers.go), and it caps the count at
+         one, so every gateway it renders today is Recreate. A
          Recreate rollout deletes the old Pod before creating the new one, so it needs no
          extra room. Counting the agent pod here at one replica made it win the max on
          every default install — it is the largest workload in the release — and the
@@ -2160,6 +2202,21 @@ The defaults carry no ephemeral-storage request because the operator renders non
   {{- $storage := (index $op "storage") | default dict -}}
   {{- $reqPvc = add $reqPvc ($storage.persistentVolumeClaims | default 0 | int64) -}}
   {{- $reqStorage = add $reqStorage ($storage.storageBytesRequest | default 0 | int64) -}}
+  {{- /* platformAgent.storage.size resizes the agent's data claim and the sandbox's data
+         claim together, and footprint.yaml counts each of them at the operator default.
+         So each claim moves by (size - default): dataClaims x the difference, which is
+         negative for a size below the default. Absent keys mean a footprint.yaml from
+         before them, which would leave the claims at the default in silence.
+         satMul/satAdd, as above: parseBytes clamps an oversized size to MaxInt64,
+         and dataClaims times that would wrap the total negative. Both take a
+         negative delta. */ -}}
+  {{- with (.Values.platformAgent.storage | default dict).size -}}
+    {{- if not (and (hasKey $storage "dataClaims") (hasKey $storage "dataClaimBytesRequest")) -}}
+      {{- fail "quota preflight: footprint.yaml has no dataClaims or dataClaimBytesRequest, so platformAgent.storage.size cannot be counted. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
+    {{- end -}}
+    {{- $dataClaimDelta := sub (include "kube-agents.parseBytes" . | int64) ($storage.dataClaimBytesRequest | int64) -}}
+    {{- $reqStorage = include "kube-agents.satAdd" (dict "a" $reqStorage "b" (include "kube-agents.satMul" (dict "a" ($storage.dataClaims | int64) "b" $dataClaimDelta))) | int64 -}}
+  {{- end -}}
 {{- end -}}
 
 {{- dict

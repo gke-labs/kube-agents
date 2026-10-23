@@ -98,6 +98,21 @@ class NightDocumentTest(unittest.TestCase):
         self.assertEqual(first["newly_failing"], [], "the first night has nothing to compare with")
         self.assertEqual(first["counts"]["failed"], 1)
 
+    def test_a_case_the_inject_lane_dropped_is_not_missing(self):
+        """The next-mode nightly drops hack/eval/inject-lane-exclusions.txt
+        before the fan-out; a night that names the case under lane_excluded
+        is complete without it, and the expected count leaves it out."""
+        data = two_nights()
+        data["runs"].append(night("3000000000000000003", "2026-09-09T00:00:00+00:00", "2026-09-09T06:40:00+00:00",
+                                  [task("case-a", "pass", "pass", "pass"), task("case-b", "pass", "pass", "pass")],
+                                  result="SUCCESS", eval_verdict="GREEN", lane_excluded=["case-c"]))
+        last = nightly.night_reports(data)[0]
+        self.assertEqual(last["missing"], [])
+        self.assertEqual(last["counts"]["expected"], 2)
+        self.assertTrue(last["complete"])
+        data["runs"][-1].pop("lane_excluded")
+        self.assertEqual(nightly.night_reports(data)[0]["missing"], ["case-c"], "without the field the case is missing, as before")
+
     def test_truncated_incomplete_and_infra_nights(self):
         data = two_nights()
         data["runs"].append(night("3000000000000000003", "2026-09-09T00:00:00+00:00", "2026-09-09T08:00:00+00:00",

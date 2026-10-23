@@ -96,6 +96,12 @@ type filterConfig struct {
 	// design and no autoscaler verdict is ever recorded against them. On by
 	// default; see autopilotScaleToZero for what it matches and why.
 	autopilotScaleToZeroHold bool
+	// settle is how long a failure in the settle family has to have lasted,
+	// by the event's own first and last sighting, before it is forwarded. Zero
+	// turns the gate off. See settleApplies for the family (the reasons that
+	// are re-emitted while they last; a one-shot event has no span) and Decide
+	// for why the span, not the clock, is what is measured.
+	settle time.Duration
 }
 
 // filterThresholds carries the count debounces as a named group. They are all
@@ -117,6 +123,10 @@ type filterThresholds struct {
 	// above: a caller that fills in nothing gets the hold, not silence from a
 	// gate it never asked to turn off. newFilterConfig does the one negation.
 	disableAutopilotScaleToZeroHold bool
+	// settle is the settle period (--settle). Zero means the default here as
+	// it does for the counts; a negative value turns the gate off, which is
+	// how parseFlags passes --settle=0 through (flags.filterThresholds).
+	settle time.Duration
 }
 
 const (
@@ -124,6 +134,18 @@ const (
 	// count at which kubelet's retry schedule has visibly failed to resolve something
 	// on its own, and is the value --unhealthy-min-count has always used.
 	defaultMinCount = 3
+	// defaultSettle is how long a failure in the settle family has to have
+	// lasted before it is forwarded: the issue's proposal, long enough for
+	// kubelet's object-cache warm-up on a fresh node (a BackOff that cleared
+	// in 110s is the motivating case) and short against the 5m ceiling of
+	// kubelet's own restart back-off, so a real crash loop crosses it on its
+	// fourth or fifth back-off.
+	defaultSettle = 2 * time.Minute
+	// settleQuietSlack is how long past the settle period a held key may go
+	// unsighted before the dispatcher counts it self-resolved: kubelet's
+	// restart back-off caps at five minutes, so a failure still going is
+	// sighted again inside it.
+	settleQuietSlack = 5 * time.Minute
 	// defaultFailedSchedulingMinCount is five failed scheduling attempts, and
 	// deliberately not a time. On a cluster with cluster-autoscaler the
 	// verdict on a new pod arrives seconds after its first attempt (measured
@@ -189,6 +211,13 @@ func newFilterConfig(reasons []string, allowNamespaces, excludeNamespaces []stri
 	if scaleUpHold <= 0 {
 		scaleUpHold = defaultScaleUpHold
 	}
+	settle := th.settle
+	switch {
+	case settle == 0:
+		settle = defaultSettle
+	case settle < 0:
+		settle = 0
+	}
 	allowedReasons := stringSet(reasons)
 	// The Autopilot hold reads "cluster-autoscaler has said nothing about this
 	// pod" off the absence of a mark, and a mark is only ever recorded for an
@@ -218,6 +247,7 @@ func newFilterConfig(reasons []string, allowNamespaces, excludeNamespaces []stri
 		failedSchedulingMinCount:   failedSchedulingMinCount,
 		scaleUpHold:                scaleUpHold,
 		autopilotScaleToZeroHold:   autopilotScaleToZeroHold,
+		settle:                     settle,
 	}
 }
 
@@ -309,6 +339,10 @@ const (
 	gateUnhealthyMinCount   filterGate = "unhealthy_min_count"
 	gateBackoffMinCount     filterGate = "backoff_min_count"
 	gateImagePullTransient  filterGate = "imagepull_transient_min_count"
+	// gateSettle is a settle-family event whose own sightings do not yet span
+	// the settle period: held, and counted by the dispatcher as forwarded or
+	// self-resolved once it is known which (settleMemo).
+	gateSettle filterGate = "settle"
 	// gateScaleUpMark is a TriggeredScaleUp or NotTriggerScaleUp event: admitted
 	// so the dispatcher records the verdict, never forwarded. Counted as filtered
 	// because it is; the dispatcher's log line says what it was recorded as.
@@ -344,7 +378,12 @@ const (
 //  3. Namespace is in the allowed list (or allowed list is empty).
 //  4. Repeat count threshold is met, for the families that flap: "Unhealthy"
 //     probe warnings, the crash-loop family, and retryable image pulls.
-//  5. FailedScheduling is a stuck pod rather than a scale-up in progress,
+//  5. The settle family (settleApplies) has lasted the settle period by the
+//     event's own first and last sighting, so a failure that clears on its
+//     own inside it is not forwarded (gateSettle); the dispatcher measures a
+//     repeat blip from its own start while its memo remembers the first.
+//     Off at --settle=0.
+//  6. FailedScheduling is a stuck pod rather than a scale-up in progress,
 //     read from cluster-autoscaler's verdict on the pod when there is one and
 //     from the repeat count when there is not (failedSchedulingGate). The two
 //     autoscaler verdicts themselves stop here as gateScaleUpMark: they are
@@ -387,6 +426,20 @@ func (f *filter) Decide(ev TriageEvent) filterGate {
 	// anything unrecognized still fire on event #1.
 	if ev.PullClass == pullClassRetryable && belowMinCount(ev.Count, f.cfg.imagePullTransientMinCount) {
 		return gateImagePullTransient
+	}
+	// The settle period, after the counts: a failure has to have repeated AND
+	// lasted. Measured on the event's own first and last sighting rather than
+	// held on a timer, so a replayed event after a restart reads the same as
+	// it did live, and no object is read back: the watcher reaches fleet
+	// clusters through the broker's watcher route, which serves no pods. A
+	// failure that clears inside the period simply stops being sighted and
+	// its span never reaches it; one that keeps going is sighted again, with
+	// the same first sighting and a later last one, and is forwarded with
+	// both and the count intact. The cost is the next sighting after the
+	// period, up to kubelet's 5m back-off ceiling on a long-running crash
+	// loop. Zero timestamps fail open, as an unknown count does.
+	if f.cfg.settle > 0 && settleApplies(canonicalizeReason(ev.Key.Reason, ev.Message)) && !settled(ev, f.cfg.settle) {
+		return gateSettle
 	}
 	if scaleUpVerdictFor(ev.Key.Reason) != scaleUpNone {
 		if ev.Reporter != scaleUpReporter {
@@ -568,6 +621,39 @@ func autopilotScaleToZero(ev TriageEvent) bool {
 	return ev.ScaleUp.Verdict == scaleUpNone &&
 		ev.Autopilot &&
 		strings.TrimSpace(ev.Message) == noNodesAvailableMessage
+}
+
+// settleApplies reports whether the canonical reason is in the settle family:
+// the reasons Autopilot's node churn emits routinely, that clear on their own
+// more often than not, and that are re-emitted while they last. The
+// crash-loop family is the motivating one (a kubelet object-cache warm-up on
+// a fresh node backs a container off for a minute or two); FailedMount and
+// Unhealthy are the same shape, retried and re-recorded every few minutes.
+// Not in it: NodeNotReady, which the node lifecycle controller records once
+// per transition against each pod and never again, so a span measured on
+// its own sightings is always zero and the gate would silence it outright;
+// OOMKilled and Evicted, which are verdicts rather than retries; the
+// image-pull family, whose transient half has its own gate and whose
+// terminal half (a bad tag) should fire at once; FailedScheduling, which the
+// autoscaler gate reads with a better signal than time; and FailedToDrainNode.
+// The family is read on the canonical reason so kubelet's Reason=BackOff
+// crash loop is in it and its image-pull BackOff is not.
+func settleApplies(canonicalReason string) bool {
+	switch canonicalReason {
+	case "CrashLoopBackOff", "FailedMount", "Unhealthy":
+		return true
+	}
+	return false
+}
+
+// settled reports whether the event's own sightings span the settle period.
+// An event missing either stamp settles at once: the gate fails open on an
+// emitter that stamps nothing, as the counts do on a zero count.
+func settled(ev TriageEvent, settle time.Duration) bool {
+	if ev.FirstSeen.IsZero() || ev.LastSeen.IsZero() {
+		return true
+	}
+	return ev.LastSeen.Sub(ev.FirstSeen) >= settle
 }
 
 // belowMinCount reports whether an event's repeat count falls short of a debounce

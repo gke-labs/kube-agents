@@ -20,6 +20,7 @@ the ask kind they carry is the one ``chat_message.ask_kind`` gives.
 """
 
 import asyncio
+import html
 import itertools
 import json
 import sys
@@ -56,6 +57,10 @@ BRIDGE_CARRIERS = frozenset({"progress", "terminal"})
 CHAT_ID = "a2a-ctx-1"
 THREAD = "slack:C1/1.2"
 HEADER = "@platform "
+#: What a clipped headline ends with.
+ELLIPSIS = chat_message._presenter.ELLIPSIS
+#: The mrkdwn marker around today's bold headline.
+BOLD = "*"
 
 
 class _ChatAdapter:
@@ -176,8 +181,7 @@ class SharedCasesTest(unittest.TestCase):
         if "url" in given:
             return [_out(chat_message.pr_message(given["url"], given["repo"], given["number"], given["line"]), NOTIFY)]
         if "reply" in given:
-            _bolded, offer = slack_ux_failure.present(given["reply"])
-            return [_out(chat_message.failure_message(given["reply"], bool(offer)), RESULT)]
+            return [_out(slack_ux_failure.layout(given["reply"], True), RESULT)]
         if "report" in given:
             laid_out = slack_ux_incident.chat_triage(given["report"].strip())
             return [_out(laid_out and laid_out[0], NOTIFY)]
@@ -288,6 +292,30 @@ class SharedCasesTest(unittest.TestCase):
         for case in cases:
             with self.subTest(case=case["name"]):
                 self.assertEqual(_as_case(self.run_case(case), case["expected"]), case["expected"])
+
+
+class QuestionDrawnOnceTest(unittest.TestCase):
+    """A question case's headline is not repeated in its detail, under next or today.
+
+    The headline is plain text, so the detail is read as plain too: a code span's
+    backticks, a link's url and paired markup do not hide a repeat."""
+
+    def test_every_question_case(self):
+        cases = [c for c in chat_cases.load() if "reason" in c["input"]]
+        self.assertGreater(len(cases), 0)
+        moments = chat_message._moments
+        for case in cases:
+            reason = case["input"]["reason"]
+            with self.subTest(case=case["name"]):
+                chat = chat_message.needs_you_message(reason)
+                detail = [moments._headline_text(line) for line in chat.get("detail", "").splitlines()]
+                shown = chat["headline"].removesuffix(ELLIPSIS)
+                self.assertFalse(any(shown in line for line in detail), detail)
+                blocks, _text = moments.needs_you(reason)
+                title = html.unescape(blocks[0]["text"]["text"]).strip(BOLD).removesuffix(ELLIPSIS)
+                _head, rest, _options = moments._question(reason, True)
+                below = [moments._headline_text(line) for line in "\n".join(rest).splitlines()]
+                self.assertFalse(any(title in line for line in below), below)
 
 
 class PlanDrawnAlikeTest(unittest.TestCase):

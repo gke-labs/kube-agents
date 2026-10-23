@@ -862,11 +862,30 @@ def _task_specs() -> list[tuple[Path, dict]]:
     return out
 
 
+def _parked_cases() -> set[str]:
+    """The validator's FIXTURE_NOT_READY set, loaded by path. A case parked there
+    has no fixture on the pool: it waits for the issue that plants one, or its
+    role left the catalogue (the exit for a retired role in
+    bench/tf/fleet/README.md). Its checks on a role the catalogue lacks are
+    skipped, as scripts/validate_bench_cases.py skips them; its other checks
+    stay under every test here."""
+    import importlib.util
+
+    validator = Path(__file__).resolve().parents[2] / "scripts" / "validate_bench_cases.py"
+    spec = importlib.util.spec_from_file_location("validate_bench_cases_for_fleet_tests", validator)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return set(module.FIXTURE_NOT_READY)
+
+
 def test_every_role_a_task_names_exists_in_the_catalog():
     """The drift that would otherwise surface as a red presubmit."""
     roles = _catalog()["roles"]
+    parked = _parked_cases()
     used = {}
     for path, spec in _task_specs():
+        if path.parent.name in parked:
+            continue
         for entry in spec.get("verification_spec") or []:
             check = entry.get("check") or {}
             if check.get("type") == "fleet_resource_property":
@@ -901,11 +920,19 @@ def test_every_namespace_a_fleet_check_names_matches_the_catalogs_role():
 
 
 def _fleet_checks():
+    roles = _catalog()["roles"]
+    parked = _parked_cases()
     for path, spec in _task_specs():
         for entry in spec.get("verification_spec") or []:
             check = entry.get("check") or {}
-            if check.get("type") == "fleet_resource_property":
-                yield f"{path.parent.name}/{entry.get('name')}", check
+            if check.get("type") != "fleet_resource_property":
+                continue
+            # A parked case's check drops out only when its role has left the
+            # catalogue (the retirement exit); a case parked for another reason
+            # keeps its checks under the probe, container and witness tests.
+            if path.parent.name in parked and check.get("fixture_role") not in roles:
+                continue
+            yield f"{path.parent.name}/{entry.get('name')}", check
 
 
 # Ambient kinds created automatically by Kubernetes in every namespace (e.g.
@@ -1730,7 +1757,7 @@ def _provision(shell, tmp_path, **env) -> Path:
         ),
         "STUB_NAMESPACES": (
             "seeded-debug seeded-reliability seeded-security seeded-capacity seeded-deprecation seeded-intent"
-            " seeded-token seeded-headroom seeded-stall seeded-upgrade seeded-topology seeded-shapes seeded-defaults"
+            " seeded-token seeded-headroom seeded-qos seeded-stall seeded-upgrade seeded-topology seeded-shapes seeded-defaults"
         ),
         # Most tests are about discovery and presence, not the credential, so
         # they run the way a laptop does; the credential tests override this.

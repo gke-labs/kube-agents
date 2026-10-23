@@ -34,6 +34,10 @@ CALL_TIMEOUT_S = 60
 PAGINATE_JQ = ".[]"
 WRITE_METHODS = ("POST", "PATCH")
 DRY_RUN_PREFIX = "--dry-run: would"
+# GitHub's answer to a field it will not take (an assignee who is not a
+# collaborator): gh prints the status to stderr and the JSON body, which
+# names the field, to stdout.
+VALIDATION_FAILED = "HTTP 422"
 
 
 def log(message: str) -> None:
@@ -48,12 +52,22 @@ class Gh:
         self.runner = runner
         self.dry_run = dry_run
         self.binary = binary
+        # What the last failed call printed (gh's stderr and stdout), for
+        # refused(); None after a call that went through. Never logged.
+        self.last_failure: str | None = None
+
+    def refused(self, field: str) -> bool:
+        """Whether the last call failed because GitHub refused ``field``
+        (a 422 naming it), as opposed to a timeout, a 5xx or a 403."""
+        text = self.last_failure or ""
+        return VALIDATION_FAILED in text and field in text
 
     def path(self, suffix: str) -> str:
         return f"repos/{self.repo}/{suffix}"
 
     def call(self, method: str, path: str, body: dict | None = None, paginate: bool = False):
         """The decoded JSON response, a list for a paginated read, or None."""
+        self.last_failure = None
         if self.dry_run and method in WRITE_METHODS:
             log(f"{DRY_RUN_PREFIX} {method} {path}\n{json.dumps(body, indent=2, ensure_ascii=False) if body else ''}")
             return None
@@ -72,10 +86,12 @@ class Gh:
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
+            self.last_failure = type(exc).__name__
             log(f"warning: gh api {method} {path}: {type(exc).__name__}; skipped")
             return None
         if proc.returncode != 0:
             first = (proc.stderr or "").strip().splitlines()
+            self.last_failure = f"{proc.stderr or ''}\n{proc.stdout or ''}"
             log(f"warning: gh api {method} {path} failed (exit {proc.returncode}): {first[0] if first else 'no stderr'}")
             return None
         text = proc.stdout or ""

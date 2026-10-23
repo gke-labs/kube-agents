@@ -124,6 +124,76 @@ func TestDispatcherDispatch_NewIncidentAndFollowUp(t *testing.T) {
 	}
 }
 
+// TestDispatcherCountsATriageSessionOnlyWhenTheInjectWasDelivered pins the
+// series the operator reads into status.usage.sessionsTotal: one per session
+// the dispatcher opened whose event the daemon then delivered. A create whose
+// inject the daemon filtered or suppressed, or that failed, opened a session
+// nobody was told about and counts nothing; a targeted-session mode opens no
+// session per event and counts nothing either, delivered or not.
+func TestDispatcherCountsATriageSessionOnlyWhenTheInjectWasDelivered(t *testing.T) {
+	cases := []struct {
+		name   string
+		mode   string
+		status int
+		body   string
+		want   float64
+	}{
+		{"delivered in per-incident mode", "per-incident", http.StatusOK, `{"status":"delivered"}`, 1},
+		{"policy filtered", "per-incident", http.StatusOK, `{"status":"filtered"}`, 0},
+		{"folded into the workload's open incident", "per-incident", http.StatusOK, `{"status":"folded","duplicate_of":"7"}`, 0},
+		{"quota suppressed", "per-incident", http.StatusOK, `{"status":"suppressed","severity":"Warning","suppressed_today":"3"}`, 0},
+		{"inject failed", "per-incident", http.StatusInternalServerError, ``, 0},
+		{"delivered to a targeted session", "targeted", http.StatusOK, `{"status":"delivered"}`, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/sessions" {
+					w.WriteHeader(http.StatusCreated)
+					_ = json.NewEncoder(w).Encode(createSessionResponse{SessionID: "session-1"})
+					return
+				}
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+			inj, err := newInjector(injectorConfig{daemonURL: server.URL, bearerToken: "mock-token", httpClient: server.Client()})
+			if err != nil {
+				t.Fatalf("failed to build injector: %v", err)
+			}
+			dedup, err := newDedupCache(24*time.Hour, "")
+			if err != nil {
+				t.Fatalf("failed to build cache: %v", err)
+			}
+			m := newMetrics()
+			disp := &dispatcher{
+				filter:      newFilter(newFilterConfig(nil, nil, nil, filterThresholds{})),
+				dedup:       dedup,
+				pullClasses: newPullClassMemo(0, 0),
+				injector:    inj,
+				metrics:     m,
+				mode:        tc.mode,
+				targetSid:   "targeted-session",
+			}
+			disp.Dispatch(context.Background(), TriageEvent{
+				Key:       EventKey{UID: "pod-1", Reason: "CrashLoopBackOff"},
+				Cluster:   "test-cluster",
+				Project:   "p",
+				Location:  "l",
+				Namespace: "default",
+				Name:      "billing-service",
+				LastSeen:  time.Now(),
+				Message:   "back-off restarting failed container",
+				Type:      "Warning",
+				Count:     3,
+			})
+			if got := testutil.ToFloat64(m.triageSessions.WithLabelValues("test-cluster", "p", "l")); got != tc.want {
+				t.Fatalf("triage sessions = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestDispatcherRollsBackDedupOnDeliveryFailure pins the invariant that makes a
 // long dedup window safe: an entry must not outlive an alert that was never
 // delivered. Observe writes the entry before either network call, and with a
@@ -355,6 +425,71 @@ func TestDispatcherKeepsDedupOnPolicyFilter(t *testing.T) {
 	}
 	if createCount != 1 {
 		t.Errorf("got %d create-session calls; want 1", createCount)
+	}
+}
+
+// TestDispatcherKeepsDedupOnFold pins injectStatusFolded: the entry stays, so the
+// pod is not re-offered while its workload's triage runs, and it is not flagged
+// policy-filtered, so a later Warning sighting does not reopen it either.
+func TestDispatcherKeepsDedupOnFold(t *testing.T) {
+	var injectCount int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/sessions" {
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(createSessionResponse{SessionID: "session-1"})
+			return
+		}
+		injectCount++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"folded","duplicate_of":"7"}`))
+	}))
+	defer server.Close()
+	inj, err := newInjector(injectorConfig{daemonURL: server.URL, bearerToken: "mock-token", httpClient: server.Client()})
+	if err != nil {
+		t.Fatalf("failed to build injector: %v", err)
+	}
+	dedup, err := newDedupCache(24*time.Hour, "")
+	if err != nil {
+		t.Fatalf("failed to build cache: %v", err)
+	}
+	m := newMetrics()
+	disp := &dispatcher{
+		filter:      newFilter(newFilterConfig(nil, nil, nil, filterThresholds{})),
+		dedup:       dedup,
+		pullClasses: newPullClassMemo(0, 0),
+		injector:    inj,
+		metrics:     m,
+		mode:        "per-incident",
+	}
+	ev := TriageEvent{
+		Key:       EventKey{UID: "pod-2", Reason: "CrashLoopBackOff"},
+		Cluster:   "test-cluster",
+		Project:   "p",
+		Location:  "l",
+		Namespace: "default",
+		Name:      "billing-service-6cfdb6b98b-zwv24",
+		LastSeen:  time.Now(),
+		Message:   "back-off restarting failed container",
+		Type:      "Warning",
+		Count:     3,
+	}
+
+	disp.Dispatch(context.Background(), ev)
+	if dedup.Len() != 1 {
+		t.Fatalf("a folded event left %d dedup entries; want 1", dedup.Len())
+	}
+	ev.LastSeen = ev.LastSeen.Add(5 * time.Minute)
+	ev.Count = 4
+	disp.Dispatch(context.Background(), ev)
+	if injectCount != 1 {
+		t.Errorf("got %d inject calls; want 1 (the Warning re-sighting stays deduped)", injectCount)
+	}
+	labels := []string{"test-cluster", "p", "l", "CrashLoopBackOff", "default"}
+	if got := testutil.ToFloat64(m.eventsFolded.WithLabelValues(labels...)); got != 1 {
+		t.Errorf("folded events = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.eventsInjected.WithLabelValues(labels...)); got != 0 {
+		t.Errorf("injected events = %v, want 0", got)
 	}
 }
 
@@ -893,6 +1028,10 @@ func newCountingDispatcher(t *testing.T, th filterThresholds) (*dispatcher, *met
 	injectCount := 0
 	var injected []InjectPayload
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == healthzPath {
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", injectFeaturesKey: []string{injectFeatureFollowup}})
+			return
+		}
 		if r.URL.Path == "/sessions" {
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(createSessionResponse{SessionID: sessionID})
@@ -909,6 +1048,10 @@ func newCountingDispatcher(t *testing.T, th filterThresholds) (*dispatcher, *met
 		}
 		injected = append(injected, p)
 		w.WriteHeader(http.StatusOK)
+		// The daemon this fake stands for posts follow-ups (session_kv_server
+		// INJECT_RESPONSE_FEATURES); TestDispatcherSweepSendsNoFollowUpToAnOlderDaemon
+		// is the one without.
+		_ = json.NewEncoder(w).Encode(injectResponse{Status: "injected", Features: []string{injectFeatureFollowup}})
 	}))
 	t.Cleanup(server.Close)
 

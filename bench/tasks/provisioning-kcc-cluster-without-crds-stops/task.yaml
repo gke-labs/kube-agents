@@ -33,8 +33,6 @@ validated: false
 
 domain: remediation
 
-owner: maintainers
-
 verification_spec:
   # The Config Connector stop, and only that one. On an install with no
   # registered repository the preflight stops first, which is correct but is

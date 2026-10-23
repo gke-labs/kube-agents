@@ -18,7 +18,9 @@ need no privilege the pod does not already hold:
   the failure threshold, edited when the picture changes, and closed with a
   comment when every leg has recovered. The forge calls go the same route the
   pull-request watcher's do — ``forge.call``, a version-control verb answered
-  by the credential broker from inside the shell sandbox;
+  by the credential broker from inside the shell sandbox. A forge with no
+  issue tracker, or no labels to find the issue by, holds no ledger: the
+  ALERT line below is then the report, with ``ledger=log-only``;
 * an **``ALERT chat_delivery_watch`` line appended to
   ``<agent home>/logs/chat_delivery_watch.log``**. The gateway pod's fluent-bit
   sidecar tails ``logs/*.log`` and ships it to the container's stdout and so
@@ -172,6 +174,13 @@ LEDGER_NONE = "none"
 FOOTER_PREFIX = "_Maintained by"
 LEDGER_CLOSED = "closed"
 LEDGER_DRY_RUN = "dry-run"
+# The ledger repository's forge cannot hold the ledger issue: it has no issue
+# tracker (Bitbucket) or no labels to find the issue by. The log channel is
+# then the whole report, as it is with no repository at all.
+LEDGER_LOG_ONLY = "log-only"
+# The issue verbs the ledger uses, and the `capabilities` fields they are read from.
+LEDGER_ISSUE_VERBS = ("issue-list", "issue-create", "issue-update", "issue-comment", "issue-close")
+CAPABILITIES_VERB = "capabilities"
 
 
 def now_iso() -> str:
@@ -213,7 +222,7 @@ def roster_paths(agent_home: Path) -> list[tuple[str, Path]]:
     profiles_dir = agent_home / PROFILES_DIR
     if profiles_dir.is_dir():
         for entry in sorted(profiles_dir.iterdir()):
-            if entry.is_dir() and entry.name not in RESERVED_PROFILES:
+            if entry.is_dir() and not entry.name.startswith(".") and entry.name not in RESERVED_PROFILES:
                 paths.append((entry.name, entry / CRON_DIR / JOBS_FILE))
     return paths
 
@@ -406,7 +415,15 @@ def advance(entry: dict, job: dict, *, silent: bool, has_output: bool = True) ->
 
 
 class LedgerError(RuntimeError):
-    """A forge step failed in a way that must not be read as 'nothing to do'."""
+    """A forge step failed in a way that must not be read as 'nothing to do'.
+
+    `repo` is the repository the failed call went to, which is not always the
+    ledger repository: a moved ledger closes its issue in the old one first.
+    """
+
+    def __init__(self, message: str, repo: str = "") -> None:
+        super().__init__(message)
+        self.repo = repo
 
 
 def verb(name: str, payload: dict, repo: str) -> dict:
@@ -423,7 +440,8 @@ def verb(name: str, payload: dict, repo: str) -> dict:
     except forge.ForgeError as refusal:
         raise LedgerError(
             f"{name} on {repo} refused: {refusal.reason}"
-            + (f": {refusal.value}" if refusal.value else "")
+            + (f": {refusal.value}" if refusal.value else ""),
+            repo,
         ) from refusal
 
 
@@ -587,6 +605,29 @@ def reconcile_issue(repo: str, degraded: list[tuple[str, dict]], state: dict, no
     return LEDGER_NONE
 
 
+def forge_keeps_ledger(repo: str) -> bool:
+    """Can the forge of `repo` hold the ledger issue? False only when it says not.
+
+    The ledger needs the issue verbs, and its label to find the issue by.
+    Asked only after a ledger call failed, so a forge that can hold it makes
+    the calls it always made. An answer that cannot be read is True, and the
+    failure is then reported as before.
+    """
+    try:
+        answer = forge.call(CAPABILITIES_VERB, {}, repo)
+    except forge.ForgeError:
+        return True
+    if not answer.get("forge") or answer.get("missing"):
+        # A host no forge serves, or a forge this install has not configured,
+        # also answers with no verbs. That is a fault to report, not a forge
+        # with no tracker.
+        return True
+    verbs = answer.get("verbs")
+    if isinstance(verbs, list) and not all(verb in verbs for verb in LEDGER_ISSUE_VERBS):
+        return False
+    return answer.get("labels") is not False
+
+
 class LedgerRepoAmbiguous(RuntimeError):
     """More than one managed repository and no `CHAT_DELIVERY_LEDGER_REPO` to choose."""
 
@@ -715,8 +756,13 @@ def tick(agent_home: Path, state_path: Path, rosters: list[tuple[str, Path]], *,
             try:
                 ledger_ref = reconcile_issue(repo, degraded, state, now, limit, recovering=bool(recovered))
             except Exception as exc:  # noqa: BLE001 - whatever GitHub does, the ALERT lines below still go out
-                ledger_ref = f"error:{type(exc).__name__}"
-                lines.append(format_self_error(exc))
+                if isinstance(exc, LedgerError) and not forge_keeps_ledger(exc.repo or repo):
+                    # Not a fault: this forge has nowhere to keep the issue,
+                    # so the log line below is the report, as with no forge.
+                    ledger_ref = LEDGER_LOG_ONLY
+                else:
+                    ledger_ref = f"error:{type(exc).__name__}"
+                    lines.append(format_self_error(exc))
     for key, entry in sorted(degraded):
         lines.append(format_alert(key, entry, limit, ledger_ref))
         entry["alerted"] = True

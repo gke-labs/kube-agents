@@ -29,6 +29,7 @@ from unittest import mock
 
 import credential_proxy
 import credential_proxy_client
+import feedback_broker
 import gke_endpoint
 import providers
 import vcs_broker
@@ -143,15 +144,23 @@ class AgentAPIProxyTest(unittest.TestCase):
                 self.end_headers()
                 self.wfile.write(body)
 
+            def do_POST(self):  # noqa: N802
+                length = int(self.headers.get("Content-Length", "0"))
+                if length:
+                    self.rfile.read(length)
+                self.do_GET()
+
             def log_message(self, _message, *_args):
                 return
 
         self.release_second_chunk = threading.Event()
         self.second_chunk_released = False
+        self.workspace_dir = tempfile.TemporaryDirectory()
         self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
         AgentAPIProxyHandler.external_key = "external-secret"
         AgentAPIProxyHandler.upstream_key = "internal-sentinel"
         AgentAPIProxyHandler.upstream_port = self.upstream.server_port
+        AgentAPIProxyHandler.workspace_root = self.workspace_dir.name
         self.proxy = ThreadingHTTPServer(("127.0.0.1", 0), AgentAPIProxyHandler)
         for server in (self.upstream, self.proxy):
             threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -161,6 +170,31 @@ class AgentAPIProxyTest(unittest.TestCase):
         self.upstream.shutdown()
         self.proxy.server_close()
         self.upstream.server_close()
+        self.workspace_dir.cleanup()
+
+    def _seed_state_db_sessions(self, rows, profile=None):
+        import sqlite3
+
+        base = Path(self.workspace_dir.name)
+        if profile:
+            base = base / "profiles" / profile
+            base.mkdir(parents=True, exist_ok=True)
+        db_path = base / "state.db"
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS sessions ("
+                "id TEXT PRIMARY KEY, "
+                "parent_session_id TEXT, "
+                "end_reason TEXT, "
+                "model_config TEXT"
+                ")"
+            )
+            for sid, parent_id, end_reason in rows:
+                conn.execute(
+                    "INSERT OR REPLACE INTO sessions (id, parent_session_id, end_reason) VALUES (?, ?, ?)",
+                    (sid, parent_id, end_reason),
+                )
+            conn.commit()
 
     def test_replaces_external_api_key_before_forwarding(self):
         request = urllib.request.Request(
@@ -180,6 +214,111 @@ class AgentAPIProxyTest(unittest.TestCase):
             urllib.request.urlopen(request)
         self.assertEqual(401, raised.exception.code)
         self.assertEqual("", self.received_authorization)
+
+    def test_refuses_bridge_a2a_session_paths_and_headers(self):
+        self._seed_state_db_sessions(
+            [
+                ("a2a-ctx-victim", None, "compression"),
+                ("20261022_120000_child1", "a2a-ctx-victim", "compression"),
+                ("20261022_120500_child2", "20261022_120000_child1", None),
+            ]
+        )
+        self._seed_state_db_sessions(
+            [
+                ("a2a-ctx-prof-victim", None, "compression"),
+                ("20261022_121000_profchild", "a2a-ctx-prof-victim", None),
+            ],
+            profile="chat",
+        )
+        for path, extra_headers, payload in (
+            ("/api/sessions/a2a-ctx-victim/chat", {}, b"{}"),
+            ("/api/sessions/a2a-ctx-victim/chat/stream", {}, b"{}"),
+            ("/api/sessions/a2a-ctx-victim", {}, b"{}"),
+            ("/api/sessions/%612a-ctx-victim/chat", {}, b"{}"),
+            ("/p/default/api/sessions/a2a-ctx-victim/chat", {}, b"{}"),
+            ("/v1/chat/completions", {"X-Hermes-Session-Id": "a2a-ctx-victim"}, b"{}"),
+            ("/v1/responses", {"X-Hermes-Session-Key": "a2a-ctx-victim"}, b"{}"),
+            (
+                "/v1/runs",
+                {"Content-Type": "application/json"},
+                b'{"session_id": "a2a-ctx-victim", "input": "hi"}',
+            ),
+            (
+                "/p/default/v1/runs",
+                {"Content-Type": "application/json"},
+                b'{"session_id": "%612a-ctx-victim", "input": "hi"}',
+            ),
+            (
+                "/api/sessions/20261022_120000_child1/chat",
+                {},
+                b"{}",
+            ),
+            (
+                "/api/sessions/20261022_120500_child2/chat/stream",
+                {},
+                b"{}",
+            ),
+            (
+                "/p/chat/api/sessions/20261022_121000_profchild/chat",
+                {},
+                b"{}",
+            ),
+            (
+                "/v1/chat/completions",
+                {"X-Hermes-Session-Id": "20261022_120500_child2"},
+                b"{}",
+            ),
+            (
+                "/v1/runs",
+                {"Content-Type": "application/json"},
+                b'{"session_id": "20261022_120500_child2", "input": "hi"}',
+            ),
+        ):
+            with self.subTest(path=path, headers=extra_headers, payload=payload):
+                self.received_authorization = ""
+                headers = {"Authorization": "Bearer external-secret", **extra_headers}
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{self.proxy.server_port}{path}",
+                    headers=headers,
+                    data=payload,
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(request)
+                self.assertEqual(403, raised.exception.code)
+                self.assertEqual("", self.received_authorization)
+
+    def test_allows_non_a2a_session_paths_and_headers(self):
+        self._seed_state_db_sessions(
+            [
+                ("sess-parent-123", None, "compression"),
+                ("20261022_120000_non_a2a_child", "sess-parent-123", None),
+            ]
+        )
+        for path, extra_headers, method, payload in (
+            ("/api/sessions?limit=1", {}, "GET", None),
+            ("/api/sessions/k8s-evt-123/chat", {}, "POST", b"{}"),
+            ("/api/sessions/20261022_120000_non_a2a_child/chat", {}, "POST", b"{}"),
+            ("/v1/chat/completions", {"X-Hermes-Session-Id": "sess-123"}, "POST", b"{}"),
+            (
+                "/v1/runs",
+                {"Content-Type": "application/json"},
+                "POST",
+                b'{"session_id": "20261022_120000_non_a2a_child", "input": "hi"}',
+            ),
+        ):
+            with self.subTest(path=path, headers=extra_headers):
+                self.received_authorization = ""
+                headers = {"Authorization": "Bearer external-secret", **extra_headers}
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{self.proxy.server_port}{path}",
+                    headers=headers,
+                    data=payload,
+                    method=method,
+                )
+                with urllib.request.urlopen(request) as response:
+                    self.assertEqual(b"proxied", response.read())
+                self.assertEqual("Bearer internal-sentinel", self.received_authorization)
 
     def test_rejection_reaches_a_client_that_sent_a_body(self):
         # Raw socket rather than urllib: the defect is at the transport, and a
@@ -5616,6 +5755,287 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertIn("exit code 9", logged)
 
 
+# The refusal stop the hint must never trip, loaded from its file: it ships in
+# the agent image, not beside this module.
+_REFUSAL_STOP_PATH = (
+    Path(__file__).resolve().parents[3] / "deploy" / "docker" / "patches" / "permission_refusal_stop.py"
+)
+# What kubectl prints for the reads below.
+_KUBECTL_NOT_FOUND_STDERR = 'Error from server (NotFound): namespaces "seeded-reliability" not found'
+_KUBECTL_NO_RESOURCES_STDERR = "No resources found in seeded-reliability namespace."
+_KUBECTL_EMPTY_JSON_LIST = '{"apiVersion": "v1", "items": [], "kind": "List", "metadata": {"resourceVersion": ""}}'
+_KUBECTL_FOUND_STDOUT = "NAME     READY   STATUS    RESTARTS   AGE\ncheckout-gateway-0   1/1   Running   0   3d\n"
+
+
+class ContextlessKubectlHostHintTest(unittest.TestCase):
+    """A context-less kubectl read that finds nothing says it read the host (#3375)."""
+
+    HOST = "gke_demo-project_us-central1_host-cluster"
+    OTHER = "gke_demo-project_us-central1-a_seeded-a"
+
+    def setUp(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.temp_dir = Path(temp_dir.name)
+        gke_endpoint.reset_cache()
+        self.addCleanup(gke_endpoint.reset_cache)
+
+    def executor(self, stdout="", stderr="", exit_code=0):
+        """An executor whose kubectl prints `stdout`/`stderr` and exits `exit_code`.
+
+        The pool is off, so no kubeconfig is regenerated; `host_context` is the
+        operator's name for the host, which is what the hint reads.
+        """
+        executor = CommandExecutor(
+            timeout_seconds=5,
+            max_output_bytes=4096,
+            state_dir=str(self.temp_dir / "state"),
+            scoped_pool=None,
+        )
+        executor.host_context = self.HOST
+        stub_dir = self.temp_dir / "bin"
+        stub_dir.mkdir(exist_ok=True)
+        (stub_dir / "stdout").write_text(stdout, encoding="utf-8")
+        (stub_dir / "stderr").write_text(stderr, encoding="utf-8")
+        stub = stub_dir / "kubectl"
+        stub.write_text(
+            f'#!/bin/bash\ncat "{stub_dir}/stdout"\ncat "{stub_dir}/stderr" >&2\nexit {exit_code}\n',
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        executor.executables["kubectl"] = str(stub)
+        return executor
+
+    def hint_named(self, cluster):
+        return credential_proxy.KUBECTL_HOST_HINT_PREFIX + credential_proxy.KUBECTL_HOST_HINT_NAMED.format(
+            cluster=cluster
+        )
+
+    def test_a_contextless_get_that_is_not_found_names_the_host_cluster(self):
+        executor = self.executor(stderr=_KUBECTL_NOT_FOUND_STDERR, exit_code=1)
+
+        result = executor.execute(["kubectl", "get", "namespace", "seeded-reliability"])
+
+        self.assertIn(self.HOST, result.stderr)
+        self.assertIn("--context <name>", result.stderr)
+        self.assertEqual(1, result.exit_code)
+        self.assertEqual("", result.stdout)
+        self.assertEqual(
+            f"{_KUBECTL_NOT_FOUND_STDERR}\n{self.hint_named(self.HOST)}\n", result.stderr
+        )
+
+    def test_a_contextless_list_with_no_resources_gets_the_line(self):
+        executor = self.executor(stderr=_KUBECTL_NO_RESOURCES_STDERR + "\n")
+
+        result = executor.execute(["kubectl", "get", "pods", "-n", "seeded-reliability"])
+
+        self.assertIn(self.HOST, result.stderr)
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual("", result.stdout)
+        self.assertTrue(result.stderr.startswith(_KUBECTL_NO_RESOURCES_STDERR + "\n"))
+        self.assertTrue(result.stderr.endswith(self.hint_named(self.HOST) + "\n"))
+
+    def test_a_contextless_empty_json_list_keeps_its_stdout_and_gets_the_line(self):
+        executor = self.executor(stdout=_KUBECTL_EMPTY_JSON_LIST)
+
+        result = executor.execute(["kubectl", "get", "pdb", "-A", "-o", "json"])
+
+        self.assertIn(self.HOST, result.stderr)
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual(_KUBECTL_EMPTY_JSON_LIST, result.stdout)
+        self.assertEqual(self.hint_named(self.HOST) + "\n", result.stderr)
+
+    def test_a_contextless_read_that_found_something_is_unchanged(self):
+        executor = self.executor(stdout=_KUBECTL_FOUND_STDOUT, stderr="Warning: something\n")
+
+        result = executor.execute(["kubectl", "get", "pods", "-n", "seeded-reliability"])
+
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual(_KUBECTL_FOUND_STDOUT, result.stdout)
+        self.assertEqual("Warning: something\n", result.stderr)
+
+    def test_a_non_empty_json_list_is_unchanged(self):
+        listed = json.dumps({"kind": "List", "items": [{"kind": "Pod"}]})
+        executor = self.executor(stdout=listed)
+
+        result = executor.execute(["kubectl", "get", "pods", "-o", "json"])
+
+        self.assertEqual(listed, result.stdout)
+        self.assertEqual("", result.stderr)
+
+    def test_a_read_with_context_that_is_not_found_is_unchanged(self):
+        for argv in (
+            ["kubectl", "--context", self.OTHER, "get", "namespace", "seeded-reliability"],
+            ["kubectl", f"--context={self.OTHER}", "get", "namespace", "seeded-reliability"],
+        ):
+            with self.subTest(argv=argv):
+                executor = self.executor(stderr=_KUBECTL_NOT_FOUND_STDERR, exit_code=1)
+                result = executor.execute(argv)
+                self.assertEqual(1, result.exit_code)
+                self.assertEqual(_KUBECTL_NOT_FOUND_STDERR, result.stderr)
+
+    def test_a_read_through_a_forwarded_kubeconfig_is_unchanged(self):
+        # The shim sends KUBECONFIG (or the shell's pin, or a GKE `--context`)
+        # as `kubeconfig_context`; that read named its cluster.
+        executor = self.executor(stderr=_KUBECTL_NOT_FOUND_STDERR, exit_code=1)
+
+        with mock.patch.object(executor, "_resolve_kubeconfig", return_value=None):
+            result = executor.execute(
+                ["kubectl", "get", "namespace", "seeded-reliability"], kubeconfig_context=self.OTHER
+            )
+
+        self.assertEqual(_KUBECTL_NOT_FOUND_STDERR, result.stderr)
+
+    def test_other_empty_list_shapes_get_the_line(self):
+        for stdout in (
+            "apiVersion: v1\nitems: []\nkind: List\nmetadata:\n  resourceVersion: \"\"\n",
+            "[]",
+        ):
+            with self.subTest(stdout=stdout):
+                executor = self.executor(stdout=stdout)
+                result = executor.execute(["kubectl", "get", "pods", "-o", "yaml"])
+                self.assertEqual(stdout, result.stdout)
+                self.assertEqual(self.hint_named(self.HOST) + "\n", result.stderr)
+
+    def test_an_object_with_an_empty_items_field_is_not_an_empty_list(self):
+        for stdout in (
+            json.dumps({"kind": "Widget", "items": []}),
+            "apiVersion: example.com/v1\nitems: []\nkind: Widget\n",
+        ):
+            with self.subTest(stdout=stdout):
+                executor = self.executor(stdout=stdout)
+                result = executor.execute(["kubectl", "get", "widget", "w", "-o", "yaml"])
+                self.assertEqual("", result.stderr)
+
+    def test_a_verb_that_is_not_a_lookup_is_unchanged(self):
+        # api-resources and version print nothing about objects on a cluster.
+        for argv in (
+            ["kubectl", "api-resources", "--api-group=nope"],
+            ["kubectl", "auth", "can-i", "get", "pods"],
+        ):
+            with self.subTest(argv=argv):
+                executor = self.executor()
+                result = executor.execute(argv)
+                self.assertEqual("", result.stderr)
+
+    def test_a_cut_or_timed_out_result_is_unchanged(self):
+        executor = self.executor(stderr=_KUBECTL_NOT_FOUND_STDERR, exit_code=1)
+        for field in ("truncated", "timed_out", "abandoned"):
+            with self.subTest(field=field):
+                came = credential_proxy.ExecutionResult(
+                    exit_code=1, stdout="", stderr=_KUBECTL_NOT_FOUND_STDERR,
+                    duration_ms=1, truncated=False, timed_out=False,
+                )
+                came = replace(came, **{field: True})
+                self.assertIs(came, executor._with_host_hint(["kubectl", "get", "ns", "x"], came))
+
+    def test_an_empty_context_value_names_no_cluster(self):
+        # `--context "$CTX"` with CTX unset: kubectl reads current-context, the host.
+        for argv in (
+            ["kubectl", "--context=", "get", "namespace", "seeded-reliability"],
+            ["kubectl", "--context", "", "get", "namespace", "seeded-reliability"],
+        ):
+            with self.subTest(argv=argv):
+                executor = self.executor(stderr=_KUBECTL_NOT_FOUND_STDERR, exit_code=1)
+                result = executor.execute(argv)
+                self.assertIn(self.hint_named(self.HOST), result.stderr)
+                self.assertEqual(1, result.exit_code)
+
+    def test_a_found_object_whose_kind_ends_in_list_is_not_an_empty_answer(self):
+        # A CRD kind like AllowList with a top-level `items` field of its own.
+        for stdout in (
+            json.dumps({"apiVersion": "example.com/v1", "kind": "AllowList", "items": []}),
+            "apiVersion: example.com/v1\nitems: []\nkind: AllowList\n",
+        ):
+            with self.subTest(stdout=stdout):
+                executor = self.executor(stdout=stdout)
+                result = executor.execute(["kubectl", "get", "allowlist", "default-allow", "-o", "json"])
+                self.assertEqual(stdout, result.stdout)
+                self.assertEqual("", result.stderr)
+
+    def test_a_header_only_custom_columns_read_gets_the_line(self):
+        for flag in (
+            ["-o", "custom-columns=NAME:.metadata.name"],
+            ["-ocustom-columns=NAME:.metadata.name"],
+            ["--output=custom-columns=NAME:.metadata.name"],
+        ):
+            with self.subTest(flag=flag):
+                executor = self.executor(stdout="NAME\n")
+                result = executor.execute(["kubectl", "get", "pods", "-n", "seeded-reliability", *flag])
+                self.assertEqual("NAME\n", result.stdout)
+                self.assertEqual(self.hint_named(self.HOST) + "\n", result.stderr)
+
+    def test_a_custom_columns_read_with_rows_or_a_plain_one_line_read_is_unchanged(self):
+        for argv, stdout in (
+            (["kubectl", "get", "pods", "-o", "custom-columns=NAME:.metadata.name"], "NAME\ncheckout-0\n"),
+            (["kubectl", "get", "pod", "checkout-0", "-o", "name"], "pod/checkout-0\n"),
+        ):
+            with self.subTest(argv=argv):
+                executor = self.executor(stdout=stdout)
+                result = executor.execute(argv)
+                self.assertEqual("", result.stderr)
+
+    def test_a_no_headers_custom_columns_read_with_one_row_is_unchanged(self):
+        # --no-headers drops the header, so one line is a found row (lapis2002 on #3557).
+        for no_headers in (["--no-headers"], ["--no-headers=true"]):
+            with self.subTest(no_headers=no_headers):
+                stdout = "v1.35.8-gke.1\n"
+                executor = self.executor(stdout=stdout)
+                result = executor.execute(
+                    ["kubectl", "get", "node", "x", "-o", "custom-columns=V:.status.nodeInfo.kubeletVersion", *no_headers]
+                )
+                self.assertEqual(stdout, result.stdout)
+                self.assertEqual("", result.stderr)
+
+    def test_a_no_headers_false_custom_columns_read_still_reads_a_lone_header(self):
+        executor = self.executor(stdout="NAME\n")
+        result = executor.execute(
+            ["kubectl", "get", "pods", "-o", "custom-columns=NAME:.metadata.name", "--no-headers=false"]
+        )
+        self.assertEqual(self.hint_named(self.HOST) + "\n", result.stderr)
+
+    def test_a_failure_that_is_not_not_found_is_unchanged(self):
+        stderr = 'error: the server doesn\'t have a resource type "pdbx"'
+        executor = self.executor(stderr=stderr, exit_code=1)
+
+        result = executor.execute(["kubectl", "get", "pdbx"])
+
+        self.assertEqual(stderr, result.stderr)
+
+    def test_without_a_host_name_the_line_still_says_where_it_read(self):
+        executor = self.executor(stderr=_KUBECTL_NOT_FOUND_STDERR, exit_code=1)
+        executor.host_context = ""
+
+        result = executor.execute(["kubectl", "describe", "namespace", "seeded-reliability"])
+
+        self.assertIn(
+            credential_proxy.KUBECTL_HOST_HINT_PREFIX + credential_proxy.KUBECTL_HOST_HINT_UNNAMED,
+            result.stderr,
+        )
+
+    def test_the_line_is_never_read_as_a_refusal_or_a_halt(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("permission_refusal_stop", _REFUSAL_STOP_PATH)
+        stop = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(stop)
+        command = {"command": "kubectl get namespace seeded-reliability"}
+        for hint in (self.hint_named(self.HOST), credential_proxy.KUBECTL_HOST_HINT_PREFIX
+                     + credential_proxy.KUBECTL_HOST_HINT_UNNAMED):
+            for text in (hint, f"{_KUBECTL_NOT_FOUND_STDERR}\n{hint}\n",
+                         json.dumps({"output": f"{_KUBECTL_NOT_FOUND_STDERR}\n{hint}\n", "exit_code": 1})):
+                with self.subTest(text=text):
+                    for failed in (True, False):
+                        self.assertIsNone(stop.classify_refusal(command, text, failed=failed))
+                    self.assertIsNone(stop.definitive_block(text))
+                    for pattern in (stop._POLICY_ACTION_RE, stop._RULE_LINE_RE, stop._VERB_LINE_RE,
+                                    stop._RENDER_LINE_RE, stop._API_DENIED_RE):
+                        self.assertIsNone(pattern.search(text), pattern.pattern)
+            # Nor in the proxy's own refusal vocabulary.
+            for word in ("refus", "denied", "forbidden", "not permitted", "blocked"):
+                self.assertNotIn(word, hint.lower())
+
+
 class GkeContextTest(unittest.TestCase):
     """`parse_gke_context` is the whole trust boundary for kubeconfig content.
 
@@ -9689,6 +10109,7 @@ class ContentWorkspaceOnGitLabTest(unittest.TestCase):
     a store recording every git call it makes."""
 
     TOKEN = "glpat-SENTINEL-must-never-appear"
+    READ_TOKEN = "glpat-READ-SENTINEL-must-never-appear"
 
     def setUp(self):
         import content_workspace
@@ -9733,6 +10154,33 @@ class ContentWorkspaceOnGitLabTest(unittest.TestCase):
     def _config_of(self, subcommand):
         return [config for argv, config in self.calls if argv[1] == subcommand]
 
+    def _forges_with_read_token(self):
+        """The forges file the operator renders when the forge has credentialsRef:
+        `readTokenPath` set, and the file there only if the Secret has the key."""
+        path = self.base / "forges-read.json"
+        path.write_text(json.dumps({"forges": [
+            {"provider": "github", "host": "github.com"},
+            {"provider": "gitlab", "host": "gitlab.com", "tokenPath": str(self.base / "token"),
+             "readTokenPath": str(self.base / "read-token"), "allowedPaths": ["acme"]},
+        ]}))
+        return path
+
+    def _with_read_token_path(self):
+        with mock.patch.dict(os.environ, {"VCS_FORGES_CONFIG": str(self._forges_with_read_token())}):
+            self.registry = credential_proxy.providers.Registry()
+        patcher = mock.patch.object(credential_proxy, "forge_registry", return_value=self.registry)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _store_read_token(self):
+        read = self.base / "read-token"
+        read.write_text(self.READ_TOKEN)
+        return str(read)
+
+    def _helper_file(self, config):
+        """The token file the forge's git helper reads, from one git call's config."""
+        return dict(config)["credential.https://gitlab.com.helper"].split()[1]
+
     def _commit(self, handle):
         self.store.commit(
             handle, "platform-agent/change", "feat: a change",
@@ -9755,6 +10203,87 @@ class ContentWorkspaceOnGitLabTest(unittest.TestCase):
         self.assertEqual([()], self._config_of("clone"))
         self.assertIsInstance(workspace.credential, credential_proxy.providers.NoCredential)
         self.assertIn("presents none", "\n".join(logs.output))
+        # This forges file names no readTokenPath, so the warning blames the
+        # operator that rendered it, not the Secret.
+        self.assertIn("names no readTokenPath", "\n".join(logs.output))
+
+    def test_a_context_gitlab_repository_clones_with_the_stored_read_token(self):
+        self._with_read_token_path()
+        read = self._store_read_token()
+        with self.assertNoLogs(credential_proxy.LOGGER, level="WARNING"):
+            workspace = self.store.open("gitlab.com/acme/notes")
+        [config] = self._config_of("clone")
+        self.assertEqual("", dict(config)["credential.helper"])
+        self.assertEqual(read, self._helper_file(config))
+        self.assertTrue(workspace.credential.stored_token)
+        dumped = json.dumps(self.calls)
+        self.assertNotIn(self.READ_TOKEN, dumped)
+        self.assertNotIn(self.TOKEN, dumped)
+
+    def test_a_secret_without_the_read_token_key_clones_a_context_repository_with_none(self):
+        # The path is configured, but the Secret lacks the key, so the
+        # operator's optional projection mounts no file: today's behaviour.
+        self._with_read_token_path()
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            workspace = self.store.open("gitlab.com/acme/notes")
+        self.assertEqual([()], self._config_of("clone"))
+        self.assertIsInstance(workspace.credential, credential_proxy.providers.NoCredential)
+        self.assertIn("presents none", "\n".join(logs.output))
+        self.assertIn(credential_proxy.FORGE_READ_TOKEN_KEY, "\n".join(logs.output))
+        # A key added later is presented on the next open, with no restart.
+        read = self._store_read_token()
+        self.calls.clear()
+        self.store.open("gitlab.com/acme/notes")
+        self.assertEqual(read, self._helper_file(self._config_of("clone")[0]))
+
+    def test_the_read_token_never_reaches_a_write_route(self):
+        self._with_read_token_path()
+        read = self._store_read_token()
+        token = str(self.base / "token")
+        # The content workspace: a managed repository's clone, fetch and push
+        # present the write token's helper, never the read token's.
+        managed = self.store.open("gitlab.com/acme/infra")
+        self._commit(managed.handle)
+        self.store.push(managed.handle, "platform-agent/change")
+        for subcommand in ("clone", "fetch", "push"):
+            with self.subTest(subcommand=subcommand):
+                configs = self._config_of(subcommand)
+                self.assertTrue(configs)
+                for config in configs:
+                    self.assertEqual(token, self._helper_file(config))
+        # A context repository clones with the read token and is never
+        # pushable: the write gate refuses it before any push.
+        context = self.store.open("gitlab.com/acme/notes")
+        self.assertEqual(read, self._helper_file(self._config_of("clone")[-1]))
+        with self.assertRaises(self.cw.RepositoryNotManaged):
+            credential_proxy.require_managed_workspace(self.store, context.handle)
+        # The API routes and `/v1/vcs/publish`: the broker's transport and git
+        # runner present `forge.credential`, the write token.
+        git_configs = []
+        with mock.patch.dict(os.environ, {"VCS_FORGES_CONFIG": str(self._forges_with_read_token())}):
+            broker = vcs_broker.VcsBroker(
+                self.base / "vcs",
+                git_runner=lambda argv, cwd, check=True, config=(): git_configs.append(config),
+            )
+        forge, repo = broker.registry.resolve("gitlab.com/acme/infra")
+        self.assertEqual({"PRIVATE-TOKEN": self.TOKEN}, broker._transport(forge, repo)._headers())
+        broker._git_for(forge, repo)(self.base, "push")
+        self.assertEqual(token, self._helper_file(git_configs[0]))
+        # `/v1/forge/refresh` has nothing to make current for a stored token,
+        # read-only or not, and presents neither.
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.max_request_bytes = 1 << 20
+        body = json.dumps({"provider": "gitlab", "repository": "https://gitlab.com/acme/infra"}).encode()
+        handler.headers = {"Content-Length": str(len(body))}
+        handler.rfile = io.BytesIO(body)
+        handler.executor = types.SimpleNamespace(
+            refresh_forge_credential=lambda *a: self.fail("no refresh for a stored token")
+        )
+        replies = []
+        handler._json = lambda status, payload: replies.append((status, payload))
+        handler._handle_forge_refresh()
+        self.assertEqual([(HTTPStatus.OK, {"status": "nothing to refresh", "forge": "gitlab"})], replies)
+        self.assertNotIn(self.READ_TOKEN, json.dumps(self.calls + replies))
 
     def test_a_path_outside_allowed_paths_is_refused_at_open_and_at_the_gate(self):
         with self.assertRaises(self.cw.ContentWorkspaceError):
@@ -14127,6 +14656,117 @@ class ApiRelayQueryStrippingTest(unittest.TestCase):
             "keyed=1&my_access_token=2&oauth_token_x=3",
             credential_proxy.strip_credential_query_keys("keyed=1&my_access_token=2&oauth_token_x=3"),
         )
+
+
+class FeedbackRouteTest(_ExecRouteServer):
+    """`POST /v1/feedback/submit`: the sandbox's one way to file a kube-agents report.
+
+    The verb lives on the broker because the shell sandbox's NetworkPolicy
+    reaches DNS and the broker only; feedback_broker.py owns the wire path and
+    test_feedback_broker.py its behaviour. These tests hold the route: who may
+    call it, how a refusal and an answer travel, and that a malformed body is a
+    400 rather than a traceback.
+    """
+
+    GOOD_PAYLOAD = {
+        "title": "credential proxy dies silently",
+        "kind": "Bug",
+        "happened": "the sidecar crash-loops and nothing surfaces it",
+        "user_confirmed": True,
+    }
+
+    def post_as(self, role, body, raw=False):
+        principal = credential_proxy.Principal(
+            workload="system:serviceaccount:ns:platform-agent-shell", uid="u", groups=(), role=role
+        )
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.server.server_port}{feedback_broker.ROUTE}",
+            data=body if raw else json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        # The authenticator rather than _authenticated: the route-role gate
+        # (403) runs inside _authenticated, and this class tests that gate.
+        authenticator = mock.Mock()
+        authenticator.authenticate.return_value = principal
+        with mock.patch.object(CredentialProxyHandler, "authenticator", authenticator):
+            try:
+                with urllib.request.urlopen(request) as response:
+                    return response.status, json.loads(response.read())
+            except urllib.error.HTTPError as error:
+                with error:
+                    return error.code, json.loads(error.read())
+
+    def test_only_the_shell_role_reaches_the_route(self):
+        with mock.patch.object(feedback_broker, "submit") as submit:
+            for role in (credential_proxy.CALLER_ROLE_SESSION, credential_proxy.CALLER_ROLE_CHAT):
+                status, _ = self.post_as(role, self.GOOD_PAYLOAD)
+                self.assertEqual(status, 403, role)
+            submit.assert_not_called()
+
+    def test_a_blocked_payload_is_400_with_the_reason_and_links(self):
+        status, body = self.post_as(
+            credential_proxy.CALLER_ROLE_SHELL, {**self.GOOD_PAYLOAD, "user_confirmed": False}
+        )
+        self.assertEqual((status, body["status"]), (400, "BLOCKED"))
+        self.assertIn("user_confirmed", body["reason"])
+        self.assertEqual(body["fallback"]["form"], feedback_broker.SHORT_LINK)
+
+    def test_a_submission_answers_200_with_the_brokers_object(self):
+        answer = {
+            "status": "SUBMITTED",
+            "issue_url": "https://github.com/gke-labs/kube-agents/issues/1",
+            "fallback": feedback_broker.FALLBACK,
+        }
+        with mock.patch.object(feedback_broker, "submit", return_value=answer) as submit:
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, self.GOOD_PAYLOAD)
+        self.assertEqual((status, body), (200, answer))
+        self.assertEqual(submit.call_args.args[0]["title"], self.GOOD_PAYLOAD["title"])
+
+    def test_an_unreachable_form_is_400_blocked_not_a_traceback(self):
+        with mock.patch.object(
+            feedback_broker, "submit", side_effect=feedback_broker.Blocked("could not reach the feedback form (x)")
+        ):
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, self.GOOD_PAYLOAD)
+        self.assertEqual((status, body["status"]), (400, "BLOCKED"))
+        self.assertIn("could not reach", body["reason"])
+
+    def test_a_full_broker_answers_503_busy_not_a_dropped_connection(self):
+        busy = credential_proxy.CommandSlotUnavailable("every slot is taken")
+        with mock.patch.object(CredentialProxyHandler, "_request_slot", side_effect=busy):
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, self.GOOD_PAYLOAD)
+        self.assertEqual(status, 503)
+        self.assertIn("error", body)
+
+    def test_an_unexpected_broker_error_is_400_blocked(self):
+        with mock.patch.object(feedback_broker, "submit", side_effect=IndexError("list index out of range")):
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, self.GOOD_PAYLOAD)
+        self.assertEqual((status, body["status"]), (400, "BLOCKED"))
+        self.assertEqual(body["fallback"], feedback_broker.FALLBACK)
+
+    def test_the_title_is_redacted_before_it_is_logged(self):
+        token = "ghp_" + "a" * 36
+        payload = {**self.GOOD_PAYLOAD, "title": token + " leaked in the relay log"}
+        with self.assertLogs("credential-proxy", level="INFO") as logs:
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, payload)
+        self.assertEqual((status, body["status"]), (400, "BLOCKED"))
+        self.assertFalse(any(token in line for line in logs.output), "the token reached the log")
+        self.assertTrue(any("feedback submit" in line for line in logs.output))
+
+    def test_a_refusal_reason_is_redacted_before_it_is_logged(self):
+        token = "ghp_" + "b" * 36
+        payload = {**self.GOOD_PAYLOAD, "kind": token}
+        with self.assertLogs("credential-proxy", level="INFO") as logs:
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, payload)
+        self.assertEqual((status, body["status"]), (400, "BLOCKED"))
+        self.assertFalse(any(token in line for line in logs.output), "the token reached the log")
+        self.assertNotIn(token, body["reason"])
+
+    def test_a_non_json_body_is_400(self):
+        status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, b"not json", raw=True)
+        self.assertEqual(status, 400)
+        self.assertIn("error", body)
+
 
 
 if __name__ == "__main__":

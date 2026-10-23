@@ -277,7 +277,8 @@ SITE_CONVENTION_PAGES = frozenset({"404.md"})
 # Uniform families a reader reaches by browsing the directory and that no page
 # links member by member: the agents' runtime material (personas, SOPs, skills
 # and their references, the onboarding templates), the upstream skill copies
-# under third_party/google-skills/, the GitOps template's
+# under third_party/google-skills/, the persona format's test fixture and
+# adapter goldens under a2a/lib/persona/, the GitOps template's
 # per-directory documents, and the integrity sweep's report and adjudication
 # written beside each committed run record under a bench task's `evidence/`,
 # named file by file so a note of another kind there still owes a link. `*`
@@ -287,12 +288,18 @@ SITE_CONVENTION_PAGES = frozenset({"404.md"})
 # document in one of these directories needs no link; a new family needs a line
 # here, argued in the pull request.
 LINK_EXEMPT_FAMILY_GLOBS = (
+    # Persona fixtures and adapter goldens: test inputs and outputs a test reads, named
+    # as a harness names them (CLAUDE.md, SKILL.md); a reader reaches the package README.
+    "a2a/lib/persona/testdata/example/**",
+    "a2a/lib/persona/claudecode/testdata/golden/**",
     "agents/chat/defaults/onboarding/*.md",
     "agents/cluster/*.md",
     "agents/cluster/skills/*/SKILL.md",
     "agents/platform/governance/*.md",
     "agents/platform/skills/*/SKILL.md",
     "agents/platform/skills/*/references/*.md",
+    "agents/tse/*.md",
+    "agents/tse/skills/*/SKILL.md",
     "bench/tasks/*/evidence/*/integrity-sweep-adjudication.md",
     "bench/tasks/*/evidence/*/integrity-sweep.md",
     "examples/gitops-repo/*/**",

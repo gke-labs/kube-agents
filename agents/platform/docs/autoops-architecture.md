@@ -53,7 +53,7 @@ flowchart TB
     DRIFT -->|change + attribution| DDET
     CAP -->|alert| PSUB
 
-    WATCH -->|inject · kind: k8s-event| SESS
+    WATCH -->|inject · kind: k8s-event, later k8s-event-followup| SESS
     DDET -->|inject · kind: gitops-drift| SESS
     PSUB -->|inject · kind: capacity| SESS
     STALLW -->|inject · kind: controller-stall| SESS
@@ -147,8 +147,10 @@ a different constant rather than a different path.
 The Go event watcher marshals an `InjectPayload`, wraps it as `{"message": "<escaped JSON>"}`, and
 `POST`s it to `/sessions/{id}/inject` (`k8s-operator/cmd/k8s-event-watcher/injector.go`). The watcher
 sends **no prompt** — it sends facts. Noise control lives here too: namespace allow/deny rules, a
-flapping guard, and a 24h dedup window keyed on `EventKey{UID, Reason}`, so a crashlooping pod is one
-incident rather than forty.
+flapping guard, a two-minute settle period for the crash-loop family (a back-off that clears sooner
+is not forwarded), and a 24h dedup window keyed on `EventKey{UID, Reason}`, so a crashlooping pod
+is one incident rather than forty. Once an alerted object has been quiet for fifteen minutes the
+watcher sends a `k8s-event-followup` on the same session, which lands in the alert's thread.
 
 **A new domain supplies:** an adapter that detects its signal, filters its own noise, and emits the
 inject envelope with its own `kind`.
@@ -185,7 +187,7 @@ same session instead of starting a new one.
 
 This is what makes follow-up work: an engineer replies _"apply Option B"_ hours later, and the agent still
 knows what Option B was. Three paths write it: the cron report relay, in-process; `send_notification`, when
-a Platform Agent posts into a thread; and the kanban notifier, when it delivers a card whose result carries
+the session row names a thread, whether or not the report was posted into it; and the kanban notifier, when it delivers a card whose result carries
 a fix a reply could authorise into one. Only the last of those is on the event-triage path, and it is the only one
 that gates on the report's shape rather than on where the write came from — the notifier cannot tell an
 event-triage card from an ordinary one by the time it runs, so the artifact is the test.
@@ -241,6 +243,11 @@ Analyze the following Kubernetes event warning on GKE cluster '{cluster}'.
 • *Resource:* {namespace}/{kind}/{name}
 • *Event Reason:* {reason}
 • *Warning Message:* {message}
+• *Last seen by the watcher:* {HH:MM UTC}
+
+**Read the object's current state before you conclude anything.** ... open the 'What's wrong'
+sentence with `State at HH:MM UTC:` where HH:MM is the time of that read ... **If the object has
+recovered** ... make 'What to do' the single bullet '**No action needed:** ... has recovered'.
 
 **Finish by calling `kanban_complete(result=<your full report>, summary=<one line>)`.**
 Pass the entire report as `result`, not a summary of it: this card is subscribed to the chat
@@ -253,7 +260,7 @@ Format the report you pass to `kanban_complete`'s `result` exactly like this —
 `##` sections are the only ones, and there is no fourth:
 
 ## What's wrong
-<1-sentence description of the problem>
+State at <HH:MM> UTC: <1-sentence description of the problem>
 
 ## Why
 - <key constraint mismatch or log finding, with the evidence that proves it>
@@ -271,6 +278,9 @@ lettered label asks the reader to pick from a list of one — so that `What to d
 ## What to do
 - **Proposed fix (<Action Title>):** <1-sentence GitOps fix>
 - **To authorize:** reply **'apply'** to open a GitOps Pull Request with this fix.
+
+The prompt also says that when no manifest change is warranted and nothing is left for anyone to do,
+`What to do` is one `No action needed:` bullet with no option and no call to action.
 
 **Who acts on this:**
 A human reads your options and the agent that holds the GitOps write path opens the Pull
@@ -309,7 +319,9 @@ written to the live cluster directly.
   option, because it sits in the same list as Option A and Option B and gets numbered alongside them
   otherwise. The bullet carries a second job on the single-option shape: with no lettered option
   under the heading, it is what `kanban_notifier.actionable_report` recognises a report by, so
-  reword it and those reports stop earning the row they invite a reply to.
+  reword it and those reports stop earning the row they invite a reply to. A report with no
+  manifest change to propose carries no bullet and so earns no row, by design: there is nothing to
+  apply.
 - **The write boundary** — the fix ships as a Pull Request; nothing is written to the live cluster. The
   triaging agent does not open that PR itself — the reply arrives as chat ingress on the front door, and
   the agent holding the GitOps write path acts on it — which is why the prompt asks for options named
@@ -321,7 +333,7 @@ diagnostic procedure — e.g. `gke-workload-troubleshooting` walks pod status �
 container logs → service and NetworkPolicy checks → propose a GitOps correction. The persona that runs
 the triage requires the agent to query the catalog and load the matching domain skill before diagnosing
 (Cluster Agent `SOUL.md` §3) and to pass a pre-report self-audit demanding quoted command output,
-resource names, and UTC timestamps (§4). The communication policy on the result — the three-part layout
+resource names, and only the timestamps a command printed (§4). The communication policy on the result — the three-part layout
 and a jargon translation table (`OOMKilled` → "the application ran out of allocated memory") — is
 Platform Agent `SOUL.md` §7, which the prompt template above mirrors.
 
@@ -381,7 +393,7 @@ than a live write, a new domain inherits reviewability and rollback for free.
 The GKE-events path is live end to end:
 
 - **Detection** — `k8s-event-watcher` streams warning events in real time, with namespace deny/allow
-  rules and a flapping guard. The deployed watcher forwards eight reasons, which
+  rules, a flapping guard and a settle period. The deployed watcher forwards eight reasons, which
   `deploy/shared/start-services.sh` passes as `--reason` and no environment variable overrides:
   `Failed`, `FailedToDrainNode`, `CrashLoopBackOff`, `BackOff`, `ImagePullBackOff`, `ErrImagePull`,
   `OOMKilled`, `FailedScheduling`. The same list admits two more, cluster-autoscaler's

@@ -155,6 +155,21 @@ def _node(*, ready: str = "True", taint: str | None = "idle-batch") -> dict:
     return node
 
 
+def _pool_node(name: str, *, allocatable: str = "1930m") -> dict:
+    return {"metadata": {"name": name}, "status": {"allocatable": {"cpu": allocatable}, "conditions": [{"type": "Ready", "status": "True"}]}}
+
+
+def _bound_pod(node: str | None, cpu: str, *, phase: str = "Running", init_cpu: str | None = None) -> dict:
+    """A pod the scheduler has placed (or, with node None, has not), with one
+    container requesting ``cpu`` and optionally one init container."""
+    spec: dict = {"containers": [{"resources": {"requests": {"cpu": cpu}}}]}
+    if node:
+        spec["nodeName"] = node
+    if init_cpu:
+        spec["initContainers"] = [{"resources": {"requests": {"cpu": init_cpu}}}]
+    return {"spec": spec, "status": {"phase": phase}}
+
+
 def _writer_job(*, failed: bool = False, counter: int | None = None) -> dict:
     """A retained writer Job. ``failed`` sets the Failed condition; ``counter`` is the
     pod-failure counter, which a Job whose pod was never admitted leaves absent."""
@@ -222,6 +237,7 @@ def _healthy_world() -> dict:
             "deployment/token-sidecar": {"status": {"readyReplicas": 1, "replicas": 1}},
             "serviceaccount/default": {"automountServiceAccountToken": True},
             "deployment/burst-ingest": {"status": {"readyReplicas": 2, "replicas": 2}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "128Mi"}}}]}}}},
+            "deployment/ledger-writer": {"status": {"readyReplicas": 2, "replicas": 2}, "spec": {"template": {"spec": {"containers": [{"resources": {"requests": {"cpu": "10m", "memory": "32Mi"}, "limits": {"cpu": "10m", "memory": "32Mi"}}}]}}}},
             "poddisruptionbudget?": {"items": []},
             "networkpolicy?": {"items": []},
             "deployment/inference-server": {"status": {"readyReplicas": 1, "replicas": 3}},
@@ -233,6 +249,15 @@ def _healthy_world() -> dict:
                 "subjects": [{"kind": "ServiceAccount", "name": "default", "namespace": "seeded-security"}],
             },
             "node?cloud.google.com/gke-nodepool=idle-batch-pool": {"items": [_node()]},
+            "node?cloud.google.com/gke-nodepool=default-pool": {"items": [_pool_node("gke-seeded-a-default-pool-0r0x"), _pool_node("gke-seeded-a-default-pool-z7br")]},
+            # Every namespace's pods, as `kubectl get pod -A` answers: GKE's set
+            # on both nodes, a fixture on each, a finished Job pod and an
+            # unbound Pending pod that count for nothing.
+            "pod?": _pods(
+                _bound_pod("gke-seeded-a-default-pool-0r0x", "270m"), _bound_pod("gke-seeded-a-default-pool-0r0x", "100m"), _bound_pod("gke-seeded-a-default-pool-0r0x", "10m"),
+                _bound_pod("gke-seeded-a-default-pool-z7br", "270m"), _bound_pod("gke-seeded-a-default-pool-z7br", "100m"), _bound_pod("gke-seeded-a-default-pool-z7br", "10m", init_cpu="300m"),
+                _bound_pod("gke-seeded-a-default-pool-z7br", "500m", phase="Succeeded"), _bound_pod(None, "10m", phase="Pending"),
+            ),
             "deployment/inventory-api": {
                 "status": {
                     "conditions": [
@@ -481,6 +506,10 @@ class CatalogTest(unittest.TestCase):
             {"subject": "pod?app=x", "path": "a", "op": "minor_behind_channel_default", "value": 1},
             {"subject": "pod; rm -rf /", "path": "a", "op": "eq", "value": 1},
             {"subject": "cluster", "path": 7, "op": "eq", "value": 1},
+            # node_cpu_spare_ge reads node objects and the pods bound to them: a node selector, no path.
+            {"subject": "deployment/x", "op": "node_cpu_spare_ge", "value": 100},
+            {"subject": "node?cloud.google.com/gke-nodepool=default-pool", "path": "status", "op": "node_cpu_spare_ge", "value": 100},
+            {"subject": "node?cloud.google.com/gke-nodepool=default-pool", "op": "node_cpu_spare_ge"},
         ]
         with tempfile.TemporaryDirectory() as tmp:
             for entry in cases:
@@ -543,6 +572,48 @@ class EvaluateTest(unittest.TestCase):
         problem = ffs.evaluate(entry, [unchannelled], channel_default=lookup)
         assert problem is not None and "channel unset" in problem
 
+    def test_node_cpu_spare_ge_sums_what_is_bound_to_each_node(self):
+        entry = self._entry("node_cpu_spare_ge", 100, path=None, subject="node?cloud.google.com/gke-nodepool=default-pool")
+        nodes = [_pool_node("n1"), _pool_node("n2", allocatable="940m")]
+        pods = {
+            # n1: 1930 - (270 + max(10, 300)) = 1360; the Succeeded pod holds nothing.
+            "n1": [_bound_pod("n1", "270m"), _bound_pod("n1", "500m", phase="Succeeded"), _bound_pod("n1", "10m", init_cpu="300m")],
+            # n2: 940 - (800 + 100) = 40, below the margin.
+            "n2": [_bound_pod("n2", "800m"), _bound_pod("n2", "0.1")],
+        }
+        problem = ffs.evaluate(entry, nodes, pods_by_node=lambda: pods)
+        assert problem is not None and '"n2": 40' in problem and '"n1": 1360' in problem, problem
+        assert ffs.evaluate(entry, nodes[:1], pods_by_node=lambda: pods) is None
+        # No node matched is no headroom, not a vacuous pass.
+        assert ffs.evaluate(entry, [], pods_by_node=lambda: pods) is not None
+
+    def test_node_cpu_spare_ge_counts_a_pod_the_way_the_scheduler_does(self):
+        entry = self._entry("node_cpu_spare_ge", 100, path=None, subject="node?cloud.google.com/gke-nodepool=default-pool")
+        node = _pool_node("n1", allocatable="600m")
+        sidecar = {"spec": {"nodeName": "n1", "containers": [{"resources": {"requests": {"cpu": "100m"}}}], "initContainers": [{"restartPolicy": "Always", "resources": {"requests": {"cpu": "50m"}}}, {"resources": {"requests": {"cpu": "120m"}}}]}, "status": {"phase": "Running"}}
+        # containers 100 + sidecar 50 = 150; the ordinary init peaks at 120 + the sidecar started before it = 170; so 170.
+        assert ffs._pod_cpu_request(sidecar) == 170
+        overhead = {"spec": {"nodeName": "n1", "overhead": {"cpu": "250m"}, "containers": [{"resources": {"requests": {"cpu": "100m"}}}]}, "status": {"phase": "Running"}}
+        assert ffs._pod_cpu_request(overhead) == 350
+        # 600 - (170 + 350) = 80, under the margin only because sidecar and overhead are counted.
+        problem = ffs.evaluate(entry, [node], pods_by_node=lambda: {"n1": [sidecar, overhead]})
+        assert problem is not None and '"n1": 80' in problem, problem
+
+    def test_a_cpu_quantity_that_is_not_finite_counts_as_nothing_rather_than_crashing(self):
+        # float() admits "inf", "Infinity", "NaN" and "1e400"; the API server never serialises them,
+        # but a value that is not a quantity must not take the whole pass down with an OverflowError.
+        for bad in ("inf", "Infinity", "NaN", "1e400", "-inf"):
+            assert ffs._millicores(bad) == 0.0, bad
+        entry = self._entry("node_cpu_spare_ge", 100, path=None, subject="node?cloud.google.com/gke-nodepool=default-pool")
+        node = {"metadata": {"name": "n1"}, "status": {"allocatable": {"cpu": "inf"}}}
+        assert ffs.evaluate(entry, [node], pods_by_node=lambda: {"n1": [_bound_pod("n1", "1e400")]}) is not None
+
+    def test_a_node_still_registering_leaves_the_role_not_checked(self):
+        entry = self._entry("node_cpu_spare_ge", 100, path=None, subject="node?cloud.google.com/gke-nodepool=default-pool")
+        fresh = {"metadata": {"name": "surge"}, "status": {}}
+        with self.assertRaises(ffs.Unreadable):
+            ffs.evaluate(entry, [_pool_node("n1"), fresh], pods_by_node=lambda: {})
+
     def test_a_failure_says_what_was_observed(self):
         problem = ffs.evaluate(self._entry("eq", 2, path="status.readyReplicas"), [{"status": {"readyReplicas": 0}}])
         assert problem == "deployment/x status.readyReplicas eq 2: observed 0"
@@ -575,7 +646,7 @@ class PassTest(_Harness):
     def test_a_healthy_fleet_converges_on_the_first_pass(self):
         done = self.run_script(_healthy_world())
         assert done.returncode == 0, done.stderr
-        assert "Seeded-fleet fixture state: 30 role(s) in their designed state, 0 drifted, 0 not checked (project kube-agents-evals)" in done.stderr
+        assert "Seeded-fleet fixture state: 32 role(s) in their designed state, 0 drifted, 0 not checked (project kube-agents-evals)" in done.stderr
         assert self.drift_files() == {}
         assert "WARNING" not in done.stderr
         # One read per distinct subject, and the channel default once.
@@ -605,7 +676,7 @@ class PassTest(_Harness):
         ]
         done = self.run_script(world, "--wait", "20", "--interval", "0.1")
         assert done.returncode == 0, done.stderr
-        assert "30 role(s) in their designed state, 0 drifted" in done.stderr
+        assert "32 role(s) in their designed state, 0 drifted" in done.stderr
         assert self.drift_files() == {}
         # Only the pending role is re-read; converged roles are not asked again.
         assert self.log.read_text().count("get deployment checkout-gateway") == 1
@@ -626,7 +697,7 @@ class PassTest(_Harness):
         world["kubectl"]["deployment/checkout-gateway"] = "UNREACHABLE"
         done = self.run_script(world)
         assert done.returncode == 0, done.stderr
-        assert "29 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
+        assert "31 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr
         assert self.drift_files() == {}
         assert "WARNING: fixture role 'no-pdb-workload' could not be checked" in done.stderr
         assert "Unable to connect" in done.stderr
@@ -652,7 +723,7 @@ class PassTest(_Harness):
         ]
         done = self.run_script(world, "--wait", "20", "--interval", "0.1")
         assert done.returncode == 0, done.stderr
-        assert "30 role(s) in their designed state, 0 drifted, 0 not checked" in done.stderr
+        assert "32 role(s) in their designed state, 0 drifted, 0 not checked" in done.stderr
 
     def test_a_read_failure_beside_a_failed_assertion_is_still_drift(self):
         world = _healthy_world()
@@ -676,7 +747,7 @@ class PassTest(_Harness):
     def test_the_idle_pool_needs_a_ready_tainted_node(self):
         world = _healthy_world()
         done = self.run_script(world)
-        assert "30 role(s) in their designed state" in done.stderr, done.stderr
+        assert "32 role(s) in their designed state" in done.stderr, done.stderr
         # The label key carries a slash: the subject is a selector, not kind/name.
         assert "get node -l cloud.google.com/gke-nodepool=idle-batch-pool" in self.log.read_text()
         world["kubectl"]["node?cloud.google.com/gke-nodepool=idle-batch-pool"] = {"items": [_node(ready="False")]}
@@ -687,6 +758,29 @@ class PassTest(_Harness):
         done = self.run_script(world)
         assert "spec.taints[?(@.key=='seeded-role')].value any_eq \"idle-batch\": observed nothing" in self.drift_files()["idle-nodepool"], done.stderr
 
+    def test_the_default_pool_needs_room_for_the_next_fixture(self):
+        world = _healthy_world()
+        done = self.run_script(world)
+        assert "32 role(s) in their designed state" in done.stderr, done.stderr
+        # The pods are read once, across every namespace, not once per node.
+        assert self.log.read_text().count("get pod -A") == 1, self.log.read_text()
+        # 2026-10-20's shape on kube-agents-evals-11: 940m nodes, the busier one 4m from full.
+        world["kubectl"]["node?cloud.google.com/gke-nodepool=default-pool"] = {"items": [_pool_node("gke-seeded-a-default-pool-0r0x", allocatable="940m"), _pool_node("gke-seeded-a-default-pool-z7br", allocatable="940m")]}
+        world["kubectl"]["pod?"] = _pods(_bound_pod("gke-seeded-a-default-pool-0r0x", "837m"), _bound_pod("gke-seeded-a-default-pool-z7br", "936m"))
+        self.provision()
+        done = self.run_script(world)
+        drift = self.drift_files()["default-pool-headroom"]
+        assert 'node_cpu_spare_ge 100: observed {"gke-seeded-a-default-pool-0r0x": 103, "gke-seeded-a-default-pool-z7br": 4}' in drift, drift
+        assert "main.tf" in drift, drift
+
+    def test_a_pod_list_that_cannot_be_read_leaves_the_headroom_role_not_checked(self):
+        world = _healthy_world()
+        world["kubectl"]["pod?"] = "UNREACHABLE"
+        done = self.run_script(world)
+        assert "31 role(s) in their designed state, 0 drifted, 1 not checked" in done.stderr, done.stderr
+        assert "default-pool-headroom" in done.stderr and "kubectl get pod -A failed" in done.stderr, done.stderr
+        assert "default-pool-headroom" not in self.drift_files()
+
     def test_the_capacity_fixture_needs_a_ready_pod_and_a_pending_surplus(self):
         world = _healthy_world()
         world["kubectl"]["pod?app=inference-server"] = _pods(_pod(restarts=0, last_reason=None))
@@ -696,7 +790,7 @@ class PassTest(_Harness):
     def test_a_retained_failed_writer_job_is_drift(self):
         world = _healthy_world()
         done = self.run_script(world)
-        assert "30 role(s) in their designed state" in done.stderr, done.stderr
+        assert "32 role(s) in their designed state" in done.stderr, done.stderr
         # The Jobs are read by label, in the role's namespace; nothing named.
         assert "get job -l app=legacy-endpoints-writer -n seeded-deprecation" in self.log.read_text()
         # failedJobsHistoryLimit 1: one retained failure is what a broken caller leaves.
@@ -728,7 +822,7 @@ class PassTest(_Harness):
         registry that still exists, a CSI-provisioned volume) reads as drift."""
         world = _healthy_world()
         done = self.run_script(world)
-        assert "30 role(s) in their designed state" in done.stderr, done.stderr
+        assert "32 role(s) in their designed state" in done.stderr, done.stderr
         heals = {
             "node-local-state": (
                 "deployment/cache-on-emptydir",
@@ -919,7 +1013,7 @@ class PassTest(_Harness):
         world["kubectl"]["deployment/arch-pinned-worker"]["spec"]["template"]["spec"]["nodeSelector"]["cloud.google.com/gke-nodepool"] = "default-pool"
         done = self.run_script(world)
         assert done.returncode == 0, done.stderr
-        assert "30 role(s) in their designed state, 0 drifted" in done.stderr
+        assert "32 role(s) in their designed state, 0 drifted" in done.stderr
         assert self.drift_files() == {}
 
     def test_the_cluster_subject_reads_the_recorded_cluster(self):
@@ -972,7 +1066,7 @@ class PassTest(_Harness):
     def test_a_context_without_the_slots_cluster_is_not_checked(self):
         (self.fleet / ".fleet-context").write_text("project=kube-agents-evals\n")
         done = self.run_script(_healthy_world())
-        assert "27 role(s) in their designed state, 0 drifted, 3 not checked" in done.stderr
+        assert "29 role(s) in their designed state, 0 drifted, 3 not checked" in done.stderr
         assert "records no cluster for slot" in done.stderr
 
     def test_only_published_roles_are_asserted(self):
@@ -1017,7 +1111,7 @@ class PassTest(_Harness):
         }
         done = subprocess.run([sys.executable, str(_SCRIPT)], capture_output=True, text=True, env=env, check=False)
         assert done.returncode == 0, done.stderr
-        assert "30 role(s) in their designed state" in done.stderr
+        assert "32 role(s) in their designed state" in done.stderr
 
     def test_stalled_controller_fixture_detects_drift_on_missing_deadline(self):
         world = _healthy_world()
@@ -1113,7 +1207,9 @@ class ReportTest(_Harness):
                 "cuda-pinned-gpu-job": "converged",
                 "declared-no-pdb-workload": "converged",
                 "declared-overrequest-workload": "converged",
+                "guaranteed-qos-workload": "converged",
                 "declared-token-workload": "converged",
+                "default-pool-headroom": "converged",
                 "deprecated-api-caller": "converged",
                 "deprecated-label-selector": "converged",
                 "drift-outlier": "unchecked",
@@ -1143,7 +1239,7 @@ class ReportTest(_Harness):
         self.assertTrue(doc["roles"]["drift-outlier"]["detail"][0].startswith("cluster: clusters describe seeded-c failed"), doc["roles"]["drift-outlier"])
         self.assertEqual(doc["roles"]["idle-nodepool"], {"cluster_slot": "a", "state": "unpublished", "detail": []})
         self.assertEqual(doc["roles"]["version-laggard"]["cluster_slot"], "b")
-        self.assertEqual(doc["summary"], {"converged": 27, "drifted": 1, "unchecked": 1})
+        self.assertEqual(doc["summary"], {"converged": 29, "drifted": 1, "unchecked": 1})
         self.assertIn("1 drifted, 1 not checked", done.stderr)
 
     def test_without_the_flag_no_report_is_written(self):

@@ -7404,18 +7404,14 @@ class ManifestComposesWithAuditReportTest(unittest.TestCase):
 
 
 class DeclarationIndexIsACopyTest(unittest.TestCase):
-    """`workload_declarations` and `declaration_for` are duplicated from
-    `collect.py` rather than imported. Every collector here runs standalone
-    under `python3 <file>`; `fleet_stockout.py` imports a few leaf helpers
-    from its siblings, but this one keeps its own copy, for the reason
-    `fleet_waste.workload_declarations` gives.
-
-    Duplication is the convention, and drift is what it costs: two collectors
-    resolving the same object to different files, or one of them keeping a bug
-    the other fixed, with nothing failing to say so. These tests are the guard
-    the convention does not otherwise have -- they compare the executable code
-    and ignore the docstrings, which differ on purpose because each copy argues
-    from the findings its own stream published.
+    """The declaration index is `collect.py`'s. `workload_declarations` and
+    `declaration_for` are imported from it, so the two collectors cannot
+    resolve the same object to different files; the first two tests pin the
+    import. The release half is still a copy: every collector here runs
+    standalone under `python3 <file>`, and `collect` resolves from the same
+    directory, so the remaining tests compare the executable code of each copy
+    with the original and ignore the docstrings, which differ on purpose
+    because each copy argues from the findings its own stream published.
     """
 
     def test_the_internal_load_balancer_annotations_match_collect(self):
@@ -7448,13 +7444,15 @@ class DeclarationIndexIsACopyTest(unittest.TestCase):
             out.append(ast.dump(fn))
         return out
 
-    def test_workload_declarations_matches_collect_py(self):
-        mine, theirs = self.bodies("workload_declarations")
-        self.assertEqual(mine, theirs, "the copy has drifted from collect.py's original")
+    def test_workload_declarations_is_collect_py_s(self):
+        import collect
 
-    def test_declaration_for_matches_collect_py(self):
-        mine, theirs = self.bodies("declaration_for")
-        self.assertEqual(mine, theirs, "the copy has drifted from collect.py's original")
+        self.assertIs(fw.workload_declarations, collect.workload_declarations)
+
+    def test_declaration_for_is_collect_py_s(self):
+        import collect
+
+        self.assertIs(fw.declaration_for, collect.declaration_for)
 
     def test_reconciler_of_matches_collect_py(self):
         # Under the same convention and with the same cost of drift: the phrase

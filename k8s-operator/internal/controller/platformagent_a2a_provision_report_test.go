@@ -490,8 +490,8 @@ func TestAnEmptyTerminationMessageIsNotClean(t *testing.T) {
 }
 
 // TestTheReportWaitsForThePodAndReportsOnce: the Job reads complete before
-// its pod is in the cache. That pass stamps nothing, so the next one, with
-// the pod there, still reports; and it reports exactly once.
+// its pod comes back from the read. That pass stamps nothing, so the next
+// one, with the pod there, still reports; and it reports exactly once.
 func TestTheReportWaitsForThePodAndReportsOnce(t *testing.T) {
 	agent := a2aTestAgent()
 	r, cl, req := a2aGateTestReconciler(t, agent)
@@ -524,7 +524,7 @@ func TestTheReportWaitsForThePodAndReportsOnce(t *testing.T) {
 // of the reader's selector. A Job deleted by hand and re-created under the
 // same digested name shares the namespace with the previous Job's pods until
 // the garbage collector reaches them; one of those, succeeded and carrying a
-// gap report, is not this Job's run. With no pod of its own in the cache the
+// gap report, is not this Job's run. With no pod of its own returned the
 // Job takes the waiting path while its completion is fresh (no Event, no
 // stamp) and the vanished-pod path once it is older than the grace (no
 // Event, stamped unreadable); the other Job's report reaches the
@@ -547,7 +547,7 @@ func TestAPodOfAnotherJobUnderTheSameNameIsNotRead(t *testing.T) {
 		t.Fatalf("another Job's pod was read as this Job's run: %d Event(s): %q", len(events), events)
 	}
 	if got := reportedJob(t, ctx, cl, agent); got != "" {
-		t.Fatalf("Job stamp = %q on a fresh completion with none of its own pods in the cache; want no stamp, the pass waits", got)
+		t.Fatalf("Job stamp = %q on a fresh completion with none of its own pods returned; want no stamp, the pass waits", got)
 	}
 
 	ageTheProvisionJob(t, ctx, cl, agent, 2*a2aProvisionReportGrace)
@@ -578,7 +578,7 @@ func TestAReconcilerWithoutARecorderStillStampsTheJob(t *testing.T) {
 }
 
 // ageTheProvisionJob moves the provision Job's completion back by age, so a
-// pass reads it as an old completion rather than one the cache may still be
+// pass reads it as an old completion rather than one the read may still be
 // catching up with.
 func ageTheProvisionJob(t *testing.T, ctx context.Context, cl client.Client, agent *agentv1alpha1.PlatformAgent, age time.Duration) {
 	t.Helper()
@@ -622,7 +622,7 @@ func a2aGateTestReconcilerCountingProvisionPodLists(t *testing.T, agent *agentv1
 // TestAJobWhoseSucceededPodIsGoneIsStampedUnreadableOnce: the Job completed
 // and its succeeded pod is no longer there to read (the pod garbage
 // collector after a node scale-down, a Succeeded-pod cleanup, a hand
-// delete). That is not "the cache has not caught up": the Job counted the
+// delete). That is not "the pod is not visible yet": the Job counted the
 // success and the completion is well past the grace. The run's report is
 // lost, and the pass says so once, stamping the Job unreadable, rather than
 // re-listing the pods and re-logging on every pass for the rest of the
@@ -663,11 +663,11 @@ func TestAJobWhoseSucceededPodIsGoneIsStampedUnreadableOnce(t *testing.T) {
 }
 
 // TestAFreshCompletionWithNoPodStillWaits is the other side of the grace:
-// the Job completed just now, its counted pod is not in the cache yet, and
+// the Job completed just now, its counted pod is not back from the read yet, and
 // the pass leaves it unstamped for the next one. TestTheReportWaitsForThe-
 // PodAndReportsOnce covers the report that then arrives; this pins that the
 // wait is decided by the completion's age and not by the count alone, so
-// the vanished-pod branch cannot swallow a report the cache was about to
+// the vanished-pod branch cannot swallow a report the next read was about to
 // deliver.
 func TestAFreshCompletionWithNoPodStillWaits(t *testing.T) {
 	job := &batchv1.Job{}
@@ -681,7 +681,7 @@ func TestAFreshCompletionWithNoPodStillWaits(t *testing.T) {
 	old := metav1.NewTime(now.Add(-a2aProvisionReportGrace))
 	job.Status.CompletionTime = &old
 	if !a2aProvisionPodVanished(job, now) {
-		t.Fatal("a completion a whole grace old still read as the cache catching up")
+		t.Fatal("a completion a whole grace old still read as the pod not being visible yet")
 	}
 	job.Status.CompletionTime = nil
 	if !a2aProvisionPodVanished(job, now) {

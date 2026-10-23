@@ -1,14 +1,21 @@
 # The presubmit eval rosters are owned here: hack/eval/presubmit-cases.txt is
 # what every pull request runs and hack/eval/blocking-roster.txt is what can
 # red one, so adding or removing a case in either needs an eval-crew approver
-# and a root approver does not count (no_parent_owners). Everything else under
-# hack/ -- hack/eval/nightly-cases.txt, hack/eval/inject-lane-exclusions.txt,
-# hack/eval/inject-lane-safeguards.yaml, ci-eval-pr.sh itself, the deploy
-# scripts -- matches no filter and falls through to the root OWNERS, so a new
-# case lands in the nightly with the normal approvers (#1546, decided
-# 2026-09-15). docs/eval-gate-roster.md states the rule.
+# and a root approver does not count (no_parent_owners). The inject lane's two
+# files join them because the merge-blocking presubmit runs on that lane:
+# hack/eval/inject-lane-exclusions.txt takes a case out of every pull
+# request's matrix and, for a roster case, out of what can red one, and
+# hack/eval/inject-lane-safeguards.yaml adds a rung 1 check to every case
+# there. Everything else under hack/ -- hack/eval/nightly-cases.txt,
+# ci-eval-pr.sh itself, the deploy scripts -- matches no filter and falls
+# through to the root OWNERS, so a new case lands in the nightly with the
+# normal approvers (#1546, decided 2026-09-15). docs/eval-gate-roster.md
+# states the rule.
 filters:
-  'eval/(presubmit-cases|blocking-roster)\.txt$':
+  'eval/(presubmit-cases|blocking-roster|inject-lane-exclusions)\.txt$':
+    approvers:
+    - eval-crew
+  'eval/inject-lane-safeguards\.yaml$':
     approvers:
     - eval-crew
 options:

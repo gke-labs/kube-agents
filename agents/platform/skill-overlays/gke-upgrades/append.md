@@ -10,7 +10,7 @@ table rather than reasoning from memory:
 
 ```bash
 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --target-version <version> \
-  --output /opt/data/scratch/fleet_versions.json
+  --output /opt/data/scratch/fleet_versions_$(date +%s)_$$.json
 ```
 
 Without `--target-version` it measures each cluster against its own release channel's default and
@@ -44,4 +44,5 @@ When the checklist's deprecated-API item comes up, the same skill's `api_depreca
 the linked GitOps repositories' manifests for apiVersions the target removes and reports each with
 its replacement and the commit it read; run it with `--target-version` and the version report's
 `--output` from a full run, since it refuses a `--cluster` run's file as one cluster's floor. It
-reads Git only: point at GKE Deprecation Insights for live client usage.
+reads Git only; live client usage of removed and deprecated APIs is what `--readiness` reads from
+the audit log, with GKE Deprecation Insights as the thirty-day cross-check.

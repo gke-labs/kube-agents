@@ -26,13 +26,16 @@ DEPLOY_SCRIPT = REPO_ROOT / "hack" / "ci-deploy.sh"
 ENV_SCRIPT = REPO_ROOT / "hack" / "ci-env.sh"
 
 SECTION_START = "# ─── 7. Agent API Connectivity Verification"
-SECTION_END = "TOTAL_DURATION="
+# The next section's header: 7b gates on the Pub/Sub platform adapter and has
+# its own test (tests/test_ci_deploy_pubsub_relay_gate.py) and constants.
+SECTION_END = "# ─── 7b. "
 
 KUBECTL_STUB = """#!/usr/bin/env bash
 echo "$@" >> "${STUB_LOG}/kubectl.args"
 case "$1" in
   port-forward)
     echo "Forwarding from 127.0.0.1:8642 -> 8642"
+    touch "${STUB_LOG}/pf-up"
     exec sleep 60
     ;;
   get)
@@ -54,8 +57,19 @@ fi
 exit 0
 """
 
+# The section kills the tunnel as soon as curl returns, so an nc that answers
+# at once lets the kill land before the kubectl stub has logged its call. Like
+# the real `nc -z`, this one reports the port open only once the tunnel is up:
+# the marker the kubectl stub leaves, taken so the next attempt waits for its own.
 NC_STUB = """#!/usr/bin/env bash
-exit 0
+for _ in $(seq 1 50); do
+  if [ -e "${STUB_LOG}/pf-up" ]; then
+    rm -f "${STUB_LOG}/pf-up"
+    exit 0
+  fi
+  sleep 0.01
+done
+exit 1
 """
 
 

@@ -16,6 +16,7 @@ import functools
 import json
 import logging
 import os
+import posixpath
 import queue
 import re
 import select
@@ -25,6 +26,7 @@ import signal
 import shutil
 import socket
 import socketserver
+import sqlite3
 import ssl
 import subprocess
 import sys
@@ -42,6 +44,8 @@ from typing import Any, Callable, Iterator, Mapping, NamedTuple, TextIO
 
 import api_policy
 import command_policy
+import credential_shapes
+import feedback_broker
 import mcp_policy
 import providers
 import repo_ref
@@ -75,14 +79,19 @@ _KUBECTL_SUBCOMMANDS: dict[str, frozenset[str]] = {
 # credential_proxy_client runs on import.
 from credential_proxy_client import (  # noqa: F401  (re-export)
     API_RELAY_PREFIX,
+    CONTEXT_FLAG,
     END_OF_FLAGS,
     KUBECONFIG_FLAG,
     ClusterTarget,
+    kubectl_context_flag,
     parse_gke_context,
     read_current_context,
 )
 
 LOGGER = logging.getLogger("credential-proxy")
+# The optional key, in the Secret a forge's credentialsRef names, that holds
+# its read-only token. Named in the log when a context clone presents none.
+FORGE_READ_TOKEN_KEY = "read-token"
 SLACK_EVENT_QUEUE_MAXSIZE = 1000
 SLACK_ERROR_DIAGNOSTIC_FIELDS = ("ok", "error", "needed", "provided")
 
@@ -90,6 +99,65 @@ SLACK_ERROR_DIAGNOSTIC_FIELDS = ("ok", "error", "needed", "provided")
 # request that names no cluster resolves to this rather than to whatever the
 # base kubeconfig currently points at.
 HOST_CONTEXT_ENV = "KUBE_CONTEXT_NAME"
+
+# A kubectl read that names no cluster -- no `--context`, no `--kubeconfig`, no
+# KUBECONFIG forwarded by the shim -- runs on the host cluster through the
+# broker's default kubeconfig. When it finds nothing, the caller cannot tell
+# "absent" from "absent on the host": a worker read a namespace on the host and
+# reported it missing from the fleet (#3371, #3375). So a NotFound or an empty
+# answer to such a read gets one line naming the cluster it ran on. Appended to
+# stderr, so stdout -- often parsed as JSON -- is untouched; the exit code is
+# never changed; and any other result is returned as it came. The trigger is
+# the output's shape, not the cluster's state, so a partial NotFound
+# (`get ns a b`, one missing) or an existing pod with no logs gets the line too;
+# it only says where the read went, which is true either way.
+#
+# The wording is a plain statement of where the read went. It must stay clear
+# of what the refusal stop reads (deploy/docker/patches/permission_refusal_stop.py:
+# the action boundary notice, the `policy rule:`/`policy verb:` lines, and the
+# API-denial shapes), so the hint is never counted as a refusal or a halt.
+# test_credential_proxy.ContextlessKubectlHostHintTest holds it to that.
+KUBECTL_HOST_HINT_VERBS = frozenset({"get", "describe", "events", "logs", "top"})
+# kubectl's prefix for a server NotFound, the only "nothing there" a failed read
+# carries. A client-side "not found" (an unknown resource type, a context the
+# kubeconfig lacks) is a different fault and gets no hint.
+KUBECTL_NOT_FOUND_MARKER = "Error from server (NotFound)"
+# An empty list in `-o json`/`-o yaml` is a few hundred bytes; anything longer
+# has items and is not parsed at all.
+KUBECTL_EMPTY_LIST_PROBE_BYTES = 4096
+# Only kubectl's own list wrapper counts: `kubectl get <type>` prints
+# `apiVersion: v1, kind: List` for every resource type, built-in or custom. A
+# found object is never that pair -- the core group has no `List` resource, and
+# a custom kind (`AllowList`) carries its own group in `apiVersion` -- so an
+# object with an `items` field of its own is never read as an empty answer. A
+# typed list (`PodList`) only comes from `get --raw` and gets no line, which is
+# today's behaviour.
+KUBECTL_LIST_ITEMS_KEY = "items"
+KUBECTL_LIST_KIND_KEY = "kind"
+KUBECTL_LIST_API_VERSION_KEY = "apiVersion"
+KUBECTL_LIST_KIND = "List"
+KUBECTL_LIST_API_VERSION = "v1"
+KUBECTL_EMPTY_YAML_ITEMS_RE = re.compile(r"^items: \[\]\s*$", re.MULTILINE)
+KUBECTL_YAML_LIST_KIND_RE = re.compile(r"^kind: List\s*$", re.MULTILINE)
+KUBECTL_YAML_LIST_API_VERSION_RE = re.compile(r"^apiVersion: v1\s*$", re.MULTILINE)
+# `-o custom-columns` prints its header row even over an empty list, and the
+# generic printer it goes through prints no "No resources found", so a header
+# alone is the empty answer in that mode. Matched on the output flag's value,
+# in every spelling kubectl takes; the last one wins, as in kubectl.
+KUBECTL_OUTPUT_FLAGS = ("-o", "--output")
+KUBECTL_CUSTOM_COLUMNS_PREFIX = "custom-columns"
+KUBECTL_NO_HEADERS_FLAG = "--no-headers"
+KUBECTL_HOST_HINT_PREFIX = "[credential-proxy] "
+KUBECTL_HOST_HINT_NAMED = (
+    "This kubectl named no cluster, so it read the host cluster {cluster}"
+    " (the credential proxy's default kubeconfig). To read another cluster,"
+    " pass " + CONTEXT_FLAG + " <name>."
+)
+KUBECTL_HOST_HINT_UNNAMED = (
+    "This kubectl named no cluster, so it read this install's host cluster"
+    " (the credential proxy's default kubeconfig). To read another cluster,"
+    " pass " + CONTEXT_FLAG + " <name>."
+)
 
 # Bounds on a one-shot kubectl read. kubectl's own client default is 300s, so a
 # control plane that is down, private or firewalled parks a broker worker for
@@ -338,6 +406,15 @@ API_RELAY_DEADLINE_S = 120
 # smaller `pageSize`, which every listed endpoint supports. Read in chunks up
 # to the cap rather than with `.read()`, so the cap bounds memory too.
 API_RELAY_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+# Pub/Sub's largest message (10 MB of data), and the answer cap the platform
+# Pub/Sub relay carries instead of API_RELAY_MAX_RESPONSE_BYTES: a pull is a
+# lease, Pub/Sub has started the ack deadline and the ack ids are in the body
+# by the time the broker reads it, so an answer refused for size strands the
+# message until the deadline, forever for one that is always over. The adapter
+# pulls one message at a time; 16 MiB holds the largest one base64-encoded
+# (13.4 MiB) with its envelope.
+PUBSUB_MAX_MESSAGE_BYTES = 10 * 1024 * 1024
+PLATFORM_PUBSUB_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 API_RELAY_READ_CHUNK_BYTES = 64 * 1024
 # Query keys removed before forwarding. Each is a way to substitute a
 # credential for the broker's or to change the response class: an API key
@@ -532,9 +609,62 @@ VCS_REQUESTS_METRIC = "kubeagents_vcs_requests_total"
 VCS_VERB_LABEL = "verb"
 # Proposals this install opened that the forge reports merged, counted once
 # each per broker process as the broker's reads show them
-# (vcs_broker.VcsBroker._count_merges); the series the operator reads
+# (vcs_broker.VcsBroker._count_outcomes); the series the operator reads
 # `status.usage.remediationsMergedTotal` from. No labels.
 VCS_MERGED_METRIC = "kubeagents_vcs_proposals_merged_total"
+# Proposals this install opened that the forge reports closed without a merge,
+# counted the same way beside the merged series; the series the operator reads
+# `status.usage.remediationsClosedUnmergedTotal` from. No labels.
+VCS_CLOSED_UNMERGED_METRIC = "kubeagents_vcs_proposals_closed_unmerged_total"
+# The broker's own failures, by kind: work it took on and could not carry out
+# for a reason that is its own or its upstream's, never the command's exit
+# code and never a refusal. A second count beside the tool counter rather
+# than a new status in it, so toolExecutionsTotal keeps its meaning across
+# versions; the operator folds the whole family into
+# status.usage.brokerFailuresTotal.
+BROKER_FAILURES_METRIC = "kubeagents_broker_execution_failures_total"
+BROKER_FAILURE_KIND_LABEL = "kind"
+# A brokered command that ran past its deadline (exit 124), recorded where
+# the command completes.
+BROKER_FAILURE_EXEC_TIMEOUT = "exec_timeout"
+# Everything else is read off the response, keyed by its route family
+# (BROKER_FAILURE_KIND_BY_ROUTE). On the broker's own routes a 500, 502 or
+# 504 is one and a 503 is not: that 503 is the broker's busy, contention
+# rather than failure, and the exec route's busy is already an outcome of the
+# tool counter. The one 503 of the broker's that is a fault, the
+# version-control route's unreadable managed-repository list, is recorded at
+# its site. On the relays the upstream's status passes through, so any 5xx is
+# one, a 503 included: there it is the upstream saying unavailable.
+BROKER_FAILURE_EXEC_FAILED = "exec_failed"
+BROKER_FAILURE_VCS_FAILED = "vcs_failed"
+BROKER_FAILURE_FORGE_REFRESH_FAILED = "forge_refresh_failed"
+BROKER_FAILURE_API_RELAY_FAILED = "api_relay_failed"
+# The broker's own chat event pull failing: its Pub/Sub subscription or its
+# credential to it, recorded at the three pull sites, since the chat families
+# are otherwise excluded from the response hook (their 502 is the caller's).
+BROKER_FAILURE_CHAT_PULL_FAILED = "chat_pull_failed"
+BROKER_FAILURE_OTHER_FAILED = "other_failed"
+BROKER_FAILURE_KINDS = frozenset({
+    BROKER_FAILURE_EXEC_TIMEOUT,
+    BROKER_FAILURE_EXEC_FAILED,
+    BROKER_FAILURE_VCS_FAILED,
+    BROKER_FAILURE_FORGE_REFRESH_FAILED,
+    BROKER_FAILURE_API_RELAY_FAILED,
+    BROKER_FAILURE_CHAT_PULL_FAILED,
+    BROKER_FAILURE_OTHER_FAILED,
+})
+# The methods the broker serves. The base class answers any other with a 501
+# of its own before authentication, which is no relay's failure.
+BROKER_FAILURE_COUNTED_METHODS = frozenset({"GET", "POST"})
+BROKER_FAILURE_STATUS_CODES = frozenset({
+    str(int(HTTPStatus.INTERNAL_SERVER_ERROR)),
+    str(int(HTTPStatus.BAD_GATEWAY)),
+    str(int(HTTPStatus.GATEWAY_TIMEOUT)),
+})
+# The relays' bound is the whole 5xx class, since the upstream's status passes
+# through: a 501 or 507 from a Cloud API counts as the 503 does.
+BROKER_FAILURE_RELAY_STATUS_FLOOR = int(HTTPStatus.INTERNAL_SERVER_ERROR)
+BROKER_FAILURE_RELAY_STATUS_CEILING = BROKER_FAILURE_RELAY_STATUS_FLOOR + 100
 TOOL_DURATION_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0)
 # The label key the operator's usage poller filters outcomes on
 # (toolInvocationsStatusLabel in usage_counters_scrape.go): a rename here
@@ -555,6 +685,12 @@ TOOL_STATUS_ABANDONED = "abandoned"
 # under saturation "never started" and "failed" are the two numbers an
 # operator needs apart.
 TOOL_STATUS_BUSY = "busy"
+# The tool counter's whole outcome vocabulary, declared once so the operator's
+# side can be held to it: tests/test_usage_counters_series_names.py reads this
+# set and asserts the statuses the poller sums plus the ones it leaves out are
+# exactly these, so a status added here and nowhere else fails the suite
+# rather than landing silently outside every status counter.
+TOOL_STATUSES = frozenset({TOOL_STATUS_SUCCESS, TOOL_STATUS_ERROR, TOOL_STATUS_BLOCKED, TOOL_STATUS_ABANDONED, TOOL_STATUS_BUSY})
 # What a label reads when the request named nothing in its vocabulary: an
 # executable the broker does not serve, a verb no policy table lists, a path
 # no route claims, an argv whose verb cannot be read past an unknown flag.
@@ -625,6 +761,12 @@ AUDIT_STATUS_BLOCKED = "blocked"
 AUDIT_STATUS_REJECTED = "rejected"
 AUDIT_STATUS_FAILED = "failed"
 AUDIT_STATUS_ABANDONED = "abandoned"
+# The feedback verb's audit vocabulary: a closed pair, like every tool and
+# subcommand label here, never the route or the report's text.
+FEEDBACK_AUDIT_TOOL = "feedback"
+FEEDBACK_AUDIT_SUBCOMMAND = "submit"
+FEEDBACK_REASON_LOG_LENGTH = 200
+FEEDBACK_REASON_FAULT = "the broker could not complete the filing ({error}); nothing was sent"
 AUDIT_STATUS_BUSY = "busy"
 # Rule ids for the refusals the exec route decides itself rather than by a
 # policy rule. The response body and the audit record name the same constant,
@@ -661,16 +803,6 @@ def is_valid_repository(repository: Any) -> bool:
     return repo_ref.is_github_slug(repository)
 
 
-# Two shapes, because two are what the GitHub refresh helper handles: the
-# installation token Minty returns, and the Google OIDC identity token sent to
-# authenticate the request to it.
-_CREDENTIAL_SHAPES = re.compile(
-    r"gh[pousr]_[A-Za-z0-9]{20,}"
-    r"|github_pat_[A-Za-z0-9_]{20,}"
-    r"|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
-)
-
-
 def redact_credentials(text: str) -> str:
     """Blank out token-shaped substrings so a subprocess's output can be logged.
 
@@ -685,12 +817,11 @@ def redact_credentials(text: str) -> str:
     header back in a 4xx would put a credential in a string we are about to log.
     Match on shape so that stops being an argument about someone else's service.
 
-    Deliberately not a general-purpose redactor. Two others already exist
-    (`AuditRedactor`, and `redact_secrets` in the fleet-audit skill) and both
-    cover more shapes; neither belongs in this container, which must not import
-    from the Hermes plugin tree. Consolidating the three is separate work.
+    The shapes are credential_shapes.py's, the list the feedback gate refuses
+    to publish: one copy for both, seeded from `AuditRedactor` in the chart,
+    which this container must not import from the Hermes plugin tree.
     """
-    return _CREDENTIAL_SHAPES.sub("[REDACTED]", text)
+    return credential_shapes.redact(text)
 
 
 def _redacted_fields(exc) -> dict:
@@ -1007,6 +1138,10 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("/v1/chat/api", (CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT)),
     ("/v1/chat/", (CALLER_ROLE_CHAT,)),
     ("/v1/exec", (CALLER_ROLE_SHELL, CALLER_ROLE_SESSION)),
+    # The feedback form verb: the sandbox's one way to file a report about
+    # kube-agents itself (feedback_broker.py). The shell alone: a session pod
+    # files nothing on anyone's behalf.
+    ("/v1/feedback/", (CALLER_ROLE_SHELL,)),
     ("/v1/forge/", (CALLER_ROLE_SHELL,)),
     # The constant, not a literal: required_roles() answers () on a miss and
     # _role_permits then admits every role, so a prefix spelled twice is a
@@ -1021,10 +1156,63 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # them holds the chat token and cannot present this one.
     (watcher_policy.WATCHER_GCP_PREFIX, (CALLER_ROLE_WATCHER,)),
     (watcher_policy.WATCHER_K8S_PREFIX, (CALLER_ROLE_WATCHER,)),
+    # The Pub/Sub platform adapter's four calls, on the subscriptions the
+    # AgentPlugins configure: the gateway's own, so the chat role, which is the
+    # token the Hermes container holds. Its own prefix rather than the
+    # watcher's with a second role: the two are confined to different
+    # subscription sets, and the prefix is what this table keys the role on.
+    (watcher_policy.PLATFORM_PUBSUB_PREFIX, (CALLER_ROLE_CHAT,)),
     ("/v1/github/", (CALLER_ROLE_SHELL,)),
     ("/v1/vcs/", (CALLER_ROLE_SHELL,)),
     ("/v1/workspace/", (CALLER_ROLE_SHELL,)),
 )
+
+# The failure kind a 5xx on a route family counts under, keyed by the family
+# label _endpoint_label reads off ROUTE_ROLES (the prefix without its trailing
+# slash). None is a family whose 5xx is not the broker's failure: the chat and
+# Slack relays answer 502 for the caller's own channel, scope and space errors
+# (channel_not_found, not_in_channel, missing_scope), which the request
+# counter still shows; their event pulls, which fail on the broker's own
+# subscription, are recorded at their sites as chat_pull_failed. A family not
+# listed counts as other_failed.
+BROKER_FAILURE_KIND_BY_ROUTE: dict[str, str | None] = {
+    "/v1/exec": BROKER_FAILURE_EXEC_FAILED,
+    "/v1/vcs": BROKER_FAILURE_VCS_FAILED,
+    "/v1/forge": BROKER_FAILURE_FORGE_REFRESH_FAILED,
+    # The legacy name of the forge refresh route, served for one release of
+    # skew: the same mint, the same kind.
+    "/v1/github": BROKER_FAILURE_FORGE_REFRESH_FAILED,
+    API_RELAY_PREFIX.rstrip("/"): BROKER_FAILURE_API_RELAY_FAILED,
+    mcp_policy.MCP_RELAY_PREFIX.rstrip("/"): BROKER_FAILURE_API_RELAY_FAILED,
+    watcher_policy.WATCHER_GCP_PREFIX.rstrip("/"): BROKER_FAILURE_API_RELAY_FAILED,
+    watcher_policy.WATCHER_K8S_PREFIX.rstrip("/"): BROKER_FAILURE_API_RELAY_FAILED,
+    "/v1/chat/a2a": None,
+    "/v1/chat/api": None,
+    "/v1/chat": None,
+}
+
+
+def _route_failure_kind(path: str) -> str:
+    """The failure kind a fault on ``path`` counts under, for a site that knows
+    it answered a fault whatever the status: the route family's kind, or
+    other_failed for a family that has none."""
+    return BROKER_FAILURE_KIND_BY_ROUTE.get(_endpoint_label(path)) or BROKER_FAILURE_OTHER_FAILED
+
+
+def _broker_failure_kind(family: str, status_code: str) -> str | None:
+    """The failure kind a response counts under, or None for one that is not a
+    failure of the broker's: a status under 500, the broker's own 503 on a
+    route of its own, or any status on a family whose 5xx is the caller's."""
+    kind = BROKER_FAILURE_KIND_BY_ROUTE.get(family, BROKER_FAILURE_OTHER_FAILED)
+    if kind is None:
+        return None
+    if kind == BROKER_FAILURE_API_RELAY_FAILED:
+        try:
+            status = int(status_code)
+        except ValueError:
+            return None
+        return kind if BROKER_FAILURE_RELAY_STATUS_FLOOR <= status < BROKER_FAILURE_RELAY_STATUS_CEILING else None
+    return kind if status_code in BROKER_FAILURE_STATUS_CODES else None
 
 
 def _validate_route_roles(table: tuple[tuple[str, tuple[str, ...]], ...]) -> None:
@@ -1302,7 +1490,8 @@ def read_credential_for(registry: providers.Registry, repository: str) -> provid
       (GitLab), that token, through the forge's helper; on GitHub, nothing --
       the clone and push ride the ambient write credential the CLI installed,
       as they always have;
-    - context: the forge's read-only credential, and never the write token; a
+    - context: the forge's read-only credential, and never the write token
+      (on GitLab, the optional `read-token` key beside the write token); a
       forge that offers none clones with no credential;
     - unregistered: no credential at all, a public upstream read.
 
@@ -1343,16 +1532,31 @@ def read_credential_for(registry: providers.Registry, repository: str) -> provid
     if role != ROLE_CONTEXT:
         return providers.NoCredential()
     # A context repository gets the forge's read-only credential, and never
-    # the write token: a forge that offers none -- GitLab's stored token has
-    # no read-only variant here -- clones it with no credential, which reads a
-    # public repository and refuses a private one at the clone.
+    # the write token: a forge that offers none -- GitLab without a
+    # `read-token` key in its credentials Secret -- clones it with no
+    # credential, which reads a public repository and refuses a private one
+    # at the clone.
     credential = forge.read_credential(repo)
     if isinstance(credential, providers.NoCredential) and _holds_stored_token(forge):
+        if not getattr(forge, "read_token_path", ""):
+            # The forge was given no read-token path: the forges file came
+            # from an operator older than the read token, so no change to the
+            # Secret can help until the operator is upgraded.
+            LOGGER.warning(
+                "content workspace open repo=%s role=context: the broker's "
+                "config names no readTokenPath for the %s forge (an operator "
+                "older than the read-only token rendered it), so the clone "
+                "presents none; a private repository will refuse it",
+                repository, forge.name,
+            )
+            return credential
         LOGGER.warning(
-            "content workspace open repo=%s role=context: the %s forge offers no "
-            "read-only credential and its stored token can write, so the clone "
-            "presents none; a private repository will refuse it",
-            repository, forge.name,
+            "content workspace open repo=%s role=context: the %s forge has no "
+            "usable read-only token (key %s in its credentials Secret: missing, "
+            "unreadable, empty, or not one line of printable ASCII) and its stored "
+            "token can write, so the clone presents none; a private repository "
+            "will refuse it",
+            repository, forge.name, FORGE_READ_TOKEN_KEY,
         )
     return credential
 
@@ -1614,6 +1818,15 @@ SLACK_REMOVE_ALLOWLIST = frozenset({"reactions.remove"})
 # `chat.delete?x` and `chat.delete.` would pass it -- and slack_sdk joins the
 # string into the URL, where the fragment is dropped and the query ignored.
 SLACK_METHOD_SHAPE = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)+")
+# The subscriptions the platform Pub/Sub relay may reach, as the operator renders
+# them from the AgentPlugin configs; read by platform_pubsub_subscriptions().
+PLATFORM_PUBSUB_SUBSCRIPTIONS_ENV = "PLATFORM_PUBSUB_SUBSCRIPTIONS"
+# One fully qualified subscription, the shape watcher_policy matches on the
+# wire; an entry that is not one would never match a call and would read as a
+# configured subscription that silently refuses everything.
+_QUALIFIED_SUBSCRIPTION = re.compile(
+    rf"projects/{watcher_policy.PUBSUB_PROJECT}/subscriptions/{watcher_policy.SUBSCRIPTION}"
+)
 # The IAM permission a Pub/Sub pull spends on the subscription. A refused pull
 # names it in the log when the error's own ErrorInfo did not, so the line says
 # what to grant rather than only that something was refused.
@@ -2273,6 +2486,7 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
     upstream_key: str
     upstream_host = "127.0.0.1"
     upstream_port = 8642
+    workspace_root: str = "/opt/data"
     max_request_bytes = 10 * 1024 * 1024
     protocol_version = "HTTP/1.1"
 
@@ -2309,6 +2523,12 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             self._drain_request_body()
             self.send_error(HTTPStatus.UNAUTHORIZED)
             return
+        if self._targets_bridge_session(
+            self.path, self.headers, workspace_root=self.workspace_root
+        ):
+            self._drain_request_body()
+            self.send_error(HTTPStatus.FORBIDDEN)
+            return
         # The three refusals below cannot drain -- see _drain_request_body -- so a
         # caller that sent a body may read the close before the response. They are
         # answers to a malformed or oversized request, where the framing is already
@@ -2326,6 +2546,11 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
             return
         body = self.rfile.read(content_length) if content_length else None
+        if body and self._targets_bridge_session(
+            self.path, self.headers, body=body, workspace_root=self.workspace_root
+        ):
+            self.send_error(HTTPStatus.FORBIDDEN)
+            return
         headers = {
             name: value
             for name, value in self.headers.items()
@@ -2385,6 +2610,115 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         """Drain the body before a pre-authentication refusal; see drain_request_body."""
         drain_request_body(self, self.max_request_bytes)
 
+    @classmethod
+    def _is_bridge_session_id(
+        cls,
+        raw_session_id: Any,
+        workspace_root: str | Path | None = None,
+    ) -> bool:
+        val = str(raw_session_id or "").strip()
+        while (unquoted := urllib.parse.unquote(val)) != val:
+            val = unquoted
+        sid = val.strip()
+        if not sid:
+            return False
+        if sid.lower().startswith("a2a-"):
+            return True
+        root = Path(
+            workspace_root
+            or getattr(cls, "workspace_root", "")
+            or os.getenv("CREDENTIAL_PROXY_WORKSPACE_ROOT")
+            or os.getenv("HERMES_HOME")
+            or "/opt/data"
+        )
+        db_paths: list[Path] = [root / "state.db"]
+        profiles_dir = root / "profiles"
+        if profiles_dir.is_dir():
+            db_paths.extend(sorted(profiles_dir.glob("*/state.db")))
+        for db_path in db_paths:
+            if not db_path.is_file():
+                continue
+            try:
+                with contextlib.closing(
+                    sqlite3.connect(
+                        f"file:{db_path}?mode=ro", uri=True, timeout=2.0
+                    )
+                ) as conn:
+                    cur = sid
+                    seen = {cur}
+                    for _ in range(256):
+                        row = conn.execute(
+                            "SELECT parent_session_id FROM sessions WHERE id = ?",
+                            (cur,),
+                        ).fetchone()
+                        parent = str(row[0] or "").strip() if row else ""
+                        if not parent or parent in seen:
+                            break
+                        if parent.lower().startswith("a2a-"):
+                            return True
+                        seen.add(parent)
+                        cur = parent
+            except Exception as exc:
+                LOGGER.debug("could not inspect %s for session %s: %s", db_path, sid, exc)
+        return False
+
+    @classmethod
+    def _targets_bridge_session(
+        cls,
+        path: str,
+        headers: Any,
+        body: bytes | None = None,
+        workspace_root: str | Path | None = None,
+    ) -> bool:
+        """Return True when an external request names an `a2a-*` bridge session or child.
+
+        `hermes-bridge` talks to Hermes on loopback (`127.0.0.1:8642`), never
+        through `agent-api-auth` (`8643`). Refusing `a2a-*` session paths,
+        headers, `/v1/runs` request-body `session_id` fields, and `state.db`
+        child continuations on the external proxy stops a holder of
+        `API_SERVER_EXTERNAL_KEY` from running a turn in a bridge-owned
+        `a2a-<contextId>` session and inheriting its `session_kv` caller identity.
+        """
+        for header in ("X-Hermes-Session-Id", "X-Hermes-Session-Key"):
+            raw_values = (
+                headers.get_all(header, [])
+                if hasattr(headers, "get_all")
+                else [headers.get(header, "")]
+            )
+            for raw_val in raw_values:
+                if cls._is_bridge_session_id(raw_val, workspace_root):
+                    return True
+        raw_path = urllib.parse.urlsplit(path).path
+        while (unquoted := urllib.parse.unquote(raw_path)) != raw_path:
+            raw_path = unquoted
+        normalized = posixpath.normpath(raw_path.replace("\\", "/"))
+        raw_segments = [seg for seg in normalized.split("/") if seg]
+        segments = [seg.lower() for seg in raw_segments]
+        for idx, seg in enumerate(segments):
+            if seg.startswith("a2a-"):
+                return True
+            if seg == "sessions" and idx > 0 and segments[idx - 1] == "api":
+                if idx + 1 < len(raw_segments) and cls._is_bridge_session_id(
+                    raw_segments[idx + 1], workspace_root
+                ):
+                    return True
+        if body:
+            try:
+                parsed = json.loads(body)
+            except Exception:
+                unquoted_body = urllib.parse.unquote_to_bytes(body).lower()
+                if b"a2a-" in unquoted_body:
+                    return True
+            else:
+                if isinstance(parsed, dict):
+                    for key in ("session_id", "sessionId", "gateway_session_key"):
+                        if key in parsed and parsed[key] is not None:
+                            if not isinstance(parsed[key], str) or cls._is_bridge_session_id(
+                                parsed[key], workspace_root
+                            ):
+                                return True
+        return False
+
     @staticmethod
     def _sanitize_header(value: str) -> str:
         """See sanitize_header; kept as a method for the call sites below."""
@@ -2404,8 +2738,9 @@ class ApiRelayResponse:
     status: int
     content_type: str
     body: bytes
-    # True when the upstream body ran past API_RELAY_MAX_RESPONSE_BYTES; `body`
-    # is then empty, because a truncated JSON page is worse than no page.
+    # True when the upstream body ran past the call's cap (API_RELAY_MAX_RESPONSE_BYTES,
+    # or the family's own); `body` is then empty, because a truncated JSON page is
+    # worse than no page.
     over_cap: bool = False
 
 
@@ -2497,8 +2832,12 @@ class GoogleApiRelay:
         *,
         body: bytes | None = None,
         headers: tuple[tuple[str, str], ...] = (),
+        max_bytes: int | None = None,
     ) -> ApiRelayResponse:
         """One `GET https://{host}{target}` on the broker's credential, or a POST with `body`.
+
+        `max_bytes` is the answer cap, API_RELAY_MAX_RESPONSE_BYTES unless a
+        family carries its own (the platform Pub/Sub relay does).
 
         `target` is the path and query as the handler assembled them, already
         checked against the policy and stripped of the credential keys. Raises
@@ -2561,7 +2900,7 @@ class GoogleApiRelay:
                 if not chunk:
                     break
                 received += len(chunk)
-                if received > API_RELAY_MAX_RESPONSE_BYTES:
+                if received > (max_bytes if max_bytes is not None else API_RELAY_MAX_RESPONSE_BYTES):
                     return ApiRelayResponse(
                         response.status, response.getheader("Content-Type", ""), b"", True
                     )
@@ -3375,6 +3714,79 @@ def _is_get_credentials(argv: list[str]) -> bool:
     except ValueError:
         return False
     return argv[index + 1 : index + 3] == ["clusters", "get-credentials"]
+
+
+def _kubectl_output_format(argv: list[str]) -> str:
+    """The value of the last `-o`/`--output` in a kubectl argv, or ""."""
+    value = ""
+    index = 1
+    while index < len(argv):
+        argument = argv[index]
+        if argument == END_OF_FLAGS:
+            break
+        if argument in KUBECTL_OUTPUT_FLAGS and index + 1 < len(argv):
+            value = argv[index + 1]
+            index += 2
+            continue
+        for flag in KUBECTL_OUTPUT_FLAGS:
+            if argument.startswith(f"{flag}="):
+                value = argument.partition("=")[2]
+                break
+        else:
+            short = KUBECTL_OUTPUT_FLAGS[0]
+            if argument.startswith(short) and not argument.startswith("--"):
+                value = argument[len(short):]
+        index += 1
+    return value
+
+
+def _kubectl_no_headers(argv: list[str]) -> bool:
+    """Does argv turn off kubectl's header row? `--no-headers` is a boolean
+    flag, so `--no-headers=false` keeps the header and the last setting wins."""
+    no_headers = False
+    for arg in argv:
+        if arg == KUBECTL_NO_HEADERS_FLAG:
+            no_headers = True
+        elif arg.startswith(KUBECTL_NO_HEADERS_FLAG + "="):
+            no_headers = arg.split("=", 1)[1].strip().lower() not in ("false", "0", "f")
+    return no_headers
+
+
+def _kubectl_output_is_empty(argv: list[str], stdout: str) -> bool:
+    """Did a successful kubectl read print nothing, or a list with no items?
+
+    "No resources found" goes to stderr, leaving stdout empty; `-o json` and
+    `-o yaml` print kubectl's empty `List` instead, `-o jsonpath='{.items}'` a
+    bare `[]`, and `-o custom-columns` its header row alone. Anything longer
+    than an empty list can be is not parsed.
+    """
+    text = stdout.strip()
+    if not text:
+        return True
+    if len(text) > KUBECTL_EMPTY_LIST_PROBE_BYTES:
+        return False
+    if _kubectl_output_format(argv).startswith(KUBECTL_CUSTOM_COLUMNS_PREFIX):
+        # With --no-headers the one line is a found row, not a header; an
+        # empty read already returned above.
+        return not _kubectl_no_headers(argv) and len(text.splitlines()) == 1
+    if (
+        KUBECTL_EMPTY_YAML_ITEMS_RE.search(text)
+        and KUBECTL_YAML_LIST_KIND_RE.search(text)
+        and KUBECTL_YAML_LIST_API_VERSION_RE.search(text)
+    ):
+        return True
+    try:
+        document = json.loads(text)
+    except ValueError:
+        return False
+    if document == []:
+        return True
+    return (
+        isinstance(document, dict)
+        and document.get(KUBECTL_LIST_ITEMS_KEY) == []
+        and document.get(KUBECTL_LIST_KIND_KEY) == KUBECTL_LIST_KIND
+        and document.get(KUBECTL_LIST_API_VERSION_KEY) == KUBECTL_LIST_API_VERSION
+    )
 
 
 def _kubectl_runs_long(argv: list[str]) -> bool:
@@ -6041,7 +6453,7 @@ class CommandExecutor:
             kubeconfig_path = self._default_kubeconfig()
         else:
             kubeconfig_path = None
-        return self._execute(
+        result = self._execute(
             command,
             stdin=stdin,
             cwd=cwd,
@@ -6049,6 +6461,49 @@ class CommandExecutor:
             timeout_seconds=kubectl_deadline,
             caller=caller,
         )
+        # Read off the caller's argv, not `command`: the request timeout added
+        # above is not the caller's, and a rerouted `--kubeconfig` is already
+        # in `flag_kubeconfig`.
+        if (
+            executable == "kubectl"
+            and flag_kubeconfig is None
+            and not kubeconfig_context
+            # An empty value (`--context "$UNSET"`) names nothing: kubectl
+            # reads current-context, the host.
+            and not kubectl_context_flag(argv)
+        ):
+            return self._with_host_hint(argv, result)
+        return result
+
+    def _with_host_hint(self, argv: list[str], result: ExecutionResult) -> ExecutionResult:
+        """`result`, plus a line naming the host when a context-less read found nothing.
+
+        See KUBECTL_HOST_HINT_VERBS. Only a read verb, only a server NotFound or
+        an empty answer, and never a result that was cut, timed out or
+        abandoned: what those say about the cluster is unknown. stdout and the
+        exit code are returned as they came.
+        """
+        if result.truncated or result.timed_out or result.abandoned:
+            return result
+        verb, _ = command_policy._kubectl_verb_and_flag(argv)
+        if not verb or verb[0] not in KUBECTL_HOST_HINT_VERBS:
+            return result
+        if result.exit_code == 0:
+            found_nothing = _kubectl_output_is_empty(argv, result.stdout)
+        else:
+            found_nothing = KUBECTL_NOT_FOUND_MARKER in result.stderr
+        if not found_nothing:
+            return result
+        target = self._ambient_target()
+        hint = (
+            KUBECTL_HOST_HINT_NAMED.format(cluster=target.context_name)
+            if target is not None
+            else KUBECTL_HOST_HINT_UNNAMED
+        )
+        stderr = result.stderr
+        if stderr and not stderr.endswith("\n"):
+            stderr += "\n"
+        return replace(result, stderr=f"{stderr}{KUBECTL_HOST_HINT_PREFIX}{hint}\n")
 
     def execute_internal(
         self, argv: list[str], cwd: str | None = None
@@ -7665,6 +8120,7 @@ def build_vcs_broker(
         # Looked up at call time: the handler's registry is a class attribute
         # a test replaces per case, and this broker outlives none of them.
         merge_observer=lambda count: CredentialProxyHandler.metrics.record_merged(count),
+        close_observer=lambda count: CredentialProxyHandler.metrics.record_closed_unmerged(count),
         started_at=PROCESS_START_TIME_SECONDS,
     )
     LOGGER.info(
@@ -8138,6 +8594,8 @@ class ProxyMetrics:
         self._requests: dict[tuple[str, str], int] = {}
         self._vcs: dict[tuple[str, str], int] = {}
         self._merged = 0
+        self._closed_unmerged = 0
+        self._failures: dict[str, int] = {}
         # Per tool: cumulative bucket counts (one per TOOL_DURATION_BUCKETS
         # bound, the +Inf bucket being the count), the sum, and the count.
         self._duration_buckets: dict[str, list[int]] = {}
@@ -8231,12 +8689,23 @@ class ProxyMetrics:
         with self._lock:
             self._merged += count
 
+    def record_closed_unmerged(self, count: int) -> None:
+        with self._lock:
+            self._closed_unmerged += count
+
+    def record_failure(self, kind: str) -> None:
+        kind = kind if kind in BROKER_FAILURE_KINDS else BROKER_FAILURE_OTHER_FAILED
+        with self._lock:
+            self._failures[kind] = self._failures.get(kind, 0) + 1
+
     def render(self) -> str:
         with self._lock:
             invocations = sorted(self._tool_invocations.items())
             requests = sorted(self._requests.items())
             vcs = sorted(self._vcs.items())
             merged = self._merged
+            closed_unmerged = self._closed_unmerged
+            failures = sorted(self._failures.items())
             durations = {
                 tool: (list(self._duration_buckets[tool]), self._duration_sum[tool], self._duration_count[tool])
                 for tool in sorted(self._duration_buckets)
@@ -8314,7 +8783,16 @@ class ProxyMetrics:
             f"# HELP {VCS_MERGED_METRIC} Proposals this install opened that the forge reported merged, counted once each per process.",
             f"# TYPE {VCS_MERGED_METRIC} counter",
             f"{VCS_MERGED_METRIC} {merged}",
+            f"# HELP {VCS_CLOSED_UNMERGED_METRIC} Proposals this install opened that the forge reported closed without a merge, counted once each per process.",
+            f"# TYPE {VCS_CLOSED_UNMERGED_METRIC} counter",
+            f"{VCS_CLOSED_UNMERGED_METRIC} {closed_unmerged}",
         ]
+        lines += [
+            f"# HELP {BROKER_FAILURES_METRIC} Brokered work the broker could not carry out, by kind: a command past its deadline, a broker fault, a git failure, a failed token mint or an upstream relay error.",
+            f"# TYPE {BROKER_FAILURES_METRIC} counter",
+        ]
+        for kind, count in failures:
+            lines.append(f'{BROKER_FAILURES_METRIC}{{{BROKER_FAILURE_KIND_LABEL}="{_escape_label_value(kind)}"}} {count}')
         lines += [
             f"# HELP {PROCESS_START_TIME_METRIC} Start time of the process since unix epoch in seconds, captured once at start.",
             f"# TYPE {PROCESS_START_TIME_METRIC} gauge",
@@ -8474,6 +8952,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # one Pub/Sub target the watcher relay reaches. Empty: the detector is off
     # and every Pub/Sub call is refused.
     watcher_subscription: str = ""
+    # The subscriptions the gateway's Pub/Sub platform adapter may reach through
+    # `/v1/pubsub/gcp/`, each `projects/<p>/subscriptions/<s>`, as the operator
+    # rendered them from the AgentPlugin configs. Empty: no plugin route the
+    # operator could qualify, and every call is refused.
+    platform_pubsub_subscriptions: frozenset[str] = frozenset()
     # (project, location, cluster) -> (deadline, host, CA PEM or ""), for the
     # watcher's Kubernetes route. See `_watcher_cluster_endpoint`.
     watcher_endpoints: dict[tuple[str, str, str], tuple[float, str, str]] = {}
@@ -8596,6 +9079,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 type(exc).__name__,
             )
             self.repository_refusal_status = HTTPStatus.SERVICE_UNAVAILABLE
+            # A fault, not a refusal, answered with the status the response
+            # hook reads as busy: counted here, where the difference is known,
+            # under the kind of the route that asked (the version-control
+            # route or a forge refresh).
+            self.metrics.record_failure(_route_failure_kind(getattr(self, "path", "")))
             self._json(
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 {
@@ -8632,6 +9120,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if self.path.startswith(watcher_policy.WATCHER_GCP_PREFIX):
             self._handle_watcher_gcp()
             return
+        if self.path.startswith(watcher_policy.PLATFORM_PUBSUB_PREFIX):
+            self._handle_platform_pubsub()
+            return
         if self.path.startswith(watcher_policy.WATCHER_K8S_PREFIX):
             self._handle_watcher_k8s()
             return
@@ -8653,6 +9144,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, {"event": self.slack_relay.pull()})
             except Exception as exc:
                 LOGGER.warning("Slack event pull failed: %s", type(exc).__name__)
+                self.metrics.record_failure(BROKER_FAILURE_CHAT_PULL_FAILED)
                 self._json(
                     HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Slack event pull failed"}
                 )
@@ -8668,6 +9160,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 event = self.a2a_chat_relay.pull()
                 self._json(HTTPStatus.OK, {"event": event, "subscription": subscription})
             except Exception as exc:
+                self.metrics.record_failure(BROKER_FAILURE_CHAT_PULL_FAILED)
                 fields = _log_chat_pull_failure("a2a chat", self.a2a_chat_relay, exc)
                 pubsub = {key: fields[key] for key in ("type", "code") if key in fields}
                 self._json(
@@ -8688,6 +9181,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, {"event": event})
             except Exception as exc:
                 _log_chat_pull_failure("chat", self.chat_relay, exc)
+                self.metrics.record_failure(BROKER_FAILURE_CHAT_PULL_FAILED)
                 self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "chat event pull failed"})
             return
         if self.path != HEALTHZ_PATH:
@@ -8710,6 +9204,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
         if self.path.startswith(watcher_policy.WATCHER_GCP_PREFIX):
             self._handle_watcher_gcp()
+            return
+        if self.path.startswith(watcher_policy.PLATFORM_PUBSUB_PREFIX):
+            self._handle_platform_pubsub()
             return
         if self.path.startswith(watcher_policy.WATCHER_K8S_PREFIX):
             # GET only; reaches the handler so the refusal names its rule.
@@ -8737,6 +9234,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/v1/vcs/"):
             self._handle_vcs_post()
+            return
+        if self.path == feedback_broker.ROUTE:
+            self._handle_feedback_post()
             return
         if self.path != "/v1/exec":
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
@@ -9063,6 +9563,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     subcommand_label,
                     TOOL_STATUS_SUCCESS if result.exit_code == 0 else TOOL_STATUS_ERROR,
                 )
+                if result.timed_out:
+                    self.metrics.record_failure(BROKER_FAILURE_EXEC_TIMEOUT)
                 self.metrics.observe_duration(tool_label, result.duration_ms / MILLISECONDS_PER_SECOND)
                 response = {
                     "status": "completed",
@@ -9591,10 +10093,52 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         is the table; the forwarding is the Cloud API relay's, with a body for
         the Pub/Sub POSTs, and the status, Content-Type and body pass back.
         """
+        self._relay_google_call(
+            "watcher gcp",
+            watcher_policy.WATCHER_GCP_PREFIX,
+            lambda host, path, body: watcher_policy.evaluate_gcp(
+                self.command, host, path, body, self.watcher_subscription
+            ),
+        )
+
+    def _handle_platform_pubsub(self) -> None:
+        """`/v1/pubsub/gcp/<host>/<path>`: one Pub/Sub call for the gateway's platform adapter.
+
+        The adapter (agentplugins/pubsub-platform) used to pull its
+        subscriptions on the gateway pod's own Workload Identity, which the pod
+        no longer holds. `watcher_policy.evaluate_pubsub` is the table, pinned
+        to `platform_pubsub_subscriptions`; the forwarding is the watcher
+        family's, unchanged.
+        """
+        self._relay_google_call(
+            "platform pubsub",
+            watcher_policy.PLATFORM_PUBSUB_PREFIX,
+            lambda host, path, body: watcher_policy.evaluate_pubsub(
+                self.command, host, path, body, self.platform_pubsub_subscriptions
+            ),
+            family="platform Pub/Sub relay",
+            max_bytes=PLATFORM_PUBSUB_MAX_RESPONSE_BYTES,
+        )
+
+    def _relay_google_call(
+        self,
+        label: str,
+        prefix: str,
+        decide: Callable[[str, str, bytes], command_policy.Decision],
+        family: str = "watcher relay",
+        max_bytes: int | None = None,
+    ) -> None:
+        """Forward one `<prefix><host>/<path>` Google call that `decide` allows.
+
+        `label` is the first word of every audit line, naming the family; the
+        caller's role was already checked against ROUTE_ROLES by the time this
+        runs, so `decide` is the second gate, on the target. `max_bytes` is the
+        family's answer cap, the relay's own when None.
+        """
         request_id = str(uuid.uuid4())
         parts = urllib.parse.urlsplit(self.path)
-        host, _, path = parts.path[len(watcher_policy.WATCHER_GCP_PREFIX) :].partition("/")
-        self._log_watcher_request("watcher gcp", request_id, f"{host}/{path}")
+        host, _, path = parts.path[len(prefix) :].partition("/")
+        self._log_watcher_request(label, request_id, f"{host}/{path}")
         body = b""
         if self.command == watcher_policy.METHOD_POST:
             # The two answers /v1/exec and the MCP relay give: 400 for a length
@@ -9602,11 +10146,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
-                LOGGER.warning("watcher gcp rejected request_id=%s reason=content-length", request_id)
+                LOGGER.warning("%s rejected request_id=%s reason=content-length", label, request_id)
                 self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid content length"})
                 return
             if length < 0 or length > self.max_request_bytes:
-                LOGGER.warning("watcher gcp rejected request_id=%s reason=content-length", request_id)
+                LOGGER.warning("%s rejected request_id=%s reason=content-length", label, request_id)
                 self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "request body too large"})
                 return
             body = self.rfile.read(length)
@@ -9615,15 +10159,15 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         problem = api_relay_target_problem(host, path, parts.query)
         query = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
         if problem is None and not set(query) <= WATCHER_GCP_QUERY_KEYS:
-            problem = (API_RELAY_BAD_QUERY, "the watcher relay forwards no query keys but alt and prettyPrint")
+            problem = (API_RELAY_BAD_QUERY, f"the {family} forwards no query keys but alt and prettyPrint")
         if problem is not None:
             code, reason = problem
-            LOGGER.warning("watcher gcp rejected request_id=%s code=%s", request_id, code)
+            LOGGER.warning("%s rejected request_id=%s code=%s", label, request_id, code)
             self._json(HTTPStatus.BAD_REQUEST, {"error": reason, "code": code})
             return
-        decision = watcher_policy.evaluate_gcp(self.command, host, path, body, self.watcher_subscription)
+        decision = decide(host, path, body)
         if not decision.allowed:
-            LOGGER.warning("watcher gcp blocked request_id=%s rule=%s", request_id, decision.rule_id)
+            LOGGER.warning("%s blocked request_id=%s rule=%s", label, request_id, decision.rule_id)
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
@@ -9640,19 +10184,22 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 {"error": "Cloud API relay disabled", "code": "API_RELAY_DISABLED"},
             )
             return
-        authorization = self._relay_authorization("watcher gcp", request_id)
+        authorization = self._relay_authorization(label, request_id)
         if authorization is None:
             return
         target = f"/{path}?{parts.query}" if parts.query else f"/{path}"
         extra: dict[str, Any] = {}
         if self.command == watcher_policy.METHOD_POST:
             extra = {"body": body, "headers": (("Content-Type", WATCHER_GCP_CONTENT_TYPE),)}
-        upstream = self._relay_fetch("watcher gcp", request_id, host, target, authorization, **extra)
+        if max_bytes is not None:
+            extra["max_bytes"] = max_bytes
+        upstream = self._relay_fetch(label, request_id, host, target, authorization, **extra)
         if upstream is None:
             return
         if upstream.over_cap or HTTPStatus.MULTIPLE_CHOICES <= upstream.status < HTTPStatus.BAD_REQUEST:
             LOGGER.warning(
-                "watcher gcp upstream refused request_id=%s status=%d over_cap=%s",
+                "%s upstream refused request_id=%s status=%d over_cap=%s",
+                label,
                 request_id,
                 upstream.status,
                 upstream.over_cap,
@@ -9667,7 +10214,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # Only the fields the watchers read; never masterAuth's client key.
             projected = watcher_policy.project_cluster(upstream.body)
             if projected is None:
-                LOGGER.warning("watcher gcp unparseable cluster request_id=%s", request_id)
+                LOGGER.warning("%s unparseable cluster request_id=%s", label, request_id)
                 self._json(
                     HTTPStatus.BAD_GATEWAY,
                     {"error": "the upstream answer could not be relayed", "code": "UPSTREAM_UNRELAYABLE"},
@@ -9675,7 +10222,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 return
             relayed = projected
         LOGGER.info(
-            "watcher gcp forwarded request_id=%s rule=%s status=%d bytes=%d",
+            "%s forwarded request_id=%s rule=%s status=%d bytes=%d",
+            label,
             request_id,
             decision.rule_id,
             upstream.status,
@@ -9734,8 +10282,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     def _log_watcher_request(self, label: str, request_id: str, target: str) -> None:
         """The pre-decision audit line, naming the caller, as the other credentialed routes write it.
 
-        The broker makes every watcher call on its own credential, so this line
-        is the record of which ServiceAccount presented the watcher token.
+        The broker makes every relayed Google call, the watcher family's and the
+        platform Pub/Sub family's, on its own credential, so this line is the
+        record of which ServiceAccount presented the token.
         """
         principal = self.principal
         LOGGER.info(
@@ -9788,13 +10337,22 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         decision = watcher_policy.evaluate_k8s(self.command, rest, query)
         if not decision.allowed:
             LOGGER.warning("watcher k8s blocked request_id=%s rule=%s", request_id, decision.rule_id)
+            # A metav1.Status, which client-go decodes into a StatusError carrying
+            # this message verbatim; any other body it reports as a bare
+            # Forbidden. The drift detector's join forwards a record it could not
+            # read with that error as its lookup error, so the rule id is what
+            # tells the agent "a policy refused this kind" from an RBAC fault.
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
-                    "status": "blocked",
-                    "code": "SECURITY_POLICY_BLOCKED",
-                    "rule": decision.rule_id,
-                    "message": decision.message,
+                    "kind": "Status",
+                    "apiVersion": "v1",
+                    "metadata": {},
+                    "status": "Failure",
+                    "message": f"SECURITY_POLICY_BLOCKED ({decision.rule_id}): {decision.message}",
+                    "reason": "Forbidden",
+                    "details": {"causes": [{"reason": "SECURITY_POLICY_BLOCKED", "message": decision.rule_id}]},
+                    "code": HTTPStatus.FORBIDDEN.value,
                 },
             )
             return
@@ -10167,6 +10725,82 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
         self._json(HTTPStatus.OK, {"status": "refreshed", "forge": forge.name})
 
+    def _handle_feedback_post(self) -> None:
+        """`POST /v1/feedback/submit`: file a confirmed kube-agents report once.
+
+        feedback_broker owns the payload rules and the wire path; this route
+        reads the body, holds a request slot around the outbound calls as the
+        forge verbs do, and maps the outcome: the broker's status object on
+        200, a `BLOCKED` object on 400 when nothing was sent (a refused
+        payload, a form that cannot be reached), and the audit line carries
+        the title and the status, never the report's text.
+        """
+        request_id = str(uuid.uuid4())
+        principal = getattr(self, "principal", None)
+        principal_label = _sanitize_for_logging(
+            principal.describe() if principal is not None else "", max_length=PRINCIPAL_LOG_LENGTH
+        )
+
+        def audit(status: str) -> dict[str, Any]:
+            return {
+                AUDIT_EXTRA_KEY: _tool_audit(
+                    status, request_id, principal_label, FEEDBACK_AUDIT_TOOL, FEEDBACK_AUDIT_SUBCOMMAND
+                )
+            }
+
+        try:
+            payload = self._read_json_body()
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        # Redacted before it is sanitized: the gate inside feedback_broker has
+        # not run yet, and a person's title can carry a token.
+        title = _sanitize_for_logging(redact_credentials(str(payload.get("title", ""))))
+        LOGGER.info(
+            "feedback submit request_id=%s principal=%s title=%s",
+            request_id, principal_label, title, extra=audit(AUDIT_STATUS_STARTED),
+        )
+        try:
+            with self._request_slot():
+                answer = feedback_broker.submit(payload)
+        except feedback_broker.Blocked as exc:
+            LOGGER.info(
+                "feedback submit blocked request_id=%s: %s",
+                request_id, _sanitize_for_logging(redact_credentials(exc.reason), max_length=FEEDBACK_REASON_LOG_LENGTH),
+                extra=audit(AUDIT_STATUS_BLOCKED),
+            )
+            self._json(HTTPStatus.BAD_REQUEST, feedback_broker.blocked_answer(exc.reason))
+            return
+        except CallerHungUp as exc:
+            LOGGER.info("feedback submit abandoned request_id=%s: %s", request_id, exc, extra=audit(AUDIT_STATUS_ABANDONED))
+            return
+        except CommandSlotUnavailable as exc:
+            # A full broker is a 503 the client reads as "nothing was sent",
+            # like the exec and forge routes; a dropped connection would read
+            # as a lost answer and strand the caller's marker.
+            LOGGER.warning("feedback submit busy request_id=%s: %s", request_id, exc, extra=audit(AUDIT_STATUS_BUSY))
+            self._busy(exc)
+            return
+        except Exception as exc:  # noqa: BLE001 -- every outcome here must be an answer
+            # feedback_broker converts the wire's failures into Blocked or
+            # UNCONFIRMED itself; what reaches this arm is a fault in reading
+            # a page the form served. The POST has not happened before the
+            # page is read, so this is a BLOCKED, not a lost answer.
+            LOGGER.warning(
+                "feedback submit failed request_id=%s type=%s", request_id, type(exc).__name__,
+                extra=audit(AUDIT_STATUS_FAILED),
+            )
+            self._json(
+                HTTPStatus.BAD_REQUEST,
+                feedback_broker.blocked_answer(FEEDBACK_REASON_FAULT.format(error=type(exc).__name__)),
+            )
+            return
+        LOGGER.info(
+            "feedback submit %s request_id=%s title=%s",
+            answer.get("status"), request_id, title, extra=audit(AUDIT_STATUS_COMPLETED),
+        )
+        self._json(HTTPStatus.OK, answer)
+
     def _handle_vcs_post(self) -> None:
         """The version-control routes: `POST /v1/vcs/<verb>`.
 
@@ -10522,7 +11156,13 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # request line itself could not be parsed, and that response counts
         # under LABEL_OTHER like any other unclaimed one.
         status_code = str(int(code)) if isinstance(code, int) else str(code)
-        self.metrics.record_request(_endpoint_label(getattr(self, "path", "")), status_code)
+        family = _endpoint_label(getattr(self, "path", ""))
+        self.metrics.record_request(family, status_code)
+        # The same hook counts the broker's failures, by the route's family
+        # and the status (_broker_failure_kind).
+        kind = _broker_failure_kind(family, status_code)
+        if kind is not None and getattr(self, "command", "") in BROKER_FAILURE_COUNTED_METHODS:
+            self.metrics.record_failure(kind)
         super().log_request(code, size)
 
     def log_message(self, message: str, *args: Any) -> None:
@@ -10618,6 +11258,11 @@ def start_agent_api_proxy() -> ThreadingHTTPServer:
         raise RuntimeError("API_SERVER_EXTERNAL_KEY must be configured")
     AgentAPIProxyHandler.upstream_key = os.getenv(
         "AGENT_API_UPSTREAM_KEY", "cluster-internal-trusted"
+    )
+    AgentAPIProxyHandler.workspace_root = (
+        os.getenv("CREDENTIAL_PROXY_WORKSPACE_ROOT")
+        or os.getenv("HERMES_HOME")
+        or "/opt/data"
     )
     port = int(os.getenv("AGENT_API_PROXY_PORT", "8643"))
     server = ThreadingTCPHTTPServer(("0.0.0.0", port), AgentAPIProxyHandler)
@@ -10784,6 +11429,42 @@ def chat_relay_subscriptions(project_id: str) -> tuple[str, str]:
     return chat_subscription, a2a_subscription
 
 
+def platform_pubsub_subscriptions() -> frozenset[str]:
+    """The subscriptions the platform Pub/Sub relay may reach, from the environment.
+
+    `PLATFORM_PUBSUB_SUBSCRIPTIONS` is a comma-separated list of
+    `projects/<p>/subscriptions/<s>`, rendered by the operator from the
+    AgentPlugin configs; unset or empty means no plugin route the operator
+    could qualify, and the relay refuses every call. An entry of any other
+    shape is dropped
+    with a warning rather than refusing the boot: the operator renders the
+    list from user-authored AgentPlugin configs, and one typo in a route must
+    not take the broker, and with it every other route, off the air. A dropped
+    entry's route is refused by the policy, which the adapter logs with the
+    rule, so the typo is still loud where it was made.
+    """
+    raw = os.getenv(PLATFORM_PUBSUB_SUBSCRIPTIONS_ENV, "")
+    entries = [entry.strip() for entry in raw.split(",")]
+    kept: set[str] = set()
+    dropped = 0
+    for entry in entries:
+        if not entry:
+            continue
+        if _QUALIFIED_SUBSCRIPTION.fullmatch(entry):
+            kept.add(entry)
+        else:
+            dropped += 1
+    if dropped:
+        # The count, not the entries: the value is caller text from a CR.
+        LOGGER.warning(
+            "%s holds %d %s not a projects/<project>/subscriptions/<name> path; dropped",
+            PLATFORM_PUBSUB_SUBSCRIPTIONS_ENV,
+            dropped,
+            "entry that is" if dropped == 1 else "entries that are",
+        )
+    return frozenset(kept)
+
+
 def serve(args: argparse.Namespace) -> None:
     role = resolve_role()
     if role == "api-proxy":
@@ -10855,6 +11536,12 @@ def serve(args: argparse.Namespace) -> None:
     CredentialProxyHandler.api_relay = GoogleApiRelay()
     LOGGER.info("Cloud API relay enabled routes=%d", len(api_policy.API_READ_ROUTES))
     CredentialProxyHandler.watcher_subscription = os.getenv("WATCHER_PUBSUB_SUBSCRIPTION", "").strip()
+    CredentialProxyHandler.platform_pubsub_subscriptions = platform_pubsub_subscriptions()
+    if CredentialProxyHandler.platform_pubsub_subscriptions:
+        LOGGER.info(
+            "platform Pub/Sub relay enabled subscriptions=%d",
+            len(CredentialProxyHandler.platform_pubsub_subscriptions),
+        )
     CredentialProxyHandler.slack_max_request_bytes = int(
         os.getenv("SLACK_RELAY_MAX_REQUEST_BYTES", str(28 * 1024 * 1024))
     )

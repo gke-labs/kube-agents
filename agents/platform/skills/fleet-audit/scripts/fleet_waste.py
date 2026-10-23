@@ -153,6 +153,7 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
     if _shared_dir not in sys.path:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
+from collect import declaration_for, workload_declarations  # noqa: E402
 
 # The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
@@ -4522,118 +4523,6 @@ def check_unsized(context: dict, usage_peaks: dict, *, now: datetime, autopilot:
     return hits
 
 
-def workload_declarations(root: Path) -> dict[tuple[str, str, str, str], set[str]]:
-    """Index the Kubernetes objects a GitOps clone declares, by cluster tree.
-
-    Maps `(cluster, kind, namespace, metadata.name)` to the set of
-    clone-relative paths declaring it — a set, because two files claiming one
-    object is the ambiguity `declaration_for` refuses to resolve rather than
-    guessing between.
-
-    Copied from `collect.py`, which carries the full argument for why this
-    exists at all: the SOPs otherwise tell the *model* to run
-    `grep -rl "name: <object>"` once per finding, and a grep that is kind-blind
-    and unanchored does not decide consistently. What earns the copy here is
-    that this collector already disagrees with itself. In the live fleet's
-    2026-09-06 run it published three `kind: manifest` sizing findings whose
-    paths this index resolves, and two `overrequest` findings marked
-    `kind: manual` — "no pull request is possible" — on
-    `Deployment/ai-inference-hardened` and `Deployment/ai-inference-unsafe`,
-    both of which it also resolves, in the same repository, on the same run.
-    A shrunk `resources.requests` is the most mechanical manifest edit this
-    audit produces; leaving it `manual` for want of a file path costs a PR
-    that needs no fact from outside the file.
-
-    Returns `{}` when PyYAML is absent or the clone is unreadable, which leaves
-    every candidate unannotated and the SOP's grep as the only answer -- the
-    behaviour that shipped before this existed.
-    """
-    try:
-        import yaml  # noqa: PLC0415 -- optional; absence disables the annotation
-    except ImportError:
-        return {}
-
-    index: dict[tuple[str, str, str, str], set[str]] = {}
-    try:
-        paths = sorted(root.rglob("*.yaml")) + sorted(root.rglob("*.yml"))
-    except OSError:
-        return {}
-    for path in paths:
-        # `.git` holds packed objects, not manifests, and rglob walks into it.
-        if GIT_DIR_NAME in path.parts:
-            continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        try:
-            docs = list(yaml.safe_load_all(text))
-        except yaml.YAMLError:
-            # A file this collector cannot parse is one it cannot make a claim
-            # about. Skipping leaves those findings unannotated.
-            continue
-        try:
-            relative = path.relative_to(root)
-        except ValueError:
-            continue
-        parts = relative.parts
-        # Only a file under `clusters/<name>/` is applied to a known cluster.
-        # Anything else -- `gcp/`, `bootstrap/`, the repo root -- is either a
-        # Config Connector resource this index skips or hub infrastructure no
-        # per-cluster finding should resolve to, so it is indexed under no
-        # cluster and can never match: `declaration_for` requires the cluster.
-        if len(parts) <= GITOPS_CLUSTER_TREE_DEPTH or parts[0] != GITOPS_CLUSTER_TREE_ROOT:
-            continue
-        cluster = parts[1]
-        for doc in docs:
-            if not isinstance(doc, dict):
-                continue
-            api = str(doc.get("apiVersion") or "")
-            kind = str(doc.get("kind") or "")
-            if not kind or KCC_API_GROUP_SUFFIX in api:
-                continue
-            meta = doc.get("metadata")
-            if not isinstance(meta, dict):
-                continue
-            name = str(meta.get("name") or "")
-            namespace = str(meta.get("namespace") or "")
-            if not name or not namespace:
-                continue
-            index.setdefault((cluster, kind, namespace, name), set()).add(str(relative))
-    return index
-
-
-def declaration_for(
-    index: dict[tuple[str, str, str, str], set[str]],
-    cluster: str,
-    namespace: str,
-    obj: str,
-) -> dict | None:
-    """Where the GitOps repo declares one candidate's object, or `None`.
-
-    `None` means unannotated — no claim either way — and is what an absent
-    index, an object outside `Kind/name` form, or a genuine miss all return.
-    A hit carries `path` (the declaration itself, for a remediation that
-    *changes* the object, which every sizing finding here is) and `directory`
-    (its parent, for one that *creates* a sibling beside it).
-
-    The match is exact on all four of cluster, kind, namespace and name; see
-    `collect.py`'s copy for why every looser arm was measured and dropped.
-    """
-    kind, _, name = obj.partition("/")
-    if not kind or not name or not cluster or not namespace:
-        return None
-    paths = index.get((cluster, kind, namespace, name))
-    if not paths or len(paths) > 1:
-        # Two files declaring one object is a duplicate resource id that Argo
-        # and Config Sync both reject; picking one would name the wrong file
-        # half the time. Say nothing and let the SOP's `manual` branch hold.
-        return None
-    path = next(iter(paths))
-    parent = str(Path(path).parent)
-    return {"path": path, "directory": parent}
-
-
 def _argocd_chart_source(spec: dict) -> dict | None:
     """The one chart source on an Argo CD Application, with its field path.
 
@@ -4721,7 +4610,7 @@ def _argocd_values_field(source: dict, field: str) -> str:
 def release_declarations(root: Path) -> dict[tuple, dict]:
     """Index the Helm releases a GitOps clone installs, by destination cluster.
 
-    `workload_declarations` above resolves a workload to the file declaring
+    `workload_declarations` in `collect` resolves a workload to the file declaring
     *that object*. A workload a chart renders has no such file: the repo
     declares the release, and the object exists only after Helm expands the
     chart. That is what sends a right-sizing finding to `manual` -- and

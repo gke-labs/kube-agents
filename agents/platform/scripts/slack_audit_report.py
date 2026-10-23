@@ -109,7 +109,11 @@ TRAILING_LEDGER_SUFFIX = r">?\)?[\s.]*\Z"
 TRAILING_LEDGER = re.compile(TRAILING_LEDGER_PREFIX + ISSUE_URL + TRAILING_LEDGER_SUFFIX, re.IGNORECASE)
 #: An issue on any forge, anywhere in a report (``failed_line``): GitHub's ``/issues/<n>``,
 #: GitLab's ``/-/issues/<n>`` or ``/-/work_items/<n>``, on any host. Only says a ledger was named.
-ANY_ISSUE_URL = re.compile(r"https?://\S+?/(?:-/)?(?:issues|work_items)/\d{1,9}\b", re.IGNORECASE)
+#: The host and path exclude ``:``, so one URL's scan ends at the next ``://`` and a report
+#: that is a run of URLs is read once rather than once per URL.
+ANY_ISSUE_URL = re.compile(
+    r"https?://[^\s:/]+(?::\d{1,5})?/(?:[^\s:]*?/)?(?:-/)?(?:issues|work_items)/\d{1,9}\b", re.IGNORECASE
+)
 
 
 @functools.lru_cache(maxsize=8)
@@ -300,7 +304,7 @@ LEDGER_BUTTON = "Ledger issue #{number} ↗"
 WRONG_LABEL = re.compile(
     r"^[ \t]*(?:#{1,6}[ \t]+)?(?:\*\*|__)?What['’]s[ \t]+wrong"
     r"(?:(?:[ \t]*[:—–-](?:\*\*|__)?|(?:\*\*|__)[ \t]*[:—–-])[ \t]+(?P<rest>\S.*)"
-    r"|[ \t]*:?(?:\*\*|__)?[ \t]*(?:#+[ \t]*)?)$",
+    r"|[ \t]*(?::?(?:\*\*|__)[ \t]*|:[ \t]*)?(?:#+[ \t]*)?)$",
     re.IGNORECASE | re.MULTILINE,
 )
 #: A line that ends the section's first paragraph: a heading, a list item, or a bold label alone.
@@ -772,8 +776,9 @@ def failed_line(report: str) -> str | None:
 
     A report that ends with its ledger link completed (the card is built from
     the ledger), and so did one that names an issue URL on any forge anywhere: it wrote a
-    ledger, and posts as written. One with no issue URL that opens a "What's
-    wrong" section is a run that could not write its ledger (no GitOps
+    ledger, and posts as written (a URL with a ``:`` past the port, a userinfo with a
+    password, or an IPv6 host, is not read as one). One with no issue URL that opens a
+    "What's wrong" section is a run that could not write its ledger (no GitOps
     repository registered, say): the line is that section's first sentence, as
     the agent wrote it, markdown and all; the headline cut past ``HEADLINE_MAX``
     does not apply, since the line is the whole notification and its "because"
