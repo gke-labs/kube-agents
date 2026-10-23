@@ -1,4 +1,4 @@
 name: chat_metrics
 version: 1.0.0
-description: Count inbound chat messages and failed turns by platform, and serve them on a metrics-only listener for the operator and the collector.
+description: Count inbound chat messages and failed turns by platform and the board's cards that gave up, and serve them on a metrics-only listener for the operator and the collector.
 kind: standalone

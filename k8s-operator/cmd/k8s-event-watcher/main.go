@@ -737,6 +737,15 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 			ev.Key.Reason, ev.Namespace, ev.Name, sid)
 		return
 	}
+	if status == injectStatusFolded {
+		// 2xx, and the daemon recorded it against an incident already
+		// admitted for this workload. Kept rather than rolled back, and not
+		// flagged: see injectStatusFolded.
+		d.metrics.eventsFolded.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, ev.Namespace).Inc()
+		log.Printf("folded %s pod=%s/%s (sid=%s) — the workload's incident is already open",
+			ev.Key.Reason, ev.Namespace, ev.Name, sid)
+		return
+	}
 	if status == injectStatusSuppressed {
 		// 2xx, and nobody was told: the daemon spent the day's ceiling
 		// for this severity and dropped the alert. Rolled back for the

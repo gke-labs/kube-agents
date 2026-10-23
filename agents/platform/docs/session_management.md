@@ -45,6 +45,14 @@ Deduplication bounds how often _one_ failure is reported. It does nothing about 
 
 A [`gitops-drift` inject](#the-second-producer-gitops-drift) reaches the ceiling by a different route: it is graded `Warning` unconditionally and skips both the classifier and the gate, because the detector that sent it already decided the record was worth a human's attention. It is billed to a bucket of its own (`GitOpsDrift`) rather than to the `Warning` one its ledger row records it as, because `_claim_alert_quota` keys the table on the string it is handed and the two traffic shapes are not comparable: one `kubectl apply` over a directory is several audit entries and several injects, where the watcher's warnings arrive one incident at a time. Sharing the bucket therefore let routine drift cap-drop a deployed signal. The cost is that the ceilings add up, so a busy day of both posts more total alerts than the single budget allowed; neither ceiling bounds the fan-out itself.
 
+#### Folding a workload's repeat events
+
+The watcher deduplicates on the involved object's UID and the reason, so one broken Deployment reaches `inject_message` once per replica, once per replacement pod, and once per reason in a cascade (`Unhealthy`, then `BackOff`). With `INCIDENT_WORKLOAD_DEDUP_SECONDS` above `0` (default `0`, off; capped at `86400`; a negative or unparseable value reads as `0`), a Warning-or-worse event for a `(cluster, namespace, object kind, fold_key)` that already has an admitted row younger than the window is written with `duplicate_of` set to that row (a Critical only when that row is Critical too, below). It claims no allowance, posts nothing and starts no turn, and the route answers `folded`. The watcher keeps its dedup entry unflagged and counts the event in `k8s_event_watcher_events_folded_total`, not as injected or as a triage session; `filtered` would let the next Warning sighting reopen the entry. A watcher that predates the status reads it as delivered, which keeps the entry the same way and miscounts it. The window runs from the anchor, so once it passes, the next new pod or reason from a workload that is still failing is announced again.
+
+`fold_key` is what makes two events one workload, and the inject payload carries no owner reference (the watcher never fills in `context.controller_ref`), so it is read from the pod's name. A Deployment's pod (its ReplicaSet's pod-template hash, then its own suffix: `checkout-6cfdb6b98b-zwv24`) folds on the workload `clean_workload_name` gives it. The hash is `SafeEncodeString` of a decimal number, so its characters are only `4`–`9`, `b`, `c`, `d` and `f`, and the fold key is set only for a segment of 8–10 of those. That keeps out a CronJob run's pod (`report-29812345-abcde`) and a date-stamped Job's (`db-migrate-20261021-abcde`), which the display cleaner shows under the same prefix: folded, a Job's failure would sit under a same-named Deployment's incident. The hash is shorter than 8 characters for about 0.2% of pod templates, and those Deployments do not fold: a lower bound would also match short name segments and fold different owners together. A non-Pod object folds on its own name. Any other Pod name has no key, so it neither folds nor anchors: a StatefulSet's `web-0` and `web-1` keep their ordinals, and a DaemonSet's or a Job's pods end in a five-character segment the cleaner also strips from a bare pod, where it is not a replica suffix (`api-cache` and `api-proxy` both display as `api`). Folding those would let one workload's alert silence another's, so they each still alert. A Critical event folds only into a Critical anchor: a workload that gets worse after its Warning went out is announced again.
+
+An admitted row is one with `notified` non-zero or a `delivery_error`. A failed chat post resets `notified` to `0` within seconds while its triage keeps running, so anchoring on `notified` alone would let every sibling open its own triage on an install whose chat route is broken. A row the gate filtered, the ceiling dropped, or that was itself folded never anchors a window, and neither does a row whose triage never started: when `trigger_agent_troubleshooter` cannot create the gateway session or the gateway refuses the turn (a 3xx, a 4xx, a 503, or an error while connecting or sending; a 2xx, any other 5xx or an error while waiting for the response counts as started, since the turn may have run; a draining gateway creates the session and answers the turn 503), it clears the row's `fold_key`, so a sibling that arrives after that is admitted and starts the triage. The same happens when that background task dies on an exception, and every start of the server clears all fold keys, because a row whose task never ran (the process died between the insert and the task) has nothing else to release it; a workload whose triage did start loses its window, at the cost of one more triage (one per severity, since a Critical folds only into a Critical) for a sibling that arrives after the restart. Siblings that folded into the row before it was released stay folded. For a refused turn they arrive within seconds of it, while the gateway that refused it is still refusing; for a task that died, they are the ones that landed while it ran. The daily recap does not count a folded row as withheld by the ceiling, and `GET /v1/intercepted-events` lists it as `folded`, with the anchor's id in its `duplicate_of`.
+
 A [`controller-stall` inject](#the-third-producer-controller-stall) claims no allowance at all: the stall watch caps itself at three alerts a tick, and that cap is its only bound. Neither does a drift backlog record that is digested (`POST /v1/drift-backlog`): it starts no turn and is counted in one digest. A late record that is carded instead — a late `kubectl` write, or a late row of a principal with fewer than three in the digest — bills `GitOpsDrift` as a live record does. A refused minority row stays in the digest; a refused late `kubectl` write is suppressed as a live record is.
 
 | Bucket        | Env var                      | Default |
@@ -323,7 +331,7 @@ number instead of losing them; the watcher's own dedup snapshot cannot substitut
 rolling window of _active_ incidents keyed by `(uid, reason)`, carries no namespace or workload
 name, and resets each entry's `count` when its window rolls over.
 
-`notified = 0` covers three unrelated outcomes and the recap must not conflate them. The [severity
+`notified = 0` covers four unrelated outcomes and the recap must not conflate them. The [severity
 gate](#severity-gate) holds back events Kubernetes itself graded informational, and those are the
 recap's subject — reported as a count. An alert the [daily ceiling](#daily-alert-ceiling) dropped
 carries the same flag but was graded `Critical` or `Warning` and was on its way to chat, so the
@@ -337,7 +345,7 @@ written. The row goes in before the chat post is attempted: the send runs in a b
 row written afterwards would be lost outright if the process died mid-flight. A send that then fails
 comes back and clears the flag, recording why in `delivery_error` — without that correction the row
 reads as delivered, and the recap prints its ✅ all-clear over a day an alert never reached anyone.
-It is a separate column rather than a fourth `severity` reading because a ceiling drop and a failed
+It is a separate column rather than another `severity` reading because a ceiling drop and a failed
 send prescribe opposite remedies: raise the ceiling, or fix the chat credentials. The recap keeps
 that distinction in its counts and drops it from its listing: it names neither class, and prints a
 separate ⚠️ total for each above the body. No metric counts the delivery-failure class at all, so
@@ -346,6 +354,8 @@ system. The SOP's "What this recap does not report" owns the naming-versus-count
 what to query for the detail. Like `cluster`, it postdates the first draft of this table, and the recap selects it only
 when `PRAGMA table_info` says it is there — see "Which columns are migrated, and which are not" below for
 why that tolerance is in the reader and not in `init_db`, and why `cluster` does not get it.
+
+The fourth is a row folded into its workload's open incident ([Folding a workload's repeat events](#folding-a-workloads-repeat-events)): graded `Critical` or `Warning`, and not posted because an incident for the same workload was already admitted (posted, dispatched headless, or posted and refused by chat). It carries `duplicate_of`, which is how the recap tells it from a ceiling drop. It counts it in neither tally, and keys its group as an alert that went out, so it joins its anchor's group when the reason, severity and delivery match and forms a group of its own when they do not.
 
 It differs from the ceiling in one further respect. `inject_message` returns on a ceiling refusal
 before it queues the background task, so no session is ever created. `trigger_agent_troubleshooter`
@@ -395,7 +405,9 @@ CREATE TABLE intercepted_events(
   created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   backlog     INTEGER NOT NULL DEFAULT 0,  -- drift backlog: 1 owed a digest, 2 digested, 3 no chat platform, 4 carded
   principal   TEXT NOT NULL DEFAULT '',    -- written on drift backlog rows only, for the digest's count
-  payload     TEXT NOT NULL DEFAULT ''     -- drift backlog rows only: the record, to card it from
+  payload     TEXT NOT NULL DEFAULT '',    -- drift backlog rows only: the record, to card it from
+  duplicate_of INTEGER,                    -- the admitted row this event was folded into; NULL otherwise
+  fold_key    TEXT NOT NULL DEFAULT ''     -- what the row folds on: the workload of a pod named like a Deployment's, or a non-Pod object's name; '' when it cannot fold or anchor, was released, or predates the last server start
 );
 ```
 
@@ -422,9 +434,9 @@ time and bounds nothing on disk; 512 keeps more than it shows, which leaves room
 ##### Which columns are migrated, and which are not
 
 `init_db` runs `ALTER TABLE intercepted_events ADD COLUMN ...` for `session_id`, `backlog`,
-`principal` and `payload` (which arrived after the table first shipped in 0.2.0, so released 0.2.0+
+`principal`, `payload`, `duplicate_of` and `fold_key` (which arrived after the table first shipped in 0.2.0, so released 0.2.0+
 databases carry `cluster`, `object_uid` and `delivery_error` and gain `session_id`, `backlog`,
-`principal` and `payload` in place on startup), and runs `CREATE TABLE IF NOT EXISTS` for everything else: there is no `ALTER TABLE` for
+`principal`, `payload`, `duplicate_of` and `fold_key` in place on startup), and runs `CREATE TABLE IF NOT EXISTS` for everything else: there is no `ALTER TABLE` for
 `cluster`, `object_uid` or `delivery_error` anywhere in the tree. Those three columns landed
 before the table ever shipped in a release, so the only databases carrying an earlier shape
 without them are pre-0.2.0 dev installs that ran an intermediate commit of the change that
