@@ -25,6 +25,7 @@
 # same test holds that chain to no longer than the longer stack chain.
 ai-security-planted-model-audit
 fleet-audit-clean-close-reads-clean
+gpu-stress-test-diagnosis
 autoops-warning-event-triage
 incident-triage-workload-fold
 obtainability-planted-orphan-service
@@ -47,8 +48,8 @@ gitops-drift-backlog-digest
 # main". This line is inert until they exist, which is why it is placed on
 # the arithmetic alone.
 gitops-drift-load-bearing-change-triage
-# Registered 2026-10-22 (#3583) at 1500s, the longest stack case. Listed here
-# with gpu-stress-test-diagnosis (900s) moved to main-a, the halves stand at
-# 9450s (main-a) against 9300s (main-b); with the gpu case kept here they
-# are 1650s apart, over the one-case tolerance.
+# Registered 2026-10-22 (#3583) at 1500s. With autoops-quiet-followup (1800s)
+# on main-a since #3617, the halves stand at 11250s (main-a) against 11100s
+# (main-b) with gpu-stress-test-diagnosis kept above; moved to main-a they
+# are 1950s apart, over the one-case tolerance.
 triage-start-burst
