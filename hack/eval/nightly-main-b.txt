@@ -32,6 +32,7 @@ obtainability-planted-orphan-service
 fleet-audit-unchanged-finding-keeps-wording
 first-install-hello-running
 first-install-hello-done
+fleet-audit-unread-target-keeps-finding
 gitops-drift-backlog-digest
 # One of the two CUJ 1 halves registered on 2026-10-20 (#2889). With both in
 # main-a, alongside gitops-drift-backlog-digest, its chain is 9750s against
@@ -48,3 +49,8 @@ gitops-drift-backlog-digest
 # main". This line is inert until they exist, which is why it is placed on
 # the arithmetic alone.
 gitops-drift-load-bearing-change-triage
+# Registered 2026-10-22 (#3583) at 1500s. With autoops-quiet-followup (1800s)
+# on main-a since #3617, the halves stand at 11250s (main-a) against 11100s
+# (main-b) with gpu-stress-test-diagnosis kept above; moved to main-a they
+# are 1950s apart, over the one-case tolerance.
+triage-start-burst

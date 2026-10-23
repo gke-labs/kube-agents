@@ -592,6 +592,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # post a fired audit run produced is the report its `finish` rendered is the
     # whole assertion.
     "audit_chat_report_posted": (),
+    # This repository, agent-pod- and cluster-reading: the namespace names the
+    # burst whose admitted alerts must each have started a triage turn.
+    "triage_starts": ("namespace",),
 }
 
 # Check types that read live cluster state. A case using one is asserting on

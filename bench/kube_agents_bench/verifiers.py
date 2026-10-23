@@ -2055,6 +2055,10 @@ _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
 _OMITTED_NOTICE_RE = re.compile(r"(\d+) further finding\(s\) are omitted from this description")
 # Mirrors audit_report's `HELD_IDS_RE`: the held ids its held span records.
 _HELD_IDS_RE = re.compile(r"<!--[ \t]*audit-held-ids:[ \t]*(\[.*?\])[ \t]*-->", re.S)
+# Mirrors audit_report's `NOT_RECHECKED_IDS_COMMENT`: the ids its held span
+# keeps under "Not re-checked this run", previous findings on a target the run
+# did not check.
+_NOT_RECHECKED_IDS_RE = re.compile(r"<!--[ \t]*audit-not-rechecked-ids:[ \t]*(\[.*?\])[ \t]*-->", re.S)
 _CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
 # Ids quoted in an `every_finding_named` failure; the count is always exact.
 _MAX_UNNAMED_IN_REASON = 5
@@ -4493,9 +4497,16 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             body = ledger["body"]
             named = set(_HEADING_ID_RE.findall(body))
             named |= set(_CODE_SPAN_RE.findall(_HTML_COMMENT_RE.sub("", body)))
-            # Collector-held ids are the collector's, rendered in what the
-            # findings leave; this check grades the findings the run filed.
-            held = {fid for match in _HELD_IDS_RE.findall(body) for fid in _json_str_list(match)}
+            # Collector-held ids are the collector's, and not-re-checked ids
+            # are previous findings this run did not check. Both are rendered
+            # in what the findings leave; this check grades the findings the
+            # run filed.
+            held = {
+                fid
+                for pattern in (_HELD_IDS_RE, _NOT_RECHECKED_IDS_RE)
+                for match in pattern.findall(body)
+                for fid in _json_str_list(match)
+            }
             unnamed = [fid for fid in filed[0] if fid not in named and fid not in held]
             # Past its cap the complete-id block is left out and `filed` is the
             # delta block, which lacks the omitted ids; the renderer's omission

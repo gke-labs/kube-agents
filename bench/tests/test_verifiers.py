@@ -4176,6 +4176,18 @@ def test_every_finding_named_does_not_grade_a_collector_held_id(token, github):
     assert _ledger_check(every_finding_named=True).verify(5.0).status == "pass"
 
 
+def test_every_finding_named_does_not_grade_a_not_rechecked_id(token, github):
+    # The note and id-only tiers of the held span show no row for a previous
+    # finding on a target the run did not check; the span lists its id.
+    _stash_report()
+    held = (
+        "\n<!-- audit-held:begin -->\n<!-- audit-held-ids: [] -->\n"
+        f'<!-- audit-not-rechecked-ids: ["{_NAMED_CUT}"] -->\n<!-- audit-held:end -->\n'
+    )
+    github.routes[_api()] = (200, _issue(_cut_body(held)))
+    assert _ledger_check(every_finding_named=True).verify(5.0).status == "pass"
+
+
 def test_every_finding_named_fails_on_an_omission_notice_without_a_complete_block(token, github):
     _stash_report()
     body = _ledger_body(
@@ -4447,6 +4459,21 @@ def test_the_complete_block_regex_reads_what_audit_report_writes():
     body = _ledger_body() + template.replace("{payload}", payload) + "\n"
     parsed = verifiers._finding_ids(body)
     assert parsed == (["a.b.c.d", "e.f.g.h"], "audit-findings-all")
+
+
+def test_the_not_rechecked_regex_reads_what_audit_report_writes():
+    """_NOT_RECHECKED_IDS_RE copies the list that audit_report's held span writes.
+    Build that list from the script's own name and template, so a change on that
+    side fails here and not as a grade on a not-re-checked id."""
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "agents/platform/skills/fleet-audit/scripts/audit_report.py"
+    ).read_text()
+    (name,) = re.findall(r'^NOT_RECHECKED_IDS_COMMENT = "([^"]+)"$', source, re.M)
+    assert 'f"<!-- {NOT_RECHECKED_IDS_COMMENT}: {json.dumps(unread)} -->"' in source
+    comment = f"<!-- {name}: {json.dumps(['a.b.c.d', 'e.f.g.h'])} -->"
+    (payload,) = verifiers._NOT_RECHECKED_IDS_RE.findall(comment)
+    assert json.loads(payload) == ["a.b.c.d", "e.f.g.h"]
 
 
 def test_no_body_scoped_ledger_phrase_collides_with_a_roster_check_slug():

@@ -1163,7 +1163,9 @@ class ProvisionRerunGateTest(unittest.TestCase):
     def test_the_status_words_are_the_operators(self) -> None:
         consts = constants()
         controller = text(_CONTROLLER / "platformagent_controller.go")
-        self.assertIn(f'agent.Status.Phase = "{consts["CR_PHASE_DEGRADED"]}"', controller)
+        # The phase is a constant the usage gauges' vocabulary shares (usage_gauges.go).
+        self.assertIn("agent.Status.Phase = degradedPhase", controller)
+        self.assertRegex(controller, rf'degradedPhase\s+= "{consts["CR_PHASE_DEGRADED"]}"')
         self.assertIn(f'r.updateStatusDegraded(ctx, instance, "{consts["CR_READY_REASON_PROVISION_FAILED"]}", a2aState.message', controller)
         self.assertRegex(controller, r'Type:\s*"Ready",\s*Status:\s*metav1\.ConditionFalse,\s*Reason:\s*reason,')
         self.assertIn('ObservedGeneration int64 `json:"observedGeneration,omitempty"`', text(_API_TYPES))
