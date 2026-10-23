@@ -591,6 +591,18 @@ Layout:
   the console pod is enough, because `/config.json` hands the password to the page, and to
   any other process running locally while the forward is open.
 
+  **Amended 10/21 (#3653):** a second console client, the MCP server (`a2a/cmd/mcp`), under
+  the operator flag `A2A_MCP_DOOR=true` and only then. It runs in its own Deployment
+  (`<agent>-a2a-mcp`, from the console image) holding the `console` password, one key of the
+  creds Secret like the console's, and dials 4222 over TLS as `console`; the NATS fence
+  admits it on 4222 by label and never on 9222. It adds no principal and no grant: what an
+  MCP caller can do on the bus is what the console can. Callers authenticate to the server
+  with its own bearer token (`<agent>-a2a-mcp-token`, minted by the operator), never with a
+  bus credential, and reach it only through `kubectl port-forward`: the Service is ClusterIP
+  and the pod's ingress is deny-all. Reading the token needs `get` on that Secret, so the
+  access gate is the Secret's RBAC plus `pods/portforward`. That is a gate the console does
+  not have: its pod hands the password to whoever forwards to it.
+
 - **The notify route.** The agent's proactive posts to the chat home channel under `next`, and a
   kanban card's report back to the gateway conversation it was filed in
   (spec-chatops-gateway.md, "Proactive posts: the chat.notify route"). The `agent` user gains

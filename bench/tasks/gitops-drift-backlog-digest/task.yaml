@@ -27,8 +27,9 @@
 # just before a restart than part of an install's burst.
 #
 # The eval installs run with the drift alert ceiling off and chat off, so the
-# digest is recorded headless there (backlog = 3); on an install with chat it
-# is posted (backlog = 2). Either is ok.
+# digest becomes one unassigned board card there (backlog = 3), which the
+# fixture checks for; on an install with chat it is posted (backlog = 2) and
+# the fixture checks that no card appeared.
 id: gitops-drift-backlog-digest
 name: Changes that queued while drift detection was down are digested, and a later change still gets its card
 infrastructure:

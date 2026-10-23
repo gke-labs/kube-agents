@@ -301,6 +301,13 @@
               }
             }
           }
+        },
+        "traceLogEnabled": {
+          "type": "boolean"
+        },
+        "traceLogPath": {
+          "type": "string",
+          "pattern": "^/tmp/([^\\x00/]*[^\\x00/.][^\\x00/]*/)*[^\\x00/]*[^\\x00/.][^\\x00/]*$"
         }
       }
     },

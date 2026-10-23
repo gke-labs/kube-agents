@@ -252,7 +252,7 @@ run once: the run it last posted per job is kept in `audit_report_runs`. A run
 that failed is delivered as the scheduler's failure line, which the relay
 plugin recognises by its exact opening and the job's name
 (`adapter.SCHEDULER_FAILURE_PREFIXES`, pinned against the scheduler at image
-build) and flags; the relay posts that line as written, as on main, and marks
+build) and flags; the relay posts that line in plain words (below) and marks
 the record on disk posted, so a later run cannot post an earlier run's report
 as its own. The flag is read off the text, which the model can also write, so
 when the record's last step is at or after the delivering run's start (its
@@ -266,6 +266,27 @@ and leaves the run unposted. `[SILENT]` is unchanged: the scheduler drops a
 silent run before delivery. Only the scheduler's delivery leg is replaced: the relay plugin sends
 `also_delivered_to` on every delivery and `report_to_chat` never does, so a
 mid-run `report_to_chat` is posted as written.
+
+The scheduler's failure line names a CLI and a config file nobody in the
+channel can reach, so for any job, audit or not, the relay posts it as one plain
+line instead (`scheduler_failure_line`): "**The Workload Reliability Audit didn't
+run.** The AI model's usage limit was reached. It will try again tomorrow."
+The reason is the scheduler's own, in plain words, or "It hit an error" for one
+the relay does not name, and the scheduler's line goes to the server's log
+(`logs/session_kv_server.log`, which fluent-bit ships). "tomorrow" is for a job
+whose roster schedule fires once a day, every day (`cron_schedule.is_daily`);
+any other says "It will try again at its next scheduled run." A failure no
+retry clears says so instead of promising one: rejected credentials, and the
+scheduler's blocked-configuration line (which it sends once, running the job no
+more until the configuration is fixed), end with "An admin needs to fix this
+before it can run; the details are in the agent's log." There is no clock time: under `spec.mode: next`, the default
+for a first install, the gateway escapes Slack's `<!date^…>` token, and a time
+in one zone is wrong for most readers. A failure posts once: `scheduler_failure_posts` keeps the reason each
+job last posted, and the same reason is withheld until the job's `completed` row
+in the run ledger starts after that post, or until any delivery from the job
+that is not a failure line, whose own report is the sign it runs again. A
+different reason posts at once, and a ledger the relay cannot read posts rather
+than withholds.
 
 Each report ends with a `Ledger: <url>` line, which the Slack headline reads,
 so a run over one repository gets its card. A message that carries the line
@@ -663,8 +684,9 @@ time delivery is reached. `run_one_job` applies the `[SILENT]` check and, on a
 failed run, substitutes `_summarize_cron_failure_for_delivery(job, error)` —
 both _before_ calling `_deliver_result`. So a `deliver: "chat"` job inherits
 silence-on-nothing-to-report and audible failures without asking the model for
-either. For a fleet-audit job the relay posts that failure summary as written
-too, and in place of any other final message it posts the rendered report. One case the scheduler's check misses: it matches the bare marker only,
+either. The relay posts that failure summary in plain words, once until the job
+runs again, and for a fleet-audit job it posts the rendered report in place of
+any other final message. One case the scheduler's check misses: it matches the bare marker only,
 and a run that emphasised it (`**[SILENT]**`, where the SOP asked for the bare
 marker as the whole response) reached both senders. The adapter therefore
 carries its own `is_silent_report`, which undresses the marker before testing,

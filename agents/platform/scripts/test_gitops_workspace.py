@@ -447,6 +447,16 @@ class TestLeaseMarker(WorkspaceTestCase):
         self.assertEqual(first["created_at"], second["created_at"])
         self.assertGreater(marker.stat().st_mtime, time.time() - 60)
 
+    def test_the_stamps_read_the_same_clock_as_time_time(self):
+        # `time.gmtime()` with no argument reads the coarse C clock, which can
+        # trail `time.time()` by a second right after a second boundary. The
+        # fleet audit compares `refreshed_at` with an in-flight note stamped
+        # from `time.time()`, so the marker has to read that clock and no other.
+        with patch("time.time", return_value=1_000_000_000.0):
+            record = gitops_workspace.write_lease(self.holder(), LEASE, "acme/fleet")
+        self.assertEqual(record["created_at"], "2001-09-09T01:46:40Z")
+        self.assertEqual(record["refreshed_at"], "2001-09-09T01:46:40Z")
+
     def test_unreadable_and_malformed_markers_read_as_absent(self):
         self.holder().mkdir(parents=True)
         self.assertIsNone(gitops_workspace.read_lease(self.holder()))
