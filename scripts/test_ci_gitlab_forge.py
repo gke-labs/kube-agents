@@ -1602,6 +1602,10 @@ class EvalScriptGitLabTest(unittest.TestCase):
         # A developer's own instance: the host follows the override, the kind does not.
         own = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": "gitlab-ce", "EVAL_FORGE_STATE_DIR": str(state), "EVAL_GITLAB_CE_HOST": "gitlab.dev.example"}, bin_dir=self.bin)
         self.assertIn("KIND=gitlab HOST=gitlab.dev.example", own.stdout)
+        # A relative state directory is refused where it is read: the grader would resolve it under bench/.
+        relative = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": "gitlab-ce", "EVAL_FORGE_STATE_DIR": "forge-state"}, bin_dir=self.bin)
+        self.assertNotEqual(relative.returncode, 0)
+        self.assertIn("EVAL_FORGE_STATE_DIR='forge-state' must be an absolute path", relative.stderr)
         # A host that is not a bare hostname stops the eval at the table, naming the variable, not as an unknown forge.
         for bad, why in (("gitlab.dev.example:8443", "is not a dotted bare hostname"), ("gitlab.dev example", "is not a dotted bare hostname"), ("gitlab", "is not a dotted bare hostname"), ("gitlab.com", "is a public forge")):
             with self.subTest(host=bad):
