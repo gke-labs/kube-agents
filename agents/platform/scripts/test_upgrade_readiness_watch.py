@@ -185,6 +185,9 @@ class Base(unittest.TestCase):
             os.environ,
             {
                 watch.WATCH_HOME_ENV: str(self.home),
+                # The profile home holds no roster, so the failure line's ending
+                # does not depend on the machine's own HERMES_HOME.
+                watch.HOME_ENV: self.tmp.name,
                 watch.PROJECTS_ENV: "p1",
                 watch.REFRESH_DAYS_ENV: "",
                 watch.SKILL_SCRIPTS_DIR_ENV: "",
@@ -1513,7 +1516,7 @@ class Failures(Base):
         text = (self.home / "reports" / TARGET / "latest.md").read_text()
         self.assertIn("The next scheduled refresh is after 2026-10-15 while any cluster is still pending; ask the Platform Agent", text)
 
-    def test_an_unsaveable_ledger_exits_non_zero(self) -> None:
+    def test_an_unsaveable_ledger_exits_zero_with_its_own_line(self) -> None:
         sandbox = FakeSandbox(envelope([member("a", "lagging")]), envelope([member("a", "lagging", readiness="ready")]))
         with mock.patch.object(watch, "save_ledger", side_effect=OSError("read-only file system")):
             code, out = self.run_tick(sandbox)
@@ -1521,7 +1524,7 @@ class Failures(Base):
         self.assertIn("writing the ledger or the report failed: read-only file system", out)
         self.assertIn(watch.FAILED_NEEDS_ADMIN, out)
 
-    def test_an_unwritable_report_exits_non_zero_and_claims_nothing(self) -> None:
+    def test_an_unwritable_report_exits_zero_and_claims_nothing(self) -> None:
         sandbox = FakeSandbox(envelope([member("a", "lagging")]), envelope([member("a", "lagging", readiness="ready")]))
         with mock.patch.object(watch, "write_report", side_effect=OSError("disk full")):
             code, out = self.run_tick(sandbox)
@@ -2945,6 +2948,7 @@ class SaveFailure(unittest.TestCase):
             os.environ,
             {
                 watch.WATCH_HOME_ENV: str(self.home),
+                watch.HOME_ENV: self.tmp.name,
                 watch.PROJECTS_ENV: "p1",
                 fleet_scope_targets.AGENT_HOME_ENV: self.tmp.name,
                 fleet_scope_targets.SCOPE_FILE_ENV: "",
