@@ -104,7 +104,7 @@ Write one declared line per family, verbatim:
 family <name>: canary <cluster>; gate <clear|risk|pending>; rollout <go|hold>
 ```
 
-`go` only on `clear`; `hold` on `risk` and on `pending`, with the reason in the next sentence.
+`go` only on `clear`; `hold` on `risk` and on `pending`. A hold is never bare: the sentence before the line quotes the report's entry for the gate, as the report writes it. For a log-volume risk that is the container (`<namespace>/Container/<name>`), its before-week and after-week bytes and the ratio; for an Error or Warning its heading and mitigation; for `pending`, the time the gate can be read. A line handed back without that sentence is not an answer, whoever asked.
 
 ### 5. The rest
 
@@ -123,7 +123,7 @@ The manual path and the sequence path produce the same two declared lines.
 
 ### 7. Report in chat
 
-The answer carries, in this order: the precheck line(s), one per host project; one family line per family; the canaries with their reasons and prerequisites; the operator steps and pull requests, each named as one or the other; and the time the next gate can be read. When the plan is a hand-over (sections 2 and 3 done, no upgrade run yet), every family line reads `gate pending; rollout hold` and the next sentence says the gate is read seven days after the canary's upgrade ends. Name the report each gate came from by its dated path under `/opt/data/upgrade-retrospective/reports/`. The answer is never `[SILENT]`.
+The answer carries, in this order: the precheck line(s), one per host project; one family line per family, each hold with its reason quoted from the report; the canaries with their reasons and prerequisites; the operator steps and pull requests, each named as one or the other; and the time the next gate can be read. When the plan is a hand-over (sections 2 and 3 done, no upgrade run yet), every family line reads `gate pending; rollout hold` and the next sentence says the gate is read seven days after the canary's upgrade ends. Name the report each gate came from by its dated path under `/opt/data/upgrade-retrospective/reports/`. The answer is never `[SILENT]`.
 
 ### 8. What this SOP is not
 
