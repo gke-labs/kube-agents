@@ -49,8 +49,11 @@ const (
 	// document, and the slowest, connection_status, bounds its own read
 	// (mcp.statusTimeout); a streamed answer, if a later tool adds one,
 	// has to revisit this.
-	writeTimeout  = 30 * time.Second
-	shutdownGrace = 5 * time.Second
+	writeTimeout = 30 * time.Second
+	// shutdownGrace outlasts the slowest request in flight, a status read
+	// (mcp's statusTimeout, 8 s), so a stop during one is a clean drain,
+	// well inside the pod's default 30 s termination grace.
+	shutdownGrace = 10 * time.Second
 	// dialTimeout bounds one attempt at the first connect to the bus.
 	dialTimeout = 30 * time.Second
 	// The first connect is retried, from dialBackoff doubling to
