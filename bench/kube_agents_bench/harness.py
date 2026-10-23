@@ -2606,12 +2606,15 @@ class KubeAgentsHarness(AgentHarness):
         The opening turn has ended. The cards its session filed are read off
         the board; with one there, ``send_stop`` sends ``stop`` on the
         conversation, and the harness then sleeps out the observation window
-        with no further turn, polling the board so the record says where
-        each card ended. A card still not terminal at the end is archived,
-        as a stalled card is, so it holds no dispatcher slot into the next
-        unit. :data:`stop_hook.STOP_ENTRY` goes on the trajectory either way,
-        ``completed`` only when a card was filed and the gateway took the word
-        as a stop.
+        with no further turn, polling the board, and grades where each card
+        stood at the window's last read. A card still not terminal then is
+        archived, as a stalled card is, so it holds no dispatcher slot into
+        the next unit, and every card's state is purged off the pod. A board
+        the harness cannot read (before the stop, after which the stop still
+        goes, since the gateway needs no card ids; or at the window's end)
+        makes the run infrastructure. :data:`stop_hook.STOP_ENTRY` goes on
+        the trajectory either way, ``completed`` only when a card was filed
+        and the gateway took the word as a stop.
         """
         entry: dict[str, Any] = {"name": stop_hook.STOP_ENTRY, "args": {"session": session_id}}
         result.trajectory.append(entry)
@@ -2664,25 +2667,37 @@ class KubeAgentsHarness(AgentHarness):
             result.errors.append(f"{stop_hook.STOP_ENTRY}: {detail}")
         deadline = time.monotonic() + stop.observe_seconds
         statuses: dict[str, str] = {}
-        read_after_stop = False
+        fresh = False
         while True:
             seen = board.read_session_cards(_agent_shell, session_id, _EXEC_TIMEOUT)
+            fresh = seen is not None
             if seen is not None:
-                read_after_stop = True
                 statuses = {t: str(seen.cards.get(t, {}).get("status") or "unknown") for t in cards}
             left = deadline - time.monotonic()
             if left <= 0:
                 break
             time.sleep(min(left, max(poll_interval, 1.0)))
+        # The verdict is the window's last read, never an earlier one: the
+        # archive lands after the door answers the stop, so a read from the
+        # window's start would show a card the stop then archived as running.
+        # A failed last read is retried as any board read is.
+        for _ in range(1, _MAX_TRANSPORT_FAILURES):
+            if fresh:
+                break
+            time.sleep(max(0.0, poll_interval))
+            seen = board.read_session_cards(_agent_shell, session_id, _EXEC_TIMEOUT)
+            fresh = seen is not None
+            if seen is not None:
+                statuses = {t: str(seen.cards.get(t, {}).get("status") or "unknown") for t in cards}
         result.metadata["stop_card_statuses"] = statuses
-        if not read_after_stop:
-            # The harness's exec, not the gateway: no read after the stop is
-            # a verdict on nothing, so the run is infrastructure.
+        if not fresh:
+            # The harness's exec, not the gateway: no read at the window's end
+            # is a verdict on nothing, so the run is infrastructure.
             _archive_stalled_cards(cards, _EXEC_TIMEOUT)
             _purge_card_state(cards, _EXEC_TIMEOUT)
             raise _TransportError(
                 f"{stop_hook.CARDS_STOPPED_ENTRY}: the session store for {session_id} could not "
-                f"be read once in the {stop.observe_seconds:.0f}s after the stop"
+                f"be read at the end of the {stop.observe_seconds:.0f}s after the stop"
             )
         # What the stop did, read before the harness archives any leftover:
         # every card it filed archived, or the stop did not reach them all.

@@ -59,6 +59,15 @@ def _cards(statuses):
 PURGED = []
 
 
+@pytest.fixture(autouse=True)
+def _no_pod(monkeypatch):
+    """No test here reaches the real pod: the purge and the archive run
+    `kubectl exec` against whatever kubeconfig the machine has."""
+    PURGED.clear()
+    monkeypatch.setattr(harness, "_purge_card_state", lambda ids, timeout: PURGED.extend(ids))
+    monkeypatch.setattr(harness, "_archive_stalled_cards", lambda ids, timeout: None)
+
+
 def _run(monkeypatch, reads, send=(True, "stopped")):
     """Run the stop with board reads answered from ``reads`` in order."""
     calls = iter(reads)
@@ -153,10 +162,20 @@ def test_an_unreadable_session_still_sends_the_stop_and_is_infrastructure(monkey
     assert result.trajectory[-1]["status"] == "error"
 
 
-def test_a_window_with_no_read_after_the_stop_is_infrastructure(monkeypatch):
-    with pytest.raises(harness._TransportError, match="could not be read once"):
-        _run(monkeypatch, [_cards({"t_1": "running"}), None])
+def test_a_window_with_no_read_at_its_end_is_infrastructure(monkeypatch):
+    with pytest.raises(harness._TransportError, match="could not be read at the end"):
+        _run(monkeypatch, [_cards({"t_1": "running"})] + [None] * harness._MAX_TRANSPORT_FAILURES)
     assert PURGED == ["t_1"]
+
+
+def test_the_verdict_is_the_last_read_not_the_first(monkeypatch):
+    """The first read after the stop can predate the archive; the window's
+    end, retried past a failure, is what is graded."""
+    result, _, _, archived = _run(
+        monkeypatch, [_cards({"t_1": "running"}), None, _cards({"t_1": "archived"})]
+    )
+    assert _stopped(result)["status"] == "completed"
+    assert archived == []
 
 
 def test_a_session_not_in_the_store_says_so(monkeypatch):

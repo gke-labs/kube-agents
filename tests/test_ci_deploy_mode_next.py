@@ -542,7 +542,7 @@ class FlagSetIsNextTest(unittest.TestCase):
     def test_the_release_candidate_path_names_the_candidates_published_images(self) -> None:
         """The release-candidate eval grades next (#2007): section 4 under the
         flag with RC_COMMIT_SHA set submits no build and hands the operator the
-        same eight values, with the five A2A references and the bridge's under
+        same nine values, with the five A2A references and the bridge's under
         the published registry at the candidate's commit, the image names
         REQUIRED_RELEASE_IMAGES publishes."""
         result = run_build_section(
@@ -559,6 +559,7 @@ class FlagSetIsNextTest(unittest.TestCase):
         self.assertEqual(values[5], "operator.extraEnv[5].value=true")
         self.assertEqual(values[6], f"operator.extraEnv[6].value={_RC_REGISTRY_PREFIX}/hermes-bridge:{_RC_COMMIT_SHA}")
         self.assertEqual(values[7], f"operator.extraEnv[7].value={_BRIDGE_CONCURRENCY}")
+        self.assertEqual(values[8], "operator.extraEnv[8].value=true")
         self.assertNotIn(_AR_REPO, result.stdout)
         # The names are the ones the release publishes.
         common = text(_REPO_ROOT / "scripts" / "release" / "common.sh")

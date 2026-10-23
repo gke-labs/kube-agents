@@ -479,16 +479,28 @@ def test_every_shipped_blind_check_is_named(path):
     assert unnamed == [], f"{path}: transport-blind entries without a name"
     # Compound node types are not leaves; only leaf types decide.
     compounds = {"sequence", "parallel", "all", "any", "none"}
-    # A check naming only entries the harness writes is graded on every
-    # record, so it is declared here and left out there too.
-    def harness_only(entry):
-        lists = re.findall(r'"tool_names": \[([^\]]*)\]', json.dumps(entry.get("check")))
-        named = re.findall(r'"([^"]+)"', " ".join(lists))
+    # Leaf by leaf, as the loader decides: an entry is all-blind when every
+    # leaf is of a blind type and none is a check naming only entries the
+    # harness writes, which is graded on every record.
+    def leaves(node):
+        if isinstance(node, list):
+            return [leaf for item in node for leaf in leaves(item)]
+        if not isinstance(node, dict):
+            return []
+        if node.get("type") in compounds:
+            return [leaf for value in node.values() for leaf in leaves(value)]
+        return [node] if "type" in node else []
+
+    def harness_only(leaf):
+        named = leaf.get("tool_names") or []
         return bool(named) and set(named) <= HARNESS_WRITTEN_ENTRIES
 
     all_blind = {
         str(e["name"])
         for e in declared
-        if (types_of(e) - compounds) <= TRANSPORT_BLIND_CHECK_TYPES and not harness_only(e)
+        if all(
+            leaf.get("type") in TRANSPORT_BLIND_CHECK_TYPES and not harness_only(leaf)
+            for leaf in leaves(e.get("check"))
+        )
     }
     assert load_case(path).transport_blind_checks == all_blind
