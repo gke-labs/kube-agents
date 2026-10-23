@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -503,6 +504,7 @@ func TestTurnFate(t *testing.T) {
 		"/session look at pods":     {false, []string{"look at pods"}},
 		"/feedback":                 {true, nil},
 		"/feedback the bot is slow": {false, []string{"/feedback the bot is slow"}},
+		"/feedback summary":         {true, nil},
 	} {
 		settled, texts := turnFate(text)
 		if settled != want.settled || strings.Join(texts, "|") != strings.Join(want.texts, "|") {
@@ -701,5 +703,66 @@ func TestASettledTurnTakesNoSubmissions(t *testing.T) {
 	<-done
 	if got != 1 {
 		t.Errorf("a stop waiting on its notice holds %d subscriptions, want 1", got)
+	}
+}
+
+// A caller already out of time when it asks for a free lock gets its own
+// context error, not one that reads as another turn holding the conversation.
+func TestALockAskedForTooLateSaysSo(t *testing.T) {
+	c := NewConversations()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for i := 0; i < 50; i++ {
+		_, err := c.lock(ctx, "tok")
+		if !errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "another turn") {
+			t.Fatalf("lock with a done context and no holder: %v", err)
+		}
+	}
+	if len(c.sending) != 0 {
+		t.Errorf("%d send locks left behind", len(c.sending))
+	}
+}
+
+// A conversation resumed by its token is named by the token, not as the
+// default conversation, which is another conversation.
+func TestAResumedConversationIsNamedByItsToken(t *testing.T) {
+	s, _, _, _ := turnServer(t, gatewayScenario{finish: true})
+	res := callTool(t, s, ToolSendMessage, map[string]any{"text": "hi", "conversation_token": "mcpresumed01", "wait_seconds": 10})
+	if res.IsError {
+		t.Fatalf("send_message failed: %s", res.Content[0].Text)
+	}
+	mustContain(t, res.Content[0].Text, "Conversation by token `mcpresumed01`")
+	mustNotContain(t, res.Content[0].Text, "Conversation `default`")
+}
+
+// emptyFetchConsumer is a consumer whose every fetch comes back empty, as a
+// stalled read's would.
+type emptyFetchConsumer struct{ jetstream.Consumer }
+
+func (emptyFetchConsumer) Fetch(int, ...jetstream.FetchOpt) (jetstream.MessageBatch, error) {
+	return emptyBatch{}, nil
+}
+
+type emptyBatch struct{}
+
+func (emptyBatch) Messages() <-chan jetstream.Msg {
+	c := make(chan jetstream.Msg)
+	close(c)
+	return c
+}
+func (emptyBatch) Error() error { return nil }
+
+// A task read whose fetch comes back empty while events are still pending
+// is an error, not the task's end folded from what was read so far.
+func TestAStalledTaskReadIsAnError(t *testing.T) {
+	w := &taskWatch{ref: TaskRef{Addressee: fakeAddressee, TaskID: "task-stall"}, cons: emptyFetchConsumer{}, pending: 5, release: func(bool) {}}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := w.next(ctx); err == nil || !strings.Contains(err.Error(), "still pending") {
+		t.Errorf("a stalled fetch with 5 pending returned %v, want the stall reported", err)
+	}
+	w.pending = 0
+	if err := w.next(ctx); err != nil {
+		t.Errorf("an empty fetch with nothing pending (waiting for new events) returned %v", err)
 	}
 }

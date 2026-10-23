@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
@@ -106,11 +107,7 @@ func sendAndWait(ctx context.Context, bus TurnBus, convs *Conversations, alias, 
 		return "", err
 	}
 	var sb strings.Builder
-	if byToken {
-		fmt.Fprintf(&sb, "Conversation by token `%s`.\n\n", token)
-	} else {
-		writeConversation(&sb, alias, token)
-	}
+	writeConversation(&sb, alias, token, byToken)
 	writeNotices(&sb, res.Notices)
 	if res.Task == nil {
 		if len(res.Notices) == 0 {
@@ -353,7 +350,7 @@ func TaskControlTool(bus TurnBus, convs *Conversations) Tool {
 					return "", err
 				}
 				var sb strings.Builder
-				writeConversation(&sb, a.Conversation, token)
+				writeConversation(&sb, a.Conversation, token, a.ConversationToken != "")
 				sb.WriteString("Sent stop.\n")
 				writeNotices(&sb, res.Notices)
 				return sb.String(), nil
@@ -400,9 +397,15 @@ func waitFor(seconds int) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
-// writeConversation names the conversation; the alias is the caller's, so it
-// is shown as an inert cell.
-func writeConversation(sb *strings.Builder, alias, token string) {
+// writeConversation names the conversation a call used. A call that named a
+// token used that conversation whatever alias came with it, so it is named
+// by the token alone; otherwise the alias is the caller's, so it is shown as
+// an inert cell.
+func writeConversation(sb *strings.Builder, alias, token string, byToken bool) {
+	if byToken {
+		fmt.Fprintf(sb, "Conversation by token `%s`.\n\n", token)
+		return
+	}
 	if alias == "" {
 		alias = DefaultConversation
 	}
@@ -511,10 +514,8 @@ func capText(s string) string {
 		return s
 	}
 	cut := maxAnswerBytes
-	for cut > 0 && !utf8RuneStart(s[cut]) {
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
 		cut--
 	}
 	return s[:cut] + "\n\n…(answer shortened; the full answer is on the task)"
 }
-
-func utf8RuneStart(b byte) bool { return b&0xC0 != 0x80 }
