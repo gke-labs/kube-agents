@@ -167,3 +167,13 @@ resource "null_resource" "recorded_weeks" {
     EOT
   }
 }
+
+# Passed straight through: devops-bench reads these after apply and points the
+# ambient kubeconfig at cluster_name.
+output "cluster_name" {
+  value = var.host_cluster_name
+}
+
+output "cluster_location" {
+  value = var.host_cluster_location
+}
