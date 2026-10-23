@@ -170,11 +170,11 @@ CASE_NOTES = {
     ),
     "no-critical-item": (
         "inventory_card.chat: a scan with no critical item is done. No rows, no fix button, the queue line "
-        "paces the smaller items, and the detail says what the checks found."
+        "counts the smaller items, and the detail says what the checks found."
     ),
     "twenty-rows": (
-        "inventory_card.chat: a first-report limit past the spec's 20 rows. The card shows 20 rows and counts "
-        "the rest as queued criticals, so the headline, the rows and the See-all count agree."
+        "inventory_card.chat: a first-report limit past the spec's 20 rows. select lists 20, so the shown "
+        "file, the rows, the queued count and the See-all count agree."
     ),
 }
 
@@ -205,9 +205,17 @@ class TwoCriticalsTest(unittest.TestCase):
         )
 
     def test_the_queue_line_counts_the_rest_and_the_critical_pace(self):
-        self.assertEqual(
-            self.card.after, "5 more items are queued, 2 of them critical. I'll bring up to 2 critical a day, then up to 3 of the others."
-        )
+        self.assertEqual(self.card.after, "5 more items are queued, 2 of them critical. I'll bring up to 2 critical a day.")
+
+    def test_rows_with_only_smaller_items_queued_name_no_pace(self):
+        # Both criticals listed and three smaller items queued: the queue adds none of
+        # them while a listed critical waits, so the card states no pace for them.
+        items = criticals_items()[:2] + criticals_items()[4:]
+        scores = criticals_scores()
+        scores["scores"] = {item["id"]: scores["scores"][item["id"]] for item in items}
+        card = build(items, scores)
+        self.assertEqual(card.after, "3 smaller items are queued.")
+        self.assertEqual(card.choices, ["Fix the first one", "See all 5 items"])
 
     def test_the_buttons_and_the_fix_reply(self):
         self.assertEqual(self.card.choices, ["Fix the first one", "See all 7 items"])
@@ -221,9 +229,7 @@ class TwoCriticalsTest(unittest.TestCase):
         card = build(criticals_items(), criticals_scores(), pacing=limits(first_report_criticals=1))
         self.assertEqual(card.headline, "First look at your fleet: one thing to fix first")
         self.assertEqual(card.choices, ["Fix it", "See all 7 items"])
-        self.assertEqual(
-            card.after, "6 more items are queued, 3 of them critical. I'll bring up to 2 critical a day, then up to 3 of the others."
-        )
+        self.assertEqual(card.after, "6 more items are queued, 3 of them critical. I'll bring up to 2 critical a day.")
 
     def test_a_gathered_item_counts_its_other_objects(self):
         items = criticals_items()
@@ -267,31 +273,22 @@ class TwoCriticalsTest(unittest.TestCase):
         self.assertTrue(reply.startswith("Fix the first one: word word"))
         self.assertEqual(inventory_card.chat(card)[0]["choices"][0]["reply"], reply)
 
-    def test_a_zero_daily_limit_says_the_critical_items_wait_and_paces_the_others(self):
+    def test_a_zero_daily_limit_says_the_critical_items_wait(self):
         card = build(criticals_items(), criticals_scores(), pacing=limits(daily_criticals=0))
-        self.assertEqual(
-            card.after,
-            "5 more items are queued, 2 of them critical. The critical ones wait until you ask. I'll bring up to 3 of the others a day.",
-        )
+        self.assertEqual(card.after, "5 more items are queued, 2 of them critical. The critical ones wait until you ask.")
 
-    def test_a_zero_noncritical_limit_paces_the_critical_items_and_says_the_others_wait(self):
-        card = build(criticals_items(), criticals_scores(), pacing=limits(noncritical_max=0))
-        self.assertEqual(
-            card.after, "5 more items are queued, 2 of them critical. I'll bring up to 2 critical a day. The others wait until you ask."
-        )
+    def test_the_others_limit_does_not_reach_the_card(self):
+        for noncritical_max in (0, 3):
+            with self.subTest(noncritical_max=noncritical_max):
+                card = build(criticals_items(), criticals_scores(), pacing=limits(noncritical_max=noncritical_max))
+                self.assertEqual(card.after, self.card.after)
 
-    def test_two_zero_limits_say_every_item_waits(self):
-        card = build(criticals_items(), criticals_scores(), pacing=limits(daily_criticals=0, noncritical_max=0))
-        self.assertEqual(card.after, "5 more items are queued, 2 of them critical. They wait in the queue until you ask.")
-
-    def test_only_critical_items_queued_take_the_critical_pace_alone(self):
+    def test_only_critical_items_queued(self):
         items = criticals_items()[:4]
         scores = criticals_scores()
         scores["scores"] = {item["id"]: scores["scores"][item["id"]] for item in items}
         card = build(items, scores)
-        self.assertEqual(card.after, "2 more items are queued, 2 of them critical. I'll bring up to 2 a day.")
-        card = build(items, scores, pacing=limits(daily_criticals=0))
-        self.assertEqual(card.after, "2 more items are queued, 2 of them critical. They wait in the queue until you ask.")
+        self.assertEqual(card.after, "2 more items are queued, 2 of them critical. I'll bring up to 2 critical a day.")
 
 
 class DoneTest(unittest.TestCase):
@@ -302,23 +299,20 @@ class DoneTest(unittest.TestCase):
         self.assertEqual((card.rows, card.after, card.choices, card.replies), ([], "", [], {}))
         self.assertEqual([row["text"] for row in card.fold_rows], CHECK_WORDS)
 
-    def test_no_critical_item_paces_the_smaller_ones(self):
+    def test_no_critical_item_counts_the_smaller_ones(self):
         card = build(no_critical_items(), no_critical_scores())
         self.assertEqual(card.headline, "First look at your fleet: done")
         self.assertEqual(card.detail, "1 cluster scanned in full · no critical item in this scan's 9 checks")
-        self.assertEqual(card.after, "4 smaller items are queued. I'll bring up to 3 a day.")
+        self.assertEqual(card.after, "4 smaller items are queued.")
         self.assertEqual(card.choices, ["See all 4 items"])
-
-    def test_a_zero_noncritical_limit_says_the_items_wait(self):
-        card = build(no_critical_items(), no_critical_scores(), pacing=limits(noncritical_max=0))
-        self.assertEqual(card.after, "4 smaller items are queued. They wait in the queue until you ask.")
+        self.assertEqual(build(no_critical_items(), no_critical_scores(), pacing=limits(noncritical_max=0)).after, card.after)
 
     def test_one_smaller_item_is_singular(self):
         items = no_critical_items()[:1]
         scores = no_critical_scores()
         scores["scores"] = {items[0]["id"]: scores["scores"][items[0]["id"]]}
         card = build(items, scores)
-        self.assertEqual(card.after, "1 smaller item is queued. I'll bring up to 3 a day.")
+        self.assertEqual(card.after, "1 smaller item is queued.")
         self.assertEqual(card.choices, ["See all 1 item"])
 
 
@@ -338,9 +332,7 @@ class DismissedTest(unittest.TestCase):
         dismissed = shown["items"][0]["ids"][0]
         card = build(items, scores, shown, suppressed=frozenset({dismissed}))
         # Four criticals less the dismissed one less the one row: two wait, with the three others.
-        self.assertEqual(
-            card.after, "5 more items are queued, 2 of them critical. I'll bring up to 2 critical a day, then up to 3 of the others."
-        )
+        self.assertEqual(card.after, "5 more items are queued, 2 of them critical. I'll bring up to 2 critical a day.")
 
     def test_every_listed_row_dismissed_leaves_the_criticals_queued_not_done(self):
         items, scores = criticals_items(), criticals_scores()
@@ -349,9 +341,7 @@ class DismissedTest(unittest.TestCase):
         card = build(items, scores, shown, suppressed=dismissed)
         self.assertEqual(card.headline, "First look at your fleet: 2 critical items queued")
         self.assertEqual(card.detail, "1 cluster scanned in full · 9 configuration checks")
-        self.assertEqual(
-            card.after, "5 more items are queued, 2 of them critical. I'll bring up to 2 critical a day, then up to 3 of the others."
-        )
+        self.assertEqual(card.after, "5 more items are queued, 2 of them critical. I'll bring up to 2 critical a day.")
         self.assertEqual((card.rows, card.choices), ([], ["See all 5 items"]))
 
     def test_a_shown_file_select_wrote_with_exclusions_matches(self):
@@ -366,9 +356,7 @@ class DismissedTest(unittest.TestCase):
         card = build(items, scores, shown, suppressed=frozenset({dismissed}))
         self.assertEqual([row["text"][:11] for row in card.rows], ["log-shipper", "pricing-eng"])
         self.assertEqual(card.headline, "First look at your fleet: two things to fix first")
-        self.assertEqual(
-            card.after, "4 more items are queued, 1 of them critical. I'll bring up to 2 critical a day, then up to 3 of the others."
-        )
+        self.assertEqual(card.after, "4 more items are queued, 1 of them critical. I'll bring up to 2 critical a day.")
         self.assertEqual(card.choices, ["Fix the first one", "See all 6 items"])
 
     def test_a_dismissed_critical_row_takes_its_gathered_line_off_the_card(self):
@@ -386,9 +374,7 @@ class DismissedTest(unittest.TestCase):
         card = build(items, scores, shown, suppressed=frozenset({dismissed}))
         self.assertEqual(card.headline, "First look at your fleet: one thing to fix first")
         self.assertEqual([(row["severity"], row["text"][:11]) for row in card.rows], [("critical", "log-shipper")])
-        self.assertEqual(
-            card.after, "6 more items are queued, 2 of them critical. I'll bring up to 2 critical a day, then up to 3 of the others."
-        )
+        self.assertEqual(card.after, "6 more items are queued, 2 of them critical. I'll bring up to 2 critical a day.")
         self.assertEqual(card.choices, ["Fix it", "See all 7 items"])
 
     def test_a_dismissed_id_with_a_shown_file_matching_neither_recompute(self):
@@ -404,18 +390,20 @@ class ListTurnedOffTest(unittest.TestCase):
         card = build(criticals_items(), criticals_scores(), pacing=limits(first_report_criticals=0))
         self.assertEqual(card.headline, "First look at your fleet: 4 critical items queued")
         self.assertEqual(card.detail, "1 cluster scanned in full · 9 configuration checks")
-        self.assertEqual(
-            card.after, "7 more items are queued, 4 of them critical. I'll bring up to 2 critical a day, then up to 3 of the others."
-        )
+        self.assertEqual(card.after, "7 more items are queued, 4 of them critical. I'll bring up to 2 critical a day.")
         self.assertEqual((card.rows, card.choices), ([], ["See all 7 items"]))
 
 
 class RowCapTest(unittest.TestCase):
-    def test_rows_past_the_cap_stay_queued_as_critical(self):
-        card = build(many_items(), many_scores(), pacing=limits(first_report_criticals=MANY))
+    def test_a_limit_past_the_row_cap_lists_the_cap_and_queues_the_rest(self):
+        # select lists at most the rows one card carries, so the shown file, the
+        # marks and the card name the same items and the rest stay new in the queue.
+        shown = shown_for(many_items(), many_scores(), MANY)
+        self.assertEqual(len(shown["items"]), chat_message.ROWS_MAX)
+        card = build(many_items(), many_scores(), shown, pacing=limits(first_report_criticals=MANY))
         self.assertEqual(len(card.rows), chat_message.ROWS_MAX)
         self.assertEqual(card.headline, f"First look at your fleet: {chat_message.ROWS_MAX} things to fix first")
-        self.assertEqual(card.after, "5 more items are queued, 5 of them critical. I'll bring up to 2 a day.")
+        self.assertEqual(card.after, "5 more items are queued, 5 of them critical. I'll bring up to 2 critical a day.")
         self.assertEqual(card.choices, ["Fix the first one", f"See all {MANY} items"])
         message = inventory_card.chat(card)[0]
         self.assertEqual(len(message["rows"]), chat_message.ROWS_MAX)
@@ -439,8 +427,12 @@ class UnavailableTest(unittest.TestCase):
     def test_a_file_without_its_list(self):
         self.assertUnavailable("no `items` list", {"total": 0}, None, limits(), {"items": []})
         self.assertUnavailable("no `items` list", {"items": []}, None, limits(), {})
-        self.assertUnavailable("no `items` list", {"items": []}, None, limits(), {"items": [{"class": "critical"}]})
         self.assertUnavailable("no `scores` map", {"items": criticals_items()}, {"complete_clusters": []}, limits(), {"items": []})
+
+    def test_a_shown_item_without_its_ids_list(self):
+        for entry in ({"class": "critical"}, {"class": "critical", "ids": "f001"}, "f001"):
+            with self.subTest(entry=entry):
+                self.assertUnavailable("an item in the shown file has no `ids` list", {"items": []}, None, limits(), {"items": [entry]})
 
     def test_complete_clusters_that_is_not_a_list_of_names(self):
         items = criticals_items()

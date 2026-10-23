@@ -1,7 +1,7 @@
 {
   "name": "first-report-twenty-rows",
   "source": "agents/chat/scripts/test_inventory_card.py::CasesTest.test_the_shared_cases_are_these_fixtures",
-  "notes": "inventory_card.chat: a first-report limit past the spec's 20 rows. The card shows 20 rows and counts the rest as queued criticals, so the headline, the rows and the See-all count agree.",
+  "notes": "inventory_card.chat: a first-report limit past the spec's 20 rows. select lists 20, so the shown file, the rows, the queued count and the See-all count agree.",
   "input": {
     "first_report": {
       "items": {
@@ -923,26 +923,6 @@
           {
             "class": "critical",
             "ids": ["crashloop-backoff.wide-prod.cluster-20.shop.api-20"]
-          },
-          {
-            "class": "critical",
-            "ids": ["crashloop-backoff.wide-prod.cluster-21.shop.api-21"]
-          },
-          {
-            "class": "critical",
-            "ids": ["crashloop-backoff.wide-prod.cluster-22.shop.api-22"]
-          },
-          {
-            "class": "critical",
-            "ids": ["crashloop-backoff.wide-prod.cluster-23.shop.api-23"]
-          },
-          {
-            "class": "critical",
-            "ids": ["crashloop-backoff.wide-prod.cluster-24.shop.api-24"]
-          },
-          {
-            "class": "critical",
-            "ids": ["crashloop-backoff.wide-prod.cluster-25.shop.api-25"]
           }
         ]
       }
@@ -1058,7 +1038,7 @@
           }
         ],
         "after": [
-          "5 more items are queued, 5 of them critical. I'll bring up to 2 a day."
+          "5 more items are queued, 5 of them critical. I'll bring up to 2 critical a day."
         ],
         "fold": {
           "title": "What the scan checked",

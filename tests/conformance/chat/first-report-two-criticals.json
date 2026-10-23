@@ -298,7 +298,7 @@
           }
         ],
         "after": [
-          "5 more items are queued, 2 of them critical. I'll bring up to 2 critical a day, then up to 3 of the others."
+          "5 more items are queued, 2 of them critical. I'll bring up to 2 critical a day."
         ],
         "fold": {
           "title": "What the scan checked",

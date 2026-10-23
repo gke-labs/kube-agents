@@ -1,7 +1,7 @@
 {
   "name": "first-report-no-critical-item",
   "source": "agents/chat/scripts/test_inventory_card.py::CasesTest.test_the_shared_cases_are_these_fixtures",
-  "notes": "inventory_card.chat: a scan with no critical item is done. No rows, no fix button, the queue line paces the smaller items, and the detail says what the checks found.",
+  "notes": "inventory_card.chat: a scan with no critical item is done. No rows, no fix button, the queue line counts the smaller items, and the detail says what the checks found.",
   "input": {
     "first_report": {
       "items": {
@@ -167,7 +167,7 @@
         "schema": "kube-agents.chat/v1",
         "headline": "First look at your fleet: done",
         "detail": "1 cluster scanned in full \u00b7 no critical item in this scan's 9 checks",
-        "after": ["4 smaller items are queued. I'll bring up to 3 a day."],
+        "after": ["4 smaller items are queued."],
         "fold": {
           "title": "What the scan checked",
           "text": "startup probes\nResourceQuota and LimitRange\nread-only root filesystems\nShielded Nodes\nDataplane V2\nManaged Service for Prometheus\nnode auto-upgrade\nstatic Google Cloud keys in pods\nadded capabilities"

@@ -40,6 +40,7 @@ COMPLETE_KEY = "complete_clusters"
 ITEMS_FILE = "the items file"
 SCORES_FILE = "the scores file"
 SHOWN_FILE = "the shown file"
+SHOWN_ENTRY = "an item in the shown file"
 
 HEADLINE_FIX = "First look at your fleet: {count}"
 HEADLINE_DONE = "First look at your fleet: done"
@@ -62,19 +63,15 @@ OBJECT_NOUN = ("object", "objects")
 RISK_MAX = 120
 ACTION_MAX = 170
 SENTENCE_JOIN = " "
-#: The queue line, the one line after the rows.
+#: The queue line, the one line after the rows. It paces the queued criticals
+#: only: ``fq.pace`` adds no other item while a critical waits, so the others'
+#: pace depends on the user's decisions, and the report text states it.
 MORE_ITEMS_NOUN = ("more item is", "more items are")
 SMALLER_ITEMS_NOUN = ("smaller item is", "smaller items are")
 QUEUED_CRITICAL = "{more} queued, {deferred} of them critical."
 QUEUED = "{more} queued."
-#: The pace, for a remainder of one kind. ``PacingLimits`` paces each kind on its
-#: own limit, and ``fq.pace`` adds no other item while a critical waits, so a mixed
-#: remainder names the critical pace first, then the others'.
-PACE = "I'll bring up to {count} a day."
-PACE_NONE = "They wait in the queue until you ask."
-PACE_BOTH = "I'll bring up to {criticals} critical a day, then up to {others} of the others."
-PACE_CRITICALS_OTHERS_WAIT = "I'll bring up to {count} critical a day. The others wait until you ask."
-PACE_CRITICALS_WAIT_OTHERS = "The critical ones wait until you ask. I'll bring up to {count} of the others a day."
+PACE_CRITICALS = "I'll bring up to {count} critical a day."
+PACE_CRITICALS_WAIT = "The critical ones wait until you ask."
 FOLD_TITLE = "What the scan checked"
 SEE_ALL = "See all {count}"
 ITEM_NOUN = ("item", "items")
@@ -83,8 +80,6 @@ ITEM_NOUN = ("item", "items")
 FIX_REPLY = "{label}: {title}"
 FIX_REPLY_JOIN = ": "
 CRITICAL = fq.SEVERITIES[0]
-#: The rows a chat message carries (the spec's cap, chat_message.ROWS_MAX).
-ROWS_MAX = chat_message.ROWS_MAX
 NO_SCORES = "no scores file beside the items"
 NOT_AN_OBJECT = "{name} is not a JSON object"
 NO_LIST = "{name} has no `{key}` list"
@@ -143,10 +138,12 @@ def _inputs(items: Any, scores: Any, shown: Any) -> tuple[list, dict, set[str], 
     shown_items = _mapping(shown, SHOWN_FILE).get(inventory_findings.SHOWN_ITEMS)
     if not isinstance(shown_items, list):
         raise CardUnavailable(NO_LIST.format(name=SHOWN_FILE, key=inventory_findings.SHOWN_ITEMS))
-    try:
-        shown_ids = [[str(fid) for fid in entry[inventory_findings.SHOWN_IDS]] for entry in shown_items]
-    except (KeyError, TypeError) as exc:
-        raise CardUnavailable(NO_LIST.format(name=SHOWN_FILE, key=inventory_findings.SHOWN_ITEMS)) from exc
+    shown_ids = []
+    for entry in shown_items:
+        ids = entry.get(inventory_findings.SHOWN_IDS) if isinstance(entry, dict) else None
+        if not isinstance(ids, list):
+            raise CardUnavailable(NO_LIST.format(name=SHOWN_ENTRY, key=inventory_findings.SHOWN_IDS))
+        shown_ids.append([str(fid) for fid in ids])
     return item_list, score_map, complete, shown_ids
 
 
@@ -229,29 +226,15 @@ def _detail(rows: int, deferred: int, complete: set[str]) -> str:
     return DETAIL_SEPARATOR.join(parts)
 
 
-def _pace(deferred: int, others: int, limits: fq.PacingLimits) -> str:
-    criticals, smaller = limits.daily_criticals, limits.noncritical_max
-    if not (deferred and others):
-        daily = criticals if deferred else smaller
-        return PACE.format(count=daily) if daily else PACE_NONE
-    if criticals and smaller:
-        return PACE_BOTH.format(criticals=criticals, others=smaller)
-    if criticals:
-        return PACE_CRITICALS_OTHERS_WAIT.format(count=criticals)
-    if smaller:
-        return PACE_CRITICALS_WAIT_OTHERS.format(count=smaller)
-    return PACE_NONE
-
-
 def _queue_line(deferred: int, others: int, limits: fq.PacingLimits) -> str:
     remaining = deferred + others
     if not remaining:
         return ""
-    if deferred:
-        queued = QUEUED_CRITICAL.format(more=_plural(remaining, MORE_ITEMS_NOUN), deferred=deferred)
-    else:
-        queued = QUEUED.format(more=_plural(remaining, SMALLER_ITEMS_NOUN))
-    return f"{queued} {_pace(deferred, others, limits)}"
+    if not deferred:
+        return QUEUED.format(more=_plural(remaining, SMALLER_ITEMS_NOUN))
+    queued = QUEUED_CRITICAL.format(more=_plural(remaining, MORE_ITEMS_NOUN), deferred=deferred)
+    pace = PACE_CRITICALS.format(count=limits.daily_criticals) if limits.daily_criticals else PACE_CRITICALS_WAIT
+    return f"{queued} {pace}"
 
 
 def _fix_reply(label: str, title: str) -> str:
@@ -272,9 +255,7 @@ def build(
     """
     item_list, score_map, complete, shown_ids = _inputs(items, scores, shown)
     listed, deferred, others = _listed(item_list, score_map, limits.first_report_criticals, shown_ids, suppressed)
-    # A card shows at most ROWS_MAX rows; an item past the cap stays queued as critical.
-    deferred += max(len(listed) - ROWS_MAX, 0)
-    rows = [_row(members) for members in listed[:ROWS_MAX]]
+    rows = [_row(members) for members in listed]
     total = len(rows) + deferred + others
     choices = []
     replies = {}
