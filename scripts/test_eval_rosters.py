@@ -613,6 +613,30 @@ def positive_check_types(node, negations: int = 0) -> set:
     return set()
 
 
+class GHESLaneTest(unittest.TestCase):
+    """hack/eval/ghes-cases.txt: what the GHES lane runs (kube-agents#3684),
+    under the GitLab lane's rules: registered cases that grade the forge."""
+
+    FORGE_CHECKS = {"pull_request_opened", "pull_request_diff_contains", "ledger_issue_contains"}
+    PINNED = ["vcs-spent-branch-reuse", "vcs-review-feedback-read-back", "pdb-remediation-pr"]
+
+    def test_the_file_is_the_pinned_set(self):
+        self.assertEqual(eval_rosters.ghes_cases(), self.PINNED)
+
+    def test_every_lane_case_is_registered_and_grades_the_forge(self):
+        import yaml
+
+        registered = eval_rosters.presubmit_cases() + eval_rosters.nightly_cases()
+        for case in eval_rosters.ghes_cases():
+            with self.subTest(case=case):
+                self.assertIn(case, registered, "the lane picks from the catalogue, it does not register")
+                doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+                self.assertTrue(positive_check_types(doc) & self.FORGE_CHECKS, f"{case} grades nothing on the forge")
+
+    def test_no_commented_out_case_path(self):
+        self.assertEqual(eval_rosters.commented_out_cases(eval_rosters.GHES_CASES_FILE.read_text(encoding="utf-8")), [])
+
+
 class GitLabLaneTest(unittest.TestCase):
     """hack/eval/gitlab-cases.txt: what the GitLab lane's presubmit
     runs (kube-agents#2394). Registered cases only, every entry a case that

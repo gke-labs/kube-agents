@@ -317,12 +317,13 @@ class GitLabLaneTest(unittest.TestCase):
         self.assertIn("rung 4 is disarmed on this lane", result.stdout)
 
     def test_a_forge_whose_list_the_checkout_lacks_is_refused_by_name(self):
-        """ghes maps to eval/ghes-cases.txt, which arrives with its lane (#3684):
-        until then the matrix stops naming the list and the lane, not with the
-        roster reader's message for a missing file."""
+        """ghes maps to eval/ghes-cases.txt; a checkout without it (a branch
+        from before the lane, #3684) stops naming the list and the lane, not
+        with the roster reader's message for a missing file."""
         with tempfile.TemporaryDirectory() as tmp:
             hack = pathlib.Path(tmp) / "hack"
             shutil.copytree(HACK_DIR / "eval", hack / "eval")
+            (hack / "eval" / "ghes-cases.txt").unlink()
             result = load_matrix({"EVAL_FORGE": "ghes"}, hack_dir=hack)
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("TASK ", result.stdout)

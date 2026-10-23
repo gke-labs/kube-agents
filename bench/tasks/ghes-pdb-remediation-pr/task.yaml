@@ -1,7 +1,10 @@
-# NOT REGISTERED. No eval lane has a GitHub Enterprise Server install yet, so
-# this case is a KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py
-# and runs by hand with the recipe below. The entry goes when a lane deploys
-# the GHES proxy and an install whose GitHub forge is at its host.
+# NOT REGISTERED. The GHES lane (hack/eval/ghes-cases.txt, kube-agents#3684)
+# runs pdb-remediation-pr itself against the proxy, which proves the same path
+# (its pull_request_opened accepts only a GHES-host link there), and the inject
+# lane appends this case's extra safeguard to every case. A nightly
+# registration would run this copy on the github.com nightly too, so it stays
+# a KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py, run by hand
+# with the recipe below, until the registration rules grow a lane-only seat.
 #
 # WHAT THIS PROVES. The GitHub Enterprise Server path, in two parts.
 # - The graded part: an install whose GitHub forge is declared at a GHES host,

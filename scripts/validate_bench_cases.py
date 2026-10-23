@@ -205,13 +205,14 @@ KNOWN_UNREGISTERED = {
     "notification-dead-thread-falls-back": (
         "needs a chat platform, which no CI install has; run by hand on a chat install"
     ),
-    # It grades a GitHub forge declared at a GitHub Enterprise Server host,
-    # which needs the GHES proxy (hack/ghes-proxy) and an install pointed at
-    # it. No eval lane deploys either, so it runs by hand with the recipe in
-    # its header. The entry goes when a lane deploys both.
+    # It grades a GitHub forge declared at a GitHub Enterprise Server host.
+    # The GHES lane (hack/eval/ghes-cases.txt) runs pdb-remediation-pr itself
+    # against the proxy, which proves the same path; registering this copy in
+    # the nightly would run it on the github.com nightly too. The entry goes
+    # when the registration rules grow a lane-only seat.
     "ghes-pdb-remediation-pr": (
-        "needs the GHES proxy and a GHES-forge install, which no eval lane has; "
-        "run by hand with the recipe in the case header"
+        "the GHES lane runs pdb-remediation-pr against the proxy; a nightly registration "
+        "would run this copy on github.com too; run by hand with the recipe in the case header"
     ),
     # The upgrade-failure catalogue's scenario cases enter
     # hack/eval/nightly-cases.txt in batches of five (decided 2026-10-15 on
