@@ -29,7 +29,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
-import chat_message
 import findings_queue as fq
 
 DEFAULT_RAW_PATH = "/opt/data/INVENTORY.raw.md"
@@ -46,7 +45,8 @@ SHOWN_CLASS = "class"
 SHOWN_IDS = "ids"
 #: The first report is one chat message, so it lists at most the rows one carries
 #: whatever the limit says; an item past them is deferred, not listed and marked shown.
-FIRST_REPORT_ROWS_MAX = chat_message.ROWS_MAX
+#: Equal to `chat_message.ROWS_MAX`, which a sandbox script cannot import; the card's tests hold them equal.
+FIRST_REPORT_ROWS_MAX = 20
 TMP_SUFFIX = ".tmp"
 DEFAULT_ENDPOINT = "http://127.0.0.1:8699"
 POST_TIMEOUT_SECONDS = 30

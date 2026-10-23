@@ -42,7 +42,7 @@ FLOORED_RUBRIC = {"B": 3, "L": 10, "detect": 1, "recover": 2, "C": 1.0}
 MAJOR_HIGH_RUBRIC = {"B": 5, "L": 4, "detect": 3, "recover": 3, "C": 1.0}
 LIMIT = fq.DEFAULT_FIRST_REPORT_CRITICALS
 #: Enough critical items to pass the chat message's row cap.
-MANY = chat_message.ROWS_MAX + 5
+MANY = inventory_findings.FIRST_REPORT_ROWS_MAX + 5
 #: Each check's words, as the card folds them.
 CHECK_WORDS = [words for _, words in inventory_findings.SCAN_CHECKS]
 #: A risk longer than the row's budget.
@@ -398,15 +398,17 @@ class RowCapTest(unittest.TestCase):
     def test_a_limit_past_the_row_cap_lists_the_cap_and_queues_the_rest(self):
         # select lists at most the rows one card carries, so the shown file, the
         # marks and the card name the same items and the rest stay new in the queue.
+        cap = inventory_findings.FIRST_REPORT_ROWS_MAX
+        self.assertLessEqual(cap, chat_message.ROWS_MAX)
         shown = shown_for(many_items(), many_scores(), MANY)
-        self.assertEqual(len(shown["items"]), chat_message.ROWS_MAX)
+        self.assertEqual(len(shown["items"]), cap)
         card = build(many_items(), many_scores(), shown, pacing=limits(first_report_criticals=MANY))
-        self.assertEqual(len(card.rows), chat_message.ROWS_MAX)
-        self.assertEqual(card.headline, f"First look at your fleet: {chat_message.ROWS_MAX} things to fix first")
+        self.assertEqual(len(card.rows), cap)
+        self.assertEqual(card.headline, f"First look at your fleet: {cap} things to fix first")
         self.assertEqual(card.after, "5 more items are queued, 5 of them critical. I'll bring up to 2 critical a day.")
         self.assertEqual(card.choices, ["Fix the first one", f"See all {MANY} items"])
         message = inventory_card.chat(card)[0]
-        self.assertEqual(len(message["rows"]), chat_message.ROWS_MAX)
+        self.assertEqual(len(message["rows"]), cap)
 
 
 class UnavailableTest(unittest.TestCase):
