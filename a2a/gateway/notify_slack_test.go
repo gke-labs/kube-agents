@@ -316,7 +316,7 @@ func TestSlackNotifyRefusesInteractiveBlocks(t *testing.T) {
 		// The element alone, under a block that is otherwise allowed.
 		"rating element": `[{"type":"section","text":{"type":"mrkdwn","text":"x"},"accessory":{"type":"feedback_buttons","action_id":"kage.feedback","positive_button":{"text":{"type":"plain_text","text":"Good"},"value":"up"},"negative_button":{"text":{"type":"plain_text","text":"Bad"},"value":"down"}}}]`,
 		"icon button":    `[{"type":"section","text":{"type":"mrkdwn","text":"x"},"accessory":{"type":"icon_button","action_id":"kage.feedback","icon":"trash","text":{"type":"plain_text","text":"x"}}}]`,
-		"rating block": `[{"type":"context_actions","block_id":"kage.feedback.t-1","elements":[{"type":"feedback_buttons","action_id":"kage.feedback","positive_button":{"text":{"type":"plain_text","text":"Good"},"value":"up"},"negative_button":{"text":{"type":"plain_text","text":"Bad"},"value":"down"}}]}]`,
+		"rating block":   `[{"type":"context_actions","block_id":"kage.feedback.t-1","elements":[{"type":"feedback_buttons","action_id":"kage.feedback","positive_button":{"text":{"type":"plain_text","text":"Good"},"value":"up"},"negative_button":{"text":{"type":"plain_text","text":"Bad"},"value":"down"}}]}]`,
 	} {
 		if got := serveJSON(t, n, lib.NotifyRequest{Text: "x", Blocks: json.RawMessage(blocks)}); !strings.Contains(got.Error, "interactive") {
 			t.Errorf("%s: reply = %+v, want an interactive refusal", name, got)

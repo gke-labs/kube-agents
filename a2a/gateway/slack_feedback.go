@@ -37,16 +37,16 @@ const (
 
 	// The words the controls and the modal show (the approved mock,
 	// phase2/feedback).
-	slackFeedbackGood       = "Good answer"
-	slackFeedbackBad        = "Bad answer"
-	slackFeedbackTitle      = "What went wrong?"
-	slackFeedbackLabel      = "Anything else?"
-	slackFeedbackSubmit     = "Send"
-	slackFeedbackClose      = "Cancel"
-	slackFeedbackKeptLine   = "Your question and this answer are kept on your install for %s so an operator can turn them into a test."
+	slackFeedbackGood     = "Good answer"
+	slackFeedbackBad      = "Bad answer"
+	slackFeedbackTitle    = "What went wrong?"
+	slackFeedbackLabel    = "Anything else?"
+	slackFeedbackSubmit   = "Send"
+	slackFeedbackClose    = "Cancel"
+	slackFeedbackKeptLine = "Your question and this answer are kept on your install for %s so an operator can turn them into a test."
 	// slackFeedbackKeptNoAsk is the kept line when the ask is no longer on
 	// record (AskTTL, a reaped session), so only the answer is kept.
-	slackFeedbackKeptNoAsk = "This answer is kept on your install for %s so an operator can turn it into a test."
+	slackFeedbackKeptNoAsk  = "This answer is kept on your install for %s so an operator can turn it into a test."
 	slackFeedbackDays       = "%d days"
 	slackFeedbackOneDay     = "1 day"
 	slackFeedbackThanksLine = "Thanks. I kept this answer for your team to review."
