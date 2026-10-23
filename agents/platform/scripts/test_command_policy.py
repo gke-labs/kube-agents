@@ -304,6 +304,41 @@ class KubectlReadOnlyTest(unittest.TestCase):
                 self.assertEqual("identity.caller-supplied-impersonation", decision.rule_id)
 
 
+class GcloudNearestReadHintTest(unittest.TestCase):
+    """A refusal of a misspelt read names the admitted read it resembles."""
+
+    HINT = command_policy._NEAREST_READ_HINT.format(command="container fleet rolloutsequences list")
+
+    def test_a_hyphenated_misspelling_is_pointed_at_the_one_word_read(self):
+        decision = evaluate(["gcloud", "container", "fleet", "rollout-sequences", "list", "--project", "p"])
+        self.assertFalse(decision.allowed)
+        self.assertEqual("gcp.read-only", decision.rule_id)
+        self.assertTrue(decision.message.endswith(self.HINT), decision.message)
+
+    def test_an_extra_group_word_still_finds_the_read(self):
+        argv = ["gcloud", "container", "fleet", "rollout-sequencing", "rollout-sequences", "list"]
+        self.assertTrue(evaluate(argv).message.endswith(self.HINT))
+
+    def test_a_missing_group_word_still_finds_the_read(self):
+        argv = ["gcloud", "container", "rollout-sequences", "list", "--project", "p"]
+        self.assertTrue(evaluate(argv).message.endswith(self.HINT))
+
+    def test_a_write_gets_no_hint(self):
+        for argv in (
+            ["gcloud", "container", "clusters", "upgrade", "prod-usc1"],
+            ["gcloud", "container", "fleet", "rolloutsequences", "delete", "seeded-train"],
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed)
+                self.assertNotIn("nearest admitted read", decision.message)
+
+    def test_a_read_of_another_group_gets_no_hint(self):
+        decision = evaluate(["gcloud", "container", "fleet", "foo", "list"])
+        self.assertFalse(decision.allowed)
+        self.assertNotIn("nearest admitted read", decision.message)
+
+
 class KubectlKubercTest(unittest.TestCase):
     """--kuberc is a flags file, and it launders the impersonation refusal."""
 
