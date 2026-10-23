@@ -522,7 +522,8 @@ case running at the time. A case that requests a pull request runs alone, so its
 marked exclusive and a write in it is charged whether named or not. The run refuses to start
 on either lane without a GitOps repository for the safeguard to read, `EVAL_GITOPS_REPO=none`
 included, and on GitHub without `EVAL_LEDGER_APP_KEY_FILE` it refuses unless
-`BENCH_GITHUB_TOKEN` or `GITHUB_TOKEN` holds a token the safeguard can read the repository with.
+`BENCH_GITHUB_TOKEN` or `GITHUB_TOKEN` is set; whether that token can read the repository is
+learned on the first repetition, whose check errors naming the repository and the missing permission.
 The task files under `bench/tasks/` are untouched. A case that
 requests a pull request (a `pull_request_opened` or `pull_request_diff_contains` check of its
 own) is allowed the ones its reply names, and the script runs those cases in a second phase
