@@ -28979,13 +28979,23 @@ class TestPlainChatLines(unittest.TestCase):
         self.assertEqual(len([line for line in lines if line.startswith("`major`")]), 2)
         self.assertIn("2 more (1 major, 1 minor) are saved on the install.", lines)
 
-    def test_a_summary_the_store_does_not_hold_says_the_rest_are_not_listed(self):
-        findings = [make_finding(fid=f"m{i}", severity="major") for i in range(3)]
+    def test_a_summary_the_store_does_not_hold_lists_more_and_says_the_rest_are_not_listed(self):
+        # The message is the only copy, so it keeps as many findings as the old summary did.
+        findings = [make_finding(fid=f"c{i}") for i in range(4)] + [
+            make_finding(fid=f"m{i}", severity="major") for i in range(8)
+        ]
         lines = audit_report.render_no_forge_summary(
             AUDIT, make_doc(findings=findings), [], [], [], True, [], audit_report.NO_FORGE_UNSTORED_NOTE, stored=False
         ).splitlines()
-        self.assertIn("1 more (1 major) is not listed here.", lines)
+        rows = [line for line in lines if line.startswith("`")]
+        self.assertEqual(len(rows), audit_report.NO_FORGE_SUMMARY_FINDINGS)
+        self.assertEqual(sum(row.startswith("`critical`") for row in rows), 4)
+        self.assertIn("2 more (2 major) are not listed here.", lines)
         self.assertEqual(lines[-1], audit_report.NO_FORGE_UNSTORED_NOTE)
+
+    def test_stored_is_keyword_only(self):
+        with self.assertRaises(TypeError):
+            audit_report.render_no_forge_summary(AUDIT, make_doc(findings=[]), [], [], [], True, [], "note", 0, False)
 
     def test_the_summary_lists_three_critical_findings_and_counts_the_rest(self):
         findings = [make_finding(fid=f"c{i}") for i in range(5)] + [make_finding(fid="m", severity="major")]
@@ -28994,6 +29004,41 @@ class TestPlainChatLines(unittest.TestCase):
         ).splitlines()
         self.assertEqual(len([line for line in lines if line.startswith("`critical`")]), 3)
         self.assertIn("3 more (2 critical, 1 major) are saved on the install.", lines)
+
+    def _slack(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
+        import slack_audit_report
+
+        return slack_audit_report
+
+    def test_the_slack_card_knows_both_no_repository_notes(self):
+        self.assertEqual(
+            self._slack().NO_LEDGER_NOTES, (audit_report.NO_FORGE_NOTE, audit_report.NO_FORGE_UNSTORED_NOTE)
+        )
+
+    def test_a_summary_whose_note_carries_a_remedy_posts_as_written(self):
+        # The card would clip the remedy at its line length, so these summaries go out whole.
+        sar = self._slack()
+        findings = [make_finding(fid="c", check="public-control-plane", obj="Cluster/prod-us-east", namespace="")]
+        notes = {
+            "unreachable": audit_report.UNREACHABLE_NOTE.format(
+                repo="acme/fleet", reason="FORGE_NOT_FOUND", noun="pull request", remedy=audit_report.UNREACHABLE_FORGE_REMEDY
+            ),
+            "no role": audit_report.NO_REPOSITORY_CHOSEN_NOTE.format(
+                message=audit_report.NO_GITOPS_ROLE_MESSAGE.format(
+                    repos="acme/a, acme/b", why=audit_report.NO_GITOPS_ROLE_WHY, remedy=audit_report.NO_GITOPS_ROLE_REMEDY
+                )
+            ),
+        }
+        for name, note in notes.items():
+            with self.subTest(note=name):
+                summary = audit_report.render_no_forge_summary(
+                    AUDIT, make_doc(findings=findings), [], [], [], True, [], note
+                )
+                self.assertTrue(summary.endswith(note))
+                self.assertIsNone(sar.summary_card(summary))
+                self.assertIsNone(sar.blocks_from_summary(summary))
+                self.assertIsNone(sar.chat_from_summary(summary))
 
     def test_the_summary_reads_back_as_the_slack_card(self):
         sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))

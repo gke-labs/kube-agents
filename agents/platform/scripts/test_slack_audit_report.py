@@ -1235,6 +1235,28 @@ class FinishLineTest(unittest.TestCase):
             f"**{sar.CLEAN_CARD.format(name='Security & RBAC Posture Audit')}**\n{LINK}",
         )
 
+    def test_a_lead_count_the_issue_disagrees_with_falls_back(self):
+        # The ledger was not rewritten this run: the line's count at its severity is not the issue's.
+        for line in (
+            "Security & RBAC Posture Audit: 3 critical findings, 1 new.",
+            "Security & RBAC Posture Audit: 1 major finding, 1 new.",
+        ):
+            with self.subTest(line=line):
+                report = f"{line}\nLedger: {LEDGER}"
+                self.assertIsNone(sar.headline_from_issue(ISSUE, REF, report))
+                self.assertIsNone(sar.blocks_from_issue(ISSUE, REF, report))
+
+    def test_a_lead_count_below_the_most_severe_level_agrees(self):
+        body = BODY.replace("7 findings: 2 critical, 1 major, 4 minor.", "5 findings: 0 critical, 1 major, 4 minor.")
+        body = body.split("### Major (1)", 1)[1]
+        issue = dict(ISSUE, title="[audit] Security & RBAC Posture Audit — 5 findings (0 critical)",
+                     body="5 findings: 0 critical, 1 major, 4 minor.\n\n### Major (1)" + body)
+        report = f"Security & RBAC Posture Audit: 1 major finding, 1 resolved.\nLedger: {LEDGER}"
+        self.assertEqual(
+            sar.headline_from_issue(issue, REF, report).splitlines()[0],
+            "**Security & RBAC Posture Audit: 1 major finding**",
+        )
+
     def test_a_held_line_does_not_rebuild_the_card(self):
         report = (
             "Security & RBAC Posture Audit: no findings across 3 clusters, but the ledger stays open: "
@@ -1279,13 +1301,37 @@ class SummaryCardTest(unittest.TestCase):
         self.assertEqual(text, sar.headline_from_summary(SUMMARY))
 
     def test_a_run_with_no_findings_has_no_button(self):
-        summary = "Security & RBAC Posture Audit: no findings, 2 resolved.\nNo GitOps repository is connected."
+        summary = "Security & RBAC Posture Audit: no findings, 2 resolved.\nNo GitOps repository is connected, so no ledger issue or fix pull requests were opened."
         blocks, _ = sar.blocks_from_summary(summary)
         self.assertFalse([block for block in blocks if block["type"] == "actions"])
 
     def test_a_report_with_a_ledger_is_not_a_summary(self):
         self.assertIsNone(sar.summary_card(f"{SUMMARY}\nLedger: {LEDGER}"))
         self.assertIsNone(sar.summary_card(FINISH_REPORT))
+
+    def test_a_summary_with_another_note_posts_as_written(self):
+        # A repository the broker cannot reach, or several and none chosen: the note carries a
+        # remedy the card's lines would clip, so the summary goes out whole.
+        unreachable = (
+            "The repository acme/fleet could not be reached through the broker (FORGE_NOT_FOUND), so no ledger "
+            "issue was written and no remediation pull request was opened. The run did not choose another "
+            "repository. Make sure that the repository exists and that the install's forge credential can read "
+            "and write it. The findings are in the report store."
+        )
+        summary = SUMMARY.replace(SUMMARY.splitlines()[-1], unreachable)
+        self.assertIsNone(sar.summary_card(summary))
+        self.assertIsNone(sar.blocks_from_summary(summary))
+        self.assertIsNone(sar.chat_from_summary(summary))
+
+    def test_a_line_the_card_would_clip_posts_the_summary_whole(self):
+        gap = "Coverage is incomplete: " + "seeded-c: 3 of 16 checks did not run; " * 10
+        summary = SUMMARY.replace("\nNo GitOps", f"\n{gap}\nNo GitOps")
+        self.assertIsNone(sar.summary_card(summary))
+
+    def test_more_lines_than_a_chat_message_keeps_post_the_summary_whole(self):
+        extra = "".join(f"\nline {i}" for i in range(sar._chat.AFTER_MAX))
+        summary = SUMMARY.replace("\nNo GitOps", f"{extra}\nNo GitOps")
+        self.assertIsNone(sar.summary_card(summary))
 
     def test_another_shape_posts_as_written(self):
         for report in ("", "Here's the audit.", "## What's wrong\nThe audit could not write its ledger.", REPORT):
@@ -1300,7 +1346,7 @@ class SummaryCardTest(unittest.TestCase):
 
     def test_a_long_report_is_read_quickly(self):
         start = time.monotonic()
-        sar.summary_card("Audit: 1 critical finding" + "x" * LONG_INPUT + "\n" + "`critical` y" * LONG_INPUT)
+        sar.summary_card("Audit: 1 critical finding" + "x" * LONG_INPUT + "\n" + "`critical` y" * LONG_INPUT + "\n" + sar.NO_LEDGER_NOTES[0])
         self.assertLess(time.monotonic() - start, FAST_SECONDS)
 
 

@@ -994,7 +994,9 @@ UNREADABLE_GITOPS_KEY_REMEDY = (
 )
 # The no-forge run's empty workspace, `<SCRATCH_DIR>/<prefix><audit-id>`.
 NO_FORGE_WORKSPACE_PREFIX = "workspace_"
-# How many held ids the chat summary names; the store keeps every one.
+# How many held ids the chat summary names, and how many findings it lists,
+# most severe first, for a run the store does not hold, whose summary is then
+# the only copy; the store keeps every one.
 NO_FORGE_SUMMARY_FINDINGS = 10
 # The rows the chat summary lists: the critical findings up to the first
 # number, else the top findings of the most severe level present up to the
@@ -18497,14 +18499,16 @@ def render_no_forge_summary(
     held: list[str],
     note: str,
     dropped: int = 0,
+    *,
     stored: bool = True,
 ) -> str:
     """The chat summary of a run with no forge, which is the only report its operator gets.
 
     The headline (:func:`findings_headline`), the most severe findings up to
     `NO_FORGE_SUMMARY_CRITICAL_ROWS` or `NO_FORGE_SUMMARY_TOP_ROWS`
-    (:func:`summary_row`), a line counting the rest by
-    severity, saved on the install unless the store write failed (`stored`),
+    (:func:`summary_row`), or up to `NO_FORGE_SUMMARY_FINDINGS` of them when
+    the store write failed (`stored`) and this message is the only copy, a
+    line counting the rest by severity,
     the ids the collector still flags that the document left out, how many of
     this run's collector candidates the document does not carry (`dropped`),
     the coverage gaps, and `note`. `slack_audit_report.summary_card` reads it
@@ -18514,7 +18518,7 @@ def render_no_forge_summary(
     findings = list(data.get("findings") or [])
     lines = [findings_headline(audit_name(audit_id), findings, len(new_ids), len(resolved_ids), delta_known)]
     ordered = sort_findings(findings)
-    shown = _summary_shown(ordered)
+    shown = _summary_shown(ordered) if stored else ordered[:NO_FORGE_SUMMARY_FINDINGS]
     lines.extend(summary_row(finding) for finding in shown)
     left = severity_counts(ordered[len(shown):])
     more = sum(left.values())
@@ -18693,7 +18697,7 @@ def _finish_without_forge(
     # operator that it does not.
     payload["silent_ok"] = bool(payload["silent_ok"]) and stored and unreachable is None
     payload["summary"] = render_no_forge_summary(
-        audit_id, data, gaps, new_ids, resolved_ids, delta_known, held, note, len(unpublished), stored
+        audit_id, data, gaps, new_ids, resolved_ids, delta_known, held, note, len(unpublished), stored=stored
     )
     append_chat_report(
         audit_id, NO_FORGE_REPO, payload["summary"], now, refinish=bool(payload.get(REFINISH_KEY))

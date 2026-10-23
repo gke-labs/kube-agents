@@ -74,6 +74,7 @@ from slack_presenter import (
     HEADLINE_MAX,
     LIST_MARKER,
     MENTION,
+    ROW_TEXT_MAX,
     _clip,
     _plain,
     as_line,
@@ -229,6 +230,10 @@ FINDINGS_TOTAL = re.compile(r"\b(?P<count>\d{1,9}|no|zero)\s+findings?\b", re.IG
 #: The other counts an SOP line states for a run that changed its ledger:
 #: "<n> resolved", and a count by severity ("2 critical, 6 major").
 CHANGE_COUNT = re.compile(r"\b(?P<count>\d{1,9})\s+(?:new|resolved|critical|major|minor)\b", re.IGNORECASE)
+#: The lead of fleet-audit's own audit line (``audit_report.findings_headline``): the
+#: count of the most severe findings present, "2 critical findings". It states no
+#: total, so the card checks it against the issue's count at that severity instead.
+FINDINGS_LEAD = re.compile(r"\b(?P<count>\d{1,9})\s+(?P<severity>critical|major|minor)\s+findings?\b", re.IGNORECASE)
 #: A count by severity alone ("2 critical"), which a clean run's line never states above 0.
 SEVERITY_COUNT = re.compile(r"\b(?P<count>\d{1,9})\s+(?:critical|major|minor)\b", re.IGNORECASE)
 #: A line describing a clean, held or carried run, which leaves the ledger open
@@ -310,6 +315,16 @@ SUMMARY_HEADLINE = re.compile(
     r"\A[^\n:`]{1,200}: (?:\d{1,9} (?:critical|major|minor) findings?|no findings)\b[^\n]{0,300}\Z"
 )
 SUMMARY_ROW = re.compile(r"\A`(?P<severity>critical|major|minor)` (?P<text>[^\n]{1,1000})\Z")
+#: The summary's last line when the install has no GitOps repository at all
+#: (``audit_report.NO_FORGE_NOTE`` and ``NO_FORGE_UNSTORED_NOTE``), which the card
+#: shows whole. Any other note (a repository the broker cannot reach, several
+#: repositories and none chosen) carries a remedy longer than a card's line, so that
+#: summary posts as written.
+NO_LEDGER_NOTES = (
+    "No GitOps repository is connected, so no ledger issue or fix pull requests were opened.",
+    "No GitOps repository is connected, so no ledger issue or fix pull requests were opened. "
+    "This run could not be saved on the install, so keep this message.",
+)
 
 #: The "What's wrong" section of a report written to the Platform Agent's three
 #: sections (``agents/platform/SOUL.md``): a heading (``## What's wrong``) or a
@@ -555,7 +570,25 @@ def _parse_issue(issue: dict, report: str) -> AuditReport | None:
     if not findings:
         return None  # the card would count findings neither it nor the ledger shows
     body = _without_fences(raw.replace("\r\n", "\n"))
-    return AuditReport(name, count, line, findings, _totals(body, findings, critical), _skipped(body))
+    totals = _totals(body, findings, critical)
+    if not _lead_agrees(line, totals):
+        return None  # the line's own count disagrees with the ledger, which was not rewritten this run
+    return AuditReport(name, count, line, findings, totals, _skipped(body))
+
+
+def _lead_agrees(line: str, totals: dict[str, int]) -> bool:
+    """Whether the line's lead count (:data:`FINDINGS_LEAD`), when it states one, is the issue's.
+
+    The lead names the most severe level present, so it agrees when the issue
+    counts that many at its severity and none at a more severe one. A line with
+    no lead agrees, and is checked by its total instead.
+    """
+    lead = FINDINGS_LEAD.search(line)
+    if lead is None:
+        return True
+    severity = lead.group("severity").lower()
+    above = SEVERITIES[: SEVERITIES.index(severity)]
+    return totals[severity] == int(lead.group("count")) and not any(totals[level] for level in above)
 
 
 def _totals(body: str, findings: list[Finding], critical: int) -> dict[str, int]:
@@ -794,14 +827,16 @@ def summary_card(report: str) -> Card | None:
     repository (:data:`SUMMARY_HEADLINE`): its headline, its finding rows,
     and its other lines under them (the rest counted by severity, the ids the
     collector still flags, the coverage gaps, why no ledger was written).
-    None for a report that names an issue URL, which has a ledger, and for any
-    other shape, which posts as written. A row keeps a link's text and drops its
+    None for a report that names an issue URL, which has a ledger; for one
+    whose last line is not one of :data:`NO_LEDGER_NOTES`; for one with a line
+    under the rows that the card would clip, or more of them than a chat
+    message keeps; and for any other shape. Those post as written. A row keeps a link's text and drops its
     target, as a ledger card's row does.
     """
     if ledger_ref(report) is not None or ANY_ISSUE_URL.search(report):
         return None
     lines = [line.strip() for line in report.strip().splitlines() if line.strip()]
-    if not lines or not SUMMARY_HEADLINE.match(lines[0]):
+    if not lines or not SUMMARY_HEADLINE.match(lines[0]) or lines[-1] not in NO_LEDGER_NOTES:
         return None
     rows: list[dict] = []
     after: list[str] = []
@@ -812,6 +847,10 @@ def summary_card(report: str) -> Card | None:
             rows.append({"severity": row.group("severity"), "text": text})
         else:
             after.append(_row_text(line))
+    # A line the card would clip, or one past what a chat message keeps, would lose
+    # what the summary says; the summary then posts whole.
+    if len(after) > _chat.AFTER_MAX or any(len(line) > ROW_TEXT_MAX for line in after):
+        return None
     return Card(_row_text(lines[0]), rows, "\n".join(after), "")
 
 

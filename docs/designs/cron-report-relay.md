@@ -108,7 +108,9 @@ and the link, unless the relayed line counts a finding. When the issue cannot be
 the leg posts the relayed line in bold with the link. Not parsing includes a title
 of 0 findings, a body listing no finding, a "<n> new" above the
 title's count, a title whose count disagrees with the finding total the relayed
-line states, and a relayed line with no total that counts no non-zero new,
+line states, an issue that disagrees with the count the line leads with (fleet-audit's own
+line states no total and leads with the count of its most severe findings, "2 critical
+findings", which must be the issue's count at that severity, with none more severe), and a relayed line with no total that counts no non-zero new,
 resolved or severity count or calls the run clean, held, carried or nothing
 reproduced (a zero-finding partial or held run leaves the ledger open over its old
 title, or over a refreshed coverage title when a gap opened the ledger). A run that speaks only
