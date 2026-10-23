@@ -469,13 +469,26 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/apply_cron_tirith_scan.p
 # records <hermes home>/cron/runs/<job>_<execution> as the run's tool-layer cwd;
 # the session cwd, and so context-file loading, is unchanged, and script jobs
 # keep their cwd. kanban_workspace_gc.py prunes old run directories.
+#
+# Shares the block: per-job turn budget (gke-labs/kube-agents#1947). The
+# scheduler read a run's iteration cap from the profile's agent.max_turns alone,
+# so the 250 the fleet audits need reached every kanban worker spawned under the
+# platform profile. The patch reads a roster entry's own `max_turns` first
+# (mirroring NousResearch/hermes-agent#134059); the audits carry 250 and the
+# profile default drops to 150. Same staging directory, one COPY and one RUN,
+# for the layer budget at the top of this file.
 COPY deploy/docker/patches/apply_cron_run_workdir.py \
      deploy/docker/patches/verify_cron_run_workdir.py \
+     deploy/docker/patches/apply_cron_job_max_turns.py \
+     deploy/docker/patches/verify_cron_job_max_turns.py \
      deploy/docker/patches/patchlib.py \
      /tmp/cron-run-workdir/
 RUN /opt/hermes/.venv/bin/python3 /tmp/cron-run-workdir/apply_cron_run_workdir.py /opt/hermes && \
     grep -q "kube-agents patch: cron run workdir" /opt/hermes/cron/scheduler.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/cron-run-workdir/verify_cron_run_workdir.py /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/cron-run-workdir/apply_cron_job_max_turns.py /opt/hermes && \
+    grep -q "kube-agents patch: per-job turn budget" /opt/hermes/cron/scheduler.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/cron-run-workdir/verify_cron_job_max_turns.py /opt/hermes && \
     rm -rf /tmp/cron-run-workdir
 
 # Security: cron risk gate, execute_code refuse, and content checks (THREAT-002).
@@ -874,6 +887,14 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # edit_message; the steer and auth failure replies are replaced where they
 # are built, so no exception text reaches Slack). See
 # deploy/docker/patches/slack_boilerplate.py.
+# Slack, flag or not: a message_changed that is not an edit (no `edited`, or
+# the same `edited.ts` as previous_message, since Slack keeps it once set) is
+# dropped instead of being read as a new message. Slack sends one for a thread's
+# parent whenever a reply in the thread changes, and after a restart empties the
+# adapter's processed-ts map that change re-ran the thread's opening @mention.
+# A real edit carries a new `edited`, so an @mention edited in still gets its turn.
+# Applied first, against upstream's text. See the module docstring in
+# deploy/docker/patches/apply_slack_unedited_change.py.
 # Slack thread context, whatever the flag: a thread root the bot posted itself is
 # labelled "[thread parent, posted by you earlier]" instead of reading as a
 # person's message, and every context block says it is conversation, not observed
@@ -921,10 +942,14 @@ COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/patchlib.py \
      deploy/docker/patches/apply_slack_agent_view.py \
      deploy/docker/patches/verify_slack_agent_view.py \
+     deploy/docker/patches/apply_slack_unedited_change.py \
+     deploy/docker/patches/verify_slack_unedited_change.py \
      deploy/docker/patches/apply_slack_thread_provenance.py \
      deploy/docker/patches/verify_slack_thread_provenance.py \
      /tmp/message-surface/
-RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis.py /opt/hermes && \
+RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_unedited_change.py /opt/hermes && \
+    grep -qF "kube-agents patch: slack_unedited_change" /opt/hermes/plugins/platforms/slack/adapter.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis.py /opt/hermes && \
     grep -q "_CODE_SENTINEL_RE" /opt/hermes/plugins/platforms/slack/block_kit.py && \
     ! grep -q "inline code is opaque" /opt/hermes/plugins/platforms/slack/block_kit.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_google_chat_attachment_notice.py /opt/hermes && \
@@ -981,6 +1006,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_failure.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_kanban_progress_lines.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_boilerplate.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_unedited_change.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_thread_provenance.py /opt/hermes && \
     rm -rf /tmp/message-surface
 
@@ -2352,7 +2378,7 @@ cfg = load_config_readonly(); \
 caps = ToolCallGuardrailConfig.from_mapping(cfg.get('tool_loop_guardrails', {})).loop_caps; \
 assert caps.max_web_searches == 200, 'per-card web_search budget lost: %r' % caps.max_web_searches; \
 assert caps.max_subagents == 50, 'overlay clobbered max_subagents: %r' % caps.max_subagents; \
-assert cfg.get('agent', {}).get('max_turns') == 250, 'iteration budget lost: %r' % cfg.get('agent', {}).get('max_turns')" && \
+assert cfg.get('agent', {}).get('max_turns') == 150, 'worker iteration budget lost: %r' % cfg.get('agent', {}).get('max_turns')" && \
     cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_slack_relay_registry_contract.py && \
     cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_card_stop.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/platform-config/check_skill_commands.py \

@@ -97,12 +97,22 @@ type NATSBus struct {
 	client *lib.Client
 	cfg    BusConfig
 
-	// mu serialises status reads, so concurrent callers share one read
-	// rather than each opening a consumer, and guards the cached answer.
+	// mu guards the cached answer and the read in flight, which concurrent
+	// callers share rather than each opening a consumer.
 	mu       sync.Mutex
 	cached   BusStatus
 	cachedAt time.Time
+	inflight *statusRead
 	now      func() time.Time
+	// readBus is one read of the bus (read, but for tests).
+	readBus func(context.Context) BusStatus
+}
+
+// statusRead is one status read in flight: st is its answer once done is
+// closed.
+type statusRead struct {
+	done chan struct{}
+	st   BusStatus
 }
 
 // DialBus connects to the bus once. Its caller retries a bus that is not
@@ -129,7 +139,9 @@ func DialBus(ctx context.Context, cfg BusConfig) (*NATSBus, error) {
 	if err != nil {
 		return nil, fmt.Errorf("connect to the bus at %s as %s: %w", cfg.URL, cfg.User, err)
 	}
-	return &NATSBus{client: client, cfg: cfg, now: time.Now}, nil
+	b := &NATSBus{client: client, cfg: cfg, now: time.Now}
+	b.readBus = b.read
+	return b, nil
 }
 
 // Close drops the connection.
@@ -138,22 +150,56 @@ func (b *NATSBus) Close() { b.client.Close() }
 // Status reports the bus's state, read at most statusCacheTTL ago. Every
 // part that fails is named in Problems rather than failing the whole report,
 // so a half-working bus still tells the caller which half.
+//
+// The read runs detached from its caller, bounded by statusTimeout alone,
+// and is cached when it ends: a caller that gives up (a client that
+// disconnected) is answered at once with that, and the read it started still
+// answers the next caller rather than leaving it to read DIRECTORY again.
 func (b *NATSBus) Status(ctx context.Context) BusStatus {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if !b.cachedAt.IsZero() && b.now().Sub(b.cachedAt) < statusCacheTTL {
+		defer b.mu.Unlock()
 		return b.cached
 	}
-	rctx, cancel := context.WithTimeout(ctx, statusTimeout)
-	defer cancel()
-	st := b.read(rctx)
-	// A read the caller cut short (a client that disconnected) answers that
-	// caller only: cached, its cancellation would be every caller's answer.
-	if ctx.Err() != nil {
-		return st
+	sr := b.inflight
+	if sr == nil {
+		sr = &statusRead{done: make(chan struct{})}
+		b.inflight = sr
+		go b.refresh(sr)
 	}
-	b.cached, b.cachedAt = st, b.now()
-	return b.cached
+	b.mu.Unlock()
+	select {
+	case <-sr.done:
+		return sr.st
+	case <-ctx.Done():
+		return BusStatus{
+			Deployment: b.cfg.Deployment,
+			URL:        b.cfg.URL,
+			User:       b.cfg.User,
+			Problems:   []string{fmt.Sprintf("the request ended while the status read was still running: %v", ctx.Err())},
+		}
+	}
+}
+
+// refresh runs one read for sr and caches its answer.
+func (b *NATSBus) refresh(sr *statusRead) {
+	rctx, cancel := context.WithTimeout(context.Background(), statusTimeout)
+	defer cancel()
+	// The read runs outside net/http's per-request recovery, so a panic in
+	// it is turned into a problem here; either way the read is stored and
+	// its waiters released, or every later caller would wait on it.
+	defer func() {
+		if p := recover(); p != nil {
+			sr.st = BusStatus{Deployment: b.cfg.Deployment, URL: b.cfg.URL, User: b.cfg.User,
+				Problems: []string{fmt.Sprintf("the status read failed: %v", p)}}
+		}
+		b.mu.Lock()
+		b.cached, b.cachedAt = sr.st, b.now()
+		b.inflight = nil
+		b.mu.Unlock()
+		close(sr.done)
+	}()
+	sr.st = b.readBus(rctx)
 }
 
 func (b *NATSBus) read(ctx context.Context) BusStatus {
