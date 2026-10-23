@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+from collections.abc import Callable
 
 # A command line is read as the shell reads it: tokenised first, quotes honoured, so a quoted
 # path is one word and a quoted sentence is one word too (which is what tells a run of a script
@@ -28,6 +29,8 @@ _SHELL_PARENS = frozenset("()")
 _OPERATOR_MARK = "\x00O{index}\x00"
 _OPERATOR_MARK_RE = re.compile(r"^\x00O(\d+)\x00$")
 _SHELL_PROGRAMS_WITH_COMMAND_STRING = ("sh", "bash", "zsh", "dash")
+# `eval` runs its words, joined by spaces, as a command line of its own (`eval "git push ..."`).
+_SHELL_EVAL = "eval"
 # A shell program is unwrapped only where the shell would run it: as the segment's command word,
 # or behind words that hand their argv on unchanged -- `NAME=value` assignments, these wrappers,
 # their flags and a duration or count such as `timeout 600`'s. A shell word behind `echo` or
@@ -269,7 +272,8 @@ def _shell_argvs(command: str) -> list[list[str]]:
     (``bash -c``, under ``timeout``, ``nohup`` or an ``env``) carries a command line in the word
     after its ``-c``-style flag, which is read the same way and yields its own argvs; so does
     each command or process substitution and each backtick pair on the line (``OUT=$(python3
-    ... --readiness)``, ``cat <(...)``), whose commands the shell runs."""
+    ... --readiness)``, ``cat <(...)``), whose commands the shell runs, and the words after an
+    ``eval``, joined by spaces as ``eval`` joins them."""
     words, spans = _shell_words_and_spans(command)
     argvs: list[list[str]] = []
     argv: list[str] = []
@@ -282,6 +286,9 @@ def _shell_argvs(command: str) -> list[list[str]]:
         argv.append(word)
     for argv in list(argvs):
         index = _command_word_index(argv)
+        if index is not None and argv[index] == _SHELL_EVAL:
+            argvs.extend(_shell_argvs(" ".join(argv[index + 1:])))
+            continue
         if index is None or os.path.basename(argv[index]) not in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
             continue
         for flag_index in range(index + 1, len(argv) - 1):
@@ -296,9 +303,13 @@ def _shell_argvs(command: str) -> list[list[str]]:
     return argvs
 
 
-def _command_word_index(argv: list[str], script: str | None = None) -> int | None:
+def _command_word_index(
+    argv: list[str], script: str | None = None, matches: Callable[[list[str], int], bool] | None = None
+) -> int | None:
     """The index of the word the shell runs as this argv's command, when it is one the reader
-    knows: a shell program, an interpreter, or ``script`` itself. Leading ``NAME=value``
+    knows: a shell program, an interpreter, ``eval``, ``script`` itself, or a word at which
+    ``matches(argv, index)`` holds (the GitHub-write attribution asks for the commands that
+    create a branch or a pull request this way). Leading ``NAME=value``
     assignments and reserved words are skipped, and so is a redirect with its target, which bash
     takes anywhere on the line. After an exec wrapper (``timeout``, ``sudo``, ``env`` ...) only
     the wrapper's own words are transparent: a flag, the word after a flag (its value, ``-u user``
@@ -315,7 +326,9 @@ def _command_word_index(argv: list[str], script: str | None = None) -> int | Non
     positionals = 0
     for index, word in enumerate(argv):
         base = os.path.basename(word)
-        if base in _SHELL_PROGRAMS_WITH_COMMAND_STRING or _INTERPRETER_RE.match(base) or (script and base == script):
+        if matches is not None and matches(argv, index):
+            return index
+        if base in _SHELL_PROGRAMS_WITH_COMMAND_STRING or _INTERPRETER_RE.match(base) or (script and base == script) or word == _SHELL_EVAL:
             return index
         if _SHELL_ASSIGNMENT_RE.match(word) or word in _SHELL_RESERVED_WORDS:
             takes_value = False

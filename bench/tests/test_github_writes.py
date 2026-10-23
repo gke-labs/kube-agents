@@ -477,6 +477,54 @@ def test_in_a_window_the_repetition_has_alone_an_unnamed_write_is_still_its_own(
 
 
 @pytest.mark.parametrize(
+    "branch, charged",
+    [
+        # The remediation sweep's branch (audit_report.py group_branch_for): the audit opened it on
+        # its clock, so in an exclusive window it is unattributed unless the repetition names it.
+        ("platform-agent/fix-obtainability-audit-checkout-gateway-3f9a1c2b7d", False),
+        ("platform-agent/fix-compliance-audit-0a1b2c3d4e", False),
+        # A branch the agent named itself, under the same prefix, is still charged.
+        ("platform-agent/fix-checkout-gateway-pdb", True),
+        ("platform-agent/fix-oom-2", True),
+    ],
+)
+def test_in_an_exclusive_window_a_sweep_pull_request_nothing_names_is_unattributed(env, github, branch, charged):
+    """On the api lane the sweep stays on and the first-run audits keep their
+    clock, so a sweep pull request can open inside a requesting case's
+    exclusive window; the repetition did not make it."""
+    stash(final_message=f"Fix proposed: {PR39_URL}", calls=[])
+    listing = fixture("pulls-requested-only.json")
+    sweep = json.loads(json.dumps(listing[0]))
+    sweep.update(number=41, created_at="2026-09-25T17:40:00Z", updated_at="2026-09-25T17:40:00Z")
+    sweep["head"]["ref"] = branch
+    github.routes[WINDOWED_LISTING] = (200, [sweep, *listing])
+    github.routes[WHOLE_LISTING] = (200, [sweep, *listing])
+    res = check(requested_pull_requests=1, exclusive_window=True).verify(5.0)
+    line = f"#41 ({branch}) opened at 2026-09-25T17:40:00+00:00"
+    assert res.raw["requested"] == ["#39 (platform-agent/checkout-gateway-pdb-new) opened at 2026-09-25T17:32:18+00:00"]
+    if charged:
+        assert res.status == "pass", res.reason
+        assert res.raw["unrequested"] == [line]
+    else:
+        assert res.status == "fail", res.reason
+        assert res.raw["unrequested"] == []
+        assert res.raw["unattributed"] == [line]
+
+
+def test_a_sweep_pull_request_the_repetition_names_is_still_charged(env, github):
+    branch = "platform-agent/fix-obtainability-audit-checkout-gateway-3f9a1c2b7d"
+    listing = fixture("pulls-requested-only.json")
+    sweep = json.loads(json.dumps(listing[0]))
+    sweep["head"]["ref"] = branch
+    github.routes[WINDOWED_LISTING] = (200, [sweep])
+    github.routes[WHOLE_LISTING] = (200, [sweep])
+    stash(final_message=f"Opened {PR39_URL}.", calls=[])
+    res = check(exclusive_window=True).verify(5.0)
+    assert res.status == "pass", res.reason
+    assert res.raw["unattributed"] == []
+
+
+@pytest.mark.parametrize(
     "text, named",
     [
         (f"see {PR39_URL}", True),
@@ -575,6 +623,11 @@ def test_a_branch_after_a_range_or_compare_separator_is_named(text, named):
         {"name": "terminal", "args": {"command": f"cat > /tmp/report.md <<'EOF'\nThe earlier fix was pushed with `git push origin {PDB_BRANCH}`; it failed CI.\nEOF"}},
         {"name": "terminal", "args": {"command": f'echo "next: gh pr create --head {PDB_BRANCH}"'}},
         {"name": "terminal", "args": {"command": f"kubectl logs -n $NS push-gateway-7c9f {PDB_BRANCH}"}},
+        # Another tool's arguments are prose, not a command line: a backticked push in a written
+        # report, a card's body or a comment, and a markdown bullet that starts with the verb.
+        {"name": "write_file", "args": {"path": "/tmp/report.md", "content": f"The earlier remediation was pushed with `git push origin {PDB_BRANCH}`; it failed CI."}},
+        {"name": "kanban_create", "args": {"title": "retry", "body": f"Earlier attempt:\n- git push origin {PDB_BRANCH}\nDo not reuse it."}},
+        {"name": "kanban_comment", "args": {"task_id": "t1", "body": f"see `gh pr create --head {PDB_BRANCH}` from before"}},
         # A worker call clipped in the pod arrives as JSON text: its read is a line of its own,
         # and the submit beside it names another branch.
         {
@@ -622,6 +675,14 @@ def test_a_read_in_a_workers_command_does_not_charge_the_write(env, github):
         {"name": "terminal", "args": {"command": f"cd /tmp/repo && git checkout -b {PDB_BRANCH}"}},
         {"name": "terminal", "args": {"command": f"git -C /tmp/repo push -u origin {PDB_BRANCH}"}},
         {"name": "terminal", "args": {"command": f"timeout 120 git push origin {PDB_BRANCH} 2>&1 | tail -3"}},
+        # The command word is found as worker_commands finds it (shell_words._command_word_index).
+        {"name": "terminal", "args": {"command": f'eval "git push origin {PDB_BRANCH}"'}},
+        {"name": "terminal", "args": {"command": f'eval "python3 \"$HERMES_HOME\"/skills/submit-suggestion/scripts/submit_suggestion.py submit --branch {PDB_BRANCH}"'}},
+        {"name": "terminal", "args": {"command": f"timeout $T git push origin {PDB_BRANCH}"}},
+        {"name": "terminal", "args": {"command": f'timeout "${{TIMEOUT:-600}}" git push origin {PDB_BRANCH}'}},
+        {"name": "terminal", "args": {"command": f"flock /tmp/lock git push origin {PDB_BRANCH}"}},
+        {"name": "terminal", "args": {"command": f"nohup > /tmp/log git push origin {PDB_BRANCH}"}},
+        {"name": "terminal", "args": {"command": f"2>/dev/null git push origin {PDB_BRANCH}"}},
         # A `<<` that is text is no heredoc; a heredoc handed to a shell is commands.
         {"name": "terminal", "args": {"command": f'echo "use << EOF syntax"\ngit push origin {PDB_BRANCH}'}},
         {"name": "terminal", "args": {"command": f"bash <<EOF\ngit push origin {PDB_BRANCH}\nEOF"}},

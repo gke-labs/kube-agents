@@ -95,12 +95,9 @@ from kube_agents_bench.forges import (
 from kube_agents_bench.shell_words import (
     _INTERPRETER_RE,
     _OPERATOR_MARK,
-    _SHELL_ASSIGNMENT_RE,
-    _SHELL_COUNT_RE,
-    _SHELL_EXEC_WRAPPERS,
     _SHELL_FLAG_PREFIX,
     _SHELL_PROGRAMS_WITH_COMMAND_STRING,
-    _SHELL_RESERVED_WORDS,
+    _command_word_index,
     _read_shell_line,
     _shell_argvs,
 )
@@ -154,6 +151,14 @@ BOT_LOGIN_SUFFIX = "[bot]"
 #: of its own is not seen here; the reset deletes it whatever it is called.
 #: ``bench/tests/test_github_writes.py`` pins the literal to forge.py's.
 AGENT_BRANCH_PREFIX = "platform-agent/"
+#: The head branch the fleet audits' own remediation sweep writes on, as
+#: ``group_branch_for`` names it
+#: (agents/platform/skills/fleet-audit/scripts/audit_report.py):
+#: ``platform-agent/fix-<audit-id>-[<slug>-]<10-hex digest>``. The audit's
+#: ``finish`` opens it on its clock, not for any repetition, so a write on
+#: such a branch is charged only to the repetition that names it, even in an
+#: exclusive window (:func:`is_sweep_branch`).
+SWEEP_BRANCH = re.compile(rf"^{AGENT_BRANCH_PREFIX}fix-[a-z0-9-]+-[0-9a-f]{{10}}$")
 #: The ``ref`` prefix the refs listing returns.
 REFS_HEADS_PREFIX = "refs/heads/"
 
@@ -256,10 +261,10 @@ HEREDOC_RUNNERS = frozenset((*_SHELL_PROGRAMS_WITH_COMMAND_STRING, "ssh"))
 #: heredoc (``--body "$(cat <<'EOF'``); ``$((`` is arithmetic.
 OPEN_SUBSTITUTIONS = ("$(", "`")
 ARITHMETIC_OPENER = "$(("
-#: Words that hand the rest of an argv on to the command after them
-#: (:func:`_creates`), beside assignments, exec wrappers, interpreters, flags
-#: and counts: ``uv run``, ``eval``, ``--``.
-PASS_THROUGH_WORDS = frozenset(("run", "eval", "--"))
+#: Words behind an interpreter that hand the rest of an argv on to the
+#: command after them (:func:`_creates`), beside its flags and another
+#: interpreter: ``uv run``, ``--``.
+PASS_THROUGH_WORDS = frozenset(("run", "--"))
 #: An interpreter's flag whose next word is code, never a script to run.
 CODE_FLAG = "-c"
 #: What closes a quoted value a clipped call or a one-row-per-line worker log
@@ -793,34 +798,44 @@ def writing_segments(command: str) -> list[str]:
     return [" ".join(argv) for argv in argvs if _creates(argv)]
 
 
+def _writes_at(argv: list[str], index: int) -> bool:
+    """Whether the words of ``argv`` from ``index`` on spell one of
+    :data:`WRITING_COMMANDS`, the first by its basename."""
+    joined = " ".join([os.path.basename(argv[index]), *argv[index + 1:]])
+    return any(p.match(joined) for p in WRITING_COMMANDS)
+
+
 def _creates(argv: list[str]) -> bool:
     """Whether ``argv``'s command word is one of :data:`WRITING_COMMANDS`.
-    The command word is the first word past those that hand the argv on:
-    ``NAME=value`` assignments, reserved words, exec wrappers with their
-    flags, a flag's value and a count (``sudo -u bob``, ``timeout 60``), an
-    interpreter with its flags (``python3 -u``, ``uv run``) and ``eval``.
-    Any other word ends the search, so ``echo git push`` and ``kubectl logs
-    $NS push-gateway`` create nothing; so does an interpreter's ``-c``,
-    whose next word is code."""
+    The command word is found as ``worker_commands`` finds it
+    (:func:`kube_agents_bench.shell_words._command_word_index`: assignments,
+    reserved words, redirects, exec wrappers with their flags, values,
+    counts, expansions and positionals), so the two readers agree; ``eval``'s
+    words are read as a command line of their own by
+    :func:`kube_agents_bench.shell_words._shell_argvs`. Behind an
+    interpreter the command is its script, past the interpreter's flags and
+    their values, :data:`PASS_THROUGH_WORDS` and another interpreter
+    (``python3 -u``, ``uv run python3``). Any other word ends the search, so
+    ``echo git push`` and ``kubectl logs $NS push-gateway`` create nothing;
+    so does an interpreter's ``-c``, whose next word is code."""
+    index = _command_word_index(argv, matches=_writes_at)
+    if index is None:
+        return False
+    if _writes_at(argv, index):
+        return True
+    if not _INTERPRETER_RE.match(os.path.basename(argv[index])):
+        return False
     after_flag = False
-    for index, word in enumerate(argv):
-        base = os.path.basename(word)
-        if any(p.match(" ".join([base, *argv[index + 1:]])) for p in WRITING_COMMANDS):
+    for at in range(index + 1, len(argv)):
+        word = argv[at]
+        if _writes_at(argv, at):
             return True
         if word == CODE_FLAG:
             return False
-        if word.startswith(_SHELL_FLAG_PREFIX) and word != "--":
+        if word.startswith(_SHELL_FLAG_PREFIX) and word not in PASS_THROUGH_WORDS:
             after_flag = True
             continue
-        if (
-            _SHELL_ASSIGNMENT_RE.match(word)
-            or word in _SHELL_RESERVED_WORDS
-            or word in PASS_THROUGH_WORDS
-            or base in _SHELL_EXEC_WRAPPERS
-            or _INTERPRETER_RE.match(base)
-            or _SHELL_COUNT_RE.match(word)
-            or after_flag
-        ):
+        if word in PASS_THROUGH_WORDS or _INTERPRETER_RE.match(os.path.basename(word)) or after_flag:
             after_flag = False
             continue
         return False
@@ -857,6 +872,12 @@ def _without_heredoc_bodies(command: str) -> str:
         if delimiters and not HEREDOC_RUNNERS & {os.path.basename(w) for w in _read_shell_line(line)[0].split()}:
             pending = delimiters
     return "\n".join(kept)
+
+
+def is_sweep_branch(branch: str) -> bool:
+    """Whether ``branch`` is one the fleet audits' remediation sweep names
+    (:data:`SWEEP_BRANCH`)."""
+    return bool(SWEEP_BRANCH.match(branch or ""))
 
 
 def is_writing_tool(name: str) -> bool:

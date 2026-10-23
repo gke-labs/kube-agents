@@ -5541,10 +5541,13 @@ def _own_words_and_calls(snap: transcript.TranscriptSnapshot) -> str:
     its reply, and the calls that create a branch or a pull request -- the
     front agent's and its delegated workers' tool calls (the worker
     trajectory joins ``trajectory`` tagged with its ``agent``) and the
-    workers' terminal commands. Not a read's arguments and not any tool
-    result: ``gh pr view <url>``, ``vcs.py clone --branch <branch>`` and a
-    listing name another case's pull request as easily as this one's
-    (:func:`kube_agents_bench.github_writes.writing_segments`)."""
+    workers' terminal commands. Not a read's arguments, not any tool result,
+    and not any other tool's arguments: ``gh pr view <url>``, ``vcs.py clone
+    --branch <branch>`` and a listing name another case's pull request as
+    easily as this one's
+    (:func:`kube_agents_bench.github_writes.writing_segments`), and a card's
+    body, a comment or a file's content is prose, whose backticked ``git
+    push <branch>`` quotes a command rather than runs one."""
     parts = [snap.final_message, snap.output]
     for call in snap.trajectory:
         if not isinstance(call, dict):
@@ -5556,8 +5559,6 @@ def _own_words_and_calls(snap: transcript.TranscriptSnapshot) -> str:
             # A terminal or execute_code call, clipped arguments decoded as the worker_commands
             # verifier decodes them (:func:`_code_call_text`).
             parts.extend(github_writes.writing_segments(command))
-        else:
-            parts.extend(seg for s in _strings_in(call.get("args")) for seg in github_writes.writing_segments(s))
     for row in snap.worker_commands or []:
         if isinstance(row, dict):
             parts.extend(github_writes.writing_segments(str(row.get("command") or "")))
@@ -5641,7 +5642,12 @@ class GitHubWritesVerifier(BaseVerifier):
     write fails the repetition that named it rather than every repetition
     running at the time. With ``exclusive_window`` -- set by the lane on a
     case that requests a pull request, which runs alone -- a write nothing
-    names is charged all the same, since no other repetition was writing.
+    names is charged all the same, since no other repetition was writing --
+    except one on a branch the fleet audits' remediation sweep names
+    (``platform-agent/fix-<audit-id>-...-<digest>``,
+    :data:`kube_agents_bench.github_writes.SWEEP_BRANCH`): the api lane
+    keeps the sweep on and the four first-run audits keep their clock, so
+    such a pull request is unattributed there as in a shared window.
     Otherwise a write no repetition names is graded by none (a reply that
     does not link it from a run whose workers' calls were not read back --
     the bridge's ``cli`` executor, a wait that fell back, a card the read
@@ -5778,7 +5784,9 @@ class GitHubWritesVerifier(BaseVerifier):
         excused = []
         unattributed = []
         for write in report.writes:
-            if not self.exclusive_window and not github_writes.named_in(write, own, repo, forge):
+            # A sweep pull request the audits opened on their clock is no repetition's, alone or not.
+            shared = not self.exclusive_window or github_writes.is_sweep_branch(write.branch)
+            if shared and not github_writes.named_in(write, own, repo, forge):
                 unattributed.append(write)
                 continue
             if allowance and write.number in requested:

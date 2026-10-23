@@ -552,7 +552,9 @@ window to the case in flight. So `hack/ci-deploy.sh` installs the inject lane's 
 `KUBEAGENTS_AUDIT_AUTO_PROMOTE=false` in `spec.deployment.env`: the audits still run and file
 their ledgers, `finish` opens nothing nobody asked for, and a `/remediate` still works. The api
 lane keeps the sweep on, where a sweep's pull request names no repetition and lands under
-`unattributed`, and the job's repository reset closes what it opens ([#3439](https://github.com/gke-labs/kube-agents/issues/3439)).
+`unattributed`, in a requesting case's exclusive window as well (the check knows it by the
+`platform-agent/fix-<audit-id>-…-<digest>` branch the sweep names, `SWEEP_BRANCH` in
+`bench/kube_agents_bench/github_writes.py`), and the job's repository reset closes what it opens ([#3439](https://github.com/gke-labs/kube-agents/issues/3439)).
 
 ## The GitLab lane
 

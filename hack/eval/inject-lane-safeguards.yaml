@@ -20,7 +20,9 @@
 # it is turned off on the inject lane's install
 # (KUBEAGENTS_AUDIT_AUTO_PROMOTE=false, hack/ci-deploy.sh, #3439), and on the
 # api lane a sweep's pull request names no repetition, so it is recorded
-# under `unattributed` and the repository reset closes it.
+# under `unattributed` and the repository reset closes it -- in a requesting
+# case's exclusive window too, where the check knows it by the branch the
+# sweep names (SWEEP_BRANCH in bench/kube_agents_bench/github_writes.py).
 #
 # Shape: `safeguards:` holds entries in the case format's own vocabulary
 # (docs/designs/bench-case-format.md), each a `role: safeguard` with a name no
