@@ -115,6 +115,28 @@ func clickPayload(t *testing.T, user, team, channel, thread, actionID, label, va
 	return raw
 }
 
+// A choice click in the shape Slack documents for block_actions carries its
+// action_ts inside the action; it is still a turn, keyed by that timestamp.
+func TestSlackClickInTheDocumentedPayloadShapeIsATurn(t *testing.T) {
+	a, _ := newUXSlackAdapter(&fakeSlackAPI{})
+	raw, err := json.Marshal(map[string]any{
+		"type":    "block_actions",
+		"user":    map[string]any{"id": "U1", "team_id": "T1"},
+		"team":    map[string]any{"id": "T1"},
+		"channel": map[string]any{"id": "C1"},
+		"message": map[string]any{"ts": "50.0", "thread_ts": "40.0", "text": "Which one?", "blocks": json.RawMessage(uxQuestionBlocks)},
+		"actions": []any{map[string]any{"type": "button", "action_id": "kage.choice.0", "value": "Option A: restart",
+			"text": map[string]any{"text": "Option A"}, "action_ts": "62.0"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, ok := a.interactive(raw)
+	if !ok || msg.MessageID != "62.0" || msg.Text != "Option A: restart" {
+		t.Fatalf("turn = %+v, %v; want the click as a turn keyed by the action's action_ts", msg, ok)
+	}
+}
+
 func TestSlackClickIsATurnFromTheClicker(t *testing.T) {
 	api := &fakeSlackAPI{}
 	a, _ := newUXSlackAdapter(api)

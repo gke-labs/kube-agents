@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -114,6 +115,53 @@ func ratingPayload(t *testing.T, user, value string) json.RawMessage {
 		t.Fatal(err)
 	}
 	return raw
+}
+
+// documentedRatingPayload is a 👍/👎 tap in the shape Slack documents for
+// block_actions (docs.slack.dev, "block_actions payload"): action_ts inside
+// the action, none at the top.
+func documentedRatingPayload(t *testing.T, actionID, value string) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{
+		"type":       "block_actions",
+		"user":       map[string]any{"id": "U1", "team_id": "T1"},
+		"team":       map[string]any{"id": "T1"},
+		"channel":    map[string]any{"id": "C1"},
+		"container":  map[string]any{"type": "message", "message_ts": "50.0", "channel_id": "C1"},
+		"trigger_id": "trig-1",
+		"message":    map[string]any{"ts": "50.0", "thread_ts": "40.0", "text": "*It is OOMKilled.*"},
+		"actions": []any{map[string]any{"type": slackFeedbackButtons, "action_id": actionID,
+			"block_id": slackFeedbackBlockPrefix + "t-root", "value": value, "action_ts": "61.0"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func TestSlackRatingInTheDocumentedPayloadShapeIsRecorded(t *testing.T) {
+	a, rec, api := newFeedbackSlackAdapter()
+	a.interactive(documentedRatingPayload(t, slackFeedbackAction, FeedbackDown))
+	if len(rec.ratings) != 1 || rec.ratings[0].Rating != FeedbackDown || rec.ratings[0].TaskID != "t-root" {
+		t.Fatalf("ratings = %+v, want the 👎 recorded from a payload whose action_ts is inside the action", rec.ratings)
+	}
+	if len(api.views) != 1 {
+		t.Errorf("views = %d, want the note box opened", len(api.views))
+	}
+}
+
+func TestSlackRatingTapsTheGatewayCannotReadAreLogged(t *testing.T) {
+	a, rec, _ := newFeedbackSlackAdapter()
+	logs := &recordingHandler{}
+	a.log = slog.New(logs)
+	a.interactive(documentedRatingPayload(t, slackFeedbackAction, "positive"))
+	a.interactive(documentedRatingPayload(t, "another.app", FeedbackUp))
+	if len(rec.ratings) != 0 {
+		t.Fatalf("ratings = %+v, want none", rec.ratings)
+	}
+	if !logs.has("value", "positive") || !logs.has("actionId", "another.app") {
+		t.Error("a rating tap the gateway drops must be logged with its ids and value")
+	}
 }
 
 // sentBlocks is the blocks and attachments options would send.

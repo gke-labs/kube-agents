@@ -213,13 +213,21 @@ func slackSectionParts(text string) []string {
 }
 
 // feedbackClick handles a tap on the rating controls: never a turn.
-func (s *SlackAdapter) feedbackClick(p slackClickPayload, blockID, value string) {
+func (s *SlackAdapter) feedbackClick(p slackClickPayload, actionType, blockID, value string) {
 	recorder := s.feedbackRecorder()
 	taskID, ok := strings.CutPrefix(blockID, slackFeedbackBlockPrefix)
 	if recorder == nil || !ok || taskID == "" || (value != FeedbackUp && value != FeedbackDown) {
+		// Ids and the rating's value only, never text: a tap the gateway
+		// cannot read is otherwise indistinguishable from no tap at all.
+		s.log.Info("slack: dropping a rating tap the gateway cannot read",
+			"actionType", actionType, "actionId", slackFeedbackAction, "blockId", blockID, "value", value,
+			"feedbackOn", recorder != nil, "channel", p.Channel.ID)
 		return
 	}
 	if p.User.ID == "" || p.Channel.ID == "" || p.Message.TS == "" || p.ActionTS == "" {
+		s.log.Info("slack: dropping a rating tap with ids missing",
+			"blockId", blockID, "user", p.User.ID != "", "channel", p.Channel.ID != "",
+			"message", p.Message.TS != "", "actionTs", p.ActionTS != "")
 		return
 	}
 	if s.otherWorkspace(p.User.TeamID) || s.otherWorkspace(p.Team.ID) {

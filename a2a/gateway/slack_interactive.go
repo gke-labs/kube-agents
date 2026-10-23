@@ -86,9 +86,15 @@ type slackClickPayload struct {
 		Attachments json.RawMessage `json:"attachments"`
 	} `json:"message"`
 	Actions []struct {
+		// Type is the element's (button, feedback_buttons), logged with
+		// the ids when a click is dropped.
+		Type     string `json:"type"`
 		ActionID string `json:"action_id"`
 		BlockID  string `json:"block_id"`
 		Value    string `json:"value"`
+		// ActionTS is where a block_actions payload carries the click's
+		// timestamp (interactive copies it to the payload's ActionTS).
+		ActionTS string `json:"action_ts"`
 		Text     struct {
 			Text string `json:"text"`
 		} `json:"text"`
@@ -366,6 +372,12 @@ func (s *SlackAdapter) interactive(raw json.RawMessage) (InboundMessage, bool) {
 		s.log.Warn("slack: unreadable interactive payload", "err", err)
 		return InboundMessage{}, false
 	}
+	if p.ActionTS == "" && len(p.Actions) > 0 {
+		// Slack documents a block_actions payload's action_ts inside each
+		// action, not at the top as a shortcut's is; read without this, a
+		// real click has no timestamp and is dropped.
+		p.ActionTS = p.Actions[0].ActionTS
+	}
 	if p.Type == slackViewSubmission {
 		// A 👎's note, sent from its modal: never a turn.
 		s.feedbackNote(raw)
@@ -375,9 +387,16 @@ func (s *SlackAdapter) interactive(raw json.RawMessage) (InboundMessage, bool) {
 		return InboundMessage{}, false
 	}
 	action := p.Actions[0]
+	if action.Type == slackFeedbackButtons && action.ActionID != slackFeedbackAction {
+		// A rating control the gateway did not draw (another app's, or an
+		// action id that changed): logged, so a tap never vanishes unseen.
+		s.log.Info("slack: dropping a rating tap with an unknown action id",
+			"actionType", action.Type, "actionId", action.ActionID, "blockId", action.BlockID, "channel", p.Channel.ID)
+		return InboundMessage{}, false
+	}
 	if action.ActionID == slackFeedbackAction {
 		// A rating: never a turn.
-		s.feedbackClick(p, action.BlockID, action.Value)
+		s.feedbackClick(p, action.Type, action.BlockID, action.Value)
 		return InboundMessage{}, false
 	}
 	if !strings.HasPrefix(action.ActionID, slackChoiceActionPrefix) {
