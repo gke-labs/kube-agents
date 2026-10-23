@@ -113,5 +113,35 @@ class InstallGuidesAreReadNotSearchedTest(unittest.TestCase):
         self.assertIn("a template default applies only where the workload", content)
         self.assertIn("Search-result snippets are not requirements", content)
 
+
+class SubmitSuggestionHandsEditsToTheirAuthoringSkillTest(unittest.TestCase):
+    """#2999's lane run: asked to raise a Terraform node pool's autoscaling
+    maximum, the agent went straight to submit-suggestion, edited the .tf, and
+    never loaded gcp-terraform, so tofu fmt never ran (#3565). Step 2 hands a
+    Terraform, Config Connector or Helm-chart edit to its authoring skill."""
+
+    def test_step_two_names_each_authoring_skill(self):
+        content = (REPO_ROOT / "agents/platform/skills/submit-suggestion/SKILL.md").read_text(encoding="utf-8")
+        step2 = content[content.index("### Step 2: Make the Changes"):content.index("### Deleting a resource")]
+        for skill in ("gcp-terraform", "gcp-config-connector", "gitops-helm-chart"):
+            self.assertIn(f"**{skill}**", step2)
+        self.assertIn("follow it from its Step 1", step2)
+        # The authoring skill submits its own branch; editing this skill's copy
+        # would leave submit with nothing to find.
+        self.assertIn("Leave the copy you prepared here unused", step2)
+        # A review round or an open proposal already fixes the branch; the
+        # authoring skill's own prepare and submit would open a second PR.
+        self.assertIn("When the branch is already decided, stay on it.", step2)
+        self.assertIn("not its Step 1 `prepare`, its branch name or\nits submit", step2)
+
+    def test_review_rounds_apply_the_same_table(self):
+        # Step 5 is where pr-conversation enters; a .tf edit in a review round
+        # takes the authoring skill's rules too.
+        content = (REPO_ROOT / "agents/platform/skills/submit-suggestion/SKILL.md").read_text(encoding="utf-8")
+        step5 = content[content.index("### Step 5: Addressing Review Feedback"):]
+        self.assertIn("authoring skill's rules here too (Step 2's table)", step5)
+        self.assertIn("`tofu fmt` after any `.tf` edit", step5)
+        self.assertIn("submit do not apply: stay on `<source>` in this copy", step5)
+
 if __name__ == "__main__":
     unittest.main()

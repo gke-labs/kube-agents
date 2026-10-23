@@ -306,13 +306,13 @@ func TestTheA2AGatewayMetricsSurfaceOnTheAPIServerEnvtest(t *testing.T) {
 	agent.UID = types.UID("a2a-gateway-metrics-uid")
 	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
 
-	if _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
+	if _, _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
 		t.Fatalf("reconcileA2ANetworkFences: %v", err)
 	}
 	if err := r.applyA2AGatewayDeployment(ctx, agent, buildA2AGatewayDeployment(agent)); err != nil {
 		t.Fatalf("applyA2AGatewayDeployment: %v", err)
 	}
-	if _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
+	if _, _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
 		t.Fatalf("reconcileA2ANetworkFences over a running gateway: %v", err)
 	}
 
@@ -587,7 +587,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		if err := cl.Delete(ctx, &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayFenceKey(agent).Name, Namespace: agent.Namespace}}); err != nil {
 			t.Fatalf("precondition: the fence was not there to delete: %v", err)
 		}
-		if _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
+		if _, _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
 			t.Fatal(err)
 		}
 		assertA2AGatewayFence(t, ctx, cl, agent)
@@ -598,7 +598,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		t.Setenv(a2aAgentDoorEnvVar, "")
 		agent := a2aTestAgent()
 		r, cl, _ := a2aGateTestReconciler(t, agent)
-		if _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
+		if _, _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
 			t.Fatal(err)
 		}
 		if err := cl.Get(ctx, a2aGatewayFenceKey(agent), &networkingv1.NetworkPolicy{}); !errors.IsNotFound(err) {

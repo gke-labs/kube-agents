@@ -1,0 +1,145 @@
+[
+  {
+    "kind": "Node",
+    "metadata": {
+      "labels": {
+        "addon.gke.io/node-local-dns-ds-ready": "true",
+        "beta.kubernetes.io/arch": "amd64",
+        "beta.kubernetes.io/instance-type": "e2-small",
+        "beta.kubernetes.io/os": "linux",
+        "cloud.google.com/gke-boot-disk": "pd-balanced",
+        "cloud.google.com/gke-container-runtime": "containerd",
+        "cloud.google.com/gke-cpu-scaling-level": "2",
+        "cloud.google.com/gke-logging-variant": "DEFAULT",
+        "cloud.google.com/gke-max-pods-per-node": "110",
+        "cloud.google.com/gke-memory-gb-scaling-level": "2",
+        "cloud.google.com/gke-netd-ready": "true",
+        "cloud.google.com/gke-nodepool": "default-pool",
+        "cloud.google.com/gke-os-distribution": "cos",
+        "cloud.google.com/gke-provisioning": "standard",
+        "cloud.google.com/gke-stack-type": "IPV4",
+        "cloud.google.com/machine-family": "e2",
+        "cloud.google.com/private-node": "false",
+        "disk-type.gke.io/pd-balanced": "true",
+        "disk-type.gke.io/pd-extreme": "true",
+        "disk-type.gke.io/pd-ssd": "true",
+        "disk-type.gke.io/pd-standard": "true",
+        "failure-domain.beta.kubernetes.io/region": "us-central1",
+        "failure-domain.beta.kubernetes.io/zone": "us-central1-a",
+        "iam.gke.io/gke-metadata-server-enabled": "true",
+        "kubernetes.io/arch": "amd64",
+        "kubernetes.io/hostname": "gke-seeded-b-default-pool-4176890d-q0q0",
+        "kubernetes.io/os": "linux",
+        "node.kubernetes.io/instance-type": "e2-small",
+        "topology.gke.io/zone": "us-central1-a",
+        "topology.kubernetes.io/region": "us-central1",
+        "topology.kubernetes.io/zone": "us-central1-a"
+      },
+      "name": "gke-seeded-b-default-pool-4176890d-q0q0",
+      "creationTimestamp": "2026-10-07T18:35:15Z"
+    },
+    "spec": {
+      "providerID": "gce://haoxuw-gke-dev/us-central1-a/gke-seeded-b-default-pool-4176890d-q0q0",
+      "taints": [],
+      "unschedulable": false
+    },
+    "status": {
+      "allocatable": {
+        "cpu": "940m",
+        "ephemeral-storage": "4253788136",
+        "hugepages-1Gi": "0",
+        "hugepages-2Mi": "0",
+        "memory": "1391012Ki",
+        "pods": "110"
+      },
+      "conditions": [
+        {
+          "lastHeartbeatTime": "2026-10-20T15:43:18Z",
+          "lastTransitionTime": "2026-10-07T18:35:18Z",
+          "message": "kubelet is posting ready status",
+          "reason": "KubeletReady",
+          "status": "True",
+          "type": "Ready"
+        }
+      ],
+      "nodeInfo": {
+        "kubeletVersion": "v1.34.12-gke.1011000"
+      }
+    }
+  },
+  {
+    "kind": "Node",
+    "metadata": {
+      "labels": {
+        "addon.gke.io/node-local-dns-ds-ready": "true",
+        "beta.kubernetes.io/arch": "amd64",
+        "beta.kubernetes.io/instance-type": "e2-small",
+        "beta.kubernetes.io/os": "linux",
+        "cloud.google.com/gke-boot-disk": "pd-balanced",
+        "cloud.google.com/gke-container-runtime": "containerd",
+        "cloud.google.com/gke-cpu-scaling-level": "2",
+        "cloud.google.com/gke-logging-variant": "DEFAULT",
+        "cloud.google.com/gke-max-pods-per-node": "110",
+        "cloud.google.com/gke-memory-gb-scaling-level": "2",
+        "cloud.google.com/gke-netd-ready": "true",
+        "cloud.google.com/gke-nodepool": "no-surge-pool",
+        "cloud.google.com/gke-os-distribution": "cos",
+        "cloud.google.com/gke-provisioning": "standard",
+        "cloud.google.com/gke-stack-type": "IPV4",
+        "cloud.google.com/machine-family": "e2",
+        "cloud.google.com/private-node": "false",
+        "disk-type.gke.io/pd-balanced": "true",
+        "disk-type.gke.io/pd-extreme": "true",
+        "disk-type.gke.io/pd-ssd": "true",
+        "disk-type.gke.io/pd-standard": "true",
+        "failure-domain.beta.kubernetes.io/region": "us-central1",
+        "failure-domain.beta.kubernetes.io/zone": "us-central1-a",
+        "iam.gke.io/gke-metadata-server-enabled": "true",
+        "kubernetes.io/arch": "amd64",
+        "kubernetes.io/hostname": "gke-seeded-b-no-surge-pool-235d7913-2jpr",
+        "kubernetes.io/os": "linux",
+        "node.kubernetes.io/instance-type": "e2-small",
+        "seeded-role": "no-surge",
+        "topology.gke.io/zone": "us-central1-a",
+        "topology.kubernetes.io/region": "us-central1",
+        "topology.kubernetes.io/zone": "us-central1-a"
+      },
+      "name": "gke-seeded-b-no-surge-pool-235d7913-2jpr",
+      "creationTimestamp": "2026-10-01T14:33:03Z"
+    },
+    "spec": {
+      "providerID": "gce://haoxuw-gke-dev/us-central1-a/gke-seeded-b-no-surge-pool-235d7913-2jpr",
+      "taints": [
+        {
+          "effect": "NoSchedule",
+          "key": "seeded-role",
+          "value": "no-surge"
+        }
+      ],
+      "unschedulable": false
+    },
+    "status": {
+      "allocatable": {
+        "cpu": "940m",
+        "ephemeral-storage": "4253788136",
+        "hugepages-1Gi": "0",
+        "hugepages-2Mi": "0",
+        "memory": "1391012Ki",
+        "pods": "110"
+      },
+      "conditions": [
+        {
+          "lastHeartbeatTime": "2026-10-20T15:42:57Z",
+          "lastTransitionTime": "2026-10-01T14:33:06Z",
+          "message": "kubelet is posting ready status",
+          "reason": "KubeletReady",
+          "status": "True",
+          "type": "Ready"
+        }
+      ],
+      "nodeInfo": {
+        "kubeletVersion": "v1.34.11-gke.1209000"
+      }
+    }
+  }
+]

@@ -152,8 +152,8 @@ readonly EVAL_DRIFT_READY_INTERVAL_SECONDS=5
 # kanban.max_in_progress in its managed scope: 6 (defaultKanbanMaxInProgress),
 # or spec.harness.tuning.maxInProgress when the CR carries it.
 # The eval deliberately runs below that production default, at five. It fans
-# its units out at EVAL_TASK_PARALLELISM (4 on a pull request, 8 on the
-# nightly since oss-test-infra#2707), and nearly every unit's opening turn
+# its units out at EVAL_TASK_PARALLELISM (4 on a pull request, 6 on the
+# nightlies, 8 on the GitLab one), and nearly every unit's opening turn
 # delegates one platform card. The override was added when the image default
 # was two, where most lanes queued: a queued card waits out the cards ahead of
 # it and then runs its own 10-45 minutes, past the 2700-3000s delegation
@@ -181,7 +181,7 @@ readonly EVAL_DRIFT_READY_INTERVAL_SECONDS=5
 # that leaves four for user cards: exactly the pull request's four lanes
 # (EVAL_TASK_PARALLELISM_DEFAULT below), with the fifth held for event triage.
 # A lane's fan-out child runs in the slot its waiting coordinator gives back.
-# The nightly's eight lanes still queue four deep. Raising the cap belongs with
+# The nightlies' six lanes still queue two deep. Raising the cap belongs with
 # that measurement. Each class may hold four of the five slots here, against
 # five of six in production. Set on this install only.
 # tests/test_ci_deploy_kanban_cap.py pins the flag, the floor (the lanes plus
@@ -249,7 +249,7 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 
 # EVAL_MODE_NEXT=1 flips the eval install to `spec.mode: next` once the
 # today-mode install has passed step 6, so the matrix can be run against the
-# next stack: the merge-blocking presubmit's, the next-mode nightly's on main,
+# next stack: the merge-blocking presubmit's, the main nightly's on main,
 # and the today lane's, which rolls the next install back to today before its
 # matrix (EVAL_ROLLBACK_LANE=1, hack/ci-eval-pr.sh) (#1686, #2007). Unset, or set to
 # anything but "1", is today: every line the flag guards is skipped and the
@@ -313,9 +313,11 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # merge-blocking presubmit in a Tide batch (it grades next since next became
 # the mode new installs get, #2007, "The cutover itself"); the today lane's
 # six-hourly periodic on main, which deploys next and rolls it back to today
-# before its matrix (EVAL_ROLLBACK_LANE=1); the daily full-catalog next-mode
-# nightly on main (the agent on Claude, compared with a today-mode nightly on
-# the same model); the GitLab lane's nightly under next (EVAL_FORGE=gitlab,
+# before its matrix (EVAL_ROLLBACK_LANE=1); the main nightly's two parts on
+# main, which grade the full catalog under next (the nightly the dashboard and
+# the digest read; ci-kube-agents-eval-nightly-today, the today-mode nightly
+# kept as the rollback check, is not listed and so is refused the flag); the
+# GitLab lane's nightly under next (EVAL_FORGE=gitlab,
 # hack/eval/gitlab-cases.txt, beside the today-mode GitLab nightly); and the
 # release-candidate eval's postsubmit, which grades a candidate in the mode a
 # new install gets (hack/ci-eval-rc.sh). The today lane's on-demand presubmit
@@ -332,7 +334,7 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # a run graded through the inject door records under the version key's next
 # mode (bench-gate), and hack/ci-eval-pr.sh keeps the today lane, the GitLab
 # lane and a release candidate out of the recorder altogether.
-readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-today ci-kube-agents-eval-nightly-next-claude ci-kube-agents-eval-nightly-gitlab-next post-kube-agents-eval-rc"
+readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-today ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-gitlab-next post-kube-agents-eval-rc"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
 # The broker Deployment, named after the CR the way the operator names it
@@ -400,7 +402,7 @@ readonly BRIDGE_SIDECAR_NAME="hermes-bridge"
 readonly BRIDGE_EXECUTOR_EXPECTED="api"
 # BRIDGE_CONCURRENCY is sized against the matrix's fan-out: hack/ci-eval-pr.sh
 # runs EVAL_TASK_PARALLELISM units at once from the same job environment,
-# defaulting to 4 (the nightly sets 8), and every unit past the bridge's
+# defaulting to 4 (the next-mode nightlies set 6), and every unit past the bridge's
 # concurrency waits in its queue for the whole budget and is classified as
 # infrastructure (docs/designs/eval-next-transport.md, the executor
 # paragraph). The default here is pinned equal to the eval script's by
@@ -974,7 +976,7 @@ fi
 
 # The mode flip exists for the runs that grade next or roll it back: a pull
 # request's, or one of the jobs EVAL_MODE_NEXT_JOB_NAMES lists (the today
-# lane's periodic and the next-mode nightlies on main, the blocking presubmit
+# lane's periodic and the main and GitLab nightlies on main, the blocking presubmit
 # in a Tide batch, and the release-candidate eval).
 # A flagged run on main records under the version key's next mode, never into
 # today's window (bench-gate reads the mode off the transport; hack/ci-eval-pr.sh
