@@ -2,10 +2,13 @@
 readiness_rules — the per-entry rules `upgrade_readiness.EXTRA_RULES` runs after the PDB,
 maintenance and skew rules of `fleet_upgrade_report.py --readiness`.
 
-One module per entry of docs/designs/upgrade-failure-catalogue.md. Each module exposes:
+One module per entry of docs/designs/upgrade-failure-catalogue.md, and after them the
+plan-level rules, which grade the upgrade plan rather than a catalogue scenario (the
+rollout-sequence precheck). Each module exposes:
 
 - `RULE_ID`, the slug the report keys the rule's counts under and stamps on its findings;
-  `ENTRY`, the catalogue entry number; `CAN_BLOCK`, whether a finding of the rule can ever
+  `ENTRY`, the catalogue entry number, or None for a plan-level rule, which `EXTRA_RULES`
+  registers after every numbered one; `CAN_BLOCK`, whether a finding of the rule can ever
   block the upgrade. A rule with `CAN_BLOCK = False` files risks and notes; an `unknown` it
   files is reported in the note and never moves the member's verdict, since the finding it
   could not make would not have blocked either, and a blocker it files is demoted to a risk
