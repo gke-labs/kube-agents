@@ -525,7 +525,7 @@ ANNOUNCED_UNGRADED_KEY = "ungraded"
 # in this file beside it, so the same failure is posted once and its recovery
 # once.
 FAILURE_MARKER_FILE_NAME = "last-failure.txt"
-RECOVERED_LINE = "{prefix} watch: the tick runs again"
+RECOVERED_LINE = "**The upgrade readiness check is running again.**"
 DETAIL_KEY = "detail"
 ATTEMPTS_KEY = "attempts"
 # What an ungraded version's announcement is keyed on: each of its projects
@@ -547,6 +547,18 @@ REPORT_LINE = (
     "{ready} ready{ungraded}; report on the gateway pod at {path}; next refresh after {next_date}"
 )
 BLOCKED_NAMES = " ({names})"
+# A failed tick posts one plain line: what did not happen, why, and when it
+# runs next. The exception and its text go to stderr as `FAILED_LINE`, which
+# the scheduler keeps in the run's output; the channel never sees them.
+FAILED_TICK_LINE = "**The upgrade readiness check didn't run today.** {reason}. It will try again tomorrow."
+FAILED_WRITE_LINE = (
+    "**The upgrade readiness check didn't finish today.** It couldn't save its report. It will try again tomorrow."
+)
+FAILED_REASON_REFUSED = "It couldn't read the clusters in the install's scope"
+FAILED_REASON_SCOPE_UNREADABLE = "It couldn't read the install's scope"
+FAILED_REASON_UNRESOLVED = "It couldn't look up the fleet's projects"
+FAILED_REASON_TIMED_OUT = "Reading the fleet took too long"
+FAILED_REASON_ERROR = "It hit an error"
 FAILED_LINE = "{prefix} watch: {what} failed: {detail}"
 FAILED_WHAT_TICK = "the tick"
 FAILED_WHAT_WRITE = "writing the ledger or the report"
@@ -655,6 +667,10 @@ def refused_tick_signature(failed: dict) -> str:
 
 class SandboxTimedOut(RuntimeError):
     """The sandbox run hit the client-side timeout."""
+
+
+class ScopeUnreadable(RuntimeError):
+    """The operator's scope render could not be read, so whether the install declares a scope is unknown."""
 
 
 class ProjectUnresolved(RuntimeError):
@@ -925,7 +941,7 @@ def declared_scope() -> fleet_scope_targets.ScopeTargets | None:
     try:
         return fleet_scope_targets.declared_scope_targets()
     except fleet_scope_targets.ScopeRenderUnreadable as exc:
-        raise RuntimeError(SCOPE_UNREADABLE_DETAIL.format(error=exc)) from None
+        raise ScopeUnreadable(SCOPE_UNREADABLE_DETAIL.format(error=exc)) from None
 
 
 def scope_flags(scope: fleet_scope_targets.ScopeTargets | None) -> list[str]:
@@ -2177,15 +2193,29 @@ def sweep(started: float, home: Path, ledger: dict, dry_run: bool) -> list[str]:
     except OSError as exc:
         raise WriteFailed(str(exc)) from exc
     if recovered:
-        lines.insert(0, RECOVERED_LINE.format(prefix=LINE_PREFIX))
+        lines.insert(0, RECOVERED_LINE)
     return lines
+
+
+def failure_reason(exc: Exception) -> str:
+    """Why a tick failed, in the channel's words: the kind of failure, never its text."""
+    if isinstance(exc, ReportRefused):
+        return FAILED_REASON_REFUSED
+    if isinstance(exc, ScopeUnreadable):
+        return FAILED_REASON_SCOPE_UNREADABLE
+    if isinstance(exc, ProjectUnresolved):
+        return FAILED_REASON_UNRESOLVED
+    if isinstance(exc, SandboxTimedOut):
+        return FAILED_REASON_TIMED_OUT
+    return FAILED_REASON_ERROR
 
 
 def announce_failure_once(detail: str, key: str | None = None) -> bool:
     """A failure that persists is posted once per distinct key, the detail
-    itself unless the caller hands one (a refused tick's, so the resolved set
-    the detail names can change membership without re-posting a standing
-    refusal), and the next clean tick posts a recovery line. The marker lives
+    itself unless the caller hands one (the plain reason, or a refused tick's
+    signature, so neither a sandbox's changing stderr nor a resolved set that
+    changes membership re-posts a standing failure), and the next clean tick
+    posts a recovery line. The marker lives
     beside the ledger, to which a failed tick writes nothing but the
     standing-outside record and the learned ids; a marker that cannot be read or written leaves
     the line posted every time, since nothing can remember it."""
@@ -2207,15 +2237,22 @@ def main(argv: list[str] | None = None) -> int:
     try:
         lines = tick(dry_run=args.dry_run)
     except WriteFailed as exc:
-        print(FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_WRITE, detail=exc))
+        print(FAILED_WRITE_LINE)
+        print(FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_WRITE, detail=exc), file=sys.stderr)
         return WRITE_FAILED_EXIT
     except Exception as exc:  # noqa: BLE001 - one line to chat, never a traceback
         detail = f"{type(exc).__name__}: {exc}"
+        reason = failure_reason(exc)
+        # Keyed on the kind of failure, never its text: a sandbox's stderr
+        # carries paths that change every run, and keyed on it the same
+        # failure was posted every day. A refused tick keeps its signature,
+        # so a refusal whose cause changes is posted again.
+        key = exc.signature if isinstance(exc, ReportRefused) and exc.signature else reason
         # A dry run changes nothing, the marker included, and is never silenced
         # by it: the operator running one is looking at the failure.
-        key = exc.signature if isinstance(exc, ReportRefused) else None
         if args.dry_run or announce_failure_once(detail, key):
-            print(FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_TICK, detail=detail))
+            print(FAILED_TICK_LINE.format(reason=reason))
+            print(FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_TICK, detail=detail), file=sys.stderr)
         return 0
     for line in lines:
         print(line)

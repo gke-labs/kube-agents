@@ -240,6 +240,46 @@ SCHEDULER_LEG_KEY = "also_delivered_to"
 # deploy/docker/plugins/chat/adapter.py: SCHEDULER_FAILURE_FIELD, set when the
 # delivery is the scheduler's failure line for the run.
 SCHEDULER_FAILURE_KEY = "scheduler_failure"
+# What the scheduler's failure line is posted as (`scheduler_failure_line`):
+# what did not happen, why, and when the job runs next. The scheduler's own
+# line names a CLI and a config file nobody in the channel can reach, so it
+# goes to this process's log instead.
+SCHEDULER_FAILURE_HEAD = "**The {title} didn't run.**"
+SCHEDULER_FAILURE_NEXT = "It will try again {when}."
+SCHEDULER_FAILURE_NEXT_UNKNOWN = "It will try again at its next scheduled run."
+# The scheduler sends its blocked-configuration line once and runs the job no
+# more until the configuration is fixed.
+SCHEDULER_FAILURE_NEXT_BLOCKED = "It won't run again until its configuration is fixed."
+SCHEDULER_FAILURE_ERROR = "It hit an error"
+SCHEDULER_FAILURE_BLOCKED = "Its configuration is invalid"
+SCHEDULER_FAILURE_BLOCKED_MARK = "blocked by configuration validation"
+# The scheduler's reasons (cron/scheduler.py: _summarize_cron_failure_for_delivery),
+# each by the words its line carries after the job's name, said in plain words.
+# A line that matches none is `SCHEDULER_FAILURE_ERROR`.
+SCHEDULER_FAILURE_REASONS = (
+    ("failed: script timed out", "It ran too long and was stopped"),
+    ("failed: provider rate limit", "The AI model's usage limit was reached"),
+    ("failed: provider weekly usage limit", "The AI model's usage limit was reached"),
+    ("failed: provider quota limit", "The AI model's usage limit was reached"),
+    ("failed: the job itself stalled", "It stopped making progress"),
+    ("failed: provider timeout", "The AI model didn't answer in time"),
+    ("failed: provider authentication error", "The AI model rejected its credentials"),
+)
+# When the job runs next. Slack writes the token in each reader's own time zone
+# ("tomorrow at 2:50 AM"); the text after the bar is what a client that cannot
+# shows, and what every other platform gets, as does Slack under
+# `spec.mode: next`, whose gateway escapes the token's brackets.
+SLACK_DATE_TOKEN = "<!date^{epoch}^{{date_short_pretty}} at {{time}}|{fallback}>"
+NEXT_RUN_UTC = "on {month} {day} at {clock} UTC"
+NEXT_RUN_MONTH_FORMAT = "%b"
+NEXT_RUN_CLOCK_FORMAT = "%H:%M"
+CRON_NEXT_RUN_KEY = "next_run_at"
+# The ledger status of a run that finished without failing. One after a failure
+# was posted means the job recovered, so its next failure is news again.
+RUN_LEDGER_COMPLETED = "completed"
+# The route's status for a failure line it did not post, because the same
+# failure was posted and the job has not run cleanly since.
+CRON_REPORT_SUPPRESSED = "suppressed"
 AUDIT_REPOS_SUMMARY_LINE = "{label}: {count} repositories reported in this run."
 # `audit_report.CHAT_REPORT_LEDGER_LINE`, read back for a truncation notice.
 AUDIT_LEDGER_LINE_RE = re.compile(r"^Ledger: (\S+)$", re.MULTILINE)
@@ -1052,6 +1092,20 @@ def init_db() -> None:
                     job_id    TEXT NOT NULL,
                     run       TEXT NOT NULL,
                     posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (profile, job_id)
+                )
+                """
+            )
+            # The failure each job last posted, and when, so a failure that
+            # repeats is posted once: the next post is a different failure, or
+            # the same one after a run that finished cleanly.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS scheduler_failure_posts (
+                    profile   TEXT NOT NULL,
+                    job_id    TEXT NOT NULL,
+                    reason    TEXT NOT NULL,
+                    posted_at REAL NOT NULL,
                     PRIMARY KEY (profile, job_id)
                 )
                 """
@@ -3937,6 +3991,147 @@ def audit_chat_report(profile: str, job_id: str, title: str) -> tuple[str, str]:
     return CHAT_REPORT_PARTS_SEPARATOR.join(finished), run
 
 
+class SchedulerFailure(NamedTuple):
+    """The scheduler's failure line said plainly (:func:`scheduler_failure_line`).
+
+    `reason` is what the repeat check compares; `text` is the line every leg
+    posts but Slack's under `spec.mode: today`, which posts `slack_text`, the
+    same line with the next run in the reader's own time zone.
+    """
+
+    reason: str
+    text: str
+    slack_text: str
+
+
+def _profile_home(profile: str) -> str:
+    """`profile`'s home under the agent home, where its cron roster and run ledger live."""
+    from gitops_workspace import agent_home
+
+    return agent_home() if profile == DEFAULT_PROFILE else os.path.join(agent_home(), PROFILES_DIR, profile)
+
+
+def _next_run_at(profile: str, job_id: str) -> datetime | None:
+    """When `job_id` runs next, from its profile's roster; None when unknown or not ahead.
+
+    The scheduler advances `next_run_at` before a run starts, so while a run
+    delivers it already names the following one.
+    """
+    if not _PROFILE_SEGMENT_RE.match(profile):
+        return None
+    try:
+        with open(os.path.join(_profile_home(profile), *CRON_ROSTER), encoding="utf-8") as handle:
+            store = json.load(handle)
+    except Exception as exc:
+        logger.warning(f"Relay for {profile}/{job_id}: cron roster unreadable: {exc}")
+        return None
+    jobs = store.get("jobs") if isinstance(store, dict) else store
+    for job in jobs if isinstance(jobs, list) else []:
+        if isinstance(job, dict) and str(job.get("id") or "") == job_id:
+            try:
+                when = datetime.fromisoformat(str(job.get(CRON_NEXT_RUN_KEY) or ""))
+            except ValueError:
+                return None
+            if when.tzinfo is None or when <= datetime.now(timezone.utc):
+                return None
+            return when
+    return None
+
+
+def scheduler_failure_line(profile: str, job_id: str, title: str, report: str) -> SchedulerFailure:
+    """The scheduler's failure line for a run of `job_id`, as one plain line.
+
+    "**The <title> didn't run.** <why>. It will try again <when>." The why is
+    the scheduler's reason in plain words (`SCHEDULER_FAILURE_REASONS`), or
+    `SCHEDULER_FAILURE_ERROR` for one it does not name, and the when is the
+    roster's next run, or `SCHEDULER_FAILURE_NEXT_UNKNOWN` without one. A job
+    the scheduler blocked on its configuration runs no more until it is fixed,
+    and says so instead.
+    """
+    head = SCHEDULER_FAILURE_HEAD.format(title=title or job_id)
+    lower = report.lower()
+    if SCHEDULER_FAILURE_BLOCKED_MARK in lower:
+        line = f"{head} {SCHEDULER_FAILURE_BLOCKED}. {SCHEDULER_FAILURE_NEXT_BLOCKED}"
+        return SchedulerFailure(SCHEDULER_FAILURE_BLOCKED, line, line)
+    reason = next((plain for words, plain in SCHEDULER_FAILURE_REASONS if words in lower), SCHEDULER_FAILURE_ERROR)
+    when = _next_run_at(profile, job_id)
+    if when is None:
+        line = f"{head} {reason}. {SCHEDULER_FAILURE_NEXT_UNKNOWN}"
+        return SchedulerFailure(reason, line, line)
+    when = when.astimezone(timezone.utc)
+    fallback = NEXT_RUN_UTC.format(
+        month=when.strftime(NEXT_RUN_MONTH_FORMAT), day=when.day, clock=when.strftime(NEXT_RUN_CLOCK_FORMAT)
+    )
+    token = SLACK_DATE_TOKEN.format(epoch=int(when.timestamp()), fallback=fallback)
+    return SchedulerFailure(
+        reason,
+        f"{head} {reason}. {SCHEDULER_FAILURE_NEXT.format(when=fallback)}",
+        f"{head} {reason}. {SCHEDULER_FAILURE_NEXT.format(when=token)}",
+    )
+
+
+def _run_completed_since(profile: str, job_id: str, since: float) -> bool:
+    """Whether the scheduler's ledger has a run of `job_id` that started after `since` and finished cleanly.
+
+    True when the ledger cannot say, so a failure that cannot be told from a
+    repeat is posted rather than withheld.
+    """
+    path = os.path.join(_profile_home(profile), *RUN_LEDGER)
+    if not os.path.exists(path):
+        return True
+    try:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=AUDIT_RUNS_DB_TIMEOUT_S)) as conn:
+            rows = conn.execute(
+                "SELECT started_at FROM executions WHERE job_id = ? AND status = ?",
+                (job_id, RUN_LEDGER_COMPLETED),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        logger.warning(f"Relay for {profile}/{job_id}: run ledger unreadable: {exc}")
+        return True
+    for (started,) in rows:
+        try:
+            if datetime.fromisoformat(str(started)).timestamp() > since:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _failure_already_posted(profile: str, job_id: str, reason: str) -> bool:
+    """Whether `reason` is the failure `job_id` last posted, with no clean run since."""
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=AUDIT_RUNS_DB_TIMEOUT_S)) as conn:
+            row = conn.execute(
+                "SELECT reason, posted_at FROM scheduler_failure_posts WHERE profile = ? AND job_id = ?",
+                (profile, job_id),
+            ).fetchone()
+    except Exception as exc:
+        logger.warning(f"Relay for {profile}/{job_id}: last posted failure unreadable: {exc!r}")
+        return False
+    if not row or row[0] != reason:
+        return False
+    return not _run_completed_since(profile, job_id, float(row[1]))
+
+
+def _record_failure_posted(profile: str, job_id: str, reason: str | None) -> None:
+    """Remember the failure `job_id` posted, or forget it when `reason` is None (the job ran)."""
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=AUDIT_RUNS_DB_TIMEOUT_S)) as conn:
+            with conn:
+                if reason is None:
+                    conn.execute(
+                        "DELETE FROM scheduler_failure_posts WHERE profile = ? AND job_id = ?", (profile, job_id)
+                    )
+                else:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO scheduler_failure_posts (profile, job_id, reason, posted_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (profile, job_id, reason, time.time()),
+                    )
+    except Exception as exc:
+        logger.error(f"Relay for {profile}/{job_id}: posted failure not recorded: {exc!r}")
+
+
 def relay_cron_report(
     session_id: str,
     profile: str,
@@ -3945,6 +4140,7 @@ def relay_cron_report(
     report: str,
     truncation_notice: str = "",
     also_delivered_to: Sequence[str] = (),
+    slack_report: str = "",
 ) -> tuple[str | None, list[str]]:
     """Post a specialist's finished report to chat, as the specialist wrote it.
 
@@ -3976,6 +4172,10 @@ def relay_cron_report(
     {}` drops Slack from the expansion silently. Deciding here, from this
     process's environment, would subtract a leg the scheduler never sent and
     leave that channel with nothing at all.
+
+    `slack_report`, when given, is what a Slack leg posts in place of
+    `report` under `spec.mode: today`, where Slack renders what the gateway
+    under `next` would escape (:func:`scheduler_failure_line`).
 
     Returns `(error, undelivered)`. `error` is None when the report
     reached at least one chat platform, else a short description of what went
@@ -4110,6 +4310,8 @@ def relay_cron_report(
                 leg_message = truncation_notice + headline.text
             elif failed and not chat_notify.routes(platform):
                 leg_message = failed
+            elif slack_report and platform == SLACK_PLATFORM and not chat_notify.routes(platform):
+                leg_message = truncation_notice + slack_report
             else:
                 leg_message = message
             new_thread_id = _send_to_chat(platform, leg_message, leg_chat_id, leg_thread_id)
@@ -4239,19 +4441,44 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
     # Only the scheduler's delivery leg sends `also_delivered_to`; a mid-run
     # `report_to_chat` does not, and its text is posted as written.
     from_scheduler = SCHEDULER_LEG_KEY in request_data
+    failure_flagged = from_scheduler and request_data.get(SCHEDULER_FAILURE_KEY) is True
+    failure: SchedulerFailure | None = None
     failure_run = ""
     if from_scheduler and _is_fleet_audit_job(profile, job_id) and _is_shipped_audit_job(job_id):
-        if request_data.get(SCHEDULER_FAILURE_KEY) is True and not _record_written_by_this_run(profile, job_id):
-            # The scheduler's line for a failed run, posted as written, as on
-            # main: it says why the run failed, and the record on disk is an
-            # earlier run's. Marking that record posted keeps a later run that
-            # never reached `start` from posting it as its own.
+        if failure_flagged and not _record_written_by_this_run(profile, job_id):
+            # The scheduler's line for a failed run: it says why the run
+            # failed, and the record on disk is an earlier run's. Marking that
+            # record posted keeps a later run that never reached `start` from
+            # posting it as its own.
             failure_run = _record_run(job_id)
+            failure = scheduler_failure_line(profile, job_id, title, report)
         else:
             # The flag is read off the text, which the model can also write:
             # a run that wrote its own record reached `finish`, so its report
             # is posted whatever its last message says.
             report, audit_run = audit_chat_report(profile, job_id, title)
+    elif failure_flagged:
+        failure = scheduler_failure_line(profile, job_id, title, report)
+    if failure is not None:
+        logger.warning(f"Relay for {profile}/{job_id}: the run failed; the scheduler said: {report}")
+        if _failure_already_posted(profile, job_id, failure.reason):
+            # Posted once already, with no clean run since: the channel knows.
+            if failure_run:
+                _mark_run_posted(profile, job_id, failure_run)
+            logger.info(f"Relay for {profile}/{job_id}: the same failure was posted already; not posting it again")
+            return {
+                "status": CRON_REPORT_SUPPRESSED,
+                "session_id": "",
+                "relay": "ok",
+                "relay_detail": "",
+                "undelivered": "",
+                "truncated": "",
+            }
+        report = failure.text
+    elif from_scheduler:
+        # The job delivered something other than a failure, so it ran, and
+        # its next failure is news; its report is the "working again" signal.
+        _record_failure_posted(profile, job_id, None)
     report, truncation_notice = _truncate_report(report, profile, job_id, audit_record=bool(audit_run))
 
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -4259,7 +4486,8 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
 
     try:
         error, undelivered = relay_cron_report(
-            session_id, profile, job_id, title, report, truncation_notice, also_delivered_to
+            session_id, profile, job_id, title, report, truncation_notice, also_delivered_to,
+            slack_report=failure.slack_text if failure is not None else "",
         )
     except Exception as exc:  # never leak a stack trace into last_delivery_error
         logger.exception(f"Relay for {profile}/{job_id} raised")
@@ -4268,6 +4496,8 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
         raise HTTPException(status_code=502, detail=f"chat relay failed: {error}")
     if audit_run or failure_run:
         _mark_run_posted(profile, job_id, audit_run or failure_run)
+    if failure is not None:
+        _record_failure_posted(profile, job_id, failure.reason)
     # 200, because the report is in the channel and the run did its job. `relay`
     # and `relay_detail` reported a degraded delivery, which only a failed Chat
     # Agent turn produced; no turn runs now, so they always read ok, and they

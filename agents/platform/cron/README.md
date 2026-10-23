@@ -216,8 +216,10 @@ spelled by its number is keyed by the id `gcloud projects describe` resolves,
 learned on its first table run. A number the credential cannot resolve is
 never a key, so its clusters earn no report until it resolves: when nothing
 was read under a key (it is the only project, or every other is an unresolved
-number too), the tick fails with the reason and the remedy, posted once and
-kept in `last-failure.txt` until the next clean tick posts the recovery;
+number too), the tick fails, posted once as a plain line ("The upgrade readiness
+check didn't run today", why, and that it tries again tomorrow) with the reason
+and the remedy on stderr, and kept in `last-failure.txt` by the kind of failure
+until the next clean tick posts the recovery;
 beside projects that were keyed, the table is partial, posted once with the
 reason, and the ledger's `table_errors` keeps it. The remedy is
 `resourcemanager.projects.get` on the credential (every read role the install
@@ -629,7 +631,8 @@ not the final message,
 which holds whatever else the model wrote in its last turn. A run publishes to
 one repository, the one with `role: gitops`; a run that a person ran for several
 repositories posts each finished repository's report, then a line naming any it
-did not finish. A failed run posts the scheduler's failure line, which says why,
+did not finish. A failed run posts the scheduler's failure line in plain words,
+once until the job runs again ([the relay design](../../../docs/designs/cron-report-relay.md)),
 and a run that finished no repository without failing posts a one-line notice
 that it did not finish. On Slack the report is then replaced by a headline linking its
 ledger issue when the run covered one repository; a message with that line, or
