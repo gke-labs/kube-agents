@@ -597,6 +597,34 @@ def test_an_opening_task_that_did_not_complete_writes_no_timing(
     assert not target.exists()
 
 
+def test_an_opening_post_whose_reply_was_lost_writes_no_timing(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """The door may have started the task on the POST whose reply never came,
+    and its dedupe hands the retry that same task, so when the turn began is
+    unknown: no time is written rather than one counted from the retry."""
+    target = tmp_path / "timing.json"
+    monkeypatch.setenv("KUBE_AGENTS_TIMING_FILE", str(target))
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "done")
+    original = inject.InjectTask.submit
+    calls: list[int] = []
+
+    def _lost_once(task: inject.InjectTask) -> str:
+        calls.append(1)
+        if len(calls) == 1:
+            task.unanswered_post = True
+            raise inject.InjectUnavailable("reply lost", answered=False)
+        return original(task)
+
+    monkeypatch.setattr(inject.InjectTask, "submit", _lost_once)
+
+    result = KubeAgentsHarness().run("hello")
+
+    assert result.output == "done"
+    assert len(calls) == 2
+    assert not target.exists()
+
+
 def test_a_refused_opening_task_writes_no_timing(
     stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:

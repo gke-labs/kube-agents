@@ -865,7 +865,9 @@ def today_view(data: dict) -> dict:
     return view
 
 
-def digest_line(data: dict | None, now: datetime.datetime, clock=None, label: str = DIGEST_LABEL) -> str:
+def digest_line(
+    data: dict | None, now: datetime.datetime, clock=None, label: str = DIGEST_LABEL, todays_build_is_tonight: bool = False
+) -> str:
     """One line for the 9 AM digest. ``clock`` renders a datetime the way
     the rest of the digest does (post_health.clock); without one the ISO
     form is used. A truncated or missing night says so instead of numbers,
@@ -875,7 +877,12 @@ def digest_line(data: dict | None, now: datetime.datetime, clock=None, label: st
     the main part is missing. A night with numbers whose reps carried the
     opening chat turn's time gives its p50 and p95, as advice
     (``turn1_note``). ``label`` names the nightly the line is about
-    (``DIGEST_LABEL_TODAY`` for ``today_view``)."""
+    (``DIGEST_LABEL_TODAY`` for ``today_view``). ``todays_build_is_tonight``
+    is for a job still running at the digest hour on an ordinary day (the
+    today-mode nightly starts 06:00 UTC): a build first seen on ``now``'s
+    night date is tonight's, not a late last night, so it never stands in
+    for a missing last night; the line says last night is missing and that
+    tonight's build is running."""
     when = clock or (lambda value: value.isoformat(timespec="minutes"))
     if not data:
         return f"{DIGEST_GLYPH} {label}: no data.json to read a night from"
@@ -886,15 +893,20 @@ def digest_line(data: dict | None, now: datetime.datetime, clock=None, label: st
 
     if night is None:
         running = running_nights(data, now)
+        tonight = []
+        if todays_build_is_tonight:
+            tonight = [e for e in running if night_day(parse_iso(e["first_seen"])) == night_day(now)]
+            running = [e for e in running if e not in tonight]
         if running:
             # Still in flight at digest time -- a late start, or a night at
             # its budget -- so there are no numbers yet, and the report
             # carries them once the collector records the build.
             return still_running(running[-1])
+        also = f"{SEP}tonight's build running since {when(parse_iso(tonight[-1]['first_seen']))}" if tonight else ""
         if newest is None:
-            return f"{DIGEST_GLYPH} {label}: no run on record yet"
+            return f"{DIGEST_GLYPH} {label}: no run on record yet{also}"
         started = parse_iso(newest.get("started"))
-        return f"{DIGEST_GLYPH} {label}: no run last night (the newest on record started {when(started) if started else 'at an unknown time'})"
+        return f"{DIGEST_GLYPH} {label}: no run last night (the newest on record started {when(started) if started else 'at an unknown time'}){also}"
     if PART_MAIN in night.get("running_parts", []):
         # Only the writers part has finished: its few cases are not the
         # night's numbers, which follow with the main part.

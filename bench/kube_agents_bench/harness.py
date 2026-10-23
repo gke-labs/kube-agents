@@ -2113,11 +2113,16 @@ class KubeAgentsHarness(AgentHarness):
             # disagree about whether the tunnel is up.
             base_url = f"http://127.0.0.1:{local_port}"
 
-        # When the door first accepted the opening POST: the opening turn's
-        # clock starts there, as the api path's starts at the attempt that
-        # succeeds, and a transport retry rejoins it rather than restarting
-        # it (the same instant the deadline is set from).
+        # When the opening POST the door accepted went out: the opening
+        # turn's clock starts there, as the api path's starts at the attempt
+        # that succeeds, and a transport retry after the acceptance (a
+        # dropped poll) rejoins it rather than restarting it. An opening POST
+        # whose reply was lost may have started the task already, and the
+        # door's dedupe hands the retry the same task, so its start is
+        # unknown: such a turn is not timed (opening_post_lost), as the api
+        # path times no retried attempt.
         opening_accepted: list[float] = []
+        opening_post_lost: list[bool] = []
 
         def _exchange(task: inject.InjectTask, budget: float, *, opening: bool) -> inject.Exchange:
             """One task to its terminal, through the transport retry.
@@ -2145,12 +2150,12 @@ class KubeAgentsHarness(AgentHarness):
                             inject.check_budget(budget, task.first_event_grace)
                         elif budget < floor:
                             budget = floor
+                    posted = time.monotonic()
                     task_id = task.submit()
                     if deadline is None:
-                        accepted = time.monotonic()
-                        deadline = accepted + budget
-                        if opening and task_id:
-                            opening_accepted.append(accepted)
+                        deadline = time.monotonic() + budget
+                        if opening and task_id and not opening_post_lost:
+                            opening_accepted.append(posted)
                     if not task_id:
                         # The door started nothing and said why. No agent saw
                         # the prompt, so this is the run class rather than an
@@ -2182,6 +2187,8 @@ class KubeAgentsHarness(AgentHarness):
                         )
                     return task.await_terminal(task_id, deadline=deadline)
                 except inject.InjectUnavailable as exc:
+                    if opening and deadline is None and task.unanswered_post:
+                        opening_post_lost.append(True)
                     failures += 1
                     _log.warning(
                         "inject: exchange on %s failed in transport (%d/%d): %s",

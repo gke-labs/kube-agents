@@ -1587,7 +1587,7 @@ def render_digest(health: dict, now: datetime, data: dict | None = None) -> str:
     if data is not None:
         lines.append(nightly.digest_line(data, now, clock=lambda value: clock(value, weekday=True)))
         lines.append(NIGHTLY_URL)
-        lines.append(nightly.digest_line(nightly.today_view(data), now, clock=lambda value: clock(value, weekday=True), label=nightly.DIGEST_LABEL_TODAY))
+        lines.append(nightly.digest_line(nightly.today_view(data), now, clock=lambda value: clock(value, weekday=True), label=nightly.DIGEST_LABEL_TODAY, todays_build_is_tonight=True))
         lines.append(nightly.NIGHTLY_TODAY_HISTORY_URL)
     fleet = fixture_digest_line(health)
     if fleet:

@@ -684,13 +684,24 @@ class Digest(RunHarness):
         self.assertEqual(lines[1], "🌙 Nightly: 2 cases · 2 passed all reps · 0 partial · 0 failed · first night on record · 6h")
         self.assertEqual(lines[3], "🌙 Rollback nightly (today): 2 cases · 1 passed all reps · 0 partial · 1 failed · newly failing: case-b · 14h")
         self.assertEqual(lines[4], nightly.NIGHTLY_TODAY_HISTORY_URL)
-        # A day with no rollback night on record since the day before
-        # yesterday says so, as the main line does.
+        # A morning with no rollback night on record since the day before
+        # yesterday says so, as the main line does. Tonight's build, running
+        # since 06:05Z as on every morning, does not stand in for it: it is
+        # named beside the missing night rather than as "still running".
         data["runs"] = [r for r in data["runs"] if r["tier"] == "nightly"]
         data["runs"].insert(0, night("3000000000000000001", 1, "nightly-today", nightly.NIGHTLY_TODAY_JOB, green))
-        del data["pending_builds"]
+        data["pending_builds"] = [{"build_id": "3000000000000000005", "first_seen": "2026-09-05T06:05:00+00:00", "tier": "nightly-today"}]
+        data["generated_at"] = "2026-09-05T13:00:00+00:00"
         self.tick(health(), self.at(DIGEST_UTC, 5, day=5), data=data)
-        self.assertIn("\n🌙 Rollback nightly (today): no run last night (the newest on record started Tue 2:00 AM ET)\n", self.opener.texts[1])
+        self.assertIn(
+            "\n🌙 Rollback nightly (today): no run last night (the newest on record started Tue 2:00 AM ET)"
+            " · tonight's build running since Sat 2:05 AM ET\n",
+            self.opener.texts[1],
+        )
+        # With nothing in flight, the missing night alone.
+        del data["pending_builds"]
+        self.tick(health(), self.at(DIGEST_UTC, 5, day=6), data=data)
+        self.assertIn("\n🌙 Rollback nightly (today): no run last night (the newest on record started Tue 2:00 AM ET)\n", self.opener.texts[2])
 
     def test_the_digest_without_data_json_is_unchanged(self):
         self.tick(health(), self.at(DIGEST_UTC, 5))
