@@ -2931,6 +2931,10 @@ summary to chat. A repository on a forge with no issue verbs uses the same
 path. The signal is `capabilities`: when its `verbs` do not include the issue
 verbs, the ledger goes to the store. An answer that cannot be read keeps the
 forge path, so a transient fault on GitHub or GitLab does not move a ledger.
+The read that then checks that the repository can be reached is the listing
+that the chosen path needs: one open issue for a ledger on the forge, and one
+open proposal for a ledger in the store. An issue listing proves nothing on a
+forge that has no issues.
 
 One difference makes the decision carry two facts, not one. The path with no
 GitOps repository opens no remediation proposal, because there is no forge to
@@ -2952,15 +2956,29 @@ class LedgerDecision(NamedTuple):
     ledger: Literal["forge", "store"]
     remediation: bool
     reason: str | None
+    probe: str = "issue-list"
 ```
 
 `start` makes the decision and writes it into the run record, `ledger` and
 `remediation` included, and `finish` follows the record. If `finish` decided
 again, a forge that changed between the two steps would split one run across
-two ledgers. The "store, remediation on" row is new behaviour for the store
-path: it opens, finds and closes remediation proposals as the forge path does
+two ledgers. `probe` is the listing that found a repository unreachable: the
+note gives its advice from the record, with no broker call, so a broker that
+is lost at `finish` cannot stop the run after its store write. In the "store,
+remediation on" row the store path opens, finds and closes remediation
+proposals as the forge path does
 (`open_remediation_pr`, `list_remediation_prs`, `close_stale_remediation_prs`),
-and it puts their links in the chat summary and in the stored report. An
+and it puts their links in the chat summary and in the stored report. The
+stored report is the ledger: it holds the body that the forge path would post,
+with the status `STORE_LEDGER`, and nothing posts it. The next run of the
+repository reads it as its memory, so the delta, the findings that `start`
+names, and the guard that stops a clean run from closing a fix over a finding
+that it did not account for read it as the forge path reads the stored body of
+the issue. One input differs: the forge path seeds a lost memory from the
+issue, and this ledger has no other copy, so a store with no ledger in it is a
+lost memory while a remediation proposal of the stream is open. The
+envelope is not marked as a diverted run's is, and the no-forge path and the
+forge path do not read it. An
 install can use a forge with no issues only where `start` makes this decision:
 on a path that does not, the ledger lookup refuses, and the run stops at
 `start`.
@@ -2972,7 +2990,10 @@ ledger in the store. Its ledger lookup refuses, not answers "none", because
 
 What a store ledger does not give: a ledger that a person can open, link and
 comment on. A `/remediate` request then comes through chat, not a ledger
-comment, and the history is on the volume of the report store.
+comment, and the history is on the volume of the report store. A request in
+chat is not tied to a forge identity, so it cannot overrule a person's close of
+a remediation proposal, as a write-gated ledger comment can. Only the person at
+the terminal can, with `--override-human-close`.
 
 The chat-delivery watch keeps its own ledger issue beside a log channel that
 does not depend on chat. On a forge with no issue tracker, or no labels, the

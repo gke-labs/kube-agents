@@ -10,7 +10,7 @@ An audit request arrives in one of three distinct forms, distinguished by the re
 
 When you are delegated a task or kanban card to execute an audit stream following its standard operating procedure (e.g. _"Run the security and RBAC posture audit, following the compliance-audit SOP"_ or a card naming the stream and SOP):
 
-- **You are the audit worker.** You have been given a dedicated worker session and turn budget for this specific audit stream.
+- **You are the audit worker.** You have been given a dedicated worker session and turn budget for this specific audit stream. That budget is the kanban worker's, the profile's `agent.max_turns` (150), not the 250 the stream's roster entry gives its scheduled run (form 2 below). On a large fleet a cluster-by-cluster sweep can exhaust it; the worker then dies with the run still in flight, and the retry's `start` is refused as already running.
 - **Execute the audit following its SOP (mapped in `AUDITS` at the top of `audit_report.py`, e.g. `/opt/data/profiles/platform/governance/compliance_audit_sop.md` for `compliance-audit`) directly.** Use the two-command lifecycle ([lifecycle.md](lifecycle.md), [finish.md](finish.md)):
   1. `/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py start --audit <stream> [--repo "<owner>/<repo>"]`
   2. Read the SOP in full — `start` prints its path as `sop` — then enumerate clusters and run the checks as it says. Do not work the audit out from this skill and a script's `--help`: where the SOP runs a collector, it is the SOP that says how to invoke it and that every candidate in the manifest is a verified finding. A candidate your document leaves out is not published: `finish` reports it under `unpublished_candidates`, and holds it on the ledger if an earlier run already carried it.
@@ -47,7 +47,7 @@ HERMES_HOME=/opt/data/profiles/platform /opt/hermes/.venv/bin/hermes cron run co
 Every stream's cron job lives in this profile's own roster, ticked once a minute by the Chat Agent's
 `profile-cron-tick`. `hermes cron run` marks the job due rather than running it here; the next tick
 picks it up within a minute and runs it through the identical path the 06:20 tick uses, with the
-stream's prompt verbatim, its `skills` preloaded, and this profile's `max_turns`.
+stream's prompt verbatim, its `skills` preloaded, and the entry's own `max_turns`.
 
 `cronjob(action='run')` is not the route. Where the session cannot take a detached result — a
 one-shot `hermes -z`, a stateless HTTP turn, a Kanban worker, a nested cron run — or where the

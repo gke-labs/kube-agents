@@ -828,7 +828,40 @@ type TuningSpec struct {
 	// +kubebuilder:validation:Maximum=10000
 	// +optional
 	MaxSessions *int `json:"maxSessions,omitempty"`
+
+	// Profiles sizes AgentProfile work (#3655): the install-wide ceiling on
+	// concurrent profile tasks and the warm workers kept per interactive
+	// (profile, tier). Until the sizing budget exists these are fixed,
+	// conservative defaults.
+	// +optional
+	Profiles *ProfileTuning `json:"profiles,omitempty"`
 }
+
+// ProfileTuning carries the AgentProfile knobs on the PlatformAgent.
+type ProfileTuning struct {
+	// Ceiling is the most profile tasks running at once across every profile
+	// on the install. The dispatcher enforces it, reserving max(1,
+	// ceil(Ceiling/3)) of it for interactive tiers so unattended work can't
+	// starve people, and the profile namespace's pod quota is derived from it.
+	// Absent means DefaultProfileCeiling.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=1000
+	// +optional
+	Ceiling *int `json:"ceiling,omitempty"`
+
+	// WarmReplicas is how many warm worker pods each interactive (profile,
+	// tier) keeps running. Absent means DefaultProfileWarmReplicas.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	// +optional
+	WarmReplicas *int `json:"warmReplicas,omitempty"`
+}
+
+// The ProfileTuning defaults.
+const (
+	DefaultProfileCeiling      = 8
+	DefaultProfileWarmReplicas = 1
+)
 
 // AgentLimits bounds a single agent run. Both limits exist because they fail the same
 // way — the run stops mid-task without calling a terminal kanban tool, which the

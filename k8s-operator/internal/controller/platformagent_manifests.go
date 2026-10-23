@@ -1515,6 +1515,14 @@ func buildPluginStagingInitContainer(homeDir string, plugin *agentv1alpha1.Agent
 			"-c",
 			stageScript,
 		},
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceEphemeralStorage: resource.MustParse(pluginStagingEphemeralRequest),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceEphemeralStorage: resource.MustParse(pluginStagingEphemeralRequest),
+			},
+		},
 		VolumeMounts: []corev1.VolumeMount{
 			{
 				Name:      buildPluginVolumeName(plugin.Name),
@@ -3477,7 +3485,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			volumes = append(volumes, corev1.Volume{
 				Name: buildPluginVolumeName(plugin.Name),
 				VolumeSource: corev1.VolumeSource{
-					EmptyDir: &corev1.EmptyDirVolumeSource{},
+					EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(pluginStagingSizeLimit))},
 				},
 			})
 		}
@@ -5661,7 +5669,7 @@ func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 		{
 			Name: "fluent-bit-state",
 			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{},
+				EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(fluentBitStateSizeLimit))},
 			},
 		},
 		{

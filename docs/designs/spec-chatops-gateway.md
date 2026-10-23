@@ -2043,7 +2043,12 @@ gateway publishes an empty request on `chat.board` with its reply under `chat.bo
 and the Hermes bridge answers with session-kv's `GET /v1/board` (`agents/platform/scripts/board_snapshot.py`):
 every Cluster Agent profile's cluster and any cluster a finding names, with the findings queue's open findings for each, the worst 15 listed beside the total, the running
 kanban cards, the newest `pr_opened` events, and the newest finished fleet-audit run from the report
-store. Waiting on you is the adapter's own record: the open question of each conversation whose
+store; and `first_report_pending` while onboarding has filed its sweep, its first report is not out
+(the findings nudge's own marker pair, `findings_nudge.first_report_markers`: the delivery claim, or
+on the conversation path the recorded outcome, because a claim there can be released), and delivery
+has not yet put the sweep's findings in the queue (`.bootstrap_findings_registered`), with `first_message_pending` while no message has primed onboarding either (no
+`.bootstrap_greeted`) and the sweep is under a week old, past which the plugin primes nothing. The tab then draws a cluster with no open finding as not yet
+checked instead of green, and asks for the first message. Waiting on you is the adapter's own record: the open question of each conversation whose
 latest verified asker is the viewer, so it is per member and the rest is the install's, and it holds
 only questions posted since the gateway started. One snapshot serves every open for 30 seconds, and a failed read for 5; one republish pass runs at a time, from one read. A
 member who opened the tab in the last ten minutes is published to again, ten seconds after a burst
@@ -2063,9 +2068,29 @@ the one every other writer here has.
 `{"messageId","text","kind"}`, `kind` defaulting to `text` - to `chat.console.<token>.in`;
 the adapter posts the gateway's own notices back as `{"messageId","text","edit"}` on
 `chat.console.<token>.out`. Outside `a2a.>` on purpose: this is chat transport, not bus
-protocol, and the payload spec's agreement rules do not apply to it. The answers never
-travel here. They stream through TASKS, which the console page renders directly, so a lost
-`.out` frame across a reconnect costs a notice and never an answer. An `.in` frame published
+protocol, and the payload spec's agreement rules do not apply to it. Each task's end goes out
+on `.out` too (added 10/22), as every observer is told it (`observeTaskTerminal`): once per
+delegation chain, under the task the turn started, with the hand-off rule applied. It is one
+frame with `"kind": "result"`, the A2A `state`, the task the turn started as `taskId` and the
+agent that turn was addressed to as `addressee` (not whichever agent answered at the chain's end),
+and
+`messageId` `r-<taskId>-<state>`, so a repeated end (a redelivery, a heal) repeats its id while a
+different end of the same task (a never-started heal, then its late completion) is a new frame. An
+end the gateway declared itself (the bus unreachable, a task released for producing nothing) is
+worded as the page's notice is. Its text
+is the deliverable for a completed task and the gateway's notice otherwise. A chain that ends at
+a child with no wake (the session could not take one) ends failed, carrying the notice; a console
+client reads the child's answer from TASKS. A notice carries
+none of those fields, so a client waiting on a turn can tell the two apart. The page reads
+answers from TASKS and gets the notices, and it skips these frames, so for the page a lost
+`.out` frame across a reconnect still costs a notice and never an answer. A console client such
+as the MCP server reads each task's end from these frames as it happens. `.out` is not on a
+stream, so a frame published while the client is not subscribed (a restart, a reconnect) is not
+replayed. The `console` identity holds TASKS consumer grants, so the client recovers a missed
+end from the task's own events there. Turn answers to a follow-up inside a live task are not
+sent; that client reads them from TASKS or waits for the end. An answer past 256 KiB, or one
+whose escaped frame would pass the server's `max_payload`, is cut and says so; TASKS keeps
+it whole. An `.in` frame published
 while no gateway subscription is live (the gateway restarting, or the NATS config not yet
 rolled) is dropped by core NATS without trace; the browser sees only a pending entry that
 never attaches. A receipt frame on `.out` is the natural follow-up for the page.

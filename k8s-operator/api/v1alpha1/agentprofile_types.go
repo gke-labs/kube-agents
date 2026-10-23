@@ -106,6 +106,18 @@ type AgentProfileSpec struct {
 	// +required
 	Concurrency int32 `json:"concurrency"`
 
+	// AllowedTiers are the tiers this profile may run at (#3660, "Tiers and
+	// identity"). A task runs at its requester's tier, and the dispatcher
+	// refuses one whose tier is not listed here; a pinned production profile
+	// might allow only read. Tier is authority, so it lives on the CR, never
+	// in the persona. Absent means read alone (AllowedTierList).
+	// +listType=set
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=2
+	// +kubebuilder:validation:items:Enum=read;unattended
+	// +optional
+	AllowedTiers []string `json:"allowedTiers,omitempty"`
+
 	// Resources is the pod resource class.
 	// +required
 	Resources AgentProfileResources `json:"resources"`
@@ -295,6 +307,22 @@ type AgentProfile struct {
 	// +required
 	Spec   AgentProfileSpec   `json:"spec"`
 	Status AgentProfileStatus `json:"status,omitempty"`
+}
+
+// The tiers a profile may run at. Lowercase DNS labels, because each is also
+// a token of the profile's submission subject.
+const (
+	AgentProfileTierRead       = "read"
+	AgentProfileTierUnattended = "unattended"
+)
+
+// AllowedTierList reports the tiers the profile may run at, applying the
+// default (read alone) when the field is absent.
+func (p *AgentProfile) AllowedTierList() []string {
+	if len(p.Spec.AllowedTiers) == 0 {
+		return []string{AgentProfileTierRead}
+	}
+	return p.Spec.AllowedTiers
 }
 
 // QueueTimeout reports the effective queue deadline, applying the spec's

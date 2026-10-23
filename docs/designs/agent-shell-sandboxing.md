@@ -1389,13 +1389,15 @@ cost O(N²) (#3701). Nothing about it is ordered against the sandbox starting: t
 the StatefulSet come up independently, so the script waits for sshd and, failing that,
 leaves the agent pod's files untouched and lets the next start retry.
 
-**One of its failures holds the agent pod down and the rest do not**, which is a distinction
-the exit codes carry rather than a judgement the entrypoint makes. A copy that ran and
-failed can have moved the model's files off the agent pod's volume without landing them on
-the sandbox's, and coming up healthy in that state is the outcome the mirror exists to
-prevent — so it exits `EXIT_FATAL`, the container refuses to start, and
-`getDeploymentStatusDetails` surfaces a Degraded CR naming this container. Everything else
-exits `EXIT_RETRY`: the entrypoint warns and the agent starts.
+**Almost none of its failures hold the agent pod down**, which is a distinction the exit
+codes carry rather than a judgement the entrypoint makes. A copy that ran and failed exits
+`EXIT_RETRY` like everything else: the copy reads the agent pod's volume and never removes
+from it, so a transfer that dies halfway leaves every file where it was and the migration
+marker unwritten, and the next start copies again, keeping whatever already landed. The
+entrypoint warns and the agent starts. `EXIT_FATAL` is left for what running the script
+again cannot fix, no `tar` on `PATH` and an unhandled exception (the reasoning is at the
+exit codes in `deploy/shared/sandbox_mirror.py`): the container refuses to start, and
+`getDeploymentStatusDetails` surfaces a Degraded CR naming this container.
 
 The dividing line is who can provoke the failure, not how bad it looks. Everything under
 the sandbox's `/opt/data` except the image's trees is owned by uid 1000 and the volume

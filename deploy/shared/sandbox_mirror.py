@@ -25,10 +25,10 @@ them over once.
 
 Neither step is fatal on its own. The sandbox is a separate pod with no ordering
 against this one, so "not up yet" is an ordinary outcome; both steps are
-idempotent and the next container start retries. One thing is fatal, and the
-exit codes below say why it is the only one: a copy that ran and failed. That
-holds the agent pod down, because coming up healthy with the model's files
-stranded is the failure this script exists to prevent.
+idempotent and the next container start retries. That includes a copy that ran
+and failed: the copy never removes anything from the agent pod, so nothing is
+stranded and the next start copies again. The exit codes below say what is
+fatal instead -- no tar on PATH, and an unhandled exception.
 
 What does *not* come across, and why the list below is a denylist:
 
