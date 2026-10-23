@@ -137,9 +137,26 @@ def test_a_session_read_that_fails_once_is_retried_and_the_stop_goes(monkeypatch
     assert sent == [True] and entry["status"] == "completed"
 
 
-def test_an_unreadable_session_sends_no_stop_and_is_infrastructure(monkeypatch):
+def test_an_unreadable_session_still_sends_the_stop_and_is_infrastructure(monkeypatch):
+    """The gateway finds the conversation's cards itself, so the stop needs
+    no ids: it goes, and the run is infrastructure."""
+    sent = []
+    monkeypatch.setattr(harness.board, "read_session_cards", lambda *a, **k: None)
+    monkeypatch.setattr(harness.time, "sleep", lambda s: None)
+    result = AgentResult(output="on it", trajectory=[])
     with pytest.raises(harness._TransportError, match="could not be read"):
-        _run(monkeypatch, [None] * harness._MAX_TRANSPORT_FAILURES)
+        harness.KubeAgentsHarness()._stop_after_first_card(
+            result, "a2a-ctx-1", stop_hook.Stop(prompt="ask", observe_seconds=0.0),
+            send_stop=lambda: sent.append(True) or (True, "stopped"), poll_interval=0.0,
+        )
+    assert sent == [True]
+    assert result.trajectory[-1]["status"] == "error"
+
+
+def test_a_window_with_no_read_after_the_stop_is_infrastructure(monkeypatch):
+    with pytest.raises(harness._TransportError, match="could not be read once"):
+        _run(monkeypatch, [_cards({"t_1": "running"}), None])
+    assert PURGED == ["t_1"]
 
 
 def test_a_session_not_in_the_store_says_so(monkeypatch):

@@ -3082,3 +3082,28 @@ def test_a_stop_the_door_never_carried_is_infrastructure(
 
     assert infra(result)
     assert "the stop could not reach the gateway" in result.errors[0]
+
+
+def test_a_stop_that_drops_once_in_transport_is_retried(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The opening exchange and the status turns retry a retryable transport
+    failure; the stop does too, under its own message id, which the door
+    dedupes on."""
+    real_submit = inject.InjectTask.submit
+    drops: list[int] = []
+
+    def flaky(self: Any) -> str:
+        if self.prompt == stop_hook.STOP_WORD and not drops:
+            drops.append(1)
+            raise inject.InjectUnavailable("connection reset", retryable=True)
+        return real_submit(self)
+
+    def arrange(stub: _StubGatewayServer) -> None:
+        refuse_no_task(stub)
+        monkeypatch.setattr(inject.InjectTask, "submit", flaky)
+
+    _, answers = run_stopped_ask(stub_gateway, monkeypatch, arrange)
+
+    assert drops == [1]
+    assert answers[0][0] is True

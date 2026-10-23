@@ -483,7 +483,7 @@ def test_every_shipped_blind_check_is_named(path):
     # record, so it is declared here and left out there too.
     def harness_only(entry):
         lists = re.findall(r'"tool_names": \[([^\]]*)\]', json.dumps(entry.get("check")))
-        named = re.findall(r'"([a-z_]+)"', " ".join(lists))
+        named = re.findall(r'"([^"]+)"', " ".join(lists))
         return bool(named) and set(named) <= HARNESS_WRITTEN_ENTRIES
 
     all_blind = {

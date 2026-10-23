@@ -2455,11 +2455,32 @@ class KubeAgentsHarness(AgentHarness):
                     author=author,
                     message_id=f"{message_id}{_INJECT_STOP_SUFFIX}",
                 )
-                try:
-                    started = stopper.submit()
-                except inject.InjectUnavailable as exc:
-                    # The door, not the agent: infrastructure, never graded.
-                    raise _TransportError(f"the stop could not reach the gateway: {exc}") from exc
+                failures = 0
+                while True:
+                    try:
+                        started = stopper.submit()
+                        break
+                    except inject.InjectUnavailable as exc:
+                        # Retried as the opening exchange is; the door
+                        # dedupes on the message id, so a repeat of a POST
+                        # it took gets the first answer.
+                        failures += 1
+                        _log.warning(
+                            "inject: stop on %s failed in transport (%d/%d): %s",
+                            exchange.conversation,
+                            failures,
+                            _MAX_TRANSPORT_FAILURES,
+                            exc,
+                        )
+                        if not exc.retryable or failures >= _MAX_TRANSPORT_FAILURES:
+                            # The door, not the agent: infrastructure, never graded.
+                            raise _TransportError(
+                                f"the stop could not reach the gateway: {exc}"
+                            ) from exc
+                        try:
+                            _tunnel(reset=True)
+                        except RuntimeError as pf_exc:
+                            _log.warning("inject: port-forward respawn failed before retry: %s", pf_exc)
                 if started:
                     # A task means the gateway read the word as an ask, not a
                     # stop; bound it like any stray.
@@ -2611,7 +2632,14 @@ class KubeAgentsHarness(AgentHarness):
                     f"the session store for {session_id} could not be read "
                     f"{_MAX_TRANSPORT_FAILURES} times running"
                 )
-                entry.update(status="error", result=f"nothing was stopped: {why}")
+                # The stop needs no card ids (the gateway finds the
+                # conversation's cards), so it still goes, and bounds the
+                # card the harness cannot archive; the run is infrastructure.
+                try:
+                    sent, detail = send_stop()
+                except _TransportError as exc:
+                    sent, detail = False, str(exc)
+                entry.update(status="error", result=f"{why}; stop sent: {sent} ({detail})")
                 raise _TransportError(f"{stop_hook.STOP_ENTRY}: {why}")
         cards = list(read.card_ids) if read is not None and read.session_found else []
         entry["args"]["cards"] = cards
@@ -2629,22 +2657,33 @@ class KubeAgentsHarness(AgentHarness):
             # so archive them before the run is classed as infrastructure.
             entry.update(status="error", result="the stop could not reach the gateway")
             _archive_stalled_cards(cards, _EXEC_TIMEOUT)
+            _purge_card_state(cards, _EXEC_TIMEOUT)
             raise
         entry.update(status="completed" if sent else "error", result=detail)
         if not sent:
             result.errors.append(f"{stop_hook.STOP_ENTRY}: {detail}")
-        result.metadata["stop_sent_at"] = time.time()
         deadline = time.monotonic() + stop.observe_seconds
         statuses: dict[str, str] = {}
+        read_after_stop = False
         while True:
             seen = board.read_session_cards(_agent_shell, session_id, _EXEC_TIMEOUT)
             if seen is not None:
+                read_after_stop = True
                 statuses = {t: str(seen.cards.get(t, {}).get("status") or "unknown") for t in cards}
             left = deadline - time.monotonic()
             if left <= 0:
                 break
             time.sleep(min(left, max(poll_interval, 1.0)))
         result.metadata["stop_card_statuses"] = statuses
+        if not read_after_stop:
+            # The harness's exec, not the gateway: no read after the stop is
+            # a verdict on nothing, so the run is infrastructure.
+            _archive_stalled_cards(cards, _EXEC_TIMEOUT)
+            _purge_card_state(cards, _EXEC_TIMEOUT)
+            raise _TransportError(
+                f"{stop_hook.CARDS_STOPPED_ENTRY}: the session store for {session_id} could not "
+                f"be read once in the {stop.observe_seconds:.0f}s after the stop"
+            )
         # What the stop did, read before the harness archives any leftover:
         # every card it filed archived, or the stop did not reach them all.
         stopped = bool(cards) and all(statuses.get(t) == stop_hook.STOPPED_STATUS for t in cards)
