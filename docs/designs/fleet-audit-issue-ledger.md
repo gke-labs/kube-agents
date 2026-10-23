@@ -45,6 +45,27 @@ Two tiers. The issue is the only always-on object.
 One open GitHub issue per audit stream, rewritten in place on every run.
 
 - Title, body, labels, and every timestamp are generated. The agent never hand-writes them.
+- The harness finds the ledger with one list of the open issues that carry the `audit:<audit-id>`
+  label. When the list has more than one issue, the highest number is the ledger. An empty list is
+  not always "no ledger": GitHub's label-filtered list can omit an open, labelled issue for a short
+  time, usually just after a label write. `start`, `finish` and `remediate` look up the ledger, and
+  each one ensures the labels just before the lookup. The forge writes a label only when its colour
+  or description changed, or, on GitHub, when the case of its name changed. If the list is empty,
+  the harness reads directly each issue that the stream's report store
+  ([`fleet-audit-report-store.md`](fleet-audit-report-store.md)) names for this repository, highest
+  number first, as the full list does. The first issue that is open and still carries the
+  `audit:<audit-id>` label is the ledger, and the run logs a warning that the list omitted it. A
+  closed issue stays closed. A failed read stops the search and gives "no ledger", because a lower
+  number is not the ledger while a higher one can still be. The store names an issue in each
+  envelope of `latest.json` and the ring: the `issue_number`, and the `open_issue_number` that a
+  clean run writes when it holds the ledger open with no trusted memory (that run stores no
+  `issue_number`, so the next run's memory stays lost). An envelope that a diverted run marked never
+  names the ledger. The store names no open ledger when it is absent or unreadable, when it was
+  written for another repository, or when every run that it keeps closed the ledger, ran with no
+  forge, or diverted. An open, labelled issue that no envelope names, for example one opened by
+  hand, stays unseen until the list shows it again. Read as "no ledger", an omitted ledger makes
+  `finish` open a second ledger with no memory and lose the state of the first one (held rows,
+  carried findings).
 - The run-over-run delta mechanism is carried over unchanged: the hidden
   `<!-- audit-findings: [...] -->` marker moves from the PR body to the issue body and
   `parse_delta_block` / `compute_delta` are reused verbatim. What the marker _lists_ is the set of
@@ -695,19 +716,6 @@ One asymmetry with the real run is deliberate: a dry run **warns** about a `reme
 is missing or fails containment, and does not rewrite the finding to `manual` the way `finish` does.
 Degrading a document it is only previewing would show the reader a body the real run never produces.
 
-### `remediate --audit <id> --findings-file <path> --finding <id>... [--manifest-file <path>]`
-
-The promotion primitive, callable directly and reused internally by `finish`. For each group: reset
-the branch onto `main`, stage only the group's manifest paths (the existing wildcard-pathspec refusal
-is retained), commit with a generated Conventional Commit subject, push, and create or edit the PR.
-
-**It promotes what was named and nothing else.** The auto-promotion sweep of §3.1 belongs to
-`finish`, where the whole fleet is being reported on anyway, and does not ride along on this
-subcommand. Sharing one code path between the two is right; sharing the sweep is not — it would
-make `remediate --finding one-id` open up to six pull requests, five of them for findings the
-operator never mentioned and cannot tell apart from the one they did, on the command whose entire
-purpose is to act on a specific request.
-
 Manifest files must already exist under the workspace, but **a missing one is no longer a hard
 error**. That finding degrades to `kind: manual`, keeps its evidence and recommendation, says in the
 ledger that a fix was named but not written, and the report publishes. Killing a nine-critical
@@ -728,6 +736,70 @@ Refusing once was not enough: a worker re-ran `finish` unchanged and the fix rea
 it writes instead: a declared `no-pdb` finding gets the SOP's PodDisruptionBudget from the
 collector's `pod_selector`, in a new file beside the declaration; a decline of that budget stands
 only when its reason carries the URL of the pull request already carrying it. The SKILL's "Write every `manifest` remediation file" rule is the worker-facing statement.
+
+After these passes, `finish` adds to each `manual` remediation a note that tells the reader where
+the fix belongs. The note comes only from the collector's candidate for the same finding id. There
+is one location note at most: the `declaration` file, or else the `release_declaration` file with
+the fact that the next sync or upgrade of the release can revert a patch to the live object, or else
+the `namespace_directory` where a new object belongs, with the `resources:` entry that an `overlay`
+source needs or the `metadata.namespace` that a `cluster` source needs. A `reconciler` adds a second
+note: its next sync or upgrade can revert a change made by hand. A plain `helm install` release
+reverts a field that the chart sets only at the next `helm upgrade`, so the notes say "can revert",
+not "is reverted".
+The paths come from file names in the repository and the reconciler from annotations on the live
+object, so a note shows only letters, digits and `_./-` from them. A path with another character
+gets no location note. A reconciler that is not exactly one of the phrases the collector writes is
+shown as "a controller whose name the audit does not show". A value that the redaction of the
+stored document changes, such as a `sk-` inside `task-` with 32 characters after it, is not shown
+either, because the stored note would show a value that is not in the repository. So a value cannot
+add a link or a mention to the ledger, and the next pass can find and remove each whole note. The
+pass also removes a note whose value an older run let the redaction change. A path or a
+reconciler longer than 512 characters is not shown either (`ROUTE_PATH_MAX_CHARS`,
+`ROUTE_RECONCILER_MAX_CHARS`), so the route notes always leave room for the start of the worker's
+note and its ` …(truncated)` mark.
+The notes go in a paragraph of their own after the worker's note, and a code fence that the
+worker's note leaves open is closed first. A note whose path the worker's note already names as a
+whole path is not written, unless the cut below removes that mention. A candidate without these
+fields gets no note, because a missing `declaration` is not a claim that no file declares the
+object. A route note copied from an earlier ledger is removed before the notes are written again,
+also from a fix that gets no route note, from a remediation of every kind (a fix that `finish`
+wrote and a worker's `manifest` fix too), and on a run without a manifest. A fix that `finish` wrote, that the worker
+declined, or that an open pull request carries gets no route note, because the row already gives
+the answer. A pull request carries the fix when its delta block names the finding, or, for a
+degraded fix, when it is on the branch that the promised path names. Only an open pull request
+counts: when a merged fix still reproduces (`pr-merged-persists`) or a person closed the pull
+request (`refused`), the reader must make the change by hand, so the row gets the route notes.
+The ledger that a forge with no issue tracker keeps in the report store gets the same notes, with
+the same rules. When that run cannot list the pull requests, no fix counts as carried, and each
+`manual` fix gets its notes.
+The notes give the location; a worker clause that contradicts them stays, and the note beside it is the correction. The worker's note is
+cut first when the total is longer than the note cap, measured after redaction and the escape of a
+comment opener as the renderer measures it, so the route notes stay in the rendered row, and the cut
+is never inside a code block: a note with a fence loses its first code block and all text after
+it, and the text before the block is cut. When the route notes still do not fit with the truncation
+mark, the location note is left out; the reconciler note always fits, because of the caps above, so
+a reconciled object is never published without it. The cut is in the worker's part of the note:
+the text that the degrade of an unwritten file adds at the end stays whole, unless the reconciler
+note leaves no room for it. The text that the Kustomize degrade writes at the start, with its copy
+of the worker's file, is never cut, because that copy is the only published copy of the fix. When
+the route notes do not fit with it, the location note is left out first, and then the copy is made
+shorter by whole lines, with its fences closed, to make room for the reconciler note. The stored document keeps the note from before the cut in the
+remediation's `uncut_note`, and the carry of an unchanged finding puts that note back, so the cut
+does not stay on a later run that has room. The dry run can leave out notes the real run adds, because it reads no
+pull request and no `--decline-fix`, and so skips every fix the refusal would list.
+
+### `remediate --audit <id> --findings-file <path> --finding <id>... [--manifest-file <path>]`
+
+The promotion primitive, callable directly and reused internally by `finish`. For each group: reset
+the branch onto `main`, stage only the group's manifest paths (the existing wildcard-pathspec refusal
+is retained), commit with a generated Conventional Commit subject, push, and create or edit the PR.
+
+**It promotes what was named and nothing else.** The auto-promotion sweep of §3.1 belongs to
+`finish`, where the whole fleet is being reported on anyway, and does not ride along on this
+subcommand. Sharing one code path between the two is right; sharing the sweep is not — it would
+make `remediate --finding one-id` open up to six pull requests, five of them for findings the
+operator never mentioned and cannot tell apart from the one they did, on the command whose entire
+purpose is to act on a specific request.
 
 `remediate` degrades the same way, for the same reason at a smaller scale. A named target whose fix
 is not a readable file inside the clone is refused **by name** — logged, and returned in the

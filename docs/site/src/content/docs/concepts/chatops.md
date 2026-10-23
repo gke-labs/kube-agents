@@ -112,7 +112,7 @@ Paste the output into your app's **App Manifest** page in the Slack App Console 
 
 It is optional at install time. Leave the prompt empty and, if the install's first chat message on either platform comes from Slack, it makes its channel or DM the home channel. Otherwise Slack has none until you run `/sethome` (or `/hermes sethome`) in the channel you want, which is also how you move it. That writes the value into the **Planning Agent** profile — the one that owns Slack ingress — which is why the command has to run through the gateway rather than being applied by an agent on its own profile.
 
-Under `spec.mode: next` only the resource field counts: `spec.integration.slack.homeChannel` on the PlatformAgent. The operator hands it to the A2A gateway, which posts the agent's proactive messages (alerts, scheduled reports, and the fleet audit's report card) into that channel and nowhere else, as new threads or as replies in them, and `/sethome` does not reach it. The field must be a channel ID (`C...`, or `G...` for a private channel), not a name; with it unset or malformed the agent posts nothing to Slack unprompted. Unset, the PlatformAgent carries the [`HomeChannelUnset`](/kube-agents/operator/platformagent-crd/#status) condition and the installer warns before it applies. A reply a person types in one of those threads starts a new conversation rather than continuing the investigation that raised the alert.
+Under `spec.mode: next` only the resource field counts: `spec.integration.slack.homeChannel` on the PlatformAgent. The operator hands it to the A2A gateway, which posts the agent's proactive messages (alerts, scheduled reports, and the fleet audit's report card) into that channel and nowhere else, as new threads or as replies in them, and `/sethome` does not reach it. `spec.integration.slack.homeChannelPolicy` (`auto` or `manual`) is accepted and recorded in this release but has no effect yet: the gateway does not learn a channel, so `homeChannel` alone decides. The field must be a channel ID (`C...`, or `G...` for a private channel), not a name; with it unset or malformed the agent posts nothing to Slack unprompted. Unset, the PlatformAgent carries the [`HomeChannelUnset`](/kube-agents/operator/platformagent-crd/#status) condition and the installer warns before it applies. A reply a person types in one of those threads starts a new conversation rather than continuing the investigation that raised the alert.
 
 A scheduled brief posts flat in that channel, never inside a thread. `/sethome` also records whichever thread it happened to be typed in, and threading every scheduled report under one ageing thread leaves only the first one visible — so cron delivery drops the thread deliberately. A job that wants its output in a thread names an explicit `deliver=` target instead.
 
@@ -361,6 +361,24 @@ platformAgent:
 ```
 
 [`session_management.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/docs/session_management.md#folding-a-workloads-repeat-events) describes which earlier alert a later event is folded into.
+
+### Opening the pull request without a reply
+
+By default, a triage report proposes GitOps fixes and stops. A human replies `apply` (or `apply Option B`), and the Platform Agent opens that fix as a pull request. Set `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` to `true` to skip the wait. The Planning Agent then files a second card beside the triage card. That card goes to the Platform Agent and names the triage card as its parent, so it waits in `todo` until the diagnosis is `done` or `archived`. If the triage card ends `blocked`, the second card waits too, and the board health check lists it under the blocked card. Once the report is complete, the second card opens the option the report marked Recommended, or the single proposed fix, through `submit-suggestion`. Any other value, or no value, keeps the default.
+
+Set it the same way as `INCIDENT_WORKLOAD_DEDUP_SECONDS`, as an entry in `platformAgent.deployment.env` or in `spec.deployment.env`:
+
+```yaml
+platformAgent:
+  deployment:
+    env:
+      - name: INCIDENT_TRIAGE_OPEN_PULL_REQUEST
+        value: "true"
+```
+
+A human still reviews and merges the pull request, and nothing is written to the live cluster. The branch is `platform-agent/incident-<incident>`, keyed to the cluster, namespace, kind, workload and reason. The workload is named the way the fold above names it: a Deployment's pods share their Deployment's name, and any other pod keeps its own name. So a retried event for the same Deployment revises the open pull request instead of opening a second one. StatefulSet, DaemonSet, Job and CronJob pods, and bare pods, each get a branch of their own, because the pod name alone cannot prove they belong to one workload. With the fold on, a Deployment's repeat events inside the window start no triage, so they file no pull-request card either. The second card's result, the pull request URL, is posted in the same thread as the report.
+
+The setting has limits. Drift and controller-stall reports are not covered; they still wait for a reply. On Slack with `KAGE_SLACK_UX` on, the report's button for the recommended or single fix is left off when the report says that fix's pull request `is being opened automatically`; buttons for the other options stay. A typed `apply Option B` still works and opens its own pull request. Changing the value rolls the agent pod. The agent ignores the variable in its own `.env` file, so only the install can turn it on. It is an environment variable for now and can move to a `PlatformAgent` field once it has proven itself.
 
 ## First-run onboarding
 

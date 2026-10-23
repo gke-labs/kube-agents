@@ -158,6 +158,8 @@ domains:
 # post-incident RCA rather than event-fired triage), went back on when that
 # case moved to the nightly (2026-09-03), and came off again on 2026-09-22
 # when incident-triage-oom-event-probe took a roster seat (#1023).
+# source-control came off on 2026-10-23, when vcs-spent-branch-reuse took a
+# roster seat on its nightly record.
 #
 # An entry goes back on here only alongside a scenario that stopped running,
 # or arrives with a new row whose cases have no roster line yet.
@@ -195,8 +197,8 @@ allowlist:
   # read seeded-c's leftover authorized-networks block as configured.
   # Delete this entry in the pull request that restores it to the roster.
   - consistency
-  # observability and source-control, since the rows were added: every case
-  # claiming either is a nightly case, so neither has a blocking-roster case.
-  # Delete an entry in the pull request that gives its domain a roster line.
+  # observability, since the row was added: every case claiming it is a
+  # nightly case, so it has no blocking-roster case. Delete the entry in the
+  # pull request that gives the domain a roster line. source-control sat here
+  # beside it until vcs-spent-branch-reuse took its roster line on 2026-10-23.
   - observability
-  - source-control

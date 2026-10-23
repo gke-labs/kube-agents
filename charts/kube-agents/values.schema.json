@@ -1030,6 +1030,15 @@
                   "host": {
                     "type": "string"
                   },
+                  "scheme": {
+                    "type": "string",
+                    "enum": ["https", "http"]
+                  },
+                  "port": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 65535
+                  },
                   "namespace": {
                     "type": "string"
                   },
@@ -1186,6 +1195,10 @@
                 },
                 "answerFeedback": {
                   "type": "boolean"
+                },
+                "homeChannelPolicy": {
+                  "type": "string",
+                  "enum": ["", "auto", "manual"]
                 }
               }
             },

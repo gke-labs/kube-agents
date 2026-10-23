@@ -4176,6 +4176,16 @@ GIT_FORCED_CONFIG: tuple[tuple[str, str], ...] = (
 )
 
 
+def _ca_authority(entry) -> str:
+    host = str(entry.get("host") or "").strip().lower()
+    if not host:
+        return ""
+    port = entry.get("port")
+    if port not in (None, "", 0) and not isinstance(port, bool) and ":" not in host:
+        return f"{host}:{port}"
+    return host
+
+
 def forge_ca_git_config(entries) -> tuple[tuple[str, str], ...]:
     """git config that trusts each forge's own CA on that forge's hosts only.
 
@@ -4189,7 +4199,7 @@ def forge_ca_git_config(entries) -> tuple[tuple[str, str], ...]:
     pairs: list[tuple[str, str]] = []
     for entry in entries or ():
         ca_file = str(entry.get("ca_file") or "").strip()
-        host = str(entry.get("host") or "").strip().lower()
+        host = _ca_authority(entry)
         if not ca_file or not host:
             continue
         # Measured in the broker image (git 2.47, libcurl-gnutls): the file
@@ -4207,9 +4217,9 @@ def forge_ca_git_config(entries) -> tuple[tuple[str, str], ...]:
 def forge_ca_sources(entries) -> dict[str, str]:
     """Each forge host that names a CA, mapped to where the CA comes from."""
     return {
-        str(entry.get("host") or "").strip().lower(): str(entry.get("ca_source") or "")
+        _ca_authority(entry): str(entry.get("ca_source") or "")
         for entry in entries or ()
-        if str(entry.get("ca_file") or "").strip()
+        if str(entry.get("ca_file") or "").strip() and _ca_authority(entry)
     }
 
 
@@ -4224,7 +4234,13 @@ def _ca_reading_entries(entries) -> tuple[dict[str, str], ...]:
     except ValueError:
         return ()
     return tuple(
-        {"host": forge.hosts[0], "ca_file": forge.ca_file, "ca_source": forge.ca_source}
+        {
+            "host": f"{forge.hosts[0]}:{forge.port}"
+            if getattr(forge, "port", None) and ":" not in forge.hosts[0]
+            else forge.hosts[0],
+            "ca_file": forge.ca_file,
+            "ca_source": forge.ca_source,
+        }
         for forge in forges
         if forge.ca_file and forge.hosts
     )
@@ -5835,9 +5851,9 @@ class CommandExecutor:
             # It is a colon-separated list, and the empty string is not
             # "allow all" — it is a list containing one empty protocol name,
             # so it allows nothing and breaks every clone. The value must stay
-            # non-empty. `https` alone is correct today because every URL the
-            # skills clone, fetch or push is https (gitops_workspace builds
-            # them from a fixed https prefix).
+            # non-empty. `https` is the base; `_execute` widens it to
+            # `https:http` only when `allow_http` is set for an explicitly
+            # declared `http` forge.
             #
             # It also refuses the `file` protocol, and that is load-bearing
             # rather than incidental: `--upload-pack=<cmd>` and
@@ -6534,6 +6550,8 @@ class CommandExecutor:
         argv: list[str],
         cwd: Path,
         config: tuple[tuple[str, str], ...] = (),
+        *,
+        allow_http: bool = False,
     ) -> ExecutionResult:
         """git the broker issues on its own behalf, in a tree the agent cannot name.
 
@@ -6586,6 +6604,7 @@ class CommandExecutor:
                 cwd=str(cwd),
                 containment_root=self.content_workspace_root,
                 extra_config=tuple(config),
+                allow_http=allow_http,
             )
         self._drop_write_tokens_refused_by(result.exit_code, result.stderr, config)
         return result
@@ -6609,6 +6628,8 @@ class CommandExecutor:
         cwd: Path,
         check: bool = True,
         config: tuple[tuple[str, str], ...] = (),
+        *,
+        allow_http: bool = False,
     ) -> subprocess.CompletedProcess:
         """git the version-control broker issues, in its own scratch tree.
 
@@ -6646,6 +6667,7 @@ class CommandExecutor:
             cwd=str(cwd),
             containment_root=self.vcs_root,
             extra_config=tuple(config),
+            allow_http=allow_http,
         )
         self._drop_write_tokens_refused_by(result.exit_code, result.stderr, config)
         if check and result.exit_code != 0:
@@ -7874,6 +7896,8 @@ class CommandExecutor:
         extra_config: tuple[tuple[str, str], ...] = (),
         timeout_seconds: int | None = None,
         caller: socket.socket | None = None,
+        *,
+        allow_http: bool = False,
     ) -> ExecutionResult:
         """Run a command. `kubeconfig_path` is already resolved and trusted.
 
@@ -7952,6 +7976,8 @@ class CommandExecutor:
                     )
                 )
             )
+        if allow_http:
+            command_environment["GIT_ALLOW_PROTOCOL"] = "https:http"
         if kubeconfig_path is not None:
             command_environment["KUBECONFIG"] = str(kubeconfig_path)
         effective_timeout: float = (

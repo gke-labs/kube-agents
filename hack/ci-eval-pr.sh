@@ -2879,8 +2879,9 @@ if [ -z "${BLOCKING_ROSTER_ON_LANE}" ] && [ -n "${INJECT_LANE_DROPPED_ROSTER}" ]
   exit 1
 fi
 
-# The GitLab lane's list may hold no roster case (all three of its seats are
-# held out since pdb-remediation-pr's demotion of 2026-10-17, #3120), which empties the export by design, like a nightly part: said
+# The GitLab lane's list may hold no roster case (it held none from
+# pdb-remediation-pr's demotion of 2026-10-17, #3120, until
+# vcs-spent-branch-reuse's roster line of 2026-10-23), which empties the export by design, like a nightly part: said
 # in the log, not stopped. After the inject guard, so a lane the guard stops
 # does not also hear this.
 if [ -n "${GITLAB_LANE_DROPPED:-}" ] && [ -z "${BLOCKING_ROSTER_DEFAULT}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
@@ -3125,7 +3126,7 @@ unit_cost_hint() {
     # Nightly-only. The audit measured 1415-1488s a repetition with its ledger
     # write (build 2099607409826729984); the crashloop triage takes the
     # incumbent autoops hint (same watcher and card waits) until it passes.
-    ai-security-planted-model-audit) echo 1450 ;;
+    ai-security-planted-model-audit | ai-security-manual-names-reconciler) echo 1450 ;;
     # Not measured yet: the same stream and stack shape as the case above, so
     # it takes that case's hint until its nightly record says otherwise.
     fleet-audit-clean-close-reads-clean) echo 1450 ;;
