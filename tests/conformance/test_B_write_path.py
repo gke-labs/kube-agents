@@ -75,6 +75,7 @@ def _profile_configs():
     return {
         "platform": merge(shared, platform),
         "cluster": yaml.safe_load(h.text("cluster_config")),
+        "tse": yaml.safe_load(h.text("tse_config")),
     }
 
 
@@ -259,7 +260,10 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
             for path in (h.path_of("shared_defaults_config"), *sorted((h.REPO_ROOT / "agents").glob("*/config.yaml")))
             if _servers_reaching(yaml.safe_load(path.read_text()) or {}, _GKE_MCP_TARGETS)
         }
-        modelled = {h.SOURCES[name].path for name in ("shared_defaults_config", "platform_config", "cluster_config")}
+        modelled = {
+            h.SOURCES[name].path
+            for name in ("shared_defaults_config", "platform_config", "cluster_config", "tse_config")
+        }
         self.assertEqual(
             set(),
             declaring - modelled,
@@ -540,7 +544,7 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
         """
         relay = "${KUBE_AGENTS_MCP_RELAY_URL}/"
         checked = 0
-        for source in ("shared_defaults_config", "platform_config", "cluster_config"):
+        for source in ("shared_defaults_config", "platform_config", "cluster_config", "tse_config"):
             servers = (yaml.safe_load(h.text(source)) or {}).get("mcp_servers") or {}
             for alias, spec in servers.items():
                 spec = spec or {}

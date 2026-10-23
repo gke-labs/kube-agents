@@ -1135,6 +1135,7 @@ read-only **managed scope** pinned over it.
 | `platform`                                                    | Image-built base + `profile-platform.overlay.yaml` merged at startup                                                                                                       | Image owns the base, operator the overlay              |
 | `platform`, with [`platformFrontDoor`](#platformfrontdoor) on | The same two inputs, but the base is back-filled rather than force-synced — and the `/etc/hermes` pins land here too, because that mount is machine-global                 | Agent owns the file, operator the overlay and the pins |
 | `cluster-*`                                                   | Image-built base, copied when the profile is scaffolded and back-filled at startup + `profileclass-cluster.overlay.yaml`, plus `profile-<name>.overlay.yaml` if one exists | Image owns the base, operator the overlay              |
+| `tse` (optional, when enabled)                                | Image-built base at `/opt/tse-template`, force-synced at startup when `KUBE_AGENTS_ENABLED_PROFILES` contains `tse` + `profile-tse.overlay.yaml` if one exists             | Image owns the base, operator the overlay              |
 
 A cluster profile is the only one that can take two overlays: the class overlay carries
 `tuning.cluster`, which applies to all of them, and a plugin targeting one specific cluster produces

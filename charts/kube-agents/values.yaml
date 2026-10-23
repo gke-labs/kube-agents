@@ -1031,9 +1031,13 @@ platformAgent:
     image:
       repository: docker.io/alpine/k8s
       tag: "1.36.5"
-    # How long to wait for the finalizer to clear.
+    # How long to wait for AgentProfile finalizers to clear before deleting
+    # the PlatformAgent CR.
+    agentProfileTimeout: 30s
+    # How long to wait for the PlatformAgent finalizer to clear.
     timeout: 120s
-    # Bounds the Job itself (image pull, scheduling) above that wait.
+    # Bounds the Job itself (image pull, scheduling) above the combined
+    # agentProfileTimeout + timeout waits.
     activeDeadlineSeconds: 300
   security:
     # Kubernetes ServiceAccount the credential broker pod runs as; the agent
@@ -1373,3 +1377,50 @@ plugins:
       sink: gke-stockout-alerts-sink
       thresholdCount: 1
       thresholdWindowSeconds: 300
+
+# Optional built-in specialist AgentProfiles deployed into the cluster (`spec.mode: next`).
+# When `profiles.tse.enabled` is true, the operator reconciles the `tse` AgentProfile's
+# ServiceAccount, NATS auth-callout identity, and agent card (`a2a.agents.tse`), and
+# passes `tse` to the gateway pod via KUBE_AGENTS_ENABLED_PROFILES so its Hermes
+# profile home (`/opt/data/profiles/tse`) is scaffolded from `/opt/tse-template` at startup.
+profiles:
+  # GKE Support Agent (TSE): customer-side L1 GKE support case deflection and
+  # structured incident triage specialist (`agents/tse/`, `/opt/tse-template`).
+  tse:
+    enabled: false
+    description: >-
+      Customer-side GKE Technical Solutions Engineer (TSE) for L1 support case
+      deflection and cross-layer incident triage. Performs read-only diagnostics
+      across Kubernetes (kubectl) and GCP control-plane telemetry (Cloud Logging,
+      Cloud Monitoring, GKE operations) using sanitized Google Cloud support
+      skills, returning either a grounded Root Cause Analysis with a proposed
+      GitOps fix or a redacted Google Cloud Support Escalation Bundle.
+    persona:
+      # Placeholder image reference required by the AgentProfile CRD schema;
+      # today the gateway scaffolds `tse` from `/opt/tse-template` in the
+      # platform-agent image until the per-profile Job dispatcher lands.
+      image:
+        repository: ghcr.io/gke-labs/kube-agents/platform-agent
+        tag: "" # defaults to platformAgent.deployment.image.tag or Chart.appVersion
+    harness:
+      image:
+        repository: ghcr.io/gke-labs/kube-agents/a2a-worker
+        tag: "" # defaults to platformAgent.deployment.image.tag or Chart.appVersion
+      model: model-default
+      maxTurns: 90
+    bus:
+      publishTopics: []
+      subscribeTopics:
+        - shared.blueprint
+        - agent.platform.upgrade-readiness
+    lifecycle:
+      activeDeadlineSeconds: 1800
+      ttlSecondsAfterFinished: 600
+    concurrency: 2
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 2Gi

@@ -681,12 +681,15 @@ A2A_OPERATOR_ENV_ARGS=()
 # first-run chain included) writes one whenever a pool repository declares a
 # workload with a major finding (#3439). spec.deployment.env carries the
 # switch; the operator forwards it to the shell sandbox, where finish runs.
-# Empty on the today lane, so that release stays byte-for-byte the same.
+# It also enables the optional `tse` AgentProfile so `mode: next` eval lanes
+# scaffold `/opt/data/profiles/tse` (#3492). Empty on the today lane, so that
+# release stays byte-for-byte the same.
 MODE_NEXT_ENV_ARGS=()
 if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   MODE_NEXT_ENV_ARGS=(
     --set-string "platformAgent.deployment.env[3].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"
     --set-string "platformAgent.deployment.env[3].value=false"
+    --set "profiles.tse.enabled=true"
   )
 fi
 

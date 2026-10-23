@@ -481,8 +481,9 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-run-workdir/apply_cron_run_workdir.p
 # Security: cron risk gate, execute_code refuse, and content checks (THREAT-002).
 # Must run after cron_tirith_scan: anchors into tools/approval.py at the point
 # introduced by apply_cron_tirith_scan.py.
-COPY --chmod=0644 agents/platform/scripts/command_policy.py /opt/hermes/tools/command_policy.py
-COPY --chmod=0644 deploy/docker/patches/cron_risk_gate.py /opt/hermes/tools/cron_risk_gate.py
+COPY --chmod=0644 agents/platform/scripts/command_policy.py \
+     deploy/docker/patches/cron_risk_gate.py \
+     /opt/hermes/tools/
 COPY deploy/docker/patches/apply_cron_risk_gate.py \
      deploy/docker/patches/verify_cron_risk_gate.py \
      deploy/docker/patches/patchlib.py \
@@ -1000,13 +1001,14 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
 # verify_kanban_worker_tools.py proves the gate answers correctly against the
 # real agent.delegation_context and that the schemas actually disappear.
 # See the module docstring in deploy/docker/patches/kanban_worker_tools.py.
-COPY deploy/docker/patches/kanban_worker_tools.py /opt/hermes/tools/kanban_worker_tools.py
 # The three ownership predicates -- dispatcher worker, delegate_task child, cron
 # run -- shared with hermes_cli/kanban_guardrail_exit.py further down, which asks
 # the same two questions with the opposite `on_unknown`. Landed in this block
 # because it is the first that needs it; the guardrail block imports the same
 # tools.kanban_ownership and adds no COPY of its own.
-COPY deploy/docker/patches/kanban_ownership.py /opt/hermes/tools/kanban_ownership.py
+COPY deploy/docker/patches/kanban_worker_tools.py \
+     deploy/docker/patches/kanban_ownership.py \
+     /opt/hermes/tools/
 # Also staged next to the applier: it imports WORKER_ONLY_TOOLS from
 # kanban_worker_tools, which imports kanban_ownership, and only the script's own
 # directory is on sys.path.
@@ -2270,6 +2272,10 @@ COPY --chown=hermes:hermes agents/platform/hindsight/ /opt/platform-template/hin
 # into per-cluster Hermes profiles at runtime by scripts/cluster_agent_profile.py.
 COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 
+# Copy the GKE Support Agent (tse) profile TEMPLATE (persona, config, skills),
+# scaffolded into the optional `tse` Hermes profile at runtime when enabled.
+COPY --chown=hermes:hermes agents/tse/ /opt/tse-template/
+
 # Platform config is self-contained (scaffold does not merge again): build it by
 # merging the shared defaults base with the platform overrides and bake it into
 # the template. This reproduces the exact config the platform ran with as the
@@ -2335,6 +2341,7 @@ assert cfg.get('agent', {}).get('max_turns') == 250, 'iteration budget lost: %r'
         --tirith-bin /usr/local/bin/tirith \
         agents/platform/skills=/opt/platform-template/skills \
         agents/cluster/skills=/opt/cluster-template/skills \
+        agents/tse/skills=/opt/tse-template/skills \
         a2a/persona/platform/skills=/opt/a2a-template/skills && \
     rm -rf /tmp/platform-config
 
@@ -2546,19 +2553,19 @@ COPY agents/platform/plugins/ agents/chat/plugins/ /tmp/repo-plugins/
 # account for.
 RUN set -eu; \
     chown -R hermes:hermes /opt/defaults; \
-    for d in /opt/defaults /opt/hermes/skills /opt/cluster-template /opt/platform-template /opt/chat-template /opt/a2a-template /tmp/repo-plugins; do \
+    for d in /opt/defaults /opt/hermes/skills /opt/cluster-template /opt/tse-template /opt/platform-template /opt/chat-template /opt/a2a-template /tmp/repo-plugins; do \
         find "$d" -type d -exec chmod 755 {} + ; \
         find "$d" -type f -exec chmod 644 {} + ; \
     done; \
     find /opt/defaults/scripts -type f -exec chmod 755 {} + ; \
-    for d in /opt/hermes/skills /opt/platform-template /opt/cluster-template; do \
+    for d in /opt/hermes/skills /opt/platform-template /opt/cluster-template /opt/tse-template; do \
         find "$d" -path '*/scripts/*' -type f -exec chmod 755 {} + ; \
     done; \
     cp -a /tmp/repo-plugins/. /opt/hermes/plugins/; \
     rm -rf /tmp/repo-plugins; \
     /opt/hermes/.venv/bin/python3 -m compileall -q /opt/hermes \
       || echo "WARN: some modules under /opt/hermes did not precompile; they will compile at import, as they do without this step" >&2; \
-    for d in /opt/hermes/skills /opt/platform-template/skills /opt/cluster-template/skills /opt/a2a-template/skills; do \
+    for d in /opt/hermes/skills /opt/platform-template/skills /opt/cluster-template/skills /opt/tse-template/skills /opt/a2a-template/skills; do \
         [ -d "$d" ] \
             || { echo "$d does not exist at manifest generation; the boot check refuses to start a pod whose skill tree has no manifest inside it, so shipping this image would crash-loop the fleet" >&2; exit 1; }; \
         [ -z "$(find "$d" -type l -print -quit)" ] \
@@ -2570,7 +2577,7 @@ RUN set -eu; \
             || { echo "manifest for $d has $(wc -l < "$d/skills_manifest.sha256") entries, expected $n" >&2; exit 1; }; \
         chmod 644 "$d/skills_manifest.sha256"; \
     done; \
-    chown -R root:root /opt/hermes/skills /opt/platform-template /opt/cluster-template /opt/chat-template /opt/a2a-template /opt/defaults/scripts; \
+    chown -R root:root /opt/hermes/skills /opt/platform-template /opt/cluster-template /opt/tse-template /opt/chat-template /opt/a2a-template /opt/defaults/scripts; \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 -m tools.skill_manage_image_owned --check-roots
 
 # Guard: nothing that carries a cluster credential may come back into this image.
@@ -2619,7 +2626,7 @@ RUN set -eu; \
       fi; \
     done; \
     /opt/hermes/.venv/bin/python3 /opt/defaults/scripts/terminal_env_pin.py --build-check; \
-    for profile in /opt/chat-template:/opt/defaults /opt/platform-template:/opt/platform-template /opt/cluster-template:/opt/cluster-template; do \
+    for profile in /opt/chat-template:/opt/defaults /opt/platform-template:/opt/platform-template /opt/cluster-template:/opt/cluster-template /opt/tse-template:/opt/tse-template; do \
       config_dir="${profile%%:*}"; soul="${profile#*:}/SOUL.md"; \
       scratch="$(mktemp -d)"; \
       cp "${config_dir}/config.yaml" "${scratch}/config.yaml"; \

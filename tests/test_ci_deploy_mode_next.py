@@ -857,6 +857,7 @@ class TasksBudgetSizingTest(unittest.TestCase):
         assert block is not None
         self.assertIn('--set-string "platformAgent.deployment.env[3].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"', block.group(1))
         self.assertIn('--set-string "platformAgent.deployment.env[3].value=false"', block.group(1))
+        self.assertIn('--set "profiles.tse.enabled=true"', block.group(1))
         self.assertIn('${MODE_NEXT_ENV_ARGS[@]+"${MODE_NEXT_ENV_ARGS[@]}"}', script)
         root = _CI_DEPLOY.parent.parent
         self.assertIn('envAuditAutoPromote = "KUBEAGENTS_AUDIT_AUTO_PROMOTE"', (root / "k8s-operator/internal/controller/shell_sandbox_manifests.go").read_text())

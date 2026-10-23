@@ -172,7 +172,8 @@ var SensitiveEnvVars = map[string]struct{}{
 	// gateway conversation a card was filed in, on the same route, and names
 	// the platform in the cron relay's refusal when no home channel is set.
 	// The operator renders it exactly when the gateway arms the route.
-	"A2A_NOTIFY_CONVERSATIONS": {},
+	"A2A_NOTIFY_CONVERSATIONS":     {},
+	"KUBE_AGENTS_ENABLED_PROFILES": {},
 	// NATS_CA_FILE names the CA the client trusts the bus by. An override is
 	// the TLS half of a redirected NATS_URL: pointed at a CA of the setter's
 	// choosing, the client accepts a server that CA signed as the bus, and

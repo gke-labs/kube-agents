@@ -3224,6 +3224,7 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 				{Name: a2aBusTokenFileEnv, Value: "/opt/data/attacker/token"},
 				{Name: a2aNotifyPlatformEnvVar, Value: "google_chat"},
 				{Name: a2aNotifyConversationsEnvVar, Value: "google_chat"},
+				{Name: enabledProfilesEnvVar, Value: "tse"},
 				{Name: "NATS_USER", Value: "gateway"},
 				{Name: "NATS_PASSWORD", Value: "hunter2"},
 				{Name: "PLUGIN_OWN_KEY", Value: "kept"},
@@ -3268,7 +3269,10 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 	// so the operator renders no value, and a plugin's would reroute the
 	// agent's proactive posts to a route with no gateway behind it.
 	// A2A_NOTIFY_CONVERSATIONS is the fifth, for the same reason.
-	for _, name := range []string{"NATS_USER", "NATS_PASSWORD", a2aBusTokenFileEnv, a2aNotifyPlatformEnvVar, a2aNotifyConversationsEnvVar} {
+	// KUBE_AGENTS_ENABLED_PROFILES is the sixth: no optional Hermes profile is
+	// bound on this install, so the operator renders no value, and a plugin's
+	// would scaffold an unapproved specialist profile on the gateway pod.
+	for _, name := range []string{"NATS_USER", "NATS_PASSWORD", a2aBusTokenFileEnv, a2aNotifyPlatformEnvVar, a2aNotifyConversationsEnvVar, enabledProfilesEnvVar} {
 		if counts[name] != 0 {
 			t.Errorf("a plugin's %s survived into the agent env under next", name)
 		}
@@ -3287,7 +3291,7 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 	if counts["PLUGIN_OWN_KEY"] != 1 || values["PLUGIN_OWN_KEY"].Value != "kept" {
 		t.Error("the bus-name reservation dropped a plugin variable it has no claim on")
 	}
-	for _, name := range []string{"NATS_URL", a2aNATSCAFileEnv, a2aBusUserEnv, a2aBusTokenFileEnv, a2aNotifyPlatformEnvVar, a2aNotifyConversationsEnvVar, "NATS_USER", "NATS_PASSWORD"} {
+	for _, name := range []string{"NATS_URL", a2aNATSCAFileEnv, a2aBusUserEnv, a2aBusTokenFileEnv, a2aNotifyPlatformEnvVar, a2aNotifyConversationsEnvVar, enabledProfilesEnvVar, "NATS_USER", "NATS_PASSWORD"} {
 		if _, sensitive := agentv1alpha1.SensitiveEnvVars[name]; !sensitive {
 			t.Errorf("%s is not in SensitiveEnvVars; the drop above covers plugin env only, and membership "+
 				"is what keeps the name out of the sidecar containers, which take spec.deployment.env "+

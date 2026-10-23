@@ -46,17 +46,20 @@ kube-agents/
 │   │                                              persona docs + runtime-debugging
 │   │                                              SKILL.md bundles
 │   ├── contributor/                               Contributor-agent protocol (claim/PR/review loop)
-│   └── platform/                                  Platform Agent profile
-│       ├── AGENTS.md, SOUL.md, CAPABILITIES.md    persona and workspace docs
-│       ├── docs/                                  runtime references (glossary,
-│       │                                          console links) + design docs
-│       ├── governance/                            cron-run SOP playbooks + the
-│       │                                          first-run inventory-scan and
-│       │                                          report-prioritization SOPs
-│       ├── skill-overlays/                        patches + append.md behind the mirrored
-│       │                                          gke-* skills (scripts/skill_overlay.py)
-│       └── skills/                                SKILL.md bundles + the
-│                                                  gke-compute-classes references
+│   ├── platform/                                  Platform Agent profile
+│   │   ├── AGENTS.md, SOUL.md, CAPABILITIES.md    persona and workspace docs
+│   │   ├── docs/                                  runtime references (glossary,
+│   │   │                                          console links) + design docs
+│   │   ├── governance/                            cron-run SOP playbooks + the
+│   │   │                                          first-run inventory-scan and
+│   │   │                                          report-prioritization SOPs
+│   │   ├── skill-overlays/                        patches + append.md behind the mirrored
+│   │   │                                          gke-* skills (scripts/skill_overlay.py)
+│   │   └── skills/                                SKILL.md bundles + the
+│   │                                              gke-compute-classes references
+│   └── tse/                                       Optional GKE Support Agent (tse) template:
+│       ├── AGENTS.md, SOUL.md, CAPABILITIES.md    persona and capability card
+│       └── skills/                                support-escalation-bundle SKILL.md
 ├── a2a/docs/                                      design notes kept beside the A2A
 │                                                  bus Go module they describe
 ├── bench/                                         devops-bench evaluation harness README
@@ -206,7 +209,8 @@ identifier appears, add its source here.
 | The operator-rendered Hermes bridge: the operator settings `A2A_BRIDGE_IMAGE`, `A2A_BRIDGE_CONCURRENCY`, `A2A_BRIDGE_EXECUTOR` and `A2A_BRIDGE_RESOURCES`, the image fallback, the bridge's default resources, the agent env names the bridge does not inherit, and the gateway's `A2A_BUSY_NOTICE_AT` rendered from the bridge's worker count | `k8s-operator/internal/controller/platformagent_a2a_bridge.go` (`a2aBridgeImageEnvVar`, `a2aBridgeConcurrencyOperatorEnvVar`, `a2aBridgeExecutorOperatorEnvVar` and `a2aBridgeResourcesOperatorEnvVar`, `a2aBridgeImage`, `a2aRenderedBridgeDefaultResources`, `a2aBridgeDroppedAgentEnv`, `a2aBusyNoticeAtEnvVar` and `a2aBusyNoticeAt`) |
 | The A2A JetStream stream limits: each stream's subjects, retention, byte cap, `max_consumers` and `max_msgs_per_subject`, including the ones derived from `spec.harness.tuning.maxSessions` and the bridge's `BRIDGE_CONCURRENCY` (a declared sidecar's, or the operator's `A2A_BRIDGE_CONCURRENCY` for a rendered bridge) | `k8s-operator/internal/controller/platformagent_a2a_manifests.go` (the rendered provision script and the constants above it); `docs/designs/spec-nats-deployment.md` argues the numbers but does not set them |
 | Minimum supported tool versions (`gcloud`, `terraform`, `go`) | `scripts/installer/min_versions.sh` |
-| Toolsets, plugins, and MCP servers of an agent profile | that profile's `config.yaml` (`agents/platform/`, `agents/chat/`, `agents/cluster/`) |
+| Toolsets, plugins, and MCP servers of an agent profile | that profile's `config.yaml` (`agents/platform/`, `agents/chat/`, `agents/cluster/`, `agents/tse/`) |
+| Optional built-in `AgentProfile` specialist scaffolding (`tse`, `KUBE_AGENTS_ENABLED_PROFILES`, `.optional-profile` stamp, and `.deleted/<name>` archival) | `isOptionalHermesProfileName` and `enabledAgentProfileNames` in `k8s-operator/internal/controller/agentprofile_identities.go`, `heldEnabledProfiles` in `k8s-operator/internal/controller/platformagent_controller.go`, `enabledProfilesEnvVar` in `k8s-operator/internal/controller/platformagent_manifests.go` (writer), and `reconcile_optional_profiles` in `deploy/shared/docker-entrypoint.sh` (reader) |
 | Cron job rosters and schedules | `agents/chat/defaults/cron/jobs.json` and `agents/platform/cron/jobs.json` |
 | Persona rules and `§N` section numbering | the profile's `SOUL.md` |
 | RBAC bindings and KSA defaults laid down per agent | `k8s-operator/internal/controller/platformagent_manifests.go` |
