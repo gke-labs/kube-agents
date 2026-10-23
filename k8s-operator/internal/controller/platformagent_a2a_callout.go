@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -408,6 +409,15 @@ func a2aStripBusCredentialSources(volumes []corev1.Volume, agentName string) []c
 // and so whoever writes the sidecar can already name any scope they like. The
 // override bought nothing and cost a silent clobber. The bridge sets neither
 // name, so it still takes the downward API and still gets the ENOENT repair.
+//
+// NATS_CA_FILE and the bus CA mount go on with the switch, as overrides. The
+// bus requires TLS, and a bridge the CR declares carries its own NATS_URL and
+// credentials (a2a/docs/hermes-bridge.md) but nothing that trusts the
+// operator's CA, so without these it fails verification and crash-loops the
+// agent pod. The name is ours, and a CR value pointing at another file would
+// choose which server the sidecar accepts as the bus. The mount is skipped
+// where the container already has one by that volume name or at that path, as
+// the rendered bridge does by inheritance.
 func a2aExecutorSidecarEnv(containers []corev1.Container) []corev1.Container {
 	if len(containers) == 0 {
 		return containers
@@ -425,11 +435,18 @@ func a2aExecutorSidecarEnv(containers []corev1.Container) []corev1.Container {
 		}
 		switchOverride := []corev1.EnvVar{
 			{Name: a2aCapabilityRequiredEnvVar, Value: a2aCapabilityRequired()},
+			a2aNATSCAFileEnvVar(),
 		}
 		// mergeEnvVars' second argument wins, so the nesting IS the
 		// precedence: the container's own env beats the namespace default,
 		// and the switch beats both.
 		c.Env = mergeEnvVars(mergeEnvVars(namespaceDefault, c.Env), switchOverride)
+		mount := a2aNATSCABundleMount()
+		if !slices.ContainsFunc(c.VolumeMounts, func(m corev1.VolumeMount) bool {
+			return m.Name == mount.Name || m.MountPath == mount.MountPath
+		}) {
+			c.VolumeMounts = append(slices.Clone(c.VolumeMounts), mount)
+		}
 		out = append(out, c)
 	}
 	return out
@@ -700,6 +717,7 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						WorkingDir: "/",
 						Env: []corev1.EnvVar{
 							{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
+							a2aNATSCAFileEnvVar(),
 							{Name: "NATS_USER", Value: a2aCalloutConfUser},
 							{Name: "NATS_PASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
 								LocalObjectReference: corev1.LocalObjectReference{Name: a2aCredsSecretName(agent)},
@@ -742,7 +760,8 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 								Key:                  a2aCalloutXKeySeedKey,
 							}}},
 						},
-						Ports: []corev1.ContainerPort{{Name: "status", ContainerPort: a2aCalloutStatusPort}},
+						VolumeMounts: []corev1.VolumeMount{a2aNATSCABundleMount()},
+						Ports:        []corev1.ContainerPort{{Name: "status", ContainerPort: a2aCalloutStatusPort}},
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
 								Path: "/readyz", Port: intstr.FromInt32(a2aCalloutStatusPort),
@@ -779,6 +798,7 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 						},
 					}},
+					Volumes: []corev1.Volume{a2aNATSCABundleVolume(agent)},
 				},
 			},
 		},

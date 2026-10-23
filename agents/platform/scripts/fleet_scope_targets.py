@@ -15,8 +15,8 @@ audit sweeps the projects read `ok` or `api-disabled` and the management
 project whatever its row read (the collectors read it themselves), names the
 ones the scope declares but the reconcile could not read, so the run accounts
 for them rather than reading as a full sweep, and lists nothing. It also
-hands over the clusters `spec.scope.exclude.clusters` names, which every fleet
-read leaves out (#3081): the scope is otherwise per project, so without them an
+hands over the clusters `spec.scope.exclude.clusters` names, which the collectors
+that list clusters leave out (#3081): the scope is otherwise per project, so without them an
 excluded cluster in a swept project is read like any other. An install that declares no scope has drawn
 no boundary; the answer is None there, and the audit keeps the listing it had.
 With no snapshot yet, or one that does not parse, the operator's render answers
@@ -25,7 +25,15 @@ reconcile writes the resolved set.
 
 Read in the agent pod, where the snapshot is, by the platform_control MCP
 server's `fleet_scope` tool (platform_mcp_server.py), which hands the agent
-the resolved set and the arguments to pass the collectors. The collectors
+the resolved set and the arguments to pass the collectors, and by the
+`upgrade-readiness-watch` job (upgrade_readiness_watch.py), a `no_agent`
+script on the same pod that hands the readiness report script
+`collector_args`, less the cluster exclusion, beside each project it reads
+(the `upgrade-readiness-weekly-review` job does the same through it), by the
+`sa-role-watch` job (sa_role_watch.py), which reads the IAM policy of each
+project in the resolved scope, and by the onboarding inventory scan
+(agents/chat/scripts/bootstrap_scan_gate.py), which leaves the declaration's
+excluded clusters out of the sweep it files. The collectors
 themselves cannot read the file: they run in the shell sandbox, whose
 /opt/data is a separate volume at the same path (deploy/sandbox/entrypoint.sh
 says nothing is copied across), so the agent carries the scope from the tool
@@ -63,7 +71,9 @@ SNAPSHOT_FILE = "fleet_scope.json"
 # §5 is its contract). A row read `ok` holds clusters the install can reach;
 # any other outcome names a project the scope declares and this install could
 # not read this run. A `retiring` row is a project the scope no longer names,
-# kept only until its profiles are pruned, so it is not in the sweep.
+# kept only until its profiles are pruned, so it is not in the sweep; its id
+# rides on `ScopeTargets.retiring` for a reader that meets the project under
+# another name.
 OUTCOME_OK = "ok"
 # A declared project whose Kubernetes Engine API is off holds no GKE cluster
 # and is swept: the GKE collectors count it empty rather than partial (the GCE
@@ -75,6 +85,11 @@ OUTCOME_API_DISABLED = "api-disabled"
 # cross `maxProjects`: the members all have rows at `over-cap`, so the lookup
 # resolved and the gap is already in `unread` by name.
 OUTCOME_OVER_CAP = "over-cap"
+# A listing the reconcile could not finish: a timeout, a network or quota
+# error, a gcloud failure it did not classify, or a project a carried tick did
+# not resolve. Not an access failure; the row says the reconcile did not read
+# the project this run, not that the install cannot.
+OUTCOME_UNREACHABLE = "unreachable"
 OUTCOME_UNKNOWN = "unknown"
 # A declared project the reconcile has not resolved yet (the render answered).
 OUTCOME_UNRESOLVED = "unresolved"
@@ -109,6 +124,9 @@ SCOPE_EXCLUDE_CLUSTERS_FLAG = fleet_scope_args.SCOPE_EXCLUDE_CLUSTERS_FLAG
 # (ScopeClusterRef) and the reconcile copies it into `declared`.
 CLUSTER_REF_KEYS = ("projectId", "location", "clusterName")
 STATE_IN_SCOPE = "in-scope"
+# The row's state for a project the declaration no longer names, whose profiles
+# the reconcile keeps until its next clean run prunes them.
+STATE_RETIRING = "retiring"
 # Whether the CR carried a spec.scope block this run, which the reconcile records
 # beside `declared`: a present block with every list empty is the host-only
 # boundary, not the absence of one. A run that could not read the block carries
@@ -142,8 +160,11 @@ SCOPE_FILE_ENV = "KUBEAGENTS_SCOPE_FILE"
 RENDER_PRESENT_KEY = "present"
 # Where the management project's id is read when the render alone answers: the
 # sweep is then that project, until the next tick writes the resolved set. One
-# name: it is what the platform_control env block forwards to the only
-# production reader, the fleet_scope tool (agents/platform/config.yaml).
+# name: it is what the platform_control env block forwards to the fleet_scope
+# tool (agents/platform/config.yaml), and what the gateway pod's own
+# environment carries for the upgrade-readiness-watch,
+# upgrade-readiness-weekly-review and sa-role-watch jobs and the onboarding
+# inventory scan (bootstrap_scan_gate.py), the other production readers.
 MANAGEMENT_PROJECT_ENVS = ("GCP_PROJECT_ID",)
 
 # The keys under `declared` whose presence means the install drew a boundary,
@@ -171,25 +192,68 @@ class ScopeTargets:
     # names: left out of fleet answers and the per-cluster audits, not
     # a coverage gap.
     excluded_clusters: tuple[tuple[str, str, str], ...] = ()
+    # The `exclude.projects` entries the declaration carries (a project id or
+    # a glob against ids), with the explicit projects the reconcile dropped on
+    # one, by id or by number (`excludedProjects`): what `declared_scope_targets` skips
+    # on the way into `unread`. Never in the sweep and never in the collector
+    # flags; carried so a reader that meets a project with no row can say
+    # whether an exclude entry matches its id (`excludes`), as the
+    # upgrade-readiness watch does for a roster project the report refused;
+    # whether that entry is why the row is missing only the reconcile knows.
+    excluded: tuple[str, ...] = ()
+    # The folders, organisations and selectors the declaration names, as the
+    # reconcile keys their lookups (`folders/<id>`, `organizations/<id>`,
+    # `sharedVpcHosts/<host>`, `metricsScopes/<scope>`), sorted. Never in the
+    # sweep and never in the collector flags; carried so a reader that holds a
+    # project's cause across a failed lookup can tell a container the
+    # declaration had, whose failed lookup carries the members it had, from
+    # one it has just gained, whose failed lookup carries none, as the
+    # upgrade-readiness watch does.
+    declared_containers: tuple[str, ...] = ()
+    # The projects the snapshot holds at `state: retiring`: ones the declaration
+    # no longer names, whose Cluster Agent profiles the reconcile keeps until
+    # its next clean run prunes them. Never in the sweep and never in the
+    # collector flags; carried so a reader that meets such a project under
+    # another name can tell one the reconcile is about to prune from one the
+    # declaration never named, as the upgrade-readiness watch does for a roster
+    # project the report refused.
+    retiring: tuple[str, ...] = ()
 
-    def collector_args(self) -> str:
-        """The arguments that hand this scope to a collector: `--scope-projects`
-        with the sweep, and `--scope-unread` naming each declared project the
-        install could not read, as `project=outcome`. With nothing readable the
-        unread flag goes alone, so a collector handed it still knows a scope
-        was declared and reports that rather than listing. Never empty: a
-        declared scope with no row at all hands the collector the fixed
-        unresolved row, so it reports "nothing readable" rather than telling
-        the agent to call the tool it has just called."""
-        args = []
+    def excludes(self, project: str) -> bool:
+        """Whether an exclude entry matches the project's id: the match the
+        reader makes when it skips a declared project, so the two agree. Not
+        whether the entry is why the project has no row, which only the
+        reconcile knows: a project under no part of the declaration matches a
+        glob the same way, and a member a Metrics Scope named by number is
+        dropped on the number, which no id matches."""
+        return any(fnmatch.fnmatchcase(project, entry) for entry in self.excluded)
+
+    def collector_argv(self) -> tuple[str, ...]:
+        """The arguments that hand this scope to a collector, as an argument
+        list (each flag and its value one token each) for a caller that builds
+        the collector's argv itself, as the upgrade-readiness watch does:
+        `--scope-projects` with the sweep, `--scope-unread` naming each
+        declared project the install could not read, as `project=outcome`, and
+        `--scope-exclude-clusters` with the excluded clusters.
+        With nothing readable the unread flag goes alone, so a collector handed
+        it still knows a scope was declared and reports that rather than
+        listing. Never empty: a declared scope with no row at all hands the
+        collector the fixed unresolved row, so it reports "nothing readable"
+        rather than telling the agent to call the tool it has just called."""
+        argv: list[str] = []
         if self.projects:
-            args.append(f"{SCOPE_PROJECTS_FLAG} {','.join(self.projects)}")
+            argv += [SCOPE_PROJECTS_FLAG, ",".join(self.projects)]
         unread = self.unread or ((UNRESOLVED_SCOPE_ROW, OUTCOME_UNRESOLVED),) if not self.projects else self.unread
         if unread:
-            args.append(f"{SCOPE_UNREAD_FLAG} " + ",".join(f"{project}={outcome}" for project, outcome in unread))
+            argv += [SCOPE_UNREAD_FLAG, ",".join(f"{project}={outcome}" for project, outcome in unread)]
         if self.excluded_clusters:
-            args.append(f"{SCOPE_EXCLUDE_CLUSTERS_FLAG} " + ",".join(fleet_scope_args.format_cluster_ref(*ref) for ref in self.excluded_clusters))
-        return " ".join(args)
+            argv += [SCOPE_EXCLUDE_CLUSTERS_FLAG, ",".join(fleet_scope_args.format_cluster_ref(*ref) for ref in self.excluded_clusters)]
+        return tuple(argv)
+
+    def collector_args(self) -> str:
+        """`collector_argv` as the one line the `fleet_scope` tool hands the
+        agent to paste after a collector command."""
+        return " ".join(self.collector_argv())
 
 
 def _excluded_clusters(block: object) -> tuple[tuple[str, str, str], ...]:
@@ -233,6 +297,17 @@ def _read_render() -> dict | None:
     return parsed
 
 
+def _declared_containers(declared: dict) -> tuple[str, ...]:
+    """The folders, organisations and selectors a declaration names, keyed as
+    the reconcile keys their lookups, sorted."""
+    return tuple(sorted(
+        f"{key}/{entry}"
+        for key in CONTAINER_AND_SELECTOR_KEYS
+        for entry in (declared.get(key) if isinstance(declared.get(key), list) else [])
+        if isinstance(entry, str) and entry
+    ))
+
+
 def _from_render(path: Path) -> ScopeTargets | None:
     """The answer when no snapshot answers: the render's boundary, the host
     swept and a fixed unresolved row plus every project the render declares
@@ -263,6 +338,8 @@ def _from_render(path: Path) -> ScopeTargets | None:
         path=os.environ.get(SCOPE_FILE_ENV) or str(path),
         note=note,
         excluded_clusters=_excluded_clusters(render),
+        excluded=tuple(exclude_patterns),
+        declared_containers=_declared_containers(render),
     )
 
 
@@ -298,10 +375,13 @@ def declared_scope_targets(agent_home: str | os.PathLike | None = None) -> Scope
         return _from_render(path)
     projects: list[str] = []
     unread: list[tuple[str, str]] = []
+    retiring: list[str] = []
     for row in parsed["projects"]:
         if not isinstance(row, dict) or not row.get("id"):
             continue
         if row.get("state", STATE_IN_SCOPE) != STATE_IN_SCOPE:
+            if row.get("state") == STATE_RETIRING:
+                retiring.append(str(row["id"]))
             continue
         project = str(row["id"])
         # The install's own project is always swept: the collectors read it
@@ -316,7 +396,8 @@ def declared_scope_targets(agent_home: str | os.PathLike | None = None) -> Scope
     # declared project with no cluster (the GCE and networking streams'
     # ordinary target) would otherwise vanish from a complete-looking sweep.
     # An explicit project an exclude pattern matches gets no row on any tick
-    # and is not unread: the operator left it out on purpose.
+    # and is not unread: the operator left it out on purpose. The entries ride
+    # on `excluded` for a reader that meets such a project under another name.
     exclude_patterns = [p for p in ((declared.get("exclude") or {}).get("projects") or []) if isinstance(p, str)]
     dropped = {p for p in (parsed.get(EXCLUDED_KEY) or []) if isinstance(p, str)}
     seen = set(projects) | {project for project, _ in unread}
@@ -345,4 +426,7 @@ def declared_scope_targets(agent_home: str | os.PathLike | None = None) -> Scope
         resolved_at=str(resolved_at) if isinstance(resolved_at, str) else None,
         path=str(path),
         excluded_clusters=_excluded_clusters(declared),
+        excluded=(*exclude_patterns, *(p for p in sorted(dropped) if p not in exclude_patterns)),
+        declared_containers=_declared_containers(declared),
+        retiring=tuple(retiring),
     )

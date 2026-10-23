@@ -81,6 +81,10 @@ const (
 	// and the kustomize manager both stamp it.
 	a2aOperatorBusClientLabel      = "kubeagents.x-k8s.io/a2a-bus-client"
 	a2aOperatorBusClientLabelValue = "operator"
+
+	// optionalHermesProfileTSE is the built-in optional GKE Support Agent
+	// Hermes specialist template baked into the platform-agent image (/opt/tse-template).
+	optionalHermesProfileTSE = "tse"
 )
 
 // agentProfileTopicRE is the CRD's topic-grant pattern, rechecked when the map
@@ -300,6 +304,40 @@ func agentProfileMapEntries(agent *agentv1alpha1.PlatformAgent, profiles []agent
 		out = append(out, entry)
 	}
 	return out
+}
+
+// isOptionalHermesProfileName reports whether name matches a built-in optional
+// Hermes specialist template baked into the platform-agent image (/opt/<name>-template).
+// Ordinary AgentProfiles (such as `chat` or custom A2A bus profiles like `auditor`)
+// describe A2A bus identities only and do not scaffold a Hermes profile on the
+// gateway pod, so creating or deleting them does not mutate KUBE_AGENTS_ENABLED_PROFILES
+// or restart the gateway Deployment.
+func isOptionalHermesProfileName(name string) bool {
+	return name == optionalHermesProfileTSE
+}
+
+// enabledAgentProfileNames returns the sorted names of bound, non-terminating
+// AgentProfiles whose identity resolution succeeded and whose name matches a
+// built-in optional Hermes specialist template (currently `tse`). These are
+// passed to the gateway pod via KUBE_AGENTS_ENABLED_PROFILES in `mode: next`
+// so the entrypoint scaffolds and syncs their Hermes profile directories.
+func enabledAgentProfileNames(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) []string {
+	if len(profiles) == 0 {
+		return nil
+	}
+	resolutions := resolveAgentProfileIdentities(agent, profiles)
+	var names []string
+	for i := range profiles {
+		p := &profiles[i]
+		if !p.DeletionTimestamp.IsZero() || !isOptionalHermesProfileName(p.Name) {
+			continue
+		}
+		if res, ok := resolutions[p.Name]; ok && res.refused == nil {
+			names = append(names, p.Name)
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 // ReservedServiceAccountOverride returns a refusal message when

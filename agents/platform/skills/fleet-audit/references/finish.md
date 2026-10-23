@@ -74,8 +74,12 @@ gives its `started_at` and `finished_at`. A timer without its input is absent. T
   `comments could not be read`). Not a clean result; report it as
   [The clean run](clean-run.md#the-clean-run) says.
 - `{"status":"NO_FORGE","issue_url":null,…,"findings":4,"critical":2,"no_forge":"…","summary":"…"}`
-  — no forge is configured, so nothing was published; see
+  — no forge is configured, or the broker cannot reach the repository, so nothing was published; see
   [No forge configured](#no-forge-configured).
+- `{"status":"STORE_LEDGER","issue_url":null,…,"prs_opened":["…"],"ledger":"store","ledger_note":"…","summary":"…"}`
+  — the forge has no issue tracker, or no labels: the ledger is in the report store and chat, and
+  the remediation pull requests still open on the forge; see
+  [A forge with no issue tracker](#a-forge-with-no-issue-tracker).
 
 Add `--dry-run` to validate and print the rendered ledger body — and every PR body it _would_ open —
 to stdout with **zero** git or forge side effects. It applies the same grouping and the same
@@ -161,7 +165,16 @@ for the full rule.
 ### No forge configured
 
 An install with no GitOps repository registered in `$GITOPS_STATE_CONFIGMAP` (and no `--repo`) has
-no forge to write a ledger to. The audit runs anyway:
+no forge to write a ledger to. A run whose repository the broker cannot reach (the forge says that it
+does not exist, or that the credential cannot read it) is the same: its `no_forge` note names the
+repository and the reason, and the JSON line of `finish` carries them under `unreachable_repo`. The
+check is one issue listing that `start` makes through the broker (one pull request listing when the
+ledger goes to the report store: a forge with no issue tracker, or with issues and no labels), and
+`finish` follows its result.
+The run does not choose another repository, and it is never silent (`silent_ok: false`). A run for
+which several repositories are managed and none can be chosen (none has `role: gitops`) is the same
+too: its note gives the reason and the fix, and the JSON line carries it under
+`no_repository_chosen`. The audit runs anyway:
 
 - `start` skips the credential, the labels and the ledger lookup, and prints `"mode": "none"`,
   `"repo": null`, `"issue": null`, a `no_forge` note, and a `workspace` path to an empty directory. Pass that `workspace` to the collector as the SOP says. There is no repository, so
@@ -170,14 +183,61 @@ no forge to write a ledger to. The audit runs anyway:
 - Run every check as the SOP says and write the findings document as usual. A `manifest`
   remediation is still a valid way to describe a fix, but nothing opens it as a pull request.
 - `finish` validates the document as usual, then writes it to the report store instead of a ledger
-  and prints `status: "NO_FORGE"`, `issue_url: null`, `new` and `resolved` against the previous
-  no-forge run, `findings`, `critical`, the `no_forge` note, and `summary`. A previous finding the
-  collector still flags is held, as on a ledger: it stays in the store and is not resolved. If the
-  store write fails, the note and the summary say so.
+  and prints `status: "NO_FORGE"`, `issue_url: null`, `new`, `resolved`, `findings`, `critical`,
+  the `no_forge` note, and `summary`. If the store write fails, the note and the summary say so.
+- On an install with no repository, `new` and `resolved` are against the previous no-forge run, and
+  a previous finding the collector still flags is held, as on a ledger: it stays in the store and is
+  not resolved.
+- On a run whose repository could not be reached, or for which no repository could be chosen,
+  the change is unknown: `new` and `resolved` are 0, nothing is held, and `silent_ok` is false. An
+  unreachable repository's report is stored under that repository; a run with no repository chosen
+  is stored as a run with no forge.
 
 **Report.** `status: "NO_FORGE"` replaces the SOP's report lines, which all name a ledger URL that
 does not exist. `silent_ok` decides silence as usual: on a scheduled run, `silent_ok: true` → exactly
 `[SILENT]`. Otherwise, and on every on-demand run, your final response is `summary` verbatim. It
 names the most severe findings with the object each one is about, the ids held for the collector,
-the coverage gaps, and that no forge is configured. Do not report the run as
+the coverage gaps, and that no forge is configured or which repository could not be reached. Do not report the run as
 failed, and do not invent an issue URL.
+
+### A forge with no issue tracker
+
+A repository on a forge that has no issue tracker (Bitbucket), or that has issues and no labels, has
+no ledger issue: the ledger is found by its label. `start` asks the forge's `capabilities` and
+decides. The ledger goes to the report store and to chat, as with no forge, and the remediation pull
+requests still open on the forge. `start` writes the decision into the run record, and `finish`
+follows it. A `capabilities` answer that cannot be read keeps the ledger issue.
+
+- `start` clones the repository as usual and prints `"issue": null`, the `repo`, the usual `mode`
+  and `workspace`, `"ledger": "store"`, and a `ledger_note` that says why. `carried` lists the
+  findings the stored ledger carries. `pending_remediation_requests` is always empty: there is no
+  ledger thread.
+- Write the findings and the `manifest` fixes as usual. `finish` applies the same refusals and the
+  same Kustomize and declaration checks as with a ledger issue, and the sweep opens the same pull
+  requests, at most five a run. On a forge with no labels they carry the stream in their
+  description and their branch name instead of labels.
+- `finish` prints `status: "STORE_LEDGER"`, `issue_url: null`, `new` and `resolved` against the
+  previous such run, `prs_opened`, `prs_still_open`, `prs_closed`, `unaccounted`, `findings`,
+  `critical`, `"ledger": "store"`, the `ledger_note`, and `summary`. A clean run closes a stale pull
+  request only when coverage is complete and every finding the stored ledger carries is reported or
+  explained under `resolved_because` and not still flagged by the collector, as with a ledger issue.
+  If the forge refuses the listing of the remediation pull requests (too many pull requests in the
+  repository, or an unknown login), `finish` still stores the findings, opens, updates and closes
+  no pull request, and says why in `remediation_refused` and in `summary`. Such a run is never
+  silent. A previous finding the collector
+  still flags is held on the stored ledger, and the next `start` lists it in `carried`.
+- `silent_ok` follows the ledger-issue rule: nothing is wrong with the repository, so a scheduled
+  run with nothing new is silent. A run the store does not hold is never silent.
+- If the store lost the previous ledger, a clean run closes no pull request, and its
+  `coverage_gaps` says why. The store loses it when its last write failed, or when its record cannot
+  be read. A store that does not exist, or that holds only records of runs that could not reach the
+  repository in a ring that is not full, is a first run when no remediation pull request of the
+  stream is open, and a lost ledger when one is open. A new identity scheme does not lose it. It stores a record that the next run also reads as lost, so each clean
+  run after it closes nothing until a run that reports findings stores the ledger again. Such a
+  run is never silent.
+- A `/remediate` cannot be commented on a ledger. A person asks in chat, and you run `remediate` for
+  the ids they name ([remediation.md](remediation.md)).
+
+**Report.** As for `NO_FORGE`: `silent_ok` decides silence, and otherwise your final response is
+`summary` verbatim. It names the findings, the pull request links, and why the ledger is in the
+report store. Do not invent an issue URL.

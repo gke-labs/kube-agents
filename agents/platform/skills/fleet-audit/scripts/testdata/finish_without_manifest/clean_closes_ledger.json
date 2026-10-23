@@ -2,6 +2,14 @@
  "rc": 0,
  "calls": [
   [
+   "forge",
+   "capabilities"
+  ],
+  [
+   "forge",
+   "issue-list"
+  ],
+  [
    "git",
    "remote",
    "set-url",
@@ -81,6 +89,8 @@
   ]
  ],
  "cwds": [
+  null,
+  null,
   "<TMP>/gitops/compliance-audit/acme__fleet",
   "<TMP>/gitops/compliance-audit/acme__fleet",
   "<TMP>/gitops/compliance-audit/acme__fleet",
@@ -100,6 +110,14 @@
   null
  ],
  "payloads": [
+  {
+   "repository": "acme/fleet"
+  },
+  {
+   "limit": 1,
+   "repository": "acme/fleet",
+   "state": "open"
+  },
   null,
   null,
   null,
@@ -188,5 +206,5 @@
   }
  ],
  "stdout": "{\"status\": \"CLEAN\", \"issue_url\": \"https://github.com/acme/fleet/issues/42\", \"new\": 0, \"resolved\": 1, \"prs_opened\": [], \"prs_still_open\": [], \"prs_closed\": [], \"silent_ok\": false, \"partial\": false, \"coverage_gaps\": [], \"declared\": 0, \"postures_withheld\": [], \"unaccounted\": [], \"publish_s\": \"<SECONDS>\"}\n",
- "stderr": "[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge issue-list acme/fleet\n[<TS>] [FLEET-AUDIT] forge proposal-list acme/fleet\n[<TS>] [FLEET-AUDIT] forge issue-view acme/fleet #42\n[<TS>] [FLEET-AUDIT] forge issue-comment acme/fleet #42\n[<TS>] [FLEET-AUDIT] forge issue-close acme/fleet #42\n[<TS>] [FLEET-AUDIT] forge issue-update acme/fleet #42\n[<TS>] [FLEET-AUDIT] Audit compliance-audit is clean; closed issue #42.\n"
+ "stderr": "[<TS>] [FLEET-AUDIT] forge capabilities acme/fleet\n[<TS>] [FLEET-AUDIT] forge issue-list acme/fleet\n[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge label-ensure acme/fleet\n[<TS>] [FLEET-AUDIT] forge issue-list acme/fleet\n[<TS>] [FLEET-AUDIT] forge proposal-list acme/fleet\n[<TS>] [FLEET-AUDIT] forge issue-view acme/fleet #42\n[<TS>] [FLEET-AUDIT] forge issue-comment acme/fleet #42\n[<TS>] [FLEET-AUDIT] forge issue-close acme/fleet #42\n[<TS>] [FLEET-AUDIT] forge issue-update acme/fleet #42\n[<TS>] [FLEET-AUDIT] Audit compliance-audit is clean; closed issue #42.\n"
 }

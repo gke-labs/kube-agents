@@ -58,13 +58,10 @@ import pathlib
 import random
 import re
 import sys
-import urllib.error
-import urllib.parse
-import urllib.request
 
 import yaml
 
-from github_api import API_ROOT, PER_PAGE, GitHubAPI, log
+from github_api import GitHubAPI, log
 
 # The `AI Review` check run comes from the kube-agents-bot GitHub App. The name
 # alone is not enough of an identity check: any App may post a check run with
@@ -183,10 +180,6 @@ UNSUPPORTED_CONFIG = {
 # Glob syntax minimatch accepts and `glob_to_regex` does not translate. `!` is
 # only special leading the pattern; the rest are special anywhere.
 UNSUPPORTED_GLOB_CHARS = "{}[]()|\\"
-
-
-def log(message):
-    print(message, file=sys.stderr, flush=True)
 
 
 # --------------------------------------------------------------------------- #

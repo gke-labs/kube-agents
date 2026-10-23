@@ -144,15 +144,23 @@ class AgentAPIProxyTest(unittest.TestCase):
                 self.end_headers()
                 self.wfile.write(body)
 
+            def do_POST(self):  # noqa: N802
+                length = int(self.headers.get("Content-Length", "0"))
+                if length:
+                    self.rfile.read(length)
+                self.do_GET()
+
             def log_message(self, _message, *_args):
                 return
 
         self.release_second_chunk = threading.Event()
         self.second_chunk_released = False
+        self.workspace_dir = tempfile.TemporaryDirectory()
         self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
         AgentAPIProxyHandler.external_key = "external-secret"
         AgentAPIProxyHandler.upstream_key = "internal-sentinel"
         AgentAPIProxyHandler.upstream_port = self.upstream.server_port
+        AgentAPIProxyHandler.workspace_root = self.workspace_dir.name
         self.proxy = ThreadingHTTPServer(("127.0.0.1", 0), AgentAPIProxyHandler)
         for server in (self.upstream, self.proxy):
             threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -162,6 +170,31 @@ class AgentAPIProxyTest(unittest.TestCase):
         self.upstream.shutdown()
         self.proxy.server_close()
         self.upstream.server_close()
+        self.workspace_dir.cleanup()
+
+    def _seed_state_db_sessions(self, rows, profile=None):
+        import sqlite3
+
+        base = Path(self.workspace_dir.name)
+        if profile:
+            base = base / "profiles" / profile
+            base.mkdir(parents=True, exist_ok=True)
+        db_path = base / "state.db"
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS sessions ("
+                "id TEXT PRIMARY KEY, "
+                "parent_session_id TEXT, "
+                "end_reason TEXT, "
+                "model_config TEXT"
+                ")"
+            )
+            for sid, parent_id, end_reason in rows:
+                conn.execute(
+                    "INSERT OR REPLACE INTO sessions (id, parent_session_id, end_reason) VALUES (?, ?, ?)",
+                    (sid, parent_id, end_reason),
+                )
+            conn.commit()
 
     def test_replaces_external_api_key_before_forwarding(self):
         request = urllib.request.Request(
@@ -181,6 +214,111 @@ class AgentAPIProxyTest(unittest.TestCase):
             urllib.request.urlopen(request)
         self.assertEqual(401, raised.exception.code)
         self.assertEqual("", self.received_authorization)
+
+    def test_refuses_bridge_a2a_session_paths_and_headers(self):
+        self._seed_state_db_sessions(
+            [
+                ("a2a-ctx-victim", None, "compression"),
+                ("20261022_120000_child1", "a2a-ctx-victim", "compression"),
+                ("20261022_120500_child2", "20261022_120000_child1", None),
+            ]
+        )
+        self._seed_state_db_sessions(
+            [
+                ("a2a-ctx-prof-victim", None, "compression"),
+                ("20261022_121000_profchild", "a2a-ctx-prof-victim", None),
+            ],
+            profile="chat",
+        )
+        for path, extra_headers, payload in (
+            ("/api/sessions/a2a-ctx-victim/chat", {}, b"{}"),
+            ("/api/sessions/a2a-ctx-victim/chat/stream", {}, b"{}"),
+            ("/api/sessions/a2a-ctx-victim", {}, b"{}"),
+            ("/api/sessions/%612a-ctx-victim/chat", {}, b"{}"),
+            ("/p/default/api/sessions/a2a-ctx-victim/chat", {}, b"{}"),
+            ("/v1/chat/completions", {"X-Hermes-Session-Id": "a2a-ctx-victim"}, b"{}"),
+            ("/v1/responses", {"X-Hermes-Session-Key": "a2a-ctx-victim"}, b"{}"),
+            (
+                "/v1/runs",
+                {"Content-Type": "application/json"},
+                b'{"session_id": "a2a-ctx-victim", "input": "hi"}',
+            ),
+            (
+                "/p/default/v1/runs",
+                {"Content-Type": "application/json"},
+                b'{"session_id": "%612a-ctx-victim", "input": "hi"}',
+            ),
+            (
+                "/api/sessions/20261022_120000_child1/chat",
+                {},
+                b"{}",
+            ),
+            (
+                "/api/sessions/20261022_120500_child2/chat/stream",
+                {},
+                b"{}",
+            ),
+            (
+                "/p/chat/api/sessions/20261022_121000_profchild/chat",
+                {},
+                b"{}",
+            ),
+            (
+                "/v1/chat/completions",
+                {"X-Hermes-Session-Id": "20261022_120500_child2"},
+                b"{}",
+            ),
+            (
+                "/v1/runs",
+                {"Content-Type": "application/json"},
+                b'{"session_id": "20261022_120500_child2", "input": "hi"}',
+            ),
+        ):
+            with self.subTest(path=path, headers=extra_headers, payload=payload):
+                self.received_authorization = ""
+                headers = {"Authorization": "Bearer external-secret", **extra_headers}
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{self.proxy.server_port}{path}",
+                    headers=headers,
+                    data=payload,
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(request)
+                self.assertEqual(403, raised.exception.code)
+                self.assertEqual("", self.received_authorization)
+
+    def test_allows_non_a2a_session_paths_and_headers(self):
+        self._seed_state_db_sessions(
+            [
+                ("sess-parent-123", None, "compression"),
+                ("20261022_120000_non_a2a_child", "sess-parent-123", None),
+            ]
+        )
+        for path, extra_headers, method, payload in (
+            ("/api/sessions?limit=1", {}, "GET", None),
+            ("/api/sessions/k8s-evt-123/chat", {}, "POST", b"{}"),
+            ("/api/sessions/20261022_120000_non_a2a_child/chat", {}, "POST", b"{}"),
+            ("/v1/chat/completions", {"X-Hermes-Session-Id": "sess-123"}, "POST", b"{}"),
+            (
+                "/v1/runs",
+                {"Content-Type": "application/json"},
+                "POST",
+                b'{"session_id": "20261022_120000_non_a2a_child", "input": "hi"}',
+            ),
+        ):
+            with self.subTest(path=path, headers=extra_headers):
+                self.received_authorization = ""
+                headers = {"Authorization": "Bearer external-secret", **extra_headers}
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{self.proxy.server_port}{path}",
+                    headers=headers,
+                    data=payload,
+                    method=method,
+                )
+                with urllib.request.urlopen(request) as response:
+                    self.assertEqual(b"proxied", response.read())
+                self.assertEqual("Bearer internal-sentinel", self.received_authorization)
 
     def test_rejection_reaches_a_client_that_sent_a_body(self):
         # Raw socket rather than urllib: the defect is at the transport, and a
@@ -5615,6 +5753,287 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertIn("came-from-stdout", logged)
         self.assertIn("came-from-stderr", logged)
         self.assertIn("exit code 9", logged)
+
+
+# The refusal stop the hint must never trip, loaded from its file: it ships in
+# the agent image, not beside this module.
+_REFUSAL_STOP_PATH = (
+    Path(__file__).resolve().parents[3] / "deploy" / "docker" / "patches" / "permission_refusal_stop.py"
+)
+# What kubectl prints for the reads below.
+_KUBECTL_NOT_FOUND_STDERR = 'Error from server (NotFound): namespaces "seeded-reliability" not found'
+_KUBECTL_NO_RESOURCES_STDERR = "No resources found in seeded-reliability namespace."
+_KUBECTL_EMPTY_JSON_LIST = '{"apiVersion": "v1", "items": [], "kind": "List", "metadata": {"resourceVersion": ""}}'
+_KUBECTL_FOUND_STDOUT = "NAME     READY   STATUS    RESTARTS   AGE\ncheckout-gateway-0   1/1   Running   0   3d\n"
+
+
+class ContextlessKubectlHostHintTest(unittest.TestCase):
+    """A context-less kubectl read that finds nothing says it read the host (#3375)."""
+
+    HOST = "gke_demo-project_us-central1_host-cluster"
+    OTHER = "gke_demo-project_us-central1-a_seeded-a"
+
+    def setUp(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.temp_dir = Path(temp_dir.name)
+        gke_endpoint.reset_cache()
+        self.addCleanup(gke_endpoint.reset_cache)
+
+    def executor(self, stdout="", stderr="", exit_code=0):
+        """An executor whose kubectl prints `stdout`/`stderr` and exits `exit_code`.
+
+        The pool is off, so no kubeconfig is regenerated; `host_context` is the
+        operator's name for the host, which is what the hint reads.
+        """
+        executor = CommandExecutor(
+            timeout_seconds=5,
+            max_output_bytes=4096,
+            state_dir=str(self.temp_dir / "state"),
+            scoped_pool=None,
+        )
+        executor.host_context = self.HOST
+        stub_dir = self.temp_dir / "bin"
+        stub_dir.mkdir(exist_ok=True)
+        (stub_dir / "stdout").write_text(stdout, encoding="utf-8")
+        (stub_dir / "stderr").write_text(stderr, encoding="utf-8")
+        stub = stub_dir / "kubectl"
+        stub.write_text(
+            f'#!/bin/bash\ncat "{stub_dir}/stdout"\ncat "{stub_dir}/stderr" >&2\nexit {exit_code}\n',
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        executor.executables["kubectl"] = str(stub)
+        return executor
+
+    def hint_named(self, cluster):
+        return credential_proxy.KUBECTL_HOST_HINT_PREFIX + credential_proxy.KUBECTL_HOST_HINT_NAMED.format(
+            cluster=cluster
+        )
+
+    def test_a_contextless_get_that_is_not_found_names_the_host_cluster(self):
+        executor = self.executor(stderr=_KUBECTL_NOT_FOUND_STDERR, exit_code=1)
+
+        result = executor.execute(["kubectl", "get", "namespace", "seeded-reliability"])
+
+        self.assertIn(self.HOST, result.stderr)
+        self.assertIn("--context <name>", result.stderr)
+        self.assertEqual(1, result.exit_code)
+        self.assertEqual("", result.stdout)
+        self.assertEqual(
+            f"{_KUBECTL_NOT_FOUND_STDERR}\n{self.hint_named(self.HOST)}\n", result.stderr
+        )
+
+    def test_a_contextless_list_with_no_resources_gets_the_line(self):
+        executor = self.executor(stderr=_KUBECTL_NO_RESOURCES_STDERR + "\n")
+
+        result = executor.execute(["kubectl", "get", "pods", "-n", "seeded-reliability"])
+
+        self.assertIn(self.HOST, result.stderr)
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual("", result.stdout)
+        self.assertTrue(result.stderr.startswith(_KUBECTL_NO_RESOURCES_STDERR + "\n"))
+        self.assertTrue(result.stderr.endswith(self.hint_named(self.HOST) + "\n"))
+
+    def test_a_contextless_empty_json_list_keeps_its_stdout_and_gets_the_line(self):
+        executor = self.executor(stdout=_KUBECTL_EMPTY_JSON_LIST)
+
+        result = executor.execute(["kubectl", "get", "pdb", "-A", "-o", "json"])
+
+        self.assertIn(self.HOST, result.stderr)
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual(_KUBECTL_EMPTY_JSON_LIST, result.stdout)
+        self.assertEqual(self.hint_named(self.HOST) + "\n", result.stderr)
+
+    def test_a_contextless_read_that_found_something_is_unchanged(self):
+        executor = self.executor(stdout=_KUBECTL_FOUND_STDOUT, stderr="Warning: something\n")
+
+        result = executor.execute(["kubectl", "get", "pods", "-n", "seeded-reliability"])
+
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual(_KUBECTL_FOUND_STDOUT, result.stdout)
+        self.assertEqual("Warning: something\n", result.stderr)
+
+    def test_a_non_empty_json_list_is_unchanged(self):
+        listed = json.dumps({"kind": "List", "items": [{"kind": "Pod"}]})
+        executor = self.executor(stdout=listed)
+
+        result = executor.execute(["kubectl", "get", "pods", "-o", "json"])
+
+        self.assertEqual(listed, result.stdout)
+        self.assertEqual("", result.stderr)
+
+    def test_a_read_with_context_that_is_not_found_is_unchanged(self):
+        for argv in (
+            ["kubectl", "--context", self.OTHER, "get", "namespace", "seeded-reliability"],
+            ["kubectl", f"--context={self.OTHER}", "get", "namespace", "seeded-reliability"],
+        ):
+            with self.subTest(argv=argv):
+                executor = self.executor(stderr=_KUBECTL_NOT_FOUND_STDERR, exit_code=1)
+                result = executor.execute(argv)
+                self.assertEqual(1, result.exit_code)
+                self.assertEqual(_KUBECTL_NOT_FOUND_STDERR, result.stderr)
+
+    def test_a_read_through_a_forwarded_kubeconfig_is_unchanged(self):
+        # The shim sends KUBECONFIG (or the shell's pin, or a GKE `--context`)
+        # as `kubeconfig_context`; that read named its cluster.
+        executor = self.executor(stderr=_KUBECTL_NOT_FOUND_STDERR, exit_code=1)
+
+        with mock.patch.object(executor, "_resolve_kubeconfig", return_value=None):
+            result = executor.execute(
+                ["kubectl", "get", "namespace", "seeded-reliability"], kubeconfig_context=self.OTHER
+            )
+
+        self.assertEqual(_KUBECTL_NOT_FOUND_STDERR, result.stderr)
+
+    def test_other_empty_list_shapes_get_the_line(self):
+        for stdout in (
+            "apiVersion: v1\nitems: []\nkind: List\nmetadata:\n  resourceVersion: \"\"\n",
+            "[]",
+        ):
+            with self.subTest(stdout=stdout):
+                executor = self.executor(stdout=stdout)
+                result = executor.execute(["kubectl", "get", "pods", "-o", "yaml"])
+                self.assertEqual(stdout, result.stdout)
+                self.assertEqual(self.hint_named(self.HOST) + "\n", result.stderr)
+
+    def test_an_object_with_an_empty_items_field_is_not_an_empty_list(self):
+        for stdout in (
+            json.dumps({"kind": "Widget", "items": []}),
+            "apiVersion: example.com/v1\nitems: []\nkind: Widget\n",
+        ):
+            with self.subTest(stdout=stdout):
+                executor = self.executor(stdout=stdout)
+                result = executor.execute(["kubectl", "get", "widget", "w", "-o", "yaml"])
+                self.assertEqual("", result.stderr)
+
+    def test_a_verb_that_is_not_a_lookup_is_unchanged(self):
+        # api-resources and version print nothing about objects on a cluster.
+        for argv in (
+            ["kubectl", "api-resources", "--api-group=nope"],
+            ["kubectl", "auth", "can-i", "get", "pods"],
+        ):
+            with self.subTest(argv=argv):
+                executor = self.executor()
+                result = executor.execute(argv)
+                self.assertEqual("", result.stderr)
+
+    def test_a_cut_or_timed_out_result_is_unchanged(self):
+        executor = self.executor(stderr=_KUBECTL_NOT_FOUND_STDERR, exit_code=1)
+        for field in ("truncated", "timed_out", "abandoned"):
+            with self.subTest(field=field):
+                came = credential_proxy.ExecutionResult(
+                    exit_code=1, stdout="", stderr=_KUBECTL_NOT_FOUND_STDERR,
+                    duration_ms=1, truncated=False, timed_out=False,
+                )
+                came = replace(came, **{field: True})
+                self.assertIs(came, executor._with_host_hint(["kubectl", "get", "ns", "x"], came))
+
+    def test_an_empty_context_value_names_no_cluster(self):
+        # `--context "$CTX"` with CTX unset: kubectl reads current-context, the host.
+        for argv in (
+            ["kubectl", "--context=", "get", "namespace", "seeded-reliability"],
+            ["kubectl", "--context", "", "get", "namespace", "seeded-reliability"],
+        ):
+            with self.subTest(argv=argv):
+                executor = self.executor(stderr=_KUBECTL_NOT_FOUND_STDERR, exit_code=1)
+                result = executor.execute(argv)
+                self.assertIn(self.hint_named(self.HOST), result.stderr)
+                self.assertEqual(1, result.exit_code)
+
+    def test_a_found_object_whose_kind_ends_in_list_is_not_an_empty_answer(self):
+        # A CRD kind like AllowList with a top-level `items` field of its own.
+        for stdout in (
+            json.dumps({"apiVersion": "example.com/v1", "kind": "AllowList", "items": []}),
+            "apiVersion: example.com/v1\nitems: []\nkind: AllowList\n",
+        ):
+            with self.subTest(stdout=stdout):
+                executor = self.executor(stdout=stdout)
+                result = executor.execute(["kubectl", "get", "allowlist", "default-allow", "-o", "json"])
+                self.assertEqual(stdout, result.stdout)
+                self.assertEqual("", result.stderr)
+
+    def test_a_header_only_custom_columns_read_gets_the_line(self):
+        for flag in (
+            ["-o", "custom-columns=NAME:.metadata.name"],
+            ["-ocustom-columns=NAME:.metadata.name"],
+            ["--output=custom-columns=NAME:.metadata.name"],
+        ):
+            with self.subTest(flag=flag):
+                executor = self.executor(stdout="NAME\n")
+                result = executor.execute(["kubectl", "get", "pods", "-n", "seeded-reliability", *flag])
+                self.assertEqual("NAME\n", result.stdout)
+                self.assertEqual(self.hint_named(self.HOST) + "\n", result.stderr)
+
+    def test_a_custom_columns_read_with_rows_or_a_plain_one_line_read_is_unchanged(self):
+        for argv, stdout in (
+            (["kubectl", "get", "pods", "-o", "custom-columns=NAME:.metadata.name"], "NAME\ncheckout-0\n"),
+            (["kubectl", "get", "pod", "checkout-0", "-o", "name"], "pod/checkout-0\n"),
+        ):
+            with self.subTest(argv=argv):
+                executor = self.executor(stdout=stdout)
+                result = executor.execute(argv)
+                self.assertEqual("", result.stderr)
+
+    def test_a_no_headers_custom_columns_read_with_one_row_is_unchanged(self):
+        # --no-headers drops the header, so one line is a found row (lapis2002 on #3557).
+        for no_headers in (["--no-headers"], ["--no-headers=true"]):
+            with self.subTest(no_headers=no_headers):
+                stdout = "v1.35.8-gke.1\n"
+                executor = self.executor(stdout=stdout)
+                result = executor.execute(
+                    ["kubectl", "get", "node", "x", "-o", "custom-columns=V:.status.nodeInfo.kubeletVersion", *no_headers]
+                )
+                self.assertEqual(stdout, result.stdout)
+                self.assertEqual("", result.stderr)
+
+    def test_a_no_headers_false_custom_columns_read_still_reads_a_lone_header(self):
+        executor = self.executor(stdout="NAME\n")
+        result = executor.execute(
+            ["kubectl", "get", "pods", "-o", "custom-columns=NAME:.metadata.name", "--no-headers=false"]
+        )
+        self.assertEqual(self.hint_named(self.HOST) + "\n", result.stderr)
+
+    def test_a_failure_that_is_not_not_found_is_unchanged(self):
+        stderr = 'error: the server doesn\'t have a resource type "pdbx"'
+        executor = self.executor(stderr=stderr, exit_code=1)
+
+        result = executor.execute(["kubectl", "get", "pdbx"])
+
+        self.assertEqual(stderr, result.stderr)
+
+    def test_without_a_host_name_the_line_still_says_where_it_read(self):
+        executor = self.executor(stderr=_KUBECTL_NOT_FOUND_STDERR, exit_code=1)
+        executor.host_context = ""
+
+        result = executor.execute(["kubectl", "describe", "namespace", "seeded-reliability"])
+
+        self.assertIn(
+            credential_proxy.KUBECTL_HOST_HINT_PREFIX + credential_proxy.KUBECTL_HOST_HINT_UNNAMED,
+            result.stderr,
+        )
+
+    def test_the_line_is_never_read_as_a_refusal_or_a_halt(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("permission_refusal_stop", _REFUSAL_STOP_PATH)
+        stop = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(stop)
+        command = {"command": "kubectl get namespace seeded-reliability"}
+        for hint in (self.hint_named(self.HOST), credential_proxy.KUBECTL_HOST_HINT_PREFIX
+                     + credential_proxy.KUBECTL_HOST_HINT_UNNAMED):
+            for text in (hint, f"{_KUBECTL_NOT_FOUND_STDERR}\n{hint}\n",
+                         json.dumps({"output": f"{_KUBECTL_NOT_FOUND_STDERR}\n{hint}\n", "exit_code": 1})):
+                with self.subTest(text=text):
+                    for failed in (True, False):
+                        self.assertIsNone(stop.classify_refusal(command, text, failed=failed))
+                    self.assertIsNone(stop.definitive_block(text))
+                    for pattern in (stop._POLICY_ACTION_RE, stop._RULE_LINE_RE, stop._VERB_LINE_RE,
+                                    stop._RENDER_LINE_RE, stop._API_DENIED_RE):
+                        self.assertIsNone(pattern.search(text), pattern.pattern)
+            # Nor in the proxy's own refusal vocabulary.
+            for word in ("refus", "denied", "forbidden", "not permitted", "blocked"):
+                self.assertNotIn(word, hint.lower())
 
 
 class GkeContextTest(unittest.TestCase):

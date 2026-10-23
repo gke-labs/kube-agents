@@ -54,6 +54,22 @@ spec:
             spec:
               description: AgentProfileSpec defines the desired state of AgentProfile.
               properties:
+                allowedTiers:
+                  description: |-
+                    AllowedTiers are the tiers this profile may run at (#3660, "Tiers and
+                    identity"). A task runs at its requester's tier, and the dispatcher
+                    refuses one whose tier is not listed here; a pinned production profile
+                    might allow only read. Tier is authority, so it lives on the CR, never
+                    in the persona. Absent means read alone (AllowedTierList).
+                  items:
+                    enum:
+                      - read
+                      - unattended
+                    type: string
+                  maxItems: 2
+                  minItems: 1
+                  type: array
+                  x-kubernetes-list-type: set
                 bus:
                   description: |-
                     Bus holds topic grants beyond the task subjects every executor gets.
@@ -184,8 +200,9 @@ spec:
                   type: object
                 persona:
                   description: |-
-                    Persona is the OCI artifact holding SOUL.md, AGENTS.md, skills and the
-                    persona config, mounted read-only via image volume.
+                    Persona is the OCI artifact holding the persona (persona.yaml,
+                    instructions.md, skills/, mcp.yaml) under its /files directory, mounted
+                    read-only at /persona.
                   properties:
                     image:
                       description: Image is the OCI reference of the persona artifact.
@@ -247,6 +264,50 @@ spec:
                     - limits
                     - requests
                   type: object
+                tools:
+                  description: |-
+                    Tools are OCI images of command-line tools for the profile's pods. Each
+                    is mounted read-only at /opt/tools/<name> and its bin/ directory is put
+                    on PATH, in list order, so one tools image serves every harness. A tools
+                    image holds no credentials: a tool that needs them (kubectl or gcloud
+                    against the fleet, a forge CLI) gets them from the broker, per task.
+                  items:
+                    description: AgentProfileTool is one command-line tools image.
+                    properties:
+                      image:
+                        description: |-
+                          Image is the OCI reference of the tools image. Its payload is the image's
+                          /files directory, mounted at /opt/tools/<name>; binaries go in
+                          /files/bin.
+                        minLength: 1
+                        type: string
+                      imagePullPolicy:
+                        description: |-
+                          ImagePullPolicy is the pull policy for the image. Absent means
+                          IfNotPresent.
+                        enum:
+                          - Always
+                          - IfNotPresent
+                          - Never
+                        type: string
+                      name:
+                        description: |-
+                          Name is the tool's directory under /opt/tools: a DNS-1123 label unique
+                          in the list, at most 24 characters so the staging init container's name
+                          ("stage-tool-<name>") stays within the 35 GKE Autopilot allows.
+                        maxLength: 24
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]{0,22}[a-z0-9])?$
+                        type: string
+                    required:
+                      - image
+                      - name
+                    type: object
+                  maxItems: 16
+                  type: array
+                  x-kubernetes-list-map-keys:
+                    - name
+                  x-kubernetes-list-type: map
               required:
                 - concurrency
                 - description

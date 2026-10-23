@@ -2569,6 +2569,51 @@ print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-cent
         self.assertIn("Managed OpenTelemetry Scope:", out)
         self.assertIn("gcloud container clusters update test-cluster --location us-central1 --project test-proj --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS", out)
 
+    def test_a_relative_install_env_is_made_absolute_against_the_operators_directory(self):
+        """Before any cd: a run with no checkout clones one and cds into it, and
+        every later read, write and printed command must still name the
+        operator's file."""
+        with tempfile.TemporaryDirectory() as tmp:
+            work = pathlib.Path(tmp).resolve() / "work"
+            work.mkdir()
+            (work / "prod.env").write_text("PROJECT_ID=p\n")
+            body = (f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}" >/dev/null 2>&1\n'
+                    'echo "FILE=$INSTALL_ENV_FILE"\n')
+            env = get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": "prod.env"})
+            proc = subprocess.run(["bash", "-c", body], capture_output=True, text=True, env=env,
+                                  cwd=str(work), stdin=subprocess.DEVNULL, timeout=_INSTALLER_RUN_TIMEOUT_SECONDS)
+        self.assertIn(f"FILE={work}/prod.env", proc.stdout, proc.stderr)
+
+    def test_print_generate_only_handoff_names_the_chat_checklist_after_the_apply(self):
+        """The handoff is the last thing this route prints, and no apply it
+        describes sets up the chat app."""
+        call = ('print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-central1" '
+                '"/tmp/test-repo/terraform/examples/full-install/terraform.tfvars"\n')
+        base = (f'{_SOURCE_INSTALLER_COMMON}\nPROJECT_ID="test-proj"\nCLUSTER_NAME="test-cluster"\n'
+                'INSTALL_ENV_FILE="/tmp/test/install.env"\n')
+        ghes = 'GITOPS_HOST=ghe.example.com GITOPS_CA_SECRET=ghe-ca\n'
+        printers = _INSTALLER_COMMON.parent
+        gchat = f"KUBE_AGENTS_INSTALL_ENV=/tmp/test/install.env bash {printers}/print_instructions_gchat.sh"
+        slack = f"KUBE_AGENTS_INSTALL_ENV=/tmp/test/install.env bash {printers}/print_instructions_slack.sh"
+        for keys, step, shown in (
+            ("GOOGLE_CHAT_ENABLED=yes SLACK_ENABLED=false\n", "4.", (gchat,)),
+            ("GOOGLE_CHAT_ENABLED=true SLACK_ENABLED=true\n" + ghes, "5.", (gchat, slack)),
+            ("GOOGLE_CHAT_ENABLED=false SLACK_ENABLED=false\n", None, ()),
+        ):
+            with self.subTest(keys=keys):
+                proc = self._run_install_func(base + keys + call)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                out = proc.stdout
+                if step is None:
+                    self.assertNotIn("setup checklist", out)
+                    self.assertNotIn("print_instructions_", out)
+                    continue
+                heading = out.index(f"{step} After the apply, the chat app's setup checklist")
+                for command in shown:
+                    self.assertLess(heading, out.index(command))
+                for command in {gchat, slack} - set(shown):
+                    self.assertNotIn(command, out)
+
     def test_write_json_report_includes_generate_only(self):
         """Verifies write_json_report outputs generate_only boolean."""
         cmd = """
@@ -5651,6 +5696,79 @@ class BootstrapRecordsIdentityKeysOnlyWhenSetTest(unittest.TestCase):
         self.assertRegex(out, re.compile(r"^GKE_DB_KMS_KEY=key-two$", re.MULTILINE))
 
 
+class PlatformAgentStorageSizePersistsThroughInstallEnvTest(unittest.TestCase):
+    """A size a first install inherits from the shell is recorded in install.env.
+
+    Every later run drops an inherited PLATFORM_AGENT_STORAGE_SIZE and reads
+    the file alone, so a size the first run applied but did not record would
+    read as the default on the next run, which drops the field and leaves
+    the claims larger than the CR says. Unset, nothing is recorded, so later
+    runs follow the default.
+    """
+
+    def _bootstrap_with_export(self, tmp, export_line):
+        dest = pathlib.Path(tmp) / "new.install.env"
+        loaded = pathlib.Path(tmp) / "loaded.install.env"
+        loaded.write_text("")
+        loaded.chmod(0o600)
+        proc = subprocess.run(
+            ["bash", "-c",
+             f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+             'source scripts/installer/installer_common.sh\n'
+             'resolve_shared_defaults\n'
+             'PARAM_DRY_RUN=false; PARAM_MEMORY=file\n'
+             f'{export_line}\n'
+             f'bootstrap_install_env_file "{dest}" some-tag >/dev/null'],
+            capture_output=True, text=True,
+            env=self._env({
+                "KUBE_AGENTS_INSTALL_ENV": str(loaded),
+                "PROJECT_ID": "p", "CLUSTER_NAME": "c", "REGION": "us-central1",
+            }),
+            cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        self.assertTrue(dest.exists(), proc.stderr + proc.stdout)
+        return dest
+
+    @staticmethod
+    def _env(overrides):
+        env = get_isolated_test_env(overrides=overrides)
+        env.pop("PLATFORM_AGENT_STORAGE_SIZE", None)
+        env.update(overrides)
+        return env
+
+    def test_an_inherited_size_is_recorded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(tmp, 'export PLATFORM_AGENT_STORAGE_SIZE="80Gi"')
+            self.assertIn("PLATFORM_AGENT_STORAGE_SIZE=80Gi\n", dest.read_text())
+
+    def test_an_unset_size_records_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for export_line in ("unset PLATFORM_AGENT_STORAGE_SIZE", 'export PLATFORM_AGENT_STORAGE_SIZE=""'):
+                with self.subTest(export_line=export_line):
+                    dest = self._bootstrap_with_export(tmp, export_line)
+                    self.assertNotIn("PLATFORM_AGENT_STORAGE_SIZE", dest.read_text())
+                    dest.unlink()
+
+    def test_a_later_run_drops_an_inherited_size(self):
+        # Sourcing install.sh over an install.env that exists unsets the
+        # inherited value, as it does PLATFORM_AGENT_MODE.
+        with tempfile.TemporaryDirectory() as tmp:
+            loaded = pathlib.Path(tmp) / "loaded.install.env"
+            loaded.write_text("PROJECT_ID=p\n")
+            loaded.chmod(0o600)
+            proc = subprocess.run(
+                ["bash", "-c",
+                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                 'echo "SIZE=[${PLATFORM_AGENT_STORAGE_SIZE:-}]"'],
+                capture_output=True, text=True,
+                env=self._env({"KUBE_AGENTS_INSTALL_ENV": str(loaded), "PLATFORM_AGENT_STORAGE_SIZE": "80Gi"}),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertIn("SIZE=[]", proc.stdout)
+
+
 class ModelMaxTokensPersistsThroughInstallEnvTest(unittest.TestCase):
     """The flag on the first run, the file on every later one.
 
@@ -7008,9 +7126,12 @@ class PlatformAgentModeTest(unittest.TestCase):
         block = text[summary : text.index('print_step "12.', summary)]
         self.assertIn('if [ "$platform_agent_mode" = "next" ]; then', block)
         self.assertIn("Component Stack (spec.mode):${C_RESET} ${C_BOLD}next${C_RESET} (the NATS bus and the A2A gateway", block)
-        # A Slack-only next install is told what it gives up, and how to keep it.
-        self.assertIn('if slack_moves_to_a2a_gateway "$platform_agent_mode" "$slack_enabled" "$google_chat_enabled"; then', block)
-        self.assertIn("Today's stack keeps the plan card.", block)
+        # The gateway draws the plan card under next, so the next branch prints the mode line and
+        # nothing else: no warning, and no Slack-only caveat, however it is worded.
+        next_branch = block[block.index('if [ "$platform_agent_mode" = "next" ]; then') : block.index("\n  else\n")]
+        self.assertEqual(next_branch.count("echo -e"), 1, next_branch)
+        self.assertNotIn("C_YELLOW", next_branch)
+        self.assertNotIn("slack_moves_to_a2a_gateway", next_branch)
         self.assertIn("Component Stack (spec.mode):${C_RESET} ${platform_agent_mode}", block)
 
     def test_a_mirrored_next_install_is_told_the_bus_images_are_not_mirrored(self):
@@ -7562,7 +7683,7 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
                  "enable_gvisor enable_webui gemini_api_key github_app_id github_org github_repo "
                  "google_chat_home_channel image_tag kms_key kms_keyring litellm_env_secret_name model_default_name "
                  "model_provider openai_api_key openai_compatible_api_base openai_compatible_api_key openai_compatible_ca_secret_name "
-                 "openai_compatible_egress_cidrs openai_compatible_target_port permission_set project_id region "
+                 "openai_compatible_egress_cidrs openai_compatible_target_port permission_set project_id project_number region "
                  "repo_dir vertex_location vertex_project_id").split()
         stubs = (
             "resolve_effective_image_tag() { :; }\nvalidate_immutable_ref() { :; }\nverify_local_source_ref() { :; }\n"
@@ -7573,6 +7694,9 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
             "announce_platform_agent_mode_for_apply() { :; }\n"
             "check_scope_container_access() { :; }\nenable_scope_selector_apis() { :; }\n"
             'apply_crd_upgrades() { echo "APPLIED crds"; }\nrun_lifecycle_apply() { echo "APPLIED terraform"; }\n'
+            # The arm's one prompt reads /dev/tty, which this runner does not
+            # detach from.
+            'prompt_read() { echo "PROMPTED $1"; }\n'
         )
         content = "PROJECT_ID=p\nREGION=r\nPLATFORM_AGENT_MODE=next\nSLACK_ENABLED=true\nGOOGLE_CHAT_ENABLED=false\n"
         with tempfile.TemporaryDirectory() as tmp:
@@ -7645,6 +7769,87 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         out = proc.stdout + proc.stderr
         self.assertIn("APPLIED terraform", out)
         self.assertEqual(r["leftovers"], [], out)
+
+
+    _MENU_CLEAN_GENERATOR = "write_tfvars_from_state() { echo generated > \"$1\"; }\n"
+    # Records what the arm hands the checklist helper, and prints what the
+    # helper would: something only when a chat platform is on.
+    _MENU_CHECKLIST_SPY = (
+        'print_chat_setup_checklists() { echo "CHECKLIST mode=$1 number=[${PROJECT_NUMBER:-}]"; '
+        'CHAT_SETUP_CHECKLIST_PRINTED=false; '
+        'if is_truthy "${GOOGLE_CHAT_ENABLED:-}" || is_truthy "${SLACK_ENABLED:-}"; then CHAT_SETUP_CHECKLIST_PRINTED=true; fi; }\n'
+        'gcloud() { if [ "$1 $2" = "projects describe" ]; then echo 123456789012; fi; }\n'
+    )
+
+    def _menu_checklist(self, setup):
+        """The arm called bare, as the menu's case statement calls it."""
+        proc, _ = self._menu_apply(self._MENU_CLEAN_GENERATOR,
+                                   call=f'{self._MENU_CHECKLIST_SPY}{setup}\n_menu_apply; echo "rc=$?"\n')
+        return proc.stdout + proc.stderr
+
+    def test_the_menu_prints_the_chat_checklist_after_its_apply(self):
+        out = self._menu_checklist("google_chat_enabled=true PLATFORM_AGENT_MODE_AFTER_APPLY=today")
+        self.assertIn("rc=0", out)
+        applied = out.index("APPLIED terraform")
+        checklist = out.index("CHECKLIST mode=today number=[123456789012]")
+        self.assertLess(applied, checklist)
+        self.assertLess(checklist, out.index("kubectl rollout status deployment/platform-agent-gateway "))
+        self.assertNotIn("platform-agent-a2a-gateway", out)
+        self.assertLess(checklist, out.index("PROMPTED Press Enter to return to the control panel"))
+
+    def test_the_menu_names_the_deployment_that_answers_each_platform(self):
+        for setup, waits, skips in (
+            # Under next Google Chat holds the A2A gateway, and Slack beside it stays on the agent.
+            ("google_chat_enabled=true slack_enabled=false PLATFORM_AGENT_MODE_AFTER_APPLY=next",
+             ("deployment/platform-agent-a2a-gateway ",), ("deployment/platform-agent-gateway ",)),
+            ("google_chat_enabled=true slack_enabled=true PLATFORM_AGENT_MODE_AFTER_APPLY=next",
+             ("deployment/platform-agent-a2a-gateway ", "deployment/platform-agent-gateway "), ()),
+            ("google_chat_enabled=false slack_enabled=true PLATFORM_AGENT_MODE_AFTER_APPLY=next",
+             ("deployment/platform-agent-a2a-gateway ",), ("deployment/platform-agent-gateway ",)),
+            ("google_chat_enabled=false slack_enabled=true PLATFORM_AGENT_MODE_AFTER_APPLY=today",
+             ("deployment/platform-agent-gateway ",), ("deployment/platform-agent-a2a-gateway ",)),
+        ):
+            with self.subTest(setup=setup):
+                out = self._menu_checklist(setup)
+                self.assertIn("rc=0", out)
+                for deployment in waits:
+                    self.assertIn(f"kubectl rollout status {deployment}", out)
+                for deployment in skips:
+                    self.assertNotIn(f"kubectl rollout status {deployment}", out)
+
+    def test_the_menu_reads_the_project_number_instead_of_inheriting_it(self):
+        out = self._menu_checklist('google_chat_enabled=true\nexport PROJECT_NUMBER=999\n'
+                                   'gcloud() { return 1; }')
+        self.assertIn("rc=0", out)
+        self.assertIn("CHECKLIST mode=next number=[]", out)
+
+    def test_the_menu_reads_google_chat_on_the_way_the_generator_does(self):
+        out = self._menu_checklist("google_chat_enabled=yes slack_enabled=false")
+        self.assertIn("number=[123456789012]", out)
+        self.assertIn("PROMPTED", out)
+
+    def test_the_menu_with_no_chat_platform_neither_waits_nor_reads_the_project(self):
+        # And with no mode after the apply on record, the mode install.env sets.
+        out = self._menu_checklist('google_chat_enabled=false slack_enabled=false project_number="" PLATFORM_AGENT_MODE_AFTER_APPLY=""')
+        self.assertIn("rc=0", out)
+        self.assertIn("CHECKLIST mode=next number=[]", out)
+        self.assertNotIn("PROMPTED", out)
+        self.assertNotIn("rollout status", out)
+
+    def test_the_menu_survives_end_of_input_at_its_prompt(self):
+        # Ctrl-D: read fails, and a bare call under the ERR trap would turn a
+        # finished apply into a failed run.
+        out = self._menu_checklist('google_chat_enabled=true\nprompt_read() { return 1; }')
+        self.assertIn("rc=0", out)
+
+    def test_the_menu_prints_no_checklist_when_its_apply_is_refused(self):
+        proc, _ = self._menu_apply(self._MENU_GENERATOR_RECOVERS_A_LIST,
+                                   call=f'{self._MENU_CHECKLIST_SPY}'
+                                        'rc=0; _menu_apply || rc=$?; echo "rc=$rc"\n')
+        out = proc.stdout + proc.stderr
+        self.assertIn("rc=1", out)
+        self.assertNotIn("CHECKLIST", out)
+        self.assertNotIn("PROMPTED", out)
 
 
 class FrontDoorsAgreeOnTheRepositoryTest(unittest.TestCase):
@@ -8898,6 +9103,11 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                             out,
                         )
                         self.assertLess(warning, out.index("Provisioning paused by user"))
+                        # After the lines to add: the printer reads them.
+                        self.assertLess(out.index("first add these lines"),
+                                        out.index(f"KUBE_AGENTS_INSTALL_ENV={path} bash "))
+                        self.assertIn("/scripts/installer/print_instructions_slack.sh", out)
+                        self.assertNotIn("print_instructions_gchat.sh", out)
                         # The file is as it was, so nothing says it was saved.
                         self.assertNotIn("saved", out)
                         for token in ("xoxb-typed", "xapp-typed", "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"):
@@ -12345,7 +12555,7 @@ class NoChatTerminalAccessTest(unittest.TestCase):
         the feature looking present while nobody sees it, so the second call is
         pinned separately from the first.
         """
-        banner = self.source.index("print_instructions_slack.sh")
+        banner = self.source.index('\n  print_chat_setup_checklists "${PLATFORM_AGENT_MODE_AFTER_APPLY:-$platform_agent_mode}"\n')
         self.assertLess(
             banner,
             self.source.rindex("_prompt_no_chat_enabled"),

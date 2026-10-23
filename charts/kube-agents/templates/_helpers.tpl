@@ -720,13 +720,14 @@ Takes a dict of provider, model, callbacks, maxTokens (optional; 0 or absent
 renders no max_tokens) and reasoningEffort (optional; empty or absent renders
 no reasoning_effort), plus apiBase and sslVerify (optional; absent renders
 neither key), which only openai_compatible passes.
+callbacks is the formatted list of LiteLLM callbacks, built by the caller.
 */}}
 {{- define "kube-agents.litellmConfig" -}}
 {{- /*
   max_tokens on every alias when .maxTokens is above zero, and no key at all
-  otherwise, so the default render matches the kustomize base
-  (k8s-operator/config/integrations/litellm/base/config.yaml), which carries
-  no such key on purpose. One value for all three aliases: they are one
+  otherwise, so the default render adds no key the kustomize base
+  (k8s-operator/config/integrations/litellm/base/config.yaml) lacks beyond the
+  Gemini thinking key below; the base carries no max_tokens on purpose. One value for all three aliases: they are one
   upstream model, and the budget is the backend's property, not the alias's.
   LiteLLM's router spreads litellm_params underneath the request's own
   arguments, so this is what a request that names no max_tokens gets, not a
@@ -745,6 +746,38 @@ neither key), which only openai_compatible passes.
   because Vertex AI refuses it on Gemini 3.x Flash (see the auxiliary block in
   deploy/shared/defaults/config.yaml).
 */}}
+{{- /*
+  thinking: {type: enabled} on every alias for a Gemini model that thinks, so
+  its thoughts come back as thought parts (reasoning_content) rather than not
+  at all. Gemini thinks by default but returns its thoughts only when the
+  request sets thinkingConfig.includeThoughts. With that off, Gemini 3.x has
+  been seen writing its reasoning into the answer instead, under a first line
+  `thought`, where nothing downstream can tell it from the answer; asking for
+  the thoughts gives them a channel of their own. Of the
+  settings LiteLLM maps to includeThoughts, this is the one that changes
+  nothing else: with no budget_tokens, LiteLLM v1.106.0
+  (VertexGeminiConfig._map_thinking_param) sends includeThoughts alone on
+  Gemini 3.x, no thinkingLevel, so the model keeps its own depth; on 2.5 it
+  sends no thinkingBudget either.
+
+  Only for a Gemini model that thinks: 2.5, 3.x on, and the -latest aliases
+  LiteLLM counts as 3.x, through gemini or vertex_ai, the name read from its
+  last path segment so a Model Garden path counts. LiteLLM refuses thinking on
+  a model it does not treat as a reasoning model (gemini-2.0-flash, gemma-*;
+  also the 2.5 TTS and computer-use previews, which nobody runs an agent on)
+  and on Claude it would turn thinking on, so every other render stays
+  byte-identical. Left out when .reasoningEffort is set: LiteLLM maps that to
+  includeThoughts as well, and the two on one deployment fail every Gemini 3.x
+  request (thinkingLevel beside a thinking param); on 2.5 the thinking key
+  would drop the effort's thinkingBudget. A request that names its own reasoning_effort gets this key dropped
+  by LiteLLM's router (_deployment_params_with_request_reasoning_override),
+  and its effort maps to includeThoughts too. The kustomize base carries no
+  such key: it picks an overlay by provider alone and also serves openai,
+  which refuses the parameter.
+*/}}
+{{- $geminiThinkingModelPattern := "^gemini-(2[.]5|[3-9]|(pro|flash|flash-lite)-latest$)" -}}
+{{- $geminiThinkingModel := regexMatch $geminiThinkingModelPattern (base .model) -}}
+{{- $geminiThoughts := and (or (eq .provider "gemini") (eq .provider "vertex_ai")) $geminiThinkingModel (not .reasoningEffort) -}}
 {{- /*
   Recent Claude models (Opus 5 among them) answer temperature, top_p and top_k
   with a 400 ("`temperature` is deprecated for this model"), and LiteLLM
@@ -793,6 +826,9 @@ model_list:
       {{- with .reasoningEffort }}
       reasoning_effort: {{ . | quote }}
       {{- end }}
+      {{- if $geminiThoughts }}
+      thinking: {"type": "enabled"}
+      {{- end }}
       {{- if $claudeDrop }}
       additional_drop_params: ["temperature", "top_p", "top_k"]
       {{- end }}
@@ -811,6 +847,9 @@ model_list:
       {{- with .reasoningEffort }}
       reasoning_effort: {{ . | quote }}
       {{- end }}
+      {{- if $geminiThoughts }}
+      thinking: {"type": "enabled"}
+      {{- end }}
       {{- if $claudeDrop }}
       additional_drop_params: ["temperature", "top_p", "top_k"]
       {{- end }}
@@ -828,6 +867,9 @@ model_list:
       {{- end }}
       {{- with .reasoningEffort }}
       reasoning_effort: {{ . | quote }}
+      {{- end }}
+      {{- if $geminiThoughts }}
+      thinking: {"type": "enabled"}
       {{- end }}
       {{- if $claudeDrop }}
       additional_drop_params: ["temperature", "top_p", "top_k"]
@@ -1935,7 +1977,7 @@ The defaults carry no ephemeral-storage request because the operator renders non
 {{- if and .Values.platformAgent.enabled .Values.platformAgent.cleanupHook.enabled -}}
   {{- /* Pre-delete hook Job in templates/platform-agent-cr-cleanup.yaml: runs at helm uninstall
          while every release pod still exists, so quota admission needs headroom for it. */ -}}
-  {{- $cleanupRes := dict "resources" (dict "requests" (dict "cpu" "50m" "memory" "64Mi") "limits" (dict "cpu" "200m" "memory" "128Mi")) -}}
+  {{- $cleanupRes := dict "resources" (dict "requests" (dict "cpu" "50m" "memory" "64Mi" "ephemeral-storage" "1088Mi") "limits" (dict "cpu" "200m" "memory" "128Mi" "ephemeral-storage" "1088Mi")) -}}
   {{- $chartWorkloads = append $chartWorkloads (dict "values" $cleanupRes "pods" 1 "surges" false) -}}
 {{- end -}}
 
@@ -2161,6 +2203,21 @@ The defaults carry no ephemeral-storage request because the operator renders non
   {{- $storage := (index $op "storage") | default dict -}}
   {{- $reqPvc = add $reqPvc ($storage.persistentVolumeClaims | default 0 | int64) -}}
   {{- $reqStorage = add $reqStorage ($storage.storageBytesRequest | default 0 | int64) -}}
+  {{- /* platformAgent.storage.size resizes the agent's data claim and the sandbox's data
+         claim together, and footprint.yaml counts each of them at the operator default.
+         So each claim moves by (size - default): dataClaims x the difference, which is
+         negative for a size below the default. Absent keys mean a footprint.yaml from
+         before them, which would leave the claims at the default in silence.
+         satMul/satAdd, as above: parseBytes clamps an oversized size to MaxInt64,
+         and dataClaims times that would wrap the total negative. Both take a
+         negative delta. */ -}}
+  {{- with (.Values.platformAgent.storage | default dict).size -}}
+    {{- if not (and (hasKey $storage "dataClaims") (hasKey $storage "dataClaimBytesRequest")) -}}
+      {{- fail "quota preflight: footprint.yaml has no dataClaims or dataClaimBytesRequest, so platformAgent.storage.size cannot be counted. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
+    {{- end -}}
+    {{- $dataClaimDelta := sub (include "kube-agents.parseBytes" . | int64) ($storage.dataClaimBytesRequest | int64) -}}
+    {{- $reqStorage = include "kube-agents.satAdd" (dict "a" $reqStorage "b" (include "kube-agents.satMul" (dict "a" ($storage.dataClaims | int64) "b" $dataClaimDelta))) | int64 -}}
+  {{- end -}}
 {{- end -}}
 
 {{- dict
@@ -2343,7 +2400,7 @@ The defaults carry no ephemeral-storage request because the operator renders non
       {{- $patchCmd := printf "kubectl patch resourcequota %s -n %s --type=strategic --patch '%s'" $qName $ctx.Release.Namespace $patchBody -}}
       {{- $ephNote := "" -}}
       {{- if $constrainsEphemeral -}}
-        {{- $ephNote = printf "\n(a quota constraining ephemeral storage additionally requires a LimitRange in namespace %q providing default requests and limits, because chart workloads and operator containers omit them; without one, pod creation fails with 'must specify requests.ephemeral-storage')" $ctx.Release.Namespace -}}
+        {{- $ephNote = printf "\n(a quota constraining ephemeral storage additionally requires a LimitRange in namespace %q providing default requests and limits, because the operator, the minter, the Hindsight API and several operator-rendered containers omit them; without one, pod creation fails with 'must specify requests.ephemeral-storage')" $ctx.Release.Namespace -}}
       {{- end -}}
       {{- $report := printf "ResourceQuota %q in namespace %q has insufficient capacity for release %q:\n%s\n\nRemediation: increase the quota with:\n  %s\n(those values leave room for one rollout surge Pod, except for claim counts and storage, which a surge Pod does not add to)%s" $qName $ctx.Release.Namespace $ctx.Release.Name (join "\n" $shortfalls) $patchCmd $ephNote -}}
       {{- $quotaReports = append $quotaReports $report -}}

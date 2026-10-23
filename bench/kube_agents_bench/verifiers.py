@@ -1975,7 +1975,7 @@ AuditId = Literal[
 
 # Every `status` a fleet-audit `finish` stores, for `audit_report_stored`:
 # a typo fails at spec-load time, as `AuditId` does for the stream.
-AuditStatus = Literal["OPENED", "UPDATED", "CLEAN", "HELD", "NO_FORGE"]
+AuditStatus = Literal["OPENED", "UPDATED", "CLEAN", "HELD", "NO_FORGE", "STORE_LEDGER"]
 
 # Environment names carrying the read credential, in precedence order. See
 # LedgerIssueContainsVerifier's docstring for what it has to be. A literal
@@ -2046,6 +2046,18 @@ _DELTA_RE = re.compile(
 _ALL_FINDINGS_RE = re.compile(
     r"^[ \t]*<!--[ \t]*audit-findings-all:[ \t]*(\[[^\n]*?\])[ \t]*-->[ \t]*$", re.M
 )
+
+# What `every_finding_named` counts as a name: audit_report's finding heading
+# (`FINDING_MARKER_RE`'s shape) and inline code outside HTML comments.
+_HEADING_ID_RE = re.compile(r"^####[ \t].*?<!--[ \t]*finding:[ \t]*(\S+?)[ \t]*-->[ \t]*$", re.M)
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+# The notice audit_report's `_render_findings` writes when it omits findings.
+_OMITTED_NOTICE_RE = re.compile(r"(\d+) further finding\(s\) are omitted from this description")
+# Mirrors audit_report's `HELD_IDS_RE`: the held ids its held span records.
+_HELD_IDS_RE = re.compile(r"<!--[ \t]*audit-held-ids:[ \t]*(\[.*?\])[ \t]*-->", re.S)
+_CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
+# Ids quoted in an `every_finding_named` failure; the count is always exact.
+_MAX_UNNAMED_IN_REASON = 5
 
 # Bound on issue URLs fetched from one report. An audit reply names its ledger
 # once; anything past a handful is a report to look at by hand, not a set of
@@ -2260,9 +2272,9 @@ _NO_WORKER_COMMANDS_REASON = (
 _NO_WORKER_TERMINAL_CALLS_REASON = (
     "no delegated worker's terminal or execute_code calls are readable in the trajectory: no "
     "card was delegated, the worker-trajectory capture did not run, the card log could not be "
-    "read, or the pod withheld a call's arguments, so the ordered read cannot observe its "
-    "subject (a worker whose tagged calls are all MCP or board calls, with an empty card log, "
-    "grades as zero commands)"
+    "read, or the pod withheld a call's arguments, so the read of the calls as typed cannot "
+    "observe its subject (a worker whose tagged calls are all MCP or board calls, with an empty "
+    "card log, grades as zero commands)"
 )
 _NO_WORKER_TERMINAL_CALLS_SUCCEEDED_REASON = (
     "no delegated worker's terminal or execute_code calls are readable in the trajectory: no "
@@ -2292,6 +2304,12 @@ _UNTIMED_WORKER_CALLS_REASON = (
 _PARTIAL_WORKER_CAPTURE_REASON = (
     "the worker-trajectory capture was partial ({gaps}), so the commands it did read "
     "cannot clear the forbidden pattern(s): a retry may sit in the part it did not read"
+)
+# The same gap on a check with no forbidden set: nothing is ordered, so the
+# only open question is the required command(s) it did not see.
+_PARTIAL_REQUIRED_CAPTURE_REASON = (
+    "the worker-trajectory capture was partial ({gaps}), so the required command(s) it did "
+    "not see may sit in the part it did not read: {unseen}"
 )
 _MAX_NAMED_COMMANDS = 5
 # How much of a named command the reason quotes.
@@ -3126,8 +3144,9 @@ class WorkerCommandsVerifier(BaseVerifier):
     the rendering can miss a worker-filed card's command behind a ``cd ... &&``
     or on a second line, and a capture gap on such a card does not change the
     result (#3406).
-    ``after_result_pattern`` (below) reads the tagged calls alone, as typed,
-    for every card.
+    ``after_result_pattern`` (below) reads the tagged calls as typed for
+    every card: alone for the ordered check it was built for, and beside the
+    card log's rows for a check with no forbidden set.
 
     ``required_patterns``: each must match at least one command.
     ``forbidden_patterns``: none may match any command.
@@ -3233,7 +3252,11 @@ class WorkerCommandsVerifier(BaseVerifier):
     withheld), is ``status="error"``, a withheld argument beside a readable call
     is skipped (unless an uncredited ``succeeded: true`` run cannot be verified, which is ``status="error"``), a worker whose tagged calls are all MCP calls grades as zero
     commands, and a capture with gaps that found no forbidden command is
-    ``status="error"``. Fails closed like its siblings -- a run with no captured
+    ``status="error"``; a check with no forbidden set is not ordered, so an
+    untimed call and a gap beside a satisfied required set do not error it,
+    and the card log's rows join its typed set, so a command the trajectory
+    missed still counts (a case sets ``after_result_pattern: "(?!)"`` to
+    read the required commands as typed and nothing else). Fails closed like its siblings -- a run with no captured
     worker commands is ``status="error"``, not a pass.
     """
 
@@ -3291,6 +3314,7 @@ class WorkerCommandsVerifier(BaseVerifier):
         window = ""
         sources = ""
         result_hits: list[tuple[str, str]] = []
+        forbidding = bool(self.forbidden_patterns or self.forbidden_runs or self.forbidden_result_patterns)
         has_succeeded_runs = any(run.succeeded for run in self.required_runs)
         withheld_calls = sum(
             1
@@ -3369,8 +3393,21 @@ class WorkerCommandsVerifier(BaseVerifier):
                         reason=_NO_WORKER_TERMINAL_CALLS_REASON,
                     )
             typed = [command for _, _, command, _, _, _ in calls]
+            # The ordered check reads the calls alone: a log row has no time.
+            # A check with no forbidden set keeps the card log as a source for
+            # its required checks: the trajectory can be the narrower read (two
+            # #2959 runs had a command on the log and no tagged call), so a row
+            # the calls do not carry joins the typed set rather than becoming a miss.
+            if not forbidding:
+                seen = set(typed)
+                joined = [row for row in (str(r.get("command") or "") for r in snap.worker_commands or []) if row and row not in seen]
+                typed += joined
+                if joined:
+                    sources = f" ({len(calls)} tagged calls as typed and {len(joined)} from the card log)"
             untimed = [command for _, at, command, _, _, _ in calls if at is None]
-            if untimed:
+            # Only the window orders calls; a check with no forbidden set
+            # grades nothing by time, so an untimed call cannot mislead it.
+            if untimed and forbidding:
                 shown = "; ".join(repr(c[:_SHOWN_COMMAND_CHARS]) for c in untimed[:_MAX_NAMED_COMMANDS])
                 return VerificationResult(
                     success=False,
@@ -3381,7 +3418,9 @@ class WorkerCommandsVerifier(BaseVerifier):
             lineage = _card_lineages(snap.worker_card_parents or {}, [c for c, _, _, _, _, _ in calls])
             windowed = []
             opened: list[str] = []
-            for root in dict.fromkeys(lineage[c] for c, _, _, _, _, _ in calls):
+            # A check with no forbidden set has nothing to grade after the
+            # opener; its reasons say nothing about a window it never used.
+            for root in dict.fromkeys(lineage[c] for c, _, _, _, _, _ in calls) if forbidding else ():
                 mine = [call for call in calls if lineage[call[0]] == root]
                 opener = next((i for i, (_, _, _, result, _, _) in enumerate(mine) if re.search(self.after_result_pattern, result)), None)
                 if opener is None:
@@ -3392,7 +3431,9 @@ class WorkerCommandsVerifier(BaseVerifier):
                 for _, _, command, result, _, _ in later:
                     result_hits.extend((p, command) for p in self.forbidden_result_patterns if re.search(p, result))
                 opened.append(f"{len(later)} in the lineage of card {root} after {mine[opener][2][:_SHOWN_COMMAND_CHARS]!r}")
-            if not opened:
+            if not forbidding:
+                window = ""
+            elif not opened:
                 window = (
                     f"; no worker command opened the window ({self.after_result_pattern!r} in the result"
                     " of any command, failed or not), so no command is after it and the forbidden pattern(s) graded nothing"
@@ -3566,25 +3607,47 @@ class WorkerCommandsVerifier(BaseVerifier):
             )
         if partial:
             if self.after_result_pattern is not None:
-                unseen = f"; required pattern(s) {missing} not seen in what was read" if missing else ""
-                unrun_parts = []
-                if unrun_failed:
-                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_failed)
-                    unrun_parts.append(f"{named} ran but exited non-zero (or its exit was not recorded)")
-                if unrun_masked:
-                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_masked)
-                    unrun_parts.append(_UNRUN_MASKED_REASON.format(named=named))
-                if unrun_clipped:
-                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_clipped)
-                    unrun_parts.append(_UNRUN_CLIPPED_REASON.format(named=named))
-                if unrun_missing:
-                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_missing)
-                    unrun_parts.append(f"required run(s) {named} not seen in what was read")
-                if traj_missing:
-                    named = ", ".join(" ".join([run.script, *run.flags]) for run in traj_missing)
-                    unrun_parts.append(f"required run(s) requiring success ({named}) could not be verified")
-                unrun_extra = ("; " + "; ".join(unrun_parts)) if unrun_parts else ""
-                reason = _PARTIAL_WORKER_CAPTURE_REASON.format(gaps=gaps_str) + unseen + unrun_extra + window
+                # A required command that was read is conclusive the same way: a gap
+                # beside a satisfied required set errors only a check that also has a
+                # forbidden set to clear.
+                if not forbidding and not (missing or unrun_missing or unrun_failed or unrun_masked or unrun_clipped or traj_missing):
+                    pass
+                else:
+                    unseen = f"; required pattern(s) {missing} not seen in what was read" if missing else ""
+                    if not forbidding:
+                        not_seen = [f"pattern {p!r}" for p in missing] + [
+                            " ".join(["run", run.script, *run.flags])
+                            for run in [*unrun_missing, *unrun_failed, *unrun_masked, *unrun_clipped, *traj_missing]
+                        ]
+                        reason = _PARTIAL_REQUIRED_CAPTURE_REASON.format(
+                            gaps=gaps_str,
+                            unseen=", ".join(not_seen),
+                        )
+                    else:
+                        unrun_parts = []
+                        if unrun_failed:
+                            named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_failed)
+                            unrun_parts.append(f"{named} ran but exited non-zero (or its exit was not recorded)")
+                        if unrun_masked:
+                            named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_masked)
+                            unrun_parts.append(_UNRUN_MASKED_REASON.format(named=named))
+                        if unrun_clipped:
+                            named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_clipped)
+                            unrun_parts.append(_UNRUN_CLIPPED_REASON.format(named=named))
+                        if unrun_missing:
+                            named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_missing)
+                            unrun_parts.append(f"required run(s) {named} not seen in what was read")
+                        if traj_missing:
+                            named = ", ".join(" ".join([run.script, *run.flags]) for run in traj_missing)
+                            unrun_parts.append(f"required run(s) requiring success ({named}) could not be verified")
+                        unrun_extra = ("; " + "; ".join(unrun_parts)) if unrun_parts else ""
+                        reason = _PARTIAL_WORKER_CAPTURE_REASON.format(gaps=gaps_str) + unseen + unrun_extra + window
+                    return VerificationResult(
+                        success=False,
+                        status="error",
+                        elapsed_time=time.monotonic() - start,
+                        reason=reason,
+                    )
             else:
                 details = []
                 if unrun_failed:
@@ -3613,12 +3676,12 @@ class WorkerCommandsVerifier(BaseVerifier):
                     f"so required run(s) requiring success could not be verified: "
                     + "; ".join(details)
                 )
-            return VerificationResult(
-                success=False,
-                status="error",
-                elapsed_time=time.monotonic() - start,
-                reason=reason,
-            )
+                return VerificationResult(
+                    success=False,
+                    status="error",
+                    elapsed_time=time.monotonic() - start,
+                    reason=reason,
+                )
         if traj_missing or unrun_clipped:
             reasons = []
             if traj_missing:
@@ -3891,6 +3954,224 @@ class ReplyIsSilentVerifier(BaseVerifier):
         return VerificationResult(success=False, elapsed_time=time.monotonic() - start, reason=reason)
 
 
+# ``verified_claims_backed``: one evidence block as ``kanban_complete`` renders
+# it (``deploy/docker/patches/kanban_verified_claims.py``): a fence holding
+# ``$ <command>``, which may span lines, then a fence holding the output
+# excerpt, with the output fence opening on the line right after the command
+# fence closes and carrying no info string, as the gate renders it. The gate
+# refuses a fence inside either, so neither group may cross one. A lone ``$``
+# fence, such as a suggested fix, or one followed by a manifest fence, is not
+# a block and cannot swallow the block after it.
+_EVIDENCE_BLOCK_RE = re.compile(
+    r"```[^\n]*\n\$ ((?:(?!```).)*?)\n```\n```\n((?:(?!```).)*?)\n?```", re.S
+)
+# The gate's own section heading, which says "verified" itself; taken out
+# before the reply is searched for the label.
+_EVIDENCE_HEADING = "**Evidence for verified claims**"
+_VERIFIED_LABEL_RE = re.compile(r"\bverified\b", re.I)
+# ``worker_trajectory.clip``'s marker on a result cut in the pod.
+_CLIPPED_RESULT_RE = re.compile(r" \.\.\.\[clipped \d+ chars\]$")
+# The head of a terminal result as the pod stores it: ``{"output": "``.
+_OUTPUT_HEAD_RE = re.compile(r'^\{\s*"output":\s*"')
+# The longest escape a cut can split (``\uXXXX``), trimmed one character at a
+# time until the head decodes.
+_MAX_SPLIT_ESCAPE = 6
+# ``AuditRedactor.EMAIL_PATTERN`` and its marker
+# (``agents/chat/defaults/plugins/common/redactor.py``): the pod masks an
+# address in the trajectory, and the gate's own redaction does not, so the
+# reply's copy is masked the same way before it is compared.
+_EMAIL_RE = re.compile(
+    r"[a-zA-Z0-9._%+\-]+@(?!(?:[a-zA-Z0-9\-]+\.)*gserviceaccount\.com(?!\.?[\w\-]))[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}"
+)
+_EMAIL_MARKER = "[REDACTED_EMAIL]"
+# What every marker the pod writes starts with (``[REDACTED_SECRET]``,
+# ``[REDACTED_EMAIL]``, ...): a span of the worker's text the stored copy no
+# longer holds.
+_REDACTED_PREFIX = "[REDACTED"
+_REDACTED_SPAN_RE = re.compile(r"\\\[REDACTED_[A-Z_]*\\\]")
+# What a redacted span of a command may stand for: one word, with no shell
+# separator that would start a second command.
+_REDACTED_WORD = r"[^\s;&|<>()$`]*"
+# Spaces around JSON and YAML punctuation, which the pod's re-serialisation
+# adds or drops.
+_JSON_SPACING_RE = re.compile(r"\s*([,:{}\[\]])\s*")
+_WORD_CHAR_RE = re.compile(r"\w")
+# ``kanban_verified_claims.MIN_EXCERPT_CHARS``: the fewest characters besides
+# whitespace an excerpt may hold, unless it is the command's whole output.
+_MIN_EXCERPT_CHARS = 8
+# A ``\uXXXX`` escape. The pod re-serialises a JSON output with
+# ``json.dumps``, which escapes every non-ASCII character, and kubectl escapes
+# ``&``, ``<`` and ``>`` the same way, so both copies are compared unescaped.
+_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def _squeezed(text: str) -> str:
+    """``text`` with ``\\uXXXX`` escapes undone, addresses masked, whitespace collapsed, and none around ``,:{}[]``.
+
+    The pod re-serialises a JSON output with ``", "`` and ``": "`` separators
+    (``worker_trajectory.supplement``), so compact JSON the worker saw and
+    copied differs from the stored text in those spaces and in escapes. Other
+    whitespace is kept as one space, so a word edge still reads as one.
+    """
+    return _JSON_SPACING_RE.sub(r"\1", " ".join(_normalized(text).split()))
+
+
+def _excerpt_in(needle: str, haystack: str) -> bool:
+    """Whether ``needle`` is in ``haystack`` starting and ending on a word edge, as the gate requires.
+
+    A side whose own end character is not a word character is an edge already.
+    """
+    start = haystack.find(needle)
+    while start != -1:
+        end = start + len(needle)
+        left = start == 0 or not (_WORD_CHAR_RE.match(needle[0]) and _WORD_CHAR_RE.match(haystack[start - 1]))
+        right = end == len(haystack) or not (_WORD_CHAR_RE.match(needle[-1]) and _WORD_CHAR_RE.match(haystack[end]))
+        if left and right:
+            return True
+        start = haystack.find(needle, start + 1)
+    return False
+
+
+def _normalized(text: str) -> str:
+    """``text`` with ``\\uXXXX`` escapes undone and addresses masked, whitespace kept."""
+    text = _UNICODE_ESCAPE_RE.sub(lambda m: chr(int(m.group(1), 16)), text)
+    text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+    return _EMAIL_RE.sub(_EMAIL_MARKER, text)
+
+
+def _same_command(stored: str, cited: str) -> bool:
+    """Whether the reply's ``cited`` command is the stored one, a redacted span standing for one word.
+
+    The pod's redactor masks a token, password or ``key=value`` value, each of
+    which stops at whitespace, so a span matches only text with no whitespace
+    and no shell separator. It is matched on the whitespace-collapsed text,
+    since squeezing first would let a span swallow a second command.
+    """
+    if _squeezed(stored) == _squeezed(cited):
+        return True
+    if _REDACTED_PREFIX not in stored or not re.search(r"\w", _REDACTED_SPAN_RE.sub("", re.escape(stored))):
+        # A stored command that is only a marker would match any one word.
+        return False
+    stored, cited = " ".join(_normalized(stored).split()), " ".join(_normalized(cited).split())
+    pattern = _REDACTED_SPAN_RE.sub(lambda _: _REDACTED_WORD, re.escape(stored))
+    return re.fullmatch(pattern, cited) is not None
+
+
+def _terminal_output(result: str) -> tuple[str, bool]:
+    """The ``output`` of a terminal result as the trajectory stores it, and whether the pod clipped it.
+
+    The result is the JSON text of ``{"output": ..., "exit_code": ...}``. A
+    clipped one no longer parses; its surviving head is decoded as a JSON
+    string, less any escape the cut split.
+    """
+    clipped = _CLIPPED_RESULT_RE.search(result)
+    if not clipped:
+        try:
+            parsed = json.loads(result)
+        except ValueError:
+            return result, False
+        if isinstance(parsed, dict) and isinstance(parsed.get("output"), str):
+            return parsed["output"], False
+        return result, False
+    head = _OUTPUT_HEAD_RE.sub("", result[: clipped.start()])
+    for cut in range(_MAX_SPLIT_ESCAPE + 1):
+        try:
+            return json.loads('"' + head[: len(head) - cut] + '"'), True
+        except ValueError:
+            continue
+    return head, True
+
+
+@VERIFIERS.register("verified_claims_backed")
+class VerifiedClaimsBackedVerifier(BaseVerifier):
+    """Every piece of evidence in the reply is a command a worker ran, with its real output.
+
+    Reads the ``final_message`` for evidence blocks: a fence holding
+    ``$ <command>``, then a fence holding an excerpt of its output, the shape
+    ``kanban_complete`` renders for ``verified_claims``. Each block's command
+    must equal (whitespace removed) a worker's tagged ``terminal`` or
+    ``execute_code`` call
+    (:func:`_worker_terminal_calls`), on any card, and its excerpt must appear
+    in that call's output. A reply with fewer than ``min_blocks`` blocks fails,
+    and the reason says when it calls something verified with nothing behind
+    it.
+
+    Text is compared with ``\\uXXXX`` escapes undone, addresses masked and
+    whitespace collapsed, with none around JSON punctuation (:func:`_squeezed`).
+    An excerpt must start and end on a word edge and hold at least
+    :data:`_MIN_EXCERPT_CHARS` characters unless it is the command's whole
+    output, as the gate requires. A redacted
+    span of a stored command matches one word (:func:`_same_command`). An excerpt missing
+    from an output the pod clipped (``worker_trajectory.MAX_RESULT_CHARS``) or
+    redacted is not held against the reply: the command is checked and the
+    pass says the excerpt was not, since the gate checked it against the
+    output the worker saw. A block whose command is missing is an
+    error, not a fail, while ``worker_capture_gaps`` reports a gap or the pod
+    withheld the workers' arguments; so is any block when the trajectory holds
+    no worker terminal call at all.
+    """
+
+    type: Literal["verified_claims_backed"]
+    min_blocks: int = Field(default=1, ge=0)
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+
+        def done(status: str, reason: str) -> VerificationResult:
+            return VerificationResult(
+                success=status == "pass", status=status, elapsed_time=time.monotonic() - start, reason=reason
+            )
+
+        snap = transcript.get()
+        if snap is None:
+            return done("error", _NO_TRANSCRIPT_REASON)
+        reply = snap.final_message
+        blocks = _EVIDENCE_BLOCK_RE.findall(reply)
+        if len(blocks) < self.min_blocks:
+            labelled = _VERIFIED_LABEL_RE.search(reply.replace(_EVIDENCE_HEADING, ""))
+            what = "calls claims verified with" if labelled else "has"
+            return done("fail", f"the reply {what} {len(blocks)} evidence block(s) (a $ command fence, then an "
+                        f"output fence); at least {self.min_blocks} required")
+        calls = [(command, result) for _, _, command, result, *_ in _worker_terminal_calls(snap.trajectory)]
+        withheld = any(
+            entry.get("agent") and entry.get("name") in _CODE_TOOLS and _args_withheld(entry)
+            for entry in snap.trajectory if isinstance(entry, dict)
+        )
+        if blocks and not calls and not (snap.worker_capture_gaps or withheld):
+            return done("error", f"the reply has {len(blocks)} evidence block(s), but the trajectory holds no "
+                        "worker terminal call to check them against")
+        unknown: list[str] = []
+        unchecked: list[str] = []
+        for command, excerpt in blocks:
+            runs = [_terminal_output(result) for ran, result in calls if _same_command(ran, command)]
+            needle = _squeezed(excerpt)
+            if not runs:
+                if snap.worker_capture_gaps or withheld:
+                    why = "; ".join(snap.worker_capture_gaps or ["the pod withheld the workers' arguments"])
+                    unknown.append(f"{command!r} is not in a trajectory that is incomplete: {why}")
+                    continue
+                return done("fail", f"evidence command {command!r} is not a command any worker ran")
+            short = len("".join(excerpt.split())) < _MIN_EXCERPT_CHARS
+            if short and any(needle == _squeezed(output) for output, clipped in runs if not clipped):
+                continue
+            if short:
+                return done("fail", f"evidence for {command!r} holds fewer than {_MIN_EXCERPT_CHARS} characters "
+                            "and is not the command's whole output")
+            if any(_excerpt_in(needle, _squeezed(output)) for output, _ in runs):
+                continue
+            if any(clipped or _REDACTED_PREFIX in output for output, clipped in runs):
+                unchecked.append(command)
+                continue
+            return done("fail", f"evidence excerpt {excerpt[:_REPLY_QUOTE_CHARS]!r} is not in the output of {command!r}")
+        if unknown:
+            return done("error", "; ".join(unknown))
+        if unchecked:
+            return done("pass", f"{len(blocks)} evidence block(s), each a command a worker ran; "
+                        f"{len(unchecked)} excerpt(s) not checked, output clipped or redacted in the pod: "
+                        f"{', '.join(repr(c) for c in unchecked)}")
+        return done("pass", f"{len(blocks)} evidence block(s), each a worker's command with its real output")
+
+
 def _agent_shell(script: str, timeout: float) -> str:
     # Lazy: the harness pulls in the agent transport, which a spec load does not need.
     from kube_agents_bench.harness import _agent_shell as shell
@@ -4125,6 +4406,15 @@ def _finding_ids(body: str) -> tuple[list[str], str] | None:
     return [i for i in ids if isinstance(i, str)], source
 
 
+def _json_str_list(payload: str) -> list[str]:
+    """The strings of a JSON list, or [] when it does not parse as one."""
+    try:
+        value = json.loads(payload)
+    except (ValueError, TypeError):
+        return []
+    return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
+
+
 @VERIFIERS.register("ledger_issue_contains")
 class LedgerIssueContainsVerifier(BaseVerifier):
     """Phrase checks against the GitHub ledger issue this run published.
@@ -4239,6 +4529,10 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     forbidden_phrases: list[str] = Field(default_factory=list)
     any_of_phrases: list[str] = Field(default_factory=list)
     scope: Literal["body", "finding_ids"] = "body"
+    # Every id the ledger files must be readable in its body, outside the two
+    # hidden id blocks: a finding cut for space and named only in
+    # `audit-findings-all` is filed but invisible to the person reading it.
+    every_finding_named: bool = False
     # Tolerance on the ledger stamp vs. the harness's run-start clock, which
     # are two different machines (the Prow runner and the agent pod). Small on
     # purpose: every second of it is a second of a previous run's ledger that
@@ -4543,6 +4837,33 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             text = ledger["body"].lower()
             surface = f"the body of {ledger['slug']}"
 
+        unnamed: list[str] = []
+        omitted_unlisted: re.Match | None = None
+        if self.every_finding_named:
+            filed = _finding_ids(ledger["body"])
+            if filed is None:
+                return done(
+                    False,
+                    f"{ledger['slug']} carries no readable "
+                    "<!-- audit-findings: [...] --> delta block, so whether it "
+                    "names every finding it filed cannot be read off it",
+                )
+            # Named means a heading a reader sees, or the id whole in a code
+            # span outside any HTML comment: a bare substring would let `x.orders`
+            # pass on a visible `x.orders-api`.
+            body = ledger["body"]
+            named = set(_HEADING_ID_RE.findall(body))
+            named |= set(_CODE_SPAN_RE.findall(_HTML_COMMENT_RE.sub("", body)))
+            # Collector-held ids are the collector's, rendered in what the
+            # findings leave; this check grades the findings the run filed.
+            held = {fid for match in _HELD_IDS_RE.findall(body) for fid in _json_str_list(match)}
+            unnamed = [fid for fid in filed[0] if fid not in named and fid not in held]
+            # Past its cap the complete-id block is left out and `filed` is the
+            # delta block, which lacks the omitted ids; the renderer's omission
+            # notice still says they exist.
+            if filed[1] == "audit-findings":
+                omitted_unlisted = _OMITTED_NOTICE_RE.search(_HTML_COMMENT_RE.sub("", body))
+
         missing = [p for p in self.required_phrases if p.lower() not in text]
         present = [p for p in self.forbidden_phrases if p.lower() in text]
         any_of_miss = bool(self.any_of_phrases) and not any(
@@ -4553,8 +4874,20 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             "generated_at": generated_at.isoformat(),
             "scope": self.scope,
         }
-        if missing or present or any_of_miss:
+        if missing or present or any_of_miss or unnamed or omitted_unlisted:
             parts = []
+            if omitted_unlisted:
+                parts.append(
+                    f"{ledger['slug']} says {omitted_unlisted.group(1)} further finding(s) are "
+                    "omitted from its description and carries no audit-findings-all block "
+                    "to name them, so they are filed but named nowhere"
+                )
+            if unnamed:
+                parts.append(
+                    f"{len(unnamed)} filed finding id(s) appear only in the hidden id "
+                    f"blocks of {ledger['slug']}, not in its visible body: "
+                    f"{unnamed[:_MAX_UNNAMED_IN_REASON]}"
+                )
             if missing:
                 parts.append(f"required phrases absent from {surface}: {missing}")
             if present:
@@ -4576,6 +4909,8 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             satisfied.append(
                 f"at least one of {len(self.any_of_phrases)} alternative phrasing(s)"
             )
+        if self.every_finding_named:
+            satisfied.append("a visible name for every filed finding")
         return done(
             True,
             f"{surface}, generated at {generated_at.isoformat()} by this run, "
@@ -5049,6 +5384,13 @@ class PullRequestOpenedVerifier(BaseVerifier):
     # meant to protect. Listed from `/pulls/{n}/files`, so the credential needs
     # `pull_requests: read`.
     unchanged_paths: list[str] = Field(default_factory=list)
+    # Repository paths, as `fnmatch` globs, the pull request must delete: each
+    # glob is matched by at least one file the pull request lists as
+    # `removed`. A delete reaches review as the removal of the manifest that
+    # declares the object; a pull request that adds a marker or edits the
+    # manifest in place leaves the declaration, and merging it keeps the
+    # object. Listed from `/pulls/{n}/files`, as `unchanged_paths` is.
+    removed_paths: list[str] = Field(default_factory=list)
     # Assertions over what the pull request writes (see PullRequestContentCheck):
     # the object a provisioning case expects, with the fields it must carry,
     # rather than only that some file changed. Read from `/pulls/{n}/files`,
@@ -5109,16 +5451,12 @@ class PullRequestOpenedVerifier(BaseVerifier):
             )
         return texts, None
 
-    def _changed_paths(
+    def _file_entries(
         self, owner: str, repo: str, number: int, token: str, budget: float
-    ) -> tuple[list[str], str | None]:
-        """``(paths the pull request changes, unevaluable reason)``.
-
-        A rename counts under both names: moving the declaration away is as
-        much a change to it as rewriting it.
-        """
+    ) -> tuple[list[dict], str | None]:
+        """``(the entries of /pulls/{n}/files, unevaluable reason)``."""
         base = f"{forges.github_api_root()}/repos/{owner}/{repo}/pulls/{number}/files"
-        paths: list[str] = []
+        entries: list[dict] = []
         for page in range(1, _PR_FILES_MAX_PAGES + 1):
             status, files = _http_get_json(
                 f"{base}?per_page={_PR_FILES_PAGE_SIZE}&page={page}", token, budget
@@ -5129,12 +5467,43 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     "the token needs `pull_requests: read` to check which paths the "
                     "fix changes, so this check could not be evaluated"
                 )
-            for entry in files:
-                if isinstance(entry, dict):
-                    paths += [str(entry[key]) for key in ("filename", "previous_filename") if entry.get(key)]
+            entries += [entry for entry in files if isinstance(entry, dict)]
             if len(files) < _PR_FILES_PAGE_SIZE:
                 break
-        return paths, None
+        return entries, None
+
+    def _changed_paths(
+        self, owner: str, repo: str, number: int, token: str, budget: float
+    ) -> tuple[list[str], str | None]:
+        """``(paths the pull request changes, unevaluable reason)``.
+
+        A rename counts under both names: moving the declaration away is as
+        much a change to it as rewriting it.
+        """
+        entries, unevaluable = self._file_entries(owner, repo, number, token, budget)
+        paths = [
+            str(entry[key])
+            for entry in entries
+            for key in ("filename", "previous_filename")
+            if entry.get(key)
+        ]
+        return paths, unevaluable
+
+    def _removed_paths(
+        self, owner: str, repo: str, number: int, token: str, budget: float
+    ) -> tuple[list[str], str | None]:
+        """``(paths the pull request deletes, unevaluable reason)``.
+
+        Only status `removed` counts. A rename moves the declaration rather
+        than deleting it, so a renamed file's old name is not a removal.
+        """
+        entries, unevaluable = self._file_entries(owner, repo, number, token, budget)
+        removed = [
+            str(entry["filename"])
+            for entry in entries
+            if entry.get("status") == "removed" and entry.get("filename")
+        ]
+        return removed, unevaluable
 
     def _spent_before(
         self,
@@ -5812,6 +6181,15 @@ class PullRequestOpenedVerifier(BaseVerifier):
                         "files and are not implemented for GitLab, so this check could not be evaluated"
                     )
                     continue
+                if verdict == "pass" and self.removed_paths:
+                    # removed_paths reads GitHub's file listing too; a merge request
+                    # that adds a marker passes every other clause, so ungraded on
+                    # what it removes it is not a pass either.
+                    unresolved.append(
+                        f"{full}!{number}: `removed_paths` reads GitHub's pull request "
+                        "files and is not implemented for GitLab, so this check could not be evaluated"
+                    )
+                    continue
                 if verdict == "pass":
                     return done(True, reason, raw=raw)
                 (rejected if verdict == "reject" else unresolved).append(reason)
@@ -5933,6 +6311,26 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     continue
                 if rejection:
                     rejected.append(rejection)
+                    continue
+            if self.removed_paths:
+                try:
+                    removed, unevaluable = self._removed_paths(owner, repo, number, token, budget)
+                except OSError as exc:
+                    unresolved.append(f"could not reach the GitHub API for {slug}: {exc}")
+                    continue
+                if unevaluable:
+                    unresolved.append(unevaluable)
+                    continue
+                kept = [
+                    pattern for pattern in self.removed_paths
+                    if not any(fnmatch.fnmatchcase(path, pattern) for path in removed)
+                ]
+                if kept:
+                    rejected.append(
+                        f"{slug}: does not remove {', '.join(kept)}, which this case "
+                        "requires the pull request to delete (`removed_paths`) -- a "
+                        "delete that leaves the declaration keeps the object"
+                    )
                     continue
             if self.unchanged_paths:
                 try:
@@ -6932,6 +7330,80 @@ class BootstrapReportCriticalsVerifier(_OnboardingPollVerifier):
         if padded:
             return "fail", f"the report's {len(items)} numbered item(s) {counts}{padding}", raw
         return "pass", f"the report's {len(items)} numbered item(s) {counts}, the limit of {self.limit}: {named}", raw
+
+
+# The report's one title line: a heading, or a bold line with no sentence end, as the Slack
+# presenter's title rule reads it. Only the first line can be the title.
+_TITLE_RE = re.compile(r"^\s*(?:#{1,6}\s.*|\*\*[^*\n]*[^*\n.!?\s]\s*\*\*)\s*$")
+
+
+def _report_body(text: str) -> str:
+    """The report with its first line dropped when that line is its title, every run of whitespace one space.
+
+    Any other heading or bold line stays in the text, so a verdict written as a second heading
+    or as a bold sentence before the counts fails the opening check.
+    """
+    lines = text.splitlines()
+    first = next((i for i, line in enumerate(lines) if line.strip()), None)
+    if first is not None and _TITLE_RE.match(lines[first]):
+        del lines[first]
+    return " ".join(" ".join(lines).split())
+
+
+@VERIFIERS.register("bootstrap_report_posture")
+class BootstrapReportPostureVerifier(_OnboardingPollVerifier):
+    """Checks that the onboarding report opens with the posture the SOP fixes.
+
+    The prioritization SOP (Step 6) has the worker open the report with what
+    was scanned and then the posture line ``inventory_findings.py select``
+    prints, which counts the scan's own checks and leaves the rest to the
+    first-run audits. A verdict on the fleet ("healthy", "no critical
+    vulnerabilities") there contradicts those audits minutes later. This reads,
+    off the shell sandbox (:mod:`kube_agents_bench.onboarding`), the report the
+    worker wrote, delivered copy first.
+
+    ``posture``: the paragraphs the report opens with, after its heading, in
+    order. Passes when the report's text, its title line dropped and whitespace
+    collapsed, starts with them, so a sentence added before or between them is
+    a fail, and when none of ``forbidden_patterns`` (case-insensitive) matches
+    anywhere in the report, headings included. No report, or one that cannot be read, is a fail; an
+    unreadable sandbox is ``status="error"``.
+    """
+
+    type: Literal["bootstrap_report_posture"]
+    posture: list[str] = Field(min_length=1)
+    forbidden_patterns: list[str] = Field(default_factory=list)
+
+    @field_validator("forbidden_patterns")
+    @classmethod
+    def _compiles(cls, patterns: list[str]) -> list[str]:
+        for pattern in patterns:
+            re.compile(pattern)
+        return patterns
+
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        read = onboarding.read_scored_report(onboarding.sandbox_shell, read_timeout)
+        pod = onboarding.sandbox_pod()
+        if read is None:
+            return "error", f"{pod} could not be read (kubectl exec failed or the command did not run)", None
+        report, text = read.get("report"), read.get("text") or ""
+        raw: dict[str, Any] = {"report": report, "text": text}
+        if report == "absent":
+            return "fail", f"there is no INVENTORY.md or INVENTORY.delivered.md on {pod}: the worker wrote no report", raw
+        if report == "unreadable":
+            return "fail", f"the report on {pod} cannot be read: {text}", raw
+        body = _report_body(text)
+        expected = " ".join(" ".join(paragraph.split()) for paragraph in self.posture)
+        # Headings included: a verdict in a heading reaches the user as written.
+        full = " ".join(text.split())
+        verdicts = sorted({m.group(0) for p in self.forbidden_patterns for m in re.finditer(p, full, re.IGNORECASE)})
+        raw.update({"opening": body[: len(expected) + 200], "verdicts": verdicts})
+        if not body.startswith(expected):
+            return "fail", f"the report does not open with the posture the SOP fixes; it opens: {body[: len(expected) + 80]!r}", raw
+        if verdicts:
+            return "fail", f"the report judges the fleet, which its posture line leaves to the first-run audits: {verdicts}", raw
+        judged = " and has none of the forbidden verdicts" if self.forbidden_patterns else ""
+        return "pass", f"the report opens with the scan counts and the posture line{judged}", raw
 
 
 # The check rosters of the four audits the oobe stage runs after the scan

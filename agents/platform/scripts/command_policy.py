@@ -64,7 +64,9 @@ _ALLOWED = Decision(allowed=True, rule_id="", message="")
 # tool, or another identity (#1945). Two spellings because the refusals come
 # in two shapes: an action refusal means a state change is off-limits, while
 # a flag refusal leaves re-running without the flag as the legitimate retry,
-# and only the flag's effect is off-limits. Every claim is conditional on
+# and only the flag's effect is off-limits -- when that retry would be
+# allowed. When it would not, the flag notice is not used at all (see
+# _STILL_REFUSED and _flag_refusal, #2979). Every claim is conditional on
 # purpose. The read-only fallbacks also fire on unlisted reads -- `kubectl
 # help delete`, `gcloud topic formats`, `cluster-info dump` -- where the
 # permitted outcome is an allowed spelling (`--help` where an escape exists,
@@ -76,10 +78,12 @@ _ALLOWED = Decision(allowed=True, rule_id="", message="")
 # sanctioned route often exists but differs per flag: `get-credentials` then
 # `--context` is the answer to a refused `--server`, and no fixed sentence
 # could name every such route.
-# The two unreadable-command refusals and the asset-search type refusal carry
-# neither notice, on purpose: re-running with a spelling this module accepts is
-# the legitimate outcome there, and calling that a boundary would stop retries
-# the policy permits.
+# The generic unreadable-command refusal and the asset-search type refusal
+# carry neither notice, on purpose: re-running with a spelling this module
+# accepts is the legitimate outcome there, and calling that a boundary would
+# stop retries the policy permits. The unreadable refusal's refused-retry
+# variant (#2979) carries the action notice, through the read-only refusal it
+# quotes, because there no spelling would be allowed.
 _ACTION_BOUNDARY_NOTICE = (
     "This is a permission boundary, not an error to work around: if this "
     "command would change cluster or cloud state, that change is refused "
@@ -92,6 +96,35 @@ _FLAG_BOUNDARY_NOTICE = (
     "command may be retried without the flag, but what the flag itself does "
     "is withheld, so do not look for another way to do it. Anything this "
     "policy allows is not a workaround."
+)
+
+# Replaces the removal hint and _FLAG_BOUNDARY_NOTICE when the command would
+# still be a refused write with the flag removed. The flag notice invites a
+# retry without the flag, and a model takes the invitation literally: told to
+# drop `--binauthz-evaluation-mode` from `gcloud container clusters update`, it
+# dropped it and ran the bare update, which is refused as a write regardless
+# (#2979). So the invitation is made only when the remainder would be allowed,
+# and otherwise the refusal says the command itself is the boundary.
+_STILL_REFUSED = "Without that flag the command is still refused, so do not retry it with the flag removed."
+# The gcloud unreadable refusal's lead when the retry it would invite is
+# refused too. Also how a reading's decision is recognised as that variant,
+# so the variant needs no verb_tuple to mark it.
+_UNREADABLE_WRITE_LEAD = (
+    "gcloud used a flag whose arity is unknown to this module, but the "
+    "command is refused whatever that flag is."
+)
+_KUBECTL_READ_ONLY_MESSAGE = (
+    "Agents hold read-only access to Kubernetes. Propose this change "
+    "as a pull request instead. "
+    + _ACTION_BOUNDARY_NOTICE
+)
+_GCLOUD_READ_ONLY_MESSAGE = (
+    "Agents hold read-only access to Google Cloud. Propose this "
+    "change as a pull request instead. If this is a read the "
+    "product runs on its own, it is missing from "
+    "GCLOUD_READ_COMMANDS in command_policy.py -- report it "
+    "rather than working around it. "
+    + _ACTION_BOUNDARY_NOTICE
 )
 
 # Only these two reach a cluster or a cloud project. Everything else the proxy
@@ -376,6 +409,29 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         # link and unlink a monitored project, stay refused, and the tests hold
         # that door.
         ("beta", "monitoring", "metrics-scopes", "describe"),
+        # Cloud Monitoring alert policy reads: whether a policy exists, is
+        # enabled, and which notification channels it names. Without them a
+        # Cluster Agent asked about alert status can report only in-cluster
+        # substitutes (GMP replica counts, Warning events), after a refused
+        # turn. roles/monitoring.viewer already grants alertPolicies.list and
+        # .get; this table was the only block. gcloud has the group on all
+        # three tracks, and the allowlist matches the track word as typed, so
+        # each spelling is its own entry: the imported gke-alert-configuration
+        # skill spells the call with `alpha`, and imported skills are not
+        # edited here. The six are kept together, out of alphabetical order,
+        # so this reason covers all of them. Output is condition filters,
+        # thresholds, documentation text, user labels, channel resource names
+        # and the mutatedBy principals, which `projects get-iam-policy` already
+        # shows. It carries no credentials. The writes one word away
+        # (`create`, `update`, `delete`, `migrate`, `conditions ...`) stay
+        # refused, and so does `monitoring channels`: a channel label can hold
+        # a webhook URL with a token in it. The tests hold both doors.
+        ("alpha", "monitoring", "policies", "describe"),
+        ("alpha", "monitoring", "policies", "list"),
+        ("beta", "monitoring", "policies", "describe"),
+        ("beta", "monitoring", "policies", "list"),
+        ("monitoring", "policies", "describe"),
+        ("monitoring", "policies", "list"),
         # Budget reads for the cost skills. list only: budgets are written
         # by humans, and `billing accounts list` is deliberately absent --
         # the skills take the account id from configuration, not discovery.
@@ -1163,7 +1219,205 @@ def local_render(argv: list[str]) -> bool:
     return verb is not None and verb[:2] == ("apply", _LOCAL_RENDER_SUBCOMMAND)
 
 
+def _refused_flags(tool: str) -> frozenset[str]:
+    """Every flag the policy refuses by name for `tool`, whatever the command."""
+    if tool == "kubectl":
+        # --kuberc is already in _KUBECTL_IDENTITY_FLAGS.
+        return frozenset(_IMPERSONATION_FLAGS | _KUBECTL_IDENTITY_FLAGS | _KUBECTL_FILE_WRITE_FLAGS)
+    return frozenset(
+        _IMPERSONATION_FLAGS | _GCLOUD_IDENTITY_FLAGS | _GCLOUD_FILE_WRITE_FLAGS | {"--flags-file"}
+    )
+
+
+def _strip_refused_flags(argv: list[str]) -> list[str]:
+    """argv with every flag refused by name removed, with its value.
+
+    Each of those flags takes a value unless it is in a boolean set, so the
+    value is the next token when it is not attached with `=`. A spelling this
+    cannot take apart (a pflag shorthand cluster such as `-sURL`) stays in, and
+    the remainder is then refused again for it rather than classified.
+    """
+    refused = _refused_flags(argv[0])
+    booleans = _KUBECTL_BOOLEAN_FLAGS | _GCLOUD_BOOLEAN_FLAGS
+    kept = argv[:1]
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        name, separator, _ = token.partition("=")
+        if token.startswith("-") and name in refused:
+            index += 1 if (separator or name in booleans) else 2
+            continue
+        kept.append(token)
+        index += 1
+    return kept
+
+
+def _gcloud_words_before_unknown_flag(argv: list[str]) -> tuple[list[str], int]:
+    """The words of a gcloud argv up to its first unknown flag, and that flag's index.
+
+    Everything before the first unknown flag is parsed with known arity, so
+    those words are the command path as far as it goes. The index is
+    len(argv) when there is no unknown flag.
+    """
+    words: list[str] = []
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if token.startswith("-"):
+            name, separator, _ = token.partition("=")
+            if name in _GCLOUD_BOOLEAN_FLAGS:
+                index += 1
+                continue
+            if name in _GCLOUD_FLAGS_WITH_VALUE:
+                index += 1 if separator else 2
+                continue
+            break
+        words.append(token)
+        index += 1
+    return words, index
+
+
+def _gcloud_prefix_write(argv: list[str]) -> bool:
+    """Whether the words before a gcloud argv's unknown flag already rule out a read.
+
+    When no entry in GCLOUD_READ_COMMANDS agrees with them (neither a prefix
+    of them nor extending them), no flag or word after them can make the
+    command a read, with one exception: a help flag anywhere in the argv can
+    make it a synopsis request the help escape allows (`clusters upgrade c
+    --node-pool=p --image-type=t --help`). Before the unknown flag the walk
+    reads it with each flag's arity; past it, whether a help token stands as a
+    flag or as another flag's value cannot be read, so any help token keeps
+    the answer open, and the retry is invited.
+    """
+    words, index = _gcloud_words_before_unknown_flag(argv)
+    if not words:
+        return False
+    if _gcloud_asks_for_help(argv[:index]) or any(
+        token.partition("=")[0] in _GCLOUD_HELP_FLAGS for token in argv[index:]
+    ):
+        return False
+    return not any(
+        tuple(words[:min(len(command), len(words))]) == command[:min(len(command), len(words))]
+        for command in GCLOUD_READ_COMMANDS
+    )
+
+
+def _is_unreadable_write(decision: Decision) -> bool:
+    """Whether a decision is the gcloud unreadable refusal's refused-retry variant."""
+    return decision.rule_id == "gcp.unreadable-command" and decision.message.startswith(_UNREADABLE_WRITE_LEAD)
+
+
+def _still_refused_without_flags(argv: list[str]) -> str | None:
+    """The read-only refusal argv would still get with its refused flags removed, or None.
+
+    The refusals that invite a retry without a flag ask this first: a retry
+    that is refused anyway is not a retry to invite. Returns that refusal's
+    message, which is fixed text (no caller bytes), so the flag refusal can
+    say what the retry would meet instead of inviting it. None when the
+    remainder would be allowed, or cannot be judged: an argv this cannot take
+    apart (an attached shorthand such as `-sURL`), or a remainder that is
+    itself unreadable.
+
+    Also None for every kubectl argv, whose flag refusals keep inviting the
+    retry. The runtime's refusal stop halts a turn on a `kubernetes.read-only`
+    refusal of a write and does not count a flag refusal's own rule id, so for
+    a kubectl write refused for a flag the flagless retry is how the turn
+    reaches that halt (#3380).
+    """
+    if argv[0] == "kubectl":
+        return None
+    stripped = _strip_refused_flags(argv)
+    if stripped == argv:
+        # Evaluating it again would only ask this question again.
+        return None
+    remainder = evaluate(stripped)
+    if remainder.rule_id in (KUBERNETES_READ_ONLY_RULE, "gcp.read-only"):
+        return remainder.message
+    if _is_unreadable_write(remainder):
+        return _GCLOUD_READ_ONLY_MESSAGE
+    return None
+
+
+def _flag_refusal(argv: list[str], rule_id: str, reason: str, removal: str, flag: str) -> Decision:
+    """A refusal for a flag, which invites a retry without it only when that retry would be allowed.
+
+    Otherwise it says the retry is refused and why, with the remainder's own
+    read-only refusal, and names no verb: the shim prints verb_tuple, and the
+    remainder's would carry a positional (`exec my-pod`) that the read-only
+    refusal trims.
+    """
+    still_refused = _still_refused_without_flags(argv)
+    if still_refused is not None:
+        return Decision(
+            allowed=False,
+            rule_id=rule_id,
+            message=f"{reason} {_STILL_REFUSED} {still_refused}",
+            offending_flag=flag,
+        )
+    parts = [reason, removal, _FLAG_BOUNDARY_NOTICE] if removal else [reason, _FLAG_BOUNDARY_NOTICE]
+    return Decision(allowed=False, rule_id=rule_id, message=" ".join(parts), offending_flag=flag)
+
+
+def _gcloud_help_escape_for_every_reading(argv: list[str]) -> bool:
+    """Whether `--help` is an allowed retry for every flagless reading of argv.
+
+    The surface comes from the readings, not from the words before the flag:
+    an unknown flag ahead of the surface (`gcloud --new config set …`) leaves
+    no words before it, and the surface that decides the escape follows it. A
+    reading whose surface cannot be read, or names none, offers no escape.
+    """
+    _, index = _gcloud_words_before_unknown_flag(argv)
+    if index >= len(argv):
+        return False
+    readings = [argv[:index] + argv[index + 1:]]
+    if "=" not in argv[index]:
+        readings.append(argv[:index] + argv[index + 2:])
+    for reading in readings:
+        words, _ = _gcloud_words_and_flag(reading)
+        surface = _gcloud_surface(words) if words is not None else None
+        if surface is None or surface in _NO_HELP_ESCAPE_SURFACES:
+            return False
+    return True
+
+
+def _gcloud_unknown_flag_write(argv: list[str]) -> bool | None:
+    """Whether every flagless retry of an unknown-flag gcloud argv is refused.
+
+    The retry the unreadable refusal would invite drops the first unknown
+    flag: just its token when the value is attached with `=`, and when it is
+    not, either the token alone or the token and the next one, since its arity
+    is what is unknown. When every such reading is refused as a write, so is
+    the retry, and the refusal says so instead of inviting it. One level only:
+    a reading that is itself unreadable is judged by its prefix
+    (_gcloud_prefix_write), so a run of unknown flags costs a fixed amount.
+
+    True when every reading is refused, False when some reading is not (it
+    is allowed, so the retry is worth inviting: `update x --new -h` drops to
+    `update x -h`, a synopsis request), and None when a reading cannot be
+    judged, which leaves the decision to the prefix check.
+    """
+    _, index = _gcloud_words_before_unknown_flag(argv)
+    if index >= len(argv):
+        return None
+    readings = [argv[:index] + argv[index + 1:]]
+    if "=" not in argv[index]:
+        readings.append(argv[:index] + argv[index + 2:])
+    refused = 0
+    for reading in readings:
+        decision = _evaluate(reading, readings=False)
+        if decision.rule_id == "gcp.read-only" or _is_unreadable_write(decision):
+            refused += 1
+        elif decision.rule_id != "gcp.unreadable-command":
+            return False
+    return True if refused == len(readings) else None
+
+
 def evaluate(argv: list[str]) -> Decision:
+    """See _evaluate."""
+    return _evaluate(argv)
+
+
+def _evaluate(argv: list[str], readings: bool = True) -> Decision:
     """Allow or refuse a command on read-only grounds.
 
     Never raises. Anything unrecognised is refused.
@@ -1173,16 +1427,12 @@ def evaluate(argv: list[str]) -> Decision:
 
     impersonation_flag = _refuses_impersonation(argv)
     if impersonation_flag:
-        return Decision(
-            allowed=False,
-            rule_id="identity.caller-supplied-impersonation",
-            message=(
-                "Impersonation is set by the credential proxy, not by the "
-                "caller. Remove --as, --as-group, --as-uid, --as-user-extra and "
-                "--impersonate-service-account. "
-                + _FLAG_BOUNDARY_NOTICE
-            ),
-            offending_flag=impersonation_flag,
+        return _flag_refusal(
+            argv,
+            "identity.caller-supplied-impersonation",
+            "Impersonation is set by the credential proxy, not by the caller.",
+            "Remove --as, --as-group, --as-uid, --as-user-extra and --impersonate-service-account.",
+            impersonation_flag,
         )
 
     if argv[0] == "kubectl":
@@ -1192,46 +1442,39 @@ def evaluate(argv: list[str]) -> Decision:
         # happens to be a vehicle for.
         kuberc_flag = _kubectl_has_kuberc(argv)
         if kuberc_flag:
-            return Decision(
-                allowed=False,
-                rule_id="kubernetes.kuberc-forbidden",
-                message=(
-                    "--kuberc reads options from a file under the agent's control, "
-                    "including impersonation defaults that never appear in the "
-                    "command line. We cannot read that file without a race "
-                    "condition, so we refuse it outright. "
-                    + _FLAG_BOUNDARY_NOTICE
-                ),
-                offending_flag=kuberc_flag,
+            return _flag_refusal(
+                argv,
+                "kubernetes.kuberc-forbidden",
+                "--kuberc reads options from a file under the agent's control, "
+                "including impersonation defaults that never appear in the "
+                "command line. We cannot read that file without a race "
+                "condition, so we refuse it outright.",
+                "",
+                kuberc_flag,
             )
 
         identity_flag = _kubectl_refuses_identity_change(argv)
         if identity_flag:
-            return Decision(
-                allowed=False,
-                rule_id="kubernetes.identity-change-forbidden",
-                message=(
-                    "Identity and API server address belong to the broker. Remove "
-                    "--server, --token, --user, --client-certificate, "
-                    "--insecure-skip-tls-verify and the other credential flags to "
-                    "use the cluster and identity the proxy configured. "
-                    + _FLAG_BOUNDARY_NOTICE
-                ),
-                offending_flag=identity_flag,
+            return _flag_refusal(
+                argv,
+                "kubernetes.identity-change-forbidden",
+                "Identity and API server address belong to the broker.",
+                "Remove --server, --token, --user, --client-certificate, "
+                "--insecure-skip-tls-verify and the other credential flags to "
+                "use the cluster and identity the proxy configured.",
+                identity_flag,
             )
 
         file_write_flag = _kubectl_refuses_file_write(argv)
         if file_write_flag:
-            return Decision(
-                allowed=False,
-                rule_id="kubernetes.file-write-forbidden",
-                message=(
-                    "--profile, --profile-output, --cache-dir and --output-directory "
-                    "write to a path of the caller's choosing inside the credential "
-                    "sidecar. Remove them. "
-                    + _FLAG_BOUNDARY_NOTICE
-                ),
-                offending_flag=file_write_flag,
+            return _flag_refusal(
+                argv,
+                "kubernetes.file-write-forbidden",
+                "--profile, --profile-output, --cache-dir and --output-directory "
+                "write to a path of the caller's choosing inside the credential "
+                "sidecar.",
+                "Remove them.",
+                file_write_flag,
             )
 
         verb, unknown_flag = _kubectl_verb_and_flag(argv)
@@ -1246,11 +1489,7 @@ def evaluate(argv: list[str]) -> Decision:
             return Decision(
                 allowed=False,
                 rule_id=KUBERNETES_READ_ONLY_RULE,
-                message=(
-                    "Agents hold read-only access to Kubernetes. Propose this change "
-                    "as a pull request instead. "
-                    + _ACTION_BOUNDARY_NOTICE
-                ),
+                message=_KUBECTL_READ_ONLY_MESSAGE,
                 verb_tuple=verb,
             )
         if verb in KUBECTL_READ_VERBS or verb[:1] in KUBECTL_READ_VERBS:
@@ -1258,59 +1497,75 @@ def evaluate(argv: list[str]) -> Decision:
         return Decision(
             allowed=False,
             rule_id=KUBERNETES_READ_ONLY_RULE,
-            message=(
-                "Agents hold read-only access to Kubernetes. Propose this change "
-                "as a pull request instead. "
-                + _ACTION_BOUNDARY_NOTICE
-            ),
+            message=_KUBECTL_READ_ONLY_MESSAGE,
             verb_tuple=verb,
         )
 
     if argv[0] == "gcloud":
         flags_file = _gcloud_has_flags_file(argv)
         if flags_file:
-            return Decision(
-                allowed=False,
-                rule_id="gcp.flags-file-forbidden",
-                message=(
-                    "--flags-file reads from a file under the agent's control. "
-                    "We cannot read that file without a race condition, so we refuse "
-                    "it outright. Expand flags manually instead of using a file. "
-                    + _FLAG_BOUNDARY_NOTICE
-                ),
-                offending_flag=flags_file,
+            return _flag_refusal(
+                argv,
+                "gcp.flags-file-forbidden",
+                "--flags-file reads from a file under the agent's control. "
+                "We cannot read that file without a race condition, so we refuse "
+                "it outright.",
+                "Expand flags manually instead of using a file.",
+                flags_file,
             )
 
         identity_flag = _gcloud_refuses_identity_change(argv)
         if identity_flag:
-            return Decision(
-                allowed=False,
-                rule_id="gcp.identity-change-forbidden",
-                message=(
-                    "Identity belongs to the broker. Remove --access-token-file, "
-                    "--configuration, --account and the other identity flags to "
-                    "use the default identity. "
-                    + _FLAG_BOUNDARY_NOTICE
-                ),
-                offending_flag=identity_flag,
+            return _flag_refusal(
+                argv,
+                "gcp.identity-change-forbidden",
+                "Identity belongs to the broker.",
+                "Remove --access-token-file, --configuration, --account and the "
+                "other identity flags to use the default identity.",
+                identity_flag,
             )
 
         write_flag = _gcloud_writes_a_file(argv)
         if write_flag:
-            return Decision(
-                allowed=False,
-                rule_id="gcp.file-write-forbidden",
-                message=(
-                    "--output-path and --log-http-log-file write a file inside "
-                    "the credential proxy's own container, not the agent "
-                    "workspace. Drop the flag; where the command offers the same "
-                    "content on standard output, redirect that instead. "
-                    + _FLAG_BOUNDARY_NOTICE
-                ),
-                offending_flag=write_flag,
+            return _flag_refusal(
+                argv,
+                "gcp.file-write-forbidden",
+                "--output-path and --log-http-log-file write a file inside "
+                "the credential proxy's own container, not the agent "
+                "workspace.",
+                "Drop the flag; where the command offers the same content on "
+                "standard output, redirect that instead.",
+                write_flag,
             )
 
         words, unknown_flag = _gcloud_words_and_flag(argv)
+        retry_refused = None
+        if words is None:
+            # The retry the generic refusal below invites would be refused too
+            # (#2979): every flagless reading is refused, or, where a reading
+            # cannot be judged, the words before the flag already rule out a read.
+            from_readings = _gcloud_unknown_flag_write(argv) if readings else None
+            retry_refused = from_readings if from_readings is not None else _gcloud_prefix_write(argv)
+        if retry_refused:
+            help_clause = (
+                " For its synopsis only, --help with no other flags is allowed."
+                if _gcloud_help_escape_for_every_reading(argv) else ""
+            )
+            return Decision(
+                allowed=False,
+                rule_id="gcp.unreadable-command",
+                message=(
+                    _UNREADABLE_WRITE_LEAD
+                    + " "
+                    + _STILL_REFUSED
+                    + " "
+                    + _GCLOUD_READ_ONLY_MESSAGE
+                    + help_clause
+                ),
+                # No verb: on a two-word surface the third word would be
+                # the caller's positional (`projects delete acme-prod`).
+                offending_flag=unknown_flag,
+            )
         if words is None:
             return Decision(
                 allowed=False,
@@ -1321,11 +1576,10 @@ def evaluate(argv: list[str]) -> Decision:
                 # and `--maintenance-window-start` reach this branch. Saying
                 # "global flag" sent readers looking for a gcloud release note
                 # that does not exist, and an agent repeating the advice into a
-                # report tells a customer something untrue. Both examples are
-                # flags on `container clusters update`, which this gate refuses
-                # as a write regardless, so the retry below is what resolves the
-                # ambiguity: if the command still fails without the flag, the
-                # flag was never the reason.
+                # report tells a customer something untrue. A flag on a command
+                # whose every flagless retry is refused takes the variant above
+                # instead (#2979); this branch is what is left, where a retry
+                # without the flag may be allowed.
                 message=(
                     "gcloud used a flag whose arity is unknown to this module, so the "
                     "command path cannot be read. Re-run without the flag: if the "
@@ -1362,14 +1616,7 @@ def evaluate(argv: list[str]) -> Decision:
             return Decision(
                 allowed=False,
                 rule_id="gcp.read-only",
-                message=(
-                    "Agents hold read-only access to Google Cloud. Propose this "
-                    "change as a pull request instead. If this is a read the "
-                    "product runs on its own, it is missing from "
-                    "GCLOUD_READ_COMMANDS in command_policy.py -- report it "
-                    "rather than working around it. "
-                    + _ACTION_BOUNDARY_NOTICE
-                ),
+                message=_GCLOUD_READ_ONLY_MESSAGE,
                 verb_tuple=_gcloud_verb_tuple(words),
             )
         return _ALLOWED

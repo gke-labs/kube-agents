@@ -233,7 +233,13 @@ joins its own cluster and every Cluster Agent profile, whichever project it name
 
 Inside the agent pod the detector reaches Pub/Sub through the credential proxy (`WATCHER_BROKER_URL`
 and `WATCHER_BROKER_TOKEN_FILE`, set by the operator; the broker relays the four calls on the one
-configured subscription, and fleet reads the same way as the event watcher's). The credential behind
+configured subscription, and fleet reads the same way as the event watcher's). On a profile cluster
+the join's read goes through the same broker, which reads only the kinds in its table
+(`WATCHER_NAMED_READS` in `agents/platform/scripts/watcher_policy.py`): built-in declarative kinds and
+the six GitOps sync objects the agent can read itself, never a Secret. A record of any other kind
+comes out `failed`, with the broker's rule in the lookup error, and so without the `reconciled`
+judgement: a GitOps-managed object of an unlisted kind (a Flux HelmRelease, say) is reported without
+"since reconciled by" even when its controller has already put it back. The credential behind
 those calls is then the broker's, which needs `roles/pubsub.subscriber` on the subscription; with
 neither variable set, Application Default Credentials need it — the Workload Identity the
 `drift-pubsub` module grants it to. Add `roles/pubsub.viewer`
@@ -540,7 +546,7 @@ one whose profile failed to write.
 | `no_object`       | Nothing to fetch: a delete, or a create whose name the API server had not assigned when audited.                                                                                                                                                                                                                                                                                                                                                  |
 | `gone`            | The cluster served the path and answered `NotFound`. The object existed when the call was audited and does not now.                                                                                                                                                                                                                                                                                                                               |
 | `unreachable`     | The record names a live object this process cannot read: a cluster the join has no client for, or any cluster at all when neither source is configured. The shutdown lines name them. When no readable Cluster Agent profile names the cluster the record is outside the install's scope and is logged (`inject=held_out_of_scope`) and not escalated; when one does, or the scope is unknown, it is forwarded and injected as any other outcome. |
-| `failed`          | Any other lookup error: RBAC, a network fault, a timeout, an API group or version the cluster does not serve.                                                                                                                                                                                                                                                                                                                                     |
+| `failed`          | Any other lookup error: RBAC, a network fault, a timeout, an API group or version the cluster does not serve, or a kind the credential proxy does not read for a profile cluster (`SECURITY_POLICY_BLOCKED (kubernetes.watcher.kind)`).                                                                                                                                                                                                           |
 | `skipped_backlog` | A backlog record the join did not look up, because the daemon takes the digest route and nothing reads its ownership ([The backlog](#the-backlog)). Decided after the delete test and the cluster lookup, so a backlog delete is still `no_object` and a backlog record from an unread cluster is still `unreachable`.                                                                                                                            |
 
 A 404 answers both `gone` and `failed`, so they are told apart by what the error names rather than by
@@ -699,9 +705,14 @@ backlog. That includes records nacked at shutdown and changes made within the si
 before the restart. Two rules keep a person's edit in that window carded: the kubectl rule above,
 and the daemon's, which cards every late row of a principal with fewer than three late rows in the
 digest. What is left without a card of its own is three or more late non-kubectl changes by one
-principal, which the digest names under that principal. On an install with no chat platform the
-digest is not posted, so those changes are visible only as the `backlog` rows of
-`GET /v1/intercepted-events`; on `main` each would have left a triage card. A Helm upgrade the old detector is still running for is not covered:
+principal, which the digest names under that principal. On an install with no chat platform enabled
+(a `next` install whose only chat platform has no home channel counts) the digest is one card on the
+task board, unassigned and blocked, so no agent acts on it and it stays in view. The daily board
+health report names it while it stays blocked; that report reaches a person once the install
+has chat. One card per burst: the digest closes 60 seconds after its newest row or 10
+minutes after its oldest, so while the detector lags more than 30 minutes, each burst of three or
+more changes by one person, more than 60 seconds apart, files its own card. A Helm upgrade the old
+detector is still running for is not covered:
 its writes reach a running process and are triaged as live changes.
 
 ## Three things to know before changing it

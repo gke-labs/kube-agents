@@ -12,7 +12,7 @@ asks whether an upgrade has reached every cluster, which members are behind a ta
 fleet is from a release-channel default, whether one cluster's control plane is current for its
 channel (`--cluster <location>/<name>`), or whether the repositories are ready for a target
 version. Run the version report again during a rollout and it also says, per member, what changed
-since the previous run and which members have stopped moving (see "Track a rollout across runs").
+since the previous run and which members have stopped moving (see "Track a rollout across runs" and `references/track-a-rollout.md`).
 With `--readiness` it also says, per member, what would stop the upgrade: a PodDisruptionBudget
 that blocks every node drain, a fail-closed admission webhook with an unreachable backend in the
 upgrade's path or able to refuse the control plane's bootstrap RBAC writes (ClusterRoles and
@@ -27,6 +27,17 @@ runbooks and checklists, use the
 configuration drift: the fleet-consistency audit compares a cluster's configuration against its
 live peers, and the drift-detection design (not yet shipped) means live state diverging from Git.
 Neither reads versions against a target.
+
+## Before you run anything: is this the brief?
+
+A request for **the upgrade readiness brief**, for **which findings need a decision**, or for
+**this week's upgrade readiness report** is not answered by this skill's table. Stop here, load the
+`upgrade-readiness-brief` skill (`skill_view upgrade-readiness-brief`) and follow it: it reads the
+Saturday review's copy under `/opt/data/upgrade-readiness/weekly/` and the findings queue, and
+answers in the brief's shape, which opens with **Decide now** and the undecided critical findings'
+queue ids. Run this skill's report only when that skill tells you to (no weekly review exists yet),
+or when the question is the readiness table itself ("is every cluster ready", "what would stop the
+upgrade", "which clusters lag").
 
 ## Run the report
 
@@ -71,7 +82,7 @@ The script lives under the profile home, `/opt/data/profiles/platform` (`/opt/da
   `1.31.4-gke.1183000 channel default (REGULAR)`.
 - `--output` writes the same data as JSON: `members[]`, `errors[]`, a `summary` count per
   status, `narrowed_to` (the `--cluster` specs of a narrowed run, `null` on a full one) and, on a
-  full run only, the `rollout` block and the per-member `progress` fields described below. A
+  full run only, the `rollout` block and the per-member `progress` fields `references/track-a-rollout.md` describes. A
   `--cluster` run writes neither, since it neither reads nor compares the record; it prints a
   note where the progress section would be.
   The file is written whole (a temp file, then a rename) at the end of the run, so a reader never
@@ -80,14 +91,17 @@ The script lives under the profile home, `/opt/data/profiles/platform` (`/opt/da
   the block above does; read back the path the script prints on its `Wrote … to` line.
   The weekly audit's collector is the exception: it moves its own per-run file onto the fixed name
   described below.
-- `--rollout-in-progress` and `--state-dir` belong to rollout tracking, below; `--readiness`,
-  `--at` and `--kubeconfig-dir` to the readiness check, below that.
+- `--rollout-in-progress` belongs to rollout tracking, below, and `--state-dir` to its record
+  (`references/track-a-rollout.md`); `--readiness`, `--at` and `--kubeconfig-dir` to the
+  readiness check, below that.
 
 The script runs `gcloud container clusters list`, `gcloud container get-server-config` and, when neither
 `--project` nor a declared scope is passed, `gcloud config get-value project` and `gcloud projects list` (plus `gcloud projects describe` for a
 project whose `clusters list` was refused as API-disabled or whose configured identifier is a
 project number), each with a 60-second timeout, and
-with `--readiness` one `gcloud container clusters get-credentials` and the `kubectl get`s per
+with `--readiness` three `gcloud` list reads per project (`compute backend-services list`,
+`compute instances list`, `container operations list`, each projected to the fields the per-entry
+rules read), one `gcloud container clusters get-credentials` and the `kubectl get`s per
 member that "Check upgrade readiness" lists (the PDB rule's, the webhook rule's, then one per
 group of kinds the per-entry rules read), plus whatever a registered rule reads itself through the
 script's own runner under the same cap (a rule that reads the audit log runs paged `gcloud logging
@@ -159,67 +173,24 @@ the pools that do parse. A note reading `upgrade in flight` means the cluster or
 
 ## Track a rollout across runs
 
-Every full run records its per-member result and compares itself with the previous run for the
-same target, so two runs during a rollout show what moved between them. A `--cluster` run does
-neither: it prints a note in place of the progress section, and its JSON carries no `rollout`
-block and no per-member `progress`, `unchanged_since` or `unchanged_for_seconds`. The record
-lives at
-`/opt/data/state/fleet-upgrade-verification/<target>.json` (`channel-default.json` for a run
-without `--target-version`), on the persistent volume the shell sandbox keeps between turns;
-`--state-dir` points it elsewhere. Each target has its own record, so a run against a different
-target starts a new baseline rather than comparing across targets.
-
-The first run for a target prints one line saying the baseline was recorded and where. Every later
-run prints a "Rollout progress" section after the table, naming the previous run's time and, per
-member, the control-plane and lowest-pool versions then and now, the current status, and one of:
-
-- `completed`: the member is `current` or `ahead` after a version change, or its status became
-  `current` or `ahead` since the previous run. A `current` member that followed its channel
-  default to a new version is `completed`, not `started`.
-- `started`: the control plane or the lowest pool changed version without reaching the target,
-  or the cluster or a pool is `RECONCILING`/`PROVISIONING`.
-- `unchanged`: the same versions as the previous run. A member whose versions are the same but
-  whose status changed (the channel default advanced under it) is also `unchanged`, but it starts
-  a new observation series: it is not `stalled` in that run, and its elapsed time counts from it.
-- `stalled (unchanged for <elapsed>)`: an `unchanged` member that is `lagging` or `patch-behind`
-  while a rollout is active, seen at these versions and this status by the previous run too.
-  Elapsed counts from the first of the consecutive runs that saw the member so, and keeps growing
-  across runs until the member moves.
-- `new`: no record of this member in the previous run.
-
-An `unknown` grade (a failed `get-server-config` read, an unparsable version) is not evidence of a
-move: the comparison falls back to the versions alone, the record keeps the last graded status
-and its clock, and a member that is `current` at the same versions as an ungraded baseline is
-`unchanged`, not `completed`.
-
-A rollout is active when at least one member is `started` or `completed` in the same comparison,
-or when the operator passed `--rollout-in-progress`, which is for a rollout whose first wave has
-not produced a mover yet. Pass the flag when the user says a rollout is under way; when there is
-no earlier record to compare with and the user asks which members have stalled, run the report
-twice in the turn with the flag and read the second run's section. Without a mover or the flag,
-an unmoved member is `unchanged`, never `stalled`, so two quiet runs a week apart do not invent a
-stall. A member that is `current`, `ahead` or
-`unknown` is never `stalled`.
-
-A member in the previous record with no row this run is listed once under the section: dropped
-from the record when its project was read cleanly (the cluster is gone), carried forward when
-its project failed to read or was not in this run's `--project` scope, so a failed read never
-loses a record or manufactures a stall. A record the script cannot read is reported on stderr and
-replaced by a new baseline; a record it cannot write sets exit code 1 with the table still
-printed. In a full run's JSON, each member carries `progress`, `unchanged_since` and
-`unchanged_for_seconds`, and the top-level `rollout` block has the record path, both run
-timestamps, whether the rollout counted as active and why, a count per progress value, and the
-members missing this run.
+Every full run compares itself with the previous run for the same target and prints a "Rollout
+progress" section saying, per member, what started, completed or stalled since then. Pass
+`--rollout-in-progress` when the user says a rollout is under way; when there is no earlier record
+to compare with and the user asks which members have stalled, run the report twice in the turn
+with the flag and read the second run's section. What each progress value means, the record
+file and the JSON: `references/track-a-rollout.md`.
 
 ## Check upgrade readiness
 
-`--readiness` adds a second table after the version table, one row per member, graded against
+`--readiness` adds a readiness table after the version table, one row per member, graded against
 the same target as the member's version row, and a `readiness` object per member in the JSON
 (`members[].readiness`, with a top-level `readiness` block holding the instant evaluated and a
-count per verdict). Without the flag nothing changes. The rules below each name the governance
+count per verdict), then the add-on inventory table (`members[].readiness.addons` in the JSON, the
+known-issues rule's input). Without the flag nothing changes. The rules below each name the governance
 SOP check they derive from, except the webhook rule, which has no SOP check yet; after them run
 the per-entry rules registered in `upgrade_readiness.EXTRA_RULES` (`scripts/readiness_rules/`, one
-module per entry of the upgrade-failure catalogue in the repository's design docs; the package
+module per rule, each stamped with the entry of the upgrade-failure catalogue in the repository's
+design docs it reads (an entry can have several); the package
 docstring is the contract a module meets); the maintenance rule departs from its SOP where the two
 differ, and says so. Run it once, from this profile, for every cluster the question covers; a
 readiness question fanned out to the Cluster Agents loses the maintenance read and the grading
@@ -325,7 +296,7 @@ The per-entry rules run after those four, over the same cluster record and the r
 the webhook read, one per group of kinds: `kubectl get daemonset,cronjob,pvc,networkpolicy,namespace
 -A -o json`; `kubectl get pods -A -o json` on its own, because the pod list is the one most
 likely to exceed the credential proxy's output cap and a cut read must cost only the rules that
-need pods; the Nodes through a jsonpath template that keeps each node's name, labels, taints,
+need pods; the Nodes through a jsonpath template that keeps each node's name, `providerID`, Pod CIDR, labels, taints,
 whether it is cordoned, node info, allocatable and conditions and drops the rest (so a few
 hundred nodes stay under that cap); and `kubectl get storageclass,pv -o json`. Each of them
 fails on its own: a refused or unparsable read, or one the credential proxy cut at its output
@@ -348,13 +319,8 @@ Each rule returns blockers,
 risks, reasons it could not decide, and notes, and declares whether it can block at all; a
 blocker joins the verdict, a risk never does, and the table prints them under `other blockers`
 and `risks`, each as `<rule id>: <the rule's description>`, so the cell names the rule the way the
-note column does. The rules registered today, with the catalogue entry each reads:
-
-- **Zonal control plane** (`zonal-control-plane`, entry 11). A cluster whose `location` is a zone
-  is a risk on every report, never a blocker: the Kubernetes API is unreachable for a short window
-  while the single control-plane replica is rebuilt, running pods are unaffected, and the cell
-  says what to do about it. A location that is neither a zone nor a region is unknown, and since
-  the rule can never block, that unknown goes in the note and leaves the verdict to the other rules.
+note column does. The rules, one per catalogue entry or incident scenario, with their reads and
+actions: [`references/readiness-rules.md`](references/readiness-rules.md).
 
 A member is `blocked` when any rule blocks, whatever else could not be evaluated; `unknown` when
 nothing blocked but a rule that could have blocked could not be evaluated (the cluster read
@@ -365,7 +331,7 @@ reported in the note. In the JSON each member carries `readiness.rules` (per rul
 whether it can block, and a count of its blocking, risk, unknown and note entries),
 `rule_blocking`, `risks` and `unknown` (the findings across rules, once, each with its `rule`,
 `entry` and the `text` the cell or the note prints; an unknown entry with its `reason` and
-`can_block`), `notes`, `read_errors` (per kind) and `audit_log` (per read); the top-level
+`can_block`), `notes`, `addons` (the add-on inventory rows), `read_errors` (per kind) and `audit_log` (per read); the top-level
 `readiness` block counts the members with risks (`members_with_risks`). A failed
 `get-credentials`, PDB read or webhook read is listed under the table as a read failure for that
 member and sets exit code 1, like a failed gcloud read. A failed `get-credentials` or PDB read
@@ -376,6 +342,26 @@ while the member's maintenance and skew rules, and a per-entry rule that reads t
 record alone, are still graded, and the other members are unaffected. `--at` with a
 value that is not RFC 3339, or `--at` or `--kubeconfig-dir` without `--readiness`, is a usage
 error (exit 2).
+
+## Scheduled runs of the readiness report
+
+Besides the Monday upgrade audit, whose `upgrade-blocked` check runs `--readiness` for each cluster
+found behind, two cron jobs on the Platform Agent's roster run the whole report without a request
+(`cron/README.md` in the platform profile says how):
+
+- `upgrade-readiness-watch`, daily: for a cluster below a version its release channel offers; the
+  report lands under `upgrade-readiness/reports/<version>/` on the agent's volume with one chat line.
+- `upgrade-readiness-weekly-review`, Saturdays: every cluster in scope, every blocker and risk
+  registered on the findings queue; the technical report is `upgrade-readiness/weekly/latest.md`
+  on the agent's volume, with a copy at `/opt/data/upgrade-readiness/weekly/latest.md` in the
+  sandbox; the review job writes both, so never create, copy over or edit them from this skill
+  (the brief reads them as the review's record). `upgrade-readiness-weekly-brief` follows it with
+  the week's brief in chat. A user who
+  asks for "this week's upgrade readiness report" gets that copy printed; one who asks for the brief,
+  or for what needs their decision, gets the brief's shape composed from the copy and the findings
+  queue by the `upgrade-readiness-brief` skill (the SOP's "On request" route as the agent loads
+  it), never this skill's table or a summary of it: the brief leads with **Decide now** and the
+  undecided critical findings' queue ids.
 
 ## Scan the GitOps manifests
 

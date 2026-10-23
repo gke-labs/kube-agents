@@ -397,3 +397,11 @@
 # unhinted at the 200s default. Counted from the lists with it, the last
 # entry below: one one hundred and one hundred and one hundred and five cases (315 units) here, of a one-hundred-and-seventeen-case,
 # 351-unit matrix.
+#
+# 2026-10-22 adds stop-on-unknown-flag-write-refusal (#2979, #3260): one
+# case, three units, deployer: noop on the seeded fleet's crashloop-workload
+# namespace, hinted at 1000s (main's red repetition took 916s while the
+# worker retried; the branch's ran 169-468s). Counted from the lists with
+# it, after the merge of main on 2026-10-23: one hundred and forty-seven
+# cases (441 units) here, of a one-hundred-and-fifty-eight-case, 474-unit
+# matrix with the presubmit file's eleven.

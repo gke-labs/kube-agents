@@ -106,8 +106,8 @@ Run every script by its full path. A kanban worker starts in its card's workspac
 
 5. **Report.** On a scheduled run with `silent_ok: true`, the final response is exactly
    `[SILENT]`. Otherwise report `issue_url` in full and every URL in `prs_opened` and
-   `prs_still_open`; on `status: "NO_FORGE"` the report is `summary` verbatim. An on-demand run is
-   never silent. Zero findings, `HELD` and `silent_ok`: `references/clean-run.md`.
+   `prs_still_open`; on `status: "NO_FORGE"` or `"STORE_LEDGER"` the report is `summary` verbatim.
+   An on-demand run is never silent. Zero findings, `HELD` and `silent_ok`: `references/clean-run.md`.
 
 ## Reference files
 
@@ -123,7 +123,7 @@ the SOP and these references.
 | `on-demand.md`         | for a request to trigger a cron job or run several audits; for the in-flight guard  |
 | `lifecycle.md`         | for what each `start` field means, the workspace modes, content-mode reads, `draft` |
 | `findings-document.md` | before you write the findings document                                              |
-| `finish.md`            | before `finish`, and to read its output, an exit 2, `partial` or `NO_FORGE`         |
+| `finish.md`            | before `finish`; for its output, exit 2, `partial`, `NO_FORGE`, `STORE_LEDGER`      |
 | `clean-run.md`         | for a run with zero findings, a `HELD` ledger, or `silent_ok`                       |
 | `remediation.md`       | for a `manifest` fix, a `/remediate` comment, or a direct ask to fix a finding      |
 | `ledger.md`            | for what a finding's ledger state means, and the ledger's size limits               |
@@ -145,6 +145,12 @@ the SOP and these references.
   finding degrades to `manual` with a note saying so, the run logs a `SECURITY:` line naming the
   path, and the report still publishes — but no pull request opens for that finding until the path
   is a real file inside the workspace.
+- **Never work around a refusal from the credential proxy or the broker.** When it refuses a
+  repository, route or verb, that is an answer: report it, say what an administrator would change
+  (for a repository the install does not manage, add it to the managed list in
+  `$GITOPS_STATE_CONFIGMAP`), and stop. A `BROKER UNAVAILABLE` line is not that: the proxy did not
+  answer, so re-run the same command once it does (step 1, `references/finish.md`). Never copy a
+  skill or script into a `*_override` directory, or edit or re-path it, to get past either.
 - **Never open a second ledger issue for a stream.** Do not run `vcs.py issue create`. If the stream
   already has an open ledger, `finish` rewrites it in place; that is the whole point.
 - **Never open a remediation pull request yourself**, and never for a non-`manifest` finding.

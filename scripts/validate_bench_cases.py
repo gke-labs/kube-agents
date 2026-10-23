@@ -162,23 +162,21 @@ SCENARIO_BATCH_WAIT = (
 )
 
 KNOWN_UNREGISTERED = {
-    # The two CUJ 1 cases (#2889), held out for the same infra-lock budget
-    # as the stack cases below: a `stack:` case runs alone on lock-infra
-    # whatever EVAL_TASK_PARALLELISM is, and the main nightly part's serial
-    # chain is already at or past the 480m deadline on cost hints alone.
-    "gitops-drift-deleted-policy-triage": (
-        "#2889: stack case held out of the nightly until the infra-lock "
-        "chain has room"
-    ),
-    "gitops-drift-load-bearing-change-triage": (
-        "#2889: stack case held out of the nightly until the infra-lock "
-        "chain has room"
-    ),
     # Provisions its own cluster, so registering it costs every pull request
     # a second multi-minute provision. Whether it belongs in presubmit or
     # nightly is a tier decision nobody has made; this entry is the record
     # that the omission is known rather than accidental.
     "cluster-provision-kanban": "cluster-scoped provisioning task, tier decision pending",
+    # Has its fixture (its own stack) and its eval record (#3467: red on main,
+    # three greens on the fix, on a dev install), and belongs in the nightly.
+    # The pool runners hold no role that creates a Cloud Monitoring alert
+    # policy, so every apply of its stack would fail with 403; #3632 grants
+    # roles/monitoring.alertPolicyEditor. The entry goes when the case joins
+    # hack/eval/nightly-cases.txt.
+    "monitoring-alert-policy-read": (
+        "#3632: stack case held out of the nightly until the pool runners can "
+        "create a Cloud Monitoring alert policy"
+    ),
     # Has its fixture (its own stack) and its eval record (#2468: red on main,
     # three greens on the fix), and belongs in the nightly. #2755 lists what it
     # still needs first: Compute network permission for the CI runners,
@@ -209,6 +207,12 @@ KNOWN_UNREGISTERED = {
         "needs a chat platform, which no CI install has; run by hand on a chat install"
     ),
     "fleet-audit-chat-report-is-the-report": (
+        "needs a chat platform, which no CI install has; run by hand on a chat install"
+    ),
+    # Same constraint, one step further in: it grades a report falling back to the
+    # home channel after its thread refused it, so an install with no chat platform
+    # has neither the thread nor the channel and the case can only fail.
+    "notification-dead-thread-falls-back": (
         "needs a chat platform, which no CI install has; run by hand on a chat install"
     ),
     # It grades a GitHub forge declared at a GitHub Enterprise Server host,
@@ -287,6 +291,38 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    # Needs a GitOps repository that declares the namespace under a path a
+    # reconciler syncs; no pool project's repository has one. Run by hand on
+    # the GitOps-wired dev lane (gitops-target-1, sackheads/kage-fleet-dev).
+    "delete-namespace-declared-pr": (
+        "#3576: needs a declared, reconciler-synced namespace in the pool GitOps repositories"
+    ),
+    # Needs a GitOps repository with a Config Connector + Config Sync sibling
+    # cluster; no pool project has one. Run by hand on the GitOps-wired dev
+    # lane (ka-fleet-dev-1, sackheads/kage-fleet-dev).
+    "substrate-cluster-gitops-pr": (
+        "#3576: needs a Config Connector + Config Sync sibling cluster in the pool GitOps repositories"
+    ),
+    # Needs a GitOps repository whose provisioning/ path holds Terraform; no
+    # pool project's repository has one. Run by hand on a dev install whose
+    # repository does (ka-fleet-dev-1, sackheads/kage-fleet-dev at branch hcl).
+    "terraform-spot-replacement-pr": (
+        "#3576: needs a Terraform provisioning/ path in the pool GitOps repositories"
+    ),
+    "terraform-node-pool-autoscaling-pr": (
+        "#3576: needs a Terraform provisioning/ path in the pool GitOps repositories"
+    ),
+    "fanout-bound-ten-cards": (
+        "#3560: needs an eval install with more than ten clusters in scope, so a "
+        "fleet question reaches the ten-card fan-out bound; the seeded fleet and "
+        "every dev install have five or fewer"
+    ),
+    "upgrades-readiness-lb-drain-timeout": (
+        "#3524: needs bench/tf/fleet's drain-timeout backend service on seeded-b's default "
+        "pool (the readiness-lb-drain-timeout role) applied to every pool project (fleet "
+        "re-apply); no pool project has a backend service draining longer than the 600 s "
+        "GKE waits per node"
+    ),
     "scope-excluded-cluster-not-listed": (
         "#3213: needs an eval install whose PlatformAgent spec.scope.exclude.clusters "
         "names seeded-b (seeded-a and seeded-c in scope); no pool install declares a "
@@ -336,6 +372,20 @@ FIXTURE_NOT_READY = {
         "#2419: needs an install with no forge (a PlatformAgent with no "
         "spec.integration); every CI eval install has a GitHub forge, so no CI tier "
         "can run it; run it by hand against such an install"
+    ),
+    "fleet-audit-forge-without-issues-keeps-the-ledger-in-the-store": (
+        "#1154: needs an install whose forge's capabilities declare no issue verbs "
+        "and labels: false (an install whose forge declares no issue tracker, as a "
+        "Bitbucket provider does), and the no-pdb-workload declaration of #2228; "
+        "every CI eval install has a GitHub forge, so no CI tier can run it; run it "
+        "by hand against such an install"
+    ),
+    "fleet-audit-ledger-goes-to-the-gitops-repository": (
+        "#3536: needs an install whose PlatformAgent declares a second managed "
+        "repository beside the gitops one; every CI eval install declares one, and "
+        "a case cannot add one to a shared install, since the operator never removes "
+        "it from managed_repos and every other fleet-audit case on main would then "
+        "refuse; run it by hand against such an install"
     ),
     "gitops-drift-no-repository-triage": (
         "#3313: needs an install with no usable GitOps repository (a PlatformAgent "
@@ -393,6 +443,27 @@ FIXTURE_NOT_READY = {
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "
         "verification sweep"
     ),
+    "upgrades-removed-api-caller-named": (
+        "#2655: needs a removed-api-caller role, a writer that calls an API "
+        "version the cluster's next minor stops serving, which no standing fleet "
+        "role can carry (the catalogue's entry 6 Fixture line says why), so the "
+        "seeded fleet's upgrade-failure shapes merged without it; the "
+        "deprecated-api-caller role is stamped deprecated, not removed, and stands "
+        "in for entry 9, and the readiness report's removed-api-callers rule is "
+        "covered by unit tests on a captured log sample. The case waits for the "
+        "role on a purpose-built cluster, or for the next minor that removes a "
+        "served API; #2275 is the umbrella that tracks the scenario cases to merge"
+    ),
+    "upgrades-readiness-surge-headroom": (
+        "#3569: needs a cluster whose Pod secondary range leaves fewer free "
+        "per-node blocks than the maxSurge sum of its surging pools, or a node "
+        "pool with an accelerator on the surge strategy with no reservation "
+        "affinity; the seeded fleet plants neither (a secondary range is fixed "
+        "at cluster creation, so the short range is a new small cluster slot, "
+        "and an accelerator pool costs by the hour on every pool project), so "
+        "the surge-capacity rule's two surge halves are covered by unit tests on "
+        "a recorded cluster record and node list until the fixture lands"
+    ),
 }
 
 # Cases graded by the judge alone. The OutcomeValidity >= 0.7 fallback in
@@ -441,13 +512,20 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # The parsed manifest's fields and selector are the assertion; `kind` alone
     # only names what to look for.
     "report_manifest": ("fields", "selects", "excludes"),
-    "ledger_issue_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
+    "ledger_issue_contains": (
+        "required_phrases",
+        "forbidden_phrases",
+        "any_of_phrases",
+        "every_finding_named",
+    ),
     # No field: a bold one-sentence lead, no heading and the length caps are
     # the assertion, and every field narrows it.
     "answer_first": (),
     # No field: "this run's report is in the store" is the assertion, and
     # `status` and `required_finding_phrases` only narrow it.
     "audit_report_stored": (),
+    # The audits whose part of the reply is graded against the store.
+    "report_store_reply": ("audits",),
     # No field, deliberately: the freshness binding is the assertion and every
     # field only narrows it. See the empty-tuple rule in _check_assertions.
     "pull_request_opened": (),
@@ -463,6 +541,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # No assertion field: "the gateway would post nothing" is the assertion; `reply` only picks
     # which reply is graded.
     "reply_is_silent": (),
+    # No field: "every evidence block in the reply is a worker's command with its real output"
+    # is the assertion; `min_blocks` only sets how many blocks a reply needs.
+    "verified_claims_backed": (),
     # This repository, agent-disk-reading: the discovery sweep a cron job filed.
     "bootstrap_fanout": ("require",),
     # This repository, sandbox-reading: the findings the onboarding
@@ -480,6 +561,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # This repository, sandbox-reading: how many of the batch's critical
     # findings the onboarding report lists, against `limit`.
     "bootstrap_report_criticals": ("limit",),
+    # This repository, sandbox-reading: the paragraphs the onboarding report
+    # opens with, and the verdicts it must not write.
+    "bootstrap_report_posture": ("posture",),
     # This repository, sandbox-reading. No field, like pull_request_opened:
     # the diff against the image is the assertion. It reads the agent's own
     # shell sandbox pod, not a seeded-fleet fixture, so it is not in
@@ -492,9 +576,17 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # case planted. The rows it names are the assertion; with none it could
     # only pass.
     "findings_item_state": ("finding_ids",),
+    # This repository, agent-pod-reading: how many of a workload's events the
+    # session daemon folded into its newest incident. The count is the
+    # assertion; min_folded is at least 1, so it cannot pass on nothing folded.
+    "workload_incident_folded": ("min_folded",),
     # This repository, agent-pod-reading. No field: whether every post a planted
     # report produced is that report, exactly, is the whole assertion.
     "relay_posted_as_written": (),
+    # This repository, agent-pod-reading. No field: whether a report its thread
+    # refused still reached the home channel is the whole assertion, and the
+    # probe's planted thread is what makes the refusal certain.
+    "notification_fell_back_to_home": (),
     # This repository, agent-pod- and sandbox-reading. No field: whether every
     # post a fired audit run produced is the report its `finish` rendered is the
     # whole assertion.

@@ -661,9 +661,12 @@ class StateLockTest(unittest.TestCase):
     def state_lock(self, case: str) -> str:
         return shell_answer("unit_state_lock", f"unit_state_lock {case}").stdout.strip()
 
-    def test_only_oobe_first_run_audits_is_exempt(self):
-        self.assertTrue(self.exempt("oobe-first-run-audits"))
-        for case in ("bootstrap-discovery-fanout", "gpu-stress-test-diagnosis", "capacity-pinned-pool-probe"):
+    def test_only_the_listed_cases_are_exempt(self):
+        for case in ("oobe-first-run-audits", "autoops-warning-event-no-action-triage"):
+            with self.subTest(case=case):
+                self.assertTrue(self.exempt(case))
+        for case in ("bootstrap-discovery-fanout", "gpu-stress-test-diagnosis", "capacity-pinned-pool-probe",
+                     "autoops-warning-event-triage"):
             with self.subTest(case=case):
                 self.assertFalse(self.exempt(case))
 
@@ -697,11 +700,11 @@ class StateLockTest(unittest.TestCase):
         self.assertEqual(self.state_lock("capacity-pinned-pool-probe"), "")
 
     def test_an_exempt_stack_reaches_its_cluster_through_its_own_kubeconfig(self):
-        for case in ("oobe-first-run-audits",):
+        for case in ("oobe-first-run-audits", "autoops-warning-event-no-action-triage"):
             with self.subTest(case=case):
                 self.assertTrue(self.exempt(case))
                 main = (TF_ROOT / task_stack(case) / "main.tf").read_text(encoding="utf-8")
-                own = main.index('KUBECONFIG="$kubeconfig_dir/config"')
+                own = re.search(r'KUBECONFIG="\$\w+/config"', main).start()
                 self.assertLess(own, main.index("get-credentials"))
                 self.assertLess(own, main.index("kubectl"))
 

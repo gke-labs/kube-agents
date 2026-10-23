@@ -11,12 +11,14 @@
 # night). The registration lint (scripts/validate_bench_cases.py) reads this
 # file as well as the presubmit one; the domain-coverage lint reads only
 # blocking-roster.txt, so neither an entry here nor a held-out presubmit
-# seat counts as coverage. The Gemini nightly runs as two periodics:
-# ci-kube-agents-eval-nightly with EVAL_NIGHTLY_PART=main, and
-# ci-kube-agents-eval-nightly-writers with EVAL_NIGHTLY_PART=writers, the
-# cases that request a pull request, on a second project (the variable's
-# comment in the script says why). EVAL_NIGHTLY_PART=main-a and main-b halve
-# the main part again, for two jobs on two projects (#3384).
+# seat counts as coverage. The main nightly grades spec.mode next
+# (EVAL_MODE_NEXT=1) as two periodics: ci-kube-agents-eval-nightly with
+# EVAL_NIGHTLY_PART=main, and ci-kube-agents-eval-nightly-writers with
+# EVAL_NIGHTLY_PART=writers, the cases that request a pull request, on a
+# second project (the variable's comment in the script says why).
+# EVAL_NIGHTLY_PART=main-a and main-b halve the main part again, for two jobs
+# on two projects (#3384). ci-kube-agents-eval-nightly-today runs the whole
+# matrix on spec.mode today as the rollback check.
 #
 # WHO APPROVES. The normal approvers (root OWNERS). Only the presubmit files
 # beside this one carry the eval-crew rule (#1546, decided 2026-09-15).
@@ -64,7 +66,8 @@
 # are frozen in the order they landed.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
-# Spec-ready, each domain covered in the presubmit by its probe:
+# Spec-ready, each domain covered in the presubmit by its probe (upgrades'
+# probe nightly since 2026-10-16, #3269; consistency's since 2026-10-21, #3598):
 #   -- obtainability-planted-pdb: measured PASSED at 962s on 2026-08-26
 #      (build 2092638061140643840); too slow for a presubmit seat.
 #   -- stockout-pinned-pool: same full-audit shape and cost band; its
@@ -178,7 +181,8 @@
 # the same SOP-faithful shape and 900s band as consistency-drift-outlier
 # above, grading the collector-only `no-environment-label` check (SOP §4.14)
 # against the install's own unlabelled host cluster beside the labelled
-# seeded trio. Its domain's presubmit seat stays with the probe.
+# seeded trio. Its domain's presubmit seat stayed with the probe (nightly
+# since 2026-10-21, #3598).
 ./tasks/consistency-no-environment-label/task.yaml
 
 # The third tofu-provisioned case, and the drift half of incident triage
@@ -186,8 +190,9 @@
 # takes the infra lock, plants a Deployment whose replica count was taken out
 # of band, hands the Session KV daemon the audit record that change would have
 # produced, and blocks until the resulting triage card is on the board
-# (bounded at 5 minutes) -- then the agent turn waits on the card itself, as
-# autoops does. Hinted at 900s with them, unmeasured.
+# (bounded at 5 minutes) and then until it finishes (bounded at 15), so the
+# agent turn reads a finished card rather than polling a running one. Hinted
+# at 900s with them, unmeasured.
 #
 # The daemon also has a drift alert ceiling that the other two do not have.
 # It allows ALERT_DAILY_LIMIT_DRIFT drift alerts a day per install and
@@ -496,6 +501,17 @@
 # the card round trip.
 ./tasks/chat-voice-ack-names-target/task.yaml
 
+# The front door files nothing for a workload named only in a sample report the
+# bot once posted in the thread (#3080; agents/chat/SOUL.md §2, step 3).
+# deployer: noop, transcript-only, a single front-door turn and no card.
+./tasks/chat-sample-report-is-not-cluster-state/task.yaml
+# Its labelled twin: the same turn as the patched Slack adapter delivers it,
+# with the bot's own root marked "posted by you earlier" (#3080).
+./tasks/chat-sample-report-is-not-cluster-state-labelled/task.yaml
+# And the ordinary path the same rule must keep: a real report the bot posted,
+# "fix the first one", a card filed at once with a confirm-first criterion.
+./tasks/chat-real-report-fix-files-confirm-first/task.yaml
+
 # The onboarding prioritization stage (#2143): plants a fixed raw inventory
 # report on the install under test's shell sandbox, files the
 # bootstrap-inventory-prioritize card, and grades the findings its worker
@@ -792,11 +808,10 @@
 # A plain chat request for the clusters that differ from their peers runs the
 # drift audit's collector (#2386), and answers in chat without publishing.
 # deployer: noop; reads the seeded fleet's drift-outlier role (slot c).
-# Nightly rather than presubmit: consistency-authorized-networks-probe holds
-# the domain's presubmit seat. Red on main: no SOUL.md row routes the question
-# to fleet_drift.py. Marked expected_fail: true, so the nightly records it as
-# EXPECTED_FAIL and also records whether the outlier and facet reply checks
-# pass on seeded-c. The follow-up that adds the drift row removes the marker.
+# Nightly rather than presubmit: consistency-authorized-networks-probe held
+# the domain's presubmit seat (nightly too since 2026-10-21, #3598). Green on
+# the SOUL.md drift row (#3398, #3609); ran as expected_fail from #3135 until
+# then.
 ./tasks/drift-chat-request-runs-collector/task.yaml
 
 # A plain chat request about the security of the fleet's AI and
@@ -881,6 +896,37 @@
 # Add a case at its place in that order, so two pull requests that each add
 # a case don't edit the same lines. scripts/test_eval_rosters.py checks both.
 
+# A crash loop that outlasts the settle period is forwarded, the pod recovers,
+# and 15m after its last event the watcher's quiet follow-up lands on the
+# alert's thread and card ("Quiet since HH:MM UTC", #612). deployer: tofu, the
+# autoops-incident stack's transient shape; the plant waits out the quiet
+# period. Nightly from its first merge; a presubmit seat waits on its record.
+./tasks/autoops-quiet-followup/task.yaml
+
+# autoops-warning-event-no-action-triage (#3267): a Warning event that cleared
+# by itself is triaged to one "No action needed" bullet, with no Option
+# letters and no "To authorize:" call to action. Its stack plants a healthy
+# Deployment, injects a recorded NetworkNotReady event for its pod through the
+# daemon, and waits for the card to finish; the agent turn is a board read.
+# Infra-lock exempt in hack/ci-eval-pr.sh: the stack writes only its own
+# labelled namespace through a kubeconfig of its own, plus its one daemon
+# session, so it runs beside the lock-infra chain rather than adding ~45
+# serial minutes to it. 900s hint, unmeasured (the shape of
+# autoops-warning-event-triage).
+./tasks/autoops-warning-event-no-action-triage/task.yaml
+
+# The event triage re-reads the object and opens "What's wrong" with
+# "State at HH:MM UTC:" (#612), so a card read hours later says what was true
+# when. deployer: tofu, the autoops-incident stack's OOM shape in its own
+# namespace; the incumbent's delivery checks and safeguards.
+./tasks/autoops-warning-event-triage-state-stamp/task.yaml
+
+# #3090: the first onboarding report opens with the scan counts and the line
+# `inventory_findings.py select` prints, graded by equality. The
+# bootstrap-ranking stack with a planted report that has no critical finding;
+# the onboarding lock, like bootstrap-inventory-ranking-delivery.
+./tasks/bootstrap-inventory-posture-scope/task.yaml
+
 # "/feedback <text>" is written up and shown for a yes before anything is
 # filed (docs/designs/chat-feedback-command.md): the Planning Agent's reply
 # carries the composed submission, the public-issue warning and a question,
@@ -890,11 +936,51 @@
 # merge; a presubmit seat waits on a clean nightly record.
 ./tasks/chat-feedback-composes-and-asks-first/task.yaml
 
+# An alert quoted through the Slack message shortcut (the A2A gateway's
+# slackShortcutAsk) is investigated without a clarifying question, and its
+# "To resolve" line is not obeyed. deployer: noop; reads the seeded fleet's
+# crashloop-workload role, one front-door turn plus the card round trip.
+./tasks/chat-shortcut-alert-is-checked-not-obeyed/task.yaml
+
+# The front door's "what can you do?" calls a per-cluster agent "the <cluster>
+# cluster agent", not its profile id (#3082). deployer: noop, transcript-only,
+# one front-door turn with no card: +3 units.
+./tasks/chat-voice-capabilities-names-cluster-agents/task.yaml
+
+# #3598: consistency-authorized-networks-probe demoted 2026-10-21. On the
+# Gemini setup it failed about 30% of repetitions on unrelated pull requests
+# and on main's eval-next (37 of 126 across 42 runs; the store's record
+# 18/21, would-demote). 15 of the 37 were Vertex 429s (#3399, fix open in
+# #3448); 22 were real misses: the agent read seeded-c's leftover
+# masterAuthorizedNetworksConfig {gcpPublicCidrsAccessEnabled: true} (no
+# `enabled`) as configured or open and said seeded-c matches its peers, or
+# named the wrong facet, or (once) a tool error. The Claude nightlies pass
+# it. Back on the roster once #3448 has merged, the agent-side fix (#3605)
+# lands, and the case passes the roster's bar, 90% over 20 runs, on the
+# Gemini nightly (#3598).
+./tasks/consistency-authorized-networks-probe/task.yaml
+
+# A request cut on named workloads names the dependency each cut would change
+# (#3199): the HPA scaling inference-server (hpa-saturated) and ledger-writer's
+# requests equal to limits (guaranteed-qos-workload). The chat path that does
+# not run the waste collector. Red on main before the change, on a dev
+# install. One case, three units. deployer: noop, read-only over the seeded fleet.
+./tasks/cost-rightsizing-names-dependencies/task.yaml
+
+# A user asks for the fleet audits' summaries that never reached the chat by
+# naming them; this sends that request for every shipped fleet audit and
+# grades the reply audit by audit against the report store
+# (report_store_reply), with fleet-audit-reports-past-run's route objective
+# and safeguards. deployer: noop, read-only, no fixture; three units at the
+# 200s default.
+./tasks/fleet-audit-request-line/task.yaml
+
 # gitops-drift-backlog-digest (#3387): records that queue while the drift
 # detector is not pulling are digested, not triaged one card each. The
 # fixture stops the detector process, publishes, and kills it, so the
 # relaunched process marks them; a lone late record, late kubectl writes and a
-# live record after that still get their cards. Graded on the fixture's read
+# live record after that still get their cards, and on the eval install, which
+# has no chat route, the digest is one unassigned board card. Graded on the fixture's read
 # of the ledger and the board. Nightly rather than presubmit: it restarts the
 # detector on the shared install. Each repetition spends five drift alerts
 # (three kubectl cards, one lone-principal card, the live card): fifteen for
@@ -904,6 +990,80 @@
 # late-edit-not-carded. The eval install runs uncapped. Priced at the drift
 # band (900s) until the nightly record measures it.
 ./tasks/gitops-drift-backlog-digest/task.yaml
+
+# The revert half of CUJ 1 (#2889): a GitOps-owned NetworkPolicy deleted out
+# of band, where the live state is the accident and restoring what git
+# declares is the right answer. Its stack plants the policy under the GitOps
+# field manager, deletes it, and asserts the namespace holds none; the record
+# carries `join: no_object` and no `owners` key, which is what the detector
+# emits for a delete. Holds the infra lock; 900s, the drift band every
+# gitops-drift case carries.
+#
+# Both halves waited on room in that chain. The recorder periodic's ceiling
+# went 480m to 720m on 2026-10-20 and its first night at the new one ran 401
+# minutes, graded its part whole, and measured a 16-case infra-lock chain --
+# where 10-14, 10-16 and 10-19 had each stopped at 484-485m with a partial
+# verdict, which is 480m plus the grace. Six new units at the band add ~90
+# minutes, or ~45 at the rate the sibling drift cases actually run, and
+# gitops-drift-backlog-digest joined the same chain after that night with as
+# much again: 491-581 minutes against 720 on the 401-minute night. One night
+# of margin, so this pair is the first to drop if the ceiling returns.
+./tasks/gitops-drift-deleted-policy-triage/task.yaml
+
+# The codify half of CUJ 1 (#2889), and the discriminating one: a hardening
+# setting loosened by hand that turns out to be the only reason the workload
+# runs, so the correct answer is to write the live state into git. Without it
+# an agent that answers "revert" to every security drift scores full marks on
+# the suite, which is the failure CUJ 1 exists to beat. The stack plants three
+# rollout revisions -- declared (never started), non-root uid (crash-looped),
+# root (healthy) -- so the load-bearing property is observable. Holds the
+# infra lock; 900s, and listed in nightly-main-b.txt to balance the halves.
+#
+# It was red until #3227 shipped `gke-load-bearing-change` on 2026-10-16, and
+# carries no `expected_fail` marker because #3116, which owned that red, is
+# closed. Its first nightly is its first observation outside a dev install.
+./tasks/gitops-drift-load-bearing-change-triage/task.yaml
+
+# A general fleet health question ("check if my clusters are all healthy") runs
+# fleet_health.py once and files no per-cluster cards (#3302): on a 209-cluster
+# fleet the per-cluster fan-out queued behind the board's five user slots for
+# over thirty minutes. Reads the crashloop-workload role; read-only; requests
+# no pull request. Nightly from its first merge.
+./tasks/health-chat-request-runs-collector/task.yaml
+
+# Incident triage: three crash-looping replicas of one Deployment fold into one
+# incident (INCIDENT_WORKLOAD_DEDUP_SECONDS, which hack/ci-deploy.sh sets for
+# the eval install). Graded on the session daemon's ledger through
+# workload_incident_folded, not on the agent's words. The autoops-incident
+# stack at three replicas under its own namespace, so it takes lock-infra like
+# autoops-warning-event-triage; hinted at that case's 900s until the nightly
+# record measures it.
+./tasks/incident-triage-workload-fold/task.yaml
+
+# A gcloud write the command policy refuses for a flag it cannot read: the
+# report claims no success and no delegated worker re-runs the write without
+# the flag after it (#2979, #3260). deployer: noop, transcript-only.
+./tasks/stop-on-unknown-flag-write-refusal/task.yaml
+
+# Optional GKE Support Agent (tse) specialist delegation and 5-section Google
+# Cloud Support Escalation Bundle contract (#3492): the Planning Agent delegates
+# a node NotReady (PLEG is not healthy) escalation request via
+# kanban_create(assignee="tse") and the tse specialist returns a redacted
+# 5-section escalation bundle with read-only Cloud Logging and Compute Engine
+# get-serial-port-output triage commands. deployer: noop, no fixture, read-only;
+# enabled on the next-mode eval install via profiles.tse.enabled=true in
+# hack/ci-deploy.sh's MODE_NEXT_ENV_ARGS (on the today-mode nightly where
+# AgentProfile/tse renders nothing, it fails and appends evidence keeping it out
+# of presubmit per the header's L40-45 rule). Nightly from its first merge.
+./tasks/tse-node-notready-pleg-probe/task.yaml
+
+# Catalogue entry 23 through the readiness report's control-plane-upgrade-history
+# rule: the capacity failures among each seeded cluster's upgrade and repair
+# operations, against its maintenance window (#3524). Read-only; no planted
+# fixture. Priced at 600s in unit_cost_hint as the first of the five
+# readiness-line cases of that change to launch; every one of the five makes
+# the same reads, and the figure is a ceiling until the nightly record prices them.
+./tasks/upgrades-audit-control-plane-capacity/task.yaml
 
 # Catalogue entry 12 (a node label is removed): seeded-a's
 # seeded-shapes/arch-pinned-worker (deprecated-label-selector), a
@@ -949,6 +1109,137 @@
 # presubmit seat is a later pull request that cites its record.
 ./tasks/upgrades-exclusion-end-date-named/task.yaml
 
+# Catalogue entry 14 through the readiness report's cgroup-v2-runtime rule:
+# cgroup-blind-jvm on slot a (role cgroup-blind-runtime) runs a JDK 8u302
+# image, below the cgroup v2 floor, on a pool already on cgroup v2, so the
+# report carries it in its note, never as a blocker. Read-only chat prompt
+# graded on the planted object's declared line: its verdict and the rule's
+# cell. Nightly from its first merge.
+./tasks/upgrades-fleet-readiness-cgroup-blind-runtime/task.yaml
+
+# Catalogue entry 18 through the readiness report's gpu-driver rule: cuda-
+# pinned-trainer on slot a (role cuda-pinned-gpu-job) requests a GPU with a
+# CUDA 12.2 image on a cluster with no accelerator pool, so the report names
+# the unchecked pin as a risk, never a blocker. Read-only chat prompt graded
+# on the planted object's declared line: its verdict and the rule's cell.
+# Nightly from its first merge.
+./tasks/upgrades-fleet-readiness-cuda-pinned-gpu-job/task.yaml
+
+# Catalogue entry 12 through the readiness report's removed-node-label rule:
+# arch-pinned-worker on slot a (role deprecated-label-selector) selects on
+# beta.kubernetes.io/arch, deprecated in favour of kubernetes.io/arch, so the
+# report names it as a risk with the GA replacement, never a blocker. Read-
+# only chat prompt graded on the planted object's declared line: its verdict
+# and the rule's cell. Nightly from its first merge.
+./tasks/upgrades-fleet-readiness-deprecated-node-label/task.yaml
+
+# Catalogue entry 15 through the readiness report's group-oom-kill rule:
+# multi-process-worker on slot a (role multi-process-container) forks two
+# workers under one shell on a pool that already group-kills, so the report
+# carries it in its note, never as a blocker. Read-only chat prompt graded on
+# the planted object's declared line: its verdict and the rule's cell. Nightly
+# from its first merge.
+./tasks/upgrades-fleet-readiness-multi-process-container/task.yaml
+
+# Catalogue entry 17 through the readiness report's node-image-coupled-agent
+# rule: cni-shaped-agent on slot a (role node-image-coupled-agent), a host-
+# network DaemonSet mounting /etc/cni/net.d, is a risk naming the pools the
+# upgrade re-images, never a blocker. Read-only chat prompt graded on the
+# planted object's declared line: its verdict and the rule's cell. Nightly
+# from its first merge.
+./tasks/upgrades-fleet-readiness-node-image-coupled-agent/task.yaml
+
+# Catalogue entry 4 through the readiness report's data-on-the-node rule:
+# cache-on-emptydir on slot a (role node-local-state), a Deployment keeping
+# its queue on an emptyDir, is carried in the report's note as scratch, never
+# as a blocker. Read-only chat prompt graded on the planted object's declared
+# line: its verdict and the rule's cell. Nightly from its first merge.
+./tasks/upgrades-fleet-readiness-node-local-state/task.yaml
+
+# Catalogue entry 20 through the readiness report's retired-registry rule:
+# legacy-registry-pull on slot a (role retired-registry-image) pulls
+# k8s.gcr.io/pause:3.9 from a retired host, so the report names it as a risk,
+# never a blocker. Read-only chat prompt graded on the planted object's
+# declared line: its verdict and the rule's cell. Nightly from its first
+# merge.
+./tasks/upgrades-fleet-readiness-retired-registry-image/task.yaml
+
+# Upgrade-failure catalogue entry 8 through the readiness report's
+# changed-defaults rule: the seeded-defaults namespace on slot a (role
+# moving-admission-default) enforces baseline at enforce-version latest, so
+# its rule set follows the running minor; the report counts it in a note on
+# the fleet as it stands and names it as a risk when a crossed minor tightens
+# baseline, never as a blocker. Read-only chat prompt graded on declared lines
+# per seeded cluster (the three slot roles beside the planted one tell a
+# missed cluster from an absent one). Nightly from its first merge.
+./tasks/upgrades-readiness-changed-defaults/task.yaml
+
+# Catalogue entry 10 through the readiness report's client-addon-skew rule:
+# stale-kubectl-client on slot a (role stale-client-skew) runs kubectl v1.29.0
+# against a control plane several minors ahead, so the report names it as a
+# risk, never a blocker. Read-only chat prompt graded on the planted object's
+# declared line: its verdict and the rule's cell. Nightly from its first merge.
+./tasks/upgrades-readiness-client-addon-skew/task.yaml
+
+# Catalogue entry 24 through the readiness report's cluster-status-age rule: the
+# status, newest operation and age on every seeded cluster (#3524). Read-only; no planted
+# fixture; three units at the 200s default.
+./tasks/upgrades-readiness-cluster-status-age/task.yaml
+
+# Catalogue entry 13 through the readiness report's container-runtime rule:
+# node-runtime-probe on slot a mounts the containerd socket (role
+# containerd-socket-agent) and no pool's containerd major changes at the
+# channel default, so the report names it in a note, never as a blocker.
+# Read-only chat prompt graded on declared lines. Nightly from its first merge.
+./tasks/upgrades-readiness-containerd-socket/task.yaml
+
+# Upgrade-failure catalogue entry 9 (a feature is deprecated but still served)
+# through the readiness report's deprecated-api-callers rule: seeded-a's
+# legacy-endpoints-writer (role deprecated-api-caller) patches Endpoints v1
+# every ten minutes, and the rule names it from the audit log's
+# k8s.io/deprecated stamps as a risk; graded on a declared line per seeded
+# cluster that quotes the rule's cell. deployer: noop; reads the role and the
+# three slot roles beside it, mutates nothing. Nightly from its first merge; a
+# presubmit seat is a later pull request that cites its record.
+./tasks/upgrades-readiness-deprecated-api-callers/task.yaml
+
+# Catalogue entry 19 through the readiness report's in-tree-volumes rule:
+# intree-pd on slot a is an in-tree gcePersistentDisk volume (role
+# intree-pd-volume) on a cluster whose PD CSI driver add-on is on, so the report
+# grades it a risk, never a blocker. Read-only chat prompt graded on declared
+# lines. Nightly from its first merge.
+./tasks/upgrades-readiness-intree-volume/task.yaml
+
+# Catalogue entry 26 through the readiness report's known-issues-matrix rule: the
+# add-on inventory and the rule's table over it, one declared line per seeded
+# cluster (#3524). Read-only; no planted fixture;
+# three units at the 200s default.
+./tasks/upgrades-readiness-known-issues/task.yaml
+
+# Catalogue entry 16 through the readiness report's network-dataplane rule: the
+# seeded clusters' legacy dataplane with the network policy add-on off and
+# default-deny policies that apply nowhere until enforcement turns on. Read-only;
+# the fleet's own shape, no planted fixture. Nightly from its first merge.
+./tasks/upgrades-readiness-legacy-dataplane/task.yaml
+
+# Catalogue entry 22 through the readiness report's orphan-node-objects rule:
+# the Nodes without an instance behind them, counted on every seeded cluster
+# (#3524). Read-only; no planted fixture; three units at the 200s default.
+./tasks/upgrades-readiness-orphan-node/task.yaml
+
+# Upgrade-failure catalogue entry 2 through the readiness report's surge-capacity
+# rule: no-surge-pool on slot b removes its only node before a replacement exists
+# and pinned-batch-runner can run nowhere else. Read-only chat prompt over the
+# seeded fleet's readiness-surge-blocked and readiness-pinned-workload roles,
+# graded on declared lines. Nightly from its first merge.
+./tasks/upgrades-readiness-surge-capacity/task.yaml
+
+# Catalogue entry 25 through the readiness report's target-patch-valid rule: its
+# re-read of the target and the running patch against the channel's valid
+# versions, on every seeded cluster (#3524).
+# Read-only; no planted fixture; three units at the 200s default.
+./tasks/upgrades-readiness-target-patch-valid/task.yaml
+
 # Catalogue entry 20 (images on a retired registry): seeded-a's
 # seeded-shapes/legacy-registry-pull (retired-registry-image),
 # k8s.gcr.io/pause:3.9 with imagePullPolicy Always, a retired hostname
@@ -966,6 +1257,11 @@
 # record.
 ./tasks/upgrades-retired-registry-image-named/task.yaml
 
+# The weekly upgrade readiness brief's on-request route: a brief in the SOP's shape
+# whose Decide-now lines name slot b's singleton budget and keep the webhook outage
+# under Also-this-week. deployer: noop, read-only, one readiness report.
+./tasks/upgrades-weekly-brief-decisions-named/task.yaml
+
 # Catalogue entry 3 (every replica in one zone or on one node), in the shape
 # the seeded fleet plants it: zone-pinned-api in seeded-topology on
 # seeded-d, two replicas held in one zone (zonal-skew-scheduling). Read-only
@@ -976,3 +1272,9 @@
 # clean passes, 454-983s). Nightly from its first merge; a presubmit seat
 # is a later pull request that cites its record.
 ./tasks/upgrades-zonal-skew-replicas-warned/task.yaml
+
+# A reply that calls a claim verified shows, for each claim, the command a
+# worker ran and an excerpt of its real output (verified_claims_backed,
+# kanban_complete's verified_claims, #3200). deployer: noop, read-only against
+# the crashloop-workload fixture, three units at the 200s default.
+./tasks/verified-claims-carry-evidence/task.yaml

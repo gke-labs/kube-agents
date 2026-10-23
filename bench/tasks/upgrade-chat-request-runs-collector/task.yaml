@@ -108,6 +108,12 @@ verification_spec:
     mode: assert
     check:
       type: worker_commands
+      # Read each tagged `terminal` call as typed. Without after_result_pattern
+      # the check reads Hermes's one-line rendering of the worker's command,
+      # which shows a chain as its first command plus `+ N commands` and joins
+      # a second line into the first (#3128). The pattern never matches a
+      # result and no forbidden pattern is set, so it opens no window.
+      after_result_pattern: "(?!)"
       required_runs:
         - script: patch_readiness.py
   # SOUL.md's patch-posture row puts FLEET_AUDIT_SCRATCH_DIR= before python3,
@@ -125,6 +131,12 @@ verification_spec:
     mode: assert
     check:
       type: worker_commands
+      # Read each tagged `terminal` call as typed. Without after_result_pattern
+      # the check reads Hermes's one-line rendering of the worker's command,
+      # which shows a chain as its first command plus `+ N commands` and joins
+      # a second line into the first (#3128). The pattern never matches a
+      # result and no forbidden pattern is set, so it opens no window.
+      after_result_pattern: "(?!)"
       required_patterns:
         - '(?m)(?:^|[;&|(]|\benv)\s*(?:[A-Za-z_]\w*=\S*\s+)*FLEET_AUDIT_SCRATCH_DIR=(["'']?)/opt/data/scratch/chat/?\1\s[^;&|\n]*\bpatch_readiness\.py\b(?![^;&|\n]*\s--?h(?:elp)?\b)'
   # A chat answer opens no ledger run, even where a skill's workflow does.

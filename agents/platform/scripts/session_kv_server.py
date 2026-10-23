@@ -9,7 +9,10 @@ import math
 import os
 import hashlib
 import re
+import signal
+import threading
 import sqlite3
+import shlex
 import subprocess
 import tempfile
 import sys
@@ -20,8 +23,8 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, NamedTuple, Optional, Sequence
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, wait as futures_wait
+from contextlib import closing, nullcontext
 from pathlib import Path
 
 import logging
@@ -30,6 +33,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from agent_common_server import _run_env, CONFIG_PATH, DOTENV_PATH
 import board_snapshot
 import chat_notify
+import cron_schedule
 import findings_queue
 import gitops_workspace
 import slack_audit_report
@@ -117,6 +121,10 @@ FEED_STATUS_INJECTED = "injected"
 FEED_STATUS_FILTERED = "filtered"
 FEED_STATUS_SUPPRESSED = "suppressed"
 FEED_STATUS_UNDELIVERED = "undelivered"
+# A row folded into an earlier admitted event for the same workload
+# (INCIDENT_WORKLOAD_DEDUP_SECONDS), which is also what the inject route answers
+# for it. Checked before `undelivered`/`suppressed`: its `notified` is 0.
+FEED_STATUS_FOLDED = "folded"
 # A drift backlog row that is digested or owed a digest. Checked before the
 # others, because its `notified` is 0 and would otherwise read as suppressed. A
 # carded backlog row (DRIFT_BACKLOG_CARDED) reads as a live drift row does.
@@ -178,6 +186,14 @@ CONVERSATION_FIELD_MAX_CHARS = 512
 # a card needs.
 CONVERSATION_ROUTE_ASK_KEY = "ask"
 CONVERSATION_ASK_TOKEN = re.compile(r"[a-z0-9-]{1,16}")
+# The gateway's salted HMAC pseudonym for the speaker (`authority.requester.principal`)
+# and the conversation's audience kind (`authority.audience.kind`, "dm" or "group").
+# Both are optional. The memory provider reads them to isolate personal memory per
+# user and disable personal memory in group conversations.
+CONVERSATION_ROUTE_USER_KEY = "user_id"
+CONVERSATION_ROUTE_USER_TOKEN = re.compile(r"hmac:[0-9a-f]{32}")
+CONVERSATION_ROUTE_CHAT_TYPE_KEY = "chat_type"
+CONVERSATION_ROUTE_CHAT_TYPES = frozenset({"dm", "group"})
 
 # Hermes' managed scope, the administrator-pinned layer `load_hermes_dotenv`
 # applies LAST with override=True. The operator mounts it at /etc/hermes and
@@ -234,6 +250,42 @@ SCHEDULER_LEG_KEY = "also_delivered_to"
 # deploy/docker/plugins/chat/adapter.py: SCHEDULER_FAILURE_FIELD, set when the
 # delivery is the scheduler's failure line for the run.
 SCHEDULER_FAILURE_KEY = "scheduler_failure"
+# What the scheduler's failure line is posted as (`scheduler_failure_line`):
+# what did not happen, why, and when the job runs next. The scheduler's own
+# line names a CLI and a config file nobody in the channel can reach, so it
+# goes to this process's log instead.
+SCHEDULER_FAILURE_HEAD = "**The {title} didn't run.**"
+# When the job runs next, with no clock time (`cron_schedule`): "tomorrow"
+# only for a job whose schedule fires once a day, every day.
+SCHEDULER_FAILURE_NEXT_DAILY = "It will try again tomorrow."
+SCHEDULER_FAILURE_NEXT_UNKNOWN = "It will try again at its next scheduled run."
+# A failure no retry clears ends with this instead of a promise to try again:
+# the scheduler's line, with the details, is in this server's log, which
+# fluent-bit ships with the agent's other logs.
+SCHEDULER_FAILURE_NEEDS_ADMIN = "An admin needs to fix this before it can run; the details are in the agent's log."
+SCHEDULER_FAILURE_ERROR = "It hit an error"
+SCHEDULER_FAILURE_BLOCKED = "Its configuration is invalid"
+SCHEDULER_FAILURE_BLOCKED_MARK = "blocked by configuration validation"
+# The scheduler's reasons (cron/scheduler.py: _summarize_cron_failure_for_delivery),
+# each by the words its line carries after the job's name, said in plain words,
+# and whether a person has to act before the job can run (True) or the next
+# run may clear it (False). A line that matches none is `SCHEDULER_FAILURE_ERROR`,
+# and is promised a retry: nothing in it says which it is.
+SCHEDULER_FAILURE_REASONS = (
+    ("failed: script timed out", "It ran too long and was stopped", False),
+    ("failed: provider rate limit", "The AI model's usage limit was reached", False),
+    ("failed: provider weekly usage limit", "The AI model's usage limit was reached", False),
+    ("failed: provider quota limit", "The AI model's usage limit was reached", False),
+    ("failed: the job itself stalled", "It stopped making progress", False),
+    ("failed: provider timeout", "The AI model didn't answer in time", False),
+    ("failed: provider authentication error", "The AI model rejected its credentials", True),
+)
+# The ledger status of a run that finished without failing. One after a failure
+# was posted means the job recovered, so its next failure is news again.
+RUN_LEDGER_COMPLETED = "completed"
+# The route's status for a failure line it did not post, because the same
+# failure was posted and the job has not run cleanly since.
+CRON_REPORT_SUPPRESSED = "suppressed"
 AUDIT_REPOS_SUMMARY_LINE = "{label}: {count} repositories reported in this run."
 # `audit_report.CHAT_REPORT_LEDGER_LINE`, read back for a truncation notice.
 AUDIT_LEDGER_LINE_RE = re.compile(r"^Ledger: (\S+)$", re.MULTILINE)
@@ -530,6 +582,58 @@ ALERT_DAILY_LIMITS = {
     DRIFT_QUOTA_KEY: _alert_daily_limit("ALERT_DAILY_LIMIT_DRIFT", DEFAULT_ALERT_DAILY_LIMIT_DRIFT),
 }
 
+# How long an admitted event holds its workload's incident open: within this
+# many seconds of it, a later Warning-or-worse event for the same (cluster,
+# namespace, object kind, fold key) is recorded as a duplicate of it and starts
+# no triage, posts nothing and spends no alert budget; a Critical is folded only
+# into a Critical (_workload_incident_anchor). The watcher deduplicates
+# on (object UID, reason), so without this every replica of a broken Deployment,
+# every replacement pod and every reason in a cascade opens a triage of its own.
+# The window runs from the anchor, not from the latest duplicate, so a new pod
+# or reason from a workload that keeps failing is announced again once the
+# window has passed. 0, the default, turns
+# folding off; a negative or unparseable value reads as the default, the same
+# parse the daily ceilings use. Capped at a day, the watcher's own dedup window.
+INCIDENT_WORKLOAD_DEDUP_MAX_SECONDS = 86400
+INCIDENT_WORKLOAD_DEDUP_SECONDS = min(
+    _alert_daily_limit("INCIDENT_WORKLOAD_DEDUP_SECONDS", 0), INCIDENT_WORKLOAD_DEDUP_MAX_SECONDS
+)
+# A pod named like a Deployment's for display: 8-10 hex characters, then the
+# pod's own suffix (`checkout-6cfdb6b98b-zwv24` -> `checkout`). clean_workload_name
+# strips it, and so a CronJob run's pod (`report-29812345-abcde`) and a
+# date-stamped Job's (`db-migrate-20261021-abcde`) display under their owner's
+# prefix too, which is a display choice and not an identity.
+DEPLOYMENT_POD_NAME_RE = re.compile(r"^(.*?)-[a-f0-9]{8,10}-[a-z0-9]{5}$")
+# What a fold key is read from: a ReplicaSet's pod-template hash is
+# rand.SafeEncodeString of a decimal number, which maps the ten digits to
+# exactly `4-9bcdf`, so this matches every Deployment pod the display pattern
+# does and refuses a segment holding any of `0-3`, `a` or `e` (every Unix-minute
+# CronJob run until the 2040s, every date stamp, `deadbeef`). Folding those
+# would put a Job's failure under a same-named Deployment's incident and
+# silence it. The lower bound stays at 8: the hash is shorter for about 0.2% of
+# templates, which then do not fold, and a lower bound would also match short
+# name segments (`log-bd`) and fold different owners together; a missed fold
+# only announces an event, a wrong one silences it.
+POD_TEMPLATE_HASH_POD_RE = re.compile(r"^(.*?)-[4-9bcdf]{8,10}-[a-z0-9]{5}$")
+# The severity get_severity_details grades a blocker, which folds only into an
+# anchor of its own grade (_workload_incident_anchor).
+CRITICAL_SEVERITY = "Critical"
+# A 5xx other than 503 can come after the turn already filed its card, so it
+# reads as a started turn; a 503 and anything below 500 come before any turn
+# (_start_agent_turn).
+HTTP_SERVER_ERROR_MIN = 500
+HTTP_SERVICE_UNAVAILABLE = 503
+# How long _start_agent_turn waits on the gateway's synchronous chat route,
+# which answers only when the turn has finished.
+GATEWAY_TURN_TIMEOUT_S = 300.0
+# Bounds the anchor lookup's wait on a locked database, as the other ledger
+# writers here do; a lookup that gives up announces the event.
+INCIDENT_FOLD_DB_TIMEOUT_S = 5.0
+# Held from the anchor lookup to the ledger insert, so two replicas' events
+# arriving together cannot both find no anchor and both open a triage. The
+# route is a sync def served on a threadpool, so they can.
+_WORKLOAD_FOLD_LOCK = threading.Lock()
+
 # The `kind` a drift record carries, set by the drift detector
 # (`injectKindDrift` in k8s-operator/cmd/drift-detector/inject.go). It is the
 # only field `inject_message` routes on, and the two constants are one decision
@@ -540,11 +644,11 @@ ALERT_DAILY_LIMITS = {
 # Every other caller of that route is the event watcher, which stamps its own
 # `kind` (`injectKindEvent`/`injectKindFollowup` in
 # k8s-operator/cmd/k8s-event-watcher/types.go, "k8s-event" and
-# "k8s-event-followup"). The dispatch is an equality test against this string
-# rather than a match against those, so anything that is not drift -- their
-# kinds, a kind a future producer invents, or no kind at all -- takes the event
-# path, which is the behaviour the event watcher had before this route learned
-# to dispatch.
+# "k8s-event-followup"). The dispatch is an equality test against this string,
+# the stall kind and the follow-up kind, so anything that is none of those --
+# `k8s-event`, a kind a future producer invents, or no kind at all -- takes the
+# event path, which is the behaviour the event watcher had before this route
+# learned to dispatch.
 INJECT_KIND_DRIFT = "gitops-drift"
 
 # The `kind` a stall producer stamps on a new stall episode
@@ -579,10 +683,46 @@ INJECT_KIND_STALL = "controller-stall"
 # signal: an old daemon returns `{"status": "ok"}` and nothing else, so a
 # producer that requires its kind here fails closed against one.
 #
-# Add a kind to this list only when the dispatch actually handles it. The
-# watcher's two are here because the event path is what "not drift" means, and
-# that is a real answer for them rather than a fallback.
-INJECT_KINDS_SUPPORTED = ["k8s-event", "k8s-event-followup", INJECT_KIND_DRIFT, INJECT_KIND_STALL]
+# Add a kind to this list only when the dispatch actually handles it.
+# `k8s-event` is here because the event path is what "not drift" means, a
+# real answer for it rather than a fallback; `k8s-event-followup` has a branch
+# of its own (`_inject_followup`).
+# The `kind` the event watcher stamps on a quiet follow-up for an incident it
+# already alerted (`injectKindFollowup` in
+# k8s-operator/cmd/k8s-event-watcher/types.go): the object has emitted no new
+# event for the watcher's --quiet-after since the last sighting. It arrives on
+# the alert's own session, which is how `_inject_followup` finds the thread.
+INJECT_KIND_FOLLOWUP = "k8s-event-followup"
+INJECT_KINDS_SUPPORTED = ["k8s-event", INJECT_KIND_FOLLOWUP, INJECT_KIND_DRIFT, INJECT_KIND_STALL]
+# What this daemon does with an event's session beyond posting the alert,
+# advertised twice: on the event path's `injected` answer, which the watcher
+# records per session (injectResponse.Features in injector.go), and under
+# `features` on /healthz beside the drift backlog's (DAEMON_FEATURES below),
+# which the watcher's sweep reads again before each tick's follow-ups, so an
+# agent image rolled back to a build without the follow-up branch is never
+# sent one (it would take the kind down the event path and post a second
+# alert). `inject_kinds` cannot carry the promise: it listed
+# `k8s-event-followup` before this branch existed.
+INJECT_FEATURE_FOLLOWUP = "followup"
+INJECT_RESPONSE_FEATURES = [INJECT_FEATURE_FOLLOWUP]
+# The quiet follow-up's line, and the watchdog's.
+FOLLOWUP_EMOJI = "💤"
+WATCHDOG_EMOJI = "⏱️"
+SECONDS_PER_MINUTE = 60
+# How long after an alert posts the watchdog looks for a triage card on its
+# session and, finding none and no report in the thread, says so there. The
+# front door files the card inside a minute when its turn runs; an hour is
+# past any card's normal run, so a thread silent that long has no card coming.
+# An in-process timer, so a daemon restart inside the hour drops the check for
+# the alerts posted before it (the stall watch's day-later retry is the
+# durable form; this is the cheap one). 0 switches it off. Read through the
+# integer-knob reader the ceilings use, so a value that is not an integer
+# falls back to the default with a log line instead of failing the import and
+# taking the whole server down with it.
+DEFAULT_TRIAGE_WATCHDOG_SECONDS = 3600
+TRIAGE_WATCHDOG_SECONDS = _alert_daily_limit("TRIAGE_WATCHDOG_SECONDS", DEFAULT_TRIAGE_WATCHDOG_SECONDS)
+# The busy timeout of the sqlite connects the follow-up and the watchdog open.
+SQLITE_BUSY_TIMEOUT_SECONDS = 5.0
 
 # Drift is graded `Warning` rather than given a severity of its own, and this
 # is now a statement about wording alone. Display and billing were the same
@@ -733,7 +873,7 @@ DRIFT_MAX_RENDERED_PATHS = 12
 # Advertised in `/healthz` `features`, so a detector reading an older daemon
 # keeps sending every record as a card.
 DRIFT_BACKLOG_FEATURE = "drift-backlog"
-DAEMON_FEATURES = [DRIFT_BACKLOG_FEATURE]
+DAEMON_FEATURES = [DRIFT_BACKLOG_FEATURE, INJECT_FEATURE_FOLLOWUP]
 # `intercepted_events.backlog`. Zero for every row that is not backlog, which
 # includes every row written before the column existed. A pending row is owed a
 # digest or a card; the other three are terminal.
@@ -771,6 +911,37 @@ DRIFT_BACKLOG_LEASE_MARGIN_SECONDS = 30
 DRIFT_BACKLOG_LEASE_NAME = "digest"
 # Principals and objects the digest names before it counts the rest.
 DRIFT_BACKLOG_MAX_PRINCIPALS = 8
+# On an install with no chat route the digest is one card on the task board,
+# filed through the Hermes CLI with no assignee and status blocked: no agent
+# turn files it or reads it, so a principal-chosen name in its body is never a
+# prompt, and it stays in view until a person acts on it. The CLI rather than
+# hermes_cli.kanban.run_slash: it returns an exit code, takes a timeout, and is
+# safe to call from this threaded server.
+DRIFT_BACKLOG_CARD_TITLE = "Drift backlog: {count} {noun} reached drift detection late"
+DRIFT_BACKLOG_CARD_KEY_PREFIX = "drift-backlog-"
+DRIFT_BACKLOG_CARD_CREATED_BY = "drift-detector"
+DRIFT_BACKLOG_CARD_STATUS = "blocked"
+# The CLI timeout is the send timeout, so the lease (sized from it) outlives
+# the call. A timeout counts as no card, unlike the chat send, because the rows
+# must not be marked without a task id; a create that committed before the kill
+# is returned by the key on the retry, so no second card follows unless the set
+# of pending rows changed in between.
+DRIFT_BACKLOG_CARD_TIMEOUT_SECONDS = DRIFT_BACKLOG_SEND_TIMEOUT_SECONDS
+# Below the CLI timeout, so a busy board answers (with an error) inside it
+# instead of Hermes' two-minute default lock wait outliving the call.
+DRIFT_BACKLOG_CARD_BUSY_TIMEOUT_MS = "30000"
+# Rows the card lists one by one before it counts the rest.
+DRIFT_BACKLOG_CARD_MAX_ROWS = 100
+# A name the card shows as is. Names come from the cluster and the audit log,
+# so one that fails this (a space, a quote, a backtick) is shown as a placeholder.
+_DRIFT_BACKLOG_NAME_RE = re.compile(r"^[A-Za-z0-9._:@+-]{1,200}$")
+DRIFT_BACKLOG_NAME_PLACEHOLDER = "<name of {length} characters, not shown>"
+# How the card tells a reader to get the full list.
+DRIFT_BACKLOG_FEED_COMMAND = (
+    "kubectl -n kubeagents-system exec deployment/platform-agent-gateway -c platform-agent -- "
+    "sh -c 'curl -s -H \"Authorization: Bearer $SESSION_KV_API_KEY\" "
+    "\"http://127.0.0.1:8699/v1/intercepted-events?limit=200\"'"
+)
 DRIFT_BACKLOG_MAX_OBJECTS = 5
 DRIFT_BACKLOG_EMOJI = "🗂️"
 # How many times the digest tries to mark its rows after a post, and the pause
@@ -898,6 +1069,13 @@ def init_db() -> None:
                 ("backlog", f"backlog INTEGER NOT NULL DEFAULT {DRIFT_BACKLOG_NONE}"),
                 ("principal", "principal TEXT NOT NULL DEFAULT ''"),
                 ("payload", "payload TEXT NOT NULL DEFAULT ''"),
+                # The ledger id of the admitted event this one was folded
+                # into (INCIDENT_WORKLOAD_DEDUP_SECONDS); NULL on every other row.
+                ("duplicate_of", "duplicate_of INTEGER"),
+                # What a row folds on (_fold_key): the workload of a
+                # Deployment's pod, or a non-Pod object's own name. Empty on
+                # every row that can neither fold nor anchor.
+                ("fold_key", "fold_key TEXT NOT NULL DEFAULT ''"),
             ):
                 if column in ledger_columns:
                     continue
@@ -991,6 +1169,29 @@ def init_db() -> None:
                 )
                 """
             )
+            # The failure each job last posted, and when, so a failure that
+            # repeats is posted once: the next post is a different failure, or
+            # the same one after a run that finished cleanly.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS scheduler_failure_posts (
+                    profile   TEXT NOT NULL,
+                    job_id    TEXT NOT NULL,
+                    reason    TEXT NOT NULL,
+                    posted_at REAL NOT NULL,
+                    PRIMARY KEY (profile, job_id)
+                )
+                """
+            )
+            # A fold anchor is written as an intent, before its background task
+            # runs, so a process that died in between (OOM, SIGKILL, a crash)
+            # leaves a row anchoring its workload with no triage behind it and
+            # nothing left to release it. Every start therefore releases them
+            # all: a workload whose triage did start loses its window, which
+            # costs one more triage (per severity: a Critical folds only into a
+            # Critical) for a sibling that arrives after
+            # the restart, and is noise rather than silence.
+            conn.execute("UPDATE intercepted_events SET fold_key = '' WHERE fold_key != ''")
             findings_queue.init_findings_schema(conn)
             _purge_plaintext_identities(conn)
 
@@ -1057,6 +1258,8 @@ def record_intercepted_event(
     occurrences: int,
     notified: bool,
     session_id: str = "",
+    duplicate_of: Optional[int] = None,
+    fold_key: str = "",
 ) -> Optional[int]:
     """Append one forwarded event to the ledger the daily recap reads.
 
@@ -1102,8 +1305,8 @@ def record_intercepted_event(
                 cursor = conn.execute(
                     "INSERT INTO intercepted_events "
                     "(cluster, namespace, workload, object_uid, object_kind, reason, message, severity, "
-                    "occurrences, notified, session_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "occurrences, notified, session_id, duplicate_of, fold_key) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         cluster,
                         namespace,
@@ -1116,6 +1319,8 @@ def record_intercepted_event(
                         int(occurrences),
                         1 if notified else 0,
                         session_id,
+                        duplicate_of,
+                        fold_key,
                     ),
                 )
                 return cursor.lastrowid
@@ -1171,6 +1376,96 @@ def mark_delivery_headless(event_row_id: Optional[int]) -> None:
         logger.error(f"Failed to record headless delivery for ledger row {event_row_id}: {exc}")
 
 
+def mark_triage_not_started(event_row_id: Optional[int]) -> None:
+    """Stop a ledger row anchoring its workload's window, because its triage never started.
+
+    Clears `fold_key` and nothing else. `notified` and `delivery_error` still
+    say what reached chat: an alert that posted and whose gateway session then
+    failed was delivered, and reading it as undelivered would send someone to
+    check chat credentials that work. With no fold key the next sibling is
+    admitted and starts the triage this one could not.
+
+    Best-effort for the same reason as the other ledger corrections.
+    """
+    if not event_row_id:
+        return
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=INCIDENT_FOLD_DB_TIMEOUT_S)) as conn:
+            with conn:
+                conn.execute("UPDATE intercepted_events SET fold_key = '' WHERE id = ?", (int(event_row_id),))
+    except Exception as exc:
+        logger.error(f"Failed to release the fold anchor on ledger row {event_row_id}: {exc}")
+
+
+def _fold_key(object_kind: str, object_name: str) -> str:
+    """What an event folds on, or "" for an event that neither folds nor anchors.
+
+    A Deployment's pod (POD_TEMPLATE_HASH_POD_RE) folds on its workload. Any
+    other Pod name does not fold: a StatefulSet's `web-0` and `web-1` keep their
+    ordinals, a CronJob run's or a date-stamped Job's pod is not the same
+    workload as a same-named Deployment, and a DaemonSet's, a Job's or a bare
+    pod's last segment is not one workload's replica suffix. A non-Pod object
+    folds on its own name, which is exact.
+    """
+    if object_kind.lower() != "pod":
+        return object_name
+    m = POD_TEMPLATE_HASH_POD_RE.match(object_name)
+    return m.group(1) if m else ""
+
+
+def _workload_incident_anchor(
+    cluster: str, namespace: str, object_kind: str, fold_key: str, severity: str
+) -> Optional[int]:
+    """The ledger id of the workload's open incident, or None (INCIDENT_WORKLOAD_DEDUP_SECONDS).
+
+    An anchor is a row the route admitted: `notified` non-zero, or a
+    `delivery_error`. The second matters because a failed chat post resets
+    `notified` to 0 within seconds (`mark_delivery_failed`) while the triage it
+    started keeps running, and on an install with no working chat route every
+    admitted row ends that way; anchoring on `notified` alone would let each
+    sibling open a triage of its own. A row whose triage never started has
+    its `fold_key` cleared (mark_triage_not_started): nobody is working on it. A
+    refused row never anchors: one the Info gate filtered or the ceiling
+    dropped has `notified = 0` and no error, and so does a duplicate, so a
+    refused event cannot silence a later warning. Only a row with a `fold_key`
+    anchors, which leaves out the drift and stall rows that share the table.
+
+    A Critical event folds only into a Critical anchor. A workload that gets
+    worse after its Warning was announced (a `BackOff`, then `OOMKilled`) is a
+    second announcement chat should see; folded, the Critical would reach no
+    one, and the Warning's triage was opened on the lesser symptom.
+
+    Best-effort: a failed read returns None, so the event is announced rather
+    than lost.
+    """
+    if INCIDENT_WORKLOAD_DEDUP_SECONDS <= 0 or not fold_key:
+        return None
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=INCIDENT_FOLD_DB_TIMEOUT_S)) as conn:
+            row = conn.execute(
+                "SELECT id FROM intercepted_events "
+                "WHERE cluster = ? AND namespace = ? AND object_kind = ? AND fold_key = ? "
+                "AND (? != ? OR severity = ?) "
+                "AND (notified != 0 OR delivery_error != '') "
+                "AND created_at >= datetime('now', ?) "
+                "ORDER BY id DESC LIMIT 1",
+                (
+                    cluster,
+                    namespace,
+                    object_kind,
+                    fold_key,
+                    severity,
+                    CRITICAL_SEVERITY,
+                    CRITICAL_SEVERITY,
+                    f"-{INCIDENT_WORKLOAD_DEDUP_SECONDS} seconds",
+                ),
+            ).fetchone()
+    except Exception as exc:
+        logger.error(f"Failed to look up an open incident for {namespace}/{fold_key}: {exc}")
+        return None
+    return row[0] if row else None
+
+
 @app.get("/healthz")
 def healthz() -> Dict[str, Any]:
     """Unauthenticated on purpose: it returns no data and gates the others.
@@ -1205,7 +1500,7 @@ def create_session() -> Dict[str, str]:
 def clean_workload_name(kind: str, name: str) -> str:
     if kind.lower() == "pod":
         # Match pattern of deployment replica (e.g. -6cfdb6b98b-zwv24)
-        m = re.match(r"^(.*?)-[a-f0-9]{8,10}-[a-z0-9]{5}$", name)
+        m = DEPLOYMENT_POD_NAME_RE.match(name)
         if m:
             return m.group(1)
         # Match pattern of statefulset/job/pod replica (e.g. -0 or -abcde)
@@ -1453,11 +1748,13 @@ def enabled_chat_platforms() -> list[str]:
     the run is still a 200, and the platform is named in the route's
     `undelivered` field. Read that rather than reading `relay`.
 
-    This is the third copy of this question in the tree, and the copies should
-    converge rather than a fourth being added: `platform_mcp_server
-    .get_enabled_platforms` is still keyed on the absent SLACK_BOT_TOKEN (#735
-    is open against it), and `chat_platforms.enabled_chat_platforms` answers it
-    for the Cluster Agent reconcile summary (#989).
+    This question is answered in more than one place, and the copies should
+    converge rather than another being added: `chat_platforms
+    .enabled_chat_platforms` answers it for the Cluster Agent reconcile summary
+    (#989) and, since #743, for `platform_mcp_server.send_notification`, whose
+    own local copy never read the managed scope at all. Deliberately not a
+    count — `agent_common_server` records that maintaining one has already gone
+    wrong once.
 
     Converging on `chat_platforms` is now safe on the sources as well as on the
     ORDER and the per-platform resolution. This paragraph used to warn that it
@@ -1881,10 +2178,11 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
     three-section rule above, and it sits outside the ``## What to do`` → 🔗
     span that the bench delivery contract slices.
 
-    The report ends by inviting the reader to reply ``apply``, and something
-    honours it. The agent that acts on such a reply reads the report back from
-    the ``incidents`` table through the ``incident_context`` plugin, and the row
-    that lookup needs is written by the same delivery that posted the report:
+    A report that proposes a fix ends by inviting the reader to reply
+    ``apply``, and something honours it. The agent that acts on such a reply
+    reads the report back from the ``incidents`` table through the
+    ``incident_context`` plugin, and the row that lookup needs is written by
+    the same delivery that posted the report:
     ``kanban_notifier.store_incident_report`` keys it to the chat thread once
     the notifier has sent it. That was not true between #738 — which replaced
     the egress call in ``platform_mcp_server.send_notification``, the table's
@@ -1912,12 +2210,20 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
     against the gate; bench/tests/test_triage_delivery_contract.py holds it
     against both the gate and that eval case.
 
+    A report that proposes no fix carries neither an ``Option`` letter nor
+    that bullet: its one bullet is **No action needed**. So it earns no
+    ``incidents`` row, which is intended: a reply of ``apply`` has nothing to
+    apply. bench/tasks/autoops-warning-event-no-action-triage/task.yaml
+    requires the ``No action needed:`` label and forbids the ``Option``
+    letter and the authorize bullet, so a reword here also reaches that case;
+    bench/tests/test_triage_delivery_contract.py holds the two together.
+
     §7 rule 3 — "no offer to help further" — does not reach the bullet. Rule 3
     is about closing chatter, the "let me know if you need anything else" that
     ends a message with nothing in it; rule 1 requires the report to say what
-    the agent wants done. The report asks the reader for exactly one decision,
-    and the ``To authorize:`` bullet is how that decision is expressed. It is
-    the ask, not an offer alongside it.
+    the agent wants done. A report that proposes a fix asks the reader for
+    exactly one decision, and the ``To authorize:`` bullet is how that decision
+    is expressed. It is the ask, not an offer alongside it.
 
     The report template below is STANDARD markdown, and must stay that way.
     Every chat platform's adapter translates the agent's markdown on the way
@@ -1943,22 +2249,35 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
                    or os.environ.get("GCP_PROJECT") or "")
     workloads_project_query = f"?project={gcp_project}" if gcp_project else ""
     logs_project_query = f";project={gcp_project}" if gcp_project else ""
+    last_seen = _hhmm_utc(payload.get("last_seen")) or "a few minutes ago"
+    object_ref = f"{namespace}/{object_kind}/{object_name}"
 
     return (
         f"Analyze the following Kubernetes event warning on GKE cluster '{cluster_name}'.\n\n"
         f"**Event Details:**\n"
-        f"- **Resource:** {namespace}/{object_kind}/{object_name}\n"
+        f"- **Resource:** {object_ref}\n"
         f"- **Event Reason:** {event_reason}\n"
-        f"- **Warning Message:** {message}\n\n"
+        f"- **Warning Message:** {message}\n"
+        f"- **Last seen by the watcher:** {last_seen}\n\n"
+        f"**Read the object's current state before you conclude anything.** The watcher saw this event at "
+        f"{last_seen}; only a fresh read says whether it still stands. Run `kubectl get` and `kubectl describe` "
+        f"on {object_ref} (and `kubectl get events` for it) before you write, and open the 'What's wrong' "
+        f"sentence with `State at HH:MM UTC:` where HH:MM is the time of that read, so a reader hours later "
+        f"knows what was true when. Change nothing in the cluster.\n\n"
+        f"**If the object has recovered** — Running and ready, no restart or warning since the event, or gone "
+        f"because its controller replaced it — say so in 'What's wrong', quote the read that shows it in 'Why', "
+        f"make 'What to do' the single bullet '**No action needed:** {object_ref} has recovered', and leave the "
+        f"'To authorize:' bullet off entirely. Do not invent a fix to fill the section.\n\n"
         f"**Finish by calling `kanban_complete(result=<your full report>, summary=<one line>)`.** "
         f"Pass the entire report as `result`, not a summary of it: this card is subscribed to the chat thread where the "
         f"alert was raised, and `result` is what gets posted there. A card completed with a one-line `result` delivers "
         f"one line to the person waiting for the diagnosis.\n\n"
-        f"**Done when:** the root cause is named with the evidence that proves it; at least one GitOps remediation option is proposed, "
+        f"**Done when:** the 'What's wrong' sentence opens with the literal words `State at HH:MM UTC:` (HH:MM being the time of "
+        f"your own read of {object_ref}); the root cause is named with the evidence that proves it; at least one GitOps remediation option is proposed, "
         f"or the report says explicitly that no manifest change is warranted and why; and the whole report is recorded with `kanban_complete`. "
-        f"Nothing else is a condition of finishing. The shape below is how to present that work, not a fourth requirement: "
-        f"once you have those three things, complete the card — never `kanban_block` over formatting. "
-        f"State those three things in `summary`'s one line as well: a judge that grades this card reads `summary` before `result`.\n\n"
+        f"Nothing else is a condition of finishing. The shape below is how to present that work, not a fifth requirement: "
+        f"once you have those four things, complete the card — never `kanban_block` over formatting. "
+        f"State those things in `summary`'s one line as well: a judge that grades this card reads `summary` before `result`.\n\n"
         f"**Do this yourself. Do not delegate the diagnosis to another agent, and do not open child cards for it** — "
         f"you are the agent scoped to the cluster that is failing, and the report has to be this card's own result to be delivered.\n\n"
         f"Propose as many GitOps remediation options as the root cause genuinely warrants — one is fine if there is only one sound fix; do not invent filler alternatives to pad the list.\n\n"
@@ -1970,14 +2289,20 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
         f"- **Proposed fix (<Action Title>):** <1-sentence description of the GitOps fix>.\n"
         f"- **To authorize:** reply **'apply'** to open a GitOps Pull Request with this fix.\n"
         f"No Recommended line, and nothing after **'apply'** in the call to action — a bare 'apply' is unambiguous when there is one fix.\n\n"
+        f"**When no manifest change is warranted and nothing is left for anyone to do:** this is the report the **Done when** line allows. "
+        f"The 'What to do' section is then this one bullet and nothing else:\n"
+        f"- **No action needed:** <1-sentence reason, for example the warning resolved itself and the workload is healthy now>.\n"
+        f"No Option letters, no Proposed fix, no Recommended line and no 'To authorize:' bullet, because there is nothing to apply. "
+        f"Do not invent a fix to fill the section.\n\n"
         f"Every <...> above and in the template below is a placeholder: fill each one in. The posted report must never contain a literal '<letter>'.\n\n"
-        f"The last bullet of the 'What to do' section is the call to action, not another option: keep its 'To authorize:' label, "
+        f"When the report proposes a fix, the last bullet of the 'What to do' section is the call to action, not another option: keep its 'To authorize:' label, "
         f"never give it an Option letter, and never count it when you number the options. "
         f"A reply in this thread reaches an agent that can see your report, so the offer is honoured.\n\n"
         f"Format the report you pass to `kanban_complete`'s `result` exactly like this — "
         f"these three `##` sections are the only ones, and there is no fourth:\n\n"
         f"## What's wrong\n\n"
-        f"<Short 1-sentence description of the problem>\n\n"
+        f"State at <HH:MM> UTC: <Short 1-sentence description of the problem>\n\n"
+        f"(The words `State at`, the time of your read and ` UTC:` open that sentence, exactly so; a report without them is not finished.)\n\n"
         f"## Why\n\n"
         f"- <Key constraint mismatch or log finding in 1-2 sentences, with the evidence that proves it>\n\n"
         f"## What to do\n\n"
@@ -2411,9 +2736,9 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"- **Proposed fix (<Action Title>):** <1-sentence description of the GitOps fix>.\n"
         f"- **To authorize:** reply **'apply'** to open a GitOps Pull Request with this fix.\n"
         f"No Recommended line, and nothing after **'apply'** in the call to action.\n\n"
-        f"**If the change was already reconciled away and nothing is left to do,** say that in 'What to do' as "
-        f"the single 'Proposed fix' bullet — 'no change needed, the object already matches the declared state' — "
-        f"and keep the 'To authorize:' bullet off entirely. Do not invent a fix to fill the section.\n\n"
+        f"**If the change was already reconciled away and nothing is left to do,** make 'What to do' this one "
+        f"bullet: '- **No action needed:** the object already matches the declared state.' No Proposed fix, and "
+        f"keep the 'To authorize:' bullet off entirely. Do not invent a fix to fill the section.\n\n"
         f"Every <...> above and in the template below is a placeholder: fill each one in. The posted report must "
         f"never contain a literal '<letter>'.\n\n"
         f"Format the report you pass to `kanban_complete`'s `result` exactly like this — "
@@ -2621,8 +2946,8 @@ def _stall_task_body(payload: Dict[str, Any]) -> str:
         f"- **To authorize:** reply **'apply'** to open a GitOps Pull Request with this fix.\n"
         f"No Recommended line, and nothing after **'apply'** in the call to action.\n\n"
         f"**If the scan finds nothing stalled any more,** say so in 'What's wrong', quote the scan's "
-        f"`stalled resources: 0` line in 'Why', make 'What to do' the single bullet 'No change needed: the namespace "
-        f"has recovered', and leave the 'To authorize:' bullet off entirely. Do not invent a fix to fill the section.\n\n"
+        f"`stalled resources: 0` line in 'Why', make 'What to do' the single bullet '- **No action needed:** the "
+        f"namespace has recovered.', and leave the 'To authorize:' bullet off entirely. Do not invent a fix to fill the section.\n\n"
         f"Every <...> above and in the template below is a placeholder: fill each one in. The posted report must "
         f"never contain a literal '<letter>'.\n\n"
         f"The last bullet of the 'What to do' section is the call to action, not another option: keep its "
@@ -2701,8 +3026,23 @@ def _stall_agent_query(payload: Dict[str, Any]) -> str:
     )
 
 
-def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[str, str]) -> None:
-    """Post the agent query request to execute the diagnostic reasoning loop."""
+def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[str, str]) -> bool:
+    """Post the agent query request to execute the diagnostic reasoning loop.
+
+    True when the turn may have started: a 5xx other than 503, or an error
+    while waiting for the response, which may be a turn that outlived the
+    timeout. An error while connecting or sending (URLError) is False. Reading either as
+    refused would let a sibling open a second triage beside it
+    (mark_triage_not_started). Anything else is False. In the Hermes route
+    (`_handle_session_chat`) a 4xx is a failed check before the turn, a 503 is
+    `gateway_draining` (the admission wrapper, which `POST /api/sessions` does
+    not have, so a draining gateway creates the session and refuses the turn)
+    or `session_db_unavailable`, and no turn ran for either. The route sends
+    no redirect; a 307 or 308 from anything in front of it is one urlopen does
+    not follow for a POST, so no turn ran for that either. A 5xx out of
+    `_run_agent` comes after the turn started, possibly after the front door
+    filed its card.
+    """
     try:
         req = urllib.request.Request(
             f"{api_url}/api/sessions/{session_id}/chat",
@@ -2710,11 +3050,24 @@ def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[s
             headers=headers,
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=300.0) as resp:
-            if resp.status != 200:
-                logger.error(f"Gateway API chat execution failed (status {resp.status})")
+        # urlopen raises HTTPError for every non-2xx it does not follow, so a
+        # returned response is an accepted turn (a followed 301/302/303 would
+        # land elsewhere as a GET; the Hermes route sends none).
+        with urllib.request.urlopen(req, timeout=GATEWAY_TURN_TIMEOUT_S):
+            pass
+    except urllib.error.HTTPError as exc:
+        logger.error(f"Gateway API chat execution failed (status {exc.code})")
+        return exc.code >= HTTP_SERVER_ERROR_MIN and exc.code != HTTP_SERVICE_UNAVAILABLE
+    except urllib.error.URLError as exc:
+        # urlopen wraps an error raised while connecting or sending the request
+        # (a refused connection, a connect timeout) in URLError; an error while
+        # waiting for the response, such as a read timeout, comes out unwrapped.
+        # So this one is a request the gateway never had in full: no turn.
+        logger.error(f"Gateway API chat request was not delivered: {exc.reason}")
+        return False
     except Exception as exc:
         logger.error(f"Failed to call gateway API chat execution: {exc}")
+    return True
 
 
 def trigger_agent_troubleshooter(
@@ -2729,7 +3082,31 @@ def trigger_agent_troubleshooter(
 
     ``slack_alert_msg`` replaces ``alert_msg`` when the alert goes to Slack, and
     ``alert_title`` is recorded only for a Slack thread.
+
+    An exception releases the row's fold anchor before it propagates: the
+    ledger row was written as admitted before this task was queued, and a task
+    that died before the turn would otherwise leave every sibling folding into
+    a triage that never started (mark_triage_not_started). _start_agent_turn
+    catches its own errors, so nothing raised here comes after a turn began.
     """
+    try:
+        _trigger_agent_troubleshooter(
+            session_id, alert_msg, payload, event_row_id, slack_alert_msg=slack_alert_msg, alert_title=alert_title
+        )
+    except Exception:
+        mark_triage_not_started(event_row_id)
+        raise
+
+
+def _trigger_agent_troubleshooter(
+    session_id: str,
+    alert_msg: str,
+    payload: Dict[str, Any],
+    event_row_id: Optional[int] = None,
+    slack_alert_msg: Optional[str] = None,
+    alert_title: Optional[str] = None,
+) -> None:
+    """trigger_agent_troubleshooter's work, without the release on an exception."""
     # 1. Post initial warning notification to Google Chat or Slack.
     #
     #    One destination, but the first one is not the only one tried. This path
@@ -2787,6 +3164,12 @@ def trigger_agent_troubleshooter(
             _register_session_routing(session_id, active_platform, thread_id)
             if alert_title and active_platform == SLACK_PLATFORM:
                 _record_alert_title(session_id, alert_title)
+            # Armed here, before the gateway is contacted: an alert whose turn
+            # never starts (session creation refused, the turn's POST failing)
+            # is the case the watchdog exists for, and the steps below return
+            # early on exactly those failures.
+            routed_platform, routed_chat, routed_thread = _lookup_session_routing(session_id)
+            _schedule_triage_watchdog(session_id, routed_platform, routed_chat, routed_thread)
         else:
             # The ledger row already says this alert was announced; it was written
             # before the post was attempted. Correct it now, or the daily recap
@@ -2825,11 +3208,13 @@ def trigger_agent_troubleshooter(
     session_created = _create_gateway_session(api_url, session_id, headers)
     if not session_created:
         logger.error(f"Aborting troubleshooting trigger: session creation failed for {session_id}")
+        mark_triage_not_started(event_row_id)
         return
 
     # 5. Formulate instructions query and execute the agent turn
     agent_query = _build_agent_query(payload)
-    _start_agent_turn(api_url, session_id, agent_query, headers)
+    if not _start_agent_turn(api_url, session_id, agent_query, headers):
+        mark_triage_not_started(event_row_id)
 
 
 # --------------------------------------------------------------------------
@@ -3274,18 +3659,28 @@ def _is_fleet_audit_job(profile: str, job_id: str) -> bool:
     except Exception as exc:
         logger.warning(f"Audit headline skipped: {profile} cron roster unreadable: {exc}")
         return False
-    return _roster_runs_fleet_audit(store, job_id)
+    return _roster_fleet_audit_job(store, job_id) is not None
 
 
-def _roster_runs_fleet_audit(store: Any, job_id: str) -> bool:
-    """Whether `job_id` in a cron roster's parsed JSON runs the fleet-audit skill."""
+def _roster_fleet_audit_job(store: Any, job_id: str) -> str | None:
+    """The roster's own id for `job_id` when that job runs the fleet-audit skill, else None.
+
+    The string returned is the roster entry's: equal to `job_id`, and read from
+    the roster file rather than taken from whoever asked.
+    """
     jobs = store.get("jobs") if isinstance(store, dict) else store
     for job in jobs if isinstance(jobs, list) else []:
-        if isinstance(job, dict) and str(job.get("id") or "") == job_id:
-            # Hermes accepts a list, a single string, or the legacy `skill` field.
-            skills = job.get("skills") or job.get("skill") or []
-            return FLEET_AUDIT_SKILL in ([skills] if isinstance(skills, str) else skills)
-    return False
+        if not isinstance(job, dict):
+            continue
+        roster_id = str(job.get("id") or "")
+        if roster_id != job_id:
+            continue
+        # Hermes accepts a list, a single string, or the legacy `skill` field.
+        skills = job.get("skills") or job.get("skill") or []
+        if FLEET_AUDIT_SKILL in ([skills] if isinstance(skills, str) else skills):
+            return roster_id
+        return None
+    return None
 
 
 def _is_managed_github_repo(repo: str) -> bool:
@@ -3512,7 +3907,16 @@ def _read_chat_report_record(job_id: str) -> dict | None:
     Raises ChatReportUnreadable when the read itself failed, which says
     nothing about whether the run finished.
     """
-    path = os.path.join(FLEET_AUDIT_SCRATCH_DIR, CHAT_REPORT_FILE.format(audit=job_id))
+    # `job_id` is caller-supplied, and a record is only ever under the scratch
+    # directory: a path that leaves it names no record. abspath (a relative
+    # root resolves against the working directory, as the open would) followed
+    # by startswith is the containment check CodeQL recognises (py/path-injection).
+    root = os.path.abspath(FLEET_AUDIT_SCRATCH_DIR)
+    path = os.path.normpath(os.path.join(root, CHAT_REPORT_FILE.format(audit=job_id)))
+    prefix = root if root.endswith(os.sep) else root + os.sep  # a root of "/" already ends in one
+    if not path.startswith(prefix):
+        logger.warning(f"Relay for {job_id}: chat report path leaves {root}")
+        return None
     try:
         import sandbox_exec
 
@@ -3567,15 +3971,26 @@ def _mark_run_posted(profile: str, job_id: str, run: str) -> None:
         logger.error(f"Relay for {profile}/{job_id}: run {run} not marked posted: {exc!r}")
 
 
-def _is_shipped_audit_job(job_id: str) -> bool:
-    """Whether the image's Platform Agent roster ships `job_id` as a fleet-audit job."""
+def _shipped_audit_job(job_id: str) -> str | None:
+    """The image roster's own id for `job_id` when it ships as a fleet-audit job, else None.
+
+    The roster is the allowlist, and the value handed back is its element rather
+    than the request's string that matched it. `job_id` arrives on the
+    `/v1/cron-reports` body, and the callers in the branch this guards name a
+    file with it that `sandbox_exec.read_bytes` opens through the sandbox's
+    shell. CodeQL's `py/command-line-injection` query counts no quoting as a
+    sanitizer, only a comparison against a literal or a barrier a model names,
+    so the request's copy would carry its taint to that shell however it was
+    escaped; the roster's copy, read from the image, never had any. Equal by
+    value, so nothing downstream changes.
+    """
     try:
         with open(IMAGE_PLATFORM_ROSTER, encoding="utf-8") as handle:
             store = json.load(handle)
     except (OSError, ValueError) as exc:
         logger.warning(f"Relay for {job_id}: image roster unreadable: {exc}")
-        return False
-    return _roster_runs_fleet_audit(store, job_id)
+        return None
+    return _roster_fleet_audit_job(store, job_id)
 
 
 def _delivering_run_start(profile: str, job_id: str) -> float | None:
@@ -3587,8 +4002,21 @@ def _delivering_run_start(profile: str, job_id: str) -> float | None:
     """
     from gitops_workspace import agent_home
 
-    base = agent_home() if profile == DEFAULT_PROFILE else os.path.join(agent_home(), PROFILES_DIR, profile)
-    path = os.path.join(base, *RUN_LEDGER)
+    # `profile` is caller-supplied, and a ledger is only ever under the agent
+    # home (the default profile) or the profiles directory (the rest): a path
+    # that leaves its root is no ledger. abspath (a relative home resolves
+    # against the working directory, as the open would) followed by startswith
+    # is the containment check CodeQL recognises (py/path-injection).
+    home = os.path.abspath(agent_home())
+    if profile == DEFAULT_PROFILE:
+        root, base = home, home
+    else:
+        root = os.path.join(home, PROFILES_DIR)
+        base = os.path.join(root, profile)
+    path = os.path.normpath(os.path.join(base, *RUN_LEDGER))
+    prefix = root if root.endswith(os.sep) else root + os.sep  # a root of "/" already ends in one
+    if not path.startswith(prefix):
+        return None
     if not os.path.exists(path):
         return None
     try:
@@ -3697,6 +4125,123 @@ def audit_chat_report(profile: str, job_id: str, title: str) -> tuple[str, str]:
     elif len(finished) > 1:
         finished.append(AUDIT_REPOS_SUMMARY_LINE.format(label=label, count=len(finished)))
     return CHAT_REPORT_PARTS_SEPARATOR.join(finished), run
+
+
+class SchedulerFailure(NamedTuple):
+    """The scheduler's failure line said plainly (:func:`scheduler_failure_line`): `reason` is what the repeat check compares."""
+
+    reason: str
+    text: str
+
+
+def _profile_home(profile: str) -> str:
+    """`profile`'s home under the agent home, where its cron roster and run ledger live."""
+    from gitops_workspace import agent_home
+
+    return agent_home() if profile == DEFAULT_PROFILE else os.path.join(agent_home(), PROFILES_DIR, profile)
+
+
+def _runs_daily(profile: str, job_id: str) -> bool:
+    """Whether `job_id` in `profile`'s cron roster fires once a day, every day; False when it cannot be read."""
+    if not _PROFILE_SEGMENT_RE.match(profile):
+        return False
+    try:
+        return cron_schedule.job_runs_daily(_profile_home(profile), job_id)
+    except Exception as exc:
+        logger.warning(f"Relay for {profile}/{job_id}: cron schedule unreadable: {exc}")
+        return False
+
+
+def scheduler_failure_line(profile: str, job_id: str, title: str, report: str) -> SchedulerFailure:
+    """The scheduler's failure line for a run of `job_id`, as one plain line.
+
+    "**The <title> didn't run.** <why>. It will try again tomorrow." The why is
+    the scheduler's reason in plain words (`SCHEDULER_FAILURE_REASONS`), or
+    `SCHEDULER_FAILURE_ERROR` for one it does not name. "tomorrow" is for a job
+    that fires once a day, every day; any other says
+    `SCHEDULER_FAILURE_NEXT_UNKNOWN`. A failure no retry clears (rejected
+    credentials, or a job the scheduler blocked on its configuration, which it
+    runs no more until it is fixed) ends with `SCHEDULER_FAILURE_NEEDS_ADMIN`.
+    """
+    head = SCHEDULER_FAILURE_HEAD.format(title=title or job_id)
+    lower = report.lower()
+    if SCHEDULER_FAILURE_BLOCKED_MARK in lower:
+        return SchedulerFailure(SCHEDULER_FAILURE_BLOCKED, f"{head} {SCHEDULER_FAILURE_BLOCKED}. {SCHEDULER_FAILURE_NEEDS_ADMIN}")
+    reason, needs_admin = next(
+        ((plain, admin) for words, plain, admin in SCHEDULER_FAILURE_REASONS if words in lower),
+        (SCHEDULER_FAILURE_ERROR, False),
+    )
+    if needs_admin:
+        then = SCHEDULER_FAILURE_NEEDS_ADMIN
+    else:
+        then = SCHEDULER_FAILURE_NEXT_DAILY if _runs_daily(profile, job_id) else SCHEDULER_FAILURE_NEXT_UNKNOWN
+    return SchedulerFailure(reason, f"{head} {reason}. {then}")
+
+
+def _run_completed_since(profile: str, job_id: str, since: float) -> bool:
+    """Whether the scheduler's ledger has a run of `job_id` that started after `since` and finished cleanly.
+
+    True when the ledger cannot say, so a failure that cannot be told from a
+    repeat is posted rather than withheld; that includes a `profile` that is not
+    one path segment, since it is caller-supplied and a path that leaves the
+    profiles directory is no ledger.
+    """
+    if not _PROFILE_SEGMENT_RE.match(profile):
+        return True
+    path = os.path.join(_profile_home(profile), *RUN_LEDGER)
+    if not os.path.exists(path):
+        return True
+    try:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=AUDIT_RUNS_DB_TIMEOUT_S)) as conn:
+            rows = conn.execute(
+                "SELECT started_at FROM executions WHERE job_id = ? AND status = ?",
+                (job_id, RUN_LEDGER_COMPLETED),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        logger.warning(f"Relay for {profile}/{job_id}: run ledger unreadable: {exc}")
+        return True
+    for (started,) in rows:
+        try:
+            if datetime.fromisoformat(str(started)).timestamp() > since:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _failure_already_posted(profile: str, job_id: str, reason: str) -> bool:
+    """Whether `reason` is the failure `job_id` last posted, with no clean run since."""
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=AUDIT_RUNS_DB_TIMEOUT_S)) as conn:
+            row = conn.execute(
+                "SELECT reason, posted_at FROM scheduler_failure_posts WHERE profile = ? AND job_id = ?",
+                (profile, job_id),
+            ).fetchone()
+    except Exception as exc:
+        logger.warning(f"Relay for {profile}/{job_id}: last posted failure unreadable: {exc!r}")
+        return False
+    if not row or row[0] != reason:
+        return False
+    return not _run_completed_since(profile, job_id, float(row[1]))
+
+
+def _record_failure_posted(profile: str, job_id: str, reason: str | None) -> None:
+    """Remember the failure `job_id` posted, or forget it when `reason` is None (the job ran)."""
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=AUDIT_RUNS_DB_TIMEOUT_S)) as conn:
+            with conn:
+                if reason is None:
+                    conn.execute(
+                        "DELETE FROM scheduler_failure_posts WHERE profile = ? AND job_id = ?", (profile, job_id)
+                    )
+                else:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO scheduler_failure_posts (profile, job_id, reason, posted_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (profile, job_id, reason, time.time()),
+                    )
+    except Exception as exc:
+        logger.error(f"Relay for {profile}/{job_id}: posted failure not recorded: {exc!r}")
 
 
 def relay_cron_report(
@@ -4001,19 +4546,46 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
     # Only the scheduler's delivery leg sends `also_delivered_to`; a mid-run
     # `report_to_chat` does not, and its text is posted as written.
     from_scheduler = SCHEDULER_LEG_KEY in request_data
+    failure_flagged = from_scheduler and request_data.get(SCHEDULER_FAILURE_KEY) is True
+    failure: SchedulerFailure | None = None
     failure_run = ""
-    if from_scheduler and _is_fleet_audit_job(profile, job_id) and _is_shipped_audit_job(job_id):
-        if request_data.get(SCHEDULER_FAILURE_KEY) is True and not _record_written_by_this_run(profile, job_id):
-            # The scheduler's line for a failed run, posted as written, as on
-            # main: it says why the run failed, and the record on disk is an
-            # earlier run's. Marking that record posted keeps a later run that
-            # never reached `start` from posting it as its own.
-            failure_run = _record_run(job_id)
+    # The roster's copy of the job id, not the request's.
+    audit_job = _shipped_audit_job(job_id) if from_scheduler and _is_fleet_audit_job(profile, job_id) else None
+    if audit_job is not None:
+        if failure_flagged and not _record_written_by_this_run(profile, audit_job):
+            # The scheduler's line for a failed run: it says why the run
+            # failed, and the record on disk is an earlier run's. Marking that
+            # record posted keeps a later run that never reached `start` from
+            # posting it as its own.
+            failure_run = _record_run(audit_job)
+            failure = scheduler_failure_line(profile, job_id, title, report)
         else:
             # The flag is read off the text, which the model can also write:
             # a run that wrote its own record reached `finish`, so its report
             # is posted whatever its last message says.
-            report, audit_run = audit_chat_report(profile, job_id, title)
+            report, audit_run = audit_chat_report(profile, audit_job, title)
+    elif failure_flagged:
+        failure = scheduler_failure_line(profile, job_id, title, report)
+    if failure is not None:
+        logger.warning(f"Relay for {profile}/{job_id}: the run failed; the scheduler said: {report}")
+        if _failure_already_posted(profile, job_id, failure.reason):
+            # Posted once already, with no clean run since: the channel knows.
+            if failure_run:
+                _mark_run_posted(profile, audit_job, failure_run)
+            logger.info(f"Relay for {profile}/{job_id}: the same failure was posted already; not posting it again")
+            return {
+                "status": CRON_REPORT_SUPPRESSED,
+                "session_id": "",
+                "relay": "ok",
+                "relay_detail": "",
+                "undelivered": "",
+                "truncated": "",
+            }
+        report = failure.text
+    elif from_scheduler:
+        # The job delivered something other than a failure, so it ran, and
+        # its next failure is news; its report is the "working again" signal.
+        _record_failure_posted(profile, job_id, None)
     report, truncation_notice = _truncate_report(report, profile, job_id, audit_record=bool(audit_run))
 
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -4029,7 +4601,10 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
     if error:
         raise HTTPException(status_code=502, detail=f"chat relay failed: {error}")
     if audit_run or failure_run:
-        _mark_run_posted(profile, job_id, audit_run or failure_run)
+        # Keyed by the same string `audit_chat_report` reads it back under.
+        _mark_run_posted(profile, audit_job, audit_run or failure_run)
+    if failure is not None:
+        _record_failure_posted(profile, job_id, failure.reason)
     # 200, because the report is in the channel and the run did its job. `relay`
     # and `relay_detail` reported a degraded delivery, which only a failed Chat
     # Agent turn produced; no turn runs now, so they always read ok, and they
@@ -4385,6 +4960,103 @@ def _drift_backlog_digest_text(rows: Sequence[Dict[str, Any]]) -> str:
     )
 
 
+def _drift_backlog_card_name(value: Any) -> str:
+    """A name for the card body: shown when it matches the allowlist, else a placeholder."""
+    text = str(value or "")
+    if not text:
+        return DRIFT_UNKNOWN_FIELD
+    if _DRIFT_BACKLOG_NAME_RE.fullmatch(text):
+        return text
+    return DRIFT_BACKLOG_NAME_PLACEHOLDER.format(length=len(text))
+
+
+def _drift_backlog_card_body(rows: Sequence[Dict[str, Any]]) -> str:
+    """The card's body: the digest's count by principal, then every row up to a cap.
+
+    Both lists are capped because the body travels as one argv element, which the
+    kernel limits to 128 KiB; an uncapped body would fail to file and retry forever.
+    """
+    by_principal: Dict[str, int] = {}
+    for row in rows:
+        principal = row["principal"] or DRIFT_UNKNOWN_FIELD
+        by_principal[principal] = by_principal.get(principal, 0) + 1
+    ranked = sorted(by_principal.items(), key=lambda item: (-item[1], item[0]))
+    principals = ", ".join(f"{_drift_backlog_card_name(p)} ({n})" for p, n in ranked[:DRIFT_BACKLOG_MAX_PRINCIPALS])
+    if len(ranked) > DRIFT_BACKLOG_MAX_PRINCIPALS:
+        principals += f", and {len(ranked) - DRIFT_BACKLOG_MAX_PRINCIPALS} more"
+    lines = [
+        f"{len(rows)} {'change' if len(rows) == 1 else 'changes'} reached drift detection late (they queued "
+        f"before it started pulling, or waited over {DRIFT_BACKLOG_MAX_WAIT_TEXT}). This install has no chat "
+        "platform enabled, so this card is the digest. No agent acts on it: a person reads it and archives it.",
+        "",
+        "By principal: " + principals,
+        "",
+        "Changes:",
+    ]
+    for row in rows[:DRIFT_BACKLOG_CARD_MAX_ROWS]:
+        obj = "/".join(_drift_backlog_card_name(part) for part in (row["namespace"], row["object_kind"], row["workload"]) if part)
+        lines.append(
+            f"- {_drift_backlog_card_name(row['principal'])} changed {obj} on "
+            f"{_drift_backlog_card_name(row['cluster'])} (recorded {row['created_at']} UTC)"
+        )
+    if len(rows) > DRIFT_BACKLOG_CARD_MAX_ROWS:
+        lines.append(f"- and {len(rows) - DRIFT_BACKLOG_CARD_MAX_ROWS} more")
+    lines += ["", f"Full list (the `{FEED_STATUS_BACKLOG}` rows): {DRIFT_BACKLOG_FEED_COMMAND}"]
+    return "\n".join(lines)
+
+
+def _file_drift_backlog_card(rows: Sequence[Dict[str, Any]]) -> str:
+    """File the digest as one unassigned, blocked card and return its id, or "" when no card exists.
+
+    The idempotency key names the rows, so a retry over the same rows gets the
+    card that exists back rather than a second one.
+    """
+    noun = "change" if len(rows) == 1 else "changes"
+    cmd = [
+        chat_notify.HERMES_CLI, "kanban", "create",
+        DRIFT_BACKLOG_CARD_TITLE.format(count=len(rows), noun=noun),
+        "--body", _drift_backlog_card_body(rows),
+        "--initial-status", DRIFT_BACKLOG_CARD_STATUS,
+        "--idempotency-key", f"{DRIFT_BACKLOG_CARD_KEY_PREFIX}{rows[0]['id']}-{rows[-1]['id']}",
+        "--created-by", DRIFT_BACKLOG_CARD_CREATED_BY,
+        "--json",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            env=_run_env({"HERMES_KANBAN_BUSY_TIMEOUT_MS": DRIFT_BACKLOG_CARD_BUSY_TIMEOUT_MS}),
+            timeout=DRIFT_BACKLOG_CARD_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        logger.error(f"Drift backlog card: `hermes kanban create` did not answer in {DRIFT_BACKLOG_CARD_TIMEOUT_SECONDS}s")
+        return ""
+    except Exception as exc:
+        logger.error(f"Drift backlog card: could not run `hermes kanban create`: {exc}")
+        return ""
+    if proc.returncode != 0:
+        logger.error(
+            f"Drift backlog card: `hermes kanban create` exited {proc.returncode}: "
+            f"{(proc.stderr or proc.stdout or '').strip()[:LEDGER_MESSAGE_MAX_CHARS]}"
+        )
+        return ""
+    # The board's own stderr can share the buffer, so find the JSON object
+    # rather than parsing the whole string as one.
+    out = proc.stdout or ""
+    start, end = out.find("{"), out.rfind("}")
+    task_id = ""
+    if start != -1 and end > start:
+        try:
+            task_id = str((json.loads(out[start:end + 1]) or {}).get("id") or "")
+        except ValueError:
+            task_id = ""
+    if not task_id:
+        logger.error(f"Drift backlog card: no task id in the board's answer: {out.strip()[:LEDGER_MESSAGE_MAX_CHARS]}")
+    return task_id
+
+
 def _refund_alert_quota(severity: str) -> None:
     """Give back one of today's alerts for `severity`, claimed for a post that
     never happened. Best-effort: a failed refund costs one unit of the day's
@@ -4408,7 +5080,7 @@ def _card_drift_backlog_minorities(rows: Sequence[Dict[str, Any]]) -> list[Dict[
     A carded row gets what a live drift record gets, less field ownership (its
     join was skipped): a quota claim, a session, the alert and the triage turn.
     A row the ceiling refuses stays in the digest, so the change is still named
-    in chat. The row is marked DRIFT_BACKLOG_CARDED before the turn starts, so a
+    in the digest. The row is marked DRIFT_BACKLOG_CARDED before the turn starts, so a
     crash after it cannot card it twice; a turn that fails after that is lost as
     a live one would be. A row whose session or mark cannot be written goes to
     the digest too, so it is named and marked with the rest rather than left
@@ -4514,8 +5186,8 @@ def _post_drift_backlog_digest() -> bool:
     """Claim the pending rows, post one digest for them, and mark them.
 
     Returns False when the post failed or another holder has the lease, so the
-    worker waits DRIFT_BACKLOG_RETRY_SECONDS. A headless install marks the rows
-    with no post, as the alert path does for its own rows.
+    worker waits DRIFT_BACKLOG_RETRY_SECONDS. An install with no chat route
+    files the digest as one board card instead (_file_drift_backlog_card).
     """
     global _drift_backlog_unfinished
     if _drift_backlog_unfinished is not None:
@@ -4541,8 +5213,12 @@ def _post_drift_backlog_digest() -> bool:
         if not rows:
             return True
         if headless:
+            task_id = _file_drift_backlog_card(rows)
+            if not task_id:
+                logger.error(f"Drift backlog card for {len(rows)} record(s) was not filed; retrying in {DRIFT_BACKLOG_RETRY_SECONDS}s")
+                return False
             outcome = DRIFT_BACKLOG_HEADLESS
-            logger.info(f"Drift backlog: {len(rows)} record(s) recorded with no digest posted (no chat platform enabled)")
+            logger.info(f"Drift backlog card {task_id} filed for {len(rows)} record(s) (no chat route)")
             return True
         message = _drift_backlog_digest_text(rows)
         active = get_active_platform(platforms)
@@ -4634,7 +5310,7 @@ def inject_message(
     request_data: Dict[str, Any],
     background_tasks: BackgroundTasks,
     x_watcher_features: str = Header(default=""),
-) -> Dict[str, str]:
+) -> Dict[str, Any]:
     """Receive the event payload and notify the Platform Agent via Google Chat.
 
     Three producers reach this route and they send different records. The event
@@ -4643,10 +5319,10 @@ def inject_message(
     audit-log record of a change someone made; a stall producer
     (docs/designs/stall-watch-inject.md) sends `kind: controller-stall` and the
     objects it saw stop making progress. The
-    dispatch is an equality test against `INJECT_KIND_DRIFT` and
-    `INJECT_KIND_STALL`, not a match against the watcher's kinds, so everything
-    else — those two, a kind a future producer invents, or no kind at all —
-    takes the event path.
+    dispatch is an equality test against `INJECT_KIND_DRIFT`, `INJECT_KIND_STALL`
+    and `INJECT_KIND_FOLLOWUP` (the watcher's quiet follow-up, `_inject_followup`),
+    so everything else — `k8s-event`, a kind a future producer invents, or no
+    kind at all — takes the event path.
 
     Everything below the dispatch is that event path, unchanged, and the fields
     it reads exist on nothing else — `payload.get("kind_of_object") or "Pod"`
@@ -4669,6 +5345,8 @@ def inject_message(
         return _inject_drift(session_id, payload, background_tasks)
     if payload.get("kind") == INJECT_KIND_STALL:
         return _inject_stall(session_id, payload, background_tasks)
+    if payload.get("kind") == INJECT_KIND_FOLLOWUP:
+        return _inject_followup(session_id, payload, background_tasks)
 
     event_reason = payload.get("reason") or "Unknown"
     namespace = payload.get("namespace") or "default"
@@ -4720,30 +5398,55 @@ def inject_message(
     # Info event before this line, neither reaches the claim and the bucket is
     # never drawn down at all. Move the claim above the gate and five suppressed
     # `BackOff`s can exhaust it and cap-drop the node event behind them.
+    #
+    # The workload fold comes between the two for the same reason: a duplicate
+    # is never going to post, so it must not spend a budget either.
     quota_denied = False
     suppressed_today = 0
-    if not suppressed:
-        allowed, suppressed_today = _claim_alert_quota(severity_label)
-        quota_denied = not allowed
+    anchor_id = None
+    with _WORKLOAD_FOLD_LOCK if INCIDENT_WORKLOAD_DEDUP_SECONDS > 0 else nullcontext():
+        fold_key = _fold_key(object_kind, object_name)
+        if not suppressed:
+            anchor_id = _workload_incident_anchor(event_cluster, namespace, object_kind, fold_key, severity_label)
+        if not suppressed and anchor_id is None:
+            allowed, suppressed_today = _claim_alert_quota(severity_label)
+            quota_denied = not allowed
 
-    # One ledger row per forwarded event, whatever became of it, with
-    # `notified` carrying the outcome — that invariant is what lets the daily
-    # recap report a suppressed event as a number rather than lose it. A
-    # cap-dropped alert is written here too: it is the case the recap most
-    # needs to show, since nothing about it reaches chat at all.
-    event_row_id = record_intercepted_event(
-        cluster=event_cluster,
-        namespace=namespace,
-        workload=clean_name,
-        object_uid=object_uid,
-        object_kind=object_kind,
-        reason=event_reason,
-        message=clean_msg,
-        severity=severity_label,
-        occurrences=count,
-        notified=not (suppressed or quota_denied),
-        session_id=session_id,
-    )
+        # One ledger row per forwarded event, whatever became of it, with
+        # `notified` carrying the outcome — that invariant is what lets the daily
+        # recap report a suppressed event as a number rather than lose it. A
+        # cap-dropped alert is written here too: it is the case the recap most
+        # needs to show, since nothing about it reaches chat at all.
+        event_row_id = record_intercepted_event(
+            cluster=event_cluster,
+            namespace=namespace,
+            workload=clean_name,
+            object_uid=object_uid,
+            object_kind=object_kind,
+            reason=event_reason,
+            message=clean_msg,
+            severity=severity_label,
+            occurrences=count,
+            notified=not (suppressed or quota_denied or anchor_id is not None),
+            session_id=session_id,
+            duplicate_of=anchor_id,
+            fold_key=fold_key,
+        )
+
+    if anchor_id is not None:
+        # Neither "filtered" nor "suppressed", both of which reopen. The watcher
+        # rolls back its entry on "suppressed", and flags it on "filtered" so
+        # the next Warning sighting of the same key reopens it; either way this
+        # pod's (UID, reason) comes back at kubelet's repeat cadence while the
+        # anchor's triage runs. The watcher keeps its entry for "folded" and
+        # counts it in k8s_event_watcher_events_folded_total. One that predates
+        # the status reads it as delivered, which keeps the entry the same way
+        # and counts it as injected, so no feature negotiation is needed.
+        logger.info(
+            f"Folded {severity_label} event {event_reason} for {namespace}/{object_kind}/{object_name} "
+            f"into ledger row {anchor_id} (no chat alert, no triage session)"
+        )
+        return {"status": FEED_STATUS_FOLDED, "duplicate_of": str(anchor_id)}
 
     if suppressed:
         # "filtered", deliberately not the "suppressed" the ceiling answers
@@ -4820,7 +5523,165 @@ def inject_message(
         alert_title=_alert_session_title(clean_name, event_cluster, event_reason, message),
     )
 
-    return {"status": "injected"}
+    return {"status": "injected", "features": INJECT_RESPONSE_FEATURES}
+
+
+def _hhmm_utc(stamp: Any) -> str:
+    """``HH:MM UTC`` for an ISO-8601 stamp, or "" when it cannot be read."""
+    if not stamp:
+        return ""
+    try:
+        text = str(stamp).replace("Z", "+00:00")
+        return datetime.fromisoformat(text).astimezone(timezone.utc).strftime("%H:%M UTC")
+    except (TypeError, ValueError):
+        return ""
+
+
+def _thread_has_report(chat_id: str, thread_id: str) -> bool:
+    """Whether a triage report has been stored for the thread (``POST /v1/incidents``)."""
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)) as conn:
+            return conn.execute(
+                "SELECT 1 FROM incidents WHERE chat_id = ? AND thread_id = ?", (chat_id, thread_id)
+            ).fetchone() is not None
+    except sqlite3.Error as exc:
+        logger.error(f"Failed to read incidents for thread {thread_id}: {exc}")
+        return False
+
+
+# What `_card_for_alert_session` answers when the board cannot be read: not
+# "no card", which the watchdog would announce, and not a card id.
+BOARD_UNREADABLE = "unreadable"
+
+
+def _card_for_alert_session(session_id: str) -> Optional[str]:
+    """The card the alert's session filed, read off the board the way the stall
+    watch reads it; None when the board has none for the session (a board file
+    not yet created counts as that, as `card_for_session` reads it);
+    BOARD_UNREADABLE when the board cannot say (locked past its busy timeout,
+    unreadable), which a caller must treat as unknown rather than as absence."""
+    try:
+        from stall_watch import card_for_session  # lazy: the board path is the gateway's
+
+        return card_for_session(session_id)
+    except Exception as exc:  # noqa: BLE001 - reported; the caller decides what unknown means
+        logger.warning(f"Could not look up the card for session {session_id}: {exc}")
+        return BOARD_UNREADABLE
+
+
+def _comment_alert_card(session_id: str, text: str) -> bool:
+    """Leave ``text`` as a comment on the alert's card, so the board carries the
+    follow-up beside the report. False when there is no card or the board refused."""
+    card = _card_for_alert_session(session_id)
+    if not card or card == BOARD_UNREADABLE:
+        return False
+    try:
+        from stall_watch import kanban  # lazy: the in-process board API is the gateway venv's
+
+        kanban(f"comment {shlex.quote(card)} {shlex.quote(text)}")
+        return True
+    except Exception as exc:  # noqa: BLE001 - reported; the chat line is the delivery that matters
+        logger.warning(f"Could not comment on card {card} for session {session_id}: {exc}")
+        return False
+
+
+def _followup_message(session_id: str, payload: Dict[str, Any], now: Optional[datetime] = None) -> str:
+    """The quiet follow-up's one line: what went quiet, since when, and that
+    silence is all the watcher knows. The object comes from the payload: the
+    watcher binds it on the entry when the alert goes out, and sends a
+    follow-up for no entry that lacks it."""
+    namespace = payload.get("namespace") or ""
+    name = payload.get("name") or ""
+    cluster = payload.get("cluster") or os.environ.get("GKE_CLUSTER_NAME", "")
+    reason = payload.get("reason") or "warning"
+    subject = f"`{namespace}/{name}`" if namespace and name else (f"`{name}`" if name else "the object")
+    where = f" on `{cluster}`" if cluster else ""
+    since = _hhmm_utc(payload.get("last_seen"))
+    first = _hhmm_utc(payload.get("first_seen"))
+    quiet_for = ""
+    try:
+        last = datetime.fromisoformat(str(payload.get("last_seen")).replace("Z", "+00:00"))
+        minutes = int(((now or datetime.now(timezone.utc)) - last).total_seconds() // SECONDS_PER_MINUTE)
+        if minutes > 0:
+            quiet_for = f" for {minutes} min"
+    except (TypeError, ValueError):
+        pass
+    count = payload.get("count")
+    seen = f", {count} seen" if isinstance(count, int) and count > 1 else ""
+    first_text = f" (first at {first}{seen})" if first else ""
+    head = f"{FOLLOWUP_EMOJI} **Quiet since {since}:**" if since else f"{FOLLOWUP_EMOJI} **Quiet:**"
+    return (
+        f"{head} no new `{clean_reason_label(reason)}` events from {subject}{where}{quiet_for}{first_text}. "
+        "Read off events alone: the object was not re-read, so a recovered pod and a deleted one look the same. "
+        "The triage above says what was true when it was written."
+    )
+
+
+def _post_followup(session_id: str, platform: str, chat_id: str, thread_id: str, text: str) -> None:
+    """Deliver a follow-up line into the alert's thread and onto its card."""
+    if _send_to_chat(platform, text, chat_id, thread_id) is None:
+        logger.error(f"Follow-up for session {session_id} did not reach {platform} thread {thread_id}")
+    _comment_alert_card(session_id, text)
+
+
+def _inject_followup(
+    session_id: str,
+    payload: Dict[str, Any],
+    background_tasks: BackgroundTasks,
+) -> Dict[str, str]:
+    """The `k8s-event-followup` half of `inject_message`.
+
+    The watcher sends one when an incident it alerted on has emitted no new
+    event for its quiet period (dispatcher.Sweep in the watcher). It arrives on
+    the alert's own session, so the thread is the one `_register_session_routing`
+    recorded; the line goes there as a reply, and onto the card the session
+    filed as a comment, so a reader of either sees that the object went quiet
+    and when. No ledger row, no quota, no agent turn: nothing new happened in
+    the cluster, something stopped happening. A session nothing routed (the
+    alert never reached chat) gets `unrouted` and nothing is posted; the
+    watcher marks the incident notified either way, which is right, since
+    there is no thread to tell.
+
+    A reply, not an edit of the alert: the gateway edits by update key only
+    inside a conversation request (a2a/gateway/notify.go, postConversation),
+    and the alert was a home-channel post whose key was never bound, so a
+    keyed send here would post anew at best and at worst overwrite whatever
+    message had taken that key since, the triage report included.
+    """
+    platform, chat_id, thread_id = _lookup_session_routing(session_id)
+    if not platform or not thread_id:
+        logger.info(f"Follow-up for session {session_id}: no chat thread is routed to it; nothing posted")
+        return {"status": "unrouted"}
+    text = _followup_message(session_id, payload)
+    background_tasks.add_task(_post_followup, session_id, platform, chat_id, thread_id, text)
+    return {"status": "followup"}
+
+
+def _triage_watchdog(session_id: str, platform: str, chat_id: str, thread_id: str) -> None:
+    """Say so in the thread when, an hour on, the alert has no card and no report.
+
+    A board that cannot be read is unknown, not empty: the line is posted only
+    on a board that answered and had no card for the session. The line states
+    the two facts it checked and no cause: the turn may have failed to start,
+    or run and filed nothing, and this check cannot tell which.
+    """
+    if _thread_has_report(chat_id, thread_id) or _card_for_alert_session(session_id) is not None:
+        return
+    text = (
+        f"{WATCHDOG_EMOJI} **No triage for this alert in {TRIAGE_WATCHDOG_SECONDS // SECONDS_PER_MINUTE} min.** "
+        "No card was filed for it and no report has reached this thread. The alert stands as posted."
+    )
+    if _send_to_chat(platform, text, chat_id, thread_id) is None:
+        logger.error(f"Watchdog line for session {session_id} did not reach {platform} thread {thread_id}")
+
+
+def _schedule_triage_watchdog(session_id: str, platform: str, chat_id: str, thread_id: str) -> None:
+    """Arm `_triage_watchdog` for the alert, on a daemon thread the process does not wait for."""
+    if TRIAGE_WATCHDOG_SECONDS <= 0 or not thread_id:
+        return
+    timer = threading.Timer(TRIAGE_WATCHDOG_SECONDS, _triage_watchdog, args=(session_id, platform, chat_id, thread_id))
+    timer.daemon = True
+    timer.start()
 
 
 def _conversation_session_id(context_id: str) -> str:
@@ -4856,11 +5717,22 @@ def put_conversation_route(session_id: str, request_data: Dict[str, Any]) -> Dic
     conversation = str(request_data.get("conversation") or "").strip()
     context_id = str(request_data.get("context_id") or "").strip()
     ask = str(request_data.get(CONVERSATION_ROUTE_ASK_KEY) or "").strip()
-    prefix = CONVERSATION_KEY_PREFIXES.get(platform)
-    if prefix is None:
-        raise HTTPException(status_code=400, detail=f"platform {platform!r} is not one the gateway holds")
-    if not conversation.startswith(prefix) or len(conversation) == len(prefix):
-        raise HTTPException(status_code=400, detail=f"conversation is not a {platform} conversation key ({prefix}...)")
+    user_id = str(request_data.get(CONVERSATION_ROUTE_USER_KEY) or "").strip()
+    chat_type = str(request_data.get(CONVERSATION_ROUTE_CHAT_TYPE_KEY) or "").strip().lower()
+    if platform:
+        prefix = CONVERSATION_KEY_PREFIXES.get(platform)
+        if prefix is None:
+            raise HTTPException(status_code=400, detail=f"platform {platform!r} is not one the gateway holds")
+        if not conversation.startswith(prefix) or len(conversation) == len(prefix):
+            raise HTTPException(status_code=400, detail=f"conversation is not a {platform} conversation key ({prefix}...)")
+    else:
+        if not (CONVERSATION_ROUTE_USER_TOKEN.fullmatch(user_id) or chat_type in CONVERSATION_ROUTE_CHAT_TYPES):
+            raise HTTPException(
+                status_code=400,
+                detail="an identity-only route (no platform) needs a user_id of the form hmac:<32-hex> or a chat_type of 'dm' or 'group'",
+            )
+        if not conversation:
+            raise HTTPException(status_code=400, detail="conversation is required")
     if not context_id:
         raise HTTPException(status_code=400, detail="context_id is required")
     if max(len(conversation), len(context_id)) > CONVERSATION_FIELD_MAX_CHARS:
@@ -4887,6 +5759,10 @@ def put_conversation_route(session_id: str, request_data: Dict[str, Any]) -> Dic
             }
             if CONVERSATION_ASK_TOKEN.fullmatch(ask):
                 route[CONVERSATION_ROUTE_ASK_KEY] = ask
+            if CONVERSATION_ROUTE_USER_TOKEN.fullmatch(user_id):
+                route[CONVERSATION_ROUTE_USER_KEY] = user_id
+            if chat_type in CONVERSATION_ROUTE_CHAT_TYPES:
+                route[CONVERSATION_ROUTE_CHAT_TYPE_KEY] = chat_type
             meta[CONVERSATION_ROUTE_KEY] = route
             conn.execute(
                 "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?) "
@@ -5125,7 +6001,13 @@ def _validate_non_negative_int64(value: int, name: str) -> int:
     return value
 
 
-def _feed_status(notified: int, severity: str, delivery_error: str, backlog: int = DRIFT_BACKLOG_NONE) -> str:
+def _feed_status(
+    notified: int,
+    severity: str,
+    delivery_error: str,
+    backlog: int = DRIFT_BACKLOG_NONE,
+    duplicate_of: Optional[int] = None,
+) -> str:
     """What became of a ledger row, in the inject route's own words.
 
     Derived rather than stored, from the three columns that already decide it:
@@ -5134,10 +6016,13 @@ def _feed_status(notified: int, severity: str, delivery_error: str, backlog: int
     skips chat delivery) only for an alert admitted past the severity gate and
     daily quota, an Info row is the one the severity gate filters, and
     `delivery_error` is written only when a chat post was attempted and failed.
-    A backlog row that is not carded is `backlog` whatever the other three say.
+    A backlog row that is not carded is `backlog` whatever the other three say,
+    and a row with `duplicate_of` is `folded`.
     """
     if backlog and backlog != DRIFT_BACKLOG_CARDED:
         return FEED_STATUS_BACKLOG
+    if duplicate_of is not None:
+        return FEED_STATUS_FOLDED
     if notified:
         return FEED_STATUS_INJECTED
     if delivery_error:
@@ -5165,7 +6050,7 @@ def list_intercepted_events(
     limit = _clamp_limit(limit, FEED_EVENTS_MAX_LIMIT)
     columns = (
         "id, session_id, created_at, cluster, namespace, object_kind, workload, "
-        "reason, severity, notified, delivery_error, message, backlog"
+        "reason, severity, notified, delivery_error, message, backlog, duplicate_of"
     )
     with closing(_read_only(SESSION_KV_DB_PATH)) as conn:
         if since_id is not None:
@@ -5189,8 +6074,11 @@ def list_intercepted_events(
             "name": row["workload"],
             "reason": row["reason"],
             "severity": row["severity"],
-            "status": _feed_status(row["notified"], row["severity"], row["delivery_error"], row["backlog"]),
+            "status": _feed_status(
+                row["notified"], row["severity"], row["delivery_error"], row["backlog"], row["duplicate_of"]
+            ),
             "message": row["message"],
+            "duplicate_of": row["duplicate_of"],
         }
         for row in rows[:limit]
     ]
@@ -5339,6 +6227,885 @@ def get_task(task_id: str) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# Stopping a conversation's cards: POST /v1/sessions/{id}/cards/stop (#3263).
+#
+# `stop` in a gateway conversation cancels the front door's turn, and by then
+# that turn has usually ended. What is still running is the kanban cards it
+# filed: rows on the board that the dispatcher in this container runs as worker
+# processes, which report back through `a2a notify --conversation`. The
+# hermes-bridge calls this route for the conversation's session when the
+# gateway hands it a card-stop control task. It archives every open card in
+# the conversation and says which.
+#
+# "In the conversation" is: filed under the session or one of its compression
+# continuations, or fanned out by such a card (`kanban_worker_children`, or
+# the `created` event's `creator_task_id`), to any depth, whatever session the
+# child carries. A card with no session that is subscribed to this session and
+# thread counts too, unless it inherited that subscription from a `task_links`
+# parent. Hermes copies a parent's subscriptions onto every link child
+# (`_inherit_notify_subs`, from `create_task` and `link_tasks`), so a cron
+# job's, an alert's or another conversation's card that waits on ours carries
+# our thread's subscription. Such a card is never stopped, and neither is any
+# `task_links` child under another session: archiving our card promotes it,
+# as finishing it would have. The links only order the archive.
+#
+# It runs here, not in the bridge, because Hermes kills a running card's worker
+# only when the claim lock names this host, and the bridge sidecar has the
+# hostname but not the pid namespace: from there the kill finds nothing, or
+# finds an unrelated process with the same number. Hermes' own `archive_task`
+# does each archive, so the run's close and `recompute_ready` are the
+# dispatcher's own code; nothing here writes a card's status.
+#
+# The order is most of the design. `archive_task` ends with `recompute_ready`,
+# which promotes a todo card once its parents are all done or archived, and the
+# dispatcher claims a ready card on its next tick (5 s). So:
+#
+#   1. every card in the set that is not running, leaves before the cards that
+#      gate them, so no card in the set is ever promoted;
+#   2. the running ones, in parallel, one connection each, since each archive
+#      can wait about 5 s for its worker to exit;
+#   3. up to three re-scans, 2 s apart, for a card a dying worker filed after
+#      the set was collected, and for a worker pid written onto a row after it
+#      was archived. `_set_worker_pid` has no status guard, so a card archived
+#      between `claim_task` and the spawn gets the new worker's pid, and nothing
+#      else ever kills that worker. A card archived while running with no pid
+#      yet is watched for one, every second, until the deadline, and reported
+#      `unresolved` if none appears.
+#
+# The answer has a hard bound, CARD_STOP_WORST_CASE_S (24 s). An archive is not
+# bounded by anything this route controls: Hermes' `write_txn` retries BEGIN
+# and COMMIT five times each under the busy timeout, `archive_task` runs up to
+# three of them, waits ~5 s for a worker, and `_cleanup_workspace` runs git and
+# tmux with timeouts of 5 to 60 s. So every archive runs on a worker thread,
+# and the route waits for them only until CARD_STOP_DEADLINE_S; one still
+# running then is reported `pending` and left to finish on its own. No archive
+# starts with less than CARD_STOP_ARCHIVE_RESERVE_S left, the tree collection
+# stops at the same mark, and the re-scans and the pid watch stop at the
+# deadline. What can still run past it is one statement on the route's own
+# connection, a re-scan read or the pid sweep's UPDATE, which waits at most
+# CARD_STOP_BUSY_TIMEOUT_S. Hence deadline + busy timeout + 1 s of slack.
+#
+# The worker kill goes through a `signal_fn` of ours, which signals a pid only
+# when its environment carries the card's `HERMES_KANBAN_TASK`, and signals
+# the marked members of the worker's process group with it: Hermes signals the
+# worker's pid only, and the worker is a session leader
+# (`start_new_session=True`), so what it starts without a session of its own,
+# the ssh client of each terminal command among them, would outlive it. After
+# the archive the group is swept once more for anything left. A process
+# without the marker is never signalled. That excludes the shared ssh
+# ControlMaster, which daemonizes out of the group and serves every worker and
+# the front door at once, and every command Hermes starts with a scrubbed
+# environment. The command an ssh client was running in the shell sandbox is
+# beyond any signal from here.
+# --------------------------------------------------------------------------
+
+# Hermes' terminal statuses. Every other status Hermes declares is open, and
+# open is what gets archived.
+CARD_STOP_SETTLED_STATUSES = frozenset({"done", "archived"})
+# The open cards one call archives in a pass. A conversation's real tree is a
+# handful; past this the response says `truncated`, the pass keeps the deepest
+# cards (so no kept card gates a dropped one), and the re-scans take the rest.
+CARD_STOP_MAX_CARDS = 200
+# The cards the closure visits, settled ones included, before it stops looking.
+CARD_STOP_MAX_VISITED = 2000
+# Running cards archived at once. Each holds a connection and can wait ~5 s in
+# Hermes' `_poll_worker_exit`.
+CARD_STOP_PARALLEL = 8
+CARD_STOP_RESCAN_ROUNDS = 3
+CARD_STOP_RESCAN_INTERVAL_SECONDS = 2.0
+# How often a card archived mid-claim is checked for a worker pid.
+CARD_STOP_LATE_PID_INTERVAL_SECONDS = 1.0
+# After this the route starts nothing and waits for nothing.
+CARD_STOP_DEADLINE_S = 20.0
+# No card's archive starts, and the tree collection stops, with less than this
+# left: Hermes' ~5 s wait for a worker to exit after SIGTERM, then its SIGKILL.
+CARD_STOP_ARCHIVE_RESERVE_S = 6.0
+# The busy timeout of the route's board connections, in place of Hermes' 120 s.
+CARD_STOP_BUSY_TIMEOUT_S = 3.0
+# The bound on the answer: see the section comment. The bridge's request
+# timeout and the gateway's wait for the control task sit above it.
+CARD_STOP_WORST_CASE_S = CARD_STOP_DEADLINE_S + CARD_STOP_BUSY_TIMEOUT_S + 1.0
+# Between SIGTERM and SIGKILL for what is left of a stopped card's worker group.
+CARD_STOP_KILL_GRACE_SECONDS = 3.0
+CARD_STOP_KILL_POLL_SECONDS = 0.1
+# The variable the dispatcher pins into every worker it spawns: the card's id.
+CARD_STOP_WORKER_TASK_ENV = "HERMES_KANBAN_TASK"
+# Fan-out attribution, owned by deploy/docker/patches/kanban_children_settled.py.
+# Both it and the `created` event's `creator_task_id` are read: the table is
+# created on its first write and holds only the fan-outs since, and the event
+# is Hermes' own record of every create that named a creator.
+CARD_STOP_CHILDREN_TABLE = "kanban_worker_children"
+# Hermes' session store, where a compressed session's continuation names the
+# session it continues (`parent_session_id`, with the parent ended
+# 'compression'); a card filed after a compression carries the continuation's
+# id.
+CARD_STOP_STATE_DB_NAME = "state.db"
+CARD_STOP_COMPRESSION_WALK_MAX = 32
+# The per-connection PRAGMAs Hermes' `_open_configured` (kanban_db_connect.py)
+# sets on a board connection, less its WAL setup, which belongs to the file
+# and was done by the dispatcher that created it. verify_card_stop.py checks
+# them against a connection Hermes opens.
+CARD_STOP_BOARD_PRAGMAS = (
+    "synchronous=FULL",
+    "wal_autocheckpoint=100",
+    "journal_size_limit=8388608",
+    "foreign_keys=ON",
+    "secure_delete=ON",
+    "cell_size_check=ON",
+)
+# Rows per `IN (...)`, under SQLite's bound-parameter limit on any build.
+CARD_STOP_SQL_CHUNK = 500
+# Test hook, `None` in production: the state.db to read.
+CARD_STOP_STATE_DB_PATH: Optional[str] = None
+PROC_ROOT = "/proc"
+
+
+def _card_stop_sleep(seconds: float) -> None:
+    """The wait between re-scans; a seam so tests can act inside it."""
+    time.sleep(seconds)
+
+
+def _card_stop_clock() -> float:
+    """The deadline's clock; a seam so tests can move it."""
+    return time.monotonic()
+
+
+class _Budget:
+    """The call's deadline. `hit` records that something was not started for it."""
+
+    def __init__(self) -> None:
+        self.deadline = _card_stop_clock() + CARD_STOP_DEADLINE_S
+        self.hit = False
+
+    def left(self) -> float:
+        return self.deadline - _card_stop_clock()
+
+    def allows(self, needed: float) -> bool:
+        if self.left() >= needed:
+            return True
+        self.hit = True
+        return False
+
+
+def _hermes_kanban():
+    """Hermes' kanban module, and its `connect_tracked` when this Hermes has one,
+    imported on first use: the gateway venv's, not a test's."""
+    from hermes_cli import kanban_db
+
+    try:
+        from hermes_cli.sqlite_safe_read import connect_tracked
+    except ImportError:
+        connect_tracked = None
+    return kanban_db, connect_tracked
+
+
+def _card_stop_connect(connect_tracked, board: str) -> sqlite3.Connection:
+    """A board connection for this route: Hermes' PRAGMAs and our busy timeout.
+
+    Not `kanban_db_connect.connect`: its first call in a process takes a
+    cross-process init flock (up to 10 s), probes the file, and runs `init_db`
+    under Hermes' 120 s busy timeout, all before a PRAGMA of ours could apply.
+    The board exists and the dispatcher initialized it. `connect_tracked`
+    registers the connection, so Hermes' byte-level probes of the file, whose
+    `close()` would drop this connection's POSIX locks, are refused while it is
+    open.
+    """
+    kwargs: Dict[str, Any] = {"timeout": CARD_STOP_BUSY_TIMEOUT_S, "isolation_level": None, "check_same_thread": False}
+    if connect_tracked is not None:
+        conn = connect_tracked(board, connect_fn=sqlite3.connect, **kwargs)
+    else:
+        conn = sqlite3.connect(board, **kwargs)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout = {int(CARD_STOP_BUSY_TIMEOUT_S * 1000)}")
+        for pragma in CARD_STOP_BOARD_PRAGMAS:
+            conn.execute(f"PRAGMA {pragma}")
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
+def _card_stop_state_db() -> str:
+    """Hermes' session store for this server's HERMES_HOME, or "" when unknown."""
+    if CARD_STOP_STATE_DB_PATH is not None:
+        return CARD_STOP_STATE_DB_PATH
+    try:
+        from hermes_constants import get_hermes_home
+
+        home = str(get_hermes_home() or "")
+    except Exception:  # noqa: BLE001 - outside the gateway venv
+        home = os.environ.get("HERMES_HOME", "").strip()
+    return os.path.join(home, CARD_STOP_STATE_DB_NAME) if home else ""
+
+
+# A compressed session's continuations: Hermes' own rule, `_CHAIN_STEP_SQL` in
+# hermes_state_compression.py (get_compression_chain). A child of a session
+# ended 'compression' is a continuation unless it is a branch (`_branched_from`
+# in its model_config), a delegate (`_delegate_from`) or a tool's session; the
+# JSON lookups are guarded as Hermes' `_sql_json_extract` guards them. Every
+# such child is walked, where Hermes picks the likeliest one as the chain's
+# next step: a second continuation is a retry of the same conversation.
+_CONTINUATIONS_SQL = """
+    SELECT child.id FROM sessions parent
+    JOIN sessions child ON child.parent_session_id = parent.id
+    WHERE parent.id = ?
+      AND parent.end_reason = 'compression'
+      AND json_extract(CASE WHEN json_valid(child.model_config) THEN child.model_config ELSE json_object() END,
+                       '$._branched_from') IS NULL
+      AND json_extract(CASE WHEN json_valid(child.model_config) THEN child.model_config ELSE json_object() END,
+                       '$._delegate_from') IS NULL
+      AND COALESCE(child.source, '') != 'tool'
+"""
+
+
+def _compression_descendants(session_id: str) -> list[str]:
+    """The sessions that continue `session_id` through compression, at any depth.
+
+    Fails open to none: the session's own cards are still found.
+    """
+    state_db = _card_stop_state_db()
+    if not state_db or not os.path.isfile(state_db):
+        return []
+    found: list[str] = []
+    frontier = [session_id]
+    try:
+        with closing(_read_only(state_db)) as conn:
+            while frontier and len(found) < CARD_STOP_COMPRESSION_WALK_MAX:
+                current = frontier.pop(0)
+                for row in conn.execute(_CONTINUATIONS_SQL, (current,)):
+                    if row[0] and row[0] != session_id and row[0] not in found:
+                        found.append(row[0])
+                        frontier.append(row[0])
+    except sqlite3.Error as exc:
+        logger.warning("card stop: the compression lineage of %s is unreadable: %s", session_id, exc)
+    return found[:CARD_STOP_COMPRESSION_WALK_MAX]
+
+
+def _ids_where_in(conn: sqlite3.Connection, query: str, ids: Sequence[str], params: Sequence[Any] = ()) -> list[Any]:
+    """Run `query`, whose one `{marks}` is an `IN` list, over `ids` in chunks."""
+    rows: list[Any] = []
+    ids = list(ids)
+    for start in range(0, len(ids), CARD_STOP_SQL_CHUNK):
+        chunk = ids[start:start + CARD_STOP_SQL_CHUNK]
+        marks = ",".join("?" * len(chunk))
+        rows.extend(conn.execute(query.format(marks=marks), (*params, *chunk)).fetchall())
+    return rows
+
+
+def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)).fetchone() is not None
+
+
+class _CardTree(NamedTuple):
+    cards: Dict[str, Dict[str, Any]]  # id -> title, status, worker_pid, created_at, via
+    links: list[tuple[str, str]]  # (parent, child) task_links edges inside `cards`
+    truncated: bool
+
+
+# A fan-out child's id from its `created` event. `json_valid` inside a CASE,
+# which SQLite evaluates in order: one malformed payload is skipped, not an
+# error for the whole query.
+_CREATED_BY_SQL = (
+    "SELECT task_id FROM task_events WHERE kind = 'created' "
+    "AND CASE WHEN json_valid(payload) THEN json_extract(payload, '$.creator_task_id') END IN ({marks})"
+)
+
+
+def _collect_card_tree(
+    conn: sqlite3.Connection, sessions: Sequence[str], session_id: str, conversation: str, budget: _Budget
+) -> _CardTree:
+    """Every card in the conversation: see the section comment for what that is.
+
+    Seeded by `tasks.session_id` over the session and its compression
+    continuations, then by the subscription rows `kanban_event_routing.py`
+    wrote for this session and conversation, kept only for a card with no
+    session that did not inherit the row from a `task_links` parent. Then
+    fan-out children, to a fixed point, until CARD_STOP_ARCHIVE_RESERVE_S is
+    all that is left. Settled cards are walked through, so a done parent's
+    running child is found, and returned too: the caller keeps the open ones
+    and names the done ones.
+    """
+    via: Dict[str, str] = {}
+
+    def reach(ids: Sequence[str], how: str) -> list[str]:
+        new = [i for i in dict.fromkeys(ids) if i and i not in via]
+        for i in new:
+            via[i] = how
+        return new
+
+    frontier = reach([r[0] for r in _ids_where_in(conn, "SELECT id FROM tasks WHERE session_id IN ({marks})", sessions)], "session")
+    if conversation and _has_table(conn, "kanban_notify_subs"):
+        subscribed = conn.execute(
+            "SELECT s.task_id FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
+            "WHERE s.chat_id = ? AND s.thread_id = ? AND t.session_id IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM task_links l JOIN kanban_notify_subs p ON p.task_id = l.parent_id "
+            "                WHERE l.child_id = s.task_id AND p.chat_id = s.chat_id AND p.thread_id = s.thread_id)",
+            (session_id, conversation),
+        )
+        frontier += reach([r[0] for r in subscribed], "subscription")
+    children_table = _has_table(conn, CARD_STOP_CHILDREN_TABLE)
+    truncated = False
+    while frontier:
+        if len(via) > CARD_STOP_MAX_VISITED or not budget.allows(CARD_STOP_ARCHIVE_RESERVE_S):
+            truncated = True
+            break
+        fanned = _ids_where_in(conn, _CREATED_BY_SQL, frontier)
+        if children_table:
+            fanned += _ids_where_in(
+                conn, f"SELECT child_id FROM {CARD_STOP_CHILDREN_TABLE} WHERE creator_id IN ({{marks}})", frontier
+            )
+        frontier = reach([r[0] for r in fanned], "child")
+
+    cards: Dict[str, Dict[str, Any]] = {}
+    for row in _ids_where_in(
+        conn, "SELECT id, title, status, worker_pid, created_at FROM tasks WHERE id IN ({marks})", list(via)
+    ):
+        cards[row[0]] = {
+            "title": row[1],
+            "status": row[2],
+            "worker_pid": row[3],
+            "created_at": row[4] or 0,
+            "via": via[row[0]],
+        }
+    links = [
+        (r[0], r[1])
+        for r in _ids_where_in(conn, "SELECT parent_id, child_id FROM task_links WHERE parent_id IN ({marks})", list(cards))
+        if r[1] in cards
+    ]
+    return _CardTree(cards, links, truncated)
+
+
+def _leaves_first(ids: Sequence[str], links: Sequence[tuple[str, str]]) -> list[str]:
+    """`ids` with every card after the cards it gates, so archiving in this order
+    never leaves an archived parent over a todo child of the same set, and any
+    prefix of it holds every child of every card it holds."""
+    members = set(ids)
+    children: Dict[str, list[str]] = {i: [] for i in ids}
+    for parent, child in links:
+        if parent in members and child in members:
+            children[parent].append(child)
+    order: list[str] = []
+    seen: set[str] = set()
+    for root in ids:
+        if root in seen:
+            continue
+        seen.add(root)
+        stack = [(root, iter(children[root]))]
+        while stack:
+            node, pending = stack[-1]
+            nxt = next((c for c in pending if c not in seen), None)
+            if nxt is None:
+                stack.pop()
+                order.append(node)
+            else:
+                seen.add(nxt)
+                stack.append((nxt, iter(children[nxt])))
+    return order
+
+
+def _proc_pids() -> list[int]:
+    try:
+        return [int(name) for name in os.listdir(PROC_ROOT) if name.isdigit()]
+    except OSError:
+        return []
+
+
+def _proc_pgid(pid: int) -> Optional[int]:
+    try:
+        return os.getpgid(pid)
+    except OSError:
+        return None
+
+
+def _proc_environ(pid: int) -> bytes:
+    """A process's environment as the kernel holds it; empty for a zombie or a
+    process this user cannot read."""
+    try:
+        with open(os.path.join(PROC_ROOT, str(pid), "environ"), "rb") as fh:
+            return fh.read()
+    except OSError:
+        return b""
+
+
+def _proc_alive(pid: int) -> bool:
+    """True while `pid` runs; a zombie has exited."""
+    try:
+        with open(os.path.join(PROC_ROOT, str(pid), "stat"), "rb") as fh:
+            return fh.read().rsplit(b")", 1)[1].split()[0] != b"Z"
+    except (OSError, IndexError):
+        return False
+
+
+def _signal_process(pid: int, sig: int) -> bool:
+    try:
+        os.kill(pid, sig)
+        return True
+    except OSError:
+        return False
+
+
+def _carries_card_marker(pid: int, task_id: str) -> bool:
+    return f"{CARD_STOP_WORKER_TASK_ENV}={task_id}".encode() in _proc_environ(pid).split(b"\0")
+
+
+def _card_processes(task_id: str, worker_pid: int) -> list[int]:
+    """The live processes in the worker's process group that carry the card's marker.
+
+    The dispatcher starts every worker as a session leader, so its pid is its
+    group's id, and the group outlives the leader for as long as any member does.
+    """
+    own = os.getpid()
+    return [
+        pid
+        for pid in _proc_pids()
+        if pid != own and _proc_pgid(pid) == worker_pid and _carries_card_marker(pid, task_id)
+    ]
+
+
+class _WorkerSignals:
+    """One card's worker kill: the `signal_fn` Hermes' `archive_task` calls, and
+    the sweep after it. Counts every process signalled, by either."""
+
+    def __init__(self, task_id: str) -> None:
+        self.task_id = task_id
+        self.pid: Optional[int] = None
+        self.signalled: set[int] = set()
+        self.killed: set[int] = set()
+        self.refused = False
+
+    def signal_fn(self, pid: int, sig: int) -> None:
+        """Signal the worker and its group's marked members, or refuse.
+
+        A pid without the card's marker raises: ProcessLookupError when it has
+        exited (Hermes records the worker terminated, which it is), and
+        PermissionError when a live process holds it, which Hermes records as
+        a termination it could not do.
+        """
+        pid = int(pid)
+        self.pid = pid
+        if not _carries_card_marker(pid, self.task_id):
+            if not _proc_alive(pid):
+                raise ProcessLookupError(pid)
+            self.refused = True
+            raise PermissionError(f"pid {pid} does not carry {CARD_STOP_WORKER_TASK_ENV}={self.task_id}")
+        sent = self.killed if sig == signal.SIGKILL else self.signalled
+        if not _signal_process(pid, sig):
+            raise ProcessLookupError(pid)
+        sent.add(pid)
+        for member in _card_processes(self.task_id, pid):
+            if member != pid and _signal_process(member, sig):
+                sent.add(member)
+
+    def sweep(self, worker_pid: int, grace: float) -> Dict[str, Any]:
+        """SIGTERM, then SIGKILL after `grace`, whatever of the worker's group
+        still carries the marker. The marker is re-read before every signal, so
+        a pid the kernel has handed to another process in between is never
+        signalled."""
+        self.pid = worker_pid
+        targets = _card_processes(self.task_id, worker_pid)
+        termed = [pid for pid in targets if _carries_card_marker(pid, self.task_id) and _signal_process(pid, signal.SIGTERM)]
+        self.signalled.update(termed)
+        deadline = time.monotonic() + max(0.0, grace)
+        remaining = list(termed)
+        while remaining and time.monotonic() < deadline:
+            time.sleep(CARD_STOP_KILL_POLL_SECONDS)
+            remaining = [pid for pid in remaining if _carries_card_marker(pid, self.task_id)]
+        self.killed.update(
+            pid for pid in remaining if _carries_card_marker(pid, self.task_id) and _signal_process(pid, signal.SIGKILL)
+        )
+        return self.report()
+
+    def report(self) -> Dict[str, Any]:
+        report: Dict[str, Any] = {"pid": self.pid, "signalled": len(self.signalled), "killed": len(self.killed)}
+        if self.refused:
+            report["refused"] = "the pid's process does not carry the card's marker"
+        return report
+
+
+def _kill_grace(budget: _Budget) -> float:
+    return min(CARD_STOP_KILL_GRACE_SECONDS, max(0.0, budget.left()))
+
+
+def _archive_card(kanban_db, conn: sqlite3.Connection, task_id: str, budget: _Budget) -> tuple[str, Dict[str, Any]]:
+    """Archive one card through Hermes and kill its worker's processes.
+
+    Returns ("stopped", entry), ("settled", entry) for a card that finished
+    since the set was collected, or ("gone", {}) for one already archived or
+    deleted. The status and pid are read just before the archive, which takes
+    its own snapshot inside its transaction; a card that completes in between
+    is archived as a done card, and reported as the running card it was.
+
+    `archive_task` commits the archive before it kills the worker and runs
+    `recompute_ready`, so a raise can come after the card is archived. Then the
+    card is still swept and reported stopped, with the error as a note.
+    """
+    row = conn.execute("SELECT title, status, worker_pid FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None or row[1] == "archived":
+        return "gone", {}
+    if row[1] in CARD_STOP_SETTLED_STATUSES:
+        return "settled", {"id": task_id, "title": row[0], "status": row[1]}
+    signals = _WorkerSignals(task_id)
+    note = None
+    try:
+        if not kanban_db.archive_task(conn, task_id, signal_fn=signals.signal_fn):
+            return "gone", {}
+    except Exception as exc:  # noqa: BLE001 - a raise after the commit still stopped the card
+        after = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if after is None or after[0] != "archived":
+            raise
+        note = f"archived, then Hermes raised: {exc}"
+        logger.warning("card stop: %s was archived, then archive_task raised: %s", task_id, exc)
+    pid = signals.pid or row[2]
+    worker = signals.sweep(int(pid), _kill_grace(budget)) if pid else None
+    entry = {"id": task_id, "title": row[0], "prior_status": row[1], "worker": worker}
+    if note:
+        entry["note"] = note
+    if pid is None and _archived_mid_claim(conn, task_id, row[1]):
+        entry[_CLAIMED_WITHOUT_PID] = True
+    return "stopped", entry
+
+
+# Set on an entry, and taken off before the answer, for a card archived after
+# its claim and before its worker's pid was written.
+_CLAIMED_WITHOUT_PID = "_claimed_without_pid"
+
+
+def _archived_mid_claim(conn: sqlite3.Connection, task_id: str, prior_status: str) -> bool:
+    """Whether the archive closed a run: the card was claimed, whatever this
+    route read a moment earlier. Hermes' `archived` event carries the run it
+    closed, and none for a card never claimed."""
+    try:
+        row = conn.execute(
+            "SELECT run_id FROM task_events WHERE task_id = ? AND kind = 'archived' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+    except sqlite3.Error:  # a board without the column: what was read is all there is
+        return prior_status == "running"
+    return prior_status == "running" or (row is not None and row[0] is not None)
+
+
+class _StartGate:
+    """Which archives have started, and the point after which none may.
+
+    The route closes it when it stops waiting. A worker thread asks to start
+    each archive under the same lock, so when the route answers, every card is
+    either started (`pending` if it has not landed: it will finish) or never
+    will be (`failed`, a deadline miss), and a straggler thread starts nothing
+    after the answer.
+    """
+
+    def __init__(self, budget: _Budget) -> None:
+        self.budget = budget
+        self.lock = threading.Lock()
+        self.closed = False
+        self.started: set[str] = set()
+
+    def start(self, task_id: str) -> bool:
+        with self.lock:
+            if self.closed or not self.budget.allows(CARD_STOP_ARCHIVE_RESERVE_S):
+                return False
+            self.started.add(task_id)
+            return True
+
+    def close(self) -> set[str]:
+        """Close the gate; the ids that started, which is final from here."""
+        with self.lock:
+            self.closed = True
+            return set(self.started)
+
+
+def _archive_card_on_own_connection(
+    kanban_db, connect_tracked, board: str, task_id: str, budget: _Budget, gate: _StartGate
+) -> tuple[str, Dict[str, Any]]:
+    """Phase 2: one running card, on a worker thread with its own connection."""
+    if not gate.start(task_id):
+        return "deadline", {}
+    with closing(_card_stop_connect(connect_tracked, board)) as conn:
+        return _archive_card(kanban_db, conn, task_id, budget)
+
+
+def _archive_in_order(
+    kanban_db, connect_tracked, board: str, ids: Sequence[str], budget: _Budget, out: list, gate: _StartGate
+) -> None:
+    """Phase 1: the cards that are not running, in order, on one worker thread.
+
+    Each outcome is appended to `out` as it lands, so a caller that stops
+    waiting at the deadline still has every one that did.
+    """
+    with closing(_card_stop_connect(connect_tracked, board)) as conn:
+        for task_id in ids:
+            if not gate.start(task_id):
+                out.append((task_id, "deadline", {}))
+                continue
+            try:
+                out.append((task_id, *_archive_card(kanban_db, conn, task_id, budget)))
+            except Exception as exc:  # noqa: BLE001 - one card's failure must not leave the rest running
+                out.append((task_id, "raised", exc))
+
+
+def _sweep_late_worker_pids(conn: sqlite3.Connection, archived: Sequence[str], budget: _Budget) -> list[Dict[str, Any]]:
+    """Kill a worker spawned onto a card after this call archived it, then clear its pid.
+
+    A pid whose process does not carry the card's marker is left alone, row
+    and all: it is not this card's worker, or not one this user can see.
+    """
+    swept: list[Dict[str, Any]] = []
+    rows = _ids_where_in(
+        conn,
+        "SELECT id, worker_pid FROM tasks WHERE status = 'archived' AND worker_pid IS NOT NULL AND id IN ({marks})",
+        archived,
+    )
+    for task_id, pid in rows:
+        if not _carries_card_marker(int(pid), task_id):
+            continue
+        result = _WorkerSignals(task_id).sweep(int(pid), _kill_grace(budget))
+        conn.execute(
+            "UPDATE tasks SET worker_pid = NULL WHERE id = ? AND status = 'archived' AND worker_pid = ?",
+            (task_id, pid),
+        )
+        logger.warning("card stop: killed worker %s, spawned onto %s after it was archived", pid, task_id)
+        swept.append({"id": task_id, **result})
+    return swept
+
+
+@app.post("/v1/sessions/{session_id}/cards/stop", dependencies=[Depends(verify_api_key)])
+def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Archive every open card in a gateway conversation; see the section comment.
+
+    The hermes-bridge calls this for its own `a2a-*` session, with the context
+    id the gateway's control task carried. The session must be the one that
+    context id names, as for the route PUT: a consistency check on what the
+    bridge sends, not an authorization, since any holder of the key can name
+    any context id. `conversation`, the gateway's key, adds the session-less
+    cards subscribed to this session and that conversation.
+
+    Returns what was stopped (`via` says how each card was reached: its
+    session, its subscription, or as a fan-out `child`; `worker` the processes
+    signalled, null for a card with no worker; `late_worker` a worker killed
+    after the archive; `note` an error Hermes raised after archiving), what had
+    already finished (`settled`), `failed` for a card whose archive raised or
+    that the deadline left unstarted, `pending` for an archive still running
+    at the deadline, `unresolved` for a card archived mid-claim whose worker
+    pid never appeared (a worker may still spawn for it), `errors` for a board
+    error after the first pass, how many re-scans ran, `truncated` when the set
+    was larger than one pass, and `deadline` when the budget ran out. Answers
+    within CARD_STOP_WORST_CASE_S. Calling it again stops nothing new, since
+    an archived card is not open.
+    """
+    context_id = str(request_data.get("context_id") or "").strip()
+    conversation = str(request_data.get("conversation") or "").strip()
+    if not session_id.startswith(CONVERSATION_SESSION_PREFIX):
+        raise HTTPException(status_code=400, detail=f"cards are stopped only for {CONVERSATION_SESSION_PREFIX}* sessions")
+    if not context_id:
+        raise HTTPException(status_code=400, detail="context_id is required")
+    if max(len(conversation), len(context_id)) > CONVERSATION_FIELD_MAX_CHARS:
+        raise HTTPException(status_code=400, detail="conversation or context_id is too long")
+    if session_id != _conversation_session_id(context_id):
+        raise HTTPException(status_code=400, detail="context_id is not this session's")
+
+    budget = _Budget()
+    result: Dict[str, Any] = {
+        "session_id": session_id,
+        "board": False,
+        "stopped": [],
+        "settled": [],
+        "failed": [],
+        "pending": [],
+        "unresolved": [],
+        "errors": [],
+        "rounds": 0,
+        "truncated": False,
+        "deadline": False,
+    }
+    board = _kanban_db_path()
+    if not os.path.isfile(board):
+        return result
+    try:
+        kanban_db, connect_tracked = _hermes_kanban()
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail=f"Hermes' kanban module is not importable: {exc}") from None
+    result["board"] = True
+    sessions = [session_id, *_compression_descendants(session_id)]
+    stopped: Dict[str, Dict[str, Any]] = {}
+    settled: Dict[str, Dict[str, Any]] = {}
+    failed: Dict[str, Dict[str, Any]] = {}
+    pending: Dict[str, Dict[str, Any]] = {}
+    attempts: Dict[str, int] = {}  # archives that raised, per card; each is retried once
+    watch: Dict[str, str] = {}  # archived mid-claim with no worker pid yet: id -> title
+    # Every archive runs here, and the route never waits on this pool past the
+    # deadline; `shutdown(wait=False)` below leaves a straggler to finish.
+    pool = ThreadPoolExecutor(max_workers=CARD_STOP_PARALLEL)
+    gate = _StartGate(budget)
+
+    def record(task_id: str, outcome: str, entry: Any, card: Dict[str, Any]) -> None:
+        pending.pop(task_id, None)
+        if outcome == "stopped":
+            if entry.pop(_CLAIMED_WITHOUT_PID, False):
+                watch[task_id] = card["title"]
+            stopped[task_id] = {**entry, "via": card["via"]}
+            failed.pop(task_id, None)
+        elif outcome == "settled" and task_id not in stopped:
+            settled[task_id] = entry
+        elif outcome == "deadline":
+            failed[task_id] = {"id": task_id, "title": card["title"], "error": "the deadline came before its archive"}
+        elif outcome == "raised":
+            logger.error("card stop: archiving %s failed: %s", task_id, entry)
+            attempts[task_id] = attempts.get(task_id, 0) + 1
+            failed[task_id] = {"id": task_id, "title": card["title"], "error": str(entry)}
+
+    def still_running(task_id: str, card: Dict[str, Any]) -> None:
+        budget.hit = True
+        pending[task_id] = {"id": task_id, "title": card["title"]}
+
+    def stop(tree: _CardTree) -> bool:
+        """Archive the tree's open cards in phases 1 and 2. True when any of them
+        had not failed before, which is what earns another re-scan."""
+        for task_id, card in tree.cards.items():
+            if card["status"] == "done":
+                record(task_id, "settled", {"id": task_id, "title": card["title"], "status": "done"}, card)
+        open_ids = sorted(
+            (
+                i
+                for i, card in tree.cards.items()
+                if card["status"] not in CARD_STOP_SETTLED_STATUSES and attempts.get(i, 0) < 2 and i not in pending
+            ),
+            key=lambda i: (tree.cards[i]["created_at"], i),
+        )
+        order = _leaves_first(open_ids, tree.links)
+        if len(order) > CARD_STOP_MAX_CARDS:
+            result["truncated"] = True
+            order = order[:CARD_STOP_MAX_CARDS]
+        if tree.truncated:
+            result["truncated"] = True
+        if not order:
+            return False
+        fresh = any(i not in attempts for i in order)
+        idle = [i for i in order if tree.cards[i]["status"] != "running"]
+        running = [i for i in order if tree.cards[i]["status"] == "running"]
+        if idle:
+            landed: list = []
+            phase1 = pool.submit(_archive_in_order, kanban_db, connect_tracked, board, idle, budget, landed, gate)
+            try:
+                phase1.result(timeout=max(0.0, budget.left()))
+            except FutureTimeout:
+                pass
+            except Exception as exc:  # noqa: BLE001 - the thread's own connection failed to open
+                for task_id in idle:
+                    record(task_id, "raised", exc, tree.cards[task_id])
+                landed = []
+            started = gate.close() if not phase1.done() else None
+            done = set()
+            for task_id, outcome, entry in list(landed):
+                record(task_id, outcome, entry, tree.cards[task_id])
+                done.add(task_id)
+            if started is not None:
+                # Only an archive that started is still coming; the rest never will.
+                for task_id in idle:
+                    if task_id in done:
+                        continue
+                    if task_id in started:
+                        still_running(task_id, tree.cards[task_id])
+                    else:
+                        budget.hit = True
+                        record(task_id, "deadline", {}, tree.cards[task_id])
+                # Phase 2 never starts over a phase 1 still archiving: a running
+                # parent archived first would promote its children.
+                for task_id in running:
+                    record(task_id, "deadline", {}, tree.cards[task_id])
+                return fresh
+        if running:
+            futures = {
+                task_id: pool.submit(_archive_card_on_own_connection, kanban_db, connect_tracked, board, task_id, budget, gate)
+                for task_id in running
+            }
+            futures_wait(futures.values(), timeout=max(0.0, budget.left()))
+            started = gate.close() if not all(f.done() for f in futures.values()) else set()
+            for task_id, future in futures.items():
+                card = tree.cards[task_id]
+                if not future.done():
+                    future.cancel()
+                    if task_id in started:
+                        still_running(task_id, card)
+                    else:
+                        record(task_id, "deadline", {}, card)
+                        budget.hit = True
+                    continue
+                try:
+                    record(task_id, *future.result(), card)
+                except Exception as exc:  # noqa: BLE001
+                    record(task_id, "raised", exc, card)
+        return fresh
+
+    def after_first_pass(step: str, action) -> Any:
+        """A board error once cards are archived is reported, not a 503 that
+        would throw away what was stopped."""
+        try:
+            return action()
+        except sqlite3.Error as exc:
+            # The message stays in this log; the body names the error's class
+            # only (py/stack-trace-exposure).
+            logger.error("card stop: %s failed: %s", step, exc)
+            result["errors"].append(f"{step}: {type(exc).__name__}")
+            return None
+
+    def sweep_late(conn: sqlite3.Connection, ids: Sequence[str]) -> None:
+        for swept in _sweep_late_worker_pids(conn, list(ids), budget):
+            stopped[swept["id"]]["late_worker"] = {k: v for k, v in swept.items() if k != "id"}
+            watch.pop(swept["id"], None)
+
+    try:
+        try:
+            conn = _card_stop_connect(connect_tracked, board)
+            first = _collect_card_tree(conn, sessions, session_id, conversation, budget)
+        except sqlite3.Error as exc:
+            raise HTTPException(status_code=503, detail=f"the kanban board could not be read: {exc}") from None
+        with closing(conn):
+            if stop(first):
+                for _ in range(CARD_STOP_RESCAN_ROUNDS):
+                    if not budget.allows(CARD_STOP_RESCAN_INTERVAL_SECONDS):
+                        break
+                    _card_stop_sleep(CARD_STOP_RESCAN_INTERVAL_SECONDS)
+                    result["rounds"] += 1
+                    after_first_pass("the late-pid sweep", lambda: sweep_late(conn, list(stopped)))
+                    tree = after_first_pass(
+                        "a re-scan", lambda: _collect_card_tree(conn, sessions, session_id, conversation, budget)
+                    )
+                    if tree is None:
+                        continue
+                    if not stop(tree):
+                        break
+            # A worker can take longer than the re-scans to spawn (a worktree
+            # checkout); a card archived mid-claim is watched until the deadline.
+            # Running out of time here is the plan, not a missed card.
+            while watch and budget.left() >= CARD_STOP_LATE_PID_INTERVAL_SECONDS:
+                _card_stop_sleep(CARD_STOP_LATE_PID_INTERVAL_SECONDS)
+                after_first_pass("the late-pid watch", lambda: sweep_late(conn, sorted(watch)))
+    finally:
+        gate.close()  # a straggler starts nothing after the answer
+        pool.shutdown(wait=False, cancel_futures=True)
+    result["stopped"] = list(stopped.values())
+    result["settled"] = list(settled.values())
+    result["failed"] = list(failed.values())
+    result["pending"] = list(pending.values())
+    result["unresolved"] = [{"id": task_id, "title": title} for task_id, title in watch.items()]
+    result["deadline"] = budget.hit
+    logger.info(
+        "card stop for %s: stopped %d, settled %d, failed %d, pending %d, unresolved %d, %d re-scans%s%s",
+        session_id,
+        len(stopped),
+        len(settled),
+        len(failed),
+        len(pending),
+        len(watch),
+        result["rounds"],
+        ", truncated" if result["truncated"] else "",
+        ", deadline reached" if budget.hit else "",
+    )
+    return result
+
+
+# --------------------------------------------------------------------------
 # The findings queue: docs/designs/inventory-findings-queue.md §6.1.
 #
 # HTTP rather than MCP tools alone because the event watcher is a first-class
@@ -5382,7 +7149,14 @@ def register_findings(body: Dict[str, Any]) -> Dict[str, Any]:
     `scope` is how a source says its run was complete for one cluster, which is
     the only condition under which absence may lower a row's confidence. A
     partial run must omit it: a sweep that died halfway looks exactly like a
-    fleet that got healthier.
+    fleet that got healthier. `scope.check_prefix` narrows the claim to one
+    family of checks (ending with `-`; a batch with findings must belong to
+    it), whatever wrote the rows, or, with `scope.source` beside it, that
+    source's rows in the family; without a prefix, a batch's
+    sources (or `scope.source`, a known source the batch wrote) narrow it to
+    their rows; with a complete scope an empty `findings` list is accepted as a
+    complete run that found nothing when it names `check_prefix` or `source`,
+    and refused otherwise.
     """
     return _findings_write(findings_queue.register_findings, body.get("findings"), body.get("scope"))
 
@@ -5413,11 +7187,11 @@ def get_ranked_findings() -> Dict[str, Any]:
 
 @app.get("/v1/findings", dependencies=[Depends(verify_api_key)])
 def get_findings(
-    cluster: str = "", state: str = "", severity: str = "", limit: int = 200, project: str = ""
+    cluster: str = "", state: str = "", severity: str = "", limit: int = 200, project: str = "", check_prefix: str = ""
 ) -> Dict[str, Any]:
     try:
         with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
-            findings = findings_queue.list_findings(conn, cluster, state, severity, limit, project)
+            findings = findings_queue.list_findings(conn, cluster, state, severity, limit, project, check_prefix)
     except findings_queue.FindingError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
     return {"findings": findings}

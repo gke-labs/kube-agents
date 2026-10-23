@@ -111,6 +111,20 @@ fixtures:
       the posture is observable on apply day; its case still needs a ledger,
       which the idle pool supplies from day 7.
 
+  - role: guaranteed-qos-workload
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/ledger-writer
+    namespace: seeded-qos
+    defect: >-
+      Two replicas whose container sets requests equal to limits (10m /
+      32Mi), so the pods are Guaranteed QoS and a lower request lowers the
+      limit with it. The container burns its 10m CPU limit, so it is
+      throttled there already. A request cut has to name this dependency;
+      the waste audit never names the workload (CPU in use, both dimensions
+      under its resize floor).
+
   - role: stalled-controller
     slot: a
     available_from_day: 0
@@ -273,6 +287,20 @@ fixtures:
       disruptionsAllowed is 0 permanently and no drain that touches it can
       finish.
 
+  - role: readiness-lb-drain-timeout
+    slot: b
+    available_from_day: 0
+    objects:
+      - backendservice/drain-timeout-<prefix>-b
+      - healthcheck/drain-timeout-<prefix>-b
+    defect: >-
+      A Compute Engine backend service on the default pool's instance group
+      whose connection draining timeout is 3600 seconds, six times the 600
+      seconds GKE waits per node during a pool upgrade, behind a TCP health
+      check and no forwarding rule, so it routes nothing and costs nothing;
+      every default-pool node recreate on this cluster waits the 600 seconds
+      on it.
+
   - role: readiness-failclosed-webhook
     slot: b
     available_from_day: 0
@@ -310,6 +338,14 @@ fixtures:
     namespace: seeded-shapes
     defect: >-
       node-runtime-probe DaemonSet mounting the containerd socket from the host, read-only, on the default pool: the agent shape a containerd major change or a CRI API removal breaks
+
+  - role: default-pool-headroom
+    slot: a
+    available_from_day: 0
+    objects:
+      - nodepool/default-pool
+    defect: >-
+      Not a defect: seeded-a's default pool itself, two e2-standard-2 nodes asserted to keep 100m CPU unrequested each so the next planted fixture can place; the one role whose drift means the pool is within ten fixtures of full and a re-apply changes nothing
 
   - role: intree-pd-volume
     slot: a

@@ -49,6 +49,8 @@ const (
 	a2aNATSConfigSuffix  = "-config"
 	a2aCalloutNameSuffix = "-a2a-callout"
 	a2aCalloutKeysSuffix = "-keys"
+	a2aNATSTLSSuffix     = "-tls"
+	a2aNATSCASuffix      = "-ca"
 )
 
 // A2ANATSName is the name of the NATS objects the operator renders for a
@@ -77,6 +79,18 @@ func A2ACalloutKeysSecretName(agentName string) string {
 	return A2ACalloutName(agentName) + a2aCalloutKeysSuffix
 }
 
+// A2ANATSTLSSecretName is the Secret holding the bus's serving certificate
+// and key, which the NATS pod mounts for its client listener.
+func A2ANATSTLSSecretName(agentName string) string {
+	return A2ANATSName(agentName) + a2aNATSTLSSuffix
+}
+
+// A2ANATSCASecretName is the Secret holding the CA the operator signs the
+// bus's serving certificate with, private key included.
+func A2ANATSCASecretName(agentName string) string {
+	return A2ANATSName(agentName) + a2aNATSCASuffix
+}
+
 // A2ACredentialSecretNames is every Secret the operator renders with a bus
 // credential in it, for a PlatformAgent of that name. It is the set
 // BusCredentialRoutes refuses a user volume for; a Secret added to the bus
@@ -87,6 +101,11 @@ func A2ACredentialSecretNames(agentName string) []string {
 		A2ACredsSecretName(agentName),
 		A2ANATSConfigSecretName(agentName),
 		A2ACalloutKeysSecretName(agentName),
+		// Not passwords, but a key either way: the serving key lets a pod
+		// impersonate the bus to every client, and the CA key lets it mint
+		// a certificate that does the same.
+		A2ANATSTLSSecretName(agentName),
+		A2ANATSCASecretName(agentName),
 	}
 }
 
@@ -153,10 +172,16 @@ var SensitiveEnvVars = map[string]struct{}{
 	// gateway conversation a card was filed in, on the same route, and names
 	// the platform in the cron relay's refusal when no home channel is set.
 	// The operator renders it exactly when the gateway arms the route.
-	"A2A_NOTIFY_CONVERSATIONS": {},
-	"NATS_URL":                 {},
-	"NATS_USER":                {},
-	"NATS_PASSWORD":            {},
+	"A2A_NOTIFY_CONVERSATIONS":     {},
+	"KUBE_AGENTS_ENABLED_PROFILES": {},
+	// NATS_CA_FILE names the CA the client trusts the bus by. An override is
+	// the TLS half of a redirected NATS_URL: pointed at a CA of the setter's
+	// choosing, the client accepts a server that CA signed as the bus, and
+	// hands it the bearer token at CONNECT.
+	"NATS_CA_FILE":  {},
+	"NATS_URL":      {},
+	"NATS_USER":     {},
+	"NATS_PASSWORD": {},
 }
 
 // ReservedVolumeNames defines pod volume names the operator renders itself and
@@ -274,12 +299,13 @@ const BusCredentialRouteVolumeSource = -1
 // ServiceAccount, so the name on the volume changes nothing about what the
 // callout sees. The Secrets in A2ACredentialSecretNames need no token minting
 // at all and are the cheaper route; a check on the audience alone would narrow
-// the expensive route and advertise the cheap one. There are three of them
-// because the same credentials sit in three places: the creds Secret holds
-// the static passwords (`bridge-password` among them), the nats-config Secret
-// holds nats.conf with every one of those passwords inline, and the
-// callout-keys Secret holds the issuer seed that signs every identity the bus
-// accepts, which is worth more than any password in the other two.
+// the expensive route and advertise the cheap one. There are five of them:
+// the creds Secret holds the static passwords (`bridge-password` among them),
+// the nats-config Secret holds nats.conf with every one of those passwords
+// inline, the callout-keys Secret holds the issuer seed that signs every
+// identity the bus accepts, which is worth more than any password in the
+// others, and the two TLS Secrets hold the keys that let a pod pass as the
+// bus: the serving key, and the CA key that can mint another.
 //
 // Volume shapes only. A `secret` volume and a projected `secret` source are
 // the two volume shapes that put a Secret's data in the container; the other
@@ -802,7 +828,40 @@ type TuningSpec struct {
 	// +kubebuilder:validation:Maximum=10000
 	// +optional
 	MaxSessions *int `json:"maxSessions,omitempty"`
+
+	// Profiles sizes AgentProfile work (#3655): the install-wide ceiling on
+	// concurrent profile tasks and the warm workers kept per interactive
+	// (profile, tier). Until the sizing budget exists these are fixed,
+	// conservative defaults.
+	// +optional
+	Profiles *ProfileTuning `json:"profiles,omitempty"`
 }
+
+// ProfileTuning carries the AgentProfile knobs on the PlatformAgent.
+type ProfileTuning struct {
+	// Ceiling is the most profile tasks running at once across every profile
+	// on the install. The dispatcher enforces it, reserving max(1,
+	// ceil(Ceiling/3)) of it for interactive tiers so unattended work can't
+	// starve people, and the profile namespace's pod quota is derived from it.
+	// Absent means DefaultProfileCeiling.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=1000
+	// +optional
+	Ceiling *int `json:"ceiling,omitempty"`
+
+	// WarmReplicas is how many warm worker pods each interactive (profile,
+	// tier) keeps running. Absent means DefaultProfileWarmReplicas.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	// +optional
+	WarmReplicas *int `json:"warmReplicas,omitempty"`
+}
+
+// The ProfileTuning defaults.
+const (
+	DefaultProfileCeiling      = 8
+	DefaultProfileWarmReplicas = 1
+)
 
 // AgentLimits bounds a single agent run. Both limits exist because they fail the same
 // way — the run stops mid-task without calling a terminal kanban tool, which the
@@ -947,7 +1006,8 @@ type DeploymentSpec struct {
 	// its source is one of the routes to the agent's A2A bus credentials: a
 	// ServiceAccount token projection for the "a2a-bus" audience, or a reference
 	// to one of the Secrets the operator renders bus credentials into
-	// (<agent>-a2a-nats-creds, <agent>-a2a-nats-config, <agent>-a2a-callout-keys),
+	// (<agent>-a2a-nats-creds, <agent>-a2a-nats-config, <agent>-a2a-callout-keys,
+	// <agent>-a2a-nats-tls, <agent>-a2a-nats-ca),
 	// as either a secret volume or a projected secret source. The refusal is on
 	// the name and the shape of the source, not on what a given Secret happens to
 	// hold at the time. Reading those Secrets through env is not refused here. On
@@ -964,8 +1024,9 @@ type DeploymentSpec struct {
 	// ExtraVolumes specifies custom volumes to mount for the main container.
 	// The same reserved names and reserved sources as SidecarVolumes are refused
 	// at admission -- a ServiceAccount token projection for the "a2a-bus"
-	// audience, or a reference to <agent>-a2a-nats-creds, <agent>-a2a-nats-config
-	// or <agent>-a2a-callout-keys -- and dropped from the render on an install
+	// audience, or a reference to <agent>-a2a-nats-creds, <agent>-a2a-nats-config,
+	// <agent>-a2a-callout-keys, <agent>-a2a-nats-tls or <agent>-a2a-nats-ca -- and
+	// dropped from the render on an install
 	// running the A2A surface.
 	// +listType=map
 	// +listMapKey=name
@@ -2120,9 +2181,9 @@ type AgentStatus struct {
 // as the rest of the status.
 //
 // The operator writes ActiveInterfaces, from the spec, on every Ready status
-// update, and ToolExecutionsTotal, EventsIngestedTotal, SessionsTotal,
-// RemediationsProposedTotal, RemediationsMergedTotal,
-// ChatMessagesInboundTotal, LastActiveTime, ClustersRegistered and
+// update, and ToolExecutionsTotal, ToolExecutionsBlockedTotal, EventsIngestedTotal,
+// SessionsTotal, RemediationsProposedTotal, RemediationsMergedTotal,
+// ChatMessagesInboundTotal, LastActiveTime, LastHumanActiveTime, ClustersRegistered and
 // ClustersMonitored from the broker's, the event watcher's, the chat
 // plugin's and, on a next install, the A2A gateway's metrics
 // listeners, which it reads every five minutes on the leader; the agent's own
@@ -2159,7 +2220,8 @@ type AgentUsageStatus struct {
 	// it rejected or failed on before running: its success and error outcomes.
 	// Read from the broker's kubeagents_tool_invocations_total every five
 	// minutes and kept monotonic the same way; commands refused by policy,
-	// busy and abandoned are not counted.
+	// busy and abandoned are not counted here but in
+	// ToolExecutionsBlockedTotal.
 	// +optional
 	ToolExecutionsTotal int64 `json:"toolExecutionsTotal,omitempty"`
 
@@ -2210,9 +2272,115 @@ type AgentUsageStatus struct {
 	// kubeagents_a2a_gateway_messages_inbound_total as well, since Chat
 	// ingress is that gateway's there; kept monotonic the same way as
 	// ToolExecutionsTotal. Moves LastActiveTime, so a chat turn that runs no
-	// brokered command is activity.
+	// brokered command is activity, and LastHumanActiveTime, which nothing
+	// else moves.
 	// +optional
 	ChatMessagesInboundTotal int64 `json:"chatMessagesInboundTotal,omitempty"`
+
+	// ToolExecutionsBlockedTotal is the cumulative count of requests the
+	// credential broker did not run to an exit: its blocked outcome
+	// (a policy refusal), its busy outcome (the broker's command slots or its
+	// child memory budget held the request for the whole wait) and its
+	// abandoned outcome (the caller hung up while the request was queued or
+	// running). Read from the same kubeagents_tool_invocations_total as
+	// ToolExecutionsTotal, over the other three statuses, every five minutes
+	// and kept monotonic the same way; the two together are every request the
+	// broker's exec route took as far as its policy; a request it
+	// rejected as malformed before that reaches neither. A rising share of this against
+	// ToolExecutionsTotal says the agent keeps asking for what its mode or
+	// policy refuses, or that the broker is saturated. Moves LastActiveTime:
+	// a refused command is still the agent at work.
+	// +optional
+	ToolExecutionsBlockedTotal int64 `json:"toolExecutionsBlockedTotal,omitempty"`
+	// BrokerFailuresTotal is the cumulative count of brokered work the
+	// credential broker took on and could not carry out for a reason that is
+	// its own or its upstream's: a command that ran past its deadline (exit
+	// 124), a broker fault on the exec route (a 500), a git failure on the
+	// version-control route (a 500 or 502), a failed forge token mint (a
+	// 502), or any 5xx on the Cloud API, MCP and watcher relays, whose
+	// upstream status passes through. A command's own non-zero exit is not
+	// one (that is ToolExecutionsTotal's error outcome), nor is a policy
+	// refusal or the broker's own busy (a 403 or 503; the version-control
+	// route's 503 for an unreadable managed-repository list is a fault and
+	// does count), nor a chat or Slack post the forge refused for the
+	// caller's channel or scope; the broker's own chat event pull failing,
+	// its Pub/Sub subscription or its credential to it, does count. Read from the
+	// broker's kubeagents_broker_execution_failures_total, summed over its
+	// kind label, every five minutes and kept monotonic the same way as
+	// ToolExecutionsTotal; a timed-out command counts here and as an error
+	// there. A rising share of this against ToolExecutionsTotal says the
+	// broker, its credentials or its upstreams are failing, where a policy
+	// refusal is the tool counter's blocked outcome in Prometheus. Does not
+	// move LastActiveTime: a watcher retrying an unreachable fleet cluster
+	// through the relay is not the agent at work.
+	// +optional
+	BrokerFailuresTotal int64 `json:"brokerFailuresTotal,omitempty"`
+	// ChatTurnsErroredTotal is the cumulative count of synchronous chat turns
+	// the gateway failed to complete: on the Hermes gateway, an exception out
+	// of the turn, a result the agent marked failed (a provider 429 or 5xx, a
+	// connection error, the gateway timeout) or a provider authentication
+	// failure, counted by the chat_metrics plugin's
+	// kubeagents_chat_turns_errored_total on the gateway pod that runs
+	// Hermes; and on a next-mode install, an A2A task that ended failed or
+	// rejected, read from the A2A gateway's
+	// kubeagents_a2a_gateway_task_terminals_total under those two states.
+	// That family carries no platform, so on next it counts every A2A task's
+	// terminal, a door's program-to-program task included, not chat alone;
+	// rejected is a task the executor refused, counted as the design asks.
+	// Read every five minutes and kept monotonic the same way as
+	// ToolExecutionsTotal. Does not move LastActiveTime: the message that
+	// started the turn already did.
+	// +optional
+	ChatTurnsErroredTotal int64 `json:"chatTurnsErroredTotal,omitempty"`
+	// BackgroundTasksGaveUpTotal is the cumulative count of background cards on
+	// the agent's board whose breaker tripped: cards that exhausted their
+	// attempts and gave up, whether a cluster event or a chat ask started
+	// them. Hermes parks such a card as blocked and records a gave_up event
+	// against it, and that event is what is counted, once per card. Read
+	// every five minutes from the chat_metrics plugin's
+	// kubeagents_kanban_tasks_gave_up_total on the gateway pod that runs
+	// Hermes, which reads the board at scrape time and counts the cards that
+	// gave up since its listener started (the ones that had already given up
+	// are its baseline, so a restart adds nothing twice; a card that gives
+	// up while the gateway restarts is missed, an under-count); kept
+	// monotonic the same way as ToolExecutionsTotal. Does not move
+	// LastActiveTime: a card giving up is not the agent at work.
+	// +optional
+	BackgroundTasksGaveUpTotal int64 `json:"backgroundTasksGaveUpTotal,omitempty"`
+	// NegativeFeedbackTotal is the cumulative count of thumbs-down reactions
+	// put on one of the bot's Slack messages: the chat_feedback_reactions hook
+	// on the Hermes gateway counts a -1 or thumbsdown reaction, skin tone or
+	// not, whose reactor is not the bot and whose message is the bot's, once
+	// per reactor and message within one gateway process (a thumbs-down taken
+	// off and put back is one; after a restart the same one counts again, and
+	// a reaction before the first inbound message after a start is not
+	// counted), into the
+	// chat_metrics plugin's kubeagents_chat_feedback_negative_total, which is
+	// read every five minutes and kept monotonic the same way as
+	// ToolExecutionsTotal. Slack through the Hermes gateway only: Google Chat
+	// delivers no reaction events, and the A2A gateway's Slack adapter does not
+	// subscribe to them, so on a next-mode install with Slack through A2A this
+	// stays at 0. Does not move LastActiveTime: the message the person
+	// reacted to already did.
+	// +optional
+	NegativeFeedbackTotal int64 `json:"negativeFeedbackTotal,omitempty"`
+	// RemediationsClosedUnmergedTotal is the cumulative count of proposals
+	// this install opened that the forge reported closed without a merge, by
+	// a person, a forge rule or a bot; a close the broker made itself, the
+	// fleet audit tidying a stale proposal, is not counted. The broker counts
+	// each once per broker process when one of its own reads, proposal-list
+	// or proposal-view, shows it closed, under the rules
+	// RemediationsMergedTotal uses: the author is the credential's login, the
+	// close is not before the process started, each proposal once. Read from the broker's
+	// kubeagents_vcs_proposals_closed_unmerged_total every five minutes and
+	// kept monotonic the same way as ToolExecutionsTotal. A close no read
+	// shows is not counted, so it under-counts; a proposal closed, reopened
+	// and merged counts here and in RemediationsMergedTotal once each. A high
+	// share of this against RemediationsMergedTotal says the agent's proposals
+	// are being rejected. Does not move LastActiveTime: a close is not the
+	// agent at work.
+	// +optional
+	RemediationsClosedUnmergedTotal int64 `json:"remediationsClosedUnmergedTotal,omitempty"`
 
 	// ClustersRegistered is the number of clusters the event watcher built a
 	// client for at its last start: the management cluster and the Cluster
@@ -2257,14 +2425,33 @@ type AgentUsageStatus struct {
 	ActiveInterfaces []string `json:"activeInterfaces,omitempty"`
 
 	// LastActiveTime is the time of the last poll in which a counter above
-	// moved: a brokered command ran, a proposal was opened or merged, a chat
-	// message reached the gateway, or an event was accepted for triage.
+	// moved: a brokered command ran or was refused, a proposal was opened or
+	// merged, a chat message reached the gateway, or an event was accepted
+	// for triage; BrokerFailuresTotal, ChatTurnsErroredTotal,
+	// BackgroundTasksGaveUpTotal, NegativeFeedbackTotal and
+	// RemediationsClosedUnmergedTotal alone leave it where it was.
 	// Scheduled maintenance jobs that run brokered commands move it too --
 	// the Controller Stall Watch cron runs some every 30 minutes by default
 	// -- so it marks agent activity of any origin, not human or operator use
-	// alone. Advances at most once per five minutes.
+	// alone; LastHumanActiveTime is the one that does. Advances at most once
+	// per five minutes.
 	// +optional
 	LastActiveTime *metav1.Time `json:"lastActiveTime,omitempty"`
+
+	// LastHumanActiveTime is the time of the last poll in which the one
+	// counter only a person moves advanced: ChatMessagesInboundTotal, a chat
+	// message that reached the gateway, counted before the sender allowlist,
+	// so an unlisted sender is still a person. Nothing else moves it. Brokered
+	// commands and accepted events come from the stall-watch cron and the
+	// event watcher on their own, proposals from the fleet audits, which open
+	// them with nobody asking, and a merge or a close can be a forge rule or
+	// a bot; all of those
+	// move LastActiveTime and leave this alone, so an install nobody has
+	// talked to in a month shows it. Absent until a person has sent a message
+	// since the operator that writes it started. Advances at most once per
+	// five minutes.
+	// +optional
+	LastHumanActiveTime *metav1.Time `json:"lastHumanActiveTime,omitempty"`
 }
 
 const (

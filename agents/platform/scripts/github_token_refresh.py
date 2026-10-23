@@ -10,7 +10,6 @@ deployments continue to use the direct path.
 import argparse
 import email.message
 import http.client
-import io
 import json
 import os
 import re

@@ -58,7 +58,18 @@ class FindingNotFound(KeyError):
     would then be reported to the agent as a finding that does not exist."""
 
 
-SOURCES = ("inventory", "event-watcher", "audit")
+SOURCES = ("inventory", "event-watcher", "audit", "upgrade-readiness")
+# A check family is the slug's first segment and its separator (`upgrade-`), and
+# nothing shorter or longer: what a complete claim may name with `scope.check_prefix`.
+CHECK_FAMILY_SEPARATOR = "-"
+CHECK_FAMILY_RE = re.compile(rf"^[a-z0-9]+{re.escape(CHECK_FAMILY_SEPARATOR)}$")
+
+
+def in_check_family(check: str, family: str) -> bool:
+    """Whether a stored check belongs to a family: it starts with the family,
+    or it is the family's name alone (the stored fold strips a trailing
+    separator, so `upgrade-` with nothing after it is stored as `upgrade`)."""
+    return check.startswith(family) or check == family[: -len(CHECK_FAMILY_SEPARATOR)]
 SEVERITIES = ("critical", "major", "minor")
 REMEDIATION_KINDS = ("manifest", "gcloud", "manual")
 VERIFICATION_KINDS = ("kubectl", "gcloud", "manual")
@@ -207,6 +218,7 @@ PROVIDER_NAMESPACE_RE = re.compile(r"^(?:gke|gmp)-")
 MAX_LABEL_CHARS = 500
 MAX_TEXT_CHARS = 4000
 MAX_BATCH = 500
+MAX_LIST_LIMIT = 1000  # the most rows one list_findings call returns
 
 # Rejected values are quoted back so the caller can see what it sent, but the
 # rejection happens before any length cap, and the message ends up verbatim in
@@ -535,7 +547,11 @@ def validate_finding(raw: Any) -> dict:
     if source not in SOURCES:
         raise FindingError(f"source is {_brief(source)}; must be one of {list(SOURCES)}")
 
-    check = _text(raw.get("check") if raw.get("check") is not None else raw.get("check_slug"), "check")
+    # Folded as the derived id folds it (lower case, every run of other
+    # characters one separator), so a claim's `check_prefix` and a reader's
+    # "starts with `upgrade-`" reach a row however its writer spelled the
+    # check, as the id and the item key already do.
+    check = _id_segment(_text(raw.get("check") if raw.get("check") is not None else raw.get("check_slug"), "check"))
     # Required, not defaulted: cluster names are only unique within a project,
     # so a finding that omits its project is one key collision away from
     # silently overwriting another cluster's row (and keeping its state).
@@ -620,8 +636,18 @@ def list_findings(
     severity: str = "",
     limit: int = 200,
     project: str = "",
+    check_prefix: str = "",
 ) -> list[dict]:
     clauses, params = [], []
+    if check_prefix:
+        # A family of checks in the claim's grammar (`in_check_family`), folded
+        # as the claim folds it, so a listing and a claim name the same rows; a
+        # plain prefix, since LIKE would read `_` as a wildcard.
+        family = check_prefix.lower()
+        if not CHECK_FAMILY_RE.fullmatch(family):
+            raise FindingError(f"check_prefix is {_brief(family)}; a check family is one segment and its separator, as 'upgrade-' is")
+        clauses.append("(substr(check_slug, 1, ?) = ? OR check_slug = ?)")
+        params.extend([len(family), family, family[: -len(CHECK_FAMILY_SEPARATOR)]])
     if project:
         clauses.append("project = ?")
         params.append(project)
@@ -643,7 +669,7 @@ def list_findings(
     # Sorted before the limit, not after: slicing an unordered result makes
     # which rows come back a property of insertion order.
     ordered = sorted((_row_to_finding(row) for row in rows), key=ranked_sort_key)
-    return ordered[: max(1, min(int(limit), 1000))]
+    return ordered[: max(1, min(int(limit), MAX_LIST_LIMIT))]
 
 
 def get_finding(conn: sqlite3.Connection, finding_id: str) -> dict | None:
@@ -713,8 +739,20 @@ def _register_one(conn: sqlite3.Connection, finding: dict) -> str:
     return "updated"
 
 
-def _downgrade_absent(conn: sqlite3.Connection, project: str, cluster: str, seen: set[str]) -> int:
+def _downgrade_absent(
+    conn: sqlite3.Connection, project: str, cluster: str, seen: set[str], check_prefix: str = "", sources: frozenset = frozenset()
+) -> int:
     """§5.2's reciprocal case: absence lowers confidence, it does not resolve.
+
+    `check_prefix` narrows the claim to the rows whose `check_slug` starts with
+    it: a recurring sweep that reads one family of checks (the weekly upgrade
+    readiness review, `upgrade-`) is complete for that family alone, and must
+    not lower the confidence of an inventory or event-watcher row on the same
+    cluster that it never looked at. `sources` narrows it the same way to the
+    rows those sources wrote, which is what a batch without a prefix claims:
+    the onboarding sweep re-run by hand is complete for the inventory's rows,
+    not for the weekly review's. A claim with neither is refused upstream, so
+    no caller can lower every row on a cluster by accident.
 
     A sweep that died halfway produces the same silence as a fleet that got
     healthier, so a row the run did not re-report is re-ranked down at the
@@ -732,13 +770,17 @@ def _downgrade_absent(conn: sqlite3.Connection, project: str, cluster: str, seen
     # row, which says nothing about whether the problem is still there. Exempting
     # it would make the rows the nudge names the only ones absence never reaches.
     rows = conn.execute(
-        "SELECT id, rubric FROM findings WHERE project = ? COLLATE NOCASE "
+        "SELECT id, rubric, check_slug, source FROM findings WHERE project = ? COLLATE NOCASE "
         "AND cluster = ? COLLATE NOCASE AND state IN ('queued', 'surfaced')",
         (project, cluster),
     ).fetchall()
     downgraded = 0
-    for finding_id, raw in rows:
+    for finding_id, raw, check_slug, row_source in rows:
         if finding_id in seen:
+            continue
+        if check_prefix and not in_check_family(str(check_slug or ""), check_prefix):
+            continue
+        if sources and str(row_source or "") not in sources:
             continue
         try:
             rubric = validate_rubric(json.loads(raw))
@@ -763,15 +805,30 @@ def _downgrade_absent(conn: sqlite3.Connection, project: str, cluster: str, seen
 
 
 def register_findings(conn: sqlite3.Connection, findings: Any, scope: Any = None) -> dict:
-    """Upsert a batch, then apply the absence rule if the run says it was complete."""
+    """Upsert a batch, then apply the absence rule if the run says it was complete.
+
+    An empty batch is a run that found nothing: refused without a complete
+    `scope` (there is nothing to do), accepted with one, where the point is
+    that every row the claim covers was absent (§5.2). A complete claim
+    reaches the rows its `check_prefix` names, where the prefix is a check
+    family (it ends with `-`) and, when the batch is not empty, one every row
+    of the batch belongs to: whatever wrote them, or, when `scope.source`
+    names a source beside the prefix, that source's rows in the family alone;
+    without a prefix, the rows of the batch's own sources, or of
+    `scope.source`, which must be a known source and, when the batch is not
+    empty, one the batch wrote; a complete claim that names neither a prefix
+    nor a source and carries no findings is refused, since it would reach
+    every row on the cluster and no caller means that.
+    """
     if not isinstance(findings, list):
         raise FindingError("findings must be a list")
-    if not findings:
+    complete = isinstance(scope, dict) and bool(scope.get("complete"))
+    if not findings and not complete:
         raise FindingError("findings is empty")
     if len(findings) > MAX_BATCH:
         raise FindingError(f"batch is {len(findings)} findings, over the {MAX_BATCH} limit")
 
-    results, seen = [], set()
+    results, seen, sources, checks = [], set(), set(), set()
     for index, raw in enumerate(findings):
         try:
             finding = validate_finding(raw)
@@ -779,12 +836,38 @@ def register_findings(conn: sqlite3.Connection, findings: Any, scope: Any = None
             raise FindingError(f"findings[{index}]: {exc}") from None
         results.append({"id": finding["id"], "outcome": _register_one(conn, finding)})
         seen.add(finding["id"])
+        sources.add(finding["source"])
+        checks.add(str(finding.get("check_slug") or finding.get("check") or ""))
 
     downgraded = 0
-    if isinstance(scope, dict) and scope.get("complete"):
+    if complete:
         project = _text(scope.get("project"), "scope.project")
         cluster = _text(scope.get("cluster"), "scope.cluster")
-        downgraded = _downgrade_absent(conn, project, cluster, seen)
+        raw_prefix = scope.get("check_prefix")
+        if raw_prefix is not None and not isinstance(raw_prefix, str):
+            raise FindingError("scope.check_prefix must be a string")
+        # Folded as the stored check is, so the two sides cannot drift.
+        check_prefix = _text(raw_prefix, "scope.check_prefix", required=False).lower()
+        if check_prefix and not CHECK_FAMILY_RE.fullmatch(check_prefix):
+            raise FindingError(f"scope.check_prefix is {_brief(check_prefix)}; a check family is one segment and its separator, as 'upgrade-' is")
+        if check_prefix and checks and not all(in_check_family(check, check_prefix) for check in checks):
+            raise FindingError("scope.check_prefix names a family the batch did not write; a claim reaches only what the run read")
+        named = _text(scope.get("source"), "scope.source", required=False)
+        if named and named not in SOURCES:
+            raise FindingError(f"scope.source is {_brief(named)}; must be one of {list(SOURCES)}")
+        if named and sources and named not in sources:
+            raise FindingError("scope.source names a source the batch did not write; a claim reaches only what the run read")
+        if named:
+            sources = {named}
+        if check_prefix and not named:
+            # The prefix alone is the claim: the batch's sources narrow nothing
+            # further. A claim that names its source beside the prefix reaches
+            # that source's rows in the family alone, so the review's batch, empty
+            # or not, never lowers an `upgrade-` row another writer filed.
+            sources = set()
+        if not check_prefix and not sources:
+            raise FindingError("a complete scope with no findings needs check_prefix or source to say what it covers")
+        downgraded = _downgrade_absent(conn, project, cluster, seen, check_prefix, frozenset(sources))
 
     return {"results": results, "downgraded": downgraded}
 

@@ -25,6 +25,7 @@ from __future__ import annotations
 import importlib
 import os
 import pkgutil
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -294,6 +295,38 @@ class TheSuiteCoversEveryInvariant(unittest.TestCase):
         self.assertEqual(set(_TEST_MODULES), discovered)
 
 
+# A mutation count written back into tests/conformance/README.md (#3553): a digit
+# count of mutations, controls or the four counted verdicts, a pasted result
+# line, or "N of the M". Backticks and asterisks are stripped first, and case
+# is ignored. Deliberately no wider: spelled-out numbers and other wrappers are
+# out of scope (the stop line in #3570).
+_README_COUNT_RE = re.compile(
+    r"\b\d+\s+(?:must_survive\s+)?(?:mutations?|controls?|killed|noisy|survived|stale)\b"  # "206 mutations: 175 KILLED, 3 controls"
+    r"|\b(?:killed|noisy|survived|stale)=\d+"  # a run's result line pasted in
+    r"|\b\d+\s+of\s+the\s+\d+\b",  # "accounts for 203 of the 206", wrapped or not
+    re.IGNORECASE,
+)
+
+
+def _readme_counts(text: str) -> list[str]:
+    return _README_COUNT_RE.findall(re.sub(r"[`*]", "", text))  # a count in `code` or **bold** is still a count
+
+
+def _load_mutation_harness():
+    """hack/conformance-mutations.py loaded by path, for the tests that read its table."""
+    import importlib.util
+
+    source = Path(__file__).resolve().parents[2] / "hack" / "conformance-mutations.py"
+    spec = importlib.util.spec_from_file_location("conformance_mutations", source)
+    harness = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = harness  # dataclasses looks the defining module up here
+    try:
+        spec.loader.exec_module(harness)
+    finally:
+        sys.modules.pop(spec.name, None)
+    return harness
+
+
 class EveryAssertionHasBeenAttacked(unittest.TestCase):
     """A test nobody has tried to break is a test whose existence is a guess.
 
@@ -406,19 +439,63 @@ class EveryAssertionHasBeenAttacked(unittest.TestCase):
         # Every mutation the harness runs, not just the ones written as a
         # literal Mutation(...) call: loading the script by path is cheap here
         # and catches a helper or alias that would hide a mutation from the walk.
-        import importlib.util
-
-        spec = importlib.util.spec_from_file_location("conformance_mutations", source)
-        harness = importlib.util.module_from_spec(spec)
-        # dataclasses looks the defining module up in sys.modules.
-        sys.modules[spec.name] = harness
-        try:
-            spec.loader.exec_module(harness)
-        finally:
-            sys.modules.pop(spec.name, None)
+        harness = _load_mutation_harness()
         self.assertEqual(seen, len(harness.MUTATIONS),
                          "a mutation is built some way other than a literal Mutation(...) call")
         self.assertEqual(stale, [], "rewrite these mutations against the current source")
+
+    def test_the_summary_counts_the_table(self) -> None:
+        """--summary is where the README sends a reader for the counts (#3553)."""
+        harness = _load_mutation_harness()
+        text = harness.summary(harness.MUTATIONS)
+        controls = [m.id for m in harness.MUTATIONS if m.must_survive]
+        self.assertIn(f"{len(harness.MUTATIONS)} mutations, {len(controls)} must_survive control(s)", text)
+        for control in controls:
+            self.assertIn(control, text)
+        self.assertIn(f"counts the other {len(harness.MUTATIONS) - len(controls)}", text)
+
+    def test_the_summary_flag_prints_the_filtered_set_and_runs_nothing(self) -> None:
+        """--summary -k prints the filtered set's summary and returns before the
+        clean-tree check, so it works on a dirty tree and edits nothing (#3553)."""
+        import contextlib
+        import io
+
+        harness = _load_mutation_harness()
+
+        def must_not_be_reached():
+            raise AssertionError("--summary reached the clean-tree check, so it isn't 'nothing run'")
+
+        harness._git_clean = must_not_be_reached
+        harness._run_suite = must_not_be_reached
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            self.assertEqual(harness.main(["--summary", "-k", "B1"]), 0)
+        selected = [m for m in harness.MUTATIONS if "B1" in m.id]
+        self.assertLess(len(selected), len(harness.MUTATIONS), "the filter selected everything")
+        self.assertEqual(printed.getvalue(), harness.summary(selected) + "\n")
+
+    def test_the_readme_keeps_no_hand_written_mutation_count(self) -> None:
+        """A count restated in the README conflicts on every pull request that
+        adds a mutation and drifts anyway (#3553); --summary and a run's own
+        last line carry them instead."""
+        readme = (Path(__file__).resolve().parent / "README.md").read_text()
+        counts = _readme_counts(readme)
+        self.assertEqual(
+            counts, [],
+            "tests/conformance/README.md restates a mutation count; point at "
+            "`hack/conformance-mutations.py --summary` or a run's result line instead")
+
+    def test_the_readme_count_guard_refuses_what_it_is_for(self) -> None:
+        """A positive control, so a pattern that compiles but matches nothing
+        can't leave the guard above passing vacuously."""
+        for text in (
+            "206 mutations: 175 KILLED, 28 NOISY, 3 controls",  # the shape #3553 removed
+            "`206`\nmutations",  # wrapped, in code
+            "killed=175 noisy=28 survived=0 stale=0",  # a pasted result line
+            "accounts for 203 of the 206",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(_readme_counts(text), "the README count guard no longer refuses this")
 
     def test_every_bucket_one_assertion_is_named_by_a_mutation(self) -> None:
         _load_every_test_module()

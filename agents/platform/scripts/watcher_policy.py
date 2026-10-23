@@ -9,16 +9,22 @@ those calls through the broker, on the broker's credential, under the
 `watcher` role, and this module is the whole of what decides which calls the
 broker makes for them.
 
-Two tables, one per route family:
+Two tables, one per route family, and a third family that reuses the Pub/Sub
+half of the first:
 
 - `/v1/watcher/gcp/<host>/<path>`: the GKE `clusters.get` the watchers use to
   learn a cluster's Autopilot bit, and the four Pub/Sub calls the drift detector
   makes, each pinned to the one subscription the operator configured.
+- `/v1/pubsub/gcp/<host>/<path>`: the same four Pub/Sub calls for the gateway's
+  Pub/Sub platform adapter (agentplugins/pubsub-platform), under the `chat`
+  role, pinned to the set of subscriptions the operator rendered from the
+  AgentPlugin configs. The gateway pod holds no Google credential of its own,
+  so this is the adapter's only way to a subscription. `evaluate_pubsub`.
 - `/v1/k8s/<project>/<location>/<cluster>/<path>`: GET only. List and watch of
   core/v1 events across the cluster (the event watcher), and a GET of one named
-  object of any kind but `secrets` (the drift detector's join reads the object
-  an audit record names). No other list, no watch of anything else (the
-  deprecated `watch/<resource>` paths included), no subresource.
+  object of a kind in `WATCHER_NAMED_READS` (the drift detector's join reads the
+  object an audit record names). No other list, no watch of anything else (the
+  deprecated `watch/<resource>` paths included), no subresource, never a Secret.
 
 Standard library only, like `api_policy`. `Decision` is reused from
 `command_policy`. No refusal message repeats caller text.
@@ -34,6 +40,10 @@ from command_policy import Decision
 
 WATCHER_GCP_PREFIX = "/v1/watcher/gcp/"
 WATCHER_K8S_PREFIX = "/v1/k8s/"
+# The platform adapter's family. Its own prefix rather than a second caller on
+# the watcher's: the two roles are confined to different subscriptions, and the
+# prefix is what ROUTE_ROLES keys the role on.
+PLATFORM_PUBSUB_PREFIX = "/v1/pubsub/gcp/"
 
 METHOD_GET = "GET"
 METHOD_POST = "POST"
@@ -47,10 +57,15 @@ RULE_GCP_ROUTE = "gcp.watcher.route"
 RULE_GCP_SUBSCRIPTION = "gcp.watcher.subscription"
 RULE_GCP_BODY = "gcp.watcher.body"
 RULE_GCP_CLUSTER_GET = "gcp.watcher.cluster-get"
+RULE_PUBSUB_METHOD = "gcp.pubsub.method"
+RULE_PUBSUB_ROUTE = "gcp.pubsub.route"
+RULE_PUBSUB_SUBSCRIPTION = "gcp.pubsub.subscription"
+RULE_PUBSUB_BODY = "gcp.pubsub.body"
 RULE_K8S_METHOD = "kubernetes.watcher.method"
 RULE_K8S_TARGET = "kubernetes.watcher.target"
 RULE_K8S_PATH = "kubernetes.watcher.path"
 RULE_K8S_SECRETS = "kubernetes.watcher.secrets"
+RULE_K8S_KIND = "kubernetes.watcher.kind"
 RULE_K8S_LEGACY = "kubernetes.watcher.legacy-path"
 RULE_K8S_QUERY = "kubernetes.watcher.query"
 
@@ -96,6 +111,64 @@ _NAMED_GROUP = re.compile(
 # `namespaces/<ns>` alone matches the cluster-scoped named form with resource
 # "namespaces"; that is a named GET of a Namespace object and is allowed.
 REFUSED_RESOURCES = frozenset({"secrets"})
+
+# The GitOps reconcilers' sync objects: the six kinds gke-labs/kube-agents#2987
+# adds to the agent's `minimal` ClusterRole (get/list/watch, in
+# k8s-operator/internal/controller/platformagent_manifests.go). Drift on a
+# GitOps-managed object is what the drift detector exists for, and the join
+# reading only kinds the agent itself can read keeps the two grants in step. A
+# change to either list has to change both. Today
+# test_the_reconciler_kinds_are_the_six_the_agent_can_read pins a copy of the
+# six; a check that reads the rendered role is owed once #2987 has merged.
+RECONCILER_NAMED_READS = frozenset(
+    {
+        ("argoproj.io", "applications"),
+        ("kustomize.toolkit.fluxcd.io", "kustomizations"),
+        ("source.toolkit.fluxcd.io", "gitrepositories"),
+        ("source.toolkit.fluxcd.io", "ocirepositories"),
+        ("configsync.gke.io", "rootsyncs"),
+        ("configsync.gke.io", "reposyncs"),
+    }
+)
+# The kinds the drift detector's join may read by name, as (API group, resource
+# plural): what an audit record's resourceName carries, any version. The audit
+# sink and the detector's classifier filter no kinds (terraform/modules/
+# drift-pubsub, cmd/drift-detector/classify.go), so this table is the only kind
+# boundary on the join. These are the declarative kinds a person edits out of
+# band. Controller-written kinds (pods, replicasets, nodes, leases, events) are
+# left out, and so is every other custom resource. A record of an unlisted kind
+# is still reported: the join fails open and forwards it unenriched, with this
+# refusal as its lookup error. Widen by PR, as with api_policy.API_READ_ROUTES.
+WATCHER_NAMED_READS = frozenset(
+    {
+        ("", "configmaps"),
+        ("", "limitranges"),
+        ("", "namespaces"),
+        ("", "persistentvolumeclaims"),
+        ("", "resourcequotas"),
+        ("", "serviceaccounts"),
+        ("", "services"),
+        ("admissionregistration.k8s.io", "mutatingwebhookconfigurations"),
+        ("admissionregistration.k8s.io", "validatingadmissionpolicies"),
+        ("admissionregistration.k8s.io", "validatingadmissionpolicybindings"),
+        ("admissionregistration.k8s.io", "validatingwebhookconfigurations"),
+        ("apiextensions.k8s.io", "customresourcedefinitions"),
+        ("apps", "daemonsets"),
+        ("apps", "deployments"),
+        ("apps", "statefulsets"),
+        ("autoscaling", "horizontalpodautoscalers"),
+        ("batch", "cronjobs"),
+        ("batch", "jobs"),
+        ("networking.k8s.io", "ingresses"),
+        ("networking.k8s.io", "networkpolicies"),
+        ("policy", "poddisruptionbudgets"),
+        ("rbac.authorization.k8s.io", "clusterrolebindings"),
+        ("rbac.authorization.k8s.io", "clusterroles"),
+        ("rbac.authorization.k8s.io", "rolebindings"),
+        ("rbac.authorization.k8s.io", "roles"),
+    }
+    | RECONCILER_NAMED_READS
+)
 # Segments the API server serves in the resource position that are not a
 # resource: the deprecated `watch/<resource>` prefix (a watch, of any kind,
 # Secrets included) and `proxy/`. Read as a named GET they would be a watch the
@@ -123,6 +196,20 @@ EVENTS_QUERY_KEYS = frozenset(
 )
 # A named GET may only ask for a resource version.
 NAMED_QUERY_KEYS = frozenset({"resourceVersion"})
+
+
+def _validate_named_reads(table: frozenset[tuple[str, str]]) -> None:
+    """Refuse a malformed table at import, so a bad edit fails every test."""
+    for group, resource in table:
+        if group and not re.fullmatch(SEGMENT, group):
+            raise ValueError(f"WATCHER_NAMED_READS: group {group!r} is not an API group")
+        if not re.fullmatch(r"[a-z][a-z0-9]*", resource):
+            raise ValueError(f"WATCHER_NAMED_READS: {resource!r} is not a lower-case resource plural")
+        if resource in REFUSED_RESOURCES or resource in REFUSED_PATH_SEGMENTS:
+            raise ValueError(f"WATCHER_NAMED_READS: {resource!r} is refused under every group")
+
+
+_validate_named_reads(WATCHER_NAMED_READS)
 
 
 # What of a GKE `Cluster` the watchers are relayed: the fields the Go side reads
@@ -154,6 +241,65 @@ def _refuse(rule_id: str, message: str) -> Decision:
     return Decision(allowed=False, rule_id=rule_id, message=message)
 
 
+class _SubscriptionRules:
+    """The rule ids and refusal texts one relay family answers Pub/Sub calls with.
+
+    The watcher's and the platform adapter's families decide the same four calls
+    the same way; only who they say they are, and which subscriptions they
+    reach, differ. One decision procedure, two vocabularies, so the two cannot
+    drift apart on what a body may carry.
+    """
+
+    def __init__(self, *, method: str, route: str, subscription: str, body: str, allowed_prefix: str,
+                 route_message: str, subscription_message: str) -> None:
+        self.method = method
+        self.route = route
+        self.subscription = subscription
+        self.body = body
+        self.allowed_prefix = allowed_prefix
+        self.route_message = route_message
+        self.subscription_message = subscription_message
+
+
+_WATCHER_SUBSCRIPTION_RULES = _SubscriptionRules(
+    method=RULE_GCP_METHOD,
+    route=RULE_GCP_ROUTE,
+    subscription=RULE_GCP_SUBSCRIPTION,
+    body=RULE_GCP_BODY,
+    allowed_prefix="gcp.watcher.subscription",
+    route_message="The watcher relay makes four Pub/Sub calls on one subscription.",
+    subscription_message="The watcher relay reaches only the drift detector's configured subscription.",
+)
+_PLATFORM_SUBSCRIPTION_RULES = _SubscriptionRules(
+    method=RULE_PUBSUB_METHOD,
+    route=RULE_PUBSUB_ROUTE,
+    subscription=RULE_PUBSUB_SUBSCRIPTION,
+    body=RULE_PUBSUB_BODY,
+    allowed_prefix="gcp.pubsub.subscription",
+    route_message="The platform Pub/Sub relay makes four Pub/Sub calls on its configured subscriptions.",
+    subscription_message="The platform Pub/Sub relay reaches only the subscriptions the AgentPlugins configure.",
+)
+
+
+def _evaluate_subscription_call(
+    method: str, path: str, body: bytes, subscriptions: frozenset[str], rules: _SubscriptionRules
+) -> Decision:
+    """The four Pub/Sub calls on one of `subscriptions`; an empty set refuses them all."""
+    match = _PUBSUB_SUBSCRIPTION.fullmatch(path)
+    if match is None:
+        return _refuse(rules.route, rules.route_message)
+    if match.group("sub") not in subscriptions:
+        return _refuse(rules.subscription, rules.subscription_message)
+    verb = match.group("verb")
+    if verb is None:
+        if method != METHOD_GET:
+            return _refuse(rules.method, "A subscription is read with GET.")
+        return Decision(allowed=True, rule_id=rules.allowed_prefix + "-get", message="")
+    if method != METHOD_POST or not _body_fits(body, PUBSUB_BODIES[verb]):
+        return _refuse(rules.body, "That Pub/Sub call carries a body this relay does not forward.")
+    return Decision(allowed=True, rule_id=rules.allowed_prefix + verb.replace(":", "-"), message="")
+
+
 def evaluate_gcp(method: str, host: str, path: str, body: bytes, subscription: str) -> Decision:
     """Allow or refuse one `/v1/watcher/gcp/` call.
 
@@ -167,23 +313,24 @@ def evaluate_gcp(method: str, host: str, path: str, body: bytes, subscription: s
             return Decision(allowed=True, rule_id=RULE_GCP_CLUSTER_GET, message="")
         return _refuse(RULE_GCP_ROUTE, "The watcher relay reads one GKE cluster by name and nothing else.")
     if host == PUBSUB_HOST:
-        match = _PUBSUB_SUBSCRIPTION.fullmatch(path)
-        if match is None:
-            return _refuse(RULE_GCP_ROUTE, "The watcher relay makes four Pub/Sub calls on one subscription.")
-        if not subscription or match.group("sub") != subscription:
-            return _refuse(
-                RULE_GCP_SUBSCRIPTION,
-                "The watcher relay reaches only the drift detector's configured subscription.",
-            )
-        verb = match.group("verb")
-        if verb is None:
-            if method != METHOD_GET:
-                return _refuse(RULE_GCP_METHOD, "A subscription is read with GET.")
-            return Decision(allowed=True, rule_id="gcp.watcher.subscription-get", message="")
-        if method != METHOD_POST or not _body_fits(body, PUBSUB_BODIES[verb]):
-            return _refuse(RULE_GCP_BODY, "That Pub/Sub call carries a body this relay does not forward.")
-        return Decision(allowed=True, rule_id="gcp.watcher.subscription" + verb.replace(":", "-"), message="")
+        allowed = frozenset({subscription}) if subscription else frozenset()
+        return _evaluate_subscription_call(method, path, body, allowed, _WATCHER_SUBSCRIPTION_RULES)
     return _refuse(RULE_GCP_ROUTE, "The watcher relay reaches the GKE and Pub/Sub APIs only.")
+
+
+def evaluate_pubsub(method: str, host: str, path: str, body: bytes, subscriptions: frozenset[str]) -> Decision:
+    """Allow or refuse one `/v1/pubsub/gcp/` call for the gateway's platform adapter.
+
+    `subscriptions` is the set of `projects/<p>/subscriptions/<s>` the operator
+    rendered from the AgentPlugin configs; empty means no plugin route the
+    operator could qualify, and every call is refused. Pub/Sub is the only host: the
+    adapter has no business with the GKE API.
+    """
+    if method not in (METHOD_GET, METHOD_POST):
+        return _refuse(RULE_PUBSUB_METHOD, "The platform Pub/Sub relay forwards GET and POST only.")
+    if host != PUBSUB_HOST:
+        return _refuse(RULE_PUBSUB_ROUTE, "The platform Pub/Sub relay reaches the Pub/Sub API only.")
+    return _evaluate_subscription_call(method, path, body, subscriptions, _PLATFORM_SUBSCRIPTION_RULES)
 
 
 def _body_fits(body: bytes, keys: dict[str, type]) -> bool:
@@ -241,6 +388,13 @@ def evaluate_k8s(method: str, rest: str, query: dict[str, list[str]]) -> Decisio
         )
     if match.group("resource") in REFUSED_RESOURCES:
         return _refuse(RULE_K8S_SECRETS, "The watcher's Kubernetes route never reads a Secret.")
+    group = match.groupdict().get("group") or ""
+    if (group, match.group("resource")) not in WATCHER_NAMED_READS:
+        return _refuse(
+            RULE_K8S_KIND,
+            "The watcher's Kubernetes route reads only the kinds in its table; "
+            "the drift record is reported without ownership.",
+        )
     if not set(query) <= NAMED_QUERY_KEYS:
         return _refuse(RULE_K8S_QUERY, "A named read carries a query key this route does not forward.")
     return Decision(allowed=True, rule_id="kubernetes.watcher.named-get", message="")

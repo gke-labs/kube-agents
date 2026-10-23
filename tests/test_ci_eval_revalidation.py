@@ -581,6 +581,59 @@ class RevalidationTest(unittest.TestCase):
         self.assertRegex(proc.stdout, r"REVALIDATED against green build 200\b")
         self.assertIn("this head already passed", proc.stdout)
 
+    # ── the same tree at a new head passes like the same head ───────────────
+
+    def _same_tree_commit(self, sha):
+        """A new commit on `sha` with `sha`'s tree: what an empty commit pushes."""
+        out = subprocess.run(
+            ["git", "-C", str(self.repo), "commit-tree", f"{sha}^{{tree}}", "-p", sha, "-m", "empty"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return out.stdout.strip()
+
+    def test_a_green_at_an_earlier_head_with_the_same_tree_is_reused(self):
+        """An empty commit on c5: a new head, the same tree. The base delta
+        c1..c5 touches code.py, which the inert rule would refuse; the
+        same-tree rule does not look at the base, as for the same head."""
+        empty = self._same_tree_commit(self.c5)
+        self._plant_history([("200", True, self.c1, self.c5)])
+        proc = self._run(cur_head=empty, cur_base=self.c5)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
+        self.assertRegex(proc.stdout, r"Step 0: REVALIDATED against green build 200\b")
+        self.assertIn("this tree already passed", proc.stdout)
+        self.assertIn(f"at head {self.c5} then, {empty} now", proc.stdout)
+        self.assertNotIn("code.py", proc.stdout)
+
+    def test_a_different_tree_still_goes_through_the_inert_rule(self):
+        """c3 to c5 changes code.py: not the same tree, so the inert rule
+        decides, and it refuses."""
+        self._plant_history([("200", True, self.c1, self.c3)])
+        proc = self._run(cur_head=self.c5, cur_base=self.c2)
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn("files outside REVALIDATION_INERT_PATHS", proc.stdout)
+        self.assertNotIn("this tree already passed", proc.stdout)
+
+    def test_the_same_tree_rule_still_honours_the_cutoff(self):
+        """A green first reported before EVAL_REVALIDATION_NOT_BEFORE is not
+        reused at the same tree either: the cutoff is checked first."""
+        empty = self._same_tree_commit(self.c3)
+        self._plant_dated_green("2026-10-15T10:00:00Z")
+        proc = self._run(cur_head=empty, cur_base=self.c5, env_overrides={"EVAL_REVALIDATION_NOT_BEFORE": "2026-10-20T20:00:00Z"})
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn("before EVAL_REVALIDATION_NOT_BEFORE (2026-10-20T20:00:00Z)", proc.stdout)
+        self.assertNotIn("this tree already passed", proc.stdout)
+
+    def test_the_same_tree_rule_still_demands_the_attestation(self):
+        empty = self._same_tree_commit(self.c3)
+        self._plant_history([("200", True, self.c1, self.c3)], attest=False)
+        self._plant_statuses(self.c3, [])
+        proc = self._run(cur_head=empty, cur_base=self.c5)
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn("refusing to trust the GCS record alone", proc.stdout)
+
     def test_the_same_head_rule_still_demands_the_attestation(self):
         """Same head or not, a GCS record with no Prow-posted success status
         on that head is the forged record, and runs full."""

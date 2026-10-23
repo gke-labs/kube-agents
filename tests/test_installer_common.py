@@ -48,6 +48,22 @@ _SKIP_UNLESS_TRAP_FIRES = (
     "ToleratedProbesClearErrTrapTest pins it by shape"
 )
 
+# The front doors (install.sh's source_provisioning_helpers and Day-2 menu,
+# upgrade.sh's and uninstall.sh's main) source installer_common.sh from inside
+# a function. SourcedFromAFunctionTest runs that shape under every bash a
+# developer here may run the front doors with: the one on PATH, and macOS's
+# /bin/bash 3.2 when it is a different binary.
+_MACOS_SYSTEM_BASH = pathlib.Path("/bin/bash")
+
+
+def _bashes_here():
+    bashes = ["bash"]
+    on_path = shutil.which("bash")
+    if _MACOS_SYSTEM_BASH.exists() and (on_path is None or not _MACOS_SYSTEM_BASH.samefile(on_path)):
+        bashes.append(str(_MACOS_SYSTEM_BASH))
+    return bashes
+
+
 # installer_common.sh's contract: the caller defines the print helpers.
 _PRINT_STUBS = """
 print_info() { :; }
@@ -240,6 +256,8 @@ class InstallerCommonTest(unittest.TestCase):
                     "SCOPED_SA_POOL_MAX_ACCOUNTS": "",
                     # And the mode, refused on a value outside the CRD's enum.
                     "PLATFORM_AGENT_MODE": "",
+                    # And the data volume size, refused when malformed.
+                    "PLATFORM_AGENT_STORAGE_SIZE": "",
                     **(env or {}),
                 },
                 bin_dir=str(bin_dir),
@@ -1415,6 +1433,89 @@ class InstallerCommonTest(unittest.TestCase):
                     proc = self._run(
                         f'load_install_env "{file}"; write_tfvars_from_state "{dest}"; echo "rc=$?"',
                         env={"API_SERVER_KEY": "k", "PLATFORM_AGENT_MODE": exported},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    self.assertIn(expected, dest.read_text())
+
+    # ── PLATFORM_AGENT_STORAGE_SIZE: the PlatformAgent's spec.storage.size ──
+
+    def test_tfvars_carry_the_platform_agent_storage_size(self):
+        # Written on every run, the default included; the composition renders
+        # nothing into the chart for the default.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for env, expected in (
+                ({}, 'platform_agent_storage_size = "50Gi"\n'),
+                ({"PLATFORM_AGENT_STORAGE_SIZE": ""}, 'platform_agent_storage_size = "50Gi"\n'),
+                ({"PLATFORM_AGENT_STORAGE_SIZE": "80Gi"}, 'platform_agent_storage_size = "80Gi"\n'),
+                ({"PLATFORM_AGENT_STORAGE_SIZE": "1Ti"}, 'platform_agent_storage_size = "1Ti"\n'),
+                ({"PLATFORM_AGENT_STORAGE_SIZE": "64Ti"}, 'platform_agent_storage_size = "64Ti"\n'),
+                ({"PLATFORM_AGENT_STORAGE_SIZE": "67108864Mi"}, 'platform_agent_storage_size = "67108864Mi"\n'),
+            ):
+                with self.subTest(env=env):
+                    proc = self._run(
+                        f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", **env},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    self.assertIn(expected, dest.read_text())
+
+    def test_tfvars_refuse_a_malformed_platform_agent_storage_size(self):
+        # The generator is the installer's only check on the value: it names
+        # the key and writes nothing, rather than leave the variable's
+        # validation to refuse it at plan.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for value in ("0Gi", "80", "80G", "1.5Ti", "-10Gi", "080Gi", "80Gi ", "65Ti", "65537Gi", "99999999999Ti"):
+                with self.subTest(value=value):
+                    proc = self._run(
+                        f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                        env={"API_SERVER_KEY": "k", "PLATFORM_AGENT_STORAGE_SIZE": value},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=1", proc.stdout, proc.stderr)
+                    self.assertIn(
+                        f"PLATFORM_AGENT_STORAGE_SIZE='{value}' is not a whole number of Mi, Gi or Ti above zero",
+                        proc.stderr,
+                    )
+                    self.assertIn("Fix it in install.env, or on a first install, in the value this shell exports.", proc.stderr)
+                    self.assertFalse(dest.exists(), "no tfvars is written for a value Terraform would refuse")
+
+    def test_load_install_env_reads_the_storage_size_from_the_file_alone(self):
+        # An inherited size would grow the claims for one run, and the next run
+        # from a clean shell would drop the field again; the file's own key
+        # still loads.
+        with tempfile.TemporaryDirectory() as tmp:
+            silent = pathlib.Path(tmp) / "silent.env"
+            silent.write_text("PROJECT_ID=p\n")
+            recorded = pathlib.Path(tmp) / "recorded.env"
+            recorded.write_text("PLATFORM_AGENT_STORAGE_SIZE=80Gi\n")
+            for file, expected in ((silent, "SIZE=[]"), (recorded, "SIZE=[80Gi]")):
+                with self.subTest(file=file.name):
+                    proc = self._run(
+                        f'load_install_env "{file}"; echo "SIZE=[${{PLATFORM_AGENT_STORAGE_SIZE:-}}]"',
+                        env={"PLATFORM_AGENT_STORAGE_SIZE": "120Gi"},
+                    )
+                    self.assertIn(expected, proc.stdout, proc.stderr)
+
+    def test_a_recorded_storage_size_is_carried_into_the_regenerated_tfvars(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = pathlib.Path(tmp) / "terraform.tfvars"
+            recorded = pathlib.Path(tmp) / "recorded.env"
+            recorded.write_text("PLATFORM_AGENT_STORAGE_SIZE=80Gi\n")
+            silent = pathlib.Path(tmp) / "silent.env"
+            silent.write_text("PROJECT_ID=test-project\n")
+            for file, exported, expected in (
+                (recorded, "", 'platform_agent_storage_size = "80Gi"\n'),
+                (recorded, "120Gi", 'platform_agent_storage_size = "80Gi"\n'),
+                (silent, "120Gi", 'platform_agent_storage_size = "50Gi"\n'),
+            ):
+                with self.subTest(file=file.name, exported=exported):
+                    proc = self._run(
+                        f'load_install_env "{file}"; write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", "PLATFORM_AGENT_STORAGE_SIZE": exported},
                         describe_stub="printf '\\n'; exit 0",
                     )
                     self.assertIn("rc=0", proc.stdout, proc.stderr)
@@ -5594,6 +5695,46 @@ class NextHomeChannelUnsetWarningTest(unittest.TestCase):
         self.assertTrue(lines[-2].startswith("WARN: No home channel: proactive posts are dropped."), proc.stdout)
         self.assertTrue(lines[-1].startswith("INFO: Set SLACK_HOME_CHANNEL"), proc.stdout)
         self.assertEqual(self._run(slack_home="C0123ABCD", summary=True).stdout, "rc=0 key=\n")
+
+
+class SourcedFromAFunctionTest(unittest.TestCase):
+    """The library is sourced from inside a function by every front door, so
+    its top level runs in that function's scope. On bash 3.2 (macOS's
+    /bin/bash) a `readonly -a` there is local to the function, as a `declare`
+    is on every bash, and the array is gone by the time trim_go_space reads
+    it: install.sh stopped on `GO_TRIMSPACE_CHARS[@]: unbound variable`
+    (#3837). bash 4.4 and 5.x keep a `readonly -a` global there, so the
+    behavioural test sees the defect only on a bash 3.2 host; the shape test
+    is the guard on every bash."""
+
+    _SOURCED_FILES = sorted((_REPO_ROOT / "scripts" / "installer").glob("*.sh"))
+    # A top-level `declare`/`typeset`, or a `readonly` with an array flag, in a
+    # file sourced from a function. `local` is never legal at top level, and
+    # the function bodies are indented, so the anchor at column 0 is the
+    # top level.
+    _FUNCTION_SCOPED_DECLARATION = re.compile(
+        r"^(?:(?:declare|typeset)\b.*|readonly\s+(?:-\w+\s+)*-\w*[aA]\w*\b.*)$", re.MULTILINE)
+
+    def test_no_sourced_file_declares_at_top_level(self):
+        self.assertIn(_INSTALLER_COMMON, self._SOURCED_FILES)
+        for path in self._SOURCED_FILES:
+            with self.subTest(file=path.name):
+                hits = self._FUNCTION_SCOPED_DECLARATION.findall(path.read_text())
+                self.assertEqual(hits, [], f"{path.name}: assign the value, then `readonly NAME` on its own line")
+
+    def test_trim_go_space_runs_after_a_function_sourced_the_library(self):
+        body = (
+            _PRINT_STUBS
+            + f'load() {{ source "{_INSTALLER_COMMON}"; }}\nload\nset -u\n'
+            + 'printf "n=%s [%s] [%s]\\n" "${#GO_TRIMSPACE_CHARS[@]}" "$(trim_go_space $\'\\xc2\\xa0C0HOME \')" '
+            '"$(slack_home_channel_not_an_id $\' D0DM\\xe3\\x80\\x80\')"\n'
+        )
+        for bash in _bashes_here():
+            with self.subTest(bash=bash):
+                proc = subprocess.run([bash, "-c", body], capture_output=True, text=True,
+                                      env=get_isolated_test_env(), cwd=str(_REPO_ROOT))
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("n=25 [C0HOME] [D0DM]", proc.stdout, proc.stderr)
 
 if __name__ == "__main__":
     unittest.main()

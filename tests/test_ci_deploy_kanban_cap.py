@@ -3,7 +3,7 @@
 The operator pins ``kanban.max_in_progress`` in its managed scope: 6
 (``defaultKanbanMaxInProgress``), or the PlatformAgent CR's
 ``spec.harness.tuning.maxInProgress`` when it carries one. The eval fans its units out at
-``EVAL_TASK_PARALLELISM`` -- 4 on a pull request, 8 on the nightly -- and nearly every
+``EVAL_TASK_PARALLELISM`` -- 4 on a pull request, 6 on the nightlies -- and nearly every
 unit's opening turn delegates one platform card. The override dates from an image
 default of two, where most lanes queued: a queued card waits out the cards ahead of it and
 then runs its own 10-45 minutes, past the delegation ceiling with no worker at fault, while the dispatcher
@@ -52,8 +52,8 @@ _CAP_CONSTANT_RE = re.compile(r'^readonly EVAL_KANBAN_MAX_IN_PROGRESS="(\d+)"$',
 # k8s-operator/internal/controller/manifest_helpers.go) holds about fourteen
 # workers at the ~430 MiB one measured live over the 1.8 GiB idle set, but the
 # eval's working set above five has not been measured (#2032), and raising the
-# cap belongs with that measurement. The nightly runs eight lanes
-# (oss-test-infra#2707) and queues until then.
+# cap belongs with that measurement. The nightlies run six lanes and queue
+# until then.
 _PRESUBMIT_LANES_RE = re.compile(r'^EVAL_TASK_PARALLELISM="\$\{EVAL_TASK_PARALLELISM:-(\d+)\}"$', re.MULTILINE)
 _BRIDGE_LANES_RE = re.compile(r'^readonly EVAL_TASK_PARALLELISM_DEFAULT=(\d+)$', re.MULTILINE)
 _EVAL_WORKERS_MEASURED = 5

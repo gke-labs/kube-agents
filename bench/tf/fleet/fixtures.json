@@ -2,9 +2,9 @@
   "schema_version": 2,
   "description": "Role catalog for the seeded fleet. A scenario names a fixture ROLE; the runner (hack/fleet-kubeconfigs.sh) discovers the leased project's seeded clusters by label, matches each to a slot below, confirms every object in the role's `probes` list is present, and only then writes that role's kubeconfig. Nothing outside this file may address a seeded cluster or an eval project directly: each project carries its own set, so a case written against one must run unchanged against all of them. Names, prefix and location are deliberately absent -- they are the Terraform's business and are read back off the discovered clusters. See README.md, 'Addressing a fixture by role'. One sanctioned exception, which discovers by these same labels and the trailing -<slot> name rule: hack/ci-eval-pr.sh section 3b reuses the slot-c cluster as the gpu-stress-test log-fixture subject -- it mutates nothing in-cluster, writes only project-level Cloud Logging entries that name the cluster, and falls back to a per-run cluster when slot c is absent, not RUNNING, or its default namespace is not empty. hack/fleet-fixture-state.py discovers nothing: it reads the slot's cluster name and location back out of the `.fleet-context` file the runner wrote, for the `cluster` state subjects below.",
   "probe_syntax": "Each probe is `<kind>/<name>` or `<kind>?<label-selector>`, read against the role's `namespace` when it has one. A role's namespace is probed implicitly. A probe is the runner's promise that the object was THERE before the agent ran, and it is the only thing that entitles a check to call the same object's later absence a violation rather than an environment that was never ready -- so every subject a task.yaml asserts on must appear here, which bench/tests/test_fleet_verifier.py enforces in both directions. A role with an empty list confirms nothing, and its checks can never blame the run for an absence.",
-  "state_syntax": "Presence is not state (#1278: every probe passed while payments-api sat Pending on 30 projects). Each `state` entry is one assertion about the DESIGNED observable state of a role whose probes passed, evaluated by hack/fleet-fixture-state.py after the runner publishes the role: `subject` is a probe-shaped `<kind>/<name>`, `<kind>?<label-selector>` or bare `<kind>?` (every object of that kind in the role's namespace), or the word `cluster` for the GKE cluster carrying the role, read with `clusters describe` on the name the runner recorded; `path` is a dotted field path with `[*]`, `[N]`, `[?(@.key=='value')]` or `[\"quoted.key\"]` steps, the last for a label or selector key the bare form cannot carry (`metadata.labels[\"pod-security.kubernetes.io/enforce-version\"]`); `op` is `eq`, `ge`, `any_eq`, `any_ge`, `none_eq` (each with a `value`), `absent` (no value, no objects or no values at the path), `after_now` (an RFC 3339 timestamp still ahead), or `minor_behind_channel_default` (cluster subject only: the minor is `value` behind the cluster's own release channel default); `why` says what the cases lose when it fails. A role whose fixture is present but fails any assertion is DRIFTED: scripts/verify_ci_pool_project.py fails the project, and the script writes `<role>.drift` beside the role's kubeconfig, one failed assertion per line with what was observed (#1544). The presubmit does not run this pass and never acts on a drift; a scheduled scan of every pool project from the CI health bot is the follow-up on #1550. A role with an empty list asserts nothing beyond presence. A `value` may be an object or an empty object; it is compared whole and structurally (key order does not matter), so an `emptyDir` with no fields is `{}`. One key of a label or selector map is asserted through the quoted step, not by comparing the whole map, so a key another owner adds is not drift.",
+  "state_syntax": "Presence is not state (#1278: every probe passed while payments-api sat Pending on 30 projects). Each `state` entry is one assertion about the DESIGNED observable state of a role whose probes passed, evaluated by hack/fleet-fixture-state.py after the runner publishes the role: `subject` is a probe-shaped `<kind>/<name>`, `<kind>?<label-selector>` or bare `<kind>?` (every object of that kind in the role's namespace), or the word `cluster` for the GKE cluster carrying the role, read with `clusters describe` on the name the runner recorded; `path` is a dotted field path with `[*]`, `[N]`, `[?(@.key=='value')]` or `[\"quoted.key\"]` steps, the last for a label or selector key the bare form cannot carry (`metadata.labels[\"pod-security.kubernetes.io/enforce-version\"]`); `op` is `eq`, `ge`, `any_eq`, `any_ge`, `none_eq` (each with a `value`), `absent` (no value, no objects or no values at the path), `after_now` (an RFC 3339 timestamp still ahead), `minor_behind_channel_default` (cluster subject only: the minor is `value` behind the cluster's own release channel default), or `node_cpu_spare_ge` (a `node?<selector>` subject with no path: at least one node matches and every matched node keeps at least `value` millicores of allocatable CPU unrequested by the pods bound to it, counted the way the scheduler counts a pod, the larger of its containers' sum with restartable init containers and its biggest ordinary init container, plus pod overhead, Succeeded and Failed pods excluded; a matched node not yet reporting allocatable leaves the role not checked); `why` says what the cases lose when it fails. A role whose fixture is present but fails any assertion is DRIFTED: scripts/verify_ci_pool_project.py fails the project, and the script writes `<role>.drift` beside the role's kubeconfig, one failed assertion per line with what was observed (#1544). The presubmit does not run this pass and never acts on a drift; a scheduled scan of every pool project from the CI health bot is the follow-up on #1550. A role with an empty list asserts nothing beyond presence. A `value` may be an object or an empty object; it is compared whole and structurally (key order does not matter), so an `emptyDir` with no fields is `{}`. One key of a label or selector map is asserted through the quoted step, not by comparing the whole map, so a key another owner adds is not drift.",
   "cluster_slots": {
-    "a": "The seeded workload namespaces (each role's `namespace` names its own), plus the idle and pinned node pools.",
+    "a": "The seeded workload namespaces (each role's `namespace` names its own), plus the idle and pinned node pools, and the default pool's own headroom.",
     "b": "Control plane held one minor behind the REGULAR channel default, plus the upgrade-readiness drain defects.",
     "c": "The consistency outlier: no master authorized networks.",
     "d": "Multi-zonal: nodes in two zones, carrying the zonal-skew fixtures. The only slot whose shape is the fixture."
@@ -354,6 +354,21 @@
         }
       ]
     },
+    "readiness-lb-drain-timeout": {
+      "cluster_slot": "b",
+      "namespace": null,
+      "probes": ["node?cloud.google.com/gke-nodepool=default-pool"],
+      "fixture": "drain-timeout-<prefix>-b backend service on the default pool's instance group with connectionDraining.drainingTimeoutSec 3600, six times GKE's 600-second per-node deregistration wait, behind a TCP health check and no forwarding rule, so it routes nothing. The backend service is a Compute Engine object the probe and state grammars cannot address (kubectl kinds and the cluster record only), so the role probes the pool's node and asserts the pool; the readiness report's lb-connection-draining rule is what reads the service, and its case grades that line",
+      "state": [
+        {
+          "subject": "cluster",
+          "path": "nodePools[?(@.name=='default-pool')].status",
+          "op": "any_eq",
+          "value": "RUNNING",
+          "why": "the backend group is this pool's instance group, which the rule matches by zone and name against the backend service; a pool mid-recreate is a different finding, and a pool replaced under another name would leave the service pointing at a group no cluster claims"
+        }
+      ]
+    },
     "zonal-skew-scheduling": {
       "cluster_slot": "d",
       "namespace": "seeded-topology",
@@ -535,6 +550,49 @@
         }
       ]
     },
+    "guaranteed-qos-workload": {
+      "cluster_slot": "a",
+      "namespace": "seeded-qos",
+      "probes": ["deployment/ledger-writer"],
+      "fixture": "ledger-writer Deployment, two replicas whose container sets requests equal to limits (10m / 32Mi), so the pods are Guaranteed QoS and a lower request lowers the limit with it; the container burns its 10m CPU limit, so it is throttled there already. Behind a budget and a default-deny policy, under the waste audit's resize floor and out of its idle check, so no audit names it beyond the accepted background rows",
+      "state": [
+        {
+          "subject": "deployment/ledger-writer",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 2,
+          "why": "the dependency is a running Guaranteed workload; a Pending replica has no usage to size from"
+        },
+        {
+          "subject": "deployment/ledger-writer",
+          "path": "spec.template.spec.containers[0].resources.limits.cpu",
+          "op": "eq",
+          "value": "10m",
+          "why": "requests equal to limits is the posture; a resize anyone applies to the limit removes it, and the case then grades nothing"
+        },
+        {
+          "subject": "deployment/ledger-writer",
+          "path": "spec.template.spec.containers[0].resources.limits.memory",
+          "op": "eq",
+          "value": "32Mi",
+          "why": "the memory half of the same posture: Guaranteed needs requests equal to limits on both dimensions"
+        },
+        {
+          "subject": "deployment/ledger-writer",
+          "path": "spec.template.spec.containers[0].resources.requests.cpu",
+          "op": "eq",
+          "value": "10m",
+          "why": "the cut the case's prompt asks for: a lower request alone makes the pods Burstable, and the case then grades a premise that is gone"
+        },
+        {
+          "subject": "deployment/ledger-writer",
+          "path": "spec.template.spec.containers[0].resources.requests.memory",
+          "op": "eq",
+          "value": "32Mi",
+          "why": "the memory half of the same cut"
+        }
+      ]
+    },
     "node-local-state": {
       "cluster_slot": "a",
       "namespace": "seeded-shapes",
@@ -619,6 +677,21 @@
         }
       ]
     },
+    "default-pool-headroom": {
+      "cluster_slot": "a",
+      "namespace": null,
+      "probes": ["node?cloud.google.com/gke-nodepool=default-pool"],
+      "fixture": "seeded-a's default pool itself, two e2-standard-2 nodes with CPU to place the next planted fixture. Not a defect: the room every other slot-a fixture schedules into. At two e2-mediums the busier node was within 2-47m of full on every pool project and a 10m DaemonSet pod stranded, which the scan read as drift on that fixture's role (#3607)",
+      "state": [
+        {
+          "subject": "node?cloud.google.com/gke-nodepool=default-pool",
+          "path": null,
+          "op": "node_cpu_spare_ge",
+          "value": 100,
+          "why": "a 10m fixture pod places only on a node with that much CPU unrequested, and 100m is ten fixtures' worth of warning: below it on the busier node the pool is a few fixtures from stranding one, which then reads as drift on its own role. A re-apply changes nothing for this role: the pool's machine_type or node_count in bench/tf/fleet/main.tf (seeded_a_default) is the fix"
+        }
+      ]
+    },
     "intree-pd-volume": {
       "cluster_slot": "a",
       "namespace": "seeded-shapes",
@@ -695,7 +768,10 @@
     "moving-admission-default": {
       "cluster_slot": "a",
       "namespace": "seeded-defaults",
-      "probes": ["namespace/seeded-defaults", "deployment/baseline-edge-worker"],
+      "probes": [
+        "namespace/seeded-defaults",
+        "deployment/baseline-edge-worker"
+      ],
       "fixture": "seeded-defaults namespace with Pod Security Admission pinned to enforce baseline at version latest, so the rule set applied to its workloads changes at every minor without anyone editing it; baseline-edge-worker (one replica) is admitted by today's baseline",
       "state": [
         {
