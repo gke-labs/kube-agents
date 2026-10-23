@@ -202,6 +202,10 @@ STUCK_TITLE_MAX_CHARS = 120
 # the rest, with room to spare.
 STUCK_CARD_RESERVE = 3000
 ELLIPSIS = "…"
+# A word cut keeping less than 1/CLIP_MIN_SHARE of the budget falls back to the
+# hard cut: a long unbroken token would otherwise take the rest of the title with
+# it (slack_status._clip carries the same guard).
+CLIP_MIN_SHARE = 2
 # Markdown emphasis inside a title would close the row's bold early.
 TITLE_EMPHASIS = "*"
 
@@ -209,10 +213,12 @@ TITLE_EMPHASIS = "*"
 # any stays stuck; a run in between prints nothing about them. The record of
 # what was said lives beside the other platform watches' ledgers.
 REMIND_AFTER_DAYS = 7
-# A daily job's start drifts by seconds to minutes, so a week measured to the
-# second would slip the reminder to the eighth day; this much early still counts.
-REMIND_SLACK_SECONDS = 10 * 60
 SECONDS_PER_HOUR = 3600
+# The run that posted may have been a catch-up hours after 12:35 UTC (the
+# scheduler fires a missed daily job once, whenever the gateway is back), so a
+# week measured from it would slip the reminder to the eighth day. Half a day
+# early still counts: a once-a-day job cannot fire twice inside that.
+REMIND_SLACK_SECONDS = 12 * SECONDS_PER_HOUR
 STATE_ENV = "KANBAN_HEALTH_STATE"
 PROFILES_DIR = "profiles"
 PLATFORM_PROFILE = "platform"
@@ -422,7 +428,9 @@ def plain_title(title: str) -> str:
         return text
     cut = text[: STUCK_TITLE_MAX_CHARS - len(ELLIPSIS)]
     head, space, _rest = cut.rpartition(" ")
-    return (head if space else cut).rstrip() + ELLIPSIS
+    if not space or len(head) * CLIP_MIN_SHARE < len(cut):
+        head = cut
+    return head.rstrip() + ELLIPSIS
 
 
 def status_line(person: bool, age_hours: float) -> str:
@@ -507,11 +515,16 @@ def stuck_due(tasks: list, state: dict, now: float) -> tuple[bool, dict]:
     Said when a task is stuck that the last post did not name, or when
     ``REMIND_AFTER_DAYS`` have passed since the last post (less
     ``REMIND_SLACK_SECONDS``) and any task is still stuck. A task that comes
-    unstuck drops out of the record, so if it sticks again it is new. ``now`` is epoch seconds.
+    unstuck drops out of the record, so if it sticks again it is new. A
+    ``said_at`` ahead of ``now`` (a clock step, a hand-edited record) is treated
+    as no post at all, so it cannot silence the tasks until it ages a week.
+    ``now`` is epoch seconds.
     """
     current = sorted({task["task_id"] for task in tasks})
     said = set(state.get(STATE_SAID_KEY) or [])
     said_at = state.get(STATE_SAID_AT_KEY)
+    if said_at is not None and said_at > now:
+        said_at = None
     if not current:
         return False, {STATE_SAID_KEY: [], STATE_SAID_AT_KEY: None}
     remind_after = REMIND_AFTER_DAYS * HOURS_PER_DAY * SECONDS_PER_HOUR - REMIND_SLACK_SECONDS

@@ -437,6 +437,10 @@ class StuckTasksTests(unittest.TestCase):
         self.assertEqual(kbh.plain_title("x" * 300), "x" * (kbh.STUCK_TITLE_MAX_CHARS - 1) + "…")
         self.assertEqual(kbh.plain_title("  "), "Untitled task")
 
+    def test_a_short_word_before_a_long_token_keeps_the_hard_cut(self):
+        title = kbh.plain_title("Investigate " + "x" * 200)
+        self.assertEqual(title, ("Investigate " + "x" * 200)[: kbh.STUCK_TITLE_MAX_CHARS - 1] + "…")
+
 
 class StuckDueTests(unittest.TestCase):
     """Said when a task first gets stuck, then weekly while any stays stuck."""
@@ -467,6 +471,17 @@ class StuckDueTests(unittest.TestCase):
         self.assertTrue(due)
         due, _ = kbh.stuck_due([stuck("a", "A")], state, 1000.0 + week - kbh.REMIND_SLACK_SECONDS - 1)
         self.assertFalse(due)
+
+    def test_a_catch_up_post_hours_late_still_reminds_on_the_seventh_day(self):
+        posted = 1000.0 + 4 * 3600  # a catch-up four hours after the usual slot
+        due, _ = kbh.stuck_due([stuck("a", "A")], {"said": ["a"], "said_at": posted}, 1000.0 + 7 * self.DAY)
+        self.assertTrue(due)
+
+    def test_a_said_at_ahead_of_the_clock_does_not_silence_the_tasks(self):
+        now = 1000.0
+        due, kept = kbh.stuck_due([stuck("a", "A")], {"said": ["a"], "said_at": now + 3 * self.DAY}, now)
+        self.assertTrue(due)
+        self.assertEqual(kept["said_at"], now)
 
     def test_a_newly_stuck_task_is_said_with_the_rest_and_restarts_the_week(self):
         now = 1000.0 + 2 * self.DAY
