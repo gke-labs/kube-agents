@@ -63,7 +63,8 @@ needs an entry in `hack/eval/inject-lane-exclusions.txt`. A first line of
 prompt an ask the harness stops once it has filed a card
 ([`bench/kube_agents_bench/stop_hook.py`](../../bench/kube_agents_bench/stop_hook.py)); it runs
 only over the inject transport, so the case needs an entry in
-`hack/eval/api-lane-exclusions.txt`.
+`hack/eval/api-lane-exclusions.txt`. The harness writes two entries for such a case,
+`harness_stop_sent` and `harness_cards_stopped`, and the case's `tool_called` objectives name them.
 
 `expected_output` is the judge's reference. It feeds `OutcomeValidity` and, where the
 case declares `documentation.constraints`, `ChecklistScore`. It never gates a case that

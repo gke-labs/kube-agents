@@ -3761,7 +3761,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # The repository this unit's agent writes to, emptied of every agent pull
   # request and every branch but the default and read back, so repetitions
   # 2 and 3 start as 1 did and a leftover from an earlier lease is never what
-  # the agent builds on (#2260). Only for a case that requests a pull request:
+  # the agent builds on (#2260). Only for a case that requests a pull request, or a stopped ask:
   # those run one at a time after every other unit (unit_phase), so nothing a
   # sibling is working on is open here. Not clean: the unit does not run, the
   # locks go back, and the repetition grades MISSING -- unless what stopped it
