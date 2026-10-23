@@ -552,3 +552,37 @@ func TestThePasswordFilePathHoldsTheConsoleGrants(t *testing.T) {
 		t.Errorf("status over the password-file path: cards %v, problems %v", st.AgentCards, st.Problems)
 	}
 }
+
+// A connection_status call whose request ends before the read does (a stop,
+// or the caller's deadline) is an error, never a status reading as a
+// disconnected bus.
+func TestAStatusCallThatEndsEarlyIsAnErrorNotDisconnected(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	b := &NATSBus{now: time.Now, readBus: func(context.Context) BusStatus {
+		<-release
+		return BusStatus{URL: "the-read", Connected: true}
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	text, err := ConnectionStatusTool(b).Call(ctx, nil)
+	if err == nil || strings.Contains(text, "disconnected") {
+		t.Errorf("an early-ended call returned %q, err %v; want an error and no status", text, err)
+	}
+}
+
+// A read that panics is turned into a problem, stored, and its waiters are
+// released: a later call gets an answer instead of waiting forever.
+func TestAPanickingStatusReadIsReportedAndReleased(t *testing.T) {
+	b := &NATSBus{now: time.Now, readBus: func(context.Context) BusStatus { panic("boom") }}
+	done := make(chan BusStatus, 1)
+	go func() { done <- b.Status(context.Background()) }()
+	select {
+	case st := <-done:
+		if len(st.Problems) == 0 || !strings.Contains(st.Problems[0], "boom") {
+			t.Errorf("problems = %v, want the panic reported", st.Problems)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a panicking read left its caller waiting")
+	}
+}

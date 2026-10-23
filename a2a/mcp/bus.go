@@ -176,7 +176,7 @@ func (b *NATSBus) Status(ctx context.Context) BusStatus {
 			Deployment: b.cfg.Deployment,
 			URL:        b.cfg.URL,
 			User:       b.cfg.User,
-			Problems:   []string{fmt.Sprintf("the status read was still running when the caller gave up: %v", ctx.Err())},
+			Problems:   []string{fmt.Sprintf("the request ended while the status read was still running: %v", ctx.Err())},
 		}
 	}
 }
@@ -185,12 +185,21 @@ func (b *NATSBus) Status(ctx context.Context) BusStatus {
 func (b *NATSBus) refresh(sr *statusRead) {
 	rctx, cancel := context.WithTimeout(context.Background(), statusTimeout)
 	defer cancel()
+	// The read runs outside net/http's per-request recovery, so a panic in
+	// it is turned into a problem here; either way the read is stored and
+	// its waiters released, or every later caller would wait on it.
+	defer func() {
+		if p := recover(); p != nil {
+			sr.st = BusStatus{Deployment: b.cfg.Deployment, URL: b.cfg.URL, User: b.cfg.User,
+				Problems: []string{fmt.Sprintf("the status read failed: %v", p)}}
+		}
+		b.mu.Lock()
+		b.cached, b.cachedAt = sr.st, b.now()
+		b.inflight = nil
+		b.mu.Unlock()
+		close(sr.done)
+	}()
 	sr.st = b.readBus(rctx)
-	b.mu.Lock()
-	b.cached, b.cachedAt = sr.st, b.now()
-	b.inflight = nil
-	b.mu.Unlock()
-	close(sr.done)
 }
 
 func (b *NATSBus) read(ctx context.Context) BusStatus {

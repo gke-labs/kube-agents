@@ -412,7 +412,7 @@ func (r *PlatformAgentReconciler) deleteA2AObjectIfOwned(ctx context.Context, ag
 		return client.IgnoreNotFound(err)
 	}
 	if !metav1.IsControlledBy(obj, agent) {
-		logf.FromContext(ctx).Info("skipping unowned A2A object under a reserved name",
+		logf.FromContext(ctx).V(1).Info("skipping unowned A2A object under a reserved name",
 			"kind", fmt.Sprintf("%T", obj), "namespace", obj.GetNamespace(), "name", obj.GetName())
 		return nil
 	}
