@@ -945,7 +945,7 @@ The verifier is the one implementation; the scan runs it and reads its report.
 
 The secret is a fine-grained personal access token: resource owner `gke-agentic`, repository access the pool's `*-infra` repositories picked one by one (a fine-grained token has no wildcard, so a new pool project's repository is added to the token's list before the project is registered, as `docs/ci-pool-projects.md` 5.4 does for the ledger App's installation), permission Repository -> Metadata: read-only and nothing else, expiry one year at most. Whoever creates it records their name and the expiry date here: held by _(unset)_, expires _(unset)_. Its expiry is silent by design: the check goes "not checked" on every project and the hourly digest reads "35 checks not read in full", with no alert and no issue, so the owner puts the renewal on a calendar. The durable form is the one 5.4 chose for the ledger read, a third App holding Metadata: read-only on the selected repositories, its PEM as the repository secret and `actions/create-github-app-token` in the step exporting `GH_TOKEN`; the verifier reads only `GH_TOKEN`, so that swap is a workflow-step and docs change.
 Left out: the fleet fixtures (the fleet scan reads those), the warm-cache reader grants in the Prow project (`warm_cache`), the other GitHub-reading checks
-(`github_repo_and_app`, `gitops_declaration`, `ledger_read_credential`; each needs a credential the bot must not hold), the minter check's signing half (`token_minter`; the scan runs `token_minter_kms`), the mapping (about the checkout).
+(`github_repo_and_app`, `gitops_declaration`, `gitops_workload_manifest`, `ledger_read_credential`; each needs a credential the bot must not hold), the GitLab read of the same fixture (`gitlab_workload_manifest`, the pool's GitLab token), the minter check's signing half (`token_minter`; the scan runs `token_minter_kms`), the mapping (about the checkout).
 
 **The document.** `pool-state.json` has the fleet scan's shape. Per project,
 `checks` holds one `{state, detail}` per verifier check (`healthy`, `drifted`,
@@ -1104,3 +1104,12 @@ An incoming-webhook URL in Secret Manager
 (`ci-health-chat-webhook`, `kube-agents-prow`) is the optional alternative.
 
 `post_health.py --dry-run` prints the messages instead of posting them.
+
+The release-stage notifier (`.github/workflows/release-stage-broken-notify.yml`,
+`scripts/release/notify_release_stage_broken.py`) posts to the same space with
+the same app identity and variables when it opens or closes a
+`ci:release-stage-broken` issue for a failed run of a release pipeline
+([`scripts/release/README.md`](../scripts/release/README.md), "Pipeline Cadence &
+Execution Flow", the "When a stage fails" bullet). The workflow mints the app
+token and reads no webhook URL. `CI_HEALTH_MUTE=true` silences it too, and its
+issues still file.

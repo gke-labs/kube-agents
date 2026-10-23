@@ -27,6 +27,11 @@ readonly IMAGE_TIRITH=/usr/local/bin/tirith
 # The first four bytes of an ELF executable, in hex: step 4.4's check that a file
 # named tirith is a binary before it removes it.
 readonly ELF_MAGIC_HEX=7f454c46
+# The model-call stale bound (providers.custom.stale_timeout_seconds) every profile
+# shipped with before the kanban workers got a shorter one. The cluster loop moves a
+# Cluster Agent profile that still holds it to its template's value
+# (migrate_stale_timeout_from_template).
+readonly OLD_SHIPPED_STALE_TIMEOUT_SECONDS=600
 
 export TARGET_DIR="${PLATFORM_AGENT_HOME:-/opt/data}"
 export HERMES_HOME="$TARGET_DIR"
@@ -686,6 +691,66 @@ if added:
     os.replace(tmp_path, live_path)
     print(f"[ENTRYPOINT] config backfill: restored {len(added)} key(s) the live file did not hold: {', '.join(added)}")
 PYEOF
+}
+
+# Move a live config.yaml from the stale bound every profile used to ship with to
+# the one its image template sets now, and change nothing else. $1 = the template,
+# $2 = the live file.
+#
+# Hermes reads providers.custom.stale_timeout_seconds to decide how long a model
+# call may send nothing before it drops the stream and retries
+# (hermes_cli/timeouts.py). Every profile shipped with 600s. The kanban workers
+# now ship with a shorter bound (agents/cluster/config.yaml carries the reason),
+# but a Cluster Agent's config.yaml is not force-synced, and the back-fill above
+# only adds keys the file lacks. So a cluster onboarded before the change keeps
+# 600s for the life of the volume, while a cluster onboarded after it gets the
+# new bound.
+#
+# Only the old shipped value moves. A profile that holds any other value has
+# had it set on purpose, and keeps it. The rewrite is atomic for the same reason
+# the back-fill's is: a torn config.yaml loses `cluster_identity`.
+#
+# The caller reports its own failure, as for the back-fill.
+migrate_stale_timeout_from_template() {
+    "$INSTALL_DIR/.venv/bin/python3" - "$1" "$2" "$OLD_SHIPPED_STALE_TIMEOUT_SECONDS" <<'STALEEOF'
+import os
+import sys
+
+import yaml
+
+template_path, live_path, old_value = sys.argv[1], sys.argv[2], int(sys.argv[3])
+PROVIDERS_KEY = "providers"
+PROVIDER = "custom"
+STALE_KEY = "stale_timeout_seconds"
+
+
+def stale_block(config):
+    providers = config.get(PROVIDERS_KEY) if isinstance(config, dict) else None
+    provider = providers.get(PROVIDER) if isinstance(providers, dict) else None
+    return provider if isinstance(provider, dict) else None
+
+
+with open(template_path) as fh:
+    template = yaml.safe_load(fh) or {}
+with open(live_path) as fh:
+    live = yaml.safe_load(fh) or {}
+
+template_block = stale_block(template)
+live_block = stale_block(live)
+if template_block is None or live_block is None:
+    raise SystemExit(0)
+target = template_block.get(STALE_KEY)
+current = live_block.get(STALE_KEY)
+if current != old_value or not isinstance(target, int) or target == old_value:
+    raise SystemExit(0)
+
+live_block[STALE_KEY] = target
+tmp_path = live_path + ".stale.tmp"
+with open(tmp_path, "w") as fh:
+    yaml.safe_dump(live, fh, sort_keys=False, default_flow_style=False)
+os.replace(tmp_path, live_path)
+print(f"[ENTRYPOINT] stale timeout migrate: {PROVIDERS_KEY}.{PROVIDER}.{STALE_KEY} {current} -> {target}")
+STALEEOF
 }
 
 # Make a live config.yaml send the User-Agent its image template sends on every remote
@@ -1602,6 +1667,14 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
         if [ -f "$CLUSTER_TEMPLATE/config.yaml" ] && [ -f "$d/config.yaml" ] && [ -w "$d/config.yaml" ]; then
             backfill_config_from_template "$CLUSTER_TEMPLATE/config.yaml" "$d/config.yaml" \
                 || echo "WARN: config back-fill failed for $d/config.yaml; this cluster agent keeps the keys it was scaffolded with" >&2
+        fi
+        # Third targeted self-heal, same file: move the model-call stale bound from the
+        # 600s every profile shipped with to the template's worker bound. Fill-only
+        # cannot do it, because the key is already there. A value other than 600 was
+        # set on purpose and stays. Before the User-Agent repair, after the back-fill.
+        if [ -f "$CLUSTER_TEMPLATE/config.yaml" ] && [ -f "$d/config.yaml" ] && [ -w "$d/config.yaml" ]; then
+            migrate_stale_timeout_from_template "$CLUSTER_TEMPLATE/config.yaml" "$d/config.yaml" \
+                || echo "WARN: stale timeout migration failed for $d/config.yaml; this cluster agent keeps its old model-call bound" >&2
         fi
         # Second targeted self-heal, same file, same reason it is not force-synced: the
         # User-Agent the profile's remote MCP calls carry is image-owned, and lives in

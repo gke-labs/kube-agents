@@ -213,7 +213,8 @@ Three properties of the listing follow from what a suppressed event is:
   printed as a fact about every row in it. A session server predating the Info gate wrote
   `notified = 1` on informational events, so for a day or two after an upgrade a group can hold both
   outcomes; the key splits them rather than announcing a delivered event under a heading that says
-  it never arrived.
+  it never arrived. A row folded into its workload's open incident is keyed as one that went out,
+  since its incident was admitted.
 
 ## What this recap does not report
 
@@ -308,6 +309,13 @@ print. So a day whose only withheld traffic was excluded informational events pr
 grades 🟢, and what bounds that claim is the qualifier line rather than the emoji. What an exclusion
 cannot do is any of the above to a ceiling drop or a failed delivery, which is the property that
 matters and is the paragraph above.
+
+One more class of `Critical` or `Warning` row never reached chat and is neither named nor counted:
+one folded into its workload's open incident (`duplicate_of` set, with
+`INCIDENT_WORKLOAD_DEDUP_SECONDS` on). An incident for that workload was admitted, so nothing was
+withheld. The row adds to the headline's forwarded total, and its group is keyed as one that went
+out, so it adds to the group count only when its reason or severity differs from its anchor's, or
+its anchor's chat post failed.
 
 ## Running it by hand
 

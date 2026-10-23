@@ -844,11 +844,29 @@ CHAT_REPORT_TEXT_KEY = "text"
 # the same run must not turn silent, and the ids its ledger body marked new.
 CHAT_REPORT_SILENT_OK_KEY = "silent_ok"
 CHAT_REPORT_NEW_IDS_KEY = "new_ids"
-# Above a later `finish`'s report in the same entry: its counts are measured
-# against the report above it, or against what an earlier `finish` that died
-# before its report published, not against the previous run.
-CHAT_REPORT_REFINISH_LABEL = "Re-run in this audit; counts are against the report above."
+# Saved on the entry by the run's first `finish` of the repository, before it
+# touches the ledger: the previous run's ids it joined against, whether that
+# memory was known, and whether it was written under another id scheme. A
+# later `finish` reads the store the earlier one rewrote, so it joins against
+# these instead to count the whole run in its chat report.
+CHAT_REPORT_BASELINE_IDS_KEY = "run_baseline_ids"
+CHAT_REPORT_BASELINE_KNOWN_KEY = "run_baseline_known"
+CHAT_REPORT_BASELINE_STALE_KEY = "run_baseline_stale"
+# Every id the previous run filed, rendered or not (a body over budget cuts some):
+# none is new on any count of this run, as `finish`'s own count already holds.
+CHAT_REPORT_BASELINE_FILED_KEY = "run_baseline_filed"
+# Above a later `finish`'s report in the same entry. Its counts cover the whole
+# run when they came from the entry's baseline; otherwise (no ledger, a HELD
+# report, an entry an older image wrote) they are measured against the report
+# above it, or against what an earlier `finish` that died before its report
+# published.
+CHAT_REPORT_REFINISH_LABEL = "Re-run in this audit; counts cover the whole run, the report above included."
 CHAT_REPORT_RERUN_LABEL = (
+    "Re-run in this audit after an earlier finish published and stopped; "
+    "counts cover the whole run."
+)
+CHAT_REPORT_REFINISH_RELATIVE_LABEL = "Re-run in this audit; counts are against the report above."
+CHAT_REPORT_RERUN_RELATIVE_LABEL = (
     "Re-run in this audit after an earlier finish published and stopped; "
     "counts are against what it published."
 )
@@ -3361,8 +3379,77 @@ def save_chat_verdict(
         log(f"WARNING: chat report for {audit_id} not saved: {exc}")
 
 
+class RunBaseline(NamedTuple):
+    """The previous run's ids a `finish` counts its chat report against."""
+
+    ids: list[str]
+    known: bool
+    stale_scheme: bool
+    # Every id the previous run filed, rendered or not; never counted new.
+    filed: list[str]
+    # Read off the entry an earlier `finish` of this run saved it on.
+    from_entry: bool
+
+
+def run_baseline(
+    audit_id: str,
+    repo: str,
+    previous_ids: list[str],
+    delta_known: bool,
+    stale_scheme: bool,
+    filed_ids: Iterable[str],
+    now: datetime,
+) -> RunBaseline:
+    """The baseline on `repo`'s entry in this run, else this `finish`'s own, saved there.
+
+    Best-effort: never fails the run. Called before the ledger is touched, so a
+    `finish` that dies anywhere after it still leaves the baseline for its
+    re-run. Never replaced inside a run, so every later `finish` joins the one
+    the first saw. Saved only on an entry no `finish` has filled: an earlier
+    one that saved none (an older image, a failed write) leaves this one's
+    memory a mid-run snapshot, which no later `finish` may count from.
+    """
+    own = RunBaseline(list(previous_ids), bool(delta_known), bool(stale_scheme), sorted(set(filed_ids)), False)
+    record = _live_chat_record(audit_id, now)
+    filled = None if record is None else _filled_part(record, repo)
+    part = filled or (None if record is None else _pending_part(record, repo))
+    if part is None:
+        return own
+    ids = part.get(CHAT_REPORT_BASELINE_IDS_KEY)
+    known = part.get(CHAT_REPORT_BASELINE_KNOWN_KEY)
+    stale = part.get(CHAT_REPORT_BASELINE_STALE_KEY)
+    filed = part.get(CHAT_REPORT_BASELINE_FILED_KEY)
+    if (
+        isinstance(ids, list)
+        and all(isinstance(fid, str) for fid in ids)
+        and isinstance(known, bool)
+        and isinstance(stale, bool)
+        and isinstance(filed, list)
+        and all(isinstance(fid, str) for fid in filed)
+    ):
+        return RunBaseline(ids, known, stale, filed, True)
+    if filled is not None:
+        return own
+    part[CHAT_REPORT_BASELINE_IDS_KEY] = own.ids
+    part[CHAT_REPORT_BASELINE_KNOWN_KEY] = own.known
+    part[CHAT_REPORT_BASELINE_STALE_KEY] = own.stale_scheme
+    part[CHAT_REPORT_BASELINE_FILED_KEY] = own.filed
+    record[CHAT_REPORT_UPDATED_KEY] = now.timestamp()
+    try:
+        _write_chat_record(audit_id, record)
+    except OSError as exc:
+        log(f"WARNING: chat report baseline for {audit_id} not saved: {exc}")
+    return own
+
+
 def append_chat_report(
-    audit_id: str, repo: str, text: str, now: datetime, *, refinish: bool = False
+    audit_id: str,
+    repo: str,
+    text: str,
+    now: datetime,
+    *,
+    refinish: bool = False,
+    whole_run: bool = False,
 ) -> None:
     """Add `repo`'s report to this run's chat report. Best-effort: never fails the run.
 
@@ -3370,14 +3457,18 @@ def append_chat_report(
     the same run adds its report under the earlier one, so neither that report
     nor another repository's is lost. A `finish` with no such entry adds one,
     and with no current record (see `_current_chat_record`) opens one, so its
-    report still reaches the relay under a run of its own.
+    report still reaches the relay under a run of its own. `whole_run` says
+    the report's counts are the run's (see `run_baseline`), which its label
+    then says.
     """
+    refinish_label = CHAT_REPORT_REFINISH_LABEL if whole_run else CHAT_REPORT_REFINISH_RELATIVE_LABEL
+    rerun_label = CHAT_REPORT_RERUN_LABEL if whole_run else CHAT_REPORT_RERUN_RELATIVE_LABEL
     record = _live_chat_record(audit_id, now)
     part = None if record is None else _filled_part(record, repo)
     if part is not None and part.get(CHAT_REPORT_TEXT_KEY):
-        part[CHAT_REPORT_TEXT_KEY] = f"{part[CHAT_REPORT_TEXT_KEY]}\n\n{CHAT_REPORT_REFINISH_LABEL}\n{text}"
+        part[CHAT_REPORT_TEXT_KEY] = f"{part[CHAT_REPORT_TEXT_KEY]}\n\n{refinish_label}\n{text}"
     elif part is not None:
-        part[CHAT_REPORT_TEXT_KEY] = f"{CHAT_REPORT_RERUN_LABEL}\n{text}" if refinish else text
+        part[CHAT_REPORT_TEXT_KEY] = f"{rerun_label}\n{text}" if refinish else text
     else:
         record = _current_chat_record(audit_id, repo, now)
         pending = _pending_part(record, repo)
@@ -3397,7 +3488,13 @@ def append_chat_report(
         log(f"WARNING: chat report for {audit_id} not written: {exc}")
 
 
-def render_chat_report(audit_id: str, payload: dict, data: dict, delta_known: bool = True) -> str:
+def render_chat_report(
+    audit_id: str,
+    payload: dict,
+    data: dict,
+    delta_known: bool = True,
+    counts: tuple[int, int] | None = None,
+) -> str:
     """The report the chat relay posts for a run that published to a ledger.
 
     Built from `finish`'s own line and the findings document, so the channel
@@ -3407,13 +3504,14 @@ def render_chat_report(audit_id: str, payload: dict, data: dict, delta_known: bo
     (`slack_audit_report._ledger_line`). With no trusted memory of the previous
     run (`delta_known` false) the line's `new` and `resolved` are withheld
     zeros, so it says the change is unknown instead of counting them; a HELD
-    run prints no counts and keeps its own line.
+    run prints no counts and keeps its own line. `counts`, (new, resolved),
+    replace the line's own for a later `finish` that counts the whole run.
     """
     findings = list(data.get("findings") or [])
     clusters = len((data.get("scope") or {}).get("clusters") or [])
     name = audit_name(audit_id)
     status = payload.get("status")
-    resolved = int(payload.get("resolved") or 0)
+    new, resolved = counts or (int(payload.get("new") or 0), int(payload.get("resolved") or 0))
     unaccounted = list(payload.get(UNACCOUNTED_KEY) or [])
     if status == "CLEAN" and delta_known:
         head = f"{name}: clean, 0 findings, {resolved} resolved across {clusters} cluster(s)."
@@ -3436,7 +3534,7 @@ def render_chat_report(audit_id: str, payload: dict, data: dict, delta_known: bo
         )
     else:
         head = (
-            f"{name}: {int(payload.get('new') or 0)} new, {resolved} resolved; "
+            f"{name}: {new} new, {resolved} resolved; "
             f"{findings_phrase(len(findings))} ({severity_counts(findings)['critical']} critical) "
             f"across {clusters} cluster(s)."
         )
@@ -3874,6 +3972,25 @@ def report_finding_places(
             check, cluster, namespace, _object = derive_finding_id(finding).split(".")
             places[published_id(finding)] = (check, cluster, namespace)
     return places
+
+
+def previous_filed_ids(
+    memory: dict | None, previous_body: str, existing_issue: int | None, stale_scheme: bool
+) -> set[str]:
+    """Every id the previous run filed, rendered or not; what `new` is measured against.
+
+    From the stored document when there is one (`report_filed`); else from the
+    complete block a body that cut findings for space wrote. Empty for a first
+    run, a seeded memory with no such block, or another identity scheme.
+    """
+    filed = report_filed(memory) if existing_issue is not None and not stale_scheme else None
+    if filed is not None:
+        return set(filed[0])
+    complete = ALL_FINDINGS_RE.findall(normalise_newlines(previous_body))
+    try:
+        return set(json.loads(complete[-1])) if complete else set()
+    except (json.JSONDecodeError, TypeError):
+        return set()
 
 
 def report_filed(envelope: dict | None) -> tuple[set[str], set[tuple[str, str]]] | None:
@@ -18793,6 +18910,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             f"{ID_SCHEME}; withholding 'resolved' this run rather than reporting "
             "a rename as a fix."
         )
+    filed_cut = previous_filed_ids(memory, previous_body, existing_issue, stale_scheme)
+    baseline = run_baseline(audit_id, repo, previous_ids, delta_known, stale_scheme, filed_cut, now)
     # Every finding in the document, rendered or not. The stale-close pass
     # below reads this set and must keep reading it: a finding the body budget
     # dropped still reproduces, and retiring its pull request on that basis
@@ -19489,10 +19608,23 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             now,
             ledger_unchanged=body_untouched,
         )
+        # A HELD line prints no counts, so it keeps its own label.
+        whole_run = baseline.from_entry and payload["status"] == "CLEAN"
+        run_resolved = 0 if gaps else len(baseline.ids)
         append_chat_report(
-        audit_id, repo, render_chat_report(audit_id, payload, data, delta_known), now,
-        refinish=bool(payload.get(REFINISH_KEY)),
-    )
+            audit_id,
+            repo,
+            render_chat_report(
+                audit_id,
+                payload,
+                data,
+                baseline.known if whole_run else delta_known,
+                (0, run_resolved) if whole_run else None,
+            ),
+            now,
+            refinish=bool(payload.get(REFINISH_KEY)),
+            whole_run=whole_run,
+        )
         print(json.dumps(payload))
         return
 
@@ -19657,17 +19789,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # that one did not: a ledger that cut findings for space, and one written
     # before cut findings were listed, would announce them all on the first
     # run that has room.
-    if filed is not None:
-        new_ids = [fid for fid in new_ids if fid not in filed[0]]
-    else:
-        # A seeded memory has no document, but a body that cut findings named
-        # every one it filed in its complete block.
-        complete = ALL_FINDINGS_RE.findall(normalise_newlines(previous_body))
-        try:
-            cut = set(json.loads(complete[-1])) if complete else set()
-        except (json.JSONDecodeError, TypeError):
-            cut = set()
-        new_ids = [fid for fid in new_ids if fid not in cut]
+    new_ids = [fid for fid in new_ids if fid not in filed_cut]
     # Held back again for the collector, on the same principle as the coverage
     # rule one source further out: a candidate the collector still emits is the
     # condition still holding, whatever this run's document did or did not say
@@ -19996,9 +20118,29 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         ),
         now,
     )
+    run_counts = None
+    if baseline.from_entry and baseline.known:
+        # The run's delta, on the yardsticks and filters this run's own took.
+        run_new, run_resolved = compute_delta(baseline.ids, rendered.rendered_ids, current_ids)
+        run_new = [fid for fid in run_new if fid not in set(baseline.filed)]
+        if any(fid in still_flagged - held_exclude for fid in run_resolved):
+            run_resolved = [fid for fid in run_resolved if fid not in still_flagged]
+        if gaps or baseline.stale_scheme:
+            run_resolved = []
+        run_counts = (len(run_new), len(run_resolved))
     append_chat_report(
-        audit_id, repo, render_chat_report(audit_id, payload, data, delta_known), now,
+        audit_id,
+        repo,
+        render_chat_report(
+            audit_id,
+            payload,
+            data,
+            baseline.known if baseline.from_entry else delta_known,
+            run_counts,
+        ),
+        now,
         refinish=bool(payload.get(REFINISH_KEY)),
+        whole_run=baseline.from_entry,
     )
     print(json.dumps(payload))
 

@@ -58,14 +58,18 @@ variable "agent_deployment" {
   default     = "platform-agent-gateway"
 }
 
-# A variable rather than a literal for the same reason as the two above: the
-# watcher is a peer process inside this container, not a container of its own,
-# so a rename in deploy/ would otherwise surface here as a 300s timeout blaming
-# the watcher rather than as an error naming the container.
 variable "agent_container" {
   type        = string
-  description = "Container inside agent_deployment that k8s-event-watcher runs alongside"
-  default     = "envoy-credential-proxy"
+  # k8s-event-watcher is not a container of its own: it runs inside the
+  # agent-api-auth sidecar of the gateway pod (buildAgentAPIAuthSidecar in
+  # k8s-operator/internal/controller/platformagent_manifests.go). It used to
+  # sit beside envoy-credential-proxy, which #913 moved to its own pod on
+  # 2026-09-05, and a default still naming it timed out the watcher wait on
+  # every apply (#3681). Step 0a of main.tf refuses a container the pod does
+  # not have, before anything is planted; tests/test_autoops_incident_plant.py
+  # pins this default to the operator's agentAPIAuthContainerName.
+  description = "Container inside agent_deployment that k8s-event-watcher runs inside"
+  default     = "agent-api-auth"
 }
 
 # ---------------------------------------------------------------------------
@@ -119,6 +123,26 @@ variable "allocate_mib" {
   type        = number
   description = "Single bounded allocation the container makes, in MiB. Must exceed memory_limit_mib."
   default     = 96
+}
+
+# More than one is incident-triage-workload-fold's scenario: every replica
+# crash-loops the same way at once, so the watcher opens one incident per pod
+# and the daemon has to fold them into one.
+variable "replicas" {
+  type        = number
+  description = "Replicas of the OOM-killed Deployment"
+  default     = 1
+}
+
+# incident-triage-workload-fold's repetitions run a few minutes apart, inside
+# the daemon's fold window, so a later repetition's replicas fold into the
+# first one's incident and the watcher logs `folded` rather than `fire`. That
+# case grades the fold and sets this; the others wait on their own card and
+# leave it off.
+variable "accept_folded" {
+  type        = bool
+  description = "Count the watcher's `folded` log line, as well as `fire`, as the incident being handled"
+  default     = false
 }
 
 # Identify the CI run that planted this, so a janitor can find what a run killed

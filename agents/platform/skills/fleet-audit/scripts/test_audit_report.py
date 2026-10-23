@@ -27211,6 +27211,10 @@ class TestNoForge(BaseTestCase):
         self.assertEqual((out["new"], out["resolved"]), (0, 0))
         self.assertFalse(out["silent_ok"])
         self.assertTrue(out[audit_report.SILENT_FLOOR_KEY])
+        # Its summary counts against the earlier one, and its label says so.
+        record = json.loads(Path(audit_report.chat_report_path_for(AUDIT)).read_text(encoding="utf-8"))
+        [part] = record["parts"]
+        self.assertTrue(part["text"].startswith(audit_report.CHAT_REPORT_RERUN_RELATIVE_LABEL + "\n"))
 
     def test_a_withheld_posture_is_not_reported_as_held(self):
         self.finish(make_doc())
@@ -27700,11 +27704,207 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         self.assertEqual(repo, "acme/fleet")
         kept, appended = text.split(f"\n\n{audit_report.CHAT_REPORT_REFINISH_LABEL}\n")
         self.assertEqual(kept, first_text)
-        self.assertIn("0 new", appended.splitlines()[0])
+        # The whole run's count on the chat line; its own on the JSON line.
+        self.assertIn(": 1 new, 0 resolved;", appended.splitlines()[0])
+        self.assertEqual(second["new"], 0)
         self.assertNotEqual(self.chat_record()["run"], run)
         stored = json.loads((self.store_dir() / "latest.json").read_text(encoding="utf-8"))
         self.assertFalse(stored["silent_ok"])
         self.assertTrue(stored[audit_report.SILENT_FLOOR_KEY])
+
+    def heads(self):
+        """The audit line of each report in the entry, in order."""
+        [(_, text)] = self.entries()
+        return [line for line in text.splitlines() if line.startswith(f"{audit_report.audit_name(AUDIT)}: ")]
+
+    def on_a_ledger_of(self, *fids):
+        """Leave the open ledger and the store a previous run left with `fids`."""
+        body = published_body(
+            make_doc(findings=[make_finding(fid=fid, severity="major") for fid in fids]), generated_at=NOW
+        )
+        self.seed_report(body)
+        self.harness.replies["issue-list"] = self.issue_list()
+        return body
+
+    def test_a_later_finish_counts_what_the_earlier_one_resolved(self):
+        self.start()
+        self.on_a_ledger_of("a", "b")
+        doc = make_doc(findings=[make_finding(fid="a", severity="major")])
+        self.assertEqual(self.run_finish(doc), 0)
+        self.assertEqual(self.run_finish(doc), 0)
+        self.assertEqual(self.stdout_json()["resolved"], 0)
+        first, second = self.heads()
+        self.assertIn(": 0 new, 1 resolved;", first)
+        self.assertIn(": 0 new, 1 resolved;", second)
+
+    def test_a_finding_new_then_gone_in_one_run_is_neither_new_nor_resolved(self):
+        self.start()
+        self.on_a_ledger_of("a")
+        self.assertEqual(
+            self.run_finish(make_doc(findings=[make_finding(fid=f, severity="major") for f in ("a", "b")])), 0
+        )
+        self.assertEqual(self.run_finish(make_doc(findings=[make_finding(fid="a", severity="major")])), 0)
+        self.assertEqual(self.stdout_json()["resolved"], 1)
+        first, second = self.heads()
+        self.assertIn(": 1 new, 0 resolved;", first)
+        self.assertIn(": 0 new, 0 resolved;", second)
+
+    def test_a_finding_resolved_then_back_in_one_run_is_neither_new_nor_resolved(self):
+        self.start()
+        self.on_a_ledger_of("a", "b")
+        both = make_doc(findings=[make_finding(fid=f, severity="major") for f in ("a", "b")])
+        self.assertEqual(self.run_finish(make_doc(findings=[make_finding(fid="a", severity="major")])), 0)
+        self.assertEqual(self.run_finish(both), 0)
+        self.assertEqual(self.stdout_json()["new"], 1)
+        first, second = self.heads()
+        self.assertIn(": 0 new, 1 resolved;", first)
+        self.assertIn(": 0 new, 0 resolved;", second)
+
+    def test_a_third_finish_still_counts_from_the_run_start(self):
+        self.start()
+        self.assertEqual(self.run_finish(make_doc(findings=[make_finding(fid="a", severity="major")])), 0)
+        both = make_doc(findings=[make_finding(fid=f, severity="major") for f in ("a", "b")])
+        self.assertEqual(self.finish_again(both), 0)
+        self.assertEqual(self.finish_again(both), 0)
+        self.assertEqual(self.stdout_json()["new"], 0)
+        heads = self.heads()
+        self.assertEqual(len(heads), 3)
+        self.assertIn(": 2 new, 0 resolved;", heads[-1])
+
+    def test_a_finding_the_previous_ledger_filed_but_cut_is_not_the_runs_new(self):
+        """The previous body was over budget: `b` was filed but not rendered, so it is not new."""
+        self.start()
+        ida, idb = derived_id(fid="a"), derived_id(fid="b")
+        body = (
+            f"## Findings\n\n<!-- audit-findings: {json.dumps([ida])} -->\n"
+            f"<!-- audit-findings-all: {json.dumps([ida, idb])} -->\n"
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME} -->\n"
+        )
+        self.previous_document = {
+            "findings": [
+                {"id": ida, "check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments", "object": "Namespace/a"},
+                {"id": idb, "check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments", "object": "Namespace/b"},
+            ]
+        }
+        self.seed_report(body)
+        self.harness.replies["issue-list"] = self.issue_list()
+        doc = make_doc(findings=[make_finding(fid=f, severity="major") for f in ("a", "b")])
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        self.assertEqual(self.stdout_json()["new"], 0)
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        self.assertEqual(self.stdout_json()["new"], 0)
+        first, second = self.heads()
+        self.assertIn(": 0 new, 0 resolved;", first)
+        self.assertIn(": 0 new, 0 resolved;", second)
+        [part] = self.chat_record()["parts"]
+        self.assertEqual(part[audit_report.CHAT_REPORT_BASELINE_FILED_KEY], sorted([ida, idb]))
+
+    def test_a_clean_later_finish_counts_everything_the_run_resolved(self):
+        self.start()
+        self.on_a_ledger_of("a", "b")
+        self.assertEqual(self.run_finish(make_doc(findings=[make_finding(fid="a", severity="major")])), 0)
+        clean = make_doc(findings=[])
+        clean["resolved_because"] = resolved_for(self.stored_ledger_body(AUDIT, "acme/fleet", 42))
+        self.assertEqual(self.run_finish(clean), 0)
+        second = self.stdout_json()
+        self.assertEqual((second["status"], second["resolved"]), ("CLEAN", 1))
+        first, last = self.heads()
+        self.assertIn(": 0 new, 1 resolved;", first)
+        self.assertIn(": clean, 0 findings, 2 resolved", last)
+
+    def test_an_unknown_run_start_says_the_change_is_unknown(self):
+        self.start()
+        self.on_a_ledger_of("a")
+        (self.store_dir() / "latest.json").write_text("{}", encoding="utf-8")
+        doc = make_doc(findings=[make_finding(fid="a", severity="major")])
+        self.assertEqual(self.run_finish(doc), 0)
+        self.assertEqual(self.run_finish(doc), 0)
+        for head in self.heads():
+            self.assertIn("the change since the last run is unknown", head)
+
+    def test_an_entry_with_no_baseline_keeps_the_relative_label(self):
+        self.start()
+        doc = make_doc(findings=[make_finding(fid="a", severity="major")])
+        self.assertEqual(self.run_finish(doc), 0)
+        record = self.chat_record()
+        for part in record["parts"]:
+            for key in (
+                audit_report.CHAT_REPORT_BASELINE_IDS_KEY,
+                audit_report.CHAT_REPORT_BASELINE_KNOWN_KEY,
+                audit_report.CHAT_REPORT_BASELINE_STALE_KEY,
+            ):
+                part.pop(key, None)
+        Path(audit_report.chat_report_path_for(AUDIT)).write_text(json.dumps(record), encoding="utf-8")
+        self.assertEqual(self.finish_again(doc), 0)
+        [(_, text)] = self.entries()
+        self.assertIn(f"\n\n{audit_report.CHAT_REPORT_REFINISH_RELATIVE_LABEL}\n", text)
+        self.assertNotIn(audit_report.CHAT_REPORT_REFINISH_LABEL, text)
+        self.assertIn(": 0 new, 0 resolved;", self.heads()[-1])
+        # Nor does the second save its mid-run memory for a third to count from.
+        self.assertEqual(self.finish_again(doc), 0)
+        [(_, text)] = self.entries()
+        self.assertNotIn(audit_report.CHAT_REPORT_REFINISH_LABEL, text)
+
+    def test_a_coverage_gap_on_a_later_finish_withholds_the_runs_resolved(self):
+        self.start()
+        self.on_a_ledger_of("a", "b")
+        self.assertEqual(self.run_finish(make_doc(findings=[make_finding(fid="a", severity="major")])), 0)
+        gapped = make_doc(
+            findings=[make_finding(fid="a", severity="major")],
+            skipped=[{"cluster": "dr-west", "reason": "unreachable"}],
+        )
+        self.assertEqual(self.run_finish(gapped), 0)
+        first, second = self.heads()
+        self.assertIn(": 0 new, 1 resolved;", first)
+        self.assertIn(": 0 new, 0 resolved;", second)
+
+    def test_a_clean_later_finish_over_a_coverage_gap_claims_nothing_resolved(self):
+        self.start()
+        self.on_a_ledger_of("a", "b")
+        self.assertEqual(self.run_finish(make_doc(findings=[make_finding(fid="a", severity="major")])), 0)
+        clean = make_doc(findings=[], skipped=[{"cluster": "dr-west", "reason": "unreachable"}])
+        clean["resolved_because"] = resolved_for(self.stored_ledger_body(AUDIT, "acme/fleet", 42))
+        self.assertEqual(self.run_finish(clean), 0)
+        self.assertEqual(self.stdout_json()["status"], "CLEAN")
+        self.assertIn(": clean, 0 findings, 0 resolved", self.heads()[-1])
+
+    def test_a_run_that_started_on_another_id_scheme_withholds_its_resolved(self):
+        self.start()
+        body = (
+            f"## Findings\n\n<!-- audit-findings: {json.dumps([derived_id(fid='a'), 'gone.under.old.scheme'])} -->\n"
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME + 1} -->\n"
+        )
+        self.seed_report(body)
+        self.harness.replies["issue-list"] = self.issue_list()
+        doc = make_doc(findings=[make_finding(fid="a", severity="major")])
+        self.assertEqual(self.run_finish(doc), 0)
+        self.assertEqual(self.run_finish(doc), 0)
+        for head in self.heads():
+            self.assertIn(", 0 resolved;", head)
+
+    def test_a_finding_the_collector_still_flags_is_not_the_runs_resolved(self):
+        self.start()
+        self.on_a_ledger_of("a", "b")
+        candidates = [
+            {
+                "check": "netpol-missing",
+                "cluster": "prod-us-east",
+                "namespace": "payments",
+                "object": f"Namespace/{fid}",
+                "severity": "major",
+                "excerpt": "zero NetworkPolicies in payments",
+                "impact": "x",
+                "needs_triage": None,
+            }
+            for fid in ("a", "b")
+        ]
+        manifest = self.tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(_full_manifest(candidates=candidates)), encoding="utf-8")
+        doc = make_doc(findings=[make_finding(fid="a", severity="major")])
+        for _ in range(2):
+            self.assertEqual(self.run_finish(doc, ["--manifest-file", str(manifest)]), 0, self.err)
+        for head in self.heads():
+            self.assertIn(": 0 new, 0 resolved;", head)
 
     def test_a_second_finish_keeps_an_earlier_repositorys_report(self):
         now = datetime.now(timezone.utc)
@@ -27762,6 +27962,7 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         self.assertFalse(self.stdout_json()["silent_ok"])
         [(_, text)] = self.entries()
         self.assertTrue(text.startswith(audit_report.CHAT_REPORT_RERUN_LABEL + "\n"))
+        self.assertIn(": 1 new, 0 resolved;", text.splitlines()[1])
 
     def test_a_clean_second_finish_after_a_clean_one_with_news_is_not_silent(self):
         self.start()
@@ -27818,6 +28019,42 @@ class TestSecondFinishInOneRun(HarnessTestCase):
 
         self.assertEqual(self.finish_again(doc), 0, self.err)
         self.assertEqual(len(self.harness.forge_calls("proposal-create")), opened)
+
+    def test_a_rerun_after_a_finish_died_mid_sweep_counts_the_run(self):
+        self.start()
+        findings = []
+        for i in range(audit_report.AUTO_PROMOTION_CAP + 1):
+            path = f"clusters/prod-us-east/f{i}.yaml"
+            findings.append(
+                make_finding(fid=f"crit-{i}", remediation={"kind": "manifest", "path": path, "note": "n"})
+            )
+            self.touch(path)
+        doc = make_doc(findings=findings)
+        open_pr = audit_report.open_remediation_pr
+        calls = []
+
+        def broker_drops_on_the_second(*args, **kwargs):
+            calls.append(args)
+            if len(calls) == 2:
+                raise audit_report.BrokerUnavailable("the broker did not answer")
+            return open_pr(*args, **kwargs)
+
+        with patch.object(audit_report, "open_remediation_pr", broker_drops_on_the_second):
+            self.assertEqual(self.run_finish(doc), 2)
+        self.assertFalse((self.store_dir() / "latest.json").exists())
+        # With no store yet, the re-run seeds its memory off the ledger the
+        # dead `finish` wrote, as GitHub lists it.
+        [created_body] = self.harness.bodies_for("issue-create")
+        self.harness.listed_body = lambda audit, repo, number: created_body
+        self.harness.replies["proposal-list"] = proposals_view(
+            [pr(100, audit_report.group_branch_for(AUDIT, [findings[0]]))]
+        )
+
+        self.assertEqual(self.finish_again(doc), 0, self.err)
+        [(_, text)] = self.entries()
+        label, head = text.splitlines()[:2]
+        self.assertEqual(label, audit_report.CHAT_REPORT_RERUN_LABEL)
+        self.assertIn(f": {len(findings)} new, 0 resolved;", head)
 
     def test_a_rerun_after_a_broker_lost_mid_sweep_opens_no_second_batch(self):
         self.start()

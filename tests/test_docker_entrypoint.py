@@ -971,8 +971,8 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
         command-not-found behind its `|| echo WARN` and the test would stay green.
         """
         block = _extract_shell_block('if [ -d "$CLUSTER_TEMPLATE" ]; then')
-        script = "set -e\n"
-        for name in ("sync_profile_skills", "backfill_config_from_template", "repair_remote_mcp_user_agent"):
+        script = "set -e\n" + _extract_readonly("OLD_SHIPPED_STALE_TIMEOUT_SECONDS") + "\n"
+        for name in _CLUSTER_LOOP_FUNCTIONS:
             script += _extract_shell_function(name) + "\n"
         script += block
         with tempfile.TemporaryDirectory() as tmp:
@@ -997,6 +997,8 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
             profile.mkdir(parents=True)
             scaffolded = self._scaffolded_cluster_profile(self._OLD_HEADER)
             del scaffolded["context_file_max_chars"]
+            # Scaffolded before the workers' stale bound changed: the migration moves it.
+            scaffolded["providers"]["custom"]["stale_timeout_seconds"] = 600
             (profile / "config.yaml").write_text(
                 yaml.safe_dump(scaffolded, sort_keys=False),
                 encoding="utf-8",
@@ -1036,6 +1038,12 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
             "a cluster profile from before the context-file cap was pinned did not take it",
         )
         self.assertEqual(
+            live["providers"]["custom"]["stale_timeout_seconds"],
+            template["providers"]["custom"]["stale_timeout_seconds"],
+            "a cluster profile scaffolded with the old 600s stale bound kept it",
+        )
+        self.assertIn("stale timeout migrate", proc.stdout)
+        self.assertEqual(
             persona,
             "persona\n\n---\n\n## Target Cluster Identity\n\n- project: p\n- cluster: c\n- location: us-central1\n",
             "the persona copy and identity stamp beside the repair stopped running",
@@ -1050,8 +1058,8 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
         """When the real cluster SOUL.md template is synced onto a cluster profile,
         the startup loop stamps the target cluster identity from config.yaml."""
         block = _extract_shell_block('if [ -d "$CLUSTER_TEMPLATE" ]; then')
-        script = "set -e\n"
-        for name in ("sync_profile_skills", "backfill_config_from_template", "repair_remote_mcp_user_agent"):
+        script = "set -e\n" + _extract_readonly("OLD_SHIPPED_STALE_TIMEOUT_SECONDS") + "\n"
+        for name in _CLUSTER_LOOP_FUNCTIONS:
             script += _extract_shell_function(name) + "\n"
         script += block
         with tempfile.TemporaryDirectory() as tmp:
@@ -1114,8 +1122,8 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
         operator-mounted plugin is a symlink; the loop must leave both as they are.
         """
         block = _extract_shell_block('if [ -d "$CLUSTER_TEMPLATE" ]; then')
-        script = "set -e\n"
-        for name in ("sync_profile_skills", "backfill_config_from_template", "repair_remote_mcp_user_agent"):
+        script = "set -e\n" + _extract_readonly("OLD_SHIPPED_STALE_TIMEOUT_SECONDS") + "\n"
+        for name in _CLUSTER_LOOP_FUNCTIONS:
             script += _extract_shell_function(name) + "\n"
         # The two definitions sit above the block's opener. The shipped plugin list runs
         # as it is; the source path is a fixed image path, so the test points it at the
@@ -1205,8 +1213,8 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
         block = _extract_shell_block('if [ -d "$CLUSTER_TEMPLATE" ]; then')
         source = _ENTRYPOINT.read_text(encoding="utf-8")
         plugin_list = next(line for line in source.splitlines() if line.startswith("CLUSTER_IMAGE_PLUGINS="))
-        script = "set -e\n"
-        for name in ("sync_profile_skills", "backfill_config_from_template", "repair_remote_mcp_user_agent"):
+        script = "set -e\n" + _extract_readonly("OLD_SHIPPED_STALE_TIMEOUT_SECONDS") + "\n"
+        for name in _CLUSTER_LOOP_FUNCTIONS:
             script += _extract_shell_function(name) + "\n"
         script += plugin_list + "\n" + block
         with tempfile.TemporaryDirectory() as tmp:
@@ -1273,8 +1281,8 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
         self.assertIn("CLUSTER_SHARED_PLUGINS", preamble, "the plugin refresh's definitions moved")
         # CLUSTER_TEMPLATE comes from the fixture through the environment, as in the sibling test.
         preamble = "\n".join(line for line in preamble.splitlines() if not line.startswith("CLUSTER_TEMPLATE="))
-        script = "set -e\n"
-        for name in ("sync_profile_skills", "backfill_config_from_template", "repair_remote_mcp_user_agent"):
+        script = "set -e\n" + _extract_readonly("OLD_SHIPPED_STALE_TIMEOUT_SECONDS") + "\n"
+        for name in _CLUSTER_LOOP_FUNCTIONS:
             script += _extract_shell_function(name) + "\n"
         script += preamble + "\n" + block
         with tempfile.TemporaryDirectory() as tmp:
@@ -1438,6 +1446,110 @@ def _extract_shell_function(name):
         if lines[end] == "}":
             return "\n".join(lines[start : end + 1])
     raise AssertionError(f"{name}() has no closing brace")
+
+
+def _extract_readonly(name):
+    """Return the `readonly NAME=...` line that declares one of the entrypoint's constants."""
+    for line in _ENTRYPOINT.read_text(encoding="utf-8").splitlines():
+        if line.startswith(f"readonly {name}="):
+            return line
+    raise AssertionError(f"readonly {name} not found in {_ENTRYPOINT}")
+
+
+# The helpers step 2.6's cluster loop calls. A test that runs the loop defines every one,
+# because a missing one fails as command-not-found behind its `|| echo WARN`.
+_CLUSTER_LOOP_FUNCTIONS = (
+    "sync_profile_skills",
+    "backfill_config_from_template",
+    "migrate_stale_timeout_from_template",
+    "repair_remote_mcp_user_agent",
+)
+
+
+class StaleTimeoutMigrationTest(unittest.TestCase):
+    """A Cluster Agent profile on the volume moves from the old 600s stale bound to its template's.
+
+    The cluster loop does not force-sync a Cluster Agent's config.yaml, and the back-fill
+    only adds keys the file lacks. Without the migration, a cluster onboarded before the
+    worker bound changed keeps 600s for the life of the volume. Only the old shipped value
+    moves: any other value was set on purpose.
+    """
+
+    _CLUSTER_TEMPLATE = _REPO / "agents" / "cluster" / "config.yaml"
+
+    def _migrate(self, template, live):
+        """Run the shipped function over two files. Return `(proc, reloaded_live, unchanged)`."""
+        script = (
+            _extract_readonly("OLD_SHIPPED_STALE_TIMEOUT_SECONDS")
+            + "\n"
+            + _extract_shell_function("migrate_stale_timeout_from_template")
+            + '\nmigrate_stale_timeout_from_template "$1" "$2"\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            template_path = root / "template.yaml"
+            live_path = root / "live.yaml"
+            template_path.write_text(yaml.safe_dump(template, sort_keys=False), encoding="utf-8")
+            live_path.write_text(yaml.safe_dump(live, sort_keys=False), encoding="utf-8")
+            venv = root / "install" / ".venv" / "bin"
+            venv.mkdir(parents=True)
+            wrapper = venv / "python3"
+            wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+            wrapper.chmod(0o755)
+            before = live_path.read_bytes()
+            proc = subprocess.run(
+                ["sh", "-c", script, "sh", str(template_path), str(live_path)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={"PATH": "/usr/bin:/bin", "INSTALL_DIR": str(root / "install")},
+            )
+            after = live_path.read_bytes()
+            return proc, yaml.safe_load(after), before == after
+
+    def _template(self):
+        return yaml.safe_load(self._CLUSTER_TEMPLATE.read_text(encoding="utf-8"))
+
+    def test_a_profile_on_the_old_shipped_bound_takes_the_templates(self):
+        template = self._template()
+        live = self._template()
+        live["providers"]["custom"]["stale_timeout_seconds"] = 600
+        live["cluster_identity"] = {"project": "p", "cluster": "c", "location": "us-central1"}
+        proc, migrated, unchanged = self._migrate(template, live)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(unchanged)
+        self.assertEqual(
+            migrated["providers"]["custom"]["stale_timeout_seconds"],
+            template["providers"]["custom"]["stale_timeout_seconds"],
+        )
+        self.assertEqual(migrated["providers"]["custom"]["request_timeout_seconds"], 900)
+        self.assertEqual(migrated["cluster_identity"], live["cluster_identity"])
+        self.assertIn("stale timeout migrate", proc.stdout)
+
+    def test_a_value_set_on_purpose_stays(self):
+        live = self._template()
+        live["providers"]["custom"]["stale_timeout_seconds"] = 300
+        proc, migrated, unchanged = self._migrate(self._template(), live)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(unchanged)
+        self.assertEqual(migrated["providers"]["custom"]["stale_timeout_seconds"], 300)
+
+    def test_a_template_still_on_the_old_bound_changes_nothing(self):
+        template = self._template()
+        template["providers"]["custom"]["stale_timeout_seconds"] = 600
+        live = self._template()
+        live["providers"]["custom"]["stale_timeout_seconds"] = 600
+        proc, _, unchanged = self._migrate(template, live)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(unchanged)
+
+    def test_a_profile_without_the_provider_block_is_left_alone(self):
+        live = self._template()
+        del live["providers"]
+        proc, migrated, unchanged = self._migrate(self._template(), live)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(unchanged)
+        self.assertNotIn("providers", migrated)
 
 
 class SyncProfileSkillsTest(unittest.TestCase):

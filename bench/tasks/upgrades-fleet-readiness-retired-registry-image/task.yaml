@@ -1,0 +1,225 @@
+# The readiness report names a workload pulling from a retired registry host as a risk, not a blocker
+#
+# One of the upgrade-failure catalogue's scenario cases
+# (docs/designs/upgrade-failure-catalogue.md, entry 20: images on a retired registry).
+# It grades the readiness report's `retired-registry` rule in the
+# fleet-upgrade-verification skill (scripts/readiness_rules/retired_registry.py),
+# through the agent's answer to the fleet readiness question.
+#
+# The rule reads every template's containers and init containers outside the
+# system namespaces for an image on a retired registry host (k8s.gcr.io,
+# gcr.io/google-containers, gcr.io/google_containers, gcr.io/kubernetes-helm).
+# Such a host still answers a pull today, k8s.gcr.io by a redirect to
+# registry.k8s.io, so the report lists legacy-registry-pull under the risks,
+# named with the image, the host, what the host does today and the pools below
+# the target, whose nodes the upgrade rebuilds; nothing here blocks. So the
+# declared line reads `blocks the upgrade: no`, and the case grades that the
+# agent names the Deployment and keeps it a risk.
+#
+# What the deterministic checks read, and what they leave to the judge. The
+# prompt asks for one fixed-form line per seeded cluster, "<cluster>:
+# retired-registry: <object kind namespace/name|none>; blocks the upgrade:
+# <yes|no|none>; cell: <the rule's text for that cluster|none>", the shape the
+# per-cluster readiness cases use (upgrades-readiness-surge-capacity), and the
+# checks read those lines and nothing else; the prose, the reason the rule
+# gives, and the recommended remedy are the judge's, against
+# `expected_output`. The case first asked for one line per object the report
+# names ("<cluster>/<object name>: kind ...; blocks the upgrade: ...; cell:
+# ..."), anchored on the object's name, and nine runs on the dev install
+# passed none of them: the agent read "<cluster>/<object name>" as
+# "<project>/<cluster>" and wrote the object's name after "; blocks the
+# upgrade:", where the anchor could not find it, or left a note-column object
+# out of a list it built from the risks. A line per cluster, anchored on the
+# cluster's name with the object as one slot of the line, has no such reading.
+# Slot a's line must name the planted Deployment and read `blocks the upgrade:
+# no`, and its cell slot must carry the rule's own text, wording only the rule
+# produces (`retired-registry: Deployment seeded-shapes/legacy-registry-pull:
+# container <name> pulls k8s.gcr.io/pause:3.9 from k8s.gcr.io (frozen
+# 2023-04-03, a redirect to registry.k8s.io since 2023-03-20)`), which the
+# skill paraphrases and a hand kubectl survey cannot supply; a report whose
+# rule is missing prints no such entry, so the slot reads `none` or another
+# rule's text and the line fails there whatever the verdict says. The other
+# three slots read `none` in every slot: the fleet's only image on a retired
+# host is legacy-registry-pull's; every other image is on registry.k8s.io,
+# docker.io or Docker Hub's busybox (bench/tf/fleet/defects-*.tf), so the rule
+# prints nothing for them and a line naming an object, a verdict or a cell
+# there is a wrong read. The cell carries a `;`, which keeps the verifier's
+# value-wrap fold from removing a quote or angle bracket the agent kept around
+# it, so the cell patterns admit any prefix before the rule's text, a note
+# column's other entries included; a pod of the workload may stand in for it
+# in the object slot (the name plus one or two hash suffixes), as the agent
+# sometimes renders it. Every pattern is read after the harness's trail fold
+# (`fold_decoration`) and matches the whole line, anchored at both ends; each
+# forbid is the same frame with any other value, so a second line about a slot
+# that contradicts the first fails whatever the right line says. The patterns
+# name the slots through `{cluster:<slot>}`, which the verifier expands to the
+# cluster the runner recorded for the slot, so a fleet applied with another
+# prefix is graded on its own names; a slot the runner did not reach is an
+# `error` about the environment, never a `fail` charged to the agent, so the
+# case adds no role per slot to `fixtures:`.
+#
+# Planted defect required: on slot a, the Deployment legacy-registry-pull in
+# seeded-shapes, one replica, pulling k8s.gcr.io/pause:3.9 with
+# imagePullPolicy Always (role `retired-registry-image` in
+# bench/tf/fleet/fixtures.json). The safeguard reads that the Deployment still
+# has its one replica after the run, so an agent that changed the planted
+# object fails the case whatever its answer says. No `worker_commands`
+# objective: it reads delegated workers' terminals only and errors on a run
+# the router answered itself, so the report's own output is graded through the
+# cell slot instead, as upgrades-readiness-zonal-control-plane does.
+#
+# Isolation class: read-only (chat prompt; the readiness script reads with
+# gcloud container and kubectl get and writes only its own record and
+# per-member kubeconfig files). Eligible tier: nightly from its first merge.
+id: upgrades-fleet-readiness-retired-registry-image
+name: Fleet upgrade readiness names the image on the retired registry
+prompt: >-
+  Check every cluster in this project for its readiness to upgrade to its
+  release channel's default version. For each cluster, report what blocks the
+  upgrade and what is at risk. Read only: do not change, upgrade or remove
+  anything. End your answer with one line per seeded cluster in exactly this
+  form, no other words on the line: "<cluster>: retired-registry: <object kind
+  namespace/name|none>; blocks the upgrade: <yes|no|none>; cell: <the rule's
+  text for that cluster copied as printed|none>". The cell is the
+  retired-registry rule's text for that cluster, copied from the readiness
+  report's risks column (or its other blockers or note column) or from the
+  member's row in the report's JSON (readiness.risks, readiness.notes), as
+  printed and not paraphrased; a cluster the rule prints nothing for reads
+  none in every slot. Write the object as the report names it, with no
+  brackets, quotes or parentheses around it, and put any aside on a line of
+  its own.
+expected_output: >-
+  A per-cluster readiness report read during this run. For seeded-a it names
+  the Deployment legacy-registry-pull in seeded-shapes under the risks: its
+  container pulls k8s.gcr.io/pause:3.9, and k8s.gcr.io is frozen and
+  redirected to registry.k8s.io, so a rebuilt node pulls from a host that can
+  stop answering; the report names the pools below the target, whose nodes the
+  upgrade rebuilds. It does not call the Deployment a blocker, because the
+  host still answers today. It recommends repointing the image at
+  registry.k8s.io or at a registry the operator owns before the upgrade; it
+  changes nothing. Other clusters' blockers and risks come from the same run.
+  It ends with one declared line per seeded cluster: for seeded-a "seeded-a:
+  retired-registry: Deployment seeded-shapes/legacy-registry-pull; blocks the
+  upgrade: no; cell: retired-registry: Deployment
+  seeded-shapes/legacy-registry-pull: container pause pulls
+  k8s.gcr.io/pause:3.9 from k8s.gcr.io (frozen 2023-04-03, a redirect to
+  registry.k8s.io since 2023-03-20); a rebuilt node pulls it again from a host
+  that stopped publishing; pool(s) <pools> are below the target and are
+  rebuilt in this upgrade", the cell copied from the report's risks column,
+  and for seeded-b, seeded-c and seeded-d "retired-registry: none; blocks the
+  upgrade: none; cell: none". It cites no CVE identifiers and changes nothing.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+# Named by ROLE, not cluster: bench/tf/fleet/fixtures.json;
+# docs/designs/bench-fleet-catalog.md is the rule.
+fixtures:
+  - retired-registry-image
+
+verification_spec:
+  # One line per seeded cluster, fixed vocabulary, the cluster named at the
+  # start of the line; every pattern matches the whole declared frame,
+  # anchored at both ends, with the line's decoration folded first
+  # (`fold_decoration: true`); a parenthetical after the cluster's name is
+  # allowed.
+  - name: every-seeded-cluster-has-a-declared-line
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - retired-registry-image
+      any_of_patterns:
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: retired-registry: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: retired-registry: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: retired-registry: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: retired-registry: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]+$)'
+
+  # The verdict this case exists for: slot a's line names legacy-registry-pull
+  # and reads no; the forbid is the same frame with any other object or
+  # verdict, so a line that promotes it, leaves it out or reads none fails
+  # here whatever the prose says. A pod of the workload may stand in for it
+  # (the name plus one or two hash suffixes).
+  - name: the-planted-object-is-named-and-does-not-block
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - retired-registry-image
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: retired-registry: deployment seeded-shapes/legacy-registry-pull(?:-[a-z0-9]{5,10}){0,2}; blocks the upgrade: no; cell: [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: retired-registry: (?!deployment seeded-shapes/legacy-registry-pull(?:-[a-z0-9]{5,10}){0,2}; blocks the upgrade: no; cell: )[^\n]*$'
+
+  # The report's own wording: the entry the risks column prints for the object
+  # is the rule's text, which the skill paraphrases and a cluster listing
+  # cannot supply. A report whose rule is missing prints no such entry, so the
+  # slot reads `none` or something else and the line fails here, whatever the
+  # verdict says. Any prefix is admitted before the rule's text: a quote or
+  # angle bracket the agent kept around the cell (the `;` inside it keeps the
+  # value-wrap fold from removing one), or a note column's other entries. The
+  # required text stops before the cell's first `; `, so the pools the fleet
+  # names after it are left open.
+  - name: the-planted-objects-line-quotes-the-reports-cell
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - retired-registry-image
+      # The `retired-registry: ` prefix is the table's; report.json carries the bare text, so it is optional.
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: retired-registry: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]*?(?:retired-registry: )?deployment seeded-shapes/legacy-registry-pull: container [a-z0-9-]+ pulls k8s\.gcr\.io/pause:3\.9 from k8s\.gcr\.io \(frozen 2023-04-03, a redirect to registry\.k8s\.io since 2023-03-20\)[^\n]*$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: retired-registry: [^;\n]+; blocks the upgrade: [^;\n]+; cell: (?![^\n]*?(?:retired-registry: )?deployment seeded-shapes/legacy-registry-pull: container [a-z0-9-]+ pulls k8s\.gcr\.io/pause:3\.9 from k8s\.gcr\.io \(frozen 2023-04-03, a redirect to registry\.k8s\.io since 2023-03-20\))[^\n]*$'
+
+  # The fleet's only image on a retired host is legacy-registry-pull's; every
+  # other image is on registry.k8s.io, docker.io or Docker Hub's busybox, so
+  # the rule prints nothing for slots b, c and d and each reads none in every
+  # slot; a line naming an object, a verdict or a cell there is a wrong read,
+  # the planted finding copied onto another cluster included.
+  - name: the-other-clusters-read-none
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - retired-registry-image
+      any_of_patterns:
+        - '(?ms)\A(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: retired-registry: none; blocks the upgrade: none; cell: none$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: retired-registry: none; blocks the upgrade: none; cell: none$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: retired-registry: none; blocks the upgrade: none; cell: none$)'
+      forbidden_patterns:
+        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: retired-registry: (?!none; blocks the upgrade: none; cell: none$)[^\n]*$'
+
+  # The prompt's "read only", grounded: the planted object is as the fixture
+  # declares it after the run.
+  - name: the-planted-deployment-survived
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: retired-registry-image
+      kind: deployment
+      resource_name: legacy-registry-pull
+      namespace: seeded-shapes
+      path: spec.replicas
+      op: eq
+      value: 1
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # No vulnerability feed; a CVE id in a readiness report is an invention.
+      forbidden_phrases: ["CVE-"]

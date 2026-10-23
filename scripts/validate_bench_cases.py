@@ -291,6 +291,18 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    # Needs a GitOps repository that declares the namespace under a path a
+    # reconciler syncs; no pool project's repository has one. Run by hand on
+    # the GitOps-wired dev lane (gitops-target-1, sackheads/kage-fleet-dev).
+    "delete-namespace-declared-pr": (
+        "#3576: needs a declared, reconciler-synced namespace in the pool GitOps repositories"
+    ),
+    # Needs a GitOps repository with a Config Connector + Config Sync sibling
+    # cluster; no pool project has one. Run by hand on the GitOps-wired dev
+    # lane (ka-fleet-dev-1, sackheads/kage-fleet-dev).
+    "substrate-cluster-gitops-pr": (
+        "#3576: needs a Config Connector + Config Sync sibling cluster in the pool GitOps repositories"
+    ),
     # Needs a GitOps repository whose provisioning/ path holds Terraform; no
     # pool project's repository has one. Run by hand on a dev install whose
     # repository does (ka-fleet-dev-1, sackheads/kage-fleet-dev at branch hcl).
@@ -418,6 +430,27 @@ FIXTURE_NOT_READY = {
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "
         "verification sweep"
     ),
+    "upgrades-removed-api-caller-named": (
+        "#2655: needs a removed-api-caller role, a writer that calls an API "
+        "version the cluster's next minor stops serving, which no standing fleet "
+        "role can carry (the catalogue's entry 6 Fixture line says why), so the "
+        "seeded fleet's upgrade-failure shapes merged without it; the "
+        "deprecated-api-caller role is stamped deprecated, not removed, and stands "
+        "in for entry 9, and the readiness report's removed-api-callers rule is "
+        "covered by unit tests on a captured log sample. The case waits for the "
+        "role on a purpose-built cluster, or for the next minor that removes a "
+        "served API; #2275 is the umbrella that tracks the scenario cases to merge"
+    ),
+    "upgrades-readiness-surge-headroom": (
+        "#3569: needs a cluster whose Pod secondary range leaves fewer free "
+        "per-node blocks than the maxSurge sum of its surging pools, or a node "
+        "pool with an accelerator on the surge strategy with no reservation "
+        "affinity; the seeded fleet plants neither (a secondary range is fixed "
+        "at cluster creation, so the short range is a new small cluster slot, "
+        "and an accelerator pool costs by the hour on every pool project), so "
+        "the surge-capacity rule's two surge halves are covered by unit tests on "
+        "a recorded cluster record and node list until the fixture lands"
+    ),
 }
 
 # Cases graded by the judge alone. The OutcomeValidity >= 0.7 fallback in
@@ -478,6 +511,8 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # No field: "this run's report is in the store" is the assertion, and
     # `status` and `required_finding_phrases` only narrow it.
     "audit_report_stored": (),
+    # The audits whose part of the reply is graded against the store.
+    "report_store_reply": ("audits",),
     # No field, deliberately: the freshness binding is the assertion and every
     # field only narrows it. See the empty-tuple rule in _check_assertions.
     "pull_request_opened": (),
@@ -528,6 +563,10 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # case planted. The rows it names are the assertion; with none it could
     # only pass.
     "findings_item_state": ("finding_ids",),
+    # This repository, agent-pod-reading: how many of a workload's events the
+    # session daemon folded into its newest incident. The count is the
+    # assertion; min_folded is at least 1, so it cannot pass on nothing folded.
+    "workload_incident_folded": ("min_folded",),
     # This repository, agent-pod-reading. No field: whether every post a planted
     # report produced is that report, exactly, is the whole assertion.
     "relay_posted_as_written": (),
