@@ -177,21 +177,32 @@ class TriageWatchdogTest(unittest.TestCase):
             timer.assert_not_called()
 
     def test_the_troubleshooter_arms_it_once_the_alert_is_routed(self):
+        # The start runs on the triage pool, so the turn is observed by running
+        # the parked pool after the trigger returns, not inline with it.
+        created = session_kv_server._GatewayAttempt(session_kv_server.START_OK)
+        refused = session_kv_server._GatewayAttempt(session_kv_server.START_FATAL, "http-401")
         for session_created in (True, False):
+            pool = harness.park_triage_starts()
+            self.addCleanup(harness.park_triage_starts)
             with self.subTest(session_created=session_created), \
                  patch.object(session_kv_server, "enabled_chat_platforms", return_value=["slack"]), \
                  patch.object(session_kv_server, "get_active_platform", return_value="slack"), \
                  patch.object(session_kv_server, "_post_initial_alert", return_value="1760000000.000200"), \
                  patch.object(session_kv_server, "_slack_home_channel", return_value="C0HOME"), \
-                 patch.object(session_kv_server, "_create_gateway_session", return_value=session_created), \
-                 patch.object(session_kv_server, "_start_agent_turn") as turn, \
+                 patch.object(session_kv_server, "_send_to_chat", return_value="thread"), \
+                 patch.object(session_kv_server, "_create_gateway_session",
+                              return_value=created if session_created else refused), \
+                 patch.object(session_kv_server, "_start_agent_turn", return_value=created) as turn, \
                  patch.object(session_kv_server, "_schedule_triage_watchdog") as arm:
                 session_kv_server._ensure_session_row("k8s-evt-arm", "platform", "")
                 session_kv_server.trigger_agent_troubleshooter("k8s-evt-arm", "alert", {"reason": "BackOff"}, None)
-            # Armed whether or not the gateway accepted the session: a turn that
-            # never starts is the case the watchdog exists for.
-            arm.assert_called_once_with("k8s-evt-arm", "slack", "C0HOME", "1760000000.000200")
-            self.assertEqual(turn.call_count, 1 if session_created else 0)
+                # Armed before the gateway is contacted: the start is still
+                # parked, and a turn that never starts is the case the
+                # watchdog exists for.
+                arm.assert_called_once_with("k8s-evt-arm", "slack", "C0HOME", "1760000000.000200")
+                turn.assert_not_called()
+                pool.run()
+                self.assertEqual(turn.call_count, 1 if session_created else 0)
 
     def test_a_non_integer_watchdog_knob_falls_back_instead_of_failing_the_import(self):
         # The module is imported afresh in a child with the bad value set: the

@@ -582,10 +582,8 @@ func TestReapOnceResumableCursor(t *testing.T) {
 	ctx := context.Background()
 
 	// Seed 6 sessions
-	var seededKeys []string
 	for i := 1; i <= 6; i++ {
 		key := fmt.Sprintf("discord:g1/reap-cursor-%02d", i)
-		seededKeys = append(seededKeys, key)
 		rec := &SessionRecord{
 			Key:          key,
 			ContextID:    fmt.Sprintf("ctx-reap-%02d", i),

@@ -59,6 +59,12 @@ it, or the broker does not manage it, the run does not choose another repository
 no-forge path, and its `no_forge` note names the repository and the reason; see
 [No forge configured](finish.md#no-forge-configured). Such a run is never silent.
 
+Before that listing, `start` asks the forge's `capabilities`. A forge with no issue tracker, or with
+no labels, gets no ledger issue: `start` prints `"ledger": "store"` and a `ledger_note`, the ledger
+goes to the report store and chat, and the remediation pull requests still open on the forge. The
+listing is then one open pull request, not one open issue. See
+[A forge with no issue tracker](finish.md#a-forge-with-no-issue-tracker).
+
 ### Step 1 — `start`
 
 Before inspecting anything, claim the workspace:
@@ -142,7 +148,7 @@ in `content` mode the workspace is empty rather than a checkout. Read it rather 
 what is on disk. `none` means no forge is configured; see [No forge configured](finish.md#no-forge-configured).
 
 `pending_remediation_requests` lists the findings a repository writer has already asked to be fixed,
-parsed from the ledger's comments. **Write those manifests during inspection** — if the finding is
+parsed from the ledger's comments (always empty when `ledger` is `store`: there is no ledger thread). **Write those manifests during inspection** — if the finding is
 still reproducing at `finish`, its pull request opens immediately instead of a week later.
 
 `carried` lists every finding the open ledger carries — its id, the check that found it, where it

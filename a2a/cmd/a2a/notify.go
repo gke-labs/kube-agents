@@ -63,7 +63,7 @@ var errNotifyRouteUnavailable = errors.New("route unavailable")
 // alert-<event session>).
 const notifyUpdateMax = 128
 
-const notifyUsage = `usage: a2a notify --platform <platform> [--thread <thread> | --conversation <key> --context <id>] [--blocks-file <path> | --chat-file <path>] [--update <key>] [--timeout <d>] [--] [text]
+const notifyUsage = `usage: a2a notify --platform <platform> [--thread <thread> | --conversation <key> --context <id>] [--blocks-file <path> | --chat-file <path>] [--update <key>] [--reply-to <task>] [--timeout <d>] [--] [text]
 
 Post text to the install's chat home channel through the A2A gateway: a new
 thread, or a reply on --thread, which must be a thread of the home channel.
@@ -73,6 +73,8 @@ posts only into a live conversation whose session record has that context.
 --chat-file names a kube-agents.chat/v1 object to lay the post out with, the
 text being its fallback; --update names the message: a later notify with the
 same key, in the same conversation, edits that message instead of posting.
+--reply-to names the gateway task whose turn filed the work the post reports
+on; the console passes it on so its client can join the post to that turn.
 Reads the text from stdin when it is omitted, or "-" with no "--" before it.
 Prints the gateway's answer as JSON (message_id, the field hermes send --json
 prints, and thread_id). Exits 1 when nothing was posted, 3 when the gateway
@@ -91,6 +93,7 @@ func runNotify(args []string) error {
 	blocksFile := fs.String("blocks-file", "", "a JSON array of Slack Block Kit blocks to post as one message, with the text as its fallback (Slack only)")
 	chatFile := fs.String("chat-file", "", "a kube-agents.chat/v1 JSON object to lay the post out with, the text as its fallback")
 	update := fs.String("update", "", "a key naming the message: a later notify with the same key edits it in place")
+	replyTo := fs.String("reply-to", "", "the gateway task whose turn filed the work this reports on (with --conversation)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -109,6 +112,9 @@ func runNotify(args []string) error {
 	}
 	if *conversation != "" && *thread != "" {
 		return errors.New("notify: --thread or --conversation, not both")
+	}
+	if *replyTo != "" && (*conversation == "" || !lib.ValidSubjectToken(*replyTo)) {
+		return errors.New("notify: --reply-to takes a task id, with --conversation")
 	}
 	// flag drops the "--" it stops at, so whether one was given is read from
 	// the raw arguments: after it, a lone "-" is text, not "read stdin".
@@ -140,6 +146,7 @@ func runNotify(args []string) error {
 		req.Chat = raw
 	}
 	req.Update = *update
+	req.ReplyTo = *replyTo
 	body, err := json.Marshal(req)
 	if err != nil {
 		return err

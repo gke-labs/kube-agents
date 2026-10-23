@@ -114,8 +114,8 @@ MAX_WORKERS = 4
 # What the manifest calls a target. A GKE name is unique only inside one
 # project and location, so every cluster is `<project>/<location>/<name>`, and
 # a failed or narrowed project discovery is one `project/UNENUMERATED_PROJECTS`
-# target. Copied from `collect.py` under the standalone-collector rule below;
-# `audit_report.py` reads both shapes, so keep them in step with it.
+# target. A copy of `collect.py`'s; `audit_report.py` reads both shapes, so
+# keep them in step with it.
 QUALIFIED_TARGET_SEPARATOR = "/"
 PROJECT_TARGET_PREFIX = "project/"
 # A cluster the collector never read: not running, or its credentials failed.
@@ -153,7 +153,7 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
     if _shared_dir not in sys.path:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
-from collect import declaration_for, workload_declarations  # noqa: E402
+from collect import declaration_for, indexed_workspace, release_declaration_for, release_declarations, workload_declarations  # noqa: E402
 
 # The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
@@ -249,71 +249,11 @@ NO_TARGET_REASON = (
     "no project in scope recorded an error, so each holds no cluster and has neither the Compute Engine nor the Artifact Registry API on"
 )
 
-# Where a GitOps clone keeps the manifests applied to one cluster:
-# `clusters/<cluster>/...`, so a path shorter than two parts names no cluster.
-# Copied from `collect.py` rather than imported: every collector in this
-# directory runs standalone under `python3 <file>` (`main` imports `collect`
-# for a workspace that is not a clone, and only then), and each one that has
-# needed a constant a sibling also declares has duplicated it (`SYSTEM_NAMESPACES`
-# is the same value in three of them). Keep these three in step with
-# `collect.py`'s if the repository layout moves.
-GITOPS_CLUSTER_TREE_ROOT = "clusters"
-GITOPS_CLUSTER_TREE_DEPTH = 2
+# Whether `--workspace` is a clone: `main` reads it to tell one from a
+# content-mode scratch directory, as `collect.indexed_workspace` does. The
+# GitOps layout, and the declaration index that walks it, are `collect.py`'s
+# (imported above).
 GIT_DIR_NAME = ".git"
-# Config Connector's API group. Its objects name a GCP resource, which
-# `spec.resourceID` can override, not a workload, so `workload_declarations`
-# skips them rather than resolving a `Cluster/<name>` finding against one.
-KCC_API_GROUP_SUFFIX = "cnrm.cloud.google.com"
-# `release_declarations` indexes the objects that render a workload a GitOps
-# repo holds no manifest for -- an Argo CD `Application`, from either a chart
-# or a Kustomize overlay, and a Flux `HelmRelease` -- plus the two it needs to
-# resolve them: Argo CD's cluster registration Secret (which is how
-# `spec.destination.server` becomes a cluster name) and Flux's `HelmRepository`
-# (which is how a `HelmRelease`'s chart reference becomes a URL `helm show
-# values` can read). Copied from `collect.py` under the same
-# standalone-collector rule as the three above.
-ARGOCD_APPLICATION_KIND = "Application"
-ARGOCD_CLUSTER_SECRET_LABEL = "argocd.argoproj.io/secret-type"
-ARGOCD_CLUSTER_SECRET_VALUE = "cluster"
-ARGOCD_IN_CLUSTER_SERVER = "https://kubernetes.default.svc"
-FLUX_HELM_RELEASE_KIND = "HelmRelease"
-FLUX_HELM_REPOSITORY_KIND = "HelmRepository"
-# The two shapes a key in that index takes. An Argo CD chart Application is
-# found by the Application name its tracking id carries; a Helm release proper
-# -- `helm install`, or Flux driving it -- by release namespace and name.
-RELEASE_KEY_APPLICATION = "application"
-RELEASE_KEY_RELEASE = "release"
-# A third key on that same index, answering a different question: not "where
-# is this object declared" but "where would a *new* object for this namespace
-# go". Only a local Kustomize root can answer it, because only a local root is
-# a directory in this repository that renders into the namespace. No check here
-# creates an object, so nothing in this file reads the key; it is built anyway
-# because `release_declarations` is a copy of `collect.py`'s and the copy is
-# kept identical, not trimmed to what one stream happens to use.
-RELEASE_KEY_NAMESPACE = "namespace"
-# What `collect.broker_mirror` leaves in a content-mode mirror a file that could
-# hold a release was withheld from; `release_declarations` then answers nothing
-# rather than part.
-MIRROR_RELEASES_WITHHELD_MARKER = ".git/collect-releases-withheld"
-# Where a values override goes, per reconciler. Argo CD accepts both a YAML
-# string (`values`) and a structured block (`valuesObject`); this names the one
-# already in the file, and `valuesObject` when neither is, because a structured
-# block is what a programmatic edit can extend without reindenting a string.
-ARGOCD_VALUES_OBJECT_FIELD = "valuesObject"
-ARGOCD_VALUES_STRING_FIELD = "values"
-FLUX_VALUES_FIELD = "values"
-ARGOCD_KUSTOMIZE_PATCHES_FIELD = "patches"
-# Which of those two overrides a declaration takes, since they are written
-# differently: a values mapping the chart reads by key, or a list of patches
-# Kustomize applies to a matched object. Carried on the entry so the SOP can
-# branch on it rather than inferring one from the shape of `values_field`.
-RENDERER_HELM = "helm"
-RENDERER_KUSTOMIZE = "kustomize"
-# What marks a directory as a Kustomize root. `kustomization.yaml` is what
-# `kustomize create` writes; the other two are the legacy spellings `kustomize
-# build` still accepts, and a repo that uses one is exactly as unresolvable
-# without this as one that uses the first.
-KUSTOMIZATION_FILE_NAMES = ("kustomization.yaml", "kustomization.yml", "Kustomization")
 
 # How far back `fetch_usage_peaks` looks for a workload's peak. A week, to
 # match this stream's weekly cadence: every finding is then "this controller
@@ -768,10 +708,9 @@ IMPACT = {
 # stay recorded rather than audited. A read that fails anyway still lands on
 # the existing per-cluster `unreachable`/`gate-failed` path.
 AUDITABLE_STATUSES = frozenset({"RUNNING", "RECONCILING"})
-# The markers a reconciling controller stamps on an object it owns. Duplicated
-# from `collect.reconciler_of` for the reason `declaration_for` below is: these
-# collectors are standalone scripts, and none imports a sibling collector at
-# module level.
+# The markers a reconciling controller stamps on an object it owns. Still a
+# copy of `collect.reconciler_of`'s, as `reconciler_of` and `release_of` below
+# are; `test_fleet_waste.py` holds the copies in step with `collect.py`.
 #
 # Helm 3 writes both halves of its pair on every object in a release, and the
 # release namespace is not the object's. Argo CD's tracking id is
@@ -3704,7 +3643,7 @@ def _controller_age_days(context: dict, kind: str, ns: str, name: str, *, now: d
 def _is_internal_load_balancer(meta: dict) -> bool:
     """Whether either GKE internal-load-balancer annotation is set on this Service.
 
-    A copy of collect.py's, as `release_declarations` is."""
+    A copy of collect.py's, as `reconciler_of` is."""
     annotations = meta.get("annotations") or {}
     return any(annotations.get(key) == INTERNAL_LB_ANNOTATION_VALUE for key in INTERNAL_LB_ANNOTATIONS)
 
@@ -4521,294 +4460,6 @@ def check_unsized(context: dict, usage_peaks: dict, *, now: datetime, autopilot:
             }
         )
     return hits
-
-
-def _argocd_chart_source(spec: dict) -> dict | None:
-    """The one chart source on an Argo CD Application, with its field path.
-
-    `spec.source.chart` absent is the discriminator that keeps this off the
-    plain-manifest Applications a GitOps repo is mostly made of. Two chart
-    entries under `spec.sources` is an ambiguity with no right answer and
-    returns None, the way `declaration_for` treats two declaring files. See
-    `collect._argocd_chart_source`.
-    """
-    single = spec.get("source")
-    if isinstance(single, dict) and single.get("chart"):
-        return {"source": single, "field": "spec.source"}
-    sources = spec.get("sources")
-    if not isinstance(sources, list):
-        return None
-    charts = [
-        {"source": entry, "field": f"spec.sources[{position}]"}
-        for position, entry in enumerate(sources)
-        if isinstance(entry, dict) and entry.get("chart")
-    ]
-    return charts[0] if len(charts) == 1 else None
-
-
-def _argocd_kustomize_source(spec: dict, root: Path) -> dict | None:
-    """The one Kustomize source on an Argo CD Application, with its field path.
-
-    Reached only where `_argocd_chart_source` found no chart, and answers the
-    case its docstring sets aside. A plain directory of manifests is resolved
-    by `workload_declarations`, which finds the object's own YAML -- but an
-    overlay over a *remote* base renders objects no file in the repo declares,
-    so that lookup finds nothing and the finding falls to `manual`. It is the
-    same hole a chart put a workload in, and as common: `resources:` pointing
-    at a tagged base in another repository is an ordinary way to run a fleet.
-
-    A `kustomization.yaml` at `spec.source.path` is the discriminator, checked
-    against the clone rather than against `spec.source.kustomize`, which Argo
-    CD infers from that same file and most Applications therefore omit. Where
-    the base *is* local, the object has its own manifest, and the
-    `"declaration" not in candidate` guard in `_emit` keeps that direct edit
-    ahead of a patch here.
-
-    Multi-source and two-source ambiguity follow `_argocd_chart_source`.
-    """
-
-    def rooted(entry: object) -> bool:
-        if not isinstance(entry, dict) or entry.get("chart"):
-            return False
-        path = str(entry.get("path") or "").strip()
-        if not path or path.startswith("/") or ".." in Path(path).parts:
-            return False
-        try:
-            directory = root / path
-            return any((directory / name).is_file() for name in KUSTOMIZATION_FILE_NAMES)
-        except OSError:
-            return False
-
-    single = spec.get("source")
-    if rooted(single):
-        return {"source": single, "field": "spec.source"}
-    sources = spec.get("sources")
-    if not isinstance(sources, list):
-        return None
-    overlays = [
-        {"source": entry, "field": f"spec.sources[{position}]"}
-        for position, entry in enumerate(sources)
-        if rooted(entry)
-    ]
-    return overlays[0] if len(overlays) == 1 else None
-
-
-def _argocd_values_field(source: dict, field: str) -> str:
-    """Where a values override belongs on one Argo CD chart source.
-
-    Names the block already in the file when there is one, so an override joins
-    it rather than sitting beside a second block Argo CD would ignore --
-    `values` and `valuesObject` are mutually exclusive and Argo rejects an
-    Application carrying both.
-    """
-    helm = source.get("helm")
-    if isinstance(helm, dict) and isinstance(helm.get(ARGOCD_VALUES_STRING_FIELD), str):
-        return f"{field}.helm.{ARGOCD_VALUES_STRING_FIELD}"
-    return f"{field}.helm.{ARGOCD_VALUES_OBJECT_FIELD}"
-
-
-def release_declarations(root: Path) -> dict[tuple, dict]:
-    """Index the Helm releases a GitOps clone installs, by destination cluster.
-
-    `workload_declarations` in `collect` resolves a workload to the file declaring
-    *that object*. A workload a chart renders has no such file: the repo
-    declares the release, and the object exists only after Helm expands the
-    chart. That is what sends a right-sizing finding to `manual` -- and
-    right-sizing is the fix a pull request carries best, because `resources` is
-    the one key nearly every chart publishes. See `collect.release_declarations`,
-    which holds the full reasoning, the three key shapes, and why `ApplicationSet`
-    is deliberately not indexed.
-
-    Returns `{}` when PyYAML is absent, the clone is unreadable, or a
-    content-mode mirror carries MIRROR_RELEASES_WITHHELD_MARKER.
-    """
-    if (root / MIRROR_RELEASES_WITHHELD_MARKER).exists():
-        return {}
-    try:
-        import yaml  # noqa: PLC0415 -- optional; absence disables the annotation
-    except ImportError:
-        return {}
-
-    try:
-        paths = sorted(root.rglob("*.yaml")) + sorted(root.rglob("*.yml"))
-    except OSError:
-        return {}
-
-    documents: list[tuple[str, tuple[str, ...], dict]] = []
-    for path in paths:
-        if GIT_DIR_NAME in path.parts:
-            continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        try:
-            docs = list(yaml.safe_load_all(text))
-        except yaml.YAMLError:
-            continue
-        try:
-            relative = path.relative_to(root)
-        except ValueError:
-            continue
-        for doc in docs:
-            if isinstance(doc, dict) and doc.get("kind"):
-                documents.append((str(relative), relative.parts, doc))
-
-    # Pass 1: the two lookups an Application or a HelmRelease resolves through.
-    servers: dict[str, str] = {}
-    repositories: dict[tuple[str, str], str] = {}
-    for _, _, doc in documents:
-        kind = str(doc.get("kind") or "")
-        meta = doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {}
-        if kind == "Secret":
-            labels = meta.get("labels") if isinstance(meta.get("labels"), dict) else {}
-            if labels.get(ARGOCD_CLUSTER_SECRET_LABEL) != ARGOCD_CLUSTER_SECRET_VALUE:
-                continue
-            # `stringData` is what a committed registration uses; `data` is
-            # base64 and a committed one would be a leaked credential, so only
-            # the plaintext form is read.
-            entry = doc.get("stringData")
-            if not isinstance(entry, dict):
-                continue
-            server = str(entry.get("server") or "").strip()
-            cluster = str(entry.get("name") or "").strip()
-            if server and cluster:
-                servers[server] = cluster
-        elif kind == FLUX_HELM_REPOSITORY_KIND:
-            repo_spec = doc.get("spec") if isinstance(doc.get("spec"), dict) else {}
-            url = str(repo_spec.get("url") or "").strip()
-            name = str(meta.get("name") or "")
-            namespace = str(meta.get("namespace") or "")
-            if url and name:
-                repositories[(namespace, name)] = url
-
-    index: dict[tuple, dict] = {}
-    ambiguous: set[tuple] = set()
-
-    def record(key: tuple, entry: dict) -> None:
-        existing = index.get(key)
-        if existing is not None and existing != entry:
-            # Two declarations for one release. Same reasoning as
-            # `declaration_for`: naming one would name the wrong file half the
-            # time, so name neither.
-            ambiguous.add(key)
-            return
-        index[key] = entry
-
-    # Pass 2: the declarations themselves.
-    for relative, parts, doc in documents:
-        kind = str(doc.get("kind") or "")
-        meta = doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {}
-        spec = doc.get("spec") if isinstance(doc.get("spec"), dict) else {}
-        name = str(meta.get("name") or "")
-        if not name:
-            continue
-        if kind == ARGOCD_APPLICATION_KIND:
-            chart = _argocd_chart_source(spec)
-            overlay = _argocd_kustomize_source(spec, root) if chart is None else None
-            if chart is None and overlay is None:
-                continue
-            found = chart or overlay
-            source, field = found["source"], found["field"]
-            destination = spec.get("destination") if isinstance(spec.get("destination"), dict) else {}
-            cluster = str(destination.get("name") or "").strip()
-            if not cluster:
-                server = str(destination.get("server") or "").strip()
-                # The in-cluster destination is whichever cluster Argo CD runs
-                # on, which this index has no way to name. Skip rather than
-                # resolve a finding into the wrong tree.
-                if server and server != ARGOCD_IN_CLUSTER_SERVER:
-                    cluster = servers.get(server, "")
-            if not cluster:
-                continue
-            release_namespace = str(destination.get("namespace") or "").strip()
-            helm = source.get("helm") if isinstance(source.get("helm"), dict) else {}
-            entry = {
-                "path": relative,
-                "kind": ARGOCD_APPLICATION_KIND,
-                "renderer": RENDERER_HELM if chart else RENDERER_KUSTOMIZE,
-                "chart": str(source.get("chart") or source.get("path") or ""),
-                "repo": str(source.get("repoURL") or ""),
-                "version": str(source.get("targetRevision") or ""),
-                "values_field": (
-                    _argocd_values_field(source, field)
-                    if chart
-                    else f"{field}.{RENDERER_KUSTOMIZE}.{ARGOCD_KUSTOMIZE_PATCHES_FIELD}"
-                ),
-            }
-            record((cluster, RELEASE_KEY_APPLICATION, name), entry)
-            release_name = str(helm.get("releaseName") or "").strip() or name
-            # Only a chart install leaves the `meta.helm.sh` pair behind, so
-            # only a chart is worth the second key. Kustomize output carries
-            # the tracking id alone, which the Application key above already
-            # answers.
-            if chart and release_namespace:
-                record((cluster, RELEASE_KEY_RELEASE, release_namespace, release_name), entry)
-            # A local Kustomize root is also an answer to "where does a new
-            # object for this namespace go", which no other key gives. A chart
-            # is not: its directory is in another repository, and the values
-            # override that reaches an *existing* object cannot create one.
-            if overlay and release_namespace and entry["chart"]:
-                record((cluster, RELEASE_KEY_NAMESPACE, release_namespace), entry)
-        elif kind == FLUX_HELM_RELEASE_KIND:
-            # Flux is installed per-cluster, so the path convention is the only
-            # cluster signal a HelmRelease carries.
-            if len(parts) <= GITOPS_CLUSTER_TREE_DEPTH or parts[0] != GITOPS_CLUSTER_TREE_ROOT:
-                continue
-            cluster = parts[1]
-            namespace = str(meta.get("namespace") or "")
-            # A scalar or a list where the chart template goes is a malformed
-            # document, and one malformed file must not crash the whole run
-            # before the manifest prints. Skip it; `sourceRef` is guarded alike.
-            # An absent `chart` is the `chartRef` form, which still indexes, on
-            # an empty chart, for the values field it names.
-            chart = spec.get("chart") if spec.get("chart") is not None else {}
-            chart_spec = chart.get("spec") if isinstance(chart, dict) and chart.get("spec") is not None else {}
-            if not isinstance(chart, dict) or not isinstance(chart_spec, dict):
-                continue
-            source_ref = chart_spec.get("sourceRef") if isinstance(chart_spec.get("sourceRef"), dict) else {}
-            repo_namespace = str(source_ref.get("namespace") or namespace)
-            repo_name = str(source_ref.get("name") or "")
-            release_namespace = str(spec.get("targetNamespace") or namespace)
-            release_name = str(spec.get("releaseName") or "").strip() or name
-            if not release_namespace:
-                continue
-            entry = {
-                "path": relative,
-                "kind": FLUX_HELM_RELEASE_KIND,
-                "renderer": RENDERER_HELM,
-                "chart": str(chart_spec.get("chart") or ""),
-                "repo": repositories.get((repo_namespace, repo_name), ""),
-                "version": str(chart_spec.get("version") or ""),
-                "values_field": f"spec.{FLUX_VALUES_FIELD}",
-            }
-            record((cluster, RELEASE_KEY_RELEASE, release_namespace, release_name), entry)
-
-    for key in ambiguous:
-        index.pop(key, None)
-    return index
-
-
-def release_declaration_for(index: dict[tuple, dict], cluster: str, release: dict | None) -> dict | None:
-    """Where the GitOps repo declares one candidate's chart release, or `None`.
-
-    `None` is no claim either way, exactly as in `declaration_for`. The Argo CD
-    Application name is tried first, being the more specific of the two keys.
-    """
-    if not index or not cluster or not release:
-        return None
-    application = str(release.get("application") or "")
-    if application:
-        entry = index.get((cluster, RELEASE_KEY_APPLICATION, application))
-        if entry:
-            return entry
-    name = str(release.get("name") or "")
-    namespace = str(release.get("namespace") or "")
-    if name and namespace:
-        entry = index.get((cluster, RELEASE_KEY_RELEASE, namespace, name))
-        if entry:
-            return entry
-    return None
 
 
 def _emit(
@@ -6479,11 +6130,8 @@ def main(argv: list[str] | None = None) -> int:
         manifest = collect_fleet(args.project, workspace=workspace)
     else:
         # Possibly content mode: no clone, so `collect.py`'s mirror decides
-        # which tree to index. Imported here rather than at the top so a run
-        # without one stays standalone.
-        import collect  # noqa: PLC0415
-
-        with collect.indexed_workspace(workspace) as indexed:
+        # which tree to index.
+        with indexed_workspace(workspace) as indexed:
             manifest = collect_fleet(args.project, workspace=indexed)
     print(json.dumps(manifest, indent=2))
     return 1 if manifest.get("error") else 0
