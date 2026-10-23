@@ -1574,9 +1574,9 @@ actually lives, with rung 6 as the collapse alarm underneath it.
 - The `bench/tf/fleet` drift-reconcile schedule — a drifted fixture silently changes what a
   baseline means.
 - **The aggregate's sample floor is a placeholder for a real test.**
-  `EVAL_AGGREGATE_MIN_SCORED` (default 30) refuses to compare below ten admitted cases' worth of
-  repetitions, because a flat margin at `n = 3` measures luck. It is a floor rather than a wider
-  margin because no single flat margin is right at both `n = 3` and `n = 600`, and the fix that
+  `EVAL_AGGREGATE_MIN_SCORED` (default 30, ten admitted cases' worth when it was set) refuses to
+  compare below that many scored repetitions, because a flat margin at `n = 3` measures luck. It
+  is a floor rather than a wider margin because no single flat margin is right at both `n = 3` and `n = 600`, and the fix that
   actually scales is a two-proportion test. The store now holds the variance estimate that test
   needs, and [Sizing the aggregate margin](#sizing-the-aggregate-margin-measured-2026-09-29)
   priced it: on 2026-09-29 it reds nothing the flat 0.10 does not, one failed repetition

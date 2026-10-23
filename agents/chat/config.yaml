@@ -430,9 +430,12 @@ plugins:
     - incident_context
     - bootstrap_onboarding
     - legacy_slash_commands
-    # Counts every inbound message on pre_gateway_dispatch, and the failed turns
-    # the gateway patch reports, and serves them on the listener the operator
-    # reads into status.usage.chatMessagesInboundTotal and chatTurnsErroredTotal.
+    # Counts every inbound message on pre_gateway_dispatch, the failed turns the
+    # gateway patch reports, the board's cards that gave up and the thumbs-downs the
+    # chat_feedback_reactions hook reports from Hermes' reaction:added event, and
+    # serves them on the listener the operator reads into
+    # status.usage.chatMessagesInboundTotal, chatTurnsErroredTotal,
+    # backgroundTasksGaveUpTotal and negativeFeedbackTotal.
     # Rewrites nothing, so its place in the order does not matter.
     - chat_metrics
     # Injects the routable-specialist roster into every turn, so choosing an

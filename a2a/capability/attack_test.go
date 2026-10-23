@@ -451,13 +451,13 @@ func TestDeletingAnAncestorRevokesEveryDescendantImmediately(t *testing.T) {
 
 // --- the verb question ----------------------------------------------------
 
-func TestAVerbAboveTheCapabilitysTierIsRefused(t *testing.T) {
+func TestAVerbOutsideTheTiersSetIsRefused(t *testing.T) {
 	e := Entry{Tier: TierDeveloperTeam, Scope: "project/P/cluster/C/ns/N", Delegate: podA}
 	if err := Permits(e, VerbTaskExecute, "project/P/cluster/C/ns/N"); err != nil {
 		t.Fatalf("control: its own tier's verb should pass: %v", err)
 	}
 	mustRefuse(t, Permits(e, VerbClusterMutate, "project/P/cluster/C"),
-		"below the tier the verb requires")
+		"does not permit the verb")
 }
 
 func TestAResourceOutsideTheScopeIsRefused(t *testing.T) {
@@ -501,18 +501,21 @@ func TestAnUnknownVerbIsRefusedRatherThanAllowed(t *testing.T) {
 		"verb is not in the table")
 }
 
-func TestAnUnknownTierIsRefusedRatherThanRanked(t *testing.T) {
-	// The subtle one: an unknown tier compares equal to itself, so a
-	// narrowing check that ranked by string would pass `tier: root` under
-	// `tier: root` and a Permits that defaulted to zero would rank it below
-	// everything — refused by accident today, allowed by accident the first
-	// time somebody reorders the constants.
+func TestAnUnknownTierIsRefusedRatherThanGivenAnEmptySet(t *testing.T) {
+	// The subtle one: an unknown tier compares equal to itself, and a
+	// lookup that defaulted to an empty verb set would make it a subset of
+	// everything, so `tier: root` would narrow under any parent and Permits
+	// would refuse it only by accident.
 	e := Entry{Tier: Tier("root"), Scope: "project/P", Delegate: podA}
 	if err := e.Validate(); err == nil {
 		t.Fatal("an unknown tier validated")
 	}
-	mustRefuse(t, Narrows(Entry{Tier: Tier("root"), Scope: "project/P"}, e), "not in the lattice")
-	mustRefuse(t, Permits(e, VerbTaskExecute, "project/P"), "not in the lattice")
+	mustRefuse(t, Narrows(Entry{Tier: Tier("root"), Scope: "project/P"}, e), "is not a known tier")
+	mustRefuse(t, Permits(e, VerbTaskExecute, "project/P"), "is not a known tier")
+	// An unknown parent over a known child: Minter.Attenuate passes the
+	// caller's parent straight in, so this check is the only guard there.
+	known := Entry{Tier: TierDeveloperTeam, Scope: "project/P", Delegate: podA}
+	mustRefuse(t, Narrows(Entry{Tier: Tier("root"), Scope: "project/P"}, known), "parent carries a tier that is not a known tier")
 }
 
 // --- the store's contract -------------------------------------------------

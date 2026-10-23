@@ -94,6 +94,14 @@ const (
 	chatTurnsErroredSeries = "kubeagents_chat_turns_errored_total"
 	a2aTaskTerminalsSeries = "kubeagents_a2a_gateway_task_terminals_total"
 	a2aTerminalStateLabel  = "state"
+	// kanbanGaveUpSeries is the chat plugin's count of board cards that gave
+	// up since its process started, summed whole into backgroundTasksGaveUpTotal.
+	kanbanGaveUpSeries = "kubeagents_kanban_tasks_gave_up_total"
+	// chatFeedbackNegativeSeries is the chat plugin's count of thumbs-down
+	// reactions a person put on the bot's messages, summed over its platform
+	// label into negativeFeedbackTotal; the chat_feedback_reactions hook feeds
+	// it, and no A2A family joins it.
+	chatFeedbackNegativeSeries = "kubeagents_chat_feedback_negative_total"
 	// a2aMessagesInboundSeries is the A2A gateway's counter of the chat
 	// messages it accepted as turns, by platform: the same counter on a
 	// next-mode install, where Chat ingress is the A2A gateway's rather than
@@ -211,6 +219,10 @@ func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 		return brokerFailuresSeries, nil
 	case usageCounterChatTurnsErrored:
 		return chatTurnsErroredSeries, nil
+	case usageCounterBackgroundTasksGaveUp:
+		return kanbanGaveUpSeries, nil
+	case usageCounterNegativeFeedback:
+		return chatFeedbackNegativeSeries, nil
 	default:
 		return toolInvocationsSeries, usageLabelFilter{toolInvocationsStatusLabel: toolInvocationsCountedStatuses}
 	}

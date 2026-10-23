@@ -595,9 +595,9 @@ func TestHandleDeletionReapsOnlyTheLabeledJetStreamPVC(t *testing.T) {
 	})
 }
 
-// The web read surface: a websocket listener (still plain ws, unlike the TLS
-// client listener), a ClusterIP port
-// for it, and a `web` user that can watch everything and say nothing —
+// The web read surface: a websocket listener on TLS from the bus's serving
+// pair (#3651; TestTheRenderedWebsocketListenerServesTLS runs it), a ClusterIP
+// port for it, and a `web` user that can watch everything and say nothing —
 // subscribe on a2a.>, the JetStream read API, its own inbox, and no publish
 // reach beyond those. The read-only web rail is the consumer; kubectl
 // port-forward is the demo transport, which is why ClusterIP is enough.
@@ -607,8 +607,20 @@ func TestBuildA2ANATSConfigWebsocketAndWebUser(t *testing.T) {
 	if !strings.Contains(conf, "websocket {") {
 		t.Fatal("nats.conf has no websocket block")
 	}
-	if !strings.Contains(conf, "no_tls: true") {
-		t.Error("websocket block does not state plain ws (no_tls: true)")
+	// Slice the websocket block so a tls block elsewhere (the client
+	// listener's) cannot stand in for its own.
+	ws := conf[strings.Index(conf, "websocket {"):]
+	ws = ws[:strings.Index(ws, "\n}\n")]
+	if strings.Contains(ws, "no_tls") {
+		t.Error("websocket block still sets no_tls")
+	}
+	for _, line := range []string{
+		`cert_file: "` + a2aNATSTLSMountDir + "/" + a2aNATSTLSCertKey + `"`,
+		`key_file: "` + a2aNATSTLSMountDir + "/" + a2aNATSTLSKeyKey + `"`,
+	} {
+		if !strings.Contains(ws, line) {
+			t.Errorf("websocket block has no %s; it must serve the bus's serving pair", line)
+		}
 	}
 	if !strings.Contains(conf, "port: 9222") {
 		t.Error("websocket listener is not on 9222")
@@ -847,8 +859,8 @@ func TestBuildA2AGatewayIdentityAndOwnerWiring(t *testing.T) {
 	}
 
 	role := buildA2AGatewayRole(agent)
-	if len(role.Rules) != 2 {
-		t.Fatalf("gateway Role has %d rules, want the session-pod rule plus the pinned owner get", len(role.Rules))
+	if len(role.Rules) != 3 {
+		t.Fatalf("gateway Role has %d rules, want the session-pod rule, the pinned owner get and the pinned PlatformAgent get", len(role.Rules))
 	}
 	// The owner rule is one verb on one named object — a deployments read
 	// would be a finding.
@@ -858,6 +870,15 @@ func TestBuildA2AGatewayIdentityAndOwnerWiring(t *testing.T) {
 		len(owner.Verbs) != 1 || owner.Verbs[0] != "get" ||
 		len(owner.ResourceNames) != 1 || owner.ResourceNames[0] != "test-agent-a2a-gateway" {
 		t.Errorf("owner rule = %+v", owner)
+	}
+	// The PlatformAgent rule, for "/feedback summary", is the same shape:
+	// one verb on this agent's one resource.
+	usage := role.Rules[2]
+	if len(usage.APIGroups) != 1 || usage.APIGroups[0] != agentv1alpha1.GroupVersion.Group ||
+		len(usage.Resources) != 1 || usage.Resources[0] != "platformagents" ||
+		len(usage.Verbs) != 1 || usage.Verbs[0] != "get" ||
+		len(usage.ResourceNames) != 1 || usage.ResourceNames[0] != "test-agent" {
+		t.Errorf("PlatformAgent rule = %+v", usage)
 	}
 
 	rb := buildA2AGatewayRoleBinding(agent)
@@ -3203,6 +3224,7 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 				{Name: a2aBusTokenFileEnv, Value: "/opt/data/attacker/token"},
 				{Name: a2aNotifyPlatformEnvVar, Value: "google_chat"},
 				{Name: a2aNotifyConversationsEnvVar, Value: "google_chat"},
+				{Name: enabledProfilesEnvVar, Value: "tse"},
 				{Name: "NATS_USER", Value: "gateway"},
 				{Name: "NATS_PASSWORD", Value: "hunter2"},
 				{Name: "PLUGIN_OWN_KEY", Value: "kept"},
@@ -3247,7 +3269,10 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 	// so the operator renders no value, and a plugin's would reroute the
 	// agent's proactive posts to a route with no gateway behind it.
 	// A2A_NOTIFY_CONVERSATIONS is the fifth, for the same reason.
-	for _, name := range []string{"NATS_USER", "NATS_PASSWORD", a2aBusTokenFileEnv, a2aNotifyPlatformEnvVar, a2aNotifyConversationsEnvVar} {
+	// KUBE_AGENTS_ENABLED_PROFILES is the sixth: no optional Hermes profile is
+	// bound on this install, so the operator renders no value, and a plugin's
+	// would scaffold an unapproved specialist profile on the gateway pod.
+	for _, name := range []string{"NATS_USER", "NATS_PASSWORD", a2aBusTokenFileEnv, a2aNotifyPlatformEnvVar, a2aNotifyConversationsEnvVar, enabledProfilesEnvVar} {
 		if counts[name] != 0 {
 			t.Errorf("a plugin's %s survived into the agent env under next", name)
 		}
@@ -3266,7 +3291,7 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 	if counts["PLUGIN_OWN_KEY"] != 1 || values["PLUGIN_OWN_KEY"].Value != "kept" {
 		t.Error("the bus-name reservation dropped a plugin variable it has no claim on")
 	}
-	for _, name := range []string{"NATS_URL", a2aNATSCAFileEnv, a2aBusUserEnv, a2aBusTokenFileEnv, a2aNotifyPlatformEnvVar, a2aNotifyConversationsEnvVar, "NATS_USER", "NATS_PASSWORD"} {
+	for _, name := range []string{"NATS_URL", a2aNATSCAFileEnv, a2aBusUserEnv, a2aBusTokenFileEnv, a2aNotifyPlatformEnvVar, a2aNotifyConversationsEnvVar, enabledProfilesEnvVar, "NATS_USER", "NATS_PASSWORD"} {
 		if _, sensitive := agentv1alpha1.SensitiveEnvVars[name]; !sensitive {
 			t.Errorf("%s is not in SensitiveEnvVars; the drop above covers plugin env only, and membership "+
 				"is what keeps the name out of the sidecar containers, which take spec.deployment.env "+
@@ -7841,5 +7866,51 @@ func TestGatewayRendersABlankPlatformAllowlistAsNobody(t *testing.T) {
 		if e.Value != "" || e.ValueFrom != nil {
 			t.Fatalf("%s = %+v, want rendered empty", name, e)
 		}
+	}
+}
+
+// TestTheGatewayAlwaysArmsTheConsoleDoor: every next gateway carries
+// A2A_CONSOLE_DOOR=true, backend or not. With no backend it is what lets the
+// gateway start (a2a/gateway/config.go); beside one it changes nothing, and
+// it means a backend taken away leaves a console-only gateway rather than a
+// crash loop. The name is spelled out so the test reads the gateway's
+// contract rather than the constant it checks.
+func TestTheGatewayAlwaysArmsTheConsoleDoor(t *testing.T) {
+	cases := []struct {
+		name   string
+		inject string
+		door   string
+		agent  func() *agentv1alpha1.PlatformAgent
+		// backendEnv is an env var the case's backend renders, so the case
+		// proves the backend is really there beside the console door.
+		backendEnv string
+	}{
+		// Discord has no case of its own: its env is an optional Secret
+		// reference rendered on every gateway, so it renders exactly as
+		// "no backend" does, which covers it.
+		{"no backend", "", "", a2aTestAgent, ""},
+		{"google chat", "", "", func() *agentv1alpha1.PlatformAgent { return gchatTestAgent("next", true) }, a2aGchatRelayURLEnvVar},
+		{"slack", "", "", func() *agentv1alpha1.PlatformAgent { return slackTestAgent("next", true) }, a2aSlackAppTokenEnvVar},
+		{"inject door", "true", "", a2aTestAgent, a2aInjectListenEnvVar},
+		{"a2a door", "", "true", a2aTestAgent, a2aDoorListenEnvVar},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(a2aInjectBackendEnvVar, tc.inject)
+			t.Setenv(a2aAgentDoorEnvVar, tc.door)
+			dep := buildA2AGatewayDeployment(tc.agent())
+			env := envMapOf(dep.Spec.Template.Spec.Containers[0].Env)
+			if got, ok := env["A2A_CONSOLE_DOOR"]; !ok || got.Value != "true" || got.ValueFrom != nil {
+				t.Errorf("A2A_CONSOLE_DOOR = %+v (set=%v), want the literal \"true\"", got, ok)
+			}
+			if tc.backendEnv != "" {
+				if _, ok := env[tc.backendEnv]; !ok {
+					t.Errorf("precondition: the %s backend's %s is not rendered", tc.name, tc.backendEnv)
+				}
+			}
+			if dep.Spec.Replicas != nil && *dep.Spec.Replicas != 1 {
+				t.Errorf("the render asks for %d replicas, want 1", *dep.Spec.Replicas)
+			}
+		})
 	}
 }

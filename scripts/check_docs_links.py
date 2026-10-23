@@ -298,6 +298,8 @@ LINK_EXEMPT_FAMILY_GLOBS = (
     "agents/platform/governance/*.md",
     "agents/platform/skills/*/SKILL.md",
     "agents/platform/skills/*/references/*.md",
+    "agents/tse/*.md",
+    "agents/tse/skills/*/SKILL.md",
     "bench/tasks/*/evidence/*/integrity-sweep-adjudication.md",
     "bench/tasks/*/evidence/*/integrity-sweep.md",
     "examples/gitops-repo/*/**",

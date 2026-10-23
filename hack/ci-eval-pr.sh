@@ -2914,6 +2914,11 @@ unit_cost_hint() {
     # a plant that blocks on a card appearing, then an agent turn that waits on
     # that card finishing. A wrong hint costs packing, not correctness.
     gitops-drift-out-of-band-triage) echo 900 ;;
+    # The #612 cases on the same stack: the stamp case is the incumbent's
+    # shape; the quiet case's plant waits out the 15m quiet period before a
+    # short turn.
+    autoops-warning-event-triage-state-stamp) echo 900 ;;
+    autoops-quiet-followup) echo 1800 ;;
     # Another of the same shape: infra lock, a plant that publishes a burst and
     # then waits out the human record's card, then an agent turn that is a
     # board read. Priced at the band rather than at the 566-677s its
@@ -2933,6 +2938,9 @@ unit_cost_hint() {
     # measured 7-11 minutes a repetition on a dev install.
     gitops-drift-deleted-policy-triage) echo 900 ;;
     gitops-drift-load-bearing-change-triage) echo 900 ;;
+    # The autoops-incident stack at three replicas, on the infra lock, and a
+    # board read. Unmeasured; priced with autoops-warning-event-triage.
+    incident-triage-workload-fold) echo 900 ;;
     # Tofu too, and the same shape, plus a plant that waits out
     # stall_report.py's ten-minute Deployment threshold before it posts the
     # record and then waits for the card. 1040-1080s a repetition on a dev

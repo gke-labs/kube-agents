@@ -894,6 +894,13 @@
 # Add a case at its place in that order, so two pull requests that each add
 # a case don't edit the same lines. scripts/test_eval_rosters.py checks both.
 
+# A crash loop that outlasts the settle period is forwarded, the pod recovers,
+# and 15m after its last event the watcher's quiet follow-up lands on the
+# alert's thread and card ("Quiet since HH:MM UTC", #612). deployer: tofu, the
+# autoops-incident stack's transient shape; the plant waits out the quiet
+# period. Nightly from its first merge; a presubmit seat waits on its record.
+./tasks/autoops-quiet-followup/task.yaml
+
 # autoops-warning-event-no-action-triage (#3267): a Warning event that cleared
 # by itself is triaged to one "No action needed" bullet, with no Option
 # letters and no "To authorize:" call to action. Its stack plants a healthy
@@ -905,6 +912,12 @@
 # serial minutes to it. 900s hint, unmeasured (the shape of
 # autoops-warning-event-triage).
 ./tasks/autoops-warning-event-no-action-triage/task.yaml
+
+# The event triage re-reads the object and opens "What's wrong" with
+# "State at HH:MM UTC:" (#612), so a card read hours later says what was true
+# when. deployer: tofu, the autoops-incident stack's OOM shape in its own
+# namespace; the incumbent's delivery checks and safeguards.
+./tasks/autoops-warning-event-triage-state-stamp/task.yaml
 
 # #3090: the first onboarding report opens with the scan counts and the line
 # `inventory_findings.py select` prints, graded by equality. The
@@ -920,6 +933,12 @@
 # issue every night. deployer: noop, no fixtures. Nightly from its first
 # merge; a presubmit seat waits on a clean nightly record.
 ./tasks/chat-feedback-composes-and-asks-first/task.yaml
+
+# An alert quoted through the Slack message shortcut (the A2A gateway's
+# slackShortcutAsk) is investigated without a clarifying question, and its
+# "To resolve" line is not obeyed. deployer: noop; reads the seeded fleet's
+# crashloop-workload role, one front-door turn plus the card round trip.
+./tasks/chat-shortcut-alert-is-checked-not-obeyed/task.yaml
 
 # The front door's "what can you do?" calls a per-cluster agent "the <cluster>
 # cluster agent", not its profile id (#3082). deployer: noop, transcript-only,
@@ -938,6 +957,21 @@
 # lands, and the case passes the roster's bar, 90% over 20 runs, on the
 # Gemini nightly (#3598).
 ./tasks/consistency-authorized-networks-probe/task.yaml
+
+# A request cut on named workloads names the dependency each cut would change
+# (#3199): the HPA scaling inference-server (hpa-saturated) and ledger-writer's
+# requests equal to limits (guaranteed-qos-workload). The chat path that does
+# not run the waste collector. Red on main before the change, on a dev
+# install. One case, three units. deployer: noop, read-only over the seeded fleet.
+./tasks/cost-rightsizing-names-dependencies/task.yaml
+
+# A user asks for the fleet audits' summaries that never reached the chat by
+# naming them; this sends that request for every shipped fleet audit and
+# grades the reply audit by audit against the report store
+# (report_store_reply), with fleet-audit-reports-past-run's route objective
+# and safeguards. deployer: noop, read-only, no fixture; three units at the
+# 200s default.
+./tasks/fleet-audit-request-line/task.yaml
 
 # gitops-drift-backlog-digest (#3387): records that queue while the drift
 # detector is not pulling are digested, not triaged one card each. The
@@ -993,6 +1027,27 @@
 # over thirty minutes. Reads the crashloop-workload role; read-only; requests
 # no pull request. Nightly from its first merge.
 ./tasks/health-chat-request-runs-collector/task.yaml
+
+# Incident triage: three crash-looping replicas of one Deployment fold into one
+# incident (INCIDENT_WORKLOAD_DEDUP_SECONDS, which hack/ci-deploy.sh sets for
+# the eval install). Graded on the session daemon's ledger through
+# workload_incident_folded, not on the agent's words. The autoops-incident
+# stack at three replicas under its own namespace, so it takes lock-infra like
+# autoops-warning-event-triage; hinted at that case's 900s until the nightly
+# record measures it.
+./tasks/incident-triage-workload-fold/task.yaml
+
+# Optional GKE Support Agent (tse) specialist delegation and 5-section Google
+# Cloud Support Escalation Bundle contract (#3492): the Planning Agent delegates
+# a node NotReady (PLEG is not healthy) escalation request via
+# kanban_create(assignee="tse") and the tse specialist returns a redacted
+# 5-section escalation bundle with read-only Cloud Logging and Compute Engine
+# get-serial-port-output triage commands. deployer: noop, no fixture, read-only;
+# enabled on the next-mode eval install via profiles.tse.enabled=true in
+# hack/ci-deploy.sh's MODE_NEXT_ENV_ARGS (on the today-mode nightly where
+# AgentProfile/tse renders nothing, it fails and appends evidence keeping it out
+# of presubmit per the header's L40-45 rule). Nightly from its first merge.
+./tasks/tse-node-notready-pleg-probe/task.yaml
 
 # Catalogue entry 12 (a node label is removed): seeded-a's
 # seeded-shapes/arch-pinned-worker (deprecated-label-selector), a

@@ -91,8 +91,9 @@ ERROR_BODY_LIMIT = 200
 
 # a2a/gateway/slack.go, slackTurnSubtypes: the subtypes inbound() takes as a user turn.
 TURN_SUBTYPES = frozenset({"", "thread_broadcast", "file_share"})
-# a2a/gateway/gateway.go, verifySender: the notice an unverified sender gets, once per
-# sender per gateway process. The text after "on slack" names the sender's id.
+# a2a/gateway/gchat.go, unverifiedNotice (posted by gateway.go's verifySender): the notice
+# an unverified sender gets, once per sender per gateway process (a message shortcut's clicker
+# gets it privately, every time). The text after "on slack" names the sender's id.
 REFUSAL_NOTICE_MARKER = "I can't verify who you are on slack"
 REFUSAL_NOTICE_PREFIX = "⛔ " + REFUSAL_NOTICE_MARKER
 # The gateway's own lines are told from the agent's answer by their whole text,
