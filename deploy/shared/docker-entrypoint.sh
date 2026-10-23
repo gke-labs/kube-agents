@@ -32,6 +32,11 @@ readonly ELF_MAGIC_HEX=7f454c46
 # Cluster Agent profile that still holds it to its template's value
 # (migrate_stale_timeout_from_template).
 readonly OLD_SHIPPED_STALE_TIMEOUT_SECONDS=600
+readonly TSE_TEMPLATE="/opt/tse-template"
+readonly DEFAULTS_PLUGINS_DIR="/opt/defaults/plugins"
+readonly OPTIONAL_PROFILE_STAMP=".optional-profile"
+readonly DELETED_PROFILES_DIR=".deleted"
+readonly OPTIONAL_SYNC_ITEMS="config.yaml SOUL.md AGENTS.md CAPABILITIES.md"
 
 export TARGET_DIR="${PLATFORM_AGENT_HOME:-/opt/data}"
 export HERMES_HOME="$TARGET_DIR"
@@ -357,7 +362,7 @@ fi
 # built. There is deliberately no env-var override; a bypass switch would be readable to
 # exactly the caller this is meant to be honest with.
 SKILL_PROVENANCE_SCRIPT="/opt/defaults/scripts/verify_skills_provenance.py"
-for _tree in /opt/hermes/skills /opt/platform-template/skills /opt/cluster-template/skills /opt/a2a-template/skills; do
+for _tree in /opt/hermes/skills /opt/platform-template/skills /opt/cluster-template/skills /opt/tse-template/skills /opt/a2a-template/skills; do
     [ -f "$_tree/skills_manifest.sha256" ] || continue
     if [ ! -f "$SKILL_PROVENANCE_SCRIPT" ] || [ ! -x "$INSTALL_DIR/.venv/bin/python3" ]; then
         echo "FATAL: $_tree carries a build-time manifest but nothing here can check it ($SKILL_PROVENANCE_SCRIPT or $INSTALL_DIR/.venv/bin/python3 is missing); refusing to start" >&2
@@ -1757,6 +1762,131 @@ if platform_is_front_door && [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] \
             || echo "WARN: could not seed profiles/platform/config.yaml from $PLATFORM_TEMPLATE/config.yaml; the front door has no config of its own" >&2
     fi
 fi
+
+# 2.6c Reconcile optional built-in specialist profiles declared in KUBE_AGENTS_ENABLED_PROFILES.
+#
+# In `mode: next` (and when explicitly opted in via KUBE_AGENTS_ENABLED_PROFILES),
+# the operator populates KUBE_AGENTS_ENABLED_PROFILES from bound AgentProfile
+# custom resources whose names match a built-in optional specialist template
+# baked into the image (currently `tse`, backed by /opt/tse-template).
+# Profiles marked with `.optional-profile` that are removed from KUBE_AGENTS_ENABLED_PROFILES
+# are archived into `$TARGET_DIR/profiles/.deleted/<name>` so the Chat Agent's
+# dynamic roster (`agent_roster.py`) stops advertising them without destroying
+# prior session state.
+reconcile_optional_profiles() {
+    _opt_enabled_raw="$(printf '%s' "${KUBE_AGENTS_ENABLED_PROFILES:-}" | tr ',' ' ')"
+    _opt_enabled_list=" "
+
+    set -f
+    for _opt_token in $_opt_enabled_raw; do
+        set +f
+        [ -n "$_opt_token" ] || continue
+        case "$_opt_token" in
+            tse)
+                ;;
+            *)
+                echo "WARN: ignoring unsupported or reserved optional profile name '$_opt_token' in KUBE_AGENTS_ENABLED_PROFILES" >&2
+                continue
+                ;;
+        esac
+        case "$_opt_enabled_list" in
+            *" $_opt_token "*) ;;
+            *) _opt_enabled_list="${_opt_enabled_list}${_opt_token} " ;;
+        esac
+    done
+    set +f
+
+    for _opt_name in $_opt_enabled_list; do
+        _opt_tpl=""
+        case "$_opt_name" in
+            tse) _opt_tpl="$TSE_TEMPLATE" ;;
+        esac
+        if [ -z "$_opt_tpl" ] || [ ! -d "$_opt_tpl" ]; then
+            echo "WARN: optional profile '$_opt_name' is enabled in KUBE_AGENTS_ENABLED_PROFILES, but template '$_opt_tpl' does not exist; skipping" >&2
+            continue
+        fi
+
+        _opt_home="$TARGET_DIR/profiles/$_opt_name"
+        _opt_deleted="$TARGET_DIR/profiles/$DELETED_PROFILES_DIR/$_opt_name"
+        if [ ! -d "$_opt_home" ] && [ -d "$_opt_deleted" ]; then
+            mkdir -p "$TARGET_DIR/profiles" 2>/dev/null || {
+                echo "WARN: could not create $TARGET_DIR/profiles for '$_opt_name'; continuing" >&2
+                continue
+            }
+            if mv "$_opt_deleted" "$_opt_home" 2>/dev/null; then
+                echo "[ENTRYPOINT] Restored previously archived optional profile '$_opt_name' from $DELETED_PROFILES_DIR/." >&2
+            else
+                echo "WARN: could not restore archived optional profile '$_opt_name' from $_opt_deleted; skipping scaffold so archive is preserved" >&2
+                continue
+            fi
+        fi
+
+        if [ ! -f "$_opt_home/profile.yaml" ] && [ -f "$SCAFFOLD" ] && [ -x "$INSTALL_DIR/.venv/bin/python3" ]; then
+            echo "[ENTRYPOINT] Scaffolding optional profile '$_opt_name' from $_opt_tpl..." >&2
+            HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" "$SCAFFOLD" \
+                --name "$_opt_name" \
+                --template "$_opt_tpl" \
+                --plugins "$DEFAULTS_PLUGINS_DIR" \
+                --description "Optional specialist profile ($_opt_name)" >/dev/null \
+                || echo "WARN: optional profile '$_opt_name' scaffold failed; continuing" >&2
+        fi
+
+        # Gate all post-scaffold writes on profile.yaml (just as step 2.5 and 2.6 do
+        # for `platform`): writing files into an unregistered directory would prevent
+        # `_clear_mount_skeleton` from cleaning it up and leave the profile permanently
+        # unregistered across restarts.
+        if [ ! -f "$_opt_home/profile.yaml" ]; then
+            echo "WARN: optional profile '$_opt_name' has no profile.yaml after scaffold; skipping sync so next start can retry" >&2
+            continue
+        fi
+
+        touch "$_opt_home/$OPTIONAL_PROFILE_STAMP" 2>/dev/null || true
+
+        if [ -f "$SCAFFOLD" ] && [ -x "$INSTALL_DIR/.venv/bin/python3" ]; then
+            HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" "$SCAFFOLD" \
+                --name "$_opt_name" \
+                --template "$_opt_tpl" \
+                --plugins "$DEFAULTS_PLUGINS_DIR" \
+                --items "$OPTIONAL_SYNC_ITEMS" >/dev/null \
+                || echo "WARN: optional profile '$_opt_name' template sync failed; continuing" >&2
+        fi
+
+        sync_profile_skills "$_opt_tpl" "$_opt_home"
+
+        if [ -d "$TARGET_DIR/scripts" ]; then
+            ln -sfn "$TARGET_DIR/scripts" "$_opt_home/scripts" 2>/dev/null || true
+        fi
+    done
+
+    for _opt_dir in "$TARGET_DIR/profiles"/*; do
+        [ -d "$_opt_dir" ] || continue
+        [ -f "$_opt_dir/$OPTIONAL_PROFILE_STAMP" ] || continue
+        _opt_base="$(basename "$_opt_dir")"
+        case "$_opt_enabled_list" in
+            *" $_opt_base "*) ;;
+            *)
+                mkdir -p "$TARGET_DIR/profiles/$DELETED_PROFILES_DIR" 2>/dev/null || {
+                    echo "WARN: could not create $TARGET_DIR/profiles/$DELETED_PROFILES_DIR to archive '$_opt_base'; continuing" >&2
+                    continue
+                }
+                _opt_archived="$TARGET_DIR/profiles/$DELETED_PROFILES_DIR/$_opt_base"
+                if [ -e "$_opt_archived" ]; then
+                    _opt_prev="${_opt_archived}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+                    if mv "$_opt_archived" "$_opt_prev" 2>/dev/null; then
+                        echo "WARN: archive profiles/$DELETED_PROFILES_DIR/$_opt_base already existed; rotated prior archive to $(basename "$_opt_prev")" >&2
+                    else
+                        echo "WARN: archive profiles/$DELETED_PROFILES_DIR/$_opt_base already exists and could not be rotated; leaving both in place" >&2
+                        continue
+                    fi
+                fi
+                mv "$_opt_dir" "$_opt_archived" 2>/dev/null \
+                    && echo "[ENTRYPOINT] Archived disabled optional profile '$_opt_base' to profiles/$DELETED_PROFILES_DIR/$_opt_base." >&2 \
+                    || echo "WARN: could not archive disabled optional profile '$_opt_base'" >&2
+                ;;
+        esac
+    done
+}
+reconcile_optional_profiles
 
 # 2.65 Link profile-targeted plugin image volumes into their profile homes.
 #

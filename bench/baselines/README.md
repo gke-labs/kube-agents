@@ -114,16 +114,19 @@ versions and the mode, and nothing about which build produced a sample, so a
 candidate's record and `main`'s are the same record once written — and the
 candidate would then be judged non-inferior to a window it had just moved.
 
-A next-mode run on `main` does append. The next-mode nightly is a periodic with
-no `PULL_NUMBER` whose matrix runs through the inject door, which `bench-gate`
+A next-mode run on `main` does append. The main nightly
+(`ci-kube-agents-eval-nightly` and its `-writers` part) is a periodic with no
+`PULL_NUMBER` whose matrix runs through the inject door, which `bench-gate`
 reads as the key's `next` mode, so its lines file under a key of their own and
-never reach today's window. At a `next` key a repetition graded with a check set
+never reach today's window. Today's window is appended by
+`ci-kube-agents-eval-nightly-today`, the today-mode nightly kept as the
+rollback check, which grades a fresh `today` install over the agent API. At a
+`next` key a repetition graded with a check set
 aside as not applicable on the inject transport is recorded, because every
 next-mode run, on `main` or on a pull request, is graded under the same set-aside
 rule; at a `today` key the case is skipped. The key includes the agent model, so
-the next-mode nightly's lines are a window only for a next-mode run at its model:
-the presubmit runs another, and its next window stays empty until a next-mode
-run on `main` records at the presubmit's model.
+the main nightly's lines are a window only for a next-mode run at its model,
+which is the presubmit's.
 
 A store that will not parse is an **error**, never an empty store. Empty means
 "nothing admitted, aggregate advisory", which is a green; a corrupt file

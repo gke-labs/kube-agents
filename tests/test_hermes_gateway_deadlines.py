@@ -26,6 +26,7 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _SHARED_DEFAULTS = _REPO_ROOT / "deploy" / "shared" / "defaults" / "config.yaml"
 _CHAT = _REPO_ROOT / "agents" / "chat" / "config.yaml"
 _CLUSTER = _REPO_ROOT / "agents" / "cluster" / "config.yaml"
+_TSE = _REPO_ROOT / "agents" / "tse" / "config.yaml"
 _PLATFORM_OVERLAY = _REPO_ROOT / "agents" / "platform" / "config.yaml"
 _MERGE_CONFIGS = _REPO_ROOT / "deploy" / "docker" / "merge_configs.py"
 
@@ -60,6 +61,7 @@ class TestGatewayDeadlines(unittest.TestCase):
             ("deploy/shared/defaults/config.yaml", _load(_SHARED_DEFAULTS), FRONT_DOOR_STALE_SECONDS),
             ("agents/chat/config.yaml (front door)", _load(_CHAT), FRONT_DOOR_STALE_SECONDS),
             ("agents/cluster/config.yaml (Cluster Agents)", _load(_CLUSTER), WORKER_STALE_SECONDS),
+            ("agents/tse/config.yaml (GKE Support Agent)", _load(_TSE), WORKER_STALE_SECONDS),
             ("platform profile (shared defaults + agents/platform/config.yaml)", _merged_platform_config(), WORKER_STALE_SECONDS),
         )
         for name, config, stale in cases:
@@ -70,7 +72,7 @@ class TestGatewayDeadlines(unittest.TestCase):
 
     def test_workers_fail_faster_than_the_front_door(self) -> None:
         front_door = _deadlines(_load(_CHAT))["stale_timeout_seconds"]
-        for name, config in (("cluster", _load(_CLUSTER)), ("platform", _merged_platform_config())):
+        for name, config in (("cluster", _load(_CLUSTER)), ("tse", _load(_TSE)), ("platform", _merged_platform_config())):
             with self.subTest(profile=name):
                 worker = _deadlines(config)
                 self.assertLess(worker["stale_timeout_seconds"], front_door)

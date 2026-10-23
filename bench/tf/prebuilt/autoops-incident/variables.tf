@@ -145,6 +145,36 @@ variable "accept_folded" {
   default     = false
 }
 
+
+# The second shape the stack can plant: a container that exits non-zero until
+# crash_seconds have passed since its pod started, then runs. kubelet backs it
+# off (Reason=BackOff), the back-off climbs 10s, 20s, 40s, 80s, 160s, so the
+# restarts fall at about 10s, 30s, 70s, 150s and 310s, and kubelet re-emits
+# the BackOff event on every sync while a back-off is pending, so the event's
+# sightings span the whole time until a restart succeeds. 45 runs on the 70s
+# restart, inside the watcher's 2m settle period, and must raise no card; 240
+# outlasts it and must. 0 (the default) plants the OOM shape above instead.
+variable "crash_seconds" {
+  type        = number
+  description = "Seconds the planted container keeps crashing before it starts; 0 plants the OOM-killed shape."
+  default     = 0
+}
+# What the apply waits for before returning: `incident`, the watcher's log
+# line that it opened an incident for the namespace (the OOM shape's only
+# sensible wait); `followup`, the watcher's log line that it sent the quiet
+# follow-up for the namespace, which arrives WATCHER_QUIET_AFTER (15m) after
+# the pod's last event, and which the apply stops waiting for at its bound
+# without failing, so a case can grade the follow-up's absence.
+variable "wait_for" {
+  type        = string
+  description = "What the apply waits for: incident or followup."
+  default     = "incident"
+  validation {
+    condition     = contains(["incident", "followup"], var.wait_for)
+    error_message = "wait_for must be incident or followup."
+  }
+}
+
 # Identify the CI run that planted this, so a janitor can find what a run killed
 # before teardown left behind. Both are empty outside CI.
 variable "prow_build_id" {

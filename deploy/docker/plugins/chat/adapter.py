@@ -136,9 +136,10 @@ SILENT_MARKER = "[SILENT]"
 # The openings of the failure line the scheduler delivers in place of a failed
 # run's final response (cron/scheduler.py: _summarize_cron_failure_for_delivery
 # and the blocked-config branch of _compose_run_delivery), with the job's name. The relay
-# posts such a line as written, where it would otherwise post the fleet-audit
-# record, so the match is exact against the wrapper's own title and bounded in
-# length: a model message that only starts the same way is not a failure line.
+# posts such a line in plain words, once until the job runs cleanly, where it
+# would otherwise post the fleet-audit record or the text as written, so the match
+# is exact against the wrapper's own title and bounded in length: a model message
+# that only starts the same way is not a failure line.
 # verify_chat_relay.py pins every shape against the real scheduler.
 SCHEDULER_FAILURE_PREFIXES = (
     "⚠️ Cron '{title}' failed: ",
