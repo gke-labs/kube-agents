@@ -1380,6 +1380,31 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
             for name in names:
                 self.assertEqual((pvc / name).read_text(encoding="utf-8"), "image\n", name)
 
+    def test_a_newer_stale_pvc_copy_of_the_onboarding_plugin_is_replaced(self):
+        # The plugin's hooks and bootstrap_delivery.py (step 2b) must come from one image:
+        # an old plugin beside the new script writes no greeting hold.
+        lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+        start = next(i for i, line in enumerate(lines) if line.startswith("# The onboarding plugin is image-owned"))
+        end = next(i for i in range(start, len(lines)) if lines[i] == "fi")
+        name = "plugins/bootstrap_onboarding/plugin.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            image = pathlib.Path(tmp) / "defaults"
+            pvc = pathlib.Path(tmp) / "data"
+            (image / name).parent.mkdir(parents=True)
+            (image / name).write_text("image\n", encoding="utf-8")
+            (pvc / name).parent.mkdir(parents=True)
+            (pvc / name).write_text("stale\n", encoding="utf-8")
+            future = time.time() + 3600
+            os.utime(pvc / name, (future, future))
+            block = "\n".join(lines[start : end + 1]).replace("/opt/defaults", str(image))
+            subprocess.run(
+                ["bash", "-c", block],
+                env={**os.environ, "TARGET_DIR": str(pvc)},
+                check=True,
+                timeout=30,
+            )
+            self.assertEqual((pvc / name).read_text(encoding="utf-8"), "image\n")
+
 
 class ManagedScopeAssertionTest(unittest.TestCase):
     """Step 2d's other half: the check that the operator's pins actually arrived.
