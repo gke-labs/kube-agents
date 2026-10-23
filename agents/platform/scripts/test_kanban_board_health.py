@@ -392,6 +392,8 @@ class StuckTasksTests(unittest.TestCase):
         self.assertEqual(kbh.plain_age(24), "1 day")
         self.assertEqual(kbh.plain_age(24 * 9 + 23), "9 days")
         self.assertIsNone(kbh.plain_age(float("inf")))
+        self.assertIsNone(kbh.plain_age(float("nan")))
+        self.assertIsNone(kbh.plain_age(float("-inf")))
         self.assertEqual(kbh.status_line(False, float("inf")), "Stopped before finishing.")
         self.assertEqual(kbh.status_line(True, float("inf")), "Paused.")
 
@@ -486,13 +488,13 @@ class StuckDueTests(unittest.TestCase):
     def test_state_round_trips_and_a_bad_record_reads_empty(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "cron" / "state.json"
-            self.assertEqual(kbh.load_state(path), {})
+            self.assertEqual(kbh.load_state(path), {"said": [], "said_at": None})
             kbh.save_state(path, {"said": ["a"], "said_at": 5.0})
             self.assertEqual(kbh.load_state(path), {"said": ["a"], "said_at": 5.0})
             path.write_text("{not json")
-            self.assertEqual(kbh.load_state(path), {})
+            self.assertEqual(kbh.load_state(path), {"said": [], "said_at": None})
             path.write_text(json.dumps({"version": 99, "said": ["a"], "said_at": 5.0}))
-            self.assertEqual(kbh.load_state(path), {})
+            self.assertEqual(kbh.load_state(path), {"said": [], "said_at": None})
 
     def test_an_unwritable_record_does_not_raise(self):
         with tempfile.TemporaryDirectory() as d:
@@ -639,6 +641,16 @@ class MainOutputContractTests(unittest.TestCase):
         self.assertEqual(path.read_text(), before)
         # The next answer is still inside the week the record started, so stays quiet.
         self.assertEqual(self.run_main(tasks, [], now=1000.0 + 86400), (0, ""))
+
+    def test_a_healthy_run_writes_no_record(self):
+        self.run_main([], [])
+        self.assertFalse(Path(self.env["KANBAN_HEALTH_STATE"]).exists())
+
+    def test_a_card_that_fails_to_render_is_not_recorded_as_said(self):
+        self._patch("render_stuck_tasks", unittest.mock.Mock(side_effect=ValueError("render")))
+        with self.assertRaises(ValueError):
+            self.run_main([stuck("t_1", "Triage x", 30)], [])
+        self.assertFalse(Path(self.env["KANBAN_HEALTH_STATE"]).exists())
 
     def test_stuck_tasks_and_other_findings_print_together(self):
         _code, out = self.run_main([stuck("t_1", "Triage x", 30)], ["  ghost claim: task t is 'ready'"])

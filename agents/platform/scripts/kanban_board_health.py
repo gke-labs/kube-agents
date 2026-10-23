@@ -127,6 +127,7 @@ Run on demand:  PLATFORM_AGENT_HOME=/opt/data python3 kanban_board_health.py
 
 import collections
 import json
+import math
 import os
 import shutil
 import sqlite3
@@ -166,6 +167,11 @@ MAX_INVARIANT_ITEMS = 20
 MAX_REPORT_CHARS = 8500
 # The other findings' header, under the stuck tasks when both are present.
 REPORT_HEADER = "kanban board health: attention required"
+# What the header and its newline take of the other findings' budget.
+REPORT_HEADER_RESERVE = len(REPORT_HEADER) + 1
+# The room an omission line ("... and N other ... omitted") needs; below it
+# the line is left off rather than pushing the report past its budget.
+OMISSION_LINE_RESERVE = 120
 
 # The stuck tasks, in plain words: the task's own title and how long it has
 # waited, no ids, reasons or commands. Standard markdown, which the relay's
@@ -400,8 +406,8 @@ def stuck_tasks(stuck_items: list, context: dict) -> list:
 
 
 def plain_age(age_hours: float) -> str | None:
-    """"3 days" or "5 hours"; None when the engine gave no age."""
-    if age_hours == float("inf"):
+    """"3 days" or "5 hours"; None when the engine gave no age, or one that is not a number."""
+    if not math.isfinite(age_hours):
         return None
     hours = max(0, int(age_hours))
     days = hours // HOURS_PER_DAY
@@ -463,13 +469,18 @@ def state_path(home: Path, env=None) -> Path:
 
 
 def load_state(path: Path) -> dict:
-    """The ids last said and when; empty (so the next stuck task is said) when unreadable."""
+    """The ids last said and when; empty (so the next stuck task is said) when missing or unreadable.
+
+    Empty is the same record ``stuck_due`` keeps for a board with nothing
+    stuck, so a healthy run writes nothing.
+    """
+    empty = {STATE_SAID_KEY: [], STATE_SAID_AT_KEY: None}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {}
+        return empty
     if not isinstance(data, dict) or data.get(STATE_VERSION_KEY) != STATE_SCHEMA_VERSION:
-        return {}
+        return empty
     said = data.get(STATE_SAID_KEY)
     said_at = data.get(STATE_SAID_AT_KEY)
     return {
@@ -640,11 +651,11 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
                 parts.append(f" - {detail}")
             diag_lines.append("".join(parts))
 
-    diag_budget = max(0, min(MAX_DIAGNOSTIC_CHARS, max_chars) - 120)
+    diag_budget = max(0, min(MAX_DIAGNOSTIC_CHARS, max_chars) - OMISSION_LINE_RESERVE)
     shown_diag_lines = _take_within_budget(diag_lines, MAX_DIAGNOSTIC_ITEMS, diag_budget)
     lines = list(shown_diag_lines)
     omitted_diags = len(diag_lines) - len(shown_diag_lines)
-    if omitted_diags > 0 and max_chars >= 120:
+    if omitted_diags > 0 and max_chars >= OMISSION_LINE_RESERVE:
         lines.append(
             f"  ... and {omitted_diags} other diagnostic{'s' if omitted_diags != 1 else ''} omitted "
             f"(run hermes kanban diagnostics on the agent pod to view all)"
@@ -658,8 +669,8 @@ def report(home: Path, *, env=None, max_chars: int | None = None, **kwargs) -> t
     The stuck tasks are ``stuck_tasks`` dicts, which ``main`` renders when
     ``stuck_due`` says so, or None when the engine did not answer (its line is
     among the other lines), since then which cards are stuck is unknown. The other lines (invariant violations and the
-    engine's other findings) stay <= max_chars (including the 40-char reserve
-    for ``REPORT_HEADER``); the default leaves ``STUCK_CARD_RESERVE`` of the
+    engine's other findings) stay <= max_chars (including
+    ``REPORT_HEADER_RESERVE``); the default leaves ``STUCK_CARD_RESERVE`` of the
     report's budget to the stuck tasks.
     """
     if max_chars is None:
@@ -677,7 +688,7 @@ def report(home: Path, *, env=None, max_chars: int | None = None, **kwargs) -> t
     finally:
         conn.close()
 
-    used_chars = 40  # reserve for REPORT_HEADER and its newline
+    used_chars = REPORT_HEADER_RESERVE
     if violations:
         header = "Board invariant violations (a direct write to kanban.db is the usual cause):"
         lines.append(header)
@@ -692,7 +703,7 @@ def report(home: Path, *, env=None, max_chars: int | None = None, **kwargs) -> t
             lines.append(
                 f"  ... and {omitted_violations} other invariant violation{'s' if omitted_violations != 1 else ''} omitted"
             )
-        used_chars = 40 + sum(len(ln) + 1 for ln in lines)
+        used_chars = REPORT_HEADER_RESERVE + sum(len(ln) + 1 for ln in lines)
 
     diag_header_reserve = len("Active kanban diagnostics:\n")
     remaining_chars = max(0, max_chars - used_chars - diag_header_reserve)
@@ -723,9 +734,11 @@ def main(argv=None, *, env=None, now=None) -> int:
         path = state_path(home, env)
         state = load_state(path)
         due, kept = stuck_due(tasks, state, time.time() if now is None else now)
+        # Rendered before the record is saved, so a card that fails to render
+        # is not remembered as said.
+        out = render_stuck_tasks(tasks) if due else []
         if kept != state:
             save_state(path, kept)
-        out = render_stuck_tasks(tasks) if due else []
     if lines:
         out.extend([""] if out else [])
         out.extend([REPORT_HEADER, *lines])
