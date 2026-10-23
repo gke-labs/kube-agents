@@ -35,7 +35,8 @@ from typing import Any
 import pytest
 
 #: The variables that select and configure a forge: GitLab, a GitHub
-#: Enterprise Server host, another GitHub API root, a private CA. Every check
+#: Enterprise Server host, another GitHub API root, a private CA, the renewed
+#: GitHub grading-token file (which outranks a fixture's token). Every check
 #: reads them from the process environment, so a developer's shell that
 #: exports them (as a GitLab dev install is told to) would turn the GitHub
 #: tests' answers into another forge's. Cleared before every test; a forge
@@ -48,6 +49,7 @@ FORGE_ENV_VARS = (
     "BENCH_GITHUB_HOST",
     "BENCH_GITHUB_API_ROOT",
     "BENCH_FORGE_CA_FILE",
+    "BENCH_GITHUB_TOKEN_FILE",
 )
 
 

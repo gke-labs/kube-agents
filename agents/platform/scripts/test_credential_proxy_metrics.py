@@ -704,6 +704,33 @@ class BusyRouteCountingTest(_BrokerFixture):
         self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="busy"))
 
 
+class BrokerFailureLabelsTest(unittest.TestCase):
+    """The failures family carries kind and tool: a timeout per tool it ran,
+    every other kind under the fixed word, so a query by kind alone sums the
+    tools and a query by tool finds which CLI is timing out."""
+
+    FAMILY = "kubeagents_broker_execution_failures_total"
+
+    def test_timeouts_render_per_tool_and_other_kinds_under_none(self):
+        metrics = ProxyMetrics()
+        metrics.record_failure("exec_timeout", tool="kubectl")
+        metrics.record_failure("exec_timeout", tool="kubectl")
+        metrics.record_failure("exec_timeout", tool="gcloud")
+        metrics.record_failure("vcs_failed")
+        families = _parse(metrics.render())
+        self.assertEqual(2, _series(families, self.FAMILY, kind="exec_timeout", tool="kubectl"))
+        self.assertEqual(1, _series(families, self.FAMILY, kind="exec_timeout", tool="gcloud"))
+        self.assertEqual(1, _series(families, self.FAMILY, kind="vcs_failed", tool="none"))
+        self.assertEqual(3, len(families[self.FAMILY]))
+        self.assertIn("tool", metrics.render().split(f"# HELP {self.FAMILY}", 1)[1].split("\n", 1)[0])
+
+    def test_a_tool_outside_the_closed_set_is_folded_to_other(self):
+        metrics = ProxyMetrics()
+        metrics.record_failure("exec_timeout", tool="curl")
+        families = _parse(metrics.render())
+        self.assertEqual(1, _series(families, self.FAMILY, kind="exec_timeout", tool="other"))
+
+
 class BrokerFailureCountingTest(_BrokerFixture):
     """The broker's own failures count by kind: a timeout, a broker fault on
     the exec route, a git failure on the version-control route; a refusal, a
@@ -711,12 +738,13 @@ class BrokerFailureCountingTest(_BrokerFixture):
 
     FAMILY = "kubeagents_broker_execution_failures_total"
 
-    def assert_failure_count(self, kind, expected=1):
+    def assert_failure_count(self, kind, expected=1, tool="none"):
         # Recorded as the response is written, so poll briefly, as the vcs
-        # test does, before reading the value.
+        # test does, before reading the value. Only a timeout names a tool;
+        # every other kind carries the fixed word.
         deadline = time.monotonic() + 2.0
         while True:
-            count = _series(self.families(), self.FAMILY, kind=kind)
+            count = _series(self.families(), self.FAMILY, kind=kind, tool=tool)
             if count == expected or time.monotonic() > deadline:
                 break
             time.sleep(0.02)
@@ -730,7 +758,8 @@ class BrokerFailureCountingTest(_BrokerFixture):
         CredentialProxyHandler.executor.timeout_seconds = 1
         status, body = self.post(["kubectl", "get", "pods"])
         self.assertEqual((200, "completed", 124, True), (status, body["status"], body["exitCode"], body["timedOut"]))
-        self.assert_failure_count("exec_timeout")
+        self.assert_failure_count("exec_timeout", tool="kubectl")
+        self.assertIsNone(_series(self.families(), self.FAMILY, kind="exec_timeout", tool="none"))
         self.assertEqual(
             1, _series(self.families(), "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="error")
         )
@@ -740,7 +769,7 @@ class BrokerFailureCountingTest(_BrokerFixture):
             status, _ = self.post(["kubectl", "get", "pods"])
         self.assertEqual(500, status)
         self.assert_failure_count("exec_failed")
-        self.assertIsNone(_series(self.families(), self.FAMILY, kind="exec_timeout"))
+        self.assertIsNone(_series(self.families(), self.FAMILY, kind="exec_timeout", tool="kubectl"))
 
     def test_a_git_failure_on_the_vcs_route_counts_as_vcs_failed(self):
         def failing(payload):
@@ -825,8 +854,8 @@ class BrokerFailureCountingTest(_BrokerFixture):
         with mock.patch.object(credential_proxy, "repository_is_managed", side_effect=OSError("mount gone")):
             self.assertFalse(handler._repository_is_permitted("o/r", "github"))
         families = self.families()
-        self.assertEqual(1, _series(families, self.FAMILY, kind="forge_refresh_failed"))
-        self.assertIsNone(_series(families, self.FAMILY, kind="vcs_failed"))
+        self.assertEqual(1, _series(families, self.FAMILY, kind="forge_refresh_failed", tool="none"))
+        self.assertIsNone(_series(families, self.FAMILY, kind="vcs_failed", tool="none"))
 
     def test_an_unsupported_method_on_a_relay_path_counts_nothing(self):
         request = urllib.request.Request(self.endpoint + credential_proxy.API_RELAY_PREFIX + "x", method="PUT")

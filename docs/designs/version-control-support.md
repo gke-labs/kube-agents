@@ -2101,6 +2101,15 @@ shared table, living in the forge package. GitLab is the first to populate it,
 for its own readings of 401 and 400, so by the time Bitbucket arrives the
 mechanism has a user and a test rather than being a speculative hook.
 
+Self-managed Gitea checks a second axis of the same contract: a forge with no
+canonical SaaS host, an optional non-default `port`, and an optional
+`scheme: http` restricted to in-cluster `.svc` / `.svc.cluster.local` Services.
+Its differences — `WIP:` draft title prefixes, label name-to-numeric-ID
+resolution, issue endpoints that return pull requests alongside issues, and
+`Authorization: token <t>` on `StaticFileCredential` — stay inside its own
+package, while `Forge.scheme` and `BrokerForge.{Scheme,Port}` carry the origin
+metadata across `VCS_FORGES_CONFIG`.
+
 ### Not every provider is a forge
 
 The Bitbucket row above says "no issue tracker" is absorbed by `verbs`
@@ -2163,10 +2172,12 @@ the first three forges and not a property of the domain.**
 ## 6. The declarative surface
 
 `IntegrationSpec` declares two lists. `forges` names each forge the install talks to: a `name`
-the rest of the spec refers to it by, a `provider`, an optional `host`, an optional default
-`namespace`, and an optional `credentialsRef`. `repositories` names each repository the operator
-registers: the `forge` it lives on, the `repository` itself, an optional `namespace` of its own
-for a repository given as a bare name, a `role`, and an optional `baseBranch`.
+the rest of the spec refers to it by, a `provider`, an optional `host`, an optional `port`
+(`1`–`65535`) and `scheme` (`https` default, or `http` for an in-cluster self-managed service),
+an optional default `namespace`, and an optional `credentialsRef`. `repositories` names each
+repository the operator registers: the `forge` it lives on, the `repository` itself, an optional
+`namespace` of its own for a repository given as a bare name, a `role`, and an optional
+`baseBranch`.
 (`PlatformAgentIntegrationSpec` embeds it alongside `GoogleChat` and `Slack`, so version control
 is one integration among several.)
 
