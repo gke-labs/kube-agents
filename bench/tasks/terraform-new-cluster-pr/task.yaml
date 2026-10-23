@@ -86,9 +86,12 @@ verification_spec:
         # What the new cluster must not carry (gcp-terraform's red lines): turning
         # deletion protection off, or re-declaring a project or fleet singleton
         # the sibling's fleet.tf already declares. Every added file is checked.
-        - paths: ["clusters/eval-hcl-probe/provisioning/*.tf"]
+        # A quoted "false" converts to the bool too, and a .tfvars can carry it.
+        - paths:
+            - "clusters/eval-hcl-probe/provisioning/*.tf"
+            - "clusters/eval-hcl-probe/provisioning/*.tfvars"
           op: not_matches
-          value: 'deletion_protection\s*=\s*false'
+          value: 'deletion_protection\s*=\s*"?false"?'
         - paths: ["clusters/eval-hcl-probe/provisioning/*.tf"]
           op: not_matches
           value: 'resource\s+"google_gke_hub_feature"'
