@@ -323,6 +323,13 @@ func (c *Conversations) lock(ctx context.Context, token string) (func(), error) 
 	}
 	l.refs++
 	c.mu.Unlock()
+	// A caller already out of time gets its own error, not one that reads
+	// as contention: with the lock free, the select below could pick
+	// either case.
+	if err := ctx.Err(); err != nil {
+		c.release(token, l)
+		return nil, err
+	}
 	select {
 	case l.ch <- struct{}{}:
 		return func() {
@@ -359,7 +366,9 @@ type TurnResult struct {
 // sent or, for a delegate turn, its stripped rest.
 func turnFate(text string) (settled bool, texts []string) {
 	t := strings.TrimSpace(text)
-	if rest, ok := chattext.IsFeedbackCommand(t); ok && strings.TrimSpace(rest) == "" {
+	// A bare /feedback and /feedback summary are answered in place, as
+	// the gateway and the web console's turnFate both treat them.
+	if rest, ok := chattext.IsFeedbackCommand(t); ok && (strings.TrimSpace(rest) == "" || chattext.IsFeedbackSummaryCommand(t)) {
 		return true, nil
 	}
 	if rest, ok := chattext.IsSessionCommand(t); ok {
@@ -675,7 +684,8 @@ type FollowedTask struct {
 const delegationSettle = 2 * time.Second
 
 // WaitForTurn waits, within wait, for the turn's task to finish and, when it
-// delegated (it carries a delegate or handoff artifact), for the tasks
+// delegated (it carries a delegate artifact; a handoff to kanban cards is
+// not followed, see delegated), for the tasks
 // delegated from it: the answer of a delegation lands on the task that wakes
 // the delegator, which may come minutes after the delegator itself finished.
 // Followed tasks are read one at a time on one reader slot. It closes the

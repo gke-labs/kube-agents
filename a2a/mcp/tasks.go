@@ -230,9 +230,14 @@ func (w *taskWatch) next(ctx context.Context) error {
 		return err
 	}
 	if !got {
-		w.pending = 0
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		// Events were pending and the fetch brought none: the read stalled,
+		// which is not the end of the task. Saying so beats folding what was
+		// read as the task's state.
+		if w.pending > 0 {
+			return fmt.Errorf("task %s: a fetch came back empty with %d events still pending", w.ref, w.pending)
 		}
 	}
 	return nil
