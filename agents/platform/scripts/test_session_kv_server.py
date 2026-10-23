@@ -993,6 +993,28 @@ class TestDeliveryFailureIsWrittenBack(unittest.TestCase):
         session_kv_server.trigger_agent_troubleshooter("sess-y", "msg", {}, row_id)
         self.assertEqual(self._row(row_id), (1, ""))
 
+    @patch.object(session_kv_server, "_start_agent_turn")
+    @patch.object(session_kv_server, "_register_session_routing")
+    @patch.object(session_kv_server, "_post_initial_alert", return_value="spaces/A/threads/B")
+    def test_the_dispatcher_stamps_the_dispatch_before_creating_the_session(self, *_):
+        """The pre-kanban read ages a turn from this stamp, so it is written
+        by the dispatcher itself, right before the gateway session, sub-second."""
+        import sqlite3
+
+        row_id = self._record()
+        seen: list = []
+
+        def create(api_url, session_id, headers):
+            with sqlite3.connect(temp_db_path) as conn:
+                seen.append(conn.execute("SELECT dispatched_at FROM intercepted_events WHERE id = ?", (row_id,)).fetchone()[0])
+            return True
+
+        with patch.object(session_kv_server, "_create_gateway_session", side_effect=create):
+            session_kv_server.trigger_agent_troubleshooter("sess-stamp", "msg", {}, row_id)
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0], "dispatched_at must be stamped before the gateway session is created")
+        self.assertIn(".", seen[0])
+
     @patch.object(session_kv_server, "_create_gateway_session", return_value=False)
     @patch.object(session_kv_server, "_register_session_routing")
     @patch.object(session_kv_server, "_post_initial_alert", return_value="spaces/A/threads/B")
@@ -6207,7 +6229,6 @@ class TestDriftInject(unittest.TestCase):
         self.assertIn(f'injectKindDrift = "{session_kv_server.INJECT_KIND_DRIFT}"', source)
 
 
-
 class TestStallInject(unittest.TestCase):
     """The `controller-stall` half of /sessions/{id}/inject."""
 
@@ -7021,6 +7042,1713 @@ class TestReadOnlyActivityFeed(unittest.TestCase):
                     session_kv_server._kanban_db_path(),
                     "/custom/home/kanban.db",
                 )
+
+
+
+class TestTaskWorkerStepsFeed(unittest.TestCase):
+    """`GET /v1/tasks/{id}` and `GET /v1/sessions/{sid}/tasks` return the worker's live Hermes steps from `state.db`."""
+
+    def setUp(self):
+        import sqlite3
+        from fastapi.testclient import TestClient
+
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.root = Path(self._tmpdir.name)
+        self.kanban_path = self.root / "kanban.db"
+
+        with sqlite3.connect(self.kanban_path) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    body TEXT,
+                    assignee TEXT,
+                    status TEXT,
+                    priority INTEGER,
+                    session_id TEXT,
+                    created_at REAL,
+                    started_at REAL,
+                    completed_at REAL,
+                    last_heartbeat_at REAL,
+                    result TEXT,
+                    last_failure_error TEXT
+                );
+                CREATE TABLE task_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT,
+                    profile TEXT,
+                    status TEXT,
+                    started_at REAL,
+                    ended_at REAL,
+                    outcome TEXT,
+                    summary TEXT,
+                    error TEXT,
+                    metadata TEXT
+                );
+                CREATE TABLE task_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT,
+                    run_id INTEGER,
+                    kind TEXT,
+                    payload TEXT,
+                    created_at REAL
+                );
+                CREATE TABLE task_comments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT,
+                    author TEXT,
+                    body TEXT,
+                    created_at REAL
+                );
+                """
+            )
+            conn.execute(
+                "INSERT INTO tasks (id, title, body, assignee, status, priority, session_id, created_at) "
+                "VALUES ('t_d1c3323e', 'Open GitOps PR', 'body', 'platform', 'running', 1, 'k8s-evt-1', 100.0)"
+            )
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at, metadata) "
+                "VALUES ('t_d1c3323e', 'platform', 'running', 101.0, '{}')"
+            )
+
+        patcher = patch.object(session_kv_server, "KANBAN_DB_PATH", str(self.kanban_path))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.kv_db_path = self.root / "session_kv.db"
+        kv_patcher = patch.object(session_kv_server, "SESSION_KV_DB_PATH", str(self.kv_db_path))
+        kv_patcher.start()
+        self.addCleanup(kv_patcher.stop)
+        session_kv_server.init_db()
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(lambda: os.environ.pop("SESSION_KV_API_KEY", None))
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+
+    def _record_ledger_session(self, session_id: str, notified: bool = True):
+        return session_kv_server.record_intercepted_event(
+            cluster="prod-us",
+            namespace="default",
+            workload="payments-api",
+            object_uid="uid-1",
+            object_kind="Pod",
+            reason="BackOff",
+            message="Back-off restarting failed container",
+            severity="Warning",
+            occurrences=1,
+            notified=notified,
+            session_id=session_id,
+        )
+
+    def _write_profile_store(
+        self,
+        profile: str,
+        rows: list[tuple],
+        sessions: list[tuple] | None = None,
+        *,
+        with_tool_call_id: bool = False,
+    ):
+        import sqlite3
+
+        if not profile or profile == "default":
+            db_path = self.root / "state.db"
+        else:
+            db_path = self.root / "profiles" / profile / "state.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        id_col = ", tool_call_id TEXT" if with_tool_call_id else ""
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS sessions ("
+                "id TEXT PRIMARY KEY, title TEXT, started_at REAL, ended_at REAL)"
+            )
+            if sessions:
+                for sid, title, started_at, ended_at in sessions:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO sessions (id, title, started_at, ended_at) VALUES (?, ?, ?, ?)",
+                        (sid, title, started_at, ended_at),
+                    )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS messages ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, "
+                "content TEXT, tool_name TEXT, tool_calls TEXT, timestamp REAL, "
+                f"reasoning TEXT, active INTEGER DEFAULT 1{id_col})"
+            )
+            for row in rows:
+                if with_tool_call_id:
+                    *base, tool_call_id = row
+                else:
+                    base, tool_call_id = row, None
+                sid, role, content, tool_name, tool_calls, ts, reasoning = base
+                values = [
+                    sid,
+                    role,
+                    content,
+                    tool_name,
+                    json.dumps(tool_calls) if tool_calls is not None else None,
+                    ts,
+                    reasoning,
+                ]
+                cols = "session_id, role, content, tool_name, tool_calls, timestamp, reasoning"
+                if with_tool_call_id:
+                    cols += ", tool_call_id"
+                    values.append(tool_call_id)
+                conn.execute(
+                    f"INSERT INTO messages ({cols}) VALUES ({', '.join('?' * len(values))})",
+                    values,
+                )
+
+    def test_worker_steps_are_matched_by_dispatcher_prompt_and_returned_in_order(self):
+        long_output = "diff --git a/deployment.yaml b/deployment.yaml\n" + ("+line\n" * 80)
+        self._write_profile_store(
+            "platform",
+            [
+                ("sess-other", "user", "work kanban task t_d1c3323e_other", None, None, 90.0, None),
+                (
+                    "sess-other",
+                    "assistant",
+                    None,
+                    None,
+                    [{"function": {"name": "terminal", "arguments": '{"command":"wrong"}'}}],
+                    91.0,
+                    None,
+                ),
+                ("sess-worker", "user", "work kanban task t_d1c3323e", None, None, 101.0, None),
+                (
+                    "sess-worker",
+                    "assistant",
+                    None,
+                    None,
+                    [{"function": {"name": "terminal", "arguments": '{"command":"submit_suggestion.py prepare"}'}}],
+                    102.0,
+                    "Checking the triage options and preparing the suggestion branch.",
+                ),
+                ("sess-worker", "tool", long_output, "terminal", None, 103.0, None),
+                ("sess-worker", "assistant", "Opened Pull Request #1.", None, None, 104.0, None),
+            ],
+        )
+
+        resp = self.client.get("/v1/tasks/t_d1c3323e")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertFalse(body["steps_truncated"])
+        steps = body["steps"]
+        self.assertEqual([s["kind"] for s in steps], ["thinking", "tool_call", "tool_result", "reply"])
+        self.assertEqual(steps[0]["preview"], "Checking the triage options and preparing the suggestion branch.")
+        self.assertEqual(steps[1]["tool"], "terminal")
+        self.assertIn("submit_suggestion.py prepare", steps[1]["preview"])
+        self.assertEqual(steps[2]["tool"], "terminal")
+        self.assertTrue(steps[2]["preview"].endswith("…"))
+        self.assertIn("+line", steps[2]["detail"])
+        self.assertEqual(steps[3]["preview"], "Opened Pull Request #1.")
+
+        sess_resp = self.client.get("/v1/sessions/k8s-evt-1/tasks")
+        self.assertEqual(sess_resp.status_code, 200)
+        sess_tasks = sess_resp.json()["tasks"]
+        self.assertEqual(len(sess_tasks), 1)
+        self.assertEqual([s["kind"] for s in sess_tasks[0]["live_steps"]], ["thinking", "tool_call", "tool_result", "reply"])
+        self.assertTrue(sess_tasks[0]["live_steps"][2]["preview"].endswith("…"))
+        self.assertNotIn("detail", sess_tasks[0]["live_steps"][2])
+        self.assertFalse(sess_tasks[0]["steps_truncated"])
+
+    def test_missing_profile_store_returns_empty_steps_without_failing(self):
+        resp = self.client.get("/v1/tasks/t_d1c3323e")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body["steps"], [])
+        self.assertFalse(body["steps_truncated"])
+
+    def test_worker_steps_redact_credentials_and_withhold_when_redactor_unavailable(self):
+        import base64
+        import sqlite3
+
+        secret_tok = "ghp_" + "A" * 36
+        bearer_tok = "opaque-bearer-cred-value-987654"
+        token_scheme_val = "opaque-gitea-token-scheme-54321"
+        auth_code_val = "4/0AX4XfWh-opaque-oauth-code-777"
+        data_secret_val = "dGVzdC1kYXRhLXNlY3JldC12YWx1ZQ=="
+        string_data_val = "plain-stringdata-secret-value-42"
+        cli_tok = "s3cr3t-opaque-flag"
+        api_token_val = "opaque-api-token-flag-val-99"
+        cli_pass = "hunter2-cli-pass"
+        long_user_pw = "hunter2-long-user-pw"
+        wget_user_pw = "hunter2-wget-user-pw"
+        quoted_spaced_pw = "hunter2 quoted spaced pw"
+        attached_mysql_pw = "hunter2-attached-mysql"
+        numeric_sshpass_pw = "1234"
+        mongosh_pw = "hunter2-mongosh-pw"
+        redis_pw = "hunter2-redis-pw"
+        az_secret = "hunter2-az-sp-secret"
+        docker_pw = "hunter2-docker-flag"
+        literal_cred = "hunter2-from-literal"
+        url_pass = "url-secret-pw-99"
+        block_scalar_pw = "hunter2-block-line-1"
+        block_scalar_key = "tls-block-line-1"
+        kubeconfig_key = "LS0tLS1CRUdJTi1LUBEKEY"
+        quoted_text_key = "LS0tLS1CRUdJTi1RVU9URUQtS0VZ"
+        db_creds = "supersecret-db-val-123"
+        env_pair_creds = "user:hunter2-env-pair"
+        tls_crt_val = "LS0tLS1CRUdJTi1DRVJUSUZJQ0FURQ=="
+        p12_val = "cDEyLWtleXN0b3JlLWJ5dGVz"
+        custom_b64 = "c2VjcmV0MTIzNDU2"
+        multi_item_b64 = "bXVsdGktc2VjcmV0LWJ5dGVzLTEyMzQ1Ng=="
+        cut_json_b64 = "Y3V0LXNlY3JldC12YWw="
+        # A `grep -n` body line of a key file: a line number, then key material.
+        grep_body_b64 = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7"
+        # A `.key` key that is not a file: an all-digit value is still a credential.
+        short_api_key = "1234567890123456"
+        bare_secret_val = "bare-decoded-secret-hunter2-value"
+        long_ssh_b64 = base64.b64encode(("OPENSSH-KEY-" + ("K" * 1200)).encode("utf-8")).decode("ascii")
+        long_pem_body = "MIIEpAIBAAKCAQEA" + ("P" * 1800)
+        long_pem_doc = (
+            f"-----BEGIN RSA PRIVATE KEY-----\n{long_pem_body}\n-----END RSA PRIVATE KEY-----"
+        )
+        unterminated_pem_body = "MIIEpAIBAAKCAQEA" + ("U" * 1200)
+        unterminated_pem_doc = (
+            f"-----BEGIN RSA PRIVATE KEY-----\n{unterminated_pem_body}"
+        )
+        long_kubeconfig_b64 = "LS0tLS1CRUdJTi1MT05HLUtVQkVLRVk="
+        long_kubeconfig_json = json.dumps(
+            {
+                "apiVersion": "v1",
+                "kind": "Config",
+                "clusters": [{"name": "c1", "cluster": {"server": "https://10.0.0.1:6443"}}],
+                "users": [{"name": "u1", "user": {"client-key-data": long_kubeconfig_b64}}],
+                "padding": "x" * 9000,
+            },
+            indent=2,
+        )
+        card_body_secret = "card-body-opaque-secret-777"
+        comment_secret = "comment-opaque-secret-888"
+        run_summary_secret = "run-summary-opaque-secret-555"
+        run_error_secret = "run-error-opaque-secret-666"
+        event_payload_secret = "event-payload-opaque-secret-999"
+
+        with sqlite3.connect(self.kanban_path) as conn:
+            conn.execute(
+                "UPDATE tasks SET title = ?, body = ?, result = ? WHERE id = 't_d1c3323e'",
+                (
+                    "mkdir -p failing on node",
+                    f"password: {card_body_secret}",
+                    f"Finished with token={cli_tok}",
+                ),
+            )
+            conn.execute(
+                "UPDATE task_runs SET summary = ?, error = ? WHERE task_id = 't_d1c3323e'",
+                (
+                    f"summary password: {run_summary_secret}",
+                    f"login failed: token={run_error_secret}",
+                ),
+            )
+            conn.execute(
+                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+                ("t_d1c3323e", 1, "blocked", f"password: {event_payload_secret}", 104.5),
+            )
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                ("t_d1c3323e", "platform", f"api_key={comment_secret}", 105.0),
+            )
+
+        self._write_profile_store(
+            "platform",
+            [
+                ("sess-sec", "user", "work kanban task t_d1c3323e", None, None, 101.0, None),
+                (
+                    "sess-sec",
+                    "assistant",
+                    None,
+                    None,
+                    [
+                        {
+                            "function": {
+                                "name": "terminal",
+                                "arguments": json.dumps(
+                                    {
+                                        "command": (
+                                            f"kubectl --token {cli_tok} get secrets && "
+                                            f"some-cli --api-token {api_token_val} && "
+                                            f"kubectl create secret generic s --from-literal=credentials={literal_cred} && "
+                                            f"mysql -p{attached_mysql_pw} && "
+                                            f"mysql -u root -p -h db && "
+                                            f"mysql -P 3306 -p {attached_mysql_pw} && "
+                                            f"sshpass -p {numeric_sshpass_pw} ssh host && "
+                                            f"mongosh --host db -u admin -p {mongosh_pw} && "
+                                            f"redis-cli -a {redis_pw} && "
+                                            f"az login --service-principal -u app -p {az_secret} && "
+                                            f"docker login --docker-password {docker_pw} && "
+                                            f"curl -u admin:{cli_pass} --user admin:{long_user_pw} "
+                                            f"-x proxy:3128 -p https://registry.internal/proxy "
+                                            f"-H 'Authorization: Bearer {bearer_tok}' "
+                                            f"-H 'Authorization: Token {token_scheme_val}' "
+                                            f"https://admin:{url_pass}@registry.internal/v2/ && "
+                                            f"wget --user admin:{wget_user_pw} https://registry.internal/ && "
+                                            f'curl -u "admin:{quoted_spaced_pw}" https://registry.internal/ && '
+                                            f"docker run -u 1000:1000 busybox && "
+                                            f"gcloud container clusters create x --no-enable-basic-auth --zone us-central1-a && "
+                                            f"gh auth login --with-token && "
+                                            "mkdir -p /opt/data/gitops/x && "
+                                            'kubectl patch deploy api -p \'{"spec":{"replicas":2}}\' && '
+                                            "psql -U postgres && docker run -p 8080:80 && "
+                                            "grep -P '\\d+' && sort -u && pip install -U pkg && git log -p"
+                                        )
+                                    }
+                                ),
+                            }
+                        }
+                    ],
+                    102.0,
+                    f"Using token {secret_tok} to inspect endpoint.",
+                ),
+                (
+                    "sess-sec",
+                    "tool",
+                    (
+                        f"apiVersion: v1\nkind: Secret\ndata:\n  token: {data_secret_val}\n"
+                        f"stringData:\n  admin-pw: {string_data_val}\n"
+                        f"users:\n- user:\n    client-key-data: {kubeconfig_key}\n"
+                        f'  "client-key-data": "{quoted_text_key}"\n'
+                        f"authorization_code: {auth_code_val}\n"
+                        f"Authorization: Token {token_scheme_val}\n"
+                        f"Environment:\n  DB_CREDENTIALS:  {db_creds}\n"
+                        f"env:\n- name: DB_CREDENTIALS\n  value: {env_pair_creds}\n"
+                        f"password: |\n  {block_scalar_pw}\n"
+                        f"tls.key: |\n  {block_scalar_key}\n"
+                        f"secretName: app-tls-secret\n"
+                        f"tokenPath: /var/run/secrets/token\n"
+                        f"authMode: mtls\n"
+                        f"automountServiceAccountToken: false\n"
+                        f"file1:1:-----BEGIN RSA PRIVATE KEY-----\n"
+                        f"file2_second_match.pem:1:-----BEGIN RSA PRIVATE KEY-----\n"
+                        f"tls.crt:  1679 bytes\n"
+                        f"cert.pem: OK\n"
+                        f"cert.pem: PEM certificate\n"
+                        f"cert.pem:28:-----END CERTIFICATE-----\n"
+                        f"tls.key:2:{grep_body_b64}\n"
+                        f"api.key: {short_api_key}\n"
+                        f"Note: check the cluster credentials: deployment-controller mounts them.\n"
+                        f'{{"apiVersion":"v1","kind":"Secret","data":{{"pw":"{cut_json_b64}"'
+                    ),
+                    "terminal",
+                    None,
+                    103.0,
+                    None,
+                ),
+                (
+                    "sess-sec",
+                    "tool",
+                    json.dumps(
+                        {
+                            "output": json.dumps({"ssh-privatekey": long_ssh_b64, "custom_a": custom_b64}),
+                            "exit_code": 0,
+                            "error": None,
+                        }
+                    ),
+                    "terminal",
+                    None,
+                    103.2,
+                    None,
+                ),
+                (
+                    "sess-sec",
+                    "tool",
+                    json.dumps(
+                        {
+                            "output": (
+                                json.dumps({"ssh-privatekey": long_ssh_b64})
+                                + " "
+                                + json.dumps({"opaque_item": multi_item_b64})
+                            ),
+                            "exit_code": 0,
+                            "error": None,
+                        }
+                    ),
+                    "terminal",
+                    None,
+                    103.25,
+                    None,
+                ),
+                (
+                    "sess-sec",
+                    "tool",
+                    long_pem_doc,
+                    "terminal",
+                    None,
+                    103.3,
+                    None,
+                ),
+                (
+                    "sess-sec",
+                    "tool",
+                    unterminated_pem_doc,
+                    "terminal",
+                    None,
+                    103.35,
+                    None,
+                ),
+                (
+                    "sess-sec",
+                    "tool",
+                    long_kubeconfig_json,
+                    "terminal",
+                    None,
+                    103.4,
+                    None,
+                ),
+                (
+                    "sess-sec",
+                    "tool",
+                    json.dumps(
+                        {
+                            "kind": "ConfigMap",
+                            "data": {
+                                "tls.crt": tls_crt_val,
+                                "keystore.p12": p12_val,
+                                "plain_field": "kept_plain_value",
+                            },
+                            "env": [{"name": "DB_CREDENTIALS", "value": env_pair_creds}],
+                            "credentials_path": "/etc/creds/mounted-path",
+                        }
+                    ),
+                    "terminal",
+                    None,
+                    103.5,
+                    None,
+                ),
+                (
+                    "sess-sec",
+                    "tool",
+                    json.dumps({"status": "Done", "tier": "web1", "LOG_LEVEL": "info"}),
+                    "terminal",
+                    None,
+                    103.6,
+                    None,
+                ),
+                (
+                    "sess-sec",
+                    "assistant",
+                    None,
+                    None,
+                    [
+                        {
+                            "function": {
+                                "name": "terminal",
+                                "arguments": json.dumps(
+                                    {
+                                        "command": (
+                                            "kubectl get secret db -o jsonpath='{.data.password}' | base64 -d && "
+                                            "aws secretsmanager get-secret-value --secret-id prod/db"
+                                        )
+                                    }
+                                ),
+                            }
+                        }
+                    ],
+                    103.7,
+                    None,
+                ),
+                (
+                    "sess-sec",
+                    "tool",
+                    json.dumps({"output": f"{bare_secret_val}\n", "exit_code": 0, "error": None}),
+                    "terminal",
+                    None,
+                    103.75,
+                    None,
+                ),
+                (
+                    "sess-sec",
+                    "tool",
+                    json.dumps(
+                        {
+                            "status": "success",
+                            "data": {
+                                "resultType": "vector",
+                                "LOG_LEVEL": "info",
+                                "PORT": "8080",
+                            },
+                            "secretName": "app-tls-secret",
+                        }
+                    ),
+                    "terminal",
+                    None,
+                    103.8,
+                    None,
+                ),
+                (
+                    "sess-sec",
+                    "tool",
+                    "[" * 2000 + "]" * 2000,
+                    "terminal",
+                    None,
+                    103.9,
+                    None,
+                ),
+                ("sess-sec", "assistant", f"Checked {secret_tok} successfully.", None, None, 104.0, None),
+            ],
+        )
+
+        body = self.client.get("/v1/tasks/t_d1c3323e").json()
+        sess_body = self.client.get("/v1/sessions/k8s-evt-1/tasks").json()
+        serialized = json.dumps(body["steps"])
+        sess_serialized = json.dumps(sess_body["tasks"][0]["live_steps"])
+        for leaked in (
+            secret_tok,
+            bearer_tok,
+            token_scheme_val,
+            auth_code_val,
+            data_secret_val,
+            string_data_val,
+            cli_tok,
+            api_token_val,
+            cli_pass,
+            long_user_pw,
+            wget_user_pw,
+            quoted_spaced_pw,
+            "quoted spaced",
+            attached_mysql_pw,
+            numeric_sshpass_pw,
+            mongosh_pw,
+            redis_pw,
+            az_secret,
+            docker_pw,
+            literal_cred,
+            url_pass,
+            block_scalar_pw,
+            block_scalar_key,
+            kubeconfig_key,
+            quoted_text_key,
+            db_creds,
+            env_pair_creds,
+            tls_crt_val,
+            p12_val,
+            custom_b64,
+            multi_item_b64,
+            cut_json_b64,
+            bare_secret_val,
+            grep_body_b64,
+            short_api_key,
+            long_ssh_b64[:32],
+            long_pem_body[:32],
+            unterminated_pem_body[:32],
+            long_kubeconfig_b64,
+        ):
+            self.assertNotIn(leaked, serialized)
+            self.assertNotIn(leaked, sess_serialized)
+        self.assertIn("[REDACTED_SECRET]", serialized)
+        self.assertIn("[REDACTED_PRIVATE_KEY]", serialized)
+        for preserved in (
+            "app-tls-secret",
+            "/var/run/secrets/token",
+            "mtls",
+            "8080",
+            "vector",
+            "Done",
+            "web1",
+            "file2_second_match.pem:1:-----BEGIN",
+            "cert.pem:28:-----END",
+            "tls.crt:  1679 bytes",
+            "cert.pem: OK",
+            "cert.pem: PEM certificate",
+            "kept_plain_value",
+            "/etc/creds/mounted-path",
+            "deployment-controller mounts them",
+            "/opt/data/gitops/x",
+            "postgres",
+            "8080:80",
+            "replicas",
+            "automountServiceAccountToken: false",
+            "--no-enable-basic-auth --zone us-central1-a",
+            "--with-token",
+            "--secret-id prod/db",
+            "docker run -u 1000:1000",
+            "-p https://registry.internal/proxy",
+            "-h db",
+            "3306",
+        ):
+            self.assertIn(preserved, serialized)
+        self.assertEqual(body["task"]["title"], "mkdir -p failing on node")
+        self.assertNotIn(card_body_secret, json.dumps(body["task"]))
+        self.assertNotIn(cli_tok, json.dumps(body["task"]))
+        self.assertNotIn(run_summary_secret, json.dumps(body["runs"]))
+        self.assertNotIn(run_error_secret, json.dumps(body["runs"]))
+        self.assertIn("[REDACTED_SECRET]", json.dumps(body["runs"]))
+        self.assertNotIn(event_payload_secret, json.dumps(body["events"]))
+        self.assertIn("[REDACTED_SECRET]", json.dumps(body["events"]))
+        self.assertNotIn(comment_secret, json.dumps(body["comments"]))
+
+        with patch.object(session_kv_server, "_get_audit_redactor", return_value=None):
+            fallback_resp = self.client.get("/v1/tasks/t_d1c3323e").json()
+            fallback = fallback_resp["steps"]
+            self.assertTrue(
+                all(s["preview"] == session_kv_server.WORKER_STEP_WITHHELD and "detail" not in s for s in fallback),
+                f"expected all step kinds withheld without detail when redactor is unavailable, got {fallback}",
+            )
+            self.assertNotIn(secret_tok, json.dumps(fallback))
+            self.assertEqual(fallback_resp["task"]["body"], session_kv_server.WORKER_STEP_WITHHELD)
+            sess_fallback = self.client.get("/v1/sessions/k8s-evt-1/tasks").json()["tasks"][0]["live_steps"]
+            self.assertTrue(
+                all(s["preview"] == session_kv_server.WORKER_STEP_WITHHELD for s in sess_fallback),
+                f"expected all listing live_steps withheld without ellipsis, got {sess_fallback}",
+            )
+
+    def test_line_start_auth_scheme_pair_masks_the_token_not_only_the_scheme(self):
+        opaque = "3f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c"
+        # Under twelve characters, or with a character outside the bearer
+        # alphabet, the redactor's own bearer rule skips the token.
+        short = "s3cr3t"
+        tilde = "s3cr3t~tok"
+        for key in ("Authorization: ", "auth: ", "token: ", "AUTH_HEADER="):
+            for token in (opaque, short, tilde):
+                line = f"{key}Bearer {token}"
+                with self.subTest(line=line):
+                    cleaned = session_kv_server._scrub_worker_step_text("tool_result", line)
+                    self.assertNotIn(token, cleaned)
+                    self.assertIn("[REDACTED_SECRET]", cleaned)
+        # A key that names no credential keeps a scheme-shaped value.
+        benign = "content-type: Bearer s3cr3t"
+        self.assertEqual(session_kv_server._scrub_worker_step_text("tool_result", benign), benign)
+
+    def test_cli_segment_rules_read_past_an_operator_inside_a_quoted_argument(self):
+        # `_CLI_USERPASS_FLAG_RE` and `_CLI_SHORT_P_RE` end a command's segment
+        # at `&`, `;` or `|`; inside a quoted argument those are data.
+        for cmd, cred, kept in (
+            (
+                'curl "https://grafana/api/search?query=x&type=dash-db" -u admin:prom-operator',
+                "prom-operator",
+                "query=x&type=dash-db",
+            ),
+            (
+                'mongosh "mongodb+srv://cluster0.example.net/app?retryWrites=true&w=majority" -u app -p hunter2',
+                "hunter2",
+                "retryWrites=true&w=majority",
+            ),
+            ('mysql -e "select 1 | 2" -p hunter2', "hunter2", "select 1 | 2"),
+            ("mysql -e 'select 1' -p 'hunter2 x' && echo done", "hunter2", "&& echo done"),
+        ):
+            with self.subTest(cmd=cmd):
+                out = session_kv_server._scrub_worker_step_text("tool_call", json.dumps({"command": cmd}))
+                self.assertNotIn(cred, out)
+                self.assertIn("[REDACTED_SECRET]", out)
+                self.assertIn(kept, out)
+        # An operator outside quotes still ends the segment: each command's own `-u` is masked.
+        chained = "curl -u admin:pw-one-11 http://a && curl -u root:pw-two-22 http://b"
+        out = session_kv_server._scrub_worker_step_text("tool_call", json.dumps({"command": chained}))
+        self.assertNotIn("pw-one-11", out)
+        self.assertNotIn("pw-two-22", out)
+        self.assertIn("http://a && curl -u root:", out)
+
+    def test_cli_short_p_re_linear_scan_on_crafted_line(self):
+        import time
+
+        crafted_line = "curl " * 20000 + "mysql " * 20000
+        t0 = time.monotonic()
+        cleaned = session_kv_server._scrub_worker_step_text("tool_result", crafted_line)
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 1.0, f"regex took {elapsed:.2f}s, expected < 1s")
+        self.assertEqual(cleaned, crafted_line)
+
+    def test_secret_read_command_detector_covers_every_output_form(self):
+        # The detector keys on "get secret" plus any output shaping or pipe,
+        # not on an enumerated list of formatters an agent may not pick.
+        withheld = [
+            "kubectl get secret db -o jsonpath='{.data.password}' | base64 -d",
+            "kubectl get secret db -o=go-template='{{.data.password}}'",
+            "kubectl get secret db --output=go-template='{{index .data \"password\"}}'",
+            "kubectl get secret db -o json | jq -r '.data.password | @base64d'",
+            "kubectl get secret db -o yaml | yq -r '.data.password | @base64d'",
+            "kubectl -n prod get secrets db --template '{{.data.token}}'",
+            "kubectl get secret db -ojson",
+            # flags between the verb and the resource, or before the verb
+            "kubectl get -n prod secret db -o go-template='{{.data.password}}' | base64 -d",
+            "kubectl get --namespace prod secret db -o yaml",
+            "kubectl get -o go-template='{{.data.password}}' secret db",
+            "kubectl -n ns -o go-template='{{.data.password}}' get secret db",
+            "kubectl --template='{{index .data \"password\"}}' get secret db",
+            "kubectl get -o json secret db",
+            # backslash continuations, indented as the skills write long commands
+            "kubectl get secret db \\\n  -o go-template='{{.data.password}}' | base64 -d",
+            "kubectl \\\n  get secret db -o custom-columns=:.data.password",
+            "kubectl get secret db \\\n  -o json | jq -r '.data.password | @base64d'",
+            "cat \\\n  /var/run/secrets/kubernetes.io/serviceaccount/token",
+            # `-o` with the format attached through a quote or a variable
+            "kubectl get secret db -o'go-template={{.data.password}}'",
+            'kubectl get secret db -o"custom-columns=:.data.password"',
+            "kubectl get secret db -o$FMT",
+            "kubectl get secret db -owide",
+            # a global flag or a release track before the subcommand
+            "gcloud --project=prod secrets versions access latest --secret=db",
+            "gcloud beta secrets versions access latest --secret=db",
+            "aws --region us-east-1 secretsmanager get-secret-value --secret-id db --query SecretString --output text",
+            # other stores, and a file read under a secret-named directory
+            "aws --region us-east-1 ssm get-parameter --name /prod/db --with-decryption",
+            "az keyvault secret show --vault-name kv --name db",
+            "sops -d secrets.enc.yaml",
+            "sops --decrypt secrets.enc.yaml",
+            "kubectl exec deploy/api -- cat /etc/db-creds/password",
+            "kubectl exec -n prod api-0 -- head -c 64 /var/secrets/token",
+        ]
+        served = [
+            "kubectl get secrets -n kube-system",
+            "kubectl describe secret db",
+            "kubectl get pods -o json | jq '.items[].metadata.name'",
+            "kubectl get secrets -n kube-system --show-labels",
+            "gcloud secrets list --project=prod",
+            "aws secretsmanager list-secrets --region us-east-1",
+            "aws ssm describe-parameters",
+            "az keyvault secret list --vault-name kv",
+            "kubectl exec deploy/api -- cat /opt/data/report.txt",
+            "kubectl exec deploy/secrets-api -- cat /opt/data/report.txt",
+        ]
+        for cmd in withheld:
+            with self.subTest(cmd=cmd):
+                self.assertTrue(session_kv_server._is_secret_read_tool_call(json.dumps({"command": cmd})))
+        for cmd in served:
+            with self.subTest(cmd=cmd):
+                self.assertFalse(session_kv_server._is_secret_read_tool_call(json.dumps({"command": cmd})))
+
+    def test_cli_credential_rules_read_a_backslash_continued_command(self):
+        # The CLI rules (`-u user:pass`, `-p pass`, `--password pass`) are
+        # line-bounded; a continuation used to split the flag from its value.
+        pw = "hunter2"
+        for cmd in (
+            f"curl \\\n  -u admin:{pw} \\\n  https://registry/",
+            f"mysql -h db \\\n  -p {pw}",
+            f"docker login --password \\\n  {pw}",
+        ):
+            with self.subTest(cmd=cmd):
+                out = session_kv_server._scrub_worker_step_text("tool_call", json.dumps({"command": cmd}))
+                self.assertNotIn(pw, out)
+                self.assertIn("[REDACTED_SECRET]", out)
+                self.assertIn("https://registry/" if "curl" in cmd else "-h db" if "mysql" in cmd else "docker login", out)
+                bare = session_kv_server._scrub_worker_step_text("tool_call", cmd)
+                self.assertNotIn(pw, bare)
+        # The fold is scoped to command text: a markdown hard break in a reply
+        # and a backslash-newline inside a tool result stay as written.
+        hard_break = "first line \\\nsecond line"
+        self.assertEqual(session_kv_server._scrub_worker_step_text("reply", hard_break), hard_break)
+        self.assertEqual(session_kv_server._scrub_worker_step_text("tool_result", hard_break), hard_break)
+        other_arg = json.dumps({"path": "a \\\n  b", "command": "ls"})
+        self.assertEqual(session_kv_server._scrub_worker_step_text("tool_call", other_arg), other_arg)
+
+    def test_string_data_object_in_prose_is_scrubbed(self):
+        # The secret-block fast path used to test for a lowercase "data" and
+        # let a bare {"stringData": {...}} object in prose through untouched.
+        redactor = session_kv_server._get_audit_redactor()
+        self.assertIsNotNone(redactor)
+        text = 'patched with kubectl patch secret db -p \'{"stringData":{"conn":"host=db user=app password=hunter2","license":"L-0042-ZZ"}}\''
+        out = session_kv_server._scrub_worker_step_text("reply", text)
+        self.assertNotIn("hunter2", out)
+        self.assertNotIn("L-0042-ZZ", out)
+
+    def test_secret_read_result_is_withheld_when_store_pairs_by_tool_call_id(self):
+        secret_val = "paired-secret-hunter2-value"
+        read_args = json.dumps({"command": "kubectl get secret db -o jsonpath='{.data.password}' | base64 -d"})
+        list_args = json.dumps({"command": "kubectl get pods"})
+        self._write_profile_store(
+            "platform",
+            [
+                ("sess-ids", "user", "work kanban task t_d1c3323e", None, None, 101.0, None, None),
+                (
+                    "sess-ids",
+                    "assistant",
+                    None,
+                    None,
+                    [
+                        {"id": "c1", "function": {"name": "terminal", "arguments": list_args}},
+                        {"call_id": "c2", "name": "terminal", "arguments": read_args},
+                    ],
+                    102.0,
+                    None,
+                    None,
+                ),
+                ("sess-ids", "tool", f"{secret_val}\n", "terminal", None, 103.0, None, "c2"),
+                ("sess-ids", "tool", "pod-a Running", "terminal", None, 103.5, None, "c1"),
+                (
+                    "sess-ids",
+                    "assistant",
+                    None,
+                    None,
+                    [{"name": "terminal", "arguments": read_args}],
+                    104.0,
+                    None,
+                    None,
+                ),
+                ("sess-ids", "tool", f"{secret_val}\n", "terminal", None, 105.0, None, "id-with-no-call"),
+            ],
+            with_tool_call_id=True,
+        )
+
+        resp = self.client.get("/v1/tasks/t_d1c3323e")
+        self.assertEqual(resp.status_code, 200)
+        steps = resp.json()["steps"]
+        self.assertEqual(
+            [s["preview"] for s in steps if s["kind"] == "tool_result"],
+            [session_kv_server.WORKER_STEP_WITHHELD, "pod-a Running", session_kv_server.WORKER_STEP_WITHHELD],
+        )
+        self.assertNotIn(secret_val, json.dumps(steps))
+
+    def test_steps_truncated_is_true_when_sql_row_window_clips_older_rows(self):
+        rows: list[tuple] = [
+            ("sess-win", "user", "work kanban task t_d1c3323e", None, None, 1.0, None),
+            ("sess-win", "assistant", "Old step that will be clipped", None, None, 2.0, None),
+        ]
+        window = session_kv_server.TASK_DETAIL_MAX_STEPS * session_kv_server.TASK_STEP_ROW_MULTIPLIER
+        for idx in range(window):
+            rows.append(("sess-win", "user", f"user-turn-{idx}", None, None, float(10 + idx), None))
+        rows.append(("sess-win", "assistant", "Final visible reply", None, None, 999.0, None))
+        self._write_profile_store("platform", rows)
+
+        body = self.client.get("/v1/tasks/t_d1c3323e").json()
+        self.assertTrue(body["steps_truncated"])
+        self.assertEqual(len(body["steps"]), 1)
+        self.assertEqual(body["steps"][0]["preview"], "Final visible reply")
+
+    def test_clipped_window_head_tool_result_is_withheld_when_its_call_is_clipped(self):
+        # The secret-read `tool_call` row is the newest row the window drops and
+        # its `tool` row is the oldest row the window keeps: nothing in the
+        # window vouches for that result, so it is withheld.
+        secret_val = "clipped-head-secret-hunter2-value"
+        read_args = json.dumps({"command": "kubectl get secret db -o jsonpath='{.data.password}' | base64 -d"})
+        window = session_kv_server.TASK_DETAIL_MAX_STEPS * session_kv_server.TASK_STEP_ROW_MULTIPLIER
+        rows: list[tuple] = [
+            ("sess-clip", "user", "work kanban task t_d1c3323e", None, None, 1.0, None, None),
+            (
+                "sess-clip",
+                "assistant",
+                None,
+                None,
+                [{"id": "c-clipped", "function": {"name": "terminal", "arguments": read_args}}],
+                2.0,
+                None,
+                None,
+            ),
+            ("sess-clip", "tool", f"{secret_val}\n", "terminal", None, 3.0, None, "c-clipped"),
+        ]
+        for idx in range(window - 2):
+            rows.append(("sess-clip", "user", f"user-turn-{idx}", None, None, float(10 + idx), None, None))
+        rows.append(("sess-clip", "assistant", "Final visible reply", None, None, 999.0, None, None))
+        self._write_profile_store("platform", rows, with_tool_call_id=True)
+
+        body = self.client.get("/v1/tasks/t_d1c3323e").json()
+        self.assertTrue(body["steps_truncated"])
+        self.assertEqual(
+            [(s["kind"], s["preview"]) for s in body["steps"]],
+            [("tool_result", session_kv_server.WORKER_STEP_WITHHELD), ("reply", "Final visible reply")],
+        )
+        self.assertNotIn(secret_val, json.dumps(body))
+        # The listing reads a smaller window that drops this `tool` row outright;
+        # the listing-window case is the next test.
+
+    def test_clipped_listing_window_head_tool_result_is_withheld(self):
+        # The same shape sized to the listing's window: the detail read, with
+        # its larger window, sees the call and withholds by pairing; the
+        # listing sees only the result and withholds it as unpaired.
+        secret_val = "listing-head-secret-hunter2-value"
+        read_args = json.dumps({"command": "kubectl get secret db -o jsonpath='{.data.password}' | base64 -d"})
+        window = session_kv_server.SESSION_TASK_LIVE_STEPS_MAX * session_kv_server.TASK_STEP_ROW_MULTIPLIER
+        rows: list[tuple] = [
+            ("sess-list", "user", "work kanban task t_d1c3323e", None, None, 1.0, None, None),
+            (
+                "sess-list",
+                "assistant",
+                None,
+                None,
+                [{"id": "c-clipped", "function": {"name": "terminal", "arguments": read_args}}],
+                2.0,
+                None,
+                None,
+            ),
+            ("sess-list", "tool", f"{secret_val}\n", "terminal", None, 3.0, None, "c-clipped"),
+        ]
+        for idx in range(window - 2):
+            rows.append(("sess-list", "user", f"user-turn-{idx}", None, None, float(10 + idx), None, None))
+        rows.append(("sess-list", "assistant", "Final visible reply", None, None, 999.0, None, None))
+        self._write_profile_store("platform", rows, with_tool_call_id=True)
+
+        listing = self.client.get("/v1/sessions/k8s-evt-1/tasks").json()["tasks"][0]
+        self.assertTrue(listing["steps_truncated"])
+        self.assertEqual(
+            [(s["kind"], s["preview"]) for s in listing["live_steps"]],
+            [("tool_result", session_kv_server.WORKER_STEP_WITHHELD), ("reply", "Final visible reply")],
+        )
+        self.assertNotIn(secret_val, json.dumps(listing))
+        body = self.client.get("/v1/tasks/t_d1c3323e").json()
+        self.assertFalse(body["steps_truncated"])
+        self.assertEqual(
+            [s["preview"] for s in body["steps"] if s["kind"] == "tool_result"],
+            [session_kv_server.WORKER_STEP_WITHHELD],
+        )
+        self.assertNotIn(secret_val, json.dumps(body))
+
+    def test_session_tasks_reuses_single_profile_connection_across_multiple_cards(self):
+        import sqlite3
+
+        with sqlite3.connect(self.kanban_path) as conn:
+            conn.execute(
+                "INSERT INTO tasks (id, title, body, assignee, status, priority, session_id, created_at) "
+                "VALUES ('t_second', 'Second task', 'body2', 'platform', 'running', 1, 'k8s-evt-1', 105.0)"
+            )
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at, metadata) "
+                "VALUES ('t_second', 'platform', 'running', 106.0, '{}')"
+            )
+        rows: list[tuple] = [
+            ("sess-1", "user", "work kanban task t_d1c3323e", None, None, 101.0, None),
+            ("sess-1", "assistant", "First card reply", None, None, 102.0, None),
+            ("sess-2", "user", "work kanban task t_second", None, None, 106.0, None),
+        ]
+        for idx in range(15):
+            rows.append(("sess-2", "assistant", f"Second card step {idx}", None, None, float(107 + idx), None))
+        self._write_profile_store("platform", rows)
+
+        real_read_only = session_kv_server._read_only
+        opened_paths: list[str] = []
+
+        def counting_read_only(path: str):
+            opened_paths.append(path)
+            return real_read_only(path)
+
+        with patch.object(session_kv_server, "_read_only", side_effect=counting_read_only):
+            resp = self.client.get("/v1/sessions/k8s-evt-1/tasks")
+        self.assertEqual(resp.status_code, 200)
+        tasks = resp.json()["tasks"]
+        self.assertEqual([t["id"] for t in tasks], ["t_d1c3323e", "t_second"])
+        self.assertEqual(tasks[0]["live_steps"][0]["preview"], "First card reply")
+        self.assertFalse(tasks[0]["steps_truncated"])
+        # Listing caps `live_steps` at SESSION_TASK_LIVE_STEPS_MAX (10) newest steps.
+        self.assertEqual(len(tasks[1]["live_steps"]), session_kv_server.SESSION_TASK_LIVE_STEPS_MAX)
+        self.assertTrue(tasks[1]["steps_truncated"])
+        self.assertEqual(tasks[1]["live_steps"][0]["preview"], "Second card step 5")
+        self.assertEqual(tasks[1]["live_steps"][-1]["preview"], "Second card step 14")
+        profile_opens = [p for p in opened_paths if p.endswith("state.db")]
+        self.assertEqual(len(profile_opens), 1)
+
+        # Second poll with no new `messages` rows hits `_PROMPT_INDEX_CACHE` without
+        # running another `LIKE '%work kanban task %'` scan; appending a row scans only `WHERE id > last_seen_id`.
+        like_queries: list[tuple] = []
+
+        class _SpyConn:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def execute(self, sql, params=()):
+                if "LIKE ?" in sql:
+                    like_queries.append((sql, tuple(params)))
+                return self._inner.execute(sql, params)
+
+            def close(self):
+                return self._inner.close()
+
+        with patch.object(
+            session_kv_server,
+            "_read_only",
+            side_effect=lambda p: _SpyConn(real_read_only(p)) if p.endswith("state.db") else real_read_only(p),
+        ):
+            self.client.get("/v1/sessions/k8s-evt-1/tasks")
+            self.assertEqual(like_queries, [])
+            self._write_profile_store(
+                "platform",
+                [
+                    ("sess-1", "assistant", "Incremental step", None, None, 200.0, None),
+                ],
+            )
+            self.client.get("/v1/sessions/k8s-evt-1/tasks")
+            self.assertEqual(len(like_queries), 1)
+            self.assertGreater(like_queries[0][1][0], 0)
+
+        # If a `LIKE` scan raises `sqlite3.Error`, `last_seen_id` is NOT advanced so the next poll retries the skipped rows.
+        self._write_profile_store(
+            "platform",
+            [
+                ("sess-retry", "user", "work kanban task t_second", None, None, 300.0, None),
+                ("sess-retry", "assistant", "Retried after transient lock", None, None, 301.0, None),
+            ],
+        )
+        fail_once = [True]
+
+        class _FlakyLikeConn:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def execute(self, sql, params=()):
+                if "LIKE ?" in sql and fail_once[0]:
+                    fail_once[0] = False
+                    raise sqlite3.OperationalError("database is locked")
+                return self._inner.execute(sql, params)
+
+            def close(self):
+                return self._inner.close()
+
+        with patch.object(
+            session_kv_server,
+            "_read_only",
+            side_effect=lambda p: _FlakyLikeConn(real_read_only(p)) if p.endswith("state.db") else real_read_only(p),
+        ):
+            self.client.get("/v1/sessions/k8s-evt-1/tasks")
+            recovered = self.client.get("/v1/sessions/k8s-evt-1/tasks").json()["tasks"]
+            self.assertEqual(recovered[1]["live_steps"][-1]["preview"], "Retried after transient lock")
+
+    def test_worker_session_id_in_run_metadata_resolves_without_prompt_scan_and_falls_back_when_absent(self):
+        import sqlite3
+
+        with sqlite3.connect(self.kanban_path) as conn:
+            conn.execute("DELETE FROM task_runs WHERE task_id = 't_d1c3323e'")
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at, metadata) "
+                "VALUES ('t_d1c3323e', 'default', 'running', 101.0, ?)",
+                (json.dumps({"worker_session_id": "sess-stamped"}),),
+            )
+        # Write into the default profile store (<agent_home>/state.db) with NO
+        # `work kanban task` user prompt row so only `worker_session_id` can match.
+        self._write_profile_store(
+            "default",
+            [
+                ("sess-stamped", "assistant", "Resolved via stamped worker_session_id", None, None, 102.0, None),
+            ],
+        )
+
+        with patch.object(
+            session_kv_server._WorkerStepReader,
+            "sessions_by_prompt",
+            wraps=session_kv_server._WorkerStepReader.sessions_by_prompt,
+        ) as spy_prompt:
+            body = self.client.get("/v1/tasks/t_d1c3323e").json()
+            spy_prompt.assert_not_called()
+        self.assertEqual([s["preview"] for s in body["steps"]], ["Resolved via stamped worker_session_id"])
+
+        # When a stamped worker_session_id is absent from the store, fall back to the prompt index.
+        with sqlite3.connect(self.kanban_path) as conn:
+            conn.execute(
+                "UPDATE task_runs SET profile = 'platform', metadata = ? WHERE task_id = 't_d1c3323e'",
+                (json.dumps({"worker_session_id": "sess-nonexistent"}),),
+            )
+        self._write_profile_store(
+            "platform",
+            [
+                ("sess-fallback", "user", "work kanban task t_d1c3323e", None, None, 110.0, None),
+                ("sess-fallback", "assistant", "Resolved via prompt fallback", None, None, 111.0, None),
+            ],
+        )
+        fallback_body = self.client.get("/v1/tasks/t_d1c3323e").json()
+        self.assertEqual([s["preview"] for s in fallback_body["steps"]], ["Resolved via prompt fallback"])
+
+    def test_retried_card_with_mixed_metadata_and_prompt_sessions_orders_attempts_chronologically(self):
+        import sqlite3
+
+        with sqlite3.connect(self.kanban_path) as conn:
+            conn.execute("DELETE FROM task_runs WHERE task_id = 't_d1c3323e'")
+            # Run 1 has no worker_session_id (pre-upgrade attempt); Run 2 stamps worker_session_id.
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, metadata) "
+                "VALUES ('t_d1c3323e', 'platform', 'failed', 100.0, 150.0, '{}')"
+            )
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, started_at, metadata) "
+                "VALUES ('t_d1c3323e', 'platform', 'running', 200.0, ?)",
+                (json.dumps({"worker_session_id": "s2"}),),
+            )
+
+        rows: list[tuple] = [
+            ("s1", "user", "work kanban task t_d1c3323e", None, None, 100.0, None),
+        ]
+        for idx in range(80):
+            rows.append(("s1", "assistant", f"attempt-1-step-{idx}", None, None, float(101 + idx), None))
+        rows.append(("s2", "user", "work kanban task t_d1c3323e", None, None, 200.0, None))
+        for idx in range(30):
+            rows.append(("s2", "assistant", f"attempt-2-step-{idx}", None, None, float(201 + idx), None))
+        self._write_profile_store("platform", rows)
+
+        body = self.client.get("/v1/tasks/t_d1c3323e").json()
+        self.assertTrue(body["steps_truncated"])
+        previews = [s["preview"] for s in body["steps"]]
+        self.assertEqual(len(previews), session_kv_server.TASK_DETAIL_MAX_STEPS)
+        # Oldest 10 steps of attempt 1 were cut; the remaining 70 steps of attempt 1
+        # precede all 30 steps of the live retry attempt 2.
+        self.assertEqual(previews[0], "attempt-1-step-10")
+        self.assertEqual(previews[69], "attempt-1-step-79")
+        self.assertEqual(previews[70], "attempt-2-step-0")
+        self.assertEqual(previews[-1], "attempt-2-step-29")
+
+    def test_pre_kanban_live_session_synthesized_when_no_card_exists_yet(self):
+        import sqlite3
+
+        now = time.time()
+        self._record_ledger_session("k8s-evt-pre")
+        undelivered_id = self._record_ledger_session("k8s-evt-undelivered")
+        session_kv_server.mark_delivery_failed(undelivered_id, "all enabled chat platforms failed")
+        headless_id = self._record_ledger_session("k8s-evt-headless-pre")
+        session_kv_server.mark_delivery_headless(headless_id)
+        # The dispatcher writes the ledger row before the gateway session exists;
+        # these rows are dispatched a minute before the session rows below.
+        import sqlite3
+
+        with sqlite3.connect(self.kv_db_path) as conn:
+            conn.execute(
+                "UPDATE intercepted_events SET created_at = ?, dispatched_at = ? "
+                "WHERE session_id IN ('k8s-evt-pre', 'k8s-evt-undelivered', 'k8s-evt-headless-pre')",
+                (time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now - 60.0)),) * 2,
+            )
+        self._write_profile_store(
+            "default",
+            [
+                ("k8s-evt-pre", "user", "A Kubernetes Warning event needs triage...", None, None, now - 2.0, None),
+                (
+                    "k8s-evt-pre",
+                    "assistant",
+                    None,
+                    None,
+                    [{"function": {"name": "kanban_create", "arguments": '{"assignee":"cluster-gke","title":"Triage"}'}}],
+                    now - 1.0,
+                    "Routing the warning event to the cluster specialist.",
+                ),
+                ("k8s-evt-undelivered", "user", "A Kubernetes Warning event needs triage...", None, None, now - 2.0, None),
+                ("k8s-evt-undelivered", "assistant", None, None, None, now - 1.0, "Triage running despite chat failure."),
+                ("k8s-evt-headless-pre", "user", "A Kubernetes Warning event needs triage...", None, None, now - 2.0, None),
+                ("k8s-evt-headless-pre", "assistant", None, None, None, now - 1.0, "Triage running on headless install."),
+            ],
+            sessions=[
+                ("k8s-evt-pre", "Triage default/Pod/payments-api (BackOff)", now - 2.0, None),
+                ("k8s-evt-undelivered", "Triage default/Pod/payments-api (BackOff)", now - 2.0, None),
+                ("k8s-evt-headless-pre", "Triage default/Pod/payments-api (BackOff)", now - 2.0, None),
+            ],
+        )
+
+        resp = self.client.get("/v1/sessions/k8s-evt-pre/tasks")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body["board"])
+        self.assertEqual(body["tasks"], [])
+        routing = body["routing"]
+        self.assertNotIn("id", routing)
+        self.assertEqual(routing["title"], "Triage default/Pod/payments-api (BackOff)")
+        self.assertEqual(routing["profile"], "default")
+        self.assertEqual(routing["status"], "in_progress")
+        self.assertEqual(routing["session_id"], "k8s-evt-pre")
+        self.assertIsNone(routing["completed_at"])
+        self.assertEqual([s["kind"] for s in routing["live_steps"]], ["thinking", "tool_call"])
+        self.assertEqual(routing["live_steps"][1]["tool"], "kanban_create")
+        self.assertFalse(routing["steps_truncated"])
+
+        # An undelivered event (`notified = 0, delivery_error != ''`) still runs
+        # autonomous triage and surfaces its pre-kanban routing object.
+        undeliv_resp = self.client.get("/v1/sessions/k8s-evt-undelivered/tasks")
+        self.assertEqual(undeliv_resp.status_code, 200)
+        undeliv_body = undeliv_resp.json()
+        self.assertEqual(undeliv_body["tasks"], [])
+        self.assertEqual(undeliv_body["routing"]["session_id"], "k8s-evt-undelivered")
+        self.assertEqual(undeliv_body["routing"]["profile"], "default")
+
+        # A headless-dispatched event (`notified = NOTIFIED_HEADLESS = 2, delivery_error = ''`)
+        # also surfaces its pre-kanban routing object.
+        with sqlite3.connect(self.kv_db_path) as conn:
+            headless_row = conn.execute(
+                "SELECT notified, delivery_error FROM intercepted_events WHERE session_id = 'k8s-evt-headless-pre'"
+            ).fetchone()
+        self.assertEqual(headless_row, (session_kv_server.NOTIFIED_HEADLESS, ""))
+        headless_resp = self.client.get("/v1/sessions/k8s-evt-headless-pre/tasks")
+        self.assertEqual(headless_resp.status_code, 200)
+        headless_body = headless_resp.json()
+        self.assertEqual(headless_body["tasks"], [])
+        self.assertEqual(headless_body["routing"]["session_id"], "k8s-evt-headless-pre")
+        self.assertEqual(headless_body["routing"]["status"], "in_progress")
+
+        unknown_resp = self.client.get("/v1/sessions/k8s-evt-nonexistent/tasks")
+        self.assertEqual(unknown_resp.status_code, 200)
+        self.assertEqual(unknown_resp.json()["tasks"], [])
+        self.assertNotIn("routing", unknown_resp.json())
+
+    def test_pre_kanban_status_matrix(self):
+        """Every cell of has_ended x reply x stale, plus the two clock cases, as one table."""
+        import sqlite3
+
+        now = time.time()
+        prompt = "A Kubernetes Warning event needs triage..."
+        # The ledger row is written before the gateway session, so in the same
+        # turn ledger_at <= started_at <= ended_at; a reused (409) session has a
+        # young ledger row over an old session. None keeps the row's own time.
+        cells = [
+            # name, ledger_at, started_at, ended_at, reply_at, think_at, want_status, want_completed_at
+            ("ended-reply", now - 30.0, now - 30.0, now - 4.0, now - 5.0, None, "completed", now - 4.0),
+            ("ended-noreply", now - 10.0, now - 10.0, now - 5.0, None, now - 6.0, "failed", now - 5.0),
+            ("stale-reply", now - 1200.0, now - 1200.0, None, now - 1100.0, None, "completed", now - 1100.0),
+            ("stale-noreply", now - 1200.0, now - 1200.0, None, None, now - 10.0, "failed", now - 10.0),
+            ("live-reply", now - 30.0, now - 30.0, None, now - 5.0, None, "in_progress", None),
+            ("live-noreply", now - 30.0, now - 30.0, None, None, now - 5.0, "in_progress", None),
+            # The dispatch queued: the ledger row is old, the session young. The
+            # later clock is the turn's start, so this is live, not failed.
+            ("delayed-dispatch", now - 1200.0, now - 100.0, None, None, now - 50.0, "in_progress", None),
+            # A reused (409) session: the session is old, the ledger row young.
+            ("reused-session", now - 5.0, now - 1200.0, None, None, now - 2.0, "in_progress", None),
+            # A reused session whose first turn Hermes closed: that ended_at is
+            # older than this dispatch and does not end the new turn.
+            ("reused-ended", now - 5.0, now - 1200.0, now - 1100.0, None, now - 2.0, "in_progress", None),
+            # A reused session whose first turn replied in prose: that reply is
+            # the previous turn's. The new turn aborted without one: failed.
+            ("reused-prior-reply-ended", now - 5.0, now - 1200.0, now - 1.0, now - 1150.0, now - 2.0, "failed", now - 1.0),
+            # The same prior reply with the new turn still running: in progress,
+            # and the old reply is not among this turn's live steps.
+            ("reused-prior-reply-live", now - 5.0, now - 1200.0, None, now - 1150.0, now - 2.0, "in_progress", None),
+        ]
+        rows: list[tuple] = []
+        sessions: list[tuple] = []
+        for name, ledger_at, started_at, ended_at, reply_at, think_at, _, _ in cells:
+            sid = f"k8s-evt-matrix-{name}"
+            self._record_ledger_session(sid)
+            if ledger_at is not None:
+                ledger_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ledger_at))
+                with sqlite3.connect(self.kv_db_path) as conn:
+                    conn.execute("UPDATE intercepted_events SET created_at = ?, dispatched_at = ? WHERE session_id = ?", (ledger_ts, ledger_ts, sid))
+            sessions.append((sid, f"Triage {name}", started_at, ended_at))
+            rows.append((sid, "user", prompt, None, None, started_at, None))
+            if think_at is not None:
+                rows.append((sid, "assistant", None, None, None, think_at, "Routing..."))
+            if reply_at is not None:
+                rows.append((sid, "assistant", f"Routed {name} by prose.", None, None, reply_at, "Done."))
+        self._write_profile_store("default", rows, sessions=sessions)
+
+        for name, _, _, _, reply_at, _, want_status, want_completed_at in cells:
+            with self.subTest(cell=name):
+                routing = self.client.get(f"/v1/sessions/k8s-evt-matrix-{name}/tasks").json()["routing"]
+                self.assertEqual(routing["status"], want_status)
+                self.assertEqual(routing["completed_at"], want_completed_at)
+                if want_status == "completed":
+                    self.assertEqual(routing["result"], f"Routed {name} by prose.")
+                    self.assertIsNone(routing["error"])
+                elif want_status == "failed":
+                    self.assertIsNone(routing["result"])
+                    self.assertEqual(routing["error"], session_kv_server.PRE_KANBAN_STALE_ERROR)
+                else:
+                    self.assertIsNone(routing["result"])
+                    self.assertIsNone(routing["error"])
+                if name.startswith("reused-prior-reply"):
+                    self.assertEqual([s["kind"] for s in routing["live_steps"]], ["thinking"])
+                if name.startswith("reused-"):
+                    # The object's clocks are this turn's, not the first turn's.
+                    self.assertAlmostEqual(routing["started_at"], now - 5.0, delta=1.5)
+                    self.assertAlmostEqual(routing["created_at"], now - 5.0, delta=1.5)
+
+    def test_pre_kanban_dispatch_time_not_row_age_decides_the_ledger_only_verdict(self):
+        # A drift-backlog row is carded long after it arrived: created_at is
+        # old, dispatched_at is now. With no gateway session yet the read must
+        # say in_progress, not failed; an old dispatch with no session is failed.
+        import sqlite3
+
+        now = time.time()
+        old_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now - 1200.0))
+        carded_late_id = self._record_ledger_session("k8s-evt-carded-late")
+        self._record_ledger_session("k8s-evt-dispatched-late")
+        self._record_ledger_session("k8s-evt-queued")
+        with sqlite3.connect(self.kv_db_path) as conn:
+            conn.execute(
+                "UPDATE intercepted_events SET created_at = ? WHERE session_id IN ('k8s-evt-carded-late', 'k8s-evt-queued')",
+                (old_ts,),
+            )
+            conn.execute(
+                "UPDATE intercepted_events SET created_at = ?, dispatched_at = ? WHERE session_id = 'k8s-evt-dispatched-late'",
+                (old_ts, old_ts),
+            )
+        # An admitted row the dispatcher has not stamped is queued, whatever
+        # its arrival says: in progress, never aged into failed.
+        queued_old = self.client.get("/v1/sessions/k8s-evt-carded-late/tasks").json()["routing"]
+        self.assertEqual(queued_old["status"], "in_progress")
+        self.assertIsNone(queued_old["error"])
+        # The dispatcher's stamp, as it runs right before the gateway session is created.
+        session_kv_server.mark_dispatched(carded_late_id)
+        with sqlite3.connect(self.kv_db_path) as conn:
+            stamp = conn.execute(
+                "SELECT dispatched_at FROM intercepted_events WHERE session_id = 'k8s-evt-carded-late'"
+            ).fetchone()[0]
+        self.assertIn(".", stamp, "the dispatch stamp carries fractions of a second")
+        late = self.client.get("/v1/sessions/k8s-evt-carded-late/tasks").json()["routing"]
+        self.assertEqual(late["status"], "in_progress")
+        self.assertAlmostEqual(late["created_at"], now, delta=5.0)
+        dead = self.client.get("/v1/sessions/k8s-evt-dispatched-late/tasks").json()["routing"]
+        self.assertEqual(dead["status"], "failed")
+        self.assertEqual(dead["error"], session_kv_server.PRE_KANBAN_STALE_ERROR)
+        # A turn whose dispatch queued for twenty minutes and then started: the
+        # session's own start is the later clock, so it is live, and the object
+        # reports that start rather than the row's arrival.
+        self._write_profile_store(
+            "default",
+            [("k8s-evt-queued", "user", "A Kubernetes Warning event needs triage...", None, None, now - 3.0, None)],
+            sessions=[("k8s-evt-queued", "Triage queued", now - 3.0, None)],
+        )
+        queued = self.client.get("/v1/sessions/k8s-evt-queued/tasks").json()["routing"]
+        self.assertEqual(queued["status"], "in_progress")
+        self.assertEqual(queued["started_at"], now - 3.0)
+
+    def test_pre_kanban_startup_stamps_a_dispatch_the_previous_process_lost(self):
+        # A row admitted right before a restart never reaches mark_dispatched,
+        # so dispatched_at stays NULL and, read as queued, it would say
+        # in_progress for its whole retention. Startup stamps every unstamped
+        # row to created_at: no dispatcher from an earlier process can.
+        import sqlite3
+
+        now = time.time()
+        old_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now - 1200.0))
+        self._record_ledger_session("k8s-evt-lost-dispatch")
+        with sqlite3.connect(self.kv_db_path) as conn:
+            conn.execute(
+                "UPDATE intercepted_events SET created_at = ?, dispatched_at = NULL WHERE session_id = 'k8s-evt-lost-dispatch'",
+                (old_ts,),
+            )
+        before = self.client.get("/v1/sessions/k8s-evt-lost-dispatch/tasks").json()["routing"]
+        self.assertEqual(before["status"], "in_progress")
+        session_kv_server.init_db()
+        with sqlite3.connect(self.kv_db_path) as conn:
+            row = conn.execute(
+                "SELECT created_at, dispatched_at FROM intercepted_events WHERE session_id = 'k8s-evt-lost-dispatch'"
+            ).fetchone()
+        self.assertEqual(row[1], row[0], "startup stamps the lost dispatch to the row's arrival")
+        after = self.client.get("/v1/sessions/k8s-evt-lost-dispatch/tasks").json()["routing"]
+        self.assertEqual(after["status"], "failed")
+        self.assertEqual(after["error"], session_kv_server.PRE_KANBAN_STALE_ERROR)
+
+    def test_pre_kanban_previous_turn_rows_do_not_count_as_truncation(self):
+        # A reused session whose earlier turns left more rows than the read
+        # window holds: the window clips the previous turn, not this one.
+        import sqlite3
+
+        now = time.time()
+        self._record_ledger_session("k8s-evt-matrix-clip")
+        with sqlite3.connect(self.kv_db_path) as conn:
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now - 5.0))
+            conn.execute(
+                "UPDATE intercepted_events SET created_at = ?, dispatched_at = ? WHERE session_id = 'k8s-evt-matrix-clip'",
+                (ts, ts),
+            )
+        prompt = "A Kubernetes Warning event needs triage..."
+        rows = [("k8s-evt-matrix-clip", "user", prompt, None, None, now - 1200.0, None)]
+        for idx in range(22):
+            rows.append(("k8s-evt-matrix-clip", "assistant", None, None, None, now - 1199.0 + idx, f"old thought {idx}"))
+        rows.append(("k8s-evt-matrix-clip", "assistant", None, None, None, now - 2.0, "this turn's thought"))
+        self._write_profile_store("default", rows, sessions=[("k8s-evt-matrix-clip", "Triage clip", now - 1200.0, None)])
+        routing = self.client.get("/v1/sessions/k8s-evt-matrix-clip/tasks").json()["routing"]
+        self.assertEqual(routing["status"], "in_progress")
+        self.assertEqual([s["preview"] for s in routing["live_steps"]], ["this turn's thought"])
+        self.assertFalse(routing["steps_truncated"])
+
+    def test_pre_kanban_ended_or_stale_session_reports_terminal_status(self):
+        import sqlite3
+
+        now = time.time()
+        self._record_ledger_session("k8s-evt-ended")
+        self._record_ledger_session("k8s-evt-ended-no-reply")
+        self._record_ledger_session("k8s-evt-stale")
+        self._record_ledger_session("k8s-evt-reused")
+        self._record_ledger_session("k8s-evt-long-mcp")
+        self._record_ledger_session("k8s-evt-row-clipped")
+        self._record_ledger_session("k8s-evt-never-started")
+        self._record_ledger_session("k8s-evt-fresh")
+        sqlite_text_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now - 1200.0))
+        long_mcp_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now - 360.0))
+        with sqlite3.connect(self.kv_db_path) as conn:
+            conn.execute(
+                "UPDATE intercepted_events SET created_at = ?, dispatched_at = ? WHERE session_id IN ('k8s-evt-never-started', 'k8s-evt-stale')",
+                (sqlite_text_ts, sqlite_text_ts),
+            )
+            conn.execute(
+                "UPDATE intercepted_events SET created_at = ?, dispatched_at = ? WHERE session_id = 'k8s-evt-long-mcp'",
+                (long_mcp_ts, long_mcp_ts),
+            )
+            # The ledger row precedes its own turn's session: without this the
+            # ended sessions below would carry an ended_at older than the row.
+            conn.execute(
+                "UPDATE intercepted_events SET created_at = ?, dispatched_at = ? WHERE session_id IN ('k8s-evt-ended', 'k8s-evt-ended-no-reply', 'k8s-evt-reused', 'k8s-evt-row-clipped')",
+                (time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now - 60.0)),) * 2,
+            )
+        # A later non-dispatched (`notified = 0, delivery_error = ''`) row under the
+        # same session_id must not advance `turn_start_epoch` or un-stale `k8s-evt-stale`.
+        self._record_ledger_session("k8s-evt-stale", notified=False)
+        final_prose = "## What's wrong\n\n" + (
+            "Container failed liveness probe due to port mismatch on readiness check. " * 65
+        )
+        self.assertGreater(len(final_prose), session_kv_server.TASK_STEP_DETAIL_MAX_CHARS)
+
+        ended_rows: list[tuple] = [
+            ("k8s-evt-ended", "user", "A Kubernetes Warning event needs triage...", None, None, now - 30.0, None),
+        ]
+        for idx in range(14):
+            ended_rows.append(
+                (
+                    "k8s-evt-ended",
+                    "assistant",
+                    None,
+                    None,
+                    None,
+                    now - 29.0 + idx,
+                    f"Intermediate routing thought {idx}",
+                )
+            )
+        ended_rows.append(
+            ("k8s-evt-ended", "assistant", final_prose, None, None, now - 5.0, "Diagnosing directly.")
+        )
+
+        clipped_rows: list[tuple] = [
+            ("k8s-evt-row-clipped", "user", "A Kubernetes Warning event needs triage...", None, None, now - 50.0, None),
+        ]
+        for idx in range(25):
+            clipped_rows.append(
+                ("k8s-evt-row-clipped", "user", f"follow-up user note {idx}", None, None, now - 49.0 + idx, None)
+            )
+        clipped_rows.append(
+            ("k8s-evt-row-clipped", "assistant", None, None, None, now - 2.0, "Single surviving step after row clip.")
+        )
+
+        self._write_profile_store(
+            "default",
+            ended_rows
+            + clipped_rows
+            + [
+                (
+                    "k8s-evt-ended-no-reply",
+                    "user",
+                    "A Kubernetes Warning event needs triage...",
+                    None,
+                    None,
+                    now - 10.0,
+                    None,
+                ),
+                (
+                    "k8s-evt-ended-no-reply",
+                    "assistant",
+                    None,
+                    None,
+                    None,
+                    now - 6.0,
+                    "Starting routing turn before upstream abort...",
+                ),
+                ("k8s-evt-stale", "user", "A Kubernetes Warning event needs triage...", None, None, now - 1200.0, None),
+                # Recent message timestamp (`now - 10.0`, younger than 900s) ensures
+                # staleness is measured from turn start (`ledger_created_at` / `started_at`),
+                # not from `updated_at` (which a chat reply or late stream chunk would reset).
+                ("k8s-evt-stale", "assistant", None, None, None, now - 10.0, "Starting routing turn..."),
+                ("k8s-evt-reused", "user", "A Kubernetes Warning event needs triage...", None, None, now - 1200.0, None),
+                ("k8s-evt-reused", "assistant", None, None, None, now - 2.0, "Fresh turn on reused session..."),
+                ("k8s-evt-long-mcp", "user", "A Kubernetes Warning event needs triage...", None, None, now - 360.0, None),
+                ("k8s-evt-long-mcp", "assistant", None, None, None, now - 360.0, "Waiting on 420s MCP tool call..."),
+            ],
+            sessions=[
+                ("k8s-evt-ended", "Triage ended session", now - 30.0, now - 4.0),
+                ("k8s-evt-ended-no-reply", "Triage ended aborted session", now - 10.0, now - 5.0),
+                ("k8s-evt-stale", "Triage stale session", now - 1200.0, None),
+                ("k8s-evt-reused", "Triage reused session", now - 1200.0, None),
+                ("k8s-evt-long-mcp", "Triage long MCP session", now - 360.0, None),
+                ("k8s-evt-row-clipped", "Triage row-clipped session", now - 50.0, None),
+            ],
+        )
+
+        ended_task = self.client.get("/v1/sessions/k8s-evt-ended/tasks").json()["routing"]
+        self.assertEqual(ended_task["status"], "completed")
+        self.assertEqual(ended_task["completed_at"], now - 4.0)
+        self.assertEqual(len(ended_task["live_steps"]), session_kv_server.SESSION_TASK_LIVE_STEPS_MAX)
+        self.assertTrue(ended_task["steps_truncated"])
+        self.assertTrue(all("detail" not in s for s in ended_task["live_steps"]))
+        self.assertTrue(ended_task["summary"].endswith("…"))
+        self.assertEqual(len(ended_task["summary"]), session_kv_server.TASK_STEP_PREVIEW_MAX_CHARS + 1)
+        self.assertEqual(ended_task["result"], final_prose.strip())
+        self.assertGreater(len(ended_task["result"]), session_kv_server.TASK_STEP_DETAIL_MAX_CHARS)
+        self.assertIsNone(ended_task["error"])
+
+        clipped_task = self.client.get("/v1/sessions/k8s-evt-row-clipped/tasks").json()["routing"]
+        self.assertEqual(clipped_task["status"], "in_progress")
+        self.assertEqual(len(clipped_task["live_steps"]), 1)
+        self.assertTrue(clipped_task["steps_truncated"])
+
+        ended_no_reply_task = self.client.get("/v1/sessions/k8s-evt-ended-no-reply/tasks").json()["routing"]
+        self.assertEqual(ended_no_reply_task["status"], "failed")
+        self.assertEqual(ended_no_reply_task["completed_at"], now - 5.0)
+        self.assertIsNone(ended_no_reply_task["result"])
+        self.assertIsNone(ended_no_reply_task["summary"])
+        self.assertEqual(ended_no_reply_task["error"], session_kv_server.PRE_KANBAN_STALE_ERROR)
+
+        stale_task = self.client.get("/v1/sessions/k8s-evt-stale/tasks").json()["routing"]
+        self.assertEqual(stale_task["status"], "failed")
+        self.assertEqual(stale_task["completed_at"], now - 10.0)
+        self.assertEqual(stale_task["error"], session_kv_server.PRE_KANBAN_STALE_ERROR)
+
+        reused_task = self.client.get("/v1/sessions/k8s-evt-reused/tasks").json()["routing"]
+        self.assertEqual(reused_task["status"], "in_progress")
+        self.assertIsNone(reused_task["completed_at"])
+
+        long_mcp_task = self.client.get("/v1/sessions/k8s-evt-long-mcp/tasks").json()["routing"]
+        self.assertEqual(long_mcp_task["status"], "in_progress")
+        self.assertIsNone(long_mcp_task["completed_at"])
+
+        prev_tz = os.environ.get("TZ")
+        try:
+            os.environ["TZ"] = "UTC-2"
+            if hasattr(time, "tzset"):
+                time.tzset()
+            never_started_task = self.client.get("/v1/sessions/k8s-evt-never-started/tasks").json()["routing"]
+        finally:
+            if prev_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = prev_tz
+            if hasattr(time, "tzset"):
+                time.tzset()
+        self.assertEqual(never_started_task["status"], "failed")
+        for ts_field in ("created_at", "started_at", "completed_at", "updated_at"):
+            self.assertIsInstance(never_started_task[ts_field], float)
+            self.assertAlmostEqual(never_started_task[ts_field], now - 1200.0, delta=1.5)
+        self.assertEqual(never_started_task["live_steps"], [])
+        self.assertEqual(never_started_task["error"], session_kv_server.PRE_KANBAN_STALE_ERROR)
+
+        # A freshly dispatched ledger row whose gateway session has not yet been
+        # written to `state.db` is a turn in progress from the ledger row alone:
+        # the dispatch is queued or the gateway is down, and the contract says
+        # the object appears for every dispatched session.
+        fresh_body = self.client.get("/v1/sessions/k8s-evt-fresh/tasks").json()
+        self.assertEqual(fresh_body["tasks"], [])
+        fresh_routing = fresh_body["routing"]
+        self.assertEqual(fresh_routing["status"], "in_progress")
+        self.assertEqual(fresh_routing["profile"], "default")
+        self.assertEqual(fresh_routing["live_steps"], [])
+        self.assertIsNone(fresh_routing["completed_at"])
+        self.assertNotIn("routing_error", fresh_routing)
+        self.assertIsInstance(fresh_routing["created_at"], float)
+        self.assertAlmostEqual(fresh_routing["created_at"], now, delta=5.0)
+
+        # When `<agent_home>/state.db` exists and raises `sqlite3.Error`,
+        # `_read_pre_kanban_session_task` falls back to the ledger-backed object
+        # with `routing_error` rather than collapsing into "not a triage session".
+        real_read_only = session_kv_server._read_only
+
+        def _fail_state_db(path: str):
+            if path.endswith("state.db"):
+                raise sqlite3.OperationalError("database is locked")
+            return real_read_only(path)
+
+        with patch.object(session_kv_server, "_read_only", side_effect=_fail_state_db):
+            locked_active = self.client.get("/v1/sessions/k8s-evt-fresh/tasks").json()["routing"]
+            self.assertEqual(locked_active["status"], "in_progress")
+            self.assertEqual(locked_active["live_steps"], [])
+            self.assertEqual(locked_active["routing_error"], "database is locked")
+            self.assertAlmostEqual(locked_active["created_at"], now, delta=5.0)
+
+            locked_stale = self.client.get("/v1/sessions/k8s-evt-never-started/tasks").json()["routing"]
+            self.assertEqual(locked_stale["status"], "failed")
+            self.assertEqual(locked_stale["error"], session_kv_server.PRE_KANBAN_STALE_ERROR)
+            self.assertEqual(locked_stale["routing_error"], "database is locked")
+            self.assertAlmostEqual(locked_stale["completed_at"], now - 1200.0, delta=1.5)
+
+    def test_pre_kanban_rejects_non_ledger_front_door_chat_session(self):
+        import sqlite3
+
+        now = time.time()
+        secret_tok = "ghp_" + "B" * 36
+        self._write_profile_store(
+            "default",
+            [
+                ("slack-thread-123", "user", "Can you check our staging secret?", None, None, now - 2.0, None),
+                ("slack-thread-123", "assistant", "Here is the chat reply.", None, None, now - 1.0, None),
+                (
+                    "k8s-evt-info-only",
+                    "user",
+                    "A Kubernetes Warning event needs triage...",
+                    None,
+                    None,
+                    now - 2.0,
+                    None,
+                ),
+                ("k8s-evt-info-only", "assistant", "Here is the chat reply.", None, None, now - 1.0, None),
+                (
+                    "slack-thread-untitled",
+                    "user",
+                    "Can you triage our staging secret?",
+                    None,
+                    None,
+                    now - 2.0,
+                    None,
+                ),
+                ("slack-thread-untitled", "assistant", "Here is the chat reply.", None, None, now - 1.0, None),
+                (
+                    "slack-thread-bad-title",
+                    "user",
+                    "Can you triage our staging secret?",
+                    None,
+                    None,
+                    now - 2.0,
+                    None,
+                ),
+                ("slack-thread-bad-title", "assistant", "Here is the chat reply.", None, None, now - 1.0, None),
+                (
+                    "k8s-evt-scrub-title",
+                    "user",
+                    "A Kubernetes Warning event needs triage...",
+                    None,
+                    None,
+                    now - 2.0,
+                    None,
+                ),
+                ("k8s-evt-scrub-title", "assistant", "Routing.", None, None, now - 1.0, None),
+            ],
+            sessions=[
+                ("slack-thread-123", "Triage default/Pod/payments-api", now - 2.0, None),
+                ("k8s-evt-info-only", "Triage default/Pod/payments-api", now - 2.0, None),
+                ("slack-thread-untitled", None, now - 2.0, None),
+                ("slack-thread-bad-title", "Slack conversation", now - 2.0, None),
+                ("k8s-evt-scrub-title", f"Triage token {secret_tok}", now - 2.0, None),
+            ],
+        )
+
+        with sqlite3.connect(self.kv_db_path) as conn:
+            indexes = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'intercepted_events'"
+                )
+            }
+        self.assertIn("idx_intercepted_events_session_id", indexes)
+
+        # 1. Direct query without a ledger row returns empty.
+        resp = self.client.get("/v1/sessions/slack-thread-123/tasks")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["tasks"], [])
+        self.assertNotIn("routing", resp.json())
+
+        # 2. Injecting an Info-graded event onto `slack-thread-123` and onto
+        #    triage-shaped `k8s-evt-info-only` (which passes both content guards)
+        #    records a filtered ledger row (`notified = 0, delivery_error = ''`)
+        #    and is rejected solely by the ledger dispatch predicate.
+        for target_sid in ("slack-thread-123", "k8s-evt-info-only"):
+            info_resp = self.client.post(
+                f"/sessions/{target_sid}/inject",
+                json={"message": json.dumps({"type": "Normal", "reason": "Pulled", "message": "noop"})},
+            )
+            self.assertEqual(info_resp.status_code, 200)
+            self.assertIn(info_resp.json()["status"], ("suppressed", "filtered"))
+            with sqlite3.connect(self.kv_db_path) as conn:
+                ledger_row = conn.execute(
+                    "SELECT notified, delivery_error FROM intercepted_events WHERE session_id = ?",
+                    (target_sid,),
+                ).fetchone()
+            self.assertEqual(ledger_row, (0, ""))
+            self.assertNotIn("routing", self.client.get(f"/v1/sessions/{target_sid}/tasks").json())
+
+        # 3a. Prompt guard alone: `slack-thread-123` has a `"Triage ..."` title (so it
+        #     passes the title guard) and is rejected solely by its non-triage initial prompt.
+        self._record_ledger_session("slack-thread-123")
+        self.assertNotIn("routing", self.client.get("/v1/sessions/slack-thread-123/tasks").json())
+
+        # 3b. Title guard on untitled chat session (`title = None`): passes the prompt
+        #     guard ("triage" in first user prompt) and is rejected by its empty title.
+        self._record_ledger_session("slack-thread-untitled")
+        self.assertNotIn("routing", self.client.get("/v1/sessions/slack-thread-untitled/tasks").json())
+
+        # 3c. Title guard on non-"Triage " titled chat session: passes the prompt
+        #     guard and is rejected solely by its non-"Triage " title.
+        self._record_ledger_session("slack-thread-bad-title")
+        self.assertNotIn("routing", self.client.get("/v1/sessions/slack-thread-bad-title/tasks").json())
+
+        # 4. A legitimate triage session's `sessions.title` is scrubbed before return.
+        self._record_ledger_session("k8s-evt-scrub-title")
+        scrub_routing = self.client.get("/v1/sessions/k8s-evt-scrub-title/tasks").json()["routing"]
+        self.assertNotIn(secret_tok, scrub_routing["title"])
+
+
 
 
 
@@ -8576,6 +10304,9 @@ class TestDriftBacklog(unittest.TestCase):
         self.assertEqual(row["backlog"], session_kv_server.DRIFT_BACKLOG_CARDED)
         self.assertEqual(row["notified"], 1)
         self.assertTrue(row["session_id"])
+        # The carding is the dispatch the pre-kanban verdict reads, sub-second.
+        self.assertTrue(row["dispatched_at"], "the carding UPDATE must stamp the dispatch time the pre-kanban verdict reads")
+        self.assertIn(".", row["dispatched_at"])
         deadline = time.monotonic() + 5
         while not self.trigger.called and time.monotonic() < deadline:
             time.sleep(0.01)
