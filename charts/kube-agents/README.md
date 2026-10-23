@@ -1027,9 +1027,9 @@ Conversely, a ResourceQuota that restricts compute resources (`requests.cpu`, `l
 requires every container in the namespace to declare that request or limit unless a
 `LimitRange` provides a default. LiteLLM, Hindsight's Postgres and the cleanup Job declare an
 ephemeral-storage request and an equal limit by default (each emptyDir's sizeLimit plus its
-logs), as do the a2a session pods; the operator and the minter do not, nor do several operator
-containers (such as the shell sandbox, dashboard, and agent container), and pruning a
-workload's requests leaves it without them; the preflight checks total headroom against what is declared, not whether every
+logs), as do the a2a session pods; the operator, the minter and the Hindsight API do not, nor
+do several operator containers (such as the shell sandbox, dashboard, and agent container),
+and pruning a workload's requests leaves it without them; the preflight checks total headroom against what is declared, not whether every
 individual container declares every resource the quota constrains. A namespace quota constraining
 ephemeral storage therefore additionally requires a `LimitRange` defaulting it, or the API
 server will reject pod creation.
