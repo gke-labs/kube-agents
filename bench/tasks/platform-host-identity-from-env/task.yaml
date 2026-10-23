@@ -1,0 +1,98 @@
+# Asked which cluster kube-agents runs on, the platform worker reads the host
+# identity from its environment in one call instead of hunting for it (#3350).
+#
+# Seen live: "What cluster is kube-agents running on?" took a 3-minute,
+# 44-turn kanban delegation. The worker searched the filesystem for
+# gcp-console-links.md and listed the fleet with `gcloud container clusters
+# list` before it answered. The operator already forwards the host's
+# GKE_CLUSTER_NAME, GKE_PROJECT_ID, GKE_LOCATION and KUBE_CONTEXT_NAME into
+# the shell sandbox (SANDBOX_FORWARDED_ENV_NAMES, deploy/sandbox/entrypoint.sh),
+# and agents/platform/SOUL.md §1 "Host and Cluster Identity Queries" now says
+# to read them and to not enumerate the fleet.
+#
+# The front door holds no infrastructure tools, so the question goes through
+# kanban to the platform worker; worker_commands reads that worker's terminal.
+# A front door that answers without delegating leaves nothing to read, which
+# is status "error", not a pass.
+#
+# The required phrase is the eval install's host cluster name,
+# HOST_CLUSTER_NAME in hack/ci-env.sh (platform-agent-host). A dev install
+# whose host cluster has another name fails that one check for the name alone;
+# read its failure reason before calling a run red.
+#
+# Red on main rests on the forbidden-route check: main's worker answered too,
+# only slowly, so the name check and the env-read check can pass there. The
+# env-read check reads terminal commands; a worker that reads os.environ
+# through execute_code leaves no card-log row for it and fails that check.
+#
+# Domain: chat and routing. Isolation class: read-only. Eligible tier: nightly.
+id: platform-host-identity-from-env
+name: Asked which cluster kube-agents runs on, the worker reads its environment and does not enumerate the fleet
+prompt: >-
+  What cluster is kube-agents running on? Give me the cluster name, its GCP
+  project and its location.
+expected_output: >-
+  The front door files a kanban task for the platform specialist. The worker
+  reads the host cluster's name, project and location from its environment
+  (GKE_CLUSTER_NAME, GKE_PROJECT_ID, GKE_LOCATION or KUBE_CONTEXT_NAME) and
+  the answer names the host cluster, platform-agent-host on the eval install,
+  with its project and location. The worker does not list the fleet's
+  clusters and does not search the filesystem for console link helpers.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml: a front-door question routed to the
+# platform specialist.
+domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: fkc1e100
+
+verification_spec:
+  - name: work-was-delegated-through-kanban
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      require_success: true
+  - name: the-answer-names-the-host-cluster
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["platform-agent-host"]
+  - name: the-worker-read-the-forwarded-identity
+    role: objective
+    mode: assert
+    check:
+      # The card log renders a chained command as its first command, so the
+      # variable name or the bare printenv/env call is what can be matched.
+      type: worker_commands
+      required_patterns:
+        - 'GKE_(?:CLUSTER_NAME|PROJECT_ID|LOCATION)|KUBE_CONTEXT_NAME|^\s*(?:printenv|env)\b'
+  - name: the-worker-did-not-hunt-for-the-host
+    role: objective
+    mode: assert
+    check:
+      # The two routes the live run took: a fleet listing, and a filesystem
+      # search for the console link reference. A find rooted at / is the
+      # filesystem hunt whatever file it names. The kubeconfig's current
+      # context is the route the SOUL bullet names as not the host.
+      type: worker_commands
+      forbidden_patterns:
+        - 'gcloud\s+container\s+clusters\s+list'
+        - "gcp-console-links"
+        - '\bfind\s+/(?:\s|$)'
+        - 'kubectl\s+config\s+current-context'
+  # The delegation boundary, as in chat-routing-fleet-question: the front door
+  # files the card and never works it.
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]

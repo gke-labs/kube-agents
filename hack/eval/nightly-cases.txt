@@ -1047,6 +1047,12 @@
 # record measures it.
 ./tasks/incident-triage-workload-fold/task.yaml
 
+# Host identity from the forwarded environment (#3350): asked which cluster
+# kube-agents runs on, the platform worker reads GKE_CLUSTER_NAME and its
+# siblings instead of listing the fleet or searching the filesystem.
+# deployer: noop, no fixture, read-only; one delegated card at the 200s default.
+./tasks/platform-host-identity-from-env/task.yaml
+
 # A delegated card written to outrun the worker budget: the worker runs under
 # the platform profile's 150 turns, read from Hermes' checkpoint notice in its
 # tool results or from the card's run row, not under the 250 the fleet audits
