@@ -839,7 +839,7 @@ class ThreePartNightTest(unittest.TestCase):
         self.assertEqual((last["missing"], last["missing_parts"], last["running_parts"], last["complete"]), (["b-a", "b-b"], ["main-b"], [], False))
         self.assertFalse(last["truncated"])
         self.assertEqual(self.line(data, DIGEST_AT + datetime.timedelta(days=1)),
-                         "🌙 Nightly: 5 cases · 5 passed all reps · 0 partial · 0 failed · nothing newly failing · main-b part missing · incomplete: 5 of 7 cases recorded · 6h 40m")
+                         "🌙 Nightly: 5 cases · 5 passed all reps · 0 partial · 0 failed · main-b part missing · incomplete: 5 of 7 cases recorded · 6h 40m")
         # Still in flight on that date: running, and the digest waits for it.
         data["pending_builds"] = [{"build_id": "3000000000000000023", "first_seen": "2026-09-09T00:05:00+00:00", "tier": "nightly",
                                    "log_url": f"https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/{MAIN_B_JOB}/3000000000000000023"}]
