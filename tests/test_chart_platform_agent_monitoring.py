@@ -1,7 +1,8 @@
 """The chart renders a PodMonitoring for each of the agent's pods that serves metrics.
 
-Three today: the gateway pod, where the k8s-event-watcher serves its metrics on the
+Four today: the gateway pod, where the k8s-event-watcher serves its metrics on the
 agent-api-auth sidecar; the credential-proxy pod, where the broker serves its
+own on a metrics-only listener; the kube-proxy pod, where k8s-api-proxy serves its
 own on a metrics-only listener; and the A2A gateway pod a `spec.mode: next`
 install runs, which serves its own on a metrics-only listener too. For each,
 three things have to agree for the scrape to work: the port the operator
@@ -104,6 +105,14 @@ _SCRAPES = (
         "container": "gateway",
         "port_name": "a2a-metrics",
         "selector_keys": ("app",),
+    },
+    {
+        "suffix": "-kube-proxy-monitoring",
+        "sm_suffix": "-kube-metrics",
+        "deployment": "platformagent-kube-proxy",
+        "container": "kube-proxy",
+        "port_name": "kube-metrics",
+        "selector_keys": ("app", "kubeagents.x-k8s.io/component"),
     },
 )
 

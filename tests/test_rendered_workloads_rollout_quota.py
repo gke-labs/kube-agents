@@ -78,8 +78,8 @@ _HELM_SET_VALUES = (
 # offenders", so the count is asserted, and a new chart Deployment fails here
 # until its author looks at its strategy and bumps the number.
 _EXPECTED_RENDERED_DEPLOYMENTS = 4
-# Seven golden cases, each emitting an agent gateway and a credential proxy.
-_EXPECTED_GOLDEN_DEPLOYMENTS = 14
+# Seven golden cases, each emitting an agent gateway, a credential proxy, and a kube-proxy.
+_EXPECTED_GOLDEN_DEPLOYMENTS = 21
 
 # Single-replica workloads that deliberately keep `maxUnavailable: 0` and so
 # stall under a zero-headroom quota. The reasons are the ones

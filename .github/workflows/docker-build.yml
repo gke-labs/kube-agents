@@ -217,6 +217,15 @@ jobs:
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
 
+      - name: Build Kube Proxy
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/kube-proxy/Dockerfile
+          platforms: linux/amd64
+          push: false
+          tags: kube-proxy:latest
+
       - name: Build Replay Proxy
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:

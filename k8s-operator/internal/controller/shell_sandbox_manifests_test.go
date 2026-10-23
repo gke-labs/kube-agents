@@ -73,11 +73,11 @@ func TestShellSandboxStatefulSetHasNoKubernetesCredential(t *testing.T) {
 	}
 	// The whole list, by name, rather than a count: every volume here is a way to
 	// put bytes into the pod the agent can run arbitrary commands in, so adding one
-	// should be a decision someone makes on purpose. Exactly five are allowed —
+	// should be a decision someone makes on purpose. Exactly six are allowed —
 	// the authorized-keys Secret, the SETTINGS.md ConfigMap, the token the shell
-	// presents to the credential runtime, the empty mount over ~/.hermes, and the
-	// GitOps state ConfigMap. Anything else fails here and gets argued about in
-	// review.
+	// presents to the credential runtime, the empty mount over ~/.hermes, the
+	// GitOps state ConfigMap, and the kube-proxy public CA certificate. Anything
+	// else fails here and gets argued about in review.
 	//
 	// The third one is a credential, unlike the others, and it is here because
 	// the alternative is not "the sandbox holds nothing" but "the sandbox cannot
@@ -100,6 +100,7 @@ func TestShellSandboxStatefulSetHasNoKubernetesCredential(t *testing.T) {
 		shellSandboxCredentialProxyTokenVolume: true,
 		shellSandboxHermesHomeVolume:           true,
 		gitopsStateVolumeName:                  true,
+		kubeProxyCAVolumeName:                  true,
 	}
 	byName := map[string]corev1.Volume{}
 	for _, v := range pod.Volumes {
@@ -119,6 +120,17 @@ func TestShellSandboxStatefulSetHasNoKubernetesCredential(t *testing.T) {
 	}
 	if len(secret.Items) != 1 || secret.Items[0].Key != "authorized_keys" {
 		t.Errorf("expected only the authorized_keys item from the Secret, got %#v", secret.Items)
+	}
+	// The kube-proxy CA volume projects only the public ca.crt item from the TLS Secret, never tls.key.
+	proxyCA, ok := byName[kubeProxyCAVolumeName]
+	if !ok {
+		t.Fatalf("expected the %q volume, got %#v", kubeProxyCAVolumeName, pod.Volumes)
+	}
+	if proxyCA.Secret == nil || proxyCA.Secret.SecretName != kubeProxyTLSSecretName(agent) {
+		t.Fatalf("expected %q Secret volume from %q, got %#v", kubeProxyCAVolumeName, kubeProxyTLSSecretName(agent), proxyCA.VolumeSource)
+	}
+	if len(proxyCA.Secret.Items) != 1 || proxyCA.Secret.Items[0].Key != "ca.crt" {
+		t.Errorf("expected only the ca.crt item from the kube-proxy TLS Secret, got %#v", proxyCA.Secret.Items)
 	}
 	// The other one is a ConfigMap, which is the part that matters: a Secret named
 	// here would be a credential arriving by the same route.
@@ -819,10 +831,9 @@ func TestShellSandboxNetworkPolicyDeniesByDefault(t *testing.T) {
 		t.Errorf("expected ingress only on %d, got %#v", shellSandboxPort, in.Ports)
 	}
 
-	// Egress: DNS and the credential proxy. Anything else reachable from here is
-	// a path out of the sandbox that the incident this design answers used.
-	if len(np.Spec.Egress) != 2 {
-		t.Fatalf("expected exactly two egress rules (DNS, credential proxy), got %d", len(np.Spec.Egress))
+	// Egress: DNS, the credential proxy, and the Kubernetes API proxy.
+	if len(np.Spec.Egress) != 3 {
+		t.Fatalf("expected exactly three egress rules (DNS, credential proxy, kube proxy), got %d", len(np.Spec.Egress))
 	}
 	for i, rule := range np.Spec.Egress {
 		if len(rule.To) == 0 {
@@ -835,6 +846,10 @@ func TestShellSandboxNetworkPolicyDeniesByDefault(t *testing.T) {
 	proxy := np.Spec.Egress[1]
 	if proxy.Ports[0].Port.IntValue() != credentialProxyPort {
 		t.Errorf("expected the credential proxy port %d, got %#v", credentialProxyPort, proxy.Ports[0].Port)
+	}
+	kubeProxy := np.Spec.Egress[2]
+	if kubeProxy.Ports[0].Port.IntValue() != int(kubeProxyPort) {
+		t.Errorf("expected the kube proxy port %d, got %#v", kubeProxyPort, kubeProxy.Ports[0].Port)
 	}
 }
 
@@ -1631,9 +1646,9 @@ func TestSandboxEgressReachesNothingButDNSAndTheBroker(t *testing.T) {
 		}
 		for _, p := range rule.Ports {
 			switch p.Port.IntValue() {
-			case 53, credentialProxyPort:
+			case 53, credentialProxyPort, int(kubeProxyPort):
 			default:
-				t.Errorf("unexpected egress port %v — the sandbox needs cluster DNS and the broker, nothing else", p.Port)
+				t.Errorf("unexpected egress port %v — the sandbox needs cluster DNS, the broker, and kube-proxy, nothing else", p.Port)
 			}
 		}
 	}
@@ -1821,5 +1836,53 @@ func TestShellSandboxCarriesTheEventWatcherSwitch(t *testing.T) {
 				t.Errorf("EVENT_WATCHER_ENABLED = %v, want exactly one %q", found, tc.want)
 			}
 		})
+	}
+}
+
+func TestKubeProxyObservabilityManifests(t *testing.T) {
+	agent := shellSandboxTestAgent()
+	dep := buildKubeProxyDeployment(agent, "http://otel-collector.observability.svc:4318", false, "tls-hash")
+	c := dep.Spec.Template.Spec.Containers[0]
+
+	envs := make(map[string]string, len(c.Env))
+	for _, e := range c.Env {
+		envs[e.Name] = e.Value
+	}
+	if got := envs[kubeProxyMetricsPortEnv]; got != "8444" {
+		t.Errorf("%s = %q, want 8444", kubeProxyMetricsPortEnv, got)
+	}
+	if got := envs["OTEL_SERVICE_NAME"]; got != kubeProxyName(agent) {
+		t.Errorf("OTEL_SERVICE_NAME = %q, want %q", got, kubeProxyName(agent))
+	}
+	if got := envs["OTEL_EXPORTER_OTLP_ENDPOINT"]; got != "http://otel-collector.observability.svc:4318" {
+		t.Errorf("OTEL_EXPORTER_OTLP_ENDPOINT = %q, want custom collector", got)
+	}
+
+	var hasMetricsPort bool
+	for _, p := range c.Ports {
+		if p.Name == kubeProxyMetricsPortName && p.ContainerPort == kubeProxyMetricsPort {
+			hasMetricsPort = true
+		}
+	}
+	if !hasMetricsPort {
+		t.Errorf("expected container port %s=%d on kube-proxy container, got %#v", kubeProxyMetricsPortName, kubeProxyMetricsPort, c.Ports)
+	}
+
+	disabledDep := buildKubeProxyDeployment(agent, "", true, "tls-hash")
+	disabledEnvs := make(map[string]string)
+	for _, e := range disabledDep.Spec.Template.Spec.Containers[0].Env {
+		disabledEnvs[e.Name] = e.Value
+	}
+	if got := disabledEnvs["OTEL_SDK_DISABLED"]; got != "true" {
+		t.Errorf("OTEL_SDK_DISABLED = %q, want true when telemetry is disabled", got)
+	}
+
+	np := buildKubeProxyNetworkPolicy(agent)
+	if len(np.Spec.Ingress) != 2 {
+		t.Fatalf("expected 2 ingress rules on kube-proxy NetworkPolicy (callers + gmp-system), got %d", len(np.Spec.Ingress))
+	}
+	if len(np.Spec.Ingress[0].From) != 1 || np.Spec.Ingress[0].From[0].PodSelector == nil ||
+		np.Spec.Ingress[0].From[0].PodSelector.MatchLabels["app"] != shellSandboxName(agent) {
+		t.Errorf("expected kube-proxy NetworkPolicy port 8443 ingress only from %q, got %#v", shellSandboxName(agent), np.Spec.Ingress[0].From)
 	}
 }

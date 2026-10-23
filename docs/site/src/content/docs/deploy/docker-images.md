@@ -55,6 +55,7 @@ Tagged with the release version; `:latest` on every push to `main`.
 | ----- | ------------------ | --- | -------- | --------- |
 | `platform-agent` | `ghcr.io/gke-labs/kube-agents/platform-agent` | release tag | `PLATFORM_AGENT_IMAGE` | The agent Deployment the operator renders, and its sandbox init container. |
 | `credential-proxy` | `ghcr.io/gke-labs/kube-agents/credential-proxy` | release tag | `CREDENTIAL_PROXY_IMAGE` | The credential-proxy Deployment, and the agent-api-auth sidecar in the agent pod. |
+| `kube-proxy` | `ghcr.io/gke-labs/kube-agents/kube-proxy` | release tag | `KUBE_PROXY_IMAGE` | The kube-proxy Deployment the operator renders beside every agent pod. |
 | `agent-sandbox` | `ghcr.io/gke-labs/kube-agents/agent-sandbox` | release tag | `AGENT_SANDBOX_IMAGE` | The shell sandbox StatefulSet the operator renders beside every agent pod. |
 | `k8s-operator` | `ghcr.io/gke-labs/kube-agents/k8s-operator` | release tag | `OPERATOR_IMAGE` | The controller-manager Deployment. |
 | `replay-proxy` | `ghcr.io/gke-labs/kube-agents/replay-proxy` | release tag | `REPLAY_IMAGE` | The optional inference-replay integration. |
@@ -95,10 +96,10 @@ Needed only to rebuild the images above from source, not to run an install. Each
 | ----- | ------------------ | --- | -------- | --------- |
 | `hermes-agent` | `docker.io/nousresearch/hermes-agent` | `HERMES_AGENT_TAG` in [`tags.env`](https://github.com/gke-labs/kube-agents/blob/main/tags.env) | `HERMES_AGENT_IMAGE` | deploy/docker/Dockerfile (agent-base stage). |
 | `envoy` | `docker.io/envoyproxy/envoy` | `v1.39.1` | `ENVOY_IMAGE` | deploy/docker/Dockerfile (envoy-bin stage). |
-| `golang` | `docker.io/library/golang` | `1.27-alpine` | `GOLANG_IMAGE` | deploy/docker/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway, a2a/Dockerfile.hermes-bridge, a2a/Dockerfile.verifier, a2a/Dockerfile.worker and a2a/Dockerfile.console builder stages. |
+| `golang` | `docker.io/library/golang` | `1.27-alpine` | `GOLANG_IMAGE` | deploy/docker/Dockerfile, deploy/kube-proxy/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway, a2a/Dockerfile.hermes-bridge, a2a/Dockerfile.verifier, a2a/Dockerfile.worker and a2a/Dockerfile.console builder stages. |
 | `node` | `docker.io/library/node` | `22-slim` | `NODE_IMAGE` | a2a/Dockerfile.worker runtime stage and a2a/Dockerfile.console page build stage. |
 | `python` | `docker.io/library/python` | `3.14-slim` | `PYTHON_IMAGE` | examples/inference-replay/replay-proxy/Dockerfile and deploy/sandbox/Dockerfile. |
-| `distroless-static` | `gcr.io/distroless/static` | `nonroot` | `DISTROLESS_IMAGE` | k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway, a2a/Dockerfile.verifier and a2a/Dockerfile.console runtime stages. |
+| `distroless-static` | `gcr.io/distroless/static` | `nonroot` | `DISTROLESS_IMAGE` | deploy/kube-proxy/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway, a2a/Dockerfile.verifier and a2a/Dockerfile.console runtime stages. |
 | `busybox` | `docker.io/library/busybox` | `musl@sha256:ea2b9914a16a4ac1981994af97b318f7c7d4db76b580c56177f08bf76f4a0be8` | — | agentplugins/*/Dockerfile base images. |
 
 <!-- prettier-ignore-end -->
@@ -112,7 +113,7 @@ Every image below is published to `ghcr.io/gke-labs/kube-agents/<image>` on each
 
 The agent Deployment image. Built from the `platform` target of [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile) on top of `nousresearch/hermes-agent`. It lays down the Planning Agent workspace at `/opt/defaults` (the `default` profile) plus three specialist profile templates: the Platform Agent at `/opt/platform-template`, scaffolded into the `platform` profile at startup by the entrypoint; the Cluster Agent at `/opt/cluster-template`, scaffolded into per-cluster `cluster-*` profiles at runtime by `cluster_agent_profile.py`; and the optional GKE Support Agent at `/opt/tse-template`, scaffolded into the `tse` profile at startup when `KUBE_AGENTS_ENABLED_PROFILES` contains `tse`.
 
-There is no cluster or forge tooling in this image, in any form, and a build guard fails if any reappears. The agent's shell runs in the `agent-sandbox` image. `kubectl` and `gcloud` there are credential-proxy shims — symlinks to a client that forwards a command to the broker holding the credential — and `helm`, `yq` and OpenTofu's `tofu` are native. The agent runs `tofu` for one subcommand, `fmt`: `tofu fmt -check -diff` to check the syntax of Terraform it writes for a pull request, then `tofu fmt` to apply the formatting. Its `git` holds no credential and reaches no forge, and there is no `gh`: repositories are fetched and changed through the version-control skill's verbs, which the broker serves. Agent-pod code that needs one of them reaches the sandbox over SSH through `agents/platform/scripts/sandbox_exec.py`, and the sandbox reaches the broker at the `<name>-credential-proxy` Service.
+There is no cluster or forge tooling in this image, in any form, and a build guard fails if any reappears. The agent's shell runs in the `agent-sandbox` image. `gcloud` there is a credential-proxy shim — a symlink to a client that forwards a command to the broker holding the credential — while `kubectl`, `helm`, `yq` and OpenTofu's `tofu` are native (`kubectl` reaches the `<name>-kube-proxy` Service over HTTPS with a credential-free `kubeconfig`). The agent runs `tofu` for one subcommand, `fmt`: `tofu fmt -check -diff` to check the syntax of Terraform it writes for a pull request, then `tofu fmt` to apply the formatting. Its `git` holds no credential and reaches no forge, and there is no `gh`: repositories are fetched and changed through the version-control skill's verbs, which the broker serves. Agent-pod code that needs one of them reaches the sandbox over SSH through `agents/platform/scripts/sandbox_exec.py`, and the sandbox reaches the broker at the `<name>-credential-proxy` Service and the Kubernetes API proxy at `<name>-kube-proxy`.
 
 What is installed is the debugging set the agent's own processes use: `curl`, `jq`, `dnsutils`, `iputils-ping`, `patch`, `wget`, `nano`, `vim`.
 
@@ -125,6 +126,10 @@ A late build step precompiles the Python tree — `/opt/hermes`, its venv, and t
 The Envoy-based credential broker runtime, which runs as the `envoy-credential-proxy` container in its own `<name>-credential-proxy` Deployment. The same image also runs the gateway pod's `agent-api-auth` sidecar, with `CREDENTIAL_PROXY_ROLE=api-proxy` starting neither Envoy nor the executor there. Built from the `credential-proxy` target of the same [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile), on the shared `agent-base` stage rather than on `platform`: it adds the real `gcloud`, `kubectl`, `gh` and `git` that the sandbox image deliberately lacks, the `envoy` binary and its config, and `/opt/defaults/scripts`, which is where `start-services.sh` finds `credential_proxy.py`. It carries none of what the `platform` stage adds on top — no kube-agents personas, skills, cron entries or profile templates — because nothing that runs from this image reads them.
 
 Building it from `agent-base` rather than `platform` is also what keeps a one-file agent change cheap. The stage copies `agents/*/scripts/` itself, so an edit there still rebuilds that copy and the layers after it — but no longer the whole `platform` chain, whose output the sidecar does not use.
+
+### `kube-proxy`
+
+The Kubernetes API reverse proxy (`k8s-api-proxy`), which runs in its own `<name>-kube-proxy` Deployment alongside `<name>-credential-proxy`. Built from [`deploy/kube-proxy/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/kube-proxy/Dockerfile) on `gcr.io/distroless/static:nonroot`.
 
 ### `replay-proxy`
 
@@ -268,8 +273,8 @@ when a prefix is in effect:
 - `AGENT_SANDBOX_IMAGE` — the shell sandbox StatefulSet rendered beside every agent pod.
 - `FLUENT_BIT_IMAGE` — the logging sidecar injected into every agent pod.
 
-`CREDENTIAL_PROXY_IMAGE` needs nothing: the operator derives the broker image from the agent image
-by swapping the trailing name (`platform-agent` to `credential-proxy`), which lands on the mirror
+`CREDENTIAL_PROXY_IMAGE` and `KUBE_PROXY_IMAGE` need nothing: the operator derives them from the agent image
+by swapping the trailing name (`platform-agent` to `credential-proxy` and `kube-proxy`), which lands on the mirror
 on its own. The A2A `next` images the operator renders (`a2a-gateway`, `a2a-worker`,
 `a2a-authcallout`, `a2a-verifier`, `a2a-console`) follow `OPERATOR_IMAGE`, else `PLATFORM_AGENT_IMAGE`, the same way, so they need
 no env of their own on a mirror. The sandbox is a separate repository, so it gets no such derivation. Setting it explicitly still wins, which is why `install.sh` leaves it unset — one
@@ -347,4 +352,4 @@ yourself from the mirror and set `enable_cert_manager = false`.
 
 ## Local builds
 
-`make docker-build` at the repository root builds the agent, credential-proxy and sandbox images; `make docker-build-agents`, `make docker-build-credential-proxy` and `make docker-build-sandbox` build one. The operator image builds from `k8s-operator/` (above) and `replay-proxy` from its own Dockerfile. For iterating on the agent against a running cluster, `make dev-rebuild-agent` builds, pushes to a dev Artifact Registry repository and patches the running `PlatformAgent` — or a Deployment that pulls the image directly — to the new tag; [`k8s-operator/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/README.md) covers it.
+`make docker-build` at the repository root builds the agent, credential-proxy, kube-proxy and sandbox images; `make docker-build-agents`, `make docker-build-credential-proxy`, `make docker-build-kube-proxy` and `make docker-build-sandbox` build one. The operator image builds from `k8s-operator/` (above) and `replay-proxy` from its own Dockerfile. For iterating on the agent against a running cluster, `make dev-rebuild-agent` builds, pushes to a dev Artifact Registry repository and patches the running `PlatformAgent` — or a Deployment that pulls the image directly — to the new tag; [`k8s-operator/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/README.md) covers it.

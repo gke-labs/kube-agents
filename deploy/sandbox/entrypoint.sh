@@ -66,7 +66,7 @@ SANDBOX_SCOPE_DECLARED_FILE="/run/kube-agents-sandbox/scope-declared"
 # automatic remediation pull requests (off when "false"), read by audit_report.py
 # from the root-owned file below first, then from the session's environment.
 SANDBOX_AUDIT_AUTO_PROMOTE_FILE="/run/kube-agents-sandbox/audit-auto-promote"
-SANDBOX_FORWARDED_ENV_NAMES="CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_TOKEN_FILE KUBE_CONTEXT_NAME GKE_PROJECT_ID GKE_CLUSTER_NAME GKE_LOCATION KUBEAGENTS_SCOPE_DECLARED KUBEAGENTS_AUDIT_AUTO_PROMOTE"
+SANDBOX_FORWARDED_ENV_NAMES="CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_TOKEN_FILE KUBE_PROXY_URL KUBE_PROXY_CA_FILE KUBE_CONTEXT_NAME GKE_PROJECT_ID GKE_CLUSTER_NAME GKE_LOCATION KUBEAGENTS_SCOPE_DECLARED KUBEAGENTS_AUDIT_AUTO_PROMOTE"
 
 # Nearly every name under $DATA is owned by uid 1000 -- the image trees step 1a
 # stages are root's, everything else is the model's -- and all of it survives a
@@ -586,7 +586,7 @@ SANDBOX_SSHD_DROPIN=/etc/ssh/sshd_config.d/10-sandbox-env.conf
 SANDBOX_PATH=/opt/vcs/bin:/opt/credential-proxy/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
 # /opt/vcs/bin holds the only `git` in the sandbox, the credential-free wrapper
 # (deploy/sandbox/vcs-git.sh); /opt/credential-proxy/bin holds gcloud and
-# kubectl and nothing named git or gh, so the order between the two decides
+# nothing named kubectl, git or gh, so the order between the two decides
 # nothing. Login shells get the same prepend from /etc/profile.d/vcs-path.sh,
 # because /etc/profile overwrites this PATH before profile.d runs.
 setenv_args="PATH=\"$SANDBOX_PATH\" HERMES_HOME=\"$DATA\" PLATFORM_AGENT_HOME=\"$DATA\""
@@ -643,6 +643,74 @@ if [ -z "${CREDENTIAL_PROXY_URL:-}" ]; then
   log "CREDENTIAL_PROXY_URL is unset — kubectl and gcloud will report that"
   log "they are not configured, and the version-control verbs cannot reach the"
   log "broker."
+fi
+
+write_kube_proxy_kubeconfig() {
+  local target_file="$1"
+  local ctx="$2"
+  cat >"$target_file" <<EOF
+apiVersion: v1
+kind: Config
+clusters:
+- name: ${ctx}
+  cluster:
+    server: ${KUBE_PROXY_URL%/}/clusters/${ctx}
+    certificate-authority: ${ca_file}
+users:
+- name: kube-proxy-caller
+  user:
+    tokenFile: ${token_file}
+contexts:
+- name: ${ctx}
+  context:
+    cluster: ${ctx}
+    user: kube-proxy-caller
+current-context: ${ctx}
+EOF
+  chown agent:agent "$target_file"
+  chmod 0600 "$target_file"
+}
+
+if [ -n "${KUBE_PROXY_URL:-}" ]; then
+  default_ctx="${KUBE_CONTEXT_NAME:-in-cluster}"
+  ca_file="${KUBE_PROXY_CA_FILE:-/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt}"
+  token_file="${CREDENTIAL_PROXY_TOKEN_FILE:-/var/run/secrets/kubeagents/credential-proxy/token}"
+  clear_symlinks_under_data "$DATA/.kubeconfig"
+  displace_if_not_a_regular_file "$DATA/.kubeconfig"
+  write_kube_proxy_kubeconfig "$DATA/.kubeconfig" "$default_ctx"
+  for kc in \
+    "$DATA/kubeconfig.yaml" \
+    "$DATA/.kube/config" \
+    "$DATA"/.kubeconfigs/kubeconfig*.yaml \
+    "$DATA"/profiles/*/kubeconfig.yaml \
+    "$DATA"/profiles/*/.kubeconfigs/kubeconfig*.yaml; do
+    if [ ! -e "$kc" ] && [ ! -L "$kc" ]; then
+      continue
+    fi
+    clear_symlinks_under_data "$kc"
+    if [ ! -f "$kc" ]; then
+      continue
+    fi
+    if [ "$(stat -c '%h %U' "$kc" 2>/dev/null || true)" != "1 agent" ]; then
+      continue
+    fi
+    if grep -q "gke-gcloud-auth-plugin" "$kc" 2>/dev/null; then
+      kc_ctx="$(sed -n 's/^current-context:[[:space:]]*//p' "$kc" | head -n 1 | tr -d "'\"[:space:]")"
+      if [ -z "$kc_ctx" ]; then
+        kc_ctx="$default_ctx"
+      fi
+      case "$kc_ctx" in
+      *[!A-Za-z0-9._:-]* | "") continue ;;
+      esac
+      write_kube_proxy_kubeconfig "$kc" "$kc_ctx"
+    fi
+  done
+  if id -u hermes >/dev/null 2>&1; then
+    install -d -m 0700 -o hermes -g hermes /home/hermes/.kube
+    cp "$DATA/.kubeconfig" /home/hermes/.kube/config
+    chown hermes:hermes /home/hermes/.kube/config
+    chmod 0600 /home/hermes/.kube/config
+  fi
 fi
 
 log "ready; starting $*"

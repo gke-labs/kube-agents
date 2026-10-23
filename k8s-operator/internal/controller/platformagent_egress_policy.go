@@ -318,6 +318,13 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 		},
 	})
 
+	rules = append(rules, networkingv1.NetworkPolicyEgressRule{
+		Ports: []networkingv1.NetworkPolicyPort{tcpPort(kubeProxyPort)},
+		To: []networkingv1.NetworkPolicyPeer{
+			namespacedPodPeer(agent.Namespace, kubeProxySelector(agent)),
+		},
+	})
+
 	// The shell sandbox's sshd. Every command the model runs executes there, so
 	// this rule is the difference between an agent that can act and one whose
 	// every tool call times out. It duplicates rule 11 of buildNetworkPolicy

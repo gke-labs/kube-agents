@@ -14520,6 +14520,166 @@ class ApiRelayQueryStrippingTest(unittest.TestCase):
         )
 
 
+class KubeProxyClientTest(unittest.TestCase):
+    """Tests for kubeconfig rewriting and context registration with k8s-api-proxy."""
+
+    CONTEXT = "gke_demo-project_us-central1_cluster-a"
+
+    def test_rewrite_kubeconfig_for_kube_proxy(self):
+        raw = f"apiVersion: v1\nkind: Config\ncurrent-context: {self.CONTEXT}\n"
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "KUBE_PROXY_URL": "https://platform-agent-kube-proxy.kubeagents-system.svc.cluster.local:8443",
+                    "KUBE_PROXY_CA_FILE": "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt",
+                    "CREDENTIAL_PROXY_TOKEN_FILE": "/var/run/secrets/kubeagents/credential-proxy/token",
+                },
+                clear=False,
+            ),
+            mock.patch.object(
+                credential_proxy_client,
+                "_default_kubeconfig_candidates",
+                return_value=[],
+            ),
+        ):
+            rewritten = credential_proxy_client.rewrite_kubeconfig_for_kube_proxy(raw)
+
+        self.assertIn(
+            f"server: https://platform-agent-kube-proxy.kubeagents-system.svc.cluster.local:8443/clusters/{self.CONTEXT}",
+            rewritten,
+        )
+        self.assertIn(
+            "certificate-authority: /var/run/secrets/kubeagents/kube-proxy-ca/ca.crt",
+            rewritten,
+        )
+        self.assertIn(
+            "tokenFile: /var/run/secrets/kubeagents/credential-proxy/token",
+            rewritten,
+        )
+        self.assertEqual(self.CONTEXT, credential_proxy_client.read_current_context(rewritten))
+
+    def test_merge_context_into_default_kubeconfig_preserves_current_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kc = Path(tmp) / ".kubeconfig"
+            kc.write_text(
+                "apiVersion: v1\nkind: Config\ncurrent-context: in-cluster\n"
+                "clusters:\n- name: in-cluster\n  cluster:\n    server: https://platform-agent-kube-proxy:8443/clusters/in-cluster\n"
+                "contexts:\n- name: in-cluster\n  context:\n    cluster: in-cluster\n    user: kube-proxy-caller\n"
+                "users:\n- name: kube-proxy-caller\n  user:\n    tokenFile: /var/run/secrets/kubeagents/credential-proxy/token\n",
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "KUBE_PROXY_URL": "https://platform-agent-kube-proxy:8443",
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(
+                    credential_proxy_client,
+                    "_default_kubeconfig_candidates",
+                    return_value=[kc],
+                ),
+            ):
+                credential_proxy_client.merge_context_into_default_kubeconfig(self.CONTEXT)
+            updated = kc.read_text(encoding="utf-8")
+            self.assertIn(
+                f"https://platform-agent-kube-proxy:8443/clusters/{self.CONTEXT}",
+                updated,
+            )
+            self.assertEqual("in-cluster", credential_proxy_client.read_current_context(updated))
+
+    def test_execute_get_credentials_with_default_sandbox_kubeconfig_merges_without_overwriting_current_context(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kc = root / ".kubeconfig"
+            kc.write_text(
+                "apiVersion: v1\nkind: Config\ncurrent-context: in-cluster\n"
+                "clusters:\n- name: in-cluster\n  cluster:\n    server: https://platform-agent-kube-proxy:8443/clusters/in-cluster\n"
+                "contexts:\n- name: in-cluster\n  context:\n    cluster: in-cluster\n    user: kube-proxy-caller\n"
+                "users:\n- name: kube-proxy-caller\n  user:\n    tokenFile: /var/run/secrets/kubeagents/credential-proxy/token\n",
+                encoding="utf-8",
+            )
+            token_path = root / "token"
+            token_path.write_text("projected-jwt", encoding="utf-8")
+
+            fake_resp = io.StringIO(
+                json.dumps(
+                    {
+                        "exitCode": 0,
+                        "stdout": "",
+                        "stderr": "",
+                        "kubeconfig": (
+                            "apiVersion: v1\nkind: Config\n"
+                            f"current-context: {self.CONTEXT}\n"
+                            f"clusters:\n- name: {self.CONTEXT}\n  cluster:\n    server: https://203.0.113.10\n"
+                            f"contexts:\n- name: {self.CONTEXT}\n  context:\n    cluster: {self.CONTEXT}\n    user: {self.CONTEXT}\n"
+                            f"users:\n- name: {self.CONTEXT}\n  user:\n    exec:\n      command: gke-gcloud-auth-plugin\n"
+                        ),
+                    }
+                )
+            )
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "KUBE_PROXY_URL": "https://platform-agent-kube-proxy:8443",
+                        "KUBECONFIG": str(kc),
+                        "HERMES_HOME": str(root),
+                        "CREDENTIAL_PROXY_TOKEN_FILE": str(token_path),
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(
+                    credential_proxy_client,
+                    "_default_kubeconfig_candidates",
+                    return_value=[kc],
+                ),
+                mock.patch.object(
+                    credential_proxy_client,
+                    "open_broker_request",
+                    return_value=contextlib.nullcontext(fake_resp),
+                ),
+            ):
+                rc = credential_proxy_client.execute(
+                    "http://127.0.0.1:8080",
+                    [
+                        "gcloud",
+                        "container",
+                        "clusters",
+                        "get-credentials",
+                        "fleet-01",
+                        "--region=us-central1",
+                        "--project=my-proj",
+                    ],
+                )
+            self.assertEqual(0, rc)
+            updated_default = kc.read_text(encoding="utf-8")
+            self.assertEqual(
+                "in-cluster",
+                credential_proxy_client.read_current_context(updated_default),
+            )
+            self.assertIn(
+                f"https://platform-agent-kube-proxy:8443/clusters/{self.CONTEXT}",
+                updated_default,
+            )
+            per_cluster = (
+                root / ".kubeconfigs" / "kubeconfig_demo-project_cluster-a_us-central1.yaml"
+            )
+            self.assertTrue(per_cluster.is_file())
+            self.assertEqual(
+                self.CONTEXT,
+                credential_proxy_client.read_current_context(
+                    per_cluster.read_text(encoding="utf-8")
+                ),
+            )
+
+
 class FeedbackRouteTest(_ExecRouteServer):
     """`POST /v1/feedback/submit`: the sandbox's one way to file a kube-agents report.
 
@@ -14628,7 +14788,6 @@ class FeedbackRouteTest(_ExecRouteServer):
         status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, b"not json", raw=True)
         self.assertEqual(status, 400)
         self.assertIn("error", body)
-
 
 
 if __name__ == "__main__":

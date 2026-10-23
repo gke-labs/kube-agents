@@ -186,6 +186,18 @@ jobs:
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
 
+      - name: Build and Push Kube Proxy (GHCR)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        id: build-kube-proxy
+        with:
+          context: .
+          file: deploy/kube-proxy/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ github.ref == 'refs/heads/main' && format('ghcr.io/{0}/kube-proxy:latest', env.IMAGE_REPOSITORY) || '' }}
+            ghcr.io/${{ env.IMAGE_REPOSITORY }}/kube-proxy:${{ github.sha }}
+
       - name: Build and Push Agent Sandbox (GHCR)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         id: build-agent-sandbox
@@ -312,6 +324,7 @@ jobs:
           PLATFORM_DIGEST: ${{ steps.build-platform.outputs.digest }}
           REPLAY_PROXY_DIGEST: ${{ steps.build-replay-proxy.outputs.digest }}
           CREDENTIAL_PROXY_DIGEST: ${{ steps.build-credential-proxy.outputs.digest }}
+          KUBE_PROXY_DIGEST: ${{ steps.build-kube-proxy.outputs.digest }}
           AGENT_SANDBOX_DIGEST: ${{ steps.build-agent-sandbox.outputs.digest }}
           PUBSUB_PLATFORM_DIGEST: ${{ steps.build-pubsub-platform.outputs.digest }}
           STOCKOUT_INVESTIGATOR_DIGEST: ${{ steps.build-stockout-investigator.outputs.digest }}
@@ -325,6 +338,7 @@ jobs:
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/platform-agent@$PLATFORM_DIGEST"
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/replay-proxy@$REPLAY_PROXY_DIGEST"
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/credential-proxy@$CREDENTIAL_PROXY_DIGEST"
+          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/kube-proxy@$KUBE_PROXY_DIGEST"
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/agent-sandbox@$AGENT_SANDBOX_DIGEST"
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/pubsub-platform@$PUBSUB_PLATFORM_DIGEST"
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/gke-stockout-investigator@$STOCKOUT_INVESTIGATOR_DIGEST"

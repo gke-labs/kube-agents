@@ -19,6 +19,15 @@
       "description": "Envoy, the credential runtime, and the CLIs it wraps — the only image holding real credentials."
     },
     {
+      "name": "kube-proxy",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/kube-proxy",
+      "tagPolicy": "release",
+      "override": "KUBE_PROXY_IMAGE",
+      "pulledBy": "The kube-proxy Deployment the operator renders beside every agent pod.",
+      "description": "Out-of-sandbox Kubernetes API reverse proxy (k8s-api-proxy) enforcing verb policy and Secret value redaction."
+    },
+    {
       "name": "agent-sandbox",
       "origin": "first-party",
       "repository": "ghcr.io/gke-labs/kube-agents/agent-sandbox",
@@ -253,8 +262,8 @@
       "repository": "docker.io/library/golang",
       "tag": "1.27-alpine",
       "buildArg": "GOLANG_IMAGE",
-      "pulledBy": "deploy/docker/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway, a2a/Dockerfile.hermes-bridge, a2a/Dockerfile.verifier, a2a/Dockerfile.worker and a2a/Dockerfile.console builder stages.",
-      "description": "Go toolchain for the operator and k8s-event-watcher builds."
+      "pulledBy": "deploy/docker/Dockerfile, deploy/kube-proxy/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway, a2a/Dockerfile.hermes-bridge, a2a/Dockerfile.verifier, a2a/Dockerfile.worker and a2a/Dockerfile.console builder stages.",
+      "description": "Go toolchain for the operator, k8s-api-proxy, and k8s-event-watcher builds."
     },
     {
       "name": "node",
@@ -280,8 +289,8 @@
       "repository": "gcr.io/distroless/static",
       "tag": "nonroot",
       "buildArg": "DISTROLESS_IMAGE",
-      "pulledBy": "k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway, a2a/Dockerfile.verifier and a2a/Dockerfile.console runtime stages.",
-      "description": "Runtime base for the operator image."
+      "pulledBy": "deploy/kube-proxy/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway, a2a/Dockerfile.verifier and a2a/Dockerfile.console runtime stages.",
+      "description": "Runtime base for the operator and kube-proxy images."
     },
     {
       "name": "busybox",

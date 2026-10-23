@@ -65,6 +65,7 @@ export REQUIRED_RELEASE_IMAGES=(
   "k8s-operator"
   "platform-agent"
   "credential-proxy"
+  "kube-proxy"
   "agent-sandbox"
   "replay-proxy"
   "pubsub-platform"

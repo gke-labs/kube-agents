@@ -955,9 +955,13 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
-	// 12. Reconcile the Agent Sandbox Pod with its Envoy credential sidecar.
+	// 12. Reconcile the Agent Sandbox Pod with its Envoy credential sidecar and
+	// the Kubernetes API proxy.
 	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, instance)
 	otlpDisabled := otlpSource == otlpSourceNone
+	if err := r.reconcileKubeProxy(ctx, instance, otlpEndpoint, otlpDisabled); err != nil {
+		return ctrl.Result{}, err
+	}
 	netpolProf := r.resolveNetpolProfile(ctx, instance)
 	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, gatewayPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled); err != nil {
 		return ctrl.Result{}, err
@@ -2555,6 +2559,10 @@ func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx c
 // the one place that decides, and credential_proxy_manifests.go carries the
 // reasoning.
 func (r *PlatformAgentReconciler) reconcileShellSandbox(ctx context.Context, agent *agentv1alpha1.PlatformAgent, settingsHash string) error {
+	if _, err := r.ensureKubeProxyTLSSecret(ctx, agent); err != nil {
+		return err
+	}
+
 	sts := buildShellSandboxStatefulSet(agent, shellSandboxAuthorizedKeysSecretName(agent), credentialProxySandboxURL(agent), settingsHash)
 	objs := []client.Object{
 		buildShellSandboxServiceAccount(agent),

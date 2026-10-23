@@ -65,14 +65,14 @@ data:
 # Totals for a stock install, re-derived by hand from values.yaml and footprint.yaml. These
 # are the same numbers the install prerequisites table quotes, so a change that moves one
 # without updating the other fails here.
-_DEFAULT_PODS = 7
-_DEFAULT_REQUESTS_CPU_MILLIS = 2466
-_DEFAULT_LIMITS_CPU_MILLIS = 10200
+_DEFAULT_PODS = 8
+_DEFAULT_REQUESTS_CPU_MILLIS = 2566
+_DEFAULT_LIMITS_CPU_MILLIS = 11200
 # Memory and ephemeral storage are summed by the same helper as CPU but were asserted
 # nowhere, so a generator that stopped parsing them could be regenerated and committed
 # together with a green `--check` (both sides move at once) and nothing would catch it.
-_DEFAULT_REQUESTS_MEMORY_BYTES = 8896 * 1024**2
-_DEFAULT_LIMITS_MEMORY_BYTES = 23424 * 1024**2
+_DEFAULT_REQUESTS_MEMORY_BYTES = 9152 * 1024**2
+_DEFAULT_LIMITS_MEMORY_BYTES = 23936 * 1024**2
 _DEFAULT_REQUESTS_EPHEMERAL_BYTES = 5 * 1024**3
 _DEFAULT_LIMITS_EPHEMERAL_BYTES = 5 * 1024**3
 # Cleanup hook Job: 50m requested / 200m limit, 64Mi requested / 128Mi limit, 1 pod.
@@ -1154,7 +1154,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small limits.cpu quota must fail")
         self.assertIn("  - limits.cpu:", res.stderr)
-        self.assertIn('"limits.cpu":"10700m"', res.stderr)
+        self.assertIn('"limits.cpu":"11700m"', res.stderr)
 
     def test_limits_memory_shortfall_is_enforced(self) -> None:
         """A quota deficient in limits.memory must be refused and named in the patch."""
@@ -1163,7 +1163,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small limits.memory quota must fail")
         self.assertIn("  - limits.memory:", res.stderr)
-        self.assertIn('"limits.memory":"26496Mi"', res.stderr)
+        self.assertIn('"limits.memory":"27008Mi"', res.stderr)
 
     def test_limits_ephemeral_storage_shortfall_is_enforced(self) -> None:
         """A quota deficient in limits.ephemeral-storage must be refused and named in the patch."""
@@ -1183,7 +1183,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small cpu shorthand quota must fail")
         self.assertIn("  - cpu:", res.stderr)
-        self.assertIn('"cpu":"2566m"', res.stderr)
+        self.assertIn('"cpu":"2666m"', res.stderr)
 
     def test_shorthand_memory_spelling_is_enforced(self) -> None:
         """`memory` is the shorthand spelling for `requests.memory` and must be checked."""
@@ -1192,7 +1192,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small memory shorthand quota must fail")
         self.assertIn("  - memory:", res.stderr)
-        self.assertIn('"memory":"10944Mi"', res.stderr)
+        self.assertIn('"memory":"11200Mi"', res.stderr)
 
     def test_shorthand_ephemeral_storage_spelling_is_enforced(self) -> None:
         """`ephemeral-storage` is the shorthand spelling for `requests.ephemeral-storage`."""
@@ -1246,6 +1246,7 @@ class QuotaPreflightTest(unittest.TestCase):
         self.assertIn("dashboard", op["agentPod"])
         self.assertIn("shellSandbox", op)
         self.assertIn("credentialProxy", op)
+        self.assertIn("kubeProxy", op)
         self.assertIn("storage", op)
 
         # Verify agent-api-auth CPU limit cut to 1 core is reflected in footprint
@@ -1254,15 +1255,17 @@ class QuotaPreflightTest(unittest.TestCase):
         self.assertEqual(op["agentPod"]["dashboard"]["cpuMillisLimit"], 1000)
         self.assertEqual(op["shellSandbox"]["cpuMillisLimit"], 2000)
         self.assertEqual(op["credentialProxy"]["cpuMillisLimit"], 1000)
+        self.assertEqual(op["kubeProxy"]["cpuMillisLimit"], 1000)
 
-        # Total operator limits on default install: 4500 + 1000 + 2000 + 1000 = 8500m (8.5 CPU)
+        # Total operator limits on default install: 4500 + 1000 + 2000 + 1000 + 1000 = 9500m (9.5 CPU)
         total_op_cpu_limit = (
             op["agentPod"]["base"]["cpuMillisLimit"]
             + op["agentPod"]["dashboard"]["cpuMillisLimit"]
             + op["shellSandbox"]["cpuMillisLimit"]
             + op["credentialProxy"]["cpuMillisLimit"]
+            + op["kubeProxy"]["cpuMillisLimit"]
         )
-        self.assertEqual(total_op_cpu_limit, 8500)
+        self.assertEqual(total_op_cpu_limit, 9500)
 
         # Memory, in the same shape. A generator that stopped parsing memory would emit 0
         # here; `--check` alone would not catch that if the regenerated file were committed
@@ -1271,6 +1274,7 @@ class QuotaPreflightTest(unittest.TestCase):
         self.assertEqual(op["agentPod"]["dashboard"]["memoryBytesLimit"], 2 * 1024**3)
         self.assertEqual(op["shellSandbox"]["memoryBytesLimit"], 2 * 1024**3)
         self.assertEqual(op["credentialProxy"]["memoryBytesLimit"], 2 * 1024**3)
+        self.assertEqual(op["kubeProxy"]["memoryBytesLimit"], 512 * 1024**2)
 
         # Ephemeral storage is set on two of the four and deliberately 0 on the others;
         # asserting the zeroes is the point, since an unparsed value looks identical.

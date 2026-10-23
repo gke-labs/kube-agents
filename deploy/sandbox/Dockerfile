@@ -85,6 +85,8 @@ RUN apt-get update && \
 RUN ARCH=$(dpkg --print-architecture) && \
     curl -sSLf --retry 5 --retry-all-errors -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_${ARCH}" && \
     chmod +x /usr/local/bin/yq && \
+    curl -sSLf --retry 5 --retry-all-errors -o /usr/local/bin/kubectl "https://dl.k8s.io/release/v1.31.4/bin/linux/${ARCH}/kubectl" && \
+    chmod +x /usr/local/bin/kubectl && \
     curl -sSLf --retry 5 --retry-all-errors -o /tmp/helm.tar.gz "https://get.helm.sh/helm-v3.15.2-linux-${ARCH}.tar.gz" && \
     tar -xzf /tmp/helm.tar.gz -C /tmp && \
     mv /tmp/linux-${ARCH}/helm /usr/local/bin/helm && \
@@ -385,6 +387,7 @@ RUN groupadd --gid 1001 hermes && \
     usermod -p '*' hermes && \
     install -d -m 0700 -o hermes -g hermes /home/hermes && \
     install -d -m 0700 -o hermes -g hermes /home/hermes/.ssh && \
+    install -d -m 0700 -o hermes -g hermes /home/hermes/.kube && \
     install -d -m 0700 -o hermes -g hermes /home/hermes/.kubeconfigs
 
 # The credential-aware CLIs: symlinks to one client that forwards argv to the
@@ -715,10 +718,10 @@ RUN set -e; \
 # which is not on the build PATH either, so a hit below still means a native
 # binary arrived by some other route.
 RUN mkdir -p /opt/credential-proxy/bin && \
-    for binary in gcloud kubectl; do \
-        ln -s /usr/local/bin/credential-proxy-exec "/opt/credential-proxy/bin/${binary}"; \
-    done && \
-    for binary in gcloud kubectl gh git; do \
+    ln -s /usr/local/bin/credential-proxy-exec /opt/credential-proxy/bin/gcloud && \
+    test -x /usr/local/bin/kubectl && \
+    test ! -e /opt/credential-proxy/bin/kubectl && \
+    for binary in gcloud gh git; do \
         if command -v "${binary}" >/dev/null 2>&1; then \
             echo "unexpected credential-aware CLI in the sandbox image: ${binary}" >&2; \
             exit 1; \

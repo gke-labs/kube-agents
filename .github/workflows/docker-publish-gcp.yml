@@ -72,6 +72,16 @@ jobs:
           DIGEST=$(gcloud artifacts docker images describe "$GCP_REGISTRY/credential-proxy:$GITHUB_SHA" --format="value(image_summary.digest)")
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
 
+      - name: Build and Push Kube Proxy (GCP Cloud Build)
+        id: gcp-kube-proxy
+        run: |
+          gcloud builds submit \
+            --config=deploy/kube-proxy/cloudbuild.yaml \
+            --substitutions="_IMAGE_URI=$GCP_REGISTRY/kube-proxy:$GITHUB_SHA,_IMAGE_URI_LATEST=$GCP_REGISTRY/kube-proxy:latest" \
+            .
+          DIGEST=$(gcloud artifacts docker images describe "$GCP_REGISTRY/kube-proxy:$GITHUB_SHA" --format="value(image_summary.digest)")
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
       - name: Build and Push Agent Sandbox (GCP Cloud Build)
         id: gcp-agent-sandbox
         run: |
@@ -112,6 +122,7 @@ jobs:
           PLATFORM_DIGEST: ${{ steps.gcp-platform.outputs.digest }}
           REPLAY_PROXY_DIGEST: ${{ steps.gcp-replay-proxy.outputs.digest }}
           CREDENTIAL_PROXY_DIGEST: ${{ steps.gcp-credential-proxy.outputs.digest }}
+          KUBE_PROXY_DIGEST: ${{ steps.gcp-kube-proxy.outputs.digest }}
           AGENT_SANDBOX_DIGEST: ${{ steps.gcp-agent-sandbox.outputs.digest }}
           PUBSUB_PLATFORM_DIGEST: ${{ steps.gcp-pubsub-platform.outputs.digest }}
           STOCKOUT_INVESTIGATOR_DIGEST: ${{ steps.gcp-stockout-investigator.outputs.digest }}
@@ -119,6 +130,7 @@ jobs:
           cosign sign --yes "$GCP_REGISTRY/platform-agent@$PLATFORM_DIGEST"
           cosign sign --yes "$GCP_REGISTRY/replay-proxy@$REPLAY_PROXY_DIGEST"
           cosign sign --yes "$GCP_REGISTRY/credential-proxy@$CREDENTIAL_PROXY_DIGEST"
+          cosign sign --yes "$GCP_REGISTRY/kube-proxy@$KUBE_PROXY_DIGEST"
           cosign sign --yes "$GCP_REGISTRY/agent-sandbox@$AGENT_SANDBOX_DIGEST"
           cosign sign --yes "$GCP_REGISTRY/pubsub-platform@$PUBSUB_PLATFORM_DIGEST"
           cosign sign --yes "$GCP_REGISTRY/gke-stockout-investigator@$STOCKOUT_INVESTIGATOR_DIGEST"
