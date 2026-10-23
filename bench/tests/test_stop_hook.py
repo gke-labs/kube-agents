@@ -121,9 +121,21 @@ def test_a_card_still_running_after_the_window_is_archived(monkeypatch):
     assert _stopped(result)["status"] == "error"
 
 
-def test_an_unreadable_session_sends_no_stop(monkeypatch):
-    _, entry, sent, _ = _run(monkeypatch, [None])
+def test_a_session_read_that_fails_once_is_retried_and_the_stop_goes(monkeypatch):
+    _, entry, sent, _ = _run(monkeypatch, [None, _cards({"t_1": "running"}), _cards({"t_1": "archived"})])
+    assert sent == [True] and entry["status"] == "completed"
+
+
+def test_an_unreadable_session_sends_no_stop_and_is_infrastructure(monkeypatch):
+    with pytest.raises(harness._TransportError, match="could not be read"):
+        _run(monkeypatch, [None] * harness._MAX_TRANSPORT_FAILURES)
+
+
+def test_a_session_not_in_the_store_says_so(monkeypatch):
+    missing = board.SessionCards(session_found=False, card_ids=[], source="state.db", cards={})
+    result, entry, sent, _ = _run(monkeypatch, [missing])
     assert sent == [] and entry["status"] == "error"
+    assert any("not in the store" in e for e in result.errors)
 
 
 def test_a_stop_the_door_never_carried_archives_and_is_infrastructure(monkeypatch):

@@ -344,6 +344,31 @@ def test_a_router_scope_result_pattern_is_worker_blind(write_task):
     assert spec.negated_trace_blind_checks == frozenset()
 
 
+def test_a_tool_called_over_harness_entries_is_never_transport_blind(write_task):
+    """The harness writes these entries itself; a lossy door trace says
+    nothing about them, so a stopped ask's objectives always grade."""
+    path = write_task(
+        "harness-entries",
+        {
+            "verification_spec": [
+                {
+                    "name": "stop-sent",
+                    "role": "objective",
+                    "check": {"type": "tool_called", "tool_names": ["harness_stop_sent"], "require_success": True},
+                },
+                {
+                    "name": "mixed",
+                    "role": "objective",
+                    "check": {"type": "tool_called", "tool_names": ["harness_stop_sent", "kanban_create"]},
+                },
+            ],
+        },
+    )
+    spec = load_case(path)
+    assert spec.trace_blind_checks == {"mixed"}
+    assert spec.worker_blind_checks == frozenset()
+
+
 def test_a_task_with_no_such_check_has_an_empty_set(write_task):
     path = write_task(
         "phrases",
@@ -433,7 +458,7 @@ def test_every_shipped_blind_check_is_named(path):
     import re
 
     import yaml
-    from kube_agents_bench.cases import TRANSPORT_BLIND_CHECK_TYPES
+    from kube_agents_bench.cases import HARNESS_WRITTEN_ENTRIES, TRANSPORT_BLIND_CHECK_TYPES
 
     doc = yaml.safe_load(path.read_text(encoding="utf-8"))
 
@@ -454,7 +479,16 @@ def test_every_shipped_blind_check_is_named(path):
     assert unnamed == [], f"{path}: transport-blind entries without a name"
     # Compound node types are not leaves; only leaf types decide.
     compounds = {"sequence", "parallel", "all", "any", "none"}
+    # A check naming only entries the harness writes is graded on every
+    # record, so it is declared here and left out there too.
+    def harness_only(entry):
+        lists = re.findall(r'"tool_names": \[([^\]]*)\]', json.dumps(entry.get("check")))
+        named = re.findall(r'"([a-z_]+)"', " ".join(lists))
+        return bool(named) and set(named) <= HARNESS_WRITTEN_ENTRIES
+
     all_blind = {
-        str(e["name"]) for e in declared if (types_of(e) - compounds) <= TRANSPORT_BLIND_CHECK_TYPES
+        str(e["name"])
+        for e in declared
+        if (types_of(e) - compounds) <= TRANSPORT_BLIND_CHECK_TYPES and not harness_only(e)
     }
     assert load_case(path).transport_blind_checks == all_blind

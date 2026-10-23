@@ -19,7 +19,9 @@ stop.
 
 The harness records :data:`STOP_ENTRY`: ``completed`` when a card was filed and
 the stop reached the gateway as a stop, ``error`` otherwise (no card, the
-session unreadable, the word taken for something else). After the window it
+word taken for something else); a session store still unreadable after the
+harness's retries, or a stop the door never carried, makes the run
+infrastructure instead. After the window it
 records :data:`CARDS_STOPPED_ENTRY`: ``completed`` only when every filed card
 ended ``archived``. A case asserts both with ``tool_called`` and
 ``require_success``, so a run that filed nothing, or whose stop stopped

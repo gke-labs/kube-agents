@@ -2594,12 +2594,30 @@ class KubeAgentsHarness(AgentHarness):
         """
         entry: dict[str, Any] = {"name": stop_hook.STOP_ENTRY, "args": {"session": session_id}}
         result.trajectory.append(entry)
-        read = board.read_session_cards(_agent_shell, session_id, _EXEC_TIMEOUT) if session_id else None
+        read = None
+        if session_id:
+            # Retried as the delegation wait's read is: the exec fails
+            # transiently, and a single miss would leave the card running.
+            for attempt in range(1, _MAX_TRANSPORT_FAILURES + 1):
+                read = board.read_session_cards(_agent_shell, session_id, _EXEC_TIMEOUT)
+                if read is not None:
+                    break
+                _log.warning("session cards read failed (%d/%d)", attempt, _MAX_TRANSPORT_FAILURES)
+                if attempt < _MAX_TRANSPORT_FAILURES:
+                    time.sleep(max(0.0, poll_interval))
+            if read is None:
+                # The harness, not the agent: infrastructure, never graded.
+                why = (
+                    f"the session store for {session_id} could not be read "
+                    f"{_MAX_TRANSPORT_FAILURES} times running"
+                )
+                entry.update(status="error", result=f"nothing was stopped: {why}")
+                raise _TransportError(f"{stop_hook.STOP_ENTRY}: {why}")
         cards = list(read.card_ids) if read is not None and read.session_found else []
         entry["args"]["cards"] = cards
         if not cards:
             why = "no session to read" if not session_id else (
-                "the session store could not be read" if read is None else "the turn filed no card"
+                "the session is not in the store" if not read.session_found else "the turn filed no card"
             )
             entry.update(status="error", result=f"nothing was stopped: {why}")
             result.errors.append(f"{stop_hook.STOP_ENTRY}: {why}")
