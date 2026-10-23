@@ -264,9 +264,10 @@ obtainability activations from
 repetitions 2026-09-15 to 09-22): 680/688, 600/685, 491/679 and 69/684 — the silence case
 fails on a correct agent today, and the nightly record is what will show a fix landing.
 
-One re-admission on record: **agent-kanban-smoke** earned its seat back after the
+Two re-admissions on record: **agent-kanban-smoke** earned its seat back after the
 2026-08-27 redesign (a real SRE question graded on `kanban_create` plus cluster names);
-the reds that once argued for un-arming it belonged to the old vocabulary check.
+the reds that once argued for un-arming it belonged to the old vocabulary check. The second is
+**upgrades-lagging-master-probe**, 2026-10-23, below.
 
 Admitted on the record since the split:
 
@@ -300,8 +301,9 @@ Admitted on the record since the split:
   planted on every pool; the prompt asked for "what its release channel offers", and during the
   1.36 roll-out REGULAR's `upgradeTargetVersion` (1.35.8-gke.1439001) sat below the planted
   version while `defaultVersion` (1.36.4) sat above it, so an agent reading the target called the
-  lagging cluster current: 66 of 141 presubmit repetitions on 2026-10-16, then nightlies of 2/3,
-  2/3 and 0/3 on 10-17 to 10-19.
+  lagging cluster current: 66 of 141 presubmit repetitions passed on 2026-10-16 (34 of the 75
+  misses read the target; the rest were other wrong verdicts, wording the check lacks, and rate
+  limits), then nightlies of 2/3, 2/3 and 0/3 on 10-17 to 10-19.
   [#3338](https://github.com/gke-labs/kube-agents/pull/3338) (merged 2026-10-19) makes the
   prompt name the channel's default version. The three clean nights the bar asks for are
   `ci-kube-agents-eval-nightly` 2026-10-20 (build 2112333062724390912, kube-agents-evals-28),
@@ -310,12 +312,14 @@ Admitted on the record since the split:
   uploaded nothing when the build cluster's GKE upgrade replaced its node (#3616) and counts
   neither way. The demotion's exit condition named an agent-side fix; the eval crew's approval of
   this line accepts the prompt fix in its place, with the agent's own wrong-verdict defect
-  ([#2124](https://github.com/gke-labs/kube-agents/issues/2124)) still open. Under the #3338
-  prompt the case has no inject-lane record: the lane became the blocking one on 2026-10-21
-  (#3156), after the demotion, and the nightly grades over the api transport; its pre-fix record
-  on the optional `-next` job was mixed (2/3 on 2026-10-15, build 2110588743994839040), and the
-  pull request's own presubmit is its first under the new prompt. Taking the line took `upgrades`
-  off the `domains.yaml` allowlist.
+  ([#2124](https://github.com/gke-labs/kube-agents/issues/2124)) still open. The three nights
+  ran over the api transport: the main nightly moved to the inject door with
+  [#3783](https://github.com/gke-labs/kube-agents/pull/3783) (its first such run is 2026-10-24),
+  and the inject lane became the blocking one on 2026-10-21 (#3156), after the demotion. So under
+  the #3338 prompt the case has no inject-lane record yet; its pre-fix record on the optional
+  `-next` job was mixed (2/3 on 2026-10-15, build 2110588743994839040), and the pull request's own
+  presubmit is its first under the new prompt. Taking the line took `upgrades` off the
+  `domains.yaml` allowlist.
 - **pdb-remediation-pr**, 2026-10-14
   ([#2016](https://github.com/gke-labs/kube-agents/issues/2016) step 4), from the held-out
   seat it took on 2026-09-28. The three clean days the bar asks for are the writers nightlies
