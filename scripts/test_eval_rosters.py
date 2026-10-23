@@ -810,8 +810,10 @@ class ApiLaneExclusionsTest(unittest.TestCase):
         self.assertEqual(list(eval_rosters.api_lane_exclusions()), API_LANE_EXCLUDED)
 
     def test_every_exclusion_names_a_registered_nightly_case(self):
-        # Not a presubmit case: the presubmit runs on the api lane, so a case
-        # excluded there would hold a seat it never fills.
+        # Not a presubmit case: the presubmit matrix also runs on the today
+        # lane over api, where a case excluded here would hold a seat it
+        # never fills, and a case new to the inject door earns its record in
+        # the nightly first.
         for case in eval_rosters.api_lane_exclusions():
             with self.subTest(case=case):
                 self.assertTrue((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").is_file(), f"{case} has no task.yaml")

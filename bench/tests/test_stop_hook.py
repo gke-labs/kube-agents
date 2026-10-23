@@ -178,11 +178,36 @@ def test_the_verdict_is_the_last_read_not_the_first(monkeypatch):
     assert archived == []
 
 
-def test_a_session_not_in_the_store_says_so(monkeypatch):
+def test_a_session_not_in_the_store_still_sends_the_stop_and_is_infrastructure(monkeypatch):
     missing = board.SessionCards(session_found=False, card_ids=[], source="state.db", cards={})
-    result, entry, sent, _ = _run(monkeypatch, [missing])
-    assert sent == [] and entry["status"] == "error"
-    assert any("not in the store" in e for e in result.errors)
+    monkeypatch.setattr(harness.board, "read_session_cards", lambda *a, **k: missing)
+    sent = []
+    result = AgentResult(output="on it", trajectory=[])
+    with pytest.raises(harness._TransportError, match="not in the store"):
+        harness.KubeAgentsHarness()._stop_after_first_card(
+            result, "a2a-ctx-1", stop_hook.Stop(prompt="ask", observe_seconds=0.0),
+            send_stop=lambda: sent.append(True) or (True, "stopped"), poll_interval=0.0,
+        )
+    assert sent == [True]
+
+
+@pytest.mark.parametrize("prompt", [f"\n{DIRECTIVE}\nask", f"{DIRECTIVE}observe=60\nask"])
+def test_a_near_miss_directive_is_refused_not_sent_as_an_ask(prompt):
+    if prompt.startswith("\n"):
+        assert stop_hook.parse(prompt).prompt == "ask"
+    else:
+        with pytest.raises(ValueError, match="must stand alone"):
+            stop_hook.parse(prompt)
+
+
+def test_every_task_that_names_the_directive_is_a_stopped_ask_that_parses():
+    import yaml
+
+    tasks = harness.Path(__file__).resolve().parents[1] / "tasks"
+    for path in sorted(tasks.glob("*/task.yaml")):
+        prompt = str((yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get("prompt") or "")
+        if DIRECTIVE in prompt:
+            assert stop_hook.parse(prompt) is not None, path
 
 
 def test_a_stop_the_door_never_carried_archives_and_is_infrastructure(monkeypatch):
@@ -203,13 +228,16 @@ def test_a_stop_the_door_never_carried_archives_and_is_infrastructure(monkeypatc
     assert result.trajectory[-1]["status"] == "error"
 
 
-def test_no_session_sends_no_stop(monkeypatch):
+def test_no_session_still_sends_the_stop_and_is_infrastructure(monkeypatch):
     monkeypatch.setattr(harness.board, "read_session_cards", lambda *a, **k: pytest.fail("read with no session"))
+    sent = []
     result = AgentResult(output="on it", trajectory=[])
-    harness.KubeAgentsHarness()._stop_after_first_card(
-        result, "", stop_hook.Stop(prompt="ask", observe_seconds=0.0),
-        send_stop=lambda: pytest.fail("sent with no session"), poll_interval=0.0,
-    )
+    with pytest.raises(harness._TransportError, match="no session to read"):
+        harness.KubeAgentsHarness()._stop_after_first_card(
+            result, "", stop_hook.Stop(prompt="ask", observe_seconds=0.0),
+            send_stop=lambda: sent.append(True) or (True, "stopped"), poll_interval=0.0,
+        )
+    assert sent == [True]
     assert result.trajectory[-1]["status"] == "error"
 
 

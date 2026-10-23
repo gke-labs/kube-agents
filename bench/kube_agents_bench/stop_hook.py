@@ -68,9 +68,12 @@ class Stop:
 
 
 def is_stopped_ask(prompt: str) -> bool:
-    """Whether ``prompt`` opens with the directive: the one test :func:`parse`
-    and every other reader of the grammar share."""
-    return prompt.partition("\n")[0].split()[:1] == [STOP_DIRECTIVE]
+    """Whether ``prompt``'s first non-blank line opens with the directive: the
+    one test :func:`parse` and every other reader of the grammar share. A
+    near miss (the directive glued to its field) is a stopped ask here, so
+    :func:`parse` refuses it rather than sending the directive to the agent
+    as an ordinary ask."""
+    return prompt.strip().partition("\n")[0].startswith(STOP_DIRECTIVE)
 
 
 def parse(prompt: str) -> Stop | None:
@@ -82,8 +85,10 @@ def parse(prompt: str) -> Stop | None:
     """
     if not is_stopped_ask(prompt):
         return None
-    first, _, rest = prompt.partition("\n")
+    first, _, rest = prompt.strip().partition("\n")
     words = first.split()
+    if words[0] != STOP_DIRECTIVE:
+        raise ValueError(f"{STOP_DIRECTIVE} must stand alone, then a space before {OBSERVE_FIELD}<seconds>; got {words[0]}")
     observe = DEFAULT_OBSERVE_SECONDS
     extra = words[1:]
     if len(extra) > 1 or (extra and not extra[0].startswith(OBSERVE_FIELD)):

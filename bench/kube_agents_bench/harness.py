@@ -2647,12 +2647,24 @@ class KubeAgentsHarness(AgentHarness):
         cards = list(read.card_ids) if read is not None and read.session_found else []
         entry["args"]["cards"] = cards
         if not cards:
-            why = "no session to read" if not session_id else (
-                "the session is not in the store" if not read.session_found else "the turn filed no card"
-            )
-            entry.update(status="error", result=f"nothing was stopped: {why}")
-            result.errors.append(f"{stop_hook.STOP_ENTRY}: {why}")
-            return
+            if session_id and read is not None and read.session_found:
+                # The session is known and filed nothing: the agent's miss,
+                # graded, and nothing is left running.
+                why = "the turn filed no card"
+                entry.update(status="error", result=f"nothing was stopped: {why}")
+                result.errors.append(f"{stop_hook.STOP_ENTRY}: {why}")
+                return
+            # No session to read, or one the store does not know: the harness
+            # cannot tell whether a card was filed. The stop needs no card ids,
+            # so it still goes; the run is infrastructure, as an unreadable
+            # store is.
+            why = "no session to read" if not session_id else "the session is not in the store"
+            try:
+                sent, detail = send_stop()
+            except _TransportError as exc:
+                sent, detail = False, str(exc)
+            entry.update(status="error", result=f"{why}; stop sent: {sent} ({detail})")
+            raise _TransportError(f"{stop_hook.STOP_ENTRY}: {why}")
         try:
             sent, detail = send_stop()
         except _TransportError:
