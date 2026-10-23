@@ -66,7 +66,7 @@ the agent a usable kubectl context) when it has the complete triple; with one mi
 | `stallWatch.minStallAgeMinutes`                | int      | Minutes a stall must last before the stall watch raises a new alert for it (0–1440). Unset = `0`, alert on the first sweep that sees it.                                                                                          |
 | `stallWatch.kinds`                             | []string | Resources the stall watch scans, replacing its default list; `[all]` scans every namespaced kind. Unset = the default list.                                                                                                       |
 | `tuning.<persona>.apiMaxRetries`               | int      | Model-call retries before a run gives up. Unset = Hermes default `3`.                                                                                                                                                             |
-| `tuning.<persona>.maxTurns`                    | int      | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below).                                                                                                                                  |
+| `tuning.<persona>.maxTurns`                    | int      | Iterations allowed in a single turn. Unset = whatever the profile's `config.yaml` carries; `platform` ships `150`, the others carry none (see below).                                                                             |
 | `tuning.maxInProgress`                         | int      | Board-wide cap on concurrent kanban workers. Unset = operator default `6`.                                                                                                                                                        |
 | `tuning.maxSessions`                           | int      | Install-wide cap on concurrent A2A session pods (1–10000). Unset = operator default `10`. Inert under `mode: today`; a separate lane from `maxInProgress`. A stream too small for it makes the provision Job refuse.              |
 | `tuning.profiles.ceiling`                      | int      | Install-wide cap on concurrent AgentProfile tasks (1–1000). Unset = `8`. Inert under `mode: today`. Sizes the profile namespace's pod quota with `warmReplicas`.                                                                  |
@@ -355,12 +355,17 @@ door), `platform` (the Platform Agent), or `cluster` (**every** Cluster Agent), 
 depends on its model quota and on what its agents actually do, so a deployment doing short
 interactive work should not inherit limits raised for long-running batch work. Unset therefore means
 whatever the profile's own `config.yaml` carries, and the `default` and `cluster` configs set no
-execution limit of their own — Hermes' defaults apply there, 3 retries and 90 iterations. The
-`platform` profile is the exception: the image ships `agent.max_turns: 250` in
-`agents/platform/config.yaml` because the fleet audits outgrow 90, and
+execution limit of their own — Hermes' defaults apply there: 3 retries, and for the turn budget two
+different defaults on the pinned release: a gateway turn runs with no cap, and a kanban worker,
+which is a `hermes chat` process, with the chat CLI's own 500. The `platform` profile is the
+exception: the image ships `agent.max_turns: 150` in `agents/platform/config.yaml`, the budget its
+kanban workers run under, and the nine fleet audits carry their own `max_turns: 250` on their roster
+entries, which the scheduler reads ahead of the profile value;
 [Config reference](/kube-agents/reference/config/#agent) is canonical for why. Setting
-`tuning.platform.maxTurns` here still wins — the overlay is merged after the image force-sync — and
-removing it restores the image's value rather than Hermes'.
+`tuning.platform.maxTurns` here still wins over the profile value — the overlay is merged after the
+image force-sync — and a roster entry's own `max_turns` only ever raises its job above whichever of
+the two is in force, never lowers it, so a value above 250 raises the audits too; removing it
+restores the image's value rather than Hermes'.
 
 **`maxInProgress` is not.** Unset renders `6`, because the untuned case is the one that cannot
 absorb the alternative — see [Why dispatch is capped by default](#why-dispatch-is-capped-by-default)

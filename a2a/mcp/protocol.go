@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 
 	"github.com/gke-labs/kube-agents/a2a/mcpproto"
@@ -55,6 +56,7 @@ const (
 	msgBadID          = "an id must be a string, a number or null"
 	msgEmptyBatch     = "empty batch"
 	msgBatchTooLong   = "a batch may hold at most %d requests"
+	msgBatchTooLarge  = "a batch's answers may total at most %d bytes"
 	msgNeedsToolName  = "tools/call requires a tool name"
 	msgUnknownMethod  = "unknown method %q"
 	msgUnknownTool    = "unknown tool %q"
@@ -142,17 +144,31 @@ func (s *Server) HandleJSONRPC(ctx context.Context, raw []byte) []byte {
 		if len(frames) == 0 {
 			return marshalRPCError(json.RawMessage("null"), rpcErrInvalidRequest, msgEmptyBatch)
 		}
-		var answers []json.RawMessage
+		// Each answer is written into the response as it is produced, so it
+		// is held once, and the whole is refused once it passes its budget.
+		var out bytes.Buffer
 		for _, f := range frames {
-			if a := s.handleOne(ctx, f); a != nil {
-				answers = append(answers, a)
+			a := s.handleOne(ctx, f)
+			if a == nil {
+				continue
 			}
+			// The response once a is in: what is written, a's separator
+			// or opening bracket, a, and the closing bracket.
+			if out.Len()+len(a)+len("[]") > maxBatchResponseBytes {
+				return marshalRPCError(json.RawMessage("null"), rpcErrInvalidRequest, fmt.Sprintf(msgBatchTooLarge, maxBatchResponseBytes))
+			}
+			if out.Len() == 0 {
+				out.WriteByte('[')
+			} else {
+				out.WriteByte(',')
+			}
+			out.Write(a)
 		}
-		if len(answers) == 0 {
+		if out.Len() == 0 {
 			return nil
 		}
-		b, _ := json.Marshal(answers)
-		return b
+		out.WriteByte(']')
+		return out.Bytes()
 	}
 	return s.handleOne(ctx, trimmed)
 }
@@ -295,6 +311,12 @@ func marshalRPCError(id json.RawMessage, code int, msg string) []byte {
 // handful of requests at most.
 const maxBatchFrames = 64
 
+// maxBatchResponseBytes bounds what a batch's answers may total. The member
+// cap bounds their number, not their size: 64 large tool answers (a
+// connection_status over a full DIRECTORY) would all be held before anything
+// is written. A batch whose answers pass it gets one error instead.
+const maxBatchResponseBytes = 8 << 20
+
 // batchFrames splits a batch into its members as a stream, stopping once it
 // holds more than maxBatchFrames, so a long batch is refused without first
 // holding a copy of every member.
@@ -316,7 +338,9 @@ func batchFrames(raw []byte) (frames []json.RawMessage, tooLong bool, err error)
 	if _, err := dec.Token(); err != nil {
 		return nil, false, err
 	}
-	if dec.More() {
+	// Nothing but whitespace may follow the batch. More reports false at a
+	// closing bracket, so a stray `]` or `}` needs the next token read.
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return nil, false, errors.New("trailing data after the batch")
 	}
 	return frames, false, nil
