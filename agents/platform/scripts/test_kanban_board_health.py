@@ -22,6 +22,7 @@ import sys
 import tempfile
 import unittest
 import unittest.mock
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
@@ -424,7 +425,7 @@ class StuckTasksTests(unittest.TestCase):
         self.assertEqual(lines[-1], "And 3 more.")
 
     def test_the_worst_case_card_fits_its_reserve(self):
-        tasks = [stuck(f"t_{i}", "word " * 100 + str(i), 1e6) for i in range(kbh.MAX_STUCK_ROWS * 4)]
+        tasks = [stuck(f"t_{i}", f"{i:03d} " + "word " * 100, 1e6) for i in range(kbh.MAX_STUCK_ROWS * 4)]
         tasks += [stuck(f"g_{i}", "group", 1e6) for i in range(999)]
         text = "\n".join(kbh.render_stuck_tasks(tasks))
         self.assertLess(len(text), kbh.STUCK_CARD_RESERVE)
@@ -714,6 +715,70 @@ class MainOutputContractTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("cannot read", buffer.getvalue())
 
+
+
+class DeliveryFailureTests(unittest.TestCase):
+    """`main` against a real agent home, so it reads the scheduler's store as on the pod."""
+
+    T0 = 1_761_220_000.0
+    DAY = 24 * 3600
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        self.store = self.home / "profiles" / "platform" / "cron" / "jobs.json"
+        self.store.parent.mkdir(parents=True)
+        self.stamp(None, self.T0)
+        original = kbh.agent_home
+        kbh.agent_home = lambda: self.home
+        self.addCleanup(setattr, kbh, "agent_home", original)
+
+    def stamp(self, error, at):
+        run_at = datetime.fromtimestamp(at, tz=timezone.utc).isoformat()
+        entry = {"id": "kanban-board-health", "last_run_at": run_at, "last_delivery_error": error}
+        self.store.write_text(json.dumps({"jobs": [entry]}))
+
+    def run_main(self, report, now):
+        with unittest.mock.patch.object(kbh, "report", report):
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                kbh.main(env={}, now=now)
+        return buffer.getvalue()
+
+    def answer(self, tasks):
+        return lambda home, **kwargs: (tasks, [])
+
+    def post_then_fail_delivery(self):
+        self.assertIn("**Triage x**", self.run_main(self.answer([stuck("a", "Triage x")]), self.T0))
+        self.stamp("composed but not delivered to slack", self.T0 + 30)
+
+    def test_a_failed_delivery_says_the_tasks_again_through_main(self):
+        self.post_then_fail_delivery()
+        self.assertIn("**Triage x**", self.run_main(self.answer([stuck("a", "Triage x")]), self.T0 + self.DAY))
+
+    def test_a_forgotten_post_is_written_down_on_a_day_nothing_is_stuck(self):
+        self.post_then_fail_delivery()
+        self.assertEqual(self.run_main(self.answer([]), self.T0 + self.DAY), "")
+        self.stamp(None, self.T0 + self.DAY + 30)  # a run that printed nothing clears the stamp
+        out = self.run_main(self.answer([stuck("a", "Triage x")]), self.T0 + 2 * self.DAY)
+        self.assertIn("**Triage x**", out)
+
+    def test_an_engine_failure_after_a_failed_delivery_still_forgets_the_post(self):
+        def no_answer(home, **kwargs):
+            return None, ["Active kanban diagnostics:", "  diagnostics unavailable: boom"]
+
+        def unreadable(home, **kwargs):
+            raise sqlite3.OperationalError("unable to open database file")
+
+        for name, failing in (("engine", no_answer), ("board", unreadable)):
+            with self.subTest(failure=name):
+                self.post_then_fail_delivery()
+                self.run_main(failing, self.T0 + self.DAY)
+                self.stamp(None, self.T0 + self.DAY + 30)  # that run's own post delivered
+                out = self.run_main(self.answer([stuck("a", "Triage x")]), self.T0 + 2 * self.DAY)
+                self.assertIn("**Triage x**", out)
+                (self.home / "profiles" / "platform" / "cron" / "kanban_board_health.json").unlink()
 
 class BoardPathTests(unittest.TestCase):
     def test_board_comes_from_the_agent_home_not_hermes_home(self):

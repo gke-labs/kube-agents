@@ -772,32 +772,39 @@ def report(home: Path, *, env=None, max_chars: int | None = None, **kwargs) -> t
 
 def main(argv=None, *, env=None, now=None) -> int:
     home = agent_home()
+    path = state_path(home, env)
+    recorded = load_state(path)
+    # The scheduler's stamp of a failed delivery lasts one run, so it is read
+    # on every run, whatever the engine says: a run that could not read the
+    # board still forgets the undelivered post, and the next answer says it.
+    state = recorded
+    if last_post_undelivered(home, recorded[STATE_SAID_AT_KEY], env):
+        state = {STATE_SAID_KEY: [], STATE_SAID_AT_KEY: None}
     try:
         tasks, lines = report(home, env=env)
     except sqlite3.Error as exc:
+        if state != recorded:
+            save_state(path, state)
         print(f"kanban board health: cannot read {board_path(home)}: {exc}")
         return 0
     out = []
-    # An engine that did not answer leaves the record as it was: saving would
+    # An engine that did not answer leaves the ids as they were: saving would
     # forget every task said, and the next answer would say them all again.
     if tasks is not None:
-        path = state_path(home, env)
-        state = load_state(path)
-        if last_post_undelivered(home, state[STATE_SAID_AT_KEY], env):
-            state = {STATE_SAID_KEY: [], STATE_SAID_AT_KEY: None}
-        due, kept = stuck_due(tasks, state, time.time() if now is None else now)
+        due, state = stuck_due(tasks, state, time.time() if now is None else now)
         # Rendered before the record is saved, so a card that fails to render
         # is not remembered as said.
         out = render_stuck_tasks(tasks) if due else []
-        if kept != state:
-            save_state(path, kept)
+    # Compared with what is on disk, so a forgotten post is written down even
+    # on a day the new record matches the empty one.
+    if state != recorded:
+        save_state(path, state)
     if lines:
         out.extend([""] if out else [])
         out.extend([REPORT_HEADER, *lines])
     if out:
         print("\n".join(out))
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
