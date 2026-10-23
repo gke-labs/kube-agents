@@ -2338,6 +2338,16 @@ func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secr
 // and leaks the PV on every CR deletion. One spelling, both sites.
 const a2aNATSDataClaim = "data"
 
+// a2aProvisionResources adds the provision container's ephemeral-storage
+// request and equal limit, for the tmp emptyDir it writes
+// (a2aProvisionTmpSizeLimit), to its CPU and memory.
+func a2aProvisionResources() corev1.ResourceRequirements {
+	resources := a2aResources(a2aProvisionCPURequest, a2aProvisionMemoryRequest, a2aProvisionCPULimit, a2aProvisionMemoryLimit)
+	resources.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse(a2aProvisionEphemeralRequest)
+	resources.Limits[corev1.ResourceEphemeralStorage] = resource.MustParse(a2aProvisionEphemeralRequest)
+	return resources
+}
+
 // a2aResources builds the requests-and-limits block from the constants above.
 func a2aResources(cpuRequest, memoryRequest, cpuLimit, memoryLimit string) corev1.ResourceRequirements {
 	return corev1.ResourceRequirements{
@@ -3307,14 +3317,14 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 					// hardened read-only root needs somewhere to point it.
 					Volumes: []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent), {
 						Name:         "tmp",
-						VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+						VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(a2aProvisionTmpSizeLimit))}},
 					}},
 					Containers: []corev1.Container{{
 						Name:            a2aProvisionContainerName,
 						Image:           a2aProvisionImage(),
 						Command:         []string{"sh", "-c", script},
 						SecurityContext: hardenedSecurityContext(),
-						Resources:       a2aResources(a2aProvisionCPURequest, a2aProvisionMemoryRequest, a2aProvisionCPULimit, a2aProvisionMemoryLimit),
+						Resources:       a2aProvisionResources(),
 						// nats-box ships WORKDIR /root and declares no USER,
 						// so it expects to run as root (measured with
 						// `crane config` on 0.14.5). The pod above runs it as

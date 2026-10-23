@@ -4228,6 +4228,11 @@ func TestBuildDeployment_AgentPlugins_ImageVolumeUnsupported(t *testing.T) {
 	}
 	if pluginVol.EmptyDir == nil {
 		t.Errorf("expected plugin-myplugin volume source to be EmptyDir, got %+v", pluginVol)
+	} else if sl := pluginVol.EmptyDir.SizeLimit; sl == nil || sl.Cmp(resource.MustParse(pluginStagingSizeLimit)) != 0 {
+		// The staging emptyDir is bounded at the figure emptydir_limits.go
+		// gives; this is the only render of it, since no golden fixture
+		// carries an AgentPlugin.
+		t.Errorf("plugin-myplugin staging emptyDir sizeLimit = %v, want %s", sl, pluginStagingSizeLimit)
 	}
 
 	// 2. InitContainer must stage the plugin

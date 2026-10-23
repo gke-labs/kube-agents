@@ -1568,7 +1568,7 @@ class C1IsolationIsStructural(unittest.TestCase):
             self.assertNotRegex(body, magic_number, f"{what} hand-spells the delegate text cap")
 
     def test_C1_the_delegate_tool_schema_names_agree_with_the_wire_shape(self) -> None:
-        """The MCP tool schema and `lib.DelegateRequest` spell the same two fields.
+        """The MCP tool schema and `lib.DelegateRequest` spell the same fields, bar `parameters`.
 
         The session's harness speaks MCP to the worker-adapter's own server,
         which answers `tools/list` with `delegateToolSchema` -- a
@@ -1585,12 +1585,23 @@ class C1IsolationIsStructural(unittest.TestCase):
         """
         payload = h.text("a2a_payload")
         struct = payload.split("type DelegateRequest struct {")[1].split("\n}")[0]
-        tags = sorted(re.findall(r'`json:"(\w+)"`', struct))
+        # A tag's name runs to its first comma or quote: `json:"parameters,omitempty"`.
+        all_tags = sorted(re.findall(r'`json:"(\w+)[,"]', struct))
         self.assertEqual(
-            ["addressee", "text"],
-            tags,
+            ["addressee", "parameters", "text"],
+            all_tags,
             "lib.DelegateRequest's wire shape changed; this test compared nothing",
         )
+        # `parameters` is on the wire struct but not the tool: the worker
+        # adapter refuses a request carrying any until a gateway reads them
+        # (validateDelegate), so the model is not offered the field. The
+        # exemption holds only while that refusal does.
+        self.assertIn(
+            "if len(req.Parameters) > 0 {",
+            h.text("a2a_worker_adapter_delegate"),
+            "the adapter no longer refuses delegate parameters; declare them in delegateToolSchema",
+        )
+        tags = [t for t in all_tags if t != "parameters"]
 
         mcp = h.text("a2a_worker_adapter_mcp")
         schema = mcp.split("var delegateToolSchema")[1].split("\n}\n")[0]
