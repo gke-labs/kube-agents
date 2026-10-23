@@ -15,8 +15,11 @@
 #   backup   the GitHub login who covers when the owner is out; not the owner.
 #   meaning  one plain sentence saying what the domain checks, for a reader
 #            who does not know the code.
-# scripts/test_domain_coverage.py fails on a row missing any of the three, or
-# whose backup is its owner.
+# scripts/test_domain_coverage.py fails on a row missing owner, backup or
+# meaning, or whose backup is its owner. One optional key:
+#   new      `true` on a row whose cases have no nightly data yet, so the
+#            weekly health email (scripts/eval_dashboard/weekly_email.py)
+#            does not refuse to render over it. Remove it once the cases run.
 #
 # scripts/test_domain_coverage.py reads this file and fails when a domain has
 # no bench task carrying a deterministic verification_spec -- the rule "a
