@@ -93,7 +93,7 @@ the contract for why.
 
 A case whose spec reads live cluster state must declare it. A check that reads the
 agent's own install rather than the seeded fleet (the `bootstrap_*` checks,
-`sandbox_tree_matches_image`, `findings_item_state`, `oobe_audits_started`, `relay_posted_as_written`, `audit_chat_report_posted`, `audit_report_stored`) is not a fixture read, and a case carrying only those needs
+`sandbox_tree_matches_image`, `findings_item_state`, `oobe_audits_started`, `relay_posted_as_written`, `audit_chat_report_posted`, `audit_report_stored`, `report_store_reply`, `workload_incident_folded`) is not a fixture read, and a case carrying only those needs
 no `fixtures:`. `fixtures: []` is the declaration for a case that plants its own state — `gpu-stress-test-diagnosis` brings up
 its own Terraform stack and depends on no fixture — and an absent key on such a case is a
 finding, because a grep that returns one case for a role has to mean one case uses it. A
@@ -246,7 +246,7 @@ the workers' included; a report that states none passes), `tool_called` (calls i
 trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
 published), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier
-repetition's, unless the case sets `accepts_stream_pull_request` and runs on an audit stream, which also admits one an earlier run on its audit stream opened in the job's GitOps repository on that audit's remediation branch; `unchanged_paths` also fails one whose diff changes a listed path, and `content` asserts over the YAML or text in the files it adds), `github_writes` (every pull request or branch under the agent's
+repetition's, unless the case sets `accepts_stream_pull_request` and runs on an audit stream, which also admits one an earlier run on its audit stream opened in the job's GitOps repository on that audit's remediation branch; `unchanged_paths` also fails one whose diff changes a listed path, `removed_paths` one that does not delete every listed path, and `content` asserts over the YAML or text in the files it adds), `github_writes` (every pull request or branch under the agent's
 prefix written to the case's GitOps repository since the repetition started; it
 passes on a write, so a case wraps it in `none` to say the agent wrote nothing
 it was not asked for, and the inject lane appends exactly that entry to every
@@ -313,11 +313,22 @@ is in `state`. A listed row the queue does not hold is `status: "error"`, since 
 case's plant is missing. `audit_report_stored` reads the fleet-audit report store in the shell
 sandbox, then in the agent container, and passes when a `latest.json` for its `audit` finished since
 the run started, with `status` when it gives one and, for each `required_finding_phrases` entry, a
-finding in its `document` whose id contains it. `oobe_audits_started`, in its own module
+finding in its `document` whose id contains it. `report_store_reply`, in its own module
+(`bench/kube_agents_bench/report_store_reply.py`), reads the same store after the reply with the
+install's own `report_status.py`, and passes when each of its `audits` is mentioned in `final_message`
+and the reply carries the ledger URL of one of the audit's envelopes written before the turn (the
+newest, per repository store) or during it. An audit whose stores need no URL (a clean run with no
+open ledger, or no record before the turn) passes on the mention alone; which audit a URL is given
+to is the judge's to grade. `oobe_audits_started`, in its own module
 (`bench/kube_agents_bench/oobe.py`), reads the stack's state file and the Platform Agent's
 `cron/executions.db` in the agent pod, and passes when the stage's `.oobe_audits_fired` lists each
 of the four first-run audits as marked due and each has a run claimed since the stage marked it
 that got going (running, completed, or ended after its start), each starting only after the one before it in the chain ended.
+`workload_incident_folded`, in its own module (`bench/kube_agents_bench/incidents.py`), reads a
+workload's rows of one object `kind` (default `Pod`) from the Session KV server's event ledger in the agent pod and passes when at least
+`min_folded` of them were folded into its newest admitted incident, which must be newer than the
+run's start less `max_age_sec`; it keys on that incident rather than a time window because the stack
+plants its burst before the turn starts.
 `relay_posted_as_written`, in its own module (`bench/kube_agents_bench/relay.py`), reads the
 `relay-report` stack's state file and what the Session KV server stored for the report's threads,
 and passes when the route answered `delivered` and every stored post is the report exactly; a

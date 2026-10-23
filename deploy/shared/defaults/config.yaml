@@ -19,6 +19,11 @@ model:
 # (agent.api_max_retries) until five stale kills in a row trip its breaker, so
 # a persistent stall costs five or six 600s windows before the turn fails; a
 # one-off stall recovers at the first 600s kill.
+#
+# The Platform Agent's overlay (agents/platform/config.yaml) sets 120s on top
+# of this file at image build. The Platform Agent is a kanban worker, and a
+# long silence there is a stalled call. agents/cluster/config.yaml also sets
+# 120s. Only the front door keeps 600s.
 providers:
   custom:
     stale_timeout_seconds: 600

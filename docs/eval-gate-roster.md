@@ -31,7 +31,7 @@ partial window for it (`collecting`), that evidence feeds both. A case not named
 red a pull request on a graded failure, whatever its record says — and since 2026-09-22 it does
 not run on one either: the eval crew decided that the presubmit runs the blocking roster only
 ([#1023](https://github.com/gke-labs/kube-agents/issues/1023)), so `presubmit-cases.txt` holds
-the roster's ten cases plus, since 2026-09-29, one documented exception: the held-out seat a
+the roster's cases plus, since 2026-09-29, one documented exception: the held-out seat a
 coverage tracker puts in the presubmit file without a roster line, one per tracker
 ([#2013](https://github.com/gke-labs/kube-agents/issues/2013) for the compliance canary;
 [#2016](https://github.com/gke-labs/kube-agents/issues/2016)'s seat for pdb-remediation-pr took
@@ -82,11 +82,10 @@ The variable is comma- or whitespace-separated task ids; `_bootstrap_admitted()`
 
 ## The admission bar, and who clears it
 
-Ten of the eleven presubmit cases are admitted; the other one, the compliance canary,
-is the held-out seat described above (recount the entries of
-`hack/eval/presubmit-cases.txt` and
-`blocking-roster.txt` rather than trusting this sentence — an earlier copy of it miscounted
-twice). The bar a case clears to
+Every presubmit case without a roster line is a held-out seat as described above, and the rest
+are admitted (`python3 scripts/eval_rosters.py --summary` counts
+`hack/eval/presubmit-cases.txt` and `blocking-roster.txt`; this page writes no count, so a seat
+change doesn't edit it). The bar a case clears to
 get there: its recent record shows failures only on its own regressions or on infra classes
 the harness already excludes from the verdict.
 
@@ -349,7 +348,7 @@ blocking for every case by design, admitted or not: `grade_case` evaluates them 
 reads admission. Those classes signal a broken case or install, not flake, and the fix is
 on that side rather than on the roster.
 
-Since 2026-09-22 those rungs reach only the cases the presubmit runs: the roster's ten and,
+Since 2026-09-22 those rungs reach only the cases the presubmit runs: the roster's cases and,
 since 2026-09-29, the held-out seat. The seats of 2026-09-29 put both GitHub-writing paths back on
 every pull request — the canary's (the minted token, the cloned `*-infra` workspace, the ledger
 write, the `ledger_issue_contains` verifier) and pdb-remediation-pr's (submit-suggestion opening
@@ -370,11 +369,11 @@ say what it ran by hand.
 ## The whole-suite rate
 
 Beside the per-case rungs the verdict carries one number for the whole pull request: the pooled
-pass rate of every roster case's scored repetitions — on the presubmit nine cases × three = 27
-units, since `agent-kanban-smoke` is off the inject lane ([below](#the-inject-lane)), and ten ×
-three = 30 on the today lane (the api-transport count: 30 since 2026-10-21, 33 from 2026-10-17, 36
-on 2026-10-16, 39 from 2026-10-14, 36 before), `infra` repetitions left out — against `main`'s rate over the same cases from the evidence store (the
-newest seven nightly lines per case, about 249 runs). It is the rule that can see a pull request
+pass rate of every roster case's scored repetitions — on the presubmit, the roster less
+`agent-kanban-smoke`, which is off the inject lane ([below](#the-inject-lane)), and on the today
+lane the whole roster, each case at three repetitions (`python3 scripts/eval_rosters.py --summary`
+has the roster's count), `infra` repetitions left out — against `main`'s rate over the same cases from the evidence store (the
+newest seven nightly lines per case). It is the rule that can see a pull request
 which made several cases a little worse without making any one of them fail three times. The
 version key carries the mode ([`bench/baselines/README.md`](../bench/baselines/README.md)), so the
 presubmit's `next` is compared only with lines a next-mode run on `main` recorded at its key, and

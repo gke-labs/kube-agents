@@ -287,6 +287,16 @@ resource "google_container_cluster" "seeded_a" {
     workload_pool = "${var.project_id}.svc.id.goog"
   }
 
+  # GKE installs and manages the standard Gateway API CRDs. A scaled-to-zero
+  # gateway fixture (#3198) plants Gateway API objects on this cluster, and the
+  # kubernetes provider reads a CRD at plan time, so the CRDs must exist on
+  # every project before that fixture's objects are added. Not a drift facet
+  # (fleet_consistency_drift_sop.md section 4), so enabling it on one cluster
+  # changes no consistency finding. An in-place update.
+  gateway_api_config {
+    channel = "CHANNEL_STANDARD"
+  }
+
   # Upgrade-SOP background closure (3.4 no-channel, 3.7 no-window): a and c
   # enroll in REGULAR and take a maintenance window. Unlike seeded-b there
   # is no version fixture here, so auto-upgrade is welcome; enrollment also

@@ -420,18 +420,13 @@ RECOVERY_GREEN_RUNS = 3
 # concluded run of at least SLOW_MIN_TASKS cases (one fewer than the
 # presubmit runs: the cases hack/eval/presubmit-cases.txt lists, less those
 # hack/eval/inject-lane-exclusions.txt drops, since the presubmit grades
-# spec.mode next through the inject door and so runs that lane; 9 for the
-# ten it runs there once agent-kanban-smoke left on that lane: nine roster
-# cases and the held-out compliance canary (#2013), after three demotions
-# (#3269 on 10-16, #3120 on 10-17, #3598 on 10-21); fourteen from 2026-09-29: thirteen roster
-# cases and the canary from 2026-10-14, twelve and two seats before that
-# (#2016); twelve from 2026-09-22, when it became the
-# blocking roster only, #1023, having run 18-19 before); a run Prow cut short
-# at its ceiling recorded fewer and is not one; the floor was a literal 15
-# until the roster shrank under it, which would have made every run since a
-# partial one and the rule silent, so it follows the file and sits one
-# demotion below the roster on purpose, an admission or a demotion moving
-# it without an edit here) -- all of
+# spec.mode next through the inject door and so runs that lane;
+# _slow_min_tasks below computes it from the two files; a run Prow
+# cut short at its ceiling recorded fewer and is not one; the floor was a
+# literal 15 until the roster shrank under it, which would have made every
+# run since a partial one and the rule silent, so it follows the files and
+# sits one demotion below the roster on purpose, an admission or a demotion
+# moving it without an edit here) -- all of
 # them finished inside SLOW_WINDOW, is at least SLOW_FACTOR times the median
 # of the full runs of the trailing SLOW_BASELINE before them, given at least
 # SLOW_BASELINE_MIN_RUNS of those. Medians rather than the p90 the issue

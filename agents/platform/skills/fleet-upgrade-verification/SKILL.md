@@ -292,7 +292,7 @@ The per-entry rules run after those four, over the same cluster record and the r
 the webhook read, one per group of kinds: `kubectl get daemonset,cronjob,pvc,networkpolicy,namespace
 -A -o json`; `kubectl get pods -A -o json` on its own, because the pod list is the one most
 likely to exceed the credential proxy's output cap and a cut read must cost only the rules that
-need pods; the Nodes through a jsonpath template that keeps each node's name, labels, taints,
+need pods; the Nodes through a jsonpath template that keeps each node's name, Pod CIDR, labels, taints,
 whether it is cordoned, node info, allocatable and conditions and drops the rest (so a few
 hundred nodes stay under that cap); and `kubectl get storageclass,pv -o json`. Each of them
 fails on its own: a refused or unparsable read, or one the credential proxy cut at its output
@@ -315,13 +315,8 @@ Each rule returns blockers,
 risks, reasons it could not decide, and notes, and declares whether it can block at all; a
 blocker joins the verdict, a risk never does, and the table prints them under `other blockers`
 and `risks`, each as `<rule id>: <the rule's description>`, so the cell names the rule the way the
-note column does. The rules registered today, with the catalogue entry each reads:
-
-- **Zonal control plane** (`zonal-control-plane`, entry 11). A cluster whose `location` is a zone
-  is a risk on every report, never a blocker: the Kubernetes API is unreachable for a short window
-  while the single control-plane replica is rebuilt, running pods are unaffected, and the cell
-  says what to do about it. A location that is neither a zone nor a region is unknown, and since
-  the rule can never block, that unknown goes in the note and leaves the verdict to the other rules.
+note column does. The rules, one per catalogue entry, with their reads and actions:
+`references/readiness-rules.md`.
 
 A member is `blocked` when any rule blocks, whatever else could not be evaluated; `unknown` when
 nothing blocked but a rule that could have blocked could not be evaluated (the cluster read

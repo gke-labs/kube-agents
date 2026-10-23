@@ -584,6 +584,7 @@ INJECT_LANE_EXCLUDED = [
     "chat-failure-reply-declares-next-step",  # #2039: grades the front door's reply to a blocked card's wake; a card-wake replay
     "chat-answer-declares-next-step",  # #2039: grades the worker's answer under the door's one card; same door
     "chat-answer-tangent-offer-declares-no-step",  # the same
+    "fleet-audit-request-line",  # #2619: grades the worker's answer the api lane folds into the reply; the door's thread never gets it
 ]
 # The directives a case's prompt opens with to replay a wake into the chat
 # front door (bench/kube_agents_bench/card_wake.py); the harness errors such
@@ -592,7 +593,7 @@ FRONT_DOOR_WAKE_DIRECTIVES = ("[bench:card-failure-wake]", "[bench:slack-questio
 # Check types that read what only the chat front door's card round trip
 # delivers; on the inject lane there is no card, so the check fails rather
 # than being set aside (bench/README.md, the transport table).
-FRONT_DOOR_DELIVERY_CHECK_TYPES = frozenset({"answer_first"})
+FRONT_DOOR_DELIVERY_CHECK_TYPES = frozenset({"answer_first", "report_store_reply"})
 # Each exclusion's api-lane tier, pinned beside it: an entry is not a
 # demotion, so a case that leaves its tier's file while still excluded reds.
 INJECT_LANE_EXCLUDED_TIER = {
@@ -615,6 +616,7 @@ INJECT_LANE_EXCLUDED_TIER = {
     "chat-failure-reply-declares-next-step": "nightly",
     "chat-answer-declares-next-step": "nightly",
     "chat-answer-tangent-offer-declares-no-step": "nightly",
+    "fleet-audit-request-line": "nightly",
 }
 
 
