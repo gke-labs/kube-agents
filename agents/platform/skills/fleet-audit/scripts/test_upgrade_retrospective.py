@@ -5255,8 +5255,8 @@ class ManifestTest(unittest.TestCase):
     def test_every_collected_entry_carries_the_seven_checks_the_roster_reads(self):
         # The contract main's `coverage_gaps` reads: every `scope.clusters` entry is measured against
         # the stream's roster, and a check in neither `checks_run` nor `checks_not_applicable` is a
-        # gap. A reviewed cluster carries all six with the read that decided each. An unchanged
-        # cluster carries all six too: the operations listing that found no upgrade, with the
+        # gap. A reviewed cluster carries all seven with the read that decided each. An unchanged
+        # cluster carries all seven too: the operations listing that found no upgrade, with the
         # cluster's versions, answers every check that asks what the upgrade did, and a check whose
         # read the re-check made is backed by that read instead. The roster is `CHECK_READS`; until
         # the SOP registers it in `AUDITS`, the test registers it the same way.

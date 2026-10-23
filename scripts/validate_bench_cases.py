@@ -458,13 +458,13 @@ FIXTURE_NOT_READY = {
         "a recorded cluster record and node list until the fixture lands"
     ),
     "upgrades-readiness-rollout-sequence-precheck": (
-        "#3798: needs gkehub.googleapis.com enabled and roles/gkehub.viewer bound "
-        "for the agent's service account on every pool project, so a worker's "
-        "`gcloud container fleet rolloutsequences list` on the eval project "
-        "answers (the live answer there is existing 0, plan clear); no pool "
-        "project has the API or the role today, so the read fails for a reason "
-        "that is not the case's, and the blocked path is graded by the rule's "
-        "unit tests on a recorded list until then"
+        "#3798: needs gkehub.googleapis.com enabled, roles/gkehub.viewer bound for "
+        "the agent's service account, a fleet, and the standing RolloutSequence "
+        "`seeded-train` on every pool project, so a worker's `gcloud container fleet "
+        "rolloutsequences list` on the eval project answers `existing 1; plan "
+        "blocked`, the line the case pins; no pool project has them today, so the "
+        "read fails for a reason that is not the case's, and the blocked path is "
+        "graded by the rule's unit tests on a recorded list"
     ),
 }
 

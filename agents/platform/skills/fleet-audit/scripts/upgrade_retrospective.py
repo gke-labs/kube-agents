@@ -100,7 +100,7 @@ hand run that widens the window and advances no last-run time.
 with an outcome (`collected`; `unreachable` when its credentials failed;
 `gate-failed` when its reads failed, its project's listing failed or it is
 upgrading now; `out-of-scope` outside the fleet), the command behind each
-of the SOP's checks (`CHECK_READS`; an unchanged cluster carries all six,
+of the SOP's checks (`CHECK_READS`; an unchanged cluster carries all seven,
 backed by the operations listing that found no upgrade, or by the read the
 re-check made for the checks that read pods or nodes), `checks_unevaluated`
 for a check whose read ran and failed, never backed by the listing, a

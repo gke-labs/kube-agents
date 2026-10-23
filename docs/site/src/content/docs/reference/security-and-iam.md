@@ -257,7 +257,7 @@ The operator's rules, and the session store, follow the gateway switch. With `li
   done
   ```
 
-  The ten are `local.read_only_roles` in `terraform/examples/full-install/main.tf`.
+  The eleven are `local.read_only_roles` in `terraform/examples/full-install/main.tf`.
 
 The Kubernetes RBAC above is already read-only in every mode, so no cluster-side change is needed. Neither is the GitOps path affected: the agent proposes pull requests under every permission set, because what makes it propose rather than apply is Kubernetes RBAC, not the IAM set.
 

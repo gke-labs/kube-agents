@@ -52,7 +52,8 @@ kube-agents/
 │   │   │                                          console links) + design docs
 │   │   ├── governance/                            cron-run SOP playbooks + the
 │   │   │                                          first-run inventory-scan and
-│   │   │                                          report-prioritization SOPs
+│   │   │                                          report-prioritization SOPs,
+│   │   │                                          and the on-request rollout SOP
 │   │   ├── skill-overlays/                        patches + append.md behind the mirrored
 │   │   │                                          gke-* skills (scripts/skill_overlay.py)
 │   │   └── skills/                                SKILL.md bundles + each
