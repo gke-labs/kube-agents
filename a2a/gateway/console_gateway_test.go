@@ -234,7 +234,7 @@ func TestConsoleStillGetsTerminalNotices(t *testing.T) {
 }
 
 // A console conversation takes the answer as a terminal frame naming its
-// task, so a client with no TASKS view (the MCP server) reads it there. It is
+// task, so a console client (the MCP server) reads it there. It is
 // still never a notice.
 func TestAConsoleAnswerIsATerminalFrame(t *testing.T) {
 	r := startRig(t)

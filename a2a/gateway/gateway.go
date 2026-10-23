@@ -1974,8 +1974,8 @@ func (g *Gateway) observeTaskStarted(conversation, taskID string) {
 // is counted as failed (handOffEnd) even when the executor reported completed.
 //
 // A console conversation is told the same end as a terminal frame on .out
-// (consoleFrame), so a console client with no TASKS view learns each
-// chain's end once, under the task its turn started.
+// (consoleFrame), so a console client learns each chain's end once, under
+// the task its turn started, without reading TASKS.
 func (g *Gateway) observeTaskTerminal(rec *SessionRecord, taskID string, state lib.TaskState, source TerminalSource, reason string) {
 	g.metrics.taskTerminal(state, source)
 	if observer, ok := g.adapter.(TaskObserver); ok {

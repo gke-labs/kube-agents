@@ -2023,13 +2023,15 @@ different end of the same task (a never-started heal, then its late completion) 
 end the gateway declared itself (the bus unreachable, a task released for producing nothing) is
 worded as the page's notice is. Its text
 is the deliverable for a completed task and the gateway's notice otherwise. A chain that ends at
-a child with no wake (the session could not take one) ends failed, carrying the notice: a console
-client with no TASKS view reads the child's answer from TASKS or not at all. A notice carries
+a child with no wake (the session could not take one) ends failed, carrying the notice; a console
+client reads the child's answer from TASKS. A notice carries
 none of those fields, so a client waiting on a turn can tell the two apart. The page reads
 answers from TASKS and gets the notices, and it skips these frames, so for the page a lost
-`.out` frame across a reconnect still costs a notice and never an answer. A console client
-with no TASKS view, such as the MCP server, reads each task's end from these frames, live
-only, since `.out` is not on a stream. Turn answers to a follow-up inside a live task are not
+`.out` frame across a reconnect still costs a notice and never an answer. A console client such
+as the MCP server reads each task's end from these frames as it happens. `.out` is not on a
+stream, so a frame published while the client is not subscribed (a restart, a reconnect) is not
+replayed. The `console` identity holds TASKS consumer grants, so the client recovers a missed
+end from the task's own events there. Turn answers to a follow-up inside a live task are not
 sent; that client reads them from TASKS or waits for the end. An answer past 256 KiB, or one
 whose escaped frame would pass the server's `max_payload`, is cut and says so; TASKS keeps
 it whole. An `.in` frame published
