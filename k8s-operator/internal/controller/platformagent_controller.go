@@ -1213,6 +1213,11 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		if err := r.deleteA2ACalloutClusterRoleBinding(ctx, agent); err != nil {
 			return ctrl.Result{}, err
 		}
+		// The profile namespace's quota and fence carry no owner reference
+		// (agentprofile_namespace.go) and are not removed here yet: they stay
+		// until the chart's uninstall deletes the namespace. Removing the
+		// quota on deletion, and what a refused delete should do to the
+		// finalizer, is #3827.
 
 		// Delete managed litellm-policy during finalizer teardown only if Deployment/litellm
 		// is absent or terminating. litellm-policy is owned by Deployment/litellm (via OwnerReference)
@@ -3189,8 +3194,13 @@ func (r *PlatformAgentReconciler) reconcileAgentNetworkGuardrails(ctx context.Co
 		errs = append(errs, err)
 	}
 	if a2aStackRendering(agent) {
-		if _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
-			errs = append(errs, err)
+		if _, _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
+			var pnErr *profileNamespaceError
+			if goerrors.As(err, &pnErr) {
+				r.profileNamespaceFailure(ctx, agent, "fence", pnErr.err)
+			} else {
+				errs = append(errs, err)
+			}
 		}
 	}
 	if err := r.reconcileLiteLLMNetworkPolicy(ctx, agent, netpolProf); err != nil {
@@ -5630,6 +5640,14 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(
 			&networkingv1.NetworkPolicy{},
 			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+				// A profile fence carries no owner reference, so Owns()
+				// never maps it: re-reconcile its agent when it is created,
+				// changed or deleted, so the bus and LiteLLM stop admitting
+				// a namespace whose fence is gone, and LiteLLM admits one
+				// the pass after its fence lands.
+				if agent, ok := agentOfProfileFence(obj); ok {
+					return []reconcile.Request{{NamespacedName: agent}}
+				}
 				if obj.GetName() != litellmNetworkPolicyName {
 					return nil
 				}

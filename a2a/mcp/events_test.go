@@ -959,12 +959,15 @@ func TestReportsDoNotCrowdOutTheTurnsNotice(t *testing.T) {
 	}
 }
 
-// A report from before the turn, on a task the turn's text goes into (the
-// gateway steering a running task), is not the turn's; one after it is.
+// A report from before the turn, on a task the turn's text goes into, is not
+// the turn's; one after it is. The fake gives both turns one task, as the
+// gateway does when it steers a turn into a task it still holds (a turn this
+// server sends only once the task it knows of has ended, but one it does not
+// know of, as after a restart, it cannot wait for).
 func TestAReportFromBeforeTheTurnIsNotGathered(t *testing.T) {
 	setReportQuiet(t, time.Second)
 	s, _, _, b := turnServer(t, gatewayScenario{
-		root: func(turn int32) (string, bool) { return "task-root1", turn >= 2 },
+		root: func(turn int32) (string, bool) { return "task-root1", true },
 		after: func(nc *nats.Conn, token string, turn int32) {
 			if turn == 1 {
 				publishNotify(nc, token, notifyFrame("n-old", "task-root1", "OLD: a report from before the turn"))

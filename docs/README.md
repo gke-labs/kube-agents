@@ -55,8 +55,8 @@ kube-agents/
 │   │   │                                          report-prioritization SOPs
 │   │   ├── skill-overlays/                        patches + append.md behind the mirrored
 │   │   │                                          gke-* skills (scripts/skill_overlay.py)
-│   │   └── skills/                                SKILL.md bundles + the
-│   │                                              gke-compute-classes references
+│   │   └── skills/                                SKILL.md bundles + each
+│   │                                              skill's references/ documents
 │   └── tse/                                       Optional GKE Support Agent (tse) template:
 │       ├── AGENTS.md, SOUL.md, CAPABILITIES.md    persona and capability card
 │       └── skills/                                support-escalation-bundle SKILL.md

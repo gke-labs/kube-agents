@@ -240,6 +240,9 @@ ENTRY_RISK_RUBRIC = {
     18: (5, 4, 2, 2, 60),
     19: (5, 4, 2, 3, 90),
     20: (5, 6, 2, 2, 90),
+    23: (3, 4, 3, 3, 90),  # 65, major: a capacity failure is noticed when the operation errors and waits for the region
+    25: (3, 4, 2, 1, 100),  # 36, minor: the channel's list says so before the window, and the fix is the next active patch
+    26: (3, 4, 2, 2, 90),  # 43, major: the issue decides; the match is exact on the add-on and the patch
 }
 DEFAULT_RISK_RUBRIC = (3, 4, 2, 2, 90)
 RUBRIC_KEYS = ("B", "L", "detect", "recover")
@@ -268,6 +271,12 @@ ENTRY_TITLES = {
     18: "GPU driver mismatch",
     19: "In-tree volumes lose their CSI path",
     20: "Images on a retired registry",
+    21: "The load balancer's connection drain outlasts the node's deregistration wait",
+    22: "A Node object outlives its virtual machine",
+    23: "A control-plane upgrade or resize fails on regional compute capacity",
+    24: "A cluster held in a long reconcile",
+    25: "The target patch is withdrawn before the window",
+    26: "A known issue in an add-on at the target version",
 }
 ENTRY_MITIGATIONS = {
     1: "Give the budget room: maxUnavailable at least 1 or minAvailable below the replica count, and a "
@@ -310,6 +319,18 @@ ENTRY_MITIGATIONS = {
     "per GKE version and NVIDIA's minimum-driver matrix the floor the images accept; canary a GPU pool.",
     19: "Enable the PD CSI driver add-on and move StorageClasses to pd.csi.storage.gke.io.",
     20: "Mirror every image into a registry you own and keep egress allowlists in step.",
+    21: "Set the backend service's connection draining timeout at or under the wait: gcloud compute "
+    "backend-services update <name> --global|--region <region> --connection-draining-timeout=600.",
+    22: "Delete the orphan Node object (kubectl delete node <name>); nothing runs on it.",
+    23: "Set a maintenance window in an off-peak hour for the region and retry the upgrade in it; keep "
+    "upgrade notifications consumed so a failed attempt is a message the same day.",
+    24: "Do not start the upgrade: freeze changes and, past a few hours, open a support case quoting the "
+    "operation id, or the status and its message when no operation holds the cluster; re-check after "
+    "the status settles.",
+    25: "Target the newest active patch of the minor on the channel at or above the version, or the next "
+    "active version the channel lists; hold when none is active.",
+    26: "Upgrade the matched add-on to the fixed-in version before the window (for a managed add-on, the "
+    "GKE patch the issue names as fixed), or hold the cluster at a version the issue does not cover.",
 }
 # Entries the built-in reads stand for.
 ENTRY_BUDGET = 1

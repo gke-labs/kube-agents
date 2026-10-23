@@ -56,9 +56,10 @@ NOOP_DEPLOYER = "noop"
 
 # The check types that read the run's own tool calls or worker logs rather
 # than the answer or the cluster: ``tool_called`` reads the trajectory,
-# ``worker_commands`` the delegated cards' worker logs (or, with
-# ``after_result_pattern``, the workers' trajectory entries), ``worker_agents`` the
-# ``agent`` tags the harness puts on the workers' trajectory entries. On the
+# ``worker_commands`` the delegated cards' worker logs (and, with
+# ``after_result_pattern``, the workers' trajectory entries as typed), ``worker_agents`` the
+# ``agent`` tags the harness puts on the workers' trajectory entries,
+# ``worker_budget`` the cards' run rows the same read collects. On the
 # inject transport they are blind in two different ways, and the scorer
 # sets each aside under its own condition (``scoring.py``, the inject lane).
 # ``tool_called`` in its default ``router`` scope reads the delegating
@@ -81,7 +82,7 @@ TRACE_GRADABLE_CHECK_TYPES = frozenset({"tool_called"})
 # the trajectory, the workers' included, to tell a time the agent read from
 # one it guessed; the inject trace carries calls without their tool
 # outputs, so it is blind the same way.
-WORKER_BLIND_CHECK_TYPES = frozenset({"worker_commands", "worker_agents", "report_times_in_window"})
+WORKER_BLIND_CHECK_TYPES = frozenset({"worker_commands", "worker_agents", "worker_budget", "report_times_in_window"})
 TRANSPORT_BLIND_CHECK_TYPES = TRACE_GRADABLE_CHECK_TYPES | WORKER_BLIND_CHECK_TYPES
 # ``tool_called``'s scope key and the one scope the door's trace serves
 # (``verifiers.ToolCalledVerifier``: ``router`` is the default).
@@ -169,8 +170,8 @@ class CaseSpec:
 
     worker_blind_checks: frozenset[str] = frozenset()
     """The entries in ``transport_blind_checks`` with any leaf that reads the
-    delegated workers -- ``worker_commands``, ``worker_agents``, or a
-    ``tool_called`` in the ``workers`` or ``all`` scope -- or any
+    delegated workers -- ``worker_commands``, ``worker_agents``,
+    ``worker_budget``, or a ``tool_called`` in the ``workers`` or ``all`` scope -- or any
     ``tool_called`` with a ``result`` pattern. Blind on every inject record,
     trace or none: the trace carries no results, so no card id can be read
     from it and no result pattern can match. The delegation wait reads the

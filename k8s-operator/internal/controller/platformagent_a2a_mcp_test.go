@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"path"
 	"strings"
 	"testing"
@@ -261,6 +262,37 @@ func TestTheMCPTokenIsMintedOnceAndNeverAdopted(t *testing.T) {
 		})
 	}
 
+	// A value no Authorization header can carry, a control byte inside it,
+	// is minted over; a printable value a person wrote is kept, its ends
+	// trimmed by the server.
+	for value, kept := range map[string]bool{
+		"ab\ncd": false, "ab\rcd": false, "ab\x00cd": false, "ab\x7fcd": false, "ab\tcd": true,
+		" valid-token \n": true, "with space inside": true,
+	} {
+		t.Run(fmt.Sprintf("an owned Secret holding %q is kept: %v", value, kept), func(t *testing.T) {
+			held := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPAccessName(agent), Namespace: agent.Namespace},
+				Data: map[string][]byte{a2aMCPAccessKey: []byte(value)}}
+			if err := ctrl.SetControllerReference(agent, held, setupScheme()); err != nil {
+				t.Fatal(err)
+			}
+			r, cl := mcpTestReconciler(t, held)
+			if err := r.ensureA2AMCPToken(ctx, agent); err != nil {
+				t.Fatal(err)
+			}
+			got, err := readMCPToken(t, cl)
+			if err != nil {
+				t.Fatal(err)
+			}
+			v := got.Data[a2aMCPAccessKey]
+			if kept && string(v) != value {
+				t.Errorf("the token %q was replaced with %q", value, v)
+			}
+			if !kept && (string(v) == value || !a2aMCPTokenUsable(v)) {
+				t.Errorf("the token %q was not minted over: now %q", value, v)
+			}
+		})
+	}
+
 	// With the flag off, an unowned Secret under the reserved name is not
 	// ours: the removal skips it rather than failing the whole reconcile,
 	// and leaves it alone.
@@ -383,6 +415,60 @@ func TestTheMCPFenceWaitsForThePodToGo(t *testing.T) {
 	}
 	if err := cl.Get(ctx, fenceKey, &networkingv1.NetworkPolicy{}); !apierrors.IsNotFound(err) {
 		t.Errorf("the fence survived its pod: %v", err)
+	}
+}
+
+// With the flag off, an unowned NetworkPolicy under the fence's name is not
+// ours either: with no MCP pod left, the removal skips it rather than
+// failing the reconcile, and leaves it standing.
+func TestTheFlagOffMCPRemovalSkipsAnUnownedFence(t *testing.T) {
+	t.Setenv(a2aMCPDoorEnvVar, "")
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	squatter := buildA2AMCPNetworkPolicy(agent)
+	r, cl := mcpTestReconciler(t, squatter)
+	if err := r.reconcileA2AMCP(ctx, agent); err != nil {
+		t.Fatalf("an unowned NetworkPolicy under the fence's name stopped the reconcile: %v", err)
+	}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(squatter), &networkingv1.NetworkPolicy{}); err != nil {
+		t.Errorf("the unowned NetworkPolicy was touched: %v", err)
+	}
+}
+
+// getCounter counts the reads of each object through it.
+type getCounter struct {
+	client.Client
+	gets map[string]int
+}
+
+func (c *getCounter) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	c.gets[fmt.Sprintf("%T %s", obj, key)]++
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+// The removal reads each of its objects once a pass, owned or not: the
+// token Secret's read is uncached, and runs on every flag-off reconcile.
+func TestTheMCPRemovalReadsEachObjectOnce(t *testing.T) {
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	unowned := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPAccessName(agent), Namespace: agent.Namespace}}
+	owned := buildA2AMCPService(agent)
+	if err := ctrl.SetControllerReference(agent, owned, setupScheme()); err != nil {
+		t.Fatal(err)
+	}
+	r, _ := mcpTestReconciler(t, unowned, owned, buildA2AMCPNetworkPolicy(agent))
+	counter := &getCounter{Client: r.Client, gets: map[string]int{}}
+	r.Client = counter
+	if err := r.removeA2AMCP(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if len(counter.gets) != len(r.a2aMCPObjects(agent)) {
+		t.Errorf("reads = %v, want one of each of the %d objects", counter.gets, len(r.a2aMCPObjects(agent)))
+	}
+	for obj, n := range counter.gets {
+		if n != 1 {
+			t.Errorf("%s was read %d times, want once", obj, n)
+		}
 	}
 }
 

@@ -40,7 +40,7 @@ import {
   type Envelope,
   type StreamName,
 } from "./protocol.ts";
-import { encodeInFrame, inSubject, mintMessageId, outSubject, parseOutFrame } from "./console.ts";
+import { encodeInFrame, inSubject, mintMessageId, outSubject, paneShows, parseOutFrame } from "./console.ts";
 import type { BusConfig } from "./config.ts";
 import type { AgentView, BusEvent, ProbeResult, StreamStat } from "./model.ts";
 
@@ -445,7 +445,7 @@ export async function startBus(
       callback: (err, m) => {
         if (err) return;
         const frame = parseOutFrame(m.data);
-        if (frame !== null) dispatch({ type: "notice", frame, conversation: linked, at: Date.now() });
+        if (frame !== null && paneShows(frame)) dispatch({ type: "notice", frame, conversation: linked, at: Date.now() });
       },
     });
   }
