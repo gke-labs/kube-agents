@@ -144,15 +144,23 @@ class AgentAPIProxyTest(unittest.TestCase):
                 self.end_headers()
                 self.wfile.write(body)
 
+            def do_POST(self):  # noqa: N802
+                length = int(self.headers.get("Content-Length", "0"))
+                if length:
+                    self.rfile.read(length)
+                self.do_GET()
+
             def log_message(self, _message, *_args):
                 return
 
         self.release_second_chunk = threading.Event()
         self.second_chunk_released = False
+        self.workspace_dir = tempfile.TemporaryDirectory()
         self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), UpstreamHandler)
         AgentAPIProxyHandler.external_key = "external-secret"
         AgentAPIProxyHandler.upstream_key = "internal-sentinel"
         AgentAPIProxyHandler.upstream_port = self.upstream.server_port
+        AgentAPIProxyHandler.workspace_root = self.workspace_dir.name
         self.proxy = ThreadingHTTPServer(("127.0.0.1", 0), AgentAPIProxyHandler)
         for server in (self.upstream, self.proxy):
             threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -162,6 +170,31 @@ class AgentAPIProxyTest(unittest.TestCase):
         self.upstream.shutdown()
         self.proxy.server_close()
         self.upstream.server_close()
+        self.workspace_dir.cleanup()
+
+    def _seed_state_db_sessions(self, rows, profile=None):
+        import sqlite3
+
+        base = Path(self.workspace_dir.name)
+        if profile:
+            base = base / "profiles" / profile
+            base.mkdir(parents=True, exist_ok=True)
+        db_path = base / "state.db"
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS sessions ("
+                "id TEXT PRIMARY KEY, "
+                "parent_session_id TEXT, "
+                "end_reason TEXT, "
+                "model_config TEXT"
+                ")"
+            )
+            for sid, parent_id, end_reason in rows:
+                conn.execute(
+                    "INSERT OR REPLACE INTO sessions (id, parent_session_id, end_reason) VALUES (?, ?, ?)",
+                    (sid, parent_id, end_reason),
+                )
+            conn.commit()
 
     def test_replaces_external_api_key_before_forwarding(self):
         request = urllib.request.Request(
@@ -181,6 +214,111 @@ class AgentAPIProxyTest(unittest.TestCase):
             urllib.request.urlopen(request)
         self.assertEqual(401, raised.exception.code)
         self.assertEqual("", self.received_authorization)
+
+    def test_refuses_bridge_a2a_session_paths_and_headers(self):
+        self._seed_state_db_sessions(
+            [
+                ("a2a-ctx-victim", None, "compression"),
+                ("20261022_120000_child1", "a2a-ctx-victim", "compression"),
+                ("20261022_120500_child2", "20261022_120000_child1", None),
+            ]
+        )
+        self._seed_state_db_sessions(
+            [
+                ("a2a-ctx-prof-victim", None, "compression"),
+                ("20261022_121000_profchild", "a2a-ctx-prof-victim", None),
+            ],
+            profile="chat",
+        )
+        for path, extra_headers, payload in (
+            ("/api/sessions/a2a-ctx-victim/chat", {}, b"{}"),
+            ("/api/sessions/a2a-ctx-victim/chat/stream", {}, b"{}"),
+            ("/api/sessions/a2a-ctx-victim", {}, b"{}"),
+            ("/api/sessions/%612a-ctx-victim/chat", {}, b"{}"),
+            ("/p/default/api/sessions/a2a-ctx-victim/chat", {}, b"{}"),
+            ("/v1/chat/completions", {"X-Hermes-Session-Id": "a2a-ctx-victim"}, b"{}"),
+            ("/v1/responses", {"X-Hermes-Session-Key": "a2a-ctx-victim"}, b"{}"),
+            (
+                "/v1/runs",
+                {"Content-Type": "application/json"},
+                b'{"session_id": "a2a-ctx-victim", "input": "hi"}',
+            ),
+            (
+                "/p/default/v1/runs",
+                {"Content-Type": "application/json"},
+                b'{"session_id": "%612a-ctx-victim", "input": "hi"}',
+            ),
+            (
+                "/api/sessions/20261022_120000_child1/chat",
+                {},
+                b"{}",
+            ),
+            (
+                "/api/sessions/20261022_120500_child2/chat/stream",
+                {},
+                b"{}",
+            ),
+            (
+                "/p/chat/api/sessions/20261022_121000_profchild/chat",
+                {},
+                b"{}",
+            ),
+            (
+                "/v1/chat/completions",
+                {"X-Hermes-Session-Id": "20261022_120500_child2"},
+                b"{}",
+            ),
+            (
+                "/v1/runs",
+                {"Content-Type": "application/json"},
+                b'{"session_id": "20261022_120500_child2", "input": "hi"}',
+            ),
+        ):
+            with self.subTest(path=path, headers=extra_headers, payload=payload):
+                self.received_authorization = ""
+                headers = {"Authorization": "Bearer external-secret", **extra_headers}
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{self.proxy.server_port}{path}",
+                    headers=headers,
+                    data=payload,
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(request)
+                self.assertEqual(403, raised.exception.code)
+                self.assertEqual("", self.received_authorization)
+
+    def test_allows_non_a2a_session_paths_and_headers(self):
+        self._seed_state_db_sessions(
+            [
+                ("sess-parent-123", None, "compression"),
+                ("20261022_120000_non_a2a_child", "sess-parent-123", None),
+            ]
+        )
+        for path, extra_headers, method, payload in (
+            ("/api/sessions?limit=1", {}, "GET", None),
+            ("/api/sessions/k8s-evt-123/chat", {}, "POST", b"{}"),
+            ("/api/sessions/20261022_120000_non_a2a_child/chat", {}, "POST", b"{}"),
+            ("/v1/chat/completions", {"X-Hermes-Session-Id": "sess-123"}, "POST", b"{}"),
+            (
+                "/v1/runs",
+                {"Content-Type": "application/json"},
+                "POST",
+                b'{"session_id": "20261022_120000_non_a2a_child", "input": "hi"}',
+            ),
+        ):
+            with self.subTest(path=path, headers=extra_headers):
+                self.received_authorization = ""
+                headers = {"Authorization": "Bearer external-secret", **extra_headers}
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{self.proxy.server_port}{path}",
+                    headers=headers,
+                    data=payload,
+                    method=method,
+                )
+                with urllib.request.urlopen(request) as response:
+                    self.assertEqual(b"proxied", response.read())
+                self.assertEqual("Bearer internal-sentinel", self.received_authorization)
 
     def test_rejection_reaches_a_client_that_sent_a_body(self):
         # Raw socket rather than urllib: the defect is at the transport, and a

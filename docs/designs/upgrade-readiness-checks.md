@@ -1,7 +1,9 @@
 # Upgrade readiness checks for a large GKE fleet
 
-**Status:** requirements. Nothing here is built beyond what the Scope table credits to an existing
-audit or skill.
+**Status:** requirements. Nothing here is on `main` beyond what the Scope table credits to an
+existing audit or skill. The incident checks section records six checks and one extension,
+implemented and, as of 2026-10-21, not on `main`; the Verification and Progress sections record
+their proof.
 
 ## High level summary
 
@@ -19,6 +21,14 @@ request in chat. Today each cluster's grade is blocked, unknown or ready, and ea
 the object and the setting that blocks. This
 document specifies a verdict per cluster family: Go, No-Go or Action required. The Scope table below
 says which parts exist on main.
+
+**From the field: the incident checks.** One production fleet's support history supplies the sixteen
+upgrade incidents in the Progress table. Six new checks, and two new reads in a seventh, the
+surge-capacity check, cover thirteen of them. The other three incidents, in two scenarios, have no
+check yet. As of 2026-10-21 the seven checks are implemented and not on main. Four layers of proof
+verify a check. They are a replay test, a live read, a planted fixture with its evaluation case, and
+the weekly review run end to end. The sections "The incident checks", "Verification" and "Progress"
+record all of this.
 
 **After the upgrade: the retrospective.** The retrospective design specifies a job that runs once at
 install, at the end of each weekend and soon after each upgrade. Its report says what each upgrade
@@ -399,6 +409,104 @@ Rollout tracking against one target version already runs (see Scope). The additi
   of one cluster soon after its upgrade (the retrospective's requirement 1 states the latency), with
   the failures it finds classified against
   the catalogue and fed back to the readiness report as guards.
+
+## The incident checks
+
+The checks above come from public failures. Seven more come from one production fleet's support
+history: sixteen upgrade incidents, read for the Scope table. Thirteen are matched to a check that
+fires before the maintenance window; the other three, in two scenarios, have none yet, and the
+Progress table names them. Six of the checks are new readiness rules with their own catalogue
+entries, 21 to 26; the seventh is two reads added to the `surge-capacity` rule (entry 2), a rule
+that is itself implemented and not on `main`. As of 2026-10-21 all seven are implemented and none
+is on `main`, whose `EXTRA_RULES` carries one rule; the Scope table records each as it lands, and
+the project tracks the delivery in its issue tracker. Each rule is a module of
+`scripts/readiness_rules/` in the `fleet-upgrade-verification` skill, registered in `EXTRA_RULES`
+and run wherever `--readiness` runs: the skill's fleet run, the daily `upgrade-readiness-watch` and
+the weekly `upgrade-blocked` check. The skill's `references/readiness-rules.md`, delivered with the
+rules, is the definition of what a rule reads and at what threshold. The table says what each reads
+and what it files with the action it names; the incident is why the check exists.
+
+| Check                            | Entry | Reads                                                                                                                                                                                                                                                                                                                        | Files, and the action                                                                                                                                                                                                                                                                                                                                                                                |
+| -------------------------------- | ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `lb-connection-draining`         | 21    | The project's backend services (`gcloud compute backend-services list`, once per project), matched to the member's node-pool instance groups and to the NEGs its Services annotate                                                                                                                                           | A blocker per backend service whose `connectionDraining.drainingTimeoutSec` is above the 600 seconds GKE waits per node. Action: `gcloud compute backend-services update <name> --global\|--region <region> --connection-draining-timeout=600`                                                                                                                                                       |
+| `orphan-node-objects`            | 22    | The project's instances (`gcloud compute instances list`, once per project), joined to the member's Nodes on `spec.providerID`                                                                                                                                                                                               | A blocker per Node with no instance behind it; a Node created after the list's read time, or a `Ready` uncordoned Node the list lacks, is a note. Action: `kubectl delete node <name>`                                                                                                                                                                                                               |
+| `control-plane-upgrade-history`  | 23    | The project's operations (`gcloud container operations list`, once per project): `DONE` `UPGRADE_MASTER`, `UPGRADE_NODES` and `REPAIR_CLUSTER` operations of the last 90 days on the member or its pools whose error names capacity; the cluster's maintenance window                                                        | A risk per capacity failure, with the operation's date, its message and the window. Action: set a maintenance window in an off-peak hour for the region and retry the upgrade in it; keep upgrade notifications consumed                                                                                                                                                                             |
+| `cluster-status-age`             | 24    | The cluster's `status` and, from the same operations list, the `RUNNING` operations on it or its pools; a cluster not `RUNNING` with nothing running is read again (`clusters describe`, then its own `operations list`)                                                                                                     | A blocker when the holding operation has run for more than four hours, or when nothing runs and the status is still not `RUNNING` (quoting `statusMessage`); a younger holder is a note. Action: freeze changes and, past a few hours, open a support case quoting the operation id, or the status and its message (the `gke-upgrades` skill's "Stuck operation" procedure, delivered with the rule) |
+| `target-patch-valid`             | 25    | The location's server config (`gcloud container get-server-config`, once per location): the member's target against its channel's `validVersions` (and `validNodeVersions` for a pool move alone); the running control-plane version against the same list                                                                   | A blocker for a target the channel does not carry; a risk for a running control plane the channel has moved past. Action: target the newest active patch of the minor on the channel, else the next active version it lists                                                                                                                                                                          |
+| `known-issues-matrix`            | 26    | The DaemonSets and Deployments in `kube-system` and `gmp-system`, against `known_issues.json` beside the rules (the rows of GKE's known-issues page from 1.32 up) at the running and the target patch; the table's age                                                                                                       | A risk per matched issue, with the add-on, the fix and the page anchor; a match through an open version set is a note; a table older than thirty days is a risk. Action: target the patch the issue names as fixed, or hold; regenerate a stale table                                                                                                                                                |
+| `surge-capacity`, two more reads | 2     | For each pool below the target on the surge strategy with `maxSurge` above 0: its accelerators (`config.accelerators`) and reservation affinity (`config.reservationAffinity`); per Pod range (`networkConfig.podIpv4CidrBlock`, else `clusterIpv4Cidr`), the free aligned per-node blocks against the pools' `maxSurge` sum | A blocker for an accelerator pool that surges with no reservation affinity; a blocker when the free blocks are fewer than the surge nodes. Action: hold a reservation for the surge node, or set the in-place strategy (`max-surge` 0, `max-unavailable` 1) on a pool with a spare accelerator node; lower `max-surge` or add a secondary Pod range                                                  |
+
+A finding reaches the operator by the paths the Scope table credits, and by two more, implemented
+and not on `main` as of 2026-10-21: the Saturday review, the `upgrade-readiness-weekly-review` job
+that grades every cluster and registers each finding on the findings queue, with the brief, the
+`upgrade-readiness-weekly-brief` job's chat message that reports them; and the retrospective job
+([`upgrade-retrospective.md`](upgrade-retrospective.md)), which runs the collector on a schedule and
+records a failure after the upgrade as a guard the next readiness report shows. The collector is on
+`main`; its schedule, and the readiness report's reading of its guards, are not.
+
+## Verification
+
+A check is verified at four layers, and the four together are this document's standard for a
+check: a check is complete when each layer is on record for it, as a finding, as a clean run, or
+as ruled out with the reason.
+
+1. **Replay.** One test per incident with a check, built from recorded inputs shaped like the
+   incident, asserting the rule's finding text and its action through the registry's fold
+   (`test_incident_replays.py` beside the rules: eleven replays for the six incident rules, two for
+   the surge extension).
+2. **Live read.** `fleet_upgrade_report.py --readiness` over a development project with nothing
+   planted for the check. It proves the reads against the real APIs and shows what a healthy fleet
+   reports. On the development project the read found a control-plane upgrade that had failed on
+   compute capacity (2026-10-09, on a cluster with no maintenance window) and a control plane whose
+   patch the REGULAR channel had dropped, each with the rule's action.
+3. **Fixture and evaluation case.** A planted fixture the check finds, and whose own action removes
+   it; and the check's evaluation case, red on `main` and green three times on the branch's build
+   ([`eval_driven_development.md`](../../.agents/rules/eval_driven_development.md)). For the drain
+   check: a backend service draining for 3600 seconds on a seeded pool blocks the cluster, the
+   finding prints the `gcloud compute backend-services update` command, and after that command the
+   rule reports no service above the wait. Where nothing can be planted on a healthy cluster (a
+   ghost Node, a capacity failure, a wedged reconcile, a withdrawn patch, a published add-on issue)
+   the catalogue entry says why, the replay stands in, and the case grades the rule's note on a
+   clean fleet.
+4. **End to end.** The Saturday review and the brief, run through the cron path on an integration
+   image, with the finding named in chat: seven clusters graded, the findings registered on the
+   queue, the brief delivered to the chat channel, and the drain finding in the brief's decide-now
+   list with its command in the report.
+
+This round taught two rules of design, each now binding on a check:
+
+- A check declares its own catalogue entry, because the review titles the finding and recommends by
+  that entry: four incident rules first declared the nearest existing entry, so the review titled a
+  capacity failure "No spare capacity for the displaced pods" with the surge action, and entries 23
+  to 26 are the fix.
+- An evaluation case grades the check's own text, because a line the agent can compose from raw
+  reads proves nothing about the check: `upgrades-readiness-cluster-status-age` and
+  `upgrades-readiness-target-patch-valid` passed on `main` without the rule, and the per-object
+  `upgrades-fleet-readiness-*` cases graded a line the agent never produced, so every case now
+  copies the rule's note or finding as the report prints it.
+
+## Progress
+
+The state of each check at 2026-10-21, one row per incident scenario, with the sixteen incidents by
+date; a replayed incident carries the date its replay names. The Scope table says what is on `main`;
+this table is a dated record of each check's proof, in five words, not the run-by-run record.
+**done**: the layer is on record for the check, and the cell says what it showed where it showed a
+finding. **ran**: the layer ran with the check in it and reported no finding of this check, which is
+the clean run the standard accepts. **none**: the layer does not apply, and the cell says why.
+**pending**: the layer is under way, and the cell says what remains. **open**: not started.
+
+| Scenario                                                                     | Incidents                                      | Check                                  | Replay      | Live read                                                                                                              | Fixture                                                                                                                                                                                                             | Evaluation case                                                                                                                                                          | End to end                                                                                                                             |
+| ---------------------------------------------------------------------------- | ---------------------------------------------- | -------------------------------------- | ----------- | ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
+| The load balancer's connection drain outlasts the node's deregistration wait | 2025-06-26, 2025-07-03, 2026-03-31             | `lb-connection-draining` (21)          | done, three | ran                                                                                                                    | done: a backend service draining for 3600 seconds on a seeded pool; the rule blocks, and after its command reports no service above the wait                                                                        | pending: `upgrades-readiness-lb-drain-timeout` is green three times on the branch's build; the red against `main` is not yet on record                                   | done: named in the brief's decide-now list, with its command in the report                                                             |
+| A Node object outlives its virtual machine                                   | 2025-12-09                                     | `orphan-node-objects` (22)             | done        | ran                                                                                                                    | none: the cloud controller deletes a ghost Node within seconds                                                                                                                                                      | pending: `upgrades-readiness-orphan-node` has three greens on the branch's build, re-graded at the final pattern; the red against `main` is not yet on record            | ran                                                                                                                                    |
+| A cluster held in a long reconcile                                           | 2025-06-17                                     | `cluster-status-age` (24)              | done        | ran                                                                                                                    | none: a status other than `RUNNING` needs a real operation in flight or wedged                                                                                                                                      | done: `upgrades-readiness-cluster-status-age`, red on `main`, green three times                                                                                          | ran                                                                                                                                    |
+| A control-plane upgrade or resize fails on regional compute capacity         | 2025-06-19, 2026-01-14, 2026-04-15, 2026-10-05 | `control-plane-upgrade-history` (23)   | done, four  | done: a real control-plane upgrade that failed on capacity on 2026-10-09                                               | none: a capacity failure is the provider's                                                                                                                                                                          | pending: `upgrades-audit-control-plane-capacity`, red on `main`; three passes in five runs over two builds, and three greens of three on one build are not yet on record | done: the finding was in the review, titled by entry 2 until the rule declared entry 23                                                |
+| The target patch is withdrawn before the window                              | 2026-05-05                                     | `target-patch-valid` (25)              | done        | done: a control plane whose patch the REGULAR channel had dropped                                                      | done: the version laggard, a standing fixture, holds its control plane at a patch the channel has moved past, which is the rule's risk; no withdrawn target can be planted, the channel's list being the provider's | done: `upgrades-readiness-target-patch-valid`, red on `main`, green three times                                                                                          | done: the finding was in the review, titled by entry 10 until the rule declared entry 25                                               |
+| A known issue in an add-on at the target version                             | 2026-01-13                                     | `known-issues-matrix` (26)             | done        | done: two published issues matched on the version laggard                                                              | none: which issues the page lists is the provider's                                                                                                                                                                 | pending: `upgrades-readiness-known-issues` has two greens of three; the third green and the red against `main` are not yet on record                                     | ran                                                                                                                                    |
+| A GPU pool upgrade stalls on accelerator capacity without a reservation      | 2025-04-28                                     | `surge-capacity`, accelerator read (2) | done        | pending: the seeded fleet has no accelerator pool; the read ran on a GPU cluster's record from the development project | open: an accelerator pool costs by the hour on every pool project, and the seeded fleet has no surge-headroom fixture yet                                                                                           | open: `upgrades-readiness-surge-headroom` needs that fixture first                                                                                                       | ran                                                                                                                                    |
+| A new pool cannot register nodes on a full Pod range                         | 2025-09                                        | `surge-capacity`, Pod-range read (2)   | done        | ran                                                                                                                    | open: a Pod range is fixed at cluster creation, so the fixture is a small new cluster slot, part of the same surge-headroom fixture                                                                                 | open: the same case, after the fixture                                                                                                                                   | ran                                                                                                                                    |
+| Upgrade sequencing                                                           | 2026-09-17, 2026-09-21                         | none                                   | open        | open                                                                                                                   | open                                                                                                                                                                                                                | open                                                                                                                                                                     | open: the rollout-sequence precheck of Rollout and verification; designed, not implemented                                             |
+| The log volume rises after the upgrade                                       | 2026-04-21                                     | none                                   | open        | open                                                                                                                   | open                                                                                                                                                                                                                | open                                                                                                                                                                     | open: the post-upgrade diff of Rollout and verification as the family gate, with log volume added to what it compares; not implemented |
 
 ## How it is delivered
 
