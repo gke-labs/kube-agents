@@ -173,6 +173,12 @@ func (c *Conversations) ResolveCall(alias, token string) (string, bool, error) {
 	// one, whether or not this table still knows it (after a delete, an
 	// eviction or a restart, the token is what a caller falls back to).
 	if token == "" && (strings.HasPrefix(alias, consoleConversationPrefix) || isMintedToken(alias)) {
+		// console:<x> in a name's place is a token only when x is one, as
+		// list shows tokens; console:<name> is neither, not a conversation
+		// nobody minted.
+		if rest := strings.TrimPrefix(alias, consoleConversationPrefix); !isMintedToken(rest) {
+			return "", false, fmt.Errorf("%s is neither a conversation name nor a conversation's token (list shows a token as console:<token>)", cell(alias))
+		}
 		alias, token = "", alias
 	}
 	if token != "" {
@@ -253,19 +259,25 @@ func (c *Conversations) Create(alias, description string) (string, error) {
 
 // Forget drops alias, and reports whether it was there. The conversation
 // itself is untouched: it stays reachable by its token.
-func (c *Conversations) Forget(alias string) bool {
+func (c *Conversations) Forget(alias, token string) (string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, ok := c.byAlias[alias]; !ok {
-		// Named by its token, as list shows it, or bare.
-		a, found := c.aliasOfTokenLocked(strings.TrimPrefix(alias, consoleConversationPrefix))
-		if !found {
-			return false
-		}
-		alias = a
+	// A token wins over a name, as it does in ResolveCall.
+	if token != "" {
+		alias = ""
+	} else if _, ok := c.byAlias[alias]; ok {
+		delete(c.byAlias, alias)
+		return alias, true
+	} else {
+		// Named by its token in a name's place, as list shows it, or bare.
+		token = alias
 	}
-	delete(c.byAlias, alias)
-	return true
+	a, found := c.aliasOfTokenLocked(strings.TrimPrefix(token, consoleConversationPrefix))
+	if !found {
+		return "", false
+	}
+	delete(c.byAlias, a)
+	return a, true
 }
 
 // List returns the aliases, most recently used first.
