@@ -342,6 +342,10 @@ func New(o Options) (*Gateway, error) {
 		// backend the inject door wins the default, and every message
 		// through either stamps its own.
 		backend = a2aBackend
+	} else if backend == "" && o.Config.ConsoleDoor {
+		// The console door alone (A2A_CONSOLE_DOOR): every message through
+		// it stamps console itself, and the default says the same.
+		backend = consoleBackend
 	}
 	if backend == injectBackend {
 		// Said out loud, and repeated on the door's read route

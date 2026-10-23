@@ -331,6 +331,28 @@ WATCHER_FAILEDSCHEDULING_MIN_COUNT="${WATCHER_FAILEDSCHEDULING_MIN_COUNT:-5}"
 # last said. Raise it on a cluster whose node pools take longer to provision.
 WATCHER_SCALEUP_HOLD="${WATCHER_SCALEUP_HOLD:-15m}"
 
+# The settle period: how long a failure in the settle family (the crash-loop
+# family, FailedMount, Unhealthy; the reasons kubelet re-emits while they
+# last) has to have lasted, by the
+# event's own first and last sighting, before the watcher forwards it. It
+# runs after the count debounces above: a failure has to have repeated AND
+# lasted. A BackOff that clears inside it, kubelet warming its object cache on
+# a fresh Autopilot node, is not forwarded; a real crash loop crosses it on
+# its fourth or fifth back-off and is forwarded with its first sighting kept.
+# Never applied to OOMKilled, the image-pull family or FailedScheduling, which
+# have gates of their own. Set to 0 to switch it off.
+WATCHER_SETTLE="${WATCHER_SETTLE:-2m}"
+
+# How long after its last sighting an incident whose alert went out is reported
+# quiet: the watcher sends the Session KV server one k8s-event-followup inject
+# for it, which lands in the alert's thread saying the object has emitted
+# nothing since, so a card read hours later says what was true when. Silence,
+# not recovery: the watcher reads events only and reads no object back, and a
+# deleted pod goes as quiet as a recovered one. Past kubelet's 5m back-off
+# ceiling with margin, so a crash loop still going is never reported quiet
+# between two of its back-offs. Set to 0 to send none.
+WATCHER_QUIET_AFTER="${WATCHER_QUIET_AFTER:-15m}"
+
 # Whether to hold the FailedScheduling an Autopilot cluster emits for GKE's own
 # system pods once it has scaled itself to zero nodes — kube-dns, metrics-server,
 # rule-evaluator and the rest, left Pending by design on a cluster with no user
@@ -621,6 +643,8 @@ start_event_watcher() {
         --imagepull-transient-min-count="${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT}" \
         --failedscheduling-min-count="${WATCHER_FAILEDSCHEDULING_MIN_COUNT}" \
         --scaleup-hold="${WATCHER_SCALEUP_HOLD}" \
+        --settle="${WATCHER_SETTLE}" \
+        --quiet-after="${WATCHER_QUIET_AFTER}" \
         --autopilot-scale-to-zero-hold="${WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD}" || true
       ran=$(( SECONDS - started ))
 

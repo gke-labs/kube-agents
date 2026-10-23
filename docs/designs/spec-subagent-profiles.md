@@ -3,9 +3,10 @@
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
 - **Status:** stage 3 in progress. Built: the `AgentProfile` CRD and what the operator renders
-  from one (the ServiceAccount, the callout identity, the agent card). Not built: the
-  dispatcher and janitor, the cluster-agent profile, and the gateway reading the `chat`
-  profile.
+  from one (the ServiceAccount, the callout identity, the agent card). The execution model,
+  routing, persona format and tiers are now decided in
+  [`spec-profiles-dispatch.md`](spec-profiles-dispatch.md), which supersedes this spec where
+  they differ (warm pools for interactive profiles, one generic cluster agent, no kanban).
 - **Companions:** the A2A payload spec (`spec-a2a-payloads.md`) - envelope, subjects, task
   lifecycle; the NATS deployment spec (`spec-nats-deployment.md`) - streams, accounts,
   connection-time authz

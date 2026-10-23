@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import quote
 
 logger = logging.getLogger("hermes.plugin.chat_metrics")
@@ -75,6 +75,14 @@ HERMES_HOME_ENV = "HERMES_HOME"
 DEFAULT_HERMES_HOME = "/opt/data"
 # A scrape waits this long on a locked board before keeping the last value.
 BOARD_BUSY_TIMEOUT_SECONDS = 1.0
+# The series the operator reads status.usage.negativeFeedbackTotal from
+# (usage_counters_scrape.go's chatFeedbackNegativeSeries): thumbs-down
+# reactions a person put on one of the bot's messages, by platform, counted by
+# the chat_feedback_reactions hook once per person and message. The hook tells
+# the bot's messages from a person's by the Slack identities this module reads
+# off the gateway the inbound hook noted (note_gateway, slack_bot_user_ids).
+CHAT_FEEDBACK_NEGATIVE_METRIC = "kubeagents_chat_feedback_negative_total"
+SLACK_PLATFORM_VALUE = "slack"
 PLATFORM_LABEL = "platform"
 LABEL_OTHER = "other"
 HERMES_PLATFORM_LABELS = {
@@ -168,8 +176,8 @@ def platform_label(hermes_platform: str) -> str:
 
 
 class ChatMetrics:
-    """Three counters, by platform: inbound messages, new sessions and errored
-    turns; and the board's gave_up cards, read at scrape time."""
+    """Four counters, by platform: inbound messages, new sessions, errored turns
+    and thumbs-downs; and the board's gave_up cards, read at scrape time."""
 
     def __init__(self, kanban: Optional[KanbanGaveUpCounter] = None) -> None:
         self._kanban = kanban or KanbanGaveUpCounter()
@@ -177,6 +185,7 @@ class ChatMetrics:
         self._inbound: dict[str, int] = {}
         self._sessions: dict[str, int] = {}
         self._errored: dict[str, int] = {}
+        self._negative: dict[str, int] = {}
 
     def prime(self) -> None:
         """Take the board's baseline now rather than at the first scrape."""
@@ -199,11 +208,17 @@ class ChatMetrics:
         with self._lock:
             self._errored[label] = self._errored.get(label, 0) + 1
 
+    def record_negative_feedback(self, hermes_platform: str) -> None:
+        label = platform_label(hermes_platform)
+        with self._lock:
+            self._negative[label] = self._negative.get(label, 0) + 1
+
     def render(self) -> str:
         with self._lock:
             inbound = sorted(self._inbound.items())
             sessions = sorted(self._sessions.items())
             errored = sorted(self._errored.items())
+            negative = sorted(self._negative.items())
         lines = [
             f"# HELP {CHAT_INBOUND_METRIC} Chat messages that reached the gateway's dispatch hook, by platform.",
             f"# TYPE {CHAT_INBOUND_METRIC} counter",
@@ -227,6 +242,12 @@ class ChatMetrics:
             f"# TYPE {KANBAN_GAVE_UP_METRIC} counter",
             f"{KANBAN_GAVE_UP_METRIC} {self._kanban.count()}",
         ]
+        lines += [
+            f"# HELP {CHAT_FEEDBACK_NEGATIVE_METRIC} Thumbs-down reactions a person put on one of the bot's messages, by platform, once per person and message.",
+            f"# TYPE {CHAT_FEEDBACK_NEGATIVE_METRIC} counter",
+        ]
+        for label, count in negative:
+            lines.append(f'{CHAT_FEEDBACK_NEGATIVE_METRIC}{{{PLATFORM_LABEL}="{label}"}} {count}')
         lines += [
             f"# HELP {PROCESS_START_TIME_METRIC} Start time of the process since unix epoch in seconds, captured once at start.",
             f"# TYPE {PROCESS_START_TIME_METRIC} gauge",
@@ -295,3 +316,33 @@ def start_listener(port: int, registry: ChatMetrics) -> Optional[ThreadingHTTPSe
     thread.start()
     logger.info("chat metrics listener serving %s on port %d", METRICS_PATH, server.server_port)
     return server
+
+
+# The gateway the inbound hook last saw, kept so the reaction hook, which
+# Hermes hands only an event, can ask which Slack identities are the bot's.
+_gateway: Any = None
+
+
+def note_gateway(gateway: Any) -> None:
+    """Remember the gateway object the pre_gateway_dispatch hook was handed."""
+    global _gateway
+    _gateway = gateway
+
+
+def slack_bot_user_ids() -> frozenset:
+    """The bot's Slack user ids on every team, from the noted gateway's Slack
+    adapter; empty when no gateway has been noted or it has no Slack adapter."""
+    adapters = getattr(_gateway, "adapters", None)
+    if not isinstance(adapters, dict):
+        return frozenset()
+    ids: set = set()
+    for platform, adapter in adapters.items():
+        if str(getattr(platform, "value", platform)).lower() != SLACK_PLATFORM_VALUE:
+            continue
+        bot = getattr(adapter, "_bot_user_id", None)
+        if bot:
+            ids.add(str(bot))
+        teams = getattr(adapter, "_team_bot_user_ids", None)
+        if isinstance(teams, dict):
+            ids.update(str(v) for v in teams.values() if v)
+    return frozenset(ids)

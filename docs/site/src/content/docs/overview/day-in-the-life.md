@@ -28,7 +28,7 @@ Without kube-agents, the Service stays exposed until someone reviews Services ac
 
 ## A crash loop becomes a root cause and a pull request
 
-A config change rolls out to the `checkout` Deployment in namespace `shop` on cluster `prod-east`, and the new pods start to crash. Kubelet emits `BackOff` Warning events. The event watcher in the agent pod watches its own cluster and every cluster that has a Cluster Agent. By default, it forwards a pod's `BackOff` event when kubelet has reported it three times.
+A config change rolls out to the `checkout` Deployment in namespace `shop` on cluster `prod-east`, and the new pods start to crash. Kubelet emits `BackOff` Warning events. The event watcher in the agent pod watches its own cluster and every cluster that has a Cluster Agent. By default, it forwards a pod's `BackOff` event once kubelet has reported it three times and the failure has lasted two minutes; one that clears sooner is not forwarded.
 
 kube-agents posts one alert in chat. On Google Chat it reads "🟡 **Warning:** Back off `shop/checkout` — _event message_", followed by "🌱 _Digging down to the root cause..._". On Slack it reads "🚨 **checkout in prod-east keeps crashing.** Looking now." The Planning Agent then files one card for the `prod-east` Cluster Agent.
 
