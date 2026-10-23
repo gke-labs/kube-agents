@@ -178,15 +178,16 @@ directory the change lands in:
 
 | The change is                                                                                                                        | Load and follow first    |
 | ------------------------------------------------------------------------------------------------------------------------------------ | ------------------------ |
-| a `.tf` / `.tfvars` file (Terraform under `clusters/<cluster>/provisioning/` or the repo's root)                                     | **gcp-terraform**        |
+| a Terraform file (`.tf`, `.tf.json`, `.tfvars`), wherever it sits                                                                    | **gcp-terraform**        |
 | a Config Connector object (`apiVersion: *.cnrm.cloud.google.com/*`)                                                                  | **gcp-config-connector** |
 | a Helm chart's declaration (a Helm-sourced `RootSync`, a Flux `HelmRelease`, an Argo CD Helm `Application`, kustomize `helmCharts:`) | **gitops-helm-chart**    |
 
-Load it with `skill_view` and follow it, its own checks included (`tofu
-fmt` for Terraform). Its first step runs this skill's `prepare`; you already
-have a working copy, so skip that one and keep this `workspace` and branch.
-A second `prepare` under the authoring skill's branch name makes a second
-copy. Its last step submits through Step 3 here. A plain Kubernetes
+Load it with `skill_view` and follow it from its Step 1, its own `prepare`
+and checks included (the CRD check for Config Connector, the reconciler form
+for a chart, the owning files and pins for Terraform, then `tofu fmt`). You
+have edited nothing yet, so nothing is lost: its `prepare` opens the copy
+under its own branch name, and its last step submits that branch through
+Step 3 here. Leave the copy you prepared here unused. A plain Kubernetes
 manifest has no authoring skill; write it here.
 
 Generate or edit the files **inside the returned `workspace`**.
@@ -477,7 +478,9 @@ no token to refresh.
 
    Edit the files the reviewer commented on in the `workspace` — what is on the
    branch is what you are being asked to change, and rewriting a file from
-   memory loses the rest of it. Stage only those specific files
+   memory loses the rest of it. A Terraform, Config Connector or Helm-chart
+   file is edited by its authoring skill's rules here too (Step 2's table),
+   its checks included: `tofu fmt` after any `.tf` edit. Stage only those specific files
    (**never `git add .` / `-A`**).
 
    Pass `--title` and `--body-file` again so the description matches the

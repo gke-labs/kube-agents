@@ -125,7 +125,7 @@ class SubmitSuggestionHandsEditsToTheirAuthoringSkillTest(unittest.TestCase):
         step2 = content[content.index("### Step 2: Make the Changes"):content.index("### Deleting a resource")]
         for skill in ("gcp-terraform", "gcp-config-connector", "gitops-helm-chart"):
             self.assertIn(f"**{skill}**", step2)
-        self.assertIn("skip that one and keep this `workspace`", step2)
+        self.assertIn("follow it from its Step 1", step2)
 
 if __name__ == "__main__":
     unittest.main()
