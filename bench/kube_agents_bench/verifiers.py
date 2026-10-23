@@ -2656,7 +2656,7 @@ _SUDO_VAL_OPTS = {
 _SUDO_SHORT_VAL_OPTS = {opt[1:] for opt in _SUDO_VAL_OPTS if opt.startswith("-") and not opt.startswith("--")}
 _SUDO_VAL_LESS_FLAGS = set("AbBEHiKknNPSsVv")
 _SUDO_LONG_VAL_LESS_OPTS = {
-    "--askpass", "--bell", "--edit", "--help", "--login",
+    "--askpass", "--bell", "--help", "--login",
     "--remove-timestamp", "--reset-timestamp",
     "--non-interactive", "--stdin", "--shell", "--version", "--validate",
     "--set-home", "--preserve-groups", "--no-update",
@@ -2668,58 +2668,77 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
     """True if seg invokes an exec wrapper with options that detach the process
     or do not guarantee exit propagation (e.g. `setsid` without `-w`/`--wait`,
     or `sudo` with `-b`/`--background` or non-whitelisted options)."""
-    cmd_idx = _command_word_index(seg)
+    idx = 0
     redirect_target = False
-    for idx, word in enumerate(seg):
+    while idx < len(seg):
+        word = seg[idx]
         if redirect_target:
             redirect_target = False
+            idx += 1
             continue
         if _is_redirect(word) or (word.isdigit() and idx + 1 < len(seg) and _is_redirect(seg[idx + 1])):
             redirect_target = not word.isdigit()
+            idx += 1
             continue
-        if cmd_idx is not None and idx >= cmd_idx:
-            break
+        if _SHELL_ASSIGNMENT_RE.match(word) or word in _SHELL_RESERVED_WORDS:
+            idx += 1
+            continue
         base = os.path.basename(word)
         if base == "watch":
             return True
         if base == "setsid":
+            idx += 1
             saw_w = False
             inner_redirect_target = False
-            scan_words = seg[idx + 1:cmd_idx] if cmd_idx is not None else seg[idx + 1:]
-            for i, w in enumerate(scan_words, start=idx + 1):
+            while idx < len(seg):
+                w = seg[idx]
                 if inner_redirect_target:
                     inner_redirect_target = False
+                    idx += 1
                     continue
-                if _is_redirect(w) or (w.isdigit() and i + 1 < len(seg) and _is_redirect(seg[i + 1])):
+                if _is_redirect(w) or (w.isdigit() and idx + 1 < len(seg) and _is_redirect(seg[idx + 1])):
                     inner_redirect_target = not w.isdigit()
+                    idx += 1
                     continue
                 if w == "--":
+                    idx += 1
                     break
                 if w in ("-w", "--wait") or ("--wait".startswith(w) and len(w) >= 3):
                     saw_w = True
+                    idx += 1
+                    continue
                 elif w.startswith("-") and not w.startswith("--") and len(w) > 1:
                     if all(c in _SETSID_VAL_LESS_FLAGS for c in w[1:]):
                         if "w" in w[1:]:
                             saw_w = True
+                        idx += 1
+                        continue
                 if not w.startswith("-") and not _SHELL_ASSIGNMENT_RE.match(w):
                     break
+                idx += 1
             if not saw_w:
                 return True
+            continue
         elif base == "sudo":
+            idx += 1
             prev_opt_takes_val = False
             inner_redirect_target = False
-            scan_words = seg[idx + 1:cmd_idx] if cmd_idx is not None else seg[idx + 1:]
-            for i, w in enumerate(scan_words, start=idx + 1):
+            while idx < len(seg):
+                w = seg[idx]
                 if inner_redirect_target:
                     inner_redirect_target = False
+                    idx += 1
                     continue
                 if prev_opt_takes_val:
                     prev_opt_takes_val = False
+                    idx += 1
                     continue
-                if _is_redirect(w) or (w.isdigit() and i + 1 < len(seg) and _is_redirect(seg[i + 1])):
+                if _is_redirect(w) or (w.isdigit() and idx + 1 < len(seg) and _is_redirect(seg[idx + 1])):
                     inner_redirect_target = not w.isdigit()
+                    idx += 1
                     continue
                 if w == "--":
+                    idx += 1
                     break
                 if not w.startswith("-") and not _SHELL_ASSIGNMENT_RE.match(w):
                     break
@@ -2728,8 +2747,10 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
                     if opt_name in _SUDO_VAL_OPTS:
                         if "=" not in w:
                             prev_opt_takes_val = True
+                        idx += 1
                         continue
                     if opt_name in _SUDO_LONG_VAL_LESS_OPTS or opt_name == "--preserve-env":
+                        idx += 1
                         continue
                     return True
                 elif w.startswith("-") and len(w) > 1:
@@ -2747,11 +2768,59 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
                             break
                         return True
                     if val_opt_end:
+                        idx += 1
                         continue
+                    idx += 1
+                    continue
                 elif _SHELL_ASSIGNMENT_RE.match(w):
+                    idx += 1
                     continue
                 else:
                     return True
+            continue
+        elif base in _SHELL_EXEC_WRAPPERS:
+            idx += 1
+            takes_val = False
+            positionals = _SHELL_WRAPPER_POSITIONALS.get(base, 0)
+            inner_redirect_target = False
+            while idx < len(seg):
+                w = seg[idx]
+                if inner_redirect_target:
+                    inner_redirect_target = False
+                    idx += 1
+                    continue
+                if _is_redirect(w) or (w.isdigit() and idx + 1 < len(seg) and _is_redirect(seg[idx + 1])):
+                    inner_redirect_target = not w.isdigit()
+                    idx += 1
+                    continue
+                if takes_val:
+                    takes_val = False
+                    idx += 1
+                    continue
+                if w == "--":
+                    idx += 1
+                    break
+                if w.startswith(_SHELL_FLAG_PREFIX):
+                    takes_val = (w != _SHELL_OPTIONS_END)
+                    idx += 1
+                    continue
+                if _SHELL_COUNT_RE.match(w) or w.startswith(_SHELL_EXPANSION_PREFIX):
+                    idx += 1
+                    continue
+                if positionals:
+                    positionals -= 1
+                    idx += 1
+                    continue
+                if _SHELL_ASSIGNMENT_RE.match(w):
+                    idx += 1
+                    continue
+                break
+            continue
+        else:
+            # Word is not an assignment, not reserved, not a redirect, and not an exec wrapper.
+            # It is the command word itself (unknown script, binary, or interpreter).
+            # The wrapper prefix ends here.
+            break
     return False
 
 
@@ -2791,7 +2860,7 @@ def _shell_argvs_with_exit_propagation(
             continue
         if current_ops:
             if not segments:
-                leading_ops.extend(current_ops)
+                leading_ops.extend(op for op in current_ops if op != _SHELL_LINE_END)
             current_ops = []
         argv.append(word)
 
@@ -2799,6 +2868,8 @@ def _shell_argvs_with_exit_propagation(
         segments.append(argv)
 
     results: list[tuple[list[str], bool]] = []
+    leading_ops = [op for op in leading_ops if op != _SHELL_LINE_END]
+    current_ops = [op for op in current_ops if op != _SHELL_LINE_END]
     trailing_bg = any(op == "&" for op in current_ops)
     handled_spans: list[str] = []
 

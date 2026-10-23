@@ -9161,6 +9161,33 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs_with_exit_propagation("sudo --no-update python3 f.py --readiness") == [
         (["sudo", "--no-update", "python3", "f.py", "--readiness"], True),
     ]
+    assert _shell_argvs_with_exit_propagation("sudo --edit python3 f.py --readiness") == [
+        (["sudo", "--edit", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("./f.py --readiness --out /tmp/setsid") == [
+        (["./f.py", "--readiness", "--out", "/tmp/setsid"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("./f.py --readiness --exclude watch") == [
+        (["./f.py", "--readiness", "--exclude", "watch"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness\n") == [
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("# run\npython3 f.py --readiness") == [
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness\n# done") == [
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness\n\n") == [
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("(\npython3 f.py --readiness\n)") == [
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness &\n") == [
+        (["python3", "f.py", "--readiness"], False),
+    ]
     assert _shell_argvs_with_exit_propagation("python3 f.py --readiness > /tmp/setsid") == [
         (["python3", "f.py", "--readiness", ">", "/tmp/setsid"], True),
     ]
