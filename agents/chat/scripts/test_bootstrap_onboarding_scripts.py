@@ -877,6 +877,35 @@ class DeliveryRegistersFindingsTest(unittest.TestCase):
             ],
         )
 
+    def test_registration_records_that_the_fleet_was_checked(self):
+        self._write()
+        self._run()
+        self.assertTrue((self.d / bootstrap_delivery.FINDINGS_REGISTERED_MARKER).exists())
+
+    def test_a_clean_fleet_records_the_check_with_nothing_to_register(self):
+        self._write(items={"items": []}, scores=None)
+        self._run()
+        self.assertEqual(self.sent, [])
+        self.assertTrue((self.d / bootstrap_delivery.FINDINGS_REGISTERED_MARKER).exists())
+
+    def test_a_queue_that_does_not_answer_records_no_check(self):
+        self._write()
+        with mock.patch.object(inventory_findings, "post_batch", side_effect=OSError("down")):
+            self._run()
+        self.assertFalse((self.d / bootstrap_delivery.FINDINGS_REGISTERED_MARKER).exists())
+
+    def test_a_refused_batch_records_no_check(self):
+        self._write()
+        refused = urllib.error.HTTPError("http://q", 400, "bad", None, None)
+        with mock.patch.object(inventory_findings, "post_batch", side_effect=refused):
+            self._run()
+        self.assertFalse((self.d / bootstrap_delivery.FINDINGS_REGISTERED_MARKER).exists())
+
+    def test_the_check_marker_is_the_one_the_board_reads(self):
+        import board_snapshot  # agents/platform/scripts, beside this script in the image
+
+        self.assertEqual(bootstrap_delivery.FINDINGS_REGISTERED_MARKER, board_snapshot.FINDINGS_REGISTERED_MARKER)
+
     def test_a_hand_off_that_filed_no_ranking_card_registers_nothing(self):
         # A no-coverage sweep writes the report itself; the items and scores are the last sweep's.
         self._write()

@@ -76,7 +76,9 @@ Two rules follow, and they are the whole rule:
   report, and every report carries `issue_url` in full, with every URL in `prs_opened` and
   `prs_still_open`: a fix already waiting for review answers "was a fix proposed?" as much as one
   this run opened. A `NO_FORGE` run has no `issue_url`; its report is `summary` (see
-  [No forge configured](finish.md#no-forge-configured)).
+  [No forge configured](finish.md#no-forge-configured)). A `STORE_LEDGER` run has no `issue_url`
+  either; its report is `summary`, with the pull request links (see
+  [A forge with no issue tracker](finish.md#a-forge-with-no-issue-tracker)).
 - **An on-demand run is never silent.** `silent_ok` is the _scheduled_ verdict — it answers "would a
   channel want this?", and it cannot know a person asked. If someone dispatched this job, from a
   kanban card or straight from chat, they are waiting on the answer and
@@ -97,7 +99,8 @@ A zero-finding run comes back `silent_ok: false` in each of these cases, and all
   this run published, and a gap holds `resolved` at 0. The gaps may be the same as before; the run
   still speaks. Say in your one line that this many findings are no longer reported while a
   coverage gap stays, with the issue URL. Do not call them resolved. Each id is listed once; a later
-  run with the same gap does not list it again.
+  run with the same gap does not list it again. A finding under _Not re-checked this run_ is
+  published, so it is not listed.
 - **`status: "HELD"`** — the ledger stayed open because the run did not account for findings it was
   carrying, or because it could not read the issue's comments, where a `/remediate` may be waiting
   for an answer. "I found nothing" and "I did not write it down" must not arrive as the same

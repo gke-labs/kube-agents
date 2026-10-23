@@ -305,6 +305,69 @@ class C1IsolationIsStructural(unittest.TestCase):
         for prefix in (h.watcher_policy.WATCHER_GCP_PREFIX, h.watcher_policy.WATCHER_K8S_PREFIX):
             self.assertEqual(proxy.required_roles(prefix + "x"), (proxy.CALLER_ROLE_WATCHER,), prefix)
 
+    def test_C1_the_watcher_reads_by_name_only_the_reconciler_kinds_the_agent_can_read(self) -> None:
+        """The drift join's custom-resource kinds are the agent's own grant.
+
+        The broker lets the drift detector's join read a GitOps reconciler's
+        sync object by name (watcher_policy.RECONCILER_NAMED_READS), and the
+        operator grants the agent's minimal ClusterRole get/list/watch on the
+        same kinds (#2987). Two modules, so no single test compiles both: a
+        kind added to either side alone either relays an object the agent was
+        never granted or leaves a granted kind unenriched. Every custom-resource
+        kind (a group not on the built-in list below) in the rendered minimal
+        role, on every fixture, is a reconciler kind the join may read, and the
+        reverse, each with get.
+        """
+        expected = set(h.watcher_policy.RECONCILER_NAMED_READS)
+        self.assertTrue(expected, "the reconciler table is empty")
+
+        # Built-in groups by name, not by suffix: a CRD can live under
+        # *.k8s.io too (gateway.networking.k8s.io, snapshot.storage.k8s.io),
+        # and a suffix rule would wave it through on both sides. A built-in
+        # group new to the role or the table fails loudly here, and the fix
+        # is to add it to this list.
+        builtin = frozenset({
+            "", "admissionregistration.k8s.io", "apiextensions.k8s.io", "apps", "autoscaling",
+            "batch", "metrics.k8s.io", "networking.k8s.io", "policy", "rbac.authorization.k8s.io",
+        })
+
+        def custom(group: str) -> bool:
+            return group not in builtin
+
+        # The broker enforces WATCHER_NAMED_READS; the reconciler table is the
+        # only custom-resource part of it, and that is what keeps the two in
+        # step rather than a kind added to the wider table directly.
+        relayed = {kind for kind in h.watcher_policy.WATCHER_NAMED_READS if custom(kind[0])}
+        self.assertEqual(expected, relayed, "a custom-resource kind is relayed outside RECONCILER_NAMED_READS")
+
+        fixtures = h.golden_documents()
+        self.assertTrue(fixtures, "no golden fixtures to read")
+        for fixture, documents in fixtures.items():
+            roles = [
+                d for d in h.objects_of_kind(documents, "ClusterRole")
+                if d["metadata"]["name"].startswith("kubeagents:minimal:")
+            ]
+            with self.subTest(fixture=fixture):
+                self.assertEqual(len(roles), 1, "no single minimal ClusterRole rendered")
+                rules = roles[0].get("rules") or []
+                for rule in rules:
+                    self.assertNotIn("*", rule.get("apiGroups") or [], "a wildcard API group in the minimal role")
+                granted = {
+                    (group, resource)
+                    for rule in rules
+                    if {"get", "*"} & set(rule.get("verbs") or [])
+                    for group in rule.get("apiGroups") or []
+                    if custom(group)
+                    for resource in rule.get("resources") or []
+                }
+                self.assertEqual(
+                    expected,
+                    granted,
+                    "the agent's custom-resource reads and the drift join's reconciler kinds differ. "
+                    "If the role gained a built-in group, add it to builtin here; otherwise, unless the kind is a GitOps sync object, "
+                    "do not widen RECONCILER_NAMED_READS, which widens what the broker relays",
+                )
+
     def test_C1_the_platform_pubsub_relay_reaches_only_the_configured_subscriptions(self) -> None:
         """The gateway's Pub/Sub platform adapter pulls through the broker, and only its own subscriptions.
 

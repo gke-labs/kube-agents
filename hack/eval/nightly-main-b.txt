@@ -32,6 +32,7 @@ obtainability-planted-orphan-service
 fleet-audit-unchanged-finding-keeps-wording
 first-install-hello-running
 first-install-hello-done
+fleet-audit-unread-target-keeps-finding
 gitops-drift-backlog-digest
 # One of the two CUJ 1 halves registered on 2026-10-20 (#2889). With both in
 # main-a, alongside gitops-drift-backlog-digest, its chain is 9750s against

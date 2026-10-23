@@ -333,6 +333,11 @@ entry, or the document carrying it. This does not touch the byte-for-byte claim 
 manifest-less run: a body main wrote lists in its marker exactly what its findings section
 rendered, so the difference is empty and the run is what it was.
 
+The held span can also hold rows under _Not re-checked this run_: previous findings on a target
+that a findings run over a gap did not check ([ledger design §7.4](fleet-audit-issue-ledger.md)).
+Their ids are in the marker and not in the held-id list, so a manifest-less run does not carry
+them; the next run decides again from its own scope.
+
 The rows a manifest-less run carries render under the same heading with their own wording: held
 from a previous run's manifest, this run passed none and cannot release them, and a
 _Last recorded_ line naming the collector's last recorded command where the previous row had one
