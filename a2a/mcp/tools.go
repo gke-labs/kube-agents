@@ -99,10 +99,7 @@ func SendMessageTool(bus TurnBus, convs *Conversations) Tool {
 // token and renders what came of it: the gateway's notices, and the turn's
 // task as it stands after wait.
 func sendAndWait(ctx context.Context, bus TurnBus, convs *Conversations, alias, token, text string, wait time.Duration) (string, error) {
-	// A token names the conversation whatever name came with it, so the
-	// answer is labelled by the token rather than by a name it may not have.
-	byToken := token != "" || strings.HasPrefix(alias, consoleConversationPrefix)
-	token, err := convs.Resolve(alias, token)
+	token, byToken, err := convs.ResolveCall(alias, token)
 	if err != nil {
 		return "", err
 	}
@@ -345,7 +342,7 @@ func TaskControlTool(bus TurnBus, convs *Conversations) Tool {
 				writeTask(&sb, ref, task)
 				return sb.String(), nil
 			case actionStop:
-				token, err := convs.Resolve(a.Conversation, a.ConversationToken)
+				token, byToken, err := convs.ResolveCall(a.Conversation, a.ConversationToken)
 				if err != nil {
 					return "", err
 				}
@@ -354,7 +351,7 @@ func TaskControlTool(bus TurnBus, convs *Conversations) Tool {
 					return "", err
 				}
 				var sb strings.Builder
-				writeConversation(&sb, a.Conversation, token, a.ConversationToken != "")
+				writeConversation(&sb, a.Conversation, token, byToken)
 				sb.WriteString("Sent stop.\n")
 				writeNotices(&sb, res.Notices)
 				return sb.String(), nil

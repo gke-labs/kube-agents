@@ -181,11 +181,19 @@ func (c *Conversations) WithEvents(events *Events) *Conversations {
 // otherwise the alias's, minted on first use. The conversation is listened
 // to from then on.
 func (c *Conversations) Resolve(alias, token string) (string, error) {
-	t, named, evicted, err := c.resolve(alias, token)
+	t, _, err := c.ResolveCall(alias, token)
+	return t, err
+}
+
+// ResolveCall is Resolve, also reporting whether the call named its
+// conversation by token, so its answer is labelled by the token rather than
+// by a name it may not have.
+func (c *Conversations) ResolveCall(alias, token string) (string, bool, error) {
+	t, named, byToken, evicted, err := c.resolve(alias, token)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
-	return t, c.listen(t, named, evicted)
+	return t, byToken, c.listen(t, named, evicted)
 }
 
 // listen tells events of a conversation resolved and of one the table
@@ -198,12 +206,15 @@ func (c *Conversations) listen(token string, named bool, evicted string) error {
 	return nil
 }
 
-// resolve is Resolve's table work: the token, whether the table holds it by
-// a name, and the token of an alias forgotten to make room.
-func (c *Conversations) resolve(alias, token string) (string, bool, string, error) {
+// resolve is ResolveCall's table work: the token, whether the table holds it
+// by a name, whether the call named it by token, and the token of an alias
+// forgotten to make room.
+func (c *Conversations) resolve(alias, token string) (string, bool, bool, string, error) {
 	// A conversation's token given as its name, as list shows it
-	// (console:<token>), is the token: never a new name spelled like one.
-	if token == "" && strings.HasPrefix(alias, consoleConversationPrefix) {
+	// (console:<token>) or bare, is the token: never a new name spelled like
+	// one, whether or not this table still knows it (after a delete, an
+	// eviction or a restart, the token is what a caller falls back to).
+	if token == "" && (strings.HasPrefix(alias, consoleConversationPrefix) || isMintedToken(alias)) {
 		alias, token = "", alias
 	}
 	if token != "" {
@@ -211,30 +222,47 @@ func (c *Conversations) resolve(alias, token string) (string, bool, string, erro
 		// names it.
 		token = strings.TrimPrefix(token, consoleConversationPrefix)
 		if !lib.ValidSubjectToken(token) {
-			return "", false, "", fmt.Errorf("%q is not a conversation token", token)
+			return "", false, false, "", fmt.Errorf("%q is not a conversation token", token)
 		}
-		return token, false, "", nil
+		// A call by token is a use of the name that holds it, if any.
+		c.mu.Lock()
+		if a, ok := c.aliasOfTokenLocked(token); ok {
+			c.touchLocked(c.byAlias[a])
+		}
+		c.mu.Unlock()
+		return token, false, true, "", nil
 	}
 	if alias == "" {
 		alias = DefaultConversation
 	}
 	if err := checkAlias(alias); err != nil {
-		return "", false, "", err
+		return "", false, false, "", err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if e, ok := c.byAlias[alias]; ok {
 		c.touchLocked(e)
-		return e.token, true, "", nil
+		return e.token, true, false, "", nil
 	}
-	// So is a known conversation's bare token, as the original client took
-	// a name or a token in the same argument.
+	// So is a known conversation's bare token in any other shape (one a
+	// caller resumed by), as the original client took a name or a token in
+	// the same argument.
 	if a, ok := c.aliasOfTokenLocked(alias); ok {
 		c.touchLocked(c.byAlias[a])
-		return alias, true, "", nil
+		return alias, true, true, "", nil
 	}
 	t, evicted, err := c.addLocked(alias, "")
-	return t, err == nil, evicted, err
+	return t, err == nil, false, evicted, err
+}
+
+// isMintedToken reports whether s is spelled as this server mints tokens.
+func isMintedToken(s string) bool {
+	rest, ok := strings.CutPrefix(s, conversationTokenPrefix)
+	if !ok || len(rest) != 2*conversationTokenBytes {
+		return false
+	}
+	_, err := hex.DecodeString(rest)
+	return err == nil && strings.ToLower(rest) == rest
 }
 
 // aliasOfTokenLocked finds the alias whose conversation has token t.
@@ -388,8 +416,8 @@ func mintConversationToken() (string, error) {
 //
 // It also refuses what list could not show back as typed, so a name copied
 // from list is the same name: a token's console: prefix, backticks and pipes,
-// control and invisible (format) characters, and spaces at either end or
-// doubled.
+// control and invisible (format) characters, spaces at either end, doubled
+// or other than the plain one, and a token's own spelling.
 func checkAlias(alias string) error {
 	if n := utf8.RuneCountInString(alias); n > maxAliasRunes {
 		return fmt.Errorf("conversation name is %d characters; at most %d", n, maxAliasRunes)
@@ -397,8 +425,12 @@ func checkAlias(alias string) error {
 	if strings.HasPrefix(alias, consoleConversationPrefix) {
 		return fmt.Errorf("a name may not start with %q; pass a token as conversation_token", consoleConversationPrefix)
 	}
-	if strings.TrimSpace(alias) != alias || strings.Contains(alias, "  ") {
-		return errors.New("a conversation name may not start or end with spaces, or hold two in a row")
+	if isMintedToken(alias) {
+		return errors.New("a name may not be spelled like a conversation token; pass a token as conversation_token")
+	}
+	// list collapses every run of Unicode spaces to one ASCII space.
+	if strings.Join(strings.Fields(alias), " ") != alias {
+		return errors.New("a conversation name may not start or end with spaces, hold two in a row, or use a space other than the plain one")
 	}
 	for _, r := range alias {
 		if r == '`' || r == '|' || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
