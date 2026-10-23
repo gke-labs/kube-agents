@@ -295,9 +295,24 @@ class TestCaseDerivation(unittest.TestCase):
         self.assertEqual(case["ov_history"], [])
 
 
+class TestLaneExcluded(unittest.TestCase):
+    def test_the_inject_lanes_dropped_cases_are_named_once_each(self):
+        log = (
+            "EVAL_MODE_NEXT=1: running the matrix through the inject door (AGENT_TRANSPORT=inject, token from x)\n"
+            "AGENT_TRANSPORT=inject: case-c leaves the matrix -- excluded on this lane; the reason is in inject-lane-exclusions.txt\n"
+            "AGENT_TRANSPORT=inject: case-d leaves the matrix -- excluded on this lane; the reason is in inject-lane-exclusions.txt\n"
+            "AGENT_TRANSPORT=inject: case-c leaves the matrix -- excluded on this lane; the reason is in inject-lane-exclusions.txt\n"
+            "AGENT_TRANSPORT=inject: 2 task(s) remain in the matrix\n"
+            "Task case-a Result: [PASSED] (Duration: 1s)\n"
+            "  rep 1 report: AGENT_TRANSPORT=inject: case-e leaves the matrix -- excluded on this lane\n"
+        )
+        self.assertEqual(collect.parse_build_log(log)["lane_excluded"], ["case-c", "case-d"], "a report line is the agent's words, never the script's")
+
+
 class TestResilience(unittest.TestCase):
     def test_garbage_log_parses_to_nothing(self):
         parsed = collect.parse_build_log("no eval here\n\x00\xff{]] Task Result:\n")
+        self.assertEqual(parsed["lane_excluded"], [])
         self.assertEqual(parsed["tasks"], [])
         self.assertIsNone(parsed["project"])
         self.assertIsNone(parsed["eval_verdict"])
