@@ -7240,7 +7240,7 @@ def test_multi_replica_time_only_log_line_out_of_order_tails_corroborates_true()
 
 
 def test_fetch_live_litellm_log_command_and_options(monkeypatch: pytest.MonkeyPatch) -> None:
-    """_fetch_live_litellm_log issues kubectl logs with named constants and context."""
+    """_fetch_live_litellm_log issues kubectl logs with named constants, ignore-errors, env overrides, and context."""
     executed_cmd = []
 
     def _mock_run(cmd, capture_output, text, errors, timeout, check):
@@ -7251,6 +7251,9 @@ def test_fetch_live_litellm_log_command_and_options(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(harness, "_fetch_live_litellm_log", harness._fetch_live_litellm_log_impl)
     monkeypatch.setenv("AGENT_NAMESPACE", "custom-ns")
     monkeypatch.setenv("AGENT_CLUSTER_CONTEXT", "custom-ctx")
+    monkeypatch.setenv("LITELLM_LOG_POD_SELECTOR", "custom-selector")
+    monkeypatch.setenv("LITELLM_LOG_CONTAINER", "custom-container")
+    monkeypatch.setenv("LITELLM_LOG_TAIL_LINES", "12345")
 
     output = harness._fetch_live_litellm_log()
     assert output == "test-log-output\n"
@@ -7258,14 +7261,49 @@ def test_fetch_live_litellm_log_command_and_options(monkeypatch: pytest.MonkeyPa
         "kubectl",
         "logs",
         "-l",
-        "app=litellm",
+        "custom-selector",
         "-c",
-        "litellm-container",
+        "custom-container",
         "-n",
         "custom-ns",
         "--prefix",
-        "--tail=20000",
+        "--ignore-errors",
+        "--tail=12345",
         "--context",
         "custom-ctx",
     ]
+
+
+def test_undated_429_following_pre_window_stamp_in_same_pod_returns_none() -> None:
+    """An undated 429 line bracketed by pre-window and in-window timestamps in the same pod returns None."""
+    since = datetime(2026, 10, 19, 9, 30, 0, tzinfo=timezone.utc).timestamp()
+    log = (
+        "[pod/litellm-0] 09:00:00 - LiteLLM Proxy:INFO starting\n"
+        '[pod/litellm-0] INFO: 10.0.0.1:50000 - "POST /chat/completions HTTP/1.1" 429 Too Many Requests\n'
+        "[pod/litellm-0] 09:40:00 - LiteLLM Proxy:INFO traffic\n"
+    )
+    assert harness._scan_log_content_for_429(log, since=since) is None
+
+
+def test_telemetry_window_evaluated_per_pod_clipped_pod_returns_none() -> None:
+    """When one replica's tail is clipped (starts after since), scan returns None even if a quiet replica reaches pre-since."""
+    since = datetime(2026, 10, 19, 10, 0, 0, tzinfo=timezone.utc).timestamp()
+    log = (
+        "[pod/litellm-replica-a] 09:00:00 INFO: 200 OK GET /health\n"
+        "[pod/litellm-replica-b] 10:30:00 INFO: 200 OK POST /v1/chat/completions\n"
+        "[pod/litellm-replica-b] 10:45:00 INFO: 200 OK POST /v1/chat/completions\n"
+    )
+    assert harness._scan_log_content_for_429(log, since=since) is None
+
+
+def test_quiet_replica_pre_since_tail_does_not_inflate_wall_clock_or_accept_prior_day_429() -> None:
+    """A quiet replica whose tail is before since does not inflate log_until to tomorrow and admit yesterday's 429."""
+    since = datetime(2026, 10, 19, 10, 0, 0, tzinfo=timezone.utc).timestamp()
+    log = (
+        "[pod/litellm-replica-a] 15:00:00 - RateLimitError: 429 RESOURCE_EXHAUSTED\n"
+        "[pod/litellm-replica-a] 10:20:00 INFO: 200 OK GET /health\n"
+        "[pod/litellm-replica-b] 09:50:00 INFO: 200 OK GET /health\n"
+    )
+    assert harness._scan_log_content_for_429(log, since=since) is False
+
 

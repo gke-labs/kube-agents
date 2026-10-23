@@ -698,7 +698,16 @@ def _find_log_until(content: str, since: float | None) -> float | None:
                 )
                 if cand_same.timestamp() < since - 5.0:
                     cand_next = cand_same + timedelta(days=1)
-                    pod_tails[pod_key] = cand_next.timestamp() + 5.0
+                    if abs(time.time() - since) < 24 * 3600:
+                        if cand_next.timestamp() <= time.time() + 5.0:
+                            pod_tails[pod_key] = cand_next.timestamp() + 5.0
+                        else:
+                            pod_tails[pod_key] = cand_same.timestamp() + 5.0
+                    else:
+                        if cand_next.timestamp() - since <= 6 * 3600:
+                            pod_tails[pod_key] = cand_next.timestamp() + 5.0
+                        else:
+                            pod_tails[pod_key] = cand_same.timestamp() + 5.0
                 else:
                     pod_tails[pod_key] = cand_same.timestamp() + 5.0
                 continue
@@ -783,62 +792,100 @@ def _scan_log_content_for_429(
 
     if until is None and since is not None:
         log_until = _find_log_until(content, since)
-        if log_until is not None:
-            if abs(time.time() - since) < 24 * 3600:
-                until = max(time.time() + 5.0, log_until)
-            else:
-                until = log_until
-        else:
+        if abs(time.time() - since) < 24 * 3600:
             until = time.time() + 5.0
+        else:
+            until = log_until
 
-    current_ts: float | None = None
+    # Group lines by pod stream to maintain replica isolation
+    lines_by_pod: dict[str | None, list[str]] = {}
     current_pod: str | None = None
-    found_any_timestamp = False
-    has_undated_429 = False
-    min_ts: float | None = None
-    max_ts: float | None = None
-
     for raw_line in content.splitlines():
         line = _ANSI_ESCAPE_PATTERN.sub("", raw_line)
         m_pod = _POD_PREFIX_PATTERN.match(line)
         if m_pod:
-            pod_name = m_pod.group("pod")
-            if pod_name != current_pod:
-                current_pod = pod_name
-                current_ts = None
+            current_pod = m_pod.group("pod")
+        lines_by_pod.setdefault(current_pod, []).append(line)
 
-        ts = _parse_log_line_timestamp(line, since=since, until=until)
-        if ts is not None:
-            current_ts = ts
-            found_any_timestamp = True
-            if min_ts is None or ts < min_ts:
-                min_ts = ts
-            if max_ts is None or ts > max_ts:
-                max_ts = ts
+    has_undated_429 = False
+    traffic_pods: list[str | None] = []
+    pod_min_ts: dict[str | None, float | None] = {}
+    pod_max_ts: dict[str | None, float | None] = {}
 
-        if _LITELLM_429_PATTERN.search(line):
+    for pod, lines in lines_by_pod.items():
+        pod_has_traffic = any(_LITELLM_TRAFFIC_PATTERN.search(l) for l in lines)
+        if pod_has_traffic:
+            traffic_pods.append(pod)
+
+        # Parse explicit timestamps for all lines in this pod
+        parsed_ts: list[float | None] = [
+            _parse_log_line_timestamp(l, since=since, until=until) for l in lines
+        ]
+
+        valid_ts = [t for t in parsed_ts if t is not None]
+        if valid_ts:
+            pod_min_ts[pod] = min(valid_ts)
+            pod_max_ts[pod] = max(valid_ts)
+        else:
+            pod_min_ts[pod] = None
+            pod_max_ts[pod] = None
+
+        # Build prefix and suffix timestamp lookups for bracket bounding
+        n = len(lines)
+        prev_ts: list[float | None] = [None] * n
+        last_t: float | None = None
+        for i in range(n):
+            if parsed_ts[i] is not None:
+                last_t = parsed_ts[i]
+            prev_ts[i] = last_t
+
+        next_ts: list[float | None] = [None] * n
+        next_t: float | None = None
+        for i in range(n - 1, -1, -1):
+            if parsed_ts[i] is not None:
+                next_t = parsed_ts[i]
+            next_ts[i] = next_t
+
+        for i, line in enumerate(lines):
+            if not _LITELLM_429_PATTERN.search(line):
+                continue
+
             if session_id and session_id in line:
                 return True
-            if current_ts is not None and since is not None:
-                if current_ts >= (since - 5.0):
+
+            line_ts = parsed_ts[i]
+            if line_ts is not None:
+                if since is not None:
+                    if line_ts >= (since - 5.0):
+                        return True
+                else:
                     return True
             else:
-                has_undated_429 = True
+                # Undated 429 line
+                if since is not None:
+                    p_ts = prev_ts[i]
+                    n_ts = next_ts[i]
+                    if p_ts is not None and p_ts >= (since - 5.0):
+                        return True
+                    elif n_ts is not None and n_ts < (since - 5.0):
+                        pass
+                    else:
+                        has_undated_429 = True
+                else:
+                    has_undated_429 = True
 
     if since is not None:
-        if not found_any_timestamp or min_ts is None or max_ts is None:
-            return None
-        if min_ts > since:
-            return None
-        if max_ts < (since - 5.0):
-            return None
         if has_undated_429:
             return None
-        if not _LITELLM_429_PATTERN.search(content):
-            return False
-        if max_ts >= (since - 5.0):
-            return False
-        return None
+        if not traffic_pods:
+            return None
+        for p in traffic_pods:
+            p_min = pod_min_ts.get(p)
+            if p_min is None or p_min > since:
+                return None
+        if not any((p_max := pod_max_ts.get(p)) is not None and p_max >= (since - 5.0) for p in traffic_pods):
+            return None
+        return False
 
     if has_undated_429:
         return None
@@ -876,17 +923,24 @@ def _extract_infra_failure_reason(text: str | None) -> str | None:
 
 def _fetch_live_litellm_log_impl(timeout: float = _LITELLM_LOG_FETCH_TIMEOUT) -> str | None:
     ns = os.environ.get("AGENT_NAMESPACE", _LITELLM_NAMESPACE_DEFAULT)
+    label_selector = os.environ.get("LITELLM_LOG_POD_SELECTOR", _LITELLM_LABEL_SELECTOR)
+    container = os.environ.get("LITELLM_LOG_CONTAINER", _LITELLM_CONTAINER_NAME)
+    try:
+        tail_lines = int(os.environ.get("LITELLM_LOG_TAIL_LINES", str(_LITELLM_LOG_TAIL_LINES)))
+    except ValueError:
+        tail_lines = _LITELLM_LOG_TAIL_LINES
     cmd = [
         "kubectl",
         "logs",
         "-l",
-        _LITELLM_LABEL_SELECTOR,
+        label_selector,
         "-c",
-        _LITELLM_CONTAINER_NAME,
+        container,
         "-n",
         ns,
         "--prefix",
-        f"--tail={_LITELLM_LOG_TAIL_LINES}",
+        "--ignore-errors",
+        f"--tail={tail_lines}",
     ]
     context = os.environ.get("AGENT_CLUSTER_CONTEXT")
     if context:
