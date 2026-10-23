@@ -79,7 +79,10 @@ STAGES_KEY = "stages"
 FLEET_PROJECTS_KEY = "fleetProjects"
 SOAK_KEY = "soakDuration"
 CLUSTER_SELECTOR_KEY = "clusterSelector"
-SELECTOR_EXPRESSION_KEY = "expression"
+# The API returns the stage's selector as `clusterSelector.labelSelector` (a live listing of
+# 2026-10-23); `expression` is the field the discovery document names, kept as the fallback.
+SELECTOR_EXPRESSION_KEY = "labelSelector"
+SELECTOR_EXPRESSION_FALLBACK_KEY = "expression"
 RESOURCE_NAME_SEPARATOR = "/"
 FLEET_PROJECT_PREFIX = "projects/"
 KIND_ROLLOUT_SEQUENCE = "RolloutSequence"
@@ -208,7 +211,7 @@ def stage_record(stage) -> dict:
     stage = stage if isinstance(stage, dict) else {}
     projects = [str(p)[len(FLEET_PROJECT_PREFIX) :] if str(p).startswith(FLEET_PROJECT_PREFIX) else str(p) for p in (stage.get(FLEET_PROJECTS_KEY) or []) if p]
     selector = stage.get(CLUSTER_SELECTOR_KEY)
-    expression = selector.get(SELECTOR_EXPRESSION_KEY) if isinstance(selector, dict) else None
+    expression = (selector.get(SELECTOR_EXPRESSION_KEY) or selector.get(SELECTOR_EXPRESSION_FALLBACK_KEY)) if isinstance(selector, dict) else None
     soak = stage.get(SOAK_KEY)
     return {"fleet_projects": projects, "selector": str(expression) if expression else None, "soak": str(soak) if soak else None}
 
