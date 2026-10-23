@@ -76,8 +76,8 @@ class BoardProbe(unittest.TestCase):
         self.board([self.card("running")])
         self.assertEqual(self.probe(), "1 0")
 
-    def test_each_terminal_status_counts_as_finished(self):
-        for status in ("done", "blocked", "archived", "failed", "cancelled"):
+    def test_a_status_with_a_result_counts_as_finished(self):
+        for status in ("done", "blocked", "archived"):
             with self.subTest(status=status):
                 if self.db.exists():
                     self.db.unlink()
@@ -92,10 +92,19 @@ class BoardProbe(unittest.TestCase):
                 self.board([self.card(status)])
                 self.assertEqual(self.probe(), "1 0")
 
-    def test_a_failed_card_ends_the_wait_rather_than_sitting_out_the_ceiling(self):
-        """failed and cancelled are Hermes' terminal failures, as harness.py names them."""
-        self.board([self.card("failed")])
-        self.assertEqual(self.probe(), "1 1")
+    def test_a_failed_or_cancelled_card_is_settled_but_not_a_result(self):
+        """Terminal, so the wait ends -- but 2, not 1: there is no triage in it.
+
+        Reporting it as finished would hand the agent a card with nothing to
+        read, and the prompts look for running, done and blocked, so the agent
+        would find nothing or the previous repetition's card.
+        """
+        for status in ("failed", "cancelled"):
+            with self.subTest(status=status):
+                if self.db.exists():
+                    self.db.unlink()
+                self.board([self.card(status)])
+                self.assertEqual(self.probe(), "1 2")
 
     def test_only_the_newest_matching_card_decides(self):
         """The prompt sends the agent to the newest card, so that is the one waited on."""

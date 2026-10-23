@@ -999,6 +999,14 @@ echo "RETURNED $?"
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertEqual(self.reads(), 2)
 
+    def test_a_card_that_ended_without_a_result_fails_the_plant(self):
+        """Failed or cancelled is the install's failure: exclude the rep, do not grade it."""
+        proc = self.wait(["1 0", "1 2"])
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("ended failed or cancelled", proc.stderr)
+        self.assertNotIn("RETURNED", proc.stdout)
+        self.assertEqual(self.reads(), 2)
+
     def test_a_board_without_status_hands_over_at_once_with_a_warning(self):
         proc = self.wait(["1 -1"])
         self.assertEqual(proc.returncode, 0, proc.stderr)

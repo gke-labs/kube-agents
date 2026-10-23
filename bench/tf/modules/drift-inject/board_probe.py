@@ -17,9 +17,13 @@
 Run inside the agent container by `drift_wait_for_card`, which pipes this file
 to the pod's interpreter on stdin and passes the insert id as argv[1]. It prints
 one line, `<matching> <finished>`, and nothing else; the caller polls it.
-`<finished>` is 1 when the newest matching card is in a terminal status and 0
-when it is not, and -1 when the board has no `status` column to read, so the
-caller can tell "not finished" from "cannot tell".
+`<finished>` says how the newest matching card stands: 0 still running, 1
+finished with a result to read (done, blocked, archived), 2 finished without
+one (failed, cancelled), and -1 when the board has no `status` column, so the
+caller can tell "not finished" from "cannot tell". 1 and 2 are kept apart
+because only one of them leaves the agent a triage to read: a card that failed
+or was cancelled is the install's failure, and the caller fails the plant on it
+rather than handing the agent a card with nothing in it.
 
 The newest card rather than any of them, because that is the one the drift
 cases' prompts send the agent to. If more than one card carries the id, a
@@ -48,12 +52,15 @@ BOARD = os.environ.get("DRIFT_BOARD_URI", "file:/opt/data/kanban.db?mode=ro")
 TEXT_COLUMN_TYPE = "TEXT"
 TASKS_TABLE = "tasks"
 STATUS_COLUMN = "status"
-# The statuses after which a card's result will not change: Hermes' terminal
-# set, the same five bench/kube_agents_bench/harness.py's _TERMINAL_STATUSES
-# and agents/platform/scripts/kanban_workspace_gc.py name. failed and cancelled
-# matter as much as done: a card that failed and is left out of this set is
-# waited on to the ceiling and then reported as still running.
-FINISHED_STATUSES = ("done", "blocked", "archived", "failed", "cancelled")
+# Hermes' terminal statuses, the same five bench/kube_agents_bench/harness.py's
+# _TERMINAL_STATUSES and agents/platform/scripts/kanban_workspace_gc.py name,
+# split by whether the card left a result. The first three are the ones the
+# drift prompts accept and the sibling fixtures that wait on a card treat as
+# success; the last two must end the wait too -- left out, a failed card is
+# waited on to the ceiling -- but as a failure, not as something to read.
+SETTLED_WITH_RESULT = ("done", "blocked", "archived")
+SETTLED_WITHOUT_RESULT = ("failed", "cancelled")
+RUNNING, FINISHED, FAILED = 0, 1, 2
 # Orders matching cards so the newest is read; absent, any row stands for all.
 CREATED_COLUMN = "created_at"
 UNKNOWN = -1
@@ -80,7 +87,11 @@ def probe(insert_id):
         newest = conn.execute(
             f'SELECT "{STATUS_COLUMN}" FROM {TASKS_TABLE} WHERE {where} {order} LIMIT 1', params
         ).fetchone()[0]
-        return matching, 1 if newest in FINISHED_STATUSES else 0
+        if newest in SETTLED_WITH_RESULT:
+            return matching, FINISHED
+        if newest in SETTLED_WITHOUT_RESULT:
+            return matching, FAILED
+        return matching, RUNNING
     except sqlite3.Error:
         return 0, 0
 

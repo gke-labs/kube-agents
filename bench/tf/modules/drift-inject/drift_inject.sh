@@ -125,8 +125,10 @@ DRIFT_PROBE_STDERR="probe.err"
 # instead of losing the repetition. Sized above the slowest card the recorder
 # nightly has shown these cases, and overridable per stack.
 DRIFT_DEFAULT_CARD_FINISH_TIMEOUT=900
-# What the probe prints for "finished" when the board has no status column.
+# What the probe prints for "finished" when the board has no status column, and
+# when the newest card ended failed or cancelled -- settled, with no triage in it.
 DRIFT_FINISHED_UNKNOWN=-1
+DRIFT_FINISHED_WITHOUT_RESULT=2
 DRIFT_BOARD_PROBE="board_probe.py"
 DRIFT_BUILD_PAYLOAD="build_payload.py"
 
@@ -451,7 +453,17 @@ drift_wait_for_card() {
       echo "WARNING: the board has no status column to read, so this run cannot wait for the card to finish; the agent's turn starts with the card in whatever state it is in." >&2
       return 0
     fi
-    if [ "$finished" -ge 1 ]; then
+    if [ "$finished" -eq "$DRIFT_FINISHED_WITHOUT_RESULT" ]; then
+      # The pipeline failed rather than the agent: the front-door worker's card
+      # ended with nothing in it, so there is no triage to read. Failing the
+      # plant excludes the repetition instead of grading an agent against it,
+      # which is what the sibling fixtures that wait on a card do and what the
+      # appearance timeout above does for the same reason.
+      echo "ERROR: the triage card for $drift_insert_id ended failed or cancelled ${elapsed}s after it appeared, so there is no triage for the agent to read. This is the install, not the agent; failing the plant so the repetition is excluded rather than graded." >&2
+      drift_report_probe_error
+      exit 1
+    fi
+    if [ "$finished" -eq 1 ]; then
       echo "Triage card for $drift_insert_id finished after a further ${elapsed}s."
       return 0
     fi
