@@ -126,6 +126,11 @@ OOBE_JOB_ID = "oobe"
 # is easy to lose; keeping it means a re-send is a `cat`, not a re-scan.
 DELIVERED_REPORT_NAME = "INVENTORY.delivered.md"
 REPORT_NAME = "INVENTORY.md"
+# Touched once the sweep's findings are in the findings queue (or the sweep found
+# none), before the claim: the record that the fleet was checked, which the
+# Slack Home tab's board reads (agents/platform/scripts/board_snapshot.py) so a
+# clean cluster is not drawn as unchecked after a delivery that never posts.
+FINDINGS_REGISTERED_MARKER = ".bootstrap_findings_registered"
 
 # The items the report lists, written by ``inventory_findings.py select``
 # (its DEFAULT_SHOWN_PATH and the keys below; test_bootstrap_onboarding_scripts.py
@@ -680,6 +685,7 @@ def _register_findings(data_dir: Path, in_sandbox: bool, no_ranking: bool | None
             return suppressed
         items = extracted[ITEMS_KEY]
         if not items:
+            _mark_registered(data_dir)
             return suppressed  # a clean fleet: nothing to register, and no scores file
         raw_scores = _read_json_beside(data_dir, in_sandbox, SCORES_NAME)
         if raw_scores is None:
@@ -692,12 +698,14 @@ def _register_findings(data_dir: Path, in_sandbox: bool, no_ranking: bool | None
         sys.stderr.write(f"bootstrap_delivery: could not read the sweep's findings; registering nothing: {detail}\n")
         return suppressed
     endpoint = _findings_endpoint()
+    refused = 0
     for where, batch, scope in batches:
         try:
             result = inventory_findings.post_batch(endpoint, batch, scope)
         except urllib.error.HTTPError as e:
             # This cluster only.
             sys.stderr.write(f"bootstrap_delivery: the findings queue refused {where}'s findings: {e.code}\n")
+            refused += 1
             continue
         except Exception as e:
             sys.stderr.write(
@@ -709,7 +717,18 @@ def _register_findings(data_dir: Path, in_sandbox: bool, no_ranking: bool | None
         for entry in outcomes if isinstance(outcomes, list) else []:
             if isinstance(entry, dict) and entry.get("outcome") == SUPPRESSED:
                 suppressed.add(str(entry.get("id")))
+    # A refused batch is a cluster the queue does not hold, so the fleet is not checked yet.
+    if not refused:
+        _mark_registered(data_dir)
     return suppressed
+
+
+def _mark_registered(data_dir: Path) -> None:
+    """Record that the sweep's findings reached the queue; best effort, never raises."""
+    try:
+        (data_dir / FINDINGS_REGISTERED_MARKER).touch(exist_ok=True)
+    except OSError as e:
+        sys.stderr.write(f"bootstrap_delivery: could not touch {FINDINGS_REGISTERED_MARKER}: {e}\n")
 
 
 def _post_surfaced(endpoint: str, finding_id: str, body: dict) -> None:

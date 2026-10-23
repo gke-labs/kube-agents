@@ -20,29 +20,33 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+
+	"github.com/gke-labs/kube-agents/a2a/mcpproto"
 )
 
+// The wire constants and types are mcpproto's, shared with MCP clients; the
+// names here keep this package's own spelling of them.
 const (
-	jsonRPCVersion = "2.0"
+	jsonRPCVersion = mcpproto.JSONRPCVersion
 
 	// ServerName and ServerVersion are what initialize reports.
 	ServerName    = "kube-agents"
 	ServerVersion = "0.5.0"
 
-	methodInitialize    = "initialize"
-	methodPing          = "ping"
-	methodToolsList     = "tools/list"
-	methodToolsCall     = "tools/call"
-	methodResourcesList = "resources/list"
-	methodPromptsList   = "prompts/list"
+	methodInitialize    = mcpproto.MethodInitialize
+	methodPing          = mcpproto.MethodPing
+	methodToolsList     = mcpproto.MethodToolsList
+	methodToolsCall     = mcpproto.MethodToolsCall
+	methodResourcesList = mcpproto.MethodResourcesList
+	methodPromptsList   = mcpproto.MethodPromptsList
 
-	rpcErrParseError     = -32700
-	rpcErrInvalidRequest = -32600
-	rpcErrMethodNotFound = -32601
-	rpcErrInvalidParams  = -32602
-	rpcErrInternal       = -32603
+	rpcErrParseError     = mcpproto.ErrParseError
+	rpcErrInvalidRequest = mcpproto.ErrInvalidRequest
+	rpcErrMethodNotFound = mcpproto.ErrMethodNotFound
+	rpcErrInvalidParams  = mcpproto.ErrInvalidParams
+	rpcErrInternal       = mcpproto.ErrInternal
 
-	contentTypeText = "text"
+	contentTypeText = mcpproto.ContentTypeText
 
 	msgInvalidFrame   = "invalid JSON-RPC frame"
 	msgMissingMethod  = "missing method"
@@ -58,52 +62,36 @@ const (
 )
 
 // supportedProtocolVersions are the MCP revisions this server speaks, newest
-// first. initialize answers with the client's requested revision when it is
-// one of these and with the newest otherwise, which is the spec's negotiation:
-// the client then decides whether it can proceed.
-var supportedProtocolVersions = []string{"2025-06-18", "2025-03-26", "2024-11-05"}
+// first (mcpproto.SupportedProtocolVersions). initialize answers with the
+// client's requested revision when it is one of these and with the newest
+// otherwise, which is the spec's negotiation: the client then decides whether
+// it can proceed.
+var supportedProtocolVersions = mcpproto.SupportedProtocolVersions()
 
+// rpcRequest is mcpproto.Request plus the two fields that mark a frame as a
+// response from the client, which this server sends no requests to and so
+// answers with nothing. That detection is the server's, so the fields are not
+// in the shared type.
 type rpcRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      json.RawMessage `json:"id,omitempty"`
 	Method  string          `json:"method"`
 	Params  json.RawMessage `json:"params,omitempty"`
-	// Result and Error mark a frame as a response from the client, which
-	// this server sends no requests to and so answers with nothing.
-	Result json.RawMessage `json:"result,omitempty"`
-	Error  json.RawMessage `json:"error,omitempty"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   json.RawMessage `json:"error,omitempty"`
 }
 
-type rpcResponse struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id"`
-	Result  any             `json:"result,omitempty"`
-	Error   *rpcError       `json:"error,omitempty"`
-}
+type (
+	rpcResponse = mcpproto.Response
+	rpcError    = mcpproto.Error
 
-type rpcError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-}
-
-// ToolDefinition is one entry of tools/list.
-type ToolDefinition struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	InputSchema map[string]any `json:"inputSchema"`
-}
-
-// TextContent is one content block of a tool result.
-type TextContent struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
-}
-
-// CallToolResult is what tools/call answers with.
-type CallToolResult struct {
-	Content []TextContent `json:"content"`
-	IsError bool          `json:"isError,omitempty"`
-}
+	// ToolDefinition is one entry of tools/list.
+	ToolDefinition = mcpproto.ToolDefinition
+	// TextContent is one content block of a tool result.
+	TextContent = mcpproto.TextContent
+	// CallToolResult is what tools/call answers with.
+	CallToolResult = mcpproto.CallToolResult
+)
 
 // Tool is one registered tool: its schema and the function that runs it. The
 // function returns markdown for the caller to read; an error becomes an

@@ -35,7 +35,12 @@ target ([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md); on the inject door the
 grades through, the opening task from the door accepting it to its terminal), and the wall
 clock, with a link to the dashboard's Nightly report
 (`nightly.html`); a night Prow cut short, one still running, or no night
-since the day before yesterday, says so instead of numbers. A second line says the same of the
+since the day before yesterday, says so instead of numbers. A night can be
+the builds of up to three periodics (the main job, the main-b job when the
+main part runs as two halves, and the writers job), reported as one night:
+the line names a part that is missing, still running or cut short, and the
+night counts as cut short when its main or main-b part is.
+A second line says the same of the
 today-mode nightly kept as the rollback check (`ci-kube-agents-eval-nightly-today`, tier
 `nightly-today` in `data.json`), compared with its own night before and linked to its Prow job
 history, since the dashboard has no page for it.

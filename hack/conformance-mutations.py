@@ -631,6 +631,46 @@ Mutation(
         "watch for a namespace nobody excluded",
     ),
     Mutation(
+        "C1-watcher-reads-a-reconciler-kind-the-agent-cannot",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        ("configsync.gke.io", "reposyncs"),\n',
+         '        ("configsync.gke.io", "reposyncs"),\n        ("helm.toolkit.fluxcd.io", "helmreleases"),\n'),
+        "test_C1_the_watcher_reads_by_name_only_the_reconciler_kinds_the_agent_can_read",
+        "let the drift join read Flux HelmReleases too, for richer drift context "
+        "-- the broker relays an object, inline values and all, that the agent's "
+        "own role was deliberately never granted",
+    ),
+    Mutation(
+        "C1-watcher-relays-a-custom-kind-outside-the-reconciler-table",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        ("rbac.authorization.k8s.io", "roles"),\n',
+         '        ("rbac.authorization.k8s.io", "roles"),\n        ("cert-manager.io", "certificates"),\n'),
+        "test_C1_the_watcher_reads_by_name_only_the_reconciler_kinds_the_agent_can_read",
+        "add cert-manager Certificates to the watcher table for drift on TLS "
+        "objects -- straight into WATCHER_NAMED_READS, so the reconciler table "
+        "and the agent's role never hear about it",
+    ),
+    Mutation(
+        "C1-watcher-relays-a-crd-under-a-k8s-io-group",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        ("rbac.authorization.k8s.io", "roles"),\n',
+         '        ("rbac.authorization.k8s.io", "roles"),\n        ("gateway.networking.k8s.io", "httproutes"),\n'),
+        "test_C1_the_watcher_reads_by_name_only_the_reconciler_kinds_the_agent_can_read",
+        "add Gateway API HTTPRoutes to the watcher table, which look built-in by "
+        "their .k8s.io suffix -- the broker relays a CRD the agent's role was "
+        "never granted, and a suffix rule waves it through",
+    ),
+    Mutation(
+        "C1-agent-role-drops-a-reconciler-kind",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ("      - rootsyncs\n      - reposyncs\n",
+         "      - rootsyncs\n"),
+        "test_C1_the_watcher_reads_by_name_only_the_reconciler_kinds_the_agent_can_read",
+        "trim RepoSyncs from the agent's role as unused by the Helm skill -- "
+        "the drift join still enriches them, so the two grants no longer say "
+        "the same thing",
+    ),
+    Mutation(
         "C1-watcher-route-allows-a-list",
         "agents/platform/scripts/watcher_policy.py",
         ('_EVENTS_LIST = re.compile(r"api/v1/events")\n',

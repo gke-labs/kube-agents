@@ -1122,6 +1122,44 @@
                 "enabled": {
                   "type": "boolean"
                 },
+                "botTokenSecretRef": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "maxLength": 253,
+                      "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+                    },
+                    "key": {
+                      "type": "string",
+                      "maxLength": 253,
+                      "pattern": "^$|^[-._a-zA-Z0-9]+$",
+                      "not": {
+                        "pattern": "^\\.$|^\\.\\."
+                      }
+                    }
+                  }
+                },
+                "appTokenSecretRef": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "maxLength": 253,
+                      "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+                    },
+                    "key": {
+                      "type": "string",
+                      "maxLength": 253,
+                      "pattern": "^$|^[-._a-zA-Z0-9]+$",
+                      "not": {
+                        "pattern": "^\\.$|^\\.\\."
+                      }
+                    }
+                  }
+                },
                 "allowedUsers": {
                   "type": "array",
                   "items": {
@@ -1142,6 +1180,44 @@
               "properties": {
                 "enabled": {
                   "type": "boolean"
+                },
+                "appIdSecretRef": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "maxLength": 253,
+                      "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+                    },
+                    "key": {
+                      "type": "string",
+                      "maxLength": 253,
+                      "pattern": "^$|^[-._a-zA-Z0-9]+$",
+                      "not": {
+                        "pattern": "^\\.$|^\\.\\."
+                      }
+                    }
+                  }
+                },
+                "appPasswordSecretRef": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "maxLength": 253,
+                      "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+                    },
+                    "key": {
+                      "type": "string",
+                      "maxLength": 253,
+                      "pattern": "^$|^[-._a-zA-Z0-9]+$",
+                      "not": {
+                        "pattern": "^\\.$|^\\.\\."
+                      }
+                    }
+                  }
                 },
                 "tenantId": {
                   "type": "string"

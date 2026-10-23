@@ -2043,7 +2043,12 @@ gateway publishes an empty request on `chat.board` with its reply under `chat.bo
 and the Hermes bridge answers with session-kv's `GET /v1/board` (`agents/platform/scripts/board_snapshot.py`):
 every Cluster Agent profile's cluster and any cluster a finding names, with the findings queue's open findings for each, the worst 15 listed beside the total, the running
 kanban cards, the newest `pr_opened` events, and the newest finished fleet-audit run from the report
-store. Waiting on you is the adapter's own record: the open question of each conversation whose
+store; and `first_report_pending` while onboarding has filed its sweep, its first report is not out
+(the findings nudge's own marker pair, `findings_nudge.first_report_markers`: the delivery claim, or
+on the conversation path the recorded outcome, because a claim there can be released), and delivery
+has not yet put the sweep's findings in the queue (`.bootstrap_findings_registered`), with `first_message_pending` while no message has primed onboarding either (no
+`.bootstrap_greeted`) and the sweep is under a week old, past which the plugin primes nothing. The tab then draws a cluster with no open finding as not yet
+checked instead of green, and asks for the first message. Waiting on you is the adapter's own record: the open question of each conversation whose
 latest verified asker is the viewer, so it is per member and the rest is the install's, and it holds
 only questions posted since the gateway started. One snapshot serves every open for 30 seconds, and a failed read for 5; one republish pass runs at a time, from one read. A
 member who opened the tab in the last ten minutes is published to again, ten seconds after a burst
