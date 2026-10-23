@@ -975,6 +975,13 @@
 # 200s default.
 ./tasks/fleet-audit-request-line/task.yaml
 
+# A drift run over a coverage gap keeps the previous finding on the cluster it
+# did not compare as a held row, with its id in the ledger's hidden block.
+# prebuilt/unread-target-ledger opens a fleet-consistency-drift ledger with
+# one label-keys finding on the unlabelled host cluster, from the shell
+# sandbox. No fixture.
+./tasks/fleet-audit-unread-target-keeps-finding/task.yaml
+
 # gitops-drift-backlog-digest (#3387): records that queue while the drift
 # detector is not pulling are digested, not triaged one card each. The
 # fixture stops the detector process, publishes, and kills it, so the

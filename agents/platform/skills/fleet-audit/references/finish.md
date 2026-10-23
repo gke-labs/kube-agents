@@ -150,6 +150,18 @@ cluster is not evidence that it was fixed. Over a partial run the harness:
 
 - reports `resolved: 0` and posts no "resolved" delta, rather than announcing fixes it cannot see;
 - closes **no** remediation pull request as stale, so a fix survives to the next complete run, except the shield's close (SOP 2.7), which rests on the declaration rather than on this run's reading;
+- keeps each previous finding on a target that this run did not check on the ledger, under
+  _Not re-checked this run_. A target was not checked when it is in `scope.skipped`; when the
+  finding's check is on that target's roster and is in neither `checks_run` nor
+  `checks_not_applicable` on it; when the check is a derived one (drift's `uncohorted`) and a roster
+  check that applies there did not run; when no entry names the target and its project target is
+  in `scope.skipped`; or when the run listed no target of its kind. The id stays in the
+  hidden block, so the next complete run reports the finding again without calling it new, or
+  shows it as resolved. A finding on a target that the run read and checked is not kept: it is in
+  the document, or it is gone. A finding whose target the run cannot find on the previous ledger or
+  in the stored report is not kept either. The run keeps these findings only when a ledger is open
+  and the report store holds a trusted record of it (with no forge: a trusted record of the
+  previous run; with the ledger in the report store: a trusted stored ledger);
 - does **not** close the ledger, even with zero findings — the issue stays open and gains a comment
   naming the gaps (not again on the next clean run if the gaps did not change). `status` is `CLEAN` where the run accounted for every finding the previous
   ledger held, and `HELD` where it did not, which is a separate refusal that a gap neither causes
