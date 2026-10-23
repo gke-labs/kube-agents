@@ -217,7 +217,8 @@ learned on its first table run. A number the credential cannot resolve is
 never a key, so its clusters earn no report until it resolves: when nothing
 was read under a key (it is the only project, or every other is an unresolved
 number too), the tick fails, posted once as a plain line ("The upgrade readiness
-check didn't run today", why, and that it tries again tomorrow) with the reason
+check didn't run today", why, and that it tries again tomorrow, or at its next
+scheduled run when its roster entry is not daily) with the reason
 and the remedy on stderr, and kept in `last-failure.txt` by the kind of failure
 until the next clean tick posts the recovery;
 beside projects that were keyed, the table is partial, posted once with the

@@ -4261,7 +4261,6 @@ class TestSchedulerFailureLine(unittest.TestCase):
         "add one with `hermes fallback add`, or set a cron fleet default via `cron.model` + "
         "`cron.model_provider` in config.yaml. Full details saved in cron output."
     )
-    NEXT = datetime(2026, 10, 23, 6, 50, tzinfo=timezone.utc)
 
     def setUp(self):
         import sqlite3
@@ -4283,11 +4282,11 @@ class TestSchedulerFailureLine(unittest.TestCase):
             conn.execute("DELETE FROM incidents")
             conn.execute("DELETE FROM scheduler_failure_posts")
 
-    def roster(self, next_run_at, job="obtainability-audit"):
+    def roster(self, expr, job="obtainability-audit"):
         cron = os.path.join(self.home, "profiles", "platform", "cron")
         os.makedirs(cron, exist_ok=True)
         with open(os.path.join(cron, "jobs.json"), "w", encoding="utf-8") as handle:
-            json.dump({"jobs": [{"id": job, "name": self.TITLE, "next_run_at": next_run_at}]}, handle)
+            json.dump({"jobs": [{"id": job, "name": self.TITLE, "schedule": {"kind": "cron", "expr": expr}}]}, handle)
 
     def ledger(self, *rows):
         import sqlite3
@@ -4348,41 +4347,27 @@ class TestSchedulerFailureLine(unittest.TestCase):
             "It won't run again until its configuration is fixed.",
         )
 
-    def test_the_next_run_comes_from_the_roster(self):
-        self.roster("2099-10-23T06:50:00+00:00")
+    def test_a_daily_job_tries_again_tomorrow(self):
+        self.roster("50 6 * * *")
         failure = session_kv_server.scheduler_failure_line("platform", "obtainability-audit", self.TITLE, self.QUOTA)
         self.assertEqual(
             failure.text,
             "**The Workload Reliability Audit didn't run.** The AI model's usage limit was reached. "
-            "It will try again on Oct 23 at 06:50 UTC.",
-        )
-        epoch = int(datetime(2099, 10, 23, 6, 50, tzinfo=timezone.utc).timestamp())
-        self.assertEqual(
-            failure.slack_text,
-            "**The Workload Reliability Audit didn't run.** The AI model's usage limit was reached. "
-            f"It will try again <!date^{epoch}^{{date_short_pretty}} at {{time}}|on Oct 23 at 06:50 UTC>.",
+            "It will try again tomorrow.",
         )
 
-    def test_a_next_run_that_is_not_ahead_is_unknown(self):
-        for value in ("2001-01-01T00:00:00+00:00", "2099-01-01T00:00:00", "", None):
-            with self.subTest(value=value):
-                self.roster(value)
-                self.assertIsNone(session_kv_server._next_run_at("platform", "obtainability-audit"))
+    def test_any_other_schedule_tries_again_at_its_next_run(self):
+        for expr in ("20 7 * * 1", "*/10 * * * *"):
+            with self.subTest(expr=expr):
+                self.roster(expr)
+                failure = session_kv_server.scheduler_failure_line("platform", "obtainability-audit", self.TITLE, self.QUOTA)
+                self.assertTrue(failure.text.endswith("It will try again at its next scheduled run."))
 
-    def test_slack_under_today_gets_the_readers_time_and_every_other_leg_the_utc_one(self):
-        with patch.object(session_kv_server, "_next_run_at", return_value=self.NEXT):
-            _, sent = self.post(platforms=("slack", "google_chat"))
-        by_platform = dict(sent)
-        self.assertIn("<!date^", by_platform["slack"])
-        self.assertTrue(by_platform["google_chat"].endswith("It will try again on Oct 23 at 06:50 UTC."))
-
-    def test_slack_under_next_gets_the_utc_time(self):
-        with patch.object(session_kv_server, "_next_run_at", return_value=self.NEXT), \
-             patch.object(session_kv_server, "_post_failed_audit_via_gateway", return_value=None):
-            _, sent = self.post(platforms=("slack",), routes=True)
-        self.assertEqual(len(sent), 1)
-        self.assertNotIn("<!date^", sent[0][1])
-        self.assertIn("on Oct 23 at 06:50 UTC", sent[0][1])
+    def test_every_leg_gets_the_same_line_with_no_clock_time(self):
+        self.roster("50 6 * * *")
+        _, sent = self.post(platforms=("slack", "google_chat"))
+        self.assertEqual(len({text for _, text in sent}), 1)
+        self.assertTrue(sent[0][1].endswith("It will try again tomorrow."))
 
     def test_a_job_that_is_not_an_audit_gets_the_plain_line_too(self):
         response, sent = self.post()

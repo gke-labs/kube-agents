@@ -131,6 +131,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cron_schedule  # noqa: E402
 import fleet_scope_args  # noqa: E402
 import fleet_scope_targets  # noqa: E402
 import gitops_workspace  # noqa: E402
@@ -550,10 +551,13 @@ BLOCKED_NAMES = " ({names})"
 # A failed tick posts one plain line: what did not happen, why, and when it
 # runs next. The exception and its text go to stderr as `FAILED_LINE`, which
 # the scheduler keeps in the run's output; the channel never sees them.
-FAILED_TICK_LINE = "**The upgrade readiness check didn't run today.** {reason}. It will try again tomorrow."
-FAILED_WRITE_LINE = (
-    "**The upgrade readiness check didn't finish today.** It couldn't save its report. It will try again tomorrow."
-)
+FAILED_TICK_LINE = "**The upgrade readiness check didn't run today.** {reason}. {next}"
+FAILED_WRITE_LINE = "**The upgrade readiness check didn't finish today.** It couldn't save its report. {next}"
+# When it runs next, with no clock time (`cron_schedule`): "tomorrow" only
+# while its roster entry fires once a day, every day.
+FAILED_NEXT_DAILY = "It will try again tomorrow."
+FAILED_NEXT_UNKNOWN = "It will try again at its next scheduled run."
+WATCH_JOB_ID = "upgrade-readiness-watch"
 FAILED_REASON_REFUSED = "It couldn't read the clusters in the install's scope"
 FAILED_REASON_SCOPE_UNREADABLE = "It couldn't read the install's scope"
 FAILED_REASON_UNRESOLVED = "It couldn't look up the fleet's projects"
@@ -2197,6 +2201,11 @@ def sweep(started: float, home: Path, ledger: dict, dry_run: bool) -> list[str]:
     return lines
 
 
+def next_attempt() -> str:
+    """When the watch runs next, in the channel's words: tomorrow for a daily roster entry, else its next run."""
+    return FAILED_NEXT_DAILY if cron_schedule.job_runs_daily(profile_home(), WATCH_JOB_ID) else FAILED_NEXT_UNKNOWN
+
+
 def failure_reason(exc: Exception) -> str:
     """Why a tick failed, in the channel's words: the kind of failure, never its text."""
     if isinstance(exc, ReportRefused):
@@ -2237,7 +2246,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         lines = tick(dry_run=args.dry_run)
     except WriteFailed as exc:
-        print(FAILED_WRITE_LINE)
+        print(FAILED_WRITE_LINE.format(next=next_attempt()))
         print(FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_WRITE, detail=exc), file=sys.stderr)
         return WRITE_FAILED_EXIT
     except Exception as exc:  # noqa: BLE001 - one line to chat, never a traceback
@@ -2251,7 +2260,7 @@ def main(argv: list[str] | None = None) -> int:
         # A dry run changes nothing, the marker included, and is never silenced
         # by it: the operator running one is looking at the failure.
         if args.dry_run or announce_failure_once(detail, key):
-            print(FAILED_TICK_LINE.format(reason=reason))
+            print(FAILED_TICK_LINE.format(reason=reason, next=next_attempt()))
             print(FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_TICK, detail=detail), file=sys.stderr)
         return 0
     for line in lines:

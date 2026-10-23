@@ -270,14 +270,14 @@ mid-run `report_to_chat` is posted as written.
 The scheduler's failure line names a CLI and a config file nobody in the
 channel can reach, so for any job, audit or not, the relay posts it as one plain
 line instead (`scheduler_failure_line`): "**The Workload Reliability Audit didn't
-run.** The AI model's usage limit was reached. It will try again tomorrow at
-2:50 AM." The reason is the scheduler's own, in plain words, or "It hit an
-error" for one the relay does not name, and the scheduler's line goes to the
-server's log. The next run is the roster's `next_run_at`, which the scheduler
-advances before a run starts. Slack under `spec.mode: today` gets it as a
-`<!date^…>` token, which Slack renders in each reader's time zone; every other
-leg, Slack under `next` included (its gateway escapes the token), gets the time
-in UTC. A failure posts once: `scheduler_failure_posts` keeps the reason each
+run.** The AI model's usage limit was reached. It will try again tomorrow."
+The reason is the scheduler's own, in plain words, or "It hit an error" for one
+the relay does not name, and the scheduler's line goes to the server's log.
+"tomorrow" is for a job whose roster schedule fires once a day, every day
+(`cron_schedule.is_daily`); any other says "It will try again at its next
+scheduled run." There is no clock time: under `spec.mode: next`, the default
+for a first install, the gateway escapes Slack's `<!date^…>` token, and a time
+in one zone is wrong for most readers. A failure posts once: `scheduler_failure_posts` keeps the reason each
 job last posted, and the same reason is withheld until the job's `completed` row
 in the run ledger starts after that post, or until any delivery from the job
 that is not a failure line, whose own report is the sign it runs again. A
