@@ -148,7 +148,7 @@ import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -645,18 +645,20 @@ _LITELLM_429_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _LITELLM_TRAFFIC_PATTERN = re.compile(
-    r'(?:HTTP/\d\.\d|\b(?:POST|GET|PUT|DELETE)\s+/\S*|status_code=\d{3}\b|"(?:code|status)":\s*"?\d{3}"?|\blitellm\b|\bRESOURCE_EXHAUSTED\b|\bRateLimitError\b)',
+    r'(?:HTTP/\d\.\d|\b(?:POST|GET|PUT|DELETE)\s+/\S*|status_code=\d{3}\b|"(?:code|status)":\s*"?\d{3}"?|\bRESOURCE_EXHAUSTED\b|\bRateLimitError\b)',
     re.IGNORECASE,
 )
 _LOG_TIMESTAMP_PATTERN = re.compile(
     r"\b(?P<ts>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\b"
 )
-_LOG_TIME_ONLY_PATTERN = re.compile(r"\b(?P<time>\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)\b")
+_LOG_TIME_ONLY_PATTERN = re.compile(r"(?<!\d)(?P<time>\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)\b")
+_ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 
 def _parse_log_line_timestamp(line: str, since: float | None = None) -> float | None:
     """Extract and parse timestamp from a log line into unix epoch seconds."""
-    match = _LOG_TIMESTAMP_PATTERN.search(line)
+    clean = _ANSI_ESCAPE_PATTERN.sub("", line)
+    match = _LOG_TIMESTAMP_PATTERN.search(clean)
     if match:
         try:
             iso_str = match.group("ts").replace(" ", "T").replace(",", ".")
@@ -667,7 +669,7 @@ def _parse_log_line_timestamp(line: str, since: float | None = None) -> float | 
         except ValueError:
             pass
     if since is not None:
-        t_match = _LOG_TIME_ONLY_PATTERN.search(line)
+        t_match = _LOG_TIME_ONLY_PATTERN.search(clean)
         if t_match:
             try:
                 since_dt = datetime.fromtimestamp(since, tz=timezone.utc)
@@ -675,13 +677,22 @@ def _parse_log_line_timestamp(line: str, since: float | None = None) -> float | 
                 parts = time_str.split(":")
                 hour, minute = int(parts[0]), int(parts[1])
                 sec = float(parts[2])
-                line_dt = since_dt.replace(
+                cand_same = since_dt.replace(
                     hour=hour,
                     minute=minute,
                     second=int(sec),
                     microsecond=int((sec % 1) * 1e6),
                 )
-                return line_dt.timestamp()
+                if cand_same.timestamp() < since - 5.0:
+                    cand_next = cand_same + timedelta(days=1)
+                    if cand_next.timestamp() - since < 12 * 3600:
+                        return cand_next.timestamp()
+                    return cand_same.timestamp()
+                elif cand_same.timestamp() - since > 4 * 3600:
+                    cand_prev = cand_same - timedelta(days=1)
+                    return cand_prev.timestamp()
+                else:
+                    return cand_same.timestamp()
             except ValueError:
                 pass
     return None
@@ -701,19 +712,23 @@ def _scan_log_for_429(
                 or not _LITELLM_TRAFFIC_PATTERN.search(content)
             ):
                 return None
-            if not _LITELLM_429_PATTERN.search(content):
-                return False
 
             if since is None and not session_id:
-                return True
+                return bool(_LITELLM_429_PATTERN.search(content))
 
             current_ts: float | None = None
             found_any_timestamp = False
-            for line in content.splitlines():
+            has_undated_429 = False
+            max_ts: float | None = None
+
+            for raw_line in content.splitlines():
+                line = _ANSI_ESCAPE_PATTERN.sub("", raw_line)
                 ts = _parse_log_line_timestamp(line, since=since)
                 if ts is not None:
                     current_ts = ts
                     found_any_timestamp = True
+                    if max_ts is None or ts > max_ts:
+                        max_ts = ts
 
                 if _LITELLM_429_PATTERN.search(line):
                     if session_id and session_id in line:
@@ -721,10 +736,22 @@ def _scan_log_for_429(
                     if current_ts is not None and since is not None:
                         if current_ts >= (since - 5.0):
                             return True
-                    elif not found_any_timestamp and not session_id:
-                        return True
+                    else:
+                        has_undated_429 = True
 
-            return False
+            if has_undated_429:
+                return None
+
+            if since is not None and max_ts is not None and max_ts < (since - 5.0):
+                return None
+
+            if not _LITELLM_429_PATTERN.search(content):
+                return False
+
+            if since is not None and max_ts is not None and max_ts >= (since - 5.0):
+                return False
+
+            return None
     except OSError:
         return None
 
@@ -3240,6 +3267,8 @@ class KubeAgentsHarness(AgentHarness):
                 discrepancies=discrepancies,
                 live_statuses=live_statuses,
                 rate_limited_cards=rate_limited_cards,
+                since=getattr(self, "_run_started_at", None),
+                session_id="",
             )
             if unsettled:
                 has_delivery = _has_successful_delivery(
@@ -3267,6 +3296,8 @@ class KubeAgentsHarness(AgentHarness):
                 awaited,
                 board_messages=board_messages,
                 opening_turn=opening_turn,
+                since=getattr(self, "_run_started_at", None),
+                session_id="",
             )
             return ""
 

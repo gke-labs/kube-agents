@@ -5000,9 +5000,10 @@ def test_platform_429_corroboration_when_log_absent_records_metadata_and_marks_i
 def test_litellm_log_with_429_from_prior_rep_does_not_corroborate(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
-    """A LiteLLM log containing a 429 from an earlier repetition (timestamp before rep started) is refused."""
+    """A LiteLLM log containing a 429 from an earlier repetition when current rep traffic is present is refused."""
     log_file = tmp_path / "litellm.log"
-    log_file.write_text("INFO: 200 OK GET /health\n2026-10-18 10:00:00 - RateLimitError: 429 RESOURCE_EXHAUSTED\n")
+    now_str = datetime.now(timezone.utc).isoformat()
+    log_file.write_text(f"{now_str} INFO: 200 OK GET /health\n2026-10-18 10:00:00 - RateLimitError: 429 RESOURCE_EXHAUSTED\n")
     monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
 
     stub_agent.turns = [
@@ -5030,6 +5031,42 @@ def test_litellm_log_with_429_from_prior_rep_does_not_corroborate(
 
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
     assert any("platform proxy log showed no 429" in e for e in result.errors)
+
+
+def test_litellm_log_whose_every_stamp_predates_rep_returns_none_and_admits_with_notice(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """A LiteLLM log whose every timestamp predates the repetition returns None and admits infra with notice."""
+    log_file = tmp_path / "litellm.log"
+    log_file.write_text("2026-10-18 10:00:00 - INFO: 200 OK GET /health\n2026-10-18 10:00:05 - RateLimitError: 429 RESOURCE_EXHAUSTED\n")
+    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("failed", block_kind="transient"),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {
+                    _TASK_ID: f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=rate_limit): 429 quota exhausted"
+                },
+                "errors": {},
+                "block_kinds": {_TASK_ID: "transient"},
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Investigate.")
+
+    assert any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any("(platform proxy log unavailable at settle; not corroborated)" in e for e in result.errors)
+    assert result.metadata.get("platform_rate_limit_corroborated") is False
 
 
 def test_scan_log_for_429_returns_none_on_os_error_or_placeholder(tmp_path: Path) -> None:
@@ -5065,10 +5102,41 @@ def test_scan_log_for_429_returns_none_on_os_error_or_placeholder(tmp_path: Path
     stderr_log.write_text("No resources found in default namespace.\n")
     assert harness._scan_log_for_429(stderr_log) is None
 
+    # Kubectl container stderr naming litellm selector without traffic -> None
+    k8s_stderr = tmp_path / "k8s_stderr.log"
+    k8s_stderr.write_text('Error from server (BadRequest): container "litellm-container" in pod "litellm-0" is waiting to start: ContainerCreating\n')
+    assert harness._scan_log_for_429(k8s_stderr) is None
+
     # Log with string-coded "code": "429" -> True
     str_code_log = tmp_path / "str_code_429.log"
     str_code_log.write_text('{"error": {"message": "Rate limit reached", "type": null, "param": null, "code": "429"}}\n')
     assert harness._scan_log_for_429(str_code_log) is True
+
+    # Undated 429 when since is set returns None (cannot be placed in time)
+    undated_log = tmp_path / "undated_429.log"
+    undated_log.write_text('INFO: 10.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 429 Too Many Requests\n')
+    since_ts = datetime(2026, 10, 20, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+    assert harness._scan_log_for_429(undated_log, since=since_ts, session_id="test-session") is None
+
+    # Time-only stamp just after since (and with ANSI color codes) corroborates True
+    time_log = tmp_path / "time_only_429.log"
+    time_log.write_text('\x1b[32m12:02:00\x1b[0m - RateLimitError: 429 RESOURCE_EXHAUSTED\n')
+    assert harness._scan_log_for_429(time_log, since=since_ts) is True
+
+    # Time-only stamp across midnight (since at 23:58:00, 429 at 00:03:00) corroborates True
+    midnight_since = datetime(2026, 10, 19, 23, 58, 0, tzinfo=timezone.utc).timestamp()
+    midnight_log = tmp_path / "midnight_429.log"
+    midnight_log.write_text('[pod/litellm-0/litellm-container] 00:03:00 - RateLimitError: 429 RESOURCE_EXHAUSTED\n')
+    assert harness._scan_log_for_429(midnight_log, since=midnight_since) is True
+
+    # Time-only stamp from prior day (e.g. 15:00:00 with since at 10:00:00) with current traffic refuses False
+    prior_time_log = tmp_path / "prior_time_429.log"
+    prior_time_log.write_text(
+        '[pod/litellm-0/litellm-container] 15:00:00 - RateLimitError: 429 RESOURCE_EXHAUSTED\n'
+        '[pod/litellm-0/litellm-container] 10:01:00 - INFO: 200 OK POST /v1/chat/completions\n'
+    )
+    morning_since = datetime(2026, 10, 20, 10, 0, 0, tzinfo=timezone.utc).timestamp()
+    assert harness._scan_log_for_429(prior_time_log, since=morning_since) is False
 
 
 def test_record_unsettled_prepends_marked_ceiling_error_preserving_existing_errors(results_json: Any) -> None:
@@ -5433,6 +5501,61 @@ def test_a_delegated_worker_rate_limit_on_board_early_settle_is_infrastructure(
     assert result.has_errors()
     assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
     assert result.output == ""
+
+
+def test_a_delegated_worker_rate_limit_on_board_early_settle_refuses_when_telemetry_shows_only_prior_rep_429(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """When the opening turn early-settles a failed card, a LiteLLM log from a prior repetition is refused and stays graded."""
+    log_file = tmp_path / "litellm.log"
+    now_iso = datetime.now(timezone.utc).isoformat()
+    log_file.write_text(
+        f"{now_iso} INFO: 200 OK GET /health\n"
+        '2026-10-18 10:00:00 ERROR: VertexAIException - {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}\n'
+    )
+    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+
+    stub_agent.turns = [
+        _turn(
+            *_call(
+                "kanban_create",
+                {"title": "subtask"},
+                {"ok": True, "task_id": _TASK_ID, "status": "ready"},
+                "c1",
+            ),
+            *_call(
+                "kanban_show",
+                {"task_id": _TASK_ID},
+                {"task": {"id": _TASK_ID, "status": "failed", "result": None}, "runs": []},
+                "c2",
+            ),
+            _text("Investigating."),
+        )
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {},
+                "errors": {
+                    _TASK_ID: (
+                        "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                        "HTTP 429 quota exhausted"
+                    )
+                },
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert len(stub_agent.requests) == 1
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any("platform proxy log showed no 429" in e for e in result.errors)
 
 
 def test_a_delegated_worker_rate_limit_on_board_early_settle_fallback_when_final_read_fails(
