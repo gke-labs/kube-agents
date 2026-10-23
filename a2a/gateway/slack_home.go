@@ -88,7 +88,7 @@ const (
 	slackHomeMoreFindings = " · %d more finding%s"
 	slackHomeNoFindings   = "no open findings"
 	slackHomeNotYet       = "no findings registered yet"
-	slackHomeFirstReport  = "Send Kage a message to get your first report and findings."
+	slackHomeFirstReport  = "Send me a message to get your first report and findings."
 	slackHomeAuditCounts  = "*%s:* %d finding%s, %d critical"
 	slackHomeAuditClean   = "*%s:* clean"
 	slackHomeUpdated      = "updated "
