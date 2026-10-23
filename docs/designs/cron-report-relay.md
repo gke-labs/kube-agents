@@ -248,7 +248,11 @@ shell sandbox (`sandbox_exec.read_bytes`).
 
 The relay posts the finished repositories' reports as one message, followed by
 a line naming each repository the run started and did not finish. It posts each
-run once: the run it last posted per job is kept in `audit_report_runs`. A run
+run once: the run it last posted per job is kept in `audit_report_runs`. The
+onboarding report's audits note reads that table's `posted_at` too: a post at or
+after a run's claim is that run's, a summary or a failure notice. Once a failure notice
+has replaced the row, nothing in it says whether an earlier run posted, so the note
+names that audit (`bootstrap_delivery._relay_posts`). A run
 that failed is delivered as the scheduler's failure line, which the relay
 plugin recognises by its exact opening and the job's name
 (`adapter.SCHEDULER_FAILURE_PREFIXES`, pinned against the scheduler at image

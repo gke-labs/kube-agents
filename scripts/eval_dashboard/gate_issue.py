@@ -7,7 +7,7 @@ meanwhile said "no issue yet, file one". This is the bot filing it:
 
     the state becomes OUTAGE
     and health.json names no tracking issue (case-notes.yaml has none)
-    and no OPEN issue labelled `presubmit-gate` already names the same cases
+    and no OPEN issue already names the same cases
     -> create one, labelled `presubmit-gate`, and say "Tracking #NNN"
 
 The second shape (#1478): on 2026-09-11 five nodes of the Prow build cluster
@@ -15,7 +15,7 @@ went NotReady and twelve runs died mid-run; nobody owning the cluster was
 told. So:
 
     the condition becomes `lost_pods`
-    and no OPEN issue labelled `presubmit-gate` already names every lost node
+    and no OPEN issue already names every lost node
     -> create one addressed to the cluster owner, and say "Tracking #NNN"
 
 The third shape (#1550): the hourly seeded-fleet scan finds a fixture role out
@@ -24,7 +24,7 @@ projects at once, and every case depending on it reds on the runs that
 lease those projects. So:
 
     the condition becomes `fixture_drift`
-    and no OPEN issue labelled `presubmit-gate` already names every drifted role
+    and no OPEN issue already names every drifted role
     -> create one addressed to the fleet owner, and say "Tracking #NNN"
 
 The fourth shape (#1894): runs Prow killed at the job deadline with no
@@ -32,26 +32,40 @@ verdict, 3+ on 2+ pull requests in 2 hours, so nothing is graded and nobody
 can pass. So:
 
     the condition becomes `deadline_kill`
-    and no OPEN issue labelled `presubmit-gate` has "deadline" and "smoke" in its TITLE
+    and no OPEN `presubmit-gate` issue has "deadline" and "kill" in its TITLE
     -> create one for whoever owns the gate, and say "Tracking #NNN"
 
 The fifth shape (#1967): the hourly pool-state scan finds the same finding on
 the same pool project two scans running, or on three projects at once. So:
 
     the condition becomes `pool_drift`
-    and no OPEN issue labelled `presubmit-gate` has every finding id in its TITLE
+    and no OPEN issue has every finding id in its TITLE
     -> create one for the pool owner, with the repair per project
 
 The dedupe is against people: a human who filed first, with the case names
 (or the node names, or the role names) in the title or body -- or, for the
 deadline kills and the pool findings, in the title -- wins and the bot adopts
-their issue. A recovery gets one comment ("Healthy again after Xh; bot will not
-close it"). The four infrastructure shapes -- lost pods, fixture drift, pool
-drift, deadline kills -- are assigned to `infra_owner` in
+their issue and labels it `presubmit-gate` (#3664: the open issue for a
+drifted fixture carried `bug`/`Infra` and was never found). One rule for a
+title: any open issue. One rule for a body: a `presubmit-gate` issue, or an
+unlabelled one whose body also carries a word the condition's own evidence
+uses ("drift", "pending" for a fixture; "NotReady", "lost" for a node), so a
+passing mention of a role or node elsewhere is not the tracker; case names
+never match an unlabelled body (a roster tracker lists them all), and the
+deadline pair, having no identifier, needs the label. The bot's own
+`nightly-red` issues are never adopted: a case's bug is not the gate's
+tracker. The four infrastructure shapes -- lost pods, fixture drift,
+pool drift, deadline kills -- are assigned to `infra_owner` in
 docs/designs/domains.yaml and end with a line mentioning `infra_backup`; an
-OUTAGE's issue (a shared break, which may be any case's code) is not. The bot never closes an issue -- a green gate is not proof the
-fixture is fixed, only that three runs passed, and the node events are still
-worth reading after the pool has healed itself.
+OUTAGE's issue (a shared break, which may be any case's code) is not.
+
+An issue the bot filed is closed, with a comment: one of the four
+infrastructure shapes when its condition stops firing (health.json
+`open_conditions`) while the gate reports another, and any of them at the
+recovery; an OUTAGE's waits for the recovery, because a storm's reds can mask
+rule 1 while the break is live. An adopted issue gets the comment only. An
+issue found closed is dropped rather than cited (#2877 was cited for a week
+after a human closed it).
 
 All GitHub traffic goes through ghcli.Gh (`gh api`, the workflow's token),
 best-effort: a failure leaves the message at "no issue yet" and the next
@@ -66,10 +80,10 @@ import re
 import sys
 
 try:
-    from .health import pool_drift_split
+    from .health import parse_iso, pool_drift_split
 except ImportError:  # imported with scripts/eval_dashboard/ itself on sys.path
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-    from health import pool_drift_split
+    from health import parse_iso, pool_drift_split
 
 LABEL = "presubmit-gate"
 # Who an infrastructure issue goes to: top-level keys of domains.yaml,
@@ -91,10 +105,21 @@ YAML_NON_LOGINS = frozenset({"null", "none", "true", "false", "yes", "no", "on",
 # The issue field GitHub names when it will not assign a login.
 ASSIGNEES_FIELD = "assignees"
 JOB_NAME = "pull-kube-agents-smoke-test"
-# Where the bot looks for a human's issue first.
-OPEN_ISSUES_PATH = f"issues?labels={LABEL}&state=open&per_page=100"
+# Where the bot looks for a human's issue first: every open issue, whatever
+# its labels, read once per tick.
+OPEN_ISSUES_PATH = "issues?state=open&per_page=100"
 ISSUES_PATH = "issues"
+ISSUE_PATH = "issues/{number}"
 COMMENTS_PATH = "issues/{number}/comments"
+LABELS_PATH = "issues/{number}/labels"
+# The bot's other issue family (nightly_bugs.py): a case's bug, never the
+# gate's tracker.
+NEVER_ADOPT_LABELS = frozenset({"nightly-red"})
+# Who the bot's own issues are filed as (the workflow's GITHUB_TOKEN). Only
+# these are closed; anyone else's is adopted and left open.
+BOT_LOGINS = frozenset({"github-actions[bot]"})
+ISSUE_STATE_OPEN = "open"
+CLOSE_PAYLOAD = {"state": "closed", "state_reason": "completed"}
 # health.json's conditions this module files for besides an OUTAGE
 # (health.py owns the vocabulary).
 CONDITION_LOST_PODS = "lost_pods"
@@ -108,8 +133,20 @@ RECOVERY_RUNS = 3
 # What an open issue's TITLE must carry to be adopted as the deadline-kill
 # tracker. Title only: every bot-filed body names the job and quotes the
 # evidence block, which mentions deadline kills whenever one sits in the
-# window, so a body match would adopt a shared-break issue.
-DEADLINE_KILL_NAMES = ("deadline", "smoke")
+# window, so a body match would adopt a shared-break issue. "kill", not
+# "smoke": a feature request about the smoke gate's deadline (#2873) was
+# adopted as the tracker of the kills.
+DEADLINE_KILL_NAMES = ("deadline", "kill")
+# What an unlabelled body must say beside the name for a body match to count:
+# the words the condition's own evidence uses (#3607's body: "drift",
+# "pending"), so an issue that mentions a role or a node in passing is not
+# adopted. None (the cases, the deadline pair) means the body counts only on a
+# labelled issue.
+FIXTURE_DRIFT_BODY_WORDS = ("drift", "pending", "out of designed state")
+LOST_PODS_BODY_WORDS = ("notready", "not ready", "lost")
+# How a name is found in a title or body: not preceded by a letter, digit or
+# underscore ("kill" is not in "skill" nor in "deadline_kill").
+NAME_START_RE = r"(?<![a-z0-9_]){name}"
 # The other direction: the deadline body quotes only the deadline evidence
 # lines. health.py's evidence also carries per-case collapse lines whenever a
 # case clears the shared-break floors, and a body naming those cases would
@@ -165,7 +202,7 @@ The Prow build cluster (`kube-agents-prow`) lost the node(s) below at {when}; {r
 
 Incident brief: {brief}
 
-Filed automatically by the smoke health bot; the cluster owner should check the node events and autorepair; the bot will not close it.
+Filed automatically by the smoke health bot; the cluster owner should check the node events and autorepair; the bot closes it when the condition clears.
 """
 DEADLINE_KILL_TITLE = "Smoke gate outage: {runs} runs on {prs} PRs killed at the {minutes}-minute deadline with no verdict since {since}"
 DEADLINE_KILL_BODY = """\
@@ -209,7 +246,7 @@ The seeded fleet's fixture role(s) below are present but not in the state the ca
 
 Incident brief: {brief}
 
-Filed automatically by the smoke health bot; the daily reconcile re-applies the stack in the projects named, and the bot comments here when a scan reads them healthy; the bot will not close it.
+Filed automatically by the smoke health bot; the daily reconcile re-applies the stack in the projects named, and the bot comments here when a scan reads them healthy; the bot closes it when the condition clears.
 """
 POOL_DRIFT_TITLE = "Pool drift: {findings} on {projects} pool {noun} since {since}"
 # Four finding ids pass GitHub's title limit; the count stands in.
@@ -244,7 +281,7 @@ The hourly pool-state scan (`scripts/eval_dashboard/pool_state.py`, which runs `
 
 Incident brief: {brief}
 
-Filed automatically by the smoke health bot; whoever holds the pool should run the repairs in the projects named; the bot will not close it.
+Filed automatically by the smoke health bot; whoever holds the pool should run the repairs in the projects named; the bot closes it when the condition clears.
 """
 # POOL_DRIFT_BODY's consequence for a pull request, by whether a leased run
 # reds on the findings; health.py's incident carries the split (pool_drift_split:
@@ -267,6 +304,17 @@ POOL_DRIFT_PASSES_LEASES = (
     " pool's, and nothing on a pull request waits for the repair below."
 )
 RECOVERY_COMMENT = "Healthy again after {lasted}; bot will not close it."
+RECOVERY_CLOSE_COMMENT = "Healthy again after {lasted}; closing (filed by the bot; reopen if the cause is still live)."
+CLEARED_COMMENT = "{what} cleared at {when} (health.json no longer shows the condition); bot will not close it."
+CLEARED_CLOSE_COMMENT = "{what} cleared at {when} (health.json no longer shows the condition); closing (filed by the bot; reopen if the cause is still live)."
+# The subject of the cleared comment, by the condition the issue was filed for.
+CONDITION_WORDS = {
+    CONDITION_LOST_PODS: "The lost nodes",
+    CONDITION_FIXTURE_DRIFT: "The fixture drift",
+    CONDITION_POOL_DRIFT: "The pool drift",
+    CONDITION_DEADLINE_KILL: "The deadline kills",
+}
+CONDITION_WORDS_DEFAULT = "The break"
 NO_EVIDENCE = "- (none recorded)"
 UNKNOWN_NODE = "(node name not recorded)"
 
@@ -287,8 +335,16 @@ def infra_addressees(path: pathlib.Path = DOMAINS_FILE) -> tuple[str | None, str
 
 
 def names_all(text: str, names: list[str]) -> bool:
+    """Every name appears in the text, each starting on its own: not inside
+    a longer word ("kill" in "skill") while still matching a longer form
+    ("killed", or a case name as the stem of a sibling's)."""
     lowered = (text or "").lower()
-    return bool(names) and all(name.lower() in lowered for name in names)
+    return bool(names) and all(re.search(NAME_START_RE.format(name=re.escape(name.lower())), lowered) for name in names)
+
+
+def label_names(payload: dict) -> set[str]:
+    """An issue payload's label names (GitHub sends objects; a test may send strings)."""
+    return {label.get("name") if isinstance(label, dict) else label for label in payload.get("labels") or []}
 
 
 def as_issue(payload: dict | None, condition: str | None = None) -> dict | None:
@@ -520,6 +576,41 @@ class Tracker:
     def __init__(self, gh, infra: tuple[str | None, str | None] | None = None):
         self.gh = gh
         self.infra_owner, self.infra_backup = infra if infra is not None else infra_addressees()
+        # One tick's reads: the open-issue list and each carried issue, once.
+        self._open_issues: list | None = None
+        self._lookups: dict[int, dict | None] = {}
+        # Issue numbers the episode already carries: never adopted a second
+        # time for another condition (ensure's `skip`).
+        self._skip: set[int] = set()
+
+    def open_issues(self) -> list:
+        if self._open_issues is None:
+            issues = self.gh.call("GET", self.gh.path(OPEN_ISSUES_PATH), paginate=True)
+            self._open_issues = [issue for issue in issues or [] if isinstance(issue, dict) and not issue.get("pull_request")]
+        return self._open_issues
+
+    def lookup(self, issue: dict | None) -> dict | None:
+        """The issue's current GitHub payload (state, author, closed_at); None
+        when it cannot be read this tick."""
+        number = (issue or {}).get("number")
+        if not number:
+            return None
+        if number not in self._lookups:
+            payload = self.gh.call("GET", self.gh.path(ISSUE_PATH.format(number=number)))
+            self._lookups[number] = payload if isinstance(payload, dict) and payload.get("number") else None
+        return self._lookups[number]
+
+    def is_open(self, issue: dict | None) -> bool | None:
+        """True / False by the issue's state; None when it could not be read,
+        which keeps it (a failed read is not a close)."""
+        payload = self.lookup(issue)
+        return None if payload is None else payload.get("state") == ISSUE_STATE_OPEN
+
+    def closed_at(self, issue: dict | None):
+        return parse_iso((self.lookup(issue) or {}).get("closed_at"))
+
+    def bot_filed(self, issue: dict | None) -> bool:
+        return ((self.lookup(issue) or {}).get("user") or {}).get("login") in BOT_LOGINS
 
     def addressed(self, payload: dict, refused: bool = False) -> dict:
         """An infrastructure issue's payload, assigned to the infra owner and
@@ -545,33 +636,55 @@ class Tracker:
             created = self.gh.call("POST", self.gh.path(ISSUES_PATH), self.addressed(payload, refused=True))
         return created
 
-    def existing(self, names: list[str], title_only: bool = False, marker: re.Pattern | None = None) -> dict | None:
-        """An open `presubmit-gate` issue whose title or body names every
-        one of `names` (the failing cases, or the lost nodes) -- a human got
-        there first. `title_only` for names too common in bot-filed bodies;
-        `marker` for the bot's own issue of one kind, matched on the ids its
-        marker carries and nothing else in the body."""
-        issues = self.gh.call("GET", self.gh.path(OPEN_ISSUES_PATH), paginate=True)
-        for issue in issues or []:
-            if not isinstance(issue, dict) or issue.get("pull_request"):
+    def existing(
+        self, names: list[str], title_only: bool = False, marker: re.Pattern | None = None, body_words: tuple[str, ...] | None = None, labelled_only: bool = False
+    ) -> dict | None:
+        """An open issue whose title or body names every one of `names` (the
+        failing cases, or the lost nodes) -- a human got there first; it is
+        labelled `presubmit-gate` on adoption. A title match counts on any
+        issue (`labelled_only`: on a `presubmit-gate` one, for names that are
+        plain words); a body match on a `presubmit-gate` issue, or on an
+        unlabelled one whose body also carries one of `body_words`, the
+        condition's own vocabulary (None: never). `title_only` for names too
+        common in bot-filed bodies; `marker` for the bot's own issue of one
+        kind, matched on the ids its marker carries and nothing else."""
+        for issue in self.open_issues():
+            labelled = LABEL in label_names(issue)
+            if issue.get("number") in self._skip or NEVER_ADOPT_LABELS & label_names(issue) or (labelled_only and not labelled):
                 continue
-            body = issue.get("body") or ""
+            title, body = issue.get("title", ""), issue.get("body") or ""
             if marker is not None:
                 found = marker.search(body)
                 if found and set(names) <= set(found.group(1).split(",")):
-                    return as_issue(issue)
+                    return self.adopt(issue)
                 continue
-            text = issue.get("title", "") if title_only else f"{issue.get('title', '')}\n{body}"
-            if names_all(text, names):
-                return as_issue(issue)
+            if names_all(title, names):
+                return self.adopt(issue)
+            if title_only:
+                continue
+            if not labelled and not (body_words and any(word in body.lower() for word in body_words)):
+                continue
+            if names_all(f"{title}\n{body}", names):
+                return self.adopt(issue)
         return None
 
-    def ensure(self, health: dict, now, since_text: str, brief_link: str, window_text: str | None = None) -> dict | None:
+    def adopt(self, payload: dict) -> dict | None:
+        """The found issue as the tracker, labelled so a reader filtering on
+        `presubmit-gate` sees it; a failed label write adopts it anyway."""
+        if LABEL not in label_names(payload):
+            self.gh.call("POST", self.gh.path(LABELS_PATH.format(number=payload["number"])), {"labels": [LABEL]})
+        return as_issue(payload)
+
+    def ensure(self, health: dict, now, since_text: str, brief_link: str, window_text: str | None = None, skip=()) -> dict | None:
         """The issue to cite: a human's if one names these cases (or, for
         lost pods, these nodes; for deadline kills, the two title words),
         else a new one. `since_text` is the incident's start on the reader's
         clock; `window_text` the span of the losses or kills, for those two
-        bodies."""
+        bodies. `skip` is the numbers the episode already carries: the bot's
+        own fixture or node issue quotes the evidence, case lines included,
+        and must not become the break's tracker as well, or its close under
+        the live break takes the break's citation with it."""
+        self._skip = {int(number) for number in skip}
         condition = health.get("condition")
         if condition == CONDITION_LOST_PODS:
             return self._ensure_lost_pods(health, since_text, window_text or since_text, brief_link)
@@ -596,7 +709,7 @@ class Tracker:
 
     def _ensure_lost_pods(self, health: dict, when_text: str, window_text: str, brief_link: str) -> dict | None:
         nodes = sorted((health.get("incident") or {}).get("nodes") or {})
-        found = self.existing(nodes) if nodes else None
+        found = self.existing(nodes, body_words=LOST_PODS_BODY_WORDS) if nodes else None
         if found:
             log(f"tracking issue: adopting open #{found['number']} (names every lost node)")
             return dict(found, condition=CONDITION_LOST_PODS)
@@ -611,7 +724,7 @@ class Tracker:
         return created
 
     def _ensure_deadline_kill(self, health: dict, since_text: str, window_text: str, brief_link: str) -> dict | None:
-        found = self.existing(list(DEADLINE_KILL_NAMES), title_only=True)
+        found = self.existing(list(DEADLINE_KILL_NAMES), title_only=True, labelled_only=True)
         if found:
             log(f"tracking issue: adopting open #{found['number']} (its title names the deadline kills)")
             return dict(found, condition=CONDITION_DEADLINE_KILL)
@@ -627,7 +740,7 @@ class Tracker:
 
     def _ensure_fixture_drift(self, health: dict, since_text: str, brief_link: str) -> dict | None:
         roles = sorted((health.get("incident") or {}).get("roles") or [])
-        found = self.existing(roles) if roles else None
+        found = self.existing(roles, body_words=FIXTURE_DRIFT_BODY_WORDS) if roles else None
         if found:
             log(f"tracking issue: adopting open #{found['number']} (names every drifted role)")
             return dict(found, condition=CONDITION_FIXTURE_DRIFT)
@@ -663,8 +776,37 @@ class Tracker:
         return created
 
     def recovered(self, issue: dict, lasted: str) -> bool:
+        """The recovery's comment on every issue of the episode; the bot's
+        own are closed with it. False, with nothing written, when the issue
+        could not be read this tick: whose it is decides the close."""
+        if self.lookup(issue) is None:
+            return False
+        close = self.bot_filed(issue)
+        return self._settle(issue, (RECOVERY_CLOSE_COMMENT if close else RECOVERY_COMMENT).format(lasted=lasted), close)
+
+    def cleared(self, issue: dict, when_text: str) -> bool:
+        """The comment when the issue's own condition stopped firing while the
+        gate reports another; the bot's own are closed with it. False, with
+        nothing written, when the issue could not be read this tick."""
+        if self.lookup(issue) is None:
+            return False
+        close = self.bot_filed(issue)
+        what = CONDITION_WORDS.get((issue or {}).get("condition"), CONDITION_WORDS_DEFAULT)
+        return self._settle(issue, (CLEARED_CLOSE_COMMENT if close else CLEARED_COMMENT).format(what=what, when=when_text), close)
+
+    def _settle(self, issue: dict, comment: str, close: bool) -> bool:
+        """True when every write landed. A close that failed after its
+        comment is retried next tick, comment included: a second comment on
+        a rare failure costs less than a bot issue left open saying
+        "closing"."""
         number = (issue or {}).get("number")
         if not number:
             return False
-        response = self.gh.call("POST", self.gh.path(COMMENTS_PATH.format(number=number)), {"body": RECOVERY_COMMENT.format(lasted=lasted)})
-        return response is not None
+        response = self.gh.call("POST", self.gh.path(COMMENTS_PATH.format(number=number)), {"body": comment})
+        if not close:
+            return response is not None
+        # A dry run prints both writes; a real one closes only after the comment landed.
+        if response is None and not self.gh.dry_run:
+            return False
+        closed = self.gh.call("PATCH", self.gh.path(ISSUE_PATH.format(number=number)), dict(CLOSE_PAYLOAD))
+        return response is not None and closed is not None
