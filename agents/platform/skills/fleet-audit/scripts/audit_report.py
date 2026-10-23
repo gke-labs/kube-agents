@@ -1112,6 +1112,7 @@ CHECK_PHRASES = {
     "unbound-sa-automount": "{object} mounts a service account token it doesn't use",
     "lb-world-open": "{object} is a load balancer open to the internet",
     "anonymous-rbac-binding": "{object} grants access to anonymous users",
+    "configsync-reconciler-stalled": "{object} is stuck in Config Sync",
     # Upgrade & Patch Readiness Audit
     "master-behind": "control plane is behind its release channel",
     "pool-skew": "{object} node pool lags the control plane",
