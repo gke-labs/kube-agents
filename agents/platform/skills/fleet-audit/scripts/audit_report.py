@@ -996,11 +996,11 @@ UNREADABLE_GITOPS_KEY_REMEDY = (
 NO_FORGE_WORKSPACE_PREFIX = "workspace_"
 # How many held ids the chat summary names; the store keeps every one.
 NO_FORGE_SUMMARY_FINDINGS = 10
-# The rows the chat summary lists, as the Slack card of a ledger run does
-# (`slack_audit_report.CRITICAL_ROWS_MAX`, `TOP_FINDINGS`): every critical
-# finding up to the first number, else the top findings of the most severe
-# level present up to the second.
-NO_FORGE_SUMMARY_CRITICAL_ROWS = 10
+# The rows the chat summary lists: the critical findings up to the first
+# number, else the top findings of the most severe level present up to the
+# second. Fewer critical rows than the ledger card's ten, because the summary
+# is the whole report and the rest are counted under the rows.
+NO_FORGE_SUMMARY_CRITICAL_ROWS = 3
 NO_FORGE_SUMMARY_TOP_ROWS = 2
 # The chat summary's lines. A row is the finding's short cluster name and a
 # plain phrase for its check (`CHECK_PHRASES`), its severity as inline code.
@@ -18478,7 +18478,7 @@ def summary_row(finding: dict) -> str:
 
 
 def _summary_shown(ordered: list[dict]) -> list[dict]:
-    """The findings the summary lists: every critical one up to its cap, else the top of the most severe level."""
+    """The findings the summary lists: the critical ones up to their cap, else the top of the most severe level."""
     if not ordered:
         return []
     severity = ordered[0].get("severity")
@@ -18501,8 +18501,9 @@ def render_no_forge_summary(
 ) -> str:
     """The chat summary of a run with no forge, which is the only report its operator gets.
 
-    The headline (:func:`findings_headline`), the findings the Slack card of a
-    ledger run would list (:func:`summary_row`), a line counting the rest by
+    The headline (:func:`findings_headline`), the most severe findings up to
+    `NO_FORGE_SUMMARY_CRITICAL_ROWS` or `NO_FORGE_SUMMARY_TOP_ROWS`
+    (:func:`summary_row`), a line counting the rest by
     severity, saved on the install unless the store write failed (`stored`),
     the ids the collector still flags that the document left out, how many of
     this run's collector candidates the document does not carry (`dropped`),

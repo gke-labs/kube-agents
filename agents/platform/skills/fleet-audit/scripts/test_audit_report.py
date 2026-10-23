@@ -27169,7 +27169,7 @@ class TestNoForge(BaseTestCase):
         self.assertEqual(out["prs_opened"], [])
         summary = out["summary"].splitlines()
         self.assertEqual(summary[0], f"{audit_report.audit_name(AUDIT)}: 2 critical findings, 4 new.")
-        # Every critical finding, as the Slack card lists them; the rest counted by severity.
+        # The critical findings up to the cap; the rest counted by severity.
         self.assertEqual(
             summary[1:4],
             [
@@ -28986,6 +28986,14 @@ class TestPlainChatLines(unittest.TestCase):
         ).splitlines()
         self.assertIn("1 more (1 major) is not listed here.", lines)
         self.assertEqual(lines[-1], audit_report.NO_FORGE_UNSTORED_NOTE)
+
+    def test_the_summary_lists_three_critical_findings_and_counts_the_rest(self):
+        findings = [make_finding(fid=f"c{i}") for i in range(5)] + [make_finding(fid="m", severity="major")]
+        lines = audit_report.render_no_forge_summary(
+            AUDIT, make_doc(findings=findings), [], [], [], True, [], audit_report.NO_FORGE_NOTE
+        ).splitlines()
+        self.assertEqual(len([line for line in lines if line.startswith("`critical`")]), 3)
+        self.assertIn("3 more (2 critical, 1 major) are saved on the install.", lines)
 
     def test_the_summary_reads_back_as_the_slack_card(self):
         sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
