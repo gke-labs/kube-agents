@@ -1975,7 +1975,7 @@ AuditId = Literal[
 
 # Every `status` a fleet-audit `finish` stores, for `audit_report_stored`:
 # a typo fails at spec-load time, as `AuditId` does for the stream.
-AuditStatus = Literal["OPENED", "UPDATED", "CLEAN", "HELD", "NO_FORGE"]
+AuditStatus = Literal["OPENED", "UPDATED", "CLEAN", "HELD", "NO_FORGE", "STORE_LEDGER"]
 
 # Environment names carrying the read credential, in precedence order. See
 # LedgerIssueContainsVerifier's docstring for what it has to be. A literal

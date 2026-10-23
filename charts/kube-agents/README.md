@@ -237,6 +237,9 @@ needs — a request's own `max_tokens` still wins. `litellm.reasoningEffort`
 (`low`/`medium`/`high`, default empty, meaning none) puts a `reasoning_effort`
 under every alias the same way; LiteLLM maps it to `thinkingLevel` on Gemini 3.x
 ([details](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-reasoning-effort)).
+On a Gemini 2.5 or 3.x model the gateway asks for the model's thoughts with a
+`thinking` key under every alias, which a `reasoningEffort` value replaces
+([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#geminis-thoughts)).
 On a Claude model the gateway
 drops `temperature`, `top_p` and `top_k` from every request
 ([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-default-model)),
@@ -280,6 +283,34 @@ owns what is redacted, what is not (responses, chat egress) and why a
 pseudonymised identifier is one the agent cannot act on; the site's
 [security and IAM page](../../docs/site/src/content/docs/reference/security-and-iam.md)
 owns what the image redacts in the files on the agent's volume.
+
+`litellm.traceLogEnabled=true` turns on pass-through trajectory logging across
+the gateway: the ConfigMap gains `llm_trace_logger.py` and the shared
+`redactor.py` module, mounted at `/app/llm_trace_logger.py` and
+`/app/redactor.py` beside `config.yaml`, registers
+`llm_trace_logger.proxy_handler_instance` under `litellm_settings.callbacks`, and sets
+`LITELLM_TRACE_LOG_PATH` (`litellm.traceLogPath`, default
+`"/tmp/litellm_traces.jsonl"`, which must be a normalised file path under `/tmp/`,
+with no `.` or `..` component, because the gateway runs with
+`readOnlyRootFilesystem: true`) plus an optional `SESSION_KV_SALT`
+from the credentials Secret. Every model request and response (model alias, custom
+LLM provider, messages, tool definitions, assistant responses, reasoning content,
+token usage, and latency) is redacted through `AuditRedactor` (credentials, Secret
+data blocks, sensitive keys, emails, and IP literals, plus operator rules when
+`litellm.redaction.enabled` is also set) before being appended as one JSONL line to
+the path. IP literals are pseudonymised by default; with `litellm.redaction.enabled`
+set, they follow `litellm.redaction.ip` instead: `"off"` writes them verbatim,
+`mask` masks them, and addresses in `allowCidrs` pass through. The trace file
+rotates at `5 MiB` across `3` backups (`.1`–`.3`) under an `flock` on `<path>.lock`;
+a record over `1 MiB` keeps its metadata and drops `messages`, `tools` and
+`response` behind a `truncated` marker, every caller-chosen string is clipped, and a
+line that would still carry a file past its cap is refused with the once-per-path
+warning, so the trail on the pod's `/tmp` `emptyDir` holds at most `20 MiB`. Each record is serialised, redacted and written on one
+writer thread, off the proxy's event loop and in order.
+Pass-through only: the logger never mutates live request or response payloads, and
+I/O failures log a once-per-path warning to stderr so inference never fails. Off by
+default, and the rendered default ConfigMap and rollout checksum are unchanged while
+it is off.
 
 #### Vertex AI (`litellm.modelProvider=vertex_ai`)
 
@@ -1026,10 +1057,11 @@ stall, from an object this check never looks at. Check it separately with
 Conversely, a ResourceQuota that restricts compute resources (`requests.cpu`, `limits.cpu`,
 `requests.memory`, `limits.memory`, `requests.ephemeral-storage`, `limits.ephemeral-storage`)
 requires every container in the namespace to declare that request or limit unless a
-`LimitRange` provides a default. All chart-rendered workloads (operator, LiteLLM, minter,
-Hindsight, cleanup Job) and several operator containers (such as the shell sandbox, dashboard,
-and agent container) set no ephemeral storage, and pruning a workload's limits leaves it
-without them; the preflight checks total headroom against what is declared, not whether every
+`LimitRange` provides a default. LiteLLM, Hindsight's Postgres and the cleanup Job declare an
+ephemeral-storage request and an equal limit by default (each emptyDir's sizeLimit plus its
+logs), as do the a2a session pods; the operator, the minter and the Hindsight API do not, nor
+do several operator containers (such as the shell sandbox, dashboard, and agent container),
+and pruning a workload's requests leaves it without them; the preflight checks total headroom against what is declared, not whether every
 individual container declares every resource the quota constrains. A namespace quota constraining
 ephemeral storage therefore additionally requires a `LimitRange` defaulting it, or the API
 server will reject pod creation.

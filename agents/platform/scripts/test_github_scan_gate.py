@@ -24,6 +24,7 @@ have traded a token saving for a single point of failure.
 
 import importlib
 import inspect
+import dataclasses
 import io
 import json
 import subprocess
@@ -738,6 +739,19 @@ def make_comment(
 
 
 class PrCommentsSweepTest(unittest.TestCase):
+    def setUp(self):
+        # The unreadable-PR record lives under the profile home; each test gets
+        # its own, so no record carries from one test into the next.
+        import os
+        import tempfile
+
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        self.home = home.name
+        env = mock.patch.dict(os.environ, {"HERMES_HOME": home.name, "PLATFORM_AGENT_HOME": home.name})
+        env.start()
+        self.addCleanup(env.stop)
+
     def _sweep(self, provider, repo=REPO, env=None, repo_error=None, dry_run=False):
         # `repo` is one name, a list of them, or None for an install with none.
         if isinstance(repo, (list, tuple)):
@@ -1371,9 +1385,111 @@ class PrCommentsSweepTest(unittest.TestCase):
         result = self._sweep(provider)
         self.assertEqual(result.cards, [])
         self.assertIn("acme/toolkit#12", result.warnings[0])
-        self.assertIn(forge.REASON_CONVERSATION_TRUNCATED, result.warnings[0])
+        self.assertIn("too long for Kage to read", result.warnings[0])
+        # The reason code is for the log, not the room.
+        self.assertNotIn(forge.REASON_CONVERSATION_TRUNCATED, result.warnings[0])
         # It never clears on its own, so the way to stop it is named.
         self.assertIn("`agent:ignore`", result.warnings[0])
+
+    # -- an unreadable pull request posts once, and once when it reads again --
+    def _unreadable_tick(self, fail_on=(12,), reason="FORGE_CALL_FAILED", prs=None, dry_run=False, **kwargs):
+        """The tick's warnings, and what it logged: stderr on a dry run, the watcher's log file otherwise."""
+        import os
+
+        log = os.path.join(self.home, "logs", gate.WATCHER_LOG_FILE)
+        before = os.path.getsize(log) if os.path.exists(log) else 0
+        provider = FakeProvider(prs=prs or [make_pr(12)], fail_on=fail_on, fail_reason=reason)
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", stderr):
+            result = self._sweep(provider, dry_run=dry_run, **kwargs)
+        logged = ""
+        if os.path.exists(log):
+            with open(log, encoding="utf-8") as handle:
+                handle.seek(before)
+                logged = handle.read()
+        return result.warnings, stderr.getvalue() + logged
+
+    def test_an_unreadable_pr_is_one_plain_line(self):
+        pr = dataclasses.replace(make_pr(19), url="https://github.com/acme/toolkit/pull/19")
+        warnings, stderr = self._unreadable_tick(fail_on=(19,), prs=[pr])
+        self.assertEqual(
+            warnings,
+            [
+                "**Comments on [toolkit#19](https://github.com/acme/toolkit/pull/19) aren't being answered.** "
+                "GitHub didn't respond when Kage tried to read the pull request. It keeps trying every 10 minutes."
+            ],
+        )
+        self.assertIn("acme/toolkit#19 (FORGE_CALL_FAILED)", stderr)
+
+    def test_a_persisting_failure_posts_once(self):
+        first, _ = self._unreadable_tick()
+        second, stderr = self._unreadable_tick()
+        self.assertEqual(len(first), 1)
+        self.assertEqual(second, [])
+        self.assertIn("FORGE_CALL_FAILED", stderr, "every tick still logs it")
+
+    def test_two_codes_that_read_the_same_post_once(self):
+        first, _ = self._unreadable_tick(reason="FORGE_CALL_FAILED")
+        for code in ("BROKER_UNREACHABLE", "FORGE_CALL_FAILED", "BROKER_UNREACHABLE"):
+            warnings, logged = self._unreadable_tick(reason=code)
+            self.assertEqual(warnings, [], f"{code} reads the same sentence, so it is not news")
+            self.assertIn(code, logged)
+        self.assertEqual(len(first), 1)
+
+    def test_a_new_reason_posts_again(self):
+        self._unreadable_tick()
+        warnings, _ = self._unreadable_tick(reason=forge.REASON_CONVERSATION_TRUNCATED)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("too long", warnings[0])
+
+    def test_a_pr_that_reads_again_says_so_once(self):
+        self._unreadable_tick()
+        warnings, _ = self._unreadable_tick(fail_on=())
+        self.assertEqual(warnings, ["**Comments on acme/toolkit#12 are being answered again.**"])
+        warnings, _ = self._unreadable_tick(fail_on=())
+        self.assertEqual(warnings, [])
+
+    def test_a_pr_that_closed_drops_out_without_a_line(self):
+        self._unreadable_tick()
+        warnings, _ = self._unreadable_tick(fail_on=(), prs=[make_pr(13)])
+        self.assertEqual(warnings, [])
+        warnings, _ = self._unreadable_tick(prs=[make_pr(12)])
+        self.assertEqual(len(warnings), 1, "forgotten once closed, so a reopened one is news")
+
+    def test_a_repository_the_sweep_could_not_read_keeps_its_record(self):
+        class Refusing(FakeProvider):
+            def list_open_prs(self, repo):
+                if repo == REPO:
+                    raise forge.ForgeError("FORGE_CALL_FAILED", "HTTP 502")
+                return []
+
+        self._unreadable_tick()
+        with mock.patch("sys.stderr", io.StringIO()):
+            self._sweep(Refusing(), repo=[REPO, "acme/other"])
+        warnings, _ = self._unreadable_tick()
+        self.assertEqual(warnings, [], "still the failure posted before the repository went dark")
+
+    def test_a_dry_run_posts_every_one_and_writes_no_record(self):
+        self._unreadable_tick()
+        warnings, _ = self._unreadable_tick(dry_run=True)
+        self.assertEqual(len(warnings), 1)
+        import os
+
+        record = os.path.join(self.home, str(gate.UNREADABLE_RECORD))
+        with open(record, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), {"acme/toolkit#12": gate.UNREADABLE_WHY_DEFAULT})
+        os.remove(record)
+        self._unreadable_tick(dry_run=True)
+        self.assertFalse(os.path.exists(record))
+
+    def test_an_unreadable_record_posts_rather_than_withholds(self):
+        import os
+
+        self._unreadable_tick()
+        with open(os.path.join(self.home, str(gate.UNREADABLE_RECORD)), "w", encoding="utf-8") as handle:
+            handle.write("not json")
+        warnings, _ = self._unreadable_tick()
+        self.assertEqual(len(warnings), 1)
 
     def test_a_credential_that_cannot_name_itself_is_loud(self):
         """No viewer identity means no way to tell our own PR from anyone else's.

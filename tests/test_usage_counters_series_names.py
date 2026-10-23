@@ -75,6 +75,9 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
     def test_the_brokers_merged_counter_is_the_one_the_poller_sums(self):
         self.assertEqual(_py_const("VCS_MERGED_METRIC"), _go_const(_SCRAPE_GO, "vcsMergedSeries"))
 
+    def test_the_closed_unmerged_series_is_the_brokers(self):
+        self.assertEqual(_py_const("VCS_CLOSED_UNMERGED_METRIC"), _go_const(_SCRAPE_GO, "vcsClosedUnmergedSeries"))
+
     def test_the_a2a_gateways_inbound_counter_is_the_chat_counters_other_family(self):
         """On a next-mode install the A2A gateway counts the chat messages it accepts;
         the poller folds that family into chatMessagesInboundTotal beside the plugin's,

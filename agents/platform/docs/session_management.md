@@ -53,7 +53,7 @@ The watcher deduplicates on the involved object's UID and the reason, so one bro
 
 An admitted row is one with `notified` non-zero or a `delivery_error`. A failed chat post resets `notified` to `0` within seconds while its triage keeps running, so anchoring on `notified` alone would let every sibling open its own triage on an install whose chat route is broken. A row the gate filtered, the ceiling dropped, or that was itself folded never anchors a window, and neither does a row whose triage never started: when `trigger_agent_troubleshooter` cannot create the gateway session or the gateway refuses the turn (a 3xx, a 4xx, a 503, or an error while connecting or sending; a 2xx, any other 5xx or an error while waiting for the response counts as started, since the turn may have run; a draining gateway creates the session and answers the turn 503), it clears the row's `fold_key`, so a sibling that arrives after that is admitted and starts the triage. The same happens when that background task dies on an exception, and every start of the server clears all fold keys, because a row whose task never ran (the process died between the insert and the task) has nothing else to release it; a workload whose triage did start loses its window, at the cost of one more triage (one per severity, since a Critical folds only into a Critical) for a sibling that arrives after the restart. Siblings that folded into the row before it was released stay folded. For a refused turn they arrive within seconds of it, while the gateway that refused it is still refusing; for a task that died, they are the ones that landed while it ran. The daily recap does not count a folded row as withheld by the ceiling, and `GET /v1/intercepted-events` lists it as `folded`, with the anchor's id in its `duplicate_of`.
 
-A [`controller-stall` inject](#the-third-producer-controller-stall) claims no allowance at all: the stall watch caps itself at three alerts a tick, and that cap is its only bound. Neither does a drift backlog record that is digested (`POST /v1/drift-backlog`): it starts no turn and is counted in one digest. A late record that is carded instead — a late `kubectl` write, or a late row of a principal with fewer than three in the digest — bills `GitOpsDrift` as a live record does. A refused minority row stays in the digest; a refused late `kubectl` write is suppressed as a live record is.
+A [`controller-stall` inject](#the-third-producer-controller-stall) claims no allowance at all: the stall watch caps itself at three alerts a tick, and that cap is its only bound. Neither does a drift backlog record that is digested (`POST /v1/drift-backlog`): it starts no turn and is counted in one digest (a chat message, or one unassigned board card on an install with no chat platform enabled). A late record that is carded instead — a late `kubectl` write, or a late row of a principal with fewer than three in the digest — bills `GitOpsDrift` as a live record does. A refused minority row stays in the digest; a refused late `kubectl` write is suppressed as a live record is.
 
 | Bucket        | Env var                      | Default |
 | ------------- | ---------------------------- | ------- |
@@ -128,7 +128,9 @@ What the drift branch does differently:
   pulling, or waited over 30 minutes) goes to `POST /v1/drift-backlog` instead, with no session. The
   route writes a ledger row with `backlog = 1` and the record's `principal`, spends no quota and
   starts no turn. A worker thread posts one digest per burst, after 60 seconds with no new backlog
-  row or 10 minutes after the oldest, and marks the rows `2` (posted) or `3` (no chat platform). A
+  row or 10 minutes after the oldest, and marks the rows `2` (posted) or `3` (filed as one board card,
+  on an install with no chat platform enabled: unassigned and blocked, so no agent turn files or
+  reads it, and it stays in view until a person acts). A
   principal with fewer than three late rows is not digested: each of its rows gets a session, a quota
   claim and a card, as a live record does, rebuilt from the payload the row stores, and is marked
   `4`. A row the ceiling refuses stays in the digest. A row without a usable stored payload is
@@ -428,7 +430,7 @@ CREATE TABLE intercepted_events(
   delivery_error TEXT NOT NULL DEFAULT '',  -- non-empty when the chat post failed after notified = 1
   session_id  TEXT NOT NULL DEFAULT '',  -- the session the inject arrived on, joining the row to GET /v1/sessions/{id}/tasks
   created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  backlog     INTEGER NOT NULL DEFAULT 0,  -- drift backlog: 1 owed a digest, 2 digested, 3 no chat platform, 4 carded
+  backlog     INTEGER NOT NULL DEFAULT 0,  -- drift backlog: 1 owed a digest, 2 digested, 3 filed as a board card (no chat platform), 4 carded
   principal   TEXT NOT NULL DEFAULT '',    -- written on drift backlog rows only, for the digest's count
   payload     TEXT NOT NULL DEFAULT '',    -- drift backlog rows only: the record, to card it from
   duplicate_of INTEGER,                    -- the admitted row this event was folded into; NULL otherwise

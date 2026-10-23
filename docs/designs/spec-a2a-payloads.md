@@ -13,6 +13,9 @@
   becomes decision-grade by resolution (the Authority section).
   Amended 10/8, again without a version bump: the chat message schema (the Chat messages
   section), a DataPart layout for chat renderers that adds no kind and no envelope field.
+  Amended 10/21, again without a version bump: the library's held subscriptions (#3655),
+  which hold each delivery for a task's life and expect redelivery, are outside the
+  at-most-once rule (the `envelopeId` row and assertion 5).
   Amended 10/22, without a version bump: a new task for a profile is submitted on its own
   subject, `a2a.tasks.{profile}.{tier}.{kind}.{taskId}.submit`, so the dispatcher's
   durables never see a follow-up (the Subjects section; the design is #3660).
@@ -144,7 +147,7 @@ lacked.
 | Field                  | Rules                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `protocol`             | Required. Major.minor; bump major on breaking change. Consumers MUST reject unknown majors and MUST ignore unknown envelope fields within a major.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `envelopeId`           | Required, unique per envelope. The dedup key: JetStream redelivery means consumers will see repeats, and this is how the library delivers each envelope to the application at most once. The dedup window is bounded - an LRU or time window sized to the redelivery horizon (`MaxAckPending` × ack wait, plus margin), never an unbounded set that grows for the life of the process.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `envelopeId`           | Required, unique per envelope. The dedup key: JetStream redelivery means consumers will see repeats, and this is how the library delivers each envelope to the application at most once. Held subscriptions are the exception: they expect redelivery and recognise it by task id (assertion 5). The dedup window is bounded - an LRU or time window sized to the redelivery horizon (`MaxAckPending` × ack wait, plus margin), never an unbounded set that grows for the life of the process.                                                                                                                                                                                                                                                                                                                                                                          |
 | `correlationId`        | Required. Minted once by the gateway at the user interaction that starts a task. Copied verbatim on every hop; never re-minted by an intermediary. A task spawned in service of another task inherits its parent's value, and a follow-up or steer to a running task carries the task's original value - the steer is attributed by its own envelope and `authority` block, not by a new correlation. This is the identifier that spans question, hops, and resulting change.                                                                                                                                                                                                                                                                                                                                                                                           |
 | `traceparent`          | Optional. W3C trace context, for OTel tooling. `correlationId` is authoritative; `traceparent` is a convenience and may be re-parented per span.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `taskId` / `contextId` | Required for kinds `message`, `status-update`, `artifact-update`, `cancel`. Optional for `topic-update` (present when a topic write happened in the course of a task - see Topics). Absent for `agent-card`, `agent-closed`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
@@ -259,11 +262,16 @@ A consumer implementing rule 2 is therefore checking an invariant the server alr
 and an install that widens `.in` or `…submit` publish to a second identity has broken the rule's premise
 before any consumer sees it.
 
-**What this does not give a consumer.** It does not answer "who is the human". The chain
-terminates at a request id, not a person; `authority.requester` names a pseudonymized
-principal and is advisory. It does not expire - 09 §5 is explicit that nothing carries an
-issue time or a use count, so a resolvable reference is resolvable indefinitely, and a
-consumer MUST NOT read a successful resolution as evidence the request is still live.
+**What this does not give a consumer.** It does not answer "who is the human" for
+authorization. The capability chain terminates at a request id, not a person;
+`authority.requester` names a pseudonymized principal (`hmac:<32-hex>`) and is advisory for
+access control. As an interim exception until the #1884 capability grant carries the
+pseudonymous requester subject directly, the bridge records `authority.requester.principal`
+and `authority.audience.kind` in `session-kv` on task submission (where the gateway is the
+sole `.in` publisher under rule 2 above) to key per-user memory isolation. It does not expire -
+09 §5 is explicit that nothing carries an issue time or a use count, so a resolvable
+reference is resolvable indefinitely, and a consumer MUST NOT read a successful resolution
+as evidence the request is still live.
 
 ### Kinds and payload types
 
@@ -426,7 +434,7 @@ artifact, and nine names are reserved so renderers and audit tooling can rely on
 | `thinking` | Reasoning deltas. Debug views only                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `activity` | Tool-call trace, one entry per invocation. Always in the audit replay                                                                                                                                                                                                                                                                                                                                                                                             |
 | `progress` | Agent-authored milestones, renderable to chat at zero model cost. Stage 1 derives these from model narration; the subagent framework spec records the deviation. May carry a chat message (Chat messages, below), the live message's whole state, so `progress` is text plus at most one chat message DataPart per chunk; assertion 18's validator takes a data part there only when it is a chat message                                                         |
-| `delegate` | The session's request to the gateway to mint a child task: one `data` part `{"addressee", "text"}` on the session's own task events. Consumed by the gateway's relay, never rendered to chat; reserved 10/5, used from the delegation primitive onward                                                                                                                                                                                                            |
+| `delegate` | The session's request to the gateway to mint a child task: one `data` part `{"addressee", "text", "parameters"?}` on the session's own task events (`parameters`: the child's task parameters, below). Consumed by the gateway's relay, never rendered to chat; reserved 10/5, used from the delegation primitive onward                                                                                                                                          |
 | `turn`     | One finished turn's answer on a task with more turns queued (an executor that queues follow-ups). Chunked like `result`, posted by renderers as it completes, never the deliverable; the last turn's answer is the `result`.                                                                                                                                                                                                                                      |
 | `notice`   | A message the task posts on its own, beside its live message and its answer (a PR it opened, say): a TextPart, optionally with a chat message. Each `notice` artifact posts once and is never edited. Not the gateway's own notices. A gateway older than 10/8 drops it, so a fact that matters is in the result too; reserved 10/8                                                                                                                               |
 | `handoff`  | The task handed work to kanban cards, which report into its conversation themselves: one TextPart, `cards`. The Hermes bridge's API executor publishes it ahead of the terminal of such a task whenever the conversation route was recorded (Slack or Google Chat). Never rendered; a delegated child's wake reads it as the cards-pending signal beside the terminal's mark, which the bridge sets only on Slack with `KAGE_SLACK_UX` on (#3258). Reserved 10/16 |
@@ -713,6 +721,47 @@ and only its `mark` is validated. When the newest task ends with no mark on its 
 `canceled` completing a stop the requester sent), the `ask` comes off, a `blocked` settle lifts, and `failed` sets
 `settle: failed`. Any other message without `mark` changes nothing.
 
+### Task parameters and child results
+
+Reserved 10/22 for the profile dispatcher (`spec-subagent-profiles.md`), and used from the gateway's
+delegation to profiles onward; nothing writes them yet. Until a gateway reads a `delegate` request's `parameters`, the
+worker adapter refuses a request carrying any, rather than publish one whose child would be minted
+without its target. Both are `data` parts, and only the gateway
+writes them: the gateway strips any a client or a task supplies, and a reader refuses a message carrying two
+`taskParameters` parts.
+
+**Task parameters.** A profile task's submission carries
+`{"taskParameters": {"parameters": {"<name>": "<value>", …}}}`: the parameters its persona
+declares, such as the cluster persona's `project`, `location` and `cluster`. The gateway sets them
+from what the client or the parent task asked. They never ride the authority block. The dispatcher
+builds the verifier's resource from them (`project/<p>/location/<l>/cluster/<c>`) and passes each
+to the worker as `PROFILE_TASK_<NAME>`. The verifier refuses a target outside the grant's scope,
+and that check is what makes these message fields authoritative.
+
+- A name is a lower-case identifier of at most 63 characters, the persona loader's own rule (`lib.TaskParameterNameRE`). A value is one token of at most 128
+  characters, starting with a letter or digit and then letters, digits and `. _ : -`, so it is never
+  `.`, `..` or a flag.
+- A value can't contain `/` or a space, because the dispatcher joins values into a resource path.
+- A set has at most 16 parameters.
+- A reader that finds the part and it breaks these bounds, or carries no parameters object, refuses
+  the task rather than running it without parameters (`lib.TaskParametersOf`). The dispatcher also
+  checks that every parameter the persona declares is present before it builds the resource.
+- A child result that is malformed (no task id, a non-terminal state, text past the cap) is
+  skipped: it is no event, where a malformed parameter set would change what runs.
+
+**Child results.** When a child task ends, the gateway publishes a `message` on its parent's `…in`
+carrying `{"childResult": {"childTaskId", "addressee", "state", "text"?}}`. The parent's per-task
+reader takes it as a new turn. `state` is the child's terminal state. `text` is its deliverable
+when it completed and its reason otherwise, at most 64 KiB and cut by the gateway; the child's own
+`result` artifact keeps it whole. Only a top-level task's end goes to its conversation.
+
+This is the rule for a parent that waits by staying open: a profile task under the dispatcher. A
+profile parent that has already ended gets no child result; the gateway drops it and logs it. A
+chat session's turn ends when it delegates, so a session parent keeps the chatops wake instead
+(`spec-chatops-gateway.md`, the delegation primitive). On its child's end the gateway starts a new
+turn on the session that carries the child's result, and it doesn't deliver a `childResult` to the
+finished turn's `…in`.
+
 ### Card work after the task ends
 
 **A stopgap.** This retires when delegated work runs as bus tasks (cards as child tasks
@@ -969,6 +1018,10 @@ Envelope:
    rule, `…events` and `…supervisor` included, which is where it already was. Nothing
    requires `to` to be present on any class, and event envelopes carry none.)
 5. A redelivered envelope (same `envelopeId`) reaches the application at most once.
+   (Amended 10/21: on the library's auto-ack subscriptions. A held subscription, whose
+   handler holds each delivery for the task's life (a profile's intake, #3655), expects
+   redelivery and leaves it to the caller, which recognises it by task id: a task that had
+   already started is failed, never re-run.)
 
 Payloads:
 

@@ -2,6 +2,9 @@ package lib
 
 import (
 	"encoding/json"
+	"fmt"
+	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -131,4 +134,139 @@ func mustJSON(t *testing.T, v any) string {
 		t.Fatal(err)
 	}
 	return string(b)
+}
+
+func TestTaskParametersRoundTrip(t *testing.T) {
+	in := TaskParameters{Parameters: map[string]string{"project": "acme-prod", "location": "us-east4", "cluster": "web-1"}}
+	part, err := TaskParametersPart(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := TaskParametersOf([]Part{{Kind: "text", Text: "hi"}, part})
+	if err != nil || !ok || !reflect.DeepEqual(got, in) {
+		t.Fatalf("TaskParametersOf = %+v, %v, %v; want %+v", got, ok, err, in)
+	}
+	if _, ok, err := TaskParametersOf([]Part{{Kind: "text", Text: "hi"}}); ok || err != nil {
+		t.Errorf("no part: ok=%v err=%v, want neither", ok, err)
+	}
+	// An empty set is a task with no parameters, and goes out as an object.
+	empty, err := TaskParametersPart(TaskParameters{})
+	if err != nil || string(empty.Data) != `{"taskParameters":{"parameters":{}}}` {
+		t.Errorf("empty part = %s, %v", empty.Data, err)
+	}
+}
+
+// A value is joined into the verifier's resource path, so a '/' (or a space,
+// or anything past one token) would let it name another resource: refused
+// on the way out, and an error, not a skip, on the way in.
+func TestTaskParametersRefuseWhatCouldForgeAResource(t *testing.T) {
+	tooMany := map[string]string{}
+	for i := 0; i <= TaskParametersMax; i++ {
+		tooMany[fmt.Sprintf("p%d", i)] = "v"
+	}
+	for name, params := range map[string]map[string]string{
+		"a slash in a value":  {"cluster": "web-1/../other"},
+		"a dot step":          {"cluster": "."},
+		"a parent step":       {"cluster": ".."},
+		"a flag":              {"cluster": "-rf"},
+		"a long flag":         {"cluster": "--kubeconfig=x"},
+		"a space in a value":  {"cluster": "web 1"},
+		"an empty value":      {"cluster": ""},
+		"a long value":        {"cluster": strings.Repeat("a", TaskParameterValueMaxLen+1)},
+		"an upper-case name":  {"Cluster": "web-1"},
+		"a name with a dash":  {"target-cluster": "web-1"},
+		"a long name":         {strings.Repeat("a", 64): "v"},
+		"too many parameters": tooMany,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := TaskParametersPart(TaskParameters{Parameters: params}); err == nil {
+				t.Error("TaskParametersPart accepted it")
+			}
+			data, _ := json.Marshal(map[string]TaskParameters{"taskParameters": {Parameters: params}})
+			if _, ok, err := TaskParametersOf([]Part{{Kind: "data", Data: data}}); !ok || err == nil {
+				t.Errorf("TaskParametersOf: ok=%v err=%v, want the part found and refused", ok, err)
+			}
+		})
+	}
+}
+
+func TestChildResultRoundTrip(t *testing.T) {
+	in := ChildResult{ChildTaskID: "task-7", Addressee: "cluster", State: StateCompleted, Text: "3 nodes ready"}
+	part, err := ChildResultPart(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := ChildResultOf([]Part{{Kind: "text", Text: "x"}, part})
+	if !ok || got != in {
+		t.Fatalf("ChildResultOf = %+v, %v; want %+v", got, ok, in)
+	}
+}
+
+// A child result names a finished task: no id, a non-terminal state or text
+// past the cap is refused on the way out and skipped on the way in.
+func TestChildResultRefusesWhatIsNotAnEnd(t *testing.T) {
+	for name, c := range map[string]ChildResult{
+		"no task id":           {State: StateCompleted},
+		"a task id with a dot": {ChildTaskID: "task.7", State: StateCompleted},
+		"a working state":      {ChildTaskID: "task-7", State: StateWorking},
+		"text past the cap":    {ChildTaskID: "task-7", State: StateCompleted, Text: strings.Repeat("a", ChildResultTextCap+1)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ChildResultPart(c); err == nil {
+				t.Error("ChildResultPart accepted it")
+			}
+			data, _ := json.Marshal(map[string]ChildResult{"childResult": c})
+			if _, ok := ChildResultOf([]Part{{Kind: "data", Data: data}}); ok {
+				t.Error("ChildResultOf read it")
+			}
+		})
+	}
+}
+
+// A delegate request without parameters is the wire shape it always was,
+// so an adapter or gateway built before this reads it unchanged.
+func TestADelegateRequestWithoutParametersIsUnchangedOnTheWire(t *testing.T) {
+	data, err := json.Marshal(DelegateRequest{Addressee: "platform", Text: "do it"})
+	if err != nil || string(data) != `{"addressee":"platform","text":"do it"}` {
+		t.Fatalf("wire = %s, %v", data, err)
+	}
+	var got DelegateRequest
+	if err := json.Unmarshal([]byte(`{"addressee":"cluster","text":"t","parameters":{"cluster":"web-1"}}`), &got); err != nil ||
+		got.Parameters["cluster"] != "web-1" {
+		t.Fatalf("decoded %+v, %v", got, err)
+	}
+}
+
+// A part that is there but carries no parameters object (null, or a
+// misspelt field) is broken, not an empty set: an error, never a task run
+// with no target.
+func TestTaskParametersOfRefusesAPartWithNoParametersObject(t *testing.T) {
+	for _, data := range []string{
+		`{"taskParameters":null}`,
+		`{"taskParameters":{"parameters":null}}`,
+		`{"taskParameters":{"parameterz":{"cluster":"web-1"}}}`,
+	} {
+		if _, ok, err := TaskParametersOf([]Part{{Kind: "data", Data: json.RawMessage(data)}}); !ok || err == nil {
+			t.Errorf("%s: ok=%v err=%v, want found and refused", data, ok, err)
+		}
+	}
+}
+
+// A name as long as the persona loader allows (63) is one a submission can
+// carry: the two share TaskParameterNameRE, so a persona never declares a
+// parameter its tasks cannot be handed.
+func TestATaskParameterNameAsLongAsAPersonaAllowsIsValid(t *testing.T) {
+	if err := ValidateTaskParameters(map[string]string{strings.Repeat("a", 63): "v"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Two taskParameters parts leave a task's target ambiguous: an error, never
+// the first or the last quietly chosen.
+func TestTaskParametersOfRefusesTwoParts(t *testing.T) {
+	one, _ := TaskParametersPart(TaskParameters{Parameters: map[string]string{"cluster": "web-1"}})
+	two, _ := TaskParametersPart(TaskParameters{Parameters: map[string]string{"cluster": "prod-1"}})
+	if _, ok, err := TaskParametersOf([]Part{one, two}); !ok || err == nil {
+		t.Fatalf("ok=%v err=%v, want found and refused", ok, err)
+	}
 }

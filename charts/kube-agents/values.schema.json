@@ -301,6 +301,13 @@
               }
             }
           }
+        },
+        "traceLogEnabled": {
+          "type": "boolean"
+        },
+        "traceLogPath": {
+          "type": "string",
+          "pattern": "^/tmp/([^\\x00/]*[^\\x00/.][^\\x00/]*/)*[^\\x00/]*[^\\x00/.][^\\x00/]*$"
         }
       }
     },
@@ -704,6 +711,22 @@
                   "type": "integer",
                   "minimum": 1,
                   "maximum": 10000
+                },
+                "profiles": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "ceiling": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 1000
+                    },
+                    "warmReplicas": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 100
+                    }
+                  }
                 },
                 "default": {
                   "type": "object"
