@@ -409,7 +409,7 @@ class StuckTasksTests(unittest.TestCase):
             "Stopped 4 days ago before finishing.",
         ])
 
-    def test_a_shared_title_of_different_kinds_stays_two_rows(self):
+    def test_a_shared_title_waiting_on_a_person_and_not_stays_two_rows(self):
         lines = kbh.render_stuck_tasks([stuck("a", "Same", 30), stuck("b", "Same", 30, person=True)])
         self.assertEqual(lines.count("**Same**"), 2)
 
@@ -457,6 +457,14 @@ class StuckDueTests(unittest.TestCase):
         due, kept = kbh.stuck_due([stuck("a", "A")], {"said": ["a"], "said_at": 1000.0}, 1000.0 + 7 * self.DAY)
         self.assertTrue(due)
         self.assertEqual(kept["said_at"], 1000.0 + 7 * self.DAY)
+
+    def test_a_daily_run_a_few_minutes_short_of_the_week_still_reminds(self):
+        week = 7 * self.DAY
+        state = {"said": ["a"], "said_at": 1000.0}
+        due, _ = kbh.stuck_due([stuck("a", "A")], state, 1000.0 + week - kbh.REMIND_SLACK_SECONDS)
+        self.assertTrue(due)
+        due, _ = kbh.stuck_due([stuck("a", "A")], state, 1000.0 + week - kbh.REMIND_SLACK_SECONDS - 1)
+        self.assertFalse(due)
 
     def test_a_newly_stuck_task_is_said_with_the_rest_and_restarts_the_week(self):
         now = 1000.0 + 2 * self.DAY
@@ -521,6 +529,20 @@ class ReportTests(unittest.TestCase):
                                       binary="/x/hermes", env={})
         self.assertEqual(lines, [])
         self.assertEqual(tasks, [{"task_id": "t_stuck", "title": "Triage x", "person": True, "age_hours": 456.2}])
+
+    def test_an_engine_that_did_not_answer_returns_no_stuck_tasks(self):
+        with tempfile.TemporaryDirectory() as d:
+            make_board(Path(d), tasks=[{"id": "t", "status": "blocked"}])
+            for runner in (lambda argv, env, timeout: (2, "", "boom"),
+                           lambda argv, env, timeout: (0, "not json", "")):
+                tasks, lines = kbh.report(Path(d), runner=runner, binary="/x/hermes", env={})
+                self.assertIsNone(tasks)
+                self.assertIn("diagnostics unavailable", "\n".join(lines))
+            def timeout(argv, env, timeout):
+                raise TimeoutError("took too long")
+            self.assertIsNone(kbh.report(Path(d), runner=timeout, binary="/x/hermes", env={})[0])
+            with unittest.mock.patch.object(kbh, "hermes_bin", side_effect=FileNotFoundError("no hermes")):
+                self.assertIsNone(kbh.report(Path(d), runner=self.clean_runner, env={})[0])
 
     def test_violation_and_diagnostic_are_both_reported(self):
         with tempfile.TemporaryDirectory() as d:
@@ -604,6 +626,20 @@ class MainOutputContractTests(unittest.TestCase):
         self.assertEqual(self.run_main(tasks, [], now=1000.0 + 86400), (0, ""))
         self.assertEqual(self.run_main(tasks, [], now=1000.0 + 7 * 86400)[1], first)
 
+    def test_an_engine_that_did_not_answer_leaves_the_record_alone(self):
+        tasks = [stuck("t_1", "Triage x", 30)]
+        self.run_main(tasks, [])
+        path = Path(self.env["KANBAN_HEALTH_STATE"])
+        before = path.read_text()
+        code, out = self.run_main(None, ["Active kanban diagnostics:", "  diagnostics unavailable: boom"],
+                                  now=1000.0 + 8 * 86400)
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "kanban board health: attention required\nActive kanban diagnostics:\n"
+                              "  diagnostics unavailable: boom\n")
+        self.assertEqual(path.read_text(), before)
+        # The next answer is still inside the week the record started, so stays quiet.
+        self.assertEqual(self.run_main(tasks, [], now=1000.0 + 86400), (0, ""))
+
     def test_stuck_tasks_and_other_findings_print_together(self):
         _code, out = self.run_main([stuck("t_1", "Triage x", 30)], ["  ghost claim: task t is 'ready'"])
         card, other = out.split("\n\n**Triage x**\nStopped 1 day ago before finishing.\n\n")
@@ -638,7 +674,7 @@ class BoardPathTests(unittest.TestCase):
 
 
 class BlockedContextTests(unittest.TestCase):
-    def test_kind_reason_title_and_assignee_are_read_from_the_board(self):
+    def test_kind_and_title_are_read_from_the_board(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = make_board(
                 Path(tmp),
@@ -652,12 +688,9 @@ class BlockedContextTests(unittest.TestCase):
                 context = kbh.blocked_context(conn)
             finally:
                 conn.close()
-        self.assertEqual(set(context), {"t_b"})
-        self.assertEqual(context["t_b"]["kind"], "needs_input")
-        self.assertEqual(context["t_b"]["reason"], "judge rejected")
-        self.assertEqual(context["t_b"]["assignee"], "cluster-a")
+        self.assertEqual(context, {"t_b": {"title": "Triage x", "kind": "needs_input"}})
 
-    def test_kind_and_reason_both_follow_the_latest_event(self):
+    def test_kind_follows_the_latest_event(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = make_board(
                 Path(tmp),
@@ -670,7 +703,7 @@ class BlockedContextTests(unittest.TestCase):
                 context = kbh.blocked_context(conn)
             finally:
                 conn.close()
-        self.assertEqual((context["t_b"]["kind"], context["t_b"]["reason"]), ("dependency", "new"))
+        self.assertEqual(context["t_b"]["kind"], "dependency")
 
     def test_an_unmigrated_board_yields_no_context_rather_than_raising(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -481,9 +481,10 @@ headline counting them ("2 tasks are stuck and need someone to decide."), then
 one row per card, newest first, with the card's own title in bold and how long
 it has waited ("Stopped 3 days ago before finishing.", or "Paused 6 days ago."
 for a `needs_input` block, which waits on a person's answer). Cards sharing a
-title and kind are one row with their count, and past 15 rows the rest are
-counted. No task ids, block reasons or `hermes kanban` commands reach chat;
-`hermes kanban list` and `show` on the agent pod have them.
+title and whether they wait on a person are one row with their count, and past
+`MAX_STUCK_ROWS` rows the rest are counted. No task ids, block reasons or
+`hermes kanban` commands reach chat; `hermes kanban list` and `show` on the
+agent pod have them.
 
 It runs daily but speaks about stuck cards only when one first gets stuck, then
 once a week while any stays stuck: a card said once in a busy channel can be

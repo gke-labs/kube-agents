@@ -110,8 +110,8 @@ one row per task, newest first, with the task's own title in bold and how long
 it has waited ("Stopped 3 days ago before finishing.", or "Paused 6 days ago."
 for a block waiting on a person's answer). No task ids, block reasons or
 commands: those stay behind ``hermes kanban list`` and ``hermes kanban show``.
-Tasks sharing a title and kind are one row with their count, and past
-``MAX_STUCK_ROWS`` rows the rest are counted.
+Tasks sharing a title and whether they wait on a person are one row with
+their count, and past ``MAX_STUCK_ROWS`` rows the rest are counted.
 
 They are said when a task first gets stuck, then once a week while any stays
 stuck (``stuck_due``); a run in between says nothing about them. The record of
@@ -203,6 +203,9 @@ TITLE_EMPHASIS = "*"
 # any stays stuck; a run in between prints nothing about them. The record of
 # what was said lives beside the other platform watches' ledgers.
 REMIND_AFTER_DAYS = 7
+# A daily job's start drifts by seconds to minutes, so a week measured to the
+# second would slip the reminder to the eighth day; this much early still counts.
+REMIND_SLACK_SECONDS = 10 * 60
 SECONDS_PER_HOUR = 3600
 STATE_ENV = "KANBAN_HEALTH_STATE"
 PROFILES_DIR = "profiles"
@@ -214,6 +217,10 @@ STATE_SCHEMA_VERSION = 1
 STATE_VERSION_KEY = "version"
 STATE_SAID_KEY = "said"
 STATE_SAID_AT_KEY = "said_at"
+
+# The line a run where the engine did not answer returns, and how `report`
+# tells that run from a clean one: its stuck cards are unknown, not absent.
+DIAGNOSTICS_UNAVAILABLE = "  diagnostics unavailable"
 
 # The CLI opens the board through Hermes' own connection and may run an
 # idempotent migration; 60s is generous for a board of this size and still well
@@ -245,11 +252,11 @@ GHOST_CLAIMS_SQL = """
      ORDER BY id
 """
 
-# What the engine's JSON does not carry about a blocked card: its kind, and
-# the reason the last `blocked` event recorded (`kanban_db.block_task` writes
-# `{"reason": ..., "kind": ...}` as the event payload).
+# What the engine's JSON does not carry about a blocked card: its title, and
+# its kind as the last `blocked` event recorded it (`kanban_db.block_task`
+# writes `{"reason": ..., "kind": ...}` as the event payload).
 BLOCKED_TASKS_SQL = """
-    SELECT id, title, assignee, block_kind
+    SELECT id, title, block_kind
       FROM tasks
      WHERE status = 'blocked'
 """
@@ -315,10 +322,10 @@ def read_only_connection(db: Path) -> sqlite3.Connection:
 
 
 def blocked_context(conn: sqlite3.Connection) -> dict:
-    """kind, reason, title and assignee per blocked card, or {} on an unmigrated board."""
+    """Title and kind per blocked card, or {} on an unmigrated board."""
     try:
         tasks = {
-            row["id"]: {"title": row["title"] or "", "assignee": row["assignee"] or "", "kind": row["block_kind"], "reason": ""}
+            row["id"]: {"title": row["title"] or "", "kind": row["block_kind"]}
             for row in conn.execute(BLOCKED_TASKS_SQL)
         }
         for row in conn.execute(BLOCKED_EVENTS_SQL):
@@ -329,8 +336,7 @@ def blocked_context(conn: sqlite3.Connection) -> dict:
             except ValueError:
                 payload = {}
             if isinstance(payload, dict):
-                # Events arrive oldest first, so the last one wins for both fields.
-                tasks[row["task_id"]]["reason"] = str(payload.get("reason") or tasks[row["task_id"]]["reason"])
+                # Events arrive oldest first, so the last kind wins.
                 if payload.get("kind"):
                     tasks[row["task_id"]]["kind"] = payload["kind"]
     except sqlite3.OperationalError:
@@ -423,9 +429,9 @@ def status_line(person: bool, age_hours: float) -> str:
 def render_stuck_tasks(tasks: list) -> list:
     """The stuck tasks as chat lines: a headline counting every task, then a row per title.
 
-    Rows are newest first. Tasks sharing a title and kind are one row with
-    their count, aged by the one that has waited longest. Past
-    ``MAX_STUCK_ROWS`` the rest are counted. Empty for no tasks.
+    Rows are newest first. Tasks sharing a title and whether they wait on a
+    person are one row with their count, aged by the one that has waited
+    longest. Past ``MAX_STUCK_ROWS`` the rest are counted. Empty for no tasks.
     """
     if not tasks:
         return []
@@ -488,16 +494,16 @@ def stuck_due(tasks: list, state: dict, now: float) -> tuple[bool, dict]:
     """Whether to say the stuck tasks this run, and the record to keep.
 
     Said when a task is stuck that the last post did not name, or when
-    ``REMIND_AFTER_DAYS`` have passed since the last post and any task is
-    still stuck. A task that comes unstuck drops out of the record, so if it
-    sticks again it is new. ``now`` is epoch seconds.
+    ``REMIND_AFTER_DAYS`` have passed since the last post (less
+    ``REMIND_SLACK_SECONDS``) and any task is still stuck. A task that comes
+    unstuck drops out of the record, so if it sticks again it is new. ``now`` is epoch seconds.
     """
     current = sorted({task["task_id"] for task in tasks})
     said = set(state.get(STATE_SAID_KEY) or [])
     said_at = state.get(STATE_SAID_AT_KEY)
     if not current:
         return False, {STATE_SAID_KEY: [], STATE_SAID_AT_KEY: None}
-    remind_after = REMIND_AFTER_DAYS * HOURS_PER_DAY * SECONDS_PER_HOUR
+    remind_after = REMIND_AFTER_DAYS * HOURS_PER_DAY * SECONDS_PER_HOUR - REMIND_SLACK_SECONDS
     if set(current) - said or said_at is None or now - said_at >= remind_after:
         return True, {STATE_SAID_KEY: current, STATE_SAID_AT_KEY: now}
     return False, {STATE_SAID_KEY: sorted(said & set(current)), STATE_SAID_AT_KEY: said_at}
@@ -571,12 +577,13 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
     the engine grades it. Stuck cards are not rendered here: each is appended
     to ``stuck`` as ``(task_id, diag, entry)`` for ``stuck_tasks``, and a call
     without the list drops them. Everything else keeps the engine's own title
-    and detail, within max_chars.
+    and detail, within max_chars. A run where the engine did not answer
+    returns one line starting ``DIAGNOSTICS_UNAVAILABLE``.
     """
     try:
         exe = str(binary) if binary else str(hermes_bin())
     except FileNotFoundError as exc:
-        return [f"  diagnostics unavailable: {exc}"]
+        return [f"{DIAGNOSTICS_UNAVAILABLE}: {exc}"]
     child_env = dict(env if env is not None else os.environ)
     child_env["HERMES_HOME"] = str(home)
     # Pin the engine to the file the invariant queries just read. Left alone,
@@ -591,21 +598,21 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
     try:
         code, out, err = runner(argv, child_env, DIAGNOSTICS_TIMEOUT_SECONDS)
     except Exception as exc:  # timeout, OSError, anything the runner raises
-        return [f"  diagnostics unavailable: {type(exc).__name__}: {exc}"]
+        return [f"{DIAGNOSTICS_UNAVAILABLE}: {type(exc).__name__}: {exc}"]
     if code != 0:
         detail = [ln for ln in ((err or out or "").strip().splitlines()) if ln.strip()]
         tail = detail[-1] if detail else f"exit {code}"
-        return [f"  diagnostics unavailable: `hermes kanban diagnostics` exit {code}: {tail}"]
+        return [f"{DIAGNOSTICS_UNAVAILABLE}: `hermes kanban diagnostics` exit {code}: {tail}"]
     try:
         entries = _parse_diagnostics_json(out)
     except json.JSONDecodeError as exc:
-        return [f"  diagnostics unavailable: unparseable JSON from the CLI ({exc})"]
+        return [f"{DIAGNOSTICS_UNAVAILABLE}: unparseable JSON from the CLI ({exc})"]
     # The `--json` branch of `_cmd_diagnostics` always emits a list, so this is
     # belt-and-braces — but the contract of this whole function is that it
     # returns lines and never raises, and a dict or a bare int would otherwise
     # escape as a traceback that the scheduler reports as a failed watchdog.
     if entries is not None and not isinstance(entries, list):
-        return [f"  diagnostics unavailable: CLI returned "
+        return [f"{DIAGNOSTICS_UNAVAILABLE}: CLI returned "
                 f"{type(entries).__name__}, expected a JSON list"]
     if max_chars is None:
         max_chars = MAX_REPORT_CHARS
@@ -645,11 +652,12 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
     return lines
 
 
-def report(home: Path, *, env=None, max_chars: int | None = None, **kwargs) -> tuple[list, list]:
+def report(home: Path, *, env=None, max_chars: int | None = None, **kwargs) -> tuple[list | None, list]:
     """The whole check: ``(stuck tasks, other lines)``. Both empty means healthy, which means silent.
 
     The stuck tasks are ``stuck_tasks`` dicts, which ``main`` renders when
-    ``stuck_due`` says so. The other lines (invariant violations and the
+    ``stuck_due`` says so, or None when the engine did not answer (its line is
+    among the other lines), since then which cards are stuck is unknown. The other lines (invariant violations and the
     engine's other findings) stay <= max_chars (including the 40-char reserve
     for ``REPORT_HEADER``); the default leaves ``STUCK_CARD_RESERVE`` of the
     report's budget to the stuck tasks.
@@ -696,6 +704,8 @@ def report(home: Path, *, env=None, max_chars: int | None = None, **kwargs) -> t
     if diags:
         lines.append("Active kanban diagnostics:")
         lines.extend(diags)
+    if any(line.startswith(DIAGNOSTICS_UNAVAILABLE) for line in diags):
+        return None, lines
     return stuck_tasks(stuck, context), lines
 
 
@@ -706,12 +716,16 @@ def main(argv=None, *, env=None, now=None) -> int:
     except sqlite3.Error as exc:
         print(f"kanban board health: cannot read {board_path(home)}: {exc}")
         return 0
-    path = state_path(home, env)
-    state = load_state(path)
-    due, kept = stuck_due(tasks, state, time.time() if now is None else now)
-    if kept != state:
-        save_state(path, kept)
-    out = render_stuck_tasks(tasks) if due else []
+    out = []
+    # An engine that did not answer leaves the record as it was: saving would
+    # forget every task said, and the next answer would say them all again.
+    if tasks is not None:
+        path = state_path(home, env)
+        state = load_state(path)
+        due, kept = stuck_due(tasks, state, time.time() if now is None else now)
+        if kept != state:
+            save_state(path, kept)
+        out = render_stuck_tasks(tasks) if due else []
     if lines:
         out.extend([""] if out else [])
         out.extend([REPORT_HEADER, *lines])
