@@ -183,12 +183,11 @@ first run comes from the Chat Agent's first-run stage, the same place the four f
 once the onboarding scan settles, so a fresh install's first report is a baseline of every cluster
 it manages rather than a blank. With no GitOps repository the first-run stage still starts the
 audits, and the fleet-audit skill's `start` runs without a forge (`"mode": "none"`). This stream needs
-no repository either: the collector needs none and the report on the volume is the record. Where a repository is configured and the run is full,
+no repository either: without one `start` runs with no forge (`"mode": "none"`), and `finish` stores the document in the report store (`status: "NO_FORGE"`) instead of a ledger issue; the report on the volume is the record either way. On a full run,
 the SOP calls the `fleet_scope` tool (§3.2), probes the collector's lock (§3.6; a probe that
 names a pending reset makes the run the baseline of §3.6, the collector alone with no `start` or
-`finish`), calls `start`, runs the collector, then `finish` with the collector's manifest (`finish`
-refuses a manifest older than the run); without a repository it runs the collector alone, manifest
-included, and the first-run stage marks this job due without one. An install that onboarded before the job existed gets its baseline from
+`finish`), calls `start`, runs the collector, then `draft` and `finish` with the collector's manifest (`finish`
+refuses a manifest older than the run), with or without a repository, and the first-run stage marks this job due without one. An install that onboarded before the job existed gets its baseline from
 the first Sunday tick; the after-upgrade sweep, which on most such installs arrives first, finds no
 full run in the ledger and prints only that (§3.2).
 
@@ -901,8 +900,9 @@ the records and the live ledger and guards files under `archive/<stamp>/` and ma
 the next full run is a baseline that reviews every cluster as new under the first-run rules of
 §3.2, writes its manifest with `after_reset: true`, and the SOP calls no `finish` for it. The SOP learns
 of the pending reset before `start`: the collector's `--probe-lock`, which every route that calls
-`start` runs first, names the marker on its line, and the SOP then runs the baseline as it runs the
-no-repository route, the collector alone with no `start`, so no in-flight note is left standing
+`start` runs first, names the marker on its line, and the SOP then runs the baseline as the one route
+with no `start`, the collector alone, so no in-flight note is left standing (the no-repository route
+runs `start` and `finish` as a linked install does)
 (the case §3.1a's one refusal would otherwise gain). The ledger issue keeps its findings until the following full run files them again from its own reads
 or resolves them, and every guard's first-seen date and review count restart. Every run between
 the reset and that baseline carries the same marker. A run starts
@@ -910,8 +910,9 @@ from an empty ledger on its own only when neither a ledger nor a crash record ex
 route that may: the after-upgrade route with no full run recorded prints its no-baseline line
 instead (§3.2). The readiness watch runs on the gateway pod and reads the file as §3.5 states,
 `sandbox_exec.read_bytes` as the `agent` principal, not the `hermes` login its `gcloud` hop uses.
-The chat line still carries the counts and the top finding, so
-a reader who never opens the file gets the verdict.
+Chat receives what `finish` renders, the headline with the fleet's finding and cluster counts and
+the most severe findings by object, so a reader who never opens the file gets the verdict; the
+per-cluster lines are in the report.
 
 ### 3.7 What the run may not do
 
@@ -1002,9 +1003,9 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
    (including the freshness rule for a question); the routing lines in `CAPABILITIES.md` and the
    platform `AGENTS.md`; the roster entry
    (`0 18 * * 0`, `skills: ["fleet-audit"]`, the `AUDITS` entry with the six check ids §3.3 lists, so findings file, with check
-   ids off `MAJOR_SWEEP_CHECKS`); the SOP's two paths (the `fleet_scope` call, the lock probe, `start`, the collector and `finish` with its
-   manifest where a repository is linked, with the recovery `finish` for a collector exit without a manifest after `start`, §3.6; the
-   collector alone without one, and on either install when the probe names a pending reset, §3.6) and the first-run stage
+   ids off `MAJOR_SWEEP_CHECKS`); the SOP's paths (the `fleet_scope` call, the lock probe, `start`, the collector, `draft` and `finish` with its
+   manifest, with or without a repository (`"mode": "none"` and `NO_FORGE` without one), with the recovery `finish` for a collector exit without a manifest after `start`, §3.6; the
+   collector alone when the probe names a pending reset, §3.6) and the first-run stage
    marking this job due without a repository; the `upgrade-retrospective-after-upgrade` roster
    entry (daily 05:00 UTC, the SOP's after-upgrade route, the collector's `--after-upgrade`
    selection) and `agents/platform/scripts/upgrade_retrospective_watch.py` with its `no_agent`
