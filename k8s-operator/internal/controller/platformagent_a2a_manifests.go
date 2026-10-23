@@ -2151,8 +2151,8 @@ accounts {
         # The callout cannot authenticate through itself, so it is exempt via
         # auth_users below and carries a password. This permission pair is
         # the entire surface it needs: read the requests, answer them.
-        user: callout
-        password: "` + pw(a2aCalloutPasswordKey) + `"
+        user: ` + a2aCalloutConfIdentity.user + `
+        password: "` + pw(a2aCalloutConfIdentity.credsKey) + `"
         permissions {
           subscribe { allow = [ "$SYS.REQ.USER.AUTH" ] }
           publish { allow = [ "$SYS._INBOX.>" ] }
