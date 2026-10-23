@@ -137,7 +137,7 @@ func FormatBusStatusMarkdown(st BusStatus) string {
 				names = append(names, n)
 			}
 			sort.Strings(names)
-			sb.WriteString("Names and descriptions are as each agent published them: shown as code, shortened, without line breaks or invisible characters.\n\n")
+			sb.WriteString("Names and descriptions are as each agent published them: shown as code, shortened, without line breaks, control or format characters.\n\n")
 			sb.WriteString("| Profile | Name | Description |\n| :--- | :--- | :--- |\n")
 			for _, n := range names {
 				c := st.AgentCards[n]
