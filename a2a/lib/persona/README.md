@@ -21,9 +21,10 @@ persona and the `a2a-topics` skill) is a different thing and lives in
 
 `tools` is the allowlist. An entry is a built-in (`read_file`,
 `web_search`, `shell`), an MCP server from `mcp.yaml` (`gke`), or one of
-its tools (`gke.get_cluster`). `parameters` are values each task supplies
-in the dispatcher's preamble, such as the target cluster, so nothing
-cluster-specific is stamped into the image.
+its tools (`gke.get_cluster`). `parameters` are values each task supplies,
+such as the target cluster: the dispatcher states them in the task, and the
+profile worker also exports each as `PROFILE_TASK_<NAME>` in the environment.
+Nothing cluster-specific is stamped into the image.
 
 A persona holds no image references, no credentials and no secrets. Every
 MCP server is a server on the credential broker's MCP relay, which

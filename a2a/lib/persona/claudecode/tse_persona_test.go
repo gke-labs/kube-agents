@@ -130,9 +130,13 @@ func TestTheTsePersonaStatesItsRedLines(t *testing.T) {
 	}
 	norm := tseNormalizeMarkdown(text)
 	for what, pinned := range map[string]string{
-		"the confirm-the-target block": tseConfirmTargetBlock,
-		"the read-only rule":           tseReadOnlyRule,
-		"the redaction gate":           tseRedactionRule,
+		"the confirm-the-target block":  tseConfirmTargetBlock,
+		"the read-only rule":            tseReadOnlyRule,
+		"the redaction gate":            tseRedactionRule,
+		"the target-only rule":          tseTargetOnlyRule,
+		"the zero-assumptions rule":     tseZeroAssumptionsRule,
+		"the fail-loud rule":            tseFailLoudRule,
+		"the skills-are-read-only rule": tseSkillsReadOnlyRule,
 	} {
 		if !strings.Contains(norm, tseNormalizeMarkdown(pinned)) {
 			t.Errorf("instructions.md no longer carries %s as pinned in this test", what)
@@ -140,8 +144,8 @@ func TestTheTsePersonaStatesItsRedLines(t *testing.T) {
 	}
 }
 
-// The first step is the cluster persona's, word for word; the read-only and
-// redaction rules are §2's.
+// The first step is the cluster persona's, word for word; the rules after it
+// are §2's, pinned whole.
 var (
 	tseConfirmTargetBlock = `Credentials for the task's target are served by the credential proxy under the task's grant: ` + "`" + `kubectl` + "`" + ` and ` + "`" + `gcloud` + "`" + ` reach it through the proxy, and you never fetch or configure credentials yourself. Which cluster answers is the proxy's job, from the task's grant. Pass ` + "`" + `--project "$PROFILE_TASK_PROJECT"` + "`" + ` to every ` + "`" + `gcloud` + "`" + ` call.
 
@@ -156,7 +160,58 @@ An investigation run against the wrong cluster produces a confident, wrong repor
 `
 	tseRedactionRule = `- **Redact before anything leaves.** Before an escalation bundle or any quoted evidence goes into your answer, apply the redaction rules of the ` + "`" + `support-escalation-bundle` + "`" + ` skill (its Step 2): no Secret payloads, password or API-key values, bearer or OAuth tokens, or private keys. Keep the resource identifiers Google Cloud Support needs to locate the cluster.
 `
+	tseTargetOnlyRule = `- **The target cluster only.** Never query or reason about other clusters. If a request concerns another cluster, say in your answer that it is out of your scope.
+`
+	tseZeroAssumptionsRule = `- **Zero unverified internal assumptions.** Operate strictly on customer-visible telemetry: ` + "`" + `kubectl` + "`" + `, ` + "`" + `gcloud` + "`" + `, Cloud Logging, Cloud Monitoring, GCE serial port output, the ` + "`" + `gke` + "`" + ` and ` + "`" + `developer_knowledge` + "`" + ` MCP servers, and your skills. Never hallucinate Google tenant-project telemetry; instead, prove customer-side hypotheses are ruled out (negative proof) and package the escalation with the ` + "`" + `support-escalation-bundle` + "`" + ` skill.
+`
+	tseFailLoudRule = `- **Fail loud, never silent.** If you cannot operate — the target is missing, the task's target and the request disagree, or the credential proxy will not serve the target (§1) — say exactly why in your answer before you stop.
+`
+	tseSkillsReadOnlyRule = `- **Your skills are read-only.** Do not edit them; if one is wrong for the work, say so in your answer, naming the skill and what it should have said.
+`
 )
+
+// The include lists keep the model's offer to the relay's read tools: gke's is
+// exactly agents/platform/scripts/mcp_policy.py's GKE_READ_TOOLS, and
+// developer_knowledge's is its DEVELOPER_KNOWLEDGE_READ_TOOLS less
+// answer_query, whose small daily quota every agent of an install shares. A
+// write tool such as update_cluster added to either fails here.
+func TestTheTsePersonaOffersOnlyTheRelaysReadTools(t *testing.T) {
+	src, err := os.ReadFile("../../../../agents/platform/scripts/mcp_policy.py")
+	if err != nil {
+		t.Fatal(err)
+	}
+	readTools := func(name string) []string {
+		m := regexp.MustCompile(`(?s)\n` + name + ` = frozenset\(\s*\{(.*?)\}`).FindSubmatch(src)
+		if m == nil {
+			t.Fatalf("mcp_policy.py has no %s frozenset", name)
+		}
+		var tools []string
+		for _, q := range regexp.MustCompile(`"([a-z_0-9]+)"`).FindAllSubmatch(m[1], -1) {
+			tools = append(tools, string(q[1]))
+		}
+		if len(tools) == 0 {
+			t.Fatalf("read no tools from %s", name)
+		}
+		slices.Sort(tools)
+		return tools
+	}
+	want := map[string][]string{
+		"gke": readTools("GKE_READ_TOOLS"),
+		"developer_knowledge": slices.DeleteFunc(readTools("DEVELOPER_KNOWLEDGE_READ_TOOLS"), func(s string) bool {
+			return s == "answer_query"
+		}),
+	}
+	servers := load(t, tsePersonaDir).MCP.Servers
+	if len(servers) != len(want) {
+		t.Errorf("mcp.yaml has %d servers, want %d", len(servers), len(want))
+	}
+	for name, tools := range want {
+		got := slices.Sorted(slices.Values(servers[name].Include))
+		if !slices.Equal(got, tools) {
+			t.Errorf("%s's include list = %v, want the relay's read tools %v", name, got, tools)
+		}
+	}
+}
 
 // tseSkillEdit is an allowed difference between a tse skill and its persona
 // copy, applied to the normalized source: old must occur exactly n times.
