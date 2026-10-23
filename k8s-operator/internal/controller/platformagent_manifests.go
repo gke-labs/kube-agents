@@ -2453,9 +2453,6 @@ type renderOptions struct {
 	// PlatformAgent in `mode: next`. Empty when no optional profiles are bound,
 	// so the zero value renders byte-identical manifests.
 	enabledProfiles []string
-	// slackHomeRecord is the home-channel record the reconciler read
-	// (platformagent_home_channel_record.go); the zero value is no record.
-	slackHomeRecord homeChannelRecord
 }
 
 const enabledProfilesEnvVar = "KUBE_AGENTS_ENABLED_PROFILES"
@@ -3312,19 +3309,16 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// count Chat as a platform to post to ahead of Slack.
 	if a2aAgentSurface(agent) && a2aChatArmed(agent) && a2aGchatHomeSpace(agent) != "" {
 		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: a2aNotifyPlatformGchat})
-	} else if slackHome := a2aSlackHomeEffective(agent, opts.slackHomeRecord); a2aAgentSurface(agent) && a2aSlackArmed(agent) && slackHome != "" {
+	} else if a2aAgentSurface(agent) && a2aSlackArmed(agent) && a2aSlackHomeChannel(agent) != "" {
 		// Slack's half of the same rule: the Hermes slack platform is off
 		// when the gateway holds Slack (legacySlackConsumer), and Chat wins
-		// the single-backend gateway, so at most one platform is routed. The
-		// channel is the CR's, else the one the gateway learned and recorded
-		// (platformagent_home_channel_record.go): the one signal every
-		// agent-side reader follows.
+		// the single-backend gateway, so at most one platform is routed.
 		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: a2aNotifyPlatformSlack})
 		// The agent's own idea of the Slack home channel, as under today: the
 		// audit relay gates its report card on knowing a channel and records
 		// it on the incident's routing row. The Hermes slack platform is off
 		// here, so this arms nothing on the agent but those readers.
-		envVars = append(envVars, corev1.EnvVar{Name: agentSlackHomeChannelEnvVar, Value: slackHome})
+		envVars = append(envVars, corev1.EnvVar{Name: agentSlackHomeChannelEnvVar, Value: a2aSlackHomeChannel(agent)})
 	}
 	// A kanban card's report back to the gateway conversation it was filed
 	// in, and onboarding's first report into the conversation the user first

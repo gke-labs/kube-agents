@@ -1306,7 +1306,8 @@ func a2aSlackHomeChannel(agent *agentv1alpha1.PlatformAgent) string {
 
 // slackChannelID is s trimmed when it is a public ("C...") or private
 // ("G...") Slack channel id, and "" otherwise. The same rule reads the CR
-// field and the learned record (platformagent_home_channel_record.go).
+// field, and a gateway that learns a channel will read it too
+// (platformagent_home_channel_record.go).
 func slackChannelID(s string) string {
 	home := strings.TrimSpace(s)
 	if len(home) < a2aSlackMinChannelIDLen || (home[0] != 'C' && home[0] != 'G') {
@@ -4103,7 +4104,8 @@ func buildA2AGatewayServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.S
 //
 // Namespaced: pods, its own Deployment and its own PlatformAgent, the last two
 // pinned by name. The gateway creates and reaps one pod per delegated task in
-// its own namespace; it reads no Secret, no ConfigMap but the one home-channel record it patches, and no other namespace.
+// its own namespace; it reads no Secret, no ConfigMap but the one home-channel record it
+// may patch, and no other namespace.
 //
 // What it does NOT bound, stated because the next reader will otherwise take
 // this rule for a ceiling: `create` on pods is a privilege-escalation
@@ -4153,9 +4155,10 @@ func buildA2AGatewayRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 				ResourceNames: []string{agent.Name},
 				Verbs:         []string{"get"},
 			},
-			// The home-channel record, one named ConfigMap: read at boot and
-			// patched (data keys only) when the first admitted mention in a
-			// channel sets the home channel (platformagent_home_channel_record.go).
+			// The home-channel record, one named ConfigMap, for a gateway that
+			// learns the home channel from the first admitted mention in a
+			// channel; no shipped gateway reads or patches it yet
+			// (platformagent_home_channel_record.go).
 			{
 				APIGroups:     []string{""},
 				Resources:     []string{"configmaps"},
@@ -4696,12 +4699,12 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		if home := strings.TrimSpace(slack.HomeChannel); home != "" {
 			backendEnv = append(backendEnv, corev1.EnvVar{Name: a2aSlackHomeChannelEnvVar, Value: home})
 		}
-		// The learned-home contract (platformagent_home_channel_record.go):
-		// whether the gateway may learn a home channel from the first
-		// admitted mention, the record it writes, and its own image for the
-		// record's writer key. The gateway's home env above stays the CR's:
-		// a learned value reaches the gateway through the record, not
-		// through a re-render, so learning restarts no gateway.
+		// The learned-home contract (platformagent_home_channel_record.go),
+		// for a gateway that learns a home channel from the first admitted
+		// mention: whether it may, the record it would write, and its own
+		// image for the record's writer key. No shipped gateway reads these
+		// yet. The gateway's home env above stays the CR's: a learned value
+		// would reach the gateway through the record, not a re-render.
 		backendEnv = append(backendEnv,
 			corev1.EnvVar{Name: a2aSlackHomePolicyEnvVar, Value: slackHomeChannelPolicy(agent)},
 			corev1.EnvVar{Name: a2aHomeChannelRecordEnvVar, Value: a2aHomeChannelRecordName(agent)},

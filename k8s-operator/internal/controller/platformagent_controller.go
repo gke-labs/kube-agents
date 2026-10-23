@@ -2327,9 +2327,6 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 		return err
 	}
 	opts.heldGitHubOrg = held
-	if opts.slackHomeRecord, err = r.homeChannelRecordFor(ctx, agent); err != nil {
-		return err
-	}
 	if a2aStackRendering(agent) && !r.agentProfilesUnreadable {
 		profiles, err := boundAgentProfiles(ctx, r.Client, agent)
 		if err != nil {
@@ -4083,11 +4080,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	// The home-channel advisory rides here too: a rendered stack parked
 	// Degraded still runs a gateway that drops proactive posts, and a bare
 	// helm install parks on ShellSandboxKeysMissing indefinitely (#3320).
-	homeRec, err := r.homeChannelRecordFor(ctx, agent)
-	if err != nil {
-		return err
-	}
-	homeMsg := homeChannelUnsetMessage(agent, homeRec)
+	homeMsg := homeChannelUnsetMessage(agent)
 	if a2aGatewayConditionCurrent(agent, gatewayMsg) && busProvisionedConditionCurrent(agent, want) &&
 		a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown) &&
 		homeChannelUnsetConditionCurrent(agent, homeMsg) {
@@ -4096,7 +4089,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
 		wantLive := wantBusProvisioned(live, a2a)
 		return a2aGatewayConditionCurrent(live, gatewayMsg) && busProvisionedConditionCurrent(live, wantLive) &&
-			homeChannelUnsetConditionCurrent(live, homeChannelUnsetMessage(live, homeRec))
+			homeChannelUnsetConditionCurrent(live, homeChannelUnsetMessage(live))
 	}) {
 		return nil
 	}
@@ -4389,13 +4382,9 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	replicasLimitedMsg := replicasLimitedMessage(agent)
 	replicasLimitedUnchanged := replicasLimitedConditionCurrent(agent, replicasLimitedMsg)
 
-	// The home-channel advisory, from the spec and the record, compared on its message
+	// The home-channel advisory, from the spec alone, compared on its message
 	// for the same reason EventWatcher's is.
-	homeRec, err := r.homeChannelRecordFor(ctx, agent)
-	if err != nil {
-		return "", err
-	}
-	homeChannelUnsetMsg := homeChannelUnsetMessage(agent, homeRec)
+	homeChannelUnsetMsg := homeChannelUnsetMessage(agent)
 	homeChannelUnsetUnchanged := homeChannelUnsetConditionCurrent(agent, homeChannelUnsetMsg)
 
 	// The A2AGateway condition, same class as EventWatcher and for the same
@@ -4437,7 +4426,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	degradedUnchanged := (degradedStatus == metav1.ConditionFalse && existingDegradedCond == nil) || rbacDegradedPreserved ||
 		(degradedStatus == metav1.ConditionTrue && existingDegradedCond != nil && existingDegradedCond.Status == metav1.ConditionTrue && existingDegradedCond.Reason == degradedReason && existingDegradedCond.Message == degradedMsg)
 
-	// From the spec and the record, so it is resolved here rather than passed in like the
+	// From the spec alone, so it is resolved here rather than passed in like the
 	// telemetry and policy results, which take a discovery to produce.
 	newActiveInterfaces := resolveActiveInterfaces(agent)
 
@@ -4615,34 +4604,14 @@ func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.Platfor
 // spec, or "" when the condition is to be absent: the next stack holds no chat
 // backend, or the one it holds has a home channel. A malformed home channel is
 // not this condition's: the gateway refuses it at start and says so.
-func homeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) string {
+func homeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent) string {
 	switch {
 	case a2aChatArmed(agent) && strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel) == "":
 		return fmt.Sprintf(homeChannelUnsetMessageFormat, "Google Chat",
 			"spec.integration.googleChat.homeChannel", "GOOGLE_CHAT_HOME_CHANNEL", "a Chat space name (spaces/<id>)")
 	case a2aSlackArmed(agent) && strings.TrimSpace(agent.Spec.Integration.Slack.HomeChannel) == "":
-		// The record stands in for the field (platformagent_home_channel_record.go):
-		// an admitted learned channel clears the condition; a manual policy, a
-		// stale writer or a refused candidate is named so the reader knows why
-		// it did not.
-		if rec.channel != "" {
-			return ""
-		}
-		msg := fmt.Sprintf(homeChannelUnsetMessageFormat, "Slack",
+		return fmt.Sprintf(homeChannelUnsetMessageFormat, "Slack",
 			"spec.integration.slack.homeChannel", "SLACK_HOME_CHANNEL", "a channel id (C... or G...)")
-		switch {
-		case slackHomeChannelPolicy(agent) == slackHomeChannelPolicyManual:
-			msg += homeChannelUnsetManualSuffix
-		case rec.recorded == homeChannelRecordMalformed:
-			msg += homeChannelUnsetMalformedSuffix
-		case rec.recorded != "" && rec.stale && rec.writer == "":
-			msg += fmt.Sprintf(homeChannelUnsetStaleNoWriter, rec.recorded)
-		case rec.recorded != "" && rec.stale:
-			msg += fmt.Sprintf(homeChannelUnsetStaleFormat, rec.recorded, rec.writerShown, boundedRunes(a2aGatewayImage(), homeChannelRecordWriterMax))
-		case rec.refused != "":
-			msg += fmt.Sprintf(homeChannelUnsetRefusedFormat, rec.refused)
-		}
-		return msg
 	}
 	return ""
 }

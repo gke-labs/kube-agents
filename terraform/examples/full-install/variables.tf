@@ -616,7 +616,7 @@ variable "slack_home_channel_name" {
 }
 
 variable "slack_home_channel_policy" {
-  description = "Under spec.mode next with slack_home_channel empty: \"auto\" (also empty) lets the A2A gateway make the channel of the first admitted mention the home channel; \"manual\" keeps slack_home_channel the only source, so with it empty the agent posts nothing unprompted. Only used when enable_slack is true."
+  description = "\"auto\" (also empty) or \"manual\". Accepted and recorded in this release but with no effect yet: the A2A gateway does not learn a home channel, so slack_home_channel alone decides. Only used when enable_slack is true."
   type        = string
   default     = ""
   validation {
