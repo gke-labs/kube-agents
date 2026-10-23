@@ -165,7 +165,7 @@ if $check; then
   elif [[ $footprint_rc -ne 0 ]]; then
     exit "$footprint_rc"
   fi
-  echo "Chart CRD, RBAC and admission-policy copies are in sync with k8s-operator/config, the webhook template matches $WEBHOOK_SRC_DIR, and $FOOTPRINT_DST matches $FOOTPRINT_SRC."
+  echo "Chart CRD, RBAC and admission-policy copies are in sync with k8s-operator/config, the webhook template matches $WEBHOOK_SRC_DIR, and $FOOTPRINT_DST matches $FOOTPRINT_SRC and its next-mode sibling."
 else
   echo "Chart CRD, RBAC and admission-policy copies synced from k8s-operator/config."
   echo "Note: $WEBHOOK_TPL is hand-maintained and was not rewritten; 'make chart-check' compares it with $WEBHOOK_SRC_DIR."

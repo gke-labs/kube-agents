@@ -975,7 +975,9 @@ With `platformAgent.mode: next` it also counts what that mode adds, from footpri
 verifiers, the console, the A2A gateway, the provisioning Job (counted although it runs to
 completion, because the operator runs it again whenever its spec changes and about daily once
 its TTL removes it, with the rest of the release standing), and the
-`hermes-bridge` container in each agent pod. The mode is read from the values, so a mode set
+`hermes-bridge` container in each agent pod, sized as the operator will size it from the
+`operator.extraEnv` it is given: `A2A_BRIDGE_RESOURCES` as written when it parses, otherwise
+the agent container's size under `A2A_BRIDGE_EXECUTOR=cli`, otherwise the `api` default. The mode is read from the values, so a mode set
 on the `PlatformAgent` by hand while `platformAgent.mode` stays null is counted as `today`.
 The session pods a next install spawns on demand are not counted; the operator caps those with
 a `ResourceQuota` of its own.
@@ -990,7 +992,9 @@ CPU, memory and ephemeral-storage (requests and limits), `pods` (`count/pods`),
 keys, including `services`, `secrets` and other `count/<resource>` entries, are not
 modelled and are skipped rather than guessed at. **Scoped quotas are skipped entirely** —
 a quota with `scopes` or a `scopeSelector` applies to a subset of pods the template cannot
-identify, so comparing the whole release against it would be wrong either way. Every quota
+identify, so comparing the whole release against it would be wrong either way. So is a quota
+a `PlatformAgent` owns: the operator's next-mode session-pod quota, which it sizes above the
+release itself and puts back if patched. Every quota
 that falls short is reported in one failure, so a namespace with two of them takes one
 patch rather than two rounds.
 

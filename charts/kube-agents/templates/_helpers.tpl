@@ -2109,10 +2109,40 @@ The defaults carry no ephemeral-storage request because the operator renders non
   {{- end -}}
 
   {{- /* Next mode's hermes-bridge is another container of the agent pod, so like the
-         dashboard it scales with the agent's replicas and adds no pod. Its footprint is the
-         default api executor's; the operator's A2A_BRIDGE_EXECUTOR and A2A_BRIDGE_RESOURCES
-         env can change it, and the chart does not see either. */ -}}
-  {{- with (index ($next.agentPod | default dict) "hermesBridge") -}}
+         dashboard it scales with the agent's replicas and adds no pod. The operator sizes it
+         from its own env (a2aRenderedBridgeResources), which this chart sets through
+         operator.extraEnv, last entry winning: A2A_BRIDGE_RESOURCES, a JSON
+         ResourceRequirements, wins when it parses with requests or limits; otherwise
+         A2A_BRIDGE_EXECUTOR=cli copies the agent container (hermesBridgeCli), and anything
+         else is the api default (hermesBridge). A value the operator refuses on its stricter
+         checks is counted as written here, an over- or under-count it logs. */ -}}
+  {{- $bridge := index ($next.agentPod | default dict) "hermesBridge" -}}
+  {{- if $next -}}
+    {{- $executor := "" -}}
+    {{- $bridgeResources := "" -}}
+    {{- range $e := (.Values.operator.extraEnv | default list) -}}
+      {{- if eq (toString $e.name) "A2A_BRIDGE_EXECUTOR" -}}{{- $executor = toString $e.value -}}{{- end -}}
+      {{- if eq (toString $e.name) "A2A_BRIDGE_RESOURCES" -}}{{- $bridgeResources = toString $e.value | trim -}}{{- end -}}
+    {{- end -}}
+    {{- if eq $executor "cli" -}}
+      {{- $bridge = index $next.agentPod "hermesBridgeCli" -}}
+    {{- end -}}
+    {{- with $bridgeResources -}}
+      {{- $parsed := fromJson . -}}
+      {{- if and (not (hasKey $parsed "Error")) (or (hasKey $parsed "requests") (hasKey $parsed "limits")) -}}
+        {{- $bReq := $parsed.requests | default dict -}}
+        {{- $bLim := $parsed.limits | default dict -}}
+        {{- $bridge = dict
+              "cpuMillisRequest" (include "kube-agents.parseCpuMillis" (include "kube-agents.declaredQuantity" (dict "value" (index $bReq "cpu") "fallback" (index $bLim "cpu" | default "0"))) | int64)
+              "cpuMillisLimit" (include "kube-agents.parseCpuMillis" (index $bLim "cpu" | default "0") | int64)
+              "memoryBytesRequest" (include "kube-agents.parseBytes" (include "kube-agents.declaredQuantity" (dict "value" (index $bReq "memory") "fallback" (index $bLim "memory" | default "0"))) | int64)
+              "memoryBytesLimit" (include "kube-agents.parseBytes" (index $bLim "memory" | default "0") | int64)
+              "ephemeralStorageBytesRequest" (include "kube-agents.parseBytes" (include "kube-agents.declaredQuantity" (dict "value" (index $bReq "ephemeral-storage") "fallback" (index $bLim "ephemeral-storage" | default "0"))) | int64)
+              "ephemeralStorageBytesLimit" (include "kube-agents.parseBytes" (index $bLim "ephemeral-storage" | default "0") | int64) -}}
+      {{- end -}}
+    {{- end -}}
+  {{- end -}}
+  {{- with $bridge -}}
     {{- $podReqCpu = include "kube-agents.satAdd" (dict "a" $podReqCpu "b" (.cpuMillisRequest | default 0 | int64)) | int64 -}}
     {{- $podLimCpu = include "kube-agents.satAdd" (dict "a" $podLimCpu "b" (.cpuMillisLimit | default 0 | int64)) | int64 -}}
     {{- $podReqMem = include "kube-agents.satAdd" (dict "a" $podReqMem "b" (.memoryBytesRequest | default 0 | int64)) | int64 -}}
@@ -2257,7 +2287,17 @@ The defaults carry no ephemeral-storage request because the operator renders non
   {{- $spec := index $quota "spec" | default dict -}}
   {{- $scopes := index $spec "scopes" -}}
   {{- $scopeSelector := index $spec "scopeSelector" -}}
-  {{- if or $scopes $scopeSelector -}}
+  {{- /* A quota a PlatformAgent owns is the operator's next-mode session-pod bound, which it
+         sizes above the release's own standing pods and puts back on every reconcile
+         (server-side apply), so a patch printed against it would be reverted and the upgrade
+         refused again. The release's fit there is the operator's to keep, not this check's. */ -}}
+  {{- $operatorOwned := false -}}
+  {{- range $ref := (index ($quota.metadata | default dict) "ownerReferences" | default list) -}}
+    {{- if and (eq (toString $ref.kind) "PlatformAgent") (hasPrefix "kubeagents.x-k8s.io/" (toString $ref.apiVersion)) -}}
+      {{- $operatorOwned = true -}}
+    {{- end -}}
+  {{- end -}}
+  {{- if or $scopes $scopeSelector $operatorOwned -}}
     {{- /* Scoped quota: it applies to a subset of pods this template cannot identify, so
            comparing the whole release against it would be wrong in both directions. */ -}}
   {{- else -}}

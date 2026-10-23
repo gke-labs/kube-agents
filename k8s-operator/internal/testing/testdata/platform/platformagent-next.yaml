@@ -1,6 +1,7 @@
 # The default example CR with spec.mode: next, so the golden carries the A2A stack
-# (NATS, the A2A gateway, the auth callout, the verifier, the hermes bridge and the
-# console) that charts/kube-agents/files/footprint.yaml counts for a next-mode install.
+# (NATS, the A2A gateway, the auth callout, the verifier, the console, the hermes
+# bridge and the provisioning Job) that charts/kube-agents/files/footprint.yaml counts
+# for a next-mode install.
 apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: PlatformAgent
 metadata:

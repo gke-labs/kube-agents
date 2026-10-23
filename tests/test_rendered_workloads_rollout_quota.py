@@ -98,8 +98,8 @@ _SURGE_FIRST_BY_DESIGN = {
         "is Ready, and every guarded write in the namespace fails until it is"
     ),
     # Operator-rendered under spec.mode: next, so these are golden names. The quota
-    # preflight's patch leaves room for one surge Pod, and either of these is smaller
-    # than the chart workloads that size it.
+    # preflight's patch leaves room for one surge Pod of either (footprint.yaml marks
+    # both `surges`, and kube-agents.quotaRequirements sizes the room from them).
     "platformagent-a2a-callout": (
         "two replicas that never drop below the running count: a moment with zero "
         "ready callouts is a moment nothing new can connect to the bus, and the "

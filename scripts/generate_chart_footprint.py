@@ -103,6 +103,10 @@ _A2A_CONSOLE = "a2aConsole"
 _A2A_GATEWAY = "a2aGateway"
 _A2A_PROVISION = "a2aProvision"
 _HERMES_BRIDGE = "hermesBridge"
+# What the bridge becomes under the operator's A2A_BRIDGE_EXECUTOR=cli with no
+# A2A_BRIDGE_RESOURCES: a copy of the agent container's resources
+# (a2aRenderedBridgeResources). The preflight picks it when operator.extraEnv says cli.
+_HERMES_BRIDGE_CLI = "hermesBridgeCli"
 _NEXT_MODE = "nextMode"
 _A2A_NATS_WORKLOAD = "platformagent-a2a-nats"
 _BRIDGE_CONTAINER = "hermes-bridge"
@@ -118,6 +122,21 @@ _SURGES = "surges"
 _STRATEGY_FIELD = "strategy"
 _TYPE_FIELD = "type"
 _RECREATE = "Recreate"
+_ROLLING_UPDATE_FIELD = "rollingUpdate"
+_MAX_SURGE_FIELD = "maxSurge"
+
+
+def _rolls_with_a_surge_pod(doc: dict) -> bool:
+    """Whether a Deployment's rollout creates a pod before removing one.
+
+    Recreate never does. RollingUpdate does unless maxSurge is zero; an absent maxSurge is
+    the API server's default, 25%, which rounds up to at least one pod.
+    """
+    strategy = (doc.get(_SPEC_FIELD) or {}).get(_STRATEGY_FIELD) or {}
+    if strategy.get(_TYPE_FIELD) == _RECREATE:
+        return False
+    surge = (strategy.get(_ROLLING_UPDATE_FIELD) or {}).get(_MAX_SURGE_FIELD)
+    return str(surge).strip() not in ("0", "0%")
 
 _KIND_STATEFULSET = "StatefulSet"
 _KIND_DEPLOYMENT = "Deployment"
@@ -248,9 +267,10 @@ _IGNORED_CONTAINERS: dict[str, str] = {
 }
 
 _COMPLETENESS_ADVICE = (
-    "Each one is either part of what an install costs or it is not. Sum it into "
-    "extract_footprint as a top-level key under operatorRendered (where the chart's "
-    "kube-agents.quotaRequirements template generically iterates and counts it), or add "
+    "Each one is either part of what an install costs or it is not. Sum it into the "
+    "footprint as a top-level key, under operatorRendered when the today-mode golden "
+    "renders it and under nextMode (_A2A_WORKLOADS) when only the next-mode golden does; "
+    "the chart's kube-agents.quotaRequirements template iterates both generically. Or add "
     "it to _IGNORED_WORKLOADS or _IGNORED_CONTAINERS in this file with the reason it does "
     "not change the totals. Then run `make chart-sync`."
 )
@@ -592,14 +612,12 @@ def _extract(golden: pathlib.Path, next_mode: bool) -> dict:
             pod_workloads[workload_key] = spec
 
         if next_mode and workload_key in a2a_keys:
-            strategy = ((doc.get(_SPEC_FIELD) or {}).get(_STRATEGY_FIELD) or {}).get(_TYPE_FIELD)
             a2a_found[a2a_keys[workload_key]] = (
                 {c.get(_NAME_FIELD): c for c in spec.get(_CONTAINERS_FIELD, [])},
                 _replicas(doc),
                 workload_key,
-                # A Deployment without a strategy rolls the API server's default way,
-                # RollingUpdate. A StatefulSet deletes before it creates.
-                kind == _KIND_DEPLOYMENT and strategy != _RECREATE,
+                # A StatefulSet deletes before it creates.
+                kind == _KIND_DEPLOYMENT and _rolls_with_a_surge_pod(doc),
             )
         if next_mode and kind == _KIND_JOB and str(name).startswith(_A2A_PROVISION_JOB_PREFIX):
             provision_jobs.append(
@@ -767,6 +785,9 @@ def _extract(golden: pathlib.Path, next_mode: bool) -> dict:
             _AGENT_POD: {
                 _HERMES_BRIDGE: _workload_entry(
                     [gateway_containers[_BRIDGE_CONTAINER]], pods=0
+                ),
+                _HERMES_BRIDGE_CLI: _workload_entry(
+                    [gateway_containers[_AGENT_CONTAINER]], pods=0
                 ),
             },
         }

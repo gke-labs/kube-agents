@@ -508,7 +508,17 @@ class NextModeFootprintTest(unittest.TestCase):
             "a2aProvision", "storage",
         ):
             self.assertIn(key, self.following)
-        self.assertEqual(set(self.following["agentPod"]), {"hermesBridge"})
+        self.assertEqual(set(self.following["agentPod"]), {"hermesBridge", "hermesBridgeCli"})
+
+    def test_the_cli_bridge_is_the_agent_containers_size(self):
+        """Under A2A_BRIDGE_EXECUTOR=cli the operator copies the agent container's resources."""
+        (agent,) = [
+            c for c in _gateway_pod_spec(self.docs)["containers"] if c["name"] == "platform-agent"
+        ]
+        cli = self.following["agentPod"]["hermesBridgeCli"]
+        self.assertEqual(cli["pods"], 0)
+        self.assertEqual(cli["cpuMillisRequest"], gcf.parse_cpu_millis(agent["resources"]["requests"]["cpu"]))
+        self.assertEqual(cli["memoryBytesLimit"], gcf.parse_bytes(agent["resources"]["limits"]["memory"]))
 
     def test_each_workload_is_its_golden_container_times_its_replicas(self):
         for key, (kind, name, container) in gcf._A2A_WORKLOADS.items():
@@ -539,6 +549,15 @@ class NextModeFootprintTest(unittest.TestCase):
                 )
         self.assertTrue(self.following["a2aCallout"]["surges"])
         self.assertFalse(self.following["a2aNats"]["surges"])
+
+    def test_a_rolling_update_without_surge_does_not_surge(self):
+        def no_surge(docs):
+            doc = _find_doc(docs, "Deployment", "platformagent-a2a-callout")
+            doc["spec"]["strategy"] = {
+                "type": "RollingUpdate", "rollingUpdate": {"maxSurge": 0, "maxUnavailable": 1}
+            }
+        with _goldens_with(following=no_surge):
+            self.assertFalse(gcf.extract_footprint()["nextMode"]["a2aCallout"]["surges"])
 
     def test_the_bridge_adds_resources_but_no_pod(self):
         bridge = self.following["agentPod"]["hermesBridge"]

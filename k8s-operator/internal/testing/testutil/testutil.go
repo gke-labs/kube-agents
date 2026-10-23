@@ -290,10 +290,9 @@ func runOperatorReconcile(
 		},
 	}
 
-	// A settled run takes a pass per step of the bring-up it waits through.
-	maxIterations := 5
+	maxIterations := reconcileIterations
 	if settle {
-		maxIterations = 12
+		maxIterations = settledReconcileIterations
 	}
 	stabilized := false
 	for i := 0; i < maxIterations; i++ {
@@ -349,7 +348,7 @@ func redactHashAnnotations(t *testing.T, annotations map[string]string) {
 			want = a2aConfigHex
 		}
 		if !want.MatchString(value) {
-			t.Errorf("annotation %s = %q, want a 64-character hex SHA-256 digest", key, value)
+			t.Errorf("annotation %s = %q, want hex matching %s", key, value, want)
 		}
 		annotations[key] = hashPlaceholder
 	}
@@ -424,7 +423,13 @@ func CleanAndMarshalResources(t *testing.T, resources []client.Object) string {
 			// every byte but the generated values it interpolates.
 			for key, value := range obj.Data {
 				if renderedConfigKeys[key] {
-					obj.Data[key] = []byte(generated.Replace(string(value)))
+					// As text, so the golden shows the config and its
+					// placeholders rather than a base64 blob.
+					if obj.StringData == nil {
+						obj.StringData = map[string]string{}
+					}
+					obj.StringData[key] = generated.Replace(string(value))
+					delete(obj.Data, key)
 					continue
 				}
 				obj.Data[key] = []byte(generatedPlaceholder)
@@ -506,6 +511,14 @@ func parseMultiDocYAML(t *testing.T, data string) []interface{} {
 	}
 	return docs
 }
+
+// reconcileIterations bounds a golden's reconcile loop; a settled run takes a
+// pass per step of the bring-up it waits through (the callout serving, the
+// provisioning Job completing, the bridge joining the agent pod), so it gets more.
+const (
+	reconcileIterations        = 5
+	settledReconcileIterations = 12
+)
 
 // bringUp does what a cluster's controllers would between two reconcile
 // passes: every Deployment and StatefulSet reports all its replicas ready on

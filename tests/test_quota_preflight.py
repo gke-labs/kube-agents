@@ -721,6 +721,56 @@ class PreflightDecisionTest(unittest.TestCase):
         req = self._requirements(["litellm.enabled=false", "platformAgent.mode=next"])
         self.assertGreaterEqual(req["surgeRequestsCpu"], widest)
 
+    def _bridge_delta(self, extra_env: list[dict]) -> int:
+        """The next-mode CPU request with operator.extraEnv set, less the api-bridge one."""
+        base = self._requirements(["platformAgent.mode=next"])
+        req = self._requirements(
+            ["platformAgent.mode=next"], values={"operator": {"extraEnv": extra_env}}
+        )
+        return req["requestsCpu"] - base["requestsCpu"]
+
+    def test_mode_next_counts_a_cli_bridge_at_the_agent_containers_size(self) -> None:
+        """A2A_BRIDGE_EXECUTOR=cli makes the operator copy the agent container's resources."""
+        bridge = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["agentPod"]
+        want = bridge["hermesBridgeCli"]["cpuMillisRequest"] - bridge["hermesBridge"]["cpuMillisRequest"]
+        self.assertGreater(want, 0)
+        self.assertEqual(self._bridge_delta([{"name": "A2A_BRIDGE_EXECUTOR", "value": "cli"}]), want)
+        # api, or a value the operator does not accept, leaves the default.
+        self.assertEqual(self._bridge_delta([{"name": "A2A_BRIDGE_EXECUTOR", "value": "api"}]), 0)
+
+    def test_mode_next_counts_a2a_bridge_resources_as_written(self) -> None:
+        """A2A_BRIDGE_RESOURCES wins over the executor, as in the operator."""
+        bridge = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["agentPod"]["hermesBridge"]
+        sized = '{"requests": {"cpu": "750m", "memory": "1Gi"}, "limits": {"memory": "2Gi"}}'
+        self.assertEqual(
+            self._bridge_delta(
+                [{"name": "A2A_BRIDGE_EXECUTOR", "value": "cli"},
+                 {"name": "A2A_BRIDGE_RESOURCES", "value": sized}]
+            ),
+            750 - bridge["cpuMillisRequest"],
+        )
+        # A request left out is the limit, as the API server defaults it.
+        self.assertEqual(
+            self._bridge_delta(
+                [{"name": "A2A_BRIDGE_RESOURCES", "value": '{"limits": {"cpu": "2", "memory": "1Gi"}}'}]
+            ),
+            2000 - bridge["cpuMillisRequest"],
+        )
+        # One the operator cannot read is ignored there, and here.
+        self.assertEqual(self._bridge_delta([{"name": "A2A_BRIDGE_RESOURCES", "value": "big"}]), 0)
+
+    def test_an_operator_owned_quota_is_left_to_the_operator(self) -> None:
+        """The next-mode session quota a PlatformAgent owns is not a quota this check can fix:
+        the operator sizes it above the release and reverts a patch (#3848)."""
+        owned = self._quota({"pods": "2"})
+        owned["metadata"]["ownerReferences"] = [
+            {"apiVersion": "kubeagents.x-k8s.io/v1alpha1", "kind": "PlatformAgent", "name": "platformagent"}
+        ]
+        res = self._render({"probe": {"quotas": [owned]}}, ["platformAgent.mode=next"])
+        self.assertEqual(res.returncode, 0, f"an operator-owned quota should be skipped:\n{res.stderr}")
+        res = self._render({"probe": {"quotas": [self._quota({"pods": "2"})]}}, ["platformAgent.mode=next"])
+        self.assertNotEqual(res.returncode, 0, "the same quota, unowned, must still be checked")
+
     def test_mode_next_without_a_next_mode_footprint_fails_loudly(self) -> None:
         """A footprint without nextMode must not count the A2A stack as zero."""
         footprint_path = self.chart / "files" / "footprint.yaml"

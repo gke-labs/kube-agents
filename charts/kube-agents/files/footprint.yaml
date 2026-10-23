@@ -95,6 +95,22 @@ nextMode:
       ephemeralStorageBytesRequest: 0
       ephemeralStorageBytesLimit: 0
       pods: 0
+    hermesBridgeCli:
+      requests:
+        cpu: "1"
+        memory: 2Gi
+        ephemeral-storage: "0"
+      limits:
+        cpu: "3"
+        memory: 8Gi
+        ephemeral-storage: "0"
+      cpuMillisRequest: 1000
+      cpuMillisLimit: 3000
+      memoryBytesRequest: 2147483648
+      memoryBytesLimit: 8589934592
+      ephemeralStorageBytesRequest: 0
+      ephemeralStorageBytesLimit: 0
+      pods: 0
   a2aNats:
     requests:
       cpu: 250m
