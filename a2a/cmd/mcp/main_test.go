@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -223,18 +225,45 @@ func TestAStopDuringTheFirstDialIsClean(t *testing.T) {
 	}
 }
 
-// A stop during the slowest tool call drains it: the shutdown grace outlasts
-// inspect_pr's own bound, and ends before the kubelet's SIGKILL at the pod's
-// default 30 s termination grace (the operator sets none on the MCP pod).
-func TestTheShutdownGraceOutlastsTheSlowestToolCall(t *testing.T) {
-	const podTerminationGrace = 30 * time.Second
-	if shutdownGrace <= mcp.InspectTimeout {
-		t.Errorf("shutdownGrace %v does not outlast an inspect_pr call (%v)", shutdownGrace, mcp.InspectTimeout)
+// A stop ends the requests in flight rather than waiting them out: a handler
+// that runs until its request's context is done is ended by the stop, and
+// serve returns cleanly well inside shutdownGrace.
+func TestAStopEndsTheRequestsInFlight(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ln, err := net.Listen(networkTCP, "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if shutdownGrace >= podTerminationGrace {
-		t.Errorf("shutdownGrace %v is not inside the pod's %v termination grace", shutdownGrace, podTerminationGrace)
+	entered := make(chan struct{})
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-r.Context().Done()
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	served := make(chan error, 1)
+	go func() { served <- serve(ctx, log, ln, h) }()
+	go func() {
+		if resp, err := http.Get("http://" + ln.Addr().String() + "/"); err == nil {
+			resp.Body.Close()
+		}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request never reached the handler")
 	}
-	if mcp.InspectTimeout >= writeTimeout {
-		t.Errorf("an inspect_pr call (%v) can outlast the write timeout (%v)", mcp.InspectTimeout, writeTimeout)
+	start := time.Now()
+	cancel()
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Errorf("serve returned %v on a stop, want a clean one", err)
+		}
+		if elapsed := time.Since(start); elapsed > shutdownGrace/4 {
+			t.Errorf("the stop took %s with a request in flight", elapsed)
+		}
+	case <-time.After(shutdownGrace + 5*time.Second):
+		t.Fatal("serve did not return after the stop")
 	}
 }

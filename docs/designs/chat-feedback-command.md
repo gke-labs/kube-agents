@@ -277,7 +277,10 @@ string leaf of the spec's naming subtrees plus the resource's name and namespace
 tokens, with booleans, numbers, short strings and the template's own vocabulary skipped; a
 hit posts a fixed refusal instead, and a resource that cannot be read posts a fixed
 unavailability notice. No error text reaches chat. The web console classifies the turn as
-settled, like the bare form. No model is in the loop, so the eval loop does not apply.
+settled, like the bare form, sends it from a `usage summary` button in the chat footer, and puts
+a `copy` button on any gateway notice that holds a fenced block, so the block reaches the
+clipboard in one click (the third surface #3428 asks for). No model is in the loop, so the eval
+loop does not apply.
 
 ## Calls made in the build
 

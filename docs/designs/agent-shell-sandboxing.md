@@ -1382,17 +1382,22 @@ none of them: the profile list, the SSH key, and the files themselves. It runs f
 agent entrypoint (step 5.7, in the foreground, gated on the bootstrap primary so
 two replicas do not both push) and again from `cluster_agent_profile.py` when a profile is
 scaffolded later, so a cluster onboarded at 3am does not wait for a pod restart to get its
-directories. Nothing about it is ordered against the sandbox starting: the Deployment and
+directories. The scaffold passes `--profile <name>` and pushes that home plus the machine
+home and `profiles/platform`, the two roots the sandbox creates bare; the start pushes
+every home. Re-sending every home on every scaffold made onboarding N clusters
+cost O(N²) (#3701). Nothing about it is ordered against the sandbox starting: the Deployment and
 the StatefulSet come up independently, so the script waits for sshd and, failing that,
 leaves the agent pod's files untouched and lets the next start retry.
 
-**One of its failures holds the agent pod down and the rest do not**, which is a distinction
-the exit codes carry rather than a judgement the entrypoint makes. A copy that ran and
-failed can have moved the model's files off the agent pod's volume without landing them on
-the sandbox's, and coming up healthy in that state is the outcome the mirror exists to
-prevent — so it exits `EXIT_FATAL`, the container refuses to start, and
-`getDeploymentStatusDetails` surfaces a Degraded CR naming this container. Everything else
-exits `EXIT_RETRY`: the entrypoint warns and the agent starts.
+**Almost none of its failures hold the agent pod down**, which is a distinction the exit
+codes carry rather than a judgement the entrypoint makes. A copy that ran and failed exits
+`EXIT_RETRY` like everything else: the copy reads the agent pod's volume and never removes
+from it, so a transfer that dies halfway leaves every file where it was and the migration
+marker unwritten, and the next start copies again, keeping whatever already landed. The
+entrypoint warns and the agent starts. `EXIT_FATAL` is left for what running the script
+again cannot fix, no `tar` on `PATH` and an unhandled exception (the reasoning is at the
+exit codes in `deploy/shared/sandbox_mirror.py`): the container refuses to start, and
+`getDeploymentStatusDetails` surfaces a Degraded CR naming this container.
 
 The dividing line is who can provoke the failure, not how bad it looks. Everything under
 the sandbox's `/opt/data` except the image's trees is owned by uid 1000 and the volume

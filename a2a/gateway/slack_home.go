@@ -69,6 +69,7 @@ const (
 	slackHomeCritical = "🔴"
 	slackHomeWarning  = "🟠"
 	slackHomeHealthy  = "🟢"
+	slackHomeNeutral  = "⚪"
 
 	// slackDateToken is Slack's date formatting: rendered in the viewer's
 	// own time zone, with the fallback shown by a client that cannot.
@@ -86,6 +87,8 @@ const (
 	slackHomeBoardUnread  = "Could not read the board at %s."
 	slackHomeMoreFindings = " · %d more finding%s"
 	slackHomeNoFindings   = "no open findings"
+	slackHomeNotYet       = "no findings registered yet"
+	slackHomeFirstReport  = "Send me a message to get your first report and findings."
 	slackHomeAuditCounts  = "*%s:* %d finding%s, %d critical"
 	slackHomeAuditClean   = "*%s:* clean"
 	slackHomeUpdated      = "updated "
@@ -407,11 +410,14 @@ func (s *SlackAdapter) homeBlocks(b *lib.Board, waiting []homeQuestion, now time
 		total := max(b.ClusterCount, len(b.Clusters))
 		note(fmt.Sprintf(slackHomeClusterCount, total, plural(total)),
 			slackHomeUpdated+slackDate(b.GeneratedAt, slackDateTime))
+		if b.FirstReportPending && b.FirstMessagePending {
+			note(slackHomeFirstReport)
+		}
 		for i, c := range b.Clusters {
 			if i == slackHomeClustersMax {
 				break
 			}
-			section(clusterLine(c), nil)
+			section(clusterLine(c, b.FirstReportPending), nil)
 		}
 		if shown := min(len(b.Clusters), slackHomeClustersMax); total > shown {
 			note(fmt.Sprintf(slackHomeMoreClusters, total-shown, plural(total-shown)))
@@ -473,9 +479,13 @@ func (s *SlackAdapter) homeBlocks(b *lib.Board, waiting []homeQuestion, now time
 }
 
 // clusterLine is one cluster: a dot for its worst open finding, its name,
-// that finding's title and how many more there are.
-func clusterLine(c lib.BoardCluster) string {
+// that finding's title and how many more there are. Before the first report,
+// no finding means not checked yet, so it is not drawn green.
+func clusterLine(c lib.BoardCluster, firstReportPending bool) string {
 	name := "*" + slackEscaper.Replace(c.Name) + "*"
+	if c.Findings == 0 && firstReportPending {
+		return slackHomeNeutral + " " + name + "  " + slackHomeNotYet
+	}
 	if c.Findings == 0 {
 		return slackHomeHealthy + " " + name + "  " + slackHomeNoFindings
 	}

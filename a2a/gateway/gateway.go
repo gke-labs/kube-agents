@@ -179,6 +179,10 @@ type Gateway struct {
 	usage usageSource
 	// metrics is the gateway's counters (metrics.go); never nil after New.
 	metrics *Metrics
+	// consoleResults holds a console chain end's deliverable from
+	// observeTaskDelivered to the observeTaskTerminal that follows it
+	// (consoleFrame).
+	consoleResults consoleResultStash
 
 	// runCtx is Run's context; queue workers derive their timeouts from it.
 	runCtx context.Context
@@ -1991,10 +1995,57 @@ func (g *Gateway) observeTaskStarted(conversation, taskID string) {
 // the turn that delegated and its child from reaching observeTaskTerminal
 // separately, and a session turn that asked to delegate but started no child
 // is counted as failed (handOffEnd) even when the executor reported completed.
-func (g *Gateway) observeTaskTerminal(conversation, taskID string, state lib.TaskState, source TerminalSource, reason string) {
+//
+// A console conversation is told the same end as a terminal frame on .out
+// (consoleFrame), so a console client learns each chain's end once, under
+// the task its turn started, without reading TASKS.
+func (g *Gateway) observeTaskTerminal(rec *SessionRecord, taskID string, state lib.TaskState, source TerminalSource, reason string) {
 	g.metrics.taskTerminal(state, source)
 	if observer, ok := g.adapter.(TaskObserver); ok {
-		observer.TaskTerminal(conversation, taskID, state, source, reason)
+		observer.TaskTerminal(rec.Key, taskID, state, source, reason)
+	}
+	g.consoleFrame(rec, taskID, state, source, reason)
+}
+
+// consoleFrame publishes a console conversation's terminal frame for the end
+// observeTaskTerminal was just told. A completed task's text is the
+// deliverable observeTaskDelivered held for it, or the non-text stand-in;
+// any other end's is the relay's notice. The relay posts its notices as it
+// always has, so a frame that cannot go out costs the console client the end
+// and costs the page nothing.
+func (g *Gateway) consoleFrame(rec *SessionRecord, taskID string, state lib.TaskState, source TerminalSource, reason string) {
+	if !isConsoleConversation(rec.Key) {
+		return
+	}
+	delivered, ok := g.consoleResults.take(taskID)
+	text := terminalNotice(state, reason)
+	// An end the gateway declared itself carries no executor reason; its
+	// frame says what the page's notice says rather than the bare line.
+	if state == lib.StateFailed && reason == "" {
+		switch source {
+		case TerminalFromGateway:
+			text = noticeBusUnreachable
+		case TerminalNeverStarted:
+			text = consoleNeverStartedText
+		}
+	}
+	if state == lib.StateCompleted {
+		text = completedNonTextResult
+		if ok {
+			text = delivered
+		}
+	}
+	poster, isPoster := g.adapter.(TerminalPoster)
+	if !isPoster {
+		return
+	}
+	// A backend that takes no frames (errNoTerminalFrames, the test rig's
+	// default) is told nothing, as MarkChanged is told nothing by one
+	// without a mark; only a frame that failed to go out is logged.
+	if err := poster.PostTerminal(rec.Key, ConsoleTerminal{
+		TaskID: taskID, Addressee: rec.AddresseeFor(taskID), State: state, Text: text,
+	}); err != nil && !errors.Is(err, errNoTerminalFrames) {
+		g.log.Error("console terminal frame failed", "conversation", rec.Key, "taskId", taskID, "err", err)
 	}
 }
 
@@ -2044,7 +2095,12 @@ func (g *Gateway) observeDelivered(rec *SessionRecord, taskID, result string) {
 		return
 	}
 	if id, ends := rec.observedAs(taskID); ends {
-		g.observeTaskDelivered(rec.Key, id, result)
+		// The console's stash is taken by the observeTaskTerminal that
+		// follows; a task whose terminal was already observed (the heal got
+		// there first, and the relay's terminal arrives after) gets no
+		// second one, so nothing is put that nothing would take.
+		ref, known := rec.TaskRefFor(taskID)
+		g.observeTaskDelivered(rec, id, result, !known || !ref.TerminalObserved)
 	}
 }
 
@@ -2055,7 +2111,7 @@ func (g *Gateway) observeEnded(rec *SessionRecord, taskID string, state lib.Task
 		if replaced, why, handOff := rec.handOffEnd(taskID, state); handOff {
 			state, reason = replaced, why
 		}
-		g.observeTaskTerminal(rec.Key, id, state, source, reason)
+		g.observeTaskTerminal(rec, id, state, source, reason)
 	}
 }
 
@@ -2066,9 +2122,12 @@ func (g *Gateway) observeCancel(rec *SessionRecord, taskID string) {
 
 // observeTaskDelivered hands a DeliverableObserver the completed task's
 // result whole, before the relay posts it in chunks. See the interface.
-func (g *Gateway) observeTaskDelivered(conversation, taskID, result string) {
+func (g *Gateway) observeTaskDelivered(rec *SessionRecord, taskID, result string, stash bool) {
 	if observer, ok := g.adapter.(DeliverableObserver); ok {
-		observer.TaskDelivered(conversation, taskID, result)
+		observer.TaskDelivered(rec.Key, taskID, result)
+	}
+	if stash && isConsoleConversation(rec.Key) {
+		g.consoleResults.put(taskID, result)
 	}
 }
 
@@ -2458,7 +2517,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		// is logged, though: each wrote its ingress line above.
 		g.logTaskTerminal(rec, rec.Addressee, taskID, lib.StateFailed, TerminalFromGateway, "")
 		if ts.Role == "" {
-			g.observeTaskTerminal(rec.Key, taskID, lib.StateFailed, TerminalFromGateway, "")
+			g.observeTaskTerminal(rec, taskID, lib.StateFailed, TerminalFromGateway, "")
 		}
 		return "", false
 	}

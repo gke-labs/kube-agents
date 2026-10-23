@@ -1,0 +1,97 @@
+[
+  {
+    "name": "gk3-platform-agent-host-nap-8rbew2jw-1ee13584-kzvv",
+    "status": "RUNNING",
+    "zone": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/zones/us-central1-a"
+  },
+  {
+    "name": "gk3-platform-agent-host-pool-1-cf110dbf-n5sk",
+    "status": "RUNNING",
+    "zone": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/zones/us-central1-a"
+  },
+  {
+    "name": "gke-gemma-gpu-default-pool-cbd06cf1-7xtr",
+    "status": "RUNNING",
+    "zone": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/zones/us-central1-a"
+  },
+  {
+    "name": "gke-gemma-gpu-gpu-pool-6e1b0306-tglz",
+    "status": "RUNNING",
+    "zone": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/zones/us-central1-a"
+  },
+  {
+    "name": "gke-gemma-gpu-upgraded-default-pool-49d92e50-zcx6",
+    "status": "RUNNING",
+    "zone": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/zones/us-central1-a"
+  },
+  {
+    "name": "gke-gemma-gpu-upgraded-gpu-pool-2de3842b-qqvn",
+    "status": "RUNNING",
+    "zone": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/zones/us-central1-a"
+  },
+  {
+    "name": "gke-seeded-a-default-pool-62ac8ee0-dz26",
+    "status": "RUNNING",
+    "zone": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/zones/us-central1-a"
+  },
+  {
+    "name": "gke-seeded-a-default-pool-62ac8ee0-zt55",
+    "status": "RUNNING",
+    "zone": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/zones/us-central1-a"
+  },
+  {
+    "name": "gke-seeded-a-idle-batch-pool-a5fd3288-w0rt",
+    "status": "RUNNING",
+    "zone": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/zones/us-central1-a"
+  },
+  {
+    "name": "gke-seeded-a-pinned-inference-pool-d08d753d-jm6t",
+    "status": "RUNNING",
+    "zone": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/zones/us-central1-a"
+  },
+  {
+    "name": "gke-seeded-b-default-pool-4176890d-q0q0",
+    "status": "RUNNING",
+    "zone": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/zones/us-central1-a"
+  },
+  {
+    "name": "gke-seeded-b-no-surge-pool-235d7913-2jpr",
+    "status": "RUNNING",
+    "zone": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/zones/us-central1-a"
+  },
+  {
+    "name": "gke-seeded-c-default-pool-a3d28642-t9nr",
+    "status": "RUNNING",
+    "zone": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/zones/us-central1-a"
+  },
+  {
+    "name": "gke-seeded-d-default-pool-1a294bf0-bnoo",
+    "status": "RUNNING",
+    "zone": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/zones/us-central1-a"
+  },
+  {
+    "name": "gke-seeded-d-second-zone-pool-8d978f2c-mxwi",
+    "status": "RUNNING",
+    "zone": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/zones/us-central1-b"
+  },
+  {
+    "name": "gk3-platform-agent-host-pool-1-78ed7da4-cmvs",
+    "status": "RUNNING",
+    "zone": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/zones/us-central1-c"
+  },
+  {
+    "name": "gke-haoxuw-cluster-default-pool-de43150c-86nx",
+    "status": "RUNNING",
+    "zone": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/zones/us-central1-c"
+  },
+  {
+    "name": "gke-haoxuw-cluster-default-pool-de43150c-kx1n",
+    "status": "RUNNING",
+    "zone": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/zones/us-central1-c"
+  },
+  {
+    "name": "gke-haoxuw-cluster-default-pool-de43150c-zp1k",
+    "status": "RUNNING",
+    "zone": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/zones/us-central1-c"
+  }
+]

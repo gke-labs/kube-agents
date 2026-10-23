@@ -720,6 +720,7 @@ Takes a dict of provider, model, callbacks, maxTokens (optional; 0 or absent
 renders no max_tokens) and reasoningEffort (optional; empty or absent renders
 no reasoning_effort), plus apiBase and sslVerify (optional; absent renders
 neither key), which only openai_compatible passes.
+callbacks is the formatted list of LiteLLM callbacks, built by the caller.
 */}}
 {{- define "kube-agents.litellmConfig" -}}
 {{- /*
@@ -1976,7 +1977,7 @@ The defaults carry no ephemeral-storage request because the operator renders non
 {{- if and .Values.platformAgent.enabled .Values.platformAgent.cleanupHook.enabled -}}
   {{- /* Pre-delete hook Job in templates/platform-agent-cr-cleanup.yaml: runs at helm uninstall
          while every release pod still exists, so quota admission needs headroom for it. */ -}}
-  {{- $cleanupRes := dict "resources" (dict "requests" (dict "cpu" "50m" "memory" "64Mi") "limits" (dict "cpu" "200m" "memory" "128Mi")) -}}
+  {{- $cleanupRes := dict "resources" (dict "requests" (dict "cpu" "50m" "memory" "64Mi" "ephemeral-storage" "1088Mi") "limits" (dict "cpu" "200m" "memory" "128Mi" "ephemeral-storage" "1088Mi")) -}}
   {{- $chartWorkloads = append $chartWorkloads (dict "values" $cleanupRes "pods" 1 "surges" false) -}}
 {{- end -}}
 
@@ -2399,7 +2400,7 @@ The defaults carry no ephemeral-storage request because the operator renders non
       {{- $patchCmd := printf "kubectl patch resourcequota %s -n %s --type=strategic --patch '%s'" $qName $ctx.Release.Namespace $patchBody -}}
       {{- $ephNote := "" -}}
       {{- if $constrainsEphemeral -}}
-        {{- $ephNote = printf "\n(a quota constraining ephemeral storage additionally requires a LimitRange in namespace %q providing default requests and limits, because chart workloads and operator containers omit them; without one, pod creation fails with 'must specify requests.ephemeral-storage')" $ctx.Release.Namespace -}}
+        {{- $ephNote = printf "\n(a quota constraining ephemeral storage additionally requires a LimitRange in namespace %q providing default requests and limits, because the operator, the minter, the Hindsight API and several operator-rendered containers omit them; without one, pod creation fails with 'must specify requests.ephemeral-storage')" $ctx.Release.Namespace -}}
       {{- end -}}
       {{- $report := printf "ResourceQuota %q in namespace %q has insufficient capacity for release %q:\n%s\n\nRemediation: increase the quota with:\n  %s\n(those values leave room for one rollout surge Pod, except for claim counts and storage, which a surge Pod does not add to)%s" $qName $ctx.Release.Namespace $ctx.Release.Name (join "\n" $shortfalls) $patchCmd $ephNote -}}
       {{- $quotaReports = append $quotaReports $report -}}

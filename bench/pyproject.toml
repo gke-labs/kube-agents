@@ -78,6 +78,7 @@ report_times_in_window = "kube_agents_bench.verifiers:ReportTimesInWindowVerifie
 report_manifest = "kube_agents_bench.verifiers:ReportManifestVerifier"
 sandbox_tree_matches_image = "kube_agents_bench.verifiers:SandboxTreeMatchesImageVerifier"
 worker_commands = "kube_agents_bench.verifiers:WorkerCommandsVerifier"
+worker_budget = "kube_agents_bench.verifiers:WorkerBudgetVerifier"
 tool_called = "kube_agents_bench.verifiers:ToolCalledVerifier"
 workload_incident_folded = "kube_agents_bench.incidents:WorkloadIncidentFoldedVerifier"
 
