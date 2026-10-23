@@ -1,0 +1,71 @@
+# NIGHTLY — an entry in hack/eval/nightly-cases.txt.
+#
+# Domain: cluster-debugging (Cluster Agent, storage). Journey: a user asks for one cluster's
+# storage audit; the Platform Agent hands it to that cluster's Cluster Agent,
+# which runs the single-pass storage collector SOUL.md §3 names and reports
+# what it printed (#3285).
+#
+# What it catches. Without the collector a Cluster Agent lists PVCs, PVs,
+# StorageClasses and VolumeAttachments one kind at a time and describes PVCs
+# one by one. On main the collector is not staged in the sandbox image and
+# SOUL.md does not name it, so the route check fails there by construction.
+# The checks grade the route: a Cluster Agent did the work, ran
+# /opt/data/scripts/audit_storage.py, and no call's result shows the script
+# missing. The report check asks for the storage kinds the collector's
+# summary names. The residual: the case does not plant a failing kind, so it
+# does not grade that a CLEAN_AUDIT_STOP: NO over an unread kind is reported
+# as unread; the collector's unit tests (agents/platform/scripts/
+# test_domain_auditors.py) pin that output.
+#
+# No planted defect: every seeded cluster has StorageClasses, and the
+# collector reads whatever storage the cluster holds. Isolation class:
+# read-only. Eligible tier: nightly.
+id: cluster-agent-storage-audit-collector
+name: A Cluster Agent runs the single-pass storage collector for a storage audit
+prompt: >-
+  Have the Cluster Agent for the seeded-a cluster audit persistent storage on
+  seeded-a: PersistentVolumeClaims, PersistentVolumes, StorageClasses and
+  VolumeAttachments. Report whether any of them is unhealthy.
+expected_output: >-
+  The Platform Agent delegates the audit to seeded-a's Cluster Agent, which
+  runs /opt/data/scripts/audit_storage.py and reports the summary it printed:
+  PVC, PV, StorageClass and VolumeAttachment counts, the default
+  StorageClass, and the CLEAN_AUDIT_STOP verdict. No change is made to the
+  cluster.
+infrastructure:
+  deployer: noop
+validated: false
+
+domain: cluster-debugging
+
+owner: fkc1e100
+
+# No fixtures: the seeded fleet's standing clusters are the target, and every
+# check reads the run's transcript.
+fixtures: []
+
+verification_spec:
+  - name: a-cluster-agent-did-the-work
+    role: objective
+    check:
+      type: worker_agents
+      required_agents: ["cluster-.+"]
+  - name: the-storage-collector-ran-from-the-staged-path
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      after_result_pattern: '[\s\S]'
+      required_patterns:
+        # The staged path SOUL.md names, so a copy found some other way does not count.
+        - '(?:/opt/data/scripts/|\bcd\s+/opt/data/scripts/?\s*(?:&&|;|\n)\s*(?:python3?\s+)?(?:\./)?)audit_storage\.py\b'
+      forbidden_result_patterns:
+        - 'audit_storage\.py[''"]?: (?:[Nn]o such file or directory|(?:command )?not found|[Pp]ermission denied)'
+        - "can't open file '[^']*audit_storage\\.py'"
+  - name: report-carries-the-storage-summary
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases: ["StorageClass", "Storage Class"]
+      any_of_patterns: ['(?i)\bPersistentVolumeClaims?\b|\bPVCs?\b']
