@@ -1372,7 +1372,7 @@ class EvalScriptGitLabTest(unittest.TestCase):
         stub.write_text(
             "#!/usr/bin/env bash\n"
             f'printf "%s\\n" "$*" >> "{self.dir}/gcloud.argv"\n'
-            f'case "$*" in *"{fail}"*) [ -n "{fail}" ] && exit 1 ;; esac\n'
+            f'case "$*" in *"{fail}"*) [ -n "{fail}" ] && {{ echo "ERROR: (gcloud.secrets.versions.access) PERMISSION_DENIED: stub" >&2; exit 1; }} ;; esac\n'
             f'case "$*" in *gitlab-agent-token*) printf "%s\\n" "{agent}" ;; *gitlab-ledger-token*) printf "%s\\n" "{ledger}" ;; esac\n'
         )
         stub.chmod(0o755)
@@ -1506,6 +1506,10 @@ class EvalScriptGitLabTest(unittest.TestCase):
         self.assertIn("RC=1", proc.stdout)
         self.assertIn("could not read kube-agents-prow/gitlab-ledger-token as this runner", proc.stderr)
         self.assertNotIn("gitlab-agent-token", proc.stderr.split("could not read", 1)[1].split(" as this runner")[0])
+        # gcloud's own reason stays above the script's line: the redirect that
+        # quiets the per-run file read must not cover the Secret Manager read.
+        self.assertIn("PERMISSION_DENIED", proc.stderr)
+        self.assertLess(proc.stderr.index("PERMISSION_DENIED"), proc.stderr.index("could not read"))
 
     def test_the_resets_get_the_agent_token_and_the_forge_flag(self):
         self._gcloud()
@@ -1607,7 +1611,7 @@ class EvalScriptGitLabTest(unittest.TestCase):
         self.assertNotEqual(relative.returncode, 0)
         self.assertIn("EVAL_FORGE_STATE_DIR='forge-state' must be an absolute path", relative.stderr)
         # A host that is not a bare hostname stops the eval at the table, naming the variable, not as an unknown forge.
-        for bad, why in (("gitlab.dev.example:8443", "is not a dotted bare hostname"), ("gitlab.dev example", "is not a dotted bare hostname"), ("gitlab", "is not a dotted bare hostname"), ("gitlab.com", "is a public forge")):
+        for bad, why in (("gitlab.dev.example:8443", "is not a dotted bare hostname"), ("gitlab.dev example", "is not a dotted bare hostname"), ("gitlab", "is not a dotted bare hostname"), ("gitlab.com", "is a public forge"), ("www.gitlab.com", "is a public forge")):
             with self.subTest(host=bad):
                 refused = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": "gitlab-ce", "EVAL_FORGE_STATE_DIR": str(state), "EVAL_GITLAB_CE_HOST": bad}, bin_dir=self.bin)
                 self.assertNotEqual(refused.returncode, 0)

@@ -1330,7 +1330,7 @@ gitlab_token_source() { # <agent|ledger> -> a description for the log
 }
 read_gitlab_token() { # <agent|ledger> -> the token on stdout, newline stripped
   if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
-    tr -d '\r\n' <"$(gitlab_token_source "$1")"
+    tr -d '\r\n' <"$(gitlab_token_source "$1")" 2>/dev/null
   else
     local secret="${GITLAB_AGENT_SM_SECRET}"
     [ "$1" = "ledger" ] && secret="${GITLAB_LEDGER_SM_SECRET}"
@@ -1339,8 +1339,8 @@ read_gitlab_token() { # <agent|ledger> -> the token on stdout, newline stripped
 }
 read_gitlab_tokens() {
   local agent ledger
-  agent="$(read_gitlab_token agent 2>/dev/null)" || agent=""
-  ledger="$(read_gitlab_token ledger 2>/dev/null)" || ledger=""
+  agent="$(read_gitlab_token agent)" || agent=""
+  ledger="$(read_gitlab_token ledger)" || ledger=""
   local missing=()
   [ -n "${agent}" ] || missing+=("$(gitlab_token_source agent)")
   [ -n "${ledger}" ] || missing+=("$(gitlab_token_source ledger)")

@@ -1088,7 +1088,7 @@ forge_profile() { # <EVAL_FORGE> -> "<kind> <host> <yes|no: self-managed>"; 1 un
     return 2
   fi
   case "$(printf '%s' "${host}" | tr '[:upper:]' '[:lower:]')" in
-    github.com|gitlab.com)
+    github.com|www.github.com|ssh.github.com|gitlab.com|www.gitlab.com)
       echo "ERROR: ${var}='${host}' is a public forge, not a self-managed one; EVAL_FORGE=github or gitlab is that row." >&2
       return 2 ;;
   esac
