@@ -1422,15 +1422,11 @@ def _pending_first(task_ids: list[str], statuses: dict[str, str]) -> list[str]:
 def _has_successful_delivery(
     observed: list[dict[str, Any]],
     task_ids: Sequence[str],
-    *,
-    worker_entries: Sequence[dict[str, Any]] | None = None,
 ) -> bool:
-    """Return whether any of the task_ids has a successful delivery or worker action.
+    """Return whether any of the task_ids has a successful delivery in observed.
 
     Filters out cards reported in _FAILURE_STATUSES or carrying an infra failure reason.
     """
-    if worker_entries:
-        return True
     reported = reported_statuses(observed)
     return any(
         reported.get(tid) not in _FAILURE_STATUSES and not _extract_infra_failure_reason(text)
@@ -1447,14 +1443,13 @@ def _record_ceiling(
     delegation_timeout: float,
     *,
     opening_turn: bool = True,
-    worker_entries: Sequence[dict[str, Any]] | None = None,
 ) -> None:
     """Record that ``outstanding`` cards outran the delegation budget.
 
-    With nothing delivered and no worker action, the record holds the acknowledgement
-    alone; the marker routes it to its own class in the scorer rather than a graded
-    failure of the agent under test. A partial delivery or worker tool execution keeps
-    the plain report and grades on what arrived. Both delegation waits end their deadline path
+    With nothing delivered the record holds the acknowledgement alone; the
+    marker routes it to its own class in the scorer rather than a graded
+    failure of the agent under test. A partial delivery keeps the plain report
+    and grades on what arrived. Both delegation waits end their deadline path
     here, so the two transports cannot drift on what the scorer reads. (Unsettled
     unblocked cards at settle also produce this marker via ``_record_unsettled``).
     """
@@ -1465,7 +1460,7 @@ def _record_ceiling(
         f"{delegation_timeout:.0f}s: "
         + ", ".join(f"{t} ({statuses.get(t, 'unknown')})" for t in outstanding)
     )
-    if not delivered_results(observed, awaited) and not worker_entries and opening_turn:
+    if not delivered_results(observed, awaited) and opening_turn:
         report = f"{DELEGATION_CEILING_MARKER}: {report}"
     result.errors.append(report)
 
@@ -2856,7 +2851,7 @@ class KubeAgentsHarness(AgentHarness):
                         if has_rate_limit
                         else None
                     )
-                    if has_rate_limit and corroborated is True:
+                    if has_rate_limit and corroborated is not False:
                         if unsettled is not None:
                             unsettled.append(t)
                     else:
@@ -3051,8 +3046,6 @@ class KubeAgentsHarness(AgentHarness):
             result.metadata["delegated_cards_missing"] = list(missing)
         captured: worker_trajectory.WorkerCapture | None = None
         if timed_out:
-            captured = worker_trajectory.capture(_agent_shell, awaited, _EXEC_TIMEOUT)
-            worker_entries = captured.entries if captured else None
             _record_ceiling(
                 result,
                 observed,
@@ -3060,7 +3053,6 @@ class KubeAgentsHarness(AgentHarness):
                 outstanding,
                 {t: _status(t) for t in outstanding},
                 delegation_timeout,
-                worker_entries=worker_entries,
             )
         unsettled = []
         discrepancies = []
@@ -3085,18 +3077,14 @@ class KubeAgentsHarness(AgentHarness):
                         if has_rate_limit
                         else None
                     )
-                    if has_rate_limit and corroborated is True:
+                    if has_rate_limit and corroborated is not False:
                         unsettled.append(t)
                     else:
                         discrepancies.append(t)
         if unsettled:
-            if captured is None:
-                captured = worker_trajectory.capture(_agent_shell, awaited, _EXEC_TIMEOUT)
-            worker_entries = captured.entries if captured else None
             has_delivery = _has_successful_delivery(
                 observed,
                 [t for t in awaited if t not in unsettled],
-                worker_entries=worker_entries,
             )
             _record_unsettled(
                 result,
@@ -3496,8 +3484,6 @@ class KubeAgentsHarness(AgentHarness):
         # the run stopped.
         captured: worker_trajectory.WorkerCapture | None = None
         if outstanding and timed_out:
-            captured = worker_trajectory.capture(_agent_shell, awaited, _EXEC_TIMEOUT)
-            worker_entries = captured.entries if captured else None
             _record_ceiling(
                 result,
                 observed,
@@ -3506,7 +3492,6 @@ class KubeAgentsHarness(AgentHarness):
                 latest,
                 delegation_timeout,
                 opening_turn=opening_turn,
-                worker_entries=worker_entries,
             )
         unsettled: list[str] = []
         discrepancies: list[str] = []
@@ -3527,13 +3512,9 @@ class KubeAgentsHarness(AgentHarness):
             unsettled = [t for t in unsettled if t not in outstanding]
             discrepancies = [t for t in discrepancies if t not in outstanding]
         if unsettled:
-            if captured is None:
-                captured = worker_trajectory.capture(_agent_shell, awaited, _EXEC_TIMEOUT)
-            worker_entries = captured.entries if captured else None
             has_delivery = _has_successful_delivery(
                 observed,
                 [t for t in awaited if t not in unsettled],
-                worker_entries=worker_entries,
             )
             _record_unsettled(
                 result,
@@ -3638,22 +3619,18 @@ class KubeAgentsHarness(AgentHarness):
                     corroborated = _corroborate_platform_rate_limit(
                         since=since, session_id=session_id
                     )
-                    if corroborated is True:
-                        infra_reason = reason
-                        infra_detail = f"card on board recorded {reason}: {text[:200]}"
-                        result.metadata["platform_rate_limit_corroborated"] = True
-                        break
-                    elif corroborated is False:
+                    if corroborated is False:
                         result.errors.append(
                             f"delegated worker failed ({reason}): card on board recorded {reason} ({text[:200]}) but platform proxy log showed no 429"
                         )
                         result.metadata["platform_rate_limit_corroborated"] = False
                         break
                     else:
-                        result.errors.append(
-                            f"delegated worker failed ({reason}): card on board recorded {reason} ({text[:200]}) but platform proxy log unavailable at settle; not corroborated"
-                        )
-                        result.metadata["platform_rate_limit_corroborated"] = False
+                        infra_reason = reason
+                        infra_detail = f"card on board recorded {reason}: {text[:200]}"
+                        if corroborated is None:
+                            infra_detail += " (platform proxy log unavailable at settle; not corroborated)"
+                        result.metadata["platform_rate_limit_corroborated"] = (corroborated is True)
                         break
 
         _purge_card_state(awaited, _EXEC_TIMEOUT)
@@ -3664,7 +3641,7 @@ class KubeAgentsHarness(AgentHarness):
             for tid, text in delivered_results(observed, awaited).items()
             if reported.get(tid) not in _FAILURE_STATUSES and not _extract_infra_failure_reason(text)
         }
-        worker_acted = bool(successful_deliveries) or bool(captured and captured.entries)
+        worker_acted = bool(successful_deliveries)
         if infra_reason:
             if opening_turn and not worker_acted:
                 _mark_result_infra_failure(

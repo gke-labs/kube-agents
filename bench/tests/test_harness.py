@@ -3571,9 +3571,10 @@ def test_a_cleared_rate_limit_card_evicted_by_status_turn_running_remains_graded
 
 
 def test_status_turn_re_read_retired_card_refreshes_or_evicts_poll_fallback_remains_graded(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
     """When a status turn re-reads a card already retired from outstanding, it refreshes or evicts the stored prefix."""
+    _corroborate_429(tmp_path, monkeypatch)
     prefix = (
         "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
         'HTTP 429 ... "TPM quota exhausted"'
@@ -3645,17 +3646,18 @@ def test_status_turn_re_read_retired_card_refreshes_or_evicts_poll_fallback_rema
 
     result = KubeAgentsHarness().run("Find the root cause.")
 
-    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert not result.has_errors()
 
 
 def test_a_failure_status_card_with_empty_messages_evicted_from_poll_fallback_remains_graded(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
     """When a poll-captured rate-limit card later polls in a failure status with empty messages,
 
     it is evicted from poll_failure_messages. If final board read fails, the stale rate-limit
     message is not handed to _settle and the run remains graded with the worker's failure.
     """
+    _corroborate_429(tmp_path, monkeypatch)
     stub_agent.turns = [
         _create_turn(),
         _turn(_text("still investigating 1")),
@@ -3699,6 +3701,7 @@ def test_a_failure_status_card_with_empty_messages_evicted_from_poll_fallback_re
     result = KubeAgentsHarness().run("Find the root cause.")
 
     assert not any(harness.INFRA_FAILURE_MARKER in err for err in result.errors)
+    assert not any("delegated worker failed" in err for err in result.errors)
     assert any("agent reported no status for 3 turns running" in err for err in result.errors)
 
 
@@ -3993,9 +3996,10 @@ def test_extract_infra_failure_reason_classifier() -> None:
 
 
 def test_a_429_blocked_card_unblocked_and_running_at_settle_remains_graded(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
     """A card 429-blocked and retired, then unblocked and still running at settle, is cleared and remains graded."""
+    _corroborate_429(tmp_path, monkeypatch)
     t1 = _TASK_ID
     t2 = _TASK_ID + "-2"
     stub_agent.turns = [
@@ -4099,9 +4103,10 @@ def test_a_429_blocked_card_unblocked_and_running_at_settle_remains_graded(
 
 
 def test_a_429_blocked_card_unblocked_and_ready_at_settle_remains_graded(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
     """A card 429-blocked and retired, then unblocked to ready at settle, records the status discrepancy and remains graded."""
+    _corroborate_429(tmp_path, monkeypatch)
     t1 = _TASK_ID
     t2 = _TASK_ID + "-2"
     stub_agent.turns = [
@@ -4313,9 +4318,10 @@ def test_a_429_blocked_card_unblocked_at_settle_with_nothing_delivered_records_c
 
 
 def test_a_worker_authored_transient_block_with_need_a_moment_unblocked_at_settle_does_not_record_ceiling(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, results_json: Any
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, results_json: Any, tmp_path: Path
 ) -> None:
     """A worker-authored transient block with arbitrary reason (no rate-limit prefix) unblocked at settle records plain discrepancy and stays graded."""
+    _corroborate_429(tmp_path, monkeypatch)
     t1 = _TASK_ID
     t2 = _TASK_ID + "-2"
     stub_agent.turns = [
@@ -4800,7 +4806,7 @@ def test_worker_acted_and_delivered_before_sibling_429_rate_limit_remains_graded
 def test_worker_with_tool_calls_before_429_rate_limit_is_infrastructure(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
-    """When a worker executed tool actions before hitting 429 quota exhaustion, it acted and remains graded."""
+    """When a worker executed tool actions before hitting 429 quota exhaustion without delivery, the rep is marked infra."""
     log_file = tmp_path / "litellm.log"
     now_iso = datetime.now(timezone.utc).isoformat()
     log_file.write_text(f'{now_iso} ERROR: VertexAIException - {{"error": {{"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}}}\n')
@@ -4843,9 +4849,10 @@ def test_worker_with_tool_calls_before_429_rate_limit_is_infrastructure(
 
     result = KubeAgentsHarness().run("Investigate incident.")
 
-    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
-    assert any("delegated worker failed (rate_limit)" in e for e in result.errors)
-    assert not result.metadata.get("infra_failure")
+    assert any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any("delegated worker hit infrastructure failure (rate_limit)" in e for e in result.errors)
+    assert result.output == ""
+    assert result.metadata.get("infra_failure")
 
 
 def test_litellm_log_with_429_in_token_count_or_latency_does_not_corroborate(
@@ -4955,10 +4962,10 @@ def test_platform_429_corroboration_from_litellm_log_marks_infra(
     assert result.metadata.get("platform_rate_limit_corroborated") is True
 
 
-def test_platform_429_corroboration_when_log_absent_remains_graded(
+def test_platform_429_corroboration_when_log_absent_records_metadata_and_marks_infra(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
-    """When ARTIFACTS is set but litellm.log is absent at settle time, transient block is uncorroborated and remains graded."""
+    """When ARTIFACTS is set but litellm.log is absent at settle time, transient block marks infra with metadata recorded."""
     monkeypatch.setenv("ARTIFACTS", str(tmp_path))
 
     stub_agent.turns = [
@@ -4984,8 +4991,9 @@ def test_platform_429_corroboration_when_log_absent_remains_graded(
 
     result = KubeAgentsHarness().run("Investigate.")
 
-    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
-    assert any("platform proxy log unavailable at settle; not corroborated" in e for e in result.errors)
+    assert any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any("(platform proxy log unavailable at settle; not corroborated)" in e for e in result.errors)
+    assert result.output == ""
     assert result.metadata.get("platform_rate_limit_corroborated") is False
 
 
@@ -5236,9 +5244,10 @@ def test_a_triage_card_on_mute_agent_exit_does_not_record_unsettled_status_discr
 
 
 def test_a_429_blocked_card_unblocked_and_re_failed_for_own_fault_remains_graded(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
     """A card 429-blocked and retired, then unblocked and re-failed for its own fault, remains graded."""
+    _corroborate_429(tmp_path, monkeypatch)
     t1 = _TASK_ID
     t2 = _TASK_ID + "-2"
     stub_agent.turns = [
@@ -6658,9 +6667,10 @@ def test_a_card_wake_answer_turn_with_worker_rate_limit_preserves_wake_reply(
 
 
 def test_card_wake_answer_turn_with_unsettled_card_preserves_wake_reply_without_ceiling_marker(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
     """An unsettled card on a card-wake answer turn (opening_turn=False) does not record delegation ceiling marker."""
+    _corroborate_429(tmp_path, monkeypatch)
     scripts: list[str] = []
     base_shell = _replay_shell(scripts)
 
