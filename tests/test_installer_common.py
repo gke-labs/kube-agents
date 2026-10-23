@@ -48,6 +48,22 @@ _SKIP_UNLESS_TRAP_FIRES = (
     "ToleratedProbesClearErrTrapTest pins it by shape"
 )
 
+# The front doors (install.sh's source_provisioning_helpers and Day-2 menu,
+# upgrade.sh's and uninstall.sh's main) source installer_common.sh from inside
+# a function. SourcedFromAFunctionTest runs that shape under every bash a
+# developer here may run the front doors with: the one on PATH, and macOS's
+# /bin/bash 3.2 when it is a different binary.
+_MACOS_SYSTEM_BASH = pathlib.Path("/bin/bash")
+
+
+def _bashes_here():
+    bashes = ["bash"]
+    on_path = shutil.which("bash")
+    if _MACOS_SYSTEM_BASH.exists() and (on_path is None or not _MACOS_SYSTEM_BASH.samefile(on_path)):
+        bashes.append(str(_MACOS_SYSTEM_BASH))
+    return bashes
+
+
 # installer_common.sh's contract: the caller defines the print helpers.
 _PRINT_STUBS = """
 print_info() { :; }
@@ -5679,6 +5695,46 @@ class NextHomeChannelUnsetWarningTest(unittest.TestCase):
         self.assertTrue(lines[-2].startswith("WARN: No home channel: proactive posts are dropped."), proc.stdout)
         self.assertTrue(lines[-1].startswith("INFO: Set SLACK_HOME_CHANNEL"), proc.stdout)
         self.assertEqual(self._run(slack_home="C0123ABCD", summary=True).stdout, "rc=0 key=\n")
+
+
+class SourcedFromAFunctionTest(unittest.TestCase):
+    """The library is sourced from inside a function by every front door, so
+    its top level runs in that function's scope. On bash 3.2 (macOS's
+    /bin/bash) a `readonly -a` there is local to the function, as a `declare`
+    is on every bash, and the array is gone by the time trim_go_space reads
+    it: install.sh stopped on `GO_TRIMSPACE_CHARS[@]: unbound variable`
+    (#3837). bash 4.4 and 5.x keep a `readonly -a` global there, so the
+    behavioural test sees the defect only on a bash 3.2 host; the shape test
+    is the guard on every bash."""
+
+    _SOURCED_FILES = sorted((_REPO_ROOT / "scripts" / "installer").glob("*.sh"))
+    # A top-level `declare`/`typeset`, or a `readonly` with an array flag, in a
+    # file sourced from a function. `local` is never legal at top level, and
+    # the function bodies are indented, so the anchor at column 0 is the
+    # top level.
+    _FUNCTION_SCOPED_DECLARATION = re.compile(
+        r"^(?:(?:declare|typeset)\b.*|readonly\s+(?:-\w+\s+)*-\w*[aA]\w*\b.*)$", re.MULTILINE)
+
+    def test_no_sourced_file_declares_at_top_level(self):
+        self.assertIn(_INSTALLER_COMMON, self._SOURCED_FILES)
+        for path in self._SOURCED_FILES:
+            with self.subTest(file=path.name):
+                hits = self._FUNCTION_SCOPED_DECLARATION.findall(path.read_text())
+                self.assertEqual(hits, [], f"{path.name}: assign the value, then `readonly NAME` on its own line")
+
+    def test_trim_go_space_runs_after_a_function_sourced_the_library(self):
+        body = (
+            _PRINT_STUBS
+            + f'load() {{ source "{_INSTALLER_COMMON}"; }}\nload\nset -u\n'
+            + 'printf "n=%s [%s] [%s]\\n" "${#GO_TRIMSPACE_CHARS[@]}" "$(trim_go_space $\'\\xc2\\xa0C0HOME \')" '
+            '"$(slack_home_channel_not_an_id $\' D0DM\\xe3\\x80\\x80\')"\n'
+        )
+        for bash in _bashes_here():
+            with self.subTest(bash=bash):
+                proc = subprocess.run([bash, "-c", body], capture_output=True, text=True,
+                                      env=get_isolated_test_env(), cwd=str(_REPO_ROOT))
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("n=25 [C0HOME] [D0DM]", proc.stdout, proc.stderr)
 
 if __name__ == "__main__":
     unittest.main()

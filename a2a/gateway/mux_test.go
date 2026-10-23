@@ -267,3 +267,25 @@ func TestMultiAdapterOpenDirectGoesToThePrimary(t *testing.T) {
 		t.Error("an essential backend that is not in the map was accepted")
 	}
 }
+
+// A terminal reaches the backend that owns the conversation when it takes
+// terminal frames; one that does not answers errNoTerminalFrames, which the
+// caller treats as nothing to do (the relay's notices go out either way).
+func TestMultiAdapterRoutesATerminalToItsBackend(t *testing.T) {
+	d, c := newFakeAdapter(), newFakeAdapter()
+	c.setTakesTerminals()
+	m := newTestMux(t, map[string]Adapter{"discord": d, "console": c})
+	term := ConsoleTerminal{TaskID: "task-1", Addressee: "platform", State: lib.StateCompleted, Text: "done"}
+	if err := m.PostTerminal("console:tab-1", term); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.terminalPosts(); len(got) != 1 || got[0] != (fakeTerminal{"console:tab-1", term}) {
+		t.Errorf("console terminals = %+v", got)
+	}
+	if err := m.PostTerminal("discord:g1/c1", term); !errors.Is(err, errNoTerminalFrames) {
+		t.Errorf("discord terminal err = %v, want errNoTerminalFrames", err)
+	}
+	if err := m.PostTerminal("nowhere:x", term); err == nil {
+		t.Error("a terminal for an unknown backend was accepted")
+	}
+}

@@ -102,6 +102,10 @@ const (
 	// label into negativeFeedbackTotal; the chat_feedback_reactions hook feeds
 	// it, and no A2A family joins it.
 	chatFeedbackNegativeSeries = "kubeagents_chat_feedback_negative_total"
+	// vcsClosedUnmergedSeries is the broker's count of this install's proposals
+	// the forge reported closed without a merge, summed whole into
+	// remediationsClosedUnmergedTotal; it carries no label.
+	vcsClosedUnmergedSeries = "kubeagents_vcs_proposals_closed_unmerged_total"
 	// a2aMessagesInboundSeries is the A2A gateway's counter of the chat
 	// messages it accepted as turns, by platform: the same counter on a
 	// next-mode install, where Chat ingress is the A2A gateway's rather than
@@ -223,6 +227,8 @@ func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 		return kanbanGaveUpSeries, nil
 	case usageCounterNegativeFeedback:
 		return chatFeedbackNegativeSeries, nil
+	case usageCounterRemediationsClosedUnmerged:
+		return vcsClosedUnmergedSeries, nil
 	default:
 		return toolInvocationsSeries, usageLabelFilter{toolInvocationsStatusLabel: toolInvocationsCountedStatuses}
 	}

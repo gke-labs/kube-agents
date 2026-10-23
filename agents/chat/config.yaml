@@ -100,7 +100,10 @@ model:
 # It is 600s because Gemini thinks in silence on this path: with the request
 # shape Hermes sends, no reasoning deltas stream, and a hard prompt measured
 # 140-210s before its first chunk, so a shorter bound would cut off healthy
-# long thinks, and every retry would repeat the same think.
+# long thinks, and every retry would repeat the same think. That was measured
+# before the chart's gateway asked Gemini for its thoughts; thought summaries
+# may now arrive as reasoning deltas before the answer, which has not been
+# measured, so the bound stays.
 # request_timeout_seconds is the per-read socket timeout (and the stream read
 # timeout), not a cap on a whole call; the chart's LiteLLM sets no timeout of
 # its own. A call that stalls is retried inside each of Hermes' 3 attempts

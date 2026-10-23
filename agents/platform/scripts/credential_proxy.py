@@ -16,6 +16,7 @@ import functools
 import json
 import logging
 import os
+import posixpath
 import queue
 import re
 import select
@@ -25,6 +26,7 @@ import signal
 import shutil
 import socket
 import socketserver
+import sqlite3
 import ssl
 import subprocess
 import sys
@@ -607,9 +609,13 @@ VCS_REQUESTS_METRIC = "kubeagents_vcs_requests_total"
 VCS_VERB_LABEL = "verb"
 # Proposals this install opened that the forge reports merged, counted once
 # each per broker process as the broker's reads show them
-# (vcs_broker.VcsBroker._count_merges); the series the operator reads
+# (vcs_broker.VcsBroker._count_outcomes); the series the operator reads
 # `status.usage.remediationsMergedTotal` from. No labels.
 VCS_MERGED_METRIC = "kubeagents_vcs_proposals_merged_total"
+# Proposals this install opened that the forge reports closed without a merge,
+# counted the same way beside the merged series; the series the operator reads
+# `status.usage.remediationsClosedUnmergedTotal` from. No labels.
+VCS_CLOSED_UNMERGED_METRIC = "kubeagents_vcs_proposals_closed_unmerged_total"
 # The broker's own failures, by kind: work it took on and could not carry out
 # for a reason that is its own or its upstream's, never the command's exit
 # code and never a refusal. A second count beside the tool counter rather
@@ -2480,6 +2486,7 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
     upstream_key: str
     upstream_host = "127.0.0.1"
     upstream_port = 8642
+    workspace_root: str = "/opt/data"
     max_request_bytes = 10 * 1024 * 1024
     protocol_version = "HTTP/1.1"
 
@@ -2516,6 +2523,12 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             self._drain_request_body()
             self.send_error(HTTPStatus.UNAUTHORIZED)
             return
+        if self._targets_bridge_session(
+            self.path, self.headers, workspace_root=self.workspace_root
+        ):
+            self._drain_request_body()
+            self.send_error(HTTPStatus.FORBIDDEN)
+            return
         # The three refusals below cannot drain -- see _drain_request_body -- so a
         # caller that sent a body may read the close before the response. They are
         # answers to a malformed or oversized request, where the framing is already
@@ -2533,6 +2546,11 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
             return
         body = self.rfile.read(content_length) if content_length else None
+        if body and self._targets_bridge_session(
+            self.path, self.headers, body=body, workspace_root=self.workspace_root
+        ):
+            self.send_error(HTTPStatus.FORBIDDEN)
+            return
         headers = {
             name: value
             for name, value in self.headers.items()
@@ -2591,6 +2609,115 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
     def _drain_request_body(self) -> None:
         """Drain the body before a pre-authentication refusal; see drain_request_body."""
         drain_request_body(self, self.max_request_bytes)
+
+    @classmethod
+    def _is_bridge_session_id(
+        cls,
+        raw_session_id: Any,
+        workspace_root: str | Path | None = None,
+    ) -> bool:
+        val = str(raw_session_id or "").strip()
+        while (unquoted := urllib.parse.unquote(val)) != val:
+            val = unquoted
+        sid = val.strip()
+        if not sid:
+            return False
+        if sid.lower().startswith("a2a-"):
+            return True
+        root = Path(
+            workspace_root
+            or getattr(cls, "workspace_root", "")
+            or os.getenv("CREDENTIAL_PROXY_WORKSPACE_ROOT")
+            or os.getenv("HERMES_HOME")
+            or "/opt/data"
+        )
+        db_paths: list[Path] = [root / "state.db"]
+        profiles_dir = root / "profiles"
+        if profiles_dir.is_dir():
+            db_paths.extend(sorted(profiles_dir.glob("*/state.db")))
+        for db_path in db_paths:
+            if not db_path.is_file():
+                continue
+            try:
+                with contextlib.closing(
+                    sqlite3.connect(
+                        f"file:{db_path}?mode=ro", uri=True, timeout=2.0
+                    )
+                ) as conn:
+                    cur = sid
+                    seen = {cur}
+                    for _ in range(256):
+                        row = conn.execute(
+                            "SELECT parent_session_id FROM sessions WHERE id = ?",
+                            (cur,),
+                        ).fetchone()
+                        parent = str(row[0] or "").strip() if row else ""
+                        if not parent or parent in seen:
+                            break
+                        if parent.lower().startswith("a2a-"):
+                            return True
+                        seen.add(parent)
+                        cur = parent
+            except Exception as exc:
+                LOGGER.debug("could not inspect %s for session %s: %s", db_path, sid, exc)
+        return False
+
+    @classmethod
+    def _targets_bridge_session(
+        cls,
+        path: str,
+        headers: Any,
+        body: bytes | None = None,
+        workspace_root: str | Path | None = None,
+    ) -> bool:
+        """Return True when an external request names an `a2a-*` bridge session or child.
+
+        `hermes-bridge` talks to Hermes on loopback (`127.0.0.1:8642`), never
+        through `agent-api-auth` (`8643`). Refusing `a2a-*` session paths,
+        headers, `/v1/runs` request-body `session_id` fields, and `state.db`
+        child continuations on the external proxy stops a holder of
+        `API_SERVER_EXTERNAL_KEY` from running a turn in a bridge-owned
+        `a2a-<contextId>` session and inheriting its `session_kv` caller identity.
+        """
+        for header in ("X-Hermes-Session-Id", "X-Hermes-Session-Key"):
+            raw_values = (
+                headers.get_all(header, [])
+                if hasattr(headers, "get_all")
+                else [headers.get(header, "")]
+            )
+            for raw_val in raw_values:
+                if cls._is_bridge_session_id(raw_val, workspace_root):
+                    return True
+        raw_path = urllib.parse.urlsplit(path).path
+        while (unquoted := urllib.parse.unquote(raw_path)) != raw_path:
+            raw_path = unquoted
+        normalized = posixpath.normpath(raw_path.replace("\\", "/"))
+        raw_segments = [seg for seg in normalized.split("/") if seg]
+        segments = [seg.lower() for seg in raw_segments]
+        for idx, seg in enumerate(segments):
+            if seg.startswith("a2a-"):
+                return True
+            if seg == "sessions" and idx > 0 and segments[idx - 1] == "api":
+                if idx + 1 < len(raw_segments) and cls._is_bridge_session_id(
+                    raw_segments[idx + 1], workspace_root
+                ):
+                    return True
+        if body:
+            try:
+                parsed = json.loads(body)
+            except Exception:
+                unquoted_body = urllib.parse.unquote_to_bytes(body).lower()
+                if b"a2a-" in unquoted_body:
+                    return True
+            else:
+                if isinstance(parsed, dict):
+                    for key in ("session_id", "sessionId", "gateway_session_key"):
+                        if key in parsed and parsed[key] is not None:
+                            if not isinstance(parsed[key], str) or cls._is_bridge_session_id(
+                                parsed[key], workspace_root
+                            ):
+                                return True
+        return False
 
     @staticmethod
     def _sanitize_header(value: str) -> str:
@@ -7993,6 +8120,7 @@ def build_vcs_broker(
         # Looked up at call time: the handler's registry is a class attribute
         # a test replaces per case, and this broker outlives none of them.
         merge_observer=lambda count: CredentialProxyHandler.metrics.record_merged(count),
+        close_observer=lambda count: CredentialProxyHandler.metrics.record_closed_unmerged(count),
         started_at=PROCESS_START_TIME_SECONDS,
     )
     LOGGER.info(
@@ -8466,6 +8594,7 @@ class ProxyMetrics:
         self._requests: dict[tuple[str, str], int] = {}
         self._vcs: dict[tuple[str, str], int] = {}
         self._merged = 0
+        self._closed_unmerged = 0
         self._failures: dict[str, int] = {}
         # Per tool: cumulative bucket counts (one per TOOL_DURATION_BUCKETS
         # bound, the +Inf bucket being the count), the sum, and the count.
@@ -8560,6 +8689,10 @@ class ProxyMetrics:
         with self._lock:
             self._merged += count
 
+    def record_closed_unmerged(self, count: int) -> None:
+        with self._lock:
+            self._closed_unmerged += count
+
     def record_failure(self, kind: str) -> None:
         kind = kind if kind in BROKER_FAILURE_KINDS else BROKER_FAILURE_OTHER_FAILED
         with self._lock:
@@ -8571,6 +8704,7 @@ class ProxyMetrics:
             requests = sorted(self._requests.items())
             vcs = sorted(self._vcs.items())
             merged = self._merged
+            closed_unmerged = self._closed_unmerged
             failures = sorted(self._failures.items())
             durations = {
                 tool: (list(self._duration_buckets[tool]), self._duration_sum[tool], self._duration_count[tool])
@@ -8649,6 +8783,9 @@ class ProxyMetrics:
             f"# HELP {VCS_MERGED_METRIC} Proposals this install opened that the forge reported merged, counted once each per process.",
             f"# TYPE {VCS_MERGED_METRIC} counter",
             f"{VCS_MERGED_METRIC} {merged}",
+            f"# HELP {VCS_CLOSED_UNMERGED_METRIC} Proposals this install opened that the forge reported closed without a merge, counted once each per process.",
+            f"# TYPE {VCS_CLOSED_UNMERGED_METRIC} counter",
+            f"{VCS_CLOSED_UNMERGED_METRIC} {closed_unmerged}",
         ]
         lines += [
             f"# HELP {BROKER_FAILURES_METRIC} Brokered work the broker could not carry out, by kind: a command past its deadline, a broker fault, a git failure, a failed token mint or an upstream relay error.",
@@ -11121,6 +11258,11 @@ def start_agent_api_proxy() -> ThreadingHTTPServer:
         raise RuntimeError("API_SERVER_EXTERNAL_KEY must be configured")
     AgentAPIProxyHandler.upstream_key = os.getenv(
         "AGENT_API_UPSTREAM_KEY", "cluster-internal-trusted"
+    )
+    AgentAPIProxyHandler.workspace_root = (
+        os.getenv("CREDENTIAL_PROXY_WORKSPACE_ROOT")
+        or os.getenv("HERMES_HOME")
+        or "/opt/data"
     )
     port = int(os.getenv("AGENT_API_PROXY_PORT", "8643"))
     server = ThreadingTCPHTTPServer(("0.0.0.0", port), AgentAPIProxyHandler)

@@ -200,17 +200,17 @@ nextMode:
     requests:
       cpu: 50m
       memory: 64Mi
-      ephemeral-storage: "0"
+      ephemeral-storage: 128Mi
     limits:
       cpu: 200m
       memory: 256Mi
-      ephemeral-storage: "0"
+      ephemeral-storage: 128Mi
     cpuMillisRequest: 50
     cpuMillisLimit: 200
     memoryBytesRequest: 67108864
     memoryBytesLimit: 268435456
-    ephemeralStorageBytesRequest: 0
-    ephemeralStorageBytesLimit: 0
+    ephemeralStorageBytesRequest: 134217728
+    ephemeralStorageBytesLimit: 134217728
     pods: 1
   storage:
     persistentVolumeClaims: 1
