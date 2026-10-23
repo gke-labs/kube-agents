@@ -1,173 +1,34 @@
 ---
 name: gke-workload-troubleshooting
-description: Systematic Standard Operating Procedure (SOP) for diagnosing GKE workload failures, crash loops, resource OOMs, mounting errors, and connectivity timeouts.
+description: Routes a named workload that is failing for an unknown reason to the focused skill for its symptom. Use when a card names one Deployment, StatefulSet, DaemonSet or pod as broken, down or misbehaving without saying how. For a known symptom load pod-crashloop-oom, pod-pending-scheduling, pod-container-creating or service-connectivity directly; for a cluster-wide health question load workload-triage-scan.
 ---
 
-# GKE Workload Troubleshooting Skill
+# Task
 
-Use this skill to systematically diagnose and resolve failures in application workloads deployed in GKE clusters. This skill enforces a read-only diagnostics boundary before proposing manifest or config corrections.
+Find which symptom a named workload shows, with one projected read, and hand it to the focused skill that owns that symptom.
 
-## 🔍 Diagnostic Workflow
+# Workflow
 
-### Step 0: Context Acquisition & Time Window Definition
+1. Read the workload's pods, projected to the fields that decide the symptom:
 
-To begin troubleshooting, acquire the following context from the user or active `SETTINGS.md` config:
-
-- **Project ID** (e.g., `my-gcp-project`)
-  - **Cluster Name** (e.g., `my-gke-cluster`)
-  - **Cluster Location** (e.g., `us-central1`)
-  - **Workload Name** (e.g., `payment-api`)
-  - **Workload Namespace** (e.g., `checkout`)
-  - **Issue Time** (Optional, e.g., `2026-06-01T15:30:00Z`)
-
-Before running any diagnostics or `kubectl` commands, you **must** fetch GKE credentials and context for the target GKE cluster:
-
-```bash
-gcloud container clusters get-credentials <cluster_name> --region <cluster_location>
-```
-
-#### Time Handling & Fallbacks:
-
-1. **Determine Issue Timestamp ($T$)**:
-   - **Specific Time Provided**: If the user provides a specific timestamp, use it as $T$.
-   - **Relative Time Provided (e.g., "5 minutes ago")**: Dynamically calculate the corresponding UTC timestamp based on the current system time, and use it as $T$.
-   - **No Time Provided (Default)**:
-     1. Retrieve the GKE pod status (`kubectl get pods -n <namespace> -o yaml`).
-     2. If there are crashing or pending containers, check their state transition timestamps (e.g. `status.containerStatuses[*].lastState.terminated.finishedAt` or `status.startTime`) and use that transition time as $T$.
-     3. If no active transitions are found, default to the **current system time** as $T$.
-
-2. **Window Calculation**: Center a 1-hour query window around the issue timestamp $T$:
-   - `Start_Time` = `T - 30m`
-   - `End_Time` = `T + 30m`
-
----
-
-### Step 1: Analyze Pod Status and Conditions
-
-Inspect the workload's active pod states and controller status.
-
-**Diagnostic Commands:**
-
-```bash
-# 1. Inspect the deployment's actual selector labels:
-kubectl get deployment <workload_name> -n <workload_namespace> -o jsonpath='{.spec.selector.matchLabels}'
-# 2. Query the pods using the returned labels, for example:
-kubectl get pods -l <selector_labels> -n <workload_namespace>
-kubectl get deploy/<workload_name> -n <workload_namespace> -o yaml
-```
-
-#### Diagnostic Decision Tree:
-
-- **Phase: Pending**:
-  - The Pod cannot schedule on any node. Proceed directly to **Step 2 (Query Namespace Events)**.
-- **State: CrashLoopBackOff / Error**:
-  - Container is booting but exiting repeatedly. Check the terminated status using:
-
-    ```bash
-    kubectl get pod <pod_name> -n <workload_namespace> -o jsonpath='{.status.containerStatuses[*].lastState.terminated}'
-    ```
-
-    - **ExitCode: 137 (OOMKilled)**: Memory limit reached. Proceed to **Step 3 (Inspect Logs)** and inspect container startup command to differentiate between an application-level memory leak/loop vs an infrastructure capacity limit mismatch, then proceed to **Step 5** to propose fixes.
-    - **ExitCode: 1 or other non-zero codes**: The application code crashed. Proceed directly to **Step 3 (Inspect Logs)**.
-
-- **State: ContainerCreating**:
-  - The container is blocked during volume mount, networking setup, or image pulling. Proceed directly to **Step 2 (Query Namespace Events)**.
-
----
-
-### Step 2: Query Namespace Events
-
-Look for infrastructure, volume, image, or scheduling alerts in GKE.
-
-**Diagnostic Command:**
-
-```bash
-kubectl get events -n <workload_namespace> --sort-by='.metadata.creationTimestamp'
-# Or query Cloud Logging for historical GKE events within the time window:
-gcloud logging read "resource.type=\"k8s_cluster\" AND logName=\"projects/<project_id>/logs/events\" AND jsonPayload.involvedObject.namespace=\"<workload_namespace>\" AND timestamp>=\"[Start_Time]\" AND timestamp<=\"[End_Time]\"" --project="<project_id>"
-```
-
-_Note: Retrieve the sorted events list and manually inspect the event timestamps (CreationTimestamp/LastSeen) to identify failures occurring within the `[Start_Time]` and `[End_Time]` window. When researching unfamiliar GKE event reasons, quota errors, or controller statuses, query `mcp-developer_knowledge` first before falling back to generic web search._
-
-#### Signature Identifiers:
-
-- **`FailedScheduling`**: Node resource exhaustion. Look for messages like `0/3 nodes are available: 3 Insufficient memory.` or missing node affinity tolerations (e.g. Spot VM taints).
-- **`FailedMount`**:
-  - Missing PersistentVolumeClaim (`PVC`).
-  - Missing Secret (`Secret "<secret-name>" not found`).
-  - Missing ConfigMap (`ConfigMap "<configmap-name>" not found`).
-- **`Failed` / `BackOff` (Image Pull)**:
-  - Wrong image tag, missing image registry authentication (e.g., ImagePullBackOff).
-  - **Resolution Steps for Wrong Image Tag**:
-    1. Identify the failing container image name and the invalid tag.
-    2. Check the Git repository history for the last known working image tag for this workload. Run `git log -p -S "<image_name>" -- <manifest_file_path>` (or use `git log` on the folder containing manifests) to identify the previous working tag in Git.
-    3. If the invalid tag is a recent change in git history, compare it to the tag from the last successful commit.
-    4. Propose reverting the image tag to the last working version, or correcting the tag version in the manifest patch.
-
----
-
-### Step 3: Inspect Application Logs
-
-Extract exceptions and stack traces from the application runtime.
-
-**Diagnostic Commands:**
-
-```bash
-# Check current active log stream (handles multi-container pods)
-kubectl logs <pod_name> -n <workload_namespace> --all-containers --tail=100
-
-# Check logs from previously terminated container instances (handles multi-container pods)
-kubectl logs <pod_name> -n <workload_namespace> --all-containers -p --tail=100
-```
-
-#### Signature Identifiers:
-
-- **Out-of-Memory (OOM) Analysis**: Inspect container logs and startup commands (`spec.containers[*].command`). Differentiate between an **Application Code Leak/Loop** (unbounded array appending, memory leak signatures) vs an **Infrastructure Capacity Ceiling Mismatch** (legitimate workload demand exceeding limits).
-- **Stack Trace / Unhandled Exception**: Look for language-specific stack traces (e.g., `panic:`, `NullPointerException`, `Traceback (most recent call)`). This indicates an application bug.
-- **Egress Network Timeout**: Look for connection timeouts (e.g., `Connection timed out`, `dial tcp: i/o timeout`). Proceed to **Step 4 (Verify Connectivity)**.
-- **Permission Errors (ReadOnlyRootFilesystem)**: Look for write errors (e.g., `Read-only file system`, `Permission denied` when writing to `/tmp` or `/var/log`). Propose adding an `emptyDir` volume mount to that directory in the manifest.
-
----
-
-### Step 4: Verify Service Connectivity and Network Policies
-
-Troubleshoot connection drops to other services.
-
-**Diagnostic Commands:**
-
-```bash
-# Verify target endpoint is active
-kubectl get endpoints <target_service_name> -n <target_namespace>
-
-# Query network policies inside namespace
-kubectl get networkpolicies -n <workload_namespace> -o yaml
-```
-
-#### Logic:
-
-- If the endpoints list is empty, the target microservice itself is failing to schedule or boot (troubleshoot target service).
-- If endpoints exist but logs show timeouts, analyze the `NetworkPolicy` egress blocks. Verify if egress to the target service's IP/port is explicitly whitelisted.
-
----
-
-### Step 5: Record RCA & Proposed Correction on the Kanban Task
-
-As a Cluster Agent you operate under a strict **read-only** boundary: **do not apply patches directly to the cluster, and do not open Pull Requests yourself.** The GitOps write path (`submit-suggestion`) is owned exclusively by the Platform Agent. You also **never pass context back through your chat reply** — you communicate only through the kanban task you were spawned on.
-
-1. Synthesize the root cause analysis (e.g. _"payment-api is failing with exit code 137 because its memory limit is set to 256Mi while actual usage spiked to 270Mi"_), grounded in the exact diagnostic evidence you collected.
-2. Generate the corrected YAML manifest patch (e.g. increase memory limits, add missing Secret mounts, or add tolerations for Spot nodes).
-3. **Complete the task with the RCA in `result`** — that is the only field the requester receives; the gateway posts it into their chat thread verbatim. `metadata` is for what the Platform Agent parses, not a second home for the finding. SOUL.md §6 step 4 has the length budget — aim under 2,000 characters, tightening the prose around the cause, the evidence and the patch rather than dropping any of the three:
-
-   ```
-   kanban_complete(
-     result="<the full RCA: root cause, the evidence that grounds it, and the proposed patch>",
-     summary="<one-line status — first line only, first 400 chars>",
-     metadata={
-       "root_cause": "...",
-       "evidence": ["<quoted event/log/spec excerpts>"],
-       "proposed_patch": "<YAML>"
-     }
-   )
+   ```bash
+   kubectl get pods -n <namespace> -l <selector> -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,READY:.status.containerStatuses[*].ready,WAITING:.status.containerStatuses[*].state.waiting.reason,LAST:.status.containerStatuses[*].lastState.terminated.reason,EXIT:.status.containerStatuses[*].lastState.terminated.exitCode,RESTARTS:.status.containerStatuses[*].restartCount'
    ```
 
-   (If you cannot proceed — missing input, ambiguous scope — call `kanban_block(kind="needs_input", ...)` instead.) Your final chat reply is only a brief acknowledgement — never the RCA or patch. The Platform Agent reads the completed card and decides whether to open/update a Pull Request via `submit-suggestion`; do not duplicate an existing PR.
+   Take `<selector>` from the controller: `kubectl get deployment <name> -n <namespace> -o jsonpath='{.spec.selector.matchLabels}'` (or `statefulset`, `daemonset`). For a bare pod, use `--field-selector metadata.name=<pod>`.
+
+2. Load the skill for the first row that matches:
+
+   | Pod state                                                                                   | Skill                    |
+   | ------------------------------------------------------------------------------------------- | ------------------------ |
+   | `CrashLoopBackOff`, `Error`, `OOMKilled`, exit code set, restarts climbing, `Running` not Ready | `pod-crashloop-oom`      |
+   | `Pending` with no container state                                                           | `pod-pending-scheduling` |
+   | `ContainerCreating`, `ImagePullBackOff`, `ErrImagePull`, `CreateContainerConfigError`         | `pod-container-creating` |
+   | All pods Running and Ready, but callers report timeouts                                    | `service-connectivity`   |
+
+3. If every pod is Running and Ready with no recent restarts, the reported fault is not there. Say so with the row you read, and record it as [`workload-triage-scan/references/reporting.md`](../workload-triage-scan/references/reporting.md) describes.
+
+# Rules
+
+- Do not run `gcloud container clusters get-credentials`. Preflight has pinned the kubeconfig.
+- Never `sleep` or `--watch`; report the state you read.

@@ -96,7 +96,7 @@ prompt: >-
   you don't.
 expected_output: >-
   With the cluster view on, the session loads its gke-workload-troubleshooting
-  skill, finds the cluster carrying the seeded-debug namespace with its
+  or pod-crashloop-oom skill, finds the cluster carrying the seeded-debug namespace with its
   read-only kubectl and gcloud, and answers itself without delegating. With
   the view off, it delegates to the platform agent and relays its finding.
   Either way the answer says payments-api's container is OOMKilled on every
@@ -144,16 +144,19 @@ verification_spec:
         # shipped gke- skill counts, not only gke-workload-troubleshooting:
         # what this grades is that the persona's skills reach the model and
         # it uses one, and gke-stall-detection first is a fair reading of
-        # "crashlooping". The match is on the name, so a skill Claude Code
-        # bundles (none on main is named gke-*) cannot pass it.
+        # "crashlooping". So do the four symptom skills the persona names
+        # since #3181 split gke-workload-troubleshooting: pod-crashloop-oom
+        # is the direct route for this question. The match is on the name,
+        # so a skill Claude Code bundles (none is named gke-* or one of the
+        # four) cannot pass it.
         - type: tool_called
           tool_names: ["Skill"]
           arguments:
-            skill: ".*gke-[a-z-]+.*"
+            skill: ".*(gke-[a-z-]+|pod-crashloop-oom|pod-pending-scheduling|pod-container-creating|service-connectivity).*"
         - type: tool_called
           tool_names: ["Skill"]
           arguments:
-            command: ".*gke-[a-z-]+.*"
+            command: ".*(gke-[a-z-]+|pod-crashloop-oom|pod-pending-scheduling|pod-container-creating|service-connectivity).*"
 
   - name: the-answer-names-the-oom
     role: objective

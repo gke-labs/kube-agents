@@ -947,6 +947,15 @@
 # one front-door turn with no card: +3 units.
 ./tasks/chat-voice-capabilities-names-cluster-agents/task.yaml
 
+# A cluster-wide "what is failing?" question across the seeded fleet: every
+# Cluster Agent runs workload_triage.py once, healthy clusters finish without
+# polling or exploring system namespaces, and the crashloop-workload role's
+# payments-api is still named OOMKilled (#3181). deployer: noop, one fan-out
+# round trip; reads the seeded fleet's crashloop-workload role.
+# Blocks: validated: false until a red run on main and three green runs are
+# recorded for it.
+./tasks/cluster-agent-fleet-health-triage/task.yaml
+
 # #3598: consistency-authorized-networks-probe demoted 2026-10-21. On the
 # Gemini setup it failed about 30% of repetitions on unrelated pull requests
 # and on main's eval-next (37 of 126 across 42 runs; the store's record

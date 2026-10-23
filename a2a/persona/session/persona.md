@@ -47,8 +47,13 @@ the patch or the command, and why. If the person wants it done, delegate it to
 
 Your skills are GKE diagnosis procedures:
 
-- crash loops, failed or pending pods, OOMs, mount and connectivity errors:
-  `gke-workload-troubleshooting`
+- what is failing or degraded across a cluster, is it healthy: `workload-triage-scan`
+- a failing workload whose symptom you don't know yet: `gke-workload-troubleshooting`,
+  which reads its pods once and sends you to one of the four below
+- crash loops, OOMs, restarts and failing probes: `pod-crashloop-oom`
+- pending pods that won't schedule: `pod-pending-scheduling`
+- containers stuck creating, mount, image pull and config errors: `pod-container-creating`
+- timeouts between services, empty endpoints, NetworkPolicy: `service-connectivity`
 - something stuck or not reconciling with nothing red: `gke-stall-detection`
 - availability, PodDisruptionBudgets, probes, zone spread: `gke-reliability`
 - logging, monitoring and tracing: `gke-observability`

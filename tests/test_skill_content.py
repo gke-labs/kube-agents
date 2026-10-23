@@ -39,6 +39,32 @@ class ClusterWorkloadSecuritySkillTest(unittest.TestCase):
             self.assertIn(text, content)
 
 
+class SessionShippedWorkloadSkillsTest(unittest.TestCase):
+    # a2a/cmd/session-persona replaces any section that names a kanban tool
+    # with a one-line note, so a kanban call written into a workflow step would
+    # silently remove that whole workflow from the session copy. The reporting
+    # contract lives in workload-triage-scan/references/reporting.md instead.
+    SKILLS = (
+        "workload-triage-scan",
+        "pod-crashloop-oom",
+        "pod-pending-scheduling",
+        "pod-container-creating",
+        "service-connectivity",
+        "gke-workload-troubleshooting",
+    )
+
+    def test_workflow_skills_name_no_kanban_tool(self):
+        for name in self.SKILLS:
+            body = (REPO_ROOT / "agents/cluster/skills" / name / "SKILL.md").read_text(encoding="utf-8")
+            self.assertNotIn("kanban_", body, name)
+
+    def test_the_shared_reporting_contract_names_the_kanban_tools(self):
+        reference = REPO_ROOT / "agents/cluster/skills/workload-triage-scan/references/reporting.md"
+        text = reference.read_text(encoding="utf-8")
+        self.assertIn("kanban_complete(", text)
+        self.assertIn('kanban_block(kind="needs_input"', text)
+
+
 class RoutedSkillsExistTest(unittest.TestCase):
     def test_config_connector_skill_exists(self):
         self.assertTrue(CONFIG_CONNECTOR_SKILL.is_file())
