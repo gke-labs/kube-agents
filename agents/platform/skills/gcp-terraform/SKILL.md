@@ -31,9 +31,8 @@ the reviewer's or CI's step, because only CI has the state to plan against.
 - **A GKE node pool or cluster change** on a Terraform repository: grow or
   shrink a pool, turn on autoscaling, change a release channel or
   maintenance window, add a new cluster, adopt a cluster the repository
-  does not describe. A new cluster comes here only when `SOUL.md` §3 item 7
-  routes it here; where that item says a Terraform repository is a stop,
-  the stop is the answer.
+  does not describe. A new cluster comes here when `SOUL.md` §3 item 7
+  routes it here, which it does for a Terraform repository.
 - **A Cloud SQL change**: a read replica, a tier, backups, high
   availability.
 - **A VPC firewall rule**: open or close a port, narrow a source range,

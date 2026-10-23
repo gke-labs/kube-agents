@@ -369,3 +369,43 @@ func TestNotifyCarriesAChatMessageAndAnUpdateKey(t *testing.T) {
 		}
 	}
 }
+
+// --reply-to rides a conversation request to the console's subject; it is
+// refused without --conversation, or when it is no task id.
+func TestNotifyCarriesReplyToOnAConsoleConversation(t *testing.T) {
+	s := startNotifyServer(t)
+	notifyEnv(t, s.ClientURL())
+	nc, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(nc.Close)
+	got := make(chan lib.NotifyRequest, 1)
+	if _, err := nc.Subscribe(lib.NotifySubjectConsole, func(m *nats.Msg) {
+		var req lib.NotifyRequest
+		_ = json.Unmarshal(m.Data, &req)
+		got <- req
+		body, _ := json.Marshal(lib.NotifyReply{MessageID: "n-1", ThreadID: req.Conversation})
+		_ = m.Respond(body)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"notify", "--platform", "console", "--conversation", "console:tab-1", "--context", "ctx-1",
+		"--reply-to", "task-7", "the report"}); err != nil {
+		t.Fatalf("notify: %v", err)
+	}
+	if req := <-got; req.ReplyTo != "task-7" || req.Conversation != "console:tab-1" {
+		t.Errorf("request = %+v, want reply_to task-7 into console:tab-1", req)
+	}
+	for _, args := range [][]string{
+		{"notify", "--platform", "console", "--reply-to", "task-7", "x"},
+		{"notify", "--platform", "console", "--conversation", "console:tab-1", "--context", "ctx-1", "--reply-to", "task 7", "x"},
+	} {
+		if err := run(args); err == nil || !strings.Contains(err.Error(), "--reply-to") {
+			t.Errorf("%v: err = %v, want a --reply-to refusal", args, err)
+		}
+	}
+}

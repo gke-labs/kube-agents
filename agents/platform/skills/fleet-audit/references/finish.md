@@ -208,8 +208,9 @@ too: its note gives the reason and the fix, and the JSON line carries it under
 **Report.** `status: "NO_FORGE"` replaces the SOP's report lines, which all name a ledger URL that
 does not exist. `silent_ok` decides silence as usual: on a scheduled run, `silent_ok: true` → exactly
 `[SILENT]`. Otherwise, and on every on-demand run, your final response is `summary` verbatim. It
-names the most severe findings with the object each one is about, the ids held for the collector,
-the coverage gaps, and that no forge is configured or which repository could not be reached. Do not report the run as
+names the most severe findings, one short line each with its cluster and the object it is about,
+counts the rest, and gives the ids held for the collector, the coverage gaps, and that no GitOps
+repository is connected or which repository could not be reached. Do not report the run as
 failed, and do not invent an issue URL.
 
 ### A forge with no issue tracker

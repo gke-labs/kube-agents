@@ -51,11 +51,12 @@ const (
 
 	readHeaderTimeout = 10 * time.Second
 	idleTimeout       = 60 * time.Second
-	// writeTimeout bounds one response. Every answer here is one JSON
-	// document, and the slowest, inspect_pr, bounds its own call
-	// (mcp.InspectTimeout, 25 s); a streamed answer, if a later tool adds
-	// one, has to revisit this.
-	writeTimeout = 30 * time.Second
+	// writeTimeout bounds one response, so it must outlast the slowest call
+	// a caller may ask for: send_message waits for the gateway's submission
+	// and then up to the longest answer wait (mcp.MaxTurnWait), which also
+	// outlasts inspect_pr's own bound (mcp.InspectTimeout). A streamed
+	// answer, if a later tool adds one, has to revisit this.
+	writeTimeout = mcp.MaxTurnWait + time.Minute
 	// shutdownGrace is how long a stop waits for the requests in flight,
 	// whose contexts the stop has already ended (serve), so a stop is a
 	// clean drain well inside the pod's default 30 s termination grace.
@@ -186,7 +187,8 @@ func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string)
 		return err
 	}
 	defer bus.Close()
-	srv, err := mcp.NewServer(toolsFor(bus, s.broker)...)
+	convs := mcp.NewConversations()
+	srv, err := mcp.NewServer(toolsFor(bus, convs, s.broker)...)
 	if err != nil {
 		log.Error("mcp server", "err", err)
 		return err
@@ -201,8 +203,19 @@ func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string)
 
 // toolsFor is the tools this pod offers: inspect_pr only when it has a
 // broker.
-func toolsFor(bus mcp.Bus, broker *mcp.BrokerClient) []mcp.Tool {
-	tools := []mcp.Tool{mcp.ConnectionStatusTool(bus)}
+// toolBus is what the tools read and send through: the status read and the
+// turn tools' bus.
+type toolBus interface {
+	mcp.Bus
+	mcp.TurnBus
+}
+
+func toolsFor(bus toolBus, convs *mcp.Conversations, broker *mcp.BrokerClient) []mcp.Tool {
+	tools := []mcp.Tool{
+		mcp.ConnectionStatusTool(bus),
+		mcp.SendMessageTool(bus, convs),
+		mcp.TaskControlTool(bus, convs),
+	}
 	if broker != nil {
 		tools = append(tools, mcp.InspectPRTool(broker))
 	}

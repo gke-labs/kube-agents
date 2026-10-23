@@ -11,6 +11,10 @@ const (
 	NotifySubjectGchat = "chat.notify.gchat"
 	// NotifySubjectSlack is the subject a Slack notify is published on.
 	NotifySubjectSlack = "chat.notify.slack"
+	// NotifySubjectConsole is the subject a console notify is published on.
+	// The console has no home channel, so it serves conversation requests
+	// only.
+	NotifySubjectConsole = "chat.notify.console"
 	// NotifyReplyPrefix is the namespace a notify's reply subject must sit
 	// under: the gateway answers there and nowhere else, and the agent
 	// principal is the one reader of it.
@@ -21,12 +25,17 @@ const (
 	NotifyPlatformGchat = "google_chat"
 	// NotifyPlatformSlack is Slack's, as Hermes spells it (`--to slack`).
 	NotifyPlatformSlack = "slack"
+	// NotifyPlatformConsole is the console door's. Hermes has no console
+	// platform of its own; this is the name the agent side records on a
+	// console conversation's route.
+	NotifyPlatformConsole = "console"
 )
 
 // NotifySubjects maps a caller's platform name to its notify subject.
 var NotifySubjects = map[string]string{
-	NotifyPlatformGchat: NotifySubjectGchat,
-	NotifyPlatformSlack: NotifySubjectSlack,
+	NotifyPlatformGchat:   NotifySubjectGchat,
+	NotifyPlatformSlack:   NotifySubjectSlack,
+	NotifyPlatformConsole: NotifySubjectConsole,
 }
 
 // NotifyRequest is the body of a chat.notify request.
@@ -68,6 +77,11 @@ type NotifyRequest struct {
 	// out the same way; it ignores Update.
 	Chat   json.RawMessage `json:"chat,omitempty"`
 	Update string          `json:"update,omitempty"`
+	// ReplyTo, on a request aimed at a conversation, is the id of the
+	// gateway task whose turn filed the work this reports on, when the
+	// sender knows it. Only the console passes it on (its frame's replyTo),
+	// so a console client can join a report to the turn it answers.
+	ReplyTo string `json:"reply_to,omitempty"`
 }
 
 // NotifyReply is the answer: the first message posted and the thread it

@@ -2,7 +2,7 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one `spec.mode: next` install, so an external coding agent or IDE host can talk to it. It is a console client of the install's A2A bus: it holds the `console` bus credential and nothing else, and it can do on the bus exactly what the console page can.
 
-This is the core. It answers one tool, `connection_status`; the tools that send turns, steer tasks and read topics come in later changes.
+It answers `connection_status`, and the turn tools `send_message` and `task_control`. Further tools come in later changes.
 
 ## Turn it on
 
