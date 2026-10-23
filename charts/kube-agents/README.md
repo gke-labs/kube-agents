@@ -975,9 +975,11 @@ With `platformAgent.mode: next` it also counts what that mode adds, from footpri
 verifiers, the console, the A2A gateway, the provisioning Job (counted although it runs to
 completion, because the operator runs it again whenever its spec changes and about daily once
 its TTL removes it, with the rest of the release standing), and the
-`hermes-bridge` container in each agent pod, sized as the operator will size it from the
-`operator.extraEnv` it is given: `A2A_BRIDGE_RESOURCES` as written when it parses, otherwise
-the agent container's size under `A2A_BRIDGE_EXECUTOR=cli`, otherwise the `api` default. The mode is read from the values, so a mode set
+`hermes-bridge` container in each agent pod: at the `api` default, or, when `operator.extraEnv`
+sets `A2A_BRIDGE_EXECUTOR` or `A2A_BRIDGE_RESOURCES` in any form, at no less than the agent
+container's size (the operator's fallback under `cli`), raised per key by any readable figure
+in `A2A_BRIDGE_RESOURCES`. The chart bounds the operator's reading of those values from above
+rather than re-implementing it, so it can over-count; it never fails the render on them. The mode is read from the values, so a mode set
 on the `PlatformAgent` by hand while `platformAgent.mode` stays null is counted as `today`.
 The session pods a next install spawns on demand are not counted; the operator caps those with
 a `ResourceQuota` of its own.

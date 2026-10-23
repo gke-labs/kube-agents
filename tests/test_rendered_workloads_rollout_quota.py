@@ -80,12 +80,13 @@ _EXPECTED_RENDERED_DEPLOYMENTS = 4
 # next-mode case adding the A2A callout, verifier, console and gateway.
 _EXPECTED_GOLDEN_DEPLOYMENTS = 20
 
-# Single-replica workloads that deliberately keep `maxUnavailable: 0` and so
-# stall under a zero-headroom quota. The reasons are the ones
-# `test_deployments_rollout_quota.py` documents; the chart exposes
-# `operator.rollingUpdate.maxUnavailable` and
-# `hindsight.api.rollingUpdate.maxUnavailable` as the override for installs
-# that would rather take the outage. Keys are rendered names, so the operator's
+# Workloads that deliberately keep `maxUnavailable: 0` and so need a surge Pod
+# to roll, which a zero-headroom quota refuses. The two chart workloads are
+# single-replica; their reasons are the ones `test_deployments_rollout_quota.py`
+# documents, and the chart exposes `operator.rollingUpdate.maxUnavailable` and
+# `hindsight.api.rollingUpdate.maxUnavailable` as the override for installs that
+# would rather take the outage. The two operator-rendered next-mode workloads run
+# two replicas and have no override. Keys are rendered names, so the operator's
 # is bound to `_RELEASE_NAME`.
 _SURGE_FIRST_BY_DESIGN = {
     "hindsight-api": (

@@ -5,9 +5,10 @@ The chart's quota preflight cannot render the operator's pods, so it needs their
 totals as data. This sums them from the operator's golden manifests for the default example
 CR and writes them to a file the chart reads with `.Files.Get`: `operatorRendered` from the
 today-mode golden, and `nextMode`, what `spec.mode: next` adds to it, from the next-mode
-golden (the same CR with `mode: next`, rendered to its steady state). The next-mode golden
-has to carry the today-mode stack unchanged apart from the additions, and the generator
-refuses one that does not, so `nextMode` is a pure addition the preflight can stack on top.
+golden (the same CR with `mode: next`, rendered to its steady state). The generator sums the
+next-mode golden's today-mode workloads the same way and refuses it unless they come to the
+same operatorRendered figures as the today golden's, so `nextMode` is a pure addition the
+preflight can stack on top (the comparison is of those summed figures, not of every byte).
 
 The source is a golden, not a live render and not k8s-operator/config/, so changing the
 operator's resources takes two steps in order: re-bless the golden
@@ -243,8 +244,8 @@ _SHELL_WORKLOAD_KEY = _workload_key(_KIND_STATEFULSET, _SHELL_WORKLOAD)
 _CRED_PROXY_WORKLOAD_KEY = _workload_key(_KIND_DEPLOYMENT, _CRED_PROXY_WORKLOAD)
 _GATEWAY_WORKLOAD_KEY = _workload_key(_KIND_DEPLOYMENT, _GATEWAY_WORKLOAD)
 
-# Pod-bearing workloads the footprint deliberately leaves out, and why. Empty today: the
-# operator renders three, and all three are summed. An entry here excludes the workload
+# Pod-bearing workloads the footprint deliberately leaves out, and why. Empty today: every
+# pod-bearing workload either golden renders is summed. An entry here excludes the workload
 # and everything in it, so it needs a reason the release does not pay for those pods.
 _IGNORED_WORKLOADS: dict[str, str] = {}
 
@@ -581,7 +582,8 @@ def _extract(golden: pathlib.Path, next_mode: bool) -> dict:
     # The size of each claim spec.storage.size sizes, one entry per claim, so the check
     # below can refuse a golden where the two claims differ or one of them is gone.
     data_claim_bytes = []
-    # next mode only: the A2A workloads by footprint key, as (containers by name, replicas).
+    # next mode only: the A2A workloads by footprint key, as (containers by name, replicas,
+    # workload key, whether its rollout surges).
     a2a_found = {}
     a2a_keys = {
         _workload_key(kind, name): key for key, (kind, name, _) in _A2A_WORKLOADS.items()

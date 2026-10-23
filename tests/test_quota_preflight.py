@@ -729,35 +729,50 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         return req["requestsCpu"] - base["requestsCpu"]
 
-    def test_mode_next_counts_a_cli_bridge_at_the_agent_containers_size(self) -> None:
-        """A2A_BRIDGE_EXECUTOR=cli makes the operator copy the agent container's resources."""
+    def test_mode_next_counts_an_overridden_bridge_at_least_at_the_agent_containers_size(self) -> None:
+        """The chart does not re-implement the operator's reader of A2A_BRIDGE_EXECUTOR and
+        A2A_BRIDGE_RESOURCES; with either set, in any form, the bridge is counted at no less
+        than the agent container's size, the operator's fallback under cli."""
         bridge = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["agentPod"]
-        want = bridge["hermesBridgeCli"]["cpuMillisRequest"] - bridge["hermesBridge"]["cpuMillisRequest"]
-        self.assertGreater(want, 0)
-        self.assertEqual(self._bridge_delta([{"name": "A2A_BRIDGE_EXECUTOR", "value": "cli"}]), want)
-        # api, or a value the operator does not accept, leaves the default.
-        self.assertEqual(self._bridge_delta([{"name": "A2A_BRIDGE_EXECUTOR", "value": "api"}]), 0)
+        cli = bridge["hermesBridgeCli"]["cpuMillisRequest"] - bridge["hermesBridge"]["cpuMillisRequest"]
+        self.assertGreater(cli, 0)
+        zero_cpu_limit = (
+            '{"requests": {"cpu": "100m", "memory": "256Mi"}, "limits": {"cpu": "0", "memory": "512Mi"}}'
+        )
+        for name, env in (
+            ("cli", [{"name": "A2A_BRIDGE_EXECUTOR", "value": "cli"}]),
+            ("api, set explicitly", [{"name": "A2A_BRIDGE_EXECUTOR", "value": "api"}]),
+            ("by valueFrom", [{"name": "A2A_BRIDGE_EXECUTOR",
+                               "valueFrom": {"configMapKeyRef": {"name": "x", "key": "executor"}}}]),
+            ("a smaller override beside cli", [{"name": "A2A_BRIDGE_EXECUTOR", "value": "cli"},
+                                               {"name": "A2A_BRIDGE_RESOURCES",
+                                                "value": '{"requests": {"cpu": "100m"}}'}]),
+            ("one the operator refuses (zero cpu limit) beside cli",
+             [{"name": "A2A_BRIDGE_EXECUTOR", "value": "cli"},
+              {"name": "A2A_BRIDGE_RESOURCES", "value": zero_cpu_limit}]),
+            ("not JSON", [{"name": "A2A_BRIDGE_RESOURCES", "value": "big"}]),
+            ("a quantity it cannot read", [{"name": "A2A_BRIDGE_RESOURCES",
+                                            "value": '{"limits": {"cpu": "1x"}}'}]),
+            ("a side that is not a map", [{"name": "A2A_BRIDGE_RESOURCES",
+                                           "value": '{"requests": "x", "limits": {"cpu": "1"}}'}]),
+        ):
+            with self.subTest(name):
+                self.assertEqual(self._bridge_delta(env), cli)
 
-    def test_mode_next_counts_a2a_bridge_resources_as_written(self) -> None:
-        """A2A_BRIDGE_RESOURCES wins over the executor, as in the operator."""
+    def test_mode_next_counts_a_larger_a2a_bridge_resources_as_written(self) -> None:
+        """A readable A2A_BRIDGE_RESOURCES above the agent container's size raises the count."""
         bridge = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["agentPod"]["hermesBridge"]
-        sized = '{"requests": {"cpu": "750m", "memory": "1Gi"}, "limits": {"memory": "2Gi"}}'
         self.assertEqual(
             self._bridge_delta(
-                [{"name": "A2A_BRIDGE_EXECUTOR", "value": "cli"},
-                 {"name": "A2A_BRIDGE_RESOURCES", "value": sized}]
+                [{"name": "A2A_BRIDGE_RESOURCES", "value": '{"requests": {"cpu": "3500m", "memory": "1Gi"}}'}]
             ),
-            750 - bridge["cpuMillisRequest"],
+            3500 - bridge["cpuMillisRequest"],
         )
-        # A request left out is the limit, as the API server defaults it.
+        # A request left out is its limit, as the API server defaults it.
         self.assertEqual(
-            self._bridge_delta(
-                [{"name": "A2A_BRIDGE_RESOURCES", "value": '{"limits": {"cpu": "2", "memory": "1Gi"}}'}]
-            ),
-            2000 - bridge["cpuMillisRequest"],
+            self._bridge_delta([{"name": "A2A_BRIDGE_RESOURCES", "value": '{"limits": {"cpu": "4"}}'}]),
+            4000 - bridge["cpuMillisRequest"],
         )
-        # One the operator cannot read is ignored there, and here.
-        self.assertEqual(self._bridge_delta([{"name": "A2A_BRIDGE_RESOURCES", "value": "big"}]), 0)
 
     def test_an_operator_owned_quota_is_left_to_the_operator(self) -> None:
         """The next-mode session quota a PlatformAgent owns is not a quota this check can fix:

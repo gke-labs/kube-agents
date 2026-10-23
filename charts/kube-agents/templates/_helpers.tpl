@@ -2111,34 +2111,58 @@ The defaults carry no ephemeral-storage request because the operator renders non
   {{- /* Next mode's hermes-bridge is another container of the agent pod, so like the
          dashboard it scales with the agent's replicas and adds no pod. The operator sizes it
          from its own env (a2aRenderedBridgeResources), which this chart sets through
-         operator.extraEnv, last entry winning: A2A_BRIDGE_RESOURCES, a JSON
-         ResourceRequirements, wins when it parses with requests or limits; otherwise
-         A2A_BRIDGE_EXECUTOR=cli copies the agent container (hermesBridgeCli), and anything
-         else is the api default (hermesBridge). A value the operator refuses on its stricter
-         checks is counted as written here, an over- or under-count it logs. */ -}}
+         operator.extraEnv. The chart does not re-implement that reader -- its JSON decoding,
+         refusal rules and valueFrom are the operator's -- it bounds it from above. With
+         neither A2A_BRIDGE_EXECUTOR nor A2A_BRIDGE_RESOURCES set, the bridge is the api
+         default (hermesBridge). With either set, in any form, it is counted at no less than
+         the agent container's size (hermesBridgeCli), the operator's fallback under cli; and
+         an A2A_BRIDGE_RESOURCES whose figures read cleanly as quantities can only raise that,
+         per key, never lower it, since a value the operator refuses falls back. Nothing here
+         fails the render: a figure it cannot read is left out, and the agent-size floor
+         stands. Over-counting is this preflight's direction of error. */ -}}
   {{- $bridge := index ($next.agentPod | default dict) "hermesBridge" -}}
   {{- if $next -}}
-    {{- $executor := "" -}}
+    {{- $overridden := false -}}
     {{- $bridgeResources := "" -}}
     {{- range $e := (.Values.operator.extraEnv | default list) -}}
-      {{- if eq (toString $e.name) "A2A_BRIDGE_EXECUTOR" -}}{{- $executor = toString $e.value -}}{{- end -}}
-      {{- if eq (toString $e.name) "A2A_BRIDGE_RESOURCES" -}}{{- $bridgeResources = toString $e.value | trim -}}{{- end -}}
+      {{- $name := toString (index ($e | default dict) "name") -}}
+      {{- if or (eq $name "A2A_BRIDGE_EXECUTOR") (eq $name "A2A_BRIDGE_RESOURCES") -}}
+        {{- $overridden = true -}}
+      {{- end -}}
+      {{- if and (eq $name "A2A_BRIDGE_RESOURCES") (kindIs "string" (index $e "value")) -}}
+        {{- $bridgeResources = index $e "value" -}}
+      {{- end -}}
     {{- end -}}
-    {{- if eq $executor "cli" -}}
-      {{- $bridge = index $next.agentPod "hermesBridgeCli" -}}
-    {{- end -}}
-    {{- with $bridgeResources -}}
-      {{- $parsed := fromJson . -}}
-      {{- if and (not (hasKey $parsed "Error")) (or (hasKey $parsed "requests") (hasKey $parsed "limits")) -}}
-        {{- $bReq := $parsed.requests | default dict -}}
-        {{- $bLim := $parsed.limits | default dict -}}
-        {{- $bridge = dict
-              "cpuMillisRequest" (include "kube-agents.parseCpuMillis" (include "kube-agents.declaredQuantity" (dict "value" (index $bReq "cpu") "fallback" (index $bLim "cpu" | default "0"))) | int64)
-              "cpuMillisLimit" (include "kube-agents.parseCpuMillis" (index $bLim "cpu" | default "0") | int64)
-              "memoryBytesRequest" (include "kube-agents.parseBytes" (include "kube-agents.declaredQuantity" (dict "value" (index $bReq "memory") "fallback" (index $bLim "memory" | default "0"))) | int64)
-              "memoryBytesLimit" (include "kube-agents.parseBytes" (index $bLim "memory" | default "0") | int64)
-              "ephemeralStorageBytesRequest" (include "kube-agents.parseBytes" (include "kube-agents.declaredQuantity" (dict "value" (index $bReq "ephemeral-storage") "fallback" (index $bLim "ephemeral-storage" | default "0"))) | int64)
-              "ephemeralStorageBytesLimit" (include "kube-agents.parseBytes" (index $bLim "ephemeral-storage" | default "0") | int64) -}}
+    {{- if $overridden -}}
+      {{- $bridge = deepCopy (index $next.agentPod "hermesBridgeCli" | default dict) -}}
+      {{- with $bridgeResources -}}
+        {{- $parsed := fromJson . -}}
+        {{- if not (hasKey $parsed "Error") -}}
+          {{- $quantity := `^[0-9]+(\.[0-9]+)?(m|k|M|G|T|Ki|Mi|Gi|Ti)?$` -}}
+          {{- $requested := index $parsed "requests" -}}
+          {{- if not (kindIs "map" $requested) -}}{{- $requested = dict -}}{{- end -}}
+          {{- range $side := list "limits" "requests" -}}
+            {{- $list := index $parsed $side -}}
+            {{- if kindIs "map" $list -}}
+              {{- range $key, $field := dict "cpu" "cpuMillis" "memory" "memoryBytes" "ephemeral-storage" "ephemeralStorageBytes" -}}
+                {{- $raw := toString (index $list $key) -}}
+                {{- if regexMatch $quantity $raw -}}
+                  {{- $n := 0 -}}
+                  {{- if eq $key "cpu" -}}{{- $n = include "kube-agents.parseCpuMillis" $raw | int64 -}}{{- else -}}{{- $n = include "kube-agents.parseBytes" $raw | int64 -}}{{- end -}}
+                  {{- /* A limit also floors the request: the API server defaults an omitted
+                         request to its limit. */ -}}
+                  {{- $targets := list (printf "%sRequest" $field) -}}
+                  {{- if eq $side "limits" -}}{{- $targets = list (printf "%sLimit" $field) (printf "%sRequest" $field) -}}{{- end -}}
+                  {{- range $target := $targets -}}
+                    {{- if or (ne $side "limits") (eq $target (printf "%sLimit" $field)) (not (hasKey $requested $key)) -}}
+                      {{- $_ := set $bridge $target (max (index $bridge $target | default 0 | int64) $n) -}}
+                    {{- end -}}
+                  {{- end -}}
+                {{- end -}}
+              {{- end -}}
+            {{- end -}}
+          {{- end -}}
+        {{- end -}}
       {{- end -}}
     {{- end -}}
   {{- end -}}

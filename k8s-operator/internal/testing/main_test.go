@@ -6,12 +6,15 @@ import (
 	"testing"
 )
 
-// operatorEnv is what the operator reads from its own environment outside the
-// A2A_ flags: image overrides and its own identity. A golden is the render of
-// the example CR, not of the developer's shell.
+// operatorEnv is the operator environment outside the A2A_ flags that a render
+// is known to read: image overrides, the telemetry endpoint and discovery, and
+// the operator's own identity. A golden is the render of the example CR, not of
+// the developer's shell. A new variable the render reads belongs here.
 var operatorEnv = []string{
 	"PLATFORM_AGENT_IMAGE", "OPERATOR_IMAGE", "AGENT_SANDBOX_IMAGE", "FLUENT_BIT_IMAGE",
-	"IMAGE_PULL_SECRETS", "POD_NAMESPACE", "OPERATOR_SERVICE_ACCOUNT",
+	"CREDENTIAL_PROXY_IMAGE", "IMAGE_PULL_SECRETS",
+	"OTEL_COLLECTOR_ENDPOINT", "OTEL_COLLECTOR_DISCOVERY",
+	"POD_NAMESPACE", "OPERATOR_SERVICE_ACCOUNT",
 }
 
 // TestMain clears the operator's environment before any golden renders, as
