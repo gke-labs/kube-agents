@@ -49,11 +49,16 @@ gitops-drift-backlog-digest
 # main". This line is inert until they exist, which is why it is placed on
 # the arithmetic alone.
 gitops-drift-load-bearing-change-triage
+# Registered 2026-10-22 (#3583) at 1500s. With autoops-quiet-followup (1800s)
+# on main-a since #3617, the halves stand at 11250s (main-a) against 11100s
+# (main-b) with gpu-stress-test-diagnosis kept above; moved to main-a they
+# are 1950s apart, over the one-case tolerance.
+triage-start-burst
 
 # The two recorded-weeks cases of #3535 (upgrades-retrospective-log-volume-gate
 # and upgrades-rollout-family-held-by-canary-gate) share one stack that seeds
-# the retrospective's report store, priced at 600s each. Both here: with them
-# in main-a the halves read 12450s against 9600s, past the 1800s the balance
-# test allows; here they read 11250s against 10800s.
+# the retrospective's report store, priced at 600s each; each run applies and
+# tears it down, so the halves may split them. One here: with both here the
+# halves read 11250s (main-a) against 13200s, past the 1800s the balance test
+# allows; with the family case in main-a they read 11850s against 12600s.
 upgrades-retrospective-log-volume-gate
-upgrades-rollout-family-held-by-canary-gate

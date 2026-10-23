@@ -583,6 +583,20 @@ On clusters enforcing NetworkPolicy, scrapes are dropped unless admitted: set `p
 
 When deploying via GitOps tools like ArgoCD, `helm template` passes the destination cluster's discovered API versions by default when connected to the target cluster. If default detection does not pick up your CRDs or if running disconnected templates, explicitly set `platformAgent.serviceMonitor: true` or `platformAgent.vmPodScrape: true` in your Helm values.
 
+`operator.metrics` is the operator's own listener: the manager serves controller-runtime's
+series and every `PlatformAgent`'s `status.usage` and `status.phase` as gauges
+(`kubeagents_platformagent_usage`, `kubeagents_platformagent_usage_time_seconds`,
+`kubeagents_platformagent_phase`; [Observability](https://gke-labs.github.io/kube-agents/concepts/observability/#prometheus-metrics))
+on port `8080` (container port `metrics`), plain HTTP on the pod network.
+`operator.metrics.podMonitoring` renders `<release>-operator-monitoring` over the operator's
+pods, the same tri-state as `platformAgent.podMonitoring`. `operator.metrics.enabled: false`
+binds no listener and renders neither the port, the `PodMonitoring` nor the policy.
+`<release>-operator-netpol` bounds the plain listener as the broker's and gateway's
+policies bound theirs: ingress to the metrics port from `gke-gmp-system`, and from
+`platformAgent.monitoringScraperNamespace` when set, and nothing else; the health port, and
+the webhook port when the webhooks render, stay open. A `helm upgrade --reuse-values` from
+a release that predates `operator.metrics` renders with the listener off until the value is set.
+
 ### Turning telemetry off
 
 A cluster with no collector needs nothing done: when discovery completes and

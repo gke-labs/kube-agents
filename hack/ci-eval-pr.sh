@@ -3059,6 +3059,9 @@ unit_cost_hint() {
     # repetitions (615/715/166s, build 2097362391401500672); the 200s default
     # under-packs it by 3x.
     knowledge-grounding-sources-probe) echo 600 ;;
+    # Measured 1380-1640s a repetition on gkedemos2 (2026-10-22, ten runs back
+    # to back): a 20-minute settle after the plant, then a board read.
+    triage-start-burst) echo 1500 ;;
     # Presubmit since 2026-09-22 (#1023), nightly-only from 2026-09-15 before
     # that. Median of its three measured presubmit repetitions (737/599/1357s,
     # build 2099969322708373504); the 200s default under-packs it by 3x. The
