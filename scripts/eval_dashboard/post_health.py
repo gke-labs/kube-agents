@@ -1995,7 +1995,7 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--health", type=pathlib.Path, required=True, help="the health.json health.py wrote")
     parser.add_argument("--state", required=True, help="last-posted state: local path or gs:// object (this script's only write)")
-    parser.add_argument("--data", type=pathlib.Path, default=None, help="the collector's data.json; the digest then carries one line on last night's nightly run (unreadable: a warning and the line says so)")
+    parser.add_argument("--data", type=pathlib.Path, default=None, help="the collector's data.json; the digest then carries a section on last night's nightly run, or one line when the section cannot be built (unreadable: a warning and the digest says so)")
     parser.add_argument("--digest-hour", type=int, default=DEFAULT_DIGEST_HOUR, help="hour of the daily digest, in --digest-tz")
     parser.add_argument("--digest-tz", type=parse_tz, default=LOCAL_TZ, help=f"IANA zone the digest hour and day are read in (default {DEFAULT_TZ}); times in messages stay {DEFAULT_TZ} ({TZ_LABEL}) regardless")
     parser.add_argument("--repo", default=ghcli.DEFAULT_REPO, help="owner/repo the tracking issue is filed in")
@@ -2017,9 +2017,9 @@ def main(argv=None, environ=os.environ, opener=urllib.request.urlopen, runner=su
         try:
             data = json.loads(args.data.read_text())
         except (OSError, ValueError) as exc:
-            # The digest still goes out; its nightly line says the data was
-            # unreadable rather than inventing a quiet night.
-            log(f"warning: {args.data}: {exc}; the digest's nightly line will say so")
+            # The digest still goes out; it says the data was unreadable
+            # rather than inventing a quiet night.
+            log(f"warning: {args.data}: {exc}; the digest will say so")
             data = {}
         if not isinstance(data, dict):
             data = {}

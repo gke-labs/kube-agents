@@ -29,8 +29,9 @@ passed every graded repetition, of the cases recorded. The lists' verdicts
 are ``nightly_bugs.graded_nights``: a part cut off at the job
 deadline, a case with no graded repetition, and a run-level event (nearly
 every case failed) give no verdict. A night whose main part was cut off is
-labelled so and none of its cases are counted; a writers part cut off is
-named and its cases are not counted. Cases off the nightly matrix and cases
+labelled so and none of its cases are counted; a writers part cut off,
+missing or still running is named, and a cut-off part's cases stay in the
+pass count but its reds are not listed. Cases off the nightly matrix and cases
 marked ``expected_fail`` are left out, as the filer leaves them.
 
 Names, owners and backups come from ``docs/designs/domains.yaml`` and the
@@ -134,7 +135,7 @@ SKIP_UNTRUSTED_ISSUES = "GitHub's nightly-red issue list could not be trusted ({
 GITHUB_TIME_FORMAT = nightly_bugs.GITHUB_TIME_FORMAT
 SKIP_NO_GITHUB = "no GitHub token to read the nightly-red issues"
 SKIP_NO_NIGHT = f"no nightly run started in the last {nightly.LAST_NIGHT_MAX_AGE // datetime.timedelta(hours=1)} hours"
-SKIP_RUNNING = "last night's main part is still running"
+SKIP_RUNNING = "last night's {part} part is still running"
 SKIP_NIGHT_RUNNING = "last night's run is still running"
 SKIP_NO_MAIN = "last night's {part} part is missing, so its numbers would cover only the parts that ran"
 SKIP_BAD_LINK = "a link it would carry is malformed ({url})"
@@ -281,8 +282,9 @@ class Builder:
             # In flight with no part recorded yet (a late start, a re-run):
             # the one-line summary above says "still running" too.
             raise Skipped(SKIP_NIGHT_RUNNING if nightly.running_nights(self.data, self.now) else SKIP_NO_NIGHT)
-        if any(p in (night.get("running_parts") or []) for p in nightly.MAIN_PARTS):
-            raise Skipped(SKIP_RUNNING)
+        running = [p for p in nightly.MAIN_PARTS if p in (night.get("running_parts") or [])]
+        if running:
+            raise Skipped(SKIP_RUNNING.format(part=running[0]))
         missing = [p for p in nightly.MAIN_PARTS if p in (night.get("missing_parts") or [])]
         if missing:
             raise Skipped(SKIP_NO_MAIN.format(part=missing[0]))
@@ -335,6 +337,9 @@ class Builder:
         if ungraded:
             notes.append(NOT_GRADED_NOTE.format(count=ungraded))
         cut = [PART_CUT_NOTE.format(part=nightly.PART_WORDS.get(p.get("part"), p.get("part"))) for p in night.get("parts") or [] if p.get("truncated")]
+        # A writers part missing or still running is named too (main halves
+        # held the section back above), and keeps the night from being quiet.
+        cut += nightly.part_notes(night, cut=False)
         notes += cut
 
         new, unfiled, still, first, recovered = [], [], [], [], []

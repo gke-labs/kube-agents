@@ -884,12 +884,12 @@ Nightly report's.
 Each list shows at most 5 lines; the rest are one line linking to the Nightly
 report. A night with no new bug, no case owed a bug for the first time, no
 case red for the first night (a tracked case red again after a green night
-counts), no recovery, no infra item and no part cut off is
+counts), no recovery, no infra item and no part cut off, missing or still running is
 one line instead: the date, the pass count and how many were not graded, "no
 new reds, nothing recovered", and how many are still red. A night whose main part was cut
 off at the deadline, or a run-level event, is labelled so, none of its cases are
-counted, and only the infra list follows; a writers part cut off is named in the
-header; its cases stay in the pass count, as on the Nightly page, but its reds are not listed.
+counted, and only the infra list follows; a writers part cut off, missing or still running is named in
+the header; a cut-off part's cases stay in the pass count, as on the Nightly page, but its reds are not listed.
 
 Domain names, owners and backups come from
 [`docs/designs/domains.yaml`](designs/domains.yaml) and the case's `task.yaml`

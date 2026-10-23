@@ -255,6 +255,23 @@ class QuietDayTest(Harness):
         self.assertFalse(section.quiet)
         self.assertIn("writers part cut off at the deadline, its reds not listed below", section.lines[0])
 
+    def test_a_writers_part_missing_or_still_running_is_named_and_never_quiet(self):
+        nights = [night(day, [green("case-green")]) for day in range(15, 21)]
+        writers = []
+        for day in range(15, 20):
+            w = night(day, [green("case-red")])
+            w.update(job="ci-kube-agents-eval-nightly-writers", build_id=f"30000000000000{day}0002")
+            writers.append(w)
+        section = self.build(data(*nights, *writers))
+        self.assertFalse(section.quiet)
+        self.assertIn("writers part missing", section.lines[0])
+        running = data(*nights, *writers)
+        running["pending_builds"] = [{"build_id": "3000000000000020002", "tier": "nightly", "job": "ci-kube-agents-eval-nightly-writers",
+                                      "log_url": f"{LOGS}/ci-kube-agents-eval-nightly-writers/3000000000000020002", "first_seen": "2026-10-20T06:00:00+00:00"}]
+        section = self.build(running)
+        self.assertFalse(section.quiet)
+        self.assertIn("writers part still running", section.lines[0])
+
 
 class NightlyPageAgreementTest(Harness):
     def test_the_header_counts_are_the_nightly_pages(self):
@@ -434,6 +451,17 @@ class SkipTest(Harness):
         half.update(job="ci-kube-agents-eval-nightly-main-b", build_id="3000000000000019003")
         with self.assertRaisesRegex(nightly_digest.Skipped, "^last night's main-b part is missing"):
             self.build(data(night(19, [green("case-green")]), half, night(20, [green("case-green")]), extra_cases=(("case-b", "capacity"),)))
+        # main-b still in flight at 9 AM: held back, not built on half the matrix.
+        running = data(night(19, [green("case-green")]), half, night(20, [green("case-green")]), extra_cases=(("case-b", "capacity"),))
+        running["pending_builds"] = [{"build_id": "3000000000000020003", "tier": "nightly", "job": "ci-kube-agents-eval-nightly-main-b",
+                                      "log_url": f"{LOGS}/ci-kube-agents-eval-nightly-main-b/3000000000000020003", "first_seen": "2026-10-20T05:00:00+00:00"}]
+        with self.assertRaisesRegex(nightly_digest.Skipped, "^last night's main-b part is still running$"):
+            self.build(running)
+        with mock.patch.object(nightly_digest, "yaml", None), self.assertRaisesRegex(nightly_digest.Skipped, "pyyaml"):
+            self.build(doc)
+        # Any other failure is a skip line, never a lost digest.
+        with mock.patch.object(nightly_digest, "build", side_effect=KeyError("counts")), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(post_health.nightly_section(doc, NOW, StubGh()), "building it failed (KeyError); see the job log")
         bad = [issue(4001, "case-red", "2026-10-20T02:00:00Z", url="https://github.com/elsewhere/repo/issues/4001")]
         with self.assertRaisesRegex(nightly_digest.Skipped, "malformed"):
             self.build(doc, bad)
