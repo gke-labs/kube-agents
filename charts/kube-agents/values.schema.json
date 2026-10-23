@@ -124,6 +124,18 @@
         },
         "resources": {
           "type": "object"
+        },
+        "metrics": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "podMonitoring": {
+              "type": ["boolean", "null"]
+            }
+          }
         }
       }
     },

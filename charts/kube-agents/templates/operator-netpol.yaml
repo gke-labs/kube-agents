@@ -1,0 +1,46 @@
+{{- if and .Values.operator.enabled (.Values.operator.metrics | default dict).enabled }}
+{{- /*
+The operator's metrics listener is plain HTTP (operator-deployment.yaml), so
+this policy is what bounds who reads it, as the broker's and the gateway's
+policies bound their metrics-only ports: the GKE Managed Prometheus collector's
+namespace, and platformAgent.monitoringScraperNamespace when set, on the
+metrics port and nothing else. The health port stays open to every source for
+the kubelet's probes, and the webhook port, when the webhooks render, for the
+API server. Ingress only: the operator's egress is untouched. On a cluster
+without NetworkPolicy enforcement the object is accepted and inert, as every
+policy the install renders is.
+*/ -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-operator-netpol
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "kube-agents.operatorSelectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gmp-system
+        {{- with .Values.platformAgent.monitoringScraperNamespace }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ include "kube-agents.operatorMetricsPort" . }}
+    - ports:
+        - protocol: TCP
+          port: 8081
+        {{- if .Values.operator.webhooks.enabled }}
+        - protocol: TCP
+          port: 10250
+        {{- end }}
+{{- end }}

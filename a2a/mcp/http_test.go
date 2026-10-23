@@ -1,6 +1,9 @@
 package mcp
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -9,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const testToken = "s3cret-test-token"
@@ -139,5 +143,36 @@ func TestReadTokenRefusesNothing(t *testing.T) {
 	}
 	if _, err := ReadToken(filepath.Join(t.TempDir(), "absent")); err == nil {
 		t.Error("a missing token file was accepted")
+	}
+}
+
+// A batch's members share one budget, so two slow calls together still answer
+// inside it, and with it the server's write timeout.
+func TestABatchSharesOneBudget(t *testing.T) {
+	old := requestBudget
+	requestBudget = 200 * time.Millisecond
+	t.Cleanup(func() { requestBudget = old })
+	slow := Tool{
+		Definition: ToolDefinition{Name: "slow", InputSchema: map[string]any{"type": "object"}},
+		Call: func(ctx context.Context, _ json.RawMessage) (string, error) {
+			select {
+			case <-ctx.Done():
+				return "out of budget", nil
+			case <-time.After(5 * time.Second):
+				return "finished", nil
+			}
+		},
+	}
+	h := Handler(mustServer(t, slow), writeToken(t, testToken), quietLog())
+	call := func(id int) string {
+		return fmt.Sprintf(`{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"slow","arguments":{}}}`, id)
+	}
+	start := time.Now()
+	rec := post(h, http.Header{"Authorization": {"Bearer " + testToken}}, "["+call(1)+","+call(2)+"]")
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("a batch of two slow calls took %s, past its %s budget", took, requestBudget)
+	}
+	if rec.Code != http.StatusOK || strings.Count(rec.Body.String(), "out of budget") != 2 {
+		t.Errorf("status %d, body %s", rec.Code, rec.Body)
 	}
 }
