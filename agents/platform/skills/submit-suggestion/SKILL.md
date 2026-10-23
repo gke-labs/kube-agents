@@ -12,6 +12,7 @@ This skill equips the Platform Agent to propose declarative file updates, GKE in
 - **Declarative File Provisioning:** Triggered when new GKE manifests or configs are requested.
 - **Configuration Upgrades:** Triggered when upgrading version configurations, security patches, or network policies.
 - **Governance Policy Syncs:** Triggered when compliance playbooks or settings require updates.
+- **Any change in the GitOps repository** reaches review through this skill, but a Terraform, Config Connector or Helm-chart change is written by its authoring skill first (Step 2's table).
 - **Deletions:** Triggered when someone asks to delete a resource. See [Deleting a resource](#deleting-a-resource) before Step 1: a declared object is removed in a pull request, anything else is a stated stop.
 
 _Crucially, you are strictly forbidden from executing direct, manual mutations. All changes must flow through a secure PR path — this skill, or the **fleet-audit** skill for fixes of its findings (below)._
@@ -169,6 +170,24 @@ sandbox cannot read the branch at all; `prepare` then refuses the name with
 `BROKER_ROUTE_UNSUPPORTED` and says so — use another name, or report it where the name is fixed.
 
 ### Step 2: Make the Changes
+
+**First, hand the edit to the skill that writes its format.** `prepare` is
+often the first time you see what the change is written in, and this skill
+is the transport, not the author. Before you edit, look at the file or
+directory the change lands in:
+
+| The change is                                                                                                                        | Load and follow first    |
+| ------------------------------------------------------------------------------------------------------------------------------------ | ------------------------ |
+| a `.tf` / `.tfvars` file (Terraform under `clusters/<cluster>/provisioning/` or the repo's root)                                     | **gcp-terraform**        |
+| a Config Connector object (`apiVersion: *.cnrm.cloud.google.com/*`)                                                                  | **gcp-config-connector** |
+| a Helm chart's declaration (a Helm-sourced `RootSync`, a Flux `HelmRelease`, an Argo CD Helm `Application`, kustomize `helmCharts:`) | **gitops-helm-chart**    |
+
+Load it with `skill_view` and follow it, its own checks included (`tofu
+fmt` for Terraform). Its first step runs this skill's `prepare`; you already
+have a working copy, so skip that one and keep this `workspace` and branch.
+A second `prepare` under the authoring skill's branch name makes a second
+copy. Its last step submits through Step 3 here. A plain Kubernetes
+manifest has no authoring skill; write it here.
 
 Generate or edit the files **inside the returned `workspace`**.
 

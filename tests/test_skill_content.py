@@ -113,5 +113,19 @@ class InstallGuidesAreReadNotSearchedTest(unittest.TestCase):
         self.assertIn("a template default applies only where the workload", content)
         self.assertIn("Search-result snippets are not requirements", content)
 
+
+class SubmitSuggestionHandsEditsToTheirAuthoringSkillTest(unittest.TestCase):
+    """#2999's lane run: asked to raise a Terraform node pool's autoscaling
+    maximum, the agent went straight to submit-suggestion, edited the .tf, and
+    never loaded gcp-terraform, so tofu fmt never ran (#3565). Step 2 hands a
+    Terraform, Config Connector or Helm-chart edit to its authoring skill."""
+
+    def test_step_two_names_each_authoring_skill(self):
+        content = (REPO_ROOT / "agents/platform/skills/submit-suggestion/SKILL.md").read_text(encoding="utf-8")
+        step2 = content[content.index("### Step 2: Make the Changes"):content.index("### Deleting a resource")]
+        for skill in ("gcp-terraform", "gcp-config-connector", "gitops-helm-chart"):
+            self.assertIn(f"**{skill}**", step2)
+        self.assertIn("skip that one and keep this `workspace`", step2)
+
 if __name__ == "__main__":
     unittest.main()

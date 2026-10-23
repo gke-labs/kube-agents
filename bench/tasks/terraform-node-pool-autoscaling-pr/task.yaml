@@ -37,10 +37,12 @@ expected_output: >-
 infrastructure:
   deployer: noop
 validated: false
-# Red until #3565: the branch's one run opened the right pull request but never
-# loaded gcp-terraform, because submit-suggestion does not hand a .tf edit to
-# it, so tofu fmt did not run (run_20261020_171548_104044). The red on main
-# fails the same check. Flip this when #3565 lands.
+# Red until #3565: the branch's one run on #2999 opened the right pull
+# request but never loaded gcp-terraform, because submit-suggestion did not
+# hand a .tf edit to it, so tofu fmt did not run (run_20261020_171548_104044).
+# The red on main fails the same check. #3565's pull request adds the hand-off
+# (submit-suggestion Step 2) and flips this once its branch has three greens
+# on the GitOps lane.
 expected_fail: true
 
 # Slug per docs/designs/domains.yaml.
