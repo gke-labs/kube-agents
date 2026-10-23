@@ -945,6 +945,13 @@
 # Gemini nightly (#3598).
 ./tasks/consistency-authorized-networks-probe/task.yaml
 
+# A request cut on named workloads names the dependency each cut would change
+# (#3199): the HPA scaling inference-server (hpa-saturated) and ledger-writer's
+# requests equal to limits (guaranteed-qos-workload). The chat path that does
+# not run the waste collector. Red on main before the change, on a dev
+# install. One case, three units. deployer: noop, read-only over the seeded fleet.
+./tasks/cost-rightsizing-names-dependencies/task.yaml
+
 # A user asks for the fleet audits' summaries that never reached the chat by
 # naming them; this sends that request for every shipped fleet audit and
 # grades the reply audit by audit against the report store
@@ -1007,6 +1014,15 @@
 # over thirty minutes. Reads the crashloop-workload role; read-only; requests
 # no pull request. Nightly from its first merge.
 ./tasks/health-chat-request-runs-collector/task.yaml
+
+# Incident triage: three crash-looping replicas of one Deployment fold into one
+# incident (INCIDENT_WORKLOAD_DEDUP_SECONDS, which hack/ci-deploy.sh sets for
+# the eval install). Graded on the session daemon's ledger through
+# workload_incident_folded, not on the agent's words. The autoops-incident
+# stack at three replicas under its own namespace, so it takes lock-infra like
+# autoops-warning-event-triage; hinted at that case's 900s until the nightly
+# record measures it.
+./tasks/incident-triage-workload-fold/task.yaml
 
 # Catalogue entry 12 (a node label is removed): seeded-a's
 # seeded-shapes/arch-pinned-worker (deprecated-label-selector), a
