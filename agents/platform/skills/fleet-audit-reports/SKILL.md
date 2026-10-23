@@ -28,13 +28,17 @@ An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`,
 
 - `document` is this run's whole validated findings document — un-clipped, so it holds findings the
   issue body had no room to print.
-- `status` is `OPENED`, `UPDATED`, `CLEAN`, `HELD`, or `NO_FORGE`. `NO_FORGE` means the run had no
+- `status` is `OPENED`, `UPDATED`, `CLEAN`, `HELD`, `NO_FORGE`, or `STORE_LEDGER`. `NO_FORGE` means the run had no
   repository to publish to: it wrote no ledger issue, `issue_number` and `issue_url` are null, and
   the envelope is the only record of what it found. A `NO_FORGE` envelope in a repository's
   directory carries `unreachable_repo` (`repo`, `reason`): the run could not reach that repository.
   One under `no_forge/local` can carry `no_repository_chosen` (`reason`): several repositories are
   managed and none is the one `role: gitops` repository. For both, the new and resolved counts are
   unknown; say so. An envelope with neither key is from an install with no forge.
+  `STORE_LEDGER` means the repository is on a forge with no issue tracker, or no labels: the
+  envelope is the ledger (`issue_number` and `issue_url` are null, `ledger` is `store`), and the
+  remediation pull requests opened on the forge are in `prs_opened`, `prs_still_open` and
+  `prs_closed`. Give those links where you would give the ledger link.
   `ledger_held_open` true means a `CLEAN` or
   `HELD` run left the issue open (partial, or over findings it did not account for) without
   rewriting it: the issue still lists the previous run's findings, `current` counts those, and this
@@ -123,7 +127,8 @@ python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_qu
 delta counts and `issue_url`; name the criticals from `findings`. When `ledger_held_open` is true,
 this run found nothing but the issue still carries the previous run's findings — say both, and point
 at the issue. Always hand back the issue URL — the store is where you read, the ledger is where a
-human acts — except on a `NO_FORGE` run, which has no issue: the store is the only record.
+human acts — except on a `NO_FORGE` run, which has no issue: the store is the only record. A
+`STORE_LEDGER` run has no issue either: hand back its pull request links instead.
 
 **"What changed since the last run?"**
 

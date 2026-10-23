@@ -12,6 +12,7 @@ import {
   mintConversation,
   mintMessageId,
   outSubject,
+  paneShows,
   parseOutFrame,
   textBytes,
   tokenOf,
@@ -95,6 +96,24 @@ describe("console frames", () => {
     });
     expect(parseOutFrame('{"messageId":"c-1","text":"x","edit":true}')?.edit).toBe(true);
     expect(parseOutFrame('{"messageId":"c-1","text":"x","edit":"yes"}')?.edit).toBe(false);
+  });
+
+  it("parses a terminal frame's kind and state", () => {
+    const frame = parseOutFrame(
+      '{"messageId":"r-task-1","text":"all green","kind":"result","state":"completed","addressee":"platform","taskId":"task-1"}',
+    );
+    expect(frame?.kind).toBe("result");
+    expect(frame?.state).toBe("completed");
+  });
+
+  it("keeps every terminal frame out of the pane and every notice in", () => {
+    // The pane renders answers from TASKS and gets the gateway's notice for a
+    // failure or a cancel, so a terminal frame would print either twice.
+    expect(paneShows(parseOutFrame('{"messageId":"r-t","text":"a","kind":"result","state":"completed"}')!)).toBe(false);
+    expect(paneShows(parseOutFrame('{"messageId":"r-t","text":"❌","kind":"result","state":"failed"}')!)).toBe(false);
+    // A notice carries no kind.
+    expect(paneShows(parseOutFrame('{"messageId":"c-1","text":"❌ the task failed"}')!)).toBe(true);
+    expect(paneShows(parseOutFrame('{"messageId":"c-1","text":"⏳ submitted…"}')!)).toBe(true);
   });
 
   it("returns null for a frame it cannot use", () => {

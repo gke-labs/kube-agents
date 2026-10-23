@@ -52,7 +52,14 @@ export interface ConsoleOutFrame {
   text: string;
   /** True when this frame replaces the text of an earlier one with the same id. */
   edit: boolean;
+  /** "result" on a task's terminal frame; absent on a notice about a turn. */
+  kind?: string;
+  /** The A2A state a terminal frame's task ended in (the pane does not read it). */
+  state?: string;
 }
+
+/** The kind the gateway gives a task's terminal frame (a2a/gateway/console.go). */
+export const RESULT_FRAME_KIND = "result";
 
 export type Random = (buf: Uint8Array) => Uint8Array;
 
@@ -119,7 +126,20 @@ export function parseOutFrame(data: Uint8Array | string): ConsoleOutFrame | null
   const r = raw as Record<string, unknown>;
   if (typeof r.messageId !== "string" || r.messageId === "") return null;
   if (typeof r.text !== "string") return null;
-  return { messageId: r.messageId, text: r.text, edit: r.edit === true };
+  const frame: ConsoleOutFrame = { messageId: r.messageId, text: r.text, edit: r.edit === true };
+  if (typeof r.kind === "string") frame.kind = r.kind;
+  if (typeof r.state === "string") frame.state = r.state;
+  return frame;
+}
+
+/**
+ * Whether the chat pane shows a frame. A task's terminal frame is for a
+ * console client with no TASKS view: the pane renders answers from TASKS and
+ * already gets the gateway's notice for a task that failed or was canceled,
+ * so showing the frame too would print either twice.
+ */
+export function paneShows(frame: ConsoleOutFrame): boolean {
+  return frame.kind !== RESULT_FRAME_KIND;
 }
 
 /** Mirrors Go's strings.TrimSpace (the unicode.IsSpace set). */
@@ -222,8 +242,8 @@ export function turnFate(text: string): TurnFate {
   if (sessionRest !== null) {
     // Pre-flip the argument is the first turn as written; post-flip it is
     // unwrapped into an ordinary turn, which the delegate rule then reads.
-    // The one divergence from the gateway: a bare /feedback behind /session is the notice post-flip (the prefix is
-    // stripped before /feedback is read) and a session's first turn pre-flip. The page cannot tell the modes apart, so
+    // The divergence from the gateway: a bare /feedback or /feedback summary behind /session is the notice or the
+    // summary post-flip (the prefix is stripped before /feedback is read) and a session's first turn pre-flip. The page cannot tell the modes apart, so
     // it keeps the conservative reading and lets the post-flip turn get the "no task yet" note.
     if (sessionRest === "" || isSessionOffArg(sessionRest) || isStopTurn(sessionRest)) return { kind: "settled" };
     return { kind: "task", texts: withDelegate(sessionRest) };

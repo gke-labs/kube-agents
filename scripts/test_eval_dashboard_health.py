@@ -2213,9 +2213,12 @@ class Advice(unittest.TestCase):
         self.assertEqual(first["issue"], posted["issue"])
         self.assertEqual(first["tracking_issues"], ["#1300"])
         self.assertEqual(first["advice"], "Don't retest yet; the failing cases share a cause. Tracking: #1300")
-        # Carried from the previous health.json when the poster's state has none.
+        # Carried from the previous health.json while no poster state carries `issues`...
         second = health.adjudicate(doc, T0 + timedelta(minutes=15), first, health.Roster.fixed(ADMITTED), posted={"state": "OUTAGE"})
         self.assertEqual(second["issue"], posted["issue"])
+        # ...and not once one does: the poster dropped it (a human closed it).
+        dropped = health.adjudicate(doc, T0 + timedelta(minutes=15), first, health.Roster.fixed(ADMITTED), posted={"state": "OUTAGE", "issue": None, "issues": []})
+        self.assertEqual((dropped["issue"], dropped["tracking_issues"]), (None, []))
         # Gone on GREEN, and never a non-issue.
         self.assertIsNone(health.adjudicate(data(), T0, None, health.Roster.fixed(ADMITTED), posted=posted)["issue"])
         self.assertIsNone(health.adjudicate(doc, T0, None, health.Roster.fixed(ADMITTED), posted={"issue": None})["issue"])
@@ -3264,6 +3267,50 @@ class PoolDrift(unittest.TestCase):
         owner = {"number": 1500, "url": "https://github.com/gke-labs/kube-agents/issues/1500", "condition": "pool_drift"}
         self.assertEqual(self.judge(firing, posted={"issue": owner})["tracking_issues"], ["#1500"])
         self.assertIsNone(self.judge(firing, posted={"issue": dict(owner, condition="fixture_drift")})["issue"])
+
+
+class OpenConditions(unittest.TestCase):
+    """`open_conditions`: every rule that fires, whatever condition won, plus
+    a scan rule with nothing to clear on; the poster closes a bot-filed
+    tracking issue when its condition leaves the list."""
+
+    def judge(self, doc, fleet, pool):
+        return health.adjudicate(doc, T0, None, health.Roster.fixed(ADMITTED), fixture_state_doc=fleet, pool_state_doc=pool)
+
+    def test_a_firing_rule_stays_listed_under_a_higher_ranked_one(self):
+        lost_doc = data(*(lost(100 + i, i, T0 - timedelta(minutes=5 * i)) for i in range(3)))
+        both = self.judge(lost_doc, scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}), pool_scan())
+        self.assertEqual((both["condition"], both["open_conditions"]), ("lost_pods", ["lost_pods", "fixture_drift"]))
+
+    def test_lost_pods_and_deadline_kills_stay_open_until_the_runs_land(self):
+        # Three losses four hours ago: the two-hour window has passed and no
+        # run has landed since, so nothing has shown the nodes healthy.
+        losses = [lost(100 + i, i, T0 - timedelta(hours=4, minutes=5 * i)) for i in range(3)]
+        quiet = self.judge(data(*losses), scan(), pool_scan())
+        self.assertEqual((quiet["condition"], quiet["open_conditions"]), (None, ["lost_pods"]))
+        greens = [run(200 + i, 20 + i, T0 - timedelta(minutes=30 * i), tasks=broken_tasks(set())) for i in range(3)]
+        self.assertEqual(self.judge(data(*losses, *greens), scan(), pool_scan())["open_conditions"], [])
+        two = self.judge(data(*losses, *greens[:2]), scan(), pool_scan())
+        self.assertEqual(two["open_conditions"], ["lost_pods"], "two runs are not the bar")
+        same_pr = [run(200 + i, 20, T0 - timedelta(minutes=30 * i), tasks=broken_tasks(set())) for i in range(3)]
+        self.assertEqual(self.judge(data(*losses, *same_pr), scan(), pool_scan())["open_conditions"], ["lost_pods"], "distinct pull requests")
+        # Deadline kills: a verdict either way counts, green is not required.
+        kills = [kill(300 + i, 30 + i, T0 - timedelta(hours=4, minutes=5 * i)) for i in range(3)]
+        self.assertEqual(self.judge(data(*kills), scan(), pool_scan())["open_conditions"], ["deadline_kill"])
+        reds = [graded(400 + i, 40 + i, T0 - timedelta(minutes=30 * i), verdict="RED") for i in range(3)]
+        self.assertNotIn("deadline_kill", self.judge(data(*kills, *reds), scan(), pool_scan())["open_conditions"], "three reds with a verdict end the kills (and open a break of their own)")
+
+    def test_a_clean_fresh_scan_clears_and_an_unread_one_does_not(self):
+        green = data(*(run(100 + i, 10 + i, T0 - timedelta(minutes=30 * i), tasks=broken_tasks(set())) for i in range(3)))
+        self.assertEqual(self.judge(green, scan(), pool_scan())["open_conditions"], [])
+        for unread in (None, scan(at=T0 - timedelta(hours=4)), scan(checked=set())):
+            self.assertEqual(self.judge(green, unread, pool_scan())["open_conditions"], ["fixture_drift"])
+        self.assertEqual(self.judge(green, scan(), None)["open_conditions"], ["pool_drift"])
+        skipped = scan(checked={project(i) for i in range(1, 30)})
+        self.assertEqual(self.judge(green, skipped, pool_scan())["open_conditions"], ["fixture_drift"], "a project the scan skipped may be the incident's")
+        selected = pool_scan()
+        selected[health.POOL_SCAN.module.KEY_SCOPE] = health.POOL_SCAN.module.SCOPE_SELECTED
+        self.assertEqual(self.judge(green, scan(), selected)["open_conditions"], ["pool_drift"], "a hand run over a few projects clears nothing")
 
 
 if __name__ == "__main__":

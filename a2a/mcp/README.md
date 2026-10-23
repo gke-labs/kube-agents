@@ -32,7 +32,7 @@ Point an MCP client at `http://localhost:8089/mcp` with the header `Authorizatio
 
 A request that names an MCP revision this server doesn't speak (the `MCP-Protocol-Version` header) is refused with 400; a request without the header is served.
 
-To rotate the token, write a new value into the Secret. The server reads it on every request, so the new one is accepted, and the old one refused, as soon as the kubelet updates the mounted file, usually within a minute.
+To rotate the token, write a new value into the Secret. The server reads it on every request, so the new one is accepted, and the old one refused, as soon as the kubelet updates the mounted file, usually within a minute. A value that is blank, or holds a byte no request header could carry (a line break or another control character other than a tab), is replaced: the operator mints a new token over it.
 
 ## What it reads
 
