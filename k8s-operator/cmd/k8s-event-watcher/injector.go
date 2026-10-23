@@ -155,6 +155,18 @@ const injectStatusSuppressed = "suppressed"
 // install and a pod is not all-old or all-new.
 const injectStatusFiltered = "filtered"
 
+// injectStatusFolded is the daemon's word for "accepted, and recorded as one
+// more sighting of an incident already open for the same workload" — an
+// earlier event for it (another replica's, or this pod's under another reason)
+// was admitted within the daemon's INCIDENT_WORKLOAD_DEDUP_SECONDS window. The
+// entry stays, unflagged, and is held for this watcher's own window like any
+// delivered incident: rolling it back would re-offer this pod at its repeat
+// cadence, and flagging it policy-filtered would let the next Warning sighting
+// reopen it. No feature negotiation: a watcher predating this status reads it
+// as delivered, which keeps the entry the same way and only miscounts it as an
+// injected event and a triage session.
+const injectStatusFolded = "folded"
+
 // injectFeaturesHeader lists the response behaviours this watcher understands,
 // so the daemon can answer an older one the way that older one expects.
 //

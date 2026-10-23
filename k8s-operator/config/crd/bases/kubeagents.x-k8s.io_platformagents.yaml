@@ -11555,6 +11555,23 @@ spec:
                         type: string
                       type: array
                       x-kubernetes-list-type: set
+                    backgroundTasksGaveUpTotal:
+                      description: |-
+                        BackgroundTasksGaveUpTotal is the cumulative count of background cards on
+                        the agent's board whose breaker tripped: cards that exhausted their
+                        attempts and gave up, whether a cluster event or a chat ask started
+                        them. Hermes parks such a card as blocked and records a gave_up event
+                        against it, and that event is what is counted, once per card. Read
+                        every five minutes from the chat_metrics plugin's
+                        kubeagents_kanban_tasks_gave_up_total on the gateway pod that runs
+                        Hermes, which reads the board at scrape time and counts the cards that
+                        gave up since its listener started (the ones that had already given up
+                        are its baseline, so a restart adds nothing twice; a card that gives
+                        up while the gateway restarts is missed, an under-count); kept
+                        monotonic the same way as ToolExecutionsTotal. Does not move
+                        LastActiveTime: a card giving up is not the agent at work.
+                      format: int64
+                      type: integer
                     brokerFailuresTotal:
                       description: |-
                         BrokerFailuresTotal is the cumulative count of brokered work the
@@ -11669,7 +11686,8 @@ spec:
                         LastActiveTime is the time of the last poll in which a counter above
                         moved: a brokered command ran or was refused, a proposal was opened or
                         merged, a chat message reached the gateway, or an event was accepted
-                        for triage; BrokerFailuresTotal and ChatTurnsErroredTotal alone leave it where it was.
+                        for triage; BrokerFailuresTotal, ChatTurnsErroredTotal and BackgroundTasksGaveUpTotal
+                        alone leave it where it was.
                         Scheduled maintenance jobs that run brokered commands move it too --
                         the Controller Stall Watch cron runs some every 30 minutes by default
                         -- so it marks agent activity of any origin, not human or operator use

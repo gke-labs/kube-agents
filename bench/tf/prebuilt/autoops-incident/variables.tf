@@ -125,6 +125,26 @@ variable "allocate_mib" {
   default     = 96
 }
 
+# More than one is incident-triage-workload-fold's scenario: every replica
+# crash-loops the same way at once, so the watcher opens one incident per pod
+# and the daemon has to fold them into one.
+variable "replicas" {
+  type        = number
+  description = "Replicas of the OOM-killed Deployment"
+  default     = 1
+}
+
+# incident-triage-workload-fold's repetitions run a few minutes apart, inside
+# the daemon's fold window, so a later repetition's replicas fold into the
+# first one's incident and the watcher logs `folded` rather than `fire`. That
+# case grades the fold and sets this; the others wait on their own card and
+# leave it off.
+variable "accept_folded" {
+  type        = bool
+  description = "Count the watcher's `folded` log line, as well as `fire`, as the incident being handled"
+  default     = false
+}
+
 # Identify the CI run that planted this, so a janitor can find what a run killed
 # before teardown left behind. Both are empty outside CI.
 variable "prow_build_id" {

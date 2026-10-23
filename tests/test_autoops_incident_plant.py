@@ -92,6 +92,8 @@ _INTERPOLATIONS = {
     "var.agent_container": "agent-api-auth",
     "var.allocate_mib": "96",
     "var.memory_limit_mib": "64",
+    "var.replicas": "1",
+    "local.watcher_handled": "fire",
 }
 
 #: The label step 1 writes, and the value step 0b requires before it will
@@ -118,6 +120,9 @@ case "$*" in
   *"logs "*)
     if [ "${WATCHER_FIRES:-1}" = "1" ]; then
       echo "fire BackOff pod=%(ns)s/%(workload)s-abc123 -> sid=s1 (mode=live)"
+    fi
+    if [ "${WATCHER_FOLDS:-0}" = "1" ]; then
+      echo "folded BackOff pod=%(ns)s/%(workload)s-abc123 (sid=s1) -- the workload's incident is already open"
     fi
     exit 0 ;;
   *) exit 0 ;;
@@ -250,6 +255,19 @@ class AutoopsIncidentPlantTest(unittest.TestCase):
             "the plant deleted a namespace on a run that succeeded and found "
             f"nothing left over:\n{chr(10).join(calls)}",
         )
+
+    def test_a_folded_event_is_not_an_incident_unless_the_case_accepts_it(self):
+        # A case waiting on its own card gets none for a folded event, so by
+        # default only `fire` ends the wait; incident-triage-workload-fold
+        # grades the fold and sets accept_folded, rendered here as the pattern.
+        completed, _ = self._run(WATCHER_FIRES=0, WATCHER_FOLDS=1)
+        self.assertNotEqual(completed.returncode, 0, "a folded event ended the wait for a case that did not accept it")
+
+        accepting = self._plant.replace('grep -qE "fire ', 'grep -qE "(fire|folded) ')
+        self.assertNotEqual(accepting, self._plant, "the watcher poll's pattern moved; update this test")
+        self._script.write_text(accepting)
+        completed, _ = self._run(WATCHER_FIRES=0, WATCHER_FOLDS=1)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_leftover_namespace_is_deleted_before_the_workload_is_planted(self):
         # The self-heal, and the half that recovers a cluster already holding a

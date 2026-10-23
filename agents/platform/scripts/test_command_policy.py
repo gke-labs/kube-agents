@@ -2214,8 +2214,10 @@ class LocalRenderTests(unittest.TestCase):
 
 
 class TheDeletionSectionStaysInsideThePolicy(unittest.TestCase):
-    """submit-suggestion's "Deleting a resource" (#3077) answers a delete
-    request with a stated stop. It must run no cluster or cloud command, and
+    """submit-suggestion's "Deleting a resource" (#3077, #3233) answers a delete
+    request with a pull request that removes the declaring manifest, or a
+    stated stop. The only cluster commands it runs are reads of the
+    reconcilers that would act on the merge, each one the policy allows, and
     the direct delete it rules out must be one the policy refuses, or the
     section would rest on a refusal that is not there. Its fences sit inside
     a numbered list, so they are indented.
@@ -2229,18 +2231,28 @@ class TheDeletionSectionStaysInsideThePolicy(unittest.TestCase):
         start = text.index("### Deleting a resource")
         return text[start:text.index("\n### ", start + 1)]
 
-    def test_the_section_runs_no_cluster_or_cloud_command(self):
-        # Every case in the section ends in a stated stop: its fences are the
-        # preflight and a search of the working copy, and none runs kubectl
-        # or gcloud, so nothing in it can coach a write the policy refuses.
+    def test_the_section_runs_only_allowed_reads(self):
+        # Its fences are the preflight, a search of the working copy, and
+        # `kubectl get` of the reconciler objects and their CRDs, each on the
+        # target's own kubeconfig (the default context is the agent's own
+        # cluster, #3644's lane runs). No gcloud, and every kubectl line is a
+        # get the policy allows, so nothing in it can coach a write the policy
+        # refuses.
         lines = []
         for _, block in self.INDENTED_FENCE.findall(self._section()):
             lines += [line.strip() for line in block.splitlines() if line.strip()]
-        self.assertGreaterEqual(len(lines), 3, "the section's fences moved or the parser is stale")
+        self.assertGreaterEqual(len(lines), 8, "the section's fences moved or the parser is stale")
+        kubectl = 0
         for line in lines:
             with self.subTest(command=line):
                 argv = shlex.split(line)
-                self.assertNotIn(argv[0], GOVERNED_TOOLS)
+                self.assertNotEqual("gcloud", argv[0])
+                if argv[0] == "kubectl":
+                    kubectl += 1
+                    self.assertEqual("get", argv[1])
+                    self.assertIn("--kubeconfig", argv, "a reconciler read on the agent's own cluster")
+                    self.assertTrue(evaluate(argv).allowed, line)
+        self.assertGreaterEqual(kubectl, 5, "the reconciler reads moved or the parser is stale")
 
     def test_the_direct_delete_is_refused(self):
         for argv in (

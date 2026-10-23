@@ -50,6 +50,7 @@ const (
 	msgNotJSONRPC2    = "not a JSON-RPC 2.0 request"
 	msgBadID          = "an id must be a string, a number or null"
 	msgEmptyBatch     = "empty batch"
+	msgBatchTooLong   = "a batch may hold at most %d requests"
 	msgNeedsToolName  = "tools/call requires a tool name"
 	msgUnknownMethod  = "unknown method %q"
 	msgUnknownTool    = "unknown tool %q"
@@ -143,9 +144,12 @@ func NewServer(tools ...Tool) (*Server, error) {
 func (s *Server) HandleJSONRPC(ctx context.Context, raw []byte) []byte {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) > 0 && trimmed[0] == '[' {
-		var frames []json.RawMessage
-		if err := json.Unmarshal(trimmed, &frames); err != nil {
+		frames, tooLong, err := batchFrames(trimmed)
+		if err != nil {
 			return marshalRPCError(json.RawMessage("null"), rpcErrParseError, msgInvalidFrame)
+		}
+		if tooLong {
+			return marshalRPCError(json.RawMessage("null"), rpcErrInvalidRequest, fmt.Sprintf(msgBatchTooLong, maxBatchFrames))
 		}
 		if len(frames) == 0 {
 			return marshalRPCError(json.RawMessage("null"), rpcErrInvalidRequest, msgEmptyBatch)
@@ -293,4 +297,39 @@ func marshalRPCResult(id json.RawMessage, result any) []byte {
 func marshalRPCError(id json.RawMessage, code int, msg string) []byte {
 	b, _ := json.Marshal(rpcResponse{JSONRPC: jsonRPCVersion, ID: id, Error: &rpcError{Code: code, Message: msg}})
 	return b
+}
+
+// maxBatchFrames bounds a JSON-RPC batch. Every member is answered before
+// anything is written, and a malformed member's answer outweighs the member
+// (a two-byte `7` gets an 85-byte error), so an unbounded batch inside the
+// body cap would be answered tens of times over its own size. The 2025-06-18
+// revision this server prefers dropped batching; older clients batch a
+// handful of requests at most.
+const maxBatchFrames = 64
+
+// batchFrames splits a batch into its members as a stream, stopping once it
+// holds more than maxBatchFrames, so a long batch is refused without first
+// holding a copy of every member.
+func batchFrames(raw []byte) (frames []json.RawMessage, tooLong bool, err error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if _, err := dec.Token(); err != nil {
+		return nil, false, err
+	}
+	for dec.More() {
+		if len(frames) == maxBatchFrames {
+			return nil, true, nil
+		}
+		var f json.RawMessage
+		if err := dec.Decode(&f); err != nil {
+			return nil, false, err
+		}
+		frames = append(frames, f)
+	}
+	if _, err := dec.Token(); err != nil {
+		return nil, false, err
+	}
+	if dec.More() {
+		return nil, false, errors.New("trailing data after the batch")
+	}
+	return frames, false, nil
 }
