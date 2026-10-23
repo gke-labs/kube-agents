@@ -415,7 +415,7 @@ Done when the first call reports `private` with a `default_branch`, the second r
 
 The Prow job and the sweep's GitLab pass in `oss-test-infra` are the rest of #2394.
 
-The self-managed forges ([#3682](https://github.com/gke-labs/kube-agents/issues/3682); the forge table arrives with #3699, the lane with #3683) are to need no seed of their own: a GitHub Enterprise Server run fronts github.com, so its repository is the pool project's GitHub one above; a self-managed GitLab run stands a GitLab up on a VM in the leased project and creates its project per run, so that lane is to seed the same file at start-up through `seed_repository_file` in `hack/ci_gitlab_forge.py`, and nothing outlives the run for a backfill or the verifier to read.
+The self-managed forges ([#3682](https://github.com/gke-labs/kube-agents/issues/3682); the forge table above, the lanes with #3683 and #3684) need no seed of their own: a GitHub Enterprise Server run fronts github.com, so its repository is the pool project's GitHub one above; a self-managed GitLab run stands a GitLab up on a VM in the leased project and creates its project per run, so that lane is to seed the same file at start-up through `seed_repository_file` in `hack/ci_gitlab_forge.py`, and nothing outlives the run for a backfill or the verifier to read.
 
 ### 5.7 The Compute plant sweep
 
