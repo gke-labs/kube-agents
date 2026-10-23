@@ -1024,12 +1024,18 @@ class TestDeliveryFailureIsWrittenBack(unittest.TestCase):
         session_kv_server.trigger_agent_troubleshooter("sess-y", "msg", {}, row_id)
         self.assertEqual(self._row(row_id), (1, ""))
 
-    @patch.object(session_kv_server, "_start_agent_turn")
+    @patch.object(session_kv_server, "_start_agent_turn", return_value=STARTED)
+    @patch.object(session_kv_server, "_build_agent_query", return_value="q")
     @patch.object(session_kv_server, "_register_session_routing")
     @patch.object(session_kv_server, "_post_initial_alert", return_value="spaces/A/threads/B")
     def test_the_dispatcher_stamps_the_dispatch_before_creating_the_session(self, *_):
         """The pre-kanban read ages a turn from this stamp, so it is written
-        by the dispatcher itself, right before the gateway session, sub-second."""
+        by the dispatcher itself, right before the gateway session, sub-second.
+
+        The start runs on the triage pool, so the stamp is observed by running
+        the parked pool after the trigger returns: it is written at dispatch,
+        after the queue wait, not when the start is queued.
+        """
         import sqlite3
 
         row_id = self._record()
@@ -1040,8 +1046,12 @@ class TestDeliveryFailureIsWrittenBack(unittest.TestCase):
                 seen.append(conn.execute("SELECT dispatched_at FROM intercepted_events WHERE id = ?", (row_id,)).fetchone()[0])
             return True
 
+        pool = park_triage_starts()
+        self.addCleanup(park_triage_starts)
         with patch.object(session_kv_server, "_create_gateway_session", side_effect=create):
             session_kv_server.trigger_agent_troubleshooter("sess-stamp", "msg", {}, row_id)
+            self.assertEqual(seen, [], "the create waits for the pool")
+            pool.run()
         self.assertEqual(len(seen), 1)
         self.assertTrue(seen[0], "dispatched_at must be stamped before the gateway session is created")
         self.assertIn(".", seen[0])
