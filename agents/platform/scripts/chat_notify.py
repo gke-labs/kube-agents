@@ -49,6 +49,10 @@ SLACK_PLATFORM = "slack"
 # bus URL and an identity, A2A_BUS_USER or the older NATS_USER.
 BUS_URL_ENV = "NATS_URL"
 BUS_USER_ENVS = ("A2A_BUS_USER", "NATS_USER")
+# The CA the CLI trusts the bus by (a2a/lib/tls.go, EnvNATSCAFile). Not read
+# here: the Go CLI reads it, so a child that runs `a2a notify` has to be
+# handed it, and the MCP env contract test asserts that from this name.
+BUS_CA_ENV = "NATS_CA_FILE"
 # Where the hermes-bridge records which gateway conversation an `a2a-*` session
 # answers (a2a/hermes-bridge/route.go; session_kv_server.py, CONVERSATION_ROUTE_KEY).
 SESSION_KV_DB_ENV = "SESSION_KV_DB_PATH"

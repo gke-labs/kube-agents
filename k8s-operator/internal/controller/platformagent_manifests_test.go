@@ -1469,6 +1469,15 @@ func TestSafeSandboxEnvOverridesPassesFindingsPacingLimits(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesWorkloadDedupWindow(t *testing.T) {
+	// session_kv_server.py reads the window from its own environment; off the
+	// allowlist, the documented spec.deployment.env entry never reaches it.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{{Name: "INCIDENT_WORKLOAD_DEDUP_SECONDS", Value: "900"}})
+	if len(got) != 1 || got[0].Name != "INCIDENT_WORKLOAD_DEDUP_SECONDS" || got[0].Value != "900" {
+		t.Errorf("expected INCIDENT_WORKLOAD_DEDUP_SECONDS=900 to pass, got %#v", got)
+	}
+}
+
 func TestBuildCredentialProxyContainer(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
@@ -3782,9 +3791,10 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 	// A deployment with no chat integration pins no PLATFORM key — an agent with no chat
 	// integration has no platform credential worth freezing, and a pin invented for one
 	// would only be a key the agent is refused permission to set. What survives is the
-	// eight unconditional pins, none of which is about chat: the loopback bearer (see
+	// ten unconditional pins, none of which is about chat: the loopback bearer (see
 	// the next test), the PVC's directory mode, the mode switch, the scope path, the
-	// empty management-project override, and the stall watch's three knobs, empty.
+	// empty management-project override, the stall watch's three knobs, empty, the
+	// Pub/Sub platform relay URL, empty, and the project that qualifies its routes.
 	bare := renderManagedEnv(newTestPlatformAgent())
 	want := "API_SERVER_KEY=" + loopbackAgentAPIKey + "\n" +
 		"HERMES_HOME_MODE=" + hermesHomeMode + "\n" +
@@ -3793,7 +3803,9 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 		reconcileProjectEnvKey + "=\n" +
 		stallWatchExcludeNamespacesEnvKey + "=\n" +
 		stallWatchMinAgeEnvKey + "=\n" +
-		stallWatchKindsEnvKey + "=\n"
+		stallWatchKindsEnvKey + "=\n" +
+		pubsubRelayURLEnvVar + "=\n" +
+		pubsubRelayProjectEnvVar + "=" + pubsubRelayProject(newTestPlatformAgent()) + "\n"
 	if bare != want {
 		t.Errorf("renderManagedEnv with no integration = %q, want %q", bare, want)
 	}

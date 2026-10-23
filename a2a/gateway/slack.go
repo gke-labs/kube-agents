@@ -164,6 +164,8 @@ type slackAPI interface {
 	AddReaction(name string, item slack.ItemRef) error
 	RemoveReaction(name string, item slack.ItemRef) error
 	GetUserInfo(user string, options ...slack.GetUserInfoOption) (*slack.User, error)
+	GetUserInfoContext(ctx context.Context, user string, options ...slack.GetUserInfoOption) (*slack.User, error)
+	GetConversationInfoContext(ctx context.Context, input *slack.GetConversationInfoInput) (*slack.Channel, error)
 	SetAssistantThreadsSuggestedPrompts(params slack.AssistantThreadsSetSuggestedPromptsParameters) error
 	PublishView(userID string, view slack.HomeTabViewRequest, hash string) (*slack.ViewResponse, error)
 }
@@ -252,6 +254,10 @@ type SlackAdapter struct {
 	// ux is the click and question state (slack_interactive.go), made on
 	// first use.
 	ux *slackUX
+
+	// postWebhook posts to a shortcut's response_url (slack_shortcut.go);
+	// nil is slack-go's, through the bounded client. Tests fake it.
+	postWebhook func(ctx context.Context, url string, msg *slack.WebhookMessage) error
 
 	// workspaceURL is the bot's workspace as auth.test names it
 	// ("https://acme.slack.com/"), the root of a message's permalink; home is
@@ -382,9 +388,16 @@ func (s *SlackAdapter) SetSessionLookup(lookup SessionLookup, idleTTL time.Durat
 //
 // It also opens the thread's Agent Session, a DM thread's included:
 // processing from here until the chain ends and its card work settles
-// (slack_sessions.go).
+// (slack_sessions.go). And when the task is a verified shortcut's, it posts
+// the line naming who asked, before anything of the task's can post
+// (creditShortcut): the one post this observer makes, under the session lock
+// like the placeholder startTask posts right after it on a backend without
+// Agent Sessions.
 func (s *SlackAdapter) TaskStarted(conversation, _ string) {
 	s.updateSession(conversation, func(st *slackSession) { st.running = true })
+	// After the mark below: the credit is a Slack round trip, and a reply
+	// typed in the thread meanwhile must find the thread a session thread.
+	defer s.creditShortcut(conversation)
 	channel, threadTS, ok := slackChannelThread(conversation)
 	if !ok || threadTS == "" || slackIsDM(conversation) {
 		return
@@ -582,7 +595,8 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 				// them, becomes a turn (slack_interactive.go). A click on any
 				// other button (one on a message posted under today, a link)
 				// is acked and changes nothing. The route's raw blocks still
-				// carry none.
+				// carry none. The "ask about this" message shortcut arrives
+				// the same way and becomes a turn too (slack_shortcut.go).
 				continue
 			}
 			// Ack before parsing, not after: unacked envelopes redeliver in
@@ -671,10 +685,20 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 				}
 			}
 			if evt.Type == socketmode.EventTypeInteractive {
-				if evt.Request != nil {
-					if msg, ok := s.interactive(evt.Request.Payload); ok {
-						handler(msg)
-					}
+				if evt.Request == nil {
+					continue
+				}
+				if payload := evt.Request.Payload; slackIsShortcut(payload) {
+					// The message shortcut reads from Slack before it has a
+					// turn to hand over, so it runs off the pump; wg holds Run
+					// until it is done, and every read it makes is under ctx.
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						s.shortcut(ctx, payload, handler)
+					}()
+				} else if msg, ok := s.interactive(payload); ok {
+					handler(msg)
 				}
 				continue
 			}

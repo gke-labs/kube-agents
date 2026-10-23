@@ -261,4 +261,4 @@ has no cron caller. The card is the channel.
   own branch. Anything wider is a new `submit-suggestion` run, proposed in the
   reply and not performed.
 - **Never merge, close, or approve.** Human review gates every resolution.
-- **Never modify a pull request labelled `agent:ignore`.**
+- **Never modify a pull request labelled `agent:ignore`**, or, on a forge with no labels, one with `agent:ignore` on a line of its own in the description.

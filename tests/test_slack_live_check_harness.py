@@ -1387,8 +1387,10 @@ class UnitTest(unittest.TestCase):
             self.assertNotIn("tail", redactor.redact(f"x {printed} y"), printed)
 
     def test_refusal_marker_matches_the_gateway_source(self):
-        gateway = (REPO / "a2a" / "gateway" / "gateway.go").read_text()
-        self.assertIn('"⛔ ' + harness.REFUSAL_NOTICE_MARKER.replace("slack", '"+backend+'), gateway)
+        # unverifiedNotice, which the gateway posts and the Slack adapter
+        # sends a shortcut's clicker privately.
+        gchat = (REPO / "a2a" / "gateway" / "gchat.go").read_text()
+        self.assertIn('"⛔ ' + harness.REFUSAL_NOTICE_MARKER.replace("slack", '" + backend + '), gchat)
 
     def test_turn_subtypes_match_the_gateway_source(self):
         slack = (REPO / "a2a" / "gateway" / "slack.go").read_text()

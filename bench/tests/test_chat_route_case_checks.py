@@ -1,9 +1,9 @@
 """The chat-route cases' worker-command checks, run through the verifier.
 
-Seven cases grade a plain fleet-wide chat question that runs an audit
-stream's collector and opens no ledger run (#2386): reliability, stockout,
-AI security, upgrade and drift, plus the GCE and networking regression
-guards. Each grades the collector run with ``required_runs`` and forbids an
+Eight cases grade a plain fleet-wide chat question that runs a collector and
+opens no ledger run: reliability, stockout, AI security, upgrade and drift,
+plus the GCE and networking regression guards (#2386), and the general fleet
+health question, which runs fleet_health.py (#3302). Each grades the collector run with ``required_runs`` and forbids an
 ``audit_report.py start``/``finish`` run twice with ``forbidden_runs`` (the
 no-ledger objective and the nothing-was-published safeguard). The upgrade
 case also requires the chat scratch dir with one regex.
@@ -73,6 +73,12 @@ CASES = {
         None,
         "gcp-networking-fabric-audit",
     ),
+    "health-chat-request-runs-collector": (
+        "the-health-collector-ran",
+        "fleet-audit/scripts/fleet_health.py",
+        None,
+        "fleet-health",
+    ),
 }
 
 # Collector commands the platform worker ran in dev runs of each case or its
@@ -114,6 +120,10 @@ REAL_RUNS = {
         f"python3 {SKILLS}/gcp-networking-fabric-audit/scripts/networking_audit.py {SCOPE} --scope-unread declared-scope=unresolved --output /opt/data/scratch/chat_manifest_gcp-networking-fabric-audit.json",
         f"python3 {SKILLS}/gcp-networking-fabric-audit/scripts/networking_audit.py {SCOPE} --output /tmp/manifest_networking.json && cat /tmp/manifest_networking.json",
     ],
+    "health-chat-request-runs-collector": [
+        f"python3 {SKILLS}/fleet-audit/scripts/fleet_health.py {SCOPE} > /opt/data/scratch/chat_manifest_fleet-health.json",
+        f"python3 {SKILLS}/fleet-audit/scripts/fleet_health.py {SCOPE} > /opt/data/scratch/chat_manifest_fleet-health.json && cat /opt/data/scratch/chat_manifest_fleet-health.json",
+    ],
 }
 
 # Ledger commands workers ran in the SOP-named controls: each opens or closes
@@ -143,6 +153,7 @@ NOT_LEDGER_RUNS = [
 
 LEDGER_CHECKS = ("no-ledger-run-was-opened", "nothing-was-published")
 UPGRADE = "upgrade-chat-request-runs-collector"
+HEALTH = "health-chat-request-runs-collector"
 SCRATCH_CHECK = "the-collector-used-the-chat-scratch-dir"
 PATCH = f"{SKILLS}/fleet-audit/scripts/patch_readiness.py"
 NETWORKING = "networking-chat-request-runs-collector"
@@ -177,6 +188,8 @@ def _run(case: str) -> str:
 def _soul_command(case: str) -> str:
     """SOUL.md's chat command for the case's row, with fleet_scope's args."""
     stream = CASES[case][3]
+    if case == HEALTH:
+        return f"python3 {SKILLS}/{_run(case)} {SCOPE} --output /opt/data/scratch/chat_manifest_{stream}_$(date +%s)_$$.json"
     prefix = f"{CHAT_DIR} " if case == UPGRADE else ""
     return f"{prefix}python3 {SKILLS}/{_run(case)} {SCOPE} > /opt/data/scratch/chat_manifest_{stream}.json"
 

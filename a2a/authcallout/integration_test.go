@@ -1,8 +1,10 @@
 package authcallout
 
 import (
+	"bufio"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +19,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // The DoD, proven against a server rather than read out of a config.
@@ -80,6 +84,10 @@ type harness struct {
 	url    string
 	store  *Store
 	tokens map[string]Attested
+	// tls trusts the CA the rendered conf's serving pair was minted from;
+	// every connection the suite makes needs it, since the render requires
+	// TLS of every client.
+	tls nats.Option
 }
 
 // tokenReviewer maps a presented token to what the cluster would vouch for,
@@ -190,6 +198,7 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 	}
 	conf := replaceConfKey(string(rendered), "issuer: ", issuerPub)
 	conf = replaceConfKey(conf, "xkey: ", xkeyPub)
+	conf, tlsOpt := withTestTLS(t, conf)
 
 	confPath := filepath.Join(t.TempDir(), "nats.conf")
 	if err := os.WriteFile(confPath, []byte(conf), 0o600); err != nil {
@@ -210,6 +219,9 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 	opts.Port = -1
 	opts.Websocket.Port = -1
 	opts.HTTPPort = -1
+	// The render binds every interface; the test's serving certificate names
+	// the loopback address, so the server is bound there instead.
+	opts.Host = "127.0.0.1"
 	opts.StoreDir = t.TempDir()
 
 	// startNatsServer keeps the server's own log, so a server that never
@@ -251,7 +263,7 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 	// The callout is itself a bus client, and it authenticates statically
 	// because it cannot authenticate through itself. auth_users is what
 	// exempts it.
-	svcConn, err := nats.Connect(srv.ClientURL(), nats.UserInfo(svcUser, svcPass), nats.Name("auth-callout"))
+	svcConn, err := nats.Connect(srv.ClientURL(), nats.UserInfo(svcUser, svcPass), nats.Name("auth-callout"), tlsOpt)
 	if err != nil {
 		t.Fatalf("the callout service could not connect: %v", err)
 	}
@@ -260,14 +272,14 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 		t.Fatalf("Subscribe: %v", err)
 	}
 
-	return &harness{server: srv, url: srv.ClientURL(), store: store, tokens: tokens}
+	return &harness{server: srv, url: srv.ClientURL(), store: store, tokens: tokens, tls: tlsOpt}
 }
 
 // connectAs dials with a ServiceAccount token, the way a workload will.
 func (h *harness) connectAs(t *testing.T, user, token string) (*nats.Conn, chan error) {
 	t.Helper()
 	violations := make(chan error, 16)
-	nc, err := nats.Connect(h.url,
+	nc, err := nats.Connect(h.url, h.tls,
 		nats.Token(token),
 		nats.CustomInboxPrefix("_INBOX."+user),
 		nats.Name(user),
@@ -357,7 +369,7 @@ func TestADifferentServiceAccountGetsADifferentGrantSet(t *testing.T) {
 func TestAnUnmappedServiceAccountIsRefusedAtConnect(t *testing.T) {
 	h := startHarness(t, twoIdentityMap, defaultTokens())
 
-	nc, err := nats.Connect(h.url, nats.Token(strangerTok), nats.Name("stranger"))
+	nc, err := nats.Connect(h.url, h.tls, nats.Token(strangerTok), nats.Name("stranger"))
 	if err == nil {
 		nc.Close()
 		t.Fatal("a ServiceAccount absent from the identity map connected")
@@ -370,7 +382,7 @@ func TestAnUnmappedServiceAccountIsRefusedAtConnect(t *testing.T) {
 func TestATokenTheClusterRefusesIsRefusedAtConnect(t *testing.T) {
 	h := startHarness(t, twoIdentityMap, defaultTokens())
 
-	nc, err := nats.Connect(h.url, nats.Token("a-token-no-cluster-ever-issued"), nats.Name("forged"))
+	nc, err := nats.Connect(h.url, h.tls, nats.Token("a-token-no-cluster-ever-issued"), nats.Name("forged"))
 	if err == nil {
 		nc.Close()
 		t.Fatal("a token the cluster does not authenticate was accepted")
@@ -380,10 +392,90 @@ func TestATokenTheClusterRefusesIsRefusedAtConnect(t *testing.T) {
 	}
 }
 
+// The rendered config requires TLS of every client: the server says so in
+// its INFO, refuses a CONNECT sent in the clear, and refuses a TLS client that
+// does not trust the bus CA. Each of the three would be a plaintext bus by
+// another route.
+func TestTheRenderedBusRefusesPlaintextAndUntrustedClients(t *testing.T) {
+	h := startHarness(t, twoIdentityMap, defaultTokens())
+	addr := strings.TrimPrefix(strings.TrimPrefix(h.url, "tls://"), "nats://")
+
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	r := bufio.NewReader(conn)
+	info, err := r.ReadString('\n')
+	if err != nil {
+		t.Fatalf("reading INFO: %v", err)
+	}
+	if !strings.Contains(info, `"tls_required":true`) {
+		t.Fatalf("the server does not advertise tls_required: %s", info)
+	}
+	if _, err := conn.Write([]byte("CONNECT {\"verbose\":false,\"name\":\"plaintext\"}\r\nPING\r\n")); err != nil {
+		t.Fatalf("writing CONNECT: %v", err)
+	}
+	reply, _ := r.ReadString('\n')
+	if strings.HasPrefix(reply, "PONG") {
+		t.Fatal("a CONNECT sent in the clear was answered with PONG")
+	}
+
+	t.Setenv(lib.EnvNATSCAFile, "")
+	nc, err := nats.Connect(h.url, nats.Token(tokenPodA), nats.Name("untrusted"))
+	if err == nil {
+		nc.Close()
+		t.Fatal("a client that does not trust the bus CA connected")
+	}
+	if !strings.Contains(err.Error(), "certificate") {
+		t.Errorf("connect error = %v, want a certificate verification failure", err)
+	}
+}
+
+// lib.TLSOptions is the trust every product client takes, so it is driven
+// here against the rendered bus rather than inspected: a client that trusts
+// another CA, or the right CA under a name the certificate does not carry, is
+// refused at the handshake, and the right CA under the certificate's name
+// gets past it. A TLSOptions that stopped verifying would pass the third case
+// and fail the first two.
+func TestLibTLSOptionsVerifiesTheBus(t *testing.T) {
+	h := startHarness(t, twoIdentityMap, defaultTokens())
+	rightCA := os.Getenv(lib.EnvNATSCAFile)
+	if rightCA == "" {
+		t.Fatal("the harness set no CA file; every case below would be inert")
+	}
+	_, _ = withTestTLS(t, renderedTLSDir)
+	otherCA := os.Getenv(lib.EnvNATSCAFile)
+
+	// A token the harness maps, so the third case connects outright rather
+	// than being refused at authorization after a handshake it may or may not
+	// have made.
+	dial := func(t *testing.T, ca, serverName string) error {
+		t.Helper()
+		t.Setenv(lib.EnvNATSCAFile, ca)
+		t.Setenv(lib.EnvNATSTLSServerName, serverName)
+		nc, err := nats.Connect(h.url, append(lib.TLSOptions(), nats.Token(gatewayToken), nats.Name("tls-options"))...)
+		if err == nil {
+			nc.Close()
+		}
+		return err
+	}
+	if err := dial(t, otherCA, ""); err == nil || !strings.Contains(err.Error(), "certificate") {
+		t.Errorf("a client trusting another CA: err = %v, want a certificate verification failure", err)
+	}
+	if err := dial(t, rightCA, "attacker.example"); err == nil || !strings.Contains(err.Error(), "certificate") {
+		t.Errorf("the right CA under a name the certificate lacks: err = %v, want a certificate verification failure", err)
+	}
+	if err := dial(t, rightCA, "localhost"); err != nil {
+		t.Errorf("the right CA under the certificate's name did not connect: %v", err)
+	}
+}
+
 func TestNoTokenIsRefusedAtConnect(t *testing.T) {
 	h := startHarness(t, twoIdentityMap, defaultTokens())
 
-	nc, err := nats.Connect(h.url, nats.Name("anonymous"))
+	nc, err := nats.Connect(h.url, h.tls, nats.Name("anonymous"))
 	if err == nil {
 		nc.Close()
 		t.Fatal("a client presenting no credential at all connected")
@@ -396,7 +488,7 @@ func TestNoTokenIsRefusedAtConnect(t *testing.T) {
 func TestTheTokenIsAcceptedAsAPasswordToo(t *testing.T) {
 	h := startHarness(t, twoIdentityMap, defaultTokens())
 
-	nc, err := nats.Connect(h.url,
+	nc, err := nats.Connect(h.url, h.tls,
 		nats.UserInfo(agentSA, agentToken),
 		nats.CustomInboxPrefix("_INBOX.agent"),
 		nats.Name("agent-via-userinfo"))
@@ -424,7 +516,7 @@ func TestAClientMustUseTheInboxPrefixItsGrantsCover(t *testing.T) {
 	}
 
 	// The default random inbox is not covered by the gateway's grant.
-	wrong, err := nats.Connect(h.url, nats.Token(gatewayToken), nats.Name("gateway-default-inbox"))
+	wrong, err := nats.Connect(h.url, h.tls, nats.Token(gatewayToken), nats.Name("gateway-default-inbox"))
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
@@ -455,7 +547,7 @@ func TestACalloutWithNoMapRefusesEveryConnection(t *testing.T) {
 	// the same state a callout is in before its first informer sync.
 	h.store.current.Store(nil)
 
-	nc, err := nats.Connect(h.url, nats.Token(gatewayToken), nats.Name("gateway"))
+	nc, err := nats.Connect(h.url, h.tls, nats.Token(gatewayToken), nats.Name("gateway"))
 	if err == nil {
 		nc.Close()
 		t.Fatal("a connection was authorized while no identity map was being served")
@@ -573,7 +665,7 @@ func TestTheCalloutAnswersOneAuthorizationAtATime(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			nc, err := nats.Connect(h.url, nats.Token(agentToken), nats.CustomInboxPrefix("_INBOX.agent"), nats.Name("agent"))
+			nc, err := nats.Connect(h.url, h.tls, nats.Token(agentToken), nats.CustomInboxPrefix("_INBOX.agent"), nats.Name("agent"))
 			if err != nil {
 				failures <- err
 				return

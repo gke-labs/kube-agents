@@ -113,6 +113,7 @@ class GitLabForge(Forge):
     transport = "http"
     error_overrides = ERROR_OVERRIDES
     acknowledges = True
+    labels = True
     whoami_route = ("user", "username")
     # What an install that has not configured GitLab answers for gitlab.com: a
     # named gap rather than "not a forge this install serves".

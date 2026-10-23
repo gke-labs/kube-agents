@@ -911,6 +911,9 @@ COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/apply_slack_boilerplate.py \
      deploy/docker/patches/verify_slack_boilerplate.py \
      deploy/docker/patches/slack_boilerplate.py \
+     deploy/docker/patches/apply_chat_turn_metrics.py \
+     deploy/docker/patches/verify_chat_turn_metrics.py \
+     deploy/docker/patches/chat_turn_metrics.py \
      agents/platform/scripts/slack_presenter.py \
      agents/platform/scripts/slack_status.py \
      agents/platform/scripts/slack_moments.py \
@@ -955,6 +958,11 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
     grep -qF "_kage_slack_boilerplate.cron_delivery_text" /opt/hermes/cron/scheduler_delivery.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_thread_provenance.py /opt/hermes && \
     grep -qF "kube-agents patch: thread-context provenance" /opt/hermes/plugins/platforms/slack/adapter.py && \
+    install -m 0644 /tmp/message-surface/chat_turn_metrics.py /opt/hermes/gateway/chat_turn_metrics.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_chat_turn_metrics.py /opt/hermes && \
+    grep -qF "_kage_chat_turn_metrics.record_turn_error(source)" /opt/hermes/gateway/run_turn.py && \
+    grep -qF "_kage_chat_turn_metrics.record_turn_error(ctx.source)" /opt/hermes/gateway/run_turn_runner.py && \
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_chat_turn_metrics.py /opt/hermes && \
     cd /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_agent_view.py /opt/hermes && \
     grep -qF "def _kage_slack_ux_on(" /opt/hermes/hermes_cli/slack_cli.py && \
@@ -1058,6 +1066,11 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-worker-tools/apply_kanban_worker_t
 #     output, once, then drops it on the retry. Accepted claims are appended to
 #     `result` as an evidence section. A card's claim also passes when it
 #     matches one the gate accepted on a card it created.
+#   * kanban_rightsizing_checks: a second rule in that gate. A card whose body
+#     names the gke-rightsizing-checks skill must open its result with its
+#     dependency lines and show the five checks, and a card above such cards
+#     must carry their dependency lines word for word. Refused once, then
+#     accepted, with the gate's one refusal per card.
 # Getting that answer into the chat message is the other half of the fix and
 # belongs to the kanban_notifier patch above; verify_kanban_result.py still owns
 # the seam, replaying a real refusal through the real gate and into the real
@@ -1086,6 +1099,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-worker-tools/apply_kanban_worker_t
 COPY deploy/docker/patches/kanban_result_required.py \
      deploy/docker/patches/kanban_report_format.py \
      deploy/docker/patches/kanban_verified_claims.py \
+     deploy/docker/patches/kanban_rightsizing_checks.py \
      /opt/hermes/tools/
 # The first two appliers import their anchors from their modules, and only the
 # script's own directory is on sys.path -- hence the second copy of those two
@@ -1097,6 +1111,7 @@ COPY deploy/docker/patches/apply_kanban_result_required.py \
      deploy/docker/patches/verify_kanban_report_format.py \
      deploy/docker/patches/apply_kanban_verified_claims.py \
      deploy/docker/patches/verify_kanban_verified_claims.py \
+     deploy/docker/patches/apply_kanban_rightsizing_checks.py \
      deploy/docker/patches/kanban_result_required.py \
      deploy/docker/patches/kanban_report_format.py \
      deploy/docker/patches/patchlib.py \
@@ -1111,7 +1126,10 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_report_format.
     /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_verified_claims.py /opt/hermes && \
     grep -q "_apply_verified_claims_schema(KANBAN_COMPLETE_SCHEMA)" /opt/hermes/tools/kanban_tools.py && \
     grep -q "record_terminal_call(command, returncode, output)" /opt/hermes/tools/terminal_tool_result.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_rightsizing_checks.py /opt/hermes && \
+    grep -q "^import tools.kanban_rightsizing_checks" /opt/hermes/tools/kanban_tools.py && \
     cd /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 -c "from tools import kanban_verified_claims as g, kanban_rightsizing_checks as r; assert r.rightsizing_rule in g.RULES" && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-result/verify_kanban_result.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-result/verify_kanban_report_format.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-result/verify_kanban_verified_claims.py && \

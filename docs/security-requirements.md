@@ -81,7 +81,7 @@ See [Google Chat Session Metadata Data Flow](designs/gchat-session-metadata-data
 - Provider access uses workload identity or short-lived credentials rather than static keys in the sandbox.
 - GitHub access uses short-lived, repository-scoped installation tokens.
 - Chat and source-control credentials remain behind explicitly configured relay or command interfaces.
-- The current command proxy supports `gcloud` and `kubectl`. Additional CLIs require explicit proxy support. The one non-CLI interface is the read-only Google Cloud REST relay, `GET /v1/gcp/<host>/<path>`, admitted per host and path by a code allowlist (`agents/platform/scripts/api_policy.py`) and open to the shell role only; see [`designs/gcp-api-relay.md`](designs/gcp-api-relay.md).
+- The current command proxy supports `gcloud` and `kubectl`. Additional CLIs require explicit proxy support. The Google relays are the other non-CLI interfaces, each confined by a code table and bound to one caller role: the read-only Google Cloud REST relay, `GET /v1/gcp/<host>/<path>`, admitted per host and path by `agents/platform/scripts/api_policy.py` and open to the shell role only ([`designs/gcp-api-relay.md`](designs/gcp-api-relay.md)); the watchers' routes, the GKE read and the drift subscription under `/v1/watcher/gcp/` and Kubernetes events and named reads under `/v1/k8s/`, open to the watcher role (`agents/platform/scripts/watcher_policy.py`); and the Pub/Sub platform adapter's four subscription calls under `/v1/pubsub/gcp/`, open to the chat role and confined to the subscriptions the operator renders from the AgentPlugin configs (same file). `ROUTE_ROLES` in `agents/platform/scripts/credential_proxy.py` is the full table of routes and roles, the chat relays, the remote MCP relay and the sandbox's command and version-control routes among them.
 - A configuration file the sandbox supplies to a credentialed command selects a target; it does not supply content. The proxy must not run a credentialed command against a document the sandbox authored, because such a document can direct execution, redirect the minted token, or name a file to disclose — none of which the argument-vector deny policy can see. Kubeconfigs are regenerated in the broker for this reason.
 
 The sandbox and the credential runtime must not share a process namespace, and must not run as the
@@ -93,7 +93,9 @@ unset in every configuration.
 
 The broker authenticates every caller. A caller presents an audience-bound projected ServiceAccount
 token (one hour; the audience is per pod: `kubeagents-credential-proxy` for the sandbox,
-`kubeagents-credential-proxy-chat` for the gateway, and, under the operator's
+`kubeagents-credential-proxy-chat` for the gateway, `kubeagents-credential-proxy-watcher` for the
+watchers in the gateway Pod's `agent-api-auth` container, `kubeagents-credential-proxy-a2a-chat` for
+the A2A gateway when it consumes Google Chat under `spec.mode: next`, and, under the operator's
 `A2A_SESSION_CLUSTER_VIEW` flag, `kubeagents-credential-proxy-session` for the session pods,
 bound to their ServiceAccount as [spec-mode-switch.md](designs/spec-mode-switch.md#switches-inside-next) describes)
 as a bearer header, and the broker verifies
