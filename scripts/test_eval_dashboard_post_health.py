@@ -634,8 +634,14 @@ class Digest(RunHarness):
             "📊 *Smoke gate, last 24h:* 31 runs · 26 green · 2 PR-caused red · 5 infra · typical run 125 min · typical wait n/a\n"
             "🌙 Nightly: 3 cases · 1 passed all reps · 1 partial · 1 failed · newly failing: case-c · 6h 40m\n"
             f"{post_health.NIGHTLY_URL}\n"
+            # No GitHub token in this harness: the nightly section cannot read
+            # the nightly-red issues, so the one line stands and says why
+            # (test_eval_dashboard_nightly_digest.py covers the section).
+            "🌙 Nightly section skipped: no GitHub token to read the nightly-red issues.\n"
+            # The rollback nightly's line goes out whatever the section did.
             "🌙 Rollback nightly (today): no run on record yet\n"
-            f"{nightly.NIGHTLY_TODAY_HISTORY_URL}\n{URL}#since=2026-09-04T03:30:00Z&view=agent",
+            f"{nightly.NIGHTLY_TODAY_HISTORY_URL}\n"
+            f"{URL}#since=2026-09-04T03:30:00Z&view=agent",
         )
         self.assertEqual(post_health.NIGHTLY_URL, "https://storage.cloud.google.com/kube-agents-dashboards/evals/nightly.html")
         # A truncated night says so instead of numbers; a missing night too.
@@ -652,6 +658,7 @@ class Digest(RunHarness):
         self.assertEqual(rc, 0)
         self.assertIn("warning:", err)
         self.assertIn("\n🌙 Nightly: no data.json to read a night from\n", self.opener.texts[4])
+        self.assertIn("\n🌙 Nightly section skipped: data.json could not be read.\n", self.opener.texts[4])
         self.assertIn("\n🌙 Rollback nightly (today): no data.json to read a night from\n", self.opener.texts[4])
 
     def test_digest_carries_the_rollback_nightly_on_a_line_of_its_own(self):
@@ -681,9 +688,9 @@ class Digest(RunHarness):
         ], "pending_builds": [{"build_id": "3000000000000000004", "first_seen": "2026-09-04T06:05:00+00:00", "tier": "nightly-today"}]}
         self.tick(health(), self.at(DIGEST_UTC, 5), data=data)
         lines = self.opener.texts[0].split("\n")
-        self.assertEqual(lines[1], "🌙 Nightly: 2 cases · 2 passed all reps · 0 partial · 0 failed · first night on record · 6h")
-        self.assertEqual(lines[3], "🌙 Rollback nightly (today): 2 cases · 1 passed all reps · 0 partial · 1 failed · newly failing: case-b · 14h")
-        self.assertEqual(lines[4], nightly.NIGHTLY_TODAY_HISTORY_URL)
+        self.assertIn("🌙 Nightly: 2 cases · 2 passed all reps · 0 partial · 0 failed · first night on record · 6h", lines)
+        rollback = lines.index("🌙 Rollback nightly (today): 2 cases · 1 passed all reps · 0 partial · 1 failed · newly failing: case-b · 14h")
+        self.assertEqual(lines[rollback + 1], nightly.NIGHTLY_TODAY_HISTORY_URL)
         # A morning with no rollback night on record since the day before
         # yesterday says so, as the main line does. Tonight's build, running
         # since 06:05Z as on every morning, does not stand in for it: it is
@@ -702,6 +709,21 @@ class Digest(RunHarness):
         del data["pending_builds"]
         self.tick(health(), self.at(DIGEST_UTC, 5, day=6), data=data)
         self.assertIn("\n🌙 Rollback nightly (today): no run last night (the newest on record started Tue 2:00 AM ET)\n", self.opener.texts[2])
+
+    def test_the_rollback_line_follows_a_built_nightly_section(self):
+        # The section replaces only the main nightly's line; the rollback
+        # nightly has no section, so its line goes out after it.
+        from types import SimpleNamespace
+
+        section = SimpleNamespace(lines=["🌙 *Nightly, Fri Sep 4* · 3 of 3 scenarios passed", "• quiet night"])
+        data = {"schema_version": 1, "runs": [], "cases": []}
+        text = post_health.render_digest(health(), self.at(DIGEST_UTC, 5), data=data, section=section)
+        lines = text.split("\n")
+        self.assertEqual(lines[1:3], section.lines)
+        self.assertNotIn("🌙 Nightly: ", text)
+        rollback = lines.index("🌙 Rollback nightly (today): no run on record yet")
+        self.assertGreater(rollback, 2)
+        self.assertEqual(lines[rollback + 1], nightly.NIGHTLY_TODAY_HISTORY_URL)
 
     def test_the_digest_without_data_json_is_unchanged(self):
         self.tick(health(), self.at(DIGEST_UTC, 5))

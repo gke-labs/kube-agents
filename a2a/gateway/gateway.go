@@ -183,6 +183,10 @@ type Gateway struct {
 	// observeTaskDelivered to the observeTaskTerminal that follows it
 	// (consoleFrame).
 	consoleResults consoleResultStash
+	// consoleCardsPending marks a console chain end whose task handed work
+	// to kanban cards (lib.ArtifactHandoff), from the relay's terminal to
+	// the frame (consoleFrame); the value is unused.
+	consoleCardsPending consoleResultStash
 
 	// runCtx is Run's context; queue workers derive their timeouts from it.
 	runCtx context.Context
@@ -1276,6 +1280,13 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 			}
 		}
 		g.logTaskTerminal(rec, addressee, active.TaskID, task.State, source, finalMessageText(task))
+		// A console client is told the task handed work to cards, as the
+		// relay tells it (relayTerminal): the fold read here carries the
+		// handoff too, so a heal-found end is not the one path without it.
+		if isConsoleConversation(rec.Key) && handedOff(task.State, foldHandedOff(task)) {
+			root, _ := rec.observedAs(active.TaskID)
+			g.consoleCardsPending.put(root, "")
+		}
 		// Under the chain's root, and not at all for a child: its result
 		// is the wake's to digest, not the root's deliverable, and the
 		// root's end comes from the wake below or, with no wake, from
@@ -2018,6 +2029,7 @@ func (g *Gateway) consoleFrame(rec *SessionRecord, taskID string, state lib.Task
 		return
 	}
 	delivered, ok := g.consoleResults.take(taskID)
+	_, cardsPending := g.consoleCardsPending.take(taskID)
 	text := terminalNotice(state, reason)
 	// An end the gateway declared itself carries no executor reason; its
 	// frame says what the page's notice says rather than the bare line.
@@ -2044,6 +2056,7 @@ func (g *Gateway) consoleFrame(rec *SessionRecord, taskID string, state lib.Task
 	// without a mark; only a frame that failed to go out is logged.
 	if err := poster.PostTerminal(rec.Key, ConsoleTerminal{
 		TaskID: taskID, Addressee: rec.AddresseeFor(taskID), State: state, Text: text,
+		CardsPending: cardsPending && state == lib.StateCompleted,
 	}); err != nil && !errors.Is(err, errNoTerminalFrames) {
 		g.log.Error("console terminal frame failed", "conversation", rec.Key, "taskId", taskID, "err", err)
 	}

@@ -2055,6 +2055,10 @@ _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
 _OMITTED_NOTICE_RE = re.compile(r"(\d+) further finding\(s\) are omitted from this description")
 # Mirrors audit_report's `HELD_IDS_RE`: the held ids its held span records.
 _HELD_IDS_RE = re.compile(r"<!--[ \t]*audit-held-ids:[ \t]*(\[.*?\])[ \t]*-->", re.S)
+# Mirrors audit_report's `NOT_RECHECKED_IDS_COMMENT`: the ids its held span
+# keeps under "Not re-checked this run", previous findings on a target the run
+# did not check.
+_NOT_RECHECKED_IDS_RE = re.compile(r"<!--[ \t]*audit-not-rechecked-ids:[ \t]*(\[.*?\])[ \t]*-->", re.S)
 _CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
 # Ids quoted in an `every_finding_named` failure; the count is always exact.
 _MAX_UNNAMED_IN_REASON = 5
@@ -3264,6 +3268,174 @@ class WorkerAgentsVerifier(BaseVerifier):
         )
 
 
+
+# The dispatcher's record of a worker that ran out of its turn budget: the
+# run closes ``timed_out`` with this at the head of ``error`` (hermes
+# ``agent/turn_finalizer.py``, ``_record_kanban_budget_exhausted``). The two
+# numbers are the calls made and the cap in force.
+_BUDGET_EXHAUSTED_RE = re.compile(r"Iteration budget exhausted \((?P<used>\d+)/(?P<cap>\d+)\)")
+
+# Hermes' one-shot checkpoint notice, appended to the newest tool result once a
+# dispatcher-owned kanban worker has used 90% of a finite cap
+# (``agent/turn_iteration_prep.py``, ``ITERATION_BUDGET_WARNING_TEMPLATE``). It
+# names the cap in force whether the worker then stops or runs into the wall,
+# which is why it is the primary read; the worker capture carries it inside
+# the tagged call's ``result``. Matched with its prefix at a paragraph seam,
+# so a notice another session's transcript quotes inside a search result (a
+# JSON string, whose newlines are escaped) is not read as this worker's cap.
+_BUDGET_NOTICE_RE = re.compile(
+    r"(?:^|\n\n)\[SYSTEM NOTICE — iteration budget checkpoint\] "
+    r"You have used (?P<used>\d+) of (?P<cap>\d+) iterations"
+)
+
+# The run outcome the dispatcher records when a worker finished its card
+# (``kanban_db._end_run(outcome="completed")``); the one outcome that says the
+# worker stayed inside its cap. The harness's ceiling archive closes a running
+# card ``reclaimed`` instead, which says nothing about the cap.
+_RUN_COMPLETED = "completed"
+
+_NO_WORKER_RUNS_REASON = (
+    "no delegated card's run rows were captured for this run: either no card was "
+    "delegated, the run ended before the cards settled, or the board could not be "
+    "read -- so this check could not be evaluated"
+)
+
+
+@VERIFIERS.register("worker_budget")
+class WorkerBudgetVerifier(BaseVerifier):
+    """Checks the turn budget a delegated worker actually ran under.
+
+    Two records name the cap in force, and the check reads both. Once a
+    dispatcher-owned worker has used 90% of a finite cap, Hermes appends a
+    one-shot notice to its newest tool result, ``You have used N of M
+    iterations``, which the worker capture carries in the tagged call's
+    ``result``; a worker that goes on to exhaust the cap closes its kanban run
+    ``timed_out`` with ``Iteration budget exhausted (N/M)`` in the run's
+    ``error`` (:func:`kube_agents_bench.worker_trajectory.runs`). The notice is
+    the primary read: whether the worker then stops at the checkpoint or runs
+    into the wall is the model's choice, and the cap is on the record either
+    way. A run that finishes inside 90% of its cap records neither.
+
+    ``budget``: the cap every notice and every exhausted run must name.
+
+    Passes when at least one delegated worker reached its checkpoint or ran
+    out, and every cap named is ``budget``. Fails when a cap named is another
+    number, or when nothing was named and a worker finished its card
+    (``outcome`` ``completed``), which for a card written to outrun the cap
+    means the cap in force was larger than the one declared; the reason names
+    each card's captured call count so the read is on the record. Fails closed
+    like its siblings: an empty stash, a run with no card rows, nothing named
+    on a capture that recorded gaps (``worker_capture_gaps``), or nothing named
+    and no completed attempt either (the harness archived the card at its
+    delegation ceiling, which closes the run ``reclaimed``; a crash; an attempt
+    still open) is ``status="error"``: none of those says what cap was in force.
+    A notice past the capture's per-result clip is not read, which a card of
+    short tool outputs never reaches; a capture in which every result was
+    withheld or never recorded is unreadable, and with nothing named it is
+    ``status="error"`` too, while a single missing result among readable ones
+    does not turn a plain failure into one.
+    """
+
+    type: Literal["worker_budget"]
+    budget: int = Field(ge=1)
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+        snap = transcript.get()
+        if snap is None:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_TRANSCRIPT_REASON,
+            )
+        if snap.worker_runs is None:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_WORKER_RUNS_REASON,
+            )
+        # (task, used, cap, how) for every record that names a cap.
+        named: list[tuple[str, int, int, str]] = []
+        for row in snap.worker_runs:
+            match = _BUDGET_EXHAUSTED_RE.search(str(row.get("error") or ""))
+            if match:
+                named.append((str(row.get("task") or ""), int(match["used"]), int(match["cap"]), "exhausted"))
+        calls: dict[str, int] = {}
+        # A pod whose redactor failed to load withholds every result, and the
+        # notice with them: with nothing named, that is an unreadable cap, not
+        # evidence of a larger one. One call with no result row (a worker
+        # killed mid-call, an orphaned result) among readable ones is not: the
+        # notice would have landed on one of the others.
+        unreadable = tagged = 0
+        for entry in snap.trajectory:
+            if not entry.get("agent"):
+                continue
+            task = str(entry.get("task") or "")
+            calls[task] = calls.get(task, 0) + 1
+            tagged += 1
+            result = entry.get("result")
+            if result is None or result == worker_trajectory.WITHHELD:
+                unreadable += 1
+                continue
+            match = _BUDGET_NOTICE_RE.search(str(result))
+            if match:
+                named.append((task, int(match["used"]), int(match["cap"]), "checkpoint"))
+        seen = ", ".join(f"{task}: {n} call(s)" for task, n in sorted(calls.items())) or "no worker calls captured"
+        if not named:
+            outcomes = sorted({f"{r.get('task')}={r.get('outcome')}" for r in snap.worker_runs})
+            if not any(r.get("outcome") == _RUN_COMPLETED for r in snap.worker_runs):
+                # No worker finished inside its cap and none ran out of it: the
+                # card was archived at the delegation ceiling (``reclaimed``),
+                # crashed, or is still open. Nothing here says what cap was in force.
+                return VerificationResult(
+                    success=False,
+                    status="error",
+                    elapsed_time=time.monotonic() - start,
+                    reason=(
+                        "no delegated worker reached its turn-budget checkpoint or ran out, and none finished its "
+                        f"card, so the cap in force cannot be read (runs: {outcomes or ['no run rows']}; {seen})"
+                    ),
+                )
+            all_unreadable = tagged > 0 and unreadable == tagged
+            if snap.worker_capture_gaps or all_unreadable:
+                why = (
+                    "; ".join(snap.worker_capture_gaps)
+                    if snap.worker_capture_gaps
+                    else f"all {unreadable} worker result(s) have no readable text (none recorded, or withheld in the pod)"
+                )
+                return VerificationResult(
+                    success=False,
+                    status="error",
+                    elapsed_time=time.monotonic() - start,
+                    reason=(
+                        f"no delegated worker reached its turn-budget checkpoint or ran out (runs: {outcomes}; {seen}), "
+                        f"but the capture was incomplete, so this check could not be evaluated: {why}"
+                    ),
+                )
+            return VerificationResult(
+                success=False,
+                elapsed_time=time.monotonic() - start,
+                reason=(
+                    f"no delegated worker reached its turn-budget checkpoint or ran out, so the cap in force "
+                    f"was larger than {self.budget} or the card did not outrun it (runs: {outcomes}; {seen})"
+                ),
+            )
+        record = "; ".join(f"{task} {how} {used}/{cap}" for task, used, cap, how in named)
+        wrong = [cap for _, _, cap, _ in named if cap != self.budget]
+        if wrong:
+            return VerificationResult(
+                success=False,
+                elapsed_time=time.monotonic() - start,
+                reason=f"a delegated worker ran under a {wrong[0]}-turn budget, not {self.budget}: {record}",
+            )
+        return VerificationResult(
+            success=True,
+            elapsed_time=time.monotonic() - start,
+            reason=f"delegated worker(s) ran under the {self.budget}-turn budget: {record}",
+        )
+
 _NO_REPLAY_CARD_REASON = (
     f"no {card_wake.SETTLED_ENTRY} entry in the trajectory: the prompt was not a "
     "card-wake replay, so there is no planted card to read"
@@ -4325,9 +4497,16 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             body = ledger["body"]
             named = set(_HEADING_ID_RE.findall(body))
             named |= set(_CODE_SPAN_RE.findall(_HTML_COMMENT_RE.sub("", body)))
-            # Collector-held ids are the collector's, rendered in what the
-            # findings leave; this check grades the findings the run filed.
-            held = {fid for match in _HELD_IDS_RE.findall(body) for fid in _json_str_list(match)}
+            # Collector-held ids are the collector's, and not-re-checked ids
+            # are previous findings this run did not check. Both are rendered
+            # in what the findings leave; this check grades the findings the
+            # run filed.
+            held = {
+                fid
+                for pattern in (_HELD_IDS_RE, _NOT_RECHECKED_IDS_RE)
+                for match in pattern.findall(body)
+                for fid in _json_str_list(match)
+            }
             unnamed = [fid for fid in filed[0] if fid not in named and fid not in held]
             # Past its cap the complete-id block is left out and `filed` is the
             # delta block, which lacks the omitted ids; the renderer's omission

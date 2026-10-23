@@ -4,10 +4,8 @@ Tests argument validation, pure numeric SemVer enforcement, and image promotion
 execution with mock Docker CLI fixtures.
 """
 
-import os
 import pathlib
 import subprocess
-import tempfile
 import unittest
 
 from tests.testing.common import (
@@ -18,7 +16,6 @@ from tests.testing.release import (
     INVALID_GA_RELEASE_TAGS,
     MOCK_CANDIDATE_RELEASE_IMAGES,
     MOCK_REQUIRED_RELEASE_IMAGES,
-    MOCK_SAMPLE_COMMIT_SHA,
     MOCK_TARGET_RELEASE_TAG,
     commit_required_release_images,
     create_mock_docker_binary,

@@ -253,27 +253,31 @@ platform_toolsets:
 toolsets:
   - kanban
 
-# Per-turn tool-calling iteration budget. Hermes defaults to 90, which the fleet
-# audits outgrew when each ran its checks cluster by cluster: three separate runs
-# died on `Iteration budget exhausted (90/90)` — reported as a `timed_out` kanban
-# event, though the run was actively heartbeating and no clock ran out. Most
-# streams, cost and drift among them, now run one collector script that reads
-# the whole fleet in a single call, so a clean run costs the SOP read, the
-# collector, the recommendations and the publish harness. What still scales
-# with the fleet is the Compute Engine and networking audits, which have no
-# collector yet, and the by-hand fallback the SOPs prescribe for every cluster
-# or project a collector marks `unreachable` or `gate-failed` — a bad day on a
-# large fleet is the old per-cluster loop over part of it. 250, roughly triple
-# the observed near-miss, is kept as headroom for those paths.
+# Per-turn tool-calling iteration budget for the kanban workers: every
+# delegated chat request and issue-resolver card is spawned with HERMES_HOME
+# pinned to this profile and reads this value. Pinned rather than unset: a
+# worker is a `hermes chat` process, and the chat CLI's own defaults cap an
+# unset key at 500 (cli.py `_cli_config_defaults`), while the gateway's config
+# loader reads an unset key as no cap at all (hermes_cli/config_defaults.py).
+# 150 is 1.4 times the largest worker seen across a full presubmit run and a
+# full nightly run (2026-10-20: 156 and 132 cards, max 43 and 105 tool calls,
+# p90 22 and 36; the 105 was an upgrades audit requested through chat, which
+# runs inside a card and has no budget of its own).
 #
-# This belongs here rather than in the operator's generated root config because
-# both ways an audit can start read *this* file and not the root one: a cron run
-# on this profile's own roster (agents/platform/cron/jobs.json) is executed with
-# the profile active, and a kanban worker is spawned with HERMES_HOME pinned to
-# the profile. Scoping it here leaves the Chat Agent and the per-cluster Cluster
-# Agents on the default 90, where nothing has ever approached the ceiling.
+# The fleet audits need more: three runs died on `Iteration budget exhausted
+# (90/90)` when each ran its checks cluster by cluster, and the Compute Engine
+# and networking audits plus every SOP's by-hand fallback for an `unreachable`
+# or `gate-failed` cluster still take that path. Their roster entries carry
+# `max_turns: 250` (agents/platform/cron/jobs.json), which the image's scheduler
+# reads ahead of this value (deploy/docker/patches/apply_cron_job_max_turns.py);
+# before that patch this value was 250 and every worker ran with it (#1947).
+#
+# The operator's `spec.harness.tuning.platform.maxTurns` overlays this value; a
+# roster entry's own `max_turns` raises its job above whichever is in force and
+# never lowers it. The Chat Agent and the Cluster Agents leave the key unset,
+# so their gateway turns run uncapped and their workers at the CLI's 500.
 agent:
-  max_turns: 250
+  max_turns: 150
   # Toolsets this profile's turns never need, kept out of every model call. Gemini
   # on Vertex intermittently waits tens of seconds to minutes before its first
   # token when a request declares the full hermes-cli set (36 tools here), and

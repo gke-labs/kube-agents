@@ -60,7 +60,8 @@ repository's store. With no public body to check it against, the next no-forge r
 `current_ids`; when `latest.json` is missing or fails those checks, it reads the newest ring entry
 that passes them, since a failed write drops `latest.json` and leaves the ring. A store with no
 envelope is a first run, and one whose envelopes all fail is a lost memory, as in §4. A previous id the collector still flags is held in `current_ids` and not
-counted as resolved, as the ledger holds it.
+counted as resolved, as the ledger holds it. Over a gap, so is a previous id on a target the run did
+not check ([ledger design §7.4](fleet-audit-issue-ledger.md#74-partial-coverage)).
 
 Two runs have a repository setting but take the no-forge path, and they store marked envelopes. A run
 that could not reach its repository (the broker or the forge refused it) writes `status: NO_FORGE`
@@ -114,7 +115,10 @@ budget. The body's redaction backstop is applied to every string on the way in, 
 never holds a credential shape the public issue blanked — except a finding's `id`, which the hidden
 block publishes raw, and which a long object name can make look like a token. `current_ids` is
 exactly what the body's hidden block lists: the findings the body named, in full or on one line,
-plus the collector-held ids.
+the collector-held ids, and the ids under _Not re-checked this run_ ([ledger design §7.4](fleet-audit-issue-ledger.md#74-partial-coverage)).
+When that last list is not empty, `not_rechecked` gives the title and place of each of its findings,
+because the body may have no row for them and the document does not carry them. A held-open clean
+run copies it from the previous record.
 
 The write is best-effort: a store that cannot be written logs a warning and never changes the run's
 exit code. A failed write deletes `latest.json` on its way out, because the file left behind

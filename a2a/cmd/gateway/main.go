@@ -70,6 +70,12 @@ func buildAdapters(cfg *gateway.Config, primary gateway.Adapter, natsOpts []nats
 	if err != nil {
 		return nil, err
 	}
+	return buildAdaptersWith(cfg, primary, console, log)
+}
+
+// buildAdaptersWith is buildAdapters around a console adapter already
+// dialed, which realMain keeps for the console's chat.notify route.
+func buildAdaptersWith(cfg *gateway.Config, primary gateway.Adapter, console *gateway.ConsoleAdapter, log *slog.Logger) (gateway.Adapter, error) {
 	if primary == nil {
 		return console, nil
 	}
@@ -89,7 +95,17 @@ func buildAdapters(cfg *gateway.Config, primary gateway.Adapter, natsOpts []nats
 // TaskObserver and SessionLookupSink on to the chat backend, which is how
 // the Slack adapter below it learns its session threads.
 func composeAdapters(cfg *gateway.Config, primary gateway.Adapter, doors []gateway.DoorSpec, natsOpts []nats.Option, log *slog.Logger) (gateway.Adapter, error) {
-	chat, err := buildAdapters(cfg, primary, natsOpts, log)
+	console, err := gateway.NewConsoleAdapter(cfg.NATSURL, natsOpts, log)
+	if err != nil {
+		return nil, err
+	}
+	return composeAdaptersWith(cfg, primary, console, doors, log)
+}
+
+// composeAdaptersWith is composeAdapters around a console adapter already
+// dialed.
+func composeAdaptersWith(cfg *gateway.Config, primary gateway.Adapter, console *gateway.ConsoleAdapter, doors []gateway.DoorSpec, log *slog.Logger) (gateway.Adapter, error) {
+	chat, err := buildAdaptersWith(cfg, primary, console, log)
 	if err != nil {
 		return nil, err
 	}
@@ -149,7 +165,13 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 			adapter = chat
 		}
 	case "slack":
-		adapter, err = gateway.NewSlackAdapter(cfg.SlackBotToken, cfg.SlackAppToken, log)
+		var sl *gateway.SlackAdapter
+		sl, err = gateway.NewSlackAdapter(cfg.SlackBotToken, cfg.SlackAppToken, log)
+		if err == nil {
+			// The allowlist's T…:U… entries: other workspaces' members it serves.
+			sl.SetAllowedGuests(cfg.SlackAllowedUsers)
+			adapter = sl
+		}
 	case "":
 		// No real backend: the doors (inject, A2A) and the console are the
 		// only ingresses, which is what lets an eval install's gateway start
@@ -199,7 +221,12 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		doors = append(doors, gateway.A2ADoorSpec(door))
 	}
 
-	adapter, err = composeAdapters(cfg, adapter, doors, natsOpts, log)
+	console, err := gateway.NewConsoleAdapter(cfg.NATSURL, natsOpts, log)
+	if err != nil {
+		log.Error("console adapter", "err", err)
+		return err
+	}
+	adapter, err = composeAdaptersWith(cfg, adapter, console, doors, log)
 	if err != nil {
 		log.Error("console adapter", "err", err)
 		return err
@@ -218,21 +245,13 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		return err
 	}
 	if notifier := chatNotifier(cfg, backendAdapter, gw.Conversations, log); notifier != nil {
-		// Run retries a failed bind and stops the route when its context
-		// ends. This defer runs before client.Close (defers are LIFO), so
-		// every request the route accepted is answered on an open
-		// connection.
-		notifyCtx, cancelNotify := context.WithCancel(ctx)
-		notifierDone := make(chan struct{})
-		go func() {
-			defer close(notifierDone)
-			notifier.Run(notifyCtx, client)
-		}()
-		defer func() {
-			cancelNotify()
-			<-notifierDone
-		}()
+		defer runNotifier(ctx, notifier, client)()
 	}
+	// The console's route runs whenever the console does: a card filed from
+	// a console turn reports back into its conversation as a notify frame.
+	consoleNotifier := gateway.NewConsoleNotifier(console, log)
+	consoleNotifier.SetConversations(gw.Conversations(console))
+	defer runNotifier(ctx, consoleNotifier, client)()
 
 	log.Info("a2a gateway starting",
 		"nats", cfg.NATSURL,
@@ -281,6 +300,24 @@ func chatNotifier(cfg *gateway.Config, backend gateway.Adapter, conversations fu
 	}
 	n.SetConversations(conversations(gchat))
 	return n
+}
+
+// runNotifier runs a chat.notify route until ctx ends, and returns the stop
+// the caller defers. Run retries a failed bind and stops the route when its
+// context ends. The deferred stop runs before client.Close (defers are
+// LIFO), so every request the route accepted is answered on an open
+// connection.
+func runNotifier(ctx context.Context, n *gateway.Notifier, client *lib.Client) func() {
+	notifyCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		n.Run(notifyCtx, client)
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
 }
 
 // serve is realMain's last step: the metrics listener beside the gateway,
