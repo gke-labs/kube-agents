@@ -10,6 +10,8 @@ import json
 import math
 import os
 import hashlib
+import queue
+import random
 import re
 import signal
 import threading
@@ -180,6 +182,10 @@ FEED_STATUS_FOLDED = "folded"
 # others, because its `notified` is 0 and would otherwise read as suppressed. A
 # carded backlog row (DRIFT_BACKLOG_CARDED) reads as a live drift row does.
 FEED_STATUS_BACKLOG = "backlog"
+# The alert was admitted and its triage turn never started: the retries ran out,
+# or the start was queued past `TRIAGE_QUEUE_WAIT_LIMIT_S` and its one attempt
+# failed (`triage_state = aborted`).
+FEED_STATUS_TRIAGE_ABORTED = "triage_aborted"
 # The severity the inject route filters out of chat (see `inject_message`).
 FEED_FILTERED_SEVERITY = "Info"
 # `notified` value stamped on a ledger row when the alert was admitted and
@@ -187,6 +193,83 @@ FEED_FILTERED_SEVERITY = "Info"
 # `_feed_status` reports `injected` while `eod_report_generator` does not count
 # the row under "went to chat as it happened".
 NOTIFIED_HEADLESS = 2
+
+# A ledger row's `triage_state`: written `pending` when the triage start is
+# queued and moved to `started` once the turn is sent or `aborted`, so a row
+# left `pending` is a turn never confirmed sent (a restart drops the queue).
+TRIAGE_STATE_PENDING = "pending"
+TRIAGE_STATE_STARTED = "started"
+TRIAGE_STATE_ABORTED = "aborted"
+
+# Triage starts (session create, then `/chat`) run on their own pool of this
+# many threads. Every `/chat` turn holds a worker of the gateway's default
+# executor (min(32, cpu + 4), from the node's vCPUs: 8 on a 4-vCPU node), and
+# session creates and the readiness probe queue on the same executor: 20 starts
+# at once on a warm gateway lost 10 to create timeouts, 4 at once lost none.
+# Kept off Starlette's request pool, which `/healthz` and the inject routes
+# need. Not read from the environment: the operator passes this container only
+# the variables it allowlists. Measure again (session_management.md, "When a
+# triage cannot start") on a Hermes bump that changes its executor, or on nodes
+# with fewer than 4 vCPUs.
+TRIAGE_START_WORKERS = 4
+# Above Hermes' 20 s SQLite write-lock wait, so a create waiting on the lock is
+# not abandoned first. A create that times out may still commit; the retry then
+# gets 409, which counts as created.
+TRIAGE_CREATE_TIMEOUT_S = 25.0
+# How long `/chat` may hold a slot; the front-door turn files one card and returns.
+TRIAGE_CHAT_TIMEOUT_S = 300.0
+# Retry budget: the time spent on attempts the gateway answered and the waits
+# after them (a timeout counts: the connection was taken). Refused connections
+# and their waits do not spend it; the queue-wait limit bounds them instead.
+TRIAGE_RETRY_BUDGET_S = 300.0
+TRIAGE_RETRY_MAX_ATTEMPTS = 6
+TRIAGE_RETRY_BASE_DELAY_S = 5.0
+TRIAGE_RETRY_MAX_DELAY_S = 60.0
+# Each wait is a random fraction of the backoff in this range, so a burst's
+# retries do not reach the gateway together.
+TRIAGE_RETRY_JITTER = (0.5, 1.0)
+# The gateway's loopback address, when PLATFORM_API_URL does not name one.
+PLATFORM_API_URL_DEFAULT = "http://127.0.0.1:8642"
+# A start queued longer than this still gets one attempt, then no retry, whatever
+# the budget says: the wait bounds the retries, never the first try.
+TRIAGE_QUEUE_WAIT_LIMIT_S = 1200.0
+# The ledger write's wait for the SQLite lock, as the other ledger corrections use.
+LEDGER_WRITE_TIMEOUT_S = 5.0
+# How one gateway call on the way to a triage turn ended: done, worth another
+# try, not worth one, or `/chat` sent with no answer (the turn may be running).
+START_OK = "ok"
+START_RETRY = "retry"
+START_FATAL = "fatal"
+START_UNKNOWN = "unknown"
+GATEWAY_AUTH_REFUSED = (401, 403)
+# Hermes' run limit and its drain answer; neither started a turn.
+GATEWAY_BUSY = (429, 503)
+GATEWAY_SESSION_EXISTS = 409
+GATEWAY_SESSION_NOT_FOUND = 404
+HTTP_SERVER_ERROR = 500
+# The `detail` given to a `/chat` 404: the session is gone, so the retry creates it
+# again, once; a second 404 after that is not a lost session.
+GATEWAY_SESSION_LOST = "session-not-found"
+# Which producer a triage start came from, in its log lines and its notice.
+TRIAGE_SOURCE_EVENT = "event"
+TRIAGE_SOURCE_DRIFT = "drift"
+TRIAGE_SOURCE_STALL = "stall"
+# The give-up notice. Fixed text: the payload reaches it only as the first line
+# of the alert already posted, quoted when the notice has no thread to go in.
+# Each says whether the alert comes back and what the reader can do now; a reply
+# in the alert's thread reaches the Chat Agent with the alert attached.
+TRIAGE_NOTICE_HEAD = "⚠️ **Triage did not start for this alert.**"
+TRIAGE_NOTICE_BY_SOURCE = {
+    TRIAGE_SOURCE_EVENT: (
+        "This alert is not raised again while the workload keeps failing; it comes back only after 24 hours "
+        "with no failures. Ask about it here to start a diagnosis now."
+    ),
+    TRIAGE_SOURCE_DRIFT: "This change is not reported again. Ask about it here to have it reviewed now.",
+    TRIAGE_SOURCE_STALL: (
+        "This alert is raised again after 24 hours if the stall continues. Ask about it here to start a "
+        "diagnosis now."
+    ),
+}
 
 # Deliberately not API_SERVER_KEY. That value is the loopback sentinel
 # `cluster-internal-trusted` — a marker, not a secret — so reusing it here would
@@ -220,7 +303,7 @@ CONVERSATION_HASHED_HEX_CHARS = 32
 # The conversation key's prefix for each platform the A2A gateway can hold, as
 # the gateway spells its session-record keys (gchatConversationID,
 # slackConversationID); a key for another backend is refused.
-CONVERSATION_KEY_PREFIXES = {"google_chat": "gchat:", "slack": "slack:"}
+CONVERSATION_KEY_PREFIXES = {"google_chat": "gchat:", "slack": "slack:", "console": "console:"}
 # The metadata key the route is kept under. Its own key, not the row's
 # platform/chat_id/thread_id: those are a chat thread's address, which other
 # readers (send_notification, the delegation headers) use as one, and a
@@ -245,6 +328,19 @@ CONVERSATION_ROUTE_USER_KEY = "user_id"
 CONVERSATION_ROUTE_USER_TOKEN = re.compile(r"hmac:[0-9a-f]{32}")
 CONVERSATION_ROUTE_CHAT_TYPE_KEY = "chat_type"
 CONVERSATION_ROUTE_CHAT_TYPES = frozenset({"dm", "group"})
+# A console conversation's route also carries the gateway task its turn runs,
+# which a card the turn files snapshots so its report names the turn it
+# answers. Kept only when it is a task id's shape: one DNS-1123 label, as the
+# gateway's lib.ValidSubjectToken requires of a task id.
+CONVERSATION_ROUTE_TASK_KEY = "task_id"
+# A console card's subscription thread is "console:<token>#<taskId>": the
+# conversation key and the turn's task, joined by this separator
+# (kanban_event_routing.CONSOLE_THREAD_TASK_SEP and
+# kanban_chat_notify.CONSOLE_THREAD_TASK_SEP spell it too). The card stop
+# matches such a thread to its conversation by the key before it.
+CONSOLE_CONVERSATION_PREFIX = "console:"
+CONSOLE_THREAD_TASK_SEP = "#"
+CONVERSATION_TASK_ID_TOKEN = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
 
 # Hermes' managed scope, the administrator-pinned layer `load_hermes_dotenv`
 # applies LAST with override=True. The operator mounts it at /etc/hermes and
@@ -1114,12 +1210,14 @@ def init_db() -> None:
             # `backlog` and `principal` arrived with the drift backlog digest,
             # added the same way. `principal` is written on backlog rows only,
             # for the digest's per-principal count; a live drift row names its
-            # principal in `message`, and an event row has none.
+            # principal in `message`, and an event row has none. `triage_state`
+            # came after them, the same way.
             for column, ddl in (
                 ("session_id", "session_id TEXT NOT NULL DEFAULT ''"),
                 ("backlog", f"backlog INTEGER NOT NULL DEFAULT {DRIFT_BACKLOG_NONE}"),
                 ("principal", "principal TEXT NOT NULL DEFAULT ''"),
                 ("payload", "payload TEXT NOT NULL DEFAULT ''"),
+                ("triage_state", "triage_state TEXT NOT NULL DEFAULT ''"),
                 # The ledger id of the admitted event this one was folded
                 # into (INCIDENT_WORKLOAD_DEDUP_SECONDS); NULL on every other row.
                 ("duplicate_of", "duplicate_of INTEGER"),
@@ -1472,6 +1570,25 @@ def mark_delivery_headless(event_row_id: Optional[int]) -> None:
                 )
     except Exception as exc:
         logger.error(f"Failed to record headless delivery for ledger row {event_row_id}: {exc}")
+
+
+def mark_triage_state(event_row_id: Optional[int], state: str) -> None:
+    """Record where a ledger row's triage start stands (`TRIAGE_STATE_*`).
+
+    Best-effort, as the other ledger corrections: a failed write must not stop
+    the triage start it describes.
+    """
+    if not event_row_id:
+        return
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=LEDGER_WRITE_TIMEOUT_S)) as conn:
+            with conn:
+                conn.execute(
+                    "UPDATE intercepted_events SET triage_state = ? WHERE id = ?",
+                    (state, int(event_row_id)),
+                )
+    except Exception as exc:
+        logger.error(f"Failed to record triage state {state} for ledger row {event_row_id}: {exc}")
 
 
 def mark_triage_not_started(event_row_id: Optional[int]) -> None:
@@ -2158,10 +2275,7 @@ def _register_session_routing(session_id: str, platform: str, thread_id: str) ->
                     meta = json.loads(row[0])
                     meta["thread_id"] = thread_id
                     meta["platform"] = platform
-                    if platform == "slack":
-                        meta["chat_id"] = _slack_home_channel()
-                    else:
-                        meta["chat_id"] = thread_id.split("/threads/")[0]
+                    meta["chat_id"] = _thread_chat_id(platform, thread_id)
 
                     threads = meta.get("platform_threads")
                     if not isinstance(threads, dict):
@@ -2212,7 +2326,62 @@ def _record_alert_title(session_id: str, title: str) -> None:
         logger.warning(f"Failed to record the alert title for {session_id}: {exc}")
 
 
-def _create_gateway_session(api_url: str, session_id: str, headers: Dict[str, str]) -> bool:
+class _GatewayAttempt(NamedTuple):
+    """One call on the way to a triage turn: `outcome` is a `START_*` value.
+
+    `answered` is False only for a refused connection, which does not spend the
+    retry budget. True when the call succeeded.
+    """
+
+    outcome: str
+    detail: str = ""
+    answered: bool = True
+    retry_after: float = 0.0
+
+    def __bool__(self) -> bool:
+        return self.outcome == START_OK
+
+
+def _retry_after_seconds(exc: urllib.error.HTTPError) -> float:
+    try:
+        value = float(exc.headers.get("Retry-After") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return value if math.isfinite(value) and value > 0 else 0.0
+
+
+def _gateway_failure(exc: Exception, turn_sent: bool) -> _GatewayAttempt:
+    """Classify a failed create (`turn_sent=False`) or `/chat` call (`turn_sent=True`).
+
+    Only a failure that proves no turn started is retried. Once `/chat` was
+    sent, an error while waiting for the answer or a 5xx other than 503 may
+    hide a turn that is running, and a second one would file a second card.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        code = exc.code
+        detail = f"http-{code}"
+        if code in GATEWAY_AUTH_REFUSED:
+            return _GatewayAttempt(START_FATAL, detail)
+        if code in GATEWAY_BUSY:
+            return _GatewayAttempt(START_RETRY, detail, retry_after=_retry_after_seconds(exc))
+        if turn_sent and code == GATEWAY_SESSION_NOT_FOUND:
+            return _GatewayAttempt(START_RETRY, GATEWAY_SESSION_LOST)
+        if code >= HTTP_SERVER_ERROR:
+            return _GatewayAttempt(START_UNKNOWN if turn_sent else START_RETRY, detail)
+        return _GatewayAttempt(START_FATAL, detail)
+    reason = getattr(exc, "reason", exc)
+    if isinstance(reason, ConnectionRefusedError):
+        return _GatewayAttempt(START_RETRY, "refused", answered=False)
+    detail = "timeout" if isinstance(reason, TimeoutError) else type(reason).__name__
+    # urlopen wraps an error raised while connecting or sending the request in
+    # URLError; an error while waiting for the response (a read timeout) comes
+    # out unwrapped. Only the unwrapped one may hide a turn that is running.
+    if turn_sent and not isinstance(exc, urllib.error.URLError):
+        return _GatewayAttempt(START_UNKNOWN, detail)
+    return _GatewayAttempt(START_RETRY, detail)
+
+
+def _create_gateway_session(api_url: str, session_id: str, headers: Dict[str, str]) -> _GatewayAttempt:
     """POST request to local gateway API to initialize the troubleshooting session ID.
 
     The session lands on the gateway's default profile — the Planning Agent — and
@@ -2229,15 +2398,17 @@ def _create_gateway_session(api_url: str, session_id: str, headers: Dict[str, st
             headers=headers,
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=10.0) as resp:
-            return True
+        with urllib.request.urlopen(req, timeout=TRIAGE_CREATE_TIMEOUT_S):
+            return _GatewayAttempt(START_OK)
     except urllib.error.HTTPError as exc:
-        if exc.code == 409:  # 409 Conflict means it already exists, which is acceptable
-            return True
+        # It already exists: a retry after a create that timed out and still committed.
+        if exc.code == GATEWAY_SESSION_EXISTS:
+            return _GatewayAttempt(START_OK)
         logger.error(f"Failed to create gateway API session (code {exc.code}): {exc.read().decode()}")
+        return _gateway_failure(exc, turn_sent=False)
     except Exception as exc:
         logger.error(f"Failed to connect to gateway API server: {exc}")
-    return False
+        return _gateway_failure(exc, turn_sent=False)
 
 
 def _triage_task_body(payload: Dict[str, Any]) -> str:
@@ -3124,23 +3295,8 @@ def _stall_agent_query(payload: Dict[str, Any]) -> str:
     )
 
 
-def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[str, str]) -> bool:
-    """Post the agent query request to execute the diagnostic reasoning loop.
-
-    True when the turn may have started: a 5xx other than 503, or an error
-    while waiting for the response, which may be a turn that outlived the
-    timeout. An error while connecting or sending (URLError) is False. Reading either as
-    refused would let a sibling open a second triage beside it
-    (mark_triage_not_started). Anything else is False. In the Hermes route
-    (`_handle_session_chat`) a 4xx is a failed check before the turn, a 503 is
-    `gateway_draining` (the admission wrapper, which `POST /api/sessions` does
-    not have, so a draining gateway creates the session and refuses the turn)
-    or `session_db_unavailable`, and no turn ran for either. The route sends
-    no redirect; a 307 or 308 from anything in front of it is one urlopen does
-    not follow for a POST, so no turn ran for that either. A 5xx out of
-    `_run_agent` comes after the turn started, possibly after the front door
-    filed its card.
-    """
+def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[str, str]) -> _GatewayAttempt:
+    """Post the agent query request to execute the diagnostic reasoning loop."""
     try:
         req = urllib.request.Request(
             f"{api_url}/api/sessions/{session_id}/chat",
@@ -3148,24 +3304,196 @@ def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[s
             headers=headers,
             method="POST"
         )
-        # urlopen raises HTTPError for every non-2xx it does not follow, so a
-        # returned response is an accepted turn (a followed 301/302/303 would
-        # land elsewhere as a GET; the Hermes route sends none).
-        with urllib.request.urlopen(req, timeout=GATEWAY_TURN_TIMEOUT_S):
-            pass
-    except urllib.error.HTTPError as exc:
-        logger.error(f"Gateway API chat execution failed (status {exc.code})")
-        return exc.code >= HTTP_SERVER_ERROR_MIN and exc.code != HTTP_SERVICE_UNAVAILABLE
-    except urllib.error.URLError as exc:
-        # urlopen wraps an error raised while connecting or sending the request
-        # (a refused connection, a connect timeout) in URLError; an error while
-        # waiting for the response, such as a read timeout, comes out unwrapped.
-        # So this one is a request the gateway never had in full: no turn.
-        logger.error(f"Gateway API chat request was not delivered: {exc.reason}")
-        return False
+        with urllib.request.urlopen(req, timeout=TRIAGE_CHAT_TIMEOUT_S) as resp:
+            if resp.status != 200:
+                logger.error(f"Gateway API chat execution failed (status {resp.status})")
+            return _GatewayAttempt(START_OK)
     except Exception as exc:
         logger.error(f"Failed to call gateway API chat execution: {exc}")
-    return True
+        return _gateway_failure(exc, turn_sent=True)
+
+
+class _TriageNotice(NamedTuple):
+    """Where a give-up notice goes. `thread_id` empty: post to `platform` and quote `alert`."""
+
+    platform: str
+    thread_id: str
+    alert: str
+
+
+class _TriageStart(NamedTuple):
+    session_id: str
+    payload: Dict[str, Any]
+    event_row_id: Optional[int]
+    notice: Optional[_TriageNotice]
+    queued_at: float
+
+
+class _TriageStartPool:
+    """`workers` daemon threads on one queue.
+
+    Not a `ThreadPoolExecutor`: its workers are joined at interpreter exit, so a
+    daemon restart would wait for every start still retrying or in `/chat`.
+    """
+
+    def __init__(self, workers: int):
+        self._queue: "queue.Queue[tuple]" = queue.Queue()
+        self.threads = [
+            threading.Thread(target=self._work, name=f"triage-start-{i}", daemon=True) for i in range(workers)
+        ]
+        for thread in self.threads:
+            thread.start()
+
+    def submit(self, fn, *args) -> None:
+        self._queue.put((fn, args))
+
+    def _work(self) -> None:
+        while True:
+            fn, args = self._queue.get()
+            try:
+                fn(*args)
+            except Exception:
+                logger.exception("Triage start worker raised")
+
+
+_TRIAGE_START_POOL: Optional[_TriageStartPool] = None
+_TRIAGE_START_POOL_LOCK = threading.Lock()
+
+
+def _triage_start_pool() -> _TriageStartPool:
+    global _TRIAGE_START_POOL
+    with _TRIAGE_START_POOL_LOCK:
+        if _TRIAGE_START_POOL is None:
+            _TRIAGE_START_POOL = _TriageStartPool(TRIAGE_START_WORKERS)
+        return _TRIAGE_START_POOL
+
+
+def _alert_for(platform: str, alert_msg: str, slack_alert_msg: Optional[str]) -> str:
+    return slack_alert_msg if platform == SLACK_PLATFORM and slack_alert_msg else alert_msg
+
+
+def _triage_source(payload: Dict[str, Any]) -> str:
+    kind = payload.get("kind")
+    if kind == INJECT_KIND_DRIFT:
+        return TRIAGE_SOURCE_DRIFT
+    if kind == INJECT_KIND_STALL:
+        return TRIAGE_SOURCE_STALL
+    return TRIAGE_SOURCE_EVENT
+
+
+def _gateway_headers() -> Dict[str, str]:
+    """Read per attempt: Hermes can rewrite its key file while a start is retrying."""
+    headers = {"Content-Type": "application/json"}
+    token = _gateway_api_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _triage_retry_delay(retry: int, retry_after: float) -> float:
+    delay = min(TRIAGE_RETRY_MAX_DELAY_S, TRIAGE_RETRY_BASE_DELAY_S * 2 ** retry) * random.uniform(*TRIAGE_RETRY_JITTER)
+    return max(delay, retry_after)
+
+
+def _triage_sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _run_triage_start(start: _TriageStart) -> None:
+    """Create the session and start the turn, retrying what provably did not start.
+
+    Runs on the triage pool, so at most `TRIAGE_START_WORKERS` starts reach the
+    gateway at once; the slot is held through `/chat` and through the waits.
+    """
+    try:
+        _attempt_triage_start(start)
+    except Exception as exc:
+        logger.exception(f"Triage start for {start.session_id} raised")
+        _triage_not_started(start, f"error-{type(exc).__name__}")
+
+
+def _attempt_triage_start(start: _TriageStart) -> None:
+    session_id = start.session_id
+    waited = time.monotonic() - start.queued_at
+    logger.info(f"TRIAGE_DEQUEUED session={session_id} waited={waited:.0f}s")
+    api_url = os.environ.get("PLATFORM_API_URL", PLATFORM_API_URL_DEFAULT)
+    # The session lands on the default profile — the front door — which
+    # delegates it to the failing cluster's own agent; see _build_agent_query.
+    agent_query = _build_agent_query(start.payload)
+    need_session = True
+    recreated = False
+    answered = 0
+    budget_spent = 0.0
+    retry = 0
+    # Stamped here, after the queue wait and before the first create, so the
+    # pre-kanban read ages the turn from its dispatch (mark_dispatched).
+    mark_dispatched(start.event_row_id)
+    while True:
+        began = time.monotonic()
+        headers = _gateway_headers()
+        attempt = _create_gateway_session(api_url, session_id, headers) if need_session else _GatewayAttempt(START_OK)
+        if attempt:
+            need_session = False
+            attempt = _start_agent_turn(api_url, session_id, agent_query, headers)
+            if attempt.outcome in (START_OK, START_UNKNOWN):
+                # UNKNOWN: `/chat` was sent and not answered; the turn may be
+                # running, so it is neither retried nor reported as not started.
+                mark_triage_state(start.event_row_id, TRIAGE_STATE_STARTED)
+                logger.info(f"TRIAGE_STARTED session={session_id} answer={attempt.outcome} {attempt.detail}".rstrip())
+                return
+            if attempt.detail == GATEWAY_SESSION_LOST:
+                if recreated:
+                    attempt = attempt._replace(outcome=START_FATAL, detail=f"http-{GATEWAY_SESSION_NOT_FOUND}")
+                need_session = recreated = True
+        if attempt.outcome == START_FATAL:
+            _triage_not_started(start, attempt.detail)
+            return
+        now = time.monotonic()
+        left = TRIAGE_QUEUE_WAIT_LIMIT_S - (now - start.queued_at)
+        if attempt.answered:
+            answered += 1
+            budget_spent += now - began
+            # The budget bounds answered attempts only: a refused connection
+            # (a gateway restarting after it spent the budget) waits under the
+            # queue limit, and the next answered attempt settles it.
+            left = min(left, TRIAGE_RETRY_BUDGET_S - budget_spent)
+        if answered >= TRIAGE_RETRY_MAX_ATTEMPTS or left <= 0:
+            _triage_not_started(start, attempt.detail)
+            return
+        delay = min(_triage_retry_delay(retry, attempt.retry_after), left)
+        if attempt.answered:
+            budget_spent += delay
+        retry += 1
+        logger.warning(f"Triage start for {session_id} failed ({attempt.detail}); retrying in {delay:.0f}s")
+        _triage_sleep(delay)
+
+
+def _thread_chat_id(platform: str, thread_id: str) -> str:
+    """The chat a thread belongs to, as `hermes send --to` and the routing row name it."""
+    if platform == SLACK_PLATFORM:
+        return _slack_home_channel()
+    return thread_id.split("/threads/")[0]
+
+
+def _triage_not_started(start: _TriageStart, reason: str) -> None:
+    """Record and report a triage start that will not happen."""
+    source = _triage_source(start.payload)
+    logger.error(f"TRIAGE_NOT_STARTED session={start.session_id} source={source} reason={reason}")
+    mark_triage_state(start.event_row_id, TRIAGE_STATE_ABORTED)
+    # Nobody is working on this alert now: let the next sibling start a triage.
+    mark_triage_not_started(start.event_row_id)
+    notice = start.notice
+    if notice is None:
+        return
+    message = f"{TRIAGE_NOTICE_HEAD} {TRIAGE_NOTICE_BY_SOURCE[source]}"
+    if notice.thread_id:
+        chat_id = _thread_chat_id(notice.platform, notice.thread_id)
+        sent = _send_to_chat(notice.platform, message, chat_id, notice.thread_id)
+    else:
+        quoted = notice.alert.splitlines()[0] if notice.alert else ""
+        sent = _send_to_chat(notice.platform, f"{message}\n> {quoted}" if quoted else message)
+    if not sent:
+        logger.error(f"Notice that triage did not start for {start.session_id} was not delivered to '{notice.platform}'")
 
 
 def trigger_agent_troubleshooter(
@@ -3184,8 +3512,9 @@ def trigger_agent_troubleshooter(
     An exception releases the row's fold anchor before it propagates: the
     ledger row was written as admitted before this task was queued, and a task
     that died before the turn would otherwise leave every sibling folding into
-    a triage that never started (mark_triage_not_started). _start_agent_turn
-    catches its own errors, so nothing raised here comes after a turn began.
+    a triage that never started (mark_triage_not_started). The start itself is
+    queued last and runs on the triage pool, where _run_triage_start releases
+    the anchor the same way when it gives up.
     """
     try:
         _trigger_agent_troubleshooter(
@@ -3228,22 +3557,24 @@ def _trigger_agent_troubleshooter(
     #    refused, so on an install whose first leg accepts, nothing would say
     #    the second was skipped.
     platforms = enabled_chat_platforms()
+    # Where a "triage did not start" notice goes: the alert's thread, or the
+    # platform alone (with the alert quoted) when the alert has no thread. None
+    # when no alert reached chat, since a notice about it would refer to nothing.
+    notice: Optional[_TriageNotice] = None
     if platforms == [DEFAULT_CHAT_PLATFORM] and _chat_platforms_disabled():
         mark_delivery_headless(event_row_id)
     else:
         active_platform = get_active_platform(platforms)
         thread_id = None
         for candidate in [active_platform] + [p for p in platforms if p != active_platform]:
-            thread_id = _post_initial_alert(
-                candidate, slack_alert_msg if candidate == SLACK_PLATFORM and slack_alert_msg else alert_msg,
-                session_id,
-            )
+            thread_id = _post_initial_alert(candidate, _alert_for(candidate, alert_msg, slack_alert_msg), session_id)
             if thread_id == ALERT_SENT_WITHOUT_THREAD:
                 # Delivered, and unthreadable. Stop: the reader has the alert, and
                 # trying the next platform would post it to a second channel to
                 # chase a thread id. Fall into the `else` below, which records the
                 # delivery as unconfirmed rather than lost — the honest reading.
                 active_platform, thread_id = candidate, None
+                notice = _TriageNotice(candidate, "", _alert_for(candidate, alert_msg, slack_alert_msg))
                 break
             if thread_id:
                 active_platform = candidate
@@ -3255,11 +3586,12 @@ def _trigger_agent_troubleshooter(
                 )
 
         # 2. Register thread-to-session mappings for two-way chat routing. This has
-        #    to happen before the turn in step 5: the card that turn files reads
+        #    to happen before the turn step 3 queues: the card that turn files reads
         #    this row to address its completion back to the alert's thread (see
         #    deploy/docker/patches/kanban_event_routing.py).
         if thread_id:
             _register_session_routing(session_id, active_platform, thread_id)
+            notice = _TriageNotice(active_platform, thread_id, "")
             if alert_title and active_platform == SLACK_PLATFORM:
                 _record_alert_title(session_id, alert_title)
             # Armed here, before the gateway is contacted: an alert whose turn
@@ -3292,30 +3624,13 @@ def _trigger_agent_troubleshooter(
                 f"({', '.join(platforms)}); the daily recap will report it as undelivered"
             )
 
-
-    # 3. Configure HTTP authentication headers for Hermes REST gateway
-    api_url = os.environ.get("PLATFORM_API_URL", "http://127.0.0.1:8642")
-    headers = {"Content-Type": "application/json"}
-    token = _gateway_api_token()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    # 4. Instantiate the session in Platform Gateway. It lands on the default
-    #    profile — the front door — which delegates it to the failing cluster's
-    #    own agent; see _build_agent_query. The ledger row is stamped
-    #    dispatched here, not at its insert: the queue and the chat post sit
-    #    between the two, and the pre-kanban read ages the turn from this.
-    mark_dispatched(event_row_id)
-    session_created = _create_gateway_session(api_url, session_id, headers)
-    if not session_created:
-        logger.error(f"Aborting troubleshooting trigger: session creation failed for {session_id}")
-        mark_triage_not_started(event_row_id)
-        return
-
-    # 5. Formulate instructions query and execute the agent turn
-    agent_query = _build_agent_query(payload)
-    if not _start_agent_turn(api_url, session_id, agent_query, headers):
-        mark_triage_not_started(event_row_id)
+    # 3. Queue the start (session create, then the turn) on the triage pool and
+    #    return; this task runs on Starlette's request pool and must not wait.
+    #    The marker comes first, so a start a restart loses stays `pending`.
+    mark_triage_state(event_row_id, TRIAGE_STATE_PENDING)
+    start = _TriageStart(session_id, payload, event_row_id, notice, time.monotonic())
+    logger.info(f"TRIAGE_QUEUED session={session_id} source={_triage_source(payload)}")
+    _triage_start_pool().submit(_run_triage_start, start)
 
 
 # --------------------------------------------------------------------------
@@ -5631,7 +5946,7 @@ def inject_message(
         f"🌱 _Digging down to the root cause..._"
     )
 
-    # Delegate the heavy REST API call to FastAPI BackgroundTasks to keep response times sub-millisecond
+    # Hand the alert post and the triage start to a FastAPI background task, so the answer is immediate
     background_tasks.add_task(
         trigger_agent_troubleshooter,
         session_id,
@@ -5820,7 +6135,8 @@ def put_conversation_route(session_id: str, request_data: Dict[str, Any]) -> Dic
     the turn files subscribes to `api_server` and this session id, and
     `deploy/docker/patches/kanban_event_routing.py` reads what this stores under
     `conversation_route` (`platform`, `conversation`, the gateway's key, and
-    `context_id`) and addresses the subscription to the conversation; `ask`,
+    `context_id`, and on a console conversation `task_id`, the turn's gateway
+    task) and addresses the subscription to the conversation; `ask`,
     when the bridge sends a valid token, is the kind of the turn's ask, which
     the notifier's chat messages keep marked while the cards run. The
     kanban notifier then posts the card's report with `a2a notify
@@ -5836,6 +6152,7 @@ def put_conversation_route(session_id: str, request_data: Dict[str, Any]) -> Dic
     conversation = str(request_data.get("conversation") or "").strip()
     context_id = str(request_data.get("context_id") or "").strip()
     ask = str(request_data.get(CONVERSATION_ROUTE_ASK_KEY) or "").strip()
+    task_id = str(request_data.get(CONVERSATION_ROUTE_TASK_KEY) or "").strip()
     user_id = str(request_data.get(CONVERSATION_ROUTE_USER_KEY) or "").strip()
     chat_type = str(request_data.get(CONVERSATION_ROUTE_CHAT_TYPE_KEY) or "").strip().lower()
     if platform:
@@ -5882,6 +6199,8 @@ def put_conversation_route(session_id: str, request_data: Dict[str, Any]) -> Dic
                 route[CONVERSATION_ROUTE_USER_KEY] = user_id
             if chat_type in CONVERSATION_ROUTE_CHAT_TYPES:
                 route[CONVERSATION_ROUTE_CHAT_TYPE_KEY] = chat_type
+            if CONVERSATION_TASK_ID_TOKEN.fullmatch(task_id):
+                route[CONVERSATION_ROUTE_TASK_KEY] = task_id
             meta[CONVERSATION_ROUTE_KEY] = route
             conn.execute(
                 "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?) "
@@ -6129,6 +6448,7 @@ def _feed_status(
     delivery_error: str,
     backlog: int = DRIFT_BACKLOG_NONE,
     duplicate_of: Optional[int] = None,
+    triage_state: str = "",
 ) -> str:
     """What became of a ledger row, in the inject route's own words.
 
@@ -6140,13 +6460,18 @@ def _feed_status(
     `delivery_error` is written only when a chat post was attempted and failed.
     A backlog row that is not carded is `backlog` whatever the other three say,
     and a row with `duplicate_of` is `folded`.
+    `triage_state` is read on a `notified` row only: an admitted alert whose
+    triage never started is still `notified`, and `injected` would say the triage
+    is under way. A row whose delivery failed or is unconfirmed stays
+    `undelivered` whatever its triage did: that the alert may not have been seen
+    is the fact a reader needs first.
     """
     if backlog and backlog != DRIFT_BACKLOG_CARDED:
         return FEED_STATUS_BACKLOG
     if duplicate_of is not None:
         return FEED_STATUS_FOLDED
     if notified:
-        return FEED_STATUS_INJECTED
+        return FEED_STATUS_TRIAGE_ABORTED if triage_state == TRIAGE_STATE_ABORTED else FEED_STATUS_INJECTED
     if delivery_error:
         return FEED_STATUS_UNDELIVERED
     if severity == FEED_FILTERED_SEVERITY:
@@ -6172,7 +6497,7 @@ def list_intercepted_events(
     limit = _clamp_limit(limit, FEED_EVENTS_MAX_LIMIT)
     columns = (
         "id, session_id, created_at, cluster, namespace, object_kind, workload, "
-        "reason, severity, notified, delivery_error, message, backlog, duplicate_of"
+        "reason, severity, notified, delivery_error, message, backlog, duplicate_of, triage_state"
     )
     with closing(_read_only(SESSION_KV_DB_PATH)) as conn:
         if since_id is not None:
@@ -6197,7 +6522,8 @@ def list_intercepted_events(
             "reason": row["reason"],
             "severity": row["severity"],
             "status": _feed_status(
-                row["notified"], row["severity"], row["delivery_error"], row["backlog"], row["duplicate_of"]
+                row["notified"], row["severity"], row["delivery_error"], row["backlog"],
+                row["duplicate_of"], row["triage_state"],
             ),
             "message": row["message"],
             "duplicate_of": row["duplicate_of"],
@@ -8048,12 +8374,19 @@ def _collect_card_tree(
 
     frontier = reach([r[0] for r in _ids_where_in(conn, "SELECT id FROM tasks WHERE session_id IN ({marks})", sessions)], "session")
     if conversation and _has_table(conn, "kanban_notify_subs"):
+        # A console card's thread carries its turn's task after the key
+        # (CONSOLE_THREAD_TASK_SEP), so it is matched by that prefix too.
+        thread_match, thread_args = "s.thread_id = ?", [conversation]
+        if conversation.startswith(CONSOLE_CONVERSATION_PREFIX):
+            prefix = conversation + CONSOLE_THREAD_TASK_SEP
+            thread_match = "(s.thread_id = ? OR substr(s.thread_id, 1, ?) = ?)"
+            thread_args = [conversation, len(prefix), prefix]
         subscribed = conn.execute(
             "SELECT s.task_id FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
-            "WHERE s.chat_id = ? AND s.thread_id = ? AND t.session_id IS NULL "
+            f"WHERE s.chat_id = ? AND {thread_match} AND t.session_id IS NULL "
             "AND NOT EXISTS (SELECT 1 FROM task_links l JOIN kanban_notify_subs p ON p.task_id = l.parent_id "
             "                WHERE l.child_id = s.task_id AND p.chat_id = s.chat_id AND p.thread_id = s.thread_id)",
-            (session_id, conversation),
+            (session_id, *thread_args),
         )
         frontier += reach([r[0] for r in subscribed], "subscription")
     children_table = _has_table(conn, CARD_STOP_CHILDREN_TABLE)

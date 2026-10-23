@@ -154,9 +154,12 @@ type Notifier struct {
 	// the gateway's conversations; nil leaves conversation requests refused.
 	convPrefix string
 	conv       NotifyConversations
-	log        *slog.Logger
-	jobs       chan notifyJob
-	done       chan struct{}
+	// frames, set on the console notifier only, posts each conversation
+	// request as one notify frame (postConsole).
+	frames consoleFramePoster
+	log    *slog.Logger
+	jobs   chan notifyJob
+	done   chan struct{}
 
 	// mu orders handle's enqueue against Stop's close of jobs: a request that
 	// arrives while Stop runs is refused under the lock rather than sent on a
@@ -223,6 +226,32 @@ func NewSlackNotifier(poster notifyPoster, home string, log *slog.Logger) (*Noti
 		convPrefix: slackKeyPrefix}
 	n.threadOK, n.threadTS = n.slackThreadOK, slackThreadTS
 	return n, nil
+}
+
+// replyToRooter maps a report's reply_to to the task a console client knows
+// it by (gatewayConversations.ReplyToRoot). Optional: conversations without
+// it pass reply_to through.
+type replyToRooter interface {
+	ReplyToRoot(ctx context.Context, conversation, taskID string) string
+}
+
+// consoleFramePoster is what the console notifier posts through: one frame
+// per request, a keyed request's later post editing it, with the task the
+// report answers. The console adapter implements it (PostNotifyFrame).
+type consoleFramePoster interface {
+	PostNotifyFrame(conversation, messageID, text, replyTo string, edit bool) (string, error)
+}
+
+// NewConsoleNotifier builds the console door's notifier. The console has no
+// home channel, so it serves conversation requests only, and each is one
+// notify frame on the conversation's .out subject (postConsole) rather than
+// a chunked or laid-out chat post: a console client reads text, and a frame
+// carries a whole report.
+func NewConsoleNotifier(frames consoleFramePoster, log *slog.Logger) *Notifier {
+	if log == nil {
+		log = slog.Default()
+	}
+	return &Notifier{subject: lib.NotifySubjectConsole, frames: frames, log: log, convPrefix: consoleKeyPrefix}
 }
 
 // SetConversations arms requests aimed at a conversation the gateway holds.
@@ -563,6 +592,10 @@ func (n *Notifier) post(job notifyJob) {
 			return
 		}
 	}
+	if n.frames != nil {
+		n.postConsole(job)
+		return
+	}
 	// A conversation request never carries blocks (validateConversation),
 	// and postBlocks posts only into home, so the conversation test goes
 	// first: the order is a second guard, not the only one.
@@ -613,6 +646,43 @@ func (n *Notifier) post(job notifyJob) {
 		}
 	}
 	n.log.Info("notify posted", "home", n.home, "thread", thread, "message", first)
+}
+
+// postConsole answers a console conversation's request with one notify
+// frame: the text whole (the chat message's text is its fallback, and the
+// console renders text), an Update key editing the frame its key last posted
+// here, and ReplyTo passed on when it is a task id's shape.
+func (n *Notifier) postConsole(job notifyJob) {
+	conversation, key := job.req.Conversation, job.req.Update
+	messageID, edit := "", false
+	if key != "" {
+		if message, ok := n.updates.get(conversation, key); ok {
+			messageID, edit = message, true
+		}
+	}
+	replyTo := job.req.ReplyTo
+	if replyTo != "" && !lib.ValidSubjectToken(replyTo) {
+		n.log.Warn("notify: reply_to dropped: not a task id", "conversation", conversation, "bytes", len(replyTo))
+		replyTo = ""
+	}
+	// A card filed in a delegated child's turn names the child, which the
+	// console client was never told of; it knows the chain by its root.
+	if rooter, ok := n.conv.(replyToRooter); ok && replyTo != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), notifyLookupTimeout)
+		replyTo = rooter.ReplyToRoot(ctx, conversation, replyTo)
+		cancel()
+	}
+	message, err := n.frames.PostNotifyFrame(conversation, messageID, job.req.Text, replyTo, edit)
+	if err != nil {
+		n.log.Error("notify post failed", "conversation", conversation, "update", key, "err", err)
+		n.reply(job, lib.NotifyReply{Error: "post failed: " + err.Error()})
+		return
+	}
+	if key != "" {
+		n.updates.put(conversation, key, message)
+	}
+	n.reply(job, lib.NotifyReply{MessageID: message, ThreadID: conversation})
+	n.log.Info("notify posted", "conversation", conversation, "message", message, "update", key, "replyTo", replyTo)
 }
 
 // postConversation answers a conversation request that carries a chat
@@ -982,6 +1052,22 @@ func (c gatewayConversations) ConversationContext(ctx context.Context, key strin
 		return "", err
 	}
 	return rec.ContextID, nil
+}
+
+// ReplyToRoot is the task a console client knows taskID by: the root of its
+// delegation chain (observedAs), since a client is told of a chain only
+// under its root. A task the conversation's record does not hold, or a
+// record that cannot be read, gives taskID back unchanged.
+func (c gatewayConversations) ReplyToRoot(ctx context.Context, conversation, taskID string) string {
+	rec, err := c.g.reg.Get(ctx, conversation)
+	if err != nil || rec == nil {
+		return taskID
+	}
+	if _, ok := rec.TaskRefFor(taskID); !ok {
+		return taskID
+	}
+	root, _ := rec.observedAs(taskID)
+	return root
 }
 
 func (c gatewayConversations) Post(conversation, text string) (string, error) {

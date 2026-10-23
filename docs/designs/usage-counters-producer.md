@@ -451,6 +451,58 @@ carries no resource version and cannot be rejected that way; it can only land on
 write, which is fine, because the fields are disjoint and the values come from the ConfigMap,
 not from the CR the poller read.
 
+### The status as gauges
+
+The reconciler publishes the CR as it reads it. Right after the `Get` that opens every
+reconcile, the operator sets three gauge families on controller-runtime's registry
+(`k8s-operator/internal/controller/usage_gauges.go`): `kubeagents_platformagent_usage`
+with a `field` label per numeric field of `status.usage`, `kubeagents_platformagent_usage_time_seconds`
+for the two times as unix seconds, and `kubeagents_platformagent_phase`, one-hot over the
+phase vocabulary. The labels are the agent's namespace and name as `agent_namespace` and `agent` (a Managed Prometheus scrape owns `namespace` as a target label and renames a metric's to `exported_namespace`, as the watcher's `cluster` and `location` already arrive) and those two closed sets;
+nothing from conditions, messages or `activeInterfaces` is exported, and a reflection test
+holds the field list to the struct so a new counter cannot be added to the status without a
+sample. No writer publishes: every status write, the poller's patch and the Ready and
+Degraded writers' updates alike, re-enqueues the CR through the unfiltered watch, so the
+reconcile it triggers publishes what was written, and the informer's initial list after an
+operator restart or a leader change publishes the whole fleet on the first pass. One site
+makes the gauges a copy of the status by construction; a publish from a writer would miss
+the writers that do not call it and the early returns on an unchanged status. The manager
+serves them on its metrics listener, which the chart binds to `:8080` over plain HTTP
+(`--metrics-secure=false`): the scrape is GKE Managed Prometheus from `gke-gmp-system`, which
+carries no bearer token the manager's authorization filter would accept. What bounds the
+plain listener is the same control the broker's and the gateway's metrics-only ports have:
+the chart renders `<release>-operator-netpol` over the operator pod, ingress only, admitting
+the collector's namespace, and `platformAgent.monitoringScraperNamespace` when set, on the
+metrics port and nothing else; the health port stays open for the kubelet's probes and the
+webhook port, when the webhooks render, for the API server. The chart renders a
+`PodMonitoring` over the operator's Deployment behind `operator.metrics.podMonitoring`, the
+same tri-state as `platformAgent.podMonitoring`; `operator.metrics.enabled: false` binds
+nothing and renders neither the port, the scrape nor the policy. The three value reads go
+through `| default dict`, so a `helm upgrade --reuse-values` from a release that predates the
+key renders with the listener off rather than aborting. The kustomize base leaves the
+listener off, as before: nothing on that path scrapes it.
+
+A gauge of a counter is a departure from the producers' families, which are counters, and it
+is deliberate: the samples are a copy of the status, which already folded restarts out, so a
+collector reads the same monotonic totals the status holds and a `rate()` over them is the
+rate over the status's five-minute writes. A deleted agent's samples are dropped when its
+reconcile finds it gone. The phase vocabulary is the API's four phases plus `Degraded`, drawn from the
+constants the controller writes; a test fails on a phase assigned from a string literal through
+`Status.Phase`, `newPhase` or `phase` anywhere in the package, since a phase outside the list
+would read all zeros. Under the served-CRD skew
+below, the reconciler reads a status the server pruned, and its zeros mean unknown. The publish
+reads the writers' own records, at any age, since a record's freshness is the writers' reprobe
+gate and a sample must not lapse into zero with it: while the shared whole-block record is held,
+or the block reads entirely empty (a pruned status before this process recorded it), every usage
+and time sample is dropped for the agent and the phase alone is served; while a per-field record
+is held, the records the poller keeps for the newer fields a CRD at an intermediate schema prunes
+while serving the rest, that field's sample alone is dropped and the others are published. The
+per-field records therefore live on the reconciler beside the shared one, written and read by
+the poller as before and read by the publish. What remains is a window of at most one poll: after
+an operator restart a status pruned per field reads as zeros until the first poll writes, is
+echoed, and records the pruning, and a new agent's block carries zeros from the Ready writer's
+first write until its first poll, which for a new agent is the truth.
+
 ## The served-CRD skew
 
 A served CRD older than this release prunes `status.usage` on every write, and the Ready writer
@@ -697,8 +749,12 @@ Each of these landed with the poller; the list is the record of where the facts 
 - `docs/security-requirements.md` and `docs/credential-isolation-design.md`, which state 8766 as
   open to the collector's namespace and to no other peer; the Reach section says what replaces
   that sentence.
-- `docs/designs/cron-report-relay.md`, which records that the operator reads nothing the agent's
-  pods write and binds no metrics endpoint of its own. The poller is the exception, and that
-  record points here.
+- `docs/designs/cron-report-relay.md`, which recorded that the operator reads nothing the
+  agent's pods write and binds no metrics endpoint of its own. The poller was the first
+  exception and the operator's own gauges the second; that record points here for both.
 - The map's identifier-sources table, which gains a row for the poll interval, the ConfigMap
   name and the operator-peer rule, with the event-watcher row as the model.
+- The operator's own gauges (the section above): the observability page's metrics section
+  names the three families and the scrape, the CRD reference's `status.usage` paragraph
+  points there, the chart README documents `operator.metrics`, and the map gains a row for
+  the family names and the field lists.
