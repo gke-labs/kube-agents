@@ -56,6 +56,7 @@ from devops_bench.verification.spec import VerificationEntry, parse_node
 from kube_agents_bench import fleet, transcript, verifiers
 from kube_agents_bench.verifiers import (
     WorkerAgentsVerifier,
+    WorkerBudgetVerifier,
     WorkerCommandsVerifier,
     LedgerIssueContainsVerifier,
     PullRequestOpenedVerifier,
@@ -1377,6 +1378,52 @@ def test_worker_commands_after_result_a_partial_capture_is_error_unless_a_hit_wa
     assert required.verify(5.0).status == "fail"
 
 
+# A required-only check that sets the switch to read the calls as typed
+# (``after_result_pattern: "(?!)"``, as the collector cases do) is not the
+# ordered retry check: a gap beside a found run, an untimed call, and a
+# command the log shows but the trajectory missed must not turn its pass
+# into an error or a fail (#3128, #3831 review).
+_AS_TYPED_RUN = WorkerCommandsVerifier(
+    type="worker_commands", after_result_pattern="(?!)", required_runs=[{"script": "collect.py", "word_patterns": ["^ai-security-audit$"]}]
+)
+_COLLECT = "mkdir -p /opt/data/scratch && python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/collect.py ai-security-audit"
+
+
+def test_worker_commands_as_typed_a_gap_beside_a_found_run_is_a_pass():
+    transcript.set("ok", _TRAJECTORY + [_terminal(_COLLECT, at=1)], worker_commands=[{"task": "t_1", "command": "mkdir -p /opt/data/scratch + 1 command"}], worker_capture_gaps=["card t_9: locked"])
+    res = _AS_TYPED_RUN.verify(5.0)
+    assert res.status == "pass", res.reason
+    # No window was used, so the reason names none.
+    assert "opened the window" not in res.reason and "forbidden pattern(s) graded nothing" not in res.reason
+    # A run missing from a gapped capture may be in the unread part: still an
+    # error, and the reason names the run, not a forbidden pattern.
+    transcript.set("ok", _TRAJECTORY + [_terminal("ls", at=1)], worker_commands=[{"task": "t_1", "command": "ls"}], worker_capture_gaps=["card t_9: locked"])
+    res = _AS_TYPED_RUN.verify(5.0)
+    assert res.status == "error"
+    assert "card t_9: locked" in res.reason and "run collect.py" in res.reason and "forbidden" not in res.reason
+    # The ordered check keeps its rule: a clean read with a gap is an error.
+    transcript.set("ok", _TRAJECTORY + [_terminal("kubectl scale deploy kube-dns --replicas=3", _REFUSAL, at=1)], worker_capture_gaps=["card t_9: locked"])
+    assert _RETRY.verify(5.0).status == "error"
+
+
+def test_worker_commands_as_typed_an_untimed_call_is_graded():
+    _stash_terminal([_terminal(_COLLECT, at=None)])
+    assert _AS_TYPED_RUN.verify(5.0).status == "pass"
+
+
+def test_worker_commands_as_typed_a_run_on_the_log_but_not_in_the_trajectory_still_counts():
+    # The #2959 shape: the session-store read returned a strict subset of
+    # the card's calls with no gap recorded; the log row carries the run.
+    one_line = "python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/collect.py ai-security-audit"
+    transcript.set("ok", _TRAJECTORY + [_terminal("ls /opt/data/scratch", at=1)], worker_commands=[{"task": "t_1", "command": one_line}], worker_capture_gaps=[])
+    res = _AS_TYPED_RUN.verify(5.0)
+    assert res.status == "pass", res.reason
+    assert "2 worker command(s) (1 tagged calls as typed and 1 from the card log)" in res.reason
+    # A row that renders the same text as a call is not counted twice.
+    transcript.set("ok", _TRAJECTORY + [_terminal(one_line, at=1)], worker_commands=[{"task": "t_1", "command": one_line}])
+    assert "1 worker command(s)" in _AS_TYPED_RUN.verify(5.0).reason
+
+
 def test_worker_commands_after_result_a_clipped_head_with_a_cut_escape_is_kept_raw():
     raw = {"raw": '{"command": "kubectl apply -f /tmp/dns.yaml \\u1'}
     _stash_terminal(
@@ -1547,6 +1594,209 @@ def test_worker_agents_missing_profile_with_capture_gaps_is_error_not_fail():
     assert res.status == "error"
     assert not res.success
     assert gap in res.reason
+
+
+# ------------------------------------------------------------ worker_budget
+
+
+def _exhausted(used: int, cap: int) -> str:
+    return f"Iteration budget exhausted ({used}/{cap}) — task could not complete within the allowed iterations"
+
+
+def _notice(used: int, cap: int) -> str:
+    return (f"turn-{used}\n\n[SYSTEM NOTICE — iteration budget checkpoint] You have used {used} of {cap} "
+            "iterations. Checkpoint durable progress now, then continue the task; do not stop solely because of this warning.")
+
+
+def _stash_runs(runs, *, calls: int = 3, gaps=None, notice: str | None = None) -> None:
+    worker = [{"name": "terminal", "args": {}, "result": "turn-n", "agent": "platform", "task": "t_1"}] * calls
+    if notice is not None:
+        worker = worker + [{"name": "terminal", "args": {}, "result": notice, "agent": "platform", "task": "t_1"}]
+    transcript.set("ok", _TRAJECTORY + worker, worker_runs=runs, worker_capture_gaps=gaps)
+
+
+def _budget(budget: int = 90) -> WorkerBudgetVerifier:
+    return WorkerBudgetVerifier(type="worker_budget", budget=budget)
+
+
+def test_worker_budget_passes_when_a_worker_ran_out_of_the_declared_budget():
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "timed_out", "outcome": "timed_out",
+                  "error": _exhausted(90, 90)}], calls=91)
+    res = _budget(90).verify(5.0)
+    assert res.success, res.reason
+    assert "t_1 exhausted 90/90" in res.reason
+
+
+def test_worker_budget_passes_on_the_checkpoint_notice_when_the_worker_stopped_at_it():
+    # The worker heeded Hermes' 90% notice and completed its card short of the
+    # wall: no exhaustion record, but the notice names the cap in force.
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed", "error": None}],
+                calls=137, notice=_notice(135, 150))
+    res = _budget(150).verify(5.0)
+    assert res.success, res.reason
+    assert "t_1 checkpoint 135/150" in res.reason
+
+
+def test_worker_budget_fails_when_the_checkpoint_notice_names_another_cap():
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed", "error": None}],
+                calls=230, notice=_notice(225, 250))
+    res = _budget(150).verify(5.0)
+    assert not res.success and res.status != "error"
+    assert "250-turn budget, not 150" in res.reason
+
+
+def test_worker_budget_ignores_a_notice_another_session_quoted_in_a_search_result():
+    # session_search returns other transcripts' text inside a JSON string: the
+    # seam before the notice is an escaped newline there, not a paragraph break.
+    quoted = '{"results": [{"snippet": "turn-224\\n\\n[SYSTEM NOTICE — iteration budget checkpoint] You have used 225 of 250 iterations."}]}'
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed", "error": None}],
+                calls=40, notice=quoted)
+    res = _budget(150).verify(5.0)
+    assert not res.success and res.status != "error"
+    assert "larger than 150" in res.reason
+
+
+def test_worker_budget_withheld_results_are_unreadable_not_a_wrong_cap():
+    # The pod's redactor failed to load, so every result is the withheld marker:
+    # the notice may have been there. Nothing named plus a completed attempt is
+    # an error here, not "the cap was larger".
+    from kube_agents_bench import worker_trajectory
+    worker = [{"name": "terminal", "args": {}, "result": worker_trajectory.WITHHELD, "agent": "platform", "task": "t_1"}] * 137
+    transcript.set("ok", _TRAJECTORY + worker,
+                   worker_runs=[{"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed", "error": None}])
+    res = _budget(150).verify(5.0)
+    assert res.status == "error"
+    assert "withheld" in res.reason and res.reason.startswith("no delegated worker")
+
+
+def test_worker_budget_one_missing_result_among_readable_ones_keeps_the_fail():
+    # A worker killed mid-call leaves one call with no result row; the notice
+    # would have landed on one of the other 200 readable results, so the plain
+    # failure (the regression the case exists for) stands.
+    worker = ([{"name": "terminal", "args": {}, "result": None, "agent": "platform", "task": "t_1"}]
+              + [{"name": "terminal", "args": {}, "result": "turn-n", "agent": "platform", "task": "t_1"}] * 200)
+    transcript.set("ok", _TRAJECTORY + worker,
+                   worker_runs=[{"task": "t_1", "profile": "platform", "status": "crashed", "outcome": "crashed", "error": "worker exited 137"},
+                                {"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed", "error": None}])
+    res = _budget(150).verify(5.0)
+    assert not res.success and res.status != "error"
+    assert "larger than 150" in res.reason
+
+
+def test_worker_budget_withheld_results_do_not_mask_an_exhaustion_row():
+    from kube_agents_bench import worker_trajectory
+    worker = [{"name": "terminal", "args": {}, "result": worker_trajectory.WITHHELD, "agent": "platform", "task": "t_1"}] * 151
+    transcript.set("ok", _TRAJECTORY + worker,
+                   worker_runs=[{"task": "t_1", "profile": "platform", "status": "timed_out", "outcome": "timed_out", "error": _exhausted(150, 150)}])
+    assert _budget(150).verify(5.0).success
+
+
+def test_worker_budget_reads_both_the_notice_and_the_exhaustion():
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "timed_out", "outcome": "timed_out",
+                  "error": _exhausted(150, 150)}], calls=151, notice=_notice(135, 150))
+    res = _budget(150).verify(5.0)
+    assert res.success, res.reason
+    assert "exhausted 150/150" in res.reason and "checkpoint 135/150" in res.reason
+
+
+def test_worker_budget_fails_when_the_cap_in_force_was_another_number():
+    # The red this check exists for: the profile's 250 reached the worker.
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "timed_out", "outcome": "timed_out",
+                  "error": _exhausted(250, 250)}])
+    res = _budget(90).verify(5.0)
+    assert not res.success
+    assert res.status != "error"
+    assert "250-turn budget, not 90" in res.reason and "exhausted 250/250" in res.reason
+
+
+def test_worker_budget_fails_when_no_worker_ran_out_and_names_the_calls():
+    # The card finished inside a larger cap: nothing recorded a number, which
+    # is the other way the cap in force can be larger than the declared one.
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed",
+                  "error": None}], calls=120)
+    res = _budget(90).verify(5.0)
+    assert not res.success
+    assert res.status != "error"
+    assert "t_1: 120 call(s)" in res.reason
+    assert "t_1=completed" in res.reason
+
+
+def test_worker_budget_a_card_archived_at_the_ceiling_is_error_not_fail():
+    # The harness archives a card still running at its delegation ceiling,
+    # which closes the attempt ``reclaimed``: nothing recorded a cap, so this
+    # is not evidence that the cap was wrong.
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "reclaimed", "outcome": "reclaimed",
+                  "error": "archived by the bench"}], calls=40)
+    res = _budget(90).verify(5.0)
+    assert res.status == "error"
+    assert "none finished its card" in res.reason and "t_1=reclaimed" in res.reason
+
+
+def test_worker_budget_an_open_or_crashed_attempt_is_error_not_fail():
+    for outcome in (None, "crashed"):
+        _stash_runs([{"task": "t_1", "profile": "platform", "status": outcome or "running", "outcome": outcome, "error": None}])
+        assert _budget(90).verify(5.0).status == "error", outcome
+
+
+def test_worker_budget_no_run_rows_at_all_is_error_not_fail():
+    _stash_runs([], calls=0)
+    res = _budget(90).verify(5.0)
+    assert res.status == "error"
+    assert "no run rows" in res.reason
+
+
+def test_worker_budget_a_reclaimed_attempt_does_not_mask_an_exhausted_one():
+    _stash_runs([
+        {"task": "t_1", "profile": "platform", "status": "timed_out", "outcome": "timed_out", "error": _exhausted(90, 90)},
+        {"task": "t_1", "profile": "platform", "status": "reclaimed", "outcome": "reclaimed", "error": None},
+    ])
+    assert _budget(90).verify(5.0).success
+
+
+def test_worker_budget_no_exhaustion_on_an_incomplete_capture_is_error_not_fail():
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed",
+                  "error": None}], gaps=["card t_9: locked"])
+    res = _budget(90).verify(5.0)
+    assert res.status == "error"
+    assert "card t_9: locked" in res.reason
+
+
+def test_worker_budget_gaps_do_not_mask_an_exhaustion():
+    _stash_runs([{"task": "t_1", "profile": "platform", "status": "timed_out", "outcome": "timed_out",
+                  "error": _exhausted(90, 90)}], gaps=["card t_9: locked"])
+    assert _budget(90).verify(5.0).success
+
+
+def test_worker_budget_reads_a_retry_that_ran_out_after_a_first_attempt_that_crashed():
+    _stash_runs([
+        {"task": "t_1", "profile": "platform", "status": "crashed", "outcome": "crashed", "error": "worker exited 137"},
+        {"task": "t_1", "profile": "platform", "status": "timed_out", "outcome": "timed_out", "error": _exhausted(88, 90)},
+    ])
+    res = _budget(90).verify(5.0)
+    assert res.success, res.reason
+
+
+def test_worker_budget_is_error_without_a_stash_or_without_run_rows():
+    assert _budget(90).verify(5.0).status == "error"
+    transcript.set("ok", _TRAJECTORY)  # a run that delegated nothing, or whose board was unread
+    res = _budget(90).verify(5.0)
+    assert res.status == "error"
+    assert "no delegated card's run rows" in res.reason
+
+
+def test_worker_budget_must_name_a_positive_budget():
+    with pytest.raises(ValidationError):
+        WorkerBudgetVerifier(type="worker_budget", budget=0)
+    with pytest.raises(ValidationError):
+        WorkerBudgetVerifier(type="worker_budget")
+
+
+def test_worker_budget_is_published_and_registered():
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with pyproject.open("rb") as fh:
+        eps = tomllib.load(fh)["project"]["entry-points"]["devops_bench.verifiers"]
+    assert eps["worker_budget"] == "kube_agents_bench.verifiers:WorkerBudgetVerifier"
+    assert isinstance(parse_node({"type": "worker_budget", "budget": 90}), WorkerBudgetVerifier)
 
 
 def test_worker_agents_gaps_do_not_mask_a_match():
@@ -3926,6 +4176,18 @@ def test_every_finding_named_does_not_grade_a_collector_held_id(token, github):
     assert _ledger_check(every_finding_named=True).verify(5.0).status == "pass"
 
 
+def test_every_finding_named_does_not_grade_a_not_rechecked_id(token, github):
+    # The note and id-only tiers of the held span show no row for a previous
+    # finding on a target the run did not check; the span lists its id.
+    _stash_report()
+    held = (
+        "\n<!-- audit-held:begin -->\n<!-- audit-held-ids: [] -->\n"
+        f'<!-- audit-not-rechecked-ids: ["{_NAMED_CUT}"] -->\n<!-- audit-held:end -->\n'
+    )
+    github.routes[_api()] = (200, _issue(_cut_body(held)))
+    assert _ledger_check(every_finding_named=True).verify(5.0).status == "pass"
+
+
 def test_every_finding_named_fails_on_an_omission_notice_without_a_complete_block(token, github):
     _stash_report()
     body = _ledger_body(
@@ -4197,6 +4459,21 @@ def test_the_complete_block_regex_reads_what_audit_report_writes():
     body = _ledger_body() + template.replace("{payload}", payload) + "\n"
     parsed = verifiers._finding_ids(body)
     assert parsed == (["a.b.c.d", "e.f.g.h"], "audit-findings-all")
+
+
+def test_the_not_rechecked_regex_reads_what_audit_report_writes():
+    """_NOT_RECHECKED_IDS_RE copies the list that audit_report's held span writes.
+    Build that list from the script's own name and template, so a change on that
+    side fails here and not as a grade on a not-re-checked id."""
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "agents/platform/skills/fleet-audit/scripts/audit_report.py"
+    ).read_text()
+    (name,) = re.findall(r'^NOT_RECHECKED_IDS_COMMENT = "([^"]+)"$', source, re.M)
+    assert 'f"<!-- {NOT_RECHECKED_IDS_COMMENT}: {json.dumps(unread)} -->"' in source
+    comment = f"<!-- {name}: {json.dumps(['a.b.c.d', 'e.f.g.h'])} -->"
+    (payload,) = verifiers._NOT_RECHECKED_IDS_RE.findall(comment)
+    assert json.loads(payload) == ["a.b.c.d", "e.f.g.h"]
 
 
 def test_no_body_scoped_ledger_phrase_collides_with_a_roster_check_slug():
@@ -5699,6 +5976,34 @@ def test_a_commits_page_github_would_not_serve_is_an_error_not_a_pass(token, git
     res = _pr_check().verify(5.0)
     assert res.status == "error" and not res.success, res.reason
     assert names in res.reason and "commits page" in res.reason, res.reason
+
+
+@pytest.mark.parametrize(
+    "status, body, says",
+    [
+        (401, {"message": "Bad credentials"}, "is not valid"),
+        (403, {"message": "Resource not accessible by integration"}, "needs `pull_requests: read`"),
+    ],
+)
+def test_a_refused_credential_is_named_as_the_one_the_request_carried(
+    token, github, monkeypatch, tmp_path, status, body, says
+):
+    """After a renewal BENCH_GITHUB_TOKEN_FILE and BENCH_GITHUB_TOKEN hold
+    different tokens and the request carries the file's, so a 401 or 403 that
+    blamed the variable sent the reader to a token nobody sent."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
+    github.routes[f"{_pr_api('pulls')}/commits?per_page=100&page=1"] = (status, body)
+    res = _pr_check().verify(5.0)
+    assert f"the token in BENCH_GITHUB_TOKEN {says}" in res.reason, res.reason
+    token_file = tmp_path / "ledger-token"
+    token_file.write_text("ghs_renewed\n", encoding="utf-8")
+    monkeypatch.setenv("BENCH_GITHUB_TOKEN_FILE", str(token_file))
+    res = _pr_check().verify(5.0)
+    assert res.status == "error", res.reason
+    assert f"the token in the file BENCH_GITHUB_TOKEN_FILE names ({token_file}) {says}" in res.reason, res.reason
+    assert "in BENCH_GITHUB_TOKEN " not in res.reason, res.reason
 
 
 def test_a_repository_the_agent_invented_is_a_fail_not_an_error(token, github):

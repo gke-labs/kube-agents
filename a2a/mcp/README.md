@@ -2,7 +2,7 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one `spec.mode: next` install, so an external coding agent or IDE host can talk to it. It is a console client of the install's A2A bus: it holds the `console` bus credential and nothing else, and it can do on the bus exactly what the console page can.
 
-This is the core. It answers one tool, `connection_status`; the tools that send turns, steer tasks and read topics come in later changes.
+It answers `connection_status`, and the turn tools `send_message` and `task_control`. Further tools come in later changes.
 
 ## Turn it on
 
@@ -32,7 +32,7 @@ Point an MCP client at `http://localhost:8089/mcp` with the header `Authorizatio
 
 A request that names an MCP revision this server doesn't speak (the `MCP-Protocol-Version` header) is refused with 400; a request without the header is served.
 
-To rotate the token, write a new value into the Secret. The server reads it on every request, so the new one is accepted, and the old one refused, as soon as the kubelet updates the mounted file, usually within a minute.
+To rotate the token, write a new value into the Secret. The server reads it on every request, so the new one is accepted, and the old one refused, as soon as the kubelet updates the mounted file, usually within a minute. A value that is blank, or holds a byte no request header could carry (a line break or another control character other than a tab), is replaced: the operator mints a new token over it.
 
 ## What it reads
 

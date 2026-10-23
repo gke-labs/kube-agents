@@ -1,5 +1,5 @@
 {
-  "version": "06fa98178d9e8737",
+  "version": "16958eff5fe00a0e",
   "identities": [
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-provision",
@@ -60,6 +60,7 @@
           "$JS.API.DIRECT.GET.TOPICS-JOURNAL.>",
           "chat.notify.gchat",
           "chat.notify.slack",
+          "chat.notify.console",
           "_INBOX.agent.>"
         ],
         "subscribe": [

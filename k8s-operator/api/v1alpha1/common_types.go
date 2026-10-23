@@ -2306,7 +2306,7 @@ type AgentUsageStatus struct {
 	// caller's channel or scope; the broker's own chat event pull failing,
 	// its Pub/Sub subscription or its credential to it, does count. Read from the
 	// broker's kubeagents_broker_execution_failures_total, summed over its
-	// kind label, every five minutes and kept monotonic the same way as
+	// kind and tool labels, every five minutes and kept monotonic the same way as
 	// ToolExecutionsTotal; a timed-out command counts here and as an error
 	// there. A rising share of this against ToolExecutionsTotal says the
 	// broker, its credentials or its upstreams are failing, where a policy

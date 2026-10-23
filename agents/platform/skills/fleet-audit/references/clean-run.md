@@ -99,7 +99,8 @@ A zero-finding run comes back `silent_ok: false` in each of these cases, and all
   this run published, and a gap holds `resolved` at 0. The gaps may be the same as before; the run
   still speaks. Say in your one line that this many findings are no longer reported while a
   coverage gap stays, with the issue URL. Do not call them resolved. Each id is listed once; a later
-  run with the same gap does not list it again.
+  run with the same gap does not list it again. A finding under _Not re-checked this run_ is
+  published, so it is not listed.
 - **`status: "HELD"`** — the ledger stayed open because the run did not account for findings it was
   carrying, or because it could not read the issue's comments, where a `/remediate` may be waiting
   for an answer. "I found nothing" and "I did not write it down" must not arrive as the same

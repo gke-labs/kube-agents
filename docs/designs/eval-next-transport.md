@@ -339,12 +339,12 @@ webhooks (`a2a/docs/hermes-bridge.md`, "Activity"), one entry per invocation wit
 its input; the bridge's entries also carry the call's status, and the bridge alone publishes a
 `progress` heartbeat. `worker_commands` reads
 the kanban worker logs by card id (with `after_result_pattern`, the tagged `terminal` and `execute_code` entries
-the harness appends to the trajectory from the workers' sessions instead, present when the
+the harness appends to the trajectory from the workers' sessions as well, present when the
 wait found the cards and the door showed the trace); on
 this path it has data when the case runner's delegation wait finds the cards in the session store
 (Completion signals), and none when the wait falls back. Neither is graded
-as a failure here: on this transport's record the scorer sets every `worker_commands` and
-`worker_agents` entry aside as not applicable, and every `tool_called` entry too when the record
+as a failure here: on this transport's record the scorer sets every `worker_commands`,
+`worker_agents` and `worker_budget` entry aside as not applicable, and every `tool_called` entry too when the record
 carries no `a2a.activity` marker or a marker that reports a loss (calls the door's cap or the
 executor's budget dropped, a count or part it could not read, an input truncated with its nested
 names, or a trace older than the read that ended the wait), and grades the checks that remain

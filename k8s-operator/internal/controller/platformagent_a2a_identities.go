@@ -211,9 +211,10 @@ const (
 	// Spelled whole rather than built from a2aAgentBusUser: tests/conformance
 	// reads grants out of this file's source and resolves a literal, not an
 	// expression.
-	a2aNotifySubjectGchat  = "chat.notify.gchat"
-	a2aNotifySubjectSlack  = "chat.notify.slack"
-	a2aNotifyReplySubjects = "chat.notify.reply.agent.>"
+	a2aNotifySubjectGchat   = "chat.notify.gchat"
+	a2aNotifySubjectSlack   = "chat.notify.slack"
+	a2aNotifySubjectConsole = "chat.notify.console"
+	a2aNotifyReplySubjects  = "chat.notify.reply.agent.>"
 
 	// The board route (a2a/gateway/board.go, a2a/hermes-bridge/board.go,
 	// a2a/lib/board.go): the Slack Home tab's read of the agent pod's board.
@@ -486,6 +487,7 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			// card's report back to its conversation, one subject per backend.
 			a2aNotifySubjectGchat,
 			a2aNotifySubjectSlack,
+			a2aNotifySubjectConsole,
 			// The bridge's answer to a board request.
 			a2aBoardReplySubjects,
 			"_INBOX.gateway.>",
@@ -729,7 +731,7 @@ func agentIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 	// task plane: a notify mints no capability and starts no executor, and
 	// the gateway posts it to the home channel or to a conversation it holds a
 	// live session record for, and nowhere else.
-	publish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack)
+	publish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectConsole)
 	publish = append(publish, "_INBOX."+a2aAgentBusUser+".>")
 
 	return a2aIdentity{

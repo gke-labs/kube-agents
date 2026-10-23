@@ -22,7 +22,7 @@ that store which runs `hermes cron tick` against every named profile with work d
 [`autonomous-watchdogs.md`](../../../docs/site/src/content/docs/concepts/autonomous-watchdogs.md)).
 
 An enabled entry here therefore fires in its own process, with this profile's
-persona, toolsets (unless the entry's `enabled_toolsets` replaces them), `skills`, `model` and `max_turns` — which is the whole reason
+persona and toolsets (unless the entry's `enabled_toolsets` replaces them) and the entry's own `skills`, `model` and `max_turns` — which is the whole reason
 the watchdogs live here rather than as kanban cards filed from the Chat Agent's
 roster. A card is not a cron run, and that indirection is what stopped `skills`,
 `model` and `deliver` reaching the thing that ran.
@@ -860,3 +860,17 @@ tier default fail-closed to `"high"` under `cron_run_scope.py` and `cron_risk_ga
   no agent loop and therefore no tool-approval surface to gate; `"high"` is a threat classification of
   the untrusted input the subprocess ingests (runtime isolation is tracked in #913; today the tier is
   metadata only for those jobs).
+
+## `max_turns` contract
+
+Every model-run entry (one without `no_agent`) declares `"max_turns"`, a positive integer, and
+no `no_agent` entry carries one; `scripts/check_prompt_assets.py` (`check_cron_max_turns`)
+enforces both. The image's scheduler reads it ahead of the profile's `agent.max_turns`
+(`deploy/docker/patches/apply_cron_job_max_turns.py`, the same change upstream Hermes has
+open, so the patch drops out on the tag bump that carries it). The audits carry the budget
+their by-hand per-cluster fallback needs; the profile's own value bounds the kanban workers,
+which never need that much. Required rather than optional because an absent key silently
+runs the job under the worker budget. Hermes reads 0, a negative number, a bool or a
+non-numeric string as unlimited; the patch ignores such a roster value and the profile's stands,
+so an entry the image does not ship cannot lift a cron run past every budget. `merge_cron_store` carries it to existing installs like any
+image-owned key. Raise an entry's number when its SOP outgrows it; do not raise the profile's.

@@ -83,8 +83,9 @@ in `AGENTS.md` under Pull Request Hygiene.
 
 - **For a change to what an agent does, the live validation is the eval loop**: a case seen
   red against `main` and green three times against the branch, per
-  [`eval_driven_development.md`](eval_driven_development.md). The bullets below are the form for
-  runtime changes that do not alter agent behaviour.
+  [`eval_driven_development.md`](eval_driven_development.md), or the record of one of the two
+  agent-behaviour exemptions in that file. The bullets below are the form for runtime changes that
+  do not alter agent behaviour, and for the live or replay check those exemptions also take.
 - **Name the install and what you observed.** Cluster, image tag, operator version; what you
   did; and the result at each layer the change claims to touch — the CR `.status`, the
   Deployment env, the file or process inside the pod.

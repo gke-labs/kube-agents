@@ -825,10 +825,13 @@ class GitLabForge(Forge):
                 body["description"] = description
             node = api("POST", labels, body=body)
         else:
+            # Write only a change, as the GitHub forge does: a caller ensures
+            # the same labels on every run.
             changes: dict[str, Any] = {}
-            if color:
+            held = existing if isinstance(existing, dict) else {}
+            if color and str(held.get("color") or "").lstrip("#").lower() != color.lower():
                 changes["color"] = f"#{color}"
-            if description:
+            if description and (held.get("description") or "") != description:
                 changes["description"] = description
             node = api("PUT", f"{labels}/{quoted}", body=changes) if changes else existing
         return {"label": translate.label(node)}

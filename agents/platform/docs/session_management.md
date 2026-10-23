@@ -51,7 +51,7 @@ The watcher deduplicates on the involved object's UID and the reason, so one bro
 
 `fold_key` is what makes two events one workload, and the inject payload carries no owner reference (the watcher never fills in `context.controller_ref`), so it is read from the pod's name. A Deployment's pod (its ReplicaSet's pod-template hash, then its own suffix: `checkout-6cfdb6b98b-zwv24`) folds on the workload `clean_workload_name` gives it. The hash is `SafeEncodeString` of a decimal number, so its characters are only `4`–`9`, `b`, `c`, `d` and `f`, and the fold key is set only for a segment of 8–10 of those. That keeps out a CronJob run's pod (`report-29812345-abcde`) and a date-stamped Job's (`db-migrate-20261021-abcde`), which the display cleaner shows under the same prefix: folded, a Job's failure would sit under a same-named Deployment's incident. The hash is shorter than 8 characters for about 0.2% of pod templates, and those Deployments do not fold: a lower bound would also match short name segments and fold different owners together. A non-Pod object folds on its own name. Any other Pod name has no key, so it neither folds nor anchors: a StatefulSet's `web-0` and `web-1` keep their ordinals, and a DaemonSet's or a Job's pods end in a five-character segment the cleaner also strips from a bare pod, where it is not a replica suffix (`api-cache` and `api-proxy` both display as `api`). Folding those would let one workload's alert silence another's, so they each still alert. A Critical event folds only into a Critical anchor: a workload that gets worse after its Warning went out is announced again.
 
-An admitted row is one with `notified` non-zero or a `delivery_error`. A failed chat post resets `notified` to `0` within seconds while its triage keeps running, so anchoring on `notified` alone would let every sibling open its own triage on an install whose chat route is broken. A row the gate filtered, the ceiling dropped, or that was itself folded never anchors a window, and neither does a row whose triage never started: when `trigger_agent_troubleshooter` cannot create the gateway session or the gateway refuses the turn (a 3xx, a 4xx, a 503, or an error while connecting or sending; a 2xx, any other 5xx or an error while waiting for the response counts as started, since the turn may have run; a draining gateway creates the session and answers the turn 503), it clears the row's `fold_key`, so a sibling that arrives after that is admitted and starts the triage. The same happens when that background task dies on an exception, and every start of the server clears all fold keys, because a row whose task never ran (the process died between the insert and the task) has nothing else to release it; a workload whose triage did start loses its window, at the cost of one more triage (one per severity, since a Critical folds only into a Critical) for a sibling that arrives after the restart. Siblings that folded into the row before it was released stay folded. For a refused turn they arrive within seconds of it, while the gateway that refused it is still refusing; for a task that died, they are the ones that landed while it ran. The daily recap does not count a folded row as withheld by the ceiling, and `GET /v1/intercepted-events` lists it as `folded`, with the anchor's id in its `duplicate_of`.
+An admitted row is one with `notified` non-zero or a `delivery_error`. A failed chat post resets `notified` to `0` within seconds while its triage keeps running, so anchoring on `notified` alone would let every sibling open its own triage on an install whose chat route is broken. A row the gate filtered, the ceiling dropped, or that was itself folded never anchors a window, and neither does a row whose triage start was given up: the triage pool retries a start that provably did not begin ([When a triage cannot start](#when-a-triage-cannot-start); a 2xx, a 5xx other than 503 or an error while waiting for the `/chat` answer counts as started, since the turn may have run), and when it gives up it clears the row's `fold_key`, so a sibling that arrives after that is admitted and starts the triage. While the start is queued or retrying the row still anchors: a start is on its way, and a sibling admitted then would open a second triage on the same incident. The same release happens when the background task dies on an exception before the start is queued, and every start of the server clears all fold keys, because a row whose task never ran (the process died between the insert and the task) or whose queued start the restart lost has nothing else to release it; a workload whose triage did start loses its window, at the cost of one more triage (one per severity, since a Critical folds only into a Critical) for a sibling that arrives after the restart. Siblings that folded into the row before it was released stay folded. For a start the pool gave up on, they are the ones that arrived while it was queued or retrying, up to the queue limit plus the retry budget, and the give-up notice in the anchor's thread is the record that no triage ran for the workload; for a task that died, they are the ones that landed while it ran. The daily recap does not count a folded row as withheld by the ceiling, and `GET /v1/intercepted-events` lists it as `folded`, with the anchor's id in its `duplicate_of`.
 
 A [`controller-stall` inject](#the-third-producer-controller-stall) claims no allowance at all: the stall watch caps itself at three alerts a tick, and that cap is its only bound. Neither does a drift backlog record that is digested (`POST /v1/drift-backlog`): it starts no turn and is counted in one digest (a chat message, or one unassigned board card on an install with no chat platform enabled). A late record that is carded instead — a late `kubectl` write, or a late row of a principal with fewer than three in the digest — bills `GitOpsDrift` as a live record does. A refused minority row stays in the digest; a refused late `kubectl` write is suppressed as a live record is.
 
@@ -386,8 +386,8 @@ The fourth is a row folded into its workload's open incident ([Folding a workloa
 
 It differs from the ceiling in one further respect. `inject_message` returns on a ceiling refusal
 before it queues the background task, so no session is ever created. `trigger_agent_troubleshooter`
-marks the delivery failure and then continues into `_create_gateway_session` and `_start_agent_turn`,
-so a triage session **does** run for every undelivered alert — it only skips
+marks the delivery failure and then still queues the triage start (see "When a triage cannot start"),
+so a triage start is queued for every undelivered alert — it only skips
 `_register_session_routing` on that branch, leaving the turn with no thread to reply into even
 though `_build_agent_query` instructs the model to thread its findings. The turn still writes its
 `incidents` row; it just reaches nobody through chat. Nothing announces that session, so the session
@@ -430,15 +430,52 @@ CREATE TABLE intercepted_events(
   delivery_error TEXT NOT NULL DEFAULT '',  -- non-empty when the chat post failed after notified = 1
   session_id  TEXT NOT NULL DEFAULT '',  -- the session the inject arrived on, joining the row to GET /v1/sessions/{id}/tasks
   created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  dispatched_at TEXT,                      -- when the dispatcher created the turn's gateway session (sub-second); a drift-backlog row is stamped at carding; NULL = admitted and not yet dispatched
   backlog     INTEGER NOT NULL DEFAULT 0,  -- drift backlog: 1 owed a digest, 2 digested, 3 filed as a board card (no chat platform), 4 carded
   principal   TEXT NOT NULL DEFAULT '',    -- written on drift backlog rows only, for the digest's count
   payload     TEXT NOT NULL DEFAULT '',    -- drift backlog rows only: the record, to card it from
+  triage_state TEXT NOT NULL DEFAULT '',   -- pending when the triage start is queued, then started or aborted; '' when no start was queued (filtered, suppressed, or written before this column)
   duplicate_of INTEGER,                    -- the admitted row this event was folded into; NULL otherwise
   fold_key    TEXT NOT NULL DEFAULT ''     -- what the row folds on: the workload of a pod named like a Deployment's, or a non-Pod object's name; '' when it cannot fold or anchor, was released, or predates the last server start
 );
+CREATE INDEX IF NOT EXISTS idx_intercepted_events_session_id
+  ON intercepted_events (session_id);
 ```
 
-For installs with no chat platform enabled (or external callers reaching the loopback `127.0.0.1:8699` listener via `kubectl port-forward <agent-pod> 8699:8699`), `session_kv_server.py` also exposes `SESSION_KV_API_KEY`-authenticated read-only feed endpoints (`GET /v1/intercepted-events`, `GET /v1/sessions/{session_id}/tasks`, `GET /v1/tasks`, `GET /v1/tasks/{task_id}`, and the Home tab's `GET /v1/board`) that open `session_kv.db` and `kanban.db` with `?mode=ro`.
+##### When a triage cannot start
+
+`trigger_agent_troubleshooter` posts the alert, writes `triage_state = pending` on the row, and hands
+the session create and the `/chat` turn to a pool of 4 threads (`TRIAGE_START_WORKERS`),
+then returns. The pool is the cap: every turn holds a worker of the gateway's default executor, which
+has `min(32, vCPUs + 4)` workers (8 on a 4-vCPU node), and session creates and the
+readiness probe wait on the same executor. A burst of 20 starts at once on a warm gateway lost half of
+them to create timeouts; 4 at once lost none. The 4 depends on that executor's size, so measure it again
+(a burst of 20 failing pods against a warm gateway, counting `TRIAGE_STARTED` lines and probe timeouts) on
+a Hermes upgrade that changes the executor, or on nodes with fewer than 4 vCPUs.
+
+A start is retried only when it provably did not start: a refused connection, a 429 or 503 (after its
+`Retry-After`), a create that timed out or lost its connection (the create waits 25 s, above Hermes'
+20 s lock wait, and the retry's 409 counts as created) or got a 5xx, and a `/chat` 404, which creates
+the session again once, and a `/chat` request that failed while connecting or sending (a `URLError`;
+an error while waiting for the answer is not one). A `/chat` call that was sent and got no answer, or a 5xx other than 503, is
+never sent again, because the turn may be running; the row records it as `started`, so `started`
+means the turn was sent, not that it ran. The budget is 6 answered attempts and 300 s of time spent on
+answered attempts and the waits after them. Refused connections spend neither. A start dequeued more than
+20 minutes after it was queued still gets one attempt, and no retry: a long queue behind slow turns is not
+a gateway fault, and on `main` the start was at least attempted.
+
+A start that gives up logs `TRIAGE_NOT_STARTED session=<id> source=<event|drift|stall> reason=<...>`,
+sets `triage_state = aborted` (the feed reports it as `triage_aborted`, or `undelivered` when the
+alert's own delivery failed or is unconfirmed), releases the row's fold anchor
+([Folding a workload's repeat events](#folding-a-workloads-repeat-events)), and posts one notice in the
+alert's thread: triage did not start, whether the alert comes back, and what to do now. An alert
+delivered without a thread gets the notice as a new message that quotes the alert's first line; an
+undelivered alert and a headless install get no notice, so the session log and `triage_state` are
+their record. `TRIAGE_QUEUED`, `TRIAGE_DEQUEUED` and
+`TRIAGE_STARTED` log lines mark the other steps. A restart loses the queued starts, and their rows
+stay `pending`.
+
+For installs with no chat platform enabled (or external callers reaching the loopback `127.0.0.1:8699` listener via `kubectl port-forward <agent-pod> 8699:8699`), `session_kv_server.py` also exposes `SESSION_KV_API_KEY`-authenticated read-only feed endpoints (`GET /v1/intercepted-events`, `GET /v1/sessions/{session_id}/tasks`, `GET /v1/tasks`, `GET /v1/tasks/{task_id}`, and the Home tab's `GET /v1/board`) that open `session_kv.db`, `kanban.db`, and the Hermes session stores (`<agent_home>/state.db` and `<agent_home>/profiles/<profile>/state.db`) with `?mode=ro`, scrubbing worker step text through `AuditRedactor` before returning it. When `GET /v1/sessions/{session_id}/tasks` is called for a dispatched `intercepted_events` triage session before the front door has filed a kanban card, it returns a sibling `routing` object (`profile = "default"`) beside `tasks: []` (`in_progress` while the front-door turn is active, from the ledger row alone with `live_steps: []` until the gateway session appears in `state.db`, or terminal `completed` / `failed` once `sessions.ended_at` is set for this turn (an `ended_at`, reply or step older than the dispatch belongs to the previous turn of a reused session and is ignored) or the turn — or a ledger row whose gateway session never started in `state.db` — ages past `PRE_KANBAN_STALE_AFTER_SECONDS`, 900 s, measured from the dispatch (`dispatched_at`, stamped by the dispatcher as it creates the gateway session on every path, and by the carding of a drift-backlog row; a row still unstamped when the server starts, from before the column or from a restart between the inject and the stamp, is stamped to `created_at` at startup, so a row unstamped in the running process is queued: `in_progress` from the ledger alone, never aged into `failed`) and the session's start, whichever is later, and the object's `created_at`/`started_at` are that clock; if `<agent_home>/state.db` exists and raises `sqlite3.Error`, `routing` falls back to the ledger-backed object with `live_steps: []` and `routing_error` naming the read error).
 
 One route writes to `kanban.db` and signals processes: `POST /v1/sessions/{session_id}/cards/stop` (#3263). The hermes-bridge calls it when a gateway conversation's `stop` reaches its cards, with the conversation's context id. The route refuses any session but the `a2a-*` one that context id names; that is a consistency check on what the bridge sends, not an authorization. It archives every open card in the conversation through Hermes' own `archive_task`: the cards filed under the session or its compression continuations (not its branches or delegates), every card those cards fanned out, to any depth and whatever session the child carries, and a session-less card subscribed to that session and thread. It kills each running card's worker, and the processes in the worker's group that carry its `HERMES_KANBAN_TASK`, and no others; a command an ssh client already sent to the shell sandbox runs on. Stop doesn't touch cards from other conversations, crons or alerts that depend on this thread's cards: a `task_links` child filed under another session is left alone even though Hermes copies our thread's subscription onto it, and it is promoted once our card is archived, as it would have been when our card finished. The answer names what was stopped, and what it could not finish in time, within 24 seconds (`CARD_STOP_WORST_CASE_S`: a 20-second deadline plus one 3-second busy wait plus a second of slack); an archive still running at the deadline is reported `pending` and finishes on its own. Every holder of `SESSION_KV_API_KEY` can call it for any `a2a-*` session, so anything in the pod that can record a conversation's route can also stop that conversation's cards; the agent itself could already archive cards.
 
@@ -461,9 +498,9 @@ time and bounds nothing on disk; 512 keeps more than it shows, which leaves room
 ##### Which columns are migrated, and which are not
 
 `init_db` runs `ALTER TABLE intercepted_events ADD COLUMN ...` for `session_id`, `backlog`,
-`principal`, `payload`, `duplicate_of` and `fold_key` (which arrived after the table first shipped in 0.2.0, so released 0.2.0+
+`principal`, `payload`, `triage_state`, `duplicate_of`, `fold_key` and `dispatched_at` (which arrived after the table first shipped in 0.2.0, so released 0.2.0+
 databases carry `cluster`, `object_uid` and `delivery_error` and gain `session_id`, `backlog`,
-`principal`, `payload`, `duplicate_of` and `fold_key` in place on startup), and runs `CREATE TABLE IF NOT EXISTS` for everything else: there is no `ALTER TABLE` for
+`principal`, `payload`, `triage_state`, `duplicate_of`, `fold_key`, `dispatched_at` and `idx_intercepted_events_session_id` in place on startup), and runs `CREATE TABLE IF NOT EXISTS` for everything else: there is no `ALTER TABLE` for
 `cluster`, `object_uid` or `delivery_error` anywhere in the tree. Those three columns landed
 before the table ever shipped in a release, so the only databases carrying an earlier shape
 without them are pre-0.2.0 dev installs that ran an intermediate commit of the change that

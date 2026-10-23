@@ -143,6 +143,16 @@ operator:
   # chart cannot see and the hint would fight it.
   topologySpread:
     enabled: true
+  # The manager's own metrics listener, port 8080, plain HTTP on the pod
+  # network: controller-runtime's series plus the operator's view of every
+  # PlatformAgent, status.usage and status.phase as three gauge families
+  # (kubeagents_platformagent_usage, kubeagents_platformagent_usage_time_seconds,
+  # kubeagents_platformagent_phase), so Managed Prometheus reads the numbers
+  # the poller wrote. podMonitoring is the same tri-state as
+  # platformAgent.podMonitoring: null follows the cluster.
+  metrics:
+    enabled: true
+    podMonitoring: null
   # Admission webhooks for the PlatformAgent CR — defaulting, validation, and
   # delete protection, mirroring k8s-operator/config/webhook. Without them the
   # CRD's CEL rules and OpenAPI defaults still apply; everything the webhook
@@ -1361,7 +1371,14 @@ platformAgent:
       mode: default
     slack:
       # Bot/app tokens are read from credentials.secretName under the
-      # SLACK_BOT_TOKEN / SLACK_APP_TOKEN keys.
+      # SLACK_BOT_TOKEN / SLACK_APP_TOKEN keys by default.
+      # Custom Secret references can be specified if tokens live in separate Secrets:
+      # botTokenSecretRef:
+      #   name: ""    # defaults to credentials.secretName
+      #   key: ""     # defaults to SLACK_BOT_TOKEN
+      # appTokenSecretRef:
+      #   name: ""    # defaults to credentials.secretName
+      #   key: ""     # defaults to SLACK_APP_TOKEN
       enabled: false
       # Slack member IDs (U0123ABCD), not emails. Empty list = all users allowed.
       allowedUsers: []
@@ -1370,7 +1387,14 @@ platformAgent:
     teams:
       # Microsoft Teams ChatOps integration via Microsoft Bot Framework / Entra ID.
       # App ID and App Password are read from credentials.secretName under
-      # TEAMS_APP_ID and TEAMS_APP_PASSWORD.
+      # TEAMS_APP_ID and TEAMS_APP_PASSWORD by default.
+      # Custom Secret references can be specified if credentials live in separate Secrets:
+      # appIdSecretRef:
+      #   name: ""    # defaults to credentials.secretName
+      #   key: ""     # defaults to TEAMS_APP_ID
+      # appPasswordSecretRef:
+      #   name: ""    # defaults to credentials.secretName
+      #   key: ""     # defaults to TEAMS_APP_PASSWORD
       enabled: false
       # Microsoft Entra ID Tenant ID for single-tenant enterprise lock-down.
       tenantId: ""

@@ -238,7 +238,7 @@ A gate nobody can read is ignored within a week, whatever its statistics say. Fo
 
 ## 5. Eval-driven development
 
-The rule: if your change alters what the agent says or does, it ships with a case that proves it. Most changes do not alter behaviour and need no case.
+The rule: if your change alters what the agent says or does, it ships with a case that proves it. Most changes do not alter behaviour and need no case. Two kinds of behaviour change are exempt because no case can test them, a deterministic guard and a failure that did not turn red on demand; the rule file defines both and the record each takes.
 
 The mechanics are [`.agents/rules/eval_driven_development.md`](../../.agents/rules/eval_driven_development.md), the rule the pull request template and the pre-PR review passes hold a change to: name the case, run it red against `main` in your dev project, implement, run it green three times, register it, all in one pull request that quotes the red and the three greens. A stack does not divide that up: where the behaviour only a sibling makes observable, the sibling merges first and this change then runs the loop against the `main` that includes it, and where neither is observable without the other they are one change in one pull request. The case then stays in the suite as a regression check, and the red-to-green record in the pull request is how "this change improves X" is something a reviewer can check rather than take on trust.
 
