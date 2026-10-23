@@ -241,19 +241,39 @@ func TestTheMCPTokenIsMintedOnceAndNeverAdopted(t *testing.T) {
 		}
 	})
 
-	t.Run("an owned Secret with no token is filled", func(t *testing.T) {
-		empty := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPAccessName(agent), Namespace: agent.Namespace},
-			Data: map[string][]byte{a2aMCPAccessKey: {}}}
-		if err := ctrl.SetControllerReference(agent, empty, setupScheme()); err != nil {
-			t.Fatal(err)
+	// Empty as the server reads it: a whitespace-only value is refused there
+	// (ReadToken trims), so it is minted over here, not kept.
+	for name, value := range map[string]string{"empty": "", "whitespace-only": " \n\t"} {
+		t.Run("an owned Secret with an "+name+" token is filled", func(t *testing.T) {
+			empty := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPAccessName(agent), Namespace: agent.Namespace},
+				Data: map[string][]byte{a2aMCPAccessKey: []byte(value)}}
+			if err := ctrl.SetControllerReference(agent, empty, setupScheme()); err != nil {
+				t.Fatal(err)
+			}
+			r, cl := mcpTestReconciler(t, empty)
+			if err := r.ensureA2AMCPToken(ctx, agent); err != nil {
+				t.Fatal(err)
+			}
+			filled, err := readMCPToken(t, cl)
+			if err != nil || strings.TrimSpace(string(filled.Data[a2aMCPAccessKey])) == "" {
+				t.Fatalf("the owned, %s token Secret was not filled: %v", name, err)
+			}
+		})
+	}
+
+	// With the flag off, an unowned Secret under the reserved name is not
+	// ours: the removal skips it rather than failing the whole reconcile,
+	// and leaves it alone.
+	t.Run("with the flag off an unowned Secret is skipped, not fatal", func(t *testing.T) {
+		t.Setenv(a2aMCPDoorEnvVar, "")
+		squatter := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPAccessName(agent), Namespace: agent.Namespace},
+			Data: map[string][]byte{a2aMCPAccessKey: []byte("chosen-by-someone-else")}}
+		r, cl := mcpTestReconciler(t, squatter)
+		if err := r.reconcileA2AMCP(ctx, agent); err != nil {
+			t.Fatalf("an unowned Secret under the reserved name stopped the reconcile: %v", err)
 		}
-		r, cl := mcpTestReconciler(t, empty)
-		if err := r.ensureA2AMCPToken(ctx, agent); err != nil {
-			t.Fatal(err)
-		}
-		filled, err := readMCPToken(t, cl)
-		if err != nil || len(filled.Data[a2aMCPAccessKey]) == 0 {
-			t.Fatalf("the owned, empty token Secret was not filled: %v", err)
+		if got, err := readMCPToken(t, cl); err != nil || string(got.Data[a2aMCPAccessKey]) != "chosen-by-someone-else" {
+			t.Errorf("the unowned Secret was touched: %v", err)
 		}
 	})
 
