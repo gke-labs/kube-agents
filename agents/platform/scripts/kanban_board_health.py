@@ -192,6 +192,14 @@ PAUSED_LINE = "Paused {age} ago."
 PAUSED_LINE_NO_AGE = "Paused."
 STOPPED_LINE = "Stopped {age} ago before finishing."
 STOPPED_LINE_NO_AGE = "Stopped before finishing."
+# The todo cards a stuck task holds back (a child waits until every parent is
+# done), by title: the first, cut shorter than a row's title, then a count of
+# the rest.
+HELD_LINE = "Holding back: {titles}."
+HELD_MORE = " and {count} more"
+HELD_TITLES_MAX = 1
+HELD_TITLE_MAX_CHARS = 80
+HELD_SEPARATOR = ", "
 AGE_UNITS = (("day", "days"), ("hour", "hours"))
 HOURS_PER_DAY = 24
 STUCK_MORE_LINE = "And {count} more."
@@ -201,7 +209,7 @@ STUCK_TITLE_MAX_CHARS = 120
 # What the stuck tasks can take of `MAX_REPORT_CHARS`: the headline, the
 # rows' bold titles with a group count, their status lines, and the count of
 # the rest, with room to spare.
-STUCK_CARD_RESERVE = 3000
+STUCK_CARD_RESERVE = 5000
 ELLIPSIS = "…"
 # A word cut keeping less than 1/CLIP_MIN_SHARE of the budget falls back to the
 # hard cut: a long unbroken token would otherwise take the rest of the title with
@@ -283,6 +291,34 @@ BLOCKED_EVENTS_SQL = """
      WHERE kind = 'blocked'
      ORDER BY created_at, id
 """
+BLOCKED_CHILDREN_SQL = """
+    SELECT l.parent_id, c.id, c.title, c.assignee
+      FROM task_links l
+      JOIN tasks c ON c.id = l.child_id
+     WHERE c.status = 'todo'
+     ORDER BY c.id
+"""
+# The words `session_kv_server._triage_authorize_clauses(True)` puts in a
+# triage report's `To authorize:` bullet when the install opens the Pull
+# Request itself (`TRIAGE_OPEN_PR_MARKER` there). The Slack notifier
+# (`slack_ux_incident.OPENING_PULL_REQUEST`) and the bench case key on the same
+# words, so all three readers agree on which reports made the promise.
+TRIAGE_OPEN_PR_MARKER = "is being opened automatically"
+# A completed triage card whose report made that promise must have its linked
+# child card in `task_links`. If the front-door turn ended between Call 1 and
+# Call 2, the reader sees a report telling them not to reply `apply` while no
+# follow-up card exists to open the Pull Request.
+MISSING_PR_CHILD_SQL = f"""
+    SELECT t.id, t.title
+      FROM tasks t
+     WHERE t.status = 'done'
+       AND t.title LIKE 'Triage %'
+       AND t.result LIKE '%{TRIAGE_OPEN_PR_MARKER}%'
+       AND NOT EXISTS (
+           SELECT 1 FROM task_links l WHERE l.parent_id = t.id
+       )
+     ORDER BY t.id
+"""
 
 
 def agent_home() -> Path:
@@ -339,7 +375,7 @@ def read_only_connection(db: Path) -> sqlite3.Connection:
 
 
 def blocked_context(conn: sqlite3.Connection) -> dict:
-    """Title and kind per blocked card, or {} on an unmigrated board."""
+    """Title, kind and the todo children it holds back, per blocked card, or {} on an unmigrated board."""
     try:
         tasks = {
             row["id"]: {"title": row["title"] or "", "kind": row["block_kind"]}
@@ -356,6 +392,17 @@ def blocked_context(conn: sqlite3.Connection) -> dict:
                 # Events arrive oldest first, so the last kind wins.
                 if payload.get("kind"):
                     tasks[row["task_id"]]["kind"] = payload["kind"]
+        try:
+            for row in conn.execute(BLOCKED_CHILDREN_SQL):
+                if row["parent_id"] not in tasks:
+                    continue
+                tasks[row["parent_id"]].setdefault("waiting_children", []).append({
+                    "id": row["id"],
+                    "title": row["title"] or "",
+                    "assignee": row["assignee"] or "?",
+                })
+        except sqlite3.OperationalError:
+            pass
     except sqlite3.OperationalError:
         return {}
     return tasks
@@ -400,7 +447,8 @@ def stuck_tasks(stuck_items: list, context: dict) -> list:
     """One dict per stuck card: id, title, whether it waits on a person, and its age.
 
     The board's title and kind first (``blocked_context``), the CLI's title as
-    the fallback; the reason is not carried, since chat never shows it.
+    the fallback, and the titles of the todo cards it holds back; the reason is
+    not carried, since chat never shows it.
     """
     tasks = []
     for task_id, diag, entry in stuck_items:
@@ -412,6 +460,7 @@ def stuck_tasks(stuck_items: list, context: dict) -> list:
             "title": " ".join(str(raw_title).split()),
             "person": info.get("kind") in PERSON_BLOCK_KINDS,
             "age_hours": _card_age_hours(diag),
+            "held": [str(child.get("title") or "") for child in info.get("waiting_children") or ()],
         })
     return tasks
 
@@ -426,16 +475,26 @@ def plain_age(age_hours: float) -> str | None:
     return f"{count} {units[0] if count == 1 else units[1]}"
 
 
-def plain_title(title: str) -> str:
-    """The task's title without emphasis markers, cut at a word boundary."""
+def plain_title(title: str, limit: int = STUCK_TITLE_MAX_CHARS) -> str:
+    """The task's title without emphasis markers, cut at a word boundary within ``limit``."""
     text = " ".join(title.replace(TITLE_EMPHASIS, "").split()) or UNTITLED_TASK
-    if len(text) <= STUCK_TITLE_MAX_CHARS:
+    if len(text) <= limit:
         return text
-    cut = text[: STUCK_TITLE_MAX_CHARS - len(ELLIPSIS)]
+    cut = text[: limit - len(ELLIPSIS)]
     head, space, _rest = cut.rpartition(" ")
     if not space or len(head) * CLIP_MIN_SHARE < len(cut):
         head = cut
     return head.rstrip() + ELLIPSIS
+
+
+def held_line(group: list) -> str | None:
+    """"Holding back: <title> and N more." for the todo cards a row's tasks hold back, or None."""
+    titles = list(dict.fromkeys(plain_title(title, HELD_TITLE_MAX_CHARS) for task in group for title in task.get("held") or ()))
+    if not titles:
+        return None
+    shown = HELD_SEPARATOR.join(titles[:HELD_TITLES_MAX])
+    rest = len(titles) - HELD_TITLES_MAX
+    return HELD_LINE.format(titles=shown + (HELD_MORE.format(count=rest) if rest > 0 else ""))
 
 
 def status_line(person: bool, age_hours: float) -> str:
@@ -470,6 +529,9 @@ def render_stuck_tasks(tasks: list) -> list:
             title += STUCK_GROUP_SUFFIX.format(count=len(group))
         oldest = max(t["age_hours"] for t in group)
         lines.extend(["", title, status_line(group[0]["person"], oldest)])
+        held = held_line(group)
+        if held:
+            lines.append(held)
     hidden = sum(len(group) for group in rows[MAX_STUCK_ROWS:])
     if hidden:
         lines.extend(["", STUCK_MORE_LINE.format(count=hidden)])
@@ -583,6 +645,14 @@ def invariant_violations(conn: sqlite3.Connection) -> list:
             f"  ghost claim: task {row['id']} is '{row['status']}' but still holds "
             f"claim_lock={row['claim_lock']!r}"
         )
+    try:
+        for row in conn.execute(MISSING_PR_CHILD_SQL):
+            lines.append(
+                f"  missing follow-up child: task {row['id']} ({row['title']!r}) promised "
+                "an automatic Pull Request but has no linked child in task_links"
+            )
+    except sqlite3.OperationalError:
+        pass
     return lines
 
 

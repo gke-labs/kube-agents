@@ -3083,11 +3083,24 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		// would scaffold or archive optional specialist profiles outside the
 		// operator's AgentProfile reconciliation. The operator renders them only
 		// under next, after this merge.
+		// Drop any plugin env entry that references a forge credentialsRef
+		// Secret, matching the reconcile-time refusal in
+		// validateExtraVolumeMounts so buildPodTemplateSpec never renders a
+		// forge Secret into the platform-agent container even when called
+		// directly in unit tests.
+		var forgeSecrets []string
+		if agent.Spec.Integration != nil {
+			forgeSecrets = agent.Spec.Integration.ForgeCredentialSecretNames()
+		}
 		kept := extEnvs[:0]
 		for _, e := range extEnvs {
-			if e.Name != a2aNotifyPlatformEnvVar && e.Name != a2aNotifyConversationsEnvVar && e.Name != enabledProfilesEnvVar {
-				kept = append(kept, e)
+			if e.Name == a2aNotifyPlatformEnvVar || e.Name == a2aNotifyConversationsEnvVar || e.Name == enabledProfilesEnvVar {
+				continue
 			}
+			if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil && slices.Contains(forgeSecrets, e.ValueFrom.SecretKeyRef.Name) {
+				continue
+			}
+			kept = append(kept, e)
 		}
 		extEnvs = kept
 		if len(extEnvs) > 0 {
@@ -4946,6 +4959,14 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// day, and a value that does not parse means off, so it bounds a
 		// count of chat messages and triage turns and reaches nothing else.
 		"INCIDENT_WORKLOAD_DEDUP_SECONDS": {},
+
+		// "true" has an event triage also file a card that opens the
+		// report's recommended fix as a GitOps pull request, without waiting
+		// for a human `apply` (INCIDENT_TRIAGE_OPEN_PULL_REQUEST in
+		// session_kv_server.py). Any other value, unset included, is off. It
+		// changes which cards the front door files and nothing else: the pull
+		// request still goes through submit-suggestion and a human merges it.
+		"INCIDENT_TRIAGE_OPEN_PULL_REQUEST": {},
 	}
 	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the
 	// default suggested prompts (`apply_slack_agent_view.py`), under the same

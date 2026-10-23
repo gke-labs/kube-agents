@@ -4176,6 +4176,18 @@ def test_every_finding_named_does_not_grade_a_collector_held_id(token, github):
     assert _ledger_check(every_finding_named=True).verify(5.0).status == "pass"
 
 
+def test_every_finding_named_does_not_grade_a_not_rechecked_id(token, github):
+    # The note and id-only tiers of the held span show no row for a previous
+    # finding on a target the run did not check; the span lists its id.
+    _stash_report()
+    held = (
+        "\n<!-- audit-held:begin -->\n<!-- audit-held-ids: [] -->\n"
+        f'<!-- audit-not-rechecked-ids: ["{_NAMED_CUT}"] -->\n<!-- audit-held:end -->\n'
+    )
+    github.routes[_api()] = (200, _issue(_cut_body(held)))
+    assert _ledger_check(every_finding_named=True).verify(5.0).status == "pass"
+
+
 def test_every_finding_named_fails_on_an_omission_notice_without_a_complete_block(token, github):
     _stash_report()
     body = _ledger_body(
@@ -4447,6 +4459,21 @@ def test_the_complete_block_regex_reads_what_audit_report_writes():
     body = _ledger_body() + template.replace("{payload}", payload) + "\n"
     parsed = verifiers._finding_ids(body)
     assert parsed == (["a.b.c.d", "e.f.g.h"], "audit-findings-all")
+
+
+def test_the_not_rechecked_regex_reads_what_audit_report_writes():
+    """_NOT_RECHECKED_IDS_RE copies the list that audit_report's held span writes.
+    Build that list from the script's own name and template, so a change on that
+    side fails here and not as a grade on a not-re-checked id."""
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "agents/platform/skills/fleet-audit/scripts/audit_report.py"
+    ).read_text()
+    (name,) = re.findall(r'^NOT_RECHECKED_IDS_COMMENT = "([^"]+)"$', source, re.M)
+    assert 'f"<!-- {NOT_RECHECKED_IDS_COMMENT}: {json.dumps(unread)} -->"' in source
+    comment = f"<!-- {name}: {json.dumps(['a.b.c.d', 'e.f.g.h'])} -->"
+    (payload,) = verifiers._NOT_RECHECKED_IDS_RE.findall(comment)
+    assert json.loads(payload) == ["a.b.c.d", "e.f.g.h"]
 
 
 def test_no_body_scoped_ledger_phrase_collides_with_a_roster_check_slug():
@@ -5949,6 +5976,34 @@ def test_a_commits_page_github_would_not_serve_is_an_error_not_a_pass(token, git
     res = _pr_check().verify(5.0)
     assert res.status == "error" and not res.success, res.reason
     assert names in res.reason and "commits page" in res.reason, res.reason
+
+
+@pytest.mark.parametrize(
+    "status, body, says",
+    [
+        (401, {"message": "Bad credentials"}, "is not valid"),
+        (403, {"message": "Resource not accessible by integration"}, "needs `pull_requests: read`"),
+    ],
+)
+def test_a_refused_credential_is_named_as_the_one_the_request_carried(
+    token, github, monkeypatch, tmp_path, status, body, says
+):
+    """After a renewal BENCH_GITHUB_TOKEN_FILE and BENCH_GITHUB_TOKEN hold
+    different tokens and the request carries the file's, so a 401 or 403 that
+    blamed the variable sent the reader to a token nobody sent."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
+    github.routes[f"{_pr_api('pulls')}/commits?per_page=100&page=1"] = (status, body)
+    res = _pr_check().verify(5.0)
+    assert f"the token in BENCH_GITHUB_TOKEN {says}" in res.reason, res.reason
+    token_file = tmp_path / "ledger-token"
+    token_file.write_text("ghs_renewed\n", encoding="utf-8")
+    monkeypatch.setenv("BENCH_GITHUB_TOKEN_FILE", str(token_file))
+    res = _pr_check().verify(5.0)
+    assert res.status == "error", res.reason
+    assert f"the token in the file BENCH_GITHUB_TOKEN_FILE names ({token_file}) {says}" in res.reason, res.reason
+    assert "in BENCH_GITHUB_TOKEN " not in res.reason, res.reason
 
 
 def test_a_repository_the_agent_invented_is_a_fail_not_an_error(token, github):

@@ -409,14 +409,14 @@ class DedupeTest(Harness):
         pr = {"number": 3990, "title": "t", "body": "", "pull_request": {"url": "https://api.github.com/pulls/3990"}}
         hidden = {"number": 3667, "title": "t", "body": nightly_bugs.MARKER.format(case="case-red")}
         filer = nightly_bugs.Filer(nightly_bugs.ghcli.Gh(REPO, FakeGh(open_issues=[pr, hidden])), self.root)
-        self.assertEqual(filer.listing_doubt([pr], [], None), "the open listing holds 0 issues, GraphQL 1 (missing #3667)")
-        self.assertIsNone(filer.listing_doubt([pr, hidden], [], None))
+        self.assertEqual(nightly_bugs.listing_doubt(filer.gh, [pr], [], None), "the open listing holds 0 issues, GraphQL 1 (missing #3667)")
+        self.assertIsNone(nightly_bugs.listing_doubt(filer.gh, [pr, hidden], [], None))
 
     def test_a_listing_short_of_graphqls_total_beyond_its_first_page_is_untrusted(self):
         listed = [{"number": n, "title": "t", "body": ""} for n in range(1, 101)]
         fake = FakeGh(open_issues=listed + [{"number": 101, "title": "t", "body": ""}])
         filer = nightly_bugs.Filer(nightly_bugs.ghcli.Gh(REPO, fake), self.root)
-        self.assertIsNotNone(filer.listing_doubt(listed, [], None))
+        self.assertIsNotNone(nightly_bugs.listing_doubt(filer.gh, listed, [], None))
 
     def test_a_bug_closed_after_the_newest_red_night_is_not_filed_again(self):
         marker = nightly_bugs.MARKER.format(case="case-red")

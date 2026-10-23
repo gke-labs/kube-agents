@@ -43,7 +43,8 @@ CREATE TABLE tasks (
     created_at INTEGER,
     claim_lock TEXT,
     current_run_id INTEGER,
-    block_kind TEXT
+    block_kind TEXT,
+    result TEXT
 );
 CREATE TABLE task_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,6 +59,10 @@ CREATE TABLE task_events (
     payload TEXT,
     created_at INTEGER
 );
+CREATE TABLE task_links (
+    parent_id TEXT NOT NULL,
+    child_id TEXT NOT NULL
+);
 """
 
 STUCK_PAYLOAD = json.dumps([{
@@ -68,16 +73,16 @@ STUCK_PAYLOAD = json.dumps([{
 }])
 
 
-def make_board(tmp: Path, tasks=(), runs=(), events=()):
+def make_board(tmp: Path, tasks=(), runs=(), events=(), links=()):
     db = tmp / "kanban.db"
     conn = sqlite3.connect(db)
     conn.executescript(SCHEMA)
     for row in tasks:
         conn.execute(
-            "INSERT INTO tasks (id,title,status,assignee,created_at,claim_lock,current_run_id,block_kind)"
-            " VALUES (:id,:title,:status,:assignee,:created_at,:claim_lock,:current_run_id,:block_kind)",
+            "INSERT INTO tasks (id,title,status,assignee,created_at,claim_lock,current_run_id,block_kind,result)"
+            " VALUES (:id,:title,:status,:assignee,:created_at,:claim_lock,:current_run_id,:block_kind,:result)",
             {"title": "t", "assignee": "platform", "created_at": 1000,
-             "claim_lock": None, "current_run_id": None, "block_kind": None, **row},
+             "claim_lock": None, "current_run_id": None, "block_kind": None, "result": None, **row},
         )
     for row in events:
         conn.execute(
@@ -92,6 +97,11 @@ def make_board(tmp: Path, tasks=(), runs=(), events=()):
         if row.get("link_current"):
             conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?",
                          (cur.lastrowid, row["task_id"]))
+    for parent_id, child_id in links:
+        conn.execute(
+            "INSERT INTO task_links (parent_id,child_id) VALUES (?,?)",
+            (parent_id, child_id),
+        )
     conn.commit()
     conn.close()
     return db
@@ -130,6 +140,36 @@ class InvariantTests(unittest.TestCase):
         self.assertEqual(len(out), 1)
         self.assertIn("ghost claim", out[0])
         self.assertIn("t_ghost", out[0])
+
+    def test_done_open_pr_triage_card_without_linked_child_is_reported(self):
+        out = self.violations_for(
+            tasks=[{
+                "id": "t_orphan_triage",
+                "title": "Triage ns/Pod/api (BackOff) on c1",
+                "status": "done",
+                "assignee": "cluster-c1",
+                "result": "- **To authorize:** a GitOps Pull Request for the recommended fix is being opened automatically.",
+            }]
+        )
+        self.assertEqual(len(out), 1)
+        self.assertIn("missing follow-up child", out[0])
+        self.assertIn("t_orphan_triage", out[0])
+
+        # With the follow-up child linked in task_links, the invariant is silent.
+        linked = self.violations_for(
+            tasks=[
+                {
+                    "id": "t_triage",
+                    "title": "Triage ns/Pod/api (BackOff) on c1",
+                    "status": "done",
+                    "assignee": "cluster-c1",
+                    "result": "- **To authorize:** a GitOps Pull Request for the recommended fix is being opened automatically.",
+                },
+                {"id": "t_pr", "title": "Open GitOps PR for ns/Pod/api (BackOff) on c1", "status": "todo", "assignee": "platform"},
+            ],
+            links=[("t_triage", "t_pr")],
+        )
+        self.assertEqual(linked, [])
 
     def test_orphan_run_when_task_is_not_running(self):
         out = self.violations_for(
@@ -425,7 +465,10 @@ class StuckTasksTests(unittest.TestCase):
         self.assertEqual(lines[-1], "And 3 more.")
 
     def test_the_worst_case_card_fits_its_reserve(self):
-        tasks = [stuck(f"t_{i}", f"{i:03d} " + "word " * 100, 1e6) for i in range(kbh.MAX_STUCK_ROWS * 4)]
+        tasks = [
+            dict(stuck(f"t_{i}", f"{i:03d} " + "word " * 100, 1e6), held=["held " * 60, "other"])
+            for i in range(kbh.MAX_STUCK_ROWS * 4)
+        ]
         tasks += [stuck(f"g_{i}", "group", 1e6) for i in range(999)]
         text = "\n".join(kbh.render_stuck_tasks(tasks))
         self.assertLess(len(text), kbh.STUCK_CARD_RESERVE)
@@ -437,6 +480,30 @@ class StuckTasksTests(unittest.TestCase):
         self.assertNotIn("*", title)
         self.assertEqual(kbh.plain_title("x" * 300), "x" * (kbh.STUCK_TITLE_MAX_CHARS - 1) + "…")
         self.assertEqual(kbh.plain_title("  "), "Untitled task")
+
+    def test_a_stuck_task_names_the_todo_cards_it_holds_back(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = make_board(
+                Path(d),
+                tasks=[
+                    {"id": "t_stuck", "title": "Triage x", "status": "blocked", "assignee": "cluster-a", "block_kind": "needs_input"},
+                    {"id": "t_pr", "title": "Open GitOps PR for x", "status": "todo", "assignee": "platform"},
+                ],
+                links=[("t_stuck", "t_pr")],
+            )
+            conn = kbh.read_only_connection(db)
+            try:
+                context = kbh.blocked_context(conn)
+            finally:
+                conn.close()
+        tasks = kbh.stuck_tasks([("t_stuck", {"data": {"age_hours": 30}}, {})], context)
+        lines = kbh.render_stuck_tasks(tasks)
+        self.assertIn("Holding back: Open GitOps PR for x.", lines)
+        self.assertFalse(any("t_pr" in line for line in lines))
+
+    def test_the_held_back_line_names_one_and_counts_the_rest(self):
+        task = dict(stuck("a", "Triage x"), held=["One", "Two", "Three"])
+        self.assertIn("Holding back: One and 2 more.", kbh.render_stuck_tasks([task]))
 
     def test_a_short_word_before_a_long_token_keeps_the_hard_cut(self):
         title = kbh.plain_title("Investigate " + "x" * 200)
@@ -575,7 +642,7 @@ class ReportTests(unittest.TestCase):
             tasks, lines = kbh.report(Path(d), runner=lambda argv, env, timeout: (0, STUCK_PAYLOAD, ""),
                                       binary="/x/hermes", env={})
         self.assertEqual(lines, [])
-        self.assertEqual(tasks, [{"task_id": "t_stuck", "title": "Triage x", "person": True, "age_hours": 456.2}])
+        self.assertEqual(tasks, [{"task_id": "t_stuck", "title": "Triage x", "person": True, "age_hours": 456.2, "held": []}])
 
     def test_an_engine_that_did_not_answer_returns_no_stuck_tasks(self):
         with tempfile.TemporaryDirectory() as d:

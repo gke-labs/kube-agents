@@ -200,30 +200,51 @@ Hindsight's images sit behind `hindsight.enabled` — unset by default, and then
 `images.json`, run `make images-check` and `make docs-generate`, then grep the tree for the old
 version before opening the pull request.
 
-**CodeQL alerts.** CodeQL runs here through GitHub's default setup, which analyses pushes to `main`
-and the other protected branches, a weekly schedule, and, intermittently, pull requests whose head
-branch lives in this repository; in the repository's history one fork pull request has been
-analysed, and no pull request of any kind since early September. Contributor branches live on
-forks, so a change that closes a code-scanning alert cannot count on CI to show it closing.
-Reproduce it locally instead: install the CLI as a `gh` extension, pin it to the version the
-alert's `tool.version` reports, and build a database over a scratch tree holding the flagged file
-at its repository path, once before the change and once after:
+**CodeQL alerts.** CodeQL runs here through
+[`codeql.yml`](../.github/workflows/codeql.yml): on every pull request that touches Python, Go,
+JavaScript or workflow files, pull requests from forks included, on pushes to `main` and
+`release/**`, and weekly. A push runs the workflow file on the pushed branch, so a release line
+is covered once it is cut from a `main` that carries the file; a line cut before that
+(`release/0.17` and older) gets no analysis after default setup is off until the file is
+back-ported to it. It needs GitHub's default setup off: GitHub rejects the workflow's
+uploads while default setup is on, so an administrator switches it off when this workflow lands
+and leaves it off, and turning it back on fails every run at upload. A pull-request
+run analyses the merge commit and reports the findings on changed lines as annotations on the
+pull request and in the `CodeQL` check that GitHub posts once the `Analyze (<language>)` jobs have
+uploaded, so an alert a change would introduce shows up before the merge. It does not show an
+alert closing: a pull-request run reports changed lines only, and an absent annotation is not
+evidence. To show an alert closing, or to see one before the pull request opens, reproduce it
+locally: install the CLI as a `gh` extension, pin it to the version the alert's `tool.version`
+reports, and build a database once before the change and once after. For Python the database is
+over a scratch tree holding the flagged file at its repository path. For Go it is over the module
+that holds the file, because a Go database is built rather than read, and the build is named rather
+than left to the autobuilder, which runs whatever build file its source root holds (from the
+repository root, `make`, whose default target is the platform image's Docker build; it fails
+fast on a runner where the image tag is empty and runs for real where it is not):
 
 ```bash
 gh extension install github/gh-codeql
-gh codeql set-version 2.27.1 # the alert's tool.version
+gh codeql set-version 2.27.3 # the alert's tool.version
+# Python: the flagged file alone, at its repository path under /tmp/cq/tree
 gh codeql database create /tmp/cq/db --language=python --source-root /tmp/cq/tree
 gh codeql database analyze /tmp/cq/db \
   codeql/python-queries:Security/CWE-312/CleartextLogging.ql \
   --download --format=sarif-latest --output /tmp/cq/out.sarif
+# Go: the module that holds the flagged file, built under the tracer
+gh codeql database create /tmp/cq/db-go --language=go --source-root a2a \
+  --command 'go build ./...'
+gh codeql database analyze /tmp/cq/db-go \
+  codeql/go-queries:Security/CWE-312/CleartextLogging.ql \
+  --download --format=sarif-latest --output /tmp/cq/out-go.sarif
 ```
 
 An alert names a rule id, not a query. The query is the `.ql` in the pack whose `@id` matches it:
 after the first `--download`,
 `grep -rl '@id py/clear-text-logging-sensitive-data' ~/.codeql/packages/codeql/python-queries/`
 finds `Security/CWE-312/CleartextLogging.ql`, and `CleartextStorage.ql` beside it is the storage
-rule. The before run has to reproduce the alert at `main`'s line, and the SARIF's `codeFlows` names
-the source the flagged line was reached from; the after run reports none. Quote both under
+rule; the same grep for `@id go/clear-text-logging` over `codeql/go-queries/` finds the Go query
+above. The before run has to reproduce the alert at `main`'s line, and the SARIF's `codeFlows`
+names the source the flagged line was reached from; the after run reports none. Quote both under
 **Testing**. The pack `--download` resolves can differ from the one the hosted analysis ran, so the
 code-scanning tab on the merged head is still the final check.
 
