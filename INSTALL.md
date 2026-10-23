@@ -1346,7 +1346,7 @@ kubectl exec deploy/platform-agent-gateway -n kubeagents-system -c platform-agen
 Each audit's report is a ledger issue in the GitOps repository, and its fixes are pull requests
 there, so those two need a GitOps repository, on GitHub or on GitLab. With no GitOps repository
 registered, the audits still run: each keeps its findings in the report store on the agent's
-volume, and a run that changed something posts a summary to chat that says no forge is configured.
+volume, and a run that changed something posts a summary to chat that says no GitOps repository is connected.
 A run whose repository the broker cannot reach, or a run on an install with several managed
 repositories and none with `role: gitops`, does the same, but it posts its summary on every run,
 with the reason and the fix. See
