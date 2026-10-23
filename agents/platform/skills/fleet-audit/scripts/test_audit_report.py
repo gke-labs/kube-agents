@@ -401,6 +401,19 @@ def resolved_for(previous_body):
     ]
 
 
+
+def changed(head):
+    """(new, resolved) as an audit line states them; a count the line leaves out is 0."""
+    new = re.search(r"\b(\d+) new\b", head)
+    resolved = re.search(r"\b(\d+) resolved\b", head)
+    return (int(new.group(1)) if new else 0, int(resolved.group(1)) if resolved else 0)
+
+
+def clean_resolved(head):
+    """How many findings a clean audit line says were resolved, or None when the line is not clean."""
+    return changed(head)[1] if ": clean" in head else None
+
+
 def make_doc(findings=None, audit=AUDIT, clusters=None, skipped=None):
     if clusters is None:
         clusters = [
@@ -28012,12 +28025,15 @@ class TestNoForge(BaseTestCase):
         self.assertFalse(out["silent_ok"])
         self.assertEqual(out["prs_opened"], [])
         summary = out["summary"].splitlines()
-        self.assertTrue(summary[0].startswith(audit_report.audit_name(AUDIT)))
-        self.assertIn("4 findings (2 critical) across 2 cluster(s); 4 new, 0 resolved", summary[0])
-        # Most severe first.
+        self.assertEqual(summary[0], f"{audit_report.audit_name(AUDIT)}: 2 critical findings, 4 new.")
+        # The critical findings up to the cap; the rest counted by severity.
         self.assertEqual(
-            [line.split("] ", 1)[1].split(" (")[0] for line in summary[1:5]],
-            ["Crit one", "Crit two", "Major one", "Minor one"],
+            summary[1:4],
+            [
+                "`critical` prod-us-east: crit-one has no network policy",
+                "`critical` prod-us-east: crit-two has no network policy",
+                "2 more (1 major, 1 minor) are saved on the install.",
+            ],
         )
         self.assertEqual(summary[-1], audit_report.NO_FORGE_NOTE)
         latest = json.loads((self.store() / "latest.json").read_text(encoding="utf-8"))
@@ -28211,8 +28227,12 @@ class TestNoForge(BaseTestCase):
         self.assertIn("The collector flagged 2 candidate(s)", out["summary"])
 
     def test_the_summary_names_the_object(self):
-        out = self.finish(make_doc(findings=[make_finding(obj="ClusterRoleBinding/debug-binding", namespace="")]))
-        self.assertIn("(prod-us-east/ClusterRoleBinding/debug-binding)", out["summary"])
+        out = self.finish(
+            make_doc(
+                findings=[make_finding(obj="ClusterRoleBinding/debug-binding", namespace="", check="cluster-admin-binding")]
+            )
+        )
+        self.assertIn("`critical` prod-us-east: debug-binding grants cluster-admin", out["summary"].splitlines())
 
     def test_a_lost_latest_falls_back_to_the_ring(self):
         self.finish(make_doc(findings=THREE_SEVERITIES))
@@ -28430,7 +28450,8 @@ class TestChatReport(HarnessTestCase):
         self.assertEqual(repo, "acme/fleet")
         lines = text.splitlines()
         self.assertTrue(lines[0].startswith(f"{audit_report.audit_name(AUDIT)}: "))
-        self.assertIn(" new, ", lines[0])
+        self.assertEqual(changed(lines[0]), (1, 0))
+        self.assertNotIn("0 resolved", lines[0])
         self.assertEqual(lines[-1], "Ledger: https://github.com/acme/fleet/issues/7")
         self.assertNotIn("chat_report", self.stdout_json())
 
@@ -28447,7 +28468,7 @@ class TestChatReport(HarnessTestCase):
         payload = {"status": "HELD", "issue_url": "https://github.com/acme/fleet/issues/7",
                    "new": 0, "resolved": 0, audit_report.UNACCOUNTED_KEY: ["rbac.a", "rbac.b"]}
         text = audit_report.render_chat_report(AUDIT, payload, make_doc(findings=[]))
-        self.assertIn("2 carried finding(s) were not accounted for", text.splitlines()[0])
+        self.assertIn("no findings across 2 clusters, but the ledger stays open: 2 carried findings were not accounted for.", text.splitlines()[0])
         self.assertIn("- Not accounted for: rbac.a, rbac.b", text)
 
     def test_a_run_with_no_memory_of_the_last_says_the_change_is_unknown(self):
@@ -28636,7 +28657,7 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         kept, appended = text.split(f"\n\n{audit_report.CHAT_REPORT_REFINISH_LABEL}\n")
         self.assertEqual(kept, first_text)
         # The whole run's count on the chat line; its own on the JSON line.
-        self.assertIn(": 1 new, 0 resolved;", appended.splitlines()[0])
+        self.assertEqual(changed(appended.splitlines()[0]), (1, 0))
         self.assertEqual(second["new"], 0)
         self.assertNotEqual(self.chat_record()["run"], run)
         stored = json.loads((self.store_dir() / "latest.json").read_text(encoding="utf-8"))
@@ -28665,8 +28686,8 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         self.assertEqual(self.run_finish(doc), 0)
         self.assertEqual(self.stdout_json()["resolved"], 0)
         first, second = self.heads()
-        self.assertIn(": 0 new, 1 resolved;", first)
-        self.assertIn(": 0 new, 1 resolved;", second)
+        self.assertEqual(changed(first), (0, 1))
+        self.assertEqual(changed(second), (0, 1))
 
     def test_a_finding_new_then_gone_in_one_run_is_neither_new_nor_resolved(self):
         self.start()
@@ -28677,8 +28698,8 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         self.assertEqual(self.run_finish(make_doc(findings=[make_finding(fid="a", severity="major")])), 0)
         self.assertEqual(self.stdout_json()["resolved"], 1)
         first, second = self.heads()
-        self.assertIn(": 1 new, 0 resolved;", first)
-        self.assertIn(": 0 new, 0 resolved;", second)
+        self.assertEqual(changed(first), (1, 0))
+        self.assertEqual(changed(second), (0, 0))
 
     def test_a_finding_resolved_then_back_in_one_run_is_neither_new_nor_resolved(self):
         self.start()
@@ -28688,8 +28709,8 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         self.assertEqual(self.run_finish(both), 0)
         self.assertEqual(self.stdout_json()["new"], 1)
         first, second = self.heads()
-        self.assertIn(": 0 new, 1 resolved;", first)
-        self.assertIn(": 0 new, 0 resolved;", second)
+        self.assertEqual(changed(first), (0, 1))
+        self.assertEqual(changed(second), (0, 0))
 
     def test_a_third_finish_still_counts_from_the_run_start(self):
         self.start()
@@ -28700,7 +28721,7 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         self.assertEqual(self.stdout_json()["new"], 0)
         heads = self.heads()
         self.assertEqual(len(heads), 3)
-        self.assertIn(": 2 new, 0 resolved;", heads[-1])
+        self.assertEqual(changed(heads[-1]), (2, 0))
 
     def test_a_finding_the_previous_ledger_filed_but_cut_is_not_the_runs_new(self):
         """The previous body was over budget: `b` was filed but not rendered, so it is not new."""
@@ -28725,8 +28746,8 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         self.assertEqual(self.run_finish(doc), 0, self.err)
         self.assertEqual(self.stdout_json()["new"], 0)
         first, second = self.heads()
-        self.assertIn(": 0 new, 0 resolved;", first)
-        self.assertIn(": 0 new, 0 resolved;", second)
+        self.assertEqual(changed(first), (0, 0))
+        self.assertEqual(changed(second), (0, 0))
         [part] = self.chat_record()["parts"]
         self.assertEqual(part[audit_report.CHAT_REPORT_BASELINE_FILED_KEY], sorted([ida, idb]))
 
@@ -28740,8 +28761,8 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         second = self.stdout_json()
         self.assertEqual((second["status"], second["resolved"]), ("CLEAN", 1))
         first, last = self.heads()
-        self.assertIn(": 0 new, 1 resolved;", first)
-        self.assertIn(": clean, 0 findings, 2 resolved", last)
+        self.assertEqual(changed(first), (0, 1))
+        self.assertEqual(clean_resolved(last), 2)
 
     def test_an_unknown_run_start_says_the_change_is_unknown(self):
         self.start()
@@ -28770,7 +28791,7 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         [(_, text)] = self.entries()
         self.assertIn(f"\n\n{audit_report.CHAT_REPORT_REFINISH_RELATIVE_LABEL}\n", text)
         self.assertNotIn(audit_report.CHAT_REPORT_REFINISH_LABEL, text)
-        self.assertIn(": 0 new, 0 resolved;", self.heads()[-1])
+        self.assertEqual(changed(self.heads()[-1]), (0, 0))
         # Nor does the second save its mid-run memory for a third to count from.
         self.assertEqual(self.finish_again(doc), 0)
         [(_, text)] = self.entries()
@@ -28786,8 +28807,8 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         )
         self.assertEqual(self.run_finish(gapped), 0)
         first, second = self.heads()
-        self.assertIn(": 0 new, 1 resolved;", first)
-        self.assertIn(": 0 new, 0 resolved;", second)
+        self.assertEqual(changed(first), (0, 1))
+        self.assertEqual(changed(second), (0, 0))
 
     def test_a_clean_later_finish_over_a_coverage_gap_claims_nothing_resolved(self):
         self.start()
@@ -28797,7 +28818,7 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         clean["resolved_because"] = resolved_for(self.stored_ledger_body(AUDIT, "acme/fleet", 42))
         self.assertEqual(self.run_finish(clean), 0)
         self.assertEqual(self.stdout_json()["status"], "CLEAN")
-        self.assertIn(": clean, 0 findings, 0 resolved", self.heads()[-1])
+        self.assertEqual(clean_resolved(self.heads()[-1]), 0)
 
     def test_a_run_that_started_on_another_id_scheme_withholds_its_resolved(self):
         self.start()
@@ -28811,7 +28832,7 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         self.assertEqual(self.run_finish(doc), 0)
         self.assertEqual(self.run_finish(doc), 0)
         for head in self.heads():
-            self.assertIn(", 0 resolved;", head)
+            self.assertEqual(changed(head)[1], 0)
 
     def test_a_finding_the_collector_still_flags_is_not_the_runs_resolved(self):
         self.start()
@@ -28835,7 +28856,7 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         for _ in range(2):
             self.assertEqual(self.run_finish(doc, ["--manifest-file", str(manifest)]), 0, self.err)
         for head in self.heads():
-            self.assertIn(": 0 new, 0 resolved;", head)
+            self.assertEqual(changed(head), (0, 0))
 
     def test_a_second_finish_keeps_an_earlier_repositorys_report(self):
         now = datetime.now(timezone.utc)
@@ -28893,7 +28914,7 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         self.assertFalse(self.stdout_json()["silent_ok"])
         [(_, text)] = self.entries()
         self.assertTrue(text.startswith(audit_report.CHAT_REPORT_RERUN_LABEL + "\n"))
-        self.assertIn(": 1 new, 0 resolved;", text.splitlines()[1])
+        self.assertEqual(changed(text.splitlines()[1]), (1, 0))
 
     def test_a_clean_second_finish_after_a_clean_one_with_news_is_not_silent(self):
         self.start()
@@ -28985,7 +29006,7 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         [(_, text)] = self.entries()
         label, head = text.splitlines()[:2]
         self.assertEqual(label, audit_report.CHAT_REPORT_RERUN_LABEL)
-        self.assertIn(f": {len(findings)} new, 0 resolved;", head)
+        self.assertEqual(changed(head), (len(findings), 0))
 
     def test_a_rerun_after_a_broker_lost_mid_sweep_opens_no_second_batch(self):
         self.start()
@@ -29839,6 +29860,166 @@ class TestNoRepositoryChosen(BaseTestCase):
         self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--repo", "acme/other"]), 1)
         self.assertIn("not in the managed repositories list", self.err)
         self.assertEqual(self.out, "")
+
+
+class TestPlainChatLines(unittest.TestCase):
+    """The chat lines in plain words: no zero counts, a plain phrase per check, short cluster names."""
+
+    NAME = "Security & RBAC Posture Audit"
+
+    def test_every_check_has_a_plain_phrase(self):
+        rostered = {check for spec in audit_report.AUDITS.values() for check in spec.checks + spec.derived}
+        self.assertEqual(sorted(rostered - set(audit_report.CHECK_PHRASES)), [])
+        self.assertEqual(sorted(set(audit_report.CHECK_PHRASES) - rostered), [])
+
+    def test_the_headline_drops_every_zero_count(self):
+        findings = [make_finding(severity="major"), make_finding(severity="major")]
+        self.assertEqual(
+            audit_report.findings_headline(self.NAME, findings, 1, 0, True), f"{self.NAME}: 2 major findings, 1 new."
+        )
+        self.assertEqual(
+            audit_report.findings_headline(self.NAME, findings, 0, 0, True), f"{self.NAME}: 2 major findings."
+        )
+
+    def test_the_headline_counts_the_most_severe_level_present(self):
+        findings = [make_finding(severity="minor"), make_finding(severity="critical")]
+        self.assertEqual(
+            audit_report.findings_headline(self.NAME, findings, 0, 2, True), f"{self.NAME}: 1 critical finding, 2 resolved."
+        )
+
+    def test_a_run_with_no_memory_of_the_last_says_so_without_counts(self):
+        self.assertEqual(
+            audit_report.findings_headline(self.NAME, [make_finding()], 0, 0, False),
+            f"{self.NAME}: 1 critical finding; the change since the last run is unknown.",
+        )
+
+    def test_a_clean_line_drops_a_zero_resolved_and_says_clusters(self):
+        payload = {"status": "CLEAN", "issue_url": "https://github.com/acme/fleet/issues/7", "new": 0, "resolved": 0}
+        doc = make_doc(findings=[])
+        self.assertEqual(
+            audit_report.render_chat_report(AUDIT, payload, doc).splitlines()[0], f"{self.NAME}: clean across 2 clusters."
+        )
+        payload["resolved"] = 3
+        doc["scope"]["clusters"] = doc["scope"]["clusters"][:1]
+        self.assertEqual(
+            audit_report.render_chat_report(AUDIT, payload, doc).splitlines()[0],
+            f"{self.NAME}: clean, 3 resolved across 1 cluster.",
+        )
+
+    def test_a_row_names_the_cluster_by_its_short_name(self):
+        finding = make_finding(
+            check="public-control-plane", cluster="proj/us-central1-a/seeded-a", namespace="", obj="Cluster/seeded-a"
+        )
+        self.assertEqual(audit_report.summary_row(finding), "`critical` seeded-a: control plane is public")
+
+    def test_a_row_names_the_object_the_check_judged(self):
+        finding = make_finding(check="privileged-container", cluster="proj/us-central1-a/seeded-a", obj="Deployment/payments-api")
+        self.assertEqual(audit_report.summary_row(finding), "`critical` seeded-a: payments-api runs a privileged container")
+
+    def test_a_cluster_setting_on_an_object_names_it_in_brackets(self):
+        finding = make_finding(check="workload-identity-off", obj="NodePool/pool-1", namespace="")
+        self.assertEqual(audit_report.summary_row(finding), "`critical` prod-us-east: Workload Identity is off (pool-1)")
+
+    def test_a_kinded_object_named_like_its_cluster_is_still_the_object(self):
+        finding = make_finding(fid="p", check="legacy-metadata", obj="NodePool/prod-us-east", namespace="")
+        self.assertNotEqual(audit_report._object_name(finding), "")
+
+    def test_a_row_without_a_phrase_keeps_the_title(self):
+        unknown = make_finding(check="not-a-check", title="Something  odd")
+        self.assertEqual(audit_report.summary_row(unknown), "`critical` prod-us-east: Something odd")
+        objectless = make_finding(check="privileged-container", obj="Cluster/prod-us-east", title="A privileged pod")
+        self.assertEqual(audit_report.summary_row(objectless), "`critical` prod-us-east: A privileged pod")
+
+    def test_a_row_is_redacted(self):
+        finding = make_finding(check="not-a-check", title="token ghp_" + "a" * 36)
+        self.assertNotIn("ghp_" + "a" * 36, audit_report.summary_row(finding))
+
+    def test_the_summary_lists_the_top_two_when_nothing_is_critical(self):
+        findings = [make_finding(fid=f"m{i}", severity="major") for i in range(3)] + [make_finding(fid="n", severity="minor")]
+        lines = audit_report.render_no_forge_summary(
+            AUDIT, make_doc(findings=findings), [], [], [], True, [], audit_report.NO_FORGE_NOTE
+        ).splitlines()
+        self.assertEqual(lines[0], f"{self.NAME}: 3 major findings.")
+        self.assertEqual(len([line for line in lines if line.startswith("`major`")]), 2)
+        self.assertIn("2 more (1 major, 1 minor) are saved on the install.", lines)
+
+    def test_a_summary_the_store_does_not_hold_lists_more_and_says_the_rest_are_not_listed(self):
+        # The message is the only copy, so it keeps as many findings as the old summary did.
+        findings = [make_finding(fid=f"c{i}") for i in range(4)] + [
+            make_finding(fid=f"m{i}", severity="major") for i in range(8)
+        ]
+        lines = audit_report.render_no_forge_summary(
+            AUDIT, make_doc(findings=findings), [], [], [], True, [], audit_report.NO_FORGE_UNSTORED_NOTE, stored=False
+        ).splitlines()
+        rows = [line for line in lines if line.startswith("`")]
+        self.assertEqual(len(rows), audit_report.NO_FORGE_SUMMARY_FINDINGS)
+        self.assertEqual(sum(row.startswith("`critical`") for row in rows), 4)
+        self.assertIn("2 more (2 major) are not listed here.", lines)
+        self.assertEqual(lines[-1], audit_report.NO_FORGE_UNSTORED_NOTE)
+
+    def test_stored_is_keyword_only(self):
+        with self.assertRaises(TypeError):
+            audit_report.render_no_forge_summary(AUDIT, make_doc(findings=[]), [], [], [], True, [], "note", 0, None, False)
+
+    def test_the_summary_lists_three_critical_findings_and_counts_the_rest(self):
+        findings = [make_finding(fid=f"c{i}") for i in range(5)] + [make_finding(fid="m", severity="major")]
+        lines = audit_report.render_no_forge_summary(
+            AUDIT, make_doc(findings=findings), [], [], [], True, [], audit_report.NO_FORGE_NOTE
+        ).splitlines()
+        self.assertEqual(len([line for line in lines if line.startswith("`critical`")]), 3)
+        self.assertIn("3 more (2 critical, 1 major) are saved on the install.", lines)
+
+    def _slack(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
+        import slack_audit_report
+
+        return slack_audit_report
+
+    def test_the_slack_card_knows_both_no_repository_notes(self):
+        self.assertEqual(
+            self._slack().NO_LEDGER_NOTES, (audit_report.NO_FORGE_NOTE, audit_report.NO_FORGE_UNSTORED_NOTE)
+        )
+
+    def test_a_summary_whose_note_carries_a_remedy_posts_as_written(self):
+        # The card would clip the remedy at its line length, so these summaries go out whole.
+        sar = self._slack()
+        findings = [make_finding(fid="c", check="public-control-plane", obj="Cluster/prod-us-east", namespace="")]
+        notes = {
+            "unreachable": audit_report.UNREACHABLE_NOTE.format(
+                repo="acme/fleet",
+                reason="FORGE_NOT_FOUND",
+                noun="pull request",
+                remedy=audit_report.UNREACHABLE_FORGE_REMEDY,
+                ledger=audit_report.UNREACHABLE_ISSUE_LEDGER,
+            ),
+            "no role": audit_report.NO_REPOSITORY_CHOSEN_NOTE.format(
+                message=audit_report.NO_GITOPS_ROLE_MESSAGE.format(
+                    repos="acme/a, acme/b", why=audit_report.NO_GITOPS_ROLE_WHY, remedy=audit_report.NO_GITOPS_ROLE_REMEDY
+                )
+            ),
+        }
+        for name, note in notes.items():
+            with self.subTest(note=name):
+                summary = audit_report.render_no_forge_summary(
+                    AUDIT, make_doc(findings=findings), [], [], [], True, [], note
+                )
+                self.assertTrue(summary.endswith(note))
+                self.assertIsNone(sar.summary_card(summary))
+                self.assertIsNone(sar.blocks_from_summary(summary))
+                self.assertIsNone(sar.chat_from_summary(summary))
+
+    def test_the_summary_reads_back_as_the_slack_card(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
+        import slack_audit_report
+
+        findings = [make_finding(fid="c", check="public-control-plane", obj="Cluster/prod-us-east", namespace="")]
+        summary = audit_report.render_no_forge_summary(
+            AUDIT, make_doc(findings=findings), [], [], ["r"], True, [], audit_report.NO_FORGE_NOTE
+        )
+        card = slack_audit_report.summary_card(summary)
+        self.assertEqual(card.headline, f"{self.NAME}: 1 critical finding, 1 resolved.")
+        self.assertEqual(card.rows, [{"severity": "critical", "text": "prod-us-east: control plane is public"}])
+        self.assertEqual(card.more, audit_report.NO_FORGE_NOTE)
 
 
 class TestStoreLedger(HarnessTestCase):

@@ -5108,6 +5108,66 @@ class TestSlackAuditHeadline(unittest.TestCase):
         self.assertEqual(second[2:], (self.HOME, self.SLACK_THREAD))
 
 
+    #: fleet-audit's summary of a run with no ledger issue (audit_report.render_no_forge_summary).
+    SUMMARY = (
+        "Security & RBAC Posture Audit: 1 critical finding, 2 resolved.\n"
+        "`critical` seeded-a: control plane is public\n"
+        "3 more (3 major) are saved on the install.\n"
+        "No GitOps repository is connected, so no ledger issue or fix pull requests were opened."
+    )
+
+    def test_flag_on_a_summary_posts_its_card_as_text_and_stores_the_report(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        response, calls = self._post(composed=self.SUMMARY, job_id="rbac")
+        self.assertEqual(response.json()["status"], "delivered")
+        text = session_kv_server.slack_audit_report.headline_from_summary(self.SUMMARY)
+        self.assertTrue(text.startswith("**Security & RBAC Posture Audit: 1 critical finding, 2 resolved.**\n"))
+        self.assertEqual([c.args for c in calls], [("slack", text, "", "")])
+        self.fetch.assert_not_called()
+        self.assertEqual(self._stored(), [(self.HOME, self.SLACK_THREAD, self.SUMMARY)])
+
+    def test_flag_on_with_a_relay_posts_the_summary_as_blocks(self):
+        self._blocks_on()
+        response, calls = self._post(composed=self.SUMMARY, blocks_post=lambda *a, **k: self.BLOCKS_TS)
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(calls, [])
+        (post,) = self.posts
+        _, _, blocks, _ = post.args
+        actions = blocks[-1]["elements"]
+        self.assertEqual([action["text"]["text"] for action in actions], [session_kv_server.slack_audit_report.LOOK_FIRST])
+
+    def test_under_next_a_summary_goes_to_the_gateway_as_its_card(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        os.environ["A2A_NOTIFY_PLATFORM"] = "slack"
+        with patch.object(
+            session_kv_server, "_post_audit_chat_via_gateway", return_value=session_kv_server.AuditPost("7.7")
+        ) as via:
+            response, calls = self._post(composed=self.SUMMARY)
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(calls, [])
+        chat, text = via.call_args.args[2:4]
+        self.assertEqual(chat["rows"], [{"text": "seeded-a: control plane is public", "severity": "critical"}])
+        self.assertEqual(text, session_kv_server.slack_audit_report.headline_from_summary(self.SUMMARY))
+
+    def test_flag_on_a_summary_from_a_job_that_is_not_an_audit_is_unchanged(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        _, calls = self._post(composed=self.SUMMARY, fleet_audit=False, job_id="drift-fixer")
+        self.assertEqual([c.args for c in calls], [("slack", self.SUMMARY, "", "")])
+
+    def test_flag_on_a_summary_is_a_card_on_slack_only(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        _, calls = self._post(composed=self.SUMMARY, platforms=("slack", "google_chat"))
+        posted = dict(c.args[:2] for c in calls)
+        self.assertEqual(posted["google_chat"], self.SUMMARY)
+        self.assertTrue(posted["slack"].startswith("**"))
+
+    def test_flag_on_a_summary_card_error_posts_the_report(self):
+        os.environ["KAGE_SLACK_UX"] = "1"
+        with patch.object(session_kv_server.slack_audit_report, "headline_from_summary", side_effect=ValueError("boom")):
+            response, calls = self._post(composed=self.SUMMARY)
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual([c.args for c in calls], [("slack", self.SUMMARY, "", "")])
+
     BLOCKS_TS = "1712345999.000200"
 
     def _blocks_on(self):

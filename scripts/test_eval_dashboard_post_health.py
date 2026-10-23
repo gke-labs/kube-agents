@@ -633,7 +633,12 @@ class Digest(RunHarness):
             self.opener.texts[0],
             "📊 *Smoke gate, last 24h:* 31 runs · 26 green · 2 PR-caused red · 5 infra · typical run 125 min · typical wait n/a\n"
             "🌙 Nightly: 3 cases · 1 passed all reps · 1 partial · 1 failed · newly failing: case-c · 6h 40m\n"
-            f"{post_health.NIGHTLY_URL}\n{URL}#since=2026-09-04T03:30:00Z&view=agent",
+            f"{post_health.NIGHTLY_URL}\n"
+            # No GitHub token in this harness: the nightly section cannot read
+            # the nightly-red issues, so the one line stands and says why
+            # (test_eval_dashboard_nightly_digest.py covers the section).
+            "🌙 Nightly section skipped: no GitHub token to read the nightly-red issues.\n"
+            f"{URL}#since=2026-09-04T03:30:00Z&view=agent",
         )
         self.assertEqual(post_health.NIGHTLY_URL, "https://storage.cloud.google.com/kube-agents-dashboards/evals/nightly.html")
         # A truncated night says so instead of numbers; a missing night too.
@@ -650,6 +655,7 @@ class Digest(RunHarness):
         self.assertEqual(rc, 0)
         self.assertIn("warning:", err)
         self.assertIn("\n🌙 Nightly: no data.json to read a night from\n", self.opener.texts[4])
+        self.assertIn("\n🌙 Nightly section skipped: data.json could not be read.\n", self.opener.texts[4])
 
     def test_the_digest_without_data_json_is_unchanged(self):
         self.tick(health(), self.at(DIGEST_UTC, 5))

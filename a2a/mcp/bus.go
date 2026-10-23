@@ -106,6 +106,11 @@ type NATSBus struct {
 	now      func() time.Time
 	// readBus is one read of the bus (read, but for tests).
 	readBus func(context.Context) BusStatus
+
+	// readers holds one token per consumer this server may still hold
+	// (maxTaskReaders); reapDelay is how long a released slot stays taken.
+	readers   chan struct{}
+	reapDelay time.Duration
 }
 
 // statusRead is one status read in flight: st is its answer once done is
@@ -139,7 +144,7 @@ func DialBus(ctx context.Context, cfg BusConfig) (*NATSBus, error) {
 	if err != nil {
 		return nil, fmt.Errorf("connect to the bus at %s as %s: %w", cfg.URL, cfg.User, err)
 	}
-	b := &NATSBus{client: client, cfg: cfg, now: time.Now}
+	b := &NATSBus{client: client, cfg: cfg, now: time.Now, readers: make(chan struct{}, maxTaskReaders), reapDelay: taskConsumerIdle}
 	b.readBus = b.read
 	return b, nil
 }

@@ -616,7 +616,8 @@ VCS_MERGED_METRIC = "kubeagents_vcs_proposals_merged_total"
 # counted the same way beside the merged series; the series the operator reads
 # `status.usage.remediationsClosedUnmergedTotal` from. No labels.
 VCS_CLOSED_UNMERGED_METRIC = "kubeagents_vcs_proposals_closed_unmerged_total"
-# The broker's own failures, by kind: work it took on and could not carry out
+# The broker's own failures, by kind and, for a timeout, by the tool it ran:
+# work it took on and could not carry out
 # for a reason that is its own or its upstream's, never the command's exit
 # code and never a refusal. A second count beside the tool counter rather
 # than a new status in it, so toolExecutionsTotal keeps its meaning across
@@ -624,6 +625,11 @@ VCS_CLOSED_UNMERGED_METRIC = "kubeagents_vcs_proposals_closed_unmerged_total"
 # status.usage.brokerFailuresTotal.
 BROKER_FAILURES_METRIC = "kubeagents_broker_execution_failures_total"
 BROKER_FAILURE_KIND_LABEL = "kind"
+# The second label: the tool a timed-out command was running, from the same
+# closed set the invocations counter uses (an executable the broker serves,
+# else LABEL_OTHER); every other kind has no tool and carries the fixed word.
+BROKER_FAILURE_TOOL_LABEL = "tool"
+BROKER_FAILURE_TOOL_NONE = "none"
 # A brokered command that ran past its deadline (exit 124), recorded where
 # the command completes.
 BROKER_FAILURE_EXEC_TIMEOUT = "exec_timeout"
@@ -8595,7 +8601,7 @@ class ProxyMetrics:
         self._vcs: dict[tuple[str, str], int] = {}
         self._merged = 0
         self._closed_unmerged = 0
-        self._failures: dict[str, int] = {}
+        self._failures: dict[tuple[str, str], int] = {}
         # Per tool: cumulative bucket counts (one per TOOL_DURATION_BUCKETS
         # bound, the +Inf bucket being the count), the sum, and the count.
         self._duration_buckets: dict[str, list[int]] = {}
@@ -8693,10 +8699,12 @@ class ProxyMetrics:
         with self._lock:
             self._closed_unmerged += count
 
-    def record_failure(self, kind: str) -> None:
+    def record_failure(self, kind: str, tool: str = BROKER_FAILURE_TOOL_NONE) -> None:
         kind = kind if kind in BROKER_FAILURE_KINDS else BROKER_FAILURE_OTHER_FAILED
+        if tool != BROKER_FAILURE_TOOL_NONE and tool not in CommandExecutor.ALLOWED_EXECUTABLES:
+            tool = LABEL_OTHER
         with self._lock:
-            self._failures[kind] = self._failures.get(kind, 0) + 1
+            self._failures[(kind, tool)] = self._failures.get((kind, tool), 0) + 1
 
     def render(self) -> str:
         with self._lock:
@@ -8788,11 +8796,14 @@ class ProxyMetrics:
             f"{VCS_CLOSED_UNMERGED_METRIC} {closed_unmerged}",
         ]
         lines += [
-            f"# HELP {BROKER_FAILURES_METRIC} Brokered work the broker could not carry out, by kind: a command past its deadline, a broker fault, a git failure, a failed token mint or an upstream relay error.",
+            f"# HELP {BROKER_FAILURES_METRIC} Brokered work the broker could not carry out, by kind (a command past its deadline, a broker fault, a git failure, a failed token mint or an upstream relay error) and, for a command past its deadline, the tool it ran; every other kind carries tool={BROKER_FAILURE_TOOL_NONE}.",
             f"# TYPE {BROKER_FAILURES_METRIC} counter",
         ]
-        for kind, count in failures:
-            lines.append(f'{BROKER_FAILURES_METRIC}{{{BROKER_FAILURE_KIND_LABEL}="{_escape_label_value(kind)}"}} {count}')
+        for (kind, tool), count in failures:
+            lines.append(
+                f'{BROKER_FAILURES_METRIC}{{{BROKER_FAILURE_KIND_LABEL}="{_escape_label_value(kind)}",'
+                f'{BROKER_FAILURE_TOOL_LABEL}="{_escape_label_value(tool)}"}} {count}'
+            )
         lines += [
             f"# HELP {PROCESS_START_TIME_METRIC} Start time of the process since unix epoch in seconds, captured once at start.",
             f"# TYPE {PROCESS_START_TIME_METRIC} gauge",
@@ -9564,7 +9575,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     TOOL_STATUS_SUCCESS if result.exit_code == 0 else TOOL_STATUS_ERROR,
                 )
                 if result.timed_out:
-                    self.metrics.record_failure(BROKER_FAILURE_EXEC_TIMEOUT)
+                    self.metrics.record_failure(BROKER_FAILURE_EXEC_TIMEOUT, tool=tool_label)
                 self.metrics.observe_duration(tool_label, result.duration_ms / MILLISECONDS_PER_SECOND)
                 response = {
                     "status": "completed",

@@ -903,16 +903,10 @@ STORE_PATH_SEPARATOR = "%2F"
 NO_FORGE_REPO = "no_forge/local"
 NO_FORGE_STATUS = "NO_FORGE"
 NO_FORGE_MODE = "none"
-NO_FORGE_NOTE = (
-    "No forge is configured (no GitOps repository is registered in "
-    "$GITOPS_STATE_CONFIGMAP), so no ledger issue was written and no "
-    "remediation pull request was opened. The findings are in the report store."
-)
+NO_FORGE_NOTE = "No GitOps repository is connected, so no ledger issue or fix pull requests were opened."
 NO_FORGE_UNSTORED_NOTE = (
-    "No forge is configured (no GitOps repository is registered in "
-    "$GITOPS_STATE_CONFIGMAP), so no ledger issue was written and no "
-    "remediation pull request was opened. The report store write failed, so "
-    "the store may not hold this run: keep this message."
+    "No GitOps repository is connected, so no ledger issue or fix pull requests were opened. "
+    "This run could not be saved on the install, so keep this message."
 )
 # A run whose repository resolved but cannot be reached through the broker:
 # the forge says that the repository is missing or that the install's
@@ -1049,9 +1043,174 @@ UNREADABLE_GITOPS_KEY_REMEDY = (
 )
 # The no-forge run's empty workspace, `<SCRATCH_DIR>/<prefix><audit-id>`.
 NO_FORGE_WORKSPACE_PREFIX = "workspace_"
-# How many findings the chat summary names, most severe first; the store keeps
-# every one.
+# How many held ids the chat summary names, and how many findings it lists,
+# most severe first, for a run the store does not hold, whose summary is then
+# the only copy; the store keeps every one.
 NO_FORGE_SUMMARY_FINDINGS = 10
+# The rows the chat summary lists: the critical findings up to the first
+# number, else the top findings of the most severe level present up to the
+# second. Fewer critical rows than the ledger card's ten, because the summary
+# is the whole report and the rest are counted under the rows.
+NO_FORGE_SUMMARY_CRITICAL_ROWS = 3
+NO_FORGE_SUMMARY_TOP_ROWS = 2
+# The chat summary's lines. A row is the finding's short cluster name and a
+# plain phrase for its check (`CHECK_PHRASES`), its severity as inline code.
+SUMMARY_ROW = "`{severity}` {where}: {phrase}"
+SUMMARY_ROW_OBJECT = "{phrase} ({object})"
+SUMMARY_MORE = "{count} more ({breakdown}) {verb} saved on the install."
+SUMMARY_MORE_UNSTORED = "{count} more ({breakdown}) {verb} not listed here."
+SUMMARY_MORE_VERB = ("is", "are")
+SUMMARY_BREAKDOWN_PART = "{count} {severity}"
+SUMMARY_BREAKDOWN_SEPARATOR = ", "
+SUMMARY_HELD_MORE = ", and {count} more saved on the install"
+# The finding kind whose object is the cluster itself, which a row names once.
+CLUSTER_OBJECT_KIND = "Cluster"
+# The placeholder a phrase carries for the object it judged.
+PHRASE_OBJECT = "{object}"
+# The chat summary's and the chat report's headline: the count of the most
+# severe findings present and what changed, each clause only when it is not
+# zero.
+HEADLINE_LEAD = "{count} {severity} {noun}"
+HEADLINE_FINDINGS_NOUN = ("finding", "findings")
+HEADLINE_NO_FINDINGS = "no findings"
+HEADLINE_NEW = "{count} new"
+HEADLINE_RESOLVED = "{count} resolved"
+HEADLINE_CLAUSE_SEPARATOR = ", "
+HEADLINE_DELTA_UNKNOWN = "; the change since the last run is unknown"
+CLUSTERS_PHRASE = ("{count} cluster", "{count} clusters")
+CARRIED_PHRASE = ("{count} carried finding was", "{count} carried findings were")
+# A plain phrase for what each check found, for the chat summary of a run with
+# no ledger: "seeded-a: control plane is public", "seeded-a: payments-api runs a
+# privileged container". A phrase with `{object}` takes the name of the object
+# the finding judged; one without it names the cluster's own setting, and a
+# named object follows it in brackets. A finding whose check has no phrase, or
+# whose phrase needs an object it does not name, keeps its own title.
+# `test_every_check_has_a_plain_phrase` holds this to every roster in `AUDITS`.
+CHECK_PHRASES = {
+    # Security & RBAC Posture Audit
+    "privileged-container": "{object} runs a privileged container",
+    "host-namespace": "{object} shares the node's host namespaces",
+    "hostpath-mount": "{object} mounts a path from the node",
+    "cluster-admin-binding": "{object} grants cluster-admin",
+    "wildcard-rbac": "{object} grants wildcard permissions",
+    "netpol-missing": "{object} has no network policy",
+    "default-sa-automount": "{object} mounts the default service account's token",
+    "workload-identity-off": "Workload Identity is off",
+    "legacy-metadata": "legacy node metadata endpoints are on",
+    "public-control-plane": "control plane is public",
+    "podsecurity-gaps": "{object} doesn't enforce Pod Security",
+    "kcc-object-wedged": "{object} is stuck in Config Connector",
+    "image-floating-tag": "{object} uses a floating image tag",
+    "unbound-sa-automount": "{object} mounts a service account token it doesn't use",
+    "lb-world-open": "{object} is a load balancer open to the internet",
+    "anonymous-rbac-binding": "{object} grants access to anonymous users",
+    # Upgrade & Patch Readiness Audit
+    "master-behind": "control plane is behind its release channel",
+    "pool-skew": "{object} node pool lags the control plane",
+    "fleet-spread": "clusters run too many different versions",
+    "no-channel": "not enrolled in a release channel",
+    "no-autoupgrade": "{object} node pool has auto-upgrade off",
+    "no-autorepair": "{object} node pool has auto-repair off",
+    "no-maintenance-window": "no maintenance window is set",
+    "blocking-exclusion": "a maintenance exclusion blocks upgrades",
+    "stale-image-type": "{object} node pool uses a retired node image",
+    "no-notifications": "upgrade notifications are off",
+    "upgrade-blocked": "an upgrade is blocked",
+    # Workload Reliability Audit
+    "no-requests": "{object} sets no resource requests",
+    "no-memory-limit": "{object} has no memory limit",
+    "no-pdb": "{object} has no disruption budget",
+    "blocking-pdb": "{object} has a disruption budget that blocks node drains",
+    "no-hpa": "{object} has no autoscaler",
+    "hpa-cannot-scale": "{object} has an autoscaler that can't scale",
+    "rigid-scheduling": "{object} can only run on a narrow set of nodes",
+    "no-spread": "{object} isn't spread across zones or nodes",
+    "probes-readiness": "{object} has no readiness probe",
+    "probes-liveness": "{object} has no liveness probe",
+    "single-replica": "{object} runs a single replica",
+    "schedule-never-succeeds": "{object} can never be scheduled",
+    "rollout-drops-traffic": "{object} drops traffic during rollouts",
+    "strategy-causes-downtime": "{object} goes down during updates",
+    "cronjob-runs-overlap": "{object} starts runs that overlap",
+    "service-selects-nothing": "{object} selects no pods",
+    "service-port-unresolved": "{object} points at a port no pod exposes",
+    "liveness-preempts-readiness": "{object} restarts before it is ready",
+    "spread-not-achieved": "{object} isn't spread the way it asks",
+    "prestop-outlives-grace": "{object} is killed before its shutdown hook ends",
+    "rwo-claim-contended": "{object} shares a volume only one node can write",
+    "hpa-floors-at-one": "{object} can scale down to one replica",
+    "pdb-overlapping": "{object} has overlapping disruption budgets",
+    "untargeted-compute-class-workload": "{object} isn't placed by a compute class",
+    # Fleet Waste Audit
+    "overrequest": "{object} requests far more than it uses",
+    "orphan-pv": "{object} is a volume nothing uses",
+    "unconsumed-pvc": "{object} is a volume claim no pod mounts",
+    "unattached-disk": "{object} is a disk attached to nothing",
+    "idle-address": "{object} is a reserved IP address in no use",
+    "orphan-lb": "{object} is a load balancer for a deleted service",
+    "idle-nodepool": "{object} node pool is idle",
+    "scaledown-blocked": "{object} blocks node scale-down",
+    "terminal-pods": "{object} has finished pods left behind",
+    "idle-namespace": "{object} namespace is idle",
+    "underrequest": "{object} requests less than it uses",
+    "unsized-workload": "{object} sets no requests to size it by",
+    "idle-workload": "{object} is idle",
+    "registry-no-cleanup": "{object} registry never deletes old images",
+    # Fleet Consistency Drift Audit
+    "release-channel": "release channel differs from its peers",
+    "shielded-nodes": "Shielded Nodes setting differs from its peers",
+    "secure-boot": "Secure Boot setting differs from its peers",
+    "integrity-monitoring": "integrity monitoring differs from its peers",
+    "network-policy": "network policy setting differs from its peers",
+    "private-nodes": "private nodes setting differs from its peers",
+    "private-endpoint": "private endpoint setting differs from its peers",
+    "authorized-networks": "authorized networks differ from its peers",
+    "logging-components": "logging differs from its peers",
+    "monitoring-components": "monitoring differs from its peers",
+    "managed-prometheus": "Managed Prometheus setting differs from its peers",
+    "binary-authorization": "Binary Authorization setting differs from its peers",
+    "node-autoprovisioning": "node auto-provisioning differs from its peers",
+    "pool-autoscaling": "node pool autoscaling differs from its peers",
+    "intra-node-visibility": "intranode visibility differs from its peers",
+    "datapath-provider": "dataplane differs from its peers",
+    "label-keys": "labels differ from its peers",
+    "image-type": "node image type differs from its peers",
+    "database-encryption": "secrets encryption differs from its peers",
+    "no-environment-label": "has no environment label",
+    "uncohorted": "differs from its peers on too many settings to compare",
+    # AI Workload Security Audit
+    "inference-endpoint-public": "{object} serves a model to the internet",
+    "model-remote-code-trusted": "{object} runs a model's remote code",
+    "weights-mount-writable": "{object} mounts model weights writable",
+    "model-artifact-unpinned-source": "{object} loads a model from an unpinned source",
+    "model-credential-plaintext-env": "{object} has a model credential in plain text",
+    "model-image-floating-tag": "{object} uses a floating model image tag",
+    # Fleet Stockout Prevention & Capacity Audit
+    "ccc-missing-fallbacks": "{object} compute class has no fallback",
+    "ccc-no-ondemand-floor": "{object} compute class has no on-demand fallback",
+    "ccc-large-vm-scarcity": "{object} compute class relies on scarce large machines",
+    "ccc-priority-starvation": "{object} compute class can starve its workloads",
+    "ccc-mixed-disk-generations": "{object} compute class mixes disk types",
+    "ccc-hyperdisk-incompatible": "{object} compute class can pick machines its disks don't support",
+    "quota-exhaustion-risk": "quota is close to running out",
+    "spot-scarcity-risk": "{object} depends on scarce Spot capacity",
+    "single-zone-nodepool": "{object} node pool sits in one zone",
+    "reservation-mismatch-risk": "a reservation doesn't match what runs",
+    "autoscaler-out-of-resources": "the autoscaler couldn't get machines",
+    "dangling-compute-class": "{object} asks for a compute class that doesn't exist",
+    # GCP Networking Fabric & VPC IPAM Audit
+    "subnet-ip-exhaustion": "subnet is running out of IP addresses",
+    "cloud-nat-exhaustion": "Cloud NAT is running out of ports",
+    "psc-routing-deadlock": "a Private Service Connect route can't be reached",
+    "mtu-packet-fragmentation": "MTU settings fragment packets",
+    "cloud-armor-false-positive": "Cloud Armor blocks legitimate traffic",
+    "firewall-world-open-ingress": "{object} firewall rule is open to the internet",
+    # GCE Compute Engine and MIG Fleet Audit
+    "gce-startup-script-status": "{object} startup script failed",
+    "mig-convergence-stalled": "{object} instance group isn't converging",
+    "sole-tenant-headroom": "sole-tenant nodes are nearly full",
+    "orphaned-snapshots": "{object} is a snapshot of a deleted disk",
+}
 
 # Applied to a pull request the harness itself closed as stale. It is the
 # discriminator that keeps a *human's* close final while letting the audit
@@ -3617,40 +3776,34 @@ def render_chat_report(
     (`slack_audit_report._ledger_line`). With no trusted memory of the previous
     run (`delta_known` false) the line's `new` and `resolved` are withheld
     zeros, so it says the change is unknown instead of counting them; a HELD
-    run prints no counts and keeps its own line. `counts`, (new, resolved),
-    replace the line's own for a later `finish` that counts the whole run.
+    run prints no counts and keeps its own line. A count of zero is left out
+    (:func:`findings_headline`). `counts`, (new, resolved), replace the
+    line's own for a later `finish` that counts the whole run.
     """
     findings = list(data.get("findings") or [])
-    clusters = len((data.get("scope") or {}).get("clusters") or [])
+    clusters = clusters_phrase(len((data.get("scope") or {}).get("clusters") or []))
     name = audit_name(audit_id)
     status = payload.get("status")
     new, resolved = counts or (int(payload.get("new") or 0), int(payload.get("resolved") or 0))
     unaccounted = list(payload.get(UNACCOUNTED_KEY) or [])
     if status == "CLEAN" and delta_known:
-        head = f"{name}: clean, 0 findings, {resolved} resolved across {clusters} cluster(s)."
+        cleared = HEADLINE_CLAUSE_SEPARATOR + HEADLINE_RESOLVED.format(count=resolved) if resolved else ""
+        head = f"{name}: clean{cleared} across {clusters}."
     elif status == "HELD" and unaccounted:
+        carried = CARRIED_PHRASE[len(unaccounted) != 1].format(count=len(unaccounted))
         head = (
-            f"{name}: 0 findings across {clusters} cluster(s), but the ledger stays open: "
-            f"{len(unaccounted)} carried finding(s) were not accounted for."
+            f"{name}: {HEADLINE_NO_FINDINGS} across {clusters}, but the ledger stays open: "
+            f"{carried} not accounted for."
         )
     elif status == "HELD":
         # `finish` holds a clean ledger open with nothing unaccounted only when
         # it could not read the issue's comments, where a `/remediate` may wait.
         head = (
-            f"{name}: 0 findings across {clusters} cluster(s), but the ledger stays open: "
+            f"{name}: {HEADLINE_NO_FINDINGS} across {clusters}, but the ledger stays open: "
             f"its comments could not be read, so a /remediate there may be unanswered."
         )
-    elif not delta_known:
-        head = (
-            f"{name}: {findings_phrase(len(findings))} ({severity_counts(findings)['critical']} critical) "
-            f"across {clusters} cluster(s); the change since the last run is unknown."
-        )
     else:
-        head = (
-            f"{name}: {new} new, {resolved} resolved; "
-            f"{findings_phrase(len(findings))} ({severity_counts(findings)['critical']} critical) "
-            f"across {clusters} cluster(s)."
-        )
+        head = findings_headline(name, findings, new, resolved, delta_known)
     lines = [head]
     for label, key in (
         ("Pull requests opened", "prs_opened"),
@@ -19178,6 +19331,80 @@ def previous_store_ledger(
         return None, False
     return envelope, known
 
+def clusters_phrase(count: int) -> str:
+    """`1 cluster` / `2 clusters`."""
+    return CLUSTERS_PHRASE[count != 1].format(count=count)
+
+
+def findings_headline(
+    name: str, findings: list[dict], new: int, resolved: int, delta_known: bool
+) -> str:
+    """The audit line of a run that found something, or that found nothing and was not clean.
+
+    Leads with the count of the most severe findings present, as the Slack card
+    does, then what changed, a clause only for a count that is not zero, or
+    that the change is unknown.
+    "Fleet Stockout Prevention & Capacity Audit: 2 major findings, 1 new."
+    """
+    counts = severity_counts(findings)
+    severity = next((level for level in SEVERITIES if counts[level]), None)
+    if severity is None:
+        lead = HEADLINE_NO_FINDINGS
+    else:
+        count = counts[severity]
+        lead = HEADLINE_LEAD.format(
+            count=count, severity=severity, noun=HEADLINE_FINDINGS_NOUN[count != 1]
+        )
+    if not delta_known:
+        return f"{name}: {lead}{HEADLINE_DELTA_UNKNOWN}."
+    clauses = [lead]
+    if new:
+        clauses.append(HEADLINE_NEW.format(count=new))
+    if resolved:
+        clauses.append(HEADLINE_RESOLVED.format(count=resolved))
+    return f"{name}: {HEADLINE_CLAUSE_SEPARATOR.join(clauses)}."
+
+
+def _object_name(finding: dict) -> str:
+    """The name of the object a finding judged, or "" when it is the cluster itself."""
+    kind, _, name = str(finding.get("object") or "").rpartition("/")
+    cluster = str(finding.get("cluster") or "").rpartition("/")[2]
+    if kind.rpartition("/")[2] == CLUSTER_OBJECT_KIND or (not kind and name == cluster):
+        return ""
+    return name
+
+
+def summary_row(finding: dict) -> str:
+    """One finding as the chat summary lists it: "`critical` seeded-a: control plane is public".
+
+    The cluster by its short name, and the check's plain phrase
+    (`CHECK_PHRASES`) with the object it judged; the finding's own title where
+    the check has no phrase, or its phrase needs an object the finding does not
+    name. Redacted, because the cluster, the object and the title are the
+    model's words.
+    """
+    where = str(finding.get("cluster") or "").rpartition("/")[2]
+    obj = _object_name(finding)
+    phrase = CHECK_PHRASES.get(str(finding.get("check") or ""), "")
+    if PHRASE_OBJECT in phrase:
+        phrase = phrase.format(object=obj) if obj else ""
+    elif phrase and obj:
+        phrase = SUMMARY_ROW_OBJECT.format(phrase=phrase, object=obj)
+    text = phrase or " ".join(str(finding.get("title") or "").split())
+    row = SUMMARY_ROW.format(severity=finding.get("severity"), where=where, phrase=text)
+    return redact_secrets(row)
+
+
+def _summary_shown(ordered: list[dict]) -> list[dict]:
+    """The findings the summary lists: the critical ones up to their cap, else the top of the most severe level."""
+    if not ordered:
+        return []
+    severity = ordered[0].get("severity")
+    listed = [finding for finding in ordered if finding.get("severity") == severity]
+    cap = NO_FORGE_SUMMARY_CRITICAL_ROWS if severity == SEVERITIES[0] else NO_FORGE_SUMMARY_TOP_ROWS
+    return listed[:cap]
+
+
 def render_no_forge_summary(
     audit_id: str,
     data: dict,
@@ -19190,19 +19417,24 @@ def render_no_forge_summary(
     dropped: int = 0,
     unread: list[str] | None = None,
     *,
+    stored: bool = True,
     prs: dict | None = None,
     unaccounted: Iterable[str] = (),
     noun: str = DEFAULT_PROPOSAL_NOUN,
 ) -> str:
     """The chat summary of a run with no ledger issue, which is the only report its operator gets.
 
-    The headline counts, the most severe findings up to
-    `NO_FORGE_SUMMARY_FINDINGS` with the object each one names, the ids the
-    collector still flags that the document left out, the ids kept because
-    this run did not check their target (`unread`), how many of this run's
-    collector candidates the document does not carry (`dropped`), the
-    coverage gaps, and `note`. Redacted like the ledger body, because it is delivered to a
-    channel the same way.
+    The headline (:func:`findings_headline`), the most severe findings up to
+    `NO_FORGE_SUMMARY_CRITICAL_ROWS` or `NO_FORGE_SUMMARY_TOP_ROWS`
+    (:func:`summary_row`), or up to `NO_FORGE_SUMMARY_FINDINGS` of them when
+    the store write failed (`stored`) and this message is the only copy, a
+    line counting the rest by severity,
+    the ids the collector still flags that the document left out, the ids
+    kept because this run did not check their target (`unread`), how many of
+    this run's collector candidates the document does not carry (`dropped`),
+    the coverage gaps, and `note`. `slack_audit_report.summary_card` reads it
+    back into that card. Redacted like the ledger body, because it is delivered
+    to a channel the same way.
 
     A run whose ledger is in the store and whose fixes open on the forge also
     passes `prs`, its JSON line, for the links to the remediation proposals it
@@ -19211,41 +19443,27 @@ def render_no_forge_summary(
     keep its ledger open. `noun` is the forge's word for them.
     """
     findings = list(data.get("findings") or [])
-    clusters = len((data.get("scope") or {}).get("clusters") or [])
-    counts = severity_counts(findings)
-    delta = (
-        f"; {len(new_ids)} new, {len(resolved_ids)} resolved since the last run"
-        if delta_known
-        else "; the change since the last run is unknown"
-    )
-    lines = [
-        f"{audit_name(audit_id)}: {findings_phrase(len(findings))} "
-        f"({counts['critical']} critical) across {clusters} cluster(s){delta}."
-    ]
+    lines = [findings_headline(audit_name(audit_id), findings, len(new_ids), len(resolved_ids), delta_known)]
     ordered = sort_findings(findings)
-    for finding in ordered[:NO_FORGE_SUMMARY_FINDINGS]:
-        where = "/".join(
-            part
-            for part in (
-                str(finding.get("cluster") or ""),
-                str(finding.get("namespace") or ""),
-                str(finding.get("object") or ""),
-            )
-            if part
+    shown = _summary_shown(ordered) if stored else ordered[:NO_FORGE_SUMMARY_FINDINGS]
+    lines.extend(summary_row(finding) for finding in shown)
+    left = severity_counts(ordered[len(shown):])
+    more = sum(left.values())
+    if more:
+        breakdown = SUMMARY_BREAKDOWN_SEPARATOR.join(
+            SUMMARY_BREAKDOWN_PART.format(count=count, severity=severity)
+            for severity, count in left.items()
+            if count
         )
-        lines.append(
-            f"- [{finding.get('severity')}] {redact_secrets(str(finding.get('title') or ''))} "
-            f"({redact_secrets(where)})"
-        )
-    if len(ordered) > NO_FORGE_SUMMARY_FINDINGS:
-        lines.append(f"- and {len(ordered) - NO_FORGE_SUMMARY_FINDINGS} more in the report store")
+        template = SUMMARY_MORE if stored else SUMMARY_MORE_UNSTORED
+        lines.append(template.format(count=more, breakdown=breakdown, verb=SUMMARY_MORE_VERB[more != 1]))
     if held:
-        shown = ", ".join(held[:NO_FORGE_SUMMARY_FINDINGS])
-        more = len(held) - NO_FORGE_SUMMARY_FINDINGS
+        shown_held = ", ".join(held[:NO_FORGE_SUMMARY_FINDINGS])
+        more_held = len(held) - NO_FORGE_SUMMARY_FINDINGS
         lines.append(
             "Still flagged by the collector but not in this run's document: "
-            + shown
-            + (f", and {more} more in the report store" if more > 0 else "")
+            + shown_held
+            + (SUMMARY_HELD_MORE.format(count=more_held) if more_held > 0 else "")
         )
     if unread:
         shown = ", ".join(unread[:NO_FORGE_SUMMARY_FINDINGS])
@@ -19480,6 +19698,7 @@ def _finish_without_forge(
         note,
         len(unpublished),
         unread=unread,
+        stored=stored,
     )
     append_chat_report(
         audit_id, NO_FORGE_REPO, payload["summary"], now, refinish=bool(payload.get(REFINISH_KEY))
@@ -20075,6 +20294,7 @@ def _finish_store_ledger(
         note,
         len(payload.get(UNPUBLISHED_CANDIDATES_KEY) or []),
         unread=sorted(unread_ids),
+        stored=stored,
         prs=payload,
         unaccounted=unaccounted_ids,
         noun=noun,

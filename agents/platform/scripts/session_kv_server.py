@@ -4194,13 +4194,50 @@ def _post_audit_blocks(
     routed = chat_notify.routes(SLACK_PLATFORM)
     if headline.issue is None or not (routed or slack_blocks_post.configured()):
         return None
-    threaded = bool(chat_id and thread_id)
     if routed:
         built = slack_audit_report.chat_from_issue(headline.issue, headline.ref, message)
     else:
         built = slack_audit_report.blocks_from_issue(headline.issue, headline.ref, message)
+    return _post_audit_card(profile, job_id, built, routed, chat_id, thread_id, deadline)
+
+
+def _post_summary_card(
+    profile: str, job_id: str, report: str, chat_id: str, thread_id: str, deadline: float
+) -> AuditPost | None:
+    """Post the card of a fleet-audit report with no ledger issue (:func:`slack_audit_report.summary_card`).
+
+    The no-ledger half of :func:`_post_audit_blocks`, with its outcomes: Block
+    Kit through the Slack relay, or under ``spec.mode: next`` a chat message
+    through the gateway; None, and the caller posts text, when neither is
+    there, the card cannot be built, or the post did not land.
+    """
+    routed = chat_notify.routes(SLACK_PLATFORM)
+    if not (routed or slack_blocks_post.configured()):
+        return None
+    if routed:
+        built = slack_audit_report.chat_from_summary(report)
+    else:
+        built = slack_audit_report.blocks_from_summary(report)
+    return _post_audit_card(profile, job_id, built, routed, chat_id, thread_id, deadline)
+
+
+def _post_audit_card(
+    profile: str,
+    job_id: str,
+    built: tuple[Any, str] | None,
+    routed: bool,
+    chat_id: str,
+    thread_id: str,
+    deadline: float,
+) -> AuditPost | None:
+    """Post a built audit card, ``(blocks, text)`` or under next ``(chat, text)``; where it landed, or None.
+
+    The posting half of :func:`_post_audit_blocks`, whose docstring gives the
+    outcomes.
+    """
     if built is None:
         return None
+    threaded = bool(chat_id and thread_id)
     blocks, text = built
     left = deadline - time.monotonic()
     if left < AUDIT_BLOCKS_MIN_POST_S:
@@ -4306,6 +4343,26 @@ def _post_failed_audit_via_gateway(
     chat, text = built
     thread = thread_id if chat_id and thread_id else ""
     return _post_audit_chat_via_gateway(profile, job_id, chat, text, thread, min(AUDIT_BLOCKS_POST_TIMEOUT_S, left))
+
+
+def _slack_summary_text(platform: str, report: str, chat_id: str, profile: str, job_id: str) -> str | None:
+    """With ``KAGE_SLACK_UX`` on, the text of a fleet-audit report with no ledger issue, laid out as its card.
+
+    None, and the leg posts the report as written, unless the leg is Slack, the
+    flag is on, a channel is known (the leg's chat id or the Slack home
+    channel), the report is fleet-audit's summary of a run with no ledger
+    (:func:`slack_audit_report.summary_card`), and the job runs the fleet-audit
+    skill. The card itself is :func:`_post_summary_card`'s; this text is what
+    posts when the card does not.
+    """
+    if platform != SLACK_PLATFORM or not slack_presenter.enabled():
+        return None
+    if not (chat_id or _slack_home_channel()):
+        return None
+    text = slack_audit_report.headline_from_summary(report)
+    if text is None or not _is_fleet_audit_job(profile, job_id):
+        return None
+    return text
 
 
 def _failed_audit_line(platform: str, report: str, chat_id: str, profile: str, job_id: str) -> str | None:
@@ -4826,6 +4883,7 @@ def relay_cron_report(
             headline = None
         posted = None
         failed = None
+        summary = None
         # A truncated report keeps its notice, which the blocks have no place for,
         # and the rest of it.
         if headline and not truncation_notice:
@@ -4834,13 +4892,22 @@ def relay_cron_report(
             )
         elif not truncation_notice:
             try:
-                failed = _failed_audit_line(platform, report, leg_chat_id, profile, job_id)
+                summary = _slack_summary_text(platform, report, leg_chat_id, profile, job_id)
             except Exception as exc:
-                logger.warning(f"Relay for {profile}/{job_id}: failed-audit line skipped: {exc!r}")
-            if failed and chat_notify.routes(platform):
-                posted = _post_failed_audit_via_gateway(
+                logger.warning(f"Relay for {profile}/{job_id}: audit summary card skipped: {exc!r}")
+            if summary:
+                posted = _post_summary_card(
                     profile, job_id, report, leg_chat_id, leg_thread_id, blocks_deadline
                 )
+            else:
+                try:
+                    failed = _failed_audit_line(platform, report, leg_chat_id, profile, job_id)
+                except Exception as exc:
+                    logger.warning(f"Relay for {profile}/{job_id}: failed-audit line skipped: {exc!r}")
+                if failed and chat_notify.routes(platform):
+                    posted = _post_failed_audit_via_gateway(
+                        profile, job_id, report, leg_chat_id, leg_thread_id, blocks_deadline
+                    )
         if posted is not None:
             new_thread_id = posted.thread_id or None
         else:
@@ -4848,6 +4915,8 @@ def relay_cron_report(
             # whose folded card did not post goes out whole.
             if headline:
                 leg_message = truncation_notice + headline.text
+            elif summary:
+                leg_message = summary
             elif failed and not chat_notify.routes(platform):
                 leg_message = failed
             else:
