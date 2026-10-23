@@ -173,6 +173,30 @@
 {{- end }}
 {{- $callbackList = append $callbackList "litellm_oauth2_callback.proxy_handler_instance" }}
 {{- end }}
+{{- $traceLogEnabled := default false .Values.litellm.traceLogEnabled }}
+{{- $traceLogPath := .Values.litellm.traceLogPath | default "/tmp/litellm_traces.jsonl" }}
+{{- $traceLogSource := "" }}
+{{- if $traceLogEnabled }}
+{{- /*
+  Normalise, then compare: a path that clean rewrites (a `.` or `..`
+  component, a doubled or trailing slash) is refused as given, so no accepted
+  value resolves outside /tmp/ once the kernel resolves it.
+*/}}
+{{- if or (not (kindIs "string" $traceLogPath)) (ne (clean $traceLogPath) $traceLogPath) (not (hasPrefix "/tmp/" $traceLogPath)) (not (regexMatch `^/tmp/[^\x00/]+(/[^\x00/]+)*$` $traceLogPath)) }}
+{{- fail (printf "litellm.traceLogPath %q must be a normalised file path under /tmp/, with no . or .. component and no doubled or trailing slash (the gateway container runs with readOnlyRootFilesystem: true and only /tmp is writable)" $traceLogPath) }}
+{{- end }}
+{{- if empty $redactorSource }}
+{{- $redactorSource = .Files.Get "files/redactor.py" }}
+{{- if empty $redactorSource }}
+{{- fail "litellm.traceLogEnabled is enabled but the chart's files/redactor.py is missing" }}
+{{- end }}
+{{- end }}
+{{- $traceLogSource = .Files.Get "files/llm_trace_logger.py" }}
+{{- if empty $traceLogSource }}
+{{- fail "the chart's files/llm_trace_logger.py is missing" }}
+{{- end }}
+{{- $callbackList = append $callbackList "llm_trace_logger.proxy_handler_instance" }}
+{{- end }}
 {{- $quotedCallbacks := list }}
 {{- range $callbackList }}
 {{- $quotedCallbacks = append $quotedCallbacks (quote .) }}
@@ -189,12 +213,13 @@
 {{- $config := include "kube-agents.litellmConfig" (merge (dict "provider" $provider "model" $model "callbacks" $callbacks "maxTokens" .Values.litellm.maxTokens "reasoningEffort" .Values.litellm.reasoningEffort) $configEndpoint) }}
 {{- /*
   Every key the ConfigMap carries feeds the checksum: the thinking-replay
-  hook, the rule file and the two redaction modules are subPath mounts too, so
-  an edit to any of them has to roll the pods the same way an edit to
-  config.yaml does. With redaction off its three extras are empty strings, as
-  is the OAuth2 hook's source while the hook is not shipped.
+  hook, the rule file, the two redaction modules, the OAuth2 hook and the
+  optional trace logger are subPath mounts too, so an edit to any of them has
+  to roll the pods the same way an edit to config.yaml does. With redaction or
+  trace logging off their extras are empty strings, as is the OAuth2 hook's
+  source while the hook is not shipped.
 */}}
-{{- $checksumInput := printf "%s%s%s%s%s%s" $config $thinkingReplaySource $redactionConfig $redactorSource $redactionCallbackSource $oauthHookSource }}
+{{- $checksumInput := printf "%s%s%s%s%s%s%s" $config $thinkingReplaySource $redactionConfig $redactorSource $redactionCallbackSource $oauthHookSource $traceLogSource }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -215,6 +240,13 @@ data:
     {{- $redactorSource | nindent 4 }}
   litellm_redaction_callback.py: |
     {{- $redactionCallbackSource | nindent 4 }}
+  {{- else if $traceLogEnabled }}
+  redactor.py: |
+    {{- $redactorSource | nindent 4 }}
+  {{- end }}
+  {{- if $traceLogEnabled }}
+  llm_trace_logger.py: |
+    {{- $traceLogSource | nindent 4 }}
   {{- end }}
   {{- if $oauthHookEnabled }}
   litellm_oauth2_callback.py: |
@@ -378,6 +410,8 @@ spec:
             {{- if $redactionEnabled }}
             - name: KUBE_AGENTS_REDACTION_CONFIG
               value: /app/redaction.yaml
+            {{- end }}
+            {{- if or $redactionEnabled $traceLogEnabled }}
             # Salts the [rule:<hex>] pseudonyms. Optional: without it the
             # redactor warns and uses a per-pod salt, so tokens still redact
             # but stop matching across replicas and restarts.
@@ -399,6 +433,10 @@ spec:
               value: http/protobuf
             - name: OTEL_SERVICE_NAME
               value: litellm
+            {{- end }}
+            {{- if $traceLogEnabled }}
+            - name: LITELLM_TRACE_LOG_PATH
+              value: {{ $traceLogPath | quote }}
             {{- end }}
           ports:
             - containerPort: 8080
@@ -460,6 +498,15 @@ spec:
             - name: config-volume
               mountPath: /app/litellm_redaction_callback.py
               subPath: litellm_redaction_callback.py
+            {{- else if $traceLogEnabled }}
+            - name: config-volume
+              mountPath: /app/redactor.py
+              subPath: redactor.py
+            {{- end }}
+            {{- if $traceLogEnabled }}
+            - name: config-volume
+              mountPath: /app/llm_trace_logger.py
+              subPath: llm_trace_logger.py
             {{- end }}
             {{- if and (eq $provider "openai_compatible") $openaiCompatibleCA.name }}
             # The openai_compatible server's CA bundle, read by ssl_verify on its

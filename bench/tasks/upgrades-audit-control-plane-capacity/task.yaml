@@ -1,0 +1,107 @@
+# Catalogue entry 23: a control-plane upgrade or resize fails on regional compute capacity; the cluster's upgrade and repair operations of the last 90 days, read against the maintenance window.
+#
+# The rule reads a condition that cannot be planted on a healthy seeded cluster
+# (a capacity failure is the provider's and cannot be planted; the dev project's one real instance is the rule's unit-test fixture), so this case does not grade a detection: it grades the
+# rule's declared report line for every seeded cluster in its "no finding" form,
+# which is red on `main` (no rule prints such a line, and an agent cannot
+# invent the numbers it carries) and green once the rule prints it; the rule's
+# unit tests (scripts/test_readiness_rules.py) carry the positive detection on
+# recorded inputs. The prompt asks for one declared line per seeded cluster in
+# a fixed vocabulary copied from the rule's note in the report's note column
+# (`<rule id>: <the rule's text>`) and its JSON (`readiness.notes`); the
+# deterministic objectives read those lines and nothing else, the prose is the
+# judge's.
+#
+# The patterns name the slots through `{cluster:<slot>}`, which the verifier
+# expands to the cluster the runner recorded for the slot, so a fleet applied
+# with another prefix is graded on its own names.
+#
+# Isolation class: read-only (chat prompt; the script reads with gcloud
+# container, gcloud compute and kubectl get and writes only its own record and
+# per-member kubeconfig files). Eligible tier: nightly from its first merge.
+#
+# No deterministic mutation safeguard, documented: nothing is planted for this
+# case; the four roles below stand for their slots, so the declared-line
+# objectives can tell a cluster the agent missed from a cluster the project
+# does not have. No `worker_commands` objective either: it reads delegated
+# workers' terminals only and errors on a run the router answered itself, so
+# the report's own output is graded through the declared lines instead.
+id: upgrades-audit-control-plane-capacity
+name: Upgrade readiness reads each cluster's capacity failures against its maintenance window
+
+prompt: >-
+  For every cluster in this project, run the upgrade readiness check against each cluster's release channel default and include, per cluster, how many of its GKE upgrade or repair operations in the last 90 days failed on compute capacity, how many such operations the report considered, and the cluster's maintenance window, as the control-plane-upgrade-history rule's note in the report's note column or its JSON states them; a capacity failure is that rule's risk, with the window and the off-peak advice. Read only; change and upgrade nothing. A member may be blocked or carry
+  risks from other rules on the same report; the slots are about this rule
+  only. End your answer with one line per seeded cluster in exactly this
+  form, no other words on the line: "<cluster>: control-plane-upgrade-history: <n> capacity failure(s) among <n> upgrade or repair operation(s) in the last 90 days; maintenance window <window|none>".
+
+expected_output: >-
+  The version table and the readiness table read during this run, with the count of capacity failures the report found in each seeded cluster's last 90 days of upgrade and repair operations (zero on a clean fleet; a provider stockout during an auto-upgrade is reported with its date, never invented) and the daily maintenance window at 03:00 UTC each carries. The answer says what a capacity failure means (set a maintenance window in an off-peak hour for the region, retry the upgrade in it, keep upgrade notifications consumed) and names any it found. It ends with the declared lines, each reading "control-plane-upgrade-history: <n> capacity failure(s) among <n> upgrade or repair operation(s) in the last 90 days; maintenance window daily at 03:00 UTC for PT4H0M0S" copied from the report. It cites no CVE identifiers and performs no upgrade.
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+# No planted defect is read: the four roles are one per slot, and they are how the
+# declared-line objectives tell a cluster the agent missed from a cluster the
+# project does not have.
+fixtures:
+  - crashloop-workload
+  - version-laggard
+  - drift-outlier
+  - zonal-skew-scheduling
+
+verification_spec:
+  # One line per seeded cluster, fixed vocabulary, the cluster named at the
+  # start of the line; every pattern matches the whole declared frame, anchored
+  # at both ends, with the line's decoration folded first.
+  # The frame every cluster must satisfy, counts and window included.
+  # The fold spaces a separator only before a letter, so a count written right
+  # after `:` or `;` stays unspaced; the patterns admit the missing space there.
+  - name: every-seeded-cluster-has-a-declared-line
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: control-plane-upgrade-history: ?\d+ capacity failure\(s\) among \d+ upgrade or repair operation\(s\) in the last 90 days; maintenance window [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: control-plane-upgrade-history: ?\d+ capacity failure\(s\) among \d+ upgrade or repair operation\(s\) in the last 90 days; maintenance window [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: control-plane-upgrade-history: ?\d+ capacity failure\(s\) among \d+ upgrade or repair operation\(s\) in the last 90 days; maintenance window [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: control-plane-upgrade-history: ?\d+ capacity failure\(s\) among \d+ upgrade or repair operation\(s\) in the last 90 days; maintenance window [^\n]+$)'
+  # The daily window the fleet declares on each seeded cluster is the invented-value guard;
+  # the count of capacity failures is the report's to give: a provider stockout during a
+  # seeded cluster's auto-upgrade is a finding the judge reads for the rule's 90-day
+  # lookback, not a wrong line. A window of `none` is a cluster the fleet's reconcile has
+  # not reached, not this case's premise.
+  - name: the-declared-lines-count-capacity-failures-under-the-daily-window
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: control-plane-upgrade-history: ?\d+ capacity failure\(s\) among \d+ upgrade or repair operation\(s\) in the last 90 days; maintenance window daily at \d{2}:\d{2} utc[^\n]*$'
+      forbidden_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: control-plane-upgrade-history:(?! ?\d+ capacity failure\(s\) among \d+ upgrade or repair operation\(s\) in the last 90 days; maintenance window daily at \d{2}:\d{2} utc)[^\n]*$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # No vulnerability feed; a CVE id in a readiness report is an invention.
+      forbidden_phrases: ["CVE-"]

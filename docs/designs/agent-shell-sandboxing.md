@@ -1382,7 +1382,10 @@ none of them: the profile list, the SSH key, and the files themselves. It runs f
 agent entrypoint (step 5.7, in the foreground, gated on the bootstrap primary so
 two replicas do not both push) and again from `cluster_agent_profile.py` when a profile is
 scaffolded later, so a cluster onboarded at 3am does not wait for a pod restart to get its
-directories. Nothing about it is ordered against the sandbox starting: the Deployment and
+directories. The scaffold passes `--profile <name>` and pushes that home plus the machine
+home and `profiles/platform`, the two roots the sandbox creates bare; the start pushes
+every home. Re-sending every home on every scaffold made onboarding N clusters
+cost O(N²) (#3701). Nothing about it is ordered against the sandbox starting: the Deployment and
 the StatefulSet come up independently, so the script waits for sshd and, failing that,
 leaves the agent pod's files untouched and lets the next start retry.
 

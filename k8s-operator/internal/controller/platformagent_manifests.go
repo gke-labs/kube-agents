@@ -2440,7 +2440,14 @@ type renderOptions struct {
 	// heldGitHubOrg is the GITHUB_ORG the live gateway carries, set only while
 	// the declaration cannot name the organisation (see heldGitHubOrg).
 	heldGitHubOrg string
+	// enabledProfiles is the sorted list of resolved, non-terminating optional
+	// built-in Hermes specialist AgentProfile names (such as "tse") bound to this
+	// PlatformAgent in `mode: next`. Empty when no optional profiles are bound,
+	// so the zero value renders byte-identical manifests.
+	enabledProfiles []string
 }
+
+const enabledProfilesEnvVar = "KUBE_AGENTS_ENABLED_PROFILES"
 
 // lastWinsEnv drops every entry a later entry of the same name supersedes, keeping the
 // surviving one where it already sits. Order is otherwise untouched, so on the ordinary
@@ -3060,14 +3067,17 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			}
 			extEnvs = kept
 		}
-		// A2A_NOTIFY_PLATFORM and A2A_NOTIFY_CONVERSATIONS are dropped on
-		// every install, not only while the A2A surface is up: on a today
-		// install a plugin's value would reroute Google Chat posts from
-		// hermes send to a chat.notify route that does not exist there. The
-		// operator renders them only under next, after this merge.
+		// A2A_NOTIFY_PLATFORM, A2A_NOTIFY_CONVERSATIONS, and
+		// KUBE_AGENTS_ENABLED_PROFILES are dropped on every install, not only
+		// while the A2A surface is up: on a today install a plugin's notify value
+		// would reroute Google Chat posts from hermes send to a chat.notify route
+		// that does not exist there, and a plugin's KUBE_AGENTS_ENABLED_PROFILES
+		// would scaffold or archive optional specialist profiles outside the
+		// operator's AgentProfile reconciliation. The operator renders them only
+		// under next, after this merge.
 		kept := extEnvs[:0]
 		for _, e := range extEnvs {
-			if e.Name != a2aNotifyPlatformEnvVar && e.Name != a2aNotifyConversationsEnvVar {
+			if e.Name != a2aNotifyPlatformEnvVar && e.Name != a2aNotifyConversationsEnvVar && e.Name != enabledProfilesEnvVar {
 				kept = append(kept, e)
 			}
 		}
@@ -3271,6 +3281,12 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 				Value: a2aAgentBusUser,
 			},
 		)
+		if len(opts.enabledProfiles) > 0 {
+			envVars = append(envVars, corev1.EnvVar{
+				Name:  enabledProfilesEnvVar,
+				Value: strings.Join(opts.enabledProfiles, ","),
+			})
+		}
 	}
 	// The Hermes Google Chat platform is off under next (legacyChatConsumer),
 	// so the agent-side callers that used to `hermes send` a proactive post

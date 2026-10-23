@@ -1,0 +1,286 @@
+[
+  {
+    "name": "operation-1791343562485-ebbcbceb-7c15-4a9f-ae43-a86a788fbca1",
+    "operationType": "UPGRADE_NODES",
+    "status": "DONE",
+    "startTime": "2026-10-07T03:26:02.485569575Z",
+    "endTime": "2026-10-07T03:31:33.797438674Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/zones/us-central1-a/clusters/seeded-c/nodePools/default-pool",
+    "zone": "us-central1-a"
+  },
+  {
+    "name": "operation-1791345747420-340e78e6-3868-4267-a04b-9db624275fa3",
+    "operationType": "UPGRADE_NODES",
+    "status": "DONE",
+    "startTime": "2026-10-07T04:02:27.420649656Z",
+    "endTime": "2026-10-07T04:12:09.752536573Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/zones/us-central1-a/clusters/seeded-a/nodePools/default-pool",
+    "zone": "us-central1-a"
+  },
+  {
+    "name": "operation-1791349671239-c9c7c927-4272-4dd2-bf4f-a7edf99cdb22",
+    "operationType": "UPGRADE_NODES",
+    "status": "DONE",
+    "startTime": "2026-10-07T05:07:51.239463211Z",
+    "endTime": "2026-10-07T05:13:01.843578896Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/zones/us-central1-a/clusters/seeded-d/nodePools/second-zone-pool",
+    "zone": "us-central1-a"
+  },
+  {
+    "name": "operation-1791385017186-dfc4b587-5a5f-4291-8179-23375a4a1e8f",
+    "operationType": "UPDATE_CLUSTER",
+    "status": "DONE",
+    "startTime": "2026-10-07T14:56:57.186701494Z",
+    "endTime": "2026-10-07T15:00:42.839519893Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/zones/us-central1-a/clusters/seeded-d",
+    "zone": "us-central1-a"
+  },
+  {
+    "name": "operation-1791397632455-b8e9830e-7684-4d5c-b08e-921cac72dd95",
+    "operationType": "UPGRADE_MASTER",
+    "status": "DONE",
+    "startTime": "2026-10-07T18:27:12.455938157Z",
+    "endTime": "2026-10-07T18:34:06.632252342Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/zones/us-central1-a/clusters/seeded-b",
+    "zone": "us-central1-a"
+  },
+  {
+    "name": "operation-1791398047406-3b2d8556-49f0-4c69-b3ed-8df036a6352e",
+    "operationType": "UPDATE_CLUSTER",
+    "status": "DONE",
+    "startTime": "2026-10-07T18:34:07.406867503Z",
+    "endTime": "2026-10-07T18:34:07.779110639Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/zones/us-central1-a/clusters/seeded-b",
+    "zone": "us-central1-a"
+  },
+  {
+    "name": "operation-1791398058861-79f9472d-6079-48fc-838f-2e47f8b578dc",
+    "operationType": "UPGRADE_NODES",
+    "status": "DONE",
+    "startTime": "2026-10-07T18:34:18.86189527Z",
+    "endTime": "2026-10-07T18:38:01.638627815Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/zones/us-central1-a/clusters/seeded-b/nodePools/default-pool",
+    "zone": "us-central1-a"
+  },
+  {
+    "name": "operation-1791431182233-9a3d3c4a-2886-45d1-92a6-b975af8a3cec",
+    "operationType": "UPGRADE_NODES",
+    "status": "DONE",
+    "startTime": "2026-10-08T03:46:22.233805609Z",
+    "endTime": "2026-10-08T03:49:13.020142889Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/zones/us-central1-a/clusters/seeded-a/nodePools/idle-batch-pool",
+    "zone": "us-central1-a"
+  },
+  {
+    "name": "operation-1791433235916-c1860f09-e11c-4fe1-b75b-40cf815a7e81",
+    "operationType": "UPGRADE_NODES",
+    "status": "DONE",
+    "startTime": "2026-10-08T04:20:35.916682589Z",
+    "endTime": "2026-10-08T05:24:10.379632696Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/zones/us-central1-a/clusters/seeded-a/nodePools/pinned-inference-pool",
+    "zone": "us-central1-a"
+  },
+  {
+    "name": "operation-1792037687403-55a9eb68-f12b-456a-b19a-a3d083dd8dbb",
+    "operationType": "UPGRADE_MASTER",
+    "status": "DONE",
+    "startTime": "2026-10-15T04:14:47.403274841Z",
+    "endTime": "2026-10-15T04:23:48.918714216Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/zones/us-central1-a/clusters/seeded-c",
+    "zone": "us-central1-a"
+  },
+  {
+    "name": "operation-1792038603113-8f0cf3fd-3565-4fda-a2c5-23f682af65c7",
+    "operationType": "UPGRADE_MASTER",
+    "status": "DONE",
+    "startTime": "2026-10-15T04:30:03.113598433Z",
+    "endTime": "2026-10-15T04:37:50.313714741Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/zones/us-central1-a/clusters/seeded-d",
+    "zone": "us-central1-a"
+  },
+  {
+    "name": "operation-1792040092570-daf6e9d5-aea2-4aa7-ad12-38e48145596f",
+    "operationType": "UPGRADE_NODES",
+    "status": "DONE",
+    "startTime": "2026-10-15T04:54:52.570772229Z",
+    "endTime": "2026-10-15T04:59:58.867539329Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/zones/us-central1-a/clusters/seeded-c/nodePools/default-pool",
+    "zone": "us-central1-a"
+  },
+  {
+    "name": "operation-1792120078699-7a912109-32c6-42c7-924b-b7b8df4e2518",
+    "operationType": "UPGRADE_NODES",
+    "status": "DONE",
+    "startTime": "2026-10-16T03:07:58.699022887Z",
+    "endTime": "2026-10-16T03:11:36.550295392Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/zones/us-central1-a/clusters/seeded-d/nodePools/default-pool",
+    "zone": "us-central1-a"
+  },
+  {
+    "name": "operation-1792123015197-fd75ca24-be8d-4067-85e9-4cdb7527565a",
+    "operationType": "UPGRADE_NODES",
+    "status": "DONE",
+    "startTime": "2026-10-16T03:56:55.19745127Z",
+    "endTime": "2026-10-16T04:01:58.193012585Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/zones/us-central1-a/clusters/seeded-d/nodePools/second-zone-pool",
+    "zone": "us-central1-a"
+  },
+  {
+    "name": "operation-1792123805749-3792a5ad-715e-43fa-ada1-a96acbf38c06",
+    "operationType": "UPGRADE_MASTER",
+    "status": "DONE",
+    "startTime": "2026-10-16T04:10:05.749602632Z",
+    "endTime": "2026-10-16T04:18:52.906352119Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/zones/us-central1-a/clusters/seeded-a",
+    "zone": "us-central1-a"
+  },
+  {
+    "name": "operation-1792125242998-721d5f2c-64d8-46eb-8fd2-4a24f8125b37",
+    "operationType": "UPGRADE_NODES",
+    "status": "DONE",
+    "startTime": "2026-10-16T04:34:02.998130204Z",
+    "endTime": "2026-10-16T04:42:48.645609852Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/zones/us-central1-a/clusters/seeded-a/nodePools/default-pool",
+    "zone": "us-central1-a"
+  },
+  {
+    "name": "operation-1792128395708-bc526b2f-19c6-43d4-82d8-c941097ee7d2",
+    "operationType": "UPGRADE_NODES",
+    "status": "DONE",
+    "startTime": "2026-10-16T05:26:35.708068817Z",
+    "endTime": "2026-10-16T05:29:52.129484958Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/zones/us-central1-a/clusters/seeded-a/nodePools/idle-batch-pool",
+    "zone": "us-central1-a"
+  },
+  {
+    "name": "operation-1792129115909-7cd0417c-ac60-41c2-a173-c3ba6b79f99a",
+    "operationType": "UPGRADE_NODES",
+    "status": "DONE",
+    "startTime": "2026-10-16T05:38:35.909313531Z",
+    "endTime": "2026-10-16T06:42:09.867770034Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/zones/us-central1-a/clusters/seeded-a/nodePools/pinned-inference-pool",
+    "zone": "us-central1-a"
+  },
+  {
+    "name": "operation-1792211331896-fade28ec-72ef-4caa-b291-94df686f993c",
+    "operationType": "UPDATE_CLUSTER",
+    "status": "DONE",
+    "startTime": "2026-10-17T04:28:51.896054908Z",
+    "endTime": "2026-10-17T04:35:20.849998189Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/zones/us-central1-a/clusters/seeded-a",
+    "zone": "us-central1-a"
+  },
+  {
+    "name": "operation-1791407162933-acfb955f-6d61-4c59-a72b-6720eb3aae9f",
+    "operationType": "UPDATE_CLUSTER",
+    "status": "DONE",
+    "startTime": "2026-10-07T21:06:02.933473054Z",
+    "endTime": "2026-10-07T21:06:03.820505046Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/locations/us-central1/clusters/platform-agent-host",
+    "zone": "us-central1"
+  },
+  {
+    "name": "operation-1791561841300-0de57d30-e54e-41eb-96ee-01767c46877e",
+    "operationType": "UPGRADE_MASTER",
+    "status": "DONE",
+    "statusMessage": "Try a different location, or try again later: Google Compute Engine does not have enough resources available to fulfill request: us-central1.",
+    "startTime": "2026-10-09T16:04:01.300210096Z",
+    "endTime": "2026-10-09T16:07:45.41357594Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/locations/us-central1/clusters/platform-agent-host",
+    "zone": "us-central1",
+    "error": {
+      "code": 14,
+      "message": "Try a different location, or try again later: Google Compute Engine does not have enough resources available to fulfill request: us-central1."
+    }
+  },
+  {
+    "name": "operation-1791598096270-2c5ca088-d0c5-4b68-9825-df05b99ea519",
+    "operationType": "UPGRADE_MASTER",
+    "status": "DONE",
+    "startTime": "2026-10-10T02:08:16.270723489Z",
+    "endTime": "2026-10-10T02:18:05.518432084Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/locations/us-central1/clusters/platform-agent-host",
+    "zone": "us-central1"
+  },
+  {
+    "name": "operation-1792002388928-2275df76-3ea9-4b9c-ba79-86386f4092a3",
+    "operationType": "RESIZE_CLUSTER",
+    "status": "DONE",
+    "startTime": "2026-10-14T18:26:28.928525661Z",
+    "endTime": "2026-10-14T18:37:54.424264685Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/locations/us-central1/clusters/platform-agent-host",
+    "zone": "us-central1"
+  },
+  {
+    "name": "operation-1792016461130-4f916a1a-8a0b-42dd-9abc-faa245a1fb17",
+    "operationType": "UPGRADE_NODES",
+    "status": "DONE",
+    "startTime": "2026-10-14T22:21:01.130416447Z",
+    "endTime": "2026-10-14T22:21:34.638154025Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/locations/us-central1/clusters/platform-agent-host/nodePools/default-pool",
+    "zone": "us-central1"
+  },
+  {
+    "name": "operation-1792023904290-c38ec378-fc2c-46d0-b6e4-d96a4b4385b4",
+    "operationType": "UPGRADE_NODES",
+    "status": "DONE",
+    "startTime": "2026-10-15T00:25:04.29061682Z",
+    "endTime": "2026-10-15T00:38:57.737525947Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/locations/us-central1/clusters/platform-agent-host/nodePools/pool-1",
+    "zone": "us-central1"
+  },
+  {
+    "name": "operation-1792027765406-1593ba24-a9bd-44c7-a5a3-2ae394b7f60e",
+    "operationType": "UPGRADE_NODES",
+    "status": "DONE",
+    "startTime": "2026-10-15T01:29:25.406298746Z",
+    "endTime": "2026-10-15T01:30:50.035314464Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/locations/us-central1/clusters/platform-agent-host/nodePools/pool-2",
+    "zone": "us-central1"
+  },
+  {
+    "name": "operation-1792044017966-bcbf46fc-726a-44ab-9d93-a6acfca00781",
+    "operationType": "UPGRADE_NODES",
+    "status": "DONE",
+    "startTime": "2026-10-15T06:00:17.96687523Z",
+    "endTime": "2026-10-15T06:01:49.358279024Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/locations/us-central1/clusters/platform-agent-host/nodePools/pool-3",
+    "zone": "us-central1"
+  },
+  {
+    "name": "operation-1792046079589-44e08d1e-12ba-4fd2-b6dc-01b5b718ca8d",
+    "operationType": "UPGRADE_NODES",
+    "status": "DONE",
+    "startTime": "2026-10-15T06:34:39.589009854Z",
+    "endTime": "2026-10-15T06:36:18.755688031Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/locations/us-central1/clusters/platform-agent-host/nodePools/pool-4",
+    "zone": "us-central1"
+  },
+  {
+    "name": "operation-1792050101224-11e9e0c5-a580-4e66-982f-69ab0a0af493",
+    "operationType": "UPGRADE_NODES",
+    "status": "DONE",
+    "startTime": "2026-10-15T07:41:41.224619391Z",
+    "endTime": "2026-10-15T07:46:26.46604403Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/locations/us-central1/clusters/platform-agent-host/nodePools/nap-8rbew2jw",
+    "zone": "us-central1"
+  },
+  {
+    "name": "operation-1792201396755-6bfab7fe-522b-4502-9271-f88d425a4a62",
+    "operationType": "UPDATE_CLUSTER",
+    "status": "DONE",
+    "startTime": "2026-10-17T01:43:16.755580496Z",
+    "endTime": "2026-10-17T01:53:29.417898561Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/locations/us-central1/clusters/platform-agent-host",
+    "zone": "us-central1"
+  },
+  {
+    "name": "operation-1792442652314-ad1b48ad-992c-4e58-aadd-b270350668b1",
+    "operationType": "UPGRADE_MASTER",
+    "status": "DONE",
+    "startTime": "2026-10-19T20:44:12.314846631Z",
+    "endTime": "2026-10-19T20:54:47.237355739Z",
+    "targetLink": "https://container.googleapis.com/v1/projects/196584622296/locations/us-central1/clusters/platform-agent-host",
+    "zone": "us-central1"
+  }
+]

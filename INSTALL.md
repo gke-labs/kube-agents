@@ -1298,7 +1298,9 @@ is what a first install runs unless `--mode=today` was passed or its third-party
 first run and, with a chat backend, the A2A gateway; run the quickstart's "Verify a
 `spec.mode: next` install" checks as well, for those, the verifier and console it does not wait
 on, the conditions, and the Slack check that applies under `next`. If a pod stays unready, see
-[Troubleshooting & Common FAQ](#troubleshooting--common-faq).
+[Troubleshooting & Common FAQ](#troubleshooting--common-faq). Once `Ready` holds, check the install by
+talking to it: the site's [First prompts](docs/site/src/content/docs/install/first-prompts.md) page
+gives the first message to send and what a healthy answer looks like.
 
 ### After the first chat message: the inventory report
 

@@ -10,5 +10,7 @@ data:
         litellm_params:
           model: gemini/gemini-3.1-flash-lite
           api_key: os.environ/GEMINI_API_KEY
+          # Return Gemini's thoughts as reasoning_content, apart from the answer.
+          thinking: {"type": "enabled"}
     litellm_settings:
       callbacks: ["otel", "prometheus"]

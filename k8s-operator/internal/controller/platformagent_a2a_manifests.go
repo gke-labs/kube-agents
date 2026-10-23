@@ -2706,7 +2706,8 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 						labelPartOf:       a2aPartOf,
 						a2aComponentLabel: "seed",
 					}}},
-				}, a2aOperatorNATSPeers()...),
+					// The MCP server, under its flag (a2aMCPNATSPeers).
+				}, append(a2aOperatorNATSPeers(), a2aMCPNATSPeers(agent)...)...),
 			}, {
 				// 9222 from the console server alone. See the doc comment
 				// for why it is the only one.
@@ -4996,6 +4997,9 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 	if a2aAgentDoorEnabled() {
 		fences = append(fences, a2aDoorNetworkPolicyWithOperatorPeer(agent, r.OperatorNamespace))
 	}
+	if a2aMCPDoorEnabled() {
+		fences = append(fences, buildA2AMCPNetworkPolicy(agent))
+	}
 	// The gateway's own fence, keyed on the gateway rather than a flag: the
 	// metrics listener binds every interface whenever the pod runs. Here for
 	// the refusal-path rescue, so it is applied over a gateway that exists.
@@ -5135,6 +5139,11 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// After the fences, so its pod never runs unfenced, and ahead of the
 	// gateway's hold, because serving the page doesn't need the gateway.
 	if err := r.reconcileA2AConsole(ctx, agent); err != nil {
+		return state, err
+	}
+	// The MCP server, the other console client, under its flag and for the
+	// same reasons: after the fences, ahead of the gateway's hold.
+	if err := r.reconcileA2AMCP(ctx, agent); err != nil {
 		return state, err
 	}
 
@@ -5902,6 +5911,11 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 		// late: the Delete above returns before the pod is gone.
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aConsoleName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aConsoleName(agent), Namespace: agent.Namespace}}, r.Client},
+		// The MCP server, the other console client, beside it, and its token
+		// with it. Its fence goes later, beside the console's.
+		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPAccessName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		// The auth callout, before the bus it authorizes for. Its Deployment
 		// goes first so its deletion is initiated while there is still a server to
 		// answer for; the keys Secret goes with it rather than surviving like
@@ -5990,6 +6004,10 @@ func (r *PlatformAgentReconciler) a2aBusTeardown(agent *agentv1alpha1.PlatformAg
 		// fence ABOVE this entry, not below it.
 		// TestTheSessionFenceIsTheLastFenceTheTeardownDeletes pins that.
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aVerifierNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
+		// The MCP fence, late for the console fence's reason below, and just
+		// above it: the console fence stays directly above the session
+		// fence, which stays last.
+		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The console fence, as late as it can go for the session fence's
 		// reason: directly above the session fence, which has to stay last.
 		// The window matters more here: until the console pod exits, anything
@@ -6046,7 +6064,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// The early exit. This path runs on every reconcile of every install that
 	// is not `next` — forever, on installs that have never rendered an A2A
 	// object — so proving "nothing to do" one object at a time is a standing
-	// cost for a no-op. Ten reads answer it instead of walking every object
+	// cost for a no-op. Eleven reads answer it instead of walking every object
 	// in the teardown sequence:
 	//
 	//   - the StatefulSet, which is deleted LAST below, so its absence means an
@@ -6090,6 +6108,9 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	//     inject flag. It is the third fence reconcileA2ANetworkFences writes,
 	//     so the same two deletes leave it standing alone there, and nothing
 	//     on the today path but this walk removes it either,
+	//   - the MCP server's fence, the same shape under A2A_MCP_DOOR: written
+	//     after the pair, so the same hand leaves it alone, and nothing on the
+	//     today path but this walk removes it,
 	//   - the callout keys Secret, which is the FIRST deletable object
 	//     reconcileA2A creates — the per-user creds Secret is created before it
 	//     and deliberately survives — so a render that died anywhere leaves this
@@ -6102,8 +6123,8 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	//
 	// Without the Secrets and the fences the exit would step over those objects
 	// and leave an A2A object on a `today` install, which is the darkness
-	// property. The first eight are Owns kinds and free; the two Secret reads
-	// are uncached and happen only when the free eight all miss.
+	// property. The first nine are Owns kinds and free; the two Secret reads
+	// are uncached and happen only when the free nine all miss.
 	//
 	// A sentinel counts only when this CR owns it: a squatted or stale-UID
 	// object under a reserved name is not residue of this CR and is left to
@@ -6112,7 +6133,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// counted would send every reconcile of a today install into that refusal
 	// -- the shape a next CR deleted and re-created under the same name in
 	// today mode takes, while its old fences still carry the old UID.
-	// Ownership is read off the fetched object, so the exit stays at ten
+	// Ownership is read off the fetched object, so the exit stays at eleven
 	// Gets.
 	//
 	// Adding an object to reconcileA2A ahead of the keys Secret, or to
@@ -6121,7 +6142,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// prefix of both renders and is what makes forgetting it red rather than
 	// silent: without the keys Secret below, its writes 3 and 4 fail, and
 	// without the fences every guardrail prefix does. The inject, door,
-	// console and gateway fences are the ones no prefix leaves alone;
+	// console, gateway and MCP fences are the ones no prefix leaves alone;
 	// TestAHandDeletedPairLeavesTheInjectFenceToDriveTheFlip, its A2A door
 	// twin, TestAHandDeletedPairLeavesTheConsoleFenceToDriveTheFlip and
 	// TestTheA2AGatewayFenceComesAndGoesWithTheGateway are what red without
@@ -6135,6 +6156,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aDoorName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aConsoleNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSConfigSecretName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 	}

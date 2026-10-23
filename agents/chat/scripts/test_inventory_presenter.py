@@ -1505,9 +1505,13 @@ class OriginPlatformTest(unittest.TestCase):
             self.assertIsNone(bootstrap_delivery._origin_platform())
 
 
+# The audits note with no oobe marker: the chain's sentence, then where the summaries go.
+RUNNING_NOTE = f"{bootstrap_delivery.AUDITS_RUNNING_NOTE} {bootstrap_delivery.AUDITS_HOME_SENTENCE}"
+
+
 def delivered(report: str) -> str:
     """What delivery prints for a report with no oobe marker beside it: the report, then the audits note."""
-    return report.rstrip("\n") + "\n\n" + bootstrap_delivery.AUDITS_RUNNING_NOTE + "\n"
+    return report.rstrip("\n") + "\n\n" + RUNNING_NOTE + "\n"
 
 
 class DeliveryFlagTest(unittest.TestCase):
@@ -1608,7 +1612,7 @@ class BlocksDeliveryTest(unittest.TestCase):
         return out.getvalue()
 
     def test_posts_blocks_into_the_origin_and_prints_only_the_audits_note(self):
-        self.assertEqual(self._run(lambda *a: "9.9"), bootstrap_delivery.AUDITS_RUNNING_NOTE + "\n")
+        self.assertEqual(self._run(lambda *a: "9.9"), RUNNING_NOTE + "\n")
         (post,) = self.posts
         channel, text, blocks, thread_ts = post.args
         self.assertEqual((channel, thread_ts), ("C1", "1.5"))
@@ -1623,7 +1627,7 @@ class BlocksDeliveryTest(unittest.TestCase):
             oobe.skip(self.d, oobe.SKIP_NOT_NEW, 1000.0)
         self.assertEqual(
             self._run(lambda *a: "9.9"),
-            f"The first-run audits did not run: {oobe.SKIP_NOT_NEW}. {bootstrap_delivery.AUDITS_NOT_COVERED_NOTE}\n",
+            f"The audits did not run as part of onboarding: {oobe.SKIP_NOT_NEW}. {bootstrap_delivery.AUDITS_NOT_COVERED_NOTE}\n",
         )
         self.assertEqual(len(self.posts), 1)
 
@@ -1772,7 +1776,7 @@ class GatewayDeliveryTest(unittest.TestCase):
 
     def test_posts_the_card_into_the_origin_thread_and_prints_only_the_audits_note(self):
         out, seen = self._run()
-        self.assertEqual(out, bootstrap_delivery.AUDITS_RUNNING_NOTE + "\n")
+        self.assertEqual(out, RUNNING_NOTE + "\n")
         self.assertEqual(seen["argv"][:6], ["a2a", "notify", "--platform", "slack", "--chat-file", seen["path"]])
         self.assertEqual(seen["argv"][seen["argv"].index("--thread") + 1], "C1/1.5")
         self.assertEqual(seen["argv"][-1], PRESENTED)

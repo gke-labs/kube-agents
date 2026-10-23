@@ -105,6 +105,9 @@ func TestUsageWindowClampsToTheSessionTTL(t *testing.T) {
 	if got := usageWindow(6 * time.Hour); got != 24*time.Hour {
 		t.Fatalf("usageWindow(6h) = %v, want the one-day floor", got)
 	}
+	if got := usageWindow(100 * time.Hour); got != 4*24*time.Hour {
+		t.Fatalf("usageWindow(100h) = %v, want four whole days, the window the label names", got)
+	}
 	// t5 started three days ago: a two-day window drops it.
 	got := rollup(t, summaryRecords(), summaryNow, 2*24*time.Hour)
 	if want := (taskRollup{Total: 5, Ended: 2, Cancelled: 2, Active: 1}); got != want {

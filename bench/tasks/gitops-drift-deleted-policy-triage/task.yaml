@@ -200,7 +200,10 @@ expected_output: |
   - It identifies the subject as the NetworkPolicy 'eval-workload-netpol' in
     the 'eval-drift-policy' namespace, and the change as that policy having
     been deleted outside GitOps rather than modified.
-  - It names the principal who deleted it, 'eval-operator@example.com'.
+  - It names the principal who deleted it: either the one the card records,
+    'eval-operator@example.com', or the principal the Cloud Logging entry for
+    the deletion records, together with the observation that it differs from
+    the card.
   - It weighs what the deletion exposed in terms of the namespace as it stands
     now: the workload's pods are running and the namespace carries no
     NetworkPolicy at all, so they accept traffic from anywhere in the cluster.
@@ -280,12 +283,58 @@ verification_spec:
       # The one run that did not was reading an unrelated k8s-event card, which
       # has no principal to carry (the collision that case's header records).
       #
-      # So a red here is one of two things and the order matters: first check
-      # the report was read off the DRIFT card and not a neighbouring event
-      # card; if it was, it is a finding about _drift_task_body's "Done when"
-      # clause, which the template should learn to ask for. The fix is never to
-      # weaken this objective.
-      required_phrases: ["eval-operator@example.com"]
+      # So a red here is one of four things and the order matters. First,
+      # check the report was read off the DRIFT card and not a neighbouring
+      # event card. Second, check whether the run was on a dev install: the
+      # stack plants under the contributor's own account there, so an agent
+      # that checks the card against Cloud Logging reports that account and
+      # reds here, which is not a defect -- see below. Third, on CI, check
+      # whether it reported a CI identity below; that is a pass. Only if none
+      # of those is it a finding about _drift_task_body's "Done when" clause,
+      # which the template should learn to ask for. The fix is never to accept
+      # a principal no evidence supports.
+      #
+      # WHY IT ACCEPTS MORE THAN THE PLANTED PRINCIPAL. The planted principal
+      # is a story. The stack makes the deletion itself, under whatever
+      # identity runs it, and hands the daemon a record saying
+      # eval-operator@example.com did it -- and the card tells the agent to
+      # "search Cloud Logging for this to read the entry itself". An agent that
+      # does finds the audit entry naming the real caller, finds the card
+      # contradicted, and reports the principal the evidence supports.
+      # Measured on the recorder nightly of 2026-10-22, build
+      # 2113057845506215936, rep 2: "Cloud Logging records the delete under
+      # the principal eval-baseline-recorder@... That differs from the
+      # principal and insertId on this card". That is the behaviour CUJ 1
+      # exists to reward, and failing it graded verification as a defect.
+      #
+      # So the objective accepts the planted principal or either identity the
+      # nightly plants under. Not "any service account": a report may name the
+      # Platform Agent's own GSA in passing, and that must not pass for naming
+      # the actor. Making the story true instead was tried and does not work:
+      # a `kubectl --as` write is logged with the real caller as
+      # principalEmail and the impersonated user only as authoritySelector.
+      #
+      # The two identities are the Google accounts the two periodics that run
+      # this case map to: eval-baseline-recorder for ci-kube-agents-eval-nightly,
+      # the recorder, whose audit entry named it on 2026-10-22, and
+      # prowjob-default-sa for ci-kube-agents-eval-nightly-next-claude, by its
+      # serviceAccountName (not yet seen on this case's audit entries; the case
+      # was registered the night before). oss-test-infra#2751 moves that job to
+      # eval-baseline-recorder; when it merges, drop the second entry.
+      #
+      # What this cannot tell apart, and leaves to the judge: the runner makes
+      # every write the stack makes, not only the deletion, so a report naming
+      # it for some other audit entry -- the server-side apply, say -- without
+      # attributing the deletion to it would also pass here. The expected_output
+      # bullet on the principal asks for the attribution, which is the half a
+      # phrase check cannot read. And a periodic moving to an identity not
+      # listed here makes an agent that verifies red again.
+      any_of_phrases:
+        - "eval-operator@example.com"
+        # The recorder nightly plants under this identity, so the audit log names it.
+        - "eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
+        # The Claude nightly twins plant under this identity.
+        - "prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com"
 
   - name: triage-names-the-object-kind
     role: objective
