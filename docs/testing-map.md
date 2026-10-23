@@ -35,7 +35,7 @@ workflow run and files a main-broken issue like any other job in it.
 **`bench/tasks/` and `bench/cuj/` both drive an agent, and they are the two most confusable rows.**
 The difference is who supplies the failure and who owns the environment.
 
-A `bench/tasks/` case is an **eval, and it runs in CI**, in the Prow presubmit or the Prow nightly periodic tier (`ci-kube-agents-eval-nightly` and `ci-kube-agents-eval-nightly-writers`). It plants a defect and the
+A `bench/tasks/` case is an **eval, and it runs in CI**, in the Prow presubmit or the Prow nightly periodic tier (`ci-kube-agents-eval-nightly` and `ci-kube-agents-eval-nightly-writers` on `spec.mode: next`, `ci-kube-agents-eval-nightly-today` on `today`). It plants a defect and the
 run owns the environment the defect sits in: the case's `infrastructure.deployer` decides where,
 with `tofu` provisioning a stack for the run and tearing it down after, and `noop` grading against
 the cluster the deploy already stood up. The agent is pointed at it and its diagnosis is graded
@@ -112,32 +112,32 @@ Multiple automated jobs run on timers or tags across Prow and GitHub Actions. Se
 colloquial name "nightly" despite running on different platforms, with different triggers, budgets,
 and purposes:
 
-| Job                                   | Platform        | Trigger                                                 | Input                                     | What it produces                                                                                                                            |
-| ------------------------------------- | --------------- | ------------------------------------------------------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| `rc-release-pipeline.yml`             | GitHub Actions  | `rc-scheduler.yml`, `cron: "17 */3 * * *"`              | A commit on `main`                        | `rc_<ts>_<sha>`, then `rc_<ts>_<sha>_validated`                                                                                             |
-| `staging-promotion-pipeline.yml`      | GitHub Actions  | `staging-promotion-scheduler.yml`, `cron: "17 2 * * *"` | A validated `rc_` tag                     | The E2E matrix, then an `evalcand_` tag that nominates the commit for the eval below, then, on a green verdict, the `staging_` tag          |
-| `post-kube-agents-eval-rc`            | Prow postsubmit | An `evalcand_` tag push                                 | Nominated candidate commit (`evalcand_*`) | A verdict on that candidate against the merge-blocking presubmit matrix, not the full catalog (360m budget, parallelism 4)                  |
-| `ci-kube-agents-eval-nightly`         | Prow periodic   | `cron: "0 0 * * *"`                                     | Latest `main`                             | Baseline evidence store and dashboard rows against the eval catalog less the cases that request a pull request (720m budget, parallelism 6) |
-| `ci-kube-agents-eval-nightly-writers` | Prow periodic   | `cron: "0 0 * * *"`                                     | Latest `main`                             | The same for the cases that request a pull request, on a second leased project (240m budget)                                                |
-| `ci-kube-agents-pool-pressure`        | Prow periodic   | `cron: "23 * * * *"`                                    | None (leases nothing)                     | Pool health verification                                                                                                                    |
+| Job                                   | Platform        | Trigger                                                 | Input                                     | What it produces                                                                                                                         |
+| ------------------------------------- | --------------- | ------------------------------------------------------- | ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `rc-release-pipeline.yml`             | GitHub Actions  | `rc-scheduler.yml`, `cron: "17 */3 * * *"`              | A commit on `main`                        | `rc_<ts>_<sha>`, then `rc_<ts>_<sha>_validated`                                                                                          |
+| `staging-promotion-pipeline.yml`      | GitHub Actions  | `staging-promotion-scheduler.yml`, `cron: "17 2 * * *"` | A validated `rc_` tag                     | The E2E matrix, then an `evalcand_` tag that nominates the commit for the eval below, then, on a green verdict, the `staging_` tag       |
+| `post-kube-agents-eval-rc`            | Prow postsubmit | An `evalcand_` tag push                                 | Nominated candidate commit (`evalcand_*`) | A verdict on that candidate against the merge-blocking presubmit matrix, not the full catalog (360m budget, parallelism 4)               |
+| `ci-kube-agents-eval-nightly`         | Prow periodic   | `cron: "0 0 * * *"`                                     | Latest `main`, `spec.mode: next`          | Evidence store (`next` key) and dashboard rows: the eval catalog less the cases that request a pull request (720m budget, parallelism 6) |
+| `ci-kube-agents-eval-nightly-writers` | Prow periodic   | `cron: "0 0 * * *"`                                     | Latest `main`, `spec.mode: next`          | The same for the cases that request a pull request, on a second leased project (240m budget)                                             |
+| `ci-kube-agents-eval-nightly-today`   | Prow periodic   | `cron: "0 6 * * *"`                                     | Latest `main`, `spec.mode: today`         | The rollback check: the full catalog on a fresh `today` install, recording today's window (900m budget, parallelism 6)                   |
+| `ci-kube-agents-pool-pressure`        | Prow periodic   | `cron: "23 * * * *"`                                    | None (leases nothing)                     | Pool health verification                                                                                                                 |
 
 When diagnosing failures or reporting incidents, name the specific job rather than saying "the nightly":
 
-`ci-kube-agents-eval-nightly` is the Prow periodic eval grading `main` against the full evaluation catalog (`presubmit-cases.txt` plus `nightly-cases.txt`), less the cases that request a pull request (`EVAL_NIGHTLY_PART=main`). `ci-kube-agents-eval-nightly-writers` runs those cases (`EVAL_NIGHTLY_PART=writers`) on a second leased project at the same 00:00 UTC, with a 240m budget; the variable's comment in `hack/ci-eval-pr.sh` says why the catalog is split. The dashboard and the 9 AM ET digest report the two builds as one night.
+`ci-kube-agents-eval-nightly` is the Prow periodic eval grading `main` against the full evaluation catalog (`presubmit-cases.txt` plus `nightly-cases.txt`), less the cases that request a pull request (`EVAL_NIGHTLY_PART=main`). `ci-kube-agents-eval-nightly-writers` runs those cases (`EVAL_NIGHTLY_PART=writers`) on a second leased project at the same 00:00 UTC, with a 240m budget; the variable's comment in `hack/ci-eval-pr.sh` says why the catalog is split. The dashboard and the 9 AM ET digest report the two builds as one night. Both grade `spec.mode: next` (`EVAL_MODE_NEXT=1`, the mode a new install gets), so their cases run through the inject door less the inject lane's exclusions, and they append under the evidence store's `next` key. `ci-kube-agents-eval-nightly-today` is the rollback check: at 06:00 UTC it grades the whole catalog, exclusions included, on a fresh `today` install over the agent API, and is the one run that appends today's window. The dashboard does not collect its runs and the CI health bot does not watch them: read a night in Prow, and the record it builds on the dashboard's Trend page, which draws the today-mode series.
 
 `staging-promotion-pipeline.yml` is the GitHub Actions workflow that runs the full E2E matrix and promotes validated release candidates to staging.
 
-`post-kube-agents-eval-rc` grades nominated candidates on a `spec.mode: next` install, the mode a new install gets (`EVAL_MODE_NEXT=1` on the job), against the merge-blocking presubmit matrix less the inject lane's exclusions (`agent-kanban-smoke` among them; [`docs/eval-gate-roster.md`](eval-gate-roster.md#the-inject-lane)), the tier the pull-request gate runs, not the full catalog the nightly runs (`hack/ci-eval-rc.sh` pins `RC_EVAL_TIER`; the reason is the 360m budget, [`docs/designs/testing-strategy.md`](designs/testing-strategy.md)), under a postsubmit trigger and lower task parallelism (4 vs 8); neither failure implies the other, and a regression only a nightly-only case would catch reaches staging and is reported by the nightly afterwards.
+`post-kube-agents-eval-rc` grades nominated candidates on a `spec.mode: next` install, the mode a new install gets (`EVAL_MODE_NEXT=1` on the job), against the merge-blocking presubmit matrix less the inject lane's exclusions (`agent-kanban-smoke` among them; [`docs/eval-gate-roster.md`](eval-gate-roster.md#the-inject-lane)), the tier the pull-request gate runs, not the full catalog the nightly runs (`hack/ci-eval-rc.sh` pins `RC_EVAL_TIER`; the reason is the 360m budget, [`docs/designs/testing-strategy.md`](designs/testing-strategy.md)), under a postsubmit trigger and lower task parallelism (4 vs 6); neither failure implies the other, and a regression only a nightly-only case would catch reaches staging and is reported by the nightly afterwards.
 
 ## Running on a pull request is not gating a merge
 
 The last column says what a trigger and its `if:` conditions support, which is a weaker claim than
-"blocks the merge". Which checks are actually required lives in branch protection on
-`gke-labs/kube-agents` and in Prow config in `GoogleCloudPlatform/oss-test-infra`; neither is a file
-in this repository, so this table asserts nothing about either.
-[`pull-request-workflow.md`](pull-request-workflow.md#how-a-change-merges) names the required
-contexts as they stand, gives the command to read them back, and says why that command sees only
-the branch-protection half of the set. `make verify` (the `verify` target in the root `Makefile`) is the
+"blocks the merge". Which checks are actually required lives in the `main-merge-queue` ruleset on
+`gke-labs/kube-agents`, which is not a file in this repository, so this table asserts nothing about
+it. [`pull-request-workflow.md`](pull-request-workflow.md#how-a-change-merges) names the required
+checks as they stand, gives the command to read them back, and says how the smoke presubmit reaches
+the set through `Smoke gate`. `make verify` (the `verify` target in the root `Makefile`) is the
 local answer to the same question — everything a pull request must pass offline, in one target —
 and [`pull-request-workflow.md`](pull-request-workflow.md#local-validation-before-committing) lists
 the individual targets to run when you have touched a given area.

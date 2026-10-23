@@ -237,6 +237,9 @@ needs — a request's own `max_tokens` still wins. `litellm.reasoningEffort`
 (`low`/`medium`/`high`, default empty, meaning none) puts a `reasoning_effort`
 under every alias the same way; LiteLLM maps it to `thinkingLevel` on Gemini 3.x
 ([details](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-reasoning-effort)).
+On a Gemini 2.5 or 3.x model the gateway asks for the model's thoughts with a
+`thinking` key under every alias, which a `reasoningEffort` value replaces
+([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#geminis-thoughts)).
 On a Claude model the gateway
 drops `temperature`, `top_p` and `top_k` from every request
 ([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-default-model)),
@@ -336,6 +339,7 @@ including `/v1`) are required, and the render fails without them. Set
   endpoint and no other.
 - **Egress.** The gateway's `litellm-policy` gets one rule derived from
   `apiBase`:
+
   - An in-cluster Service (`<svc>`, `<svc>.<ns>.svc`, or
     `<svc>.<ns>.svc.cluster.local`; a bare `<svc>` is the release namespace,
     and a two-label host such as `openrouter.ai` is a hostname, not
@@ -523,7 +527,7 @@ ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/ku
 
 `platformAgent.podMonitoring` renders a `PodMonitoring` for each of the agent's
 pods that serves metrics: the gateway pod, so GKE Managed Prometheus scrapes the
-event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's port 9095 on every replica, and, under a second `PodMonitoring` that selects the leader label alone, the chat plugin's `kubeagents_chat_messages_inbound_total` from the `platform-agent` container's port 9097 on the one pod that runs Hermes, and the credential-proxy pod, so it scrapes the broker's `kubeagents_*`
+event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's port 9095 on every replica, and, under a second `PodMonitoring` that selects the leader label alone, the chat plugin's `kubeagents_chat_*` series (`kubeagents_chat_messages_inbound_total` among them) from the `platform-agent` container's port 9097 on the one pod that runs Hermes, and the credential-proxy pod, so it scrapes the broker's `kubeagents_*`
 tool-invocation, request and version-control metrics from its metrics-only port 8766, and the A2A
 gateway pod a `spec.mode: next` install runs, so it scrapes the gateway's inbound-message,
 task terminal and Google Chat pull counters from its metrics-only port 9096 (elsewhere
@@ -861,8 +865,9 @@ These knobs need context beyond the chart:
 
 - `plugins.pubsubPlatform.enabled` (default `false`): Deploys the Cloud Pub/Sub platform adapter (`AgentPlugin/pubsubplatform`), providing Pub/Sub message ingress and kanban task dispatching.
 - `plugins.stockoutInvestigator.enabled` (default `false`): Deploys the GKE Stockout Investigator (`AgentPlugin/gkestockoutinvestigator`) targeting the `platform` profile, which investigates autoscaler scale-up failures. Requires `plugins.pubsubPlatform.enabled=true`.
+- `plugins.stockoutInvestigator.applyTuning` (default `true`): merges the plugin's execution limits into `platformAgent.harness.tuning`. `false` keeps the install's own tuning, for an install that runs the plugin only to prove its ingress.
 
-When `plugins.stockoutInvestigator.enabled=true`, the chart automatically seeds `platformAgent.harness.tuning` execution limits (`maxInProgress: 3`, `platform: {apiMaxRetries: 8, maxTurns: 200}`, `cluster: {apiMaxRetries: 8, maxTurns: 150}`). Stockout remediation is long-running and quota-intensive; these limits ensure the platform agent and delegated cluster workers have sufficient turns and retry budgets to diagnose and remediate capacity incidents across the fleet. Explicit settings in `platformAgent.harness.tuning.*` take precedence over these defaults.
+When `plugins.stockoutInvestigator.enabled=true` and `plugins.stockoutInvestigator.applyTuning` is not `false`, the chart automatically seeds `platformAgent.harness.tuning` execution limits (`maxInProgress: 3`, `platform: {apiMaxRetries: 8, maxTurns: 200}`, `cluster: {apiMaxRetries: 8, maxTurns: 150}`). Stockout remediation is long-running and quota-intensive; these limits ensure the platform agent and delegated cluster workers have sufficient turns and retry budgets to diagnose and remediate capacity incidents across the fleet. Explicit settings in `platformAgent.harness.tuning.*` take precedence over these defaults.
 
 ### Scoped service accounts
 
@@ -1038,18 +1043,30 @@ identity without that permission gets `error calling lookup: resourcequotas is
 forbidden` and no install rather than a quiet pass. Grant the permission, or install with
 `--set quotaPreflight.enabled=false`.
 
+### Optional AgentProfiles (`profiles.tse`)
+
+`profiles.tse.enabled` (default `false`) renders the optional `AgentProfile/tse`
+(GKE Support Agent — Customer-Side Technical Solutions Engineer) under `mode: next`
+(`templates/profiles.yaml`, gated on both `platformAgent.enabled` and
+`profiles.tse.enabled`), with `profiles.tse.{description,persona.image,harness,bus,lifecycle,concurrency,resources}`
+controlling its `AgentProfile` spec. When bound, the operator passes
+`KUBE_AGENTS_ENABLED_PROFILES=tse` to the gateway Deployment so the entrypoint
+scaffolds `/opt/data/profiles/tse` from `/opt/tse-template` on startup.
+
 ## Uninstalling
 
 ```bash
 helm uninstall kube-agents -n kubeagents-system
 ```
 
-The `PlatformAgent` resource carries a finalizer that only the operator can
-clear, and Helm deletes the CR and the operator in the same pass — so nothing
-would be left to clear it, the CR would strand, and the namespace would hang in
-`Terminating`. `platformAgent.cleanupHook` (on by default) prevents that with a
-`pre-delete` hook that deletes the CR and waits for the finalizer while the
-operator is still running.
+The `PlatformAgent` and `AgentProfile` resources carry finalizers that only the
+operator can clear, and Helm deletes the CRs and the operator in the same pass —
+so nothing would be left to clear them, the CRs would strand, and the namespace
+would hang in `Terminating`. `platformAgent.cleanupHook` (on by default)
+prevents that with a `pre-delete` hook that deletes all `AgentProfile` CRs first
+(while the `PlatformAgent` and NATS bus are still running so tombstone cards are
+published), then deletes the `PlatformAgent` CR and waits for the finalizers
+while the operator is still running.
 
 The hook runs `kubectl` from `alpine/k8s`, because the operator image is
 distroless and carries no client — and because the hook needs a shell: it is
@@ -1091,6 +1108,7 @@ entirely — any image with `kubectl` and `/bin/sh` works.
 With `platformAgent.cleanupHook.enabled=false`, the ordering is yours to keep:
 
 ```bash
+kubectl delete agentprofile --all -n kubeagents-system --ignore-not-found --wait
 kubectl delete platformagent platform-agent -n kubeagents-system --wait
 helm uninstall kube-agents -n kubeagents-system
 ```
@@ -1116,6 +1134,7 @@ helm uninstall kube-agents -n kubeagents-system
   `terraform/examples/full-install` does both in one apply.
 
   Two behaviours worth knowing before you enable them:
+
   - **`failurePolicy` defaults to `Ignore`, where the kustomize path uses
     `Fail`.** Helm applies the webhook configurations before both the
     `Certificate` and the `PlatformAgent` CR, so under `Fail` the API server

@@ -4819,6 +4819,13 @@ class PullRequestOpenedVerifier(BaseVerifier):
     # meant to protect. Listed from `/pulls/{n}/files`, so the credential needs
     # `pull_requests: read`.
     unchanged_paths: list[str] = Field(default_factory=list)
+    # Repository paths, as `fnmatch` globs, the pull request must delete: each
+    # glob is matched by at least one file the pull request lists as
+    # `removed`. A delete reaches review as the removal of the manifest that
+    # declares the object; a pull request that adds a marker or edits the
+    # manifest in place leaves the declaration, and merging it keeps the
+    # object. Listed from `/pulls/{n}/files`, as `unchanged_paths` is.
+    removed_paths: list[str] = Field(default_factory=list)
     # Assertions over what the pull request writes (see PullRequestContentCheck):
     # the object a provisioning case expects, with the fields it must carry,
     # rather than only that some file changed. Read from `/pulls/{n}/files`,
@@ -4879,16 +4886,12 @@ class PullRequestOpenedVerifier(BaseVerifier):
             )
         return texts, None
 
-    def _changed_paths(
+    def _file_entries(
         self, owner: str, repo: str, number: int, token: str, budget: float
-    ) -> tuple[list[str], str | None]:
-        """``(paths the pull request changes, unevaluable reason)``.
-
-        A rename counts under both names: moving the declaration away is as
-        much a change to it as rewriting it.
-        """
+    ) -> tuple[list[dict], str | None]:
+        """``(the entries of /pulls/{n}/files, unevaluable reason)``."""
         base = f"{forges.github_api_root()}/repos/{owner}/{repo}/pulls/{number}/files"
-        paths: list[str] = []
+        entries: list[dict] = []
         for page in range(1, _PR_FILES_MAX_PAGES + 1):
             status, files = _http_get_json(
                 f"{base}?per_page={_PR_FILES_PAGE_SIZE}&page={page}", token, budget
@@ -4899,12 +4902,43 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     "the token needs `pull_requests: read` to check which paths the "
                     "fix changes, so this check could not be evaluated"
                 )
-            for entry in files:
-                if isinstance(entry, dict):
-                    paths += [str(entry[key]) for key in ("filename", "previous_filename") if entry.get(key)]
+            entries += [entry for entry in files if isinstance(entry, dict)]
             if len(files) < _PR_FILES_PAGE_SIZE:
                 break
-        return paths, None
+        return entries, None
+
+    def _changed_paths(
+        self, owner: str, repo: str, number: int, token: str, budget: float
+    ) -> tuple[list[str], str | None]:
+        """``(paths the pull request changes, unevaluable reason)``.
+
+        A rename counts under both names: moving the declaration away is as
+        much a change to it as rewriting it.
+        """
+        entries, unevaluable = self._file_entries(owner, repo, number, token, budget)
+        paths = [
+            str(entry[key])
+            for entry in entries
+            for key in ("filename", "previous_filename")
+            if entry.get(key)
+        ]
+        return paths, unevaluable
+
+    def _removed_paths(
+        self, owner: str, repo: str, number: int, token: str, budget: float
+    ) -> tuple[list[str], str | None]:
+        """``(paths the pull request deletes, unevaluable reason)``.
+
+        Only status `removed` counts. A rename moves the declaration rather
+        than deleting it, so a renamed file's old name is not a removal.
+        """
+        entries, unevaluable = self._file_entries(owner, repo, number, token, budget)
+        removed = [
+            str(entry["filename"])
+            for entry in entries
+            if entry.get("status") == "removed" and entry.get("filename")
+        ]
+        return removed, unevaluable
 
     def _spent_before(
         self,
@@ -5582,6 +5616,15 @@ class PullRequestOpenedVerifier(BaseVerifier):
                         "files and are not implemented for GitLab, so this check could not be evaluated"
                     )
                     continue
+                if verdict == "pass" and self.removed_paths:
+                    # removed_paths reads GitHub's file listing too; a merge request
+                    # that adds a marker passes every other clause, so ungraded on
+                    # what it removes it is not a pass either.
+                    unresolved.append(
+                        f"{full}!{number}: `removed_paths` reads GitHub's pull request "
+                        "files and is not implemented for GitLab, so this check could not be evaluated"
+                    )
+                    continue
                 if verdict == "pass":
                     return done(True, reason, raw=raw)
                 (rejected if verdict == "reject" else unresolved).append(reason)
@@ -5703,6 +5746,26 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     continue
                 if rejection:
                     rejected.append(rejection)
+                    continue
+            if self.removed_paths:
+                try:
+                    removed, unevaluable = self._removed_paths(owner, repo, number, token, budget)
+                except OSError as exc:
+                    unresolved.append(f"could not reach the GitHub API for {slug}: {exc}")
+                    continue
+                if unevaluable:
+                    unresolved.append(unevaluable)
+                    continue
+                kept = [
+                    pattern for pattern in self.removed_paths
+                    if not any(fnmatch.fnmatchcase(path, pattern) for path in removed)
+                ]
+                if kept:
+                    rejected.append(
+                        f"{slug}: does not remove {', '.join(kept)}, which this case "
+                        "requires the pull request to delete (`removed_paths`) -- a "
+                        "delete that leaves the declaration keeps the object"
+                    )
                     continue
             if self.unchanged_paths:
                 try:
@@ -6702,6 +6765,80 @@ class BootstrapReportCriticalsVerifier(_OnboardingPollVerifier):
         if padded:
             return "fail", f"the report's {len(items)} numbered item(s) {counts}{padding}", raw
         return "pass", f"the report's {len(items)} numbered item(s) {counts}, the limit of {self.limit}: {named}", raw
+
+
+# The report's one title line: a heading, or a bold line with no sentence end, as the Slack
+# presenter's title rule reads it. Only the first line can be the title.
+_TITLE_RE = re.compile(r"^\s*(?:#{1,6}\s.*|\*\*[^*\n]*[^*\n.!?\s]\s*\*\*)\s*$")
+
+
+def _report_body(text: str) -> str:
+    """The report with its first line dropped when that line is its title, every run of whitespace one space.
+
+    Any other heading or bold line stays in the text, so a verdict written as a second heading
+    or as a bold sentence before the counts fails the opening check.
+    """
+    lines = text.splitlines()
+    first = next((i for i, line in enumerate(lines) if line.strip()), None)
+    if first is not None and _TITLE_RE.match(lines[first]):
+        del lines[first]
+    return " ".join(" ".join(lines).split())
+
+
+@VERIFIERS.register("bootstrap_report_posture")
+class BootstrapReportPostureVerifier(_OnboardingPollVerifier):
+    """Checks that the onboarding report opens with the posture the SOP fixes.
+
+    The prioritization SOP (Step 6) has the worker open the report with what
+    was scanned and then the posture line ``inventory_findings.py select``
+    prints, which counts the scan's own checks and leaves the rest to the
+    first-run audits. A verdict on the fleet ("healthy", "no critical
+    vulnerabilities") there contradicts those audits minutes later. This reads,
+    off the shell sandbox (:mod:`kube_agents_bench.onboarding`), the report the
+    worker wrote, delivered copy first.
+
+    ``posture``: the paragraphs the report opens with, after its heading, in
+    order. Passes when the report's text, its title line dropped and whitespace
+    collapsed, starts with them, so a sentence added before or between them is
+    a fail, and when none of ``forbidden_patterns`` (case-insensitive) matches
+    anywhere in the report, headings included. No report, or one that cannot be read, is a fail; an
+    unreadable sandbox is ``status="error"``.
+    """
+
+    type: Literal["bootstrap_report_posture"]
+    posture: list[str] = Field(min_length=1)
+    forbidden_patterns: list[str] = Field(default_factory=list)
+
+    @field_validator("forbidden_patterns")
+    @classmethod
+    def _compiles(cls, patterns: list[str]) -> list[str]:
+        for pattern in patterns:
+            re.compile(pattern)
+        return patterns
+
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        read = onboarding.read_scored_report(onboarding.sandbox_shell, read_timeout)
+        pod = onboarding.sandbox_pod()
+        if read is None:
+            return "error", f"{pod} could not be read (kubectl exec failed or the command did not run)", None
+        report, text = read.get("report"), read.get("text") or ""
+        raw: dict[str, Any] = {"report": report, "text": text}
+        if report == "absent":
+            return "fail", f"there is no INVENTORY.md or INVENTORY.delivered.md on {pod}: the worker wrote no report", raw
+        if report == "unreadable":
+            return "fail", f"the report on {pod} cannot be read: {text}", raw
+        body = _report_body(text)
+        expected = " ".join(" ".join(paragraph.split()) for paragraph in self.posture)
+        # Headings included: a verdict in a heading reaches the user as written.
+        full = " ".join(text.split())
+        verdicts = sorted({m.group(0) for p in self.forbidden_patterns for m in re.finditer(p, full, re.IGNORECASE)})
+        raw.update({"opening": body[: len(expected) + 200], "verdicts": verdicts})
+        if not body.startswith(expected):
+            return "fail", f"the report does not open with the posture the SOP fixes; it opens: {body[: len(expected) + 80]!r}", raw
+        if verdicts:
+            return "fail", f"the report judges the fleet, which its posture line leaves to the first-run audits: {verdicts}", raw
+        judged = " and has none of the forbidden verdicts" if self.forbidden_patterns else ""
+        return "pass", f"the report opens with the scan counts and the posture line{judged}", raw
 
 
 # The check rosters of the four audits the oobe stage runs after the scan

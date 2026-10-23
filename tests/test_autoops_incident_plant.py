@@ -53,6 +53,20 @@ import unittest
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _MODULE = _REPO_ROOT / "bench" / "tf" / "prebuilt" / "autoops-incident" / "main.tf"
+_VARIABLES = _MODULE.with_name("variables.tf")
+
+#: Where the operator names the gateway Pod's container that runs the watcher,
+#: and the stack's default that has to match it (#3681: the default kept
+#: naming envoy-credential-proxy after #913 moved the watcher).
+_OPERATOR_MANIFESTS = (
+    _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_manifests.go"
+)
+_OPERATOR_CONTAINER_RE = re.compile(
+    r'^\s*agentAPIAuthContainerName\s*=\s*"([^"]+)"', re.M
+)
+_AGENT_CONTAINER_DEFAULT_RE = re.compile(
+    r'variable "agent_container" \{.*?^\s*default\s*=\s*"([^"]+)"', re.S | re.M
+)
 
 #: The create-time provisioner is the first `command = <<-EOT` block in the
 #: module; the destroy-time one is the second.
@@ -75,9 +89,14 @@ _INTERPOLATIONS = {
     "var.host_cluster_location": "us-central1",
     "var.agent_deployment": "platform-agent-gateway",
     "var.agent_namespace": "kubeagents-system",
-    "var.agent_container": "envoy-credential-proxy",
+    "var.agent_container": "agent-api-auth",
     "var.allocate_mib": "96",
     "var.memory_limit_mib": "64",
+    "var.replicas": "1",
+    "local.watcher_handled": "fire",
+    # The OOM shape and the incident wait: what the incumbent case plants.
+    "var.crash_seconds": "0",
+    "var.wait_for": "incident",
 }
 
 #: The label step 1 writes, and the value step 0b requires before it will
@@ -89,9 +108,12 @@ _OWNER_LABEL = "kube-agents-bench"
 #: healthy path: no leftover namespace, debounce already cleared, watcher fires.
 #: `NS_OWNER` uses `${VAR-default}` rather than `${VAR:-default}` so a test can
 #: set it empty to mean "the namespace carries no managed-by label".
+#: `POD_CONTAINERS` is the gateway pod's container list as step 0a reads it:
+#: the native sidecars first, then the regular containers.
 _KUBECTL_STUB = """#!/bin/bash
 echo "kubectl $*" >> "$CALLS"
 case "$*" in
+  *"get deployment"*jsonpath*)  echo "${POD_CONTAINERS-agent-api-auth platform-agent}"; exit 0 ;;
   *"get namespace"*jsonpath*)   echo "${NS_OWNER-%(owner)s}"; exit 0 ;;
   *"get namespace"*"-o yaml"*)  echo "kind: Namespace"; exit 0 ;;
   *"get namespace"*)            exit "${NS_EXISTS_RC:-1}" ;;
@@ -101,6 +123,9 @@ case "$*" in
   *"logs "*)
     if [ "${WATCHER_FIRES:-1}" = "1" ]; then
       echo "fire BackOff pod=%(ns)s/%(workload)s-abc123 -> sid=s1 (mode=live)"
+    fi
+    if [ "${WATCHER_FOLDS:-0}" = "1" ]; then
+      echo "folded BackOff pod=%(ns)s/%(workload)s-abc123 (sid=s1) -- the workload's incident is already open"
     fi
     exit 0 ;;
   *) exit 0 ;;
@@ -233,6 +258,19 @@ class AutoopsIncidentPlantTest(unittest.TestCase):
             "the plant deleted a namespace on a run that succeeded and found "
             f"nothing left over:\n{chr(10).join(calls)}",
         )
+
+    def test_a_folded_event_is_not_an_incident_unless_the_case_accepts_it(self):
+        # A case waiting on its own card gets none for a folded event, so by
+        # default only `fire` ends the wait; incident-triage-workload-fold
+        # grades the fold and sets accept_folded, rendered here as the pattern.
+        completed, _ = self._run(WATCHER_FIRES=0, WATCHER_FOLDS=1)
+        self.assertNotEqual(completed.returncode, 0, "a folded event ended the wait for a case that did not accept it")
+
+        accepting = self._plant.replace('grep -qE "fire ', 'grep -qE "(fire|folded) ')
+        self.assertNotEqual(accepting, self._plant, "the watcher poll's pattern moved; update this test")
+        self._script.write_text(accepting)
+        completed, _ = self._run(WATCHER_FIRES=0, WATCHER_FOLDS=1)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_leftover_namespace_is_deleted_before_the_workload_is_planted(self):
         # The self-heal, and the half that recovers a cluster already holding a
@@ -368,6 +406,49 @@ class AutoopsIncidentPlantTest(unittest.TestCase):
             [],
             "the plant ran kubectl against the ambient context after failing "
             f"to fetch the host cluster's credentials:\n{chr(10).join(calls)}",
+        )
+
+    def test_a_container_the_pod_lacks_fails_before_anything_is_planted(self):
+        # #3681: the watcher moved out of envoy-credential-proxy (#913) while
+        # this stack kept reading that container's log with stderr discarded,
+        # so every run spent the 300s watcher wait and blamed the watcher. The
+        # pod here carries the post-#913 layout minus agent-api-auth.
+        completed, calls = self._run(
+            POD_CONTAINERS="platform-agent platform-agent-dashboard fluent-bit"
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("has no container 'agent-api-auth'", completed.stderr)
+        self.assertEqual(
+            self._indices(calls, "apply -f -") + self._indices(calls, "logs "),
+            [],
+            "the plant went on to plant and poll against a container the pod "
+            f"does not have:\n{chr(10).join(calls)}",
+        )
+
+    def test_the_container_check_reads_native_sidecars(self):
+        # agent-api-auth is a native sidecar, so it is listed only under
+        # initContainers. A check reading .containers alone would refuse every
+        # run on a real install, which the stub's canned answer cannot show.
+        _, calls = self._run()
+        checks = self._indices(calls, "get deployment")
+        self.assertTrue(checks, f"no container check ran:\n{chr(10).join(calls)}")
+        self.assertIn(".spec.template.spec.initContainers[*].name", calls[checks[0]])
+        self.assertIn(".spec.template.spec.containers[*].name", calls[checks[0]])
+
+    def test_the_default_container_is_the_one_the_operator_runs_the_watcher_in(self):
+        operator = _OPERATOR_CONTAINER_RE.search(_OPERATOR_MANIFESTS.read_text())
+        default = _AGENT_CONTAINER_DEFAULT_RE.search(_VARIABLES.read_text())
+        self.assertIsNotNone(
+            operator, f"agentAPIAuthContainerName not found in {_OPERATOR_MANIFESTS}"
+        )
+        self.assertIsNotNone(
+            default, f"agent_container default not found in {_VARIABLES}"
+        )
+        self.assertEqual(
+            default.group(1),
+            operator.group(1),
+            "the stack would read the watcher's log from a container the "
+            "gateway Pod does not run it in",
         )
 
     def test_a_wedged_leftover_namespace_fails_with_its_own_message(self):

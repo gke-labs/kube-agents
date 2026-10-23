@@ -1026,6 +1026,19 @@ class MergedProposalMetricTest(_BrokerFixture):
         self.assertEqual(2, _series(self.families(), "kubeagents_vcs_proposals_merged_total"))
         self.assertEqual(credential_proxy.PROCESS_START_TIME_SECONDS, broker.started_at)
 
+    def test_proposals_closed_unmerged_render_as_one_unlabelled_counter(self):
+        CredentialProxyHandler.metrics.record_closed_unmerged(1)
+        CredentialProxyHandler.metrics.record_closed_unmerged(2)
+        families = self.families()
+        self.assertEqual(3, _series(families, "kubeagents_vcs_proposals_closed_unmerged_total"))
+        self.assertEqual(0, _series(families, "kubeagents_vcs_proposals_merged_total"), "a close moved the merged series")
+        self.assertIn("# TYPE kubeagents_vcs_proposals_closed_unmerged_total counter", CredentialProxyHandler.metrics.render())
+
+    def test_the_broker_built_for_the_handler_reports_closes_into_its_metrics(self):
+        broker = credential_proxy.build_vcs_broker(CredentialProxyHandler.executor)
+        broker.close_observer(3)
+        self.assertEqual(3, _series(self.families(), "kubeagents_vcs_proposals_closed_unmerged_total"))
+
 
 class MetricsListenerTest(unittest.TestCase):
     def setUp(self):
@@ -1333,6 +1346,8 @@ class LabelDerivationTest(unittest.TestCase):
             "/v1/chat/a2a/events": "/v1/chat/a2a",
             "/v1/chat/api": "/v1/chat/api",
             "/v1/gcp/monitoring.googleapis.com/v3/x?y=z": "/v1/gcp",
+            "/v1/watcher/gcp/pubsub.googleapis.com/v1/projects/p/subscriptions/s:pull": "/v1/watcher/gcp",
+            "/v1/pubsub/gcp/pubsub.googleapis.com/v1/projects/p/subscriptions/s:pull": "/v1/pubsub/gcp",
             "/v1/vcs/push": "/v1/vcs",
             "/v1/workspace/acquire": "/v1/workspace",
             "/v1/forge/refresh": "/v1/forge",

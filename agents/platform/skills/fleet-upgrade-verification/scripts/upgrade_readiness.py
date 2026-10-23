@@ -43,7 +43,25 @@ import re
 from datetime import datetime, time, timedelta, timezone
 
 import readiness_rules
-from readiness_rules import audit_log, zonal_control_plane
+from readiness_rules import (
+    audit_log,
+    capacity,
+    cgroup_v2_runtime,
+    changed_defaults,
+    client_addon_skew,
+    container_runtime,
+    dataplane,
+    deprecated_api_callers,
+    gpu_driver_mismatch,
+    group_oom_kill,
+    intree_volumes,
+    node_image_coupled_agent,
+    node_local_state,
+    removed_api_callers,
+    removed_node_label,
+    retired_registry,
+    zonal_control_plane,
+)
 from readiness_rules import finding as finding_tiers  # the tier vocabulary; `finding` itself names a loop variable below
 
 # Per-member verdicts. `blocked` when any rule blocks; `unknown` when a rule could not be
@@ -391,7 +409,22 @@ RULE_NONE = "no rules"
 # this order, which is the order the table and the JSON list their findings in. One list,
 # grouped by entry number, the entry in the comment.
 EXTRA_RULES = [
+    capacity,  # entry 2
+    node_local_state,  # entry 4
+    removed_api_callers,  # entry 6
+    changed_defaults,  # entry 8
+    deprecated_api_callers,  # entry 9
+    client_addon_skew,  # entry 10
     zonal_control_plane,  # entry 11
+    removed_node_label,  # entry 12
+    container_runtime,  # entry 13
+    cgroup_v2_runtime,  # entry 14
+    group_oom_kill,  # entry 15
+    dataplane,  # entry 16
+    node_image_coupled_agent,  # entry 17
+    gpu_driver_mismatch,  # entry 18
+    intree_volumes,  # entry 19
+    retired_registry,  # entry 20
 ]
 RULE_RESULT_KEYS = readiness_rules.RESULT_KEYS
 # What the fold stamps on a finding: the rule's id and entry on every one, the rule's own

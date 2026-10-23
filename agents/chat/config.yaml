@@ -100,7 +100,10 @@ model:
 # It is 600s because Gemini thinks in silence on this path: with the request
 # shape Hermes sends, no reasoning deltas stream, and a hard prompt measured
 # 140-210s before its first chunk, so a shorter bound would cut off healthy
-# long thinks, and every retry would repeat the same think.
+# long thinks, and every retry would repeat the same think. That was measured
+# before the chart's gateway asked Gemini for its thoughts; thought summaries
+# may now arrive as reasoning deltas before the answer, which has not been
+# measured, so the bound stays.
 # request_timeout_seconds is the per-read socket timeout (and the stream read
 # timeout), not a cap on a whole call; the chart's LiteLLM sets no timeout of
 # its own. A call that stalls is retried inside each of Hermes' 3 attempts
@@ -430,8 +433,12 @@ plugins:
     - incident_context
     - bootstrap_onboarding
     - legacy_slash_commands
-    # Counts every inbound message on pre_gateway_dispatch and serves the count on
-    # the listener the operator reads into status.usage.chatMessagesInboundTotal.
+    # Counts every inbound message on pre_gateway_dispatch, the failed turns the
+    # gateway patch reports, the board's cards that gave up and the thumbs-downs the
+    # chat_feedback_reactions hook reports from Hermes' reaction:added event, and
+    # serves them on the listener the operator reads into
+    # status.usage.chatMessagesInboundTotal, chatTurnsErroredTotal,
+    # backgroundTasksGaveUpTotal and negativeFeedbackTotal.
     # Rewrites nothing, so its place in the order does not matter.
     - chat_metrics
     # Injects the routable-specialist roster into every turn, so choosing an

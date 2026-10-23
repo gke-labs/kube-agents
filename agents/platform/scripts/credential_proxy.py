@@ -16,6 +16,7 @@ import functools
 import json
 import logging
 import os
+import posixpath
 import queue
 import re
 import select
@@ -25,6 +26,7 @@ import signal
 import shutil
 import socket
 import socketserver
+import sqlite3
 import ssl
 import subprocess
 import sys
@@ -404,6 +406,15 @@ API_RELAY_DEADLINE_S = 120
 # smaller `pageSize`, which every listed endpoint supports. Read in chunks up
 # to the cap rather than with `.read()`, so the cap bounds memory too.
 API_RELAY_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+# Pub/Sub's largest message (10 MB of data), and the answer cap the platform
+# Pub/Sub relay carries instead of API_RELAY_MAX_RESPONSE_BYTES: a pull is a
+# lease, Pub/Sub has started the ack deadline and the ack ids are in the body
+# by the time the broker reads it, so an answer refused for size strands the
+# message until the deadline, forever for one that is always over. The adapter
+# pulls one message at a time; 16 MiB holds the largest one base64-encoded
+# (13.4 MiB) with its envelope.
+PUBSUB_MAX_MESSAGE_BYTES = 10 * 1024 * 1024
+PLATFORM_PUBSUB_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 API_RELAY_READ_CHUNK_BYTES = 64 * 1024
 # Query keys removed before forwarding. Each is a way to substitute a
 # credential for the broker's or to change the response class: an API key
@@ -598,9 +609,13 @@ VCS_REQUESTS_METRIC = "kubeagents_vcs_requests_total"
 VCS_VERB_LABEL = "verb"
 # Proposals this install opened that the forge reports merged, counted once
 # each per broker process as the broker's reads show them
-# (vcs_broker.VcsBroker._count_merges); the series the operator reads
+# (vcs_broker.VcsBroker._count_outcomes); the series the operator reads
 # `status.usage.remediationsMergedTotal` from. No labels.
 VCS_MERGED_METRIC = "kubeagents_vcs_proposals_merged_total"
+# Proposals this install opened that the forge reports closed without a merge,
+# counted the same way beside the merged series; the series the operator reads
+# `status.usage.remediationsClosedUnmergedTotal` from. No labels.
+VCS_CLOSED_UNMERGED_METRIC = "kubeagents_vcs_proposals_closed_unmerged_total"
 # The broker's own failures, by kind: work it took on and could not carry out
 # for a reason that is its own or its upstream's, never the command's exit
 # code and never a refusal. A second count beside the tool counter rather
@@ -1141,6 +1156,12 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # them holds the chat token and cannot present this one.
     (watcher_policy.WATCHER_GCP_PREFIX, (CALLER_ROLE_WATCHER,)),
     (watcher_policy.WATCHER_K8S_PREFIX, (CALLER_ROLE_WATCHER,)),
+    # The Pub/Sub platform adapter's four calls, on the subscriptions the
+    # AgentPlugins configure: the gateway's own, so the chat role, which is the
+    # token the Hermes container holds. Its own prefix rather than the
+    # watcher's with a second role: the two are confined to different
+    # subscription sets, and the prefix is what this table keys the role on.
+    (watcher_policy.PLATFORM_PUBSUB_PREFIX, (CALLER_ROLE_CHAT,)),
     ("/v1/github/", (CALLER_ROLE_SHELL,)),
     ("/v1/vcs/", (CALLER_ROLE_SHELL,)),
     ("/v1/workspace/", (CALLER_ROLE_SHELL,)),
@@ -1797,6 +1818,15 @@ SLACK_REMOVE_ALLOWLIST = frozenset({"reactions.remove"})
 # `chat.delete?x` and `chat.delete.` would pass it -- and slack_sdk joins the
 # string into the URL, where the fragment is dropped and the query ignored.
 SLACK_METHOD_SHAPE = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)+")
+# The subscriptions the platform Pub/Sub relay may reach, as the operator renders
+# them from the AgentPlugin configs; read by platform_pubsub_subscriptions().
+PLATFORM_PUBSUB_SUBSCRIPTIONS_ENV = "PLATFORM_PUBSUB_SUBSCRIPTIONS"
+# One fully qualified subscription, the shape watcher_policy matches on the
+# wire; an entry that is not one would never match a call and would read as a
+# configured subscription that silently refuses everything.
+_QUALIFIED_SUBSCRIPTION = re.compile(
+    rf"projects/{watcher_policy.PUBSUB_PROJECT}/subscriptions/{watcher_policy.SUBSCRIPTION}"
+)
 # The IAM permission a Pub/Sub pull spends on the subscription. A refused pull
 # names it in the log when the error's own ErrorInfo did not, so the line says
 # what to grant rather than only that something was refused.
@@ -2456,6 +2486,7 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
     upstream_key: str
     upstream_host = "127.0.0.1"
     upstream_port = 8642
+    workspace_root: str = "/opt/data"
     max_request_bytes = 10 * 1024 * 1024
     protocol_version = "HTTP/1.1"
 
@@ -2492,6 +2523,12 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             self._drain_request_body()
             self.send_error(HTTPStatus.UNAUTHORIZED)
             return
+        if self._targets_bridge_session(
+            self.path, self.headers, workspace_root=self.workspace_root
+        ):
+            self._drain_request_body()
+            self.send_error(HTTPStatus.FORBIDDEN)
+            return
         # The three refusals below cannot drain -- see _drain_request_body -- so a
         # caller that sent a body may read the close before the response. They are
         # answers to a malformed or oversized request, where the framing is already
@@ -2509,6 +2546,11 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
             return
         body = self.rfile.read(content_length) if content_length else None
+        if body and self._targets_bridge_session(
+            self.path, self.headers, body=body, workspace_root=self.workspace_root
+        ):
+            self.send_error(HTTPStatus.FORBIDDEN)
+            return
         headers = {
             name: value
             for name, value in self.headers.items()
@@ -2568,6 +2610,115 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         """Drain the body before a pre-authentication refusal; see drain_request_body."""
         drain_request_body(self, self.max_request_bytes)
 
+    @classmethod
+    def _is_bridge_session_id(
+        cls,
+        raw_session_id: Any,
+        workspace_root: str | Path | None = None,
+    ) -> bool:
+        val = str(raw_session_id or "").strip()
+        while (unquoted := urllib.parse.unquote(val)) != val:
+            val = unquoted
+        sid = val.strip()
+        if not sid:
+            return False
+        if sid.lower().startswith("a2a-"):
+            return True
+        root = Path(
+            workspace_root
+            or getattr(cls, "workspace_root", "")
+            or os.getenv("CREDENTIAL_PROXY_WORKSPACE_ROOT")
+            or os.getenv("HERMES_HOME")
+            or "/opt/data"
+        )
+        db_paths: list[Path] = [root / "state.db"]
+        profiles_dir = root / "profiles"
+        if profiles_dir.is_dir():
+            db_paths.extend(sorted(profiles_dir.glob("*/state.db")))
+        for db_path in db_paths:
+            if not db_path.is_file():
+                continue
+            try:
+                with contextlib.closing(
+                    sqlite3.connect(
+                        f"file:{db_path}?mode=ro", uri=True, timeout=2.0
+                    )
+                ) as conn:
+                    cur = sid
+                    seen = {cur}
+                    for _ in range(256):
+                        row = conn.execute(
+                            "SELECT parent_session_id FROM sessions WHERE id = ?",
+                            (cur,),
+                        ).fetchone()
+                        parent = str(row[0] or "").strip() if row else ""
+                        if not parent or parent in seen:
+                            break
+                        if parent.lower().startswith("a2a-"):
+                            return True
+                        seen.add(parent)
+                        cur = parent
+            except Exception as exc:
+                LOGGER.debug("could not inspect %s for session %s: %s", db_path, sid, exc)
+        return False
+
+    @classmethod
+    def _targets_bridge_session(
+        cls,
+        path: str,
+        headers: Any,
+        body: bytes | None = None,
+        workspace_root: str | Path | None = None,
+    ) -> bool:
+        """Return True when an external request names an `a2a-*` bridge session or child.
+
+        `hermes-bridge` talks to Hermes on loopback (`127.0.0.1:8642`), never
+        through `agent-api-auth` (`8643`). Refusing `a2a-*` session paths,
+        headers, `/v1/runs` request-body `session_id` fields, and `state.db`
+        child continuations on the external proxy stops a holder of
+        `API_SERVER_EXTERNAL_KEY` from running a turn in a bridge-owned
+        `a2a-<contextId>` session and inheriting its `session_kv` caller identity.
+        """
+        for header in ("X-Hermes-Session-Id", "X-Hermes-Session-Key"):
+            raw_values = (
+                headers.get_all(header, [])
+                if hasattr(headers, "get_all")
+                else [headers.get(header, "")]
+            )
+            for raw_val in raw_values:
+                if cls._is_bridge_session_id(raw_val, workspace_root):
+                    return True
+        raw_path = urllib.parse.urlsplit(path).path
+        while (unquoted := urllib.parse.unquote(raw_path)) != raw_path:
+            raw_path = unquoted
+        normalized = posixpath.normpath(raw_path.replace("\\", "/"))
+        raw_segments = [seg for seg in normalized.split("/") if seg]
+        segments = [seg.lower() for seg in raw_segments]
+        for idx, seg in enumerate(segments):
+            if seg.startswith("a2a-"):
+                return True
+            if seg == "sessions" and idx > 0 and segments[idx - 1] == "api":
+                if idx + 1 < len(raw_segments) and cls._is_bridge_session_id(
+                    raw_segments[idx + 1], workspace_root
+                ):
+                    return True
+        if body:
+            try:
+                parsed = json.loads(body)
+            except Exception:
+                unquoted_body = urllib.parse.unquote_to_bytes(body).lower()
+                if b"a2a-" in unquoted_body:
+                    return True
+            else:
+                if isinstance(parsed, dict):
+                    for key in ("session_id", "sessionId", "gateway_session_key"):
+                        if key in parsed and parsed[key] is not None:
+                            if not isinstance(parsed[key], str) or cls._is_bridge_session_id(
+                                parsed[key], workspace_root
+                            ):
+                                return True
+        return False
+
     @staticmethod
     def _sanitize_header(value: str) -> str:
         """See sanitize_header; kept as a method for the call sites below."""
@@ -2587,8 +2738,9 @@ class ApiRelayResponse:
     status: int
     content_type: str
     body: bytes
-    # True when the upstream body ran past API_RELAY_MAX_RESPONSE_BYTES; `body`
-    # is then empty, because a truncated JSON page is worse than no page.
+    # True when the upstream body ran past the call's cap (API_RELAY_MAX_RESPONSE_BYTES,
+    # or the family's own); `body` is then empty, because a truncated JSON page is
+    # worse than no page.
     over_cap: bool = False
 
 
@@ -2680,8 +2832,12 @@ class GoogleApiRelay:
         *,
         body: bytes | None = None,
         headers: tuple[tuple[str, str], ...] = (),
+        max_bytes: int | None = None,
     ) -> ApiRelayResponse:
         """One `GET https://{host}{target}` on the broker's credential, or a POST with `body`.
+
+        `max_bytes` is the answer cap, API_RELAY_MAX_RESPONSE_BYTES unless a
+        family carries its own (the platform Pub/Sub relay does).
 
         `target` is the path and query as the handler assembled them, already
         checked against the policy and stripped of the credential keys. Raises
@@ -2744,7 +2900,7 @@ class GoogleApiRelay:
                 if not chunk:
                     break
                 received += len(chunk)
-                if received > API_RELAY_MAX_RESPONSE_BYTES:
+                if received > (max_bytes if max_bytes is not None else API_RELAY_MAX_RESPONSE_BYTES):
                     return ApiRelayResponse(
                         response.status, response.getheader("Content-Type", ""), b"", True
                     )
@@ -7964,6 +8120,7 @@ def build_vcs_broker(
         # Looked up at call time: the handler's registry is a class attribute
         # a test replaces per case, and this broker outlives none of them.
         merge_observer=lambda count: CredentialProxyHandler.metrics.record_merged(count),
+        close_observer=lambda count: CredentialProxyHandler.metrics.record_closed_unmerged(count),
         started_at=PROCESS_START_TIME_SECONDS,
     )
     LOGGER.info(
@@ -8437,6 +8594,7 @@ class ProxyMetrics:
         self._requests: dict[tuple[str, str], int] = {}
         self._vcs: dict[tuple[str, str], int] = {}
         self._merged = 0
+        self._closed_unmerged = 0
         self._failures: dict[str, int] = {}
         # Per tool: cumulative bucket counts (one per TOOL_DURATION_BUCKETS
         # bound, the +Inf bucket being the count), the sum, and the count.
@@ -8531,6 +8689,10 @@ class ProxyMetrics:
         with self._lock:
             self._merged += count
 
+    def record_closed_unmerged(self, count: int) -> None:
+        with self._lock:
+            self._closed_unmerged += count
+
     def record_failure(self, kind: str) -> None:
         kind = kind if kind in BROKER_FAILURE_KINDS else BROKER_FAILURE_OTHER_FAILED
         with self._lock:
@@ -8542,6 +8704,7 @@ class ProxyMetrics:
             requests = sorted(self._requests.items())
             vcs = sorted(self._vcs.items())
             merged = self._merged
+            closed_unmerged = self._closed_unmerged
             failures = sorted(self._failures.items())
             durations = {
                 tool: (list(self._duration_buckets[tool]), self._duration_sum[tool], self._duration_count[tool])
@@ -8620,6 +8783,9 @@ class ProxyMetrics:
             f"# HELP {VCS_MERGED_METRIC} Proposals this install opened that the forge reported merged, counted once each per process.",
             f"# TYPE {VCS_MERGED_METRIC} counter",
             f"{VCS_MERGED_METRIC} {merged}",
+            f"# HELP {VCS_CLOSED_UNMERGED_METRIC} Proposals this install opened that the forge reported closed without a merge, counted once each per process.",
+            f"# TYPE {VCS_CLOSED_UNMERGED_METRIC} counter",
+            f"{VCS_CLOSED_UNMERGED_METRIC} {closed_unmerged}",
         ]
         lines += [
             f"# HELP {BROKER_FAILURES_METRIC} Brokered work the broker could not carry out, by kind: a command past its deadline, a broker fault, a git failure, a failed token mint or an upstream relay error.",
@@ -8786,6 +8952,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # one Pub/Sub target the watcher relay reaches. Empty: the detector is off
     # and every Pub/Sub call is refused.
     watcher_subscription: str = ""
+    # The subscriptions the gateway's Pub/Sub platform adapter may reach through
+    # `/v1/pubsub/gcp/`, each `projects/<p>/subscriptions/<s>`, as the operator
+    # rendered them from the AgentPlugin configs. Empty: no plugin route the
+    # operator could qualify, and every call is refused.
+    platform_pubsub_subscriptions: frozenset[str] = frozenset()
     # (project, location, cluster) -> (deadline, host, CA PEM or ""), for the
     # watcher's Kubernetes route. See `_watcher_cluster_endpoint`.
     watcher_endpoints: dict[tuple[str, str, str], tuple[float, str, str]] = {}
@@ -8949,6 +9120,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if self.path.startswith(watcher_policy.WATCHER_GCP_PREFIX):
             self._handle_watcher_gcp()
             return
+        if self.path.startswith(watcher_policy.PLATFORM_PUBSUB_PREFIX):
+            self._handle_platform_pubsub()
+            return
         if self.path.startswith(watcher_policy.WATCHER_K8S_PREFIX):
             self._handle_watcher_k8s()
             return
@@ -9030,6 +9204,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
         if self.path.startswith(watcher_policy.WATCHER_GCP_PREFIX):
             self._handle_watcher_gcp()
+            return
+        if self.path.startswith(watcher_policy.PLATFORM_PUBSUB_PREFIX):
+            self._handle_platform_pubsub()
             return
         if self.path.startswith(watcher_policy.WATCHER_K8S_PREFIX):
             # GET only; reaches the handler so the refusal names its rule.
@@ -9916,10 +10093,52 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         is the table; the forwarding is the Cloud API relay's, with a body for
         the Pub/Sub POSTs, and the status, Content-Type and body pass back.
         """
+        self._relay_google_call(
+            "watcher gcp",
+            watcher_policy.WATCHER_GCP_PREFIX,
+            lambda host, path, body: watcher_policy.evaluate_gcp(
+                self.command, host, path, body, self.watcher_subscription
+            ),
+        )
+
+    def _handle_platform_pubsub(self) -> None:
+        """`/v1/pubsub/gcp/<host>/<path>`: one Pub/Sub call for the gateway's platform adapter.
+
+        The adapter (agentplugins/pubsub-platform) used to pull its
+        subscriptions on the gateway pod's own Workload Identity, which the pod
+        no longer holds. `watcher_policy.evaluate_pubsub` is the table, pinned
+        to `platform_pubsub_subscriptions`; the forwarding is the watcher
+        family's, unchanged.
+        """
+        self._relay_google_call(
+            "platform pubsub",
+            watcher_policy.PLATFORM_PUBSUB_PREFIX,
+            lambda host, path, body: watcher_policy.evaluate_pubsub(
+                self.command, host, path, body, self.platform_pubsub_subscriptions
+            ),
+            family="platform Pub/Sub relay",
+            max_bytes=PLATFORM_PUBSUB_MAX_RESPONSE_BYTES,
+        )
+
+    def _relay_google_call(
+        self,
+        label: str,
+        prefix: str,
+        decide: Callable[[str, str, bytes], command_policy.Decision],
+        family: str = "watcher relay",
+        max_bytes: int | None = None,
+    ) -> None:
+        """Forward one `<prefix><host>/<path>` Google call that `decide` allows.
+
+        `label` is the first word of every audit line, naming the family; the
+        caller's role was already checked against ROUTE_ROLES by the time this
+        runs, so `decide` is the second gate, on the target. `max_bytes` is the
+        family's answer cap, the relay's own when None.
+        """
         request_id = str(uuid.uuid4())
         parts = urllib.parse.urlsplit(self.path)
-        host, _, path = parts.path[len(watcher_policy.WATCHER_GCP_PREFIX) :].partition("/")
-        self._log_watcher_request("watcher gcp", request_id, f"{host}/{path}")
+        host, _, path = parts.path[len(prefix) :].partition("/")
+        self._log_watcher_request(label, request_id, f"{host}/{path}")
         body = b""
         if self.command == watcher_policy.METHOD_POST:
             # The two answers /v1/exec and the MCP relay give: 400 for a length
@@ -9927,11 +10146,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
-                LOGGER.warning("watcher gcp rejected request_id=%s reason=content-length", request_id)
+                LOGGER.warning("%s rejected request_id=%s reason=content-length", label, request_id)
                 self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid content length"})
                 return
             if length < 0 or length > self.max_request_bytes:
-                LOGGER.warning("watcher gcp rejected request_id=%s reason=content-length", request_id)
+                LOGGER.warning("%s rejected request_id=%s reason=content-length", label, request_id)
                 self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "request body too large"})
                 return
             body = self.rfile.read(length)
@@ -9940,15 +10159,15 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         problem = api_relay_target_problem(host, path, parts.query)
         query = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
         if problem is None and not set(query) <= WATCHER_GCP_QUERY_KEYS:
-            problem = (API_RELAY_BAD_QUERY, "the watcher relay forwards no query keys but alt and prettyPrint")
+            problem = (API_RELAY_BAD_QUERY, f"the {family} forwards no query keys but alt and prettyPrint")
         if problem is not None:
             code, reason = problem
-            LOGGER.warning("watcher gcp rejected request_id=%s code=%s", request_id, code)
+            LOGGER.warning("%s rejected request_id=%s code=%s", label, request_id, code)
             self._json(HTTPStatus.BAD_REQUEST, {"error": reason, "code": code})
             return
-        decision = watcher_policy.evaluate_gcp(self.command, host, path, body, self.watcher_subscription)
+        decision = decide(host, path, body)
         if not decision.allowed:
-            LOGGER.warning("watcher gcp blocked request_id=%s rule=%s", request_id, decision.rule_id)
+            LOGGER.warning("%s blocked request_id=%s rule=%s", label, request_id, decision.rule_id)
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
@@ -9965,19 +10184,22 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 {"error": "Cloud API relay disabled", "code": "API_RELAY_DISABLED"},
             )
             return
-        authorization = self._relay_authorization("watcher gcp", request_id)
+        authorization = self._relay_authorization(label, request_id)
         if authorization is None:
             return
         target = f"/{path}?{parts.query}" if parts.query else f"/{path}"
         extra: dict[str, Any] = {}
         if self.command == watcher_policy.METHOD_POST:
             extra = {"body": body, "headers": (("Content-Type", WATCHER_GCP_CONTENT_TYPE),)}
-        upstream = self._relay_fetch("watcher gcp", request_id, host, target, authorization, **extra)
+        if max_bytes is not None:
+            extra["max_bytes"] = max_bytes
+        upstream = self._relay_fetch(label, request_id, host, target, authorization, **extra)
         if upstream is None:
             return
         if upstream.over_cap or HTTPStatus.MULTIPLE_CHOICES <= upstream.status < HTTPStatus.BAD_REQUEST:
             LOGGER.warning(
-                "watcher gcp upstream refused request_id=%s status=%d over_cap=%s",
+                "%s upstream refused request_id=%s status=%d over_cap=%s",
+                label,
                 request_id,
                 upstream.status,
                 upstream.over_cap,
@@ -9992,7 +10214,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # Only the fields the watchers read; never masterAuth's client key.
             projected = watcher_policy.project_cluster(upstream.body)
             if projected is None:
-                LOGGER.warning("watcher gcp unparseable cluster request_id=%s", request_id)
+                LOGGER.warning("%s unparseable cluster request_id=%s", label, request_id)
                 self._json(
                     HTTPStatus.BAD_GATEWAY,
                     {"error": "the upstream answer could not be relayed", "code": "UPSTREAM_UNRELAYABLE"},
@@ -10000,7 +10222,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 return
             relayed = projected
         LOGGER.info(
-            "watcher gcp forwarded request_id=%s rule=%s status=%d bytes=%d",
+            "%s forwarded request_id=%s rule=%s status=%d bytes=%d",
+            label,
             request_id,
             decision.rule_id,
             upstream.status,
@@ -10059,8 +10282,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     def _log_watcher_request(self, label: str, request_id: str, target: str) -> None:
         """The pre-decision audit line, naming the caller, as the other credentialed routes write it.
 
-        The broker makes every watcher call on its own credential, so this line
-        is the record of which ServiceAccount presented the watcher token.
+        The broker makes every relayed Google call, the watcher family's and the
+        platform Pub/Sub family's, on its own credential, so this line is the
+        record of which ServiceAccount presented the token.
         """
         principal = self.principal
         LOGGER.info(
@@ -11035,6 +11259,11 @@ def start_agent_api_proxy() -> ThreadingHTTPServer:
     AgentAPIProxyHandler.upstream_key = os.getenv(
         "AGENT_API_UPSTREAM_KEY", "cluster-internal-trusted"
     )
+    AgentAPIProxyHandler.workspace_root = (
+        os.getenv("CREDENTIAL_PROXY_WORKSPACE_ROOT")
+        or os.getenv("HERMES_HOME")
+        or "/opt/data"
+    )
     port = int(os.getenv("AGENT_API_PROXY_PORT", "8643"))
     server = ThreadingTCPHTTPServer(("0.0.0.0", port), AgentAPIProxyHandler)
     LOGGER.info("authenticated PlatformAgent API proxy listening on port %d", port)
@@ -11200,6 +11429,42 @@ def chat_relay_subscriptions(project_id: str) -> tuple[str, str]:
     return chat_subscription, a2a_subscription
 
 
+def platform_pubsub_subscriptions() -> frozenset[str]:
+    """The subscriptions the platform Pub/Sub relay may reach, from the environment.
+
+    `PLATFORM_PUBSUB_SUBSCRIPTIONS` is a comma-separated list of
+    `projects/<p>/subscriptions/<s>`, rendered by the operator from the
+    AgentPlugin configs; unset or empty means no plugin route the operator
+    could qualify, and the relay refuses every call. An entry of any other
+    shape is dropped
+    with a warning rather than refusing the boot: the operator renders the
+    list from user-authored AgentPlugin configs, and one typo in a route must
+    not take the broker, and with it every other route, off the air. A dropped
+    entry's route is refused by the policy, which the adapter logs with the
+    rule, so the typo is still loud where it was made.
+    """
+    raw = os.getenv(PLATFORM_PUBSUB_SUBSCRIPTIONS_ENV, "")
+    entries = [entry.strip() for entry in raw.split(",")]
+    kept: set[str] = set()
+    dropped = 0
+    for entry in entries:
+        if not entry:
+            continue
+        if _QUALIFIED_SUBSCRIPTION.fullmatch(entry):
+            kept.add(entry)
+        else:
+            dropped += 1
+    if dropped:
+        # The count, not the entries: the value is caller text from a CR.
+        LOGGER.warning(
+            "%s holds %d %s not a projects/<project>/subscriptions/<name> path; dropped",
+            PLATFORM_PUBSUB_SUBSCRIPTIONS_ENV,
+            dropped,
+            "entry that is" if dropped == 1 else "entries that are",
+        )
+    return frozenset(kept)
+
+
 def serve(args: argparse.Namespace) -> None:
     role = resolve_role()
     if role == "api-proxy":
@@ -11271,6 +11536,12 @@ def serve(args: argparse.Namespace) -> None:
     CredentialProxyHandler.api_relay = GoogleApiRelay()
     LOGGER.info("Cloud API relay enabled routes=%d", len(api_policy.API_READ_ROUTES))
     CredentialProxyHandler.watcher_subscription = os.getenv("WATCHER_PUBSUB_SUBSCRIPTION", "").strip()
+    CredentialProxyHandler.platform_pubsub_subscriptions = platform_pubsub_subscriptions()
+    if CredentialProxyHandler.platform_pubsub_subscriptions:
+        LOGGER.info(
+            "platform Pub/Sub relay enabled subscriptions=%d",
+            len(CredentialProxyHandler.platform_pubsub_subscriptions),
+        )
     CredentialProxyHandler.slack_max_request_bytes = int(
         os.getenv("SLACK_RELAY_MAX_REQUEST_BYTES", str(28 * 1024 * 1024))
     )

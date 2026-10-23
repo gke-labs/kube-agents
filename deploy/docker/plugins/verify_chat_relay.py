@@ -354,8 +354,9 @@ def main() -> None:
     )
 
     # 11. The adapter flags the scheduler's failure line by its exact opening
-    # (adapter.SCHEDULER_FAILURE_PREFIXES), and the relay then posts it as
-    # written in place of a fleet-audit record. Each branch of the
+    # (adapter.SCHEDULER_FAILURE_PREFIXES), and the relay then posts it in
+    # plain words (session_kv_server.scheduler_failure_line), in place of a
+    # fleet-audit record for an audit job. Each branch of the
     # summarizer is its own f-string, so drive every one, and the
     # blocked-config line, which _compose_run_delivery builds without it.
     import inspect
@@ -401,6 +402,10 @@ def main() -> None:
     check(re.search(r"^\s*job_id TEXT", columns, re.M) is not None, "the run ledger still has job_id")
     check(re.search(r"^\s*started_at TEXT", columns, re.M) is not None, "the run ledger still has started_at")
     check("'running'" in columns, "the run ledger's status set still has 'running'")
+    # The relay also reads a `completed` row after a posted failure, which says
+    # the job recovered and its next failure is news; renamed, every repeat is
+    # withheld until a different failure.
+    check("'completed'" in columns, "the run ledger's status set still has 'completed'")
 
     print("\nverify_chat_relay: all checks passed")
 

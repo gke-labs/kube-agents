@@ -724,9 +724,9 @@ neither key), which only openai_compatible passes.
 {{- define "kube-agents.litellmConfig" -}}
 {{- /*
   max_tokens on every alias when .maxTokens is above zero, and no key at all
-  otherwise, so the default render matches the kustomize base
-  (k8s-operator/config/integrations/litellm/base/config.yaml), which carries
-  no such key on purpose. One value for all three aliases: they are one
+  otherwise, so the default render adds no key the kustomize base
+  (k8s-operator/config/integrations/litellm/base/config.yaml) lacks beyond the
+  Gemini thinking key below; the base carries no max_tokens on purpose. One value for all three aliases: they are one
   upstream model, and the budget is the backend's property, not the alias's.
   LiteLLM's router spreads litellm_params underneath the request's own
   arguments, so this is what a request that names no max_tokens gets, not a
@@ -745,6 +745,38 @@ neither key), which only openai_compatible passes.
   because Vertex AI refuses it on Gemini 3.x Flash (see the auxiliary block in
   deploy/shared/defaults/config.yaml).
 */}}
+{{- /*
+  thinking: {type: enabled} on every alias for a Gemini model that thinks, so
+  its thoughts come back as thought parts (reasoning_content) rather than not
+  at all. Gemini thinks by default but returns its thoughts only when the
+  request sets thinkingConfig.includeThoughts. With that off, Gemini 3.x has
+  been seen writing its reasoning into the answer instead, under a first line
+  `thought`, where nothing downstream can tell it from the answer; asking for
+  the thoughts gives them a channel of their own. Of the
+  settings LiteLLM maps to includeThoughts, this is the one that changes
+  nothing else: with no budget_tokens, LiteLLM v1.106.0
+  (VertexGeminiConfig._map_thinking_param) sends includeThoughts alone on
+  Gemini 3.x, no thinkingLevel, so the model keeps its own depth; on 2.5 it
+  sends no thinkingBudget either.
+
+  Only for a Gemini model that thinks: 2.5, 3.x on, and the -latest aliases
+  LiteLLM counts as 3.x, through gemini or vertex_ai, the name read from its
+  last path segment so a Model Garden path counts. LiteLLM refuses thinking on
+  a model it does not treat as a reasoning model (gemini-2.0-flash, gemma-*;
+  also the 2.5 TTS and computer-use previews, which nobody runs an agent on)
+  and on Claude it would turn thinking on, so every other render stays
+  byte-identical. Left out when .reasoningEffort is set: LiteLLM maps that to
+  includeThoughts as well, and the two on one deployment fail every Gemini 3.x
+  request (thinkingLevel beside a thinking param); on 2.5 the thinking key
+  would drop the effort's thinkingBudget. A request that names its own reasoning_effort gets this key dropped
+  by LiteLLM's router (_deployment_params_with_request_reasoning_override),
+  and its effort maps to includeThoughts too. The kustomize base carries no
+  such key: it picks an overlay by provider alone and also serves openai,
+  which refuses the parameter.
+*/}}
+{{- $geminiThinkingModelPattern := "^gemini-(2[.]5|[3-9]|(pro|flash|flash-lite)-latest$)" -}}
+{{- $geminiThinkingModel := regexMatch $geminiThinkingModelPattern (base .model) -}}
+{{- $geminiThoughts := and (or (eq .provider "gemini") (eq .provider "vertex_ai")) $geminiThinkingModel (not .reasoningEffort) -}}
 {{- /*
   Recent Claude models (Opus 5 among them) answer temperature, top_p and top_k
   with a 400 ("`temperature` is deprecated for this model"), and LiteLLM
@@ -793,6 +825,9 @@ model_list:
       {{- with .reasoningEffort }}
       reasoning_effort: {{ . | quote }}
       {{- end }}
+      {{- if $geminiThoughts }}
+      thinking: {"type": "enabled"}
+      {{- end }}
       {{- if $claudeDrop }}
       additional_drop_params: ["temperature", "top_p", "top_k"]
       {{- end }}
@@ -811,6 +846,9 @@ model_list:
       {{- with .reasoningEffort }}
       reasoning_effort: {{ . | quote }}
       {{- end }}
+      {{- if $geminiThoughts }}
+      thinking: {"type": "enabled"}
+      {{- end }}
       {{- if $claudeDrop }}
       additional_drop_params: ["temperature", "top_p", "top_k"]
       {{- end }}
@@ -828,6 +866,9 @@ model_list:
       {{- end }}
       {{- with .reasoningEffort }}
       reasoning_effort: {{ . | quote }}
+      {{- end }}
+      {{- if $geminiThoughts }}
+      thinking: {"type": "enabled"}
       {{- end }}
       {{- if $claudeDrop }}
       additional_drop_params: ["temperature", "top_p", "top_k"]

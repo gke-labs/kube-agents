@@ -255,6 +255,17 @@ class TestEODWatcherRecap(unittest.TestCase):
         self.assertIn("*0 alerts* went to chat", report)
         self.assertIn("*9 informational events* held back from chat in this window", report)
 
+    def test_a_folded_event_is_not_withheld_by_the_ceiling(self):
+        """A row folded into its workload's alert went nowhere because one alert already did."""
+        events = [event()] + [event(notified=False, duplicate_of=1) for _ in range(3)]
+        summary, report = recap(events)
+
+        self.assertEqual(summary["alerts_posted"], 1)
+        self.assertEqual(summary["cap_dropped"], 0)
+        self.assertNotIn("withheld by the daily", report)
+        # One workload, one reason: one group, as before folding existed.
+        self.assertEqual(summary["unique_incidents"], 1)
+
     def test_a_cap_dropped_alert_is_not_an_informational_event(self):
         """`notified = 0` covers two outcomes; counting them as one hides alerts.
 
@@ -825,6 +836,24 @@ class TestLedgerLoading(unittest.TestCase):
             ["api"],
             "a drift row reached the event watcher's recap",
         )
+
+    def test_duplicate_of_is_read_when_the_column_exists(self):
+        path = self._db([("prod", "api", "BackOff", 1, 2), ("prod", "api", "BackOff", 0, 1)])
+        conn = sqlite3.connect(path)
+        with conn:
+            conn.execute("ALTER TABLE intercepted_events ADD COLUMN duplicate_of INTEGER")
+            conn.execute("UPDATE intercepted_events SET duplicate_of = 1 WHERE id = 2")
+        conn.close()
+
+        rows = load_intercepted_events(path, window_hours=24)
+
+        self.assertEqual(sorted(row["duplicate_of"] for row in rows if row["duplicate_of"]), [1])
+        self.assertEqual(filter_and_aggregate_events(rows)["cap_dropped"], 0)
+
+    def test_a_ledger_without_duplicate_of_still_loads(self):
+        rows = load_intercepted_events(self._db([("prod", "api", "BackOff", 0, 1)]), window_hours=24)
+
+        self.assertEqual([row["duplicate_of"] for row in rows], [None])
 
     def test_the_drift_reason_matches_the_writer(self):
         """The constant is copied rather than imported; this is what pins it.
