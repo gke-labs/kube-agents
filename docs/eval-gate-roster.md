@@ -316,10 +316,12 @@ Admitted on the record since the split:
   ran over the api transport: the main nightly moved to the inject door with
   [#3783](https://github.com/gke-labs/kube-agents/pull/3783) (its first such run is 2026-10-24),
   and the inject lane became the blocking one on 2026-10-21 (#3156), after the demotion. So under
-  the #3338 prompt the case has no inject-lane record yet; its pre-fix record on the optional
-  `-next` job was mixed (2/3 on 2026-10-15, build 2110588743994839040), and the pull request's own
-  presubmit is its first under the new prompt. Taking the line took `upgrades` off the
-  `domains.yaml` allowlist.
+  the #3338 prompt the case's inject-lane record is this line's own pull request,
+  [#3899](https://github.com/gke-labs/kube-agents/pull/3899): `pull-kube-agents-smoke-test` build
+  2113733214391504896 (2026-10-23, kube-agents-evals-10), 3/3, each repetition reading
+  `defaultVersion`, in a GREEN run at 100 % admitted-case pass rate; its pre-fix record on the
+  optional `-next` job was mixed (2/3 on 2026-10-15, build 2110588743994839040). Taking the line
+  took `upgrades` off the `domains.yaml` allowlist.
 - **pdb-remediation-pr**, 2026-10-14
   ([#2016](https://github.com/gke-labs/kube-agents/issues/2016) step 4), from the held-out
   seat it took on 2026-09-28. The three clean days the bar asks for are the writers nightlies
