@@ -1693,14 +1693,13 @@ def test_the_default_margin_absorbs_the_measured_judge_spread(noop_spec, make_ru
 def test_reps_hitting_429_quota_are_infra_and_do_not_trigger_judged_regression(
     noop_spec, make_run
 ):
-    """#3399's case: 429 quota exhaustion in 2 of 3 reps is marked infra, not judged regression.
+    """#3399's case: 429 quota exhaustion in 2 of 3 reps is marked infra.
 
-    Repetitions 1 and 2 hit 429 quota exhaustion and score 0.0 with the judge.
+    Repetitions 1 and 2 hit 429 quota exhaustion and score 0.0 with the verifier.
     Repetition 3 passes with 0.8 against main's 0.96.
-    If reps 1 and 2 are scored, mean drops to (0.0 + 0.0 + 0.8) / 3 = 0.27,
-    firing Rung 6 (JUDGED_REGRESSION).
-    Classified as infra, only rep 3 is graded (mean 0.80), which stays within
-    the margin of main's 0.96, so verdict is GREEN.
+    If reps 1 and 2 are scored, mean drops to (0.0 + 0.0 + 0.8) / 3 = 0.27.
+    Classified as infra, only rep 3 is graded (mean 0.80), which passes within
+    the margin, so verdict is GREEN.
     """
     def worker_hit_429(rec):
         rec["errors"] = [

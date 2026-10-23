@@ -1903,13 +1903,6 @@ def instant_polls(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
-def no_telemetry_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Isolate telemetry and proxy log environment variables from developer shell."""
-    monkeypatch.delenv("LITELLM_LOG_PATH", raising=False)
-    monkeypatch.delenv("ARTIFACTS", raising=False)
-
-
-@pytest.fixture(autouse=True)
 def no_cluster_exec(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """Keep settling a card off whatever cluster kubectl is pointed at.
 
@@ -5177,8 +5170,8 @@ def test_scan_log_for_429_returns_none_on_os_error_or_placeholder(tmp_path: Path
     assert harness._scan_log_for_429(multi_pod_log, since=since_ts) is None
 
 
-def test_record_unsettled_prepends_marked_ceiling_error_preserving_existing_errors(results_json: Any) -> None:
-    """When has_delivery is False, _record_unsettled prepends marked ceiling errors so scoring reads it at errors[0]."""
+def test_record_unsettled_prepends_marked_infra_error_preserving_existing_errors(results_json: Any) -> None:
+    """When has_delivery is False, _record_unsettled prepends marked infra errors so scoring reads it at errors[0]."""
     result = AgentResult(output="acknowledged", trajectory=[], errors=["agent reported no status for 3 turns running; still waiting on: t2"])
     harness._record_unsettled(
         result,
@@ -7186,3 +7179,82 @@ def test_a_fresh_session_replay_whose_context_failed_in_the_image_sends_no_answe
     assert not result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
     assert len(stub_agent.requests) == 1
     assert _archived(scripts)
+
+
+def test_corroborate_platform_rate_limit_with_live_content_does_not_persist_to_artifacts_litellm_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live proxy log fetched at settle is scanned in-memory and not persisted to $ARTIFACTS/litellm.log."""
+    monkeypatch.setenv("ARTIFACTS", str(tmp_path))
+    since = datetime(2026, 10, 19, 23, 0, 0, tzinfo=timezone.utc).timestamp()
+    live_log = (
+        "2026-10-19 23:00:00 INFO: GET /health 200\n"
+        "2026-10-19 23:05:00 - RateLimitError: 429 RESOURCE_EXHAUSTED\n"
+    )
+    monkeypatch.setattr(harness, "_fetch_live_litellm_log", lambda *args, **kwargs: live_log)
+
+    result = harness._corroborate_platform_rate_limit(since=since)
+    assert result is True
+    # Crucially, the live log must NOT be written to $ARTIFACTS/litellm.log to avoid shadowing parallel units.
+    assert not (tmp_path / "litellm.log").exists()
+
+
+def test_time_only_log_line_across_midnight_corroborates_true() -> None:
+    """A time-only 429 log line 2.5 hours after start across midnight UTC dates to tomorrow and corroborates True."""
+    since = datetime(2026, 10, 19, 23, 0, 0, tzinfo=timezone.utc).timestamp()
+    log = (
+        "23:00:00 INFO: 200 OK GET /health\n"
+        "01:30:00 - RateLimitError: 429 RESOURCE_EXHAUSTED\n"
+    )
+    assert harness._scan_log_content_for_429(log, since=since) is True
+
+
+def test_time_only_log_line_four_hours_after_since_on_same_day_corroborates_true() -> None:
+    """A time-only 429 log line 4.5 hours after start on the same calendar day dates to today and corroborates True."""
+    since = datetime(2026, 10, 19, 10, 0, 0, tzinfo=timezone.utc).timestamp()
+    log = (
+        "10:00:00 INFO: 200 OK GET /health\n"
+        "14:30:00 - RateLimitError: 429 RESOURCE_EXHAUSTED\n"
+    )
+    assert harness._scan_log_content_for_429(log, since=since) is True
+
+
+def test_time_only_log_line_before_since_on_same_day_does_not_roll_into_tomorrow() -> None:
+    """A time-only line from 10:00 AM when repetition starts at 23:00 PM dates to same day, not next morning."""
+    since = datetime(2026, 10, 19, 23, 0, 0, tzinfo=timezone.utc).timestamp()
+    ts = harness._parse_log_line_timestamp("10:00:00 INFO: GET /health", since=since)
+    assert ts is not None
+    parsed_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    assert parsed_dt == datetime(2026, 10, 19, 10, 0, 0, tzinfo=timezone.utc)
+
+
+def test_fetch_live_litellm_log_command_and_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_fetch_live_litellm_log issues kubectl logs with named constants and context."""
+    executed_cmd = []
+
+    def _mock_run(cmd, capture_output, text, errors, timeout, check):
+        executed_cmd.extend(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="test-log-output\n")
+
+    monkeypatch.setattr(subprocess, "run", _mock_run)
+    monkeypatch.setattr(harness, "_fetch_live_litellm_log", harness._fetch_live_litellm_log_impl)
+    monkeypatch.setenv("AGENT_NAMESPACE", "custom-ns")
+    monkeypatch.setenv("AGENT_CLUSTER_CONTEXT", "custom-ctx")
+
+    output = harness._fetch_live_litellm_log()
+    assert output == "test-log-output\n"
+    assert executed_cmd == [
+        "kubectl",
+        "logs",
+        "-l",
+        "app=litellm",
+        "-c",
+        "litellm-container",
+        "-n",
+        "custom-ns",
+        "--prefix",
+        "--tail=20000",
+        "--context",
+        "custom-ctx",
+    ]
+

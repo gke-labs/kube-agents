@@ -654,9 +654,56 @@ _LOG_TIMESTAMP_PATTERN = re.compile(
 _LOG_TIME_ONLY_PATTERN = re.compile(r"(?<!\d)(?P<time>\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)\b")
 _POD_PREFIX_PATTERN = re.compile(r"^\[(?P<pod>pod/[^\]]+)\]")
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+_LITELLM_NAMESPACE_DEFAULT = "kubeagents-system"
+_LITELLM_LABEL_SELECTOR = "app=litellm"
+_LITELLM_CONTAINER_NAME = "litellm-container"
+_LITELLM_LOG_TAIL_LINES = 20000
+_LITELLM_LOG_FETCH_TIMEOUT = 15.0
 
 
-def _parse_log_line_timestamp(line: str, since: float | None = None) -> float | None:
+def _find_log_until(content: str, since: float | None) -> float | None:
+    """Determine the effective upper bound of time observed in the log content."""
+    if since is None:
+        return None
+    since_dt = datetime.fromtimestamp(since, tz=timezone.utc)
+    for line in reversed(content.splitlines()):
+        clean = _ANSI_ESCAPE_PATTERN.sub("", line)
+        dt_match = _LOG_TIMESTAMP_PATTERN.search(clean)
+        if dt_match:
+            try:
+                iso_str = dt_match.group("ts").replace(" ", "T").replace(",", ".")
+                if not iso_str.endswith("Z") and "+" not in iso_str and "-" not in iso_str[10:]:
+                    iso_str += "Z"
+                return datetime.fromisoformat(iso_str.replace("Z", "+00:00")).timestamp() + 5.0
+            except ValueError:
+                pass
+        t_match = _LOG_TIME_ONLY_PATTERN.search(clean)
+        if t_match:
+            try:
+                time_str = t_match.group("time").replace(",", ".")
+                parts = time_str.split(":")
+                hour, minute = int(parts[0]), int(parts[1])
+                sec = float(parts[2])
+                cand_same = since_dt.replace(
+                    hour=hour,
+                    minute=minute,
+                    second=int(sec),
+                    microsecond=int((sec % 1) * 1e6),
+                )
+                if cand_same.timestamp() < since - 5.0:
+                    cand_next = cand_same + timedelta(days=1)
+                    return cand_next.timestamp() + 5.0
+                return cand_same.timestamp() + 5.0
+            except ValueError:
+                pass
+    return None
+
+
+def _parse_log_line_timestamp(
+    line: str,
+    since: float | None = None,
+    until: float | None = None,
+) -> float | None:
     """Extract and parse timestamp from a log line into unix epoch seconds."""
     clean = _ANSI_ESCAPE_PATTERN.sub("", line)
     match = _LOG_TIMESTAMP_PATTERN.search(clean)
@@ -684,16 +731,25 @@ def _parse_log_line_timestamp(line: str, since: float | None = None) -> float | 
                     second=int(sec),
                     microsecond=int((sec % 1) * 1e6),
                 )
-                if cand_same.timestamp() < since - 5.0:
-                    cand_next = cand_same + timedelta(days=1)
-                    if cand_next.timestamp() - since <= 2 * 3600:
-                        return cand_next.timestamp()
-                    return cand_same.timestamp()
-                elif cand_same.timestamp() - since > 4 * 3600:
-                    cand_prev = cand_same - timedelta(days=1)
-                    return cand_prev.timestamp()
-                else:
-                    return cand_same.timestamp()
+                cand_prev = cand_same - timedelta(days=1)
+                cand_next = cand_same + timedelta(days=1)
+
+                candidates = [cand_prev, cand_same, cand_next]
+                wall_limit = (until if until is not None else time.time()) + 5.0
+
+                valid: list[tuple[float, float]] = []
+                for c in candidates:
+                    ts = c.timestamp()
+                    if ts > wall_limit:
+                        continue
+                    if ts - since > 6 * 3600:
+                        continue
+                    valid.append((abs(ts - since), ts))
+
+                if valid:
+                    valid.sort(key=lambda item: item[0])
+                    return valid[0][1]
+                return cand_same.timestamp()
             except ValueError:
                 pass
     return None
@@ -703,6 +759,7 @@ def _scan_log_content_for_429(
     content: str,
     since: float | None = None,
     session_id: str | None = None,
+    until: float | None = None,
 ) -> bool | None:
     if (
         not content.strip()
@@ -713,6 +770,16 @@ def _scan_log_content_for_429(
 
     if since is None and not session_id:
         return bool(_LITELLM_429_PATTERN.search(content))
+
+    if until is None and since is not None:
+        log_until = _find_log_until(content, since)
+        if log_until is not None:
+            if abs(time.time() - since) < 24 * 3600:
+                until = min(time.time() + 5.0, log_until)
+            else:
+                until = log_until
+        else:
+            until = time.time() + 5.0
 
     current_ts: float | None = None
     current_pod: str | None = None
@@ -730,7 +797,7 @@ def _scan_log_content_for_429(
                 current_pod = pod_name
                 current_ts = None
 
-        ts = _parse_log_line_timestamp(line, since=since)
+        ts = _parse_log_line_timestamp(line, since=since, until=until)
         if ts is not None:
             current_ts = ts
             found_any_timestamp = True
@@ -774,11 +841,12 @@ def _scan_log_for_429(
     path: Path,
     since: float | None = None,
     session_id: str | None = None,
+    until: float | None = None,
 ) -> bool | None:
     try:
         with path.open("r", encoding="utf-8", errors="replace") as f:
             content = f.read()
-            return _scan_log_content_for_429(content, since=since, session_id=session_id)
+            return _scan_log_content_for_429(content, since=since, session_id=session_id, until=until)
     except OSError:
         return None
 
@@ -796,19 +864,19 @@ def _extract_infra_failure_reason(text: str | None) -> str | None:
     return None
 
 
-def _fetch_live_litellm_log(timeout: float = 15.0) -> str | None:
-    ns = os.environ.get("AGENT_NAMESPACE", "kubeagents-system")
+def _fetch_live_litellm_log_impl(timeout: float = _LITELLM_LOG_FETCH_TIMEOUT) -> str | None:
+    ns = os.environ.get("AGENT_NAMESPACE", _LITELLM_NAMESPACE_DEFAULT)
     cmd = [
         "kubectl",
         "logs",
         "-l",
-        "app=litellm",
+        _LITELLM_LABEL_SELECTOR,
         "-c",
-        "litellm-container",
+        _LITELLM_CONTAINER_NAME,
         "-n",
         ns,
         "--prefix",
-        "--tail=20000",
+        f"--tail={_LITELLM_LOG_TAIL_LINES}",
     ]
     context = os.environ.get("AGENT_CLUSTER_CONTEXT")
     if context:
@@ -829,9 +897,13 @@ def _fetch_live_litellm_log(timeout: float = 15.0) -> str | None:
     return None
 
 
+_fetch_live_litellm_log = _fetch_live_litellm_log_impl
+
+
 def _corroborate_platform_rate_limit(
     since: float | None = None,
     session_id: str | None = None,
+    until: float | None = None,
 ) -> bool | None:
     """Verify provider quota exhaustion against platform inference gateway (LiteLLM) log if available.
 
@@ -845,24 +917,17 @@ def _corroborate_platform_rate_limit(
         p = Path(path)
         if not p.is_file():
             return None
-        return _scan_log_for_429(p, since=since, session_id=session_id)
+        return _scan_log_for_429(p, since=since, session_id=session_id, until=until)
+
+    live_content = _fetch_live_litellm_log()
+    if live_content:
+        return _scan_log_content_for_429(live_content, since=since, session_id=session_id, until=until)
 
     artifacts = os.environ.get(_ARTIFACTS_ENV)
     if artifacts:
         art_path = Path(artifacts) / "litellm.log"
         if art_path.is_file():
-            return _scan_log_for_429(art_path, since=since, session_id=session_id)
-
-    live_content = _fetch_live_litellm_log()
-    if live_content:
-        if artifacts:
-            try:
-                art_path = Path(artifacts) / "litellm.log"
-                art_path.parent.mkdir(parents=True, exist_ok=True)
-                art_path.write_text(live_content, encoding="utf-8")
-            except OSError:
-                pass
-        return _scan_log_content_for_429(live_content, since=since, session_id=session_id)
+            return _scan_log_for_429(art_path, since=since, session_id=session_id, until=until)
 
     return None
 
@@ -1548,8 +1613,9 @@ def _record_ceiling(
     marker routes it to its own class in the scorer rather than a graded
     failure of the agent under test. A partial delivery keeps the plain report
     and grades on what arrived. Both delegation waits end their deadline path
-    here, so the two transports cannot drift on what the scorer reads. (Unsettled
-    unblocked cards at settle also produce this marker via ``_record_unsettled``).
+    here, so the two transports cannot drift on what the scorer reads. (A failure
+    card unblocked to non-terminal at settle is recorded by ``_record_unsettled``
+    under ``INFRA_FAILURE_MARKER`` instead, not under this marker.)
     """
     if not outstanding:
         return

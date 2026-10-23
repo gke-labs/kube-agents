@@ -57,6 +57,8 @@ def _no_forge_from_the_shell(monkeypatch):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.delenv("LITELLM_LOG_PATH", raising=False)
     monkeypatch.delenv("ARTIFACTS", raising=False)
+    from kube_agents_bench import harness
+    monkeypatch.setattr(harness, "_fetch_live_litellm_log", lambda *args, **kwargs: None)
 
 
 FIXTURE_RUNS = Path(__file__).parent / "fixtures" / "runs"
