@@ -1328,6 +1328,15 @@ STUB_WHOAMI = textwrap.dedent(
     """
 )
 
+OPENSSL_STUB = """#!/usr/bin/env bash
+# openssl stand-in for the tests: `x509 -noout -text -in FILE` prints a Basic
+# Constraints block, CA:TRUE for a PEM certificate, CA:FALSE when the file
+# carries the marker NOT-A-CA; anything that is not PEM fails to parse.
+f="${@: -1}"
+grep -q "BEGIN CERTIFICATE" "$f" 2>/dev/null || { echo "unable to load certificate" >&2; exit 1; }
+if grep -q "NOT-A-CA" "$f"; then printf "X509v3 Basic Constraints: critical\n    CA:FALSE\n"; else printf "X509v3 Basic Constraints: critical\n    CA:TRUE\n"; fi
+"""
+
 STUB_HELPER = textwrap.dedent(
     """\
     import json, os, sys
@@ -1351,6 +1360,8 @@ class EvalScriptGitLabTest(unittest.TestCase):
         (self.dir / "ci_reset_agent_pulls.py").write_text(STUB_HELPER)
         (self.dir / "ci_gitlab_forge.py").write_text(STUB_WHOAMI)
         (self.dir / "ci-deploy.sh").write_text(CI_DEPLOY.read_text(encoding="utf-8"))
+        (self.bin / "openssl").write_text(OPENSSL_STUB)
+        (self.bin / "openssl").chmod(0o755)
 
     def _run(self, body, dead=""):
         """run_bash with the whoami stub's knobs: its log, and the token values it refuses."""
@@ -1575,22 +1586,26 @@ class EvalScriptGitLabTest(unittest.TestCase):
         for forge, kind, host in (("ghes", "github", "ghes.eval.internal"), ("gitlab-ce", "gitlab", "gitlab.eval.internal")):
             with self.subTest(forge=forge):
                 (state / "ca.crt").unlink(missing_ok=True)
-                missing = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": forge, "EVAL_FORGE_STATE_DIR": str(state)})
+                missing = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": forge, "EVAL_FORGE_STATE_DIR": str(state)}, bin_dir=self.bin)
                 self.assertNotEqual(missing.returncode, 0)
                 self.assertIn(f"{state}/ca.crt (its private CA) is missing or empty", missing.stderr)
                 state.mkdir(exist_ok=True)
+                (state / "ca.crt").write_text("-----BEGIN CERTIFICATE-----\nNOT-A-CA\n-----END CERTIFICATE-----\n")
+                leaf = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": forge, "EVAL_FORGE_STATE_DIR": str(state)}, bin_dir=self.bin)
+                self.assertNotEqual(leaf.returncode, 0)
+                self.assertIn(f"{state}/ca.crt is not a CA certificate", leaf.stderr)
                 (state / "ca.crt").write_text("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
-                proc = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": forge, "EVAL_FORGE_STATE_DIR": str(state)})
+                proc = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": forge, "EVAL_FORGE_STATE_DIR": str(state)}, bin_dir=self.bin)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 args = f"--forge gitlab --host {host} --ca-file {state}/ca.crt" if kind == "gitlab" else ""
                 self.assertIn(f"KIND={kind} HOST={host} ARGS={args} CA={state}/ca.crt", proc.stdout)
         # A developer's own instance: the host follows the override, the kind does not.
-        own = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": "gitlab-ce", "EVAL_FORGE_STATE_DIR": str(state), "EVAL_GITLAB_CE_HOST": "gitlab.dev.example"})
+        own = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": "gitlab-ce", "EVAL_FORGE_STATE_DIR": str(state), "EVAL_GITLAB_CE_HOST": "gitlab.dev.example"}, bin_dir=self.bin)
         self.assertIn("KIND=gitlab HOST=gitlab.dev.example", own.stdout)
         # A host that is not a bare hostname stops the eval at the table, naming the variable, not as an unknown forge.
         for bad, why in (("gitlab.dev.example:8443", "is not a dotted bare hostname"), ("gitlab.dev example", "is not a dotted bare hostname"), ("gitlab", "is not a dotted bare hostname"), ("gitlab.com", "is a public forge")):
             with self.subTest(host=bad):
-                refused = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": "gitlab-ce", "EVAL_FORGE_STATE_DIR": str(state), "EVAL_GITLAB_CE_HOST": bad})
+                refused = run_bash(block, env={"SCRIPT_DIR": str(HACK), "EVAL_FORGE": "gitlab-ce", "EVAL_FORGE_STATE_DIR": str(state), "EVAL_GITLAB_CE_HOST": bad}, bin_dir=self.bin)
                 self.assertNotEqual(refused.returncode, 0)
                 self.assertIn(f"EVAL_GITLAB_CE_HOST='{bad}' {why}", refused.stderr)
                 self.assertNotIn("is not a forge this eval knows", refused.stderr)

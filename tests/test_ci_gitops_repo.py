@@ -22,6 +22,7 @@ rather than a copy.
 """
 
 import base64
+import os
 import pathlib
 import re
 import subprocess
@@ -148,6 +149,31 @@ def _script_dir_with_chart(tmp_path, crd_lists_gitlab, helpers_register_gitlab=N
     return str(hack)
 
 
+_OPENSSL_STUB = """#!/usr/bin/env bash
+# openssl stand-in for the tests: `x509 -noout -text -in FILE` prints a Basic
+# Constraints block, CA:TRUE for a PEM certificate, CA:FALSE when the file
+# carries the marker NOT-A-CA; anything that is not PEM fails to parse.
+f="${@: -1}"
+grep -q "BEGIN CERTIFICATE" "$f" 2>/dev/null || { echo "unable to load certificate" >&2; exit 1; }
+if grep -q "NOT-A-CA" "$f"; then printf "X509v3 Basic Constraints: critical\n    CA:FALSE\n"; else printf "X509v3 Basic Constraints: critical\n    CA:TRUE\n"; fi
+"""
+
+
+def _openssl_stub_dir():
+    """A directory holding the openssl stand-in, made once per process."""
+    global _OPENSSL_DIR
+    try:
+        return _OPENSSL_DIR
+    except NameError:
+        pass
+    tmp = tempfile.mkdtemp(prefix="openssl-stub-")
+    stub = pathlib.Path(tmp) / "openssl"
+    stub.write_text(_OPENSSL_STUB, encoding="utf-8")
+    stub.chmod(0o755)
+    _OPENSSL_DIR = tmp
+    return tmp
+
+
 def _resolution_block():
     text = _CI_DEPLOY.read_text(encoding="utf-8")
     start = text.find(_SECTION_START)
@@ -194,6 +220,9 @@ class CiDeployGitopsRepoTest(unittest.TestCase):
                     "EVAL_FORGE_STATE_DIR": str(_REPO_ROOT / "no-such-forge-state"),
                     "EVAL_GHES_HOST": "",
                     "EVAL_GITLAB_CE_HOST": "",
+                    # openssl stands in, so the CA gate reads the fixture
+                    # files below rather than this machine's openssl.
+                    "PATH": f"{_openssl_stub_dir()}:{os.environ.get('PATH', '')}",
                     **env,
                 }
             ),
@@ -461,6 +490,24 @@ class CiDeployGitopsRepoTest(unittest.TestCase):
                     self.assertNotEqual(rc, 0)
                     self.assertIn(f"{var}='{bad}' {why}", err)
                     self.assertNotIn("is not a forge this deploy knows", err)
+                    self.assertNotIn("forges[0]", out)
+
+    def test_a_ca_file_that_is_not_a_ca_is_refused_before_anything(self):
+        # A leaf certificate copied into place, or a CA made without CA:TRUE
+        # (the macOS/LibreSSL shape), passes -s and fails the grader after the
+        # build; the gate reads basicConstraints before anything else runs.
+        for forge in ("ghes", "gitlab-ce"):
+            for content in ("-----BEGIN CERTIFICATE-----\nNOT-A-CA\n-----END CERTIFICATE-----\n", "this is not a certificate\n"):
+                with self.subTest(forge=forge, content=content[:12]), tempfile.TemporaryDirectory() as tmp:
+                    state = self._state_dir(tmp)
+                    (pathlib.Path(state) / "ca.crt").write_text(content, encoding="utf-8")
+                    rc, out, err = self._resolve(
+                        "kube-agents-evals-2", PULL_NUMBER="123", EVAL_FORGE=forge, EVAL_GITHUB_APP_ID="123456",
+                        EVAL_FORGE_STATE_DIR=state,
+                    )
+                    self.assertNotEqual(rc, 0)
+                    self.assertIn(f"{state}/ca.crt is not a CA certificate", err)
+                    self.assertIn("make-certs.sh", err)
                     self.assertNotIn("forges[0]", out)
 
     def test_a_self_managed_forge_without_its_ca_is_refused_before_anything(self):
