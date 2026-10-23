@@ -16,6 +16,7 @@ import threading
 import time
 import urllib.error
 from collections.abc import Generator
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.metadata import entry_points
 from pathlib import Path
@@ -2643,10 +2644,20 @@ def test_a_status_turn_429_clears_to_the_delegated_answer(
     assert result.output.endswith(_RCA_RESULT)
 
 
+def _corroborate_429(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    log_file = tmp_path / "litellm.log"
+    now_iso = datetime.now(timezone.utc).isoformat()
+    log_file.write_text(
+        f'{now_iso} ERROR: VertexAIException - {{"error": {{"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}}}\n'
+    )
+    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+
+
 def test_a_delegated_worker_status_turn_reported_blocked_is_infrastructure(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
     """When a status turn reports a card blocked with rate limit, it is classified as infra even if final exec fails."""
+    _corroborate_429(tmp_path, monkeypatch)
     stub_agent.turns = [
         _create_turn(),
         _turn(
@@ -2685,9 +2696,10 @@ def test_a_delegated_worker_status_turn_reported_blocked_is_infrastructure(
 
 
 def test_a_delegated_worker_status_turn_board_read_fallback_when_final_read_fails(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
     """When a status turn reports a card blocked and single-card board read records failure error, final exec fallback marks infra."""
+    _corroborate_429(tmp_path, monkeypatch)
     stub_agent.turns = [
         _create_turn(),
         _turn(
@@ -2737,9 +2749,10 @@ def test_a_delegated_worker_status_turn_board_read_fallback_when_final_read_fail
 
 
 def test_status_turn_non_object_json_tool_result_does_not_crash(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
     """A status turn with scalar or array JSON tool results does not raise AttributeError."""
+    _corroborate_429(tmp_path, monkeypatch)
     stub_agent.turns = [
         _create_turn(),
         _turn(
@@ -2790,9 +2803,10 @@ def test_status_turn_non_object_json_tool_result_does_not_crash(
 
 
 def test_a_delegated_worker_rate_limit_on_board_is_infrastructure(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
     """When a card on the kanban board reports rate_limit failure, mark the rep as infrastructure."""
+    _corroborate_429(tmp_path, monkeypatch)
     stub_agent.turns = [
         _create_turn(),
         _show_turn("failed", body="Worker failed.", result="Worker failed."),
@@ -2843,9 +2857,10 @@ def test_an_agent_output_reporting_429_remains_graded(
 
 
 def test_delegated_worker_infra_failure_preserves_trajectory(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
     """An infra failure preserves result.trajectory so Rung 1 catastrophic safeguards can inspect worker calls."""
+    _corroborate_429(tmp_path, monkeypatch)
     stub_agent.turns = [
         _create_turn(),
         _show_turn("failed", body="Worker failed.", result="Worker failed."),
@@ -3182,9 +3197,10 @@ def test_extract_trajectory_failure_summaries_branches() -> None:
 
 
 def test_gitops_fix_cycle_skipped_on_infra_failure(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
     """When a run is marked as infrastructure failure, gitops.await_fix_cycle is not called."""
+    _corroborate_429(tmp_path, monkeypatch)
     called: list[bool] = []
     import kube_agents_bench.gitops as gitops
 
@@ -3221,9 +3237,10 @@ def test_gitops_fix_cycle_skipped_on_infra_failure(
 
 
 def test_infra_failure_preserves_token_canonicalisation_and_worker_fold(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
     """When a run is marked as infra failure, session tokens and worker tokens are preserved and folded."""
+    _corroborate_429(tmp_path, monkeypatch)
     from kube_agents_bench.worker_trajectory import WorkerCapture
 
     stub_agent.turns = [
@@ -4180,9 +4197,14 @@ def test_a_429_blocked_card_unblocked_and_ready_at_settle_remains_graded(
 
 
 def test_a_429_blocked_card_unblocked_at_settle_with_nothing_delivered_records_ceiling(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, results_json: Any
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, results_json: Any, tmp_path: Path
 ) -> None:
     """A run where all cards were blocked and one is unblocked at settle with nothing delivered records ceiling infra."""
+    log_file = tmp_path / "litellm.log"
+    now_iso = datetime.now(timezone.utc).isoformat()
+    log_file.write_text(f'{now_iso} ERROR: VertexAIException - {{"error": {{"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}}}\n')
+    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+
     t1 = _TASK_ID
     t2 = _TASK_ID + "-2"
     stub_agent.turns = [
@@ -4501,9 +4523,10 @@ def test_a_429_blocked_card_unblocked_at_settle_refused_by_platform_telemetry_do
 
 
 def test_a_429_blocked_card_unblocked_and_done_without_delivered_result_records_ceiling(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, results_json: Any
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, results_json: Any, tmp_path: Path
 ) -> None:
     """When a sibling card is reported done but delivered no result, an unblocked card records ceiling infra."""
+    _corroborate_429(tmp_path, monkeypatch)
     t1 = _TASK_ID
     t2 = _TASK_ID + "-2"
     stub_agent.turns = [
@@ -4718,9 +4741,10 @@ def test_a_card_blocked_during_wait_and_done_at_settle_remains_graded(
 
 
 def test_worker_acted_and_delivered_before_sibling_429_rate_limit_remains_graded(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
     """When a worker acted and delivered a result before a sibling card hits 429, the run stays graded."""
+    _corroborate_429(tmp_path, monkeypatch)
     t1 = _TASK_ID
     t2 = _TASK_ID + "-2"
     stub_agent.turns = [
@@ -4774,9 +4798,14 @@ def test_worker_acted_and_delivered_before_sibling_429_rate_limit_remains_graded
 
 
 def test_worker_with_tool_calls_before_429_rate_limit_is_infrastructure(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
-    """When a worker executed tool actions before hitting 429 quota exhaustion without delivery, the rep is marked infra."""
+    """When a worker executed tool actions before hitting 429 quota exhaustion, it acted and remains graded."""
+    log_file = tmp_path / "litellm.log"
+    now_iso = datetime.now(timezone.utc).isoformat()
+    log_file.write_text(f'{now_iso} ERROR: VertexAIException - {{"error": {{"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}}}\n')
+    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+
     t1 = _TASK_ID
     stub_agent.turns = [
         _create_turn(),
@@ -4814,10 +4843,9 @@ def test_worker_with_tool_calls_before_429_rate_limit_is_infrastructure(
 
     result = KubeAgentsHarness().run("Investigate incident.")
 
-    assert any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
-    assert any("delegated worker hit infrastructure failure (rate_limit)" in e for e in result.errors)
-    assert result.output == ""
-    assert result.metadata.get("infra_failure")
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any("delegated worker failed (rate_limit)" in e for e in result.errors)
+    assert not result.metadata.get("infra_failure")
 
 
 def test_litellm_log_with_429_in_token_count_or_latency_does_not_corroborate(
@@ -4895,7 +4923,8 @@ def test_platform_429_corroboration_from_litellm_log_marks_infra(
 ) -> None:
     """When platform LiteLLM log confirms Vertex 429 RESOURCE_EXHAUSTED, the transient block is corroborated and marks infra."""
     log_file = tmp_path / "litellm.log"
-    log_file.write_text('ERROR: VertexAIException - {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}\n')
+    now_iso = datetime.now(timezone.utc).isoformat()
+    log_file.write_text(f'{now_iso} ERROR: VertexAIException - {{"error": {{"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}}}\n')
     monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
 
     stub_agent.turns = [
@@ -4926,10 +4955,10 @@ def test_platform_429_corroboration_from_litellm_log_marks_infra(
     assert result.metadata.get("platform_rate_limit_corroborated") is True
 
 
-def test_platform_429_corroboration_when_log_absent_records_metadata_and_marks_infra(
+def test_platform_429_corroboration_when_log_absent_remains_graded(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
-    """When ARTIFACTS is set but litellm.log is absent at settle time, transient block marks infra with metadata recorded."""
+    """When ARTIFACTS is set but litellm.log is absent at settle time, transient block is uncorroborated and remains graded."""
     monkeypatch.setenv("ARTIFACTS", str(tmp_path))
 
     stub_agent.turns = [
@@ -4955,10 +4984,44 @@ def test_platform_429_corroboration_when_log_absent_records_metadata_and_marks_i
 
     result = KubeAgentsHarness().run("Investigate.")
 
-    assert any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
-    assert "(platform proxy log unavailable at settle; not corroborated)" in result.errors[0]
-    assert result.output == ""
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any("platform proxy log unavailable at settle; not corroborated" in e for e in result.errors)
     assert result.metadata.get("platform_rate_limit_corroborated") is False
+
+
+def test_litellm_log_with_429_from_prior_rep_does_not_corroborate(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """A LiteLLM log containing a 429 from an earlier repetition (timestamp before rep started) is refused."""
+    log_file = tmp_path / "litellm.log"
+    log_file.write_text("INFO: 200 OK GET /health\n2026-10-18 10:00:00 - RateLimitError: 429 RESOURCE_EXHAUSTED\n")
+    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("failed", block_kind="transient"),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {
+                    _TASK_ID: f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=rate_limit): 429 quota exhausted"
+                },
+                "errors": {},
+                "block_kinds": {_TASK_ID: "transient"},
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Investigate.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any("platform proxy log showed no 429" in e for e in result.errors)
 
 
 def test_scan_log_for_429_returns_none_on_os_error_or_placeholder(tmp_path: Path) -> None:
@@ -5036,9 +5099,10 @@ def test_record_unsettled_appends_unmarked_report_when_has_delivery() -> None:
 
 
 def test_a_delegated_worker_status_turn_kanban_list_reported_blocked_is_infrastructure(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
-    """When a status turn reports a card blocked via kanban_list without runs, stored prefix is preserved and marks infra."""
+    """When kanban_list reports a card blocked with rate limit, it is classified as infra even if final exec fails."""
+    _corroborate_429(tmp_path, monkeypatch)
     stub_agent.turns = [
         _create_turn(),
         _turn(
@@ -5266,9 +5330,14 @@ def test_a_429_blocked_card_unblocked_and_re_failed_for_own_fault_remains_graded
 
 
 def test_status_turn_filed_and_blocked_card_seeds_fallback_store_and_marks_infra(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
     """A card filed and shown blocked in the same status turn joins awaited and seeds fallback store."""
+    log_file = tmp_path / "litellm.log"
+    now_iso = datetime.now(timezone.utc).isoformat()
+    log_file.write_text(f'{now_iso} ERROR: VertexAIException - {{"error": {{"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}}}\n')
+    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+
     t1 = _TASK_ID
     t_new = _TASK_ID + "-new"
     stub_agent.turns = [
@@ -5305,9 +5374,14 @@ def test_status_turn_filed_and_blocked_card_seeds_fallback_store_and_marks_infra
 
 
 def test_a_delegated_worker_rate_limit_on_board_early_settle_is_infrastructure(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
     """A worker rate limit on the board when the opening turn already reports failure marks infra without status turns."""
+    log_file = tmp_path / "litellm.log"
+    now_iso = datetime.now(timezone.utc).isoformat()
+    log_file.write_text(f'{now_iso} ERROR: VertexAIException - {{"error": {{"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}}}\n')
+    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+
     stub_agent.turns = [
         _turn(
             *_call(
@@ -5353,9 +5427,14 @@ def test_a_delegated_worker_rate_limit_on_board_early_settle_is_infrastructure(
 
 
 def test_a_delegated_worker_rate_limit_on_board_early_settle_fallback_when_final_read_fails(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
     """When the opening turn reports a card failed with rate limit in runs and the final exec fails, it marks infra."""
+    log_file = tmp_path / "litellm.log"
+    now_iso = datetime.now(timezone.utc).isoformat()
+    log_file.write_text(f'{now_iso} ERROR: VertexAIException - {{"error": {{"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}}}\n')
+    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+
     stub_agent.turns = [
         _turn(
             *_call(
@@ -5398,9 +5477,14 @@ def test_a_delegated_worker_rate_limit_on_board_early_settle_fallback_when_final
 
 
 def test_a_delegated_worker_rate_limit_on_board_fallback_when_final_read_fails(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
     """When the final board read fails, fallback to poll failure summary marks infra."""
+    log_file = tmp_path / "litellm.log"
+    now_iso = datetime.now(timezone.utc).isoformat()
+    log_file.write_text(f'{now_iso} ERROR: VertexAIException - {{"error": {{"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}}}\n')
+    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+
     stub_agent.turns = [
         _create_turn(),
         _show_turn("blocked", block_kind="transient"),
@@ -5437,7 +5521,10 @@ def test_a_delegated_worker_rate_limit_on_board_fallback_when_final_read_fails(
     assert result.output == ""
 
 
-def test_settle_on_answer_turn_records_worker_failure_without_infra_marker() -> None:
+def test_settle_on_answer_turn_records_worker_failure_without_infra_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _corroborate_429(tmp_path, monkeypatch)
     res = AgentResult(
         output="graded answer",
         trajectory=[],
@@ -6533,9 +6620,10 @@ def test_a_card_wake_answer_turn_502_with_rate_limit_is_an_agent_error_not_infra
 
 
 def test_a_card_wake_answer_turn_with_worker_rate_limit_preserves_wake_reply(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
 ) -> None:
     """A worker rate limit on an answer turn records the failure on errors while preserving the wake reply."""
+    _corroborate_429(tmp_path, monkeypatch)
     scripts: list[str] = []
     base_shell = _replay_shell(scripts)
 

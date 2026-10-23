@@ -148,6 +148,7 @@ import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -647,9 +648,50 @@ _LITELLM_TRAFFIC_PATTERN = re.compile(
     r'(?:HTTP/\d\.\d|\b(?:POST|GET|PUT|DELETE)\s+/\S*|status_code=\d{3}\b|"(?:code|status)":\s*"?\d{3}"?|\blitellm\b|\bRESOURCE_EXHAUSTED\b|\bRateLimitError\b)',
     re.IGNORECASE,
 )
+_LOG_TIMESTAMP_PATTERN = re.compile(
+    r"\b(?P<ts>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\b"
+)
+_LOG_TIME_ONLY_PATTERN = re.compile(r"\b(?P<time>\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)\b")
 
 
-def _scan_log_for_429(path: Path) -> bool | None:
+def _parse_log_line_timestamp(line: str, since: float | None = None) -> float | None:
+    """Extract and parse timestamp from a log line into unix epoch seconds."""
+    match = _LOG_TIMESTAMP_PATTERN.search(line)
+    if match:
+        try:
+            iso_str = match.group("ts").replace(" ", "T").replace(",", ".")
+            dt = datetime.fromisoformat(iso_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except ValueError:
+            pass
+    if since is not None:
+        t_match = _LOG_TIME_ONLY_PATTERN.search(line)
+        if t_match:
+            try:
+                since_dt = datetime.fromtimestamp(since, tz=timezone.utc)
+                time_str = t_match.group("time").replace(",", ".")
+                parts = time_str.split(":")
+                hour, minute = int(parts[0]), int(parts[1])
+                sec = float(parts[2])
+                line_dt = since_dt.replace(
+                    hour=hour,
+                    minute=minute,
+                    second=int(sec),
+                    microsecond=int((sec % 1) * 1e6),
+                )
+                return line_dt.timestamp()
+            except ValueError:
+                pass
+    return None
+
+
+def _scan_log_for_429(
+    path: Path,
+    since: float | None = None,
+    session_id: str | None = None,
+) -> bool | None:
     try:
         with path.open("r", encoding="utf-8", errors="replace") as f:
             content = f.read()
@@ -659,7 +701,30 @@ def _scan_log_for_429(path: Path) -> bool | None:
                 or not _LITELLM_TRAFFIC_PATTERN.search(content)
             ):
                 return None
-            return bool(_LITELLM_429_PATTERN.search(content))
+            if not _LITELLM_429_PATTERN.search(content):
+                return False
+
+            if since is None and not session_id:
+                return True
+
+            current_ts: float | None = None
+            found_any_timestamp = False
+            for line in content.splitlines():
+                ts = _parse_log_line_timestamp(line, since=since)
+                if ts is not None:
+                    current_ts = ts
+                    found_any_timestamp = True
+
+                if _LITELLM_429_PATTERN.search(line):
+                    if session_id and session_id in line:
+                        return True
+                    if current_ts is not None and since is not None:
+                        if current_ts >= (since - 5.0):
+                            return True
+                    elif not found_any_timestamp and not session_id:
+                        return True
+
+            return False
     except OSError:
         return None
 
@@ -677,12 +742,15 @@ def _extract_infra_failure_reason(text: str | None) -> str | None:
     return None
 
 
-def _corroborate_platform_rate_limit() -> bool | None:
+def _corroborate_platform_rate_limit(
+    since: float | None = None,
+    session_id: str | None = None,
+) -> bool | None:
     """Verify provider quota exhaustion against platform inference gateway (LiteLLM) log if available.
 
     Returns:
-        True: Telemetry log was read and confirmed a 429 status code or RESOURCE_EXHAUSTED event.
-        False: Telemetry log was read and showed no 429 event (refusing infra classification).
+        True: Telemetry log was read and confirmed a 429 status code or RESOURCE_EXHAUSTED event tied to this rep.
+        False: Telemetry log was read and showed no 429 event for this rep (refusing infra classification).
         None: Telemetry log was unreadable, placeholder, or unavailable at settle time (telemetry not pre-collected).
     """
     path = os.environ.get("LITELLM_LOG_PATH")
@@ -690,13 +758,13 @@ def _corroborate_platform_rate_limit() -> bool | None:
         p = Path(path)
         if not p.is_file():
             return None
-        return _scan_log_for_429(p)
+        return _scan_log_for_429(p, since=since, session_id=session_id)
 
     artifacts = os.environ.get(_ARTIFACTS_ENV)
     if artifacts:
         art_path = Path(artifacts) / "litellm.log"
         if art_path.is_file():
-            return _scan_log_for_429(art_path)
+            return _scan_log_for_429(art_path, since=since, session_id=session_id)
 
     return None
 
@@ -1354,11 +1422,15 @@ def _pending_first(task_ids: list[str], statuses: dict[str, str]) -> list[str]:
 def _has_successful_delivery(
     observed: list[dict[str, Any]],
     task_ids: Sequence[str],
+    *,
+    worker_entries: Sequence[dict[str, Any]] | None = None,
 ) -> bool:
-    """Return whether any of the task_ids has a successful delivery in observed.
+    """Return whether any of the task_ids has a successful delivery or worker action.
 
     Filters out cards reported in _FAILURE_STATUSES or carrying an infra failure reason.
     """
+    if worker_entries:
+        return True
     reported = reported_statuses(observed)
     return any(
         reported.get(tid) not in _FAILURE_STATUSES and not _extract_infra_failure_reason(text)
@@ -1375,13 +1447,14 @@ def _record_ceiling(
     delegation_timeout: float,
     *,
     opening_turn: bool = True,
+    worker_entries: Sequence[dict[str, Any]] | None = None,
 ) -> None:
     """Record that ``outstanding`` cards outran the delegation budget.
 
-    With nothing delivered the record holds the acknowledgement alone; the
-    marker routes it to its own class in the scorer rather than a graded
-    failure of the agent under test. A partial delivery keeps the plain report
-    and grades on what arrived. Both delegation waits end their deadline path
+    With nothing delivered and no worker action, the record holds the acknowledgement
+    alone; the marker routes it to its own class in the scorer rather than a graded
+    failure of the agent under test. A partial delivery or worker tool execution keeps
+    the plain report and grades on what arrived. Both delegation waits end their deadline path
     here, so the two transports cannot drift on what the scorer reads. (Unsettled
     unblocked cards at settle also produce this marker via ``_record_unsettled``).
     """
@@ -1392,7 +1465,7 @@ def _record_ceiling(
         f"{delegation_timeout:.0f}s: "
         + ", ".join(f"{t} ({statuses.get(t, 'unknown')})" for t in outstanding)
     )
-    if not delivered_results(observed, awaited) and opening_turn:
+    if not delivered_results(observed, awaited) and not worker_entries and opening_turn:
         report = f"{DELEGATION_CEILING_MARKER}: {report}"
     result.errors.append(report)
 
@@ -2747,6 +2820,8 @@ class KubeAgentsHarness(AgentHarness):
         discrepancies: list[str] | None = None,
         live_statuses: dict[str, str] | None = None,
         rate_limited_cards: set[str] | None = None,
+        since: float | None = None,
+        session_id: str | None = None,
     ) -> list[str]:
         """Read summary and error from the board for any awaited cards in failure statuses.
 
@@ -2776,8 +2851,12 @@ class KubeAgentsHarness(AgentHarness):
             )
             if live_status is not None and live_status not in _TERMINAL_STATUSES:
                 if bblock_kinds.get(t) == "transient":
-                    corroborated = _corroborate_platform_rate_limit() if has_rate_limit else None
-                    if has_rate_limit and corroborated is not False:
+                    corroborated = (
+                        _corroborate_platform_rate_limit(since=since, session_id=session_id)
+                        if has_rate_limit
+                        else None
+                    )
+                    if has_rate_limit and corroborated is True:
                         if unsettled is not None:
                             unsettled.append(t)
                     else:
@@ -2970,7 +3049,10 @@ class KubeAgentsHarness(AgentHarness):
         result.metadata["delegated_cards"] = {t: _status(t) for t in awaited}
         if missing:
             result.metadata["delegated_cards_missing"] = list(missing)
+        captured: worker_trajectory.WorkerCapture | None = None
         if timed_out:
+            captured = worker_trajectory.capture(_agent_shell, awaited, _EXEC_TIMEOUT)
+            worker_entries = captured.entries if captured else None
             _record_ceiling(
                 result,
                 observed,
@@ -2978,6 +3060,7 @@ class KubeAgentsHarness(AgentHarness):
                 outstanding,
                 {t: _status(t) for t in outstanding},
                 delegation_timeout,
+                worker_entries=worker_entries,
             )
         unsettled = []
         discrepancies = []
@@ -2994,14 +3077,26 @@ class KubeAgentsHarness(AgentHarness):
                             or _extract_infra_failure_reason(error_text)
                         )
                     )
-                    corroborated = _corroborate_platform_rate_limit() if has_rate_limit else None
-                    if has_rate_limit and corroborated is not False:
+                    corroborated = (
+                        _corroborate_platform_rate_limit(
+                            since=getattr(self, "_run_started_at", None),
+                            session_id=session_id,
+                        )
+                        if has_rate_limit
+                        else None
+                    )
+                    if has_rate_limit and corroborated is True:
                         unsettled.append(t)
                     else:
                         discrepancies.append(t)
         if unsettled:
+            if captured is None:
+                captured = worker_trajectory.capture(_agent_shell, awaited, _EXEC_TIMEOUT)
+            worker_entries = captured.entries if captured else None
             has_delivery = _has_successful_delivery(
-                observed, [t for t in awaited if t not in unsettled]
+                observed,
+                [t for t in awaited if t not in unsettled],
+                worker_entries=worker_entries,
             )
             _record_unsettled(
                 result,
@@ -3056,6 +3151,9 @@ class KubeAgentsHarness(AgentHarness):
             stalled=outstanding if timed_out else [],
             board_messages=board_messages,
             opening_turn=True,
+            captured=captured,
+            since=getattr(self, "_run_started_at", None),
+            session_id=session_id,
         )
         if not shown and len(result.trajectory) > before:
             withheld = result.trajectory[before:]
@@ -3396,7 +3494,10 @@ class KubeAgentsHarness(AgentHarness):
         # Only on the deadline path: after a transport failure or a mute agent
         # the budget is untouched, and claiming it ran out would misreport why
         # the run stopped.
+        captured: worker_trajectory.WorkerCapture | None = None
         if outstanding and timed_out:
+            captured = worker_trajectory.capture(_agent_shell, awaited, _EXEC_TIMEOUT)
+            worker_entries = captured.entries if captured else None
             _record_ceiling(
                 result,
                 observed,
@@ -3405,6 +3506,7 @@ class KubeAgentsHarness(AgentHarness):
                 latest,
                 delegation_timeout,
                 opening_turn=opening_turn,
+                worker_entries=worker_entries,
             )
         unsettled: list[str] = []
         discrepancies: list[str] = []
@@ -3418,13 +3520,20 @@ class KubeAgentsHarness(AgentHarness):
             discrepancies=discrepancies,
             live_statuses=live_statuses,
             rate_limited_cards=rate_limited_cards,
+            since=getattr(self, "_run_started_at", None),
+            session_id=session_id,
         )
         if outstanding:
             unsettled = [t for t in unsettled if t not in outstanding]
             discrepancies = [t for t in discrepancies if t not in outstanding]
         if unsettled:
+            if captured is None:
+                captured = worker_trajectory.capture(_agent_shell, awaited, _EXEC_TIMEOUT)
+            worker_entries = captured.entries if captured else None
             has_delivery = _has_successful_delivery(
-                observed, [t for t in awaited if t not in unsettled]
+                observed,
+                [t for t in awaited if t not in unsettled],
+                worker_entries=worker_entries,
             )
             _record_unsettled(
                 result,
@@ -3452,6 +3561,9 @@ class KubeAgentsHarness(AgentHarness):
             stalled=outstanding if timed_out else [],
             board_messages=board_messages,
             opening_turn=opening_turn,
+            captured=captured,
+            since=getattr(self, "_run_started_at", None),
+            session_id=session_id,
         )
         return session_id
 
@@ -3464,6 +3576,9 @@ class KubeAgentsHarness(AgentHarness):
         stalled: Sequence[str] = (),
         board_messages: Sequence[str] = (),
         opening_turn: bool = True,
+        captured: worker_trajectory.WorkerCapture | None = None,
+        since: float | None = None,
+        session_id: str | None = None,
     ) -> None:
         """Collect everything the delegated cards produced, then clear them out.
 
@@ -3500,7 +3615,8 @@ class KubeAgentsHarness(AgentHarness):
         result.metadata["worker_commands"] = _worker_commands(logs)
         _dump_worker_logs(logs, stalled)
         _archive_stalled_cards(stalled, _EXEC_TIMEOUT)
-        captured = worker_trajectory.capture(_agent_shell, awaited, _EXEC_TIMEOUT)
+        if captured is None:
+            captured = worker_trajectory.capture(_agent_shell, awaited, _EXEC_TIMEOUT)
         if captured is None:
             result.metadata["worker_trajectory"] = None
             # A run that filed no card settles too (nothing to wait for), and
@@ -3519,17 +3635,25 @@ class KubeAgentsHarness(AgentHarness):
             for text in board_messages:
                 reason = _extract_infra_failure_reason(text)
                 if reason:
-                    corroborated = _corroborate_platform_rate_limit()
-                    if corroborated is False:
-                        result.errors.append(
-                            f"card on board recorded {reason} ({text[:200]}) but platform proxy log showed no 429"
-                        )
-                    else:
+                    corroborated = _corroborate_platform_rate_limit(
+                        since=since, session_id=session_id
+                    )
+                    if corroborated is True:
                         infra_reason = reason
                         infra_detail = f"card on board recorded {reason}: {text[:200]}"
-                        if corroborated is None:
-                            infra_detail += " (platform proxy log unavailable at settle; not corroborated)"
-                        result.metadata["platform_rate_limit_corroborated"] = (corroborated is True)
+                        result.metadata["platform_rate_limit_corroborated"] = True
+                        break
+                    elif corroborated is False:
+                        result.errors.append(
+                            f"delegated worker failed ({reason}): card on board recorded {reason} ({text[:200]}) but platform proxy log showed no 429"
+                        )
+                        result.metadata["platform_rate_limit_corroborated"] = False
+                        break
+                    else:
+                        result.errors.append(
+                            f"delegated worker failed ({reason}): card on board recorded {reason} ({text[:200]}) but platform proxy log unavailable at settle; not corroborated"
+                        )
+                        result.metadata["platform_rate_limit_corroborated"] = False
                         break
 
         _purge_card_state(awaited, _EXEC_TIMEOUT)
@@ -3540,7 +3664,7 @@ class KubeAgentsHarness(AgentHarness):
             for tid, text in delivered_results(observed, awaited).items()
             if reported.get(tid) not in _FAILURE_STATUSES and not _extract_infra_failure_reason(text)
         }
-        worker_acted = bool(successful_deliveries)
+        worker_acted = bool(successful_deliveries) or bool(captured and captured.entries)
         if infra_reason:
             if opening_turn and not worker_acted:
                 _mark_result_infra_failure(

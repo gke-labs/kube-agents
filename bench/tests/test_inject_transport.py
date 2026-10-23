@@ -39,6 +39,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Generator
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -2672,10 +2673,18 @@ def test_a_running_card_at_the_ceiling_delivers_nothing_from_an_earlier_run(
     assert "RESOURCE_EXHAUSTED" not in result.output
 
 
+def _corroborate_429(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    log_file = tmp_path / "litellm.log"
+    now_iso = datetime.now(timezone.utc).isoformat()
+    log_file.write_text(f'{now_iso} ERROR: VertexAIException - {{"error": {{"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}}}\n')
+    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+
+
 def test_a_blocked_card_with_rate_limit_summary_on_inject_is_infrastructure(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A card on the board blocked with a rate limit summary marks the repetition as infra."""
+    _corroborate_429(tmp_path, monkeypatch)
     build_session_store(tmp_path, created=[CARD_A])
     set_card(
         tmp_path,
@@ -2700,6 +2709,7 @@ def test_a_card_unblocked_between_poll_and_final_read_on_inject_records_ceiling(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A card unblocked between the poll that ended the loop and the final read with nothing delivered records ceiling."""
+    _corroborate_429(tmp_path, monkeypatch)
     build_session_store(tmp_path, created=[CARD_A])
     set_card(
         tmp_path,
@@ -2734,6 +2744,7 @@ def test_a_card_unblocked_and_claimed_running_on_inject_records_ceiling(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A card unblocked and re-claimed running on the deliverable read with nothing delivered records ceiling."""
+    _corroborate_429(tmp_path, monkeypatch)
     build_session_store(tmp_path, created=[CARD_A])
     set_card(
         tmp_path,
@@ -2875,6 +2886,7 @@ def test_a_failed_card_with_rate_limit_error_on_inject_is_infrastructure(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A card on the board failed with a rate limit error marks the repetition as infra."""
+    _corroborate_429(tmp_path, monkeypatch)
     build_session_store(tmp_path, created=[CARD_A])
     set_card(
         tmp_path,
@@ -2916,6 +2928,7 @@ def test_transient_blocked_card_with_infra_prefix_on_inject_is_infrastructure(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A card blocked transient with hermes rate limit prefix on inject lane is classified as infra."""
+    _corroborate_429(tmp_path, monkeypatch)
     build_session_store(tmp_path, created=[CARD_A])
     set_card(
         tmp_path,
@@ -2963,6 +2976,7 @@ def test_a_triage_card_with_transient_rate_limit_summary_on_inject_is_infrastruc
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A card in triage at the ceiling with a transient rate limit summary marks rep as infra."""
+    _corroborate_429(tmp_path, monkeypatch)
     build_session_store(tmp_path, created=[CARD_A])
     set_card(
         tmp_path,
@@ -2984,7 +2998,7 @@ def test_a_triage_card_with_transient_rate_limit_summary_on_inject_is_infrastruc
     assert result.output == ""
     assert result.errors == [
         f"{harness.INFRA_FAILURE_MARKER}: delegated worker hit infrastructure failure (rate_limit): "
-        'card on board recorded rate_limit: provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429 ... "TPM quota exhausted" (platform proxy log unavailable at settle; not corroborated)',
+        'card on board recorded rate_limit: provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429 ... "TPM quota exhausted"',
         f"{harness.DELEGATION_CEILING_MARKER}: delegated tasks did not finish within 1s: {CARD_A} (triage)",
     ]
 
@@ -3021,6 +3035,7 @@ def test_a_blocked_card_with_rate_limit_summary_on_inject_does_not_issue_board_p
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Inject lane resolves failure summaries directly from read_session_cards without issuing BOARD_PRESENT exec."""
+    _corroborate_429(tmp_path, monkeypatch)
     build_session_store(tmp_path, created=[CARD_A])
     set_card(
         tmp_path,
