@@ -1232,6 +1232,14 @@ CHECK_PHRASES = {
     "mig-convergence-stalled": "{object} instance group isn't converging",
     "sole-tenant-headroom": "sole-tenant nodes are nearly full",
     "orphaned-snapshots": "{object} is a snapshot of a deleted disk",
+    # Upgrade Retrospective
+    "upgrade-operation-failed": "an upgrade operation failed",
+    "upgrade-broke-workload": "{object} broke after the upgrade",
+    "node-broken-after-upgrade": "{object} node stayed broken after its pool's rebuild",
+    "upgrade-symptom-tentative": "{object} may have been broken by the upgrade",
+    "upgrade-symptom-unclassified": "{object} shows a symptom after the upgrade that matches no known pattern",
+    "symptom-predates-upgrade": "{object} was already broken before the upgrade",
+    "upgrade-log-volume-rose": "{object} writes far more logs since the upgrade",
 }
 
 # Applied to a pull request the harness itself closed as stale. It is the
