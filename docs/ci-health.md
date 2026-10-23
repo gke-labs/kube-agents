@@ -852,7 +852,8 @@ where nearly every case failed give none), and cases marked `expected_fail`,
 off the nightly matrix, or with no `task.yaml` on the checkout are left out. An
 issue tracks a case as the filer reads it: an open `nightly-red` issue naming
 it, or a closed one that still tracks the streak (closed after its newest
-night, or handed off as not planned). The lists follow the filer's classifier,
+night, or handed off as not planned). The issue listings are cross-checked
+against GraphQL and read again exactly as the filer reads them. The lists follow the filer's classifier,
 which drops repetitions it reads as infrastructure even when the collector
 recorded them as failures; the header's counts do not, so they match the
 Nightly report's.
@@ -862,7 +863,8 @@ Nightly report's.
   matrix with no line), the wall clock, and links to the run and the Nightly
   report. The numbers are the Nightly report's "Passed all reps" and "Cases".
 - **🔴 New bugs filed:** red on 3 or more graded nights in a row, and its open
-  issue was opened after last night's run finished. Domain name, issue,
+  issue was opened after last night's run finished. A case kept from running
+  last night whose streak was filed only now is listed too. Domain name, issue,
   assignee and the domain's backup.
 - **🔴 Owed a bug, not filed yet:** red on 3 or more graded nights in a row and
   no issue tracks it (the filer is in dry run, or its filing failed). Night
@@ -900,8 +902,9 @@ plain text. A mentioned person must be a member of the space.
 
 The section is skipped, and the digest carries its one-line nightly summary
 plus the reason, when it cannot be built truthfully: `data.json` unreadable, no
-night started in the last 36 hours, the main part still running or missing,
-no GitHub token or the issues unreadable, pyyaml missing, a count that does not
+night started in the last 36 hours, last night's run or its main part still
+running, the main part missing, no GitHub token, the issues unreadable or their
+listing not trusted (GraphQL disagreed on every read, as for the filer), pyyaml missing, a count that does not
 add up, or a link that is not a well-formed `https` URL (an issue link must
 point into this repository). Links are checked for form, not fetched: the
 dashboard's links sit behind a Google login a fetch from the job cannot pass.

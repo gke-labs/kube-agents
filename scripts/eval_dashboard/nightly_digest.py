@@ -130,10 +130,12 @@ NAME_GLOSS_RE = re.compile(r"\s*\(.*\)\s*$")
 
 SKIP_NO_YAML = "pyyaml is not installed, so domains.yaml and task.yaml cannot be read"
 SKIP_NO_ISSUES = "the nightly-red issues could not be read from GitHub"
+SKIP_UNTRUSTED_ISSUES = "GitHub's nightly-red issue list could not be trusted ({doubt})"
 GITHUB_TIME_FORMAT = nightly_bugs.GITHUB_TIME_FORMAT
 SKIP_NO_GITHUB = "no GitHub token to read the nightly-red issues"
 SKIP_NO_NIGHT = f"no nightly run started in the last {nightly.LAST_NIGHT_MAX_AGE // datetime.timedelta(hours=1)} hours"
 SKIP_RUNNING = "last night's main part is still running"
+SKIP_NIGHT_RUNNING = "last night's run is still running"
 SKIP_NO_MAIN = "last night's main part is missing, so its numbers would be the writers part's alone"
 SKIP_BAD_LINK = "a link it would carry is malformed ({url})"
 SKIP_BAD_COUNT = "its counts do not add up ({passed} passed of {recorded} recorded)"
@@ -150,7 +152,8 @@ def log(message: str) -> None:
 def load_mentions(raw: str | None) -> dict[str, str]:
     """``{login (lower case): numeric Chat user id}`` from MENTIONS_ENV's
     value. A value that is not a JSON object, and an entry whose id is not
-    numeric, are dropped with a warning that names no id."""
+    numeric, are dropped with a warning that counts them and names neither
+    a login nor an id."""
     if not raw or not raw.strip():
         return {}
     try:
@@ -162,12 +165,17 @@ def load_mentions(raw: str | None) -> dict[str, str]:
         log(f"warning: {MENTIONS_ENV} is not a JSON object; no Chat mentions this time")
         return {}
     out = {}
+    dropped = 0
     for login, value in loaded.items():
         match = CHAT_USER_ID_RE.fullmatch(str(value).strip())
         if isinstance(login, str) and match:
             out[login.lower()] = match.group(1)
         else:
-            log(f"warning: {MENTIONS_ENV}: the entry for {login!r} is not a numeric Chat user id; printed as plain text")
+            dropped += 1
+    if dropped:
+        # A count, never the key: a map written the other way round has the
+        # ids as its keys.
+        log(f"warning: {MENTIONS_ENV}: {dropped} {'entry is' if dropped == 1 else 'entries are'} not a numeric Chat user id; printed as plain text")
     return out
 
 
@@ -270,7 +278,9 @@ class Builder:
     def night(self) -> tuple[dict, datetime.date]:
         night, _ = nightly.last_night(self.data, self.now)
         if night is None:
-            raise Skipped(SKIP_NO_NIGHT)
+            # In flight with no part recorded yet (a late start, a re-run):
+            # the one-line summary above says "still running" too.
+            raise Skipped(SKIP_NIGHT_RUNNING if nightly.running_nights(self.data, self.now) else SKIP_NO_NIGHT)
         if nightly.PART_MAIN in (night.get("running_parts") or []):
             raise Skipped(SKIP_RUNNING)
         if nightly.PART_MAIN in (night.get("missing_parts") or []):
@@ -281,13 +291,16 @@ class Builder:
             raise Skipped(SKIP_NO_NIGHT)
         return night, day
 
-    def run_event(self, day: datetime.date) -> bool:
+    def run_event(self, night: dict) -> bool:
+        """Whether ``night`` (``last_night``'s) is a run-level event, judged
+        as ``nightly_bugs.graded_nights`` judges it: the filed night holding
+        its main build, its parts joined. Not any other night of its date: a
+        clean same-date re-run is the night the page and the filer read."""
+        build = next((p.get("build") for p in night.get("parts") or [] if p.get("part") == nightly.PART_MAIN), None)
         for each in nightly.group_nights(nightly.sorted_nightly_runs(self.data)):
             runs = nightly.night_parts(each)
-            if nightly.night_date(runs[0]) == day:
-                joined = {"tasks": [t for run in runs for t in classify.run_tasks(run)]}
-                if classify.is_run_event(joined):
-                    return True
+            if build and any(run.get("build_id") == build for run in runs):
+                return classify.is_run_event({"tasks": [t for run in runs for t in classify.run_tasks(run)]})
         return False
 
     def build(self) -> Section:
@@ -308,7 +321,7 @@ class Builder:
         def header(body: str) -> str:
             return HEADER.format(glyph=nightly.DIGEST_GLYPH, date=date, sep=nightly.SEP, body=body, took=took, run=run, page=self.page())
 
-        if night.get("truncated") or self.run_event(day):
+        if night.get("truncated") or self.run_event(night):
             body = TRUNCATED_BODY if night.get("truncated") else RUN_EVENT_BODY
             lines = [header(body), *(self.capped(INFRA_HEADING, infra) or [INFRA_NONE])]
             self.check_links()
@@ -358,6 +371,20 @@ class Builder:
                     recovered.append((key, RECOVERED_LINE.format(domain=name, case=case, passed=v["passed"], graded=v["graded"], nights=before,
                                                                  issue=f"{nightly.SEP}{tag}" if tag else "")))
 
+        # A streak whose newest graded night is older than last night (all
+        # infra last night) and that the filer filed after last night ended
+        # -- it was in dry run, or its filing failed until now -- is new too.
+        for case, vs in sorted(verdicts.items()):
+            f = fields.get(case)
+            if case in tonight or not f or f["expected_fail"] or (expected and case not in expected) or not nightly_bugs.red_streak(vs):
+                continue
+            issue = nightly_bugs.tracking_issue(self.open_issues, case)
+            if issue and not nightly_bugs.opened_before(issue, night):
+                slug, name = self.domain_of(case, f)
+                backup = (self.domains.get(slug) or {}).get("backup")
+                new.append(((name.lower(), case), NEW_LINE.format(domain=name, case=case, issue=self.issue_link(issue), assignee=self.who(self.owner_of(case, f, issue)),
+                                                                 backup=BACKUP.format(backup=self.who(backup)) if backup else "")))
+
         if not (new or newly_owed or first_night or recovered or lost_any or infra or cut):
             red = len(still) + len(unfiled) + len(first)
             line = QUIET_LINE.format(glyph=nightly.DIGEST_GLYPH, date=short, passed=passed, recorded=recorded,
@@ -391,7 +418,8 @@ class Builder:
             tag = self.issue_link(issue)
             items.append(((0, part), LOST_LINE.format(part=nightly.PART_WORDS[part].capitalize(), how=tail[-1]["how"],
                                                       run=self.link(tail[-1]["run_url"], RUN_TEXT), issue=f"{nightly.SEP}{tag}" if tag else "")))
-        candidates = sorted(c for c in expected if not (fields.get(c) or {}).get("expected_fail"))
+        # As the filer: no readable task.yaml or expected_fail, no listing.
+        candidates = sorted(c for c in expected if fields.get(c) and not fields[c]["expected_fail"])
         tracked = {}
         for case in candidates:
             issue = nightly_bugs.tracking_issue(self.open_issues, case, nightly_bugs.KIND_INFRA)
@@ -440,12 +468,16 @@ def build(data: dict, now: datetime.datetime, gh, repo_root: pathlib.Path | None
         raise Skipped(SKIP_NO_YAML)
     if gh is None:
         raise Skipped(SKIP_NO_GITHUB)
-    open_issues = gh.call("GET", gh.path(nightly_bugs.OPEN_ISSUES_PATH), paginate=True)
     # The closed ones the filer reads too, from the window's first night: one
     # closed after a streak's newest night, or handed off, still tracks it.
     starts = [nightly.parse_iso(n.get("started")) for ns in nightly_infra.part_nights(data, LOOKBACK_NIGHTS).values() for n in ns]
     horizon = min((t for t in starts if t), default=None)
-    closed_issues = gh.call("GET", gh.path(nightly_bugs.CLOSED_ISSUES_PATH.format(since=horizon.strftime(GITHUB_TIME_FORMAT))), paginate=True) if horizon else []
+    # Read and cross-checked as the filer reads them: a REST listing that
+    # answers empty while the issues exist would make every tracked case
+    # read as owed a bug.
+    open_issues, closed_issues, doubt = nightly_bugs.read_listings(gh, horizon.strftime(GITHUB_TIME_FORMAT) if horizon else None)
     if open_issues is None or closed_issues is None:
         raise Skipped(SKIP_NO_ISSUES)
+    if doubt:
+        raise Skipped(SKIP_UNTRUSTED_ISSUES.format(doubt=doubt))
     return Builder(data, now, open_issues, repo_root or nightly_bugs.REPO_ROOT, mentions or {}, gh.repo, closed_issues, horizon).build()

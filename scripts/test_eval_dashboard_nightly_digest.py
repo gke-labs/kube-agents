@@ -86,24 +86,42 @@ def issue(number, case, created, assignee=None, url=None):
             "assignees": [{"login": assignee}] if assignee else []}
 
 
-class StubGh:
-    """ghcli.Gh's read surface: the open issues, or None for a failed read."""
+def graphql_answer(open_issues, closed_issues, closed):
+    """The filer's GraphQL cross-check (nightly_bugs.LISTING_QUERY) as GitHub
+    answers it for the issues held."""
+    def conn(held):
+        return {"totalCount": len(held), "nodes": [{"number": i["number"]} for i in held]}
+    repo = {"open": conn(open_issues)}
+    if closed:
+        repo["closed"] = conn(closed_issues)
+    return {"data": {"repository": repo}}
 
-    def __init__(self, open_issues=(), fail=False, closed_issues=()):
+
+class StubGh:
+    """ghcli.Gh's read surface: the open issues, or None for a failed read;
+    ``empty_open``: the REST listing answers [] while GraphQL still sees the
+    issues (2026-10-22)."""
+
+    def __init__(self, open_issues=(), fail=False, closed_issues=(), empty_open=False):
         self.repo = REPO
         self.open_issues = list(open_issues)
         self.closed_issues = list(closed_issues)
         self.fail = fail
+        self.empty_open = empty_open
         self.calls = []
 
     def path(self, suffix):
         return f"repos/{self.repo}/{suffix}"
 
-    def call(self, method, path, body=None, paginate=False):
+    def call(self, method, path, body=None, paginate=False, read=False):
         self.calls.append((method, path))
         if self.fail:
             return None
-        return list(self.closed_issues) if "state=closed" in path else list(self.open_issues)
+        if method == "POST" and path == "graphql":
+            return graphql_answer(self.open_issues, self.closed_issues, body["variables"]["closed"])
+        if "state=closed" in path:
+            return list(self.closed_issues)
+        return [] if self.empty_open else list(self.open_issues)
 
 
 class Harness(unittest.TestCase):
@@ -112,6 +130,9 @@ class Harness(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.root = pathlib.Path(tmp.name) / "repo"
         shutil.copytree(TESTDATA, self.root)
+        sleep = mock.patch.object(nightly_digest.nightly_bugs.time, "sleep")
+        sleep.start()
+        self.addCleanup(sleep.stop)
 
     def build(self, doc, open_issues=(), mentions=None, gh=None):
         with contextlib.redirect_stderr(io.StringIO()):
@@ -184,7 +205,10 @@ class FullSectionTest(Harness):
                 return contextlib.nullcontext(type("R", (), {"status": 200})())
 
         def gh_runner(argv, input=None, **kwargs):
-            out = "\n".join(json.dumps(i) for i in FULL_ISSUES) if argv[argv.index("-X") + 1] == "GET" else "{}"
+            if argv[argv.index("-X") + 1] == "GET":
+                out = "" if "state=closed" in argv[argv.index("-X") + 2] else "\n".join(json.dumps(i) for i in FULL_ISSUES)
+            else:
+                out = json.dumps(graphql_answer(FULL_ISSUES, [], json.loads(input)["variables"]["closed"]))
             return type("P", (), {"returncode": 0, "stdout": out, "stderr": ""})()
 
         environ = {post_health.SPACE_ENV: "spaces/AAAAtest", post_health.TOKEN_ENV: "fake-token", post_health.ghcli.TOKEN_ENV: "fake-gh",
@@ -268,6 +292,47 @@ class TrackingTest(Harness):
         self.assertIn(f"• Capacity: case-maint, night 2 · <https://github.com/{REPO}/issues/4006|#4006> · @carol", text)
 
 
+    def test_a_bug_filed_late_for_a_case_not_graded_last_night_is_new(self):
+        # case-red was red three nights, then kept from running last night;
+        # the filer (just armed, or after an outage) files it this morning.
+        nights = [night(day, [green("case-green"), red("case-red") if day in (17, 18, 19) else green("case-red"),
+                              red("case-maint") if day in (16, 17, 18) else green("case-maint")]) for day in range(15, 20)]
+        nights.append(night(20, [green("case-green"), infra("case-red"), infra("case-maint")]))
+        filed = issue(4001, "case-red", "2026-10-20T02:00:00Z", assignee="alice")
+        # One filed before last night ended was news yesterday, not today.
+        older = issue(4007, "case-maint", "2026-10-19T05:00:00Z")
+        section = self.build(data(*nights), [filed, older])
+        self.assertFalse(section.quiet)
+        text = "\n".join(section.lines)
+        self.assertIn(f"🔴 *New bugs filed* (failing every run, 3 nights in a row)\n• Capacity: case-red → <https://github.com/{REPO}/issues/4001|#4001> · <users/1001>", text)
+        self.assertNotIn("#4007", text)
+
+
+class RunEventTest(Harness):
+    def test_a_clean_same_date_rerun_after_a_run_level_event_is_read_in_full(self):
+        nights = [night(day, [green("case-green"), green("case-noowner")]) for day in range(15, 20)]
+        # The cron night: nearly every case failed (a broken image).
+        event = night(20, [red("case-green"), red("case-noowner")] + [red(f"broken-{n}") for n in range(20)])
+        # A maintainer re-ran the main job clean the same morning; the page
+        # and the filer read the re-run.
+        rerun = night(20, [green("case-green"), red("case-noowner")])
+        rerun.update(build_id="3000000000000020009", started="2026-10-20T03:00:30+00:00", finished="2026-10-20T03:59:00+00:00")
+        section = self.build(data(*nights, event, rerun))
+        text = "\n".join(section.lines)
+        self.assertNotIn(nightly_digest.RUN_EVENT_BODY, text)
+        self.assertIn("• Security: case-noowner (0/3), night 1 · @sam", text)
+
+
+class InfraTest(Harness):
+    def test_a_case_with_no_readable_task_yaml_is_not_listed_kept(self):
+        # case-gone is on the matrix but its task.yaml is gone from this
+        # checkout: the filer files nothing for it, so the digest lists
+        # nothing for it.
+        nights = [night(day, [green("case-green"), green("case-gone") if day < 18 else infra("case-gone")]) for day in range(15, 21)]
+        section = self.build(data(*nights, extra_cases=[("case-gone", "security")]))
+        self.assertNotIn("case-gone", "\n".join(section.lines))
+
+
 class TruncatedNightTest(Harness):
     def test_a_truncated_night_is_labelled_and_not_counted(self):
         nights = [night(day, [green("case-green"), red("case-red") if day >= 18 else green("case-red")]) for day in range(15, 20)]
@@ -305,8 +370,15 @@ class MentionsTest(Harness):
                 nightly_digest.load_mentions('{"Alice": "users/1001", "dave": 1002, "eve": "eve@example.com"}'),
                 {"alice": "1001", "dave": "1002"},
             )
-        self.assertIn("'eve' is not a numeric Chat user id", err.getvalue())
+        self.assertIn("1 entry is not a numeric Chat user id", err.getvalue())
         self.assertNotIn("1001", err.getvalue())
+        # A map written the other way round: its keys are the ids.
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(nightly_digest.load_mentions('{"123456789012345678901": "alice", "users/1002": "dave"}'), {})
+        self.assertIn("2 entries are not a numeric Chat user id", err.getvalue())
+        self.assertNotIn("123456789012345678901", err.getvalue())
+        self.assertNotIn("1002", err.getvalue())
         section = self.build(full_night(), FULL_ISSUES, mentions={"alice": "1001"})
         self.assertIn("<users/1001>", "\n".join(section.lines), "login matching ignores letter case")
 
@@ -346,6 +418,12 @@ class SkipTest(Harness):
             self.build(doc, gh=StubGh(fail=True))
         with self.assertRaisesRegex(nightly_digest.Skipped, "no nightly run started in the last 36 hours"):
             self.build(data(night(10, [green("case-green")])))
+        # Last night's build is in flight with no part recorded yet: the
+        # one-line summary above says "still running", and so does the reason.
+        late = data(night(19, [green("case-green")]))
+        late["pending_builds"] = [{"build_id": "3000000000000020001", "tier": "nightly", "job": JOB, "first_seen": "2026-10-20T05:00:00+00:00"}]
+        with self.assertRaisesRegex(nightly_digest.Skipped, "^last night's run is still running$"):
+            self.build(late)
         writers_only = night(20, [green("case-green")])
         writers_only.update(job="ci-kube-agents-eval-nightly-writers", build_id="3000000000000020002")
         with self.assertRaisesRegex(nightly_digest.Skipped, "main part is missing"):
@@ -353,6 +431,15 @@ class SkipTest(Harness):
         bad = [issue(4001, "case-red", "2026-10-20T02:00:00Z", url="https://github.com/elsewhere/repo/issues/4001")]
         with self.assertRaisesRegex(nightly_digest.Skipped, "malformed"):
             self.build(doc, bad)
+
+    def test_an_issue_listing_the_filer_would_not_trust_is_not_read(self):
+        # The REST listing answers [] while the issues exist and GraphQL
+        # sees them: the filer refuses that listing, and so does the section,
+        # rather than call every tracked case unfiled.
+        gh = StubGh(FULL_ISSUES, empty_open=True)
+        with self.assertRaisesRegex(nightly_digest.Skipped, r"^GitHub's nightly-red issue list could not be trusted \(the open listing holds 0 issues, GraphQL 3 \(missing #4001, #4002, #4003\)\)$"):
+            self.build(full_night(), gh=gh)
+        self.assertEqual(sum(1 for m, p in gh.calls if m == "GET" and "state=open" in p), nightly_digest.nightly_bugs.LISTING_ATTEMPTS)
 
     def test_a_skip_keeps_the_one_line_and_says_why(self):
         reason = "the nightly-red issues could not be read from GitHub"
