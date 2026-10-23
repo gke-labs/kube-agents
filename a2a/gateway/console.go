@@ -29,8 +29,9 @@ import (
 // consoleFrame): one per delegation chain, under the task the turn started,
 // as every observer is told. The page renders answers from TASKS and skips
 // those frames, so for the page a lost .out frame still costs a notice and
-// never an answer. A client with no TASKS view (the MCP server) reads each
-// end here, live only, since .out is core NATS.
+// never an answer. A console client such as the MCP server reads each end
+// here as it happens; .out is core NATS, so a frame missed across a restart
+// is recovered from TASKS, which the console identity can read.
 //
 // Identity is the grant. Only the `console` user may publish on
 // chat.console.*.in (the operator's consoleIdentity), so the sender IS
@@ -145,8 +146,8 @@ type ConsoleInFrame struct {
 //
 // A terminal frame (Kind "result") also names its task (Addressee, TaskID)
 // and the state it ended in. The page reads a completed answer off TASKS and
-// skips that frame; a client with no TASKS view (the MCP server) reads it
-// here. Every other field is absent on a notice.
+// skips that frame; another console client (the MCP server) reads it here,
+// and from TASKS for a frame it missed. Every other field is absent on a notice.
 type ConsoleOutFrame struct {
 	MessageID string        `json:"messageId"`
 	Text      string        `json:"text"`

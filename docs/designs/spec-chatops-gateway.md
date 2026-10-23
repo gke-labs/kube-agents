@@ -2094,8 +2094,7 @@ task that handed work to kanban cards (the bridge's `handoff` artifact) carries 
 true`, so a client waits for the cards' notify frames; without it, no handoff was seen and the
 client need not wait. Its text is the deliverable for a completed task and the gateway's notice
 otherwise. A chain that ends at a child with no wake (the session could not take one) ends failed,
-carrying the notice: a console client with no TASKS view reads the child's answer from TASKS or not
-at all. A kanban card's report into the conversation is a frame too, with `"kind": "notify"` and the
+carrying the notice; a console client reads the child's answer from TASKS. A kanban card's report into the conversation is a frame too, with `"kind": "notify"` and the
 turn it answers as `replyTo` ("Proactive posts: the chat.notify route", the console's route). A
 notice carries none of those fields, so a client waiting on a turn can tell the three apart. The
 page reads answers from TASKS and gets the notices, so it skips the result frames, and a lost result
@@ -2103,9 +2102,7 @@ frame costs it nothing. It shows the notify frames, which it has no other source
 report is not on TASKS, so a notify frame published while no client holds the conversation's `.out`
 subscription (the tab closed, a page reconnecting, the MCP server restarting) is lost: core NATS
 keeps nothing, and the notifier answers the card as posted. This is a known limit of the
-kanban-era route; card reports become bus child results with the profile dispatcher. A console client
-with no TASKS view, such as the MCP server, reads each task's end from these frames, live
-only, since `.out` is not on a stream. Turn answers to a follow-up inside a live task are not
+kanban-era route; card reports become bus child results with the profile dispatcher. A console client such as the MCP server reads each task's end from these frames as it happens. `.out` is not on a stream, so a result frame published while the client is not subscribed (a restart, a reconnect) is not replayed. The `console` identity holds TASKS consumer grants, so the client recovers a missed end from the task's own events there. Turn answers to a follow-up inside a live task are not
 sent; that client reads them from TASKS or waits for the end. An answer past 256 KiB, or one
 whose escaped frame would pass the server's `max_payload`, is cut and says so; TASKS keeps
 it whole. An `.in` frame published
