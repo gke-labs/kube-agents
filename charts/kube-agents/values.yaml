@@ -143,6 +143,16 @@ operator:
   # chart cannot see and the hint would fight it.
   topologySpread:
     enabled: true
+  # The manager's own metrics listener, port 8080, plain HTTP on the pod
+  # network: controller-runtime's series plus the operator's view of every
+  # PlatformAgent, status.usage and status.phase as three gauge families
+  # (kubeagents_platformagent_usage, kubeagents_platformagent_usage_time_seconds,
+  # kubeagents_platformagent_phase), so Managed Prometheus reads the numbers
+  # the poller wrote. podMonitoring is the same tri-state as
+  # platformAgent.podMonitoring: null follows the cluster.
+  metrics:
+    enabled: true
+    podMonitoring: null
   # Admission webhooks for the PlatformAgent CR — defaulting, validation, and
   # delete protection, mirroring k8s-operator/config/webhook. Without them the
   # CRD's CEL rules and OpenAPI defaults still apply; everything the webhook

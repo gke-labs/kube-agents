@@ -537,6 +537,7 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     "tool_called": ("tool_names",),
     "worker_commands": ("required_patterns", "forbidden_patterns", "required_runs", "forbidden_runs", "forbidden_result_patterns"),
     "worker_agents": ("required_agents",),
+    "worker_budget": ("budget",),
     "replay_card": ("status_in", "status_not_in", "comment_phrases", "decoy_status_in"),
     # No assertion field: "the gateway would post nothing" is the assertion; `reply` only picks
     # which reply is graded.
@@ -591,6 +592,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # post a fired audit run produced is the report its `finish` rendered is the
     # whole assertion.
     "audit_chat_report_posted": (),
+    # This repository, agent-pod- and cluster-reading: the namespace names the
+    # burst whose admitted alerts must each have started a triage turn.
+    "triage_starts": ("namespace",),
 }
 
 # Check types that read live cluster state. A case using one is asserting on

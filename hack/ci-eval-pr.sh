@@ -2201,7 +2201,7 @@ esac
 # export below leaves them out too -- a roster name the suite never grades
 # would otherwise trip bench-gate's misspelled-roster banner on every run
 # of the lane. A check the transport blinds (tool_called, worker_commands,
-# worker_agents) is the scorer's to set aside, not this file's:
+# worker_agents, worker_budget) is the scorer's to set aside, not this file's:
 # docs/designs/eval-scorer.md, "The inject lane".
 INJECT_LANE_EXCLUSIONS_FILE="${SCRIPT_DIR}/${EVAL_INJECT_LANE_EXCLUSIONS_FILE}"
 INJECT_LANE_EXCLUDED="$(roster_entries "${INJECT_LANE_EXCLUSIONS_FILE}")"
@@ -2977,6 +2977,10 @@ unit_cost_hint() {
     obtainability-planted-pdb | stockout-pinned-pool) echo 900 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier) echo 900 ;;
     consistency-no-environment-label) echo 900 ;;
+    # Not measured yet: the same stream as the case above, plus a stack that
+    # opens the ledger, so it takes that case's hint until its record says
+    # otherwise.
+    fleet-audit-unread-target-keeps-finding) echo 900 ;;
     # Tofu too: a plant of a few kubectl execs and one drift collector run,
     # then the same full drift audit as consistency-drift-outlier. Unmeasured.
     fleet-audit-unchanged-finding-keeps-wording) echo 900 ;;
@@ -2986,6 +2990,11 @@ unit_cost_hint() {
     # A plain chat request that runs the compliance collector's sweep (#2386):
     # the audit band, without the ledger write.
     security-chat-request-runs-collector) echo 900 ;;
+    # Written to outrun the worker turn budget: about 150 trivial model calls,
+    # twice (the dispatcher retries the timed-out card once), on the agent's
+    # own cluster. 13-26 min a repetition at 90 turns on a dev install on
+    # 2026-10-20; priced for 150.
+    platform-worker-turn-budget) echo 2400 ;;
     # A plain chat request that now runs the waste collector's sweep (#2386):
     # the waste audit's band, without the ledger write.
     cost-chat-request-runs-collector) echo 900 ;;
@@ -3050,6 +3059,9 @@ unit_cost_hint() {
     # repetitions (615/715/166s, build 2097362391401500672); the 200s default
     # under-packs it by 3x.
     knowledge-grounding-sources-probe) echo 600 ;;
+    # Measured 1380-1640s a repetition on gkedemos2 (2026-10-22, ten runs back
+    # to back): a 20-minute settle after the plant, then a board read.
+    triage-start-burst) echo 1500 ;;
     # Presubmit since 2026-09-22 (#1023), nightly-only from 2026-09-15 before
     # that. Median of its three measured presubmit repetitions (737/599/1357s,
     # build 2099969322708373504); the 200s default under-packs it by 3x. The
@@ -3178,10 +3190,14 @@ unit_delegation_timeout() {
   case "$1" in
     compliance-rbac-overgrant | obtainability-planted-pdb | stockout-pinned-pool) echo 3000 ;;
     upgrade-readiness-lagging-cluster | consistency-drift-outlier | fleet-cost-idle-pool) echo 3000 ;;
-    consistency-no-environment-label) echo 3000 ;;
+    consistency-no-environment-label | fleet-audit-unread-target-keeps-finding) echo 3000 ;;
     fleet-audit-unchanged-finding-keeps-wording) echo 3000 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 3000 ;;
     obtainability-planted-orphan-service) echo 3000 ;;
+    # Two attempts of about 150 trivial calls each before the card settles; the
+    # default would cut the second attempt on a slow night and grade the
+    # repetition as infrastructure instead of reading the cap.
+    platform-worker-turn-budget) echo 3000 ;;
     *) echo "${AGENT_DELEGATION_TIMEOUT:-1800}" ;;
   esac
 }
@@ -3270,8 +3286,9 @@ STATE_DIR="$(mktemp -d)"
 #                 holds infra while waiting for it.
 #   per stream -- units that grade ONE audit stream never overlap, across
 #                 tasks: consistency-drift-outlier,
-#                 consistency-no-environment-label, and
-#                 fleet-audit-unchanged-finding-keeps-wording write the
+#                 consistency-no-environment-label,
+#                 fleet-audit-unchanged-finding-keeps-wording, and
+#                 fleet-audit-unread-target-keeps-finding write the
 #                 fleet-consistency-drift ledger, and audit_report.py finish
 #                 writes to the highest OPEN issue under the stream's label,
 #                 whichever unit opened it. Without this, one lane's ledger

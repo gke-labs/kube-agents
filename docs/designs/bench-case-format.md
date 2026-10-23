@@ -206,7 +206,7 @@ deployment's ready replicas land in a range). A fourth, `fleet_resource_property
 this repository's `resource_property` against the seeded-fleet cluster that carries a
 fixture role, named by `fixture_role:` rather than by cluster.
 
-Twelve read what the run produced, from this repository
+Fourteen read what the run produced, from this repository
 (`bench/kube_agents_bench/verifiers.py`, registered through the
 `devops_bench.verifiers` entry-point group in `bench/pyproject.toml`):
 `report_contains` (phrases in the agent's answer; its `forbidden_patterns`, `required_patterns` and
@@ -261,7 +261,17 @@ line is still graded; or with `required_runs` a script by its basename and the f
 follow it on the same shell segment, read from the command's argv as the shell splits
 it, so a quoted mention of the invocation is one word and not a run, and a run made through a script file or a shell's standard input is not read, since the argv names the file or the shell; each flag is read as the exact word, so the script named is built with `allow_abbrev=False`; `word_patterns` are regular expressions each of which some later word of the segment must match on its own, and `forbidden_runs` is the same shape for a run no worker may make, such as a `kubectl get` of the objects a script grades; with `after_result_pattern` the commands come from the workers' tagged `terminal` and `execute_code` calls in the trajectory instead, with their results as the record stores them, a JSON string with newlines escaped, and the forbidden set applies only to the calls after the first whose result matched, failed or not, one window per delegated card and the cards its worker fanned out; `forbidden_result_patterns` then grade the later results too; a trajectory with no tagged call at all, none readable (every code-tool argument withheld), a call with no numeric time, or a capture with gaps and no hit, is `status: "error"`, where a worker whose tagged calls are all MCP calls grades as zero commands), `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
-workers' trajectory entries), `replay_card` (the status and comments of the card a
+workers' trajectory entries), `worker_budget` (the turn budget a delegated worker ran under,
+read from two records: Hermes' one-shot checkpoint notice, `You have used N of M iterations`,
+which a kanban worker gets in its newest tool result at 90% of a finite cap and the worker
+capture carries in the tagged call's `result`, and the run row a worker that goes on to exhaust
+the cap closes with `Iteration budget exhausted (N/M)`; `budget` is the `M` every such record must
+name; a worker that finishes inside 90% of its cap records neither, so the check is for a card
+written to outrun the cap; a run whose cards have no run rows, in which no attempt
+ran out and none completed either (the harness archives a card still running at its delegation
+ceiling, which closes the attempt `reclaimed`), or whose capture recorded gaps and no attempt ran
+out, is `status: "error"`),
+`replay_card` (the status and comments of the card a
 card-wake replay planted, read before the harness archives it), `reply_is_silent`
 (whether the gateway would post the closing message, or with `reply: answer` a question
 replay's reply to the answer turn, at all, by its own silence rule), and
@@ -274,7 +284,7 @@ is not checked, and a missing command is
 `status: "error"` when the capture has gaps, the pod withheld the workers' arguments, or the
 trajectory holds no worker terminal call).
 
-Eleven read the install under test, nine of them from that file. `bootstrap_fanout` compares the
+Thirteen read the install under test, nine of them from that file. `bootstrap_fanout` compares the
 cluster cards filed for the onboarding discovery sweep, read from the agent pod's board, against the
 Cluster Agent profiles on its disk. Its `require` is `one_card_per_cluster_agent` (exactly
 one card per ready profile with a cluster identity, keyed and assigned to it, and no cluster
@@ -338,7 +348,13 @@ the `audit-chat-report` stack's state file, what the Session KV server stored fo
 job's threads since the fire, and the chat report the run's `finish` left on the shell sandbox, and
 passes when the stored post, the scheduled delivery (the table keeps the latest post per thread, so a mid-run `report_to_chat` is not graded), is that report; a run that left no report from `finish`,
 whose record predates the fire, or that did not finish every repository it started fails, and a
-silent run or one that never ended is an error.
+silent run or one that never ended is an error. `triage_starts`, in its own module
+(`bench/kube_agents_bench/triage_starts.py`), lists the pods in its `namespace` on the agent's cluster,
+joins the Session KV server's admitted `intercepted_events` rows for them (by pod UID) to the default
+profile's Hermes `state.db`, and passes when at least `min_alerts` pods have an admitted alert and every
+one of those alerts has a session with a message, a started triage turn; a session with no message is a
+lost start, because a create the daemon gave up on still commits, and fewer than `min_alerts` admitted
+alerts (the plant failed, or the daily Warning alert limit refused part of the burst) is an error.
 
 Two limits are worth knowing before choosing one. `tool_called` defaults to
 `scope: router`, the delegating turn's calls only — the harness appends the delegated

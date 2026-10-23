@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sweep leftover Compute networks, subnets and addresses planted by killed bench runs.
+"""Sweep leftover Compute networks, subnets, addresses and alert policies planted by killed bench runs.
 
 A bench stack that plants project-level Compute resources (such as
 prebuilt subnet exhaustion stacks) creates a VPC network, subnet,
@@ -32,6 +32,13 @@ Deletion order is strictly dependency-ordered:
 1. Addresses go first (releasing in-use IP reservations on the subnet).
 2. Subnets go second (removing the subnet from the VPC).
 3. Networks go third (deleting the empty VPC).
+
+Cloud Monitoring alert policies come last and depend on nothing. A stack that
+plants one (bench/tf/prebuilt/monitoring-alert-policy) labels it
+`managed-by=kube-agents-bench`, the label the per-run clusters carry; the
+sweep deletes a labelled policy older than `max_age_hours` by its creation
+time. A leftover is disabled and names no channel, so it costs clutter in a
+shared project, never a page (gke-labs/kube-agents#3797).
 """
 
 import argparse
@@ -53,6 +60,21 @@ import boskos_pool  # noqa: E402
 # bench/tf/prebuilt/subnet-range-exhaustion/main.tf) so leftovers from killed runs
 # can be safely identified and swept.
 PLANT_DESCRIPTION_PREFIX = "kube-agents-bench plant"
+# The label the bench's per-run clusters and the alert-policy stack set
+# (bench/tf/prebuilt/monitoring-alert-policy/main.tf, user_labels), and the
+# JSON key `gcloud monitoring policies list` carries it under.
+PLANT_LABEL_KEY = "managed-by"
+PLANT_LABEL_VALUE = "kube-agents-bench"
+ALERT_POLICY_LABELS_FIELD = "userLabels"
+# An alert policy's creation time sits under creationRecord.mutateTime.
+ALERT_POLICY_CREATED_FIELD = "creationRecord"
+ALERT_POLICY_CREATED_TIME_FIELD = "mutateTime"
+# The entry a refused policy list leaves in the failed alert_policies list,
+# in place of a policy name.
+ALERT_POLICY_LIST_FAILURE_NAME = "list"
+# datetime.fromisoformat before Python 3.11 accepts at most six fractional
+# digits; a Monitoring creationRecord.mutateTime carries up to nine.
+FRACTIONAL_SECONDS_RE = re.compile(r"(\.\d{6})\d+")
 DEFAULT_MAX_AGE_HOURS = 4.0
 MIN_MAX_AGE_HOURS = 2.0
 SECONDS_PER_HOUR = 3600.0
@@ -86,7 +108,7 @@ class SweepError(Exception):
 
     def __init__(self, message: str, deleted: dict | None = None):
         super().__init__(message)
-        self.deleted = deleted or {"addresses": [], "subnets": [], "networks": []}
+        self.deleted = deleted or {"addresses": [], "subnets": [], "networks": [], "alert_policies": []}
 
 
 def parse_timestamp(ts_str: str | None) -> datetime | None:
@@ -95,7 +117,7 @@ def parse_timestamp(ts_str: str | None) -> datetime | None:
         return None
     try:
         # Handles Z and explicit timezone offsets (+00:00, -07:00)
-        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(FRACTIONAL_SECONDS_RE.sub(r"\1", ts_str).replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt
@@ -123,6 +145,22 @@ def matches_plant_description(description: str | None) -> bool:
     if not description or not isinstance(description, str):
         return False
     return description.strip().startswith(PLANT_DESCRIPTION_PREFIX)
+
+
+def matches_plant_labels(labels: dict | None) -> bool:
+    """True if the resource's user labels carry managed-by=kube-agents-bench."""
+    if not isinstance(labels, dict):
+        return False
+    return labels.get(PLANT_LABEL_KEY) == PLANT_LABEL_VALUE
+
+
+def alert_policy_created(policy: dict) -> str | None:
+    """The policy's creation time (creationRecord.mutateTime), or None."""
+    record = policy.get(ALERT_POLICY_CREATED_FIELD)
+    if not isinstance(record, dict):
+        return None
+    value = record.get(ALERT_POLICY_CREATED_TIME_FIELD)
+    return value if isinstance(value, str) else None
 
 
 def resource_name(url_or_name: str | None) -> str:
@@ -167,20 +205,31 @@ def pool_projects(ci_deploy_script=CI_DEPLOY_SCRIPT) -> set[str]:
     return projects
 
 
-def list_compute_resources(project: str, resource_type: str, runner=subprocess.run) -> list[dict]:
-    """List Compute resources of a given type in a project as JSON dicts."""
-    cmd = ["gcloud", "compute", *resource_type.split(), "list", f"--project={project}", "--format=json"]
+def _list_json(cmd: list[str], what: str, project: str, runner=subprocess.run) -> list[dict]:
+    """Run a gcloud list command and return its JSON array, or raise SweepError."""
     proc = runner(cmd, capture_output=True, text=True, check=False)
     if proc.returncode != 0:
         err = (proc.stderr or "").strip()
-        raise SweepError(f"could not list {resource_type} in {project}: {err}")
+        raise SweepError(f"could not list {what} in {project}: {err}")
     try:
         items = json.loads(proc.stdout or "[]")
     except ValueError as exc:
-        raise SweepError(f"gcloud output for {resource_type} in {project} is not JSON: {exc}")
+        raise SweepError(f"gcloud output for {what} in {project} is not JSON: {exc}")
     if not isinstance(items, list):
-        raise SweepError(f"gcloud output for {resource_type} in {project} is not a list")
+        raise SweepError(f"gcloud output for {what} in {project} is not a list")
     return items
+
+
+def list_compute_resources(project: str, resource_type: str, runner=subprocess.run) -> list[dict]:
+    """List Compute resources of a given type in a project as JSON dicts."""
+    cmd = ["gcloud", "compute", *resource_type.split(), "list", f"--project={project}", "--format=json"]
+    return _list_json(cmd, resource_type, project, runner=runner)
+
+
+def list_alert_policies(project: str, runner=subprocess.run) -> list[dict]:
+    """List a project's Cloud Monitoring alert policies as JSON dicts."""
+    cmd = ["gcloud", "monitoring", "policies", "list", f"--project={project}", "--format=json"]
+    return _list_json(cmd, "alert policies", project, runner=runner)
 
 
 def sweep_project(
@@ -199,9 +248,14 @@ def sweep_project(
     the age threshold). Standalone/orphaned subnets or addresses are gated by
     their own creationTimestamp.
 
-    Deletes addresses first, then subnets, then networks.
+    Deletes addresses first, then subnets, then networks, then the alert
+    policies labelled managed-by=kube-agents-bench and older than
+    max_age_hours (gated on their own creation time; they depend on nothing).
+    The policies are listed after the Compute deletes, so a project whose
+    sweeper role predates the alert-policy permissions still gets its Compute
+    sweep before the refused list fails it.
     Returns a dict with lists of deleted resources:
-      {"addresses": [...], "subnets": [...], "networks": [...]}
+      {"addresses": [...], "subnets": [...], "networks": [...], "alert_policies": [...]}
     """
     if now is None:
         now = datetime.now(timezone.utc)
@@ -286,8 +340,8 @@ def sweep_project(
         if is_older_than(addr.get("creationTimestamp"), max_age_hours, now=now):
             addresses_to_delete.append(addr)
 
-    deleted = {"addresses": [], "subnets": [], "networks": []}
-    failed = {"addresses": [], "subnets": [], "networks": []}
+    deleted = {"addresses": [], "subnets": [], "networks": [], "alert_policies": []}
+    failed = {"addresses": [], "subnets": [], "networks": [], "alert_policies": []}
 
     try:
         # Step 1: Delete addresses
@@ -356,11 +410,43 @@ def sweep_project(
                 err = (del_proc.stderr or "").strip()
                 print(f"  could not delete network {name} in {project}: {err}", file=sys.stderr)
                 failed["networks"].append((name, err))
+
+        # Step 4: Delete alert policies (independent of the Compute chain). A
+        # refused list is recorded as a failure rather than raised here, so the
+        # error raised below still carries the Compute deletes and failures.
+        try:
+            raw_policies = list_alert_policies(project, runner=runner)
+        except SweepError as exc:
+            print(f"  {exc}", file=sys.stderr)
+            failed["alert_policies"].append((ALERT_POLICY_LIST_FAILURE_NAME, str(exc)))
+            raw_policies = []
+        policies_to_delete = [
+            pol for pol in raw_policies
+            if matches_plant_labels(pol.get(ALERT_POLICY_LABELS_FIELD))
+            and is_older_than(alert_policy_created(pol), max_age_hours, now=now)
+        ]
+        for pol in policies_to_delete:
+            full_name = pol.get("name", "")
+            name = resource_name(full_name)
+            if dry_run:
+                print(f"  would delete alert policy {name} in {project}")
+                deleted["alert_policies"].append(name)
+                continue
+
+            cmd = ["gcloud", "monitoring", "policies", "delete", full_name, f"--project={project}", "--quiet"]
+            del_proc = runner(cmd, capture_output=True, text=True, check=False)
+            if del_proc.returncode == 0:
+                print(f"  deleted alert policy {name} in {project}")
+                deleted["alert_policies"].append(name)
+            else:
+                err = (del_proc.stderr or "").strip()
+                print(f"  could not delete alert policy {name} in {project}: {err}", file=sys.stderr)
+                failed["alert_policies"].append((name, err))
     except Terminated as exc:
         setattr(exc, "deleted", deleted)
         raise
 
-    total_failed = len(failed["addresses"]) + len(failed["subnets"]) + len(failed["networks"])
+    total_failed = sum(len(v) for v in failed.values())
     if total_failed > 0:
         fault_msgs = []
         for kind, err_list in failed.items():
@@ -371,7 +457,8 @@ def sweep_project(
     verb = "would delete" if dry_run else "deleted"
     print(
         f"{project}: {verb} {len(deleted['addresses'])} address(es), "
-        f"{len(deleted['subnets'])} subnet(s), {len(deleted['networks'])} network(s)"
+        f"{len(deleted['subnets'])} subnet(s), {len(deleted['networks'])} network(s), "
+        f"{len(deleted['alert_policies'])} alert polic(y|ies)"
     )
     return deleted
 
@@ -387,6 +474,7 @@ def _counts(resources: dict | None, allow_empty: bool = False) -> dict | None:
         "addresses": len((resources or {}).get("addresses", [])),
         "subnets": len((resources or {}).get("subnets", [])),
         "networks": len((resources or {}).get("networks", [])),
+        "alert_policies": len((resources or {}).get("alert_policies", [])),
     }
     return counts if (allow_empty or any(counts.values())) else None
 
@@ -454,9 +542,11 @@ def sweep_pool(
     total_addr = sum(d.get("addresses", 0) for d in deleted.values())
     total_sub = sum(d.get("subnets", 0) for d in deleted.values())
     total_net = sum(d.get("networks", 0) for d in deleted.values())
+    total_pol = sum(d.get("alert_policies", 0) for d in deleted.values())
     print(
         f"swept {len(set(deleted) | set(failures))} project(s): "
-        f"deleted {total_addr} address(es), {total_sub} subnet(s), {total_net} network(s); "
+        f"deleted {total_addr} address(es), {total_sub} subnet(s), {total_net} network(s), "
+        f"{total_pol} alert polic(y|ies); "
         f"{len(failures)} failed, {len(unmapped)} unmapped, {len(skipped)} skipped"
     )
     return deleted, failures, unmapped
@@ -534,7 +624,7 @@ def main(argv=None) -> int:
         "--max-age-hours",
         type=parse_max_age_hours,
         default=DEFAULT_MAX_AGE_HOURS,
-        help=f"minimum age in hours of plant networks to sweep (default: {DEFAULT_MAX_AGE_HOURS}, min: {MIN_MAX_AGE_HOURS})",
+        help=f"minimum age in hours of plant networks and alert policies to sweep (default: {DEFAULT_MAX_AGE_HOURS}, min: {MIN_MAX_AGE_HOURS})",
     )
     parser.add_argument("--dry-run", action="store_true", help="report what would be deleted, delete nothing")
     parser.add_argument(

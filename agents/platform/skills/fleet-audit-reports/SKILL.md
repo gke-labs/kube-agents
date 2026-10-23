@@ -54,7 +54,8 @@ An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`,
   request, so this run's
   `silent_ok` was kept `false` and its counts may be measured against that `finish`.
 - `current_ids` is exactly what the body's hidden block published: the findings the body named, in
-  full or on one line, plus the ids the collector held. Derive this run's full set from `document`.
+  full or on one line, the ids the collector held, and the ids under _Not re-checked this run_
+  (previous findings on a target the run did not check). Derive this run's full set from `document`.
 - `inspect_s`, `publish_s` and `collect_s` are seconds: from `start` to `finish`, for `finish` to
   publish, and for the collector to run. An envelope has only the ones `finish` could measure.
   `show` gives them, with null for the others; `streams` does not carry them.

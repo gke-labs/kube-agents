@@ -401,6 +401,19 @@ def resolved_for(previous_body):
     ]
 
 
+
+def changed(head):
+    """(new, resolved) as an audit line states them; a count the line leaves out is 0."""
+    new = re.search(r"\b(\d+) new\b", head)
+    resolved = re.search(r"\b(\d+) resolved\b", head)
+    return (int(new.group(1)) if new else 0, int(resolved.group(1)) if resolved else 0)
+
+
+def clean_resolved(head):
+    """How many findings a clean audit line says were resolved, or None when the line is not clean."""
+    return changed(head)[1] if ": clean" in head else None
+
+
 def make_doc(findings=None, audit=AUDIT, clusters=None, skipped=None):
     if clusters is None:
         clusters = [
@@ -907,6 +920,14 @@ class BaseTestCase(unittest.TestCase):
         """
         self.without_run_record = True
 
+    def keep_findings_mtime(self):
+        """Let this test's findings file keep the age the test gave it.
+
+        `run_main` otherwise stamps it from the run record's clock before
+        `finish`, so a document aged on purpose would read as this run's.
+        """
+        self.findings_mtime_kept = True
+
     def run_main(self, argv):
         """Invoke the CLI, capturing stdout/stderr into self.out / self.err."""
         if (
@@ -920,10 +941,25 @@ class BaseTestCase(unittest.TestCase):
             # against; the generic stream declares postures now, so a run
             # that never called `start` here needs it or reads as no search.
             self.record_run(audit=AUDIT)
-            # `start` precedes the findings a real run writes; a document older
-            # than the record reads as an earlier run's.
-            if "--findings-file" in argv:
-                os.utime(argv[argv.index("--findings-file") + 1])
+        if (
+            argv
+            and argv[0] == "finish"
+            and "--findings-file" in argv
+            and not getattr(self, "findings_mtime_kept", False)
+        ):
+            # `start` precedes the findings a real run writes, and `finish`
+            # refuses a document older than the run record as an earlier
+            # run's. The file is stamped here, after every record a test or
+            # the branch above wrote, from the clock the record read: left to
+            # the kernel, a write or a bare `utime` takes the coarse clock,
+            # which trails that one by up to a tick, so for a few milliseconds
+            # after each second boundary the file would land below the
+            # record's whole-second stamp. A test about a document that is
+            # older on purpose calls `keep_findings_mtime`.
+            findings_file = argv[argv.index("--findings-file") + 1]
+            if os.path.exists(findings_file):
+                now = time.time_ns()
+                os.utime(findings_file, ns=(now, now))
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = audit_report.main(argv)
@@ -14709,6 +14745,604 @@ class TestPartialCoverageGating(HarnessTestCase):
                 self.assertEqual(bool(out["coverage_gaps"]), out["partial"])
 
 
+class TestUnreadTargetKeepsItsFindings(HarnessTestCase):
+    """A findings run over a gap keeps the previous findings on a target it did not check.
+
+    Before, the body was written again from this run's document alone, so a
+    previous finding on a cluster the run could not read went off the ledger
+    and out of the hidden block. The next full run then announced it as new
+    if it was still there, and never announced a fix made during the gap.
+    """
+
+    SKIPPED = [{"cluster": "stage-eu", "reason": "control plane unreachable"}]
+    PROD = {"name": "prod-us-east", "location": "us-east1", "project": "acme-prod"}
+    STAGE = {"name": "stage-eu", "location": "europe-west1", "project": "acme-stage"}
+
+    def stage_finding(self):
+        return make_finding(
+            fid="stage", cluster="stage-eu", title="Stage namespace has no NetworkPolicy"
+        )
+
+    def stage_id(self):
+        return derived_id(cluster="stage-eu", fid="stage")
+
+    def previous_ledger(self, *findings):
+        previous = published_body(make_doc(findings=list(findings)), generated_at=NOW)
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous}),
+        }
+        return previous
+
+    def written_body(self):
+        return self.harness.bodies_for("issue-update")[-1]
+
+    def test_a_finding_on_a_skipped_cluster_stays_as_a_held_row(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        doc = make_doc(findings=[make_finding()], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+
+        body = self.written_body()
+        self.assertIn(self.stage_id(), audit_report.parse_delta_block(body))
+        self.assertIn(audit_report.UNREAD_HELD_HEADING, body)
+        self.assertIn("Stage namespace has no NetworkPolicy", body)
+        self.assertIn("- **Not re-checked:** `stage-eu` was not read this run.", body)
+        # The row is read back next run like any finding's.
+        self.assertEqual(
+            audit_report.parse_finding_locations(body)[self.stage_id()]["cluster"], "stage-eu"
+        )
+        # Not in the held-id list, so a run without a manifest does not carry it
+        # after its target is read again.
+        self.assertEqual(audit_report.parse_held_ids(body), [])
+        payload = self.stdout_json()
+        self.assertEqual(payload["resolved"], 0)
+        self.assertEqual(payload["new"], 0)
+        self.assertIn(f"HELD: {self.stage_id()}", self.err)
+
+    def test_a_finding_whose_check_did_not_run_on_its_cluster_stays(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        roster = [c for c in audit_report.audit_checks(AUDIT) if c != "netpol-missing"]
+        stage = {**self.STAGE, "checks_run": roster, "limitations": "netpol read failed"}
+        doc = make_doc(findings=[make_finding()], clusters=[self.PROD, stage])
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+
+        body = self.written_body()
+        self.assertIn(self.stage_id(), audit_report.parse_delta_block(body))
+        self.assertIn("`netpol-missing` did not run on `stage-eu` this run", body)
+
+    def test_a_finding_on_a_target_that_was_checked_is_not_carried(self):
+        """Read and checked: the finding is reported again or it is gone."""
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        # The gap is on another cluster; stage-eu ran every check.
+        doc = make_doc(
+            findings=[make_finding()],
+            clusters=[self.PROD, self.STAGE],
+            skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}],
+        )
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+
+        body = self.written_body()
+        self.assertNotIn(self.stage_id(), audit_report.parse_delta_block(body))
+        self.assertNotIn(audit_report.UNREAD_HELD_HEADING, body)
+
+    def test_a_check_declared_not_applicable_is_not_carried(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        roster = [c for c in audit_report.audit_checks(AUDIT) if c != "netpol-missing"]
+        stage = {
+            **self.STAGE,
+            "checks_run": roster,
+            "checks_not_applicable": [{"check": "netpol-missing", "reason": "the cluster has no such resource kind, so the check cannot apply"}],
+        }
+        doc = make_doc(
+            findings=[make_finding()],
+            clusters=[self.PROD, stage],
+            skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}],
+        )
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        self.assertNotIn(self.stage_id(), audit_report.parse_delta_block(self.written_body()))
+
+    def test_a_run_with_no_gap_carries_nothing(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        self.assertEqual(self.run_finish(make_doc(findings=[make_finding()])), 0, self.err)
+        self.assertNotIn(self.stage_id(), audit_report.parse_delta_block(self.written_body()))
+        self.assertEqual(self.stdout_json()["resolved"], 1)
+
+    def test_the_next_full_run_announces_a_fix_made_during_the_gap(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        gap = make_doc(findings=[make_finding()], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        # The second run reads the store the first run wrote.
+        del self.harness.replies["issue-view !comments"]
+        self.assertEqual(self.run_finish(make_doc(findings=[make_finding()])), 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["resolved"], 1)
+        self.assertEqual(payload["new"], 0)
+        comment = self.harness.bodies_for("issue-comment")[-1]
+        self.assertIn(self.stage_id(), comment)
+
+    def test_the_next_full_run_does_not_announce_a_held_finding_as_new(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        gap = make_doc(findings=[make_finding()], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        del self.harness.replies["issue-view !comments"]
+        both = make_doc(findings=[make_finding(), self.stage_finding()])
+        self.assertEqual(self.run_finish(both), 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["new"], 0)
+        self.assertEqual(payload["resolved"], 0)
+
+    def test_a_second_gap_run_keeps_the_row(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        gap = make_doc(findings=[make_finding()], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        del self.harness.replies["issue-view !comments"]
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        body = self.written_body()
+        self.assertIn(self.stage_id(), audit_report.parse_delta_block(body))
+        self.assertIn("Stage namespace has no NetworkPolicy", body)
+
+    def test_a_held_row_is_not_reported_as_no_longer_reported(self):
+        """The body shows the finding as not re-checked, so the run must not say it left the ledger."""
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        gap = make_doc(findings=[make_finding()], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        self.assertIn(self.stage_id(), audit_report.parse_delta_block(self.written_body()))
+        self.assertNotIn(audit_report.UNREPORTED_UNDER_GAP_KEY, self.stdout_json())
+        stored = json.loads((self.store_dir() / "latest.json").read_text(encoding="utf-8"))
+        self.assertNotIn(audit_report.REPORTED_UNDER_GAP_KEY, stored)
+
+    def test_a_clean_run_over_the_gap_does_not_report_a_held_row_as_dropped(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        gap = make_doc(findings=[make_finding()], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        del self.harness.replies["issue-view !comments"]
+        clean = make_doc(findings=[], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(clean), 0, self.err)
+        # The prod finding was checked and not reported; the stage one was not checked.
+        self.assertEqual(
+            self.stdout_json()[audit_report.UNREPORTED_UNDER_GAP_KEY],
+            [derived_id()],
+        )
+
+    def run_tiers_across_two_gap_runs(self, *tiers):
+        """A gap run, a second gap run and a complete run, with the held span forced to a lower tier.
+
+        `tiers` names the renderers that are made too long for the body, so
+        `render_issue_body` falls to the tier below them.
+        """
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        for name in tiers:
+            real = getattr(audit_report, name)
+            self.patch_attr(
+                name,
+                lambda *a, _real=real, **k: _real(*a, **k) + ["x" * audit_report.BODY_BUDGET],
+            )
+        gap = make_doc(findings=[make_finding()], clusters=[self.PROD], skipped=self.SKIPPED)
+        for _ in range(2):
+            self.assertEqual(self.run_finish(gap), 0, self.err)
+            body = self.written_body()
+            self.assertNotIn("Stage namespace has no NetworkPolicy", body)
+            self.assertIn(self.stage_id(), audit_report.parse_delta_block(body))
+            # The second run reads the store the first run wrote.
+            self.harness.replies.pop("issue-view !comments", None)
+        both = make_doc(findings=[make_finding(), self.stage_finding()])
+        self.assertEqual(self.run_finish(both), 0, self.err)
+        self.assertEqual(self.stdout_json()["new"], 0)
+
+    def test_a_held_id_in_the_note_tier_survives_the_next_gap_run(self):
+        self.run_tiers_across_two_gap_runs("_render_collector_held")
+
+    def test_a_held_id_in_the_ids_only_tier_survives_the_next_gap_run(self):
+        self.run_tiers_across_two_gap_runs("_render_collector_held", "_render_held_note")
+
+    def test_a_clean_run_that_keeps_the_body_keeps_the_stored_places(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        real = audit_report._render_collector_held
+        self.patch_attr(
+            "_render_collector_held",
+            lambda *a, **k: real(*a, **k) + ["x" * audit_report.BODY_BUDGET],
+        )
+        gap = make_doc(findings=[make_finding()], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        del self.harness.replies["issue-view !comments"]
+        clean = make_doc(findings=[], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(clean), 0, self.err)
+        stored = json.loads((self.store_dir() / "latest.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            [e["id"] for e in stored[audit_report.NOT_RECHECKED_KEY]], [self.stage_id()]
+        )
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        self.assertIn(self.stage_id(), audit_report.parse_delta_block(self.written_body()))
+
+    def test_an_id_with_no_place_is_logged_when_it_is_dropped(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        previous = published_body(make_doc(findings=[make_finding()]), generated_at=NOW)
+        orphan = "netpol-missing.stage-eu.payments.orphan"
+        previous = previous.replace(
+            audit_report.delta_block(audit_report.parse_delta_block(previous)),
+            audit_report.delta_block(audit_report.parse_delta_block(previous) + [orphan]),
+        )
+        self.assertIn(orphan, audit_report.parse_delta_block(previous))
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous}),
+        }
+        gap = make_doc(findings=[make_finding()], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        self.assertIn(orphan, self.err)
+        self.assertIn("no recorded place", self.err)
+
+    def test_a_remediate_on_a_held_row_is_deferred_on_a_clean_run_over_the_same_gap(self):
+        """The row says "not re-checked", so the answer must not say "no longer reproduces"."""
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        gap = make_doc(findings=[make_finding()], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        self.assertIn(self.stage_id(), audit_report.parse_delta_block(self.written_body()))
+        del self.harness.replies["issue-view !comments"]
+        self.harness.replies["*-view comments"] = comments_view(
+            {"comments": [comment(f"/remediate {self.stage_id()}")]}
+        )
+        clean = make_doc(findings=[], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(clean), 0, self.err)
+        self.assertEqual(self.stdout_json()["status"], "CLEAN")
+        posted = self.harness.bodies_for("issue-comment")
+        deferred = [b for b in posted if audit_report.deferred_marker("IC_1") in b]
+        self.assertEqual(len(deferred), 1, posted)
+        self.assertIn("did not read or did not check its target", deferred[0])
+        for body in posted:
+            self.assertNotIn("no longer reproduces", body)
+            self.assertNotIn(audit_report.acked_marker("IC_1"), body)
+
+    def test_a_clean_run_over_the_gap_keeps_held_ids_past_the_cap(self):
+        """The clean branch keeps the body as it is, so an id past the cap is still on it."""
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        other = make_finding(fid="stage-b", cluster="stage-eu", title="Stage B has no NetworkPolicy")
+        self.previous_ledger(make_finding(), self.stage_finding(), other)
+        past_cap = max(self.stage_id(), derived_id(cluster="stage-eu", fid="stage-b"))
+        self.patch_attr("MAX_HELD_IDS", 1)
+        self.harness.replies["*-view comments"] = comments_view(
+            {"comments": [comment(f"/remediate {past_cap}")]}
+        )
+        clean = make_doc(findings=[], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(clean), 0, self.err)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "CLEAN")
+        self.assertNotIn("stops tracking", self.err)
+        self.assertIn(f"HELD: {past_cap}", self.err)
+        self.assertNotIn(past_cap, payload.get(audit_report.UNREPORTED_UNDER_GAP_KEY, []))
+        posted = self.harness.bodies_for("issue-comment")
+        deferred = [b for b in posted if audit_report.deferred_marker("IC_1") in b]
+        self.assertEqual(len(deferred), 1, posted)
+        for body in posted:
+            self.assertNotIn("no longer reproduces", body)
+
+    def test_a_findings_run_over_the_gap_caps_held_ids_and_says_so(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        other = make_finding(fid="stage-b", cluster="stage-eu", title="Stage B has no NetworkPolicy")
+        self.previous_ledger(make_finding(), self.stage_finding(), other)
+        past_cap = max(self.stage_id(), derived_id(cluster="stage-eu", fid="stage-b"))
+        self.patch_attr("MAX_HELD_IDS", 1)
+        gap = make_doc(findings=[make_finding()], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        self.assertNotIn(past_cap, audit_report.parse_delta_block(self.written_body()))
+        self.assertIn("stops tracking 1 previous finding(s) on a target this run did not check", self.err)
+        self.assertIn(past_cap, self.err)
+
+    def test_a_remediate_on_a_held_row_is_deferred_on_the_findings_branch(self):
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.previous_ledger(make_finding(), self.stage_finding())
+        self.harness.replies["*-view comments"] = comments_view(
+            {"comments": [comment(f"/remediate {self.stage_id()}")]}
+        )
+        gap = make_doc(findings=[make_finding()], clusters=[self.PROD], skipped=self.SKIPPED)
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        self.assertEqual(self.stdout_json()["status"], "UPDATED")
+        posted = self.harness.bodies_for("issue-comment")
+        deferred = [b for b in posted if audit_report.deferred_marker("IC_1") in b]
+        self.assertEqual(len(deferred), 1, posted)
+        self.assertIn("did not read or did not check its target", deferred[0])
+        for body in posted:
+            self.assertNotIn(audit_report.refused_marker("IC_1"), body)
+
+    def test_an_id_the_collector_flags_gets_the_collector_reason_first(self):
+        request = {
+            "id": "c1",
+            "body": "/remediate both-id",
+            "author": {"login": "operator"},
+            "authorAssociation": "OWNER",
+        }
+        requests = audit_report.parse_remediate_commands(
+            [request], [], collector_flagged={"both-id"}, unread_held={"both-id"}
+        )
+        [reason] = requests.refusals[0]["reasons"]
+        self.assertEqual(reason, audit_report.collector_candidate_reason("both-id"))
+
+    def test_a_remediate_on_a_held_row_is_deferred_not_refused(self):
+        requests = audit_report.parse_remediate_commands(
+            [
+                {
+                    "id": "c1",
+                    "body": "/remediate stage-id",
+                    "author": {"login": "operator"},
+                    "authorAssociation": "OWNER",
+                }
+            ],
+            [],
+            unread_held={"stage-id"},
+        )
+        self.assertEqual(len(requests.refusals), 1)
+        self.assertTrue(requests.refusals[0].get("deferred"))
+        self.assertIn("did not read or did not check its target", requests.refusals[0]["reasons"][0])
+
+
+class TestUnreadTargetReason(unittest.TestCase):
+    """Which previous findings sit on a target this run did not check."""
+
+    def doc(self, audit, clusters, skipped=()):
+        return {"audit": audit, "scope": {"clusters": clusters, "skipped": list(skipped)}}
+
+    def test_a_subnet_under_a_skipped_project_was_not_read(self):
+        audit = "gcp-networking-fabric-audit"
+        data = self.doc(
+            audit,
+            [{"name": "project/other", "checks_run": []}, {"name": "other/us-east1/a", "checks_run": []}],
+            [{"cluster": "project/acme", "reason": "permission denied"}],
+        )
+        self.assertEqual(
+            audit_report.unread_target_reason(data, "subnet-ip-exhaustion", "acme/us-east1/b"),
+            "project `acme` was not read this run",
+        )
+        self.assertIsNone(
+            audit_report.unread_target_reason(data, "subnet-ip-exhaustion", "gone/us-east1/b")
+        )
+
+    def test_a_skipped_cluster_named_like_a_project_target_is_not_that_project(self):
+        """`project-acme` and `project/acme` segment the same; only the second is a project."""
+        audit = "gcp-networking-fabric-audit"
+        data = self.doc(
+            audit,
+            [{"name": "project/other", "checks_run": []}, {"name": "other/us-east1/a", "checks_run": []}],
+            [{"cluster": "project-acme", "reason": "permission denied"}],
+        )
+        self.assertIsNone(
+            audit_report.unread_target_reason(data, "subnet-ip-exhaustion", "acme/us-east1/b")
+        )
+
+    def test_an_id_the_document_resolved_is_not_kept(self):
+        """The run says the finding is gone, so it does not also say it did not check it."""
+        place = {"check": "netpol-missing", "cluster": "stage-eu", "namespace": "payments", "object": "Namespace/payments"}
+        fid = audit_report.published_id(place)
+        body = audit_report.delta_block([fid])
+        memory = {"document": {"findings": [{**place, "id": fid, "title": "Gone"}]}}
+        data = self.doc(AUDIT, [{"name": "stage-eu", "checks_run": []}])
+        self.assertEqual(
+            [e["id"] for e in audit_report.unread_held_entries(body, memory, data, exclude=set())], [fid]
+        )
+        data["resolved_because"] = [{**place, "reason": "kubectl showed the namespace has a policy now"}]
+        self.assertEqual(audit_report.unread_held_entries(body, memory, data, exclude=set()), [])
+
+    def test_a_target_of_a_kind_with_no_entry_was_not_read(self):
+        audit = "gcp-networking-fabric-audit"
+        checks = [{"check": c, "command": "gcloud x"} for c in audit_report.audit_target_checks(audit, "project/acme")]
+        data = self.doc(audit, [{"name": "project/acme", "checks_run": checks}])
+        self.assertEqual(
+            audit_report.unread_target_reason(data, "subnet-ip-exhaustion", "acme/us-east1/b"),
+            "no subnet target was read this run",
+        )
+
+    def test_a_cluster_that_left_the_fleet_is_not_held(self):
+        data = self.doc(AUDIT, [{"name": "prod-us-east", "checks_run": []}])
+        self.assertIsNone(audit_report.unread_target_reason(data, "netpol-missing", "deleted"))
+
+    def test_an_id_with_no_known_place_is_not_kept(self):
+        """A row held by id alone never gets a place back, so it would stay for good."""
+        body = audit_report.delta_block(["netpol-missing.x.y.z"])
+        data = self.doc(AUDIT, [], [{"cluster": "stage-eu", "reason": "x"}])
+        self.assertEqual(audit_report.unread_held_entries(body, None, data, exclude=set()), [])
+
+    def test_the_candidates_and_places_come_from_the_document_the_body_renders(self):
+        body = audit_report.delta_block(["netpol-missing.y.y.y"])
+        finding = {"check": "netpol-missing", "namespace": "payments", "object": "Namespace/cut"}
+        memory = {
+            "ledger_document": {"findings": [{**finding, "id": "rendered", "cluster": "stage-eu", "title": "Shown"}]},
+            "document": {"findings": [{**finding, "id": "own", "cluster": "stage-eu", "title": "Not shown"}]},
+        }
+        data = self.doc(AUDIT, [], [{"cluster": "stage-eu", "reason": "x"}])
+        entries = audit_report.unread_held_entries(body, memory, data, exclude=set())
+        self.assertEqual([(e["id"], e["title"]) for e in entries], [("rendered", "Shown")])
+
+    def truncated_previous(self):
+        """A previous body the budget truncated: prod findings named, stage-eu's minor omitted."""
+        # More criticals than one line each can name, so the body names
+        # only criticals and omits the minor: a finding that a name fits is
+        # listed on one line, and is in the hidden block.
+        prod = [
+            make_finding(fid=f"p-{n:04d}", severity="critical", cluster="prod-us-east")
+            for n in range(400)
+        ]
+        cut = make_finding(fid="cut", severity="minor", cluster="stage-eu", title="Cut for room")
+        doc = make_doc(findings=prod + [cut])
+        audit_report.validate_findings(doc, AUDIT)
+        rendered = audit_report.render_issue_body(doc, generated_at=NOW)
+        cut_id = derived_id(cluster="stage-eu", fid="cut")
+        return rendered, doc, cut_id
+
+    def test_an_id_the_body_budget_cut_is_a_candidate(self):
+        rendered, doc, cut_id = self.truncated_previous()
+        # A real truncated body: the budget cut the stage-eu finding, so it
+        # is not in the delta block.
+        self.assertIn(cut_id, [f["id"] for f in rendered.omitted])
+        self.assertNotIn(cut_id, audit_report.parse_delta_block(rendered.body))
+        unread = make_doc(findings=[], clusters=[{"name": "prod-us-east"}], skipped=[{"cluster": "stage-eu", "reason": "x"}])
+        # With the stored document, the cut finding keeps its title and place.
+        [entry] = audit_report.unread_held_entries(
+            rendered.body, {"document": doc}, unread, exclude=set()
+        )
+        self.assertEqual(entry["id"], cut_id)
+        self.assertEqual(entry["title"], "Cut for room")
+        self.assertEqual(entry["cluster"], "stage-eu")
+        # Without it nothing places the cut id, and it was never in the hidden
+        # block, so it is not held by id alone.
+        self.assertEqual(audit_report.unread_held_entries(rendered.body, None, unread, exclude=set()), [])
+
+    def test_a_finding_listed_on_one_line_keeps_its_place_without_the_store(self):
+        # The previous body listed the finding on one line (no full block),
+        # so its id is in the hidden block and its row gives the place.
+        doc = make_doc(findings=bulk_findings(250))
+        audit_report.validate_findings(doc, AUDIT)
+        rendered = audit_report.render_issue_body(doc, generated_at=NOW)
+        self.assertTrue(rendered.listed, "fixture must overflow the full rows")
+        listed = rendered.listed[-1]
+        unread = make_doc(findings=[], clusters=[{"name": "stage-eu"}], skipped=[{"cluster": "prod-us-east", "reason": "x"}])
+        entries = {e["id"]: e for e in audit_report.unread_held_entries(rendered.body, None, unread, exclude=set())}
+        entry = entries[listed["id"]]
+        self.assertEqual(entry["title"], listed["title"])
+        self.assertEqual(
+            (entry["cluster"], entry["namespace"], entry["object"]),
+            (listed["cluster"], listed["namespace"], listed["object"]),
+        )
+
+    def test_a_cut_id_on_a_target_that_was_checked_is_not_kept(self):
+        rendered, doc, cut_id = self.truncated_previous()
+        read = make_doc(findings=[], skipped=[{"cluster": "dr-west", "reason": "x"}])
+        ids = [e["id"] for e in audit_report.unread_held_entries(rendered.body, {"document": doc}, read, exclude=set())]
+        self.assertNotIn(cut_id, ids)
+
+    def test_a_derived_check_is_kept_where_a_roster_check_did_not_run(self):
+        audit = "fleet-consistency-drift"
+        command = {"command": "gcloud container clusters list --format=json"}
+        partly = self.doc(audit, [{"name": "a/b/host", "checks_run": [{"check": "no-environment-label", **command}]}])
+        reason = audit_report.unread_target_reason(partly, "uncohorted", "a/b/host")
+        self.assertIsNotNone(reason)
+        self.assertIn("`uncohorted` is read from checks that did not all run", reason)
+        whole = self.doc(
+            audit,
+            [{"name": "a/b/host", "checks_run": [{"check": c, **command} for c in audit_report.audit_checks(audit)]}],
+        )
+        self.assertIsNone(audit_report.unread_target_reason(whole, "uncohorted", "a/b/host"))
+        # A slug that is neither on the roster nor derived is not this stream's.
+        self.assertIsNone(audit_report.unread_target_reason(partly, "not-a-check", "a/b/host"))
+
+
+class TestUnreadHeldRendering(unittest.TestCase):
+    """The held rows for an unchecked target, under every tier of the held span."""
+
+    def entries(self):
+        unread = {
+            "id": "netpol-missing.stage-eu.payments.a",
+            "title": "Stage has no policy",
+            "check": "netpol-missing",
+            "cluster": "stage-eu",
+            "namespace": "payments",
+            "object": "Namespace/a",
+            "commands": [audit_report.COLLECTOR_COMMAND_UNRECORDED],
+            audit_report.UNREAD_REASON_KEY: "`stage-eu` was not read this run",
+        }
+        flagged = {
+            "id": "netpol-missing.prod.payments.b",
+            "title": "Prod has no policy",
+            "check": "netpol-missing",
+            "cluster": "prod",
+            "namespace": "payments",
+            "object": "Namespace/b",
+            "commands": ["kubectl get netpol"],
+        }
+        return unread, flagged
+
+    def test_alone_it_has_its_own_heading_and_no_held_id(self):
+        unread, _ = self.entries()
+        for lines in (
+            audit_report._render_collector_held([unread]),
+            audit_report._render_collector_held([unread], detail=False),
+            audit_report._render_held_note([unread]),
+        ):
+            text = "\n".join(lines)
+            with self.subTest(text=text[:60]):
+                self.assertIn(audit_report.UNREAD_HELD_HEADING, text)
+                self.assertNotIn(audit_report.HELD_SECTION_HEADING, text)
+                self.assertEqual(audit_report.parse_held_ids(text), [])
+
+    def test_beside_collector_rows_it_comes_after_them(self):
+        unread, flagged = self.entries()
+        text = "\n".join(audit_report._render_collector_held([flagged, unread]))
+        self.assertLess(text.index(audit_report.HELD_SECTION_HEADING), text.index(audit_report.UNREAD_HELD_SUBHEADING))
+        self.assertEqual(audit_report.parse_held_ids(text), [flagged["id"]])
+        self.assertIn("1 previous finding this run's document did not carry", text)
+        note = "\n".join(audit_report._render_held_note([flagged, unread]))
+        self.assertIn("1 previous finding(s) this run's document did not carry", note)
+        self.assertIn(audit_report.UNREAD_HELD_SUBHEADING, note)
+
+    def test_an_overflow_past_the_cap_is_stated_on_every_tier_that_has_text(self):
+        unread, flagged = self.entries()
+        for lines in (
+            audit_report._render_collector_held([unread], unread_overflow=3),
+            audit_report._render_collector_held([flagged, unread], detail=False, unread_overflow=3),
+            audit_report._render_held_note([unread], unread_overflow=3),
+            audit_report._render_held_note([flagged, unread], unread_overflow=3),
+        ):
+            self.assertIn("_3 more previous finding(s) are on a target", "\n".join(lines))
+        self.assertNotIn("more previous finding(s)", "\n".join(audit_report._render_collector_held([unread])))
+        body = audit_report.render_issue_body(make_doc(), generated_at=NOW, held=[unread], unread_overflow=3).body
+        self.assertIn("_3 more previous finding(s) are on a target", body)
+
+    def test_every_tier_lists_its_id_apart_from_the_held_ids(self):
+        unread, flagged = self.entries()
+        for held in ([unread], [flagged, unread]):
+            for lines in (
+                audit_report._render_collector_held(held),
+                audit_report._render_collector_held(held, detail=False),
+                audit_report._render_held_note(held),
+                audit_report._render_held_ids_only(held),
+            ):
+                text = "\n".join(lines)
+                with self.subTest(held=len(held), text=text[:60]):
+                    self.assertIn(
+                        f'<!-- {audit_report.NOT_RECHECKED_IDS_COMMENT}: ["{unread["id"]}"] -->', text
+                    )
+                    self.assertNotIn(unread["id"], audit_report.parse_held_ids(text))
+        # No list when nothing is held for an unchecked target.
+        self.assertNotIn(
+            audit_report.NOT_RECHECKED_IDS_COMMENT,
+            "\n".join(audit_report._render_held_ids_only([flagged])),
+        )
+
+    def test_a_body_that_lists_findings_on_one_line_keeps_its_id(self):
+        # The one-line rows fill most of the room that the findings leave, so
+        # the held span can fall to a tier with no row. In every tier the id
+        # is in the hidden block and in the not-re-checked list, and not in
+        # the held ids.
+        unread, _ = self.entries()
+        for count in (250, 1000):
+            rendered = audit_report.render_issue_body(
+                make_doc(findings=bulk_findings(count)), generated_at=NOW, held=[unread]
+            )
+            with self.subTest(count=count):
+                self.assertTrue(rendered.listed)
+                self.assertIn(unread["id"], audit_report.parse_delta_block(rendered.body))
+                self.assertIn(f'{audit_report.NOT_RECHECKED_IDS_COMMENT}: ["{unread["id"]}"]', rendered.body)
+                self.assertEqual(audit_report.parse_held_ids(rendered.body), [])
+                self.assertLessEqual(len(rendered.body), GITHUB_BODY_LIMIT)
+
+    def test_the_body_keeps_its_id_in_the_hidden_block(self):
+        unread, _ = self.entries()
+        rendered = audit_report.render_issue_body(make_doc(), generated_at=NOW, held=[unread])
+        self.assertIn(unread["id"], audit_report.parse_delta_block(rendered.body))
+        self.assertNotIn(unread["id"], rendered.rendered_ids)
+
+
 # --------------------------------------------------------------------------- #
 # Close semantics — whose close is final
 # --------------------------------------------------------------------------- #
@@ -19836,6 +20470,7 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
 
     def test_a_findings_file_written_before_start_is_refused(self):
         self.harness.replies = {"issue-list": issues_view([])}
+        self.keep_findings_mtime()
         doc_path = self.write_findings(make_doc())
         os.utime(doc_path, (1, 1))
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
@@ -21071,6 +21706,32 @@ class TestFinishManifestFlag(HarnessTestCase):
         for key in ("unpublished_candidates", "wholly_unpublished_checks", "uncorroborated_findings"):
             self.assertNotIn(key, payload)
 
+    def test_a_finish_just_after_a_second_boundary_is_not_refused_as_predating(self):
+        """The run record is stamped to the whole second, and the findings file
+        is written moments later. A file stamp from a clock that trails the
+        record's by a few milliseconds reads as an earlier run's document for a
+        moment after every second boundary, whoever wrote the record, and the
+        run is refused."""
+        self.harness.replies = {"issue-list": issues_view([])}
+        record = Path(audit_report.run_record_path_for(AUDIT))
+        # `run_main` writes the record when none is there; a test that writes
+        # it first, as `record_run` does, is the other path to `finish`.
+        openers = [("run_main", lambda: None), ("the test", lambda: self.record_run(audit=AUDIT))]
+        for boundary in range(3):
+            who, open_run = openers[boundary % len(openers)]
+            with self.subTest(boundary=boundary, record_by=who):
+                # A fresh record each time, so the opener writes it again.
+                record.unlink(missing_ok=True)
+                # Sleep to just short of the boundary, spin the last stretch.
+                next_second = int(time.time()) + 1
+                time.sleep(max(0.0, next_second - time.time() - 0.005))
+                while time.time() < next_second:
+                    pass
+                open_run()
+                rc = self.run_finish(make_doc(findings=[]))
+                self.assertNotIn("was last written before this run", self.err)
+                self.assertEqual(rc, 0, self.err)
+
     def test_a_manifest_adds_the_collector_keys_to_the_payload(self):
         self.harness.replies = {"issue-list": {"issues": []}}
         rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(_full_manifest())])
@@ -21575,6 +22236,139 @@ class TestFinishManifestFlag(HarnessTestCase):
         comment = " ".join(self.harness.bodies_for("proposal-*"))
         self.assertIn("declared to need the `default` ServiceAccount's token", comment)
 
+    def test_a_partial_run_keeps_a_shielded_pull_request_open_for_a_not_re_checked_finding(self):
+        # #6 covers api (declared, so shielded) and a finding on dr-west, which
+        # this run did not read. The dr-west finding is kept as not re-checked,
+        # so it counts as current for the shield's close, and #6 stays open:
+        # only #9, whose findings are all under the shield, is closed.
+        path = "clusters/prod-us-east/payments/default-sa-automount.yaml"
+        api = make_finding(fid="api", check="default-sa-automount", obj="Deployment/api", title="api", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        worker = make_finding(fid="worker", check="default-sa-automount", obj="Deployment/worker", title="worker", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        far = make_finding(fid="far", check="default-sa-automount", cluster="dr-west", namespace="billing", obj="Deployment/far", title="far", severity="major")
+        previous_doc = make_doc(
+            findings=[api, worker, far],
+            audit=AUDIT,
+            clusters=[
+                {"name": "prod-us-east", "location": "us-east1", "project": "acme-prod"},
+                {"name": "stage-eu", "location": "europe-west1", "project": "acme-stage"},
+                {"name": "dr-west", "location": "us-west1", "project": "acme-dr"},
+            ],
+        )
+        previous_body = published_body(previous_doc, generated_at=NOW)
+        self.declaring_replies(previous_body)
+        api_id = derived_id(check="default-sa-automount", obj="Deployment/api")
+        worker_id = derived_id(check="default-sa-automount", obj="Deployment/worker")
+        far_id = derived_id(check="default-sa-automount", cluster="dr-west", namespace="billing", obj="Deployment/far")
+        self.harness.replies["proposal-list"] = proposals_view([
+            pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([api_id, worker_id])),
+            pr(6, "platform-agent/fix-default-sa-far", body=audit_report.delta_block([api_id, far_id])),
+        ])
+        self.touch(path)
+        pathlib.Path(audit_report.declarations_path_for(AUDIT)).parent.mkdir(parents=True, exist_ok=True)
+        audit_report.write_declarations(AUDIT, "acme/fleet", [{"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "needs the token"}])
+        doc = make_doc(findings=[worker], audit=AUDIT, skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}])
+        doc["declared"] = [{"check": "default-sa-automount", "cluster": "prod-us-east", "namespace": "payments", "object": "Deployment/api", "title": "api", "declaration": {"repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "needs the token"}}]
+        manifest = _full_manifest(audit=AUDIT, candidates=[self.account_candidate("Deployment/api"), self.account_candidate("Deployment/worker")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)], audit=AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn(far_id, audit_report.parse_delta_block(self.harness.bodies_for("issue-update")[-1]))
+        self.assertEqual(self.stdout_json()["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
+
+    def test_a_partial_clean_run_keeps_a_shielded_pull_request_open_for_a_not_re_checked_finding(self):
+        # The clean branch of the test above: the document reports nothing.
+        # #6 covers api (declared, so shielded) and far on dr-west, which this
+        # run did not read, so #6 stays open; #9 covers api alone and is closed.
+        path = "clusters/prod-us-east/payments/default-sa-automount.yaml"
+        api = make_finding(fid="api", check="default-sa-automount", obj="Deployment/api", title="api", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        far = make_finding(fid="far", check="default-sa-automount", cluster="dr-west", namespace="billing", obj="Deployment/far", title="far", severity="major")
+        previous_doc = make_doc(
+            findings=[api, far],
+            audit=AUDIT,
+            clusters=[
+                {"name": "prod-us-east", "location": "us-east1", "project": "acme-prod"},
+                {"name": "stage-eu", "location": "europe-west1", "project": "acme-stage"},
+                {"name": "dr-west", "location": "us-west1", "project": "acme-dr"},
+            ],
+        )
+        previous_body = published_body(previous_doc, generated_at=NOW)
+        self.declaring_replies(previous_body)
+        api_id = derived_id(check="default-sa-automount", obj="Deployment/api")
+        far_id = derived_id(check="default-sa-automount", cluster="dr-west", namespace="billing", obj="Deployment/far")
+        self.harness.replies["proposal-list"] = proposals_view([
+            pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([api_id])),
+            pr(6, "platform-agent/fix-default-sa-far", body=audit_report.delta_block([api_id, far_id])),
+        ])
+        self.touch(path)
+        pathlib.Path(audit_report.declarations_path_for(AUDIT)).parent.mkdir(parents=True, exist_ok=True)
+        audit_report.write_declarations(AUDIT, "acme/fleet", [{"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "needs the token"}])
+        doc = make_doc(findings=[], audit=AUDIT, skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}])
+        doc["declared"] = [{"check": "default-sa-automount", "cluster": "prod-us-east", "namespace": "payments", "object": "Deployment/api", "title": "api", "declaration": {"repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "needs the token"}}]
+        manifest = _full_manifest(audit=AUDIT, candidates=[self.account_candidate("Deployment/api")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)], audit=AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
+
+    def test_a_partial_clean_run_keeps_the_pull_request_of_a_not_re_checked_finding_past_the_cap(self):
+        # The test above with far past the cap: the clean branch keeps the
+        # body, so far is still on the ledger and #6 stays open.
+        self.patch_attr("MAX_HELD_IDS", 0)
+        path = "clusters/prod-us-east/payments/default-sa-automount.yaml"
+        api = make_finding(fid="api", check="default-sa-automount", obj="Deployment/api", title="api", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        far = make_finding(fid="far", check="default-sa-automount", cluster="dr-west", namespace="billing", obj="Deployment/far", title="far", severity="major")
+        previous_doc = make_doc(
+            findings=[api, far],
+            audit=AUDIT,
+            clusters=[
+                {"name": "prod-us-east", "location": "us-east1", "project": "acme-prod"},
+                {"name": "stage-eu", "location": "europe-west1", "project": "acme-stage"},
+                {"name": "dr-west", "location": "us-west1", "project": "acme-dr"},
+            ],
+        )
+        previous_body = published_body(previous_doc, generated_at=NOW)
+        self.declaring_replies(previous_body)
+        api_id = derived_id(check="default-sa-automount", obj="Deployment/api")
+        far_id = derived_id(check="default-sa-automount", cluster="dr-west", namespace="billing", obj="Deployment/far")
+        self.harness.replies["proposal-list"] = proposals_view([
+            pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([api_id])),
+            pr(6, "platform-agent/fix-default-sa-far", body=audit_report.delta_block([api_id, far_id])),
+        ])
+        self.touch(path)
+        pathlib.Path(audit_report.declarations_path_for(AUDIT)).parent.mkdir(parents=True, exist_ok=True)
+        audit_report.write_declarations(AUDIT, "acme/fleet", [{"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "needs the token"}])
+        doc = make_doc(findings=[], audit=AUDIT, skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}])
+        doc["declared"] = [{"check": "default-sa-automount", "cluster": "prod-us-east", "namespace": "payments", "object": "Deployment/api", "title": "api", "declaration": {"repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "needs the token"}}]
+        manifest = _full_manifest(audit=AUDIT, candidates=[self.account_candidate("Deployment/api")])
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)], audit=AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
+
+    def test_a_declared_finding_on_an_unread_target_is_not_kept_as_not_re_checked(self):
+        # far is on dr-west, where `default-sa-automount` did not run this run,
+        # but the document moved it under `declared`: the owner chose it, so
+        # it is not held as not re-checked.
+        far = make_finding(fid="far", check="default-sa-automount", cluster="dr-west", namespace="billing", obj="Deployment/far", title="far", severity="major")
+        previous_doc = make_doc(
+            findings=[far],
+            audit=AUDIT,
+            clusters=[
+                {"name": "prod-us-east", "location": "us-east1", "project": "acme-prod"},
+                {"name": "dr-west", "location": "us-west1", "project": "acme-dr"},
+            ],
+        )
+        self.declaring_replies(published_body(previous_doc, generated_at=NOW))
+        far_id = derived_id(check="default-sa-automount", cluster="dr-west", namespace="billing", obj="Deployment/far")
+        declaration = {"repo": "acme/fleet", "path": "knowledge/far-token.md", "excerpt": "needs the token"}
+        pathlib.Path(audit_report.declarations_path_for(AUDIT)).parent.mkdir(parents=True, exist_ok=True)
+        audit_report.write_declarations(AUDIT, "acme/fleet", [{"check": "default-sa-automount", "namespace": "billing", "object": "Deployment/far", **declaration}])
+        roster = [c for c in audit_report.audit_checks(AUDIT) if c != "default-sa-automount"]
+        dr_west = {"name": "dr-west", "location": "us-west1", "project": "acme-dr", "checks_run": roster, "limitations": "service account read failed"}
+        doc = make_doc(findings=[], audit=AUDIT, clusters=[dr_west])
+        doc["declared"] = [{"check": "default-sa-automount", "cluster": "dr-west", "namespace": "billing", "object": "Deployment/far", "title": "far", "declaration": declaration}]
+        rc = self.run_finish(doc, audit=AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("COVERAGE GAP", self.err)
+        self.assertNotIn(f"HELD: {far_id}", self.err)
+
     def test_a_clean_run_still_closes_the_shielded_pull_request(self):
         # The clean call site: the document reports nothing, the collector
         # still emits api (declared, so declared from the manifest) and worker
@@ -21658,6 +22452,50 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertEqual(self.stdout_json()["prs_closed"], ["https://github.com/acme/fleet/pull/9"])
         comment = " ".join(self.harness.bodies_for("proposal-*"))
         self.assertIn("declared to need the `default` ServiceAccount's token", comment)
+
+    def test_a_partial_run_keeps_the_pull_request_of_an_unread_finding_past_the_cap(self):
+        # A findings run over a gap keeps at most `MAX_HELD_IDS` previous
+        # findings of the skipped cluster on the ledger. The ones past that cap
+        # leave the body, but the run still did not check their target, so the
+        # shield's close must not take their pull request, and a `/remediate`
+        # on one waits for a run that checks the target.
+        path = "clusters/prod-us-east/payments/default-sa-automount.yaml"
+        api = make_finding(fid="api", check="default-sa-automount", obj="Deployment/api", title="api", severity="major", remediation={"kind": "manifest", "path": path, "note": "shared file"})
+        netpol = make_finding()
+        stage = make_finding(fid="stage", cluster="stage-eu", title="Stage namespace has no NetworkPolicy")
+        previous_body = published_body(make_doc(findings=[api, netpol], audit=AUDIT), generated_at=NOW)
+        self.declaring_replies(previous_body)
+        api_id = derived_id(check="default-sa-automount", obj="Deployment/api")
+        past_cap = derived_id()
+        self.assertLess(api_id, past_cap)
+        self.patch_attr("MAX_HELD_IDS", 1)
+        self.harness.replies["proposal-list"] = proposals_view(
+            [pr(9, "platform-agent/fix-default-sa", body=audit_report.delta_block([api_id, past_cap]))]
+        )
+        self.harness.replies["*-view comments"] = comments_view(
+            {"comments": [comment(f"/remediate {past_cap}")]}
+        )
+        self.touch(path)
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        pathlib.Path(audit_report.declarations_path_for(AUDIT)).parent.mkdir(parents=True, exist_ok=True)
+        audit_report.write_declarations(AUDIT, "acme/fleet", [{"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "needs the token"}])
+        doc = make_doc(findings=[stage], audit=AUDIT, clusters=[{"name": "stage-eu", "location": "europe-west1", "project": "acme-stage"}], skipped=[{"cluster": "prod-us-east", "reason": "control plane unreachable"}])
+        rc = self.run_finish(doc, audit=AUDIT)
+        self.assertEqual(rc, 0, self.err)
+        payload = self.stdout_json()
+        self.assertTrue(payload["partial"])
+        self.assertIn("stops tracking 1 previous finding(s)", self.err)
+        body = self.harness.bodies_for("issue-update")[-1]
+        self.assertNotIn(past_cap, audit_report.parse_delta_block(body))
+        self.assertIn("Their pull requests stay open, and a `/remediate` on one waits", body)
+        self.assertEqual(payload["prs_closed"], [])
+        posted = self.harness.bodies_for("issue-comment")
+        deferred = [b for b in posted if audit_report.deferred_marker("IC_1") in b]
+        self.assertEqual(len(deferred), 1, posted)
+        self.assertIn("did not read or did not check its target", deferred[0])
+        for body in posted:
+            self.assertNotIn(audit_report.acked_marker("IC_1"), body)
+            self.assertNotIn(audit_report.refused_marker("IC_1"), body)
 
     def test_a_partial_run_closes_a_pull_request_whose_workloads_are_all_declared(self):
         # The strongest case: every 2.7 workload on the pull request is now
@@ -22740,6 +23578,32 @@ class TestFinishManifestFlag(HarnessTestCase):
         body = self.harness.bodies_for("issue-update")[0]
         self.assertLessEqual(len(body), audit_report.MAX_BODY_CHARS)
         return body, sorted(held_ids)
+
+    def test_not_re_checked_rows_share_the_cap_with_collector_held_rows(self):
+        # The collector-held row comes first and takes the one place, so the
+        # finding on the skipped cluster goes off the ledger, with a warning.
+        stage = make_finding(fid="stage", cluster="stage-eu", title="Stage finding")
+        stage_id = derived_id(cluster="stage-eu", fid="stage")
+        b = make_finding(fid="b", title="Bravo finding")
+        previous = published_body(make_doc(findings=[make_finding(), b, stage]), generated_at=NOW)
+        self.replay_ledger(previous)
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.patch_attr("MAX_HELD_IDS", 1)
+        manifest = _full_manifest(
+            names=("prod-us-east",),
+            candidates=[self.netpol_candidate(), self.netpol_candidate(object="Namespace/b")],
+        )
+        doc = make_doc(
+            findings=[b],
+            clusters=[{"name": "prod-us-east", "location": "us-east1", "project": "acme-prod"}],
+            skipped=[{"cluster": "stage-eu", "reason": "control plane unreachable"}],
+        )
+        rc = self.run_finish(doc, ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 0, self.err)
+        marker = audit_report.parse_delta_block(self.harness.bodies_for("issue-update")[0])
+        self.assertIn(derived_id(), marker)
+        self.assertNotIn(stage_id, marker)
+        self.assertIn("stops tracking 1 previous finding(s)", self.err)
 
     def test_held_ids_at_the_cap_all_ride_the_marker(self):
         body, held_ids = self.held_cap_run(audit_report.MAX_HELD_IDS)
@@ -27161,12 +28025,15 @@ class TestNoForge(BaseTestCase):
         self.assertFalse(out["silent_ok"])
         self.assertEqual(out["prs_opened"], [])
         summary = out["summary"].splitlines()
-        self.assertTrue(summary[0].startswith(audit_report.audit_name(AUDIT)))
-        self.assertIn("4 findings (2 critical) across 2 cluster(s); 4 new, 0 resolved", summary[0])
-        # Most severe first.
+        self.assertEqual(summary[0], f"{audit_report.audit_name(AUDIT)}: 2 critical findings, 4 new.")
+        # The critical findings up to the cap; the rest counted by severity.
         self.assertEqual(
-            [line.split("] ", 1)[1].split(" (")[0] for line in summary[1:5]],
-            ["Crit one", "Crit two", "Major one", "Minor one"],
+            summary[1:4],
+            [
+                "`critical` prod-us-east: crit-one has no network policy",
+                "`critical` prod-us-east: crit-two has no network policy",
+                "2 more (1 major, 1 minor) are saved on the install.",
+            ],
         )
         self.assertEqual(summary[-1], audit_report.NO_FORGE_NOTE)
         latest = json.loads((self.store() / "latest.json").read_text(encoding="utf-8"))
@@ -27251,6 +28118,80 @@ class TestNoForge(BaseTestCase):
         latest = json.loads((self.store() / "latest.json").read_text(encoding="utf-8"))
         self.assertIn(left_out, latest["current_ids"])
 
+    def test_a_finding_on_a_skipped_cluster_stays_in_the_store_over_a_gap(self):
+        stage = make_finding(fid="stage", cluster="stage-eu", title="Stage namespace has no NetworkPolicy")
+        stage_id = derived_id(cluster="stage-eu", fid="stage")
+        self.finish(make_doc(findings=[make_finding(), stage]))
+        prod = {"name": "prod-us-east", "location": "us-east1", "project": "acme-prod"}
+        skipped = [{"cluster": "stage-eu", "reason": "control plane unreachable"}]
+        gap = make_doc(findings=[make_finding()], clusters=[prod], skipped=skipped)
+
+        for _ in range(2):
+            out = self.finish(gap)
+            self.assertEqual((out["new"], out["resolved"]), (0, 0))
+            latest = json.loads((self.store() / "latest.json").read_text(encoding="utf-8"))
+            self.assertIn(stage_id, latest["current_ids"])
+            self.assertIn(stage_id, out["summary"])
+
+        # The next complete run does not call it new, and announces a fix.
+        self.assertEqual(self.finish(make_doc(findings=[make_finding(), stage]))["new"], 0)
+        self.finish(gap)
+        fixed = self.finish(make_doc(findings=[make_finding()]))
+        self.assertEqual((fixed["new"], fixed["resolved"]), (0, 1))
+
+    def test_a_run_with_no_repository_chosen_keeps_no_rechecked_ids_and_drops_none(self):
+        # The diverted run has no previous record, so it keeps nothing as not
+        # re-checked. Its envelope is marked, so the next true no-forge run
+        # reads the record before it and keeps the id once, with its place.
+        stage = make_finding(fid="stage", cluster="stage-eu", title="Stage namespace has no NetworkPolicy")
+        stage_id = derived_id(cluster="stage-eu", fid="stage")
+        self.finish(make_doc(findings=[make_finding(), stage]))
+        prod = {"name": "prod-us-east", "location": "us-east1", "project": "acme-prod"}
+        skipped = [{"cluster": "stage-eu", "reason": "control plane unreachable"}]
+        gap = make_doc(findings=[make_finding()], clusters=[prod], skipped=skipped)
+        self.finish(gap)
+
+        self.managed_text = '[{"type": "github", "url": "https://github.com/acme/a"}, {"type": "github", "url": "https://github.com/acme/b"}]'
+        with patch("gitops_workspace.get_managed_repos", return_value=["acme/a", "acme/b"]), patch(
+            "gitops_workspace._read_state_text",
+            lambda key: self.managed_text if key == "managed_repos" else "",
+        ):
+            diverted = self.finish(gap)
+        self.managed_text = ""
+        self.assertIn(audit_report.NO_REPOSITORY_CHOSEN_KEY, diverted)
+        self.assertNotIn("Not re-checked", diverted["summary"])
+        latest = json.loads((self.store() / "latest.json").read_text(encoding="utf-8"))
+        self.assertIn(audit_report.NO_REPOSITORY_CHOSEN_KEY, latest)
+        self.assertNotIn(stage_id, latest["current_ids"])
+        self.assertFalse(latest.get(audit_report.NOT_RECHECKED_KEY))
+
+        out = self.finish(gap)
+        self.assertEqual((out["new"], out["resolved"]), (0, 0))
+        self.assertIn(stage_id, out["summary"])
+        latest = json.loads((self.store() / "latest.json").read_text(encoding="utf-8"))
+        self.assertEqual(latest["current_ids"].count(stage_id), 1)
+        kept = latest[audit_report.NOT_RECHECKED_KEY]
+        self.assertEqual([e["id"] for e in kept], [stage_id])
+        self.assertEqual(kept[0]["cluster"], "stage-eu")
+        self.assertEqual(self.finish(make_doc(findings=[make_finding(), stage]))["new"], 0)
+
+    def test_a_declared_finding_on_an_unread_target_is_not_kept_in_the_store(self):
+        # `default-sa-automount` did not run on stage-eu, but the document moved
+        # the finding under `declared`, so it is not kept as not re-checked.
+        sa = make_finding(fid="sa", check="default-sa-automount", cluster="stage-eu", obj="Deployment/sa", title="sa", severity="major")
+        sa_id = derived_id(check="default-sa-automount", cluster="stage-eu", obj="Deployment/sa")
+        self.finish(make_doc(findings=[make_finding(), sa]))
+        roster = [c for c in audit_report.audit_checks(AUDIT) if c != "default-sa-automount"]
+        prod = {"name": "prod-us-east", "location": "us-east1", "project": "acme-prod"}
+        stage = {"name": "stage-eu", "location": "europe-west1", "project": "acme-stage", "checks_run": roster, "limitations": "service account read failed"}
+        doc = make_doc(findings=[make_finding()], clusters=[prod, stage])
+        doc["declared"] = [{"check": "default-sa-automount", "cluster": "stage-eu", "namespace": "payments", "object": "Deployment/sa", "title": "sa", "declaration": {"repo": "acme/fleet", "path": "knowledge/sa-token.md", "excerpt": "needs the token"}}]
+        self.finish(doc)
+        self.assertIn("COVERAGE GAP", self.err)
+        self.assertNotIn(f"HELD: {sa_id}", self.err)
+        latest = json.loads((self.store() / "latest.json").read_text(encoding="utf-8"))
+        self.assertNotIn(sa_id, latest["current_ids"])
+
     def test_a_failed_store_write_says_the_message_is_the_only_record(self):
         self.reports_dir.mkdir(parents=True)
         (self.reports_dir / AUDIT).write_text("not a directory", encoding="utf-8")
@@ -27286,8 +28227,12 @@ class TestNoForge(BaseTestCase):
         self.assertIn("The collector flagged 2 candidate(s)", out["summary"])
 
     def test_the_summary_names_the_object(self):
-        out = self.finish(make_doc(findings=[make_finding(obj="ClusterRoleBinding/debug-binding", namespace="")]))
-        self.assertIn("(prod-us-east/ClusterRoleBinding/debug-binding)", out["summary"])
+        out = self.finish(
+            make_doc(
+                findings=[make_finding(obj="ClusterRoleBinding/debug-binding", namespace="", check="cluster-admin-binding")]
+            )
+        )
+        self.assertIn("`critical` prod-us-east: debug-binding grants cluster-admin", out["summary"].splitlines())
 
     def test_a_lost_latest_falls_back_to_the_ring(self):
         self.finish(make_doc(findings=THREE_SEVERITIES))
@@ -27505,7 +28450,8 @@ class TestChatReport(HarnessTestCase):
         self.assertEqual(repo, "acme/fleet")
         lines = text.splitlines()
         self.assertTrue(lines[0].startswith(f"{audit_report.audit_name(AUDIT)}: "))
-        self.assertIn(" new, ", lines[0])
+        self.assertEqual(changed(lines[0]), (1, 0))
+        self.assertNotIn("0 resolved", lines[0])
         self.assertEqual(lines[-1], "Ledger: https://github.com/acme/fleet/issues/7")
         self.assertNotIn("chat_report", self.stdout_json())
 
@@ -27522,7 +28468,7 @@ class TestChatReport(HarnessTestCase):
         payload = {"status": "HELD", "issue_url": "https://github.com/acme/fleet/issues/7",
                    "new": 0, "resolved": 0, audit_report.UNACCOUNTED_KEY: ["rbac.a", "rbac.b"]}
         text = audit_report.render_chat_report(AUDIT, payload, make_doc(findings=[]))
-        self.assertIn("2 carried finding(s) were not accounted for", text.splitlines()[0])
+        self.assertIn("no findings across 2 clusters, but the ledger stays open: 2 carried findings were not accounted for.", text.splitlines()[0])
         self.assertIn("- Not accounted for: rbac.a, rbac.b", text)
 
     def test_a_run_with_no_memory_of_the_last_says_the_change_is_unknown(self):
@@ -27711,7 +28657,7 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         kept, appended = text.split(f"\n\n{audit_report.CHAT_REPORT_REFINISH_LABEL}\n")
         self.assertEqual(kept, first_text)
         # The whole run's count on the chat line; its own on the JSON line.
-        self.assertIn(": 1 new, 0 resolved;", appended.splitlines()[0])
+        self.assertEqual(changed(appended.splitlines()[0]), (1, 0))
         self.assertEqual(second["new"], 0)
         self.assertNotEqual(self.chat_record()["run"], run)
         stored = json.loads((self.store_dir() / "latest.json").read_text(encoding="utf-8"))
@@ -27740,8 +28686,8 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         self.assertEqual(self.run_finish(doc), 0)
         self.assertEqual(self.stdout_json()["resolved"], 0)
         first, second = self.heads()
-        self.assertIn(": 0 new, 1 resolved;", first)
-        self.assertIn(": 0 new, 1 resolved;", second)
+        self.assertEqual(changed(first), (0, 1))
+        self.assertEqual(changed(second), (0, 1))
 
     def test_a_finding_new_then_gone_in_one_run_is_neither_new_nor_resolved(self):
         self.start()
@@ -27752,8 +28698,8 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         self.assertEqual(self.run_finish(make_doc(findings=[make_finding(fid="a", severity="major")])), 0)
         self.assertEqual(self.stdout_json()["resolved"], 1)
         first, second = self.heads()
-        self.assertIn(": 1 new, 0 resolved;", first)
-        self.assertIn(": 0 new, 0 resolved;", second)
+        self.assertEqual(changed(first), (1, 0))
+        self.assertEqual(changed(second), (0, 0))
 
     def test_a_finding_resolved_then_back_in_one_run_is_neither_new_nor_resolved(self):
         self.start()
@@ -27763,8 +28709,8 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         self.assertEqual(self.run_finish(both), 0)
         self.assertEqual(self.stdout_json()["new"], 1)
         first, second = self.heads()
-        self.assertIn(": 0 new, 1 resolved;", first)
-        self.assertIn(": 0 new, 0 resolved;", second)
+        self.assertEqual(changed(first), (0, 1))
+        self.assertEqual(changed(second), (0, 0))
 
     def test_a_third_finish_still_counts_from_the_run_start(self):
         self.start()
@@ -27775,7 +28721,7 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         self.assertEqual(self.stdout_json()["new"], 0)
         heads = self.heads()
         self.assertEqual(len(heads), 3)
-        self.assertIn(": 2 new, 0 resolved;", heads[-1])
+        self.assertEqual(changed(heads[-1]), (2, 0))
 
     def test_a_finding_the_previous_ledger_filed_but_cut_is_not_the_runs_new(self):
         """The previous body was over budget: `b` was filed but not rendered, so it is not new."""
@@ -27800,8 +28746,8 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         self.assertEqual(self.run_finish(doc), 0, self.err)
         self.assertEqual(self.stdout_json()["new"], 0)
         first, second = self.heads()
-        self.assertIn(": 0 new, 0 resolved;", first)
-        self.assertIn(": 0 new, 0 resolved;", second)
+        self.assertEqual(changed(first), (0, 0))
+        self.assertEqual(changed(second), (0, 0))
         [part] = self.chat_record()["parts"]
         self.assertEqual(part[audit_report.CHAT_REPORT_BASELINE_FILED_KEY], sorted([ida, idb]))
 
@@ -27815,8 +28761,8 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         second = self.stdout_json()
         self.assertEqual((second["status"], second["resolved"]), ("CLEAN", 1))
         first, last = self.heads()
-        self.assertIn(": 0 new, 1 resolved;", first)
-        self.assertIn(": clean, 0 findings, 2 resolved", last)
+        self.assertEqual(changed(first), (0, 1))
+        self.assertEqual(clean_resolved(last), 2)
 
     def test_an_unknown_run_start_says_the_change_is_unknown(self):
         self.start()
@@ -27845,7 +28791,7 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         [(_, text)] = self.entries()
         self.assertIn(f"\n\n{audit_report.CHAT_REPORT_REFINISH_RELATIVE_LABEL}\n", text)
         self.assertNotIn(audit_report.CHAT_REPORT_REFINISH_LABEL, text)
-        self.assertIn(": 0 new, 0 resolved;", self.heads()[-1])
+        self.assertEqual(changed(self.heads()[-1]), (0, 0))
         # Nor does the second save its mid-run memory for a third to count from.
         self.assertEqual(self.finish_again(doc), 0)
         [(_, text)] = self.entries()
@@ -27861,8 +28807,8 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         )
         self.assertEqual(self.run_finish(gapped), 0)
         first, second = self.heads()
-        self.assertIn(": 0 new, 1 resolved;", first)
-        self.assertIn(": 0 new, 0 resolved;", second)
+        self.assertEqual(changed(first), (0, 1))
+        self.assertEqual(changed(second), (0, 0))
 
     def test_a_clean_later_finish_over_a_coverage_gap_claims_nothing_resolved(self):
         self.start()
@@ -27872,7 +28818,7 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         clean["resolved_because"] = resolved_for(self.stored_ledger_body(AUDIT, "acme/fleet", 42))
         self.assertEqual(self.run_finish(clean), 0)
         self.assertEqual(self.stdout_json()["status"], "CLEAN")
-        self.assertIn(": clean, 0 findings, 0 resolved", self.heads()[-1])
+        self.assertEqual(clean_resolved(self.heads()[-1]), 0)
 
     def test_a_run_that_started_on_another_id_scheme_withholds_its_resolved(self):
         self.start()
@@ -27886,7 +28832,7 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         self.assertEqual(self.run_finish(doc), 0)
         self.assertEqual(self.run_finish(doc), 0)
         for head in self.heads():
-            self.assertIn(", 0 resolved;", head)
+            self.assertEqual(changed(head)[1], 0)
 
     def test_a_finding_the_collector_still_flags_is_not_the_runs_resolved(self):
         self.start()
@@ -27910,7 +28856,7 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         for _ in range(2):
             self.assertEqual(self.run_finish(doc, ["--manifest-file", str(manifest)]), 0, self.err)
         for head in self.heads():
-            self.assertIn(": 0 new, 0 resolved;", head)
+            self.assertEqual(changed(head), (0, 0))
 
     def test_a_second_finish_keeps_an_earlier_repositorys_report(self):
         now = datetime.now(timezone.utc)
@@ -27968,7 +28914,7 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         self.assertFalse(self.stdout_json()["silent_ok"])
         [(_, text)] = self.entries()
         self.assertTrue(text.startswith(audit_report.CHAT_REPORT_RERUN_LABEL + "\n"))
-        self.assertIn(": 1 new, 0 resolved;", text.splitlines()[1])
+        self.assertEqual(changed(text.splitlines()[1]), (1, 0))
 
     def test_a_clean_second_finish_after_a_clean_one_with_news_is_not_silent(self):
         self.start()
@@ -28060,7 +29006,7 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         [(_, text)] = self.entries()
         label, head = text.splitlines()[:2]
         self.assertEqual(label, audit_report.CHAT_REPORT_RERUN_LABEL)
-        self.assertIn(f": {len(findings)} new, 0 resolved;", head)
+        self.assertEqual(changed(head), (len(findings), 0))
 
     def test_a_rerun_after_a_broker_lost_mid_sweep_opens_no_second_batch(self):
         self.start()
@@ -28823,7 +29769,7 @@ class TestUnreachableRepository(BaseTestCase):
             }),
             encoding="utf-8",
         )
-        self.assertIsNone(audit_report.previous_no_forge_ids(AUDIT))
+        self.assertIsNone(audit_report.previous_no_forge_record(AUDIT))
 
     def test_a_failed_store_write_keeps_the_published_memory(self):
         """The diverted run wrote nothing to the ledger, so the record of the
@@ -28914,6 +29860,166 @@ class TestNoRepositoryChosen(BaseTestCase):
         self.assertEqual(self.run_main(["start", "--audit", AUDIT, "--repo", "acme/other"]), 1)
         self.assertIn("not in the managed repositories list", self.err)
         self.assertEqual(self.out, "")
+
+
+class TestPlainChatLines(unittest.TestCase):
+    """The chat lines in plain words: no zero counts, a plain phrase per check, short cluster names."""
+
+    NAME = "Security & RBAC Posture Audit"
+
+    def test_every_check_has_a_plain_phrase(self):
+        rostered = {check for spec in audit_report.AUDITS.values() for check in spec.checks + spec.derived}
+        self.assertEqual(sorted(rostered - set(audit_report.CHECK_PHRASES)), [])
+        self.assertEqual(sorted(set(audit_report.CHECK_PHRASES) - rostered), [])
+
+    def test_the_headline_drops_every_zero_count(self):
+        findings = [make_finding(severity="major"), make_finding(severity="major")]
+        self.assertEqual(
+            audit_report.findings_headline(self.NAME, findings, 1, 0, True), f"{self.NAME}: 2 major findings, 1 new."
+        )
+        self.assertEqual(
+            audit_report.findings_headline(self.NAME, findings, 0, 0, True), f"{self.NAME}: 2 major findings."
+        )
+
+    def test_the_headline_counts_the_most_severe_level_present(self):
+        findings = [make_finding(severity="minor"), make_finding(severity="critical")]
+        self.assertEqual(
+            audit_report.findings_headline(self.NAME, findings, 0, 2, True), f"{self.NAME}: 1 critical finding, 2 resolved."
+        )
+
+    def test_a_run_with_no_memory_of_the_last_says_so_without_counts(self):
+        self.assertEqual(
+            audit_report.findings_headline(self.NAME, [make_finding()], 0, 0, False),
+            f"{self.NAME}: 1 critical finding; the change since the last run is unknown.",
+        )
+
+    def test_a_clean_line_drops_a_zero_resolved_and_says_clusters(self):
+        payload = {"status": "CLEAN", "issue_url": "https://github.com/acme/fleet/issues/7", "new": 0, "resolved": 0}
+        doc = make_doc(findings=[])
+        self.assertEqual(
+            audit_report.render_chat_report(AUDIT, payload, doc).splitlines()[0], f"{self.NAME}: clean across 2 clusters."
+        )
+        payload["resolved"] = 3
+        doc["scope"]["clusters"] = doc["scope"]["clusters"][:1]
+        self.assertEqual(
+            audit_report.render_chat_report(AUDIT, payload, doc).splitlines()[0],
+            f"{self.NAME}: clean, 3 resolved across 1 cluster.",
+        )
+
+    def test_a_row_names_the_cluster_by_its_short_name(self):
+        finding = make_finding(
+            check="public-control-plane", cluster="proj/us-central1-a/seeded-a", namespace="", obj="Cluster/seeded-a"
+        )
+        self.assertEqual(audit_report.summary_row(finding), "`critical` seeded-a: control plane is public")
+
+    def test_a_row_names_the_object_the_check_judged(self):
+        finding = make_finding(check="privileged-container", cluster="proj/us-central1-a/seeded-a", obj="Deployment/payments-api")
+        self.assertEqual(audit_report.summary_row(finding), "`critical` seeded-a: payments-api runs a privileged container")
+
+    def test_a_cluster_setting_on_an_object_names_it_in_brackets(self):
+        finding = make_finding(check="workload-identity-off", obj="NodePool/pool-1", namespace="")
+        self.assertEqual(audit_report.summary_row(finding), "`critical` prod-us-east: Workload Identity is off (pool-1)")
+
+    def test_a_kinded_object_named_like_its_cluster_is_still_the_object(self):
+        finding = make_finding(fid="p", check="legacy-metadata", obj="NodePool/prod-us-east", namespace="")
+        self.assertNotEqual(audit_report._object_name(finding), "")
+
+    def test_a_row_without_a_phrase_keeps_the_title(self):
+        unknown = make_finding(check="not-a-check", title="Something  odd")
+        self.assertEqual(audit_report.summary_row(unknown), "`critical` prod-us-east: Something odd")
+        objectless = make_finding(check="privileged-container", obj="Cluster/prod-us-east", title="A privileged pod")
+        self.assertEqual(audit_report.summary_row(objectless), "`critical` prod-us-east: A privileged pod")
+
+    def test_a_row_is_redacted(self):
+        finding = make_finding(check="not-a-check", title="token ghp_" + "a" * 36)
+        self.assertNotIn("ghp_" + "a" * 36, audit_report.summary_row(finding))
+
+    def test_the_summary_lists_the_top_two_when_nothing_is_critical(self):
+        findings = [make_finding(fid=f"m{i}", severity="major") for i in range(3)] + [make_finding(fid="n", severity="minor")]
+        lines = audit_report.render_no_forge_summary(
+            AUDIT, make_doc(findings=findings), [], [], [], True, [], audit_report.NO_FORGE_NOTE
+        ).splitlines()
+        self.assertEqual(lines[0], f"{self.NAME}: 3 major findings.")
+        self.assertEqual(len([line for line in lines if line.startswith("`major`")]), 2)
+        self.assertIn("2 more (1 major, 1 minor) are saved on the install.", lines)
+
+    def test_a_summary_the_store_does_not_hold_lists_more_and_says_the_rest_are_not_listed(self):
+        # The message is the only copy, so it keeps as many findings as the old summary did.
+        findings = [make_finding(fid=f"c{i}") for i in range(4)] + [
+            make_finding(fid=f"m{i}", severity="major") for i in range(8)
+        ]
+        lines = audit_report.render_no_forge_summary(
+            AUDIT, make_doc(findings=findings), [], [], [], True, [], audit_report.NO_FORGE_UNSTORED_NOTE, stored=False
+        ).splitlines()
+        rows = [line for line in lines if line.startswith("`")]
+        self.assertEqual(len(rows), audit_report.NO_FORGE_SUMMARY_FINDINGS)
+        self.assertEqual(sum(row.startswith("`critical`") for row in rows), 4)
+        self.assertIn("2 more (2 major) are not listed here.", lines)
+        self.assertEqual(lines[-1], audit_report.NO_FORGE_UNSTORED_NOTE)
+
+    def test_stored_is_keyword_only(self):
+        with self.assertRaises(TypeError):
+            audit_report.render_no_forge_summary(AUDIT, make_doc(findings=[]), [], [], [], True, [], "note", 0, None, False)
+
+    def test_the_summary_lists_three_critical_findings_and_counts_the_rest(self):
+        findings = [make_finding(fid=f"c{i}") for i in range(5)] + [make_finding(fid="m", severity="major")]
+        lines = audit_report.render_no_forge_summary(
+            AUDIT, make_doc(findings=findings), [], [], [], True, [], audit_report.NO_FORGE_NOTE
+        ).splitlines()
+        self.assertEqual(len([line for line in lines if line.startswith("`critical`")]), 3)
+        self.assertIn("3 more (2 critical, 1 major) are saved on the install.", lines)
+
+    def _slack(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
+        import slack_audit_report
+
+        return slack_audit_report
+
+    def test_the_slack_card_knows_both_no_repository_notes(self):
+        self.assertEqual(
+            self._slack().NO_LEDGER_NOTES, (audit_report.NO_FORGE_NOTE, audit_report.NO_FORGE_UNSTORED_NOTE)
+        )
+
+    def test_a_summary_whose_note_carries_a_remedy_posts_as_written(self):
+        # The card would clip the remedy at its line length, so these summaries go out whole.
+        sar = self._slack()
+        findings = [make_finding(fid="c", check="public-control-plane", obj="Cluster/prod-us-east", namespace="")]
+        notes = {
+            "unreachable": audit_report.UNREACHABLE_NOTE.format(
+                repo="acme/fleet",
+                reason="FORGE_NOT_FOUND",
+                noun="pull request",
+                remedy=audit_report.UNREACHABLE_FORGE_REMEDY,
+                ledger=audit_report.UNREACHABLE_ISSUE_LEDGER,
+            ),
+            "no role": audit_report.NO_REPOSITORY_CHOSEN_NOTE.format(
+                message=audit_report.NO_GITOPS_ROLE_MESSAGE.format(
+                    repos="acme/a, acme/b", why=audit_report.NO_GITOPS_ROLE_WHY, remedy=audit_report.NO_GITOPS_ROLE_REMEDY
+                )
+            ),
+        }
+        for name, note in notes.items():
+            with self.subTest(note=name):
+                summary = audit_report.render_no_forge_summary(
+                    AUDIT, make_doc(findings=findings), [], [], [], True, [], note
+                )
+                self.assertTrue(summary.endswith(note))
+                self.assertIsNone(sar.summary_card(summary))
+                self.assertIsNone(sar.blocks_from_summary(summary))
+                self.assertIsNone(sar.chat_from_summary(summary))
+
+    def test_the_summary_reads_back_as_the_slack_card(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
+        import slack_audit_report
+
+        findings = [make_finding(fid="c", check="public-control-plane", obj="Cluster/prod-us-east", namespace="")]
+        summary = audit_report.render_no_forge_summary(
+            AUDIT, make_doc(findings=findings), [], [], ["r"], True, [], audit_report.NO_FORGE_NOTE
+        )
+        card = slack_audit_report.summary_card(summary)
+        self.assertEqual(card.headline, f"{self.NAME}: 1 critical finding, 1 resolved.")
+        self.assertEqual(card.rows, [{"severity": "critical", "text": "prod-us-east: control plane is public"}])
+        self.assertEqual(card.more, audit_report.NO_FORGE_NOTE)
 
 
 class TestStoreLedger(HarnessTestCase):
@@ -29829,6 +30935,152 @@ class TestStoreLedger(HarnessTestCase):
         self.assertFalse(out["silent_ok"])
         self.assertTrue(self.latest()["ledger_held_open"])
         self.assertEqual(sorted(self.latest()["current_ids"]), sorted([a["id"], b["id"]]))
+
+    # -- not re-checked ------------------------------------------------------------
+
+    SKIPPED = [{"cluster": "stage-eu", "reason": "control plane unreachable"}]
+    PROD = {"name": "prod-us-east", "location": "us-east1", "project": "acme-prod"}
+
+    def stage_finding(self):
+        return make_finding(
+            fid="stage", cluster="stage-eu", title="Stage namespace has no NetworkPolicy"
+        )
+
+    def stage_id(self):
+        return derived_id(cluster="stage-eu", fid="stage")
+
+    def gap_doc(self, findings):
+        return make_doc(findings=findings, clusters=[self.PROD], skipped=self.SKIPPED)
+
+    def test_a_store_ledger_gap_run_keeps_a_finding_on_an_unchecked_target(self):
+        """The forge path keeps a previous finding on a target that a gap run
+        did not check as a row under _Not re-checked this run_. The stored
+        ledger must keep it the same way: the row in `ledger_body`, the id in
+        its hidden block, and the place under `not_rechecked`."""
+        self.claim()
+        self.touch(self.NETPOL)
+        self.run_once(make_doc(findings=[make_finding(), self.stage_finding()]))
+        out = self.run_once(self.gap_doc([make_finding()]))
+        self.assertEqual(out["status"], audit_report.STORE_LEDGER_STATUS)
+        self.assertEqual((out["new"], out["resolved"]), (0, 0))
+        self.assertNotIn(audit_report.UNREPORTED_UNDER_GAP_KEY, out)
+        self.assertIn(f"HELD: {self.stage_id()}", self.err)
+        self.assertIn("Not re-checked this run", out["summary"])
+        self.assertIn(self.stage_id(), out["summary"])
+        latest = self.latest()
+        body = latest["ledger_body"]
+        self.assertIn(audit_report.UNREAD_HELD_HEADING, body)
+        self.assertIn("Stage namespace has no NetworkPolicy", body)
+        self.assertIn("- **Not re-checked:** `stage-eu` was not read this run.", body)
+        self.assertIn(self.stage_id(), audit_report.parse_delta_block(body))
+        self.assertEqual(audit_report.parse_held_ids(body), [])
+        self.assertIn(self.stage_id(), latest["current_ids"])
+        self.assertEqual(
+            [entry["id"] for entry in latest[audit_report.NOT_RECHECKED_KEY]], [self.stage_id()]
+        )
+        self.assertNotIn(audit_report.REPORTED_UNDER_GAP_KEY, latest)
+        # A second gap run reads the row back from the stored ledger.
+        self.run_once(self.gap_doc([make_finding()]))
+        self.assertIn(self.stage_id(), audit_report.parse_delta_block(self.latest()["ledger_body"]))
+        # The next full run that sees it again does not call it new.
+        both = self.run_once(make_doc(findings=[make_finding(), self.stage_finding()]))
+        self.assertEqual((both["new"], both["resolved"]), (0, 0))
+
+    def test_a_store_ledger_gap_run_caps_not_re_checked_ids_and_says_so(self):
+        self.claim()
+        self.touch(self.NETPOL)
+        other = make_finding(fid="stage-b", cluster="stage-eu", title="Stage B has no NetworkPolicy")
+        self.run_once(make_doc(findings=[make_finding(), self.stage_finding(), other]))
+        past_cap = max(self.stage_id(), derived_id(cluster="stage-eu", fid="stage-b"))
+        self.patch_attr("MAX_HELD_IDS", 1)
+        self.run_once(self.gap_doc([make_finding()]))
+        body = self.latest()["ledger_body"]
+        self.assertNotIn(past_cap, audit_report.parse_delta_block(body))
+        self.assertIn("stops tracking 1 previous finding(s) on a target this run did not check", self.err)
+        self.assertIn(past_cap, self.err)
+
+    def shielded_finish(self, doc, candidates):
+        """`finish` with the declaration of api filed by `start`, so the shield closes over the gap."""
+        manifest_path = self.tmp_path / "manifest.json"
+        manifest_path.write_text(json.dumps(_full_manifest(candidates=candidates)), encoding="utf-8")
+        self.start()
+        audit_report.write_declarations(AUDIT, self.REPO, [{"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": self.REPO, "path": "knowledge/api-token.md", "excerpt": "needs the token"}])
+        doc["declared"] = [{"check": "default-sa-automount", "cluster": "prod-us-east", "namespace": "payments", "object": "Deployment/api", "title": "api", "declaration": {"repo": self.REPO, "path": "knowledge/api-token.md", "excerpt": "needs the token"}}]
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(doc), encoding="utf-8")
+        self.new_process()
+        code = self.run_main(
+            ["finish", "--audit", AUDIT, "--findings-file", path, "--manifest-file", str(manifest_path)]
+        )
+        self.assertEqual(code, 0, self.err)
+        return self.stdout_json()
+
+    def account_proposal(self, number, ids):
+        return {
+            "number": number,
+            "source": f"platform-agent/fix-{AUDIT}-default-sa-automount-{number}",
+            "sourceRepo": self.REPO,
+            "target": "main",
+            "state": "open",
+            "author": Recorder.VIEWER.removesuffix("[bot]"),
+            "url": f"https://forge.invalid/acme/fleet/pull-requests/{number}",
+            "labels": [],
+            "body": audit_report.delta_block(ids) + "\n" + audit_report.remediation_stream_marker(AUDIT),
+        }
+
+    def run_shielded_gap(self, with_worker):
+        """Seed a stored ledger of api, worker and far; then a run over a gap on dr-west.
+
+        #9 covers what the shield closes; #6 covers api and far, on dr-west,
+        which the run did not read. The forge path keeps #6 open
+        (`TestFinishManifestFlag`), and so must the store ledger.
+        """
+        self.claim()
+        path = "clusters/prod-us-east/payments/default-sa-automount.yaml"
+        fix = {"kind": "manifest", "path": path, "note": "shared file"}
+        api = make_finding(fid="api", check="default-sa-automount", obj="Deployment/api", title="api", severity="major", remediation=fix)
+        worker = make_finding(fid="worker", check="default-sa-automount", obj="Deployment/worker", title="worker", severity="major", remediation=fix)
+        far = make_finding(fid="far", check="default-sa-automount", cluster="dr-west", namespace="billing", obj="Deployment/far", title="far", severity="major", remediation={"kind": "manual", "note": "far"})
+        clusters = [
+            {"name": "prod-us-east", "location": "us-east1", "project": "acme-prod"},
+            {"name": "stage-eu", "location": "europe-west1", "project": "acme-stage"},
+            {"name": "dr-west", "location": "us-west1", "project": "acme-dr"},
+        ]
+        self.touch(path)
+        with patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: audit_report.AUTO_PROMOTE_OFF}):
+            self.run_once(make_doc(findings=[api, worker, far], clusters=clusters))
+        api_id = derived_id(check="default-sa-automount", obj="Deployment/api")
+        worker_id = derived_id(check="default-sa-automount", obj="Deployment/worker")
+        far_id = derived_id(check="default-sa-automount", cluster="dr-west", namespace="billing", obj="Deployment/far")
+        self.assertIn(far_id, self.latest()["current_ids"])
+        shielded = [api_id, worker_id] if with_worker else [api_id]
+        pr9, pr6 = self.account_proposal(9, shielded), self.account_proposal(6, [api_id, far_id])
+        self.harness.replies["proposal-list"] = {"proposals": [pr9, pr6], "truncated": False}
+        self.harness.replies["proposal-view"] = {"proposal": {"number": 9, "body": pr9["body"]}}
+        candidates = [
+            {"check": "default-sa-automount", "cluster": "prod-us-east", "namespace": "payments", "object": obj, "severity": "major", "excerpt": "automountServiceAccountToken unset on the default ServiceAccount"}
+            for obj in (["Deployment/api", "Deployment/worker"] if with_worker else ["Deployment/api"])
+        ]
+        doc = make_doc(
+            findings=[worker] if with_worker else [],
+            skipped=[{"cluster": "dr-west", "reason": "control plane unreachable"}],
+        )
+        out = self.shielded_finish(doc, candidates)
+        return out, pr9, pr6, far_id
+
+    def test_a_store_ledger_gap_run_keeps_the_fix_of_a_not_re_checked_finding_open(self):
+        out, pr9, pr6, far_id = self.run_shielded_gap(with_worker=True)
+        self.assertTrue(out["partial"])
+        self.assertIn(far_id, audit_report.parse_delta_block(self.latest()["ledger_body"]))
+        self.assertNotIn(pr6["url"], out["prs_closed"])
+        self.assertEqual(out["prs_closed"], [pr9["url"]])
+
+    def test_a_clean_store_ledger_gap_run_keeps_the_fix_of_a_not_re_checked_finding_open(self):
+        out, pr9, pr6, far_id = self.run_shielded_gap(with_worker=False)
+        self.assertTrue(self.latest()["ledger_held_open"])
+        self.assertNotIn(pr6["url"], out["prs_closed"])
+        self.assertEqual(out["prs_closed"], [pr9["url"]])
+
 
 if __name__ == "__main__":
     unittest.main()

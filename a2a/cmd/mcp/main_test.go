@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -138,5 +140,48 @@ func TestAStopDuringTheFirstDialIsClean(t *testing.T) {
 	}))
 	if err != nil {
 		t.Errorf("a stop during the first dial returned %v, want a clean stop", err)
+	}
+}
+
+// A stop ends the requests in flight rather than waiting them out: a handler
+// that runs until its request's context is done is ended by the stop, and
+// serve returns cleanly well inside shutdownGrace.
+func TestAStopEndsTheRequestsInFlight(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ln, err := net.Listen(networkTCP, "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-r.Context().Done()
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	served := make(chan error, 1)
+	go func() { served <- serve(ctx, log, ln, h) }()
+	go func() {
+		if resp, err := http.Get("http://" + ln.Addr().String() + "/"); err == nil {
+			resp.Body.Close()
+		}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request never reached the handler")
+	}
+	start := time.Now()
+	cancel()
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Errorf("serve returned %v on a stop, want a clean one", err)
+		}
+		if elapsed := time.Since(start); elapsed > shutdownGrace/4 {
+			t.Errorf("the stop took %s with a request in flight", elapsed)
+		}
+	case <-time.After(shutdownGrace + 5*time.Second):
+		t.Fatal("serve did not return after the stop")
 	}
 }

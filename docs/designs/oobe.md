@@ -246,15 +246,15 @@ times. It rides with the audits stage, whose eval case covers both.
 
 ## 6. Failure modes
 
-| Situation              | What the operator sees                                                                                   | Recovery                                                                                              |
-| ---------------------- | -------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| Audits running         | Nothing in chat until each posts its summary; `hermes cron list` in the platform profile shows them      | None needed                                                                                           |
-| Marking an audit fails | Nothing; `oobe` logs and retries the missing ids each minute, five tries per audit                       | Automatic                                                                                             |
-| An audit run fails     | The audit's own failure path; `chat-delivery-watch` opens a GitHub issue when reports stop reaching chat | As today                                                                                              |
-| No GitOps repository   | Reports stay in the report store; a run that changed something posts a summary saying there is no forge  | None, or for ledger issues, re-run the installer with `--gitops-org` and `--gitops-repo` (INSTALL.md) |
-| No home channel        | Ledger issues and PRs in the repository; the first report names each unposted audit (see §7)             | Set one (`/sethome`)                                                                                  |
-| Sweep stuck            | Audits start at the fallback                                                                             | As today for the report                                                                               |
-| Ranking card blocked   | Audits start at the fallback, unless someone unblocks the card first                                     | As today for the report                                                                               |
+| Situation              | What the operator sees                                                                                                  | Recovery                                                                                              |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Audits running         | Nothing in chat until each posts its summary; `hermes cron list` in the platform profile shows them                     | None needed                                                                                           |
+| Marking an audit fails | Nothing; `oobe` logs and retries the missing ids each minute, five tries per audit                                      | Automatic                                                                                             |
+| An audit run fails     | The audit's own failure path; `chat-delivery-watch` opens a GitHub issue when reports stop reaching chat                | As today                                                                                              |
+| No GitOps repository   | Reports stay in the report store; a run that changed something posts a summary saying no GitOps repository is connected | None, or for ledger issues, re-run the installer with `--gitops-org` and `--gitops-repo` (INSTALL.md) |
+| No home channel        | Ledger issues and PRs in the repository; the first report names each unposted audit (see §7)                            | Set one (`/sethome`)                                                                                  |
+| Sweep stuck            | Audits start at the fallback                                                                                            | As today for the report                                                                               |
+| Ranking card blocked   | Audits start at the fallback, unless someone unblocks the card first                                                    | As today for the report                                                                               |
 
 ## 7. Not in this design
 
