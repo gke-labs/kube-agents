@@ -1203,5 +1203,106 @@ class FailedLineTest(unittest.TestCase):
         self.assertIsNone(sar.failed_line("What's wrong" + "\t" * LONG_INPUT * 2 + "x\n"))
         self.assertLess(time.monotonic() - start, FAST_SECONDS)
 
+
+#: fleet-audit's lines for the run that published to ``ISSUE``, as ``render_chat_report`` writes them.
+FINISH_REPORT = f"Security & RBAC Posture Audit: 2 critical findings, 1 new, 1 resolved.\nLedger: {LEDGER}"
+#: fleet-audit's summary of a run with no ledger, as ``render_no_forge_summary`` writes it.
+SUMMARY = (
+    "Security & RBAC Posture Audit: 2 critical findings, 2 resolved.\n"
+    "`critical` seeded-a: control plane is public\n"
+    "`critical` seeded-security: debug-binding grants cluster-admin\n"
+    "5 more (1 major, 4 minor) are saved on the install.\n"
+    "No GitOps repository is connected, so no ledger issue or fix pull requests were opened."
+)
+
+
+class FinishLineTest(unittest.TestCase):
+    """fleet-audit's own line, which drops its zero counts, still builds the card and the fallback."""
+
+    def test_the_line_builds_the_card(self):
+        self.assertEqual(sar.headline_from_issue(ISSUE, REF, FINISH_REPORT).splitlines()[0], HEADLINE)
+
+    def test_the_fallback_is_the_line_in_bold(self):
+        self.assertEqual(
+            sar.headline_fallback(FINISH_REPORT, REF),
+            f"**Security & RBAC Posture Audit: 2 critical findings, 1 new, 1 resolved.**\n{LINK}",
+        )
+
+    def test_a_clean_line_reads_clean_on_a_closed_ledger(self):
+        report = f"Security & RBAC Posture Audit: clean, 2 resolved across 3 clusters.\nLedger: {LEDGER}"
+        self.assertEqual(
+            sar.headline_from_issue(dict(ISSUE, state="closed"), REF, report),
+            f"**{sar.CLEAN_CARD.format(name='Security & RBAC Posture Audit')}**\n{LINK}",
+        )
+
+    def test_a_held_line_does_not_rebuild_the_card(self):
+        report = (
+            "Security & RBAC Posture Audit: no findings across 3 clusters, but the ledger stays open: "
+            f"2 carried findings were not accounted for.\nLedger: {LEDGER}"
+        )
+        self.assertIsNone(sar.headline_from_issue(ISSUE, REF, report))
+
+
+class SummaryCardTest(unittest.TestCase):
+    """The card of a run with no ledger issue, read from fleet-audit's summary."""
+
+    def test_approved_layout(self):
+        self.assertEqual(
+            sar.headline_from_summary(SUMMARY),
+            "**Security & RBAC Posture Audit: 2 critical findings, 2 resolved.**\n"
+            "`critical` seeded-a: control plane is public\n"
+            "`critical` seeded-security: debug-binding grants cluster-admin\n"
+            "5 more (1 major, 4 minor) are saved on the install.\n"
+            "No GitOps repository is connected, so no ledger issue or fix pull requests were opened.",
+        )
+
+    def test_the_blocks_offer_the_first_finding_and_no_ledger(self):
+        blocks, text = sar.blocks_from_summary(SUMMARY)
+        buttons = [element for block in blocks if block["type"] == "actions" for element in block["elements"]]
+        self.assertEqual([button["text"]["text"] for button in buttons], [sar.LOOK_FIRST])
+        self.assertFalse(any("url" in button for button in buttons))
+        self.assertIn("seeded-a: control plane is public", text)
+
+    def test_the_card_as_a_chat_message(self):
+        chat, text = sar.chat_from_summary(SUMMARY)
+        self.assertEqual(chat["headline"], "Security & RBAC Posture Audit: 2 critical findings, 2 resolved.")
+        self.assertEqual(
+            chat["rows"],
+            [
+                {"text": "seeded-a: control plane is public", "severity": "critical"},
+                {"text": "seeded-security: debug-binding grants cluster-admin", "severity": "critical"},
+            ],
+        )
+        self.assertEqual(chat["after"][-1], "No GitOps repository is connected, so no ledger issue or fix pull requests were opened.")
+        self.assertEqual(chat["choices"], [{"text": sar.LOOK_FIRST, "primary": True}])
+        self.assertNotIn("links", chat)
+        self.assertEqual(text, sar.headline_from_summary(SUMMARY))
+
+    def test_a_run_with_no_findings_has_no_button(self):
+        summary = "Security & RBAC Posture Audit: no findings, 2 resolved.\nNo GitOps repository is connected."
+        blocks, _ = sar.blocks_from_summary(summary)
+        self.assertFalse([block for block in blocks if block["type"] == "actions"])
+
+    def test_a_report_with_a_ledger_is_not_a_summary(self):
+        self.assertIsNone(sar.summary_card(f"{SUMMARY}\nLedger: {LEDGER}"))
+        self.assertIsNone(sar.summary_card(FINISH_REPORT))
+
+    def test_another_shape_posts_as_written(self):
+        for report in ("", "Here's the audit.", "## What's wrong\nThe audit could not write its ledger.", REPORT):
+            with self.subTest(report=report[:20]):
+                self.assertIsNone(sar.summary_card(report))
+
+    def test_a_row_keeps_a_links_text_and_drops_its_target(self):
+        summary = SUMMARY.replace("control plane is public", "[click](https://evil.example/x) <!channel>")
+        card = sar.summary_card(summary)
+        self.assertNotIn("evil.example", card.rows[0]["text"])
+        self.assertNotIn("<!channel>", card.rows[0]["text"])
+
+    def test_a_long_report_is_read_quickly(self):
+        start = time.monotonic()
+        sar.summary_card("Audit: 1 critical finding" + "x" * LONG_INPUT + "\n" + "`critical` y" * LONG_INPUT)
+        self.assertLess(time.monotonic() - start, FAST_SECONDS)
+
+
 if __name__ == "__main__":
     unittest.main()

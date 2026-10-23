@@ -53,6 +53,11 @@ are model-written and editable
 on the forge, as is the issue title, and the relayed line is model-written
 too, so a row, the audit name and the relayed line keep a link's text and drop
 its target, and a ``<!channel>``-style token loses its brackets.
+
+A report with no ledger issue that is fleet-audit's summary of a run with no
+GitOps repository (``render_no_forge_summary``) gets the same card from the
+summary itself (:func:`summary_card`): its headline, its finding rows, its
+other lines under them, and "Look at the first one" with no ledger button.
 """
 
 from __future__ import annotations
@@ -294,6 +299,17 @@ CLOSED_STATE = "closed"
 ACTION_ID_PREFIX = "kage_audit"
 LOOK_FIRST = "Look at the first one"
 LEDGER_BUTTON = "Ledger issue #{number} ↗"
+
+#: fleet-audit's summary of a run with no ledger issue
+#: (``audit_report.render_no_forge_summary``): its first line is the headline,
+#: "<Name>: <n> <severity> finding(s)" or "<Name>: no findings" and what
+#: changed; a finding row is ``audit_report.SUMMARY_ROW``, its severity as
+#: inline code; every other line goes under the rows. Bounded, like the
+#: headline the card shows.
+SUMMARY_HEADLINE = re.compile(
+    r"\A[^\n:`]{1,200}: (?:\d{1,9} (?:critical|major|minor) findings?|no findings)\b[^\n]{0,300}\Z"
+)
+SUMMARY_ROW = re.compile(r"\A`(?P<severity>critical|major|minor)` (?P<text>[^\n]{1,1000})\Z")
 
 #: The "What's wrong" section of a report written to the Platform Agent's three
 #: sections (``agents/platform/SOUL.md``): a heading (``## What's wrong``) or a
@@ -769,6 +785,74 @@ def chat_from_issue(issue: dict, ref: LedgerRef, report: str = "") -> tuple[dict
         links=links,
     )
     return chat, text
+
+
+def summary_card(report: str) -> Card | None:
+    """The card of a fleet-audit report with no ledger issue, read from fleet-audit's summary, or None.
+
+    The summary is the whole report of a run on an install with no GitOps
+    repository (:data:`SUMMARY_HEADLINE`): its headline, its finding rows,
+    and its other lines under them (the rest counted by severity, the ids the
+    collector still flags, the coverage gaps, why no ledger was written).
+    None for a report that names an issue URL, which has a ledger, and for any
+    other shape, which posts as written. A row keeps a link's text and drops its
+    target, as a ledger card's row does.
+    """
+    if ledger_ref(report) is not None or ANY_ISSUE_URL.search(report):
+        return None
+    lines = [line.strip() for line in report.strip().splitlines() if line.strip()]
+    if not lines or not SUMMARY_HEADLINE.match(lines[0]):
+        return None
+    rows: list[dict] = []
+    after: list[str] = []
+    for line in lines[1:]:
+        row = SUMMARY_ROW.match(line)
+        if row and not after:
+            text = _balanced_clip(_row_text(row.group("text")), FINDING_ROW_MAX)
+            rows.append({"severity": row.group("severity"), "text": text})
+        else:
+            after.append(_row_text(line))
+    return Card(_row_text(lines[0]), rows, "\n".join(after), "")
+
+
+def headline_from_summary(report: str) -> str | None:
+    """:func:`summary_card` as markdown text, the headline in bold, or None whenever it is."""
+    card = summary_card(report)
+    if card is None:
+        return None
+    rows = [severity_row(row["severity"], row["text"]) for row in card.rows]
+    return "\n".join([f"**{card.headline}**", *rows, *_after_rows(card)])
+
+
+def blocks_from_summary(report: str) -> tuple[list[dict], str] | None:
+    """:func:`summary_card` as Block Kit ``(blocks, text)``, with "Look at the first one" and no ledger button."""
+    card = summary_card(report)
+    if card is None:
+        return None
+    after = "\n".join(_after_rows(card))
+    choices = [LOOK_FIRST] if card.rows else []
+    blocks = blocks_report(
+        card.headline, rows=card.rows, after_rows=after, choices=choices, action_id_prefix=ACTION_ID_PREFIX
+    )
+    return blocks, fallback_text(card.headline, rows=card.rows, after_rows=after)
+
+
+def chat_from_summary(report: str) -> tuple[dict, str] | None:
+    """:func:`summary_card` as a ``kube-agents.chat/v1`` message for ``spec.mode: next``: ``(chat, text)``, or None.
+
+    ``text`` is :func:`headline_from_summary`'s markdown, the fallback the
+    gateway posts when it does not lay the message out.
+    """
+    card = summary_card(report)
+    if card is None:
+        return None
+    chat = _chat.report_message(
+        card.headline,
+        rows=card.rows,
+        after_rows="\n".join(_after_rows(card)),
+        choices=[LOOK_FIRST] if card.rows else [],
+    )
+    return chat, headline_from_summary(report) or report
 
 
 def failed_line(report: str) -> str | None:

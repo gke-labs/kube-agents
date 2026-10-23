@@ -171,6 +171,14 @@ gateway lays it out, buttons included, as it lays out a card's post in a convers
 The text headline rides beside it as the fallback the gateway posts when the message
 breaks a rule or Slack refuses it; the leg's own fallbacks above are unchanged.
 
+A fleet-audit report with no ledger link that is fleet-audit's own summary of a run with
+no GitOps repository (`slack_audit_report.summary_card`) gets the same card, built from
+the summary instead of an issue. `_post_summary_card` posts `blocks_from_summary` through
+the relay, or `chat_from_summary` through the gateway under `spec.mode: next`: the
+summary's headline, its finding rows, its other lines under them, and "Look at the first
+one" with no link button. Where the card does not post, `headline_from_summary` goes out
+as text, and the fallbacks are those of the ledger card.
+
 ## Why no agent turn runs over the report
 
 The relay first ran one Chat Agent turn over each report, told to reproduce it
