@@ -48,3 +48,8 @@ gitops-drift-backlog-digest
 # main". This line is inert until they exist, which is why it is placed on
 # the arithmetic alone.
 gitops-drift-load-bearing-change-triage
+# The on-demand report case. With it in main-a, and with the stack cases that
+# main added after it was registered, main-a's chain is 11450s against main-b's 9600s:
+# 1850s apart, over the 1800s tolerance. Here, at its 200s default, the
+# halves are 11250s against 9800s.
+fleet-audit-on-demand-run-reports
