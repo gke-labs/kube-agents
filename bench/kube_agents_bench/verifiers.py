@@ -2931,7 +2931,11 @@ class WorkerCommandsVerifier(BaseVerifier):
     withheld), is ``status="error"``, a withheld argument beside a readable call
     is skipped, a worker whose tagged calls are all MCP calls grades as zero
     commands, and a capture with gaps that found no forbidden command is
-    ``status="error"``. Fails closed like its siblings -- a run with no captured
+    ``status="error"``; a check with no forbidden set is not ordered, so an
+    untimed call and a gap beside a satisfied required set do not error it,
+    and the card log's rows join its typed set, so a command the trajectory
+    missed still counts (a case sets ``after_result_pattern: "(?!)"`` to
+    read the required commands as typed and nothing else). Fails closed like its siblings -- a run with no captured
     worker commands is ``status="error"``, not a pass.
     """
 
@@ -2982,6 +2986,7 @@ class WorkerCommandsVerifier(BaseVerifier):
         window = ""
         sources = ""
         result_hits: list[tuple[str, str]] = []
+        forbidding = bool(self.forbidden_patterns or self.forbidden_runs or self.forbidden_result_patterns)
         if self.after_result_pattern is None:
             # ``None`` stays an error even when the trajectory carries tagged calls: it
             # means a filed card's log could not be read (or nothing was filed), and
@@ -3044,8 +3049,18 @@ class WorkerCommandsVerifier(BaseVerifier):
                         reason=_NO_WORKER_TERMINAL_CALLS_REASON,
                     )
             typed = [command for _, _, command, _, _ in calls]
+            # The ordered check reads the calls alone: a log row has no time.
+            # A check with no forbidden set keeps the card log as a source for
+            # its required checks: the trajectory can be the narrower read (two
+            # #2959 runs had a command on the log and no tagged call), so a row
+            # the calls do not carry joins the typed set rather than becoming a miss.
+            if not forbidding:
+                seen = set(typed)
+                typed += [row for row in (str(r.get("command") or "") for r in snap.worker_commands or []) if row and row not in seen]
             untimed = [command for _, at, command, _, _ in calls if at is None]
-            if untimed:
+            # Only the window orders calls; a check with no forbidden set
+            # grades nothing by time, so an untimed call cannot mislead it.
+            if untimed and forbidding:
                 shown = "; ".join(repr(c[:_SHOWN_COMMAND_CHARS]) for c in untimed[:_MAX_NAMED_COMMANDS])
                 return VerificationResult(
                     success=False,
@@ -3125,7 +3140,10 @@ class WorkerCommandsVerifier(BaseVerifier):
                 elapsed_time=time.monotonic() - start,
                 reason="; ".join(parts) + window,
             )
-        if partial:
+        # A required command that was read is conclusive the same way: a gap
+        # beside a satisfied required set errors only a check that also has a
+        # forbidden set to clear.
+        if partial and (forbidding or missing or unrun):
             unseen = f"; required pattern(s) {missing} not seen in what was read" if missing else ""
             return VerificationResult(
                 success=False,
