@@ -236,6 +236,16 @@ type Config struct {
 	// nothing and competes for nothing. See a2a/gateway/a2adoor.go.
 	A2ADoorListen string
 
+	// ConsoleDoor (A2A_CONSOLE_DOOR=true) says the console door is wanted
+	// on its own: a gateway with no chat backend and no other door starts
+	// for it rather than refusing. The console adapter runs whenever the
+	// gateway runs; this only lets it be the gateway's whole ingress. The
+	// operator sets it on every next gateway, so an install with no chat
+	// backend still runs one for the console page and the MCP server. Like
+	// the doors it is not a backend in the one-real-backend sense: it
+	// consumes nothing and competes for nothing.
+	ConsoleDoor bool
+
 	// A2ADoorToken is the bearer token the door requires on every RPC
 	// request (A2A_DOOR_TOKEN); the agent card is the one unauthenticated
 	// route. No unauthenticated mode for the RPCs, for the inject door's
@@ -558,8 +568,8 @@ type Config struct {
 }
 
 // Backend names the REAL chat backend this config arms: "gchat", "slack",
-// "discord", or "" when a side door (inject, A2A, or both) is the only way
-// in. FromEnv
+// "discord", or "" when a side door (inject, A2A, or both) or the console
+// door alone is the only way in. FromEnv
 // refuses more than one real backend, so the order here only decides what a
 // hand-built Config means.
 //
@@ -575,7 +585,7 @@ func (c *Config) Backend() string {
 		return slackBackend
 	case c.DiscordToken != "":
 		return discordBackend
-	case c.InjectListen != "" || c.A2ADoorListen != "":
+	case c.InjectListen != "" || c.A2ADoorListen != "" || c.ConsoleDoor:
 		// No real backend: a door is the whole of the ingress, and the
 		// attribution on a message that comes through it is the door's own.
 		return ""
@@ -652,6 +662,7 @@ func FromEnv() (*Config, error) {
 	cfg.InjectToken = strings.TrimSpace(os.Getenv("A2A_INJECT_TOKEN"))
 	cfg.InjectPrincipalMapPath = envOr("A2A_INJECT_PRINCIPAL_MAP", defaultInjectPrincipalMapPath)
 	cfg.A2ADoorListen = strings.TrimSpace(os.Getenv("A2A_DOOR_LISTEN"))
+	cfg.ConsoleDoor = os.Getenv("A2A_CONSOLE_DOOR") == "true"
 	cfg.A2ADoorToken = strings.TrimSpace(os.Getenv("A2A_DOOR_TOKEN"))
 	cfg.A2ADoorPrincipalMapPath = envOr("A2A_DOOR_PRINCIPAL_MAP", defaultA2ADoorPrincipalMapPath)
 	cfg.A2ADoorPublicURL = strings.TrimSpace(os.Getenv("A2A_DOOR_PUBLIC_URL"))
@@ -724,11 +735,14 @@ func FromEnv() (*Config, error) {
 		// inject-only when it does, and says so on the door's read route,
 		// because a next install whose relay URL failed to render looks the
 		// same. The spec's test-backend section states the same decision.
-		if cfg.InjectListen == "" && cfg.A2ADoorListen == "" {
-			return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret), A2A_GCHAT_RELAY_URL (the credential proxy's chat relay), the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair (Socket Mode), A2A_INJECT_LISTEN (the dev-only inject side door), or A2A_DOOR_LISTEN (the A2A door for agent callers)")
+		// The console door alone is enough too (A2A_CONSOLE_DOOR), for the
+		// same reason: a console client such as the MCP server needs a
+		// gateway on an install that configured no chat backend.
+		if cfg.InjectListen == "" && cfg.A2ADoorListen == "" && !cfg.ConsoleDoor {
+			return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret), A2A_GCHAT_RELAY_URL (the credential proxy's chat relay), the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair (Socket Mode), A2A_INJECT_LISTEN (the dev-only inject side door), A2A_DOOR_LISTEN (the A2A door for agent callers), or A2A_CONSOLE_DOOR=true (the console door alone)")
 		}
 	default:
-		return nil, fmt.Errorf("more than one chat backend is configured (%s): one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend. The side doors (A2A_INJECT_LISTEN, A2A_DOOR_LISTEN) are not backends in this sense and may sit beside any one of them", strings.Join(armed, ", "))
+		return nil, fmt.Errorf("more than one chat backend is configured (%s): one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend. The side doors (A2A_INJECT_LISTEN, A2A_DOOR_LISTEN, A2A_CONSOLE_DOOR) are not backends in this sense and may sit beside any one of them", strings.Join(armed, ", "))
 	}
 	// Fail closed: a door with no token would be reachable by anything that
 	// reaches the listener, and the port-forward path the runner uses is

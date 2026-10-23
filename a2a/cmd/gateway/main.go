@@ -154,6 +154,9 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		// No real backend: the doors (inject, A2A) and the console are the
 		// only ingresses, which is what lets an eval install's gateway start
 		// at all (#1660).
+		if !cfg.InjectArmed() && !cfg.A2ADoorArmed() {
+			log.Info("console-only: no chat backend, serving the console door")
+		}
 	default:
 		adapter, err = gateway.NewDiscordAdapter(cfg.DiscordToken, log)
 	}

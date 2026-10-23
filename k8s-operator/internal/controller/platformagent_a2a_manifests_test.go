@@ -7864,3 +7864,49 @@ func TestGatewayRendersABlankPlatformAllowlistAsNobody(t *testing.T) {
 		}
 	}
 }
+
+// TestTheGatewayAlwaysArmsTheConsoleDoor: every next gateway carries
+// A2A_CONSOLE_DOOR=true, backend or not. With no backend it is what lets the
+// gateway start (a2a/gateway/config.go); beside one it changes nothing, and
+// it means a backend taken away leaves a console-only gateway rather than a
+// crash loop. The name is spelled out so the test reads the gateway's
+// contract rather than the constant it checks.
+func TestTheGatewayAlwaysArmsTheConsoleDoor(t *testing.T) {
+	cases := []struct {
+		name   string
+		inject string
+		door   string
+		agent  func() *agentv1alpha1.PlatformAgent
+		// backendEnv is an env var the case's backend renders, so the case
+		// proves the backend is really there beside the console door.
+		backendEnv string
+	}{
+		// Discord has no case of its own: its env is an optional Secret
+		// reference rendered on every gateway, so it renders exactly as
+		// "no backend" does, which covers it.
+		{"no backend", "", "", a2aTestAgent, ""},
+		{"google chat", "", "", func() *agentv1alpha1.PlatformAgent { return gchatTestAgent("next", true) }, a2aGchatRelayURLEnvVar},
+		{"slack", "", "", func() *agentv1alpha1.PlatformAgent { return slackTestAgent("next", true) }, a2aSlackAppTokenEnvVar},
+		{"inject door", "true", "", a2aTestAgent, a2aInjectListenEnvVar},
+		{"a2a door", "", "true", a2aTestAgent, a2aDoorListenEnvVar},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(a2aInjectBackendEnvVar, tc.inject)
+			t.Setenv(a2aAgentDoorEnvVar, tc.door)
+			dep := buildA2AGatewayDeployment(tc.agent())
+			env := envMapOf(dep.Spec.Template.Spec.Containers[0].Env)
+			if got, ok := env["A2A_CONSOLE_DOOR"]; !ok || got.Value != "true" || got.ValueFrom != nil {
+				t.Errorf("A2A_CONSOLE_DOOR = %+v (set=%v), want the literal \"true\"", got, ok)
+			}
+			if tc.backendEnv != "" {
+				if _, ok := env[tc.backendEnv]; !ok {
+					t.Errorf("precondition: the %s backend's %s is not rendered", tc.name, tc.backendEnv)
+				}
+			}
+			if dep.Spec.Replicas != nil && *dep.Spec.Replicas != 1 {
+				t.Errorf("the render asks for %d replicas, want 1", *dep.Spec.Replicas)
+			}
+		})
+	}
+}
