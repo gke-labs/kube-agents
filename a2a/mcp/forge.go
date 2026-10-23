@@ -100,7 +100,7 @@ func NewBrokerClient(cfg BrokerConfig) (*BrokerClient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("broker URL: %w", err)
 	}
-	if (u.Scheme != schemeHTTP && u.Scheme != schemeHTTPS) || u.Host == "" {
+	if (u.Scheme != schemeHTTP && u.Scheme != schemeHTTPS) || u.Hostname() == "" {
 		return nil, fmt.Errorf("broker URL must be an http or https URL with a host, got %q", cfg.URL)
 	}
 	// ForceQuery is a bare trailing "?", and a bare "#" leaves Fragment
@@ -243,6 +243,8 @@ func brokerStatusMessage(status int, code string) string {
 		return "the forge is rate-limiting this install; try again later"
 	case brokerCodeTooLarge:
 		return "the forge's answer is larger than the credential broker accepts"
+	case "CREDENTIAL_PROXY_BUSY":
+		return "the credential broker is busy with other requests; try again shortly"
 	}
 	switch {
 	case status == http.StatusUnauthorized:
@@ -253,7 +255,7 @@ func brokerStatusMessage(status int, code string) string {
 		return "the credential broker found no such route, repository or proposal"
 	case status == http.StatusBadRequest, status == http.StatusUnprocessableEntity:
 		return "the credential broker rejected the request as malformed"
-	case status == http.StatusTooManyRequests:
+	case status == http.StatusTooManyRequests, status == http.StatusServiceUnavailable:
 		return "the credential broker or the forge is busy; try again later"
 	case status == http.StatusNotImplemented:
 		return "the credential broker serves no forge for that repository's host"
