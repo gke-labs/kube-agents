@@ -172,7 +172,8 @@ var SensitiveEnvVars = map[string]struct{}{
 	// gateway conversation a card was filed in, on the same route, and names
 	// the platform in the cron relay's refusal when no home channel is set.
 	// The operator renders it exactly when the gateway arms the route.
-	"A2A_NOTIFY_CONVERSATIONS": {},
+	"A2A_NOTIFY_CONVERSATIONS":     {},
+	"KUBE_AGENTS_ENABLED_PROFILES": {},
 	// NATS_CA_FILE names the CA the client trusts the bus by. An override is
 	// the TLS half of a redirected NATS_URL: pointed at a CA of the setter's
 	// choosing, the client accepts a server that CA signed as the bus, and
@@ -2313,6 +2314,23 @@ type AgentUsageStatus struct {
 	// LastActiveTime: a card giving up is not the agent at work.
 	// +optional
 	BackgroundTasksGaveUpTotal int64 `json:"backgroundTasksGaveUpTotal,omitempty"`
+	// NegativeFeedbackTotal is the cumulative count of thumbs-down reactions
+	// put on one of the bot's Slack messages: the chat_feedback_reactions hook
+	// on the Hermes gateway counts a -1 or thumbsdown reaction, skin tone or
+	// not, whose reactor is not the bot and whose message is the bot's, once
+	// per reactor and message within one gateway process (a thumbs-down taken
+	// off and put back is one; after a restart the same one counts again, and
+	// a reaction before the first inbound message after a start is not
+	// counted), into the
+	// chat_metrics plugin's kubeagents_chat_feedback_negative_total, which is
+	// read every five minutes and kept monotonic the same way as
+	// ToolExecutionsTotal. Slack through the Hermes gateway only: Google Chat
+	// delivers no reaction events, and the A2A gateway's Slack adapter does not
+	// subscribe to them, so on a next-mode install with Slack through A2A this
+	// stays at 0. Does not move LastActiveTime: the message the person
+	// reacted to already did.
+	// +optional
+	NegativeFeedbackTotal int64 `json:"negativeFeedbackTotal,omitempty"`
 
 	// ClustersRegistered is the number of clusters the event watcher built a
 	// client for at its last start: the management cluster and the Cluster
@@ -2359,7 +2377,7 @@ type AgentUsageStatus struct {
 	// LastActiveTime is the time of the last poll in which a counter above
 	// moved: a brokered command ran or was refused, a proposal was opened or
 	// merged, a chat message reached the gateway, or an event was accepted
-	// for triage; BrokerFailuresTotal, ChatTurnsErroredTotal and BackgroundTasksGaveUpTotal
+	// for triage; BrokerFailuresTotal, ChatTurnsErroredTotal, BackgroundTasksGaveUpTotal and NegativeFeedbackTotal
 	// alone leave it where it was.
 	// Scheduled maintenance jobs that run brokered commands move it too --
 	// the Controller Stall Watch cron runs some every 30 minutes by default

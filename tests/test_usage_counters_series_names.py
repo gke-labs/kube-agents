@@ -177,6 +177,9 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         self.assertEqual(name, _go_const(_SCRAPE_GO, "a2aTaskTerminalsSeries"))
         self.assertEqual(_go_const(_A2A_METRICS_GO, "labelState"), _go_const(_SCRAPE_GO, "a2aTerminalStateLabel"))
 
+    def test_the_chat_plugins_negative_feedback_family_is_the_one_the_poller_sums_into_negative_feedback(self):
+        self.assertEqual(_py_const("CHAT_FEEDBACK_NEGATIVE_METRIC", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "chatFeedbackNegativeSeries"))
+
     def test_the_errored_states_the_poller_filters_on_are_the_a2a_libs_failed_and_rejected(self):
         """The state values are the A2A library's constants; the gateway emits them
         through its terminal list, and the operator's map is the second copy."""

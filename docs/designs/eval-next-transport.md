@@ -545,7 +545,7 @@ spec's "Coexistence is by mode").
 The operator render kept the three conditions the A2A owner set on it: it cites the gateway
 spec's sections; the Google Chat adapter's `verifiedBy: chat-event-topic-iam` and its
 allowed-users gate are exactly as "The Google Chat adapter" section has them, the gate carried
-as `A2A_GCHAT_ALLOWED_USERS` and `A2A_GCHAT_ALLOW_ALL_USERS` from the CR's list; Google Chat enabled on the CR is a backend the operator's own check (`a2aGatewayBackend`) recognises, so a Chat install's
+as `A2A_GCHAT_ALLOWED_USERS` and `A2A_GCHAT_ALLOW_ALL_USERS` from the CR's list; Google Chat enabled on the CR is a backend the operator's own check (`a2aGatewayBackend`; removed 2026-10-22, when every next install began running a console-only gateway) recognises, so a Chat install's
 gateway renders and starts without a Discord Secret; and the one-backend guard is settled by
 precedence rather than by a guard change: the render omits the Discord reference when Chat is
 armed, the relay URL beside a Slack credential stays the gateway's refusal, and the inject door
