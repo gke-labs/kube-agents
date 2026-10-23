@@ -25,6 +25,14 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
+// reconcileIterations bounds a golden's reconcile loop; a settled run takes a
+// pass per step of the bring-up it waits through (the callout serving, the
+// provisioning Job completing, the bridge joining the agent pod), so it gets more.
+const (
+	reconcileIterations        = 5
+	settledReconcileIterations = 12
+)
+
 // TrackingClient wraps a client.Client and intercepts all mutation operations
 // (Create, Update, Patch) to collect modified resources in their insertion/generation order.
 type TrackingClient struct {
@@ -511,14 +519,6 @@ func parseMultiDocYAML(t *testing.T, data string) []interface{} {
 	}
 	return docs
 }
-
-// reconcileIterations bounds a golden's reconcile loop; a settled run takes a
-// pass per step of the bring-up it waits through (the callout serving, the
-// provisioning Job completing, the bridge joining the agent pod), so it gets more.
-const (
-	reconcileIterations        = 5
-	settledReconcileIterations = 12
-)
 
 // bringUp does what a cluster's controllers would between two reconcile
 // passes: every Deployment and StatefulSet reports all its replicas ready on

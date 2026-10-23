@@ -104,9 +104,10 @@ _A2A_CONSOLE = "a2aConsole"
 _A2A_GATEWAY = "a2aGateway"
 _A2A_PROVISION = "a2aProvision"
 _HERMES_BRIDGE = "hermesBridge"
-# What the bridge becomes under the operator's A2A_BRIDGE_EXECUTOR=cli with no
-# A2A_BRIDGE_RESOURCES: a copy of the agent container's resources
-# (a2aRenderedBridgeResources). The preflight picks it when operator.extraEnv says cli.
+# The agent container's resources, which the operator copies onto the bridge under
+# A2A_BRIDGE_EXECUTOR=cli with no A2A_BRIDGE_RESOURCES (a2aRenderedBridgeResources). The
+# preflight counts the bridge at no less than this whenever operator.extraEnv sets either
+# variable, in any form.
 _HERMES_BRIDGE_CLI = "hermesBridgeCli"
 _NEXT_MODE = "nextMode"
 _A2A_NATS_WORKLOAD = "platformagent-a2a-nats"

@@ -2138,14 +2138,18 @@ The defaults carry no ephemeral-storage request because the operator renders non
       {{- with $bridgeResources -}}
         {{- $parsed := fromJson . -}}
         {{- if not (hasKey $parsed "Error") -}}
-          {{- $quantity := `^[0-9]+(\.[0-9]+)?(m|k|M|G|T|Ki|Mi|Gi|Ti)?$` -}}
+          {{- /* The CRD's quantity grammar, as agentAPIAuthResourcesCheck holds an override
+                 to: parseCpuMillis and parseBytes read every form it admits, so a figure
+                 that matches never reaches their fail. A JSON number arrives as a float,
+                 which toString may print with an exponent; the grammar admits that too. */ -}}
+          {{- $quantity := "^(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$" -}}
           {{- $requested := index $parsed "requests" -}}
           {{- if not (kindIs "map" $requested) -}}{{- $requested = dict -}}{{- end -}}
           {{- range $side := list "limits" "requests" -}}
             {{- $list := index $parsed $side -}}
             {{- if kindIs "map" $list -}}
               {{- range $key, $field := dict "cpu" "cpuMillis" "memory" "memoryBytes" "ephemeral-storage" "ephemeralStorageBytes" -}}
-                {{- $raw := toString (index $list $key) -}}
+                {{- $raw := trimPrefix "+" (trim (toString (index $list $key))) -}}
                 {{- if regexMatch $quantity $raw -}}
                   {{- $n := 0 -}}
                   {{- if eq $key "cpu" -}}{{- $n = include "kube-agents.parseCpuMillis" $raw | int64 -}}{{- else -}}{{- $n = include "kube-agents.parseBytes" $raw | int64 -}}{{- end -}}
@@ -2311,10 +2315,11 @@ The defaults carry no ephemeral-storage request because the operator renders non
   {{- $spec := index $quota "spec" | default dict -}}
   {{- $scopes := index $spec "scopes" -}}
   {{- $scopeSelector := index $spec "scopeSelector" -}}
-  {{- /* A quota a PlatformAgent owns is the operator's next-mode session-pod bound, which it
-         sizes above the release's own standing pods and puts back on every reconcile
-         (server-side apply), so a patch printed against it would be reverted and the upgrade
-         refused again. The release's fit there is the operator's to keep, not this check's. */ -}}
+  {{- /* A quota a PlatformAgent owns is the operator's next-mode session-pod bound
+         (pods: maxSessions plus a headroom, buildA2ASessionQuota), which it puts back on every
+         reconcile (server-side apply), so a patch printed against it would be reverted and the
+         upgrade refused again. Its size is spec.harness.tuning.maxSessions's to raise, and the
+         headroom's to cover the release (gke-labs#3848), not this check's to diagnose. */ -}}
   {{- $operatorOwned := false -}}
   {{- range $ref := (index ($quota.metadata | default dict) "ownerReferences" | default list) -}}
     {{- if and (eq (toString $ref.kind) "PlatformAgent") (hasPrefix "kubeagents.x-k8s.io/" (toString $ref.apiVersion)) -}}

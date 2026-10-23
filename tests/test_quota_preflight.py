@@ -773,10 +773,34 @@ class PreflightDecisionTest(unittest.TestCase):
             self._bridge_delta([{"name": "A2A_BRIDGE_RESOURCES", "value": '{"limits": {"cpu": "4"}}'}]),
             4000 - bridge["cpuMillisRequest"],
         )
+        # Every spelling the Kubernetes quantity grammar admits raises it, not only the
+        # common suffixes: a JSON number (a float that prints with an exponent), a leading
+        # "+", an exponent and a Pi suffix, each above the agent container's 2Gi memory.
+        cli_mem = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["agentPod"]["hermesBridgeCli"][
+            "memoryBytesRequest"
+        ]
+        base = self._requirements(["platformAgent.mode=next"])
+        for written, want in (
+            ('{"requests": {"memory": 4294967296}}', 4294967296),
+            ('{"requests": {"memory": "+4Gi"}}', 4 * 1024**3),
+            ('{"requests": {"memory": "4e9"}}', 4 * 10**9),
+            ('{"requests": {"memory": "1Pi"}}', 1024**5),
+        ):
+            with self.subTest(written):
+                req = self._requirements(
+                    ["platformAgent.mode=next"],
+                    values={"operator": {"extraEnv": [{"name": "A2A_BRIDGE_RESOURCES", "value": written}]}},
+                )
+                self.assertGreater(want, cli_mem)
+                self.assertEqual(
+                    req["requestsMemory"] - base["requestsMemory"],
+                    want - yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["agentPod"]["hermesBridge"]["memoryBytesRequest"],
+                )
 
     def test_an_operator_owned_quota_is_left_to_the_operator(self) -> None:
         """The next-mode session quota a PlatformAgent owns is not a quota this check can fix:
-        the operator sizes it above the release and reverts a patch (#3848)."""
+        the operator reapplies it, so a patch would be reverted; its size is maxSessions's
+        and the headroom's (#3848)."""
         owned = self._quota({"pods": "2"})
         owned["metadata"]["ownerReferences"] = [
             {"apiVersion": "kubeagents.x-k8s.io/v1alpha1", "kind": "PlatformAgent", "name": "platformagent"}

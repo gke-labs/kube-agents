@@ -995,8 +995,9 @@ keys, including `services`, `secrets` and other `count/<resource>` entries, are 
 modelled and are skipped rather than guessed at. **Scoped quotas are skipped entirely** —
 a quota with `scopes` or a `scopeSelector` applies to a subset of pods the template cannot
 identify, so comparing the whole release against it would be wrong either way. So is a quota
-a `PlatformAgent` owns: the operator's next-mode session-pod quota, which it sizes above the
-release itself and puts back if patched. Every quota
+a `PlatformAgent` owns: the operator's next-mode session-pod quota (`pods` of `maxSessions`
+plus a headroom), which it puts back on every reconcile, so a printed patch would not stick;
+raise `spec.harness.tuning.maxSessions` instead. Every quota
 that falls short is reported in one failure, so a namespace with two of them takes one
 patch rather than two rounds.
 
