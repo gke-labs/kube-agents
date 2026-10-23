@@ -3,8 +3,8 @@ package gateway
 import (
 	"context"
 	"encoding/json"
-	"strings"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
