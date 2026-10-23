@@ -4065,8 +4065,12 @@ def _run_completed_since(profile: str, job_id: str, since: float) -> bool:
     """Whether the scheduler's ledger has a run of `job_id` that started after `since` and finished cleanly.
 
     True when the ledger cannot say, so a failure that cannot be told from a
-    repeat is posted rather than withheld.
+    repeat is posted rather than withheld; that includes a `profile` that is not
+    one path segment, since it is caller-supplied and a path that leaves the
+    profiles directory is no ledger.
     """
+    if not _PROFILE_SEGMENT_RE.match(profile):
+        return True
     path = os.path.join(_profile_home(profile), *RUN_LEDGER)
     if not os.path.exists(path):
         return True

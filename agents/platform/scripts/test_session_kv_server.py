@@ -4514,6 +4514,13 @@ class TestSchedulerFailureLine(unittest.TestCase):
         _, sent = self.post()
         self.assertEqual(len(sent), 1)
 
+    def test_a_profile_that_is_not_one_segment_reads_no_ledger(self):
+        self.ledger(("obtainability-audit", "failed", "2026-10-21T06:50:00+00:00"))
+        for profile in ("..", "../..", "/var/lib/x", "a/b"):
+            with self.subTest(profile=profile), patch.object(session_kv_server.sqlite3, "connect") as connect:
+                self.assertTrue(session_kv_server._run_completed_since(profile, "obtainability-audit", 0.0))
+                connect.assert_not_called()
+
     def test_a_clean_run_is_one_that_started_after_the_post(self):
         self.ledger(
             ("obtainability-audit", "completed", "2026-10-20T06:50:00+00:00"),

@@ -210,12 +210,14 @@ class Base(unittest.TestCase):
         self.tmp.cleanup()
 
     @staticmethod
-    def failed(detail: str, reason: str = watch.FAILED_REASON_ERROR) -> str:
+    def failed(detail: str, reason: str = watch.FAILED_REASON_ERROR, admin: bool | None = None) -> str:
         """What a failed tick prints, stdout and stderr in turn: the plain line, then the detail.
 
         No roster under this profile home, so a failure a retry may clear tries again at
         the next scheduled run; any other says a person has to act."""
-        then = watch.FAILED_NEEDS_ADMIN if reason in watch.FAILED_REASONS_NEED_ADMIN else watch.FAILED_NEXT_UNKNOWN
+        if admin is None:
+            admin = reason in watch.FAILED_REASONS_NEED_ADMIN
+        then = watch.FAILED_NEEDS_ADMIN if admin else watch.FAILED_NEXT_UNKNOWN
         line = watch.FAILED_TICK_LINE.format(reason=reason, next=then)
         return f"{line}\nupgrade readiness watch: the tick failed: {detail}\n"
 
@@ -1755,6 +1757,7 @@ class DeclaredScope(Base):
                 "it lists p1; the remedy is on the install, not this job: name the project in spec.scope, "
                 "or take it out of the roster (its Cluster Agent profile, or UPGRADE_READINESS_PROJECTS)",
                 watch.FAILED_REASON_REFUSED,
+                admin=True,
             ),
         )
         # The failed tick writes nothing of its own to the ledger but the standing-outside record (and any id it learned, none
@@ -2841,9 +2844,6 @@ class Roster(unittest.TestCase):
         self.assertEqual(entry["risk"], "high")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class PlainFailureLine(unittest.TestCase):
     """Only the plain line reaches stdout, which the relay posts; the detail goes to stderr."""
@@ -2917,3 +2917,57 @@ class PlainFailureLine(unittest.TestCase):
         for error, reason in cases:
             with self.subTest(error=error):
                 self.assertEqual(watch.failure_reason(error), reason)
+
+    def test_a_refusal_that_clears_on_its_own_promises_a_retry(self) -> None:
+        self.roster("10 10 * * *")
+        for cause in sorted(watch.REFUSAL_CAUSES_THAT_CLEAR):
+            with self.subTest(cause=cause):
+                (Path(self.tmp.name) / watch.FAILURE_MARKER_FILE_NAME).unlink(missing_ok=True)
+                out, _ = self.run_main(watch.ReportRefused("refused", cause))
+                self.assertTrue(out.endswith(" It will try again tomorrow.\n"), out)
+
+    def test_a_tick_with_any_refusal_that_needs_a_person_says_so(self) -> None:
+        self.roster("10 10 * * *")
+        refused = watch.ReportRefused("refused", watch.REFUSAL_SANDBOX)
+        refused.causes = [watch.REFUSAL_SANDBOX, watch.REFUSAL_OUTSIDE]
+        out, _ = self.run_main(refused)
+        self.assertTrue(out.endswith(watch.FAILED_NEEDS_ADMIN + "\n"))
+
+
+class SaveFailure(unittest.TestCase):
+    """A ledger save that keeps failing is announced once, as any standing failure is."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        env = mock.patch.dict(
+            os.environ,
+            {
+                watch.WATCH_HOME_ENV: str(self.home),
+                watch.PROJECTS_ENV: "p1",
+                fleet_scope_targets.AGENT_HOME_ENV: self.tmp.name,
+                fleet_scope_targets.SCOPE_FILE_ENV: "",
+            },
+        )
+        env.start()
+        self.addCleanup(env.stop)
+
+    def run_tick(self) -> str:
+        out = io.StringIO()
+        sandbox = FakeSandbox(envelope([member("a", "lagging")]), envelope([member("a", "lagging", readiness="ready")]))
+        with mock.patch.object(watch.sandbox_exec, "run", side_effect=sandbox.run), mock.patch.object(
+            watch, "save_ledger", side_effect=OSError("ledger.json.tmp is a directory")
+        ), redirect_stdout(out), redirect_stderr(io.StringIO()):
+            watch.main([])
+        return out.getvalue()
+
+    def test_a_save_that_keeps_failing_posts_once(self) -> None:
+        first = self.run_tick()
+        second = self.run_tick()
+        self.assertIn("didn't finish today", first)
+        self.assertEqual(second, "")
+
+
+if __name__ == "__main__":
+    unittest.main()

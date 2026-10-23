@@ -703,8 +703,8 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
             comments = provider.list_comments(repo, pr)
         except forge.ForgeError as refusal:
             # One pull request that will not load must not blind the sweep for
-            # the others. Collected into a single warning below rather than one
-            # line each, so a repo-wide outage is one message.
+            # the others. Collected, and posted below one line per pull request
+            # the tick it first fails, so a standing outage is posted once.
             #
             # The reason travels with it because the two that land here send an
             # operator to different places: a transport or credential fault
