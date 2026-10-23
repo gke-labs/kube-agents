@@ -215,6 +215,12 @@ func (c *Conversations) resolve(alias, token string) (string, bool, bool, string
 	// one, whether or not this table still knows it (after a delete, an
 	// eviction or a restart, the token is what a caller falls back to).
 	if token == "" && (strings.HasPrefix(alias, consoleConversationPrefix) || isMintedToken(alias)) {
+		// console:<x> in a name's place is a token only when x is one, as
+		// list shows tokens; console:<name> is neither, not a conversation
+		// nobody minted.
+		if rest := strings.TrimPrefix(alias, consoleConversationPrefix); !isMintedToken(rest) {
+			return "", false, false, "", fmt.Errorf("%s is neither a conversation name nor a conversation's token (list shows a token as console:<token>)", cell(alias))
+		}
 		alias, token = "", alias
 	}
 	if token != "" {
@@ -343,22 +349,31 @@ func (c *Conversations) lookup(alias, token string) (string, bool, error) {
 
 // Forget drops alias, and reports whether it was there. The conversation
 // itself is untouched: it stays reachable by its token.
-func (c *Conversations) Forget(alias string) bool {
+func (c *Conversations) Forget(alias, token string) (string, bool) {
 	c.mu.Lock()
-	if _, ok := c.byAlias[alias]; !ok {
-		// Named by its token, as list shows it, or bare.
-		a, found := c.aliasOfTokenLocked(strings.TrimPrefix(alias, consoleConversationPrefix))
+	// A token wins over a name, as it does in ResolveCall.
+	name := ""
+	if token == "" {
+		if _, ok := c.byAlias[alias]; ok {
+			name = alias
+		} else {
+			// Named by its token in a name's place, as list shows it, or bare.
+			token = alias
+		}
+	}
+	if name == "" {
+		a, found := c.aliasOfTokenLocked(strings.TrimPrefix(token, consoleConversationPrefix))
 		if !found {
 			c.mu.Unlock()
-			return false
+			return "", false
 		}
-		alias = a
+		name = a
 	}
-	token := c.byAlias[alias].token
-	delete(c.byAlias, alias)
+	forgotten := c.byAlias[name].token
+	delete(c.byAlias, name)
 	c.mu.Unlock()
-	c.events.Unname(token)
-	return true
+	c.events.Unname(forgotten)
+	return name, true
 }
 
 // List returns the aliases, most recently used first.

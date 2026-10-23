@@ -454,3 +454,31 @@ func TestOnlyAMintedSpellingIsAToken(t *testing.T) {
 		t.Errorf("ResolveCall(%q) = %q, %v, %v; want a new name", upper, tok, byToken, err)
 	}
 }
+
+// console:<x> in a name's place is a token only when x is one: console:<name>
+// is refused, not sent to a conversation nobody minted.
+func TestConsolePrefixOnANameIsRefused(t *testing.T) {
+	s, convs, frames := sessionServer(t)
+	_, _ = convs.Resolve("ops", "")
+	n := len(frames.all())
+	mustFail(t, callTool(t, s, ToolManageSession, map[string]any{"action": actionSessionOn, "conversation": consoleConversationPrefix + "ops"}))
+	if got := frames.all()[n:]; len(got) != 0 {
+		t.Errorf("console:<name> sent %+v", got)
+	}
+}
+
+// delete takes a token in either place, a token winning over a name as in
+// every other action, and names what it forgot.
+func TestDeleteTakesATokenAsEveryActionDoes(t *testing.T) {
+	s, convs := busless(t)
+	opsToken, _ := convs.Resolve("ops", "")
+	_, _ = convs.Resolve("dev", "")
+	out := mustSucceed(t, callTool(t, s, ToolManageSession, map[string]any{"action": actionDelete, "conversation": "dev", "conversation_token": opsToken}))
+	mustContain(t, out, "Forgot the name `ops`")
+	if rows := convs.List(); len(rows) != 1 || rows[0].Alias != "dev" {
+		t.Errorf("delete with a name and a token left %+v, want dev", rows)
+	}
+	devToken, _ := convs.Resolve("dev", "")
+	out = mustSucceed(t, callTool(t, s, ToolManageSession, map[string]any{"action": actionDelete, "conversation": consoleConversationPrefix + devToken}))
+	mustContain(t, out, "Forgot the name `dev`")
+}

@@ -188,20 +188,21 @@ func newConversation(convs *Conversations, a manageSessionArgs) (string, error) 
 }
 
 func deleteConversation(convs *Conversations, a manageSessionArgs) (string, error) {
-	if a.Conversation == "" {
-		if a.ConversationToken != "" {
-			return "", errors.New("delete forgets a name; a conversation named only by its token has no name here to forget")
-		}
-		return "", errors.New("delete needs the conversation's name")
+	if a.Conversation == "" && a.ConversationToken == "" {
+		return "", errors.New("delete needs the conversation's name, or its token")
 	}
 	// Trimmed as new trims it, so the name new made is the name forgotten.
 	a.Conversation = strings.TrimSpace(a.Conversation)
-	if !convs.Forget(a.Conversation) {
+	name, ok := convs.Forget(a.Conversation, a.ConversationToken)
+	if !ok {
+		if a.ConversationToken != "" {
+			return "", fmt.Errorf("no name here holds the conversation with token %s; delete forgets a name, and there is none to forget", cell(a.ConversationToken))
+		}
 		return "", fmt.Errorf("no conversation named %s", cell(a.Conversation))
 	}
 	return fmt.Sprintf("Forgot the name %s. This only forgets the name: the conversation's history stays on the bus, "+
 		"and a /session worker for it idles out by itself (to end one now, stop its running task and send session_off first). "+
-		"A later call with this name starts a new conversation.\n", cell(a.Conversation)), nil
+		"A later call with this name starts a new conversation.\n", cell(name)), nil
 }
 
 // formatConversations renders list's table. Names and descriptions are the

@@ -378,14 +378,14 @@ func TestOneSubscriptionPerConversation(t *testing.T) {
 		t.Errorf("a holds b's frames: %+v", p.Frames)
 	}
 
-	if !convs.Forget("a") {
+	if _, ok := convs.Forget("a", ""); !ok {
 		t.Fatal("forget failed")
 	}
 	if got := conn.NumSubscriptions() - before; got != 1 {
 		t.Errorf("after forgetting a, %d subscriptions remain, want b's alone", got)
 	}
 	// b has a frame buffered: forgetting its name keeps it until retention.
-	convs.Forget("b")
+	convs.Forget("b", "")
 	if got := conn.NumSubscriptions() - before; got != 1 {
 		t.Errorf("forgetting b dropped its buffered frames at once")
 	}
@@ -754,7 +754,7 @@ func TestADeleteDuringATurnKeepsItsReport(t *testing.T) {
 		mu.Lock()
 		c := convs
 		mu.Unlock()
-		if !c.Forget("ops") {
+		if _, ok := c.Forget("ops", ""); !ok {
 			return
 		}
 		time.Sleep(reportDelay)
