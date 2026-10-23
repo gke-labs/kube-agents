@@ -92,6 +92,18 @@ from kube_agents_bench.forges import (
     proposal_refs,
     token_env_vars,
 )
+from kube_agents_bench.shell_words import (
+    _INTERPRETER_RE,
+    _OPERATOR_MARK,
+    _SHELL_ASSIGNMENT_RE,
+    _SHELL_COUNT_RE,
+    _SHELL_EXEC_WRAPPERS,
+    _SHELL_FLAG_PREFIX,
+    _SHELL_PROGRAMS_WITH_COMMAND_STRING,
+    _SHELL_RESERVED_WORDS,
+    _read_shell_line,
+    _shell_argvs,
+)
 
 __all__ = [
     "AGENT_BRANCH_PREFIX",
@@ -202,39 +214,57 @@ BRANCH_PATH_PREFIXES = ("refs/heads/", "origin/", "/tree/", "/commits/", "/compa
 #: ``main...<branch>``: git refuses ``..`` inside a ref name, so a branch
 #: after it is whole.
 BRANCH_RANGE_SEPARATOR = ".."
-#: How a call names ``version-control``'s script: by its path, or by the
-#: variable its SKILL.md assigns the path to (``V=.../vcs.py`` then
-#: ``python3 $V branch <name>``).
-VCS_SCRIPT = r"(?:\bvcs(?:\.py)?|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)[\"']?"
-#: The commands that create a branch or a pull request, matched against one
-#: shell segment of a call (:func:`writing_segments`): ``submit-suggestion``'s
-#: ``prepare`` and ``submit``, ``version-control``'s ``branch``, ``publish``
-#: and ``proposal create``, and the raw ``git``/``gh``/``glab`` forms. What a
-#: repetition charges itself with by its calls is what these name, never a
-#: read that takes a branch or URL as its argument (``vcs.py clone
-#: --branch``, ``proposal list --source``, ``gh pr view <url>``, ``git fetch
-#: origin <branch>``): a read names another case's pull request as easily as
-#: a listing's result does.
+#: How a call names ``version-control``'s script: by its file (the command
+#: word's basename), or by the variable its SKILL.md assigns the path to
+#: (``V=.../vcs.py`` then ``python3 $V branch <name>``).
+VCS_SCRIPT = r"vcs(?:\.py)?|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?"
+#: The commands that create a branch or a pull request, matched from the
+#: command word of one argv the shell reader yields (:func:`writing_segments`),
+#: the word's basename and the words after it joined by spaces: ``submit-suggestion``'s ``prepare`` and
+#: ``submit``, ``version-control``'s ``branch``, ``publish`` and ``proposal
+#: create``, and the raw ``git``/``gh``/``glab`` forms. A verb anywhere else
+#: (a heredoc's body, an ``echo``'s text, ``$NS push-gateway``) creates
+#: nothing. What a repetition charges itself with by its calls is what these
+#: name, never a read that takes a branch or URL as its argument (``vcs.py
+#: clone --branch``, ``proposal list --source``, ``gh pr view <url>``, ``git
+#: fetch origin <branch>``): a read names another case's pull request as
+#: easily as a listing's result does.
 WRITING_COMMANDS = tuple(
-    re.compile(p)
+    re.compile(p + r"(?!\S)")
     for p in (
-        r"\bsubmit_suggestion(?:\.py)?[\"']?\s+(?:prepare|submit)\b",
-        VCS_SCRIPT + r"\s+(?:branch|publish|push)\b",
-        VCS_SCRIPT + r"\s+(?:proposal|pr|mr)\s+(?:create|open)\b",
-        r"\bgit(?:\s+-[Cc]\s+\S+)*\s+(?:push|branch|checkout\s+(?:-[bB]|--orphan)|switch\s+(?:-[cC]|--create))\b",
-        r"\bgh\b.*\bpr\s+create\b",
-        r"\bglab\b.*\bmr\s+create\b",
+        r"submit_suggestion(?:\.py)? (?:prepare|submit)",
+        rf"(?:{VCS_SCRIPT}) (?:branch|publish|push)",
+        rf"(?:{VCS_SCRIPT}) (?:proposal|pr|mr) (?:create|open)",
+        r"git(?: -[Cc] \S+| --[\w-]+(?:=\S*)?)* (?:push|branch|checkout (?:-[bB]|--orphan)|switch (?:-[cC]|--create))",
+        r"gh(?: -\S+(?: \S+)?)* pr create",
+        r"glab(?: -\S+(?: \S+)?)* mr create",
     )
 )
 #: A tool whose name says it creates a branch or a pull request (a forge MCP
 #: server's ``create_pull_request``, ``create_branch``, ``push_files``): every
 #: argument it was handed is what it wrote.
 WRITING_TOOL_NAME = re.compile(r"(?i)(?:create|open)_?(?:pull|merge|branch|proposal)|push")
-#: What separates one command from the next in a shell line, after a
-#: backslash-newline continuation is joined: a heredoc's body, a ``cd`` and a
-#: read chained before the write each fall in a segment of their own.
-SHELL_CONTINUATION = "\\\n"
-SHELL_SEGMENT_SPLIT = re.compile(r"&&|\|\||[;|\n]")
+#: A heredoc's opener (``<<'EOF'``, ``<<-EOF``, ``<<\\EOF``; not a ``<<<``
+#: here-string): the lines after it, up to its delimiter alone on a line, are
+#: the command's input, and a verb in them is text -- unless the line hands
+#: that input to a shell (:data:`HEREDOC_RUNNERS`). A match counts only where
+#: the shell reads ``<<`` as an operator (:func:`_opens_heredoc`), not inside
+#: quotes, a comment or ``$((1<<2))``.
+HEREDOC_OPENER = re.compile(r"(?<!<)<<(?!<)-?[ \t]*\\?(['\"]?)([A-Za-z0-9_.-]+)\1")
+HEREDOC_RUNNERS = frozenset((*_SHELL_PROGRAMS_WITH_COMMAND_STRING, "ssh"))
+#: The openers of a command substitution a line may leave open across a
+#: heredoc (``--body "$(cat <<'EOF'``); ``$((`` is arithmetic.
+OPEN_SUBSTITUTIONS = ("$(", "`")
+ARITHMETIC_OPENER = "$(("
+#: Words that hand the rest of an argv on to the command after them
+#: (:func:`_creates`), beside assignments, exec wrappers, interpreters, flags
+#: and counts: ``uv run``, ``eval``, ``--``.
+PASS_THROUGH_WORDS = frozenset(("run", "eval", "--"))
+#: An interpreter's flag whose next word is code, never a script to run.
+CODE_FLAG = "-c"
+#: What closes a quoted value a clipped call or a one-row-per-line worker log
+#: cut short, so the words before the cut still read.
+UNCLOSED_QUOTES = ('"', "'")
 #: A branch whose name holds none of these is a bare word (``fix``,
 #: ``main``) that a reply's prose carries by accident, so it is attributed
 #: by its pull request's URL alone, never by its name.
@@ -746,11 +776,87 @@ def named_in(
 
 
 def writing_segments(command: str) -> list[str]:
-    """The segments of a shell line that create a branch or a pull request
-    (:data:`WRITING_COMMANDS`), so a write is charged by the call that made
-    it and not by a read chained beside it."""
-    joined = command.replace(SHELL_CONTINUATION, " ")
-    return [s for s in SHELL_SEGMENT_SPLIT.split(joined) if any(p.search(s) for p in WRITING_COMMANDS)]
+    """The commands of a shell line that create a branch or a pull request
+    (:data:`WRITING_COMMANDS`), each as its argv's words joined by spaces, so
+    a write is charged by the call that made it and not by a read chained
+    beside it. The line is read as ``worker_commands`` reads it
+    (:func:`kube_agents_bench.shell_words._shell_argvs`): a ``;``, ``|`` or
+    newline inside a quoted ``--title`` is text, and a verb counts only as an
+    argv's command word (:func:`_creates`). A line whose quotes do not
+    balance, a value cut short, is read as if the open quote closed at the
+    end."""
+    command = _without_heredoc_bodies(command)
+    argvs = _shell_argvs(command)
+    for quote in UNCLOSED_QUOTES:
+        # A trailing backslash would escape the quote that closes the value.
+        argvs = argvs or _shell_argvs(command.rstrip("\\") + quote)
+    return [" ".join(argv) for argv in argvs if _creates(argv)]
+
+
+def _creates(argv: list[str]) -> bool:
+    """Whether ``argv``'s command word is one of :data:`WRITING_COMMANDS`.
+    The command word is the first word past those that hand the argv on:
+    ``NAME=value`` assignments, reserved words, exec wrappers with their
+    flags, a flag's value and a count (``sudo -u bob``, ``timeout 60``), an
+    interpreter with its flags (``python3 -u``, ``uv run``) and ``eval``.
+    Any other word ends the search, so ``echo git push`` and ``kubectl logs
+    $NS push-gateway`` create nothing; so does an interpreter's ``-c``,
+    whose next word is code."""
+    after_flag = False
+    for index, word in enumerate(argv):
+        base = os.path.basename(word)
+        if any(p.match(" ".join([base, *argv[index + 1:]])) for p in WRITING_COMMANDS):
+            return True
+        if word == CODE_FLAG:
+            return False
+        if word.startswith(_SHELL_FLAG_PREFIX) and word != "--":
+            after_flag = True
+            continue
+        if (
+            _SHELL_ASSIGNMENT_RE.match(word)
+            or word in _SHELL_RESERVED_WORDS
+            or word in PASS_THROUGH_WORDS
+            or base in _SHELL_EXEC_WRAPPERS
+            or _INTERPRETER_RE.match(base)
+            or _SHELL_COUNT_RE.match(word)
+            or after_flag
+        ):
+            after_flag = False
+            continue
+        return False
+    return False
+
+
+def _opens_heredoc(head: str) -> bool:
+    """Whether a ``<<`` right after ``head`` is one the shell reads as an
+    operator: outside quotes and comments (:func:`_read_shell_line`), at the
+    top of the line or inside a command substitution the line leaves open."""
+    text, _, operators = _read_shell_line(head + "<<")
+    if operators and operators[-1] == "<<" and text.rstrip().endswith(_OPERATOR_MARK.format(index=len(operators) - 1)):
+        return True
+    for opener in OPEN_SUBSTITUTIONS:
+        start = head.rfind(opener)
+        if start >= 0 and not head.startswith(ARITHMETIC_OPENER, start) and text.endswith(head[start:] + "<<"):
+            return _opens_heredoc(head[start + len(opener):])
+    return False
+
+
+def _without_heredoc_bodies(command: str) -> str:
+    """``command`` without the bodies of its heredocs (:data:`HEREDOC_OPENER`)
+    and their delimiter lines, except a body the line hands to a shell
+    (:data:`HEREDOC_RUNNERS`), which is read as commands."""
+    kept: list[str] = []
+    pending: list[str] = []
+    for line in command.split("\n"):
+        if pending:
+            if line.strip() == pending[0]:
+                pending.pop(0)
+            continue
+        kept.append(line)
+        delimiters = [m.group(2) for m in HEREDOC_OPENER.finditer(line) if _opens_heredoc(line[: m.start()])]
+        if delimiters and not HEREDOC_RUNNERS & {os.path.basename(w) for w in _read_shell_line(line)[0].split()}:
+            pending = delimiters
+    return "\n".join(kept)
 
 
 def is_writing_tool(name: str) -> bool:

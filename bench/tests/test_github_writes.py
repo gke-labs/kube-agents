@@ -570,6 +570,17 @@ def test_a_branch_after_a_range_or_compare_separator_is_named(text, named):
         # A read chained beside a write names nothing: the push is of another branch.
         {"name": "terminal", "args": {"command": f"git fetch origin {PDB_BRANCH} && git push origin HEAD:platform-agent/mine"}},
         {"name": "execute_code", "args": {"code": f"print(open('/tmp/x').read())  # {PDB_BRANCH}"}},
+        # A creating verb that is not the command word: a heredoc's body, an echo's text, an
+        # argument that starts with the verb.
+        {"name": "terminal", "args": {"command": f"cat > /tmp/report.md <<'EOF'\nThe earlier fix was pushed with `git push origin {PDB_BRANCH}`; it failed CI.\nEOF"}},
+        {"name": "terminal", "args": {"command": f'echo "next: gh pr create --head {PDB_BRANCH}"'}},
+        {"name": "terminal", "args": {"command": f"kubectl logs -n $NS push-gateway-7c9f {PDB_BRANCH}"}},
+        # A worker call clipped in the pod arrives as JSON text: its read is a line of its own,
+        # and the submit beside it names another branch.
+        {
+            "name": "terminal",
+            "args": {"raw": json.dumps({"command": f"git fetch origin {PDB_BRANCH}\npython3 submit_suggestion.py submit --branch platform-agent/mine --body-file /tmp/b", "x": "y" * 3000})[:2000]},
+        },
     ],
 )
 def test_a_branch_or_url_in_a_reads_arguments_does_not_charge_the_write(env, github, call):
@@ -610,8 +621,20 @@ def test_a_read_in_a_workers_command_does_not_charge_the_write(env, github):
         {"name": "terminal", "args": {"command": f"python3 vcs.py proposal create --title t --source {PDB_BRANCH}"}},
         {"name": "terminal", "args": {"command": f"cd /tmp/repo && git checkout -b {PDB_BRANCH}"}},
         {"name": "terminal", "args": {"command": f"git -C /tmp/repo push -u origin {PDB_BRANCH}"}},
+        {"name": "terminal", "args": {"command": f"timeout 120 git push origin {PDB_BRANCH} 2>&1 | tail -3"}},
+        # A `<<` that is text is no heredoc; a heredoc handed to a shell is commands.
+        {"name": "terminal", "args": {"command": f'echo "use << EOF syntax"\ngit push origin {PDB_BRANCH}'}},
+        {"name": "terminal", "args": {"command": f"bash <<EOF\ngit push origin {PDB_BRANCH}\nEOF"}},
         {"name": "terminal", "args": {"command": f"gh pr create --head {PDB_BRANCH} --title t --body b"}},
         {"name": "create_pull_request", "args": {"owner": "gke-agentic", "repo": "x", "head": PDB_BRANCH}},
+        # A shell operator inside a quoted value ahead of the branch is text.
+        {"name": "terminal", "args": {"command": f'python3 submit_suggestion.py submit --title "Add a PDB; keep one replica" --branch {PDB_BRANCH}'}},
+        {"name": "terminal", "args": {"command": f'gh pr create --body "| a | b && c |" --head {PDB_BRANCH}'}},
+        # A worker call clipped in the pod inside a quoted value after the branch.
+        {
+            "name": "terminal",
+            "args": {"raw": json.dumps({"command": f'cd /x\npython3 submit_suggestion.py submit --branch {PDB_BRANCH} --title "' + "t" * 3000 + '"'})[:2000]},
+        },
     ],
 )
 def test_the_call_that_created_the_branch_charges_the_write(env, github, call):
