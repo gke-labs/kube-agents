@@ -94,9 +94,9 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Thirty-four fixtures: thirty-one across the four cluster slots and three project-scoped. Most in-cluster
-fixtures are on slot `a`, across the eleven seeded namespaces `seeded-debug`,
-`seeded-reliability`, `seeded-security`, `seeded-capacity`, `seeded-deprecation`, `seeded-intent`, `seeded-token`, `seeded-headroom`, `seeded-stall`, `seeded-shapes` and `seeded-defaults`, plus both
+Thirty-six fixtures: thirty-three across the four cluster slots and three project-scoped. Most in-cluster
+fixtures are on slot `a`, across the twelve seeded namespaces `seeded-debug`,
+`seeded-reliability`, `seeded-security`, `seeded-capacity`, `seeded-deprecation`, `seeded-intent`, `seeded-token`, `seeded-headroom`, `seeded-qos`, `seeded-stall`, `seeded-shapes` and `seeded-defaults`, plus both
 defect node pools. Slot `c` carries a GKE-level defect only and no workloads at all: it is the
 configuration outlier. Slot `b` is the held-back control plane, and also carries the
 upgrade-readiness drain defects, which belong with the cluster whose subject is upgrading. Slot
@@ -116,6 +116,7 @@ its roles are never published.
 | `declared-no-pdb-workload`      | a       | 0   | `deployment/notification-relay` in `seeded-intent`, two replicas, no PDB, in a namespace with no NetworkPolicy; both declared on purpose in the GitOps repository's `knowledge/`                                                  |
 | `declared-token-workload`       | a       | 0   | `deployment/token-reader` and `deployment/token-sidecar` in `seeded-token`, on the default ServiceAccount with the token mounted; `token-reader` declared on purpose in the GitOps repository's `knowledge/`, `token-sidecar` not |
 | `declared-overrequest-workload` | a       | 0   | `deployment/burst-ingest` in `seeded-headroom`, two pause replicas requesting `10m` / `128Mi` each and using almost none of the memory; declared on purpose in the GitOps repository's `knowledge/`                               |
+| `guaranteed-qos-workload`       | a       | 0   | `deployment/ledger-writer` in `seeded-qos`, two replicas with requests equal to limits (`10m` / `32Mi`), so Guaranteed QoS, burning the whole CPU limit                                                                           |
 | `stalled-controller`            | a       | 0   | `deployment/inventory-api` in `seeded-stall`, CreateContainerConfigError, ProgressDeadlineExceeded                                                                                                                                |
 | `crashloop-workload`            | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop                                                                                                                                             |
 | `hpa-saturated`                 | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                                                                                                                                                             |
@@ -131,6 +132,7 @@ its roles are never published.
 | `readiness-pinned-workload`     | b       | 0   | `deployment/pinned-batch-runner` in `seeded-upgrade`, one replica pinned to that pool                                                                                                                                             |
 | `readiness-drain-blocked`       | b       | 0   | `poddisruptionbudget/pinned-batch-runner` in `seeded-upgrade`, `maxUnavailable: 0`, so `disruptionsAllowed` is 0 permanently                                                                                                      |
 | `readiness-failclosed-webhook`  | b       | 0   | `seeded-fail-closed-gate`, `failurePolicy: Fail` with a 30-second timeout and no backend                                                                                                                                          |
+| `readiness-lb-drain-timeout`    | b       | 0   | `drain-timeout-<prefix>-b`, a backend service on the default pool's instance group draining for 3600 seconds, six times GKE's 600-second per-node wait, behind a TCP health check and no forwarding rule                          |
 | `zonal-skew-scheduling`         | d       | 0   | `deployment/zone-pinned-api` in `seeded-topology`, two replicas, `ScheduleAnyway` zonal spread plus a required single-zone nodeAffinity                                                                                           |
 | `zonal-skew-volume`             | d       | 0   | `statefulset/zone-bound-store` in `seeded-topology`, two replicas on `seeded-zonal-pd`, a class pinned to the first zone                                                                                                          |
 | `zonal-skew-capacity`           | d       | 0   | `deployment/capacity-starved-worker` in `seeded-topology`, four replicas at 500m against an e2-small the sponge keeps full and an e2-standard-2 that fits one to three, so some stay Pending                                      |
@@ -166,7 +168,7 @@ neither is going to be obvious from a slug.
 **A role slug is not the `seeded-role` label.** `bench/tf/fleet/main.tf` carries
 `seeded-role=pinned-inference` on the pinned pool's node label and taint, and
 `seeded-role=idle-batch` on the idle pool's taint, and `bench/tf/fleet/defects-b.tf`
-`seeded-role=no-surge` on the no-surge pool's — so three of the thirty-one roles are called one
+`seeded-role=no-surge` on the no-surge pool's — so three of the thirty-three roles are called one
 thing by the catalogue and another by the Terraform that plants them. They are
 different mechanisms and both are load-bearing: the label and taint are scheduling
 constraints that keep other workloads off those pools, and the role slug is what the
@@ -186,12 +188,13 @@ the fleet could already show was a workload that resists eviction — `obtainabi
 PodDisruptionBudget checks, on slot `a`. What it could not show is a drain that goes ahead and
 takes a workload down with it, and one that cannot finish at all:
 
-| Role                           | What it plants                                                                                                                                                                                                                                                               |
-| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `readiness-surge-blocked`      | A node pool with `max_surge: 0`, so an upgrade recreates its only node in place rather than adding a replacement first. Not a retirement, and not always wrong — the `gke-upgrades` skill prescribes it for reservation-bound pools                                          |
-| `readiness-pinned-workload`    | A single-replica Deployment whose `nodeSelector` names that pool alone, so it is down for the whole of each in-place node recreate rather than falling back to the default pool                                                                                              |
-| `readiness-drain-blocked`      | A PodDisruptionBudget with `maxUnavailable: 0` matching that workload, so `disruptionsAllowed` is 0 permanently and no drain that touches it can finish                                                                                                                      |
-| `readiness-failclosed-webhook` | A `ValidatingWebhookConfiguration` whose `clientConfig` names a Service that does not exist, with `failurePolicy: Fail` and the API's maximum 30-second `timeoutSeconds`. The unresolvable backend is the defect; Fail alone is set by healthy webhooks throughout the fleet |
+| Role                           | What it plants                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `readiness-surge-blocked`      | A node pool with `max_surge: 0`, so an upgrade recreates its only node in place rather than adding a replacement first. Not a retirement, and not always wrong — the `gke-upgrades` skill prescribes it for reservation-bound pools                                                                                                                                                                                                                                                                                                                   |
+| `readiness-pinned-workload`    | A single-replica Deployment whose `nodeSelector` names that pool alone, so it is down for the whole of each in-place node recreate rather than falling back to the default pool                                                                                                                                                                                                                                                                                                                                                                       |
+| `readiness-drain-blocked`      | A PodDisruptionBudget with `maxUnavailable: 0` matching that workload, so `disruptionsAllowed` is 0 permanently and no drain that touches it can finish                                                                                                                                                                                                                                                                                                                                                                                               |
+| `readiness-failclosed-webhook` | A `ValidatingWebhookConfiguration` whose `clientConfig` names a Service that does not exist, with `failurePolicy: Fail` and the API's maximum 30-second `timeoutSeconds`. The unresolvable backend is the defect; Fail alone is set by healthy webhooks throughout the fleet                                                                                                                                                                                                                                                                          |
+| `readiness-lb-drain-timeout`   | A Compute Engine backend service on the default pool's instance group with a 3600-second connection draining timeout, six times the 600 seconds GKE waits per node during a pool upgrade, behind a TCP health check and no forwarding rule, so it routes nothing; every default-pool node recreate waits the full 600 seconds on it. A Compute Engine object the probe and state grammars cannot address, so the role probes the pool's node and asserts the pool, and the readiness report's `lb-connection-draining` rule is what reads the service |
 
 The first three are a chain, and that is the point. The surge setting alone is a configuration the
 `gke-upgrades` skill sometimes prescribes; joining it to the single replica pinned there is a
@@ -261,8 +264,8 @@ provisioning — it is the SOPs' own age rules. A collector that filters on
 `creationTimestamp` returns nothing for a fixture younger than its window, so the audit
 correctly reports no finding and a case asserting one correctly fails.
 
-Twenty-nine of the thirty-one are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`,
-`declared-no-pdb-workload`, `declared-token-workload`, `declared-overrequest-workload`, `stalled-controller`, `crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the four
+Thirty-one of the thirty-three are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`, `guaranteed-qos-workload`,
+`declared-no-pdb-workload`, `declared-token-workload`, `declared-overrequest-workload`, `stalled-controller`, `crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the five
 `readiness-*` roles on slot `b`, the three `zonal-skew-*` roles on slot `d` and the eleven
 upgrade-failure shapes, ten in `seeded-shapes` and one in `seeded-defaults` (`node-local-state`, `deprecated-label-selector`,
 `containerd-socket-agent`, `intree-pd-volume`, `retired-registry-image`, `moving-admission-default`,

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -110,11 +111,29 @@ type injectMessageRequest struct {
 	Message string `json:"message"`
 }
 
-// injectResponse is the daemon's reply to an accepted inject. Only the status
-// is read; the daemon sends more on the suppressed path and may send more
-// later.
+// injectResponse is the daemon's reply to an accepted inject: the status, and
+// the features the daemon lists for the session; the daemon sends more on the
+// suppressed path and may send more later.
 type injectResponse struct {
 	Status string `json:"status"`
+	// Features is what the daemon says it does with this session beyond
+	// posting the alert. The one read today is injectFeatureFollowup: a daemon
+	// that lists it posts a k8s-event-followup into the alert's thread; one
+	// that does not takes that kind down the event path and would post a
+	// second alert, so the dispatcher sends none to it (dedupEntry.
+	// FollowupSupported). The same feature is read again off /healthz before
+	// each tick's follow-ups (Features), for the daemon of that moment.
+	Features []string `json:"features,omitempty"`
+}
+
+// injectFeatureFollowup is the daemon's word for "I post a
+// k8s-event-followup into the alert's thread"; session_kv_server spells it
+// in INJECT_RESPONSE_FEATURES.
+const injectFeatureFollowup = "followup"
+
+// Supports reports whether the daemon listed feature on this response.
+func (r injectResponse) Supports(feature string) bool {
+	return hasFeature(r.Features, feature)
 }
 
 // injectStatusSuppressed is the daemon's word for "accepted, and then dropped
@@ -155,6 +174,80 @@ const injectStatusSuppressed = "suppressed"
 // install and a pod is not all-old or all-new.
 const injectStatusFiltered = "filtered"
 
+// injectStatusFolded is the daemon's word for "accepted, and recorded as one
+// more sighting of an incident already open for the same workload" — an
+// earlier event for it (another replica's, or this pod's under another reason)
+// was admitted within the daemon's INCIDENT_WORKLOAD_DEDUP_SECONDS window. The
+// entry stays, unflagged, and is held for this watcher's own window like any
+// delivered incident: rolling it back would re-offer this pod at its repeat
+// cadence, and flagging it policy-filtered would let the next Warning sighting
+// reopen it. No feature negotiation: a watcher predating this status reads it
+// as delivered, which keeps the entry the same way and only miscounts it as an
+// injected event and a triage session.
+const injectStatusFolded = "folded"
+
+// sessionIDPattern is the shape of a session id the daemon issues
+// (`k8s-evt-<hex>`, and the operator's own id in shared mode): letters,
+// digits, dot, underscore and hyphen. A session id reaches the inject URL
+// from the daemon's own answer or from the dedup snapshot on disk, and the
+// check keeps a hand-edited snapshot from steering the POST anywhere else.
+var sessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
+
+// injectStatusUnrouted is the daemon's answer to a k8s-event-followup for a
+// session no chat thread is routed to: accepted, nothing posted, nothing to
+// retry (session_kv_server, _inject_followup).
+const injectStatusUnrouted = "unrouted"
+
+// healthzPath is the daemon's unauthenticated health route, which lists the
+// inject kinds it dispatches and, under injectFeaturesKey, the features it
+// serves (the drift detector reads the same list for its own feature);
+// healthzBodyMax bounds the read.
+const (
+	healthzPath       = "/healthz"
+	injectFeaturesKey = "features"
+	healthzBodyMax    = 64 * 1024
+)
+
+// Features asks the daemon, now, which inject features it serves. The
+// per-session answer recorded at alert time says what the daemon of that
+// moment promised; this is what the daemon of this moment does, and the
+// sweep asks before each tick's follow-ups so an agent image rolled back to
+// a build without the follow-up branch is never sent one (it would take the
+// kind down the event path and post a second alert).
+func (i *injector) Features(ctx context.Context) ([]string, error) {
+	// #nosec G704 -- the daemon URL is the operator's own loopback address from --daemon-url, not a request's input
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, i.cfg.daemonURL+healthzPath, nil)
+	if err != nil {
+		return nil, fmt.Errorf("injector: build GET healthz: %w", err)
+	}
+	resp, err := i.client.Do(req) // #nosec G704 -- same URL as above
+	if err != nil {
+		return nil, fmt.Errorf("injector: GET healthz: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, healthzBodyMax))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("injector: GET healthz: status %d", resp.StatusCode)
+	}
+	var parsed struct {
+		Features []string `json:"features"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("injector: healthz body: %w", err)
+	}
+	return parsed.Features, nil
+}
+
+// hasFeature reports whether feature is in the list.
+func hasFeature(features []string, feature string) bool {
+	for _, f := range features {
+		if f == feature {
+			return true
+		}
+	}
+	return false
+}
+
 // injectFeaturesHeader lists the response behaviours this watcher understands,
 // so the daemon can answer an older one the way that older one expects.
 //
@@ -175,29 +268,34 @@ const injectFeaturesHeader = "X-Watcher-Features"
 // injectStatusFiltered. Matched against by the daemon's `_watcher_features`.
 const injectFeaturePolicyFiltered = "policy-filtered"
 
-// Inject posts the triage event details to the specified session's queue.
-//
-// Returns the daemon's status string alongside the error, because a 2xx does
-// not by itself mean anyone was told — see injectStatusSuppressed and
+// InjectDetailed POSTs the payload to the session's inject route and returns
+// the daemon's whole answer: the status Dispatch reads and the features the
+// sweep's handshake reads. The status rides beside the error because a 2xx
+// does not by itself mean anyone was told — see injectStatusSuppressed and
 // injectStatusFiltered. An empty or unparseable body reads as delivered: a
-// daemon predating this field is one that always delivers, and guessing
+// daemon predating the field is one that always delivers, and guessing
 // "dropped" would reopen every incident on every sighting.
-func (i *injector) Inject(ctx context.Context, sessionID string, payload InjectPayload) (string, error) {
+func (i *injector) InjectDetailed(ctx context.Context, sessionID string, payload InjectPayload) (injectResponse, error) {
+	var none injectResponse
 	if sessionID == "" {
-		return "", errors.New("injector: Inject: sessionID is required")
+		return none, errors.New("injector: Inject: sessionID is required")
+	}
+	if !sessionIDPattern.MatchString(sessionID) {
+		return none, fmt.Errorf("injector: Inject: session id %q is not one the daemon issues", sessionID)
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return "", fmt.Errorf("injector: marshal payload: %w", err)
+		return none, fmt.Errorf("injector: marshal payload: %w", err)
 	}
 	wrapped, err := json.Marshal(injectMessageRequest{Message: string(body)})
 	if err != nil {
-		return "", fmt.Errorf("injector: wrap inject envelope: %w", err)
+		return none, fmt.Errorf("injector: wrap inject envelope: %w", err)
 	}
 	url := i.cfg.daemonURL + "/sessions/" + sessionID + "/inject"
+	// #nosec G704 -- the daemon URL is the operator's own loopback address from --daemon-url, and the session id matched sessionIDPattern above
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(wrapped))
 	if err != nil {
-		return "", fmt.Errorf("injector: build POST inject: %w", err)
+		return none, fmt.Errorf("injector: build POST inject: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+i.cfg.bearerToken)
 	req.Header.Set("Content-Type", "application/json")
@@ -205,16 +303,16 @@ func (i *injector) Inject(ctx context.Context, sessionID string, payload InjectP
 	if i.cfg.assertedCaller != "" {
 		req.Header.Set("X-Asserted-Caller", i.cfg.assertedCaller)
 	}
-	resp, err := i.client.Do(req)
+	resp, err := i.client.Do(req) // #nosec G704 -- same URL as above
 	if err != nil {
-		return "", fmt.Errorf("injector: POST inject: %w", err)
+		return none, fmt.Errorf("injector: POST inject: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("injector: POST inject: status %d: %s", resp.StatusCode, string(respBody))
+		return none, fmt.Errorf("injector: POST inject: status %d: %s", resp.StatusCode, string(respBody))
 	}
 	var parsed injectResponse
 	_ = json.Unmarshal(respBody, &parsed)
-	return parsed.Status, nil
+	return parsed, nil
 }

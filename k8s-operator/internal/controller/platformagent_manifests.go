@@ -1515,6 +1515,14 @@ func buildPluginStagingInitContainer(homeDir string, plugin *agentv1alpha1.Agent
 			"-c",
 			stageScript,
 		},
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceEphemeralStorage: resource.MustParse(pluginStagingEphemeralRequest),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceEphemeralStorage: resource.MustParse(pluginStagingEphemeralRequest),
+			},
+		},
 		VolumeMounts: []corev1.VolumeMount{
 			{
 				Name:      buildPluginVolumeName(plugin.Name),
@@ -2440,7 +2448,14 @@ type renderOptions struct {
 	// heldGitHubOrg is the GITHUB_ORG the live gateway carries, set only while
 	// the declaration cannot name the organisation (see heldGitHubOrg).
 	heldGitHubOrg string
+	// enabledProfiles is the sorted list of resolved, non-terminating optional
+	// built-in Hermes specialist AgentProfile names (such as "tse") bound to this
+	// PlatformAgent in `mode: next`. Empty when no optional profiles are bound,
+	// so the zero value renders byte-identical manifests.
+	enabledProfiles []string
 }
+
+const enabledProfilesEnvVar = "KUBE_AGENTS_ENABLED_PROFILES"
 
 // lastWinsEnv drops every entry a later entry of the same name supersedes, keeping the
 // surviving one where it already sits. Order is otherwise untouched, so on the ordinary
@@ -3060,14 +3075,17 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			}
 			extEnvs = kept
 		}
-		// A2A_NOTIFY_PLATFORM and A2A_NOTIFY_CONVERSATIONS are dropped on
-		// every install, not only while the A2A surface is up: on a today
-		// install a plugin's value would reroute Google Chat posts from
-		// hermes send to a chat.notify route that does not exist there. The
-		// operator renders them only under next, after this merge.
+		// A2A_NOTIFY_PLATFORM, A2A_NOTIFY_CONVERSATIONS, and
+		// KUBE_AGENTS_ENABLED_PROFILES are dropped on every install, not only
+		// while the A2A surface is up: on a today install a plugin's notify value
+		// would reroute Google Chat posts from hermes send to a chat.notify route
+		// that does not exist there, and a plugin's KUBE_AGENTS_ENABLED_PROFILES
+		// would scaffold or archive optional specialist profiles outside the
+		// operator's AgentProfile reconciliation. The operator renders them only
+		// under next, after this merge.
 		kept := extEnvs[:0]
 		for _, e := range extEnvs {
-			if e.Name != a2aNotifyPlatformEnvVar && e.Name != a2aNotifyConversationsEnvVar {
+			if e.Name != a2aNotifyPlatformEnvVar && e.Name != a2aNotifyConversationsEnvVar && e.Name != enabledProfilesEnvVar {
 				kept = append(kept, e)
 			}
 		}
@@ -3271,6 +3289,12 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 				Value: a2aAgentBusUser,
 			},
 		)
+		if len(opts.enabledProfiles) > 0 {
+			envVars = append(envVars, corev1.EnvVar{
+				Name:  enabledProfilesEnvVar,
+				Value: strings.Join(opts.enabledProfiles, ","),
+			})
+		}
 	}
 	// The Hermes Google Chat platform is off under next (legacyChatConsumer),
 	// so the agent-side callers that used to `hermes send` a proactive post
@@ -3461,7 +3485,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			volumes = append(volumes, corev1.Volume{
 				Name: buildPluginVolumeName(plugin.Name),
 				VolumeSource: corev1.VolumeSource{
-					EmptyDir: &corev1.EmptyDirVolumeSource{},
+					EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(pluginStagingSizeLimit))},
 				},
 			})
 		}
@@ -4915,6 +4939,13 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		"FINDINGS_FIRST_REPORT_CRITICALS": {},
 		"FINDINGS_NONCRITICAL_AFTER_HOUR": {},
 		"FINDINGS_NONCRITICAL_MAX":        {},
+
+		// Seconds a workload's admitted event folds its later events into
+		// one incident (INCIDENT_WORKLOAD_DEDUP_SECONDS in
+		// session_kv_server.py). Parsed as a whole number and capped at a
+		// day, and a value that does not parse means off, so it bounds a
+		// count of chat messages and triage turns and reaches nothing else.
+		"INCIDENT_WORKLOAD_DEDUP_SECONDS": {},
 	}
 	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the
 	// default suggested prompts (`apply_slack_agent_view.py`), under the same
@@ -5638,7 +5669,7 @@ func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 		{
 			Name: "fluent-bit-state",
 			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{},
+				EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(fluentBitStateSizeLimit))},
 			},
 		},
 		{

@@ -4407,6 +4407,68 @@ def test_files_the_credential_cannot_read_are_unevaluable_not_a_pass(token, gith
     assert "pull_requests: read" in res.reason
 
 
+# ---- removed_paths: a delete is the removal of the declaring manifest
+
+_NS_DIR = "clusters/gitops-target-1/namespaces/gitops-owned-scratch"
+_REMOVED = [f"{_NS_DIR}/namespace.yaml", f"{_NS_DIR}/configmap.yaml", f"{_NS_DIR}/kustomization.yaml"]
+
+
+def test_a_pull_request_that_removes_every_declaring_file_passes(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=3)
+    _pr_files_route(github, *({"filename": path, "status": "removed"} for path in _REMOVED))
+    res = _pr_check(removed_paths=_REMOVED).verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_a_pull_request_that_leaves_one_declaring_file_is_a_fail(token, github):
+    """The kustomization.yaml left behind recreates the namespace."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=2)
+    _pr_files_route(github, *({"filename": path, "status": "removed"} for path in _REMOVED[:2]))
+    res = _pr_check(removed_paths=_REMOVED).verify(5.0)
+    assert res.status == "fail"
+    assert _REMOVED[2] in res.reason and "removed_paths" in res.reason
+
+
+def test_a_marker_or_an_edit_is_not_a_removal(token, github):
+    """Adding a "delete" marker or annotating the manifest in place changes a
+    file and passes every other clause; neither removes the declaration."""
+    for entry in (
+        {"filename": f"{_NS_DIR}/delete-me.yaml", "status": "added"},
+        {"filename": f"{_NS_DIR}/namespace.yaml", "status": "modified"},
+    ):
+        _stash_pr_report()
+        github.routes[_pr_api()] = (200, _pr_payload())
+        _pr_head_routes(github, changed_files=1)
+        _pr_files_route(github, entry)
+        assert _pr_check(removed_paths=[f"{_NS_DIR}/namespace.yaml"]).verify(5.0).status == "fail", entry
+        assert _pr_check().verify(5.0).status == "pass", entry
+
+
+def test_a_rename_is_not_a_removal(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    _pr_files_route(
+        github,
+        {"filename": "attic/namespace.yaml", "previous_filename": f"{_NS_DIR}/namespace.yaml", "status": "renamed"},
+    )
+    assert _pr_check(removed_paths=[f"{_NS_DIR}/namespace.yaml"]).verify(5.0).status == "fail"
+
+
+def test_removed_paths_unreadable_files_are_unevaluable(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    github.routes[f"{_pr_api('pulls')}/files?per_page=100&page=1"] = (403, {"message": "denied"})
+    res = _pr_check(removed_paths=_REMOVED).verify(5.0)
+    assert res.status == "error"
+    assert "pull_requests: read" in res.reason
+
+
 # ---- content: what the pull request writes, read at its head
 
 _CLUSTER_DIR = "clusters/substrate-a/provisioning"

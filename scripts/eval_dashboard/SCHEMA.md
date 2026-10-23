@@ -64,8 +64,8 @@ A build with no `finished.json` is still running and is skipped entirely.
 Three jobs feed it, each a source with a watermark of its own: the
 presubmit gate (`pull-kube-agents-smoke-test`, one build per pull-request
 push), the nightly periodic (`ci-kube-agents-eval-nightly`,
-`EVAL_TIER=nightly` in the same `hack/ci-eval-pr.sh`, against `main`, no
-pull request; a night split across two pool projects adds the nightly's
+`EVAL_TIER=nightly` in the same `hack/ci-eval-pr.sh`, against `main` on
+`spec.mode: next`, no pull request; a night split across two pool projects adds the nightly's
 writers periodic, `ci-kube-agents-eval-nightly-writers`, the cases that
 request a pull request, whose runs are `nightly` runs too, told apart by
 `job`) and the GitLab lane (`pull-kube-agents-smoke-test-gitlab`, a
@@ -489,6 +489,13 @@ what the renderer does with them.
   (`storm_reps`, `health.json`'s `infra_reps`) and reported under
   `metrics.ceiling_reps` instead. When `reps` is absent the task's single
   `result` stands in for one rep.
+- `runs[].lane_excluded` — the case ids `hack/ci-eval-pr.sh` dropped from
+  the matrix before the fan-out on the inject lane
+  (`hack/eval/inject-lane-exclusions.txt`), parsed from its
+  `leaves the matrix -- excluded on this lane` lines. Present only when there
+  are any, so on a
+  run that graded `spec.mode: next` through the inject door. The Nightly
+  report does not expect those cases of the night (`expected`, below).
 - `runs[].eval_verdict` — `GREEN` | `RED` | `null`: the Nightly report reads
   it; a night that is not a `SUCCESS` and carries `null` was ended before
   its verdict and is reported as truncated. `health.py` reads a presubmit
@@ -910,8 +917,10 @@ every rep of the night's `cases[]` that is not `infra` (`null` when none
 carries it). They are advisory: the page and the digest show the p95 beside
 the chat-turn target, p95 under 10 s (`TURN1_P95_TARGET_S`, from
 `docs/architecture/05-system-architecture.md`), and nothing judges the
-night on it. `expected` counts the cases `nightly_active` on this checkout;
-`missing[]` names the expected cases the night did not record.
+night on it. `expected` counts the cases `nightly_active` on this checkout,
+less any case a part of the night dropped on the inject lane
+(`runs[].lane_excluded`); `missing[]` names the expected cases the night did
+not record.
 `truncated` is a night Prow ended before its verdict: `result == "ABORTED"`
 (an interrupt), or any other non-`SUCCESS` result with `eval_verdict`
 `null` — the periodic's deadline arrives as SIGTERM and Prow records
@@ -1008,7 +1017,7 @@ run never writes it), so nothing here is a presubmit's.
 Everything above is the today-mode series: records whose key has no `mode`,
 or `mode: today`. `next` is the same `{records, metrics, default_metric,
 keys{}, nights[], cases{}, domains{}}` built from the records whose key has
-`mode: next` (the next-mode nightly's), or `null` when the store holds none;
+`mode: next` (the main nightly's), or `null` when the store holds none;
 a key in any other mode is in neither. The page draws the today series.
 
 `latency{}` is the one part of the block not read from the store, which

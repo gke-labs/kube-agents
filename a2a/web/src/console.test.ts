@@ -12,6 +12,7 @@ import {
   mintConversation,
   mintMessageId,
   outSubject,
+  paneShows,
   parseOutFrame,
   textBytes,
   tokenOf,
@@ -97,6 +98,24 @@ describe("console frames", () => {
     expect(parseOutFrame('{"messageId":"c-1","text":"x","edit":"yes"}')?.edit).toBe(false);
   });
 
+  it("parses a terminal frame's kind and state", () => {
+    const frame = parseOutFrame(
+      '{"messageId":"r-task-1","text":"all green","kind":"result","state":"completed","addressee":"platform","taskId":"task-1"}',
+    );
+    expect(frame?.kind).toBe("result");
+    expect(frame?.state).toBe("completed");
+  });
+
+  it("keeps every terminal frame out of the pane and every notice in", () => {
+    // The pane renders answers from TASKS and gets the gateway's notice for a
+    // failure or a cancel, so a terminal frame would print either twice.
+    expect(paneShows(parseOutFrame('{"messageId":"r-t","text":"a","kind":"result","state":"completed"}')!)).toBe(false);
+    expect(paneShows(parseOutFrame('{"messageId":"r-t","text":"❌","kind":"result","state":"failed"}')!)).toBe(false);
+    // A notice carries no kind.
+    expect(paneShows(parseOutFrame('{"messageId":"c-1","text":"❌ the task failed"}')!)).toBe(true);
+    expect(paneShows(parseOutFrame('{"messageId":"c-1","text":"⏳ submitted…"}')!)).toBe(true);
+  });
+
   it("returns null for a frame it cannot use", () => {
     for (const bad of ["not json", "[]", "null", '{"text":"x"}', '{"messageId":"","text":"x"}', '{"messageId":"c-1"}']) {
       expect(parseOutFrame(bad), bad).toBeNull();
@@ -141,10 +160,11 @@ describe("gateway text mirrors", () => {
   });
 
   it("settles only the turns no gateway branch makes a task of", () => {
-    for (const t of ["stop", "/session", "/session off", "/session stop", "/feedback", "/FEEDBACK  "]) {
+    for (const t of ["stop", "/session", "/session off", "/session stop", "/feedback", "/FEEDBACK  ", "/feedback summary", "/Feedback  SUMMARY ", "/feedback \u017fummary"]) {
       expect(turnFate(t)).toEqual({ kind: "settled" });
     }
     expect(turnFate("/feedback the report posted twice")).toEqual({ kind: "task", texts: ["/feedback the report posted twice"] });
+    expect(turnFate("/feedback summary please")).toEqual({ kind: "task", texts: ["/feedback summary please"] });
     // Pre-flip the gateway runs a bare /feedback behind /session as the session's first turn; the page reads it that way.
     expect(turnFate("/session /feedback")).toEqual({ kind: "task", texts: ["/feedback"] });
     expect(turnFate("is acme-prod ready?")).toEqual({ kind: "task", texts: ["is acme-prod ready?"] });
