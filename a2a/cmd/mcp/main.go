@@ -45,11 +45,11 @@ const (
 
 	readHeaderTimeout = 10 * time.Second
 	idleTimeout       = 60 * time.Second
-	// writeTimeout bounds one response. Every answer here is one JSON
-	// document, and the slowest, connection_status, bounds its own read
-	// (mcp.statusTimeout); a streamed answer, if a later tool adds one,
-	// has to revisit this.
-	writeTimeout = 30 * time.Second
+	// writeTimeout bounds one response, so it must outlast the slowest call
+	// a caller may ask for: send_message waits for the gateway's submission
+	// and then up to the longest answer wait (mcp.MaxTurnWait). A streamed
+	// answer, if a later tool adds one, has to revisit this.
+	writeTimeout = mcp.MaxTurnWait + time.Minute
 	// shutdownGrace is how long a stop waits for the requests in flight,
 	// whose contexts the stop has already ended (serve), so a stop is a
 	// clean drain well inside the pod's default 30 s termination grace.
@@ -159,7 +159,12 @@ func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string)
 		return err
 	}
 	defer bus.Close()
-	srv, err := mcp.NewServer(mcp.ConnectionStatusTool(bus))
+	convs := mcp.NewConversations()
+	srv, err := mcp.NewServer(
+		mcp.ConnectionStatusTool(bus),
+		mcp.SendMessageTool(bus, convs),
+		mcp.TaskControlTool(bus, convs),
+	)
 	if err != nil {
 		log.Error("mcp server", "err", err)
 		return err

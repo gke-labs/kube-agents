@@ -210,8 +210,12 @@ func (s *SlackAdapter) publishHome(member string, republish bool) {
 
 // homeAdmitted is the allowlist, and under allow-all the member's workspace
 // being the bot's: allow-all admits anyone who can open the app, and a Slack
-// Connect member of another organisation is not anyone. A listed member is
-// the install's own word and needs no users.info (nor users:read). decided is
+// Connect member of another organisation is not anyone. With no guest entries
+// on the list, a listed member is the install's own word and needs no
+// users.info (nor users:read). With guest entries, every member is looked up,
+// because the event carries only the bare member id: a member of another
+// workspace is admitted only by the "T…:U…" entry naming them (admitGuest), as
+// on the message path, and never by a plain entry or allow-all. decided is
 // false when that lookup failed, which says nothing either way.
 func (s *SlackAdapter) homeAdmitted(member string) (admitted, decided bool) {
 	s.home.mu.Lock()
@@ -221,18 +225,26 @@ func (s *SlackAdapter) homeAdmitted(member string) (admitted, decided bool) {
 		return false, true
 	}
 	ok, byAllowAll := admits(member)
-	if !ok {
-		return false, true
-	}
-	if !byAllowAll {
-		return true, true
+	if len(s.guests) == 0 && (!ok || !byAllowAll) {
+		return ok, true
 	}
 	user, err := s.api.GetUserInfo(member)
 	if err != nil {
 		s.log.Warn("slack: home tab member lookup failed; publishing nothing", "member", member, "err", err)
 		return false, false
 	}
-	return s.teamID != "" && user.TeamID == s.teamID, true
+	if s.otherWorkspace(user.TeamID) {
+		guest, listed := s.admitGuest(user.TeamID, "", member)
+		if !listed {
+			return false, true
+		}
+		ok, _ = admits(guest)
+		return ok, true
+	}
+	if byAllowAll {
+		return ok && s.teamID != "" && user.TeamID == s.teamID, true
+	}
+	return ok, true
 }
 
 // homeBoard is the cached snapshot, read again once it is older than

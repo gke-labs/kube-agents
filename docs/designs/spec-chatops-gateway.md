@@ -1502,7 +1502,7 @@ as the primitive, unused, like the other backends.
 (an alert, a cron finding, an audit report) has no conversation to answer, and under `next`
 the Hermes platform that used to post it is off. So the agent asks the gateway, which holds
 the Chat credential, to post it. The agent container runs `a2a notify`, which publishes a
-core NATS request on `chat.notify.gchat` carrying `{"text", "thread"?, "wait_ms"?, "conversation"?, "context_id"?, "blocks"?, "chat"?, "update"?}` (on Slack's subject, below, `chat.notify.slack`) with its reply subject
+core NATS request on `chat.notify.gchat` carrying `{"text", "thread"?, "wait_ms"?, "conversation"?, "context_id"?, "blocks"?, "chat"?, "update"?, "reply_to"?}` (on Slack's subject, below, `chat.notify.slack`) with its reply subject
 under `chat.notify.reply.agent.`; the gateway posts the text into the home space
 (`googleChat.homeChannel`, carried as `A2A_GCHAT_HOME_CHANNEL`), as a new thread or as a reply
 on a thread of that space, and answers with `message_id` (the field `hermes send --json`
@@ -1597,15 +1597,33 @@ so a block type it does not know travels as written and a field it does not mode
 home channel that is not a channel id leaves the route unarmed; the gateway logs
 "chat.notify route not armed" at start.
 
+The console has a route of its own, `chat.notify.console` (added 10/22), so a kanban card filed
+from a console turn reports back into its conversation. It serves conversation requests only:
+the console has no home channel, so a home post is refused. It runs whenever the gateway runs,
+as the console does, with no variable arming it. Each request is one frame on
+`chat.console.<token>.out` with `"kind": "notify"`, a minted `messageId` (`n-<boot>-<n>`), and
+the whole `text`, not chunked; a `chat` message's text is its fallback, and the console renders
+text. An `update` key edits the frame it posted, as it edits a chat message elsewhere. A
+request may carry `reply_to`, the gateway task whose turn filed the card (`a2a notify
+--reply-to`), which the frame passes on as `replyTo` so a console client can join the report to
+its turn. A `reply_to` that is not a task id's shape is dropped and the report still posted.
+The task reaches the card this way. The hermes-bridge records it on a console conversation's
+route (`task_id`). `kanban_event_routing` snapshots it into the card's subscription when the
+card is filed, as `console:<token>#<taskId>` (`#` cannot occur in a console token, which is one
+DNS-1123 label). The kanban notifier splits it back off as `--reply-to`. Hermes has no console
+platform, and its notifier reads a subscription's platform through its own `Platform` enum, so
+the notify patch registers one in Hermes's platform registry. That registration is kanban-era
+and goes when kanban does.
+
 A notify is not a task. It mints no capability, starts no executor, opens no session and
 carries no `authority` block; the requester rules above do not apply, because nobody
 requested it. What bounds it is where it may land and who may send it. Where: the home space,
 or a conversation the gateway holds a session record for carrying the request's context id; a
 thread of another space, or a conversation without that record and context, is refused before
 any post (on Slack, a home post lands in the home channel only, which the gateway sets on every
-post). Who: the agent principal alone publishes `chat.notify.gchat` and `chat.notify.slack`
-and reads `chat.notify.reply.agent.>`; the gateway alone reads the first two and publishes the
-third. The answer does not go to the agent's `_INBOX` for the reason the verifier's does not:
+post). Who: the agent principal alone publishes `chat.notify.gchat`, `chat.notify.slack` and
+`chat.notify.console`, and reads `chat.notify.reply.agent.>`; the gateway alone reads the first
+three and publishes the fourth. The answer does not go to the agent's `_INBOX` for the reason the verifier's does not:
 the agent reads its JetStream replies there, and a gateway able to publish into it could
 forge them; a request whose reply subject is outside the namespace is dropped unanswered.
 The agent could already post the same text to the same channel or conversation through
@@ -1635,9 +1653,10 @@ over the way Chat's does (2026-10-06): the operator renders it as `A2A_SLACK_ALL
 normalized the way the gateway reads it, with `A2A_SLACK_ALLOW_ALL_USERS` from the legacy
 consumer's rule on the raw list (absent, or a single empty string, is everyone), so one CR
 means one thing in both modes. The gateway then admits a Slack sender only if they belong
-to the bot's own workspace (a Slack Connect guest from another organisation is not a turn;
-see the mapping-table paragraph below) and the list admits them (exact `user_id` match, no
-case fold). The principal map below is an optional override for attribution, not a second
+to the bot's own workspace, or the list names them by workspace as `T…:U…` (a Slack Connect
+guest from another organisation is otherwise not a turn; see the mapping-table paragraph
+below), and the list admits them (exact match, no case fold: the `user_id` for our own
+member, the `T…:U…` entry for a guest). The principal map below is an optional override for attribution, not a second
 gate. One thing does not carry over on the flip:
 the broker reads `SLACK_BOT_TOKEN` as a comma-separated list, one token per workspace,
 where the gateway's adapter takes one token, so a multi-workspace install stays on
@@ -1670,7 +1689,8 @@ the A2A objects on skew rather than touching them, and a Slack gateway holds the
 in its own pod env, so the frozen gateway keeps its own Socket Mode connection beside the
 legacy one, until the operator recognises the mode again. Slack delivers each event to one
 of the two connections. Both admit by `allowedUsers`, but only the gateway refuses another
-workspace's member, so a Slack Connect guest is answered or dropped depending on which
+workspace's member unless a `T…:U…` entry names them, an entry the legacy consumer never
+matches, so a Slack Connect guest is answered or dropped depending on which
 consumer receives the event (as is a sender whose map entry carries the reserved `slack:`
 prefix, which only the gateway refuses). Chat's
 frozen gateway goes quiet instead, because it reaches Chat only through the broker's A2A
@@ -1797,17 +1817,25 @@ Because an unmapped sender's member id is enough to be admitted, admission must 
 past the install's own workspace. Slack names the sender's workspace as `user_team` on a
 message in a channel shared between workspaces, and a message's own `team` field names the
 workspace it was posted from. The gateway refuses a message that names a workspace other
-than the bot's own (from `auth.test`) in either: it is not a turn. When it addressed the
+than the bot's own (from `auth.test`) in either: it is not a turn, unless the allowlist names
+that member of that workspace as `T…:U…` (2026-10-21, #3294). The sender's workspace is
+`user_team` when set, else the message's `team`; when both are set and differ, no entry is
+matched, and when both are empty the sender is our own member, as below. An admitted
+guest's turn carries `T…:U…` as its author id, so the allowlist and the target allowlist
+match that one entry, and the guest's principal is `slack:T…:U…`. The principal map cannot
+name a guest: it is a Secret, and a Secret key cannot hold `:`. A
+plain `U…` entry keeps meaning our own member and never admits a guest, and allow-all, an
+empty list, admits none. When a refused message addressed the
 bot (a DM or a mention), the refusal is logged with the sender's member id, and the sender
 gets one reply in that message's thread, once per workspace and member, saying the bot
-answers only its own workspace. A click on one of the bot's buttons by such a member is
+answers only its own workspace and naming the `T…:U…` entry that would admit them. A click on one of the bot's buttons by such a member is
 refused the same way, and shares that once-per-sender notice, in the question's thread. Without a team id from `auth.test` it refuses any
-message that names a workspace, and warns once at start. A message that names no workspace
+message that names a workspace, except a guest the list names, and warns once at start. A message that names no workspace
 in either field is taken as our own member's, which rests on Slack setting them on a
 shared channel's messages; no captured Slack Connect payload has confirmed it yet. Under allow-all this is the only boundary on
 who may reach the bot, and it is stricter than the legacy consumer, which has no such
 check. Under Enterprise Grid a member of a sister workspace in a shared channel is refused
-too, since the event does not carry the sender's enterprise.
+too unless named, since the event does not carry the sender's enterprise.
 
 The table is a Kubernetes Secret, mounted read-only at the gateway's principal-map path, same file format the Discord ConfigMap uses.
 `a2a-slack-principal-map` is the name the operator mounts under `next`: alone at the
@@ -2073,21 +2101,23 @@ on `.out` too (added 10/22), as every observer is told it (`observeTaskTerminal`
 delegation chain, under the task the turn started, with the hand-off rule applied. It is one
 frame with `"kind": "result"`, the A2A `state`, the task the turn started as `taskId` and the
 agent that turn was addressed to as `addressee` (not whichever agent answered at the chain's end),
-and
-`messageId` `r-<taskId>-<state>`, so a repeated end (a redelivery, a heal) repeats its id while a
-different end of the same task (a never-started heal, then its late completion) is a new frame. An
+and `messageId` `r-<taskId>-<state>`, so a repeated end (a redelivery, a heal) repeats its id while
+a different end of the same task (a never-started heal, then its late completion) is a new frame. An
 end the gateway declared itself (the bus unreachable, a task released for producing nothing) is
-worded as the page's notice is. Its text
-is the deliverable for a completed task and the gateway's notice otherwise. A chain that ends at
-a child with no wake (the session could not take one) ends failed, carrying the notice; a console
-client reads the child's answer from TASKS. A notice carries
-none of those fields, so a client waiting on a turn can tell the two apart. The page reads
-answers from TASKS and gets the notices, and it skips these frames, so for the page a lost
-`.out` frame across a reconnect still costs a notice and never an answer. A console client such
-as the MCP server reads each task's end from these frames as it happens. `.out` is not on a
-stream, so a frame published while the client is not subscribed (a restart, a reconnect) is not
-replayed. The `console` identity holds TASKS consumer grants, so the client recovers a missed
-end from the task's own events there. Turn answers to a follow-up inside a live task are not
+worded as the page's notice is. A completed
+task that handed work to kanban cards (the bridge's `handoff` artifact) carries `"cardsPending":
+true`, so a client waits for the cards' notify frames; without it, no handoff was seen and the
+client need not wait. Its text is the deliverable for a completed task and the gateway's notice
+otherwise. A chain that ends at a child with no wake (the session could not take one) ends failed,
+carrying the notice; a console client reads the child's answer from TASKS. A kanban card's report into the conversation is a frame too, with `"kind": "notify"` and the
+turn it answers as `replyTo` ("Proactive posts: the chat.notify route", the console's route). A
+notice carries none of those fields, so a client waiting on a turn can tell the three apart. The
+page reads answers from TASKS and gets the notices, so it skips the result frames, and a lost result
+frame costs it nothing. It shows the notify frames, which it has no other source for. A card's
+report is not on TASKS, so a notify frame published while no client holds the conversation's `.out`
+subscription (the tab closed, a page reconnecting, the MCP server restarting) is lost: core NATS
+keeps nothing, and the notifier answers the card as posted. This is a known limit of the
+kanban-era route; card reports become bus child results with the profile dispatcher. A console client such as the MCP server reads each task's end from these frames as it happens. `.out` is not on a stream, so a result frame published while the client is not subscribed (a restart, a reconnect) is not replayed. The `console` identity holds TASKS consumer grants, so the client recovers a missed end from the task's own events there. Turn answers to a follow-up inside a live task are not
 sent; that client reads them from TASKS or waits for the end. An answer past 256 KiB, or one
 whose escaped frame would pass the server's `max_payload`, is cut and says so; TASKS keeps
 it whole. An `.in` frame published

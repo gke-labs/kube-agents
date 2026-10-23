@@ -21,8 +21,8 @@ render.py's docstring owns the details.
 
 More readers of the same data.json live here: `health.py` decides
 whether the presubmit gate is GREEN / DEGRADED / OUTAGE and why, and
-`post_health.py` tells a Google Chat space when that changes, with one line
-on last night's nightly run in its daily digest. `nightly_bugs.py` files an
+`post_health.py` tells a Google Chat space when that changes, with a
+section on last night's nightly run in its daily digest (`nightly_digest.py`). `nightly_bugs.py` files an
 issue for a case the nightly fails on every run three nights in a row, and
 (`nightly_infra.py`) one for the infra owner when the nightly or a case is
 kept from running.
