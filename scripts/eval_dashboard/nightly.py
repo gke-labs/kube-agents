@@ -915,10 +915,10 @@ def digest_line(data: dict | None, now: datetime.datetime, clock=None) -> str:
     parts = [f"{counts['recorded']} cases", f"{counts['passed']} passed all reps", f"{counts['partial']} partial", f"{counts['failed']} failed"]
     if counts["infra"]:
         parts.append(f"{counts['infra']} infra")
-    # Without its main part only the writers part's cases are on record, so
-    # no verdict on what is newly failing; the part notes say the main part
-    # is missing.
-    if PART_MAIN in night.get("missing_parts", []):
+    # Without either half of the main matrix, the cases that half runs were
+    # never compared, so no verdict on what is newly failing; the part notes
+    # say which part is missing.
+    if any(p in night.get("missing_parts", []) for p in MAIN_PARTS):
         pass
     elif night["newly_failing"]:
         parts.append(f"newly failing: {name_cases(night['newly_failing'])}")
