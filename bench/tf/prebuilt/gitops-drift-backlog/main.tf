@@ -17,7 +17,7 @@
 # 4. Read the ledger and the board, and write the verdict ConfigMap the task's
 #    safeguard reads.
 #
-# Verdicts. ok and the six red ones are written and exit 0, so the agent's
+# Verdicts. ok and the seven red ones are written and exit 0, so the agent's
 # turn still runs and the safeguard reds the repetition. Everything else is
 # the environment, exits non-zero, and the repetition is excluded:
 #   ok                  every backlog record has a row marked backlog, digested
@@ -36,6 +36,8 @@
 #                       rows, counting the backlog principal's records, did not
 #                       appear; or they ended as a chat post (backlog 2) and
 #                       such a card appeared.
+#   digest-mark-unexpected the digest's rows carry a mark that is neither 3
+#                       nor 2, or more than one mark.
 
 locals {
   kubectl = "kubectl"
@@ -279,7 +281,7 @@ resource "null_resource" "drift_backlog" {
       write_verdict() {
         echo "verdict=$1 detail=$2" >&2
         case "$1" in
-          ok | backlog-triaged | backlog-not-marked | digest-pending | live-marked-backlog | late-edit-not-carded | digest-card-missing) ;;
+          ok | backlog-triaged | backlog-not-marked | digest-pending | live-marked-backlog | late-edit-not-carded | digest-card-missing | digest-mark-unexpected) ;;
           *) return 0 ;;
         esac
         ${local.kubectl} create configmap "${local.verdict_configmap}" -n "$NS" \
@@ -458,6 +460,10 @@ resource "null_resource" "drift_backlog" {
             write_verdict digest-card-missing "the digest rows ended as a chat post (2) yet $digest_card_count digest card(s) cover this run's rows"
             exit 0
           fi
+          ;;
+        *)
+          write_verdict digest-mark-unexpected "the digest rows carry a mark that is neither a board card (3) nor a chat post (2): '$digest_mark'"
+          exit 0
           ;;
       esac
 

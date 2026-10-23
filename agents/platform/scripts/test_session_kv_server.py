@@ -7933,12 +7933,43 @@ class TestDriftBacklog(unittest.TestCase):
         self.assertIn("installer@example.com (3)", body)
         self.assertEqual(body.count("- installer@example.com changed prod/deployments/checkout on prod-us-east1"), 3)
         self.assertIn("/v1/intercepted-events", body)
+        self.assertIn(f"${session_kv_server.SESSION_KV_AUTH_ENV}", body)
         self.assertEqual(run.call_args.kwargs["timeout"], session_kv_server.DRIFT_BACKLOG_CARD_TIMEOUT_SECONDS)
         self.assertEqual(run.call_args.kwargs["env"]["HERMES_KANBAN_BUSY_TIMEOUT_MS"], "30000")
         self.assertEqual({r["backlog"] for r in self._rows()}, {session_kv_server.DRIFT_BACKLOG_HEADLESS})
         drift = self.client.get("/v1/alert-quota").json()["severities"][session_kv_server.DRIFT_QUOTA_KEY]
         self.assertEqual(drift["sent"], 0)
         self.trigger.assert_not_called()
+
+    def test_a_next_install_whose_platform_has_no_home_channel_files_the_card(self):
+        """The platform walk itself, not a patched answer: `spec.mode: next`,
+        the gateway holding Slack with no home channel. The operator renders
+        both Hermes platforms off and `A2A_NOTIFY_CONVERSATIONS` without
+        `A2A_NOTIFY_PLATFORM`, which it sets only with a home channel."""
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for key in PLATFORM_SIGNAL_KEYS + (chat_notify.NOTIFY_PLATFORM_ENV,):
+            os.environ.pop(key, None)
+        os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = "slack"
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        managed = os.path.join(tmp.name, "config.yaml")
+        with open(managed, "w") as handle:
+            handle.write(TestRelayWithNoChatRoute.BOTH_OFF)
+        for attribute, path in (
+            ("MANAGED_CONFIG_PATH", managed),
+            ("CONFIG_PATH", "/nonexistent/kube-agents-test-absent.yaml"),
+        ):
+            patcher = patch.object(session_kv_server, attribute, path)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self._burst()
+        with patch.object(session_kv_server.subprocess, "run", return_value=self._card_created()) as run:
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0][:3], [chat_notify.HERMES_CLI, "kanban", "create"])
+        self.assertEqual({r["backlog"] for r in self._rows()}, {session_kv_server.DRIFT_BACKLOG_HEADLESS})
 
     def test_a_card_the_board_refuses_leaves_the_rows_pending_until_a_retry_with_the_same_key(self):
         import subprocess as sp
