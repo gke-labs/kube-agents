@@ -242,11 +242,7 @@ func PollEventsTool(events *Events, convs *Conversations) Tool {
 				return "", fmt.Errorf("listen to the conversation's posts: %w", err)
 			}
 			var sb strings.Builder
-			if byToken {
-				fmt.Fprintf(&sb, "Conversation by token `%s`.\n\n", token)
-			} else {
-				writeConversation(&sb, a.Conversation, token)
-			}
+			writeConversation(&sb, a.Conversation, token, byToken)
 			since := a.Since
 			if cur := events.Cursor(); since > cur {
 				fmt.Fprintf(&sb, "since %d is past this conversation's cursor %d (this server may have restarted); reading from 0.\n\n", since, cur)
