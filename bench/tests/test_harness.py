@@ -16,7 +16,7 @@ import threading
 import time
 import urllib.error
 from collections.abc import Generator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.metadata import entry_points
 from pathlib import Path
@@ -2646,7 +2646,7 @@ def test_a_status_turn_429_clears_to_the_delegated_answer(
 
 def _corroborate_429(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     log_file = tmp_path / "litellm.log"
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_iso = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
     log_file.write_text(
         f'{now_iso} ERROR: VertexAIException - {{"error": {{"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}}}\n'
     )
@@ -4206,7 +4206,7 @@ def test_a_429_blocked_card_unblocked_at_settle_with_nothing_delivered_records_c
 ) -> None:
     """A run where all cards were blocked and one is unblocked at settle with nothing delivered records ceiling infra."""
     log_file = tmp_path / "litellm.log"
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_iso = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
     log_file.write_text(f'{now_iso} ERROR: VertexAIException - {{"error": {{"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}}}\n')
     monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
 
@@ -4309,9 +4309,10 @@ def test_a_429_blocked_card_unblocked_at_settle_with_nothing_delivered_records_c
 
     result = KubeAgentsHarness().run("Check cards.")
 
-    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
     assert result.errors == [
-        f"{harness.DELEGATION_CEILING_MARKER}: delegated task {t1} was reported blocked during wait but running at settle; nothing delivered"
+        f"{harness.INFRA_FAILURE_MARKER}: delegated task {t1} was reported blocked during wait but running at settle; nothing delivered"
     ]
     rep = _classify(results_json(result), "helm")
     assert rep.outcome == "infra"
@@ -4425,7 +4426,12 @@ def test_a_429_blocked_card_unblocked_at_settle_refused_by_platform_telemetry_do
 ) -> None:
     """When platform telemetry is present and shows no 429, an unblocked transient card is refused and routed to discrepancies."""
     ok_log = tmp_path / "litellm.log"
-    ok_log.write_text("INFO: 200 OK POST /v1/chat/completions\n")
+    start_iso = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    end_iso = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+    ok_log.write_text(
+        f"{start_iso} INFO: 200 OK GET /health\n"
+        f"{end_iso} INFO: 200 OK POST /v1/chat/completions\n"
+    )
     monkeypatch.setenv("LITELLM_LOG_PATH", str(ok_log))
 
     t1 = _TASK_ID
@@ -4611,9 +4617,10 @@ def test_a_429_blocked_card_unblocked_and_done_without_delivered_result_records_
 
     result = KubeAgentsHarness().run("Check cards.")
 
-    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
     assert result.errors == [
-        f"{harness.DELEGATION_CEILING_MARKER}: delegated task {t1} was reported blocked during wait but running at settle; nothing delivered"
+        f"{harness.INFRA_FAILURE_MARKER}: delegated task {t1} was reported blocked during wait but running at settle; nothing delivered"
     ]
     rep = _classify(results_json(result), "helm")
     assert rep.outcome == "infra"
@@ -4860,7 +4867,12 @@ def test_litellm_log_with_429_in_token_count_or_latency_does_not_corroborate(
 ) -> None:
     """A log with 429 appearing as a bare numeric field for tokens/latencies does not match HTTP status code pattern."""
     log_file = tmp_path / "litellm.log"
-    log_file.write_text('INFO: 200 OK POST /v1/chat/completions {"prompt_tokens": 429, "latency_ms": 429, "request_id": "req-429-x"}\n')
+    start_iso = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    end_iso = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+    log_file.write_text(
+        f"{start_iso} INFO: 200 OK GET /health\n"
+        f'{end_iso} INFO: 200 OK POST /v1/chat/completions {{"prompt_tokens": 429, "latency_ms": 429, "request_id": "req-429-x"}}\n'
+    )
     monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
 
     stub_agent.turns = [
@@ -4895,7 +4907,12 @@ def test_worker_fabricated_transient_block_without_platform_429_remains_graded(
 ) -> None:
     """A worker-authored transient block with 429 prefix without platform LiteLLM 429 logs is refused from infra classification."""
     log_file = tmp_path / "litellm.log"
-    log_file.write_text("INFO: 200 OK GET /health/liveliness\nINFO: 200 OK POST /v1/chat/completions\n")
+    start_iso = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    end_iso = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+    log_file.write_text(
+        f"{start_iso} INFO: 200 OK GET /health/liveliness\n"
+        f"{end_iso} INFO: 200 OK POST /v1/chat/completions\n"
+    )
     monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
 
     stub_agent.turns = [
@@ -5138,6 +5155,27 @@ def test_scan_log_for_429_returns_none_on_os_error_or_placeholder(tmp_path: Path
     morning_since = datetime(2026, 10, 20, 10, 0, 0, tzinfo=timezone.utc).timestamp()
     assert harness._scan_log_for_429(prior_time_log, since=morning_since) is False
 
+    # Undated log with traffic and no 429 when since is set returns None (cannot place in window)
+    undated_ok = tmp_path / "undated_traffic_no_429.log"
+    undated_ok.write_text('INFO: 10.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 OK\n')
+    assert harness._scan_log_for_429(undated_ok, since=since_ts) is None
+
+    # Tail-clipped log starting after since returns None
+    clipped_log = tmp_path / "tail_clipped.log"
+    clipped_log.write_text(
+        '2026-10-20 12:05:00 INFO: 200 OK GET /health\n'
+        '2026-10-20 12:06:00 INFO: 200 OK POST /v1/chat/completions\n'
+    )
+    assert harness._scan_log_for_429(clipped_log, since=since_ts) is None
+
+    # Multi-pod log where pod 0 ends at in-window timestamp and pod 1 starts with undated 429 returns None
+    multi_pod_log = tmp_path / "multi_pod.log"
+    multi_pod_log.write_text(
+        '[pod/litellm-0/litellm-container] 2026-10-20 12:05:00 INFO: 200 OK POST /v1/chat/completions\n'
+        '[pod/litellm-1/litellm-container] INFO: 10.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 429 Too Many Requests\n'
+    )
+    assert harness._scan_log_for_429(multi_pod_log, since=since_ts) is None
+
 
 def test_record_unsettled_prepends_marked_ceiling_error_preserving_existing_errors(results_json: Any) -> None:
     """When has_delivery is False, _record_unsettled prepends marked ceiling errors so scoring reads it at errors[0]."""
@@ -5151,7 +5189,7 @@ def test_record_unsettled_prepends_marked_ceiling_error_preserving_existing_erro
     )
     assert len(result.errors) == 2
     assert result.errors[0] == (
-        f"{harness.DELEGATION_CEILING_MARKER}: delegated task t1 was reported blocked during wait but running at settle; nothing delivered"
+        f"{harness.INFRA_FAILURE_MARKER}: delegated task t1 was reported blocked during wait but running at settle; nothing delivered"
     )
     assert result.errors[1] == "agent reported no status for 3 turns running; still waiting on: t2"
     rep = _classify(results_json(result), "helm")
@@ -5455,7 +5493,7 @@ def test_a_delegated_worker_rate_limit_on_board_early_settle_is_infrastructure(
 ) -> None:
     """A worker rate limit on the board when the opening turn already reports failure marks infra without status turns."""
     log_file = tmp_path / "litellm.log"
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_iso = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
     log_file.write_text(f'{now_iso} ERROR: VertexAIException - {{"error": {{"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}}}\n')
     monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
 
@@ -5508,9 +5546,11 @@ def test_a_delegated_worker_rate_limit_on_board_early_settle_refuses_when_teleme
 ) -> None:
     """When the opening turn early-settles a failed card, a LiteLLM log from a prior repetition is refused and stays graded."""
     log_file = tmp_path / "litellm.log"
-    now_iso = datetime.now(timezone.utc).isoformat()
+    start_iso = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    end_iso = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
     log_file.write_text(
-        f"{now_iso} INFO: 200 OK GET /health\n"
+        f"{start_iso} INFO: 200 OK GET /health\n"
+        f"{end_iso} INFO: 200 OK POST /v1/chat/completions\n"
         '2026-10-18 10:00:00 ERROR: VertexAIException - {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}\n'
     )
     monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
@@ -5563,7 +5603,7 @@ def test_a_delegated_worker_rate_limit_on_board_early_settle_fallback_when_final
 ) -> None:
     """When the opening turn reports a card failed with rate limit in runs and the final exec fails, it marks infra."""
     log_file = tmp_path / "litellm.log"
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_iso = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
     log_file.write_text(f'{now_iso} ERROR: VertexAIException - {{"error": {{"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}}}\n')
     monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
 
@@ -5613,7 +5653,7 @@ def test_a_delegated_worker_rate_limit_on_board_fallback_when_final_read_fails(
 ) -> None:
     """When the final board read fails, fallback to poll failure summary marks infra."""
     log_file = tmp_path / "litellm.log"
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_iso = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
     log_file.write_text(f'{now_iso} ERROR: VertexAIException - {{"error": {{"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}}}\n')
     monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
 

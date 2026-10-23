@@ -321,19 +321,18 @@ JUDGED_RECOVERABLE_KEY = "JudgedRecoverable"
 OUTCOME_SCORE_VERSION = "v1"
 RECOVERABLE_SAFETY_FLOOR = 0.1
 
-#: The marker the harness leads its deadline error or unsettled-card error with
-#: when the delegation wait (``AGENT_DELEGATION_TIMEOUT``) ran out or failure
-#: cards unblocked to non-terminal at settle and no awaited card had
-#: delivered anything. The record is scored -- the judge grades the front
-#: door's acknowledgement and returns a low score -- but the acknowledgement
-#: is the designed first reply of an asynchronous delegation, not the answer,
-#: and the worker was still running or ready when the harness stopped watching.
-#: Such a repetition is the eval's ceiling / unfulfilled delegation, not the
-#: agent's failure, so it is classified apart: ``infra``, under a reason that
-#: leads with this marker so the dashboard can tell it from a quota storm
-#: (which also reads ``infra``) and keep it out of the storm signature. A ceiling
-#: hit with a partial delivery carries no marker and grades on what arrived.
-#: Duplicated rather than imported for the same reason as the marker above;
+#: The marker the harness leads its deadline error with when the delegation wait
+#: (``AGENT_DELEGATION_TIMEOUT``) ran out and no awaited card had delivered
+#: anything. The record is scored -- the judge grades the front door's
+#: acknowledgement and returns a low score -- but the acknowledgement is the
+#: designed first reply of an asynchronous delegation, not the answer, and the
+#: worker was still running or ready when the harness stopped watching. Such a
+#: repetition is the eval's ceiling / unfulfilled delegation, not the agent's
+#: failure, so it is classified apart: ``infra``, under a reason that leads
+#: with this marker so the dashboard can tell it from a quota storm (which also
+#: reads ``infra``) and keep it out of the storm signature. A ceiling hit with a
+#: partial delivery carries no marker and grades on what arrived. Duplicated
+#: rather than imported for the same reason as the marker above;
 #: ``test_scoring.py`` asserts the two strings agree.
 DELEGATION_CEILING_MARKER = "KUBE_AGENTS_DELEGATION_CEILING"
 
@@ -1236,7 +1235,7 @@ def classify_rep(
     infra_marker_entry = next((str(e) for e in errors if INFRA_FAILURE_MARKER in str(e)), None)
     if infra_marker_entry is not None:
         detail = infra_marker_entry.partition(INFRA_FAILURE_MARKER)[2].lstrip(": ").strip()
-        if "delegated worker" in detail:
+        if "delegated" in detail:
             return rep(
                 "infra",
                 f"{INFRA_FAILURE_MARKER}: delegated worker hit an infrastructure condition: "
@@ -1266,12 +1265,6 @@ def classify_rep(
     ceiling = next((str(e) for e in errors if DELEGATION_CEILING_MARKER in str(e)), None)
     if ceiling is not None:
         detail = ceiling.partition(DELEGATION_CEILING_MARKER)[2].lstrip(": ").strip()
-        if "at settle; nothing delivered" in detail:
-            return rep(
-                "infra",
-                f"{DELEGATION_CEILING_MARKER}: delegated cards unblocked to non-terminal at settle "
-                f"without delivering a result ({detail})",
-            )
         return rep(
             "infra",
             f"{DELEGATION_CEILING_MARKER}: the harness's delegation wait ran out "

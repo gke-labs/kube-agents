@@ -652,6 +652,7 @@ _LOG_TIMESTAMP_PATTERN = re.compile(
     r"\b(?P<ts>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\b"
 )
 _LOG_TIME_ONLY_PATTERN = re.compile(r"(?<!\d)(?P<time>\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)\b")
+_POD_PREFIX_PATTERN = re.compile(r"^\[(?P<pod>pod/[^\]]+)\]")
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 
@@ -685,7 +686,7 @@ def _parse_log_line_timestamp(line: str, since: float | None = None) -> float | 
                 )
                 if cand_same.timestamp() < since - 5.0:
                     cand_next = cand_same + timedelta(days=1)
-                    if cand_next.timestamp() - since < 12 * 3600:
+                    if cand_next.timestamp() - since <= 2 * 3600:
                         return cand_next.timestamp()
                     return cand_same.timestamp()
                 elif cand_same.timestamp() - since > 4 * 3600:
@@ -698,6 +699,77 @@ def _parse_log_line_timestamp(line: str, since: float | None = None) -> float | 
     return None
 
 
+def _scan_log_content_for_429(
+    content: str,
+    since: float | None = None,
+    session_id: str | None = None,
+) -> bool | None:
+    if (
+        not content.strip()
+        or content.startswith("note: no LiteLLM log for this run")
+        or not _LITELLM_TRAFFIC_PATTERN.search(content)
+    ):
+        return None
+
+    if since is None and not session_id:
+        return bool(_LITELLM_429_PATTERN.search(content))
+
+    current_ts: float | None = None
+    current_pod: str | None = None
+    found_any_timestamp = False
+    has_undated_429 = False
+    min_ts: float | None = None
+    max_ts: float | None = None
+
+    for raw_line in content.splitlines():
+        line = _ANSI_ESCAPE_PATTERN.sub("", raw_line)
+        m_pod = _POD_PREFIX_PATTERN.match(line)
+        if m_pod:
+            pod_name = m_pod.group("pod")
+            if pod_name != current_pod:
+                current_pod = pod_name
+                current_ts = None
+
+        ts = _parse_log_line_timestamp(line, since=since)
+        if ts is not None:
+            current_ts = ts
+            found_any_timestamp = True
+            if min_ts is None or ts < min_ts:
+                min_ts = ts
+            if max_ts is None or ts > max_ts:
+                max_ts = ts
+
+        if _LITELLM_429_PATTERN.search(line):
+            if session_id and session_id in line:
+                return True
+            if current_ts is not None and since is not None:
+                if current_ts >= (since - 5.0):
+                    return True
+            else:
+                has_undated_429 = True
+
+    if since is not None:
+        if not found_any_timestamp or min_ts is None or max_ts is None:
+            return None
+        if min_ts > since:
+            return None
+        if max_ts < (since - 5.0):
+            return None
+        if has_undated_429:
+            return None
+        if not _LITELLM_429_PATTERN.search(content):
+            return False
+        if max_ts >= (since - 5.0):
+            return False
+        return None
+
+    if has_undated_429:
+        return None
+    if not _LITELLM_429_PATTERN.search(content):
+        return False
+    return None
+
+
 def _scan_log_for_429(
     path: Path,
     since: float | None = None,
@@ -706,52 +778,7 @@ def _scan_log_for_429(
     try:
         with path.open("r", encoding="utf-8", errors="replace") as f:
             content = f.read()
-            if (
-                not content.strip()
-                or content.startswith("note: no LiteLLM log for this run")
-                or not _LITELLM_TRAFFIC_PATTERN.search(content)
-            ):
-                return None
-
-            if since is None and not session_id:
-                return bool(_LITELLM_429_PATTERN.search(content))
-
-            current_ts: float | None = None
-            found_any_timestamp = False
-            has_undated_429 = False
-            max_ts: float | None = None
-
-            for raw_line in content.splitlines():
-                line = _ANSI_ESCAPE_PATTERN.sub("", raw_line)
-                ts = _parse_log_line_timestamp(line, since=since)
-                if ts is not None:
-                    current_ts = ts
-                    found_any_timestamp = True
-                    if max_ts is None or ts > max_ts:
-                        max_ts = ts
-
-                if _LITELLM_429_PATTERN.search(line):
-                    if session_id and session_id in line:
-                        return True
-                    if current_ts is not None and since is not None:
-                        if current_ts >= (since - 5.0):
-                            return True
-                    else:
-                        has_undated_429 = True
-
-            if has_undated_429:
-                return None
-
-            if since is not None and max_ts is not None and max_ts < (since - 5.0):
-                return None
-
-            if not _LITELLM_429_PATTERN.search(content):
-                return False
-
-            if since is not None and max_ts is not None and max_ts >= (since - 5.0):
-                return False
-
-            return None
+            return _scan_log_content_for_429(content, since=since, session_id=session_id)
     except OSError:
         return None
 
@@ -766,6 +793,39 @@ def _extract_infra_failure_reason(text: str | None) -> str | None:
         if match:
             return match.group(1) if match.group(1) == "rate_limit" else None
         return "rate_limit"
+    return None
+
+
+def _fetch_live_litellm_log(timeout: float = 15.0) -> str | None:
+    ns = os.environ.get("AGENT_NAMESPACE", "kubeagents-system")
+    cmd = [
+        "kubectl",
+        "logs",
+        "-l",
+        "app=litellm",
+        "-c",
+        "litellm-container",
+        "-n",
+        ns,
+        "--prefix",
+        "--tail=20000",
+    ]
+    context = os.environ.get("AGENT_CLUSTER_CONTEXT")
+    if context:
+        cmd.extend(["--context", context])
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout
+    except (OSError, subprocess.SubprocessError):
+        pass
     return None
 
 
@@ -792,6 +852,17 @@ def _corroborate_platform_rate_limit(
         art_path = Path(artifacts) / "litellm.log"
         if art_path.is_file():
             return _scan_log_for_429(art_path, since=since, session_id=session_id)
+
+    live_content = _fetch_live_litellm_log()
+    if live_content:
+        if artifacts:
+            try:
+                art_path = Path(artifacts) / "litellm.log"
+                art_path.parent.mkdir(parents=True, exist_ok=True)
+                art_path.write_text(live_content, encoding="utf-8")
+            except OSError:
+                pass
+        return _scan_log_content_for_429(live_content, since=since, session_id=session_id)
 
     return None
 
@@ -1511,7 +1582,7 @@ def _record_unsettled(
             f"delegated task {t} was reported {last} during wait but {live} at settle; nothing delivered"
         )
         if not has_delivery and opening_turn:
-            marked.append(f"{DELEGATION_CEILING_MARKER}: {report}")
+            marked.append(f"{INFRA_FAILURE_MARKER}: {report}")
         else:
             plain.append(report)
     if marked:
@@ -2865,6 +2936,7 @@ class KubeAgentsHarness(AgentHarness):
             return board_messages
 
         bblock_kinds = final_bstate[3] if len(final_bstate) > 3 else {}
+        telemetry_corroborated: bool | None = None
         for t in failure_cards:
             live_status = final_bstate[0].get(t)
             card_fallback = (fallback_messages.get(t) or []) if fallback_messages else []
@@ -2874,11 +2946,14 @@ class KubeAgentsHarness(AgentHarness):
             )
             if live_status is not None and live_status not in _TERMINAL_STATUSES:
                 if bblock_kinds.get(t) == "transient":
-                    corroborated = (
-                        _corroborate_platform_rate_limit(since=since, session_id=session_id)
-                        if has_rate_limit
-                        else None
-                    )
+                    if has_rate_limit:
+                        if telemetry_corroborated is None:
+                            telemetry_corroborated = _corroborate_platform_rate_limit(
+                                since=since, session_id=session_id
+                            )
+                        corroborated = telemetry_corroborated
+                    else:
+                        corroborated = None
                     if has_rate_limit and corroborated is not False:
                         if unsettled is not None:
                             unsettled.append(t)
@@ -3024,7 +3099,7 @@ class KubeAgentsHarness(AgentHarness):
                     err_text = str(c.get("error") or "")
                     if _extract_infra_failure_reason(sum_text) or _extract_infra_failure_reason(err_text):
                         rate_limited_cards.add(tid)
-                    elif sum_text or err_text:
+                    else:
                         rate_limited_cards.discard(tid)
 
         _track_rate_limits(read.cards)
@@ -3084,6 +3159,7 @@ class KubeAgentsHarness(AgentHarness):
             )
         unsettled = []
         discrepancies = []
+        telemetry_corroborated: bool | None = None
         for t in poll_failure_statuses:
             if _status(t) not in _TERMINAL_STATUSES and t not in outstanding:
                 card_data = read.cards.get(t, {})
@@ -3097,14 +3173,15 @@ class KubeAgentsHarness(AgentHarness):
                             or _extract_infra_failure_reason(error_text)
                         )
                     )
-                    corroborated = (
-                        _corroborate_platform_rate_limit(
-                            since=getattr(self, "_run_started_at", None),
-                            session_id=session_id,
-                        )
-                        if has_rate_limit
-                        else None
-                    )
+                    if has_rate_limit:
+                        if telemetry_corroborated is None:
+                            telemetry_corroborated = _corroborate_platform_rate_limit(
+                                since=getattr(self, "_run_started_at", None),
+                                session_id=session_id,
+                            )
+                        corroborated = telemetry_corroborated
+                    else:
+                        corroborated = None
                     if has_rate_limit and corroborated is not False:
                         unsettled.append(t)
                     else:
@@ -3357,6 +3434,7 @@ class KubeAgentsHarness(AgentHarness):
                                 rate_limited_cards.discard(t)
                         else:
                             poll_failure_messages.pop(t, None)
+                            rate_limited_cards.discard(t)
                 if all(t in on_board for t in outstanding) and not any(
                     on_board[t] in _TERMINAL_STATUSES for t in outstanding
                 ):
@@ -3477,6 +3555,8 @@ class KubeAgentsHarness(AgentHarness):
                                 rate_limited_cards.discard(t)
                         else:
                             poll_failure_messages.pop(t, None)
+                            if cstate[0].get(t) in _FAILURE_STATUSES:
+                                rate_limited_cards.discard(t)
                 else:
                     # If board read exec failed, evaluate trajectory failure summaries
                     # across all needed cards, allowing newer runs to both set and evict.
@@ -3486,7 +3566,7 @@ class KubeAgentsHarness(AgentHarness):
                     for t in needed_read:
                         if any(_extract_infra_failure_reason(m) for m in poll_failure_messages.get(t, [])):
                             rate_limited_cards.add(t)
-                        elif poll_failure_messages.get(t):
+                        else:
                             rate_limited_cards.discard(t)
             _fold_status_turn(
                 result,
@@ -3644,13 +3724,16 @@ class KubeAgentsHarness(AgentHarness):
 
         infra_reason: str | None = None
         infra_detail: str = ""
+        telemetry_corroborated: bool | None = None
         if board_messages:
             for text in board_messages:
                 reason = _extract_infra_failure_reason(text)
                 if reason:
-                    corroborated = _corroborate_platform_rate_limit(
-                        since=since, session_id=session_id
-                    )
+                    if telemetry_corroborated is None:
+                        telemetry_corroborated = _corroborate_platform_rate_limit(
+                            since=since, session_id=session_id
+                        )
+                    corroborated = telemetry_corroborated
                     if corroborated is False:
                         result.errors.append(
                             f"delegated worker failed ({reason}): card on board recorded {reason} ({text[:200]}) but platform proxy log showed no 429"

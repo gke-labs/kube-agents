@@ -1168,12 +1168,12 @@ def test_a_delegation_ceiling_with_nothing_delivered_is_its_own_infra_class(tofu
     assert INFRA_FAILURE_MARKER not in verdict.reps[0].reason
 
 
-def test_an_unsettled_card_ceiling_marker_classifies_infra_with_unsettled_reason(tofu_spec, make_run):
-    """An unsettled failure card unblocked at settle leads with DELEGATION_CEILING_MARKER
-    and explains that delegated cards unblocked to non-terminal at settle without delivering."""
+def test_an_unsettled_card_infra_marker_classifies_infra_with_delegated_reason(tofu_spec, make_run):
+    """An unsettled failure card unblocked at settle leads with INFRA_FAILURE_MARKER
+    and explains that delegated worker hit an infrastructure condition."""
     def at_unsettled(rec):
         rec["errors"] = [
-            f"{DELEGATION_CEILING_MARKER}: delegated task t1 was reported blocked during wait but running at settle; nothing delivered"
+            f"{INFRA_FAILURE_MARKER}: delegated task t1 was reported blocked during wait but running at settle; nothing delivered"
         ]
         rec["scores"]["VerificationCorrectness"] = 0.0
 
@@ -1181,8 +1181,8 @@ def test_an_unsettled_card_ceiling_marker_classifies_infra_with_unsettled_reason
     verdict = grade_case(tofu_spec, [run], admitted=True)
     assert verdict.rung is Rung.INFRA
     assert verdict.reps[0].outcome == "infra"
-    assert verdict.reps[0].reason.startswith(DELEGATION_CEILING_MARKER)
-    assert "delegated cards unblocked to non-terminal at settle without delivering a result" in verdict.reps[0].reason
+    assert verdict.reps[0].reason.startswith(INFRA_FAILURE_MARKER)
+    assert "delegated worker hit an infrastructure condition" in verdict.reps[0].reason
     assert "t1 was reported blocked during wait but running at settle" in verdict.reps[0].reason
 
 

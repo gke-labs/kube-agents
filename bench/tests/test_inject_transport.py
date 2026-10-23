@@ -39,7 +39,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Generator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -2675,7 +2675,7 @@ def test_a_running_card_at_the_ceiling_delivers_nothing_from_an_earlier_run(
 
 def _corroborate_429(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     log_file = tmp_path / "litellm.log"
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_iso = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
     log_file.write_text(f'{now_iso} ERROR: VertexAIException - {{"error": {{"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}}}\n')
     monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
 
@@ -2733,10 +2733,11 @@ def test_a_card_unblocked_between_poll_and_final_read_on_inject_records_ceiling(
 
     result = KubeAgentsHarness().run("check the fleet")
 
-    assert not infra(result)
-    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert infra(result)
+    assert any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
     assert result.errors == [
-        f"{harness.DELEGATION_CEILING_MARKER}: delegated task {CARD_A} was reported blocked during wait but ready at settle; nothing delivered"
+        f"{harness.INFRA_FAILURE_MARKER}: delegated task {CARD_A} was reported blocked during wait but ready at settle; nothing delivered"
     ]
 
 
@@ -2782,10 +2783,11 @@ def test_a_card_unblocked_and_claimed_running_on_inject_records_ceiling(
 
     result = KubeAgentsHarness().run("check the fleet")
 
-    assert not infra(result)
-    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert infra(result)
+    assert any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
     assert result.errors == [
-        f"{harness.DELEGATION_CEILING_MARKER}: delegated task {CARD_A} was reported blocked during wait but running at settle; nothing delivered"
+        f"{harness.INFRA_FAILURE_MARKER}: delegated task {CARD_A} was reported blocked during wait but running at settle; nothing delivered"
     ]
     assert result.metadata.get("final_message") == ACK
 
@@ -2851,7 +2853,12 @@ def test_a_card_unblocked_on_inject_refused_by_platform_telemetry_does_not_recor
 ) -> None:
     """When platform telemetry log is present and shows no 429, an unblocked transient card on inject is refused and routed to discrepancies."""
     ok_log = tmp_path / "litellm.log"
-    ok_log.write_text("INFO: 200 OK POST /v1/chat/completions\n")
+    start_iso = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    end_iso = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+    ok_log.write_text(
+        f"{start_iso} INFO: 200 OK GET /health\n"
+        f"{end_iso} INFO: 200 OK POST /v1/chat/completions\n"
+    )
     monkeypatch.setenv("LITELLM_LOG_PATH", str(ok_log))
 
     build_session_store(tmp_path, created=[CARD_A])
