@@ -301,9 +301,11 @@ func TaskParametersOf(parts []Part) (TaskParameters, bool, error) {
 }
 
 // ChildResult is the childResult data part: a child task's end, which the
-// gateway delivers on its parent's .in as a message (a parent that waits by
-// staying open reads its children's results there). Only a top-level
-// task's end goes to the conversation; a child's comes here instead.
+// gateway delivers on its parent's .in as a message, for a parent that waits
+// by staying open (a profile task under the dispatcher). A chat session's
+// turn ends when it delegates, so a session parent is woken with the child's
+// result as a new turn instead (spec-a2a-payloads.md, "Task parameters and
+// child results").
 type ChildResult struct {
 	ChildTaskID string    `json:"childTaskId"`
 	Addressee   string    `json:"addressee"`

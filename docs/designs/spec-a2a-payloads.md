@@ -736,8 +736,14 @@ and that check is what makes these message fields authoritative.
 carrying `{"childResult": {"childTaskId", "addressee", "state", "text"?}}`. The parent's per-task
 reader takes it as a new turn. `state` is the child's terminal state. `text` is its deliverable
 when it completed and its reason otherwise, at most 64 KiB and cut by the gateway; the child's own
-`result` artifact keeps it whole. Only a top-level task's end goes to its conversation. A parent
-that has already ended gets no child result: the gateway drops it and logs it.
+`result` artifact keeps it whole. Only a top-level task's end goes to its conversation.
+
+This is the rule for a parent that waits by staying open: a profile task under the dispatcher. A
+profile parent that has already ended gets no child result; the gateway drops it and logs it. A
+chat session's turn ends when it delegates, so a session parent keeps the chatops wake instead
+(`spec-chatops-gateway.md`, the delegation primitive). On its child's end the gateway starts a new
+turn on the session that carries the child's result, and it doesn't deliver a `childResult` to the
+finished turn's `…in`.
 
 ### Card work after the task ends
 
