@@ -378,10 +378,12 @@ which made several cases a little worse without making any one of them fail thre
 version key carries the mode ([`bench/baselines/README.md`](../bench/baselines/README.md)), so the
 presubmit's `next` is compared only with lines a next-mode run on `main` recorded at its key, and
 the today lane's `today` only with today's; a case with no line at its key contributes nothing to
-`main`'s side, with one exception below. The next-mode nightly, the one next-mode run on `main` that records, runs a
-different agent model from the presubmit and so files under another key. A case with no line at its
-next key falls back, for this number only, to its today-mode lines at the same key otherwise, and
-the verdict names those cases in a note; rung 6 never falls back. The verdict prints it on every
+`main`'s side, with one exception below. The main nightly (`ci-kube-agents-eval-nightly` and its
+`-writers` part) is the next-mode run on `main` that records, on the presubmit's agent model. A case
+with no line at its next key (one the inject lane excludes, or whose window has not filled) falls
+back, for this number only, to its today-mode lines at the same key otherwise, which
+`ci-kube-agents-eval-nightly-today` records, and the verdict names those cases in a note; rung 6
+never falls back. The verdict prints it on every
 run:
 
 ```
@@ -410,8 +412,9 @@ Nothing in this repository changes for the flip, and the same line removed disar
 periodic does not get the line: it records `main` and grades itself against a window that already
 holds its own night, so its aggregate is a report, never a gate. Revisit the margin when `main`'s
 window rate passes 0.96 (at that point 0.10 starts redding five failed repetitions, which the
-sample contains); the eval dashboard's Trend page draws that window from the same store, per case
-and per domain, so it is the place to watch for it.
+sample contains); the eval dashboard's Trend page draws today's window from the same store, per case
+and per domain. It does not draw the `next` series yet, which is the window the presubmit is compared
+with since the nightly grades `next`; the `next` block of the published `trend.json` holds it.
 
 **What an author sees when it fires.** No case is marked blocking; the failures are spread. The
 job's final log line is the ordinary `PR Smoke Test Evaluation Failed -- see .../eval-verdict.md`,
@@ -531,9 +534,8 @@ next-mode run on `main` recorded at the same key, never against the today-mode n
 comparison measured the lane rather than the pull request, and redded four admitted cases at once
 on 2026-10-17 with nothing changed on their side. Where no next-mode line exists at the key, rung 6
 is quiet; a partial window is compared, as it is for `today`. The today lane reads today's history
-only. The key includes the agent model, and the next-mode nightly runs a different one from the
-presubmit, so on the presubmit rung 6 stays quiet until a next-mode run on `main` records at the
-presubmit's model.
+only. The key includes the agent model, and the main nightly runs the presubmit's, so its next-mode
+lines are the presubmit's rung 6 history.
 
 One thing about the lane's install differs too. That write safeguard
 (`no-github-writes-the-case-did-not-request`) charges every pull request opened in a repetition's
@@ -565,7 +567,8 @@ nightly runs the same list once a night on its own leased project
 case's record is per case, not per forge; nothing runs the cases this file leaves out against
 GitLab. `ci-kube-agents-eval-nightly-gitlab-next` runs the same list under `spec.mode: next`
 (`EVAL_MODE_NEXT=1`, through the inject door), so the forge is graded on both stacks; its runs
-show in Prow only, as the dashboard collects no next-mode runs and the GitLab lane never records.
+show in Prow only, as the dashboard collects the GitLab lane's today-mode nightly alone and the GitLab
+lane never records.
 
 The roster above is still the roster, intersected with the lane's list: a roster case in the
 lane arms rung 4 there, and a held-out seat runs and reports without arming it, exactly as on

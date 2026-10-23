@@ -31,7 +31,8 @@ The digest also carries one line on last night's run of the nightly tier
 (`--data`, the `data.json` the tick collected): the cases recorded, how many
 passed all reps, partial and failed, what is newly failing against the night
 before, the opening chat turn's p50 and p95 as advice beside the p95 < 10 s
-target ([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md)), and the wall clock, with a link to the dashboard's Nightly report
+target ([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md); empty since the nightly grades
+`spec.mode: next`, because the harness times the opening turn on the agent API only), and the wall clock, with a link to the dashboard's Nightly report
 (`nightly.html`); a night Prow cut short, one still running, or no night
 since the day before yesterday, says so instead of numbers.
 `scripts/eval_dashboard/nightly.py` derives the line and the report from the

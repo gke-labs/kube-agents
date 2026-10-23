@@ -433,7 +433,7 @@ def _cluster_agent_roster() -> list[dict]:
         return []
     roster = []
     for home in sorted(base.iterdir()):
-        if home.name in RESERVED_PROFILES or not is_ready_profile(home):
+        if home.name in RESERVED_PROFILES or home.name.startswith(".") or not is_ready_profile(home):
             continue
         entry = {"name": home.name}
         try:

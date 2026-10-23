@@ -134,6 +134,8 @@ resource "null_resource" "incident" {
       tostring(var.memory_limit_mib),
       tostring(var.allocate_mib),
       tostring(var.replicas),
+      tostring(var.crash_seconds),
+      var.wait_for,
       var.host_cluster_name,
     ]))
   }
@@ -324,6 +326,48 @@ resource "null_resource" "incident" {
         build-id="${local.ci_labels["build-id"]}" \
         pull-number="${local.ci_labels["pull-number"]}"
 
+      if [ "${var.crash_seconds}" -gt 0 ]; then
+        # The transient shape: exit 1 until crash_seconds after the pod's
+        # first start, kept in an emptyDir that outlives the container's
+        # restarts, then run. kubelet's BackOff events are the ones a crash
+        # loop emits; only their span differs.
+        kubectl apply -f - <<'MANIFEST'
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: ${local.workload}
+        namespace: ${local.ns}
+        labels:
+          app: ${local.workload}
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: ${local.workload}
+        template:
+          metadata:
+            labels:
+              app: ${local.workload}
+          spec:
+            automountServiceAccountToken: false
+            volumes:
+              - name: state
+                emptyDir: {}
+            containers:
+              - name: allocator
+                image: busybox:1.36
+                command: ["sh", "-c", "[ -f /state/t0 ] || date +%s > /state/t0; t0=$(cat /state/t0); now=$(date +%s); if [ $((now - t0)) -lt ${var.crash_seconds} ]; then echo \"still failing: $((now - t0))s of ${var.crash_seconds}s\"; exit 1; fi; echo recovered; sleep 3600"]
+                volumeMounts:
+                  - name: state
+                    mountPath: /state
+                resources:
+                  requests:
+                    cpu: 10m
+                    memory: ${var.memory_limit_mib}Mi
+                  limits:
+                    memory: ${var.memory_limit_mib}Mi
+      MANIFEST
+      else
       kubectl apply -f - <<'MANIFEST'
       apiVersion: apps/v1
       kind: Deployment
@@ -354,6 +398,7 @@ resource "null_resource" "incident" {
                   limits:
                     memory: ${var.memory_limit_mib}Mi
       MANIFEST
+      fi
 
       # ---- 2. Wait for the debounce to clear --------------------------------
       # The watcher holds the crash-loop family until Event.Count reaches
@@ -387,6 +432,15 @@ resource "null_resource" "incident" {
       done
       echo "BackOff reached the debounce threshold after $${elapsed}s."
 
+      # watcher_logged: has k8s-event-watcher logged a line matching the
+      # given regex since the plant? The same read as step 3's poll, for the
+      # follow-up wait in 3b; the regex names this namespace's pods.
+      watcher_logged() {
+        kubectl logs "deployment/${var.agent_deployment}" \
+            -n "${var.agent_namespace}" -c "${var.agent_container}" \
+            --since-time="$started_at" --tail=-1 2>/dev/null \
+          | grep -qE "$1"
+      }
       # ---- 3. Wait for the watcher to hand the event to the daemon ----------
       # Read from the watcher's own log rather than from the gateway's
       # /api/sessions, which the design note in #901 suggested: that route needs
@@ -426,6 +480,27 @@ resource "null_resource" "incident" {
         elapsed=$((elapsed + 10))
       done
       echo "k8s-event-watcher handled a pod of ${local.ns} (matched '${local.watcher_handled}') after $${elapsed}s."
+      if [ "${var.wait_for}" = "followup" ]; then
+        # ---- 3b. Wait for the quiet follow-up ---------------------------------
+        # The pod recovers crash_seconds after its first start and its last
+        # BackOff is then WATCHER_QUIET_AFTER (15m) from the watcher's
+        # follow-up line; the card's own triage runs meanwhile. Bounded past
+        # that, and NOT fatal at the bound: a watcher that sends no follow-up
+        # is the behaviour the case grades, so the apply returns and the
+        # agent turn reads a card with no follow-up on it, which is the red.
+        elapsed=0
+        until watcher_logged "followup .*pod=${local.ns}/.* sent "; do
+          if [ "$elapsed" -ge 1500 ]; then
+            echo "k8s-event-watcher logged no 'followup' for a pod in ${local.ns} within $${elapsed}s (due WATCHER_QUIET_AFTER, 15m, after the pod's last event); returning so the case can grade its absence." >&2
+            break
+          fi
+          sleep 15
+          elapsed=$((elapsed + 15))
+        done
+        if [ "$elapsed" -lt 1500 ]; then
+          echo "k8s-event-watcher sent the quiet follow-up for ${local.ns} after $${elapsed}s."
+        fi
+      fi
 
       # After a `fire` line the card is filed within seconds and then takes
       # minutes to run; after a `folded` one no card is filed for this run.
