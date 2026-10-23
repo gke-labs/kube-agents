@@ -134,6 +134,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 # A sibling in the shared scripts directory: the agent home is `PLATFORM_AGENT_HOME`,
@@ -224,6 +225,10 @@ PROFILES_DIR = "profiles"
 PLATFORM_PROFILE = "platform"
 CRON_DIR = "cron"
 STATE_FILE_NAME = "kanban_board_health.json"
+# The platform store the scheduler stamps after delivery, and this job's entry
+# in it (agents/platform/cron/jobs.json).
+JOBS_FILE = "jobs.json"
+JOB_ID = "kanban-board-health"
 STATE_TMP_SUFFIX = ".tmp"
 STATE_SCHEMA_VERSION = 1
 STATE_VERSION_KEY = "version"
@@ -443,15 +448,16 @@ def status_line(person: bool, age_hours: float) -> str:
 def render_stuck_tasks(tasks: list) -> list:
     """The stuck tasks as chat lines: a headline counting every task, then a row per title.
 
-    Rows are newest first. Tasks sharing a title and whether they wait on a
-    person are one row with their count, aged by the one that has waited
-    longest. Past ``MAX_STUCK_ROWS`` the rest are counted. Empty for no tasks.
+    Rows are newest first. Tasks sharing a title as shown (``plain_title``)
+    and whether they wait on a person are one row with their count, aged by the
+    one that has waited longest, so two rows never read the same. Past
+    ``MAX_STUCK_ROWS`` the rest are counted. Empty for no tasks.
     """
     if not tasks:
         return []
     groups = collections.OrderedDict()
     for task in tasks:
-        groups.setdefault((task["title"], task["person"]), []).append(task)
+        groups.setdefault((plain_title(task["title"]), task["person"]), []).append(task)
     rows = sorted(
         groups.values(),
         key=lambda group: (min(t["age_hours"] for t in group), group[0]["title"]),
@@ -493,8 +499,39 @@ def load_state(path: Path) -> dict:
     said_at = data.get(STATE_SAID_AT_KEY)
     return {
         STATE_SAID_KEY: [str(tid) for tid in said] if isinstance(said, list) else [],
-        STATE_SAID_AT_KEY: said_at if isinstance(said_at, (int, float)) else None,
+        STATE_SAID_AT_KEY: said_at if isinstance(said_at, (int, float)) and math.isfinite(said_at) else None,
     }
+
+
+def last_post_undelivered(home: Path, said_at, env=None) -> bool:
+    """Whether the run that last said the stuck tasks failed to deliver them.
+
+    The record is saved before the relay delivers, so it cannot know. The
+    scheduler can: after delivery it stamps this job's entry in the platform
+    store with ``last_run_at`` and, on a failure, ``last_delivery_error``. An
+    error stamped at or after ``said_at`` belongs to that run (or a later one),
+    so the tasks are said again rather than left unreported for a week. Under
+    ``STATE_ENV`` (tests and hand runs) the store is not read. A failure grade
+    can also mark a post that landed (``feedback_prompt.py`` says why), which
+    costs a repeat card the next day, not a silent week.
+    """
+    if said_at is None or (env if env is not None else os.environ).get(STATE_ENV):
+        return False
+    try:
+        data = json.loads((home / PROFILES_DIR / PLATFORM_PROFILE / CRON_DIR / JOBS_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    jobs = data.get("jobs", []) if isinstance(data, dict) else data
+    job = next((j for j in jobs if isinstance(j, dict) and j.get("id") == JOB_ID), None) if isinstance(jobs, list) else None
+    if not job or not job.get("last_delivery_error"):
+        return False
+    try:
+        run_at = datetime.fromisoformat(str(job.get("last_run_at")).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if run_at.tzinfo is None:
+        run_at = run_at.replace(tzinfo=timezone.utc)
+    return run_at.timestamp() >= said_at
 
 
 def save_state(path: Path, state: dict) -> None:
@@ -746,6 +783,8 @@ def main(argv=None, *, env=None, now=None) -> int:
     if tasks is not None:
         path = state_path(home, env)
         state = load_state(path)
+        if last_post_undelivered(home, state[STATE_SAID_AT_KEY], env):
+            state = {STATE_SAID_KEY: [], STATE_SAID_AT_KEY: None}
         due, kept = stuck_due(tasks, state, time.time() if now is None else now)
         # Rendered before the record is saved, so a card that fails to render
         # is not remembered as said.

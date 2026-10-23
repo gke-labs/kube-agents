@@ -498,6 +498,9 @@ missed, and a daily repeat of the same list is noise. The ids last said, and
 when, are kept in `profiles/platform/cron/kanban_board_health.json` under the
 agent home; a card that comes unstuck drops out of it, so it is new again if it
 sticks again, and a record that cannot be read says every stuck card again. The
+record is written before the scheduler delivers, so a run that finds a
+`last_delivery_error` on this job's entry stamped after the last post says the
+cards again rather than leaving them unsaid for a week. The
 board's other findings (invariant violations and the engine's other rules) are
 rare and still print on every run that finds them, under
 `kanban board health: attention required`. It fires at 12:35 UTC, half an hour

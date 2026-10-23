@@ -441,6 +441,10 @@ class StuckTasksTests(unittest.TestCase):
         title = kbh.plain_title("Investigate " + "x" * 200)
         self.assertEqual(title, ("Investigate " + "x" * 200)[: kbh.STUCK_TITLE_MAX_CHARS - 1] + "…")
 
+    def test_titles_that_read_the_same_share_one_row(self):
+        lines = kbh.render_stuck_tasks([stuck("a", "Fix *payments*"), stuck("b", "Fix payments")])
+        self.assertEqual(lines.count("**Fix payments** (2 tasks)"), 1)
+
 
 class StuckDueTests(unittest.TestCase):
     """Said when a task first gets stuck, then weekly while any stays stuck."""
@@ -510,6 +514,31 @@ class StuckDueTests(unittest.TestCase):
             self.assertEqual(kbh.load_state(path), {"said": [], "said_at": None})
             path.write_text(json.dumps({"version": 99, "said": ["a"], "said_at": 5.0}))
             self.assertEqual(kbh.load_state(path), {"said": [], "said_at": None})
+            path.write_text('{"version": 1, "said": ["a"], "said_at": NaN}')
+            self.assertEqual(kbh.load_state(path), {"said": ["a"], "said_at": None})
+
+    def _store(self, home, error, run_at):
+        store = Path(home) / "profiles" / "platform" / "cron" / "jobs.json"
+        store.parent.mkdir(parents=True)
+        entry = {"id": "kanban-board-health", "last_run_at": run_at, "last_delivery_error": error}
+        store.write_text(json.dumps({"jobs": [entry]}))
+
+    def test_a_failed_delivery_after_the_post_unsays_it(self):
+        said_at = 1_761_220_000.0  # 2025-10-23T11:46:40Z
+        with tempfile.TemporaryDirectory() as d:
+            self._store(d, "composed but not delivered to slack", "2025-10-23T11:47:10+00:00")
+            self.assertTrue(kbh.last_post_undelivered(Path(d), said_at, env={}))
+
+    def test_a_delivered_post_or_an_older_failure_stands(self):
+        said_at = 1_761_220_000.0
+        with tempfile.TemporaryDirectory() as d:
+            self._store(d, None, "2025-10-23T11:47:10+00:00")
+            self.assertFalse(kbh.last_post_undelivered(Path(d), said_at, env={}))
+        with tempfile.TemporaryDirectory() as d:
+            self._store(d, "composed but not delivered to slack", "2025-10-22T11:47:10+00:00")
+            self.assertFalse(kbh.last_post_undelivered(Path(d), said_at, env={}))
+        with tempfile.TemporaryDirectory() as d:
+            self.assertFalse(kbh.last_post_undelivered(Path(d), said_at, env={}))
 
     def test_an_unwritable_record_does_not_raise(self):
         with tempfile.TemporaryDirectory() as d:
