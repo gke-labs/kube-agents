@@ -391,11 +391,9 @@
 # launches in the first cost tier rather than the last.
 ./tasks/vcs-issue-resolver-triage/task.yaml
 ./tasks/vcs-review-feedback-read-back/task.yaml
-# A second proposal under a spent branch name (#1918): open and close one
-# pull request, then open another on the same branch: two pull requests a
-# repetition on the throwaway repository, one of them left closed. Priced at
-# 1000s in unit_cost_hint.
-./tasks/vcs-spent-branch-reuse/task.yaml
+# vcs-spent-branch-reuse (#1918), registered here after these two, moved to
+# presubmit-cases.txt and the blocking roster on 2026-10-23 on its nightly
+# record (docs/eval-gate-roster.md, "Admitted on the record since the split").
 # A read-only forge question that asks for `gh` by name (#2201): the answer
 # must come through the version-control verbs, which is red on any build
 # whose sandbox still carries a forge CLI that answers. Read-only, so no
