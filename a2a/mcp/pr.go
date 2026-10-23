@@ -20,11 +20,14 @@ import (
 // written anywhere, and everything the forge returns is shown as inert text.
 const ToolInspectPR = "inspect_pr"
 
+// InspectTimeout bounds one inspect_pr call, the wait for a slot and every
+// broker request included when the first is asked again smaller
+// (askAgainSmaller). It is the longest any tool call here runs: it sits under
+// the HTTP server's 30s write timeout, and the server's shutdown grace is
+// sized to outlast it.
+const InspectTimeout = DefaultBrokerTimeout
+
 const (
-	// inspectTimeout bounds one tool call, both broker requests included
-	// when the first is retried without the diff. It sits under the HTTP
-	// server's 30s write timeout.
-	inspectTimeout = DefaultBrokerTimeout
 
 	// Caps on what one answer shows. The answer lands in a model's context
 	// in the caller's editor, so it is sized for reading, not archiving.
@@ -49,7 +52,7 @@ const (
 	// maxInspectInFlight bounds concurrent inspect_pr calls, so the memory
 	// one call can hold (about twice DefaultBrokerMaxResponseBytes while
 	// the answer decodes) is multiplied by a known number. A call over the
-	// limit waits for a slot inside its own inspectTimeout, so a client's
+	// limit waits for a slot inside its own InspectTimeout, so a client's
 	// parallel calls queue rather than fail, and a call that cannot get a
 	// slot in time is refused as busy, still inside the server's write
 	// timeout.
@@ -63,6 +66,11 @@ const (
 	diffBSidePrefix   = " b/"
 	diffQuotedBPrefix = ` "b/`
 	hunkPrefix        = "@@"
+	// git's own statements of a file's paths, ahead of its first hunk.
+	diffRenameToPrefix = "rename to "
+	diffOldFilePrefix  = "--- "
+	diffNewFilePrefix  = "+++ "
+	diffDevNull        = "/dev/null"
 
 	forgeGitLab = "gitlab"
 	forgeGitHub = "github"
@@ -77,8 +85,20 @@ var (
 
 	// proposalURLPattern is a GitHub pull request or GitLab merge request
 	// URL: https://<host>/<path>/pull/<n> or https://<host>/<path>/-/merge_requests/<n>.
+	// The port is matched only so that a URL with one is refused by name
+	// (errProposalURLPort) rather than passed to the broker whole.
 	proposalURLPattern = regexp.MustCompile(
-		`^https?://([A-Za-z0-9.-]+(?::[0-9]+)?)/([A-Za-z0-9_.~-]+(?:/[A-Za-z0-9_.~-]+)+?)/(?:pull|(?:-/)?merge_requests)/([0-9]+)(?:[/?#].*)?$`)
+		`^https?://([A-Za-z0-9.-]+)(:[0-9]*)?/([A-Za-z0-9_.~-]+(?:/[A-Za-z0-9_.~-]+)+?)/(?:pull|(?:-/)?merge_requests)/([0-9]+)(?:[/?#].*)?$`)
+
+	// errProposalURLPort refuses a pull or merge request URL with a port.
+	// The repository is sent to the broker as host/path, and the broker reads
+	// host:port/path as an scp-style remote whose path starts with the port,
+	// a repository the install does not manage. The broker carries no port
+	// through resolution (providers/registry.py refuses one in a forge's
+	// configuration), so dropping it silently would name a host other than
+	// the one the caller gave.
+	errProposalURLPort = errors.New("inspect_pr does not take a pull or merge request URL with a port: " +
+		"the credential broker resolves a forge by host alone. Pass the URL without the port, or `repository` as host/path with `number`")
 )
 
 // ProposalViewer is what inspect_pr needs from the broker client.
@@ -121,7 +141,7 @@ func InspectPRTool(viewer ProposalViewer) Tool {
 			}
 			// The wait for a slot is inside the call's own deadline, so a
 			// queued call still answers before the server's write timeout.
-			ctx, cancel := context.WithTimeout(ctx, inspectTimeout)
+			ctx, cancel := context.WithTimeout(ctx, InspectTimeout)
 			defer cancel()
 			select {
 			case slots <- struct{}{}:
@@ -133,30 +153,7 @@ func InspectPRTool(viewer ProposalViewer) Tool {
 			view, err := viewer.ProposalView(ctx, req)
 			diffNote, commentsNote := "", ""
 			if err != nil && diffMayBeRefused(err) && ctx.Err() == nil {
-				// Carried from #3689's fix: a diff the forge or the broker
-				// refuses for its size must not cost the caller the rest
-				// of the view, and must say why the diff is missing. One
-				// retry, never after a timeout or a cancellation
-				// (diffMayBeRefused, ctx.Err).
-				req.Diff = false
-				again, err2 := viewer.ProposalView(ctx, req)
-				if err2 != nil && diffMayBeRefused(err2) && answerTooLarge(err2) && ctx.Err() == nil {
-					// Still too large without the diff, so the comments are
-					// what is too large: the broker reads up to
-					// brokerCommentLimit from each of GitHub's three
-					// endpoints, at up to 64 KiB a body, and this tool shows
-					// 2 KiB of each. Ask once more without them, so the rest
-					// of the view is still reachable.
-					req.Comments, req.Limit = false, 0
-					if again, err2 = viewer.ProposalView(ctx, req); err2 == nil {
-						commentsNote = "the comments are too large to fetch through the credential broker with the rest of the view. " +
-							"Read them on the forge."
-					}
-				}
-				if err2 == nil {
-					diffNote = diffRetryNote(err, again)
-					view, err = again, nil
-				}
+				view, diffNote, commentsNote, err = askAgainSmaller(ctx, viewer, req, err)
 			}
 			if err != nil {
 				return "", err
@@ -164,6 +161,49 @@ func InspectPRTool(viewer ProposalViewer) Tool {
 			return formatProposalView(repo, number, view, diffNote, commentsNote), nil
 		},
 	}
+}
+
+// askAgainSmaller answers a view the broker refused in a way a big diff
+// produces (err, from req with the diff and the comments). Carried from
+// #3689's fix: a diff the forge or the broker refuses must not cost the
+// caller the rest of the view, and a note must say what was left out and
+// why, claiming no more than the refusals show. Never after a timeout or a
+// cancellation (diffMayBeRefused, ctx.Err).
+//
+// The diff is dropped first: GitHub refuses a diff past its limits whatever
+// else is asked. If the view without it is still too large, the comments are
+// what is too large (the broker reads up to brokerCommentLimit from each of
+// GitHub's three endpoints, at up to 64 KiB a body, and this tool shows 2 KiB
+// of each), so the diff is asked for again without them; only if that is
+// refused too is the view fetched with neither. At most three requests after
+// the first, all inside the call's InspectTimeout. On failure it returns the
+// first refusal, the one about the view that was asked for.
+func askAgainSmaller(ctx context.Context, viewer ProposalViewer, req ProposalViewRequest, err error) (view *ProposalView, diffNote, commentsNote string, _ error) {
+	req.Diff = false
+	view, err2 := viewer.ProposalView(ctx, req)
+	if err2 == nil {
+		return view, diffRetryNote(err, view), "", nil
+	}
+	if !answerTooLarge(err2) || ctx.Err() != nil {
+		return nil, "", "", err
+	}
+	commentsNote = "the comments are too large to fetch through the credential broker with the rest of the view. " +
+		"Read them on the forge."
+	req.Diff, req.Comments, req.Limit = true, false, 0
+	view, err3 := viewer.ProposalView(ctx, req)
+	if err3 == nil {
+		return view, "", commentsNote, nil
+	}
+	if !diffMayBeRefused(err3) || ctx.Err() != nil {
+		return nil, "", "", err
+	}
+	req.Diff = false
+	if view, err2 = viewer.ProposalView(ctx, req); err2 != nil {
+		return nil, "", "", err
+	}
+	// err3 is the refusal of the diff without the comments, so it is the
+	// evidence for the diff's note.
+	return view, diffRetryNote(err3, view), commentsNote, nil
 }
 
 // diffRetryNote says why the diff is missing from a view fetched again
@@ -203,14 +243,17 @@ func parseInspectArgs(raw json.RawMessage) (string, int, error) {
 	}
 	repo := strings.TrimSpace(args.Repository)
 	if m := proposalURLPattern.FindStringSubmatch(repo); m != nil {
-		fromURL, convErr := strconv.Atoi(m[3])
+		if m[2] != "" {
+			return "", 0, errProposalURLPort
+		}
+		fromURL, convErr := strconv.Atoi(m[4])
 		if convErr != nil || fromURL < 1 {
 			return "", 0, errBadInspectArgs
 		}
 		if number != 0 && number != fromURL {
 			return "", 0, fmt.Errorf("`number` %d disagrees with the URL's %d", number, fromURL)
 		}
-		repo, number = m[1]+"/"+m[2], fromURL
+		repo, number = m[1]+"/"+m[3], fromURL
 	}
 	if repo == "" || number < 1 || len(repo) > maxRepositoryLen ||
 		strings.IndexFunc(repo, func(r rune) bool {
@@ -560,13 +603,20 @@ type diffSummary struct {
 // committed .patch file, a fixture holding a sample diff) is content, not a
 // new file.
 //
-// It walks the diff by index, so it copies nothing: only the first
-// maxListedFiles files are kept (their paths are substrings of diff), and
-// the rest are counted. The counts stay those of the whole diff, which the
-// broker answer's size already bounds.
+// A file's path is the one git states itself ahead of the first hunk:
+// `+++ b/<path>`, `rename to <path>`, or for a deletion (`+++ /dev/null`) the
+// `--- a/<path>` side. The `diff --git` header is the fallback, for blocks
+// with none of those lines (a binary or mode-only change): with a space in a
+// path it is ambiguous, and a rename across one has no exact reading.
+//
+// It walks the diff by index, so it copies nothing but a quoted path: only
+// the first maxListedFiles files are kept (their paths are substrings of
+// diff), and the rest are counted. The counts stay those of the whole diff,
+// which the broker answer's size already bounds.
 func diffFiles(diff string) diffSummary {
 	var out diffSummary
 	var cur diffFile
+	var oldPath string
 	inFile, inHunk := false, false
 	flush := func() {
 		if !inFile {
@@ -597,20 +647,60 @@ func diffFiles(diff string) diffSummary {
 			if len(header) > maxDiffHeaderBytes {
 				header = header[:maxDiffHeaderBytes]
 			}
-			cur = diffFile{path: diffHeaderBSidePath(header)}
+			cur, oldPath = diffFile{path: diffHeaderBSidePath(header)}, ""
 			inFile, inHunk = cur.path != "", false
 		case !inFile:
 		case strings.HasPrefix(line, hunkPrefix):
 			inHunk = true
-		case !inHunk:
-		case strings.HasPrefix(line, "+"):
-			cur.additions++
-		case strings.HasPrefix(line, "-"):
-			cur.deletions++
+		case inHunk:
+			switch {
+			case strings.HasPrefix(line, "+"):
+				cur.additions++
+			case strings.HasPrefix(line, "-"):
+				cur.deletions++
+			}
+		case strings.HasPrefix(line, diffRenameToPrefix):
+			if p := diffMetaPath(line[len(diffRenameToPrefix):], ""); p != "" {
+				cur.path = p
+			}
+		case strings.HasPrefix(line, diffOldFilePrefix):
+			oldPath = diffMetaPath(line[len(diffOldFilePrefix):], "a/")
+		case strings.HasPrefix(line, diffNewFilePrefix):
+			p := diffMetaPath(line[len(diffNewFilePrefix):], "b/")
+			if p == "" && strings.TrimRight(line[len(diffNewFilePrefix):], "\t\r") == diffDevNull {
+				p = oldPath
+			}
+			if p != "" {
+				cur.path = p
+			}
 		}
 	}
 	flush()
 	return out
+}
+
+// diffMetaPath is the path in a `rename to`, `--- ` or `+++ ` line's text,
+// after prefix ("a/", "b/", or "" for a rename): C-quoted as git quotes a
+// path with special characters, or bare. git ends a bare path that holds a
+// space with a tab, which is not part of it. "" when the text is not of that
+// shape (no prefix, /dev/null, a quote that does not parse, or longer than a
+// path can be), and the caller keeps what it had.
+func diffMetaPath(text, prefix string) string {
+	text = strings.TrimSuffix(strings.TrimSuffix(text, "\r"), "\t")
+	if text == "" || len(text) > maxDiffHeaderBytes {
+		return ""
+	}
+	if text[0] == '"' {
+		unquoted, err := strconv.Unquote(text)
+		if err != nil {
+			return ""
+		}
+		text = unquoted
+	}
+	if !strings.HasPrefix(text, prefix) || len(text) == len(prefix) {
+		return ""
+	}
+	return text[len(prefix):]
 }
 
 // field is a one-line forge string as a table cell, clipped first so cell

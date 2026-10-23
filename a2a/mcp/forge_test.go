@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -300,13 +301,19 @@ func TestBrokerClientDoesNotFollowRedirects(t *testing.T) {
 func TestNewBrokerClientValidatesItsConfig(t *testing.T) {
 	token := writeToken(t, testToken)
 	for name, cfg := range map[string]BrokerConfig{
-		"no URL":         {TokenFile: token},
-		"no scheme":      {URL: "broker:8080", TokenFile: token},
-		"another scheme": {URL: "unix:///run/broker.sock", TokenFile: token},
-		"no host":        {URL: "http://", TokenFile: token},
-		"credentials":    {URL: "http://user:pw@broker:8080", TokenFile: token},
-		"a query":        {URL: "http://broker:8080?x=1", TokenFile: token},
-		"no token file":  {URL: "http://broker:8080"},
+		"no URL":                     {TokenFile: token},
+		"no scheme":                  {URL: "broker:8080", TokenFile: token},
+		"another scheme":             {URL: "unix:///run/broker.sock", TokenFile: token},
+		"no host":                    {URL: "http://", TokenFile: token},
+		"credentials":                {URL: "http://user:pw@broker:8080", TokenFile: token},
+		"a query":                    {URL: "http://broker:8080?x=1", TokenFile: token},
+		"an empty query":             {URL: "http://broker:8080?", TokenFile: token},
+		"a slash and an empty query": {URL: "http://broker:8080/?", TokenFile: token},
+		"a fragment":                 {URL: "http://broker:8080#x", TokenFile: token},
+		"an empty fragment":          {URL: "http://broker:8080#", TokenFile: token},
+		"a path":                     {URL: "http://broker:8080/api", TokenFile: token},
+		"a path and a slash":         {URL: "http://broker:8080/api/", TokenFile: token},
+		"no token file":              {URL: "http://broker:8080"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := NewBrokerClient(cfg); err == nil {
@@ -314,8 +321,59 @@ func TestNewBrokerClientValidatesItsConfig(t *testing.T) {
 			}
 		})
 	}
-	c, err := NewBrokerClient(BrokerConfig{URL: "http://broker.ns.svc:8080/", TokenFile: token})
-	if err != nil || c.endpoint != "http://broker.ns.svc:8080"+proposalViewPath {
-		t.Errorf("endpoint %q err %v", c.endpoint, err)
+	for _, base := range []string{"http://broker.ns.svc:8080/", "http://broker.ns.svc:8080", " http://broker.ns.svc:8080 "} {
+		c, err := NewBrokerClient(BrokerConfig{URL: base, TokenFile: token})
+		if err != nil || c.endpoint != "http://broker.ns.svc:8080"+proposalViewPath {
+			t.Errorf("%q: endpoint %q err %v", base, c.endpoint, err)
+		}
+	}
+}
+
+// envProxyChild marks the re-executed test binary that runs with HTTP_PROXY
+// set from its start: Go reads the proxy variables once per process, so a
+// t.Setenv in this one would be read too late, or not at all.
+const envProxyChild = "MCP_TEST_PROXY_CHILD"
+
+// An HTTP_PROXY in the pod's environment must not carry the broker request,
+// and the bearer token on it, through the proxy. The broker's host here is
+// one that does not resolve, so the direct request fails at the dial, and the
+// recording proxy must see nothing. (A loopback broker would prove nothing:
+// Go never proxies a request to loopback.)
+func TestBrokerClientIgnoresHTTPProxy(t *testing.T) {
+	if os.Getenv(envProxyChild) == "1" {
+		c := newTestClient(t, "http://broker.invalid:8080", writeToken(t, testToken), func(cfg *BrokerConfig) { cfg.Timeout = 10 * time.Second })
+		_, err := c.ProposalView(context.Background(), testViewRequest)
+		var be *BrokerError
+		if err == nil || errors.As(err, &be) || !strings.Contains(err.Error(), "broker.invalid") {
+			t.Fatalf("err = %v, want a failure to reach broker.invalid itself", err)
+		}
+		return
+	}
+	var mu sync.Mutex
+	var hits []string
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hits = append(hits, r.Method+" "+r.URL.String()+" auth="+r.Header.Get(headerAuthorization))
+		mu.Unlock()
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer proxy.Close()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, exe, "-test.run=^TestBrokerClientIgnoresHTTPProxy$", "-test.count=1") // #nosec G204 -- this test binary
+	cmd.Env = append(os.Environ(), envProxyChild+"=1",
+		"HTTP_PROXY="+proxy.URL, "http_proxy="+proxy.URL, "NO_PROXY=", "no_proxy=")
+	out, runErr := cmd.CombinedOutput()
+	mu.Lock()
+	defer mu.Unlock()
+	if len(hits) != 0 {
+		t.Errorf("the broker request went through HTTP_PROXY: %q", hits)
+	}
+	if runErr != nil {
+		t.Errorf("child: %v\n%s", runErr, out)
 	}
 }

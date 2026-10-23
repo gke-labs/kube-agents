@@ -52,14 +52,16 @@ const (
 	readHeaderTimeout = 10 * time.Second
 	idleTimeout       = 60 * time.Second
 	// writeTimeout bounds one response. Every answer here is one JSON
-	// document, and the slowest, connection_status, bounds its own read
-	// (mcp.statusTimeout); a streamed answer, if a later tool adds one,
-	// has to revisit this.
+	// document, and the slowest, inspect_pr, bounds its own call
+	// (mcp.InspectTimeout, 25 s); a streamed answer, if a later tool adds
+	// one, has to revisit this.
 	writeTimeout = 30 * time.Second
-	// shutdownGrace outlasts the slowest request in flight, a status read
-	// (mcp's statusTimeout, 8 s), so a stop during one is a clean drain,
-	// well inside the pod's default 30 s termination grace.
-	shutdownGrace = 10 * time.Second
+	// shutdownGrace outlasts the slowest request in flight, an inspect_pr
+	// call (mcp.InspectTimeout), so a stop during one is a clean drain
+	// rather than a cut connection and a failed exit. It stays inside the
+	// pod's default 30 s termination grace (the operator sets none on the
+	// MCP pod), so the drain ends before the kubelet's SIGKILL.
+	shutdownGrace = mcp.InspectTimeout + 3*time.Second
 	// dialTimeout bounds one attempt at the first connect to the bus.
 	dialTimeout = 30 * time.Second
 	// The first connect is retried, from dialBackoff doubling to

@@ -23,9 +23,11 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -198,13 +200,33 @@ func newA2AMCPServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.Service
 // way down it goes in the same pass as the Deployment, and a pod still
 // terminating keeps the token it already holds for at most its hour. The flip
 // to today sweeps it with the rest of the MCP server (cleanupA2A's list).
+//
+// An account under the reserved name that this PlatformAgent does not control
+// is treated as removeA2AMCP and ensureA2AMCPToken treat the rest of the MCP
+// objects. With the flag off it is skipped: it is not ours to remove, and this
+// runs on every next reconcile, so refusing would stop the rest of it. With
+// the flag on it is refused rather than adopted: server-side apply would keep
+// every field another manager set, a Workload Identity annotation included,
+// and the MCP pod would run as that identity.
 func (r *PlatformAgentReconciler) reconcileA2AMCPBrokerIdentity(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	sa := newA2AMCPServiceAccount(agent)
+	existing := &corev1.ServiceAccount{}
+	err := r.Get(ctx, client.ObjectKeyFromObject(sa), existing)
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to read the MCP server's ServiceAccount: %w", err)
+	}
+	unowned := err == nil && !metav1.IsControlledBy(existing, agent)
 	if !a2aMCPBrokerEnabled(agent) {
+		if unowned {
+			return nil
+		}
 		if err := r.deleteOwnedA2AObject(ctx, agent, sa, r.Client); err != nil {
 			return fmt.Errorf("failed to remove the MCP server's ServiceAccount: %w", err)
 		}
 		return nil
+	}
+	if unowned {
+		return fmt.Errorf("refusing to adopt unowned ServiceAccount %s/%s as the MCP server's identity; delete it, or give it a controller reference to this PlatformAgent", sa.Namespace, sa.Name)
 	}
 	if err := ctrl.SetControllerReference(agent, sa, r.Scheme); err != nil {
 		return err

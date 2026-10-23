@@ -111,25 +111,32 @@ func TestInspectPRArguments(t *testing.T) {
 		})
 	}
 	for name, args := range map[string]string{
-		"nothing":                   ``,
-		"not an object":             `[1]`,
-		"no repository":             `{"number":12}`,
-		"no number":                 `{"repository":"acme/widgets"}`,
-		"a zero number":             `{"repository":"acme/widgets","number":0}`,
-		"a negative number":         `{"repository":"acme/widgets","number":-3}`,
-		"a fractional number":       `{"repository":"acme/widgets","number":1.5}`,
-		"a word for a number":       `{"repository":"acme/widgets","number":"twelve"}`,
-		"a boolean number":          `{"repository":"acme/widgets","number":true}`,
-		"whitespace in repository":  `{"repository":"acme/wid gets","number":1}`,
-		"a newline in repository":   `{"repository":"acme/\nwidgets","number":1}`,
-		"a bidi mark in repository": `{"repository":"acme/\u202ewidgets","number":1}`,
-		"a huge repository":         `{"repository":"` + strings.Repeat("a", maxRepositoryLen+1) + `","number":1}`,
-		"a URL that disagrees":      `{"repository":"https://github.com/acme/widgets/pull/12","number":13}`,
+		"nothing":                       ``,
+		"not an object":                 `[1]`,
+		"no repository":                 `{"number":12}`,
+		"no number":                     `{"repository":"acme/widgets"}`,
+		"a zero number":                 `{"repository":"acme/widgets","number":0}`,
+		"a negative number":             `{"repository":"acme/widgets","number":-3}`,
+		"a fractional number":           `{"repository":"acme/widgets","number":1.5}`,
+		"a word for a number":           `{"repository":"acme/widgets","number":"twelve"}`,
+		"a boolean number":              `{"repository":"acme/widgets","number":true}`,
+		"whitespace in repository":      `{"repository":"acme/wid gets","number":1}`,
+		"a newline in repository":       `{"repository":"acme/\nwidgets","number":1}`,
+		"a bidi mark in repository":     `{"repository":"acme/\u202ewidgets","number":1}`,
+		"a huge repository":             `{"repository":"` + strings.Repeat("a", maxRepositoryLen+1) + `","number":1}`,
+		"a URL that disagrees":          `{"repository":"https://github.com/acme/widgets/pull/12","number":13}`,
+		"a GitLab MR URL with a port":   `{"repository":"https://gitlab.example.com:8443/group/proj/-/merge_requests/7"}`,
+		"a GitHub PR URL with port 443": `{"repository":"https://github.com:443/acme/widgets/pull/12"}`,
+		"a URL with an empty port":      `{"repository":"https://github.com:/acme/widgets/pull/12"}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := &fakeViewer{fn: ok}
-			if _, err := callInspect(t, f, args); err == nil {
+			_, err := callInspect(t, f, args)
+			if err == nil {
 				t.Errorf("accepted %s", args)
+			}
+			if strings.Contains(name, "port") && !errors.Is(err, errProposalURLPort) {
+				t.Errorf("err = %v, want the port refused by name", err)
 			}
 			if len(f.reqs) != 0 {
 				t.Errorf("asked the broker for %+v", f.reqs)
@@ -158,7 +165,7 @@ func TestInspectPRRendersHostileTextInert(t *testing.T) {
 			Body:   "before\n```\n## escaped heading\n```````\n" + hostile + "\n````",
 		},
 		Comments: []ProposalComment{{Kind: "issue`", Author: "eve\u200b", Path: "p`|ath", Body: "````\n![img](https://evil/x.png)\n" + hostile}},
-		Diff: "diff --git a/we`ird|name.go b/we`ird|name.go\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n" +
+		Diff: "diff --git a/we`ird|name.go b/we`ird|name.go\n--- a/we`ird|name.go\n+++ b/we`ird|name.go\n@@ -1 +1 @@\n" +
 			"-```````````\n+" + hostile + "\n",
 	}
 	out := FormatProposalViewMarkdown("acme/widgets", 12, v, "")
@@ -500,32 +507,81 @@ func TestTheDiffNoteCitesGitHubsLimitOnlyOnGitHub(t *testing.T) {
 
 // The comments alone can be past the answer's cap: the broker reads up to
 // brokerCommentLimit from each of GitHub's three endpoints, at up to 64 KiB a
-// body. The view is still reachable, without them, and says so; the first
-// call asks for no more of each than the tool shows.
+// body. The view is still reachable without them, and says so; the diff is
+// asked for again without the comments, so it is shown when it fits and
+// called too large only when a request for it alone was refused as that. The
+// first call asks for no more of each than the tool shows.
 func TestInspectPRAsksAgainWithoutTooLargeComments(t *testing.T) {
 	tooLarge := fmt.Errorf("%w (4194304 bytes)", ErrBrokerResponseTooLarge)
+	const commentsNote, diffSure = "_Comments not available: the comments are too large", "_Diff not available: the diff is too large"
+	const diffMaybe = "_Diff not available: the forge call with the diff failed (possibly too large)"
+
+	// The comments are too large and the diff is small: the third call
+	// puts the diff back, and the view shows it.
 	f := &fakeViewer{fn: func(req ProposalViewRequest) (*ProposalView, error) {
 		if req.Comments {
 			return nil, tooLarge
 		}
 		v := viewOf(t, githubViewJSON)
-		v.Comments, v.CommentCount, v.Diff = nil, 0, ""
+		v.Comments, v.CommentCount = nil, 0
+		if !req.Diff {
+			v.Diff = ""
+		}
 		return v, nil
 	}}
 	out, err := callInspect(t, f, `{"repository":"acme/widgets","number":12}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(f.reqs) != 3 || f.reqs[0].Limit != maxComments || f.reqs[1].Diff || !f.reqs[1].Comments || f.reqs[2].Comments || f.reqs[2].Diff {
-		t.Errorf("requests = %+v", f.reqs)
+	if len(f.reqs) != 3 || f.reqs[0].Limit != maxComments || f.reqs[1].Diff || !f.reqs[1].Comments ||
+		!f.reqs[2].Diff || f.reqs[2].Comments || f.reqs[2].Limit != 0 {
+		t.Errorf("requests = %+v, want the third with the diff and without the comments", f.reqs)
 	}
-	for _, want := range []string{"`Fix the thing`", "Fixes the thing.", "_Comments not available: the comments are too large", "_Diff not available: the diff is too large"} {
+	for _, want := range []string{"`Fix the thing`", "Fixes the thing.", commentsNote, "+new", "| `main.go` | 1 | 1 |"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output lacks %q", want)
 		}
 	}
-	if strings.Contains(out, "_No comments._") {
-		t.Error("the view says there are no comments when they were not fetched")
+	for _, not := range []string{"_Diff not available", "_No comments._"} {
+		if strings.Contains(out, not) {
+			t.Errorf("output says %q", not)
+		}
+	}
+
+	// Both are too large on their own: the fourth call has neither, and
+	// each note says what its own refusal showed.
+	for name, tc := range map[string]struct {
+		diffRefusal error
+		note        string
+	}{
+		"the diff past the cap": {tooLarge, diffSure},
+		"GitHub's 406":          {&BrokerError{Status: http.StatusBadGateway, Code: brokerCodeFailed}, diffMaybe},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := &fakeViewer{fn: func(req ProposalViewRequest) (*ProposalView, error) {
+				switch {
+				case req.Comments:
+					return nil, tooLarge
+				case req.Diff:
+					return nil, tc.diffRefusal
+				}
+				v := viewOf(t, githubViewJSON)
+				v.Comments, v.CommentCount, v.Diff = nil, 0, ""
+				return v, nil
+			}}
+			out, err := callInspect(t, f, `{"repository":"acme/widgets","number":12}`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(f.reqs) != 4 || !f.reqs[2].Diff || f.reqs[2].Comments || f.reqs[3].Diff || f.reqs[3].Comments {
+				t.Errorf("requests = %+v, want the fourth with neither", f.reqs)
+			}
+			for _, want := range []string{"`Fix the thing`", commentsNote, tc.note} {
+				if !strings.Contains(out, want) {
+					t.Errorf("output lacks %q", want)
+				}
+			}
+		})
 	}
 
 	// Without the diff the view fits: the comments are kept, and no third
@@ -583,10 +639,10 @@ func TestInspectPRDoesNotRetryOtherRefusals(t *testing.T) {
 	}
 }
 
-// The one retry without the diff is for a size refusal only: never after a
-// timeout or a cancellation, even one that arrives wrapped with a size
-// refusal, and never a second time; past it, only a size refusal earns the
-// one further call, without the comments.
+// Asking again smaller is for a size refusal only: never after a timeout or
+// a cancellation, even one that arrives wrapped with a size refusal; past the
+// call without the diff, only a size refusal earns the calls without the
+// comments, and the ladder ends after three.
 func TestInspectPRDoesNotRetryAfterATimeout(t *testing.T) {
 	for name, refusal := range map[string]error{
 		"a deadline":           fmt.Errorf("%w: %w", ErrBrokerResponseTooLarge, context.DeadlineExceeded),
@@ -624,15 +680,19 @@ func TestInspectPRDoesNotRetryAfterATimeout(t *testing.T) {
 			t.Errorf("%d requests, want 1", len(f.reqs))
 		}
 	})
-	t.Run("at most one retry without the diff and one without the comments", func(t *testing.T) {
-		f := &fakeViewer{fn: func(ProposalViewRequest) (*ProposalView, error) {
+	t.Run("at most three requests after the first, the last with neither diff nor comments", func(t *testing.T) {
+		first := &BrokerError{Status: http.StatusBadGateway, Code: brokerCodeTooLarge}
+		f := &fakeViewer{fn: func(req ProposalViewRequest) (*ProposalView, error) {
+			if req.Diff && req.Comments {
+				return nil, first
+			}
 			return nil, &BrokerError{Status: http.StatusBadGateway, Code: brokerCodeTooLarge}
 		}}
-		if _, err := callInspect(t, f, `{"repository":"acme/widgets","number":12}`); err == nil {
-			t.Error("no error")
+		if _, err := callInspect(t, f, `{"repository":"acme/widgets","number":12}`); !errors.Is(err, first) {
+			t.Errorf("err = %v, want the first refusal", err)
 		}
-		if len(f.reqs) != 3 || f.reqs[2].Diff || f.reqs[2].Comments {
-			t.Errorf("requests = %+v, want 3, the last with neither diff nor comments", f.reqs)
+		if len(f.reqs) != 4 || f.reqs[3].Diff || f.reqs[3].Comments {
+			t.Errorf("requests = %+v, want 4, the last with neither diff nor comments", f.reqs)
 		}
 	})
 }
@@ -758,6 +818,55 @@ func TestALoneCarriageReturnInADiffDrawsNoLine(t *testing.T) {
 	}
 	if got := diffFiles(diff).listed; len(got) != 1 || got[0] != (diffFile{"f.go", 1, 0}) {
 		t.Errorf("diffFiles = %+v", got)
+	}
+}
+
+// A file's path comes from the lines where git states it, `+++ b/`,
+// `rename to` and, for a deletion, `--- a/`, not from re-reading the
+// `diff --git` header, which a space in a path makes ambiguous. The header is
+// read only for a block with none of them.
+func TestDiffFilesTakesThePathFromGitsOwnLines(t *testing.T) {
+	for name, tc := range map[string]struct {
+		diff, want string
+	}{
+		// No split of the header has equal sides, so the header alone
+		// names "new.md", which does not exist. git ends a bare path
+		// holding a space with a tab on the ---/+++ lines.
+		"a rename across a directory with \" b/\" in its name": {
+			"diff --git a/docs b/old.md b/docs b/new.md\nsimilarity index 90%\nrename from docs b/old.md\nrename to docs b/new.md\n" +
+				"--- a/docs b/old.md\t\n+++ b/docs b/new.md\t\n@@ -1 +1 @@\n-a\n+b\n",
+			"docs b/new.md"},
+		"a pure rename, which has no ---/+++ lines": {
+			"diff --git a/docs b/old.md b/docs b/new.md\nsimilarity index 100%\nrename from docs b/old.md\nrename to docs b/new.md\n",
+			"docs b/new.md"},
+		// GitLab's fallback writer leaves the header unquoted; the header
+		// reader takes ` "b/` for the start of a quoted b-side.
+		"an unquoted header whose path holds a quote": {
+			"diff --git a/docs \"b/z.md\" b/docs \"b/z.md\"\n--- a/docs \"b/z.md\"\n+++ b/docs \"b/z.md\"\n@@ -1 +1 @@\n-a\n+b\n",
+			`docs "b/z.md"`},
+		"a quoted rename": {
+			"diff --git \"a/old\\303\\251.go\" \"b/new\\303\\251.go\"\nrename from \"old\\303\\251.go\"\nrename to \"new\\303\\251.go\"\n" +
+				"--- \"a/old\\303\\251.go\"\n+++ \"b/new\\303\\251.go\"\n@@ -1 +1 @@\n-a\n+b\n",
+			"new\u00e9.go"},
+		"a deletion takes the a-side": {
+			"diff --git a/docs \"b/gone.md\" b/docs \"b/gone.md\"\ndeleted file mode 100644\n--- a/docs \"b/gone.md\"\n+++ /dev/null\n@@ -1 +0,0 @@\n-a\n",
+			`docs "b/gone.md"`},
+		"a new file": {
+			"diff --git a/new.go b/new.go\nnew file mode 100644\n--- /dev/null\n+++ b/new.go\n@@ -0,0 +1 @@\n+a\n",
+			"new.go"},
+		"a binary change falls back to the header": {
+			"diff --git a/img.png b/img.png\nindex 1..2 100644\nBinary files a/img.png and b/img.png differ\n",
+			"img.png"},
+		"a +++ line inside a hunk is content": {
+			"diff --git a/f.patch b/f.patch\n--- a/f.patch\n+++ b/f.patch\n@@ -0,0 +1,2 @@\n+++ b/elsewhere.go\n+rename to elsewhere.go\n",
+			"f.patch"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := diffFiles(tc.diff).listed
+			if len(got) != 1 || got[0].path != tc.want {
+				t.Errorf("diffFiles = %+v, want one file %q", got, tc.want)
+			}
+		})
 	}
 }
 

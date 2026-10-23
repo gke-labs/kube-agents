@@ -92,8 +92,9 @@ type BrokerClient struct {
 }
 
 // NewBrokerClient validates cfg. The URL must be a bare http(s) base: no
-// credentials, query or fragment, since the token is the only credential and
-// the path is this client's.
+// credentials, query or fragment (not even an empty `?` or `#`), and no path
+// but "/", since the token is the only credential and the path is this
+// client's.
 func NewBrokerClient(cfg BrokerConfig) (*BrokerClient, error) {
 	u, err := url.Parse(strings.TrimSpace(cfg.URL))
 	if err != nil {
@@ -102,8 +103,13 @@ func NewBrokerClient(cfg BrokerConfig) (*BrokerClient, error) {
 	if (u.Scheme != schemeHTTP && u.Scheme != schemeHTTPS) || u.Host == "" {
 		return nil, fmt.Errorf("broker URL must be an http or https URL with a host, got %q", cfg.URL)
 	}
-	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+	// ForceQuery is a bare trailing "?", and a bare "#" leaves Fragment
+	// empty: either would end up in front of this client's path.
+	if u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.Contains(cfg.URL, "#") {
 		return nil, errors.New("broker URL must not carry credentials, a query or a fragment")
+	}
+	if u.Path != "" && u.Path != "/" {
+		return nil, fmt.Errorf("broker URL must not carry a path, got %q", u.Path)
 	}
 	if strings.TrimSpace(cfg.TokenFile) == "" {
 		return nil, errors.New("broker token file is required")
@@ -116,12 +122,19 @@ func NewBrokerClient(cfg BrokerConfig) (*BrokerClient, error) {
 	if maxBytes <= 0 {
 		maxBytes = DefaultBrokerMaxResponseBytes
 	}
+	// The broker is in-cluster: an HTTP_PROXY in the pod's environment must
+	// not route the request, and the bearer token on it, out through the
+	// proxy (the console's bus transport and the operator's usage scrape
+	// make the same choice for theirs).
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
 	return &BrokerClient{
-		endpoint:  strings.TrimRight(u.String(), "/") + proposalViewPath,
+		endpoint:  u.Scheme + "://" + u.Host + proposalViewPath,
 		tokenFile: cfg.TokenFile,
 		maxBytes:  maxBytes,
 		http: &http.Client{
-			Timeout: timeout,
+			Timeout:   timeout,
+			Transport: transport,
 			// A redirect is never followed: the next hop would get the
 			// bearer token, and the broker has no reason to send one.
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },

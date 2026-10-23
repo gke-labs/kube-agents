@@ -222,3 +222,19 @@ func TestAStopDuringTheFirstDialIsClean(t *testing.T) {
 		t.Errorf("a stop during the first dial returned %v, want a clean stop", err)
 	}
 }
+
+// A stop during the slowest tool call drains it: the shutdown grace outlasts
+// inspect_pr's own bound, and ends before the kubelet's SIGKILL at the pod's
+// default 30 s termination grace (the operator sets none on the MCP pod).
+func TestTheShutdownGraceOutlastsTheSlowestToolCall(t *testing.T) {
+	const podTerminationGrace = 30 * time.Second
+	if shutdownGrace <= mcp.InspectTimeout {
+		t.Errorf("shutdownGrace %v does not outlast an inspect_pr call (%v)", shutdownGrace, mcp.InspectTimeout)
+	}
+	if shutdownGrace >= podTerminationGrace {
+		t.Errorf("shutdownGrace %v is not inside the pod's %v termination grace", shutdownGrace, podTerminationGrace)
+	}
+	if mcp.InspectTimeout >= writeTimeout {
+		t.Errorf("an inspect_pr call (%v) can outlast the write timeout (%v)", mcp.InspectTimeout, writeTimeout)
+	}
+}

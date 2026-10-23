@@ -24,9 +24,11 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -283,6 +285,55 @@ func TestTheMCPBrokerIdentityFollowsTheFlag(t *testing.T) {
 	if err := cl.Get(ctx, key, &corev1.ServiceAccount{}); !apierrors.IsNotFound(err) {
 		t.Errorf("flag turned off: ServiceAccount survived: %v", err)
 	}
+}
+
+// A ServiceAccount under the reserved name that this PlatformAgent does not
+// control is skipped with the flag off, so it cannot stop the rest of every
+// next reconcile, and refused with the flag on, so its annotations (a planted
+// Workload Identity binding) never become the MCP pod's identity.
+func TestAnUnownedMCPServiceAccountIsSkippedOffAndRefusedOn(t *testing.T) {
+	const wiAnnotation = "iam.gke.io/gcp-service-account"
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	key := types.NamespacedName{Name: a2aMCPServiceAccountName(agent), Namespace: agent.Namespace}
+	setup := func(t *testing.T) (*PlatformAgentReconciler, client.Client) {
+		t.Helper()
+		scheme := setupScheme()
+		squatter := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace,
+			Annotations: map[string]string{wiAnnotation: "theirs@example.iam.gserviceaccount.com"}}}
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent.DeepCopy(), squatter).
+			WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+		return &PlatformAgentReconciler{Client: cl, Scheme: scheme}, cl
+	}
+	untouched := func(t *testing.T, cl client.Client) {
+		t.Helper()
+		sa := &corev1.ServiceAccount{}
+		if err := cl.Get(ctx, key, sa); err != nil {
+			t.Fatalf("the unowned ServiceAccount is gone: %v", err)
+		}
+		if len(sa.OwnerReferences) != 0 {
+			t.Errorf("the unowned ServiceAccount was adopted: owner references %+v", sa.OwnerReferences)
+		}
+	}
+
+	t.Run("flag off: skipped, not fatal", func(t *testing.T) {
+		t.Setenv(a2aMCPDoorEnvVar, "")
+		r, cl := setup(t)
+		if err := r.reconcileA2AMCPBrokerIdentity(ctx, agent); err != nil {
+			t.Fatalf("an unowned ServiceAccount under the reserved name stopped the reconcile: %v", err)
+		}
+		untouched(t, cl)
+	})
+
+	t.Run("flag on: refused, not adopted", func(t *testing.T) {
+		t.Setenv(a2aMCPDoorEnvVar, "true")
+		r, cl := setup(t)
+		err := r.reconcileA2AMCPBrokerIdentity(ctx, agent)
+		if err == nil || !strings.Contains(err.Error(), "refusing to adopt unowned ServiceAccount "+key.Namespace+"/"+key.Name) {
+			t.Fatalf("got %v, want a refusal naming the ServiceAccount", err)
+		}
+		untouched(t, cl)
+	})
 }
 
 // TestTheMCPServiceAccountIsReservedWithTheDoorOnOrOff pins the MCP pod's
