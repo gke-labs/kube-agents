@@ -381,7 +381,8 @@ THREAD_ID_KEY = "thread_id"
 # wait is the ceiling for a greeting turn that never reports back (a gateway restart
 # inside the turn, a turn that ends with no text): past it the report goes out without
 # the greeting. The longest first turn measured, a real ask that delegated work, took
-# 218 s (#1971, #2009); 300 s covers it with a margin for a loaded model.
+# 218 s (#1971, #2009); 300 s covers it with a margin for a loaded model and its provider
+# retries. A greeting that runs longer still arrives, after the report.
 GREETING_PENDING_GLOB = ".bootstrap_greeting_pending.*"
 GREETING_WAIT_SECONDS = 300
 

@@ -811,7 +811,7 @@ at `$HERMES_HOME` directly and the entrypoint seeds it with
 `cp -ru /opt/defaults/. "$TARGET_DIR/"` (`deploy/shared/docker-entrypoint.sh`,
 step 2). `cron/` is in neither force-sync list — step 2a covers `SOUL.md`,
 `AGENTS.md`, `CAPABILITIES.md` and `hindsight/config.json`, step 2b covers
-`scripts/` — and since the
+`scripts/` and `plugins/bootstrap_onboarding/` — and since the
 scheduler writes `last_run` into the volume's copy on every tick, that copy's
 timestamp is permanently ahead of the image's, and `cp -u` skips it for good.
 

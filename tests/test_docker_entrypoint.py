@@ -1384,7 +1384,7 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
         # The plugin's hooks and bootstrap_delivery.py (step 2b) must come from one image:
         # an old plugin beside the new script writes no greeting hold.
         lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
-        start = next(i for i, line in enumerate(lines) if line.startswith("# The onboarding plugin is image-owned"))
+        start = next(i for i, line in enumerate(lines) if line.startswith("# 2b, continued: the onboarding plugin is image-owned"))
         end = next(i for i in range(start, len(lines)) if lines[i] == "fi")
         name = "plugins/bootstrap_onboarding/plugin.py"
         with tempfile.TemporaryDirectory() as tmp:

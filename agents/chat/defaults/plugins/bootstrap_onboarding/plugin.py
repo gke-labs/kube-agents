@@ -159,6 +159,8 @@ CONVERSATION_DONE_FILE = ".bootstrap_conversation_done"
 # stays silent while one is young, so the greeting posts first instead of
 # racing the next cron tick. Aged by mtime there, so it carries no content.
 GREETING_PENDING_PREFIX = ".bootstrap_greeting_pending."
+# The Chat Agent's home when HERMES_HOME is unset, as the delivery stage reads it.
+DEFAULT_DATA_DIR = "/opt/data"
 # The turns this process holds delivery for, so post_llm_call on any other turn
 # touches no disk. A gateway restart empties it and leaves the file to age out.
 _greeting_turns: set = set()
@@ -193,6 +195,10 @@ _FALLBACK_COMPLETED = (
     "team to review. End on one question: do they want you to start on one of those findings? "
     "Ask nothing else, do not restate the report, and do not claim to have saved anything."
 )
+
+
+def _data_dir() -> Path:
+    return Path(os.environ.get("HERMES_HOME", DEFAULT_DATA_DIR))
 
 
 def _onboarding_dirs(data_dir: Path) -> list[Path]:
@@ -622,7 +628,7 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
 
     # Ahead of the first-turn check: a retried opening turn is no longer a
     # first turn and must still greet (see EVAL_GREET_MARKER).
-    data_dir = Path(os.environ.get("HERMES_HOME", "/opt/data"))
+    data_dir = _data_dir()
     if platform_name == EVAL_PLATFORM:
         eval_request = _eval_request(data_dir, str(kwargs.get("user_message") or ""))
         if eval_request is not None:
@@ -701,7 +707,7 @@ def handle_post_llm_call(**kwargs: Any) -> None:
     turn_id = str(kwargs.get("turn_id") or "")
     if turn_id not in _greeting_turns:
         return None
-    data_dir = Path(os.environ.get("HERMES_HOME", "/opt/data"))
+    data_dir = _data_dir()
     _drop_hold(data_dir, turn_id)
     _trigger_first(*DELIVERY_JOB_IDS)
     return None

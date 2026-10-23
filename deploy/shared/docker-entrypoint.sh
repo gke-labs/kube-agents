@@ -526,8 +526,8 @@ if [ -d "/opt/defaults/scripts" ]; then
         || echo "WARN: could not refresh $TARGET_DIR/scripts from the image; runtime profile scaffolding may run stale code" >&2
 fi
 
-# The onboarding plugin is image-owned too, and must come from the same image as the
-# delivery script above: its pre_llm_call hook holds the first report behind the greeting
+# 2b, continued: the onboarding plugin is image-owned too, and must come from the same image
+# as the delivery script above: its pre_llm_call hook holds the first report behind the greeting
 # and its post_llm_call hook releases it. A stale plugin beside a new bootstrap_delivery.py
 # writes no hold, so the report races the greeting as before the hold existed.
 if [ -d "/opt/defaults/plugins/bootstrap_onboarding" ]; then
