@@ -481,7 +481,7 @@ AUDITS: dict[str, AuditSpec] = {
     "upgrade-retrospective": AuditSpec(
         "Upgrade Retrospective",
         "upgrade_retrospective_sop.md",
-        # The six ids the collector (`upgrade_retrospective.py`, `CHECK_READS`)
+        # The seven ids the collector (`upgrade_retrospective.py`, `CHECK_READS`)
         # emits; a failure still present from an earlier review is re-emitted
         # under its original id with its persistence, never under one of its
         # own. The collector grades an Error at `major` and a Warning at

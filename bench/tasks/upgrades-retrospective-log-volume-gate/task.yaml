@@ -108,8 +108,9 @@ verification_spec:
             path: '.*(?:upgrade-retrospective/|upgrade-retro-report\.md|chat_report_upgrade-retrospective).*'
           require_success: true
 
-  # The declared line for slot a, as the seeded report has it. The forbids take
-  # the same anchor with any other verdict, or any other count.
+  # The declared line for slot a, as the seeded report has it; `container(s)`,
+  # `container` and `containers` are one rendering of the prompt's template. The
+  # forbids take the same anchor with any other verdict, or any other count.
   - name: slot-a-gate-is-risk-with-one-container-over-threshold
     role: objective
     mode: assert
@@ -119,7 +120,7 @@ verification_spec:
       fixture_roles:
         - no-pdb-workload
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: gate risk; log-volume 1 container\(s\) over threshold$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: gate risk; log-volume 1 container(?:\(s\)|s)? over threshold$'
       forbidden_patterns:
         - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: gate (?!risk;)'
         - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: gate risk; log-volume (?!1 container)'

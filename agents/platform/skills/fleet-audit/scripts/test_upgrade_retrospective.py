@@ -6377,6 +6377,30 @@ class GateRunTest(unittest.TestCase):
         third, _ = self.collect(now=LATER + timedelta(days=1))
         self.assertEqual(third["gates_reread"], [])
 
+    def test_a_breach_found_on_the_reread_is_filed_as_a_warning_and_a_candidate(self):
+        manifest_file = self.home / "manifest.json"
+        first, _ = self.collect()  # the fixture's upgrade is this week: the gate is a risk from the diff with its after-week open
+        seeded = next(r for r in first["reviews"] if r["cluster"] == SEEDED)
+        self.assertEqual((seeded["gate"]["verdict"], seeded["gate"]["after_complete"]), (ur.GATE_RISK, False))
+        second, _ = self.collect(now=LATER, session=FakeSession(scale={KONNECTIVITY: 10}), manifest_file=str(manifest_file))
+        reread = next(r for r in second["gates_reread"] if r["cluster"] == SEEDED)
+        self.assertEqual(reread["verdict"], ur.GATE_RISK)
+        self.assertIn(ur.GATE_REASON_LOG_VOLUME.format(count=1), reread["reasons"])
+        self.assertTrue(any(r.endswith(ur.GATE_REASON_INCIDENT_SUFFIX) for r in reread["reasons"]))
+        warnings = [w for w in second["sections"]["warnings"] if w["kind"] == ur.INCIDENT_LOG_VOLUME]
+        self.assertEqual([(w["cluster"], w["object"]) for w in warnings], [(SEEDED, "kube-system/Container/konnectivity-agent")])
+        self.assertIn("prepare the logging exclusion for kube-system/konnectivity-agent", second["report"])
+        manifest = json.loads(manifest_file.read_text())
+        entry = next(e for e in manifest["clusters"] if e["name"] == SEEDED)
+        self.assertEqual(entry["facts"]["status"], "unchanged")
+        self.assertEqual(entry["facts"]["gate"]["verdict"], ur.GATE_RISK)
+        self.assertEqual([(c["check"], c["object"]) for c in entry["candidates"] if c["check"] == ur.CHECK_LOG_VOLUME], [(ur.CHECK_LOG_VOLUME, "Container/konnectivity-agent")])
+        self.assertIn("curl", next(c["command"] for c in entry["commands"] if c["check"] == ur.CHECK_LOG_VOLUME))
+        ledger = ur.load_json(self.home / ur.LEDGER_FILENAME, {})
+        self.assertTrue(ledger["clusters"][SEEDED][ur.LEDGER_GATE_KEY]["after_complete"])
+        third, _ = self.collect(now=LATER + timedelta(days=1), session=FakeSession(scale={KONNECTIVITY: 10}))
+        self.assertEqual(third["gates_reread"], [])  # a gate read with its week complete stands
+
     def test_a_breach_is_a_warning_under_the_seventh_check(self):
         result, _ = self.collect(now=LATER, session=FakeSession(scale={KONNECTIVITY: 10}))
         warnings = [w for w in result["sections"]["warnings"] if w["kind"] == ur.INCIDENT_LOG_VOLUME]

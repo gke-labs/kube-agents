@@ -6843,7 +6843,7 @@ class BootstrapReportPostureVerifier(_OnboardingPollVerifier):
         return "pass", f"the report opens with the scan counts and the posture line{judged}", raw
 
 
-# The check rosters of the four audits the oobe stage runs after the scan
+# The check rosters of the five audits the oobe stage runs after the scan
 # (agents/chat/scripts/oobe.py FIRST_RUN_AUDITS; each roster is `AUDITS[<id>].checks` in
 # agents/platform/skills/fleet-audit/scripts/audit_report.py). The cluster inventory SOP
 # leaves these checks to those audits; tests/test_bootstrap_handoff.py re-derives this

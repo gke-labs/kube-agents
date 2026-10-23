@@ -57,15 +57,16 @@ class FakeRunner:
         return self.answers[host]
 
 
-def context_for(record, listing, runner):
+def context_for(record, listing, runner, graded=None):
     member = report.grade_member(record, PROJECT, CURRENT, report.ServerConfigCache())
-    context = report.readiness_context(member, AT, listing, report._pool_records(record, member), parse_version(LAGGING), False)
+    context = report.readiness_context(member, AT, listing, report._pool_records(record, member), parse_version(LAGGING), False, graded=graded)
     context[shared.CONTEXT_RUN_CMD] = runner
     return member, context
 
 
-def evaluate(record, listing, runner):
-    member, context = context_for(record, listing, runner)
+def evaluate(record, listing, runner, graded=None):
+    """`graded` is the set the run grades (`--cluster` narrows it); None grades the listing."""
+    member, context = context_for(record, listing, runner, graded=graded)
     return rule.evaluate(record, member, read(items=[]), TARGET, context), context
 
 
@@ -108,18 +109,21 @@ class MembershipTest(unittest.TestCase):
         self.assertEqual(sorted(call[0] for call in runner.calls), sorted([EXPECTED_COMMAND, [*EXPECTED_COMMAND[:5], f"--project={OTHER_HOST}", "--format=json"]]))
         self.assertEqual({call[1] for call in runner.calls}, {report.GCLOUD_TIMEOUT_SECONDS})
 
-    def test_a_member_graded_alone_is_filed_on_its_hosts_first_listed_member(self):
-        # `--cluster` narrows who is graded, not who a rule may see: the note names where the
-        # host's read lands, and a context built without the listing grades the member itself.
+    def test_a_member_graded_alone_carries_the_hosts_read(self):
+        # `--cluster` narrows who is graded, not who a rule may see: the read is filed on the
+        # host's first member among the graded clusters, so a report of one member carries the
+        # host's risk, and a note names where it landed on the other graded members.
         runner = FakeRunner({HOST: (0, EMPTY_LIST, "")})
         later = member_record("prod-b", location="us-east1")
         first = member_record("prod-a")
-        result, _ = evaluate(later, [first, later], runner)
-        self.assertEqual(result["notes"], [rule.NOTE_FILED_ON.format(host=HOST, cluster=f"{PROJECT}/us-central1-a/prod-a")])
-        self.assertEqual(runner.calls, [])
-        alone, _ = evaluate(later, [], runner)
+        alone, _ = evaluate(later, [first, later], runner, graded=[later])
         self.assertEqual(alone["notes"], [rule.NOTE_NONE.format(host=HOST)])
         self.assertEqual(len(runner.calls), 1)
+        both, _ = evaluate(later, [first, later], runner, graded=[first, later])
+        self.assertEqual(both["notes"], [rule.NOTE_FILED_ON.format(host=HOST, cluster=f"{PROJECT}/us-central1-a/prod-a")])
+        no_listing, _ = evaluate(later, [], runner)
+        self.assertEqual(no_listing["notes"], [rule.NOTE_NONE.format(host=HOST)])
+        self.assertEqual(len(runner.calls), 2)  # the member alone, and the member with no listing: one read each; none for the member filed elsewhere
 
 
 class SequenceTest(unittest.TestCase):

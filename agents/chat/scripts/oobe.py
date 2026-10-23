@@ -8,7 +8,7 @@ The design is ``docs/designs/oobe.md``. Each tick runs three stages in order:
    because the scheduler snapshots this job's destination when the run starts.
 2. The inventory scan, ``bootstrap_scan_gate.main``: file the sweep card, then the
    hand-off's cluster and ranking cards.
-3. The first-run audits, below: once the scan has settled, the four fleet audits that
+3. The first-run audits, below: once the scan has settled, the four fleet audits and the upgrade retrospective that
    would otherwise wait for their schedules (the next 06:20 UTC, the next Monday for
    cost), one after another, and then the upgrade retrospective, whose schedule is
    Sunday evening and whose first run is the baseline of every cluster the install
@@ -80,7 +80,7 @@ MARKER_TASK_ID = "task_id"
 # The hand-off's marker (bootstrap_handoff._record): `sweep=`, and `task_id=` its ranking card.
 HANDOFF_SWEEP = "sweep"
 
-# The four audits #1866 names, by their ids in agents/platform/cron/jobs.json, in the
+# The four audits #1866 names and the upgrade retrospective, by their ids in agents/platform/cron/jobs.json, in the
 # order it chains them: cost, security, reliability, capacity; then the upgrade
 # retrospective, last so the four keep #1866's order and the review of every cluster's
 # last upgrade follows the audits whose findings it cites.

@@ -1342,6 +1342,9 @@ BYTES_UNITS = ("B", "KiB", "MiB", "GiB", "TiB")
 GATE_CLEAR, GATE_RISK, GATE_PENDING = "clear", "risk", "pending"
 GATE_REASON_CLEAR = "no Error or Warning the upgrade brought, and no container past the log-volume thresholds"
 GATE_REASON_INCIDENT = "{count} Error(s) or Warning(s) the upgrade brought"
+GATE_REASON_INCIDENT_SUFFIX = "the upgrade brought"
+UNCHANGED_GATE_STATUS = "unchanged"
+UNCHANGED_GATE_REASON = "gate read again from the ledger's anchors"
 GATE_REASON_LOG_VOLUME = "{count} container(s) past the log-volume thresholds"
 GATE_REASON_AFTER_WEEK = "the after-week completes {at}"
 GATE_REASON_READ_FAILED = "the log-volume read failed ({error})"
@@ -4822,14 +4825,16 @@ def gate_record(gate: dict | None, seen_at: str) -> dict | None:
 
 
 def reread_gate(record: dict, cluster: dict, session: SessionFn | None, now: datetime, timeout: float = MONITORING_TIMEOUT_S) -> dict:
-    """A pending gate read again from its ledger anchors on an unchanged
-    cluster: the symptom part was decided at review time (a `risk` is never
-    pending), so only the log-volume part and the after-week move it."""
+    """A gate read again from its ledger anchors on an unchanged cluster whose
+    after-week was open when it was read: the diff's part was decided at
+    review time and is carried (the reasons that name what the upgrade
+    brought), and the log-volume part and the after-week are read again."""
     first_start, last_end = parse_ts(record.get("first_start")), parse_ts(record.get("last_end"))
+    carried = [reason for reason in record.get("reasons") or [] if reason.endswith(GATE_REASON_INCIDENT_SUFFIX)]
     if not first_start or not last_end:
-        return {**record, "verdict": GATE_PENDING, "reasons": [GATE_REASON_READ_FAILED.format(error="the ledger record has no anchors")], "log_volume": None}
+        return {**record, "verdict": GATE_RISK if carried else GATE_PENDING, "reasons": carried + [GATE_REASON_READ_FAILED.format(error="the ledger record has no anchors")], "log_volume": None}
     volume = fetch_log_volume(session, cluster["project"], cluster["name"], cluster["location"], first_start, last_end, now=now, timeout=timeout)
-    risk, pending = [], []
+    risk, pending = list(carried), []
     if volume["error"]:
         pending.append(GATE_REASON_READ_FAILED.format(error=volume["error"]))
     else:
@@ -4936,6 +4941,13 @@ def _log_volume_incidents(review: dict) -> list[dict]:
 
 def _ratio_text(ratio) -> str:
     return LOG_VOLUME_NEW_RATIO if ratio is None else LOG_VOLUME_RATIO_FORMAT.format(ratio=ratio)
+
+
+def _unchanged_what_happened(row: dict) -> dict:
+    """What an unchanged row's incident block says happened: nothing this run;
+    the gate was read again from the ledger's anchors."""
+    nu = row.get("next_upgrade") or {}
+    return {"status": UNCHANGED_GATE_STATUS, "reasons": [UNCHANGED_GATE_REASON], "channel": nu.get("channel"), "versions_before": None, "versions_after": {"control_plane": row.get("control_plane"), "node_pools": {}}, "cluster_status": "", "operations": []}
 
 
 def _log_volume_symptom_text(row: dict) -> str:
@@ -5282,6 +5294,13 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
             })
         for incident in sorted(incidents.values(), key=lambda i: i["object"]):
             (errors if incident["severity"] == SEVERITY_ERROR else warnings).append(incident)
+    # An unchanged cluster whose gate was read again this run files the
+    # containers past the thresholds the same way: the breach the seventh check
+    # exists to catch reaches a Sunday run through the re-read, since a cluster
+    # reviewed the week of its upgrade has its after-week open at review time.
+    for row in unchanged:
+        if row.get("gate"):
+            warnings.extend(_log_volume_incidents({"cluster": row["cluster"], "gate": row["gate"], "what_happened": _unchanged_what_happened(row), "outside_fleet": False}))
     # The reads a stale guard could not be re-observed through: a partial
     # review's core reads, or a reviewed cluster's failed shape read (an
     # entry-3 guard needs `workloads`).
@@ -5769,7 +5788,7 @@ def build_manifest(result: dict, ledger: dict, *, started_at: str, finished_at: 
         entry = {
             "name": key, "project": project, "location": location,
             "outcome": MANIFEST_OUTCOME_COLLECTED, "commands": commands, "candidates": candidates_of(key, commands, row.get("checks_unevaluated")),
-            "facts": {"status": "unchanged", "control_plane": row["control_plane"], "last_operation": row.get("last_operation"), "next_upgrade": row.get("next_upgrade"), "last_run": row.get("last_run")},
+            "facts": {"status": "unchanged", "control_plane": row["control_plane"], "last_operation": row.get("last_operation"), "next_upgrade": row.get("next_upgrade"), "last_run": row.get("last_run"), "gate": gate_record(row.get("gate"), result["generated_at"]), "family": row.get("family")},
         }
         # A re-check whose read failed: the checks it backs are unevaluated
         # and the read is a limitation, as on a review.
@@ -6151,8 +6170,6 @@ def ledger_after(ledger: dict, reviews: list[dict], clusters: list[dict], seen_a
             }
             if gates.get(key):
                 entries[key][LEDGER_GATE_KEY] = gates[key]
-            elif old.get(LEDGER_GATE_KEY) and key not in recorded_in_full:
-                entries[key][LEDGER_GATE_KEY] = old[LEDGER_GATE_KEY]
         if key in partial:
             entries.setdefault(key, {})["partial_read"] = seen_at
         elif key in recorded_in_full:
@@ -6629,14 +6646,26 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
     if not scoped:
         for row in unchanged:
             record = (new_ledger["clusters"].get(row["cluster"]) or {}).get(LEDGER_GATE_KEY) or {}
-            if record.get("verdict") != GATE_PENDING or row["cluster"] not in by_key or not budget_left():
+            # A gate read with its after-week complete stands; one read while
+            # the week was open (pending, or a risk the diff decided) is read
+            # again, since the week's log volume was not yet there to read.
+            if not record or record.get("after_complete") or row["cluster"] not in by_key or not budget_left():
                 continue
             gate = reread_gate(record, by_key[row["cluster"]], session, now, timeout=min(MONITORING_TIMEOUT_S, max(MONITORING_MIN_TIMEOUT_S, RUN_DEADLINE_S - (clock() - run_started))))
             row["gate"] = gates[row["cluster"]] = gate
+            row["family"] = family_of(by_key[row["cluster"]])
             new_ledger["clusters"][row["cluster"]][LEDGER_GATE_KEY] = gate_record(gate, seen_at)
             gates_reread.append({"cluster": row["cluster"], "verdict": gate["verdict"], "reasons": gate["reasons"]})
-            if session is not None and (gate.get("log_volume") or {}).get("error"):
-                failed_reads.append(f"{row['cluster']}: {LOG_VOLUME_READ}: {gate['log_volume']['error']}")
+            volume = gate.get("log_volume") or {}
+            if session is not None and volume.get("error"):
+                failed_reads.append(f"{row['cluster']}: {LOG_VOLUME_READ}: {volume['error']}")
+                row["commands"] = [c for c in row.get("commands") or [] if c["check"] != CHECK_LOG_VOLUME]
+                row.setdefault("checks_unevaluated", []).append({"check": CHECK_LOG_VOLUME, "reason": f"{LOG_VOLUME_READ} read failed"})
+                row["limitations"] = "; ".join(filter(None, [row.get("limitations"), f"reads that failed: {LOG_VOLUME_READ}: {volume['error']}"]))
+            elif session is not None:
+                # The check is backed by the read that answered, not the listing.
+                command = log_volume_command(by_key[row["cluster"]]["project"], volume.get("requests") or [])
+                row["commands"] = [({**c, "command": command} if c["check"] == CHECK_LOG_VOLUME else c) for c in row.get("commands") or []]
     families = family_verdicts(listed_clusters, gates)
 
     # Read failures from inside a review join the top-level list so Info

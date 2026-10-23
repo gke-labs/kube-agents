@@ -66,18 +66,25 @@ case "$command" in
     chown -h "$owner:$owner" "$dir/$link" 2>/dev/null || true
     ;;
   restore)
-    [ -e "$marker" ] || exit 0
-    previous=$(cat "$marker")
+    # The pair goes whatever the marker says (an apply that failed between
+    # `write` and `seed` left no marker); the link moves back only when it
+    # still points at the seeded report, so a full run the collector made in
+    # between keeps the newer report it linked.
     for seeded in "$seeded_md" "$seeded_json"; do
       [ -f "$seeded" ] && unlink "$seeded"
     done
-    if [ -n "$previous" ] && [ -e "$dir/$previous" ]; then
-      ln -sfn "$previous" "$dir/$link"
-      chown -h "$owner:$owner" "$dir/$link" 2>/dev/null || true
-    elif [ "$(readlink "$dir/$link" 2>/dev/null || true)" = "$stamp.md" ]; then
-      unlink "$dir/$link"
+    previous=""
+    [ -e "$marker" ] && previous=$(cat "$marker")
+    if [ "$(readlink "$dir/$link" 2>/dev/null || true)" = "$stamp.md" ]; then
+      if [ -n "$previous" ] && [ -e "$dir/$previous" ]; then
+        ln -sfn "$previous" "$dir/$link"
+        chown -h "$owner:$owner" "$dir/$link" 2>/dev/null || true
+      else
+        unlink "$dir/$link"
+      fi
     fi
-    unlink "$marker"
+    [ -e "$marker" ] && unlink "$marker"
+    exit 0
     ;;
   *)
     echo "unknown command $command" >&2

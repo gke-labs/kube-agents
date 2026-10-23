@@ -173,6 +173,7 @@ CONTEXT_MASTER = "master"
 CONTEXT_AUTOPILOT = "autopilot"
 CONTEXT_PROJECT_READS = "project_reads"
 CONTEXT_ADDONS = "addons"  # the member's add-on inventory (known_issues_matrix.inventory), built once by the report
+CONTEXT_GRADED = "graded"  # the cluster records the run grades (every listed one on a full run; the named ones under --cluster), so a once-per-host read lands on a graded member
 CONTEXT_KEYS = (
     CONTEXT_PROJECT,
     CONTEXT_LOCATION,
@@ -188,6 +189,7 @@ CONTEXT_KEYS = (
     CONTEXT_AUTOPILOT,
     CONTEXT_PROJECT_READS,
     CONTEXT_ADDONS,
+    CONTEXT_GRADED,
 )
 # The reads under `project_reads`, named once for the report that makes them and the rules
 # that ask for them: three per project (`gcloud compute backend-services list`, `gcloud

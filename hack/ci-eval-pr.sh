@@ -1299,7 +1299,7 @@ ledger_audit_id_for_task() { # <task.yaml, relative to BENCH_DIR or absolute>
 
 # Every stream lock a case's unit holds: the stream it grades and the ones its
 # task.yaml declares in `audit_streams:` (a case whose stack starts real audit
-# runs; oobe-first-run-audits starts four), read with the YAML parser by
+# runs; oobe-first-run-audits starts five), read with the YAML parser by
 # kube_agents_bench.audit_streams once before the fan-out. Sorted and each
 # once, so a unit holding several always takes them in the same order and two
 # such units cannot each hold what the other waits on.

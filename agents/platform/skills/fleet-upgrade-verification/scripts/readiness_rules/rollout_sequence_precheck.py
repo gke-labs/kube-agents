@@ -12,9 +12,9 @@ already, and add the train as stages of it or plan the train in another host pro
 The rule reads the member's `fleet` block from the cluster record (`fleet.project`, the
 host project, an id or a number; absent for a cluster that is not a fleet member) and lists
 the host project's sequences through the report's runner, once per host project per run:
-the read is filed on the host's first member in the listing (the fleet records in the
-context, sorted by project, location and name), and every other member of the host carries
-a note naming where. A member that is not a fleet member is a note: no sequence can carry
+the read is filed on the host's first member among the clusters the run grades (every
+listed member on a full run; the named ones under `--cluster`), sorted by project, location
+and name, and every other graded member of the host carries a note naming where. A member that is not a fleet member is a note: no sequence can carry
 it, so an upgrade of it is the manual path. One existing sequence is one risk naming its
 stages, each with its fleet projects, selector and soak, and the remedy is the clause after
 the last `; `, which is the one action the weekly review takes from the text. An empty list
@@ -39,6 +39,7 @@ import re
 from readiness_rules import (
     CONTEXT_CACHE,
     CONTEXT_CLUSTERS,
+    CONTEXT_GRADED,
     CONTEXT_RUN_CMD,
     CONTEXT_TIMEOUT_SECONDS,
     PROXY_TRUNCATION_MARKER,
@@ -156,11 +157,6 @@ def host_members(host: str, clusters, cluster: dict) -> list[dict]:
     return sorted(members, key=cluster_key)
 
 
-def first_member_for(host: str, clusters, cluster: dict) -> dict:
-    """The host's first member in the listing: the one the host's read is filed on."""
-    return host_members(host, clusters, cluster)[0]
-
-
 def list_sequences(run_cmd, host: str, timeout=None) -> tuple[list | None, str | None]:
     """The host project's RolloutSequences through the runner: `(sequences, None)`, or
     `(None, error)` when there is no runner, the command failed, the credential proxy cut
@@ -248,7 +244,13 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
         out["notes"].append(NOTE_NOT_A_MEMBER)
         return out
     members = host_members(host, context.get(CONTEXT_CLUSTERS), cluster)
-    first = members[0]
+    # The read is filed on the host's first member among the clusters the run
+    # grades (`--cluster` narrows who is graded, not who the rule sees), so a
+    # report of one member still carries the host's risk; on a full run that is
+    # the host's first listed member.
+    graded = context.get(CONTEXT_GRADED)
+    filing = host_members(host, graded, cluster) if graded is not None else members
+    first = filing[0]
     if cluster_key(first) != cluster_key(cluster):
         out["notes"].append(NOTE_FILED_ON.format(host=host, cluster=member_label(first)))
         return out

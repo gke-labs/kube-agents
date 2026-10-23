@@ -137,9 +137,9 @@ resource "null_resource" "recorded_weeks" {
           open(f"{work}/report.{ext}", "w").write(text)
       PY
 
+      seeded=1
       sandbox write "${self.triggers.store_dir}" "${self.triggers.stamp}" md < "$work/report.md"
       sandbox write "${self.triggers.store_dir}" "${self.triggers.stamp}" json < "$work/report.json"
-      seeded=1
       sandbox seed "${self.triggers.store_dir}" "${self.triggers.stamp}" < /dev/null
       echo "Seeded ${self.triggers.store_dir}/${self.triggers.stamp}.{md,json} (gate ${self.triggers.gate_mode}) and pointed the latest link at it."
     EOT
