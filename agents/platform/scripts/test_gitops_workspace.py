@@ -1835,8 +1835,6 @@ def seed_empty_origin(tmp_path: Path, branch: str = "main") -> Path:
     return origin
 
 
-
-
 class TestForgeNeutralNames(unittest.TestCase):
     """A managed repository on another forge, named the way the verbs take it."""
 
@@ -1859,6 +1857,15 @@ class TestForgeNeutralNames(unittest.TestCase):
         self.assertEqual(
             ["gitlab.example.com/acme/platform/infra"],
             self.names(("gitlab", "https://gitlab.example.com/acme/platform/infra.git")),
+        )
+
+    def test_a_gitea_entry_with_a_url_port_is_named_with_its_host(self):
+        self.assertEqual(
+            ["gitea-http.gitea.svc.cluster.local/demo/gke-fleet-iac"],
+            self.names(
+                ("gitea", "http://gitea-http.gitea.svc.cluster.local:3000/demo/gke-fleet-iac"),
+                ("gitea", "https://gitea-http.gitea.svc.cluster.local/demo/gke-fleet-iac.git"),
+            ),
         )
 
     def test_a_second_forge_leaves_githubs_names_bare(self):
@@ -1918,13 +1925,13 @@ class TestForgeNeutralNames(unittest.TestCase):
         # also adds the host to the slug.
         with self.assertLogs("gitops_workspace", level="WARNING"):
             self.assertEqual(
-                ["github.com/acme/fleet", "github.com/acme/gitea", "acme/infra"],
+                ["github.com/acme/fleet", "github.com/acme/forgejo", "acme/infra"],
                 self.names(
                     ("github", "https://github.com/acme/fleet"),
-                    ("github", "https://github.com/acme/gitea"),
+                    ("github", "https://github.com/acme/forgejo"),
                     ("github", "https://github.com/acme/infra"),
                     ("gitlab", "https://gitlab.example.com:8443/acme/fleet"),
-                    ("gitea", "https://gitea.example.com/acme/gitea"),
+                    ("forgejo", "https://forgejo.example.com/acme/forgejo"),
                 ),
             )
 
@@ -2219,12 +2226,24 @@ class TestPortedHostIsSkipped(unittest.TestCase):
         entries = [
             {"type": "gitlab", "url": "https://gitlab.example.com:8443/acme/infra"},
             {"type": "gitlab", "url": "gitlab.example.com:8443/acme/infra"},
+            {"type": "gitea", "url": "gitea.example.com:3000/acme/infra"},
+            {"type": "gitea", "url": "git@gitea.example.com:3000/infra"},
             {"type": "gitlab", "url": "https://gitlab.com/acme/infra"},
         ]
         with self.assertLogs(gitops_workspace.LOGGER, level="WARNING") as logs:
             names = gitops_workspace._forge_repo_names(entries, "managed_repos")
-        self.assertEqual(["gitlab.com/acme/infra"], names)
+        self.assertEqual(
+            ["gitea.example.com/3000/infra", "gitlab.com/acme/infra"],
+            names,
+        )
         self.assertEqual(2, sum("a host with a port is not supported" in line for line in logs.output))
+        self.assertEqual(
+            1,
+            sum(
+                "write a Gitea repository with a port as a full URL" in line
+                for line in logs.output
+            ),
+        )
 
 
 class TestGroupEntryIsSkipped(unittest.TestCase):

@@ -85,6 +85,13 @@ _(Example: `--repo "acme/fleet" --branch "platform-agent/provision-mercury-09"` 
 
 In a multi-repository environment, pass `--repo "<owner>/<repo>"` for the repository your task targets (identified from cluster annotations or task context per SOUL.md §3, item 6).
 
+Pass `--repo` as the repository registration names it: `<owner>/<repo>` on
+GitHub, or `<host>/<owner>/<repo>` on another declared forge (such as GitLab or
+Gitea). `prepare` echoes the canonical repository name in `repo`; pass that
+`repo` value to every later `--repo` in this skill and in `version-control`
+calls so installs that serve more than one forge do not have to guess which
+host a bare slug belongs to.
+
 It prints one JSON line. **Keep it — Step 2 works inside its `workspace`.** The
 `workspace` is named for your branch as well as the repository, because
 `/opt/data/scratch` is shared with every other card: another card suggesting a

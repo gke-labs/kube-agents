@@ -1144,3 +1144,145 @@ func TestGitIntegrationCredentialsRefOnGitHubWarns(t *testing.T) {
 		t.Errorf("warnings = %v, expected one naming spec.integration.forges[0].credentialsRef", warnings)
 	}
 }
+
+func TestWebhookRejectsForgeCredentialVolumeAndEnvOverrides(t *testing.T) {
+	ctx := context.Background()
+	val := &PlatformAgentCustomValidator{}
+	giteaIntegration := &agentv1alpha1.PlatformAgentIntegrationSpec{
+		IntegrationSpec: agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{
+				Name:           "gitea",
+				Provider:       agentv1alpha1.GitProviderGitea,
+				Host:           "gitea.example.com",
+				CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gitea-token"},
+				CABundleRef:    &agentv1alpha1.ForgeCABundleRef{Name: "gitea-ca"},
+			}},
+		},
+	}
+
+	for _, tc := range []struct {
+		name string
+		dep  *agentv1alpha1.DeploymentSpec
+		path string
+	}{
+		{
+			name: "VCS_FORGES_CONFIG env override",
+			dep: &agentv1alpha1.DeploymentSpec{
+				Env: []corev1.EnvVar{{Name: "VCS_FORGES_CONFIG", Value: "/etc/forges.json"}},
+			},
+			path: "spec.deployment.env[0].name",
+		},
+		{
+			name: "vcs-forge-credentials volume mount in extraVolumeMounts",
+			dep: &agentv1alpha1.DeploymentSpec{
+				ExtraVolumeMounts: []corev1.VolumeMount{{Name: "vcs-forge-credentials-0", MountPath: "/tmp/token"}},
+			},
+			path: "spec.deployment.extraVolumeMounts[0].name",
+		},
+		{
+			name: "vcs-forge-ca reserved volume name in extraVolumes",
+			dep: &agentv1alpha1.DeploymentSpec{
+				ExtraVolumes: []corev1.Volume{{
+					Name:         "vcs-forge-ca-0",
+					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+				}},
+			},
+			path: "spec.deployment.extraVolumes[0].name",
+		},
+		{
+			name: "vcs-forge-credentials reserved volume name in sidecarVolumes",
+			dep: &agentv1alpha1.DeploymentSpec{
+				SidecarVolumes: []corev1.Volume{{
+					Name:         "vcs-forge-credentials-0",
+					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+				}},
+			},
+			path: "spec.deployment.sidecarVolumes[0].name",
+		},
+		{
+			name: "extraVolumes mounting forge credentialsRef Secret",
+			dep: &agentv1alpha1.DeploymentSpec{
+				ExtraVolumes: []corev1.Volume{{
+					Name:         "steal-gitea",
+					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: "gitea-token"}},
+				}},
+			},
+			path: "spec.deployment.extraVolumes[0].secret.secretName",
+		},
+		{
+			name: "deployment env secretKeyRef referencing forge credentialsRef Secret",
+			dep: &agentv1alpha1.DeploymentSpec{
+				Env: []corev1.EnvVar{{
+					Name: "GITEA_TOKEN",
+					ValueFrom: &corev1.EnvVarSource{
+						SecretKeyRef: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "gitea-token"},
+							Key:                  "token",
+						},
+					},
+				}},
+			},
+			path: "spec.deployment.env[0].valueFrom.secretKeyRef.name",
+		},
+		{
+			name: "sidecarVolumes mounting projected forge credentialsRef Secret",
+			dep: &agentv1alpha1.DeploymentSpec{
+				SidecarVolumes: []corev1.Volume{{
+					Name: "steal-gitea-projected",
+					VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+						Sources: []corev1.VolumeProjection{{Secret: &corev1.SecretProjection{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "gitea-token"},
+						}}},
+					}},
+				}},
+			},
+			path: "spec.deployment.sidecarVolumes[0].projected.sources[0].secret.name",
+		},
+		{
+			name: "sidecar env secretKeyRef referencing forge credentialsRef Secret",
+			dep: &agentv1alpha1.DeploymentSpec{
+				Sidecars: []corev1.Container{{
+					Name:  "helper",
+					Image: "busybox:1.36",
+					Env: []corev1.EnvVar{{
+						Name: "GITEA_TOKEN",
+						ValueFrom: &corev1.EnvVarSource{
+							SecretKeyRef: &corev1.SecretKeySelector{
+								LocalObjectReference: corev1.LocalObjectReference{Name: "gitea-token"},
+								Key:                  "token",
+							},
+						},
+					}},
+				}},
+			},
+			path: "spec.deployment.sidecars[0].env[0].valueFrom.secretKeyRef.name",
+		},
+		{
+			name: "initContainer envFrom secretRef referencing forge credentialsRef Secret",
+			dep: &agentv1alpha1.DeploymentSpec{
+				InitContainers: []corev1.Container{{
+					Name:  "init-helper",
+					Image: "busybox:1.36",
+					EnvFrom: []corev1.EnvFromSource{{
+						SecretRef: &corev1.SecretEnvSource{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "gitea-token"},
+						},
+					}},
+				}},
+			},
+			path: "spec.deployment.initContainers[0].envFrom[0].secretRef.name",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+				Spec: agentv1alpha1.PlatformAgentSpec{
+					AgentSpec:   agentv1alpha1.AgentSpec{Deployment: tc.dep},
+					Integration: giteaIntegration,
+				},
+			}
+			_, err := val.ValidateCreate(ctx, agent)
+			assertFieldError(t, err, tc.path)
+		})
+	}
+}

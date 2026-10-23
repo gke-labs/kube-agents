@@ -19,6 +19,7 @@ package webhook
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -61,7 +62,9 @@ const DefaultPort = 10250
 // author reading the field error knows which line to change and why.
 const (
 	busTokenAudienceForbiddenFmt = "volume %q projects a serviceAccountToken for audience %q, which is the A2A bus token audience; the operator projects that token for the platform-agent container alone" // #nosec G101 -- Error message format, not a credential
-	busCredsSecretForbiddenFmt   = "volume %q mounts Secret %q, which the operator renders with A2A bus credentials for its own workloads; it may not be mounted by the CR"
+	busCredsSecretForbiddenFmt   = "volume %q mounts Secret %q, which the operator renders with A2A bus credentials for its own workloads; it may not be mounted by the CR"                                 // #nosec G101 -- Error message format, not a credential
+	forgeCredsSecretForbiddenFmt = "volume %q mounts Secret %q, which is declared as a forge credentialsRef Secret for the credential proxy alone; it may not be mounted by the CR"                         // #nosec G101 -- Error message format, not a credential
+	forgeCredsEnvForbiddenFmt    = "container %q references Secret %q, which is declared as a forge credentialsRef Secret for the credential proxy alone; it may not be referenced by the CR"               // #nosec G101 -- Error message format, not a credential
 )
 
 // The data volume size checks on spec.storage.size. A PersistentVolumeClaim
@@ -186,7 +189,8 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	if platformAgent.Spec.Deployment != nil {
 		depPath := field.NewPath("spec", "deployment")
 
-		// 2a. Validate sensitive environment variable overrides
+		// 2a. Validate sensitive environment variable overrides and forge credential Secret references
+		allErrs = append(allErrs, validateForgeCredentialEnvVars("platform-agent", platformAgent.Spec.Deployment.Env, platformAgent.Spec.Integration, depPath.Child("env"))...)
 		for i, env := range platformAgent.Spec.Deployment.Env {
 			if _, isSensitive := agentv1alpha1.SensitiveEnvVars[env.Name]; isSensitive {
 				allErrs = append(allErrs, field.Forbidden(
@@ -198,14 +202,18 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 
 		// 2b. Validate InitContainers security context
 		for i := range platformAgent.Spec.Deployment.InitContainers {
-			allErrs = append(allErrs, validateContainerSecurity(platformAgent.Spec.Deployment.InitContainers[i].SecurityContext, depPath.Child("initContainers").Index(i))...)
-			allErrs = append(allErrs, validateReservedVolumeMounts(platformAgent.Spec.Deployment.InitContainers[i].VolumeMounts, depPath.Child("initContainers").Index(i).Child("volumeMounts"))...)
+			initPath := depPath.Child("initContainers").Index(i)
+			allErrs = append(allErrs, validateContainerSecurity(platformAgent.Spec.Deployment.InitContainers[i].SecurityContext, initPath)...)
+			allErrs = append(allErrs, validateReservedVolumeMounts(platformAgent.Spec.Deployment.InitContainers[i].VolumeMounts, initPath.Child("volumeMounts"))...)
+			allErrs = append(allErrs, validateForgeCredentialContainerEnv(platformAgent.Spec.Deployment.InitContainers[i], platformAgent.Spec.Integration, initPath)...)
 		}
 
 		// 2c. Validate Sidecars security context
 		for i := range platformAgent.Spec.Deployment.Sidecars {
-			allErrs = append(allErrs, validateContainerSecurity(platformAgent.Spec.Deployment.Sidecars[i].SecurityContext, depPath.Child("sidecars").Index(i))...)
-			allErrs = append(allErrs, validateReservedVolumeMounts(platformAgent.Spec.Deployment.Sidecars[i].VolumeMounts, depPath.Child("sidecars").Index(i).Child("volumeMounts"))...)
+			sidecarPath := depPath.Child("sidecars").Index(i)
+			allErrs = append(allErrs, validateContainerSecurity(platformAgent.Spec.Deployment.Sidecars[i].SecurityContext, sidecarPath)...)
+			allErrs = append(allErrs, validateReservedVolumeMounts(platformAgent.Spec.Deployment.Sidecars[i].VolumeMounts, sidecarPath.Child("volumeMounts"))...)
+			allErrs = append(allErrs, validateForgeCredentialContainerEnv(platformAgent.Spec.Deployment.Sidecars[i], platformAgent.Spec.Integration, sidecarPath)...)
 		}
 
 		// 2d. Validate ExtraVolumes & SidecarVolumes (hostPath forbidden)
@@ -218,6 +226,7 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 			}
 			allErrs = append(allErrs, validateReservedVolumeName(vol.Name, depPath.Child("extraVolumes").Index(i).Child("name"))...)
 			allErrs = append(allErrs, validateBusCredentialSource(vol, platformAgent.Name, depPath.Child("extraVolumes").Index(i))...)
+			allErrs = append(allErrs, validateForgeCredentialSource(vol, platformAgent.Spec.Integration, depPath.Child("extraVolumes").Index(i))...)
 		}
 		for i, vol := range platformAgent.Spec.Deployment.SidecarVolumes {
 			if vol.HostPath != nil {
@@ -228,6 +237,7 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 			}
 			allErrs = append(allErrs, validateReservedVolumeName(vol.Name, depPath.Child("sidecarVolumes").Index(i).Child("name"))...)
 			allErrs = append(allErrs, validateBusCredentialSource(vol, platformAgent.Name, depPath.Child("sidecarVolumes").Index(i))...)
+			allErrs = append(allErrs, validateForgeCredentialSource(vol, platformAgent.Spec.Integration, depPath.Child("sidecarVolumes").Index(i))...)
 		}
 
 		// 2da. The fifth user-authored mount surface. Unlike the four above it
@@ -404,7 +414,8 @@ func storageSize(platformAgent *agentv1alpha1.PlatformAgent) *resource.Quantity 
 func validateReservedVolumeMounts(mounts []corev1.VolumeMount, path *field.Path) field.ErrorList {
 	var errs field.ErrorList
 	for i, m := range mounts {
-		if _, reserved := agentv1alpha1.ReservedVolumeNames[m.Name]; !reserved {
+		_, reserved := agentv1alpha1.ReservedVolumeNames[m.Name]
+		if !reserved && !agentv1alpha1.IsForgeCredentialVolumeName(m.Name) {
 			continue
 		}
 		errs = append(errs, field.Forbidden(
@@ -420,12 +431,68 @@ func validateReservedVolumeMounts(mounts []corev1.VolumeMount, path *field.Path)
 // rejects outright, so this is a wedged-reconcile guard as much as a credential
 // one.
 func validateReservedVolumeName(name string, path *field.Path) field.ErrorList {
-	if _, reserved := agentv1alpha1.ReservedVolumeNames[name]; !reserved {
+	_, reserved := agentv1alpha1.ReservedVolumeNames[name]
+	if !reserved && !agentv1alpha1.IsForgeCredentialVolumeName(name) {
 		return nil
 	}
 	return field.ErrorList{field.Forbidden(
 		path, fmt.Sprintf("volume name %q is reserved by the operator", name),
 	)}
+}
+
+func validateForgeCredentialSource(vol corev1.Volume, integration *agentv1alpha1.PlatformAgentIntegrationSpec, path *field.Path) field.ErrorList {
+	if integration == nil {
+		return nil
+	}
+	var errs field.ErrorList
+	for _, route := range integration.ForgeCredentialRoutes(vol) {
+		at := path.Child("secret", "secretName")
+		if route.Source != agentv1alpha1.BusCredentialRouteVolumeSource {
+			at = path.Child("projected", "sources").Index(route.Source).Child("secret", "name")
+		}
+		errs = append(errs, field.Forbidden(at, fmt.Sprintf(forgeCredsSecretForbiddenFmt, vol.Name, route.Secret)))
+	}
+	return errs
+}
+
+func validateForgeCredentialEnvVars(containerName string, envVars []corev1.EnvVar, integration *agentv1alpha1.PlatformAgentIntegrationSpec, path *field.Path) field.ErrorList {
+	if integration == nil {
+		return nil
+	}
+	forgeSecrets := integration.ForgeCredentialSecretNames()
+	if len(forgeSecrets) == 0 {
+		return nil
+	}
+	var errs field.ErrorList
+	for i, e := range envVars {
+		if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil && slices.Contains(forgeSecrets, e.ValueFrom.SecretKeyRef.Name) {
+			errs = append(errs, field.Forbidden(
+				path.Index(i).Child("valueFrom", "secretKeyRef", "name"),
+				fmt.Sprintf(forgeCredsEnvForbiddenFmt, containerName, e.ValueFrom.SecretKeyRef.Name),
+			))
+		}
+	}
+	return errs
+}
+
+func validateForgeCredentialContainerEnv(container corev1.Container, integration *agentv1alpha1.PlatformAgentIntegrationSpec, path *field.Path) field.ErrorList {
+	if integration == nil {
+		return nil
+	}
+	errs := validateForgeCredentialEnvVars(container.Name, container.Env, integration, path.Child("env"))
+	forgeSecrets := integration.ForgeCredentialSecretNames()
+	if len(forgeSecrets) == 0 {
+		return errs
+	}
+	for i, ef := range container.EnvFrom {
+		if ef.SecretRef != nil && slices.Contains(forgeSecrets, ef.SecretRef.Name) {
+			errs = append(errs, field.Forbidden(
+				path.Child("envFrom").Index(i).Child("secretRef", "name"),
+				fmt.Sprintf(forgeCredsEnvForbiddenFmt, container.Name, ef.SecretRef.Name),
+			))
+		}
+	}
+	return errs
 }
 
 // validateBusCredentialSource refuses a user-supplied volume whose SOURCE

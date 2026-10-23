@@ -84,7 +84,8 @@ const (
 	// gateway accepted, by platform; summed over every platform.
 	chatInboundSeries = "kubeagents_chat_messages_inbound_total"
 	// brokerFailuresSeries is the broker's failure counter, summed over its
-	// kind label into brokerFailuresTotal; the kinds stay in Prometheus.
+	// kind and tool labels into brokerFailuresTotal; the kinds, and the tool a
+	// timed-out command ran, stay in Prometheus.
 	brokerFailuresSeries = "kubeagents_broker_execution_failures_total"
 	// chatTurnsErroredSeries is the chat plugin's count of synchronous turns
 	// the Hermes gateway failed to complete, summed over its platform label
