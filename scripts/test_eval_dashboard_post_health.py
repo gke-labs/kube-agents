@@ -22,7 +22,7 @@ import urllib.error
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 
-from eval_dashboard import post_health
+from eval_dashboard import nightly, post_health
 
 SPACE = "spaces/AAAAtestspace"
 TOKEN = "ya29.super-secret-token-value"
@@ -633,7 +633,9 @@ class Digest(RunHarness):
             self.opener.texts[0],
             "📊 *Smoke gate, last 24h:* 31 runs · 26 green · 2 PR-caused red · 5 infra · typical run 125 min · typical wait n/a\n"
             "🌙 Nightly: 3 cases · 1 passed all reps · 1 partial · 1 failed · newly failing: case-c · 6h 40m\n"
-            f"{post_health.NIGHTLY_URL}\n{URL}#since=2026-09-04T03:30:00Z&view=agent",
+            f"{post_health.NIGHTLY_URL}\n"
+            "🌙 Rollback nightly (today): no run on record yet\n"
+            f"{nightly.NIGHTLY_TODAY_HISTORY_URL}\n{URL}#since=2026-09-04T03:30:00Z&view=agent",
         )
         self.assertEqual(post_health.NIGHTLY_URL, "https://storage.cloud.google.com/kube-agents-dashboards/evals/nightly.html")
         # A truncated night says so instead of numbers; a missing night too.
@@ -650,6 +652,45 @@ class Digest(RunHarness):
         self.assertEqual(rc, 0)
         self.assertIn("warning:", err)
         self.assertIn("\n🌙 Nightly: no data.json to read a night from\n", self.opener.texts[4])
+        self.assertIn("\n🌙 Rollback nightly (today): no data.json to read a night from\n", self.opener.texts[4])
+
+    def test_digest_carries_the_rollback_nightly_on_a_line_of_its_own(self):
+        # The today-mode nightly starts 06:00Z and runs most of the day, so at
+        # Fri 9 AM ET (13:00Z) Friday's build is still running and Thursday's
+        # is the newest it finished. Its runs are tier nightly-today: the main
+        # nightly's line never counts them, and its own line compares each
+        # night with its own night before.
+        def night(build, day, tier, job, tasks):
+            today = tier == "nightly-today"
+            return {"build_id": build, "tier": tier, "job": job, "pr": None, "head_sha": "abc1234",
+                    "started": f"2026-09-{day:02d}T{'06' if today else '00'}:00:00+00:00",
+                    "finished": f"2026-09-{day:02d}T{'20' if today else '06'}:00:00+00:00",
+                    "result": "FAILURE", "duration_s": 50400 if today else 21600, "tasks": tasks}
+
+        def task(name, *results):
+            return {"name": name, "result": "fail" if "fail" in results else "pass",
+                    "reps": [{"n": i + 1, "result": r, "reason": None if r == "pass" else "check absent"} for i, r in enumerate(results)]}
+
+        green = [task("case-a", "pass", "pass", "pass"), task("case-b", "pass", "pass", "pass")]
+        cases = [{"name": n, "domain": "cost", "active": True, "nightly_active": True} for n in ("case-a", "case-b")]
+        data = {"schema_version": 1, "generated_at": T0.isoformat(), "cases": cases, "runs": [
+            night("3000000000000000001", 2, "nightly-today", nightly.NIGHTLY_TODAY_JOB, green),
+            night("3000000000000000002", 3, "nightly-today", nightly.NIGHTLY_TODAY_JOB,
+                  [task("case-a", "pass", "pass", "pass"), task("case-b", "fail", "fail", "fail")]),
+            night("3000000000000000003", 4, "nightly", "ci-kube-agents-eval-nightly", green),
+        ], "pending_builds": [{"build_id": "3000000000000000004", "first_seen": "2026-09-04T06:05:00+00:00", "tier": "nightly-today"}]}
+        self.tick(health(), self.at(DIGEST_UTC, 5), data=data)
+        lines = self.opener.texts[0].split("\n")
+        self.assertEqual(lines[1], "🌙 Nightly: 2 cases · 2 passed all reps · 0 partial · 0 failed · first night on record · 6h")
+        self.assertEqual(lines[3], "🌙 Rollback nightly (today): 2 cases · 1 passed all reps · 0 partial · 1 failed · newly failing: case-b · 14h")
+        self.assertEqual(lines[4], nightly.NIGHTLY_TODAY_HISTORY_URL)
+        # A day with no rollback night on record since the day before
+        # yesterday says so, as the main line does.
+        data["runs"] = [r for r in data["runs"] if r["tier"] == "nightly"]
+        data["runs"].insert(0, night("3000000000000000001", 1, "nightly-today", nightly.NIGHTLY_TODAY_JOB, green))
+        del data["pending_builds"]
+        self.tick(health(), self.at(DIGEST_UTC, 5, day=5), data=data)
+        self.assertIn("\n🌙 Rollback nightly (today): no run last night (the newest on record started Tue 2:00 AM ET)\n", self.opener.texts[1])
 
     def test_the_digest_without_data_json_is_unchanged(self):
         self.tick(health(), self.at(DIGEST_UTC, 5))

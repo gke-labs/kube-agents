@@ -31,10 +31,14 @@ The digest also carries one line on last night's run of the nightly tier
 (`--data`, the `data.json` the tick collected): the cases recorded, how many
 passed all reps, partial and failed, what is newly failing against the night
 before, the opening chat turn's p50 and p95 as advice beside the p95 < 10 s
-target ([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md); empty since the nightly grades
-`spec.mode: next`, because the harness times the opening turn on the agent API only), and the wall clock, with a link to the dashboard's Nightly report
+target ([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md); on the inject door the next-mode nightly
+grades through, the opening task from the door accepting it to its terminal), and the wall
+clock, with a link to the dashboard's Nightly report
 (`nightly.html`); a night Prow cut short, one still running, or no night
-since the day before yesterday, says so instead of numbers.
+since the day before yesterday, says so instead of numbers. A second line says the same of the
+today-mode nightly kept as the rollback check (`ci-kube-agents-eval-nightly-today`, tier
+`nightly-today` in `data.json`), compared with its own night before and linked to its Prow job
+history, since the dashboard has no page for it.
 `scripts/eval_dashboard/nightly.py` derives the line and the report from the
 same nightly runs.
 The same tick reads the eval evidence store (`gs://kube-agents-evals-bench/evidence`,
@@ -204,7 +208,8 @@ forge-grading cases of `hack/eval/gitlab-cases.txt` (registered cases, not only 
 nightly, `ci-kube-agents-eval-nightly-gitlab`, runs the same list and lands as the
 section's nights, read from its own log prefix), against a pool project's GitLab repository, listed in the Brief's "GitLab
 lane" section with its own counts and links, and in no gate number, case
-history or digest line.
+history or digest line. The today-mode nightly's runs (`tier: nightly-today`) reach only the
+digest's rollback line.
 
 ## Hysteresis
 

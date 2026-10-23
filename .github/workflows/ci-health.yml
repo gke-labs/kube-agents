@@ -212,6 +212,10 @@ env:
   # The GitLab lane's nightly (kube-agents#2832): the lane's list once a night,
   # tier gitlab with no pull request, listed under the Brief's GitLab section.
   GITLAB_NIGHTLY_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/
+  # The today-mode nightly kept as the rollback check, in the same bucket:
+  # tier nightly-today on a watermark of its own, read by the digest's
+  # rollback line. Until it has run the prefix holds no objects, a note.
+  NIGHTLY_TODAY_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-today/
   # The release-candidate lane's archive. A postsubmit, so logs/ rather than
   # pr-logs/. Bounded by --rc-limit rather than by the presubmit watermark.
   RC_GLOB: gs://kube-agents-prow/logs/post-kube-agents-eval-rc/*
@@ -349,6 +353,7 @@ jobs:
             --nightly-prefix "$NIGHTLY_PREFIX" \
             --nightly-writers-prefix "$NIGHTLY_WRITERS_PREFIX" \
             --gitlab-nightly-prefix "$GITLAB_NIGHTLY_PREFIX" \
+            --nightly-today-prefix "$NIGHTLY_TODAY_PREFIX" \
             --rc-glob "$RC_GLOB" \
             --merge-with work/prior-data.json \
             --since-days "$SINCE_DAYS" \

@@ -9,11 +9,16 @@ when a night is split across two jobs, ``nightly.py``) against ``main`` with
 no pull request; and the GitLab lane's, one per build of
 ``pull-kube-agents-smoke-test-gitlab``, the forge-grading cases of the
 catalogue driven against a pool project's GitLab repository
-(``EVAL_FORGE=gitlab``, kube-agents#2394). Every
+(``EVAL_FORGE=gitlab``, kube-agents#2394); and the today-mode nightly's, one
+per build of ``ci-kube-agents-eval-nightly-today``, the rollback check: the
+full catalogue on a ``spec.mode: today`` install, a night of its own beside
+the main nightly's next-mode one, never joined to it. Every
 gate verdict -- the health adjudicator's rules, the "is this red mine?"
 classification, the Brief's runs list -- is a statement about the presubmit,
 so each of those consumers filters through ``presubmit_runs`` before it
-counts anything; the GitLab lane is listed on its own and counts nowhere else. A document written before the field existed carries no
+counts anything; the GitLab lane is listed on its own and counts nowhere else,
+and the today-mode nightly is read only by the digest's rollback line
+(``nightly.today_view``). A document written before the field existed carries no
 ``tier`` at all; that is the presubmit, because nothing else was collected
 then. A value this module does not know is no tier of these: a producer that
 tags runs some new way must not have them counted as the gate's by default.
@@ -26,9 +31,11 @@ from __future__ import annotations
 TIER_PRESUBMIT = "presubmit"
 TIER_NIGHTLY = "nightly"
 TIER_GITLAB = "gitlab"
-TIERS = (TIER_PRESUBMIT, TIER_NIGHTLY, TIER_GITLAB)
+TIER_NIGHTLY_TODAY = "nightly-today"
+TIERS = (TIER_PRESUBMIT, TIER_NIGHTLY, TIER_GITLAB, TIER_NIGHTLY_TODAY)
 # The tiers whose runs feed the per-case record (cases[], the Cases page's
-# rates): the GitLab lane feeds it nothing, so it has no rate.
+# rates): the GitLab lane and the today-mode nightly feed it nothing, so
+# neither has a rate.
 CASE_TIERS = (TIER_PRESUBMIT, TIER_NIGHTLY)
 
 # The key on a data.json run, and what an ABSENT value reads as: the
@@ -68,3 +75,13 @@ def is_gitlab(run) -> bool:
 def gitlab_runs(runs) -> list:
     """The GitLab lane's runs: the Brief's own section, never the gate's."""
     return [run for run in runs or [] if is_gitlab(run)]
+
+
+def is_nightly_today(run) -> bool:
+    return run_tier(run) == TIER_NIGHTLY_TODAY
+
+
+def nightly_today_runs(runs) -> list:
+    """The today-mode nightly's runs: the rollback check, never the gate's
+    and never the main nightly's."""
+    return [run for run in runs or [] if is_nightly_today(run)]

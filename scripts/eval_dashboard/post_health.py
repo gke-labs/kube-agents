@@ -11,7 +11,9 @@ sends a message only when:
     an OUTAGE grew to name a new case       -> the same shape, rate-limited
     it is the digest hour and none went out -> the daily digest with the 24h numbers,
                                                plus one line on last night's
-                                               nightly run when --data is given
+                                               nightly run, and one on the
+                                               today-mode rollback nightly's,
+                                               when --data is given
 
 Everything else is silence. The last-posted state lives in a small JSON file
 (`--state`, a local path or a gs:// object) that this script is the only
@@ -1546,7 +1548,9 @@ def render_digest(health: dict, now: datetime, data: dict | None = None) -> str:
     data.json was given -- one line on last night's nightly run with a link
     to its report: the counts, what is newly failing against the night
     before, the opening chat turn's p50 and p95 when the reps carried it,
-    and the wall clock, or that the night was truncated or missing."""
+    and the wall clock, or that the night was truncated or missing; then
+    the same line on the today-mode nightly kept as the rollback check,
+    linked to its Prow history."""
     metrics = health.get("metrics") or {}
     p50 = metrics.get("wall_clock_p50_s")
     typical = f"{int(p50 // 60)} min" if p50 is not None else "n/a"
@@ -1583,6 +1587,8 @@ def render_digest(health: dict, now: datetime, data: dict | None = None) -> str:
     if data is not None:
         lines.append(nightly.digest_line(data, now, clock=lambda value: clock(value, weekday=True)))
         lines.append(NIGHTLY_URL)
+        lines.append(nightly.digest_line(nightly.today_view(data), now, clock=lambda value: clock(value, weekday=True), label=nightly.DIGEST_LABEL_TODAY))
+        lines.append(nightly.NIGHTLY_TODAY_HISTORY_URL)
     fleet = fixture_digest_line(health)
     if fleet:
         lines.append(fleet)
