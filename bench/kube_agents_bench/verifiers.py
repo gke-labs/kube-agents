@@ -2652,11 +2652,12 @@ _SUDO_VAL_OPTS = {
     "--command-timeout", "--other-user", "--host", "--role", "--type",
 }
 _SUDO_SHORT_VAL_OPTS = {opt[1:] for opt in _SUDO_VAL_OPTS if opt.startswith("-") and not opt.startswith("--")}
-_SUDO_VAL_LESS_FLAGS = set("AbBEHiKklnNPSsVv")
+_SUDO_VAL_LESS_FLAGS = set("AbBEHiKknNPSsVv")
 _SUDO_LONG_VAL_LESS_OPTS = {
     "--askpass", "--bell", "--edit", "--help", "--login",
-    "--remove-timestamp", "--reset-timestamp", "--list",
+    "--remove-timestamp", "--reset-timestamp",
     "--non-interactive", "--stdin", "--shell", "--version", "--validate",
+    "--set-home", "--preserve-groups", "--no-update",
 }
 _SETSID_VAL_LESS_FLAGS = set("cwf")
 
@@ -2665,17 +2666,28 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
     """True if seg invokes an exec wrapper with options that detach the process
     or do not guarantee exit propagation (e.g. `setsid` without `-w`/`--wait`,
     or `sudo` with `-b`/`--background` or non-whitelisted options)."""
+    cmd_idx = _command_word_index(seg)
+    redirect_target = False
     for idx, word in enumerate(seg):
+        if redirect_target:
+            redirect_target = False
+            continue
+        if _is_redirect(word) or (word.isdigit() and idx + 1 < len(seg) and _is_redirect(seg[idx + 1])):
+            redirect_target = not word.isdigit()
+            continue
+        if cmd_idx is not None and idx >= cmd_idx:
+            break
         base = os.path.basename(word)
         if base == "setsid":
             saw_w = False
-            redirect_target = False
-            for i, w in enumerate(seg[idx + 1:], start=idx + 1):
-                if redirect_target:
-                    redirect_target = False
+            inner_redirect_target = False
+            scan_words = seg[idx + 1:cmd_idx] if cmd_idx is not None else seg[idx + 1:]
+            for i, w in enumerate(scan_words, start=idx + 1):
+                if inner_redirect_target:
+                    inner_redirect_target = False
                     continue
                 if _is_redirect(w) or (w.isdigit() and i + 1 < len(seg) and _is_redirect(seg[i + 1])):
-                    redirect_target = not w.isdigit()
+                    inner_redirect_target = not w.isdigit()
                     continue
                 if w == "--":
                     break
@@ -2691,16 +2703,17 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
                 return True
         elif base == "sudo":
             prev_opt_takes_val = False
-            redirect_target = False
-            for i, w in enumerate(seg[idx + 1:], start=idx + 1):
-                if redirect_target:
-                    redirect_target = False
+            inner_redirect_target = False
+            scan_words = seg[idx + 1:cmd_idx] if cmd_idx is not None else seg[idx + 1:]
+            for i, w in enumerate(scan_words, start=idx + 1):
+                if inner_redirect_target:
+                    inner_redirect_target = False
                     continue
                 if prev_opt_takes_val:
                     prev_opt_takes_val = False
                     continue
                 if _is_redirect(w) or (w.isdigit() and i + 1 < len(seg) and _is_redirect(seg[i + 1])):
-                    redirect_target = not w.isdigit()
+                    inner_redirect_target = not w.isdigit()
                     continue
                 if w == "--":
                     break
@@ -2731,6 +2744,8 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
                         return True
                     if val_opt_end:
                         continue
+                elif _SHELL_ASSIGNMENT_RE.match(w):
+                    continue
                 else:
                     return True
     return False

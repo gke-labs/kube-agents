@@ -8883,6 +8883,30 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs_with_exit_propagation("sudo python3 f.py --readiness") == [
         (["sudo", "python3", "f.py", "--readiness"], True),
     ]
+    assert _shell_argvs_with_exit_propagation("sudo -l python3 f.py --readiness") == [
+        (["sudo", "-l", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo --list python3 f.py --readiness") == [
+        (["sudo", "--list", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo FOO=bar python3 f.py --readiness") == [
+        (["sudo", "FOO=bar", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo --set-home python3 f.py --readiness") == [
+        (["sudo", "--set-home", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo --preserve-groups python3 f.py --readiness") == [
+        (["sudo", "--preserve-groups", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo --no-update python3 f.py --readiness") == [
+        (["sudo", "--no-update", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness > /tmp/setsid") == [
+        (["python3", "f.py", "--readiness", ">", "/tmp/setsid"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness > /tmp/sudo") == [
+        (["python3", "f.py", "--readiness", ">", "/tmp/sudo"], True),
+    ]
     assert _shell_argvs_with_exit_propagation("setsid python3 f.py --readiness") == [
         (["setsid", "python3", "f.py", "--readiness"], False),
     ]
