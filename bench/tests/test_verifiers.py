@@ -9040,7 +9040,7 @@ def test_worker_commands_required_run_succeeded_flag():
         assert res_joined.status == "fail" and "fleet_upgrade_report.py --readiness ran, but the dictated form is the command alone on its line (or followed only by &&); an operator on the line (a preceding || or !, a following |/;/||/&, a following newline, a background &, a command substitution, or a detaching wrapper such as setsid -f or sudo -b) means its exit is not credited" in res_joined.reason
 
     # Trajectory entry whose arguments were clipped in the pod (falling back to head regex)
-    # is inconclusive under succeeded: true (error status, not pass).
+    # is inconclusive under succeeded: true when the call succeeded (error status, not pass).
     raw_clipped_arg = '{"command": "python3 ' + _SCRIPT_PATH + ' --readiness > out.js ...[clipped 40 chars]'
     traj_arg_clipped = [
         {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"raw": raw_clipped_arg}, "result": '{"exit_code": 0}', "exit_code": 0, "status": "completed", "at": 1.0}
@@ -9049,6 +9049,15 @@ def test_worker_commands_required_run_succeeded_flag():
     res_arg_clipped = v.verify(5.0)
     assert res_arg_clipped.status == "error"
     assert "the call's command was clipped in the pod, so what followed the run on the line is unknown (fleet_upgrade_report.py --readiness)" in res_arg_clipped.reason
+
+    # A clipped match whose exit was non-zero is a conclusive fail (ran but exited non-zero).
+    traj_clipped_failed = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"raw": raw_clipped_arg}, "result": '{"exit_code": 1}', "exit_code": 1, "status": "completed", "at": 1.0}
+    ]
+    transcript.set("ok", traj_clipped_failed, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
+    res_clipped_failed = v.verify(5.0)
+    assert res_clipped_failed.status == "fail"
+    assert "fleet_upgrade_report.py --readiness ran but exited non-zero" in res_clipped_failed.reason
 
     # A clipped exit-0 match beside an earlier failed unclipped match remains inconclusive (error status, not conclusive fail).
     traj_failed_then_clipped = [

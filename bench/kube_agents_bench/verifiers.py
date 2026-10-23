@@ -3506,7 +3506,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                         else:
                             unrun_failed.append(run)
                     elif matched_clipped:
-                        unrun_clipped.append(run)
+                        unrun_failed.append(run)
                     elif self.after_result_pattern is None and any(_argv_runs(argv, run) for argv in argvs):
                         # The card log carries the command, but the trajectory capture missed it.
                         # Discrepancy between capture sources: cannot verify exit code.
