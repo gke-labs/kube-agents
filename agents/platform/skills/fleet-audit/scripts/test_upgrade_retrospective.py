@@ -6215,6 +6215,14 @@ class LogVolumeTest(unittest.TestCase):
         self.assertIn("interval.startTime=2026-09-29T03:27:00Z", command)
         self.assertLess(len(command), 2000)
 
+    def test_a_new_container_reads_new_not_a_ratio(self):
+        volume = ur.fetch_log_volume(FakeSession(extra_after={("seeded-shapes", "noisy"): 2 << 30}), PROJECT, "seeded-a", LOCATION, *WINDOW, now=LATER)
+        row = next(r for r in volume["rows"] if r["container"] == "noisy")
+        self.assertTrue(row["breach"] and row["ratio"] is None)
+        lines = ur._gate_lines({"verdict": ur.GATE_RISK, "reasons": ["x"], "after_complete": True, "log_volume": volume})
+        self.assertIn("seeded-shapes/noisy: 0 B -> 2.0 GiB per week (new)", lines[1])
+        self.assertNotIn("newx", lines[1])
+
     def test_a_failed_read_is_the_error_and_no_rows(self):
         for session, text in ((FakeSession(status=500, text="boom"), "HTTP 500"), (FakeSession(raises=RuntimeError("down")), "down")):
             volume = ur.fetch_log_volume(session, PROJECT, "seeded-a", LOCATION, *WINDOW, now=LATER)
@@ -6386,6 +6394,41 @@ class GateRunTest(unittest.TestCase):
         # Only seeded-a had an upgrade operation in the window; gemma waits.
         self.assertEqual(([c["cluster"] for c in result["families"][0]["canaries"]], result["families"][0]["waiting"]), ([SEEDED], [GEMMA]))
         self.assertIn(ur.INFO_FAMILIES, result["report"])
+
+    def test_a_review_with_no_upgrade_carries_the_seventh_check_on_the_listing(self):
+        manifest_file = self.home / "manifest.json"
+        result, _ = self.collect(FakeFleet(operations=[]), manifest_file=str(manifest_file))
+        for review in result["reviews"]:
+            self.assertIsNone(review["gate"])
+            commands = {c["check"]: c["command"] for c in review["commands"]}
+            self.assertEqual(set(commands), {check for check, _ in ur.CHECK_READS})
+            self.assertIn("operations list", commands[ur.CHECK_LOG_VOLUME])
+        manifest = json.loads(manifest_file.read_text())
+        for entry in manifest["clusters"]:
+            self.assertEqual([c["check"] for c in entry["commands"]], [check for check, _ in ur.CHECK_READS])
+            self.assertNotIn("checks_unevaluated", entry)
+
+    def test_a_recorded_gate_keeps_its_family_on_hold_a_week_later(self):
+        docs = [cluster_doc("seeded-a"), cluster_doc("gemma-gpu-upgraded")]
+        for doc in docs:
+            doc["resourceLabels"] = {**(doc.get("resourceLabels") or {}), ur.FAMILY_LABEL_KEY: "seeded-regular"}
+        first, _ = self.collect(FakeFleet(clusters=docs))
+        self.assertEqual(first["families"][0]["verdict"], ur.FAMILY_HOLD)
+        second, _ = self.collect(FakeFleet(clusters=docs), now=LATER)
+        self.assertEqual([u["cluster"] for u in second["unchanged"]], [GEMMA, SEEDED])
+        regular = second["families"][0]
+        self.assertEqual((regular["verdict"], regular["canaries"][0]["cluster"], regular["waiting"]), (ur.FAMILY_HOLD, SEEDED, [GEMMA]))
+        self.assertIn("rollout hold", second["report"])
+
+    def test_a_scoped_diff_lists_the_whole_family(self):
+        docs = [cluster_doc("seeded-a"), cluster_doc("gemma-gpu-upgraded")]
+        for doc in docs:
+            doc["resourceLabels"] = {**(doc.get("resourceLabels") or {}), ur.FAMILY_LABEL_KEY: "seeded-regular"}
+        result, _ = self.collect(FakeFleet(clusters=docs), cluster=[SEEDED], since="30d")
+        self.assertTrue(result["scoped"])
+        self.assertEqual([r["cluster"] for r in result["reviews"]], [SEEDED])
+        regular = result["families"][0]
+        self.assertEqual((sorted(regular["members"]), regular["waiting"]), (sorted([GEMMA, SEEDED]), [GEMMA]))
 
     def test_a_failed_read_is_an_unevaluated_check_with_its_limitation(self):
         manifest_file = self.home / "manifest.json"

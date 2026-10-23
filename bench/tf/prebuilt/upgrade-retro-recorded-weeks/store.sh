@@ -50,7 +50,11 @@ case "$command" in
   write)
     ext=${4:?md or json}
     case "$ext" in md | json) ;; *) echo "unknown extension $ext" >&2; exit 2 ;; esac
-    mkdir -p "$dir"
+    # The store belongs to the agent user; the sandbox exec runs as root, so a
+    # store this stack has to create is created owned as the collector creates it.
+    if [ ! -d "$dir" ]; then
+      install -d -m 0755 -o "$owner" -g "$owner" "$(dirname "$dir")" "$dir" 2>/dev/null || mkdir -p "$dir"
+    fi
     cat > "$dir/$stamp.$ext"
     chmod 0644 "$dir/$stamp.$ext"
     chown "$owner:$owner" "$dir/$stamp.$ext" 2>/dev/null || true

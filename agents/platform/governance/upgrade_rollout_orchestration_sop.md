@@ -72,12 +72,12 @@ The stage configuration the operator creates, one file per sequence, in the form
   soak-duration: 7d
 ```
 
-The first stage's soak is seven days because the gate of section 4 compares the seven days after the upgrade with the seven days before; a shorter soak ends before the gate can read `clear`. One sequence carries several families as further stage pairs before the catch-all stage, in the order the request gives or, without one, the family with the fewest blocking findings first. The host project must hold a fleet: a project with none answers `fleet not found` at the sequence's creation, and creating the fleet is an operator step (`gcloud container fleet create --project <host project> --display-name <4 to 30 characters>`); the agent reads no fleet resource, since the proxy admits no `fleet describe`. The operator steps, quoted verbatim and never run here:
+The first stage's soak is seven days because the gate of section 4 compares the seven days after the upgrade with the seven days before; a shorter soak ends before the gate can read `clear`. One sequence carries several families as further stage pairs before the catch-all stage, in the order the request gives or, without one, the family with the fewest blocking findings first. The host project must hold a fleet: a project with none answers `fleet not found` at the sequence's creation, and creating the fleet is an operator step (`gcloud container fleet create --project <host project> --display-name <4 to 30 characters>`); the agent reads no fleet resource, since the proxy admits no read of it. The operator steps, quoted verbatim and never run here:
 
 ```bash
 gcloud container fleet rolloutsequences create <sequence name> --project <host project> --stage-config <file>
-gcloud container fleet rolloutsequences upgrade <sequence name> --project <host project> --version <target version> --upgrade-type CONTROL_PLANE
-gcloud container fleet rolloutsequences upgrade <sequence name> --project <host project> --version <target version> --upgrade-type NODE
+gcloud container fleet rolloutsequences upgrade <sequence name> --project <host project> --control-plane-version=<target version>
+gcloud container fleet rolloutsequences upgrade <sequence name> --project <host project> --node-version=<target version>
 ```
 
 Hand the plan over in this order: the precheck line(s) of section 2, the families with their canaries and prerequisites, the label pull request or steps, the stage configuration, the three operator commands, and the sentence that section 4 decides whether the second stage runs.
@@ -129,7 +129,7 @@ It is not the readiness report, which grades one cluster against one target and 
 
 ## Red Lines
 
-- **Never run an upgrade.** No `gcloud container clusters upgrade`, `node-pools update`, `rolloutsequences create|upgrade|delete|patch`, `rollouts pause|resume|cancel|force-complete-stage`, and no `clusters update`. Each is an operator step, quoted verbatim.
+- **Never run an upgrade.** No `gcloud container clusters upgrade`, `node-pools update`, `rolloutsequences create|update|upgrade|delete`, `rollouts pause|resume|cancel|force-complete-stage`, and no `clusters update`. Each is an operator step, quoted verbatim.
 - **Never write a RolloutSequence or a label from here.** The stage configuration is text in the answer; a label is a pull request or an operator step.
 - **Never move the collector's gate.** `clear`, `risk` and `pending` are the retrospective's, from its report; a gate you compute from a read of your own is not a gate.
 - **Never let the rest follow on `pending`.** A gate that cannot be read holds the family as a risk does.

@@ -29,7 +29,8 @@ The read is `gcloud container fleet rolloutsequences list --project <host> --for
 project and `roles/gkehub.viewer` there (`gkehub.rolloutSequences.list`); the fleet block
 comes with the cluster listing and costs no read of its own.
 
-Source: https://docs.cloud.google.com/kubernetes-engine/fleet-management/docs/rollout-sequencing
+Sources: https://docs.cloud.google.com/kubernetes-engine/docs/concepts/rollout-sequencing-custom-stages/about-rollout-sequencing and
+https://docs.cloud.google.com/kubernetes-engine/docs/how-to/rollout-sequencing-custom-stages/manage-upgrades-with-rollout-sequencing
 """
 
 import json

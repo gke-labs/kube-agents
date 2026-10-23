@@ -24,7 +24,7 @@ _none_
 
 **What failed.** Cloud Logging ingestion rose from 298.0 MiB to 2.9 GiB per week (10.12x) in the seven days after the upgrade
 **Detect and mitigate next time.** prepare the logging exclusion for kube-system/konnectivity-agent, or hold the patch for the family
-**Mitigation set up.** no guard: the gate is re-read from the ledger's record on the next run.
+**Mitigation set up.** no guard: the gate stands in the ledger's record until the cluster is reviewed again, and a pending one is read again on the next full run.
 
 ## Info
 
