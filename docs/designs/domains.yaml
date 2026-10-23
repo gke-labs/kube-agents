@@ -145,10 +145,10 @@ domains:
 
 # Known-uncovered; empty is Phase 2's exit criterion. agent-kanban-smoke
 # covers chat-and-routing; cluster-debugging came off first
-# among the Phase 2 domains, in #939. Reliability, capacity, security and
-# cost are covered by domain probes (upgrades' probe was demoted to the
-# nightly on 2026-10-16, #3269, and consistency's on 2026-10-21, #3598,
-# both below) --
+# among the Phase 2 domains, in #939. Reliability, capacity, security,
+# upgrades and cost are covered by domain probes, upgrades again since 2026-10-23
+# (its probe was nightly-only from 2026-10-16, #3269; consistency's was
+# demoted on 2026-10-21, #3598, below) --
 # see the header above for why probes rather than six full audits.
 # remediation's one roster case, pdb-remediation-pr, was demoted to the
 # nightly on 2026-10-17 (#3120, below).
@@ -175,12 +175,6 @@ allowlist:
   # nightly tier (#1175). incident-triage sat here from 2026-09-03 to
   # 2026-09-22 for the same shape of reason.
   - fleet-audits
-  # upgrades, since 2026-10-16 (#3269): the domain's one presubmit case,
-  # upgrades-lagging-master-probe, was demoted to the nightly that day after
-  # the agent began reading the channel's upgradeTargetVersion as its target and
-  # failed it on unrelated pull requests.
-  # Delete this entry in the pull request that restores it to the roster.
-  - upgrades
   # remediation, since 2026-10-17 (#3120): the domain's one presubmit case,
   # pdb-remediation-pr (on the roster from 2026-10-14, #2016), was demoted to
   # the nightly that day after it collapsed on unrelated pull requests, the

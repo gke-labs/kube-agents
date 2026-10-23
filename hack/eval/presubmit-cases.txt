@@ -57,9 +57,10 @@
 # kanban smoke, the source-control branch-reuse writer (since 2026-10-23,
 # the one case here that requests a pull request), and the held-out seats (the compliance canary among them since 2026-09-29, ~1000-2000s a repetition; its
 # three repetitions serialize on the task lock). upgrades-lagging-master-probe
-# left for the nightly 2026-10-16 (#3269), putting upgrades on the
-# docs/designs/domains.yaml allowlist, and consistency-authorized-networks-probe
-# left 2026-10-21 (#3598), putting consistency there too. The remediation writer
+# left for the nightly 2026-10-16 (#3269) and came back 2026-10-23 on three
+# clean nightlies after its prompt fix (#3338); consistency-authorized-networks-probe
+# left 2026-10-21 (#3598), putting consistency on the docs/designs/domains.yaml
+# allowlist. The remediation writer
 # pdb-remediation-pr (420-1929s measured, hinted at 1250) took its roster
 # line 2026-10-14 (#2016), which took remediation off that allowlist, and was
 # demoted to the nightly 2026-10-17 (#3120), which put it back on;
@@ -84,6 +85,7 @@
 ./tasks/reliability-pdb-probe/task.yaml
 ./tasks/capacity-pinned-pool-probe/task.yaml
 ./tasks/security-overgrant-probe/task.yaml
+./tasks/upgrades-lagging-master-probe/task.yaml
 ./tasks/cost-idle-pool-probe/task.yaml
 
 # The reliability prompt variation that grades what the probe does not ask
@@ -221,8 +223,9 @@
 #   core kube-agents journey); the four full audits recast on 2026-08-26
 #   (obtainability-planted-pdb, stockout-pinned-pool,
 #   upgrade-readiness-lagging-cluster, consistency-drift-outlier), each
-#   domain covered by its probe above (the upgrades and consistency probes
-#   left for the nightly 2026-10-16, #3269, and 2026-10-21, #3598);
+#   domain covered by its probe above (the consistency probe left for the
+#   nightly 2026-10-21, #3598; the upgrades probe was nightly-only 2026-10-16
+#   to 2026-10-23, #3269);
 #   obtainability-direct-query,
 #   superseded here by reliability-pdb-probe; and on 2026-09-15 the nine
 #   cases this file's predecessor held commented out.

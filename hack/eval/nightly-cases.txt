@@ -66,8 +66,9 @@
 # are frozen in the order they landed.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
-# Spec-ready, each domain covered in the presubmit by its probe (upgrades'
-# probe nightly since 2026-10-16, #3269; consistency's since 2026-10-21, #3598):
+# Spec-ready, each domain covered in the presubmit by its probe (consistency's
+# probe nightly since 2026-10-21, #3598; upgrades' was nightly-only 2026-10-16
+# to 2026-10-23, #3269):
 #   -- obtainability-planted-pdb: measured PASSED at 962s on 2026-08-26
 #      (build 2092638061140643840); too slow for a presubmit seat.
 #   -- stockout-pinned-pool: same full-audit shape and cost band; its
@@ -332,14 +333,6 @@
 # INSTANTANEOUS question, so the cost domain is covered meanwhile. Audit
 # shape, unmeasured: priced with the 900s band in unit_cost_hint.
 ./tasks/fleet-cost-idle-pool/task.yaml
-
-# #3269: upgrades-lagging-master-probe demoted 2026-10-16. The fixture is
-# healthy (seeded-b one minor behind REGULAR's defaultVersion on every pool),
-# but the agent compares seeded-b against the channel's upgradeTargetVersion,
-# the newest patch of its own minor, and reports no lag, so it fails 0/3 on
-# unrelated pull requests. Back on the roster once an agent-side fix has the
-# comparison use the channel default and the case shows greens (#3269).
-./tasks/upgrades-lagging-master-probe/task.yaml
 
 # #3120: pdb-remediation-pr demoted 2026-10-17. It collapsed 0/3 on unrelated
 # pull requests after its roster line of 2026-10-14 (#2971, #3017, #3329):
