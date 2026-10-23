@@ -108,8 +108,12 @@ func TestWithoutImageVolumesEachImageIsStagedIntoAnEmptyDir(t *testing.T) {
 		}
 		// The staged volume is bounded, and the staging container requests it
 		// plus stagingLogsAllowance as ephemeral storage, the limit equal.
-		if v.EmptyDir == nil || v.EmptyDir.SizeLimit == nil {
-			t.Errorf("staged volume %q has no sizeLimit", v.Name)
+		wantLimit := toolStagingSizeLimit
+		if v.Name == personaVolumeName {
+			wantLimit = personaStagingSizeLimit
+		}
+		if v.EmptyDir == nil || v.EmptyDir.SizeLimit == nil || v.EmptyDir.SizeLimit.Cmp(resource.MustParse(wantLimit)) != 0 || v.EmptyDir.SizeLimit.Sign() != 1 {
+			t.Errorf("staged volume %q sizeLimit = %v, want %s and positive", v.Name, v.EmptyDir, wantLimit)
 		} else {
 			want := v.EmptyDir.SizeLimit.DeepCopy()
 			want.Add(resource.MustParse(stagingLogsAllowance))
