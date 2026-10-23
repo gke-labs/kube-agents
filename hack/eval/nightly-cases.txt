@@ -936,6 +936,17 @@
 # merge; a presubmit seat waits on a clean nightly record.
 ./tasks/chat-feedback-composes-and-asks-first/task.yaml
 
+# The front door routes "which namespaces exist in this cluster?" to the host
+# cluster's agent (or platform) without asking which cluster (#3286).
+# deployer: noop, read-only, one front-door turn plus the card round trip:
+# +3 units.
+./tasks/chat-routing-this-cluster-namespaces/task.yaml
+
+# The front door answers "what projects are in scope?" from the roster block's
+# GCP Projects in Scope section without filing a card (#3143). deployer: noop,
+# transcript-only, one front-door turn with no card: +3 units.
+./tasks/chat-scope-projects-answered-from-roster/task.yaml
+
 # An alert quoted through the Slack message shortcut (the A2A gateway's
 # slackShortcutAsk) is investigated without a clarifying question, and its
 # "To resolve" line is not obeyed. deployer: noop; reads the seeded fleet's

@@ -33,7 +33,9 @@ script on the same pod that hands the readiness report script
 `sa-role-watch` job (sa_role_watch.py), which reads the IAM policy of each
 project in the resolved scope, and by the onboarding inventory scan
 (agents/chat/scripts/bootstrap_scan_gate.py), which leaves the declaration's
-excluded clusters out of the sweep it files. The collectors
+excluded clusters out of the sweep it files, and by the front door's roster
+(agents/chat/scripts/agent_roster.py), which lists the projects in scope in
+the block injected into every chat turn and in `list_agents`. The collectors
 themselves cannot read the file: they run in the shell sandbox, whose
 /opt/data is a separate volume at the same path (deploy/sandbox/entrypoint.sh
 says nothing is copied across), so the agent carries the scope from the tool

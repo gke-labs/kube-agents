@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-# agent_roster.py - Which specialist profiles exist, and what each is for.
+# agent_roster.py - Which specialist profiles exist, what each is for, which
+# cluster the install runs on, and which GCP projects its scope names.
 #
 # The Chat Agent needs this to pick an `assignee` before it delegates, and it
-# needs it on essentially every request. Two consumers read it:
+# needs it on essentially every request. The host and scope sections let it
+# answer "what projects are in scope?" and route "this cluster" without a
+# second roundtrip. Two consumers read it:
 #
 #   * ``router_server.py``'s ``list_agents`` MCP tool — the on-demand refresh
 #     path, for when a named agent is missing or the injected roster is stale.
@@ -20,7 +23,10 @@
 # Everything here degrades rather than raises. The profiles live on a shared
 # PVC, so an I/O or permission fault must not turn routing into a traceback.
 
+import hashlib
+import importlib
 import os
+import re
 import sys
 
 from pathlib import Path
@@ -57,6 +63,53 @@ IDENTITY_FIELD_PREFIX = "cluster_"
 IDENTITY_NOTE = " (the {cluster} cluster agent{where})"
 IDENTITY_WHERE = "; {places}"
 IDENTITY_PLACE = "{key} {value}"
+
+# The cluster this pod runs on. The operator sets these on the agent container
+# outside kind (platformagent_manifests.go); the router MCP child gets them
+# through its `env:` block in agents/chat/config.yaml. GCP_PROJECT_ID is the
+# management project, which is the host project when GKE_PROJECT_ID is unset.
+HOST_CLUSTER_ENV = "GKE_CLUSTER_NAME"
+HOST_PROJECT_ENVS = ("GKE_PROJECT_ID", "GCP_PROJECT_ID")
+HOST_LOCATION_ENV = "GKE_LOCATION"
+# Hermes hands a stdio MCP server the literal placeholder when the variable it
+# names is unset (gke_endpoint.py reads it the same way); that is not a value.
+UNEXPANDED_PLACEHOLDER_PREFIX = "${"
+# The host section's heading. The plugin keys its "route this cluster to the
+# host" footer sentence on it, so the sentence never points at a section that
+# was not rendered.
+HOST_IDENTITY_HEADING = 'Host Cluster Identity ("this cluster" / "this host cluster"):'
+# Cluster Agent profile names, as cluster_agent_profile.profile_name derives
+# them. Mirrored rather than imported: that module imports the sandbox and
+# endpoint modules, and this one runs ahead of every front-door turn.
+# test_agent_roster.py holds the two in step.
+PROFILE_NAME_MAX_LEN = 63
+
+# The projects in scope come from the platform agent's own reader,
+# agents/platform/scripts/fleet_scope_targets.py, which the image ships beside
+# this script (deploy/docker/Dockerfile copies both script directories into
+# /opt/defaults/scripts). One reader means the front door and the platform
+# agent's fleet_scope tool give the same answer, including the rows the
+# reconcile could not read and the partial marker before its first write.
+SCOPE_READER = "fleet_scope_targets"
+SCOPE_HEADING = "GCP Projects in Scope:"
+SCOPE_LINE = "- GCP projects in scope ({count}): {projects}"
+SCOPE_PARTIAL_LINE = (
+    "- GCP projects in scope (partial: {reason}): {projects}. Say the list is "
+    "partial when you answer."
+)
+SCOPE_PARTIAL_UNRESOLVED = (
+    "the declaration names folders, organisations or selectors whose members "
+    "the reconcile has not resolved yet"
+)
+SCOPE_NONE_LISTED = "none read yet"
+SCOPE_UNDECLARED = (
+    "- No project scope is declared for this install (spec.scope is unset), so "
+    "there is no fixed list to recite."
+)
+SCOPE_UNREADABLE = (
+    "- The scope declaration could not be read right now. Do not answer from "
+    "memory; route the question to `platform`."
+)
 
 
 def log(msg: str) -> None:
@@ -237,10 +290,124 @@ def _identity_note(agent: dict[str, str]) -> str:
     return IDENTITY_NOTE.format(cluster=cluster, where=where)
 
 
+def _host_env(name: str) -> str:
+    """An environment value, or "" when unset or still a `${...}` placeholder."""
+    value = os.environ.get(name, "").strip()
+    return "" if value.startswith(UNEXPANDED_PLACEHOLDER_PREFIX) else value
+
+
+def _profile_name(project: str, cluster: str, location: str) -> str:
+    """The Cluster Agent profile name for a cluster (cluster_agent_profile.profile_name)."""
+    raw = f"cluster-{project}-{cluster}-{location}".lower()
+    name = re.sub(r"-{2,}", "-", re.sub(r"[^a-z0-9-]+", "-", raw)).strip("-")
+    if len(name) > PROFILE_NAME_MAX_LEN:
+        digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+        name = f"{name[: PROFILE_NAME_MAX_LEN - 9]}-{digest}"
+    return name
+
+
+def read_host_identity(agents: list[dict[str, str]] | None) -> dict[str, str] | None:
+    """The cluster this pod runs on, and its Cluster Agent when one exists.
+
+    No cluster name, no host: a project or location alone cannot say which
+    cluster "this cluster" is. The assignee is set only from a discovered
+    profile whose stamped identity matches all three values, or whose name is
+    the one the scaffold derives from them; a name that is not a profile is
+    never advertised, because a card filed to it is never dispatched.
+    """
+    cluster = _host_env(HOST_CLUSTER_ENV)
+    if not cluster:
+        return None
+    project = next((v for v in (_host_env(n) for n in HOST_PROJECT_ENVS) if v), "")
+    location = _host_env(HOST_LOCATION_ENV)
+    host = {"cluster": cluster}
+    if project:
+        host["project"] = project
+    if location:
+        host["location"] = location
+    if project and location:
+        wanted = {IDENTITY_NAME_KEY: cluster, "project": project, "location": location}
+        names = {a["name"] for a in agents or []}
+        match = next(
+            (
+                a["name"]
+                for a in agents or []
+                if all(a.get(IDENTITY_FIELD_PREFIX + k) == v for k, v in wanted.items())
+            ),
+            "",
+        )
+        derived = _profile_name(project, cluster, location)
+        assignee = match or (derived if derived in names else "")
+        if assignee:
+            host["assignee"] = assignee
+    return host
+
+
+def _format_host(host: dict[str, str] | None) -> str:
+    if not host:
+        return ""
+    parts = [f"{k}={host[k]}" for k in ("cluster", "project", "location", "assignee") if host.get(k)]
+    return f"{HOST_IDENTITY_HEADING}\n- {', '.join(parts)}"
+
+
+def _scope_reader():
+    """fleet_scope_targets, or None when it cannot be imported.
+
+    In the pod it sits beside this file. The plugin loads this file by path, so
+    its directory is not on sys.path there; it is appended (not prepended) so
+    nothing installed is shadowed. A checkout keeps it under agents/platform.
+    """
+    here = Path(__file__).resolve().parent
+    for directory in (here, here.parent.parent / "platform" / "scripts"):
+        if (directory / f"{SCOPE_READER}.py").is_file() and str(directory) not in sys.path:
+            sys.path.append(str(directory))
+    try:
+        return importlib.import_module(SCOPE_READER)
+    except Exception as e:  # an import-time fault must not cost the roster
+        log(f"cannot import {SCOPE_READER}: {e}")
+        return None
+
+
+def _format_scope(base: Path | None = None) -> str:
+    """The projects the declared scope resolved to, as the fleet_scope tool reads them."""
+    reader = _scope_reader()
+    if reader is None:
+        return ""
+    # The router child gets these through `${...}` entries; an unset one arrives
+    # as the literal placeholder, which the reader would take for a path or a
+    # project. Unset is what it means.
+    for name in (reader.SCOPE_FILE_ENV, *reader.MANAGEMENT_PROJECT_ENVS):
+        if os.environ.get(name, "").startswith(UNEXPANDED_PLACEHOLDER_PREFIX):
+            os.environ.pop(name, None)
+    root = PROFILES_BASE if base is None else base
+    try:
+        targets = reader.declared_scope_targets(root.parent)
+    except Exception as e:  # ScopeRenderUnreadable, or a fault on the shared PVC
+        log(f"cannot read the declared scope: {e}")
+        return f"{SCOPE_HEADING}\n{SCOPE_UNREADABLE}"
+    if targets is None:
+        return f"{SCOPE_HEADING}\n{SCOPE_UNDECLARED}"
+    unresolved_row = getattr(reader, "UNRESOLVED_SCOPE_ROW", None)
+    listed = list(targets.projects)
+    listed += [f"{p} ({outcome})" for p, outcome in targets.unread if p != unresolved_row]
+    reason = targets.note or (
+        SCOPE_PARTIAL_UNRESOLVED if any(p == unresolved_row for p, _ in targets.unread) else ""
+    )
+    projects = ", ".join(listed) or SCOPE_NONE_LISTED
+    if reason:
+        return f"{SCOPE_HEADING}\n{SCOPE_PARTIAL_LINE.format(reason=reason, projects=projects)}"
+    return f"{SCOPE_HEADING}\n{SCOPE_LINE.format(count=len(listed), projects=projects)}"
+
+
 def render(base: Path | None = None) -> str | None:
     """Discover and format in one call — what both consumers actually want.
 
     ``None`` means the roster could not be read at all. Both consumers treat
     that as "say nothing about the fleet" rather than "the fleet is empty".
     """
-    return format_roster(discover(base))
+    agents = discover(base)
+    roster = format_roster(agents)
+    if roster is None:
+        return None
+    extra = [b for b in (_format_host(read_host_identity(agents)), _format_scope(base)) if b]
+    return "\n\n".join([roster, *extra])
