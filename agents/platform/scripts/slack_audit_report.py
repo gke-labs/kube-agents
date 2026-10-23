@@ -577,18 +577,19 @@ def _parse_issue(issue: dict, report: str) -> AuditReport | None:
 
 
 def _lead_agrees(line: str, totals: dict[str, int]) -> bool:
-    """Whether the line's lead count (:data:`FINDINGS_LEAD`), when it states one, is the issue's.
+    """Whether the line's counts by severity (:data:`FINDINGS_LEAD`), when it states any, are the issue's.
 
-    The lead names the most severe level present, so it agrees when the issue
-    counts that many at its severity and none at a more severe one. A line with
-    no lead agrees, and is checked by its total instead.
+    Each "<n> <severity> findings" the line states must be the issue's count at
+    that severity, and the issue must count none above the most severe one the
+    line states: fleet-audit's own line leads with its most severe level. A line
+    that states none agrees, and is checked by its total instead.
     """
-    lead = FINDINGS_LEAD.search(line)
-    if lead is None:
+    stated = {match.group("severity").lower(): int(match.group("count")) for match in FINDINGS_LEAD.finditer(line)}
+    if not stated:
         return True
-    severity = lead.group("severity").lower()
-    above = SEVERITIES[: SEVERITIES.index(severity)]
-    return totals[severity] == int(lead.group("count")) and not any(totals[level] for level in above)
+    most_severe = next(level for level in SEVERITIES if level in stated)
+    above = SEVERITIES[: SEVERITIES.index(most_severe)]
+    return all(totals[level] == count for level, count in stated.items()) and not any(totals[level] for level in above)
 
 
 def _totals(body: str, findings: list[Finding], critical: int) -> dict[str, int]:
@@ -838,6 +839,10 @@ def summary_card(report: str) -> Card | None:
     lines = [line.strip() for line in report.strip().splitlines() if line.strip()]
     if not lines or not SUMMARY_HEADLINE.match(lines[0]) or lines[-1] not in NO_LEDGER_NOTES:
         return None
+    # A run that finished twice keeps both summaries, one under the other: the card
+    # would lead with the first, so the report posts whole.
+    if any(SUMMARY_HEADLINE.match(line) for line in lines[1:]):
+        return None
     rows: list[dict] = []
     after: list[str] = []
     for line in lines[1:]:
@@ -973,7 +978,8 @@ def _ledger_line(report: str) -> str:
         return last
     counted = [
         line for line in lines[:-1]
-        if COUNTS_DIGIT.search(line) and not line[:1].isspace() and not LIST_MARKER.match(line)
+        if (COUNTS_DIGIT.search(line) or FINDINGS_TOTAL.search(line))
+        and not line[:1].isspace() and not LIST_MARKER.match(line)
     ]
     shaped = [line for line in counted if COVERAGE.search(line) or FINDINGS_TOTAL.search(line) or CHANGE_COUNT.search(line)]
     return _fallback_line((shaped or counted)[-1]) if counted else ""

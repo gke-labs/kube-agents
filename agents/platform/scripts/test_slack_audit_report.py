@@ -1257,6 +1257,25 @@ class FinishLineTest(unittest.TestCase):
             "**Security & RBAC Posture Audit: 1 major finding**",
         )
 
+    def test_every_count_by_severity_the_line_states_is_checked(self):
+        # A model-written line may name a lower level first; the issue agrees with both counts.
+        report = f"Security audit, 7 findings: 1 major finding and 2 critical findings.\nLedger: {LEDGER}"
+        self.assertEqual(sar.headline_from_issue(ISSUE, REF, report).splitlines()[0], HEADLINE)
+        disagreeing = f"Security audit: 3 major findings and 2 critical findings.\nLedger: {LEDGER}"
+        self.assertIsNone(sar.headline_from_issue(ISSUE, REF, disagreeing))
+
+    def test_a_zero_finding_line_with_no_digit_still_reads_as_the_line(self):
+        # "no findings" states a total in words; a run with lost memory writes no digit.
+        report = (
+            "Security & RBAC Posture Audit: no findings; the change since the last run is unknown.\n"
+            f"Ledger: {LEDGER}"
+        )
+        self.assertIsNone(sar.headline_from_issue(ISSUE, REF, report))
+        self.assertEqual(
+            sar.headline_fallback(report, REF),
+            f"**Security & RBAC Posture Audit: no findings; the change since the last run is unknown.**\n{LINK}",
+        )
+
     def test_a_held_line_does_not_rebuild_the_card(self):
         report = (
             "Security & RBAC Posture Audit: no findings across 3 clusters, but the ledger stays open: "
@@ -1332,6 +1351,12 @@ class SummaryCardTest(unittest.TestCase):
         extra = "".join(f"\nline {i}" for i in range(sar._chat.AFTER_MAX))
         summary = SUMMARY.replace("\nNo GitOps", f"{extra}\nNo GitOps")
         self.assertIsNone(sar.summary_card(summary))
+
+    def test_a_run_that_finished_twice_posts_both_summaries_whole(self):
+        first = "Security & RBAC Posture Audit: 1 critical finding.\n`critical` seeded-a: control plane is public\n" + sar.NO_LEDGER_NOTES[0]
+        second = "Security & RBAC Posture Audit: 1 critical finding.\n`critical` seeded-b: control plane is public\n" + sar.NO_LEDGER_NOTES[0]
+        report = f"{first}\n\nRe-run in this audit; counts are against the report above.\n{second}"
+        self.assertIsNone(sar.summary_card(report))
 
     def test_another_shape_posts_as_written(self):
         for report in ("", "Here's the audit.", "## What's wrong\nThe audit could not write its ledger.", REPORT):
