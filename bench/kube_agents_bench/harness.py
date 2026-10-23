@@ -1675,6 +1675,7 @@ class KubeAgentsHarness(AgentHarness):
             worker_commands=result.metadata.get("worker_commands"),
             worker_capture_gaps=worker_trajectory.gaps(result.metadata.get("worker_trajectory")),
             worker_card_parents=worker_trajectory.parents(result.metadata.get("worker_trajectory")),
+            worker_runs=worker_trajectory.runs(result.metadata.get("worker_trajectory")),
         )
         return result
 

@@ -50,9 +50,9 @@ const (
 	// (mcp.statusTimeout); a streamed answer, if a later tool adds one,
 	// has to revisit this.
 	writeTimeout = 30 * time.Second
-	// shutdownGrace outlasts the slowest request in flight, a status read
-	// (mcp's statusTimeout, 8 s), so a stop during one is a clean drain,
-	// well inside the pod's default 30 s termination grace.
+	// shutdownGrace is how long a stop waits for the requests in flight,
+	// whose contexts the stop has already ended (serve), so a stop is a
+	// clean drain well inside the pod's default 30 s termination grace.
 	shutdownGrace = 10 * time.Second
 	// dialTimeout bounds one attempt at the first connect to the bus.
 	dialTimeout = 30 * time.Second
@@ -200,9 +200,12 @@ func dialWithRetry[B any](ctx context.Context, log *slog.Logger, backoff time.Du
 	}
 }
 
-// serve runs until ctx is done or the server fails.
+// serve runs until ctx is done or the server fails. Every request's context
+// derives from ctx, so a stop ends the requests in flight rather than waiting
+// them out past shutdownGrace.
 func serve(ctx context.Context, log *slog.Logger, ln net.Listener, h http.Handler) error {
-	srv := &http.Server{Handler: h, ReadHeaderTimeout: readHeaderTimeout, IdleTimeout: idleTimeout, WriteTimeout: writeTimeout}
+	srv := &http.Server{Handler: h, ReadHeaderTimeout: readHeaderTimeout, IdleTimeout: idleTimeout, WriteTimeout: writeTimeout,
+		BaseContext: func(net.Listener) context.Context { return ctx }}
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
 	log.Info("mcp serving", "addr", ln.Addr().String(), "path", mcp.Path)

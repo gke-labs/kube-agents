@@ -48,8 +48,9 @@
 # The fixture brings its own drift. bench/tf/prebuilt/gitops-drift-deleted-policy
 # plants the namespace, the workload, the policy applied by a GitOps field
 # manager and then deleted, hands the daemon the audit record that deletion
-# would have produced, and does not return until the resulting card is on the
-# board. Its header explains why the record is planted rather than observed.
+# would have produced, and does not return until the resulting card has
+# finished, or a ceiling passes. Its header explains why the record is planted
+# rather than observed.
 #
 # The cluster is the one the Platform Agent pod runs in, not a per-run one,
 # because the daemon binds loopback inside that pod and the planted namespace
@@ -133,8 +134,9 @@ domain: incident-triage
 # fluent exposure report having never opened the card. The three instructions
 # below are the sibling's, each arrived at the hard way -- the status filter on
 # kanban_list (a bare call pages oldest-first and misses the newest card), the
-# instruction to keep waiting (the stack returns when the card is FILED, not
-# when it is finished), and verbatim reproduction (a summary drops exactly the
+# instruction to keep waiting (the stack now waits for the card to finish,
+# up to a ceiling, so this is the fallback for a card handed over still
+# running), and verbatim reproduction (a summary drops exactly the
 # "What to do" section the delivery objective reads).
 #
 # It names the namespace, because that is how the card is found, and nothing

@@ -190,8 +190,9 @@
 # takes the infra lock, plants a Deployment whose replica count was taken out
 # of band, hands the Session KV daemon the audit record that change would have
 # produced, and blocks until the resulting triage card is on the board
-# (bounded at 5 minutes) -- then the agent turn waits on the card itself, as
-# autoops does. Hinted at 900s with them, unmeasured.
+# (bounded at 5 minutes) and then until it finishes (bounded at 15), so the
+# agent turn reads a finished card rather than polling a running one. Hinted
+# at 900s with them, unmeasured.
 #
 # The daemon also has a drift alert ceiling that the other two do not have.
 # It allows ALERT_DAILY_LIMIT_DRIFT drift alerts a day per install and
@@ -982,6 +983,13 @@
 # 200s default.
 ./tasks/fleet-audit-request-line/task.yaml
 
+# A drift run over a coverage gap keeps the previous finding on the cluster it
+# did not compare as a held row, with its id in the ledger's hidden block.
+# prebuilt/unread-target-ledger opens a fleet-consistency-drift ledger with
+# one label-keys finding on the unlabelled host cluster, from the shell
+# sandbox. No fixture.
+./tasks/fleet-audit-unread-target-keeps-finding/task.yaml
+
 # gitops-drift-backlog-digest (#3387): records that queue while the drift
 # detector is not pulling are digested, not triaged one card each. The
 # fixture stops the detector process, publishes, and kills it, so the
@@ -1046,6 +1054,13 @@
 # autoops-warning-event-triage; hinted at that case's 900s until the nightly
 # record measures it.
 ./tasks/incident-triage-workload-fold/task.yaml
+
+# A delegated card written to outrun the worker budget: the worker runs under
+# the platform profile's 150 turns, read from Hermes' checkpoint notice in its
+# tool results or from the card's run row, not under the 250 the fleet audits
+# carry on their roster entries (#1947). deployer: noop, no fixture; the run
+# spends up to 150 trivial model calls by design, twice.
+./tasks/platform-worker-turn-budget/task.yaml
 
 # A gcloud write the command policy refuses for a flag it cannot read: the
 # report claims no success and no delegated worker re-runs the write without

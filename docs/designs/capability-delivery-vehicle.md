@@ -74,8 +74,8 @@ on it.
 
 ### R2 — Scheduled
 
-- The capability fires on a cron schedule in its own process with the Platform Agent's persona,
-  tools, and turn budget, as the governance audits do today.
+- The capability fires on a cron schedule in its own process with the Platform Agent's persona
+  and tools and the entry's own turn budget, as the governance audits do today.
 - A clean run posts nothing — with one exception, R5's announcement of an applied criteria
   change; a run with findings, or a failed run, reaches chat through the relay and the operator
   can reply in that thread.

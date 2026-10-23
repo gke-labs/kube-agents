@@ -36,8 +36,8 @@ WHAT "SCORE" MEANS is written once, in ``docs/designs/eval-scorer.md``
 LATENCY IS ADVISORY, AND NOT FROM THE STORE. The store's records carry no
 timing, so the latency row under each card reads ``data.json``'s nightly
 runs, each night filed as ``nightly.filed_nights`` files it, with its own
-parts only (a main re-run night does not borrow its date's writers part,
-so writers reps count once): per night and scope (a case, a domain's cases,
+parts only (a main re-run night does not borrow its date's other parts,
+so their reps count once): per night and scope (a case, a domain's cases,
 every case), the p50 and the slow percentile (``LATENCY_SLOW_PCT``: the
 opening chat turn's p95, ``nightly.TURN1_TARGET_PCT``, which its target is
 defined on; the agent run's ``nightly.SLOW_PCT``) over the scope's reps
@@ -228,9 +228,9 @@ def night_id(record: dict, anchors: dict[str, str] | None = None) -> str:
     """One nightly job's records share its build; a record without one (a
     laptop run, a name outside the layout) stands alone under its stamp.
     ``anchors`` (nightly.night_builds) puts the builds of a night split
-    across two jobs under the one build the report files that night by, so
-    the night is one night here too, and a domain's point that night pools
-    the cases of both parts."""
+    across jobs (main, main-b, writers) under the one build the report files
+    that night by, so the night is one night here too, and a domain's point
+    that night pools the cases of all its parts."""
     build = record.get("build")
     if isinstance(build, str) and build and anchors:
         build = anchors.get(build, build)
@@ -413,8 +413,8 @@ def domain_points(cases: dict[str, dict]) -> list[dict]:
     night with the range of their means (``low``, ``high``, ``cases``).
     A night mixes keys only if its cases do; the page marks the key
     changes, it does not pool across them here because a domain's cases
-    share one nightly job and therefore one key (a night split across two
-    jobs pools both, and lists both keys under ``keys`` if they differ)."""
+    share one nightly job and therefore one key (a night split across jobs
+    pools them, and lists every key under ``keys`` if they differ)."""
     by_night: dict[str, dict] = {}
     for doc in cases.values():
         for point in doc["points"]:
@@ -467,8 +467,8 @@ def latency_document(data: dict, store_nights: list[dict], in_window) -> dict:
     """The ``latency`` block of the trend document: ``nights[]`` (``{id, at,
     build}``, oldest first) and, per scope, one point per night the scope
     recorded a rep (``latency_point``). A night is the Nightly page's
-    (``nightly.filed_nights``, its parts only; a case both parts recorded
-    counts as the main part recorded it) under the id the store's records
+    (``nightly.filed_nights``, its parts only; a case two parts recorded
+    counts as the first part in report order recorded it) under the id the store's records
     of it carry (``night_id``), dated by the store's night when it holds
     one, so the row's points sit under the bars above them, else by its
     parts' newest finish (or start). ``in_window`` is the page's window."""

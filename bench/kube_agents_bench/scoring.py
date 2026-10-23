@@ -617,7 +617,7 @@ class RepResult:
     report: str = ""
     #: Named checks the inject lane set aside as not applicable on this
     #: record's transport (``tool_called``, ``worker_commands``,
-    #: ``worker_agents``). Empty on
+    #: ``worker_agents``, ``worker_budget``). Empty on
     #: the api transport; the scores above are recomputed without them.
     not_applicable_checks: list[str] = field(default_factory=list)
 
@@ -940,7 +940,7 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
 
     The rule (#2039): on a record that is the inject transport's envelope
     from a door that showed no tool-call trace (:func:`_inject_blind`), every report entry the
-    task declares with only ``tool_called``, ``worker_commands`` or ``worker_agents`` leaves
+    task declares with only ``tool_called``, ``worker_commands``, ``worker_agents`` or ``worker_budget`` leaves
     (:attr:`CaseSpec.transport_blind_checks`) is set aside as not
     applicable -- whatever devops-bench recorded
     for it, a ``fail`` from an empty trajectory or an ``error`` from an
@@ -1016,7 +1016,7 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
     # upstream emits VerificationCoverage whenever the verification metric
     # applied, and omits VerificationCorrectness when every objective entry
     # errored -- which on this transport is what a task whose objectives are
-    # all worker_commands / worker_agents looks like, and is exactly the case
+    # all worker_commands / worker_agents / worker_budget looks like, and is exactly the case
     # the lane exists to report as not graded rather than as rung 2.
     gate_ran = SCORE_KEY_COVERAGE in record.scores
     # devops-bench's OutcomeScore composite was computed with the blind

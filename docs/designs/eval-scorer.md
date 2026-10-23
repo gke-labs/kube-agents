@@ -148,7 +148,7 @@ transport carries the task's lifecycle envelope as its trajectory (`inject.task`
 calls without their results, so it names no card. The delegation wait reads the cards from the
 pod instead, by the Hermes session the bridge's `api` executor ran the turn in, so such a record
 can carry the delegated workers' tagged entries and token counts. The scorer still treats
-`worker_commands`, `worker_agents`, `report_times_in_window`, a `tool_called` in the `workers` or `all` scope, and a
+`worker_commands`, `worker_agents`, `worker_budget`, `report_times_in_window`, a `tool_called` in the `workers` or `all` scope, and a
 `tool_called` with a `result` pattern (the trace records no results) as blind on
 every such record, a policy that stays until `scoring.py` grades them on records that carry the
 workers ([#2619](https://github.com/gke-labs/kube-agents/issues/2619)); any other router-scope `tool_called` is blind only when the
@@ -159,8 +159,8 @@ trajectory carries the transport's task marker (`_inject_record()` in `scoring.p
 router-scope `tool_called` also either no `a2a.activity` marker and nothing outside the envelope,
 or a marker that reports a loss (`_inject_blind()`); `test_scoring.py` holds the literals equal to
 the transport's. When it holds,
-every report entry the task declares whose check is made of `tool_called`, `worker_commands` or
-`worker_agents` leaves and nothing else (`CaseSpec.transport_blind_checks`, by entry name, split
+every report entry the task declares whose check is made of `tool_called`, `worker_commands`,
+`worker_agents` or `worker_budget` leaves and nothing else (`CaseSpec.transport_blind_checks`, by entry name, split
 into `trace_blind_checks` and `worker_blind_checks` by which condition applies; a compound mixing
 in an applicable leaf is not in either set, because that leaf can fail on any transport and
 setting the entry aside would hide it) is set aside as `not_applicable`, whatever
