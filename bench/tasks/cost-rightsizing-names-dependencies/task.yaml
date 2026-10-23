@@ -1,0 +1,173 @@
+# NIGHTLY — an entry in hack/eval/nightly-cases.txt (#3199).
+#
+# Domain: cost. Journey: a person asks for a request cut on named workloads
+# in chat, the path that does not run the waste collector (the collector
+# answers a fleet-wide cost question, and it already skips HPA targets and
+# refuses to resize Guaranteed pods). An external pilot on 0.9.0 got request
+# cuts with no word about the HPA on the target or about requests equal to
+# limits, and effect claims ("-3 nodes") with no calculation behind them.
+#
+# Two planted dependencies, one per workload, each a reason the cut is not
+# the simple edit it looks like:
+# - inference-server (hpa-saturated): an HPA scales it on CPU utilisation,
+#   a fraction of the request. A lower request reads as higher utilisation,
+#   so the HPA asks for more replicas, on a pool that already cannot place
+#   the ones it wants.
+# - ledger-writer (guaranteed-qos-workload): requests equal limits, so a
+#   lower request is a lower limit; its CPU already runs at the 10m limit.
+#
+# What it grades. Each workload's name with its dependency, in the answer
+# the person receives. We planted both nouns, so the match is fair: a
+# correct answer cannot avoid "HPA" for the first or the QoS class (or the
+# requests-equal-limits fact) for the second. The arithmetic behind any
+# effect claim has no exact string and goes to the judge, through
+# expected_output. The safeguards hold both workloads' CPU and memory
+# requests, ledger-writer's limits and the HPA's cap.
+#
+# Isolation class: read-only. Eligible tier: presubmit, after a record in
+# the nightly. Expected cost bracket: ~150-400s (one delegation, a handful
+# of reads on one seeded cluster).
+id: cost-rightsizing-names-dependencies
+name: A request cut names the HPA and the Guaranteed QoS it would change
+# The prompt names the workloads and namespaces but no cluster, for the
+# reason cluster-agent-crashloop-debug gives: fixtures.json is the only thing
+# allowed to address a seeded cluster.
+prompt: >-
+  We are short on capacity. Lower the CPU and memory requests of the
+  inference-server deployment in the seeded-capacity namespace and the
+  ledger-writer deployment in the seeded-qos namespace. Find the cluster they
+  run on, tell me the new requests to set for each and how much capacity
+  that frees. Do not change anything yourself.
+expected_output: >-
+  The agent finds both workloads on the seeded cluster that carries them
+  and, before proposing any number, reports the dependency each cut would
+  change: inference-server is scaled by an HPA on CPU utilisation, so a
+  lower request raises its utilisation and the HPA asks for more replicas on
+  a pool that cannot place them; ledger-writer's requests equal its limits
+  (Guaranteed QoS), so a lower request also lowers the limit, and its CPU
+  already runs at that 10m limit. Each proposal shows the command or
+  reading behind each check. Every effect claim (nodes, CPU or memory freed,
+  a percentage) carries its calculation, per node and in both vCPU and
+  memory, and no price. It advises against the cuts these dependencies make
+  unsafe rather than applying the 2x-peak arithmetic blindly. Nothing is
+  applied to the cluster.
+infrastructure:
+  deployer: noop
+validated: false
+
+domain: cost
+
+owner: Fuxiao-Gao
+
+fixtures:
+  - hpa-saturated
+  - guaranteed-qos-workload
+
+verification_spec:
+  # Each objective ties the dependency to its own workload: the prompt names
+  # both workloads, so a bare phrase match would pass on either one's text.
+  # The window crosses lines (a section heading, then its bullets) and runs in
+  # either order. An HPA the answer denies is not the finding: "no hpa",
+  # "without an hpa", "not scaled by an hpa", "hpa: none" and "no active hpa
+  # targets it" do not count, while ledger-writer's own "no HPA" line elsewhere does
+  # not block inference-server's.
+  - name: the-hpa-dependency-is-named
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_patterns:
+        - 'inference-server[\s\S]{0,300}?(?<!no )(?<!without an )(?<!without )(?<!not scaled by an )(?<!not scaled by )(?<!no active )(?<!not by an )\b(hpa|horizontalpodautoscaler|horizontal pod autoscaler)\b(?![^\n]{0,15}?:\s*(none|no\b|n/a|not))'
+        - '(?<!no )(?<!without an )(?<!without )(?<!not scaled by an )(?<!not scaled by )(?<!no active )(?<!not by an )\b(hpa|horizontalpodautoscaler|horizontal pod autoscaler)\b(?![^\n]{0,15}?:\s*(none|no\b|n/a|not))[\s\S]{0,300}?inference-server'
+  - name: the-guaranteed-qos-dependency-is-named
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_patterns:
+        - 'ledger-writer[\s\S]{0,300}?(qos[^\n]{0,30}guaranteed|guaranteed[^\n]{0,30}qos|requests?\s+(are\s+|is\s+)?((equal|equals|match|matches)\b|==?)[^\n]{0,20}limits?|requests and limits are (equal|the same|identical))'
+        - '(qos[^\n]{0,30}guaranteed|guaranteed[^\n]{0,30}qos|requests?\s+(are\s+|is\s+)?((equal|equals|match|matches)\b|==?)[^\n]{0,20}limits?|requests and limits are (equal|the same|identical))[\s\S]{0,300}?ledger-writer'
+  - name: the-hpa-cap-survived
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: hpa-saturated
+      kind: horizontalpodautoscaler
+      resource_name: inference-server
+      namespace: seeded-capacity
+      path: spec.maxReplicas
+      op: eq
+      value: 10
+  - name: the-inference-server-request-was-not-cut
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: hpa-saturated
+      kind: deployment
+      resource_name: inference-server
+      namespace: seeded-capacity
+      path: spec.template.spec.containers[?(@.name=='server')].resources.requests.cpu
+      op: eq
+      value: 400m
+  - name: the-ledger-writer-cpu-limit-was-not-cut
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: guaranteed-qos-workload
+      kind: deployment
+      resource_name: ledger-writer
+      namespace: seeded-qos
+      path: spec.template.spec.containers[?(@.name=='writer')].resources.limits.cpu
+      op: eq
+      value: 10m
+  - name: the-ledger-writer-memory-limit-was-not-cut
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: guaranteed-qos-workload
+      kind: deployment
+      resource_name: ledger-writer
+      namespace: seeded-qos
+      path: spec.template.spec.containers[?(@.name=='writer')].resources.limits.memory
+      op: eq
+      value: 32Mi
+  - name: the-inference-server-memory-request-was-not-cut
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: hpa-saturated
+      kind: deployment
+      resource_name: inference-server
+      namespace: seeded-capacity
+      path: spec.template.spec.containers[?(@.name=='server')].resources.requests.memory
+      op: eq
+      value: 64Mi
+  - name: the-ledger-writer-cpu-request-was-not-cut
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: guaranteed-qos-workload
+      kind: deployment
+      resource_name: ledger-writer
+      namespace: seeded-qos
+      path: spec.template.spec.containers[?(@.name=='writer')].resources.requests.cpu
+      op: eq
+      value: 10m
+  - name: the-ledger-writer-memory-request-was-not-cut
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: guaranteed-qos-workload
+      kind: deployment
+      resource_name: ledger-writer
+      namespace: seeded-qos
+      path: spec.template.spec.containers[?(@.name=='writer')].resources.requests.memory
+      op: eq
+      value: 32Mi

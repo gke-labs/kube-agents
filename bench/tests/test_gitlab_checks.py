@@ -234,6 +234,18 @@ def route_mr3(gitlab, **overrides) -> dict:
     return mr
 
 
+def test_removed_paths_is_unevaluable_on_gitlab_not_a_pass(env, gitlab):
+    # removed_paths reads GitHub's file listing. A merge request that only adds
+    # a "delete" marker passes every other clause, so on GitLab the clause must
+    # leave the check unevaluated, never pass it (#3644 review).
+    route_mr3(gitlab)
+    stash(f"Opened {MR3_URL}")
+    result = pr_check(removed_paths=["ns/namespace.yaml"]).verify(30)
+    assert result.success is False
+    assert result.status == "error", result.reason
+    assert "removed_paths" in result.reason and "not implemented for GitLab" in result.reason
+
+
 def test_a_merge_request_opened_in_the_run_passes(env, gitlab):
     route_mr3(gitlab)
     stash(f"Opened {MR3_URL}")
