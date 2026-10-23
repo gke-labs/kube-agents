@@ -7,12 +7,14 @@ the same words; the tests moved with it. ``test_router_server.py`` now only
 checks that the tool still delegates here.
 """
 
+import json
 import os
 import sys
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 # Add the directory containing agent_roster.py to sys.path so it can be imported.
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
@@ -246,6 +248,216 @@ class TestDiscoveryDegradesOnIOError(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             agent_roster.PROFILES_BASE = Path(tmp) / "does-not-exist"
             self.assertIn("No specialist agents", agent_roster.render())
+
+
+class TestModelIdentity(unittest.TestCase):
+    """Backing model and provider resolution for #3295."""
+
+    def setUp(self):
+        agent_roster._cached_gateway_model = ""
+        agent_roster._cached_gateway_model_expires_at = 0.0
+        agent_roster._next_gateway_probe_at = 0.0
+
+    def tearDown(self):
+        agent_roster._cached_gateway_model = ""
+        agent_roster._cached_gateway_model_expires_at = 0.0
+        agent_roster._next_gateway_probe_at = 0.0
+
+    def _render_from_gateway(self, backing, alias="model-default", env=None):
+        """Render with the gateway's model info naming ``backing`` for ``alias``."""
+        payload = {"data": [{"model_name": alias, "litellm_params": {"model": backing}}]}
+        fake_resp = mock.MagicMock()
+        fake_resp.__enter__.return_value.read.return_value = json.dumps(payload).encode("utf-8")
+        environ = {"INFERENCE_GATEWAY_SERVICE_HOST": "10.0.0.1", **(env or {})}
+        with mock.patch.dict(os.environ, environ, clear=True):
+            with mock.patch("urllib.request.urlopen", return_value=fake_resp):
+                return agent_roster.render_model_identity()
+
+    def test_renders_backing_model_from_gateway(self):
+        out = self._render_from_gateway("vertex_ai/gemini-3.8-flash")
+        self.assertIsNotNone(out)
+        self.assertIn("Backing model: gemini-3.8-flash", out)
+        self.assertIn("Provider: Google Cloud Vertex AI (vertex_ai)", out)
+        self.assertNotIn("model-default", out)
+
+    def test_hermes_agent_alias_entry_is_read_too(self):
+        out = self._render_from_gateway("anthropic/claude-opus-5", alias="hermes-agent")
+        self.assertIn("Backing model: claude-opus-5", out)
+        self.assertIn("Provider: Anthropic (anthropic)", out)
+
+    def test_omits_provider_line_for_an_unmapped_litellm_handler(self):
+        # openai_compatible installs render every alias as hosted_vllm/<model>.
+        # The served id keeps its own spelling: vLLM ids are case-sensitive.
+        out = self._render_from_gateway("hosted_vllm/meta-llama/Llama-3.1-8B-Instruct")
+        self.assertIsNotNone(out)
+        self.assertIn("Backing model: meta-llama/Llama-3.1-8B-Instruct", out)
+        self.assertNotIn("Provider:", out)
+
+    def test_provider_key_is_matched_casefolded(self):
+        out = self._render_from_gateway("Vertex_AI/gemini-3.8-flash")
+        self.assertIn("Provider: Google Cloud Vertex AI (vertex_ai)", out)
+
+    def test_filters_out_placeholder_names_in_any_case(self):
+        for backing in (
+            "custom/model-default",
+            "custom/hermes-agent",
+            "model-default",
+            "Model-Default",
+            "custom/HERMES-AGENT",
+            "custom",
+            "openai/Custom",
+        ):
+            agent_roster._next_gateway_probe_at = 0.0
+            with self.subTest(backing=backing):
+                self.assertIsNone(self._render_from_gateway(backing))
+
+    def test_env_overrides_are_not_a_source(self):
+        # Nothing in the chart, operator or installer sets these on the agent
+        # container; the gateway is the one source of the backing model.
+        env = {
+            "LITELLM_BACKING_MODEL": "anthropic/claude-opus-5",
+            "MODEL_PROVIDER": "anthropic",
+            "MODEL_NAME": "claude-opus-5",
+        }
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertIsNone(agent_roster.render_model_identity())
+        out = self._render_from_gateway("vertex_ai/gemini-3.8-flash", env=env)
+        self.assertIn("Backing model: gemini-3.8-flash", out)
+        self.assertNotIn("claude", out)
+
+    def test_resolves_from_litellm_model_info_endpoint(self):
+        payload = {
+            "data": [
+                {
+                    "model_name": "model-default",
+                    "litellm_params": {"model": "vertex_ai/gemini-3.8-flash"},
+                }
+            ]
+        }
+        fake_resp = mock.MagicMock()
+        fake_resp.__enter__.return_value.read.return_value = json.dumps(payload).encode("utf-8")
+        with mock.patch.dict(os.environ, {"INFERENCE_GATEWAY_SERVICE_HOST": "10.0.0.1"}, clear=True):
+            with mock.patch("urllib.request.urlopen", return_value=fake_resp) as mocked_open:
+                first = agent_roster.render_model_identity()
+                second = agent_roster.render_model_identity()
+        self.assertEqual(mocked_open.call_count, 1)
+        self.assertEqual(first, second)
+        self.assertIn("Backing model: gemini-3.8-flash", first)
+        self.assertIn("Provider: Google Cloud Vertex AI (vertex_ai)", first)
+
+    def test_returns_none_without_a_gateway(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch("urllib.request.urlopen") as mocked_open:
+                self.assertIsNone(agent_roster.render_model_identity())
+        mocked_open.assert_not_called()
+
+    def test_reprobes_after_ttl_and_picks_up_switched_model(self):
+        payload1 = {
+            "data": [
+                {
+                    "model_name": "model-default",
+                    "litellm_params": {"model": "vertex_ai/gemini-3.8-flash"},
+                }
+            ]
+        }
+        payload2 = {
+            "data": [
+                {
+                    "model_name": "model-default",
+                    "litellm_params": {"model": "anthropic/claude-opus-5"},
+                }
+            ]
+        }
+        resp1 = mock.MagicMock()
+        resp1.__enter__.return_value.read.return_value = json.dumps(payload1).encode("utf-8")
+        resp2 = mock.MagicMock()
+        resp2.__enter__.return_value.read.return_value = json.dumps(payload2).encode("utf-8")
+
+        current_time = 1000.0
+        with mock.patch.dict(os.environ, {"INFERENCE_GATEWAY_SERVICE_HOST": "10.0.0.1"}, clear=True):
+            with mock.patch("time.monotonic", side_effect=lambda: current_time):
+                with mock.patch("urllib.request.urlopen", side_effect=[resp1, resp2]) as mocked_open:
+                    # Initial probe
+                    out1 = agent_roster.render_model_identity()
+                    self.assertIn("gemini-3.8-flash", out1)
+                    self.assertEqual(mocked_open.call_count, 1)
+
+                    # Within TTL: returns cached
+                    current_time += 100.0
+                    out2 = agent_roster.render_model_identity()
+                    self.assertIn("gemini-3.8-flash", out2)
+                    self.assertEqual(mocked_open.call_count, 1)
+
+                    # Past TTL: reprobes and updates
+                    current_time += 250.0  # total +350s > 300s TTL
+                    out3 = agent_roster.render_model_identity()
+                    self.assertIn("claude-opus-5", out3)
+                    self.assertIn("Anthropic (anthropic)", out3)
+                    self.assertEqual(mocked_open.call_count, 2)
+
+    def test_reprobe_failure_retains_cached_model_and_enters_cooldown(self):
+        payload1 = {
+            "data": [
+                {
+                    "model_name": "model-default",
+                    "litellm_params": {"model": "vertex_ai/gemini-3.8-flash"},
+                }
+            ]
+        }
+        resp1 = mock.MagicMock()
+        resp1.__enter__.return_value.read.return_value = json.dumps(payload1).encode("utf-8")
+
+        current_time = 1000.0
+        with mock.patch.dict(os.environ, {"INFERENCE_GATEWAY_SERVICE_HOST": "10.0.0.1"}, clear=True):
+            with mock.patch("time.monotonic", side_effect=lambda: current_time):
+                with mock.patch("urllib.request.urlopen", side_effect=[resp1, OSError("probe failed")]) as mocked_open:
+                    # Initial probe succeeds
+                    out1 = agent_roster.render_model_identity()
+                    self.assertIn("gemini-3.8-flash", out1)
+                    self.assertEqual(mocked_open.call_count, 1)
+
+                    # TTL expires, re-probe fails with OSError
+                    current_time += 350.0
+                    out2 = agent_roster.render_model_identity()
+                    self.assertIn("gemini-3.8-flash", out2)  # retains last good model
+                    self.assertEqual(mocked_open.call_count, 2)
+
+                    # In failure cooldown: does not retry urlopen
+                    current_time += 10.0  # within 30s cooldown
+                    out3 = agent_roster.render_model_identity()
+                    self.assertIn("gemini-3.8-flash", out3)
+                    self.assertEqual(mocked_open.call_count, 2)
+
+    def test_degrades_and_respects_cooldown_when_gateway_fails_or_returns_non_object(self):
+        with mock.patch.dict(os.environ, {"INFERENCE_GATEWAY_SERVICE_HOST": "10.0.0.1"}, clear=True):
+            with mock.patch("urllib.request.urlopen", side_effect=OSError("unreachable")) as mocked_open:
+                self.assertIsNone(agent_roster.render_model_identity())
+                self.assertIsNone(agent_roster.render_model_identity())
+        self.assertEqual(mocked_open.call_count, 1)
+
+        agent_roster._next_gateway_probe_at = 0.0
+        bad_resp = mock.MagicMock()
+        bad_resp.__enter__.return_value.read.return_value = b"[]"
+        with mock.patch.dict(os.environ, {"INFERENCE_GATEWAY_SERVICE_HOST": "10.0.0.1"}, clear=True):
+            with mock.patch("urllib.request.urlopen", return_value=bad_resp) as mocked_bad:
+                self.assertIsNone(agent_roster.render_model_identity())
+                self.assertIsNone(agent_roster.render_model_identity())
+        self.assertEqual(mocked_bad.call_count, 1)
+
+    def test_logs_when_model_info_names_no_alias_or_is_not_an_object(self):
+        no_alias = {"data": [{"model_name": "gemini-only", "litellm_params": {"model": "vertex_ai/gemini-3.8-flash"}}]}
+        cases = ((json.dumps(no_alias).encode("utf-8"), "entry with a backing model"), (b"[]", "not a JSON object"))
+        for body, expected in cases:
+            agent_roster._next_gateway_probe_at = 0.0
+            resp = mock.MagicMock()
+            resp.__enter__.return_value.read.return_value = body
+            with mock.patch.dict(os.environ, {"INFERENCE_GATEWAY_SERVICE_HOST": "10.0.0.1"}, clear=True):
+                with mock.patch("urllib.request.urlopen", return_value=resp):
+                    with mock.patch.object(agent_roster, "log") as mocked_log:
+                        self.assertIsNone(agent_roster.render_model_identity())
+            mocked_log.assert_called_once()
+            self.assertIn(expected, mocked_log.call_args[0][0])
+            self.assertGreater(agent_roster._next_gateway_probe_at, 0.0)
 
 
 if __name__ == "__main__":

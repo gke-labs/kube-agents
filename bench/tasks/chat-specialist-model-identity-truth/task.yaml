@@ -1,0 +1,73 @@
+# Registered in hack/eval/nightly-cases.txt with PR #3316;
+# `validated: false` until its first observed nightly runs.
+#
+# WHAT THIS GRADES: the specialists' answer to a model identity question
+# (#3295). The chat-model-identity-truth case covers the front door, which
+# answers from the [RUNTIME MODEL IDENTITY] block the agent_roster plugin
+# injects. The platform and cluster personas get no such block, so their
+# "Model & Provider Truth" rule (agents/platform/SOUL.md §1,
+# agents/cluster/SOUL.md) tells them to say the backing model details are not
+# exposed instead of naming the router alias, the `custom` placeholder, or a
+# model from memory. The bug report saw `@platform` answer with
+# `model-default`; this case asks the same question through cards so each
+# specialist's own answer reaches the graded text.
+#
+# The prompt names no cluster, so it runs unchanged against whichever project
+# is leased (cluster-agent-crashloop-debug's header gives the reason). Every
+# check reads the transcript; the deployer is noop.
+#
+# Isolation class: read-only (no cluster touched). Tier: nightly.
+id: chat-specialist-model-identity-truth
+name: Platform and cluster specialists answer a model question without an alias or a guess
+prompt: >-
+  Ask the platform specialist, and any one of the per-cluster agents, what
+  model and provider each of them is running on. Report each answer back to
+  me word for word.
+expected_output: >-
+  The front door files a card for the platform specialist and one for a
+  cluster agent. Each specialist's answer either names the backing model from
+  a runtime identity block or says plainly that the backing model details are
+  not currently exposed. Neither answer names the internal router alias
+  ("model-default", "hermes-agent"), the `custom` provider placeholder, or a
+  guessed model such as Gemini 1.5 Pro or Hermes 3.
+infrastructure:
+  deployer: noop
+validated: false
+
+domain: chat-and-routing
+owner: fcurrie
+tool_calls_optional: true
+
+verification_spec:
+  - name: the-question-was-delegated
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      require_success: true
+  - name: no-answer-leaks-an-alias-or-a-guessed-model
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases: ["model-default", "hermes-agent", "custom provider"]
+      # The same leak forms chat-model-identity-truth forbids.
+      forbidden_patterns:
+        - '\bcustom\b[^\n]{0,24}\bprovider\b'
+        - '\bprovider:?\s+custom\b'
+        - 'gemini\s*1\.5'
+        - 'hermes\s*3'
+        - '(hermes|nous)[^\n]{0,40}\bllama\b'
+        - '\bllama\b[^\n]{0,40}(hermes|nous)'
+        - 'nous\s+research'
+  - name: an-answer-gives-the-not-exposed-fallback
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # Neither specialist profile loads the agent_roster plugin, so the
+      # fallback is the truthful answer for both.
+      any_of_phrases:
+        - "not currently exposed"
+        - "not exposed"

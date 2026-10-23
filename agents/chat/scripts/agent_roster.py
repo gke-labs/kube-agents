@@ -20,8 +20,11 @@
 # Everything here degrades rather than raises. The profiles live on a shared
 # PVC, so an I/O or permission fault must not turn routing into a traceback.
 
+import json
 import os
 import sys
+import time
+import urllib.request
 
 from pathlib import Path
 
@@ -57,6 +60,21 @@ IDENTITY_FIELD_PREFIX = "cluster_"
 IDENTITY_NOTE = " (the {cluster} cluster agent{where})"
 IDENTITY_WHERE = "; {places}"
 IDENTITY_PLACE = "{key} {value}"
+
+_PROVIDER_LABELS = {
+    "vertex_ai": "Google Cloud Vertex AI",
+    "gemini": "Google Gemini",
+    "anthropic": "Anthropic",
+    "openai": "OpenAI",
+}
+_PLACEHOLDER_ALIASES = {"model-default", "hermes-agent"}
+_CUSTOM_PROVIDER = "custom"
+_PROBE_SUCCESS_CACHE_TTL_SECS = 300.0
+_PROBE_RETRY_COOLDOWN_SECS = 30.0
+
+_cached_gateway_model: str = ""
+_cached_gateway_model_expires_at: float = 0.0
+_next_gateway_probe_at: float = 0.0
 
 
 def log(msg: str) -> None:
@@ -244,3 +262,94 @@ def render(base: Path | None = None) -> str | None:
     that as "say nothing about the fleet" rather than "the fleet is empty".
     """
     return format_roster(discover(base))
+
+
+def _split_backing(raw: str) -> tuple[str, str]:
+    """Split `<provider>/<model>` and drop placeholder router names.
+
+    The provider key is casefolded, and the model half is compared casefolded,
+    so `Model-Default` or `Custom` is caught the same way as the lowercase
+    spelling. A model half that is a router alias or the bare `custom`
+    placeholder means no backing model is known. The model half keeps its own
+    spelling, because a served model id (a Hugging Face id on vLLM) is
+    case-sensitive.
+    """
+    s = raw.strip()
+    if not s:
+        return "", ""
+    provider_key, model_name = s.split("/", 1) if "/" in s else ("", s)
+    provider_key, model_name = provider_key.strip().casefold(), model_name.strip()
+    folded = model_name.casefold()
+    if not model_name or folded in _PLACEHOLDER_ALIASES or folded == _CUSTOM_PROVIDER:
+        return "", ""
+    return provider_key, model_name
+
+
+def _probe_gateway_model() -> str:
+    """Resolve the backing `<provider>/<model>` from LiteLLM.
+
+    Results are cached for ``_PROBE_SUCCESS_CACHE_TTL_SECS`` so provider switches
+    in LiteLLM take effect without pod restarts, while network errors keep the
+    last-known good model and respect a 30s failure cooldown.
+    """
+    global _cached_gateway_model, _cached_gateway_model_expires_at, _next_gateway_probe_at
+    now = time.monotonic()
+    if _cached_gateway_model and now < _cached_gateway_model_expires_at:
+        return _cached_gateway_model
+    if now < _next_gateway_probe_at:
+        return _cached_gateway_model
+
+    if not os.environ.get("INFERENCE_GATEWAY_SERVICE_HOST", "").strip():
+        return _cached_gateway_model
+    ns = os.environ.get("KUBE_DEFAULT_NAMESPACE", "kubeagents-system").strip() or "kubeagents-system"
+    url = f"http://inference-gateway.{ns}.svc.cluster.local/v1/model/info"
+
+    # The 0.5s timeout bounds the connect and the read, not the DNS lookup. A
+    # degraded cluster DNS can hold a user turn for longer, at most once per
+    # cooldown window.
+    try:
+        with urllib.request.urlopen(url, timeout=0.5) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+        if not isinstance(payload, dict):
+            log(f"model info from {url} is not a JSON object; backing model unknown")
+            _next_gateway_probe_at = now + _PROBE_RETRY_COOLDOWN_SECS
+            return _cached_gateway_model
+        for entry in payload.get("data") or ():
+            if isinstance(entry, dict) and entry.get("model_name") in _PLACEHOLDER_ALIASES:
+                params = entry.get("litellm_params")
+                model = str((params if isinstance(params, dict) else {}).get("model") or "").strip()
+                if _split_backing(model)[1]:
+                    _cached_gateway_model = model
+                    _cached_gateway_model_expires_at = now + _PROBE_SUCCESS_CACHE_TTL_SECS
+                    return model
+        log(f"model info from {url} has no {sorted(_PLACEHOLDER_ALIASES)} entry with a backing model")
+    except Exception as e:
+        log(f"cannot read model info from {url}: {e}")
+
+    _next_gateway_probe_at = now + _PROBE_RETRY_COOLDOWN_SECS
+    return _cached_gateway_model
+
+
+def render_model_identity() -> str | None:
+    """Render the backing LLM model and provider when known, or ``None``.
+
+    The in-cluster LiteLLM gateway is the only source. Nothing in the chart,
+    operator or installer sets a model variable on the agent container, so an
+    env override would be a second source that only a hand edit can fill.
+    """
+    provider_key, model_name = _split_backing(_probe_gateway_model())
+    if not model_name:
+        return None
+    if provider_key in _PROVIDER_LABELS:
+        prov = f"Provider: {_PROVIDER_LABELS[provider_key]} ({provider_key})"
+        return (
+            f"Backing model: {model_name}\n{prov}\n"
+            "When asked what model or provider you are running on, state this backing model "
+            "and provider directly; never report internal router alias names or the `custom` "
+            "provider placeholder."
+        )
+    return (
+        f"Backing model: {model_name}\n"
+        "When asked what model you are running on, state this backing model directly; "
+        "never report internal router alias names or the `custom` provider placeholder."
+    )

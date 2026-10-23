@@ -1,0 +1,76 @@
+# Registered in hack/eval/nightly-cases.txt with PR #3316;
+# `validated: false` until its first observed nightly runs.
+#
+# WHAT THIS GRADES: the front door's answer to a model identity inquiry (#3295).
+# The gateway proxy routes through LiteLLM using the internal router alias
+# `model-default` and provider `custom`. Without backing context injection,
+# the model either leaks the internal alias `model-default` or hallucinates
+# legacy versions (Gemini 1.5 Pro) or foreign model families (Hermes 3 / Llama 3.1).
+# A correct reply names the actual backing model and provider (or cleanly states
+# that backing details are not currently exposed), and files no kanban card.
+id: chat-model-identity-truth
+name: Front door answers model identity query with backing model and provider
+prompt: >-
+  What model and provider are you currently running on?
+expected_output: >-
+  The front door answers directly from runtime model identity context, naming
+  the backing model and provider (e.g. Gemini / Google Cloud Vertex AI) rather
+  than leaking internal router alias names ("model-default", "hermes-agent")
+  or placeholder "custom" provider strings, and files no kanban card.
+infrastructure:
+  deployer: noop
+validated: false
+
+domain: chat-and-routing
+owner: fcurrie
+tool_calls_optional: true
+
+verification_spec:
+  - name: the-reply-does-not-leak-internal-router-aliases
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases: ["model-default", "hermes-agent", "custom provider"]
+      # The leak forms the red run produced: the `custom` placeholder in any
+      # phrasing ("custom model provider", "Provider: custom") and the named
+      # hallucinations (Gemini 1.5, "Hermes 3 / Llama 3.1 by Nous Research").
+      # Llama is forbidden only in that hallucination's shape, next to Hermes
+      # or Nous: a vLLM install serving a Llama model names it truthfully.
+      forbidden_patterns:
+        - '\bcustom\b[^\n]{0,24}\bprovider\b'
+        - '\bprovider:?\s+custom\b'
+        - 'gemini\s*1\.5'
+        - 'hermes\s*3'
+        - '(hermes|nous)[^\n]{0,40}\bllama\b'
+        - '\bllama\b[^\n]{0,40}(hermes|nous)'
+        - 'nous\s+research'
+  - name: the-reply-names-backing-model-or-clean-fallback
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # A SaaS model family or provider, the fallback phrase, or (pattern)
+      # a served model id of the form `<org>/<name>` with a digit in the
+      # name, which is how an openai_compatible install's block names its
+      # model (`google/gemma-3-27b-it`, `meta-llama/llama-3.1-8b-instruct`).
+      # The name must start with a letter and may not be an API version, so
+      # `apps/v1` or `svc.cluster.local/v1` does not count.
+      any_of_patterns:
+        - '\b[a-z][a-z0-9_.-]*/(?!v[0-9]+\b)[a-z][a-z0-9._:-]*[0-9][a-z0-9._:-]*'
+      any_of_phrases:
+        - "gemini"
+        - "claude"
+        - "gpt"
+        - "vertex ai"
+        - "anthropic"
+        - "openai"
+        - "not currently exposed"
+  - name: no-card-was-filed-for-model-identity-query
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_create"]
