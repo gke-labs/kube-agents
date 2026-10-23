@@ -2832,8 +2832,8 @@ export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-${BLOCKING_ROSTER_DEFAULT}}"
 # It defaults to unset because arming is a Prow-config decision, never a
 # default here: a laptop run must not read, let alone write, the production
 # store. Both Prow jobs export it since oss-test-infra#2698 (2026-09-14) --
-# the nightly periodic (ci-kube-agents-eval-nightly, EVAL_TIER=nightly) as
-# eval-baseline-recorder with objectViewer and objectCreator on
+# the nightly periodics (ci-kube-agents-eval-nightly, EVAL_TIER=nightly, and
+# its siblings) as eval-baseline-recorder with objectViewer and objectCreator on
 # gs://kube-agents-evals-bench, the presubmit as prowjob-default-sa with
 # objectViewer only. Pointing at a bucket that is unreachable is not fatal --
 # the store degrades to advisory with a banner -- but it is a banner on every
@@ -2914,6 +2914,11 @@ unit_cost_hint() {
     # a plant that blocks on a card appearing, then an agent turn that waits on
     # that card finishing. A wrong hint costs packing, not correctness.
     gitops-drift-out-of-band-triage) echo 900 ;;
+    # The #612 cases on the same stack: the stamp case is the incumbent's
+    # shape; the quiet case's plant waits out the 15m quiet period before a
+    # short turn.
+    autoops-warning-event-triage-state-stamp) echo 900 ;;
+    autoops-quiet-followup) echo 1800 ;;
     # Another of the same shape: infra lock, a plant that publishes a burst and
     # then waits out the human record's card, then an agent turn that is a
     # board read. Priced at the band rather than at the 566-677s its
@@ -2933,6 +2938,9 @@ unit_cost_hint() {
     # measured 7-11 minutes a repetition on a dev install.
     gitops-drift-deleted-policy-triage) echo 900 ;;
     gitops-drift-load-bearing-change-triage) echo 900 ;;
+    # The autoops-incident stack at three replicas, on the infra lock, and a
+    # board read. Unmeasured; priced with autoops-warning-event-triage.
+    incident-triage-workload-fold) echo 900 ;;
     # Tofu too, and the same shape, plus a plant that waits out
     # stall_report.py's ten-minute Deployment threshold before it posts the
     # record and then waits for the card. 1040-1080s a repetition on a dev
@@ -4029,12 +4037,14 @@ profile_begin "record + final gate"
 # so its key reads today; but a rolled-back install is not the fresh today
 # install today's window measures. `bench-gate record` refuses it too.
 #
-# A next-mode run on main does record. The next-mode nightly
-# (ci-kube-agents-eval-nightly-next-claude) is a periodic with no PULL_NUMBER,
-# and its matrix runs over the inject transport, which `bench-gate` reads as
-# the version key's `next` mode: its lines file under a key of their own,
-# never today's, and are the window an inject-lane run at the same agent model
-# (setupId) is compared with.
+# A next-mode run on main does record. The main nightly
+# (ci-kube-agents-eval-nightly and its -writers part, EVAL_MODE_NEXT=1) is a
+# periodic with no PULL_NUMBER, and its matrix runs over the inject transport,
+# which `bench-gate` reads as the version key's `next` mode: its lines file
+# under a key of their own, never today's, and are the window an inject-lane
+# run at the same agent model (setupId) is compared with. Today's window is
+# recorded by ci-kube-agents-eval-nightly-today, the today-mode nightly kept
+# as the rollback check, over the api transport.
 # (ci-kube-agents-eval-nightly-gitlab-next stays out on the GitLab condition
 # above.) Whether the job's identity may append is a grant in oss-test-infra
 # this script cannot see; without it the append fails, is logged, and the

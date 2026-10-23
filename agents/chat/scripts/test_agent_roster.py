@@ -43,6 +43,19 @@ class TestDiscovery(unittest.TestCase):
             self.assertIn("- cluster-a: Read-only cluster diagnostics.", out)
             self.assertNotIn("default", out)
 
+    def test_excludes_dot_prefixed_archive_directories(self):
+        with TemporaryDirectory() as tmp:
+            base = self._with_profiles(tmp, ["platform", "tse"])
+            (base / "platform" / "SOUL.md").write_text("# Platform Agent\n\nManages fleet GitOps.\n")
+            (base / "tse" / "SOUL.md").write_text("# GKE Support Agent (TSE)\n\nTriages L1 GKE support incidents.\n")
+            archived = base / ".deleted" / "tse-20261021T000000Z"
+            archived.mkdir(parents=True)
+            (archived / "SOUL.md").write_text("# Archived Profile\n\nShould not appear in roster.\n")
+
+            discovered = agent_roster.discover(base)
+            self.assertIsNotNone(discovered)
+            self.assertEqual([entry["name"] for entry in discovered], ["platform", "tse"])
+
     def test_a_cluster_agent_shows_the_cluster_it_targets(self):
         # #3082: the assignee id is not a name to show a person, and the cluster
         # name cannot be read back out of it. The scaffold's cluster_identity

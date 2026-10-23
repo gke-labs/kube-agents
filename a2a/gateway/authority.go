@@ -12,8 +12,13 @@ import (
 // permitted to do.
 //
 // `requester` and `audience` are ADVISORY and stay that way. Nothing stops
-// another bus client from inventing them, so consumers MUST NOT authorize on
-// them; they are the audit trail.
+// another bus client from inventing them, so consumers MUST NOT authorize tool
+// or cluster actions on them. As an interim exception until the capability
+// grant (#1884) carries the pseudonymous subject directly, after a task's
+// capability is verified the hermes-bridge passes `requester.principal` and
+// `audience.kind` into the pod's local session-kv store so the conversational
+// memory provider can scope personal memory per speaker and fail closed in
+// shared threads.
 //
 // `grants` is not advisory, and it is not a claim either. It carries a
 // reference — a key in the `cap` bucket and the revision the write returned —

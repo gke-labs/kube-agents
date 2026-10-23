@@ -175,6 +175,36 @@ mcp_servers:
         - list_node_pools
         - list_operations
 
+# Model-call deadlines for the gateway. This overrides the 600s stale bound in
+# deploy/shared/defaults/config.yaml, which this file is merged onto at image
+# build (deploy/docker/merge_configs.py merges maps leaf by leaf, so
+# request_timeout_seconds keeps the base value). stale_timeout_seconds is how
+# long Hermes waits for the first chunk, or for the next one, before it drops
+# the stream and retries (hermes_cli/timeouts.py).
+#
+# The Platform Agent runs as a kanban worker, so it uses 120s, not the front
+# door's 600s. The front door needs 600s because Gemini thinks in silence on
+# this path and a hard front-door prompt took 140-210s before its first chunk.
+# A worker hardly thinks: in the five-run latency benchmark
+# (gke-labs/kube-agents#3140) worker calls used about 100 reasoning tokens
+# each, and 99% of 6,059 worker calls sent their first chunk within 60s. The
+# slow ones were stalls, not thinks: most returned fewer than 120 tokens, three
+# in four missed the prompt cache, and each 600s stale kill matched a Vertex
+# 504. A 120s bound retries such a call up to 480s sooner. Hermes raises the
+# bound for a large prompt (to at least 240s above 50k context tokens and 300s
+# above 100k), so the gain is smaller there. agents/cluster/config.yaml sets the
+# same value for the Cluster Agents.
+#
+# A person can also chat with this profile directly (`hermes -p platform`), and
+# under the unsupported `experimental.platformFrontDoor` chat reaches it as the
+# front door. A hard question there can think in silence for more than 120s,
+# and Hermes then retries the call. Under platformFrontDoor the entrypoint only
+# fills keys this profile lacks, so an install that upgrades keeps the bound it
+# already has, and only a new install gets 120s.
+providers:
+  custom:
+    stale_timeout_seconds: 120
+
 # Explicitly list platform_toolsets
 # platform_toolsets is a reserved framework key in Hermes.
 #

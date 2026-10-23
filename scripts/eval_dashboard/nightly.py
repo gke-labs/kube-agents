@@ -1,7 +1,8 @@
 """One night of the nightly tier as a report, and the digest line about it.
 
 The nightly periodic (``ci-kube-agents-eval-nightly``, ``EVAL_TIER=nightly``
-in ``hack/ci-eval-pr.sh``) runs every case against ``main`` once a night, and
+in ``hack/ci-eval-pr.sh``, on ``spec.mode: next``) runs every case against
+``main`` once a night, and
 the collector records each build as a ``tier: "nightly"`` run (SCHEMA.md).
 This module turns those runs into what a reader wants the next morning: for
 each night, every case it recorded with its state, its repetitions, the
@@ -589,8 +590,13 @@ def joined_night_document(night: dict[str, dict], data: dict, previous: dict[str
     writers part's when the main one is absent; ``parts[]`` has each."""
     borrowed = borrowed or {}
     domain_of = domains(data)
-    expected = expected_cases(data)
     runs = night_parts(night)
+    # A case the night's inject lane dropped before the fan-out
+    # (``lane_excluded``, SCHEMA.md) was never going to be recorded, so it is
+    # not expected of this night: the next-mode nightly would otherwise read
+    # as incomplete every night.
+    excluded = {name for run in runs for name in run.get("lane_excluded") or [] if isinstance(name, str)}
+    expected = [name for name in expected_cases(data) if name not in excluded]
     cases: list[dict] = []
     parts = []
     turn1: list[float] = []

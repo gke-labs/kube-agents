@@ -6,6 +6,7 @@ import shutil
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 import unittest
 from unittest.mock import MagicMock, patch
 from pathlib import Path
@@ -265,6 +266,69 @@ class TestSessionKvServerApi(unittest.TestCase):
             body["ask"] = bad
             self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=body).status_code, 200, bad)
             self.assertNotIn("ask", self.client.get(f"/v1/sessions/{sid}/metadata").json()["conversation_route"], bad)
+
+    def test_a_route_keeps_valid_user_id_and_chat_type(self):
+        sid = "a2a-ctx-0123abcd"
+        hmac_user = "hmac:0123456789abcdef0123456789abcdef"
+        body = {
+            "platform": "google_chat",
+            "conversation": "gchat:spaces/DM1",
+            "context_id": "ctx-0123abcd",
+            "user_id": hmac_user,
+            "chat_type": "dm",
+        }
+        self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=body).status_code, 200)
+        route = self.client.get(f"/v1/sessions/{sid}/metadata").json()["conversation_route"]
+        self.assertEqual(route["user_id"], hmac_user)
+        self.assertEqual(route["chat_type"], "dm")
+
+        # Invalid user_id or chat_type tokens are dropped without refusing a chat route.
+        body["user_id"] = "alice@example.com"
+        body["chat_type"] = "channel"
+        self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=body).status_code, 200)
+        route = self.client.get(f"/v1/sessions/{sid}/metadata").json()["conversation_route"]
+        self.assertNotIn("user_id", route)
+        self.assertNotIn("chat_type", route)
+
+        # An identity-only record (platform == "") is accepted for inject doors when user_id is a valid hmac token.
+        inject_body = {
+            "platform": "",
+            "conversation": "inject:eval/run-1",
+            "context_id": "ctx-0123abcd",
+            "user_id": hmac_user,
+            "chat_type": "dm",
+        }
+        self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=inject_body).status_code, 200)
+        route = self.client.get(f"/v1/sessions/{sid}/metadata").json()["conversation_route"]
+        self.assertEqual(route["platform"], "")
+        self.assertEqual(route["user_id"], hmac_user)
+        self.assertEqual(route["chat_type"], "dm")
+
+        # An identity-only record with chat_type and no user_id (e.g. console door) is also accepted.
+        console_body = {
+            "platform": "",
+            "conversation": "console:tok-1",
+            "context_id": "ctx-0123abcd",
+            "user_id": "",
+            "chat_type": "dm",
+        }
+        self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=console_body).status_code, 200)
+        route = self.client.get(f"/v1/sessions/{sid}/metadata").json()["conversation_route"]
+        self.assertEqual(route["platform"], "")
+        self.assertNotIn("user_id", route)
+        self.assertEqual(route["chat_type"], "dm")
+
+        # Empty platform without a valid hmac user_id or chat_type is refused with a clear message.
+        bad_id_body = {
+            "platform": "",
+            "conversation": "inject:eval/run-1",
+            "context_id": "ctx-0123abcd",
+            "user_id": "",
+            "chat_type": "",
+        }
+        bad_resp = self.client.put(f"/v1/sessions/{sid}/route", json=bad_id_body)
+        self.assertEqual(bad_resp.status_code, 400)
+        self.assertIn("identity-only route", bad_resp.json()["detail"])
 
     def test_a_hashed_session_takes_its_own_context(self):
         # The bridge hashes a context id that is not path-safe
@@ -2077,6 +2141,310 @@ class TestAlertDailyQuota(unittest.TestCase):
             self.assertIsNotNone(conn.execute("SELECT 1 FROM alert_quota WHERE day = ?", (fresh_day,)).fetchone())
 
 
+class TestWorkloadIncidentFold(unittest.TestCase):
+    """INCIDENT_WORKLOAD_DEDUP_SECONDS: one broken workload is one incident, not one per pod and reason."""
+
+    WINDOW = 900
+
+    def setUp(self):
+        import sqlite3
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM alert_quota")
+        # Uncapped, so the ceiling cannot be what keeps a sibling quiet; the
+        # tests about the ceiling patch it back.
+        patcher = patch.dict(session_kv_server.ALERT_DAILY_LIMITS, {"Warning": 0, "Critical": 0})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.real_trigger = session_kv_server.trigger_agent_troubleshooter
+        trigger = patch.object(session_kv_server, "trigger_agent_troubleshooter")
+        self.trigger = trigger.start()
+        self.addCleanup(trigger.stop)
+
+    def tearDown(self):
+        os.environ.pop("SESSION_KV_API_KEY", None)
+
+    def _inject(self, pod, reason="BackOff", namespace="fold-ns", kind="Pod", cluster="c1", event_type="Warning"):
+        payload = {
+            "reason": reason,
+            "namespace": namespace,
+            "kind_of_object": kind,
+            "name": pod,
+            "uid": f"uid-{pod}-{reason}",
+            "message": "Back-off restarting failed container",
+            "type": event_type,
+            "cluster": cluster,
+        }
+        resp = self.client.post(
+            f"/sessions/sess-{pod}-{reason}/inject",
+            json={"message": json.dumps(payload)},
+            headers={"X-Watcher-Features": "policy-filtered"},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        return resp.json()
+
+    def _rows(self, workload):
+        import sqlite3
+        with sqlite3.connect(temp_db_path) as conn:
+            return conn.execute(
+                "SELECT id, reason, notified, duplicate_of FROM intercepted_events WHERE workload = ? ORDER BY id",
+                (workload,),
+            ).fetchall()
+
+    def _age(self, row_id, seconds):
+        import sqlite3
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute(
+                    "UPDATE intercepted_events SET created_at = datetime('now', ?) WHERE id = ?",
+                    (f"-{seconds} seconds", row_id),
+                )
+
+    def test_off_by_default(self):
+        self.assertEqual(session_kv_server.INCIDENT_WORKLOAD_DEDUP_SECONDS, 0)
+        for pod in ("off-api-6cfdb6b98b-aaaaa", "off-api-6cfdb6b98b-bbbbb"):
+            self.assertEqual(self._inject(pod)["status"], "injected")
+        self.assertEqual(self.trigger.call_count, 2)
+        self.assertEqual([r[3] for r in self._rows("off-api")], [None, None])
+
+    def test_a_burst_across_replicas_and_reasons_is_one_incident(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            first = self._inject("burst-api-6cfdb6b98b-aaaaa", reason="Unhealthy")
+            later = [
+                self._inject("burst-api-6cfdb6b98b-bbbbb", reason="Unhealthy"),
+                self._inject("burst-api-6cfdb6b98b-ccccc", reason="Unhealthy"),
+                # A cascade's next reason folds too.
+                self._inject("burst-api-6cfdb6b98b-aaaaa", reason="BackOff"),
+            ]
+
+        self.assertEqual(first["status"], "injected")
+        rows = self._rows("burst-api")
+        anchor_id = rows[0][0]
+        self.assertEqual([r["status"] for r in later], ["folded"] * 3)
+        self.assertEqual({r["duplicate_of"] for r in later}, {str(anchor_id)})
+        self.assertEqual(self.trigger.call_count, 1)
+        self.assertEqual([(r[2], r[3]) for r in rows], [(1, None)] + [(0, anchor_id)] * 3)
+
+    def test_a_critical_folds_only_into_a_critical(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            statuses = [
+                self._inject("worse-api-6cfdb6b98b-aaaaa", reason="BackOff")["status"],
+                # The workload got worse after its Warning went out: announced.
+                self._inject("worse-api-6cfdb6b98b-bbbbb", reason="CrashLoopBackOff")["status"],
+                # A second Critical, and a Warning after it, fold into that one.
+                self._inject("worse-api-6cfdb6b98b-ccccc", reason="OOMKilled")["status"],
+                self._inject("worse-api-6cfdb6b98b-ddddd", reason="BackOff")["status"],
+            ]
+        self.assertEqual(statuses, ["injected", "injected", "folded", "folded"])
+        rows = self._rows("worse-api")
+        self.assertEqual([r[3] for r in rows], [None, None, rows[1][0], rows[1][0]])
+
+    def test_a_folded_event_spends_no_alert_budget(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.dict(session_kv_server.ALERT_DAILY_LIMITS, {"Warning": 1}):
+            self._inject("budget-api-6cfdb6b98b-aaaaa")
+            self.assertEqual(self._inject("budget-api-6cfdb6b98b-bbbbb")["status"], "folded")
+            warning = self.client.get("/v1/alert-quota").json()["severities"]["Warning"]
+        self.assertEqual((warning["sent"], warning["suppressed"]), (1, 0))
+
+    def test_an_anchor_whose_chat_post_failed_still_folds_its_siblings(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            self._inject("undelivered-api-6cfdb6b98b-aaaaa")
+            anchor_id = self._rows("undelivered-api")[0][0]
+            session_kv_server.mark_delivery_failed(anchor_id, "no chat route")
+            sibling = self._inject("undelivered-api-6cfdb6b98b-bbbbb")
+
+        self.assertEqual(sibling["status"], "folded")
+        self.assertEqual(sibling["duplicate_of"], str(anchor_id))
+        self.assertEqual(self.trigger.call_count, 1)
+
+    def test_a_headless_anchor_folds_its_siblings(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            self._inject("headless-api-6cfdb6b98b-aaaaa")
+            session_kv_server.mark_delivery_headless(self._rows("headless-api")[0][0])
+            self.assertEqual(self._inject("headless-api-6cfdb6b98b-bbbbb")["status"], "folded")
+
+    def test_a_refused_event_never_anchors(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            # Filtered by the Info gate.
+            self.assertEqual(self._inject("refused-api-6cfdb6b98b-aaaaa", event_type="Normal")["status"], "filtered")
+            # Dropped by the ceiling.
+            with patch.object(session_kv_server, "_claim_alert_quota", return_value=(False, 1)):
+                self.assertEqual(self._inject("refused-api-6cfdb6b98b-bbbbb")["status"], "suppressed")
+            self.assertEqual(self._inject("refused-api-6cfdb6b98b-ccccc")["status"], "injected")
+        self.assertEqual(self.trigger.call_count, 1)
+
+    def test_a_folded_event_never_anchors(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            self._inject("chain-api-6cfdb6b98b-aaaaa")
+            self._inject("chain-api-6cfdb6b98b-bbbbb")
+            anchor_id, dup_id = (r[0] for r in self._rows("chain-api"))
+            # The anchor has aged out; the duplicate written inside its window has not.
+            self._age(anchor_id, self.WINDOW + 1)
+            self.assertEqual(self._inject("chain-api-6cfdb6b98b-ccccc")["status"], "injected")
+        self.assertEqual(self.trigger.call_count, 2)
+
+    def test_the_window_runs_from_the_anchor(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            self._inject("expiry-api-6cfdb6b98b-aaaaa")
+            anchor_id = self._rows("expiry-api")[0][0]
+            self._age(anchor_id, self.WINDOW - 60)
+            self.assertEqual(self._inject("expiry-api-6cfdb6b98b-bbbbb")["status"], "folded")
+            self._age(anchor_id, self.WINDOW + 1)
+            self.assertEqual(self._inject("expiry-api-6cfdb6b98b-ccccc")["status"], "injected")
+
+    def test_a_different_cluster_namespace_or_kind_is_its_own_incident(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            statuses = [
+                self._inject("scope-api-6cfdb6b98b-aaaaa")["status"],
+                self._inject("scope-api-6cfdb6b98b-bbbbb", cluster="c2")["status"],
+                self._inject("scope-api-6cfdb6b98b-ccccc", namespace="fold-ns-2")["status"],
+                self._inject("scope-api", kind="Deployment", reason="ProgressDeadlineExceeded")["status"],
+            ]
+        self.assertEqual(statuses, ["injected"] * 4)
+
+    def test_a_drift_row_for_the_same_object_does_not_anchor(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            session_kv_server.record_intercepted_event(
+                cluster="c1", namespace="fold-ns", workload="drifted-api", object_uid="insert-1",
+                object_kind="Deployment", reason=session_kv_server.DRIFT_LEDGER_REASON,
+                message="m", severity="Warning", occurrences=1, notified=True,
+            )
+            status = self._inject("drifted-api", kind="Deployment", reason="ProgressDeadlineExceeded")["status"]
+        self.assertEqual(status, "injected")
+
+    @patch.object(session_kv_server, "_create_gateway_session", return_value=False)
+    @patch.object(session_kv_server, "_register_session_routing")
+    @patch.object(session_kv_server, "_post_initial_alert", return_value="spaces/A/threads/B")
+    def test_an_anchor_whose_triage_never_started_does_not_fold_its_siblings(self, *_):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            self._inject("aborted-api-6cfdb6b98b-aaaaa")
+            anchor_id = self._rows("aborted-api")[0][0]
+            # What the background task does when the gateway session fails.
+            self.real_trigger("sess-aborted", "msg", {}, anchor_id)
+            self.assertEqual(self._inject("aborted-api-6cfdb6b98b-bbbbb")["status"], "injected")
+
+    def test_a_5xx_other_than_503_or_a_wait_for_the_response_reads_as_a_started_turn(self):
+        import urllib.error
+        # 503 is Hermes's gateway_draining and session_db_unavailable, both
+        # before the turn; a POST 307 is not followed.
+        for code, started in ((307, False), (400, False), (404, False), (500, True), (502, True), (503, False)):
+            with patch("urllib.request.urlopen", side_effect=urllib.error.HTTPError("http://gw", code, "x", {}, None)):
+                self.assertEqual(session_kv_server._start_agent_turn("http://gw", "s", "q", {}), started, code)
+        with patch("urllib.request.urlopen", side_effect=TimeoutError("read timed out")):
+            self.assertTrue(session_kv_server._start_agent_turn("http://gw", "s", "q", {}))
+        # Refused while connecting: the gateway never had the request.
+        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError(ConnectionRefusedError(111, "refused"))):
+            self.assertFalse(session_kv_server._start_agent_turn("http://gw", "s", "q", {}))
+
+    @patch.object(session_kv_server, "_start_agent_turn", return_value=False)
+    @patch.object(session_kv_server, "_create_gateway_session", return_value=True)
+    @patch.object(session_kv_server, "_register_session_routing")
+    @patch.object(session_kv_server, "_post_initial_alert", return_value="spaces/A/threads/B")
+    def test_a_refused_turn_releases_the_anchor(self, *_):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            self._inject("refusedturn-api-6cfdb6b98b-aaaaa")
+            self.real_trigger("sess-refused", "msg", {}, self._rows("refusedturn-api")[0][0])
+            self.assertEqual(self._inject("refusedturn-api-6cfdb6b98b-bbbbb")["status"], "injected")
+
+    @patch.object(session_kv_server, "_post_initial_alert", side_effect=RuntimeError("chat client blew up"))
+    def test_a_task_that_dies_before_the_turn_releases_the_anchor(self, _):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_chat_platforms_disabled", return_value=False):
+            self._inject("diedtask-api-6cfdb6b98b-aaaaa")
+            with self.assertRaises(RuntimeError):
+                self.real_trigger("sess-died", "msg", {}, self._rows("diedtask-api")[0][0])
+            self.assertEqual(self._inject("diedtask-api-6cfdb6b98b-bbbbb")["status"], "injected")
+
+    def test_a_restart_releases_every_anchor_written_before_it(self):
+        # The process died between the insert and its background task, so
+        # nothing ran to release the row; the next start has to.
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            self._inject("orphan-api-6cfdb6b98b-aaaaa")
+            session_kv_server.init_db()
+            self.assertEqual(self._inject("orphan-api-6cfdb6b98b-bbbbb")["status"], "injected")
+            # The anchor written after the start still folds its siblings.
+            self.assertEqual(self._inject("orphan-api-6cfdb6b98b-ccccc")["status"], "folded")
+
+    def test_only_a_deployments_pods_and_whole_objects_fold(self):
+        key = session_kv_server._fold_key
+        self.assertEqual(key("Pod", "checkout-6cfdb6b98b-zwv24"), "checkout")
+        # A bare pod's last segment is not a replica suffix, and a StatefulSet
+        # ordinal is not stripped: neither folds.
+        self.assertEqual(key("Pod", "api-cache"), "")
+        self.assertEqual(key("Pod", "web-0"), "")
+        self.assertEqual(key("Deployment", "checkout"), "checkout")
+        # A CronJob run and a date-stamped Job look like a Deployment pod to
+        # the display cleaner, but their segments hold digits a pod-template
+        # hash never does: a same-named Deployment's incident must not take them.
+        self.assertEqual(key("Pod", "checkout-29812345-abcde"), "")
+        self.assertEqual(key("Pod", "checkout-20261021-abcde"), "")
+        self.assertEqual(key("Pod", "checkout-deadbeef-abcde"), "")
+        self.assertEqual(clean_workload_name("Pod", "checkout-29812345-abcde"), "checkout")
+
+    def test_a_cronjob_run_does_not_fold_into_a_same_named_deployment(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            self._inject("report-6cfdb6b98b-zwv24")
+            self.assertEqual(self._inject("report-29812345-abcde")["status"], "injected")
+
+    def test_two_bare_pods_that_clean_to_one_name_are_two_incidents(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            statuses = [
+                self._inject("bare-api-cache")["status"],
+                self._inject("bare-api-proxy")["status"],
+                # A Deployment named `bare-api` cleans to the same workload and
+                # does not fold into either.
+                self._inject("bare-api-6cfdb6b98b-aaaaa")["status"],
+            ]
+        self.assertEqual(statuses, ["injected"] * 3)
+
+    def test_replicas_arriving_together_open_one_incident(self):
+        import threading
+        from fastapi import BackgroundTasks
+
+        real_claim = session_kv_server._claim_alert_quota
+
+        def slow_claim(severity):
+            # Widens the gap between the anchor lookup and the insert, which is
+            # where two unlocked injects both find no anchor.
+            time.sleep(0.3)
+            return real_claim(severity)
+
+        statuses = []
+
+        def inject(pod):
+            payload = {"reason": "BackOff", "namespace": "fold-ns", "kind_of_object": "Pod", "name": pod,
+                       "uid": f"uid-{pod}", "message": "m", "type": "Warning", "cluster": "c1"}
+            reply = session_kv_server.inject_message(
+                f"sess-{pod}", {"message": json.dumps(payload)}, BackgroundTasks(), x_watcher_features="policy-filtered"
+            )
+            statuses.append(reply["status"])
+
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_claim_alert_quota", side_effect=slow_claim):
+            threads = [threading.Thread(target=inject, args=(f"race-api-6cfdb6b98b-{c * 5}",)) for c in "ab"]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(sorted(statuses), ["folded", "injected"])
+
+    def test_the_feed_lists_a_folded_row_as_folded(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            self._inject("feed-api-6cfdb6b98b-aaaaa")
+            self._inject("feed-api-6cfdb6b98b-bbbbb")
+        events = [
+            e for e in self.client.get("/v1/intercepted-events", params={"limit": 200}).json()["events"]
+            if e["name"] == "feed-api"
+        ]
+        self.assertEqual([e["status"] for e in events], ["folded", "injected"])
+        self.assertEqual([e["duplicate_of"] for e in events], [events[1]["id"], None])
+
+
 class TestSessionKvServerQueryBuilding(unittest.TestCase):
 
     @patch.dict(os.environ, {"GCP_PROJECT_ID": "test-project-id"})
@@ -3683,6 +4051,7 @@ class TestAuditChatReport(unittest.TestCase):
             conn.execute("DELETE FROM session_metadata")
             conn.execute("DELETE FROM incidents")
             conn.execute("DELETE FROM audit_report_runs")
+            conn.execute("DELETE FROM scheduler_failure_posts")
 
     def leave(self, parts, run="20261015T062000.000000Z", updated=None, job="compliance-audit"):
         record = {
@@ -3764,12 +4133,16 @@ class TestAuditChatReport(unittest.TestCase):
         "⚠️ Cron 'Security & RBAC Posture Audit' failed: provider quota limit. "
         "Fallback chain exhausted. Full details saved in cron output."
     )
+    PLAIN_FAILURE = (
+        "**The Security & RBAC Posture Audit didn't run.** The AI model's usage limit was reached. "
+        "It will try again at its next scheduled run."
+    )
 
     def test_a_failed_runs_line_is_posted_in_place_of_an_unposted_record(self):
         # A silent run left a finished record; this run died before `start`.
         self.leave([self.REPORT])
         _, sent = self.post(report=self.FAILURE, failure=True)
-        self.assertEqual(sent, [self.FAILURE])
+        self.assertEqual(sent, [self.PLAIN_FAILURE])
 
     def test_the_failure_marks_the_record_so_a_later_run_does_not_post_it(self):
         self.leave([self.REPORT])
@@ -3789,7 +4162,16 @@ class TestAuditChatReport(unittest.TestCase):
         self.leave([self.REPORT], updated=time.time() - 600)
         with patch.object(session_kv_server, "_delivering_run_start", return_value=time.time() - 60):
             _, sent = self.post(report=self.FAILURE, failure=True)
-        self.assertEqual(sent, [self.FAILURE])
+        self.assertEqual(sent, [self.PLAIN_FAILURE])
+
+    def test_a_repeated_failure_still_marks_the_record_posted(self):
+        self.leave([self.REPORT])
+        self.post(report=self.FAILURE, failure=True)
+        with patch.object(session_kv_server, "_run_completed_since", return_value=False):
+            response, sent = self.post(report=self.FAILURE, failure=True)
+        self.assertEqual(response.json()["status"], session_kv_server.CRON_REPORT_SUPPRESSED)
+        self.assertEqual(sent, [])
+        self.assertEqual(session_kv_server._last_posted_run("platform", "compliance-audit"), "20261015T062000.000000Z")
 
     def test_the_delivering_run_start_reads_only_running_rows(self):
         import gitops_workspace
@@ -3807,6 +4189,98 @@ class TestAuditChatReport(unittest.TestCase):
         with patch.object(gitops_workspace, "agent_home", return_value=self.scratch):
             started = session_kv_server._delivering_run_start("platform", "compliance-audit")
         self.assertEqual(started, datetime(2026, 10, 16, 6, 20, tzinfo=timezone.utc).timestamp())
+
+    def test_the_delivering_run_start_stays_under_the_profiles_directory(self):
+        # A profile that climbs out of `profiles/` reaches no ledger, even one
+        # that exists where the climb lands.
+        import gitops_workspace
+        import sqlite3
+
+        cron = os.path.join(self.scratch, "cron")
+        os.makedirs(cron)
+        os.makedirs(os.path.join(self.scratch, "profiles"))  # so `profiles/..` resolves on disk
+        with sqlite3.connect(os.path.join(cron, "executions.db")) as conn, conn:
+            conn.execute("CREATE TABLE executions (job_id TEXT, status TEXT, started_at TEXT)")
+            conn.execute("INSERT INTO executions VALUES ('compliance-audit', 'running', '2026-10-16T06:20:00+00:00')")
+        with patch.object(gitops_workspace, "agent_home", return_value=self.scratch):
+            self.assertIsNone(session_kv_server._delivering_run_start("..", "compliance-audit"))
+            self.assertIsNone(session_kv_server._delivering_run_start("../..", "compliance-audit"))
+            self.assertIsNotNone(session_kv_server._delivering_run_start("default", "compliance-audit"))
+
+    def test_a_ledger_root_of_slash_still_resolves(self):
+        # An agent home of "/" (`agent_home` returns it for PLATFORM_AGENT_HOME=/)
+        # is a root that already ends in a separator; its ledger is still read.
+        import gitops_workspace
+
+        with patch.object(gitops_workspace, "agent_home", return_value="/"), \
+             patch("os.path.exists", wraps=os.path.exists) as exists:
+            session_kv_server._delivering_run_start("default", "compliance-audit")
+            session_kv_server._delivering_run_start("platform", "compliance-audit")
+        self.assertEqual(
+            [call.args[0] for call in exists.call_args_list],
+            ["/cron/executions.db", "/profiles/platform/cron/executions.db"],
+        )
+
+    def test_a_ledger_root_of_dot_still_resolves(self):
+        # An agent home of "." (`agent_home` returns it for PLATFORM_AGENT_HOME=.)
+        # resolves against the working directory, as the open would.
+        import gitops_workspace
+        import sqlite3
+        from datetime import datetime
+
+        cron = os.path.join(self.scratch, "profiles", "platform", "cron")
+        os.makedirs(cron)
+        with sqlite3.connect(os.path.join(cron, "executions.db")) as conn, conn:
+            conn.execute("CREATE TABLE executions (job_id TEXT, status TEXT, started_at TEXT)")
+            conn.execute("INSERT INTO executions VALUES ('compliance-audit', 'running', '2026-10-16T06:20:00+00:00')")
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.scratch)
+        with patch.object(gitops_workspace, "agent_home", return_value="."):
+            started = session_kv_server._delivering_run_start("platform", "compliance-audit")
+        self.assertEqual(started, datetime.fromisoformat("2026-10-16T06:20:00+00:00").timestamp())
+
+    def test_a_scratch_root_of_dot_still_reads_the_record(self):
+        # FLEET_AUDIT_SCRATCH_DIR=. resolves against the working directory, as
+        # the open would; the record there is read.
+        self.leave([self.REPORT])
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.scratch)
+        with patch.object(session_kv_server, "FLEET_AUDIT_SCRATCH_DIR", "."):
+            record = session_kv_server._read_chat_report_record("compliance-audit")
+        self.assertIsNotNone(record)
+        self.assertEqual(record["run"], "20261015T062000.000000Z")
+
+    def test_a_scratch_root_of_slash_still_reads_the_record(self):
+        # FLEET_AUDIT_SCRATCH_DIR=/ is a root that already ends in a separator;
+        # the record under it is opened, not reported as leaving the root.
+        with patch.object(session_kv_server, "FLEET_AUDIT_SCRATCH_DIR", "/"), \
+             patch("builtins.open", wraps=open) as opened:
+            self.assertIsNone(session_kv_server._read_chat_report_record("compliance-audit"))
+        self.assertEqual(opened.call_count, 1)
+        self.assertEqual(opened.call_args.args[0], "/chat_report_compliance-audit.json")
+
+    def test_a_job_id_that_leaves_the_scratch_directory_reads_no_record(self):
+        # The record is read only from under the scratch directory; a job id
+        # that climbs out of it is no record, even when a file is there. The
+        # climb needs a segment after the `chat_report_` prefix, so `x/../..`,
+        # and the directory it climbs through has to exist for the OS to follow it.
+        os.makedirs(os.path.join(self.scratch, "chat_report_x"))
+        outside = os.path.join(os.path.dirname(self.scratch), f"{os.path.basename(self.scratch)}-outside.json")
+        with open(outside, "w", encoding="utf-8") as handle:
+            json.dump({"audit": "x", "run": "r", "parts": []}, handle)
+        self.addCleanup(os.remove, outside)
+        self.leave([self.REPORT])
+        with patch("builtins.open", wraps=open) as opened:
+            self.assertIsNone(
+                session_kv_server._read_chat_report_record(f"x/../../{os.path.basename(self.scratch)}-outside")
+            )
+            self.assertIsNone(session_kv_server._read_chat_report_record("x/../../../etc/passwd"))
+            self.assertEqual(opened.call_count, 0)
+            record = session_kv_server._read_chat_report_record("compliance-audit")
+        self.assertEqual(record["run"], "20261015T062000.000000Z")
+        self.assertEqual(
+            opened.call_args.args[0], os.path.join(self.scratch, "chat_report_compliance-audit.json")
+        )
 
     def test_the_flag_without_the_scheduler_leg_changes_nothing(self):
         self.leave([])
@@ -3931,6 +4405,210 @@ class TestAuditChatReport(unittest.TestCase):
         self.assertEqual(
             read.call_args.args[0], os.path.join(self.scratch, "chat_report_compliance-audit.json")
         )
+
+
+class TestSchedulerFailureLine(unittest.TestCase):
+    """The scheduler's failure line, posted as one plain line, once until the job runs cleanly."""
+
+    TITLE = "Workload Reliability Audit"
+    QUOTA = (
+        "⚠️ Cron 'Workload Reliability Audit' failed: provider quota limit. No fallback chain configured — "
+        "add one with `hermes fallback add`, or set a cron fleet default via `cron.model` + "
+        "`cron.model_provider` in config.yaml. Full details saved in cron output."
+    )
+
+    def setUp(self):
+        import sqlite3
+
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(os.environ.pop, "SESSION_KV_API_KEY", None)
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home, True)
+        import gitops_workspace
+
+        home = patch.object(gitops_workspace, "agent_home", return_value=self.home)
+        home.start()
+        self.addCleanup(home.stop)
+        with sqlite3.connect(temp_db_path) as conn, conn:
+            conn.execute("DELETE FROM session_metadata")
+            conn.execute("DELETE FROM incidents")
+            conn.execute("DELETE FROM scheduler_failure_posts")
+
+    def roster(self, expr, job="obtainability-audit"):
+        cron = os.path.join(self.home, "profiles", "platform", "cron")
+        os.makedirs(cron, exist_ok=True)
+        with open(os.path.join(cron, "jobs.json"), "w", encoding="utf-8") as handle:
+            json.dump({"jobs": [{"id": job, "name": self.TITLE, "schedule": {"kind": "cron", "expr": expr}}]}, handle)
+
+    def ledger(self, *rows):
+        import sqlite3
+
+        cron = os.path.join(self.home, "profiles", "platform", "cron")
+        os.makedirs(cron, exist_ok=True)
+        with sqlite3.connect(os.path.join(cron, "executions.db")) as conn, conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS executions (job_id TEXT, status TEXT, started_at TEXT)")
+            conn.executemany("INSERT INTO executions VALUES (?, ?, ?)", rows)
+
+    def post(self, report=None, failure=True, platforms=("google_chat",), routes=False, job="obtainability-audit"):
+        sent = []
+
+        def send(platform, message, chat_id="", thread_id="", timeout=None):
+            sent.append((platform, message))
+            return "spaces/S/threads/T"
+
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=list(platforms)), \
+             patch.object(session_kv_server, "_is_fleet_audit_job", return_value=False), \
+             patch.object(chat_notify, "routes", return_value=routes), \
+             patch.object(session_kv_server, "_send_to_chat", side_effect=send):
+            response = self.client.post(
+                "/v1/cron-reports",
+                json={
+                    "job_id": job, "title": self.TITLE, "report": report or self.QUOTA,
+                    "also_delivered_to": [],
+                    **({"scheduler_failure": True} if failure else {}),
+                },
+            )
+        return response, sent
+
+    def test_each_scheduler_reason_reads_in_plain_words(self):
+        cases = {
+            "⚠️ Cron 'X' failed: script timed out. No model was invoked.": "It ran too long and was stopped",
+            "⚠️ Cron 'X' failed: provider rate limit. Full details saved in cron output.": "The AI model's usage limit was reached",
+            "⚠️ Cron 'X' failed: provider weekly usage limit. Full details.": "The AI model's usage limit was reached",
+            "⚠️ Cron 'X' failed: provider quota limit. Full details.": "The AI model's usage limit was reached",
+            "⚠️ Cron 'X' failed: the job itself stalled — no tool/API activity.": "It stopped making progress",
+            "⚠️ Cron 'X' failed: provider timeout. Full details.": "The AI model didn't answer in time",
+            "⚠️ Cron 'X' failed: provider authentication error. Full details.": "The AI model rejected its credentials",
+            "⚠️ Cron 'X' failed: RuntimeError: HTTP 400 cache expired": "It hit an error",
+        }
+        for line, reason in cases.items():
+            with self.subTest(line=line):
+                failure = session_kv_server.scheduler_failure_line("platform", "x", "Fleet Waste Audit", line)
+                self.assertEqual(failure.reason, reason)
+                then = (
+                    session_kv_server.SCHEDULER_FAILURE_NEEDS_ADMIN
+                    if reason == "The AI model rejected its credentials"
+                    else "It will try again at its next scheduled run."
+                )
+                self.assertEqual(failure.text, f"**The Fleet Waste Audit didn't run.** {reason}. {then}")
+
+    def test_a_failure_a_retry_does_not_clear_promises_no_retry(self):
+        self.roster("50 6 * * *")
+        line = "⚠️ Cron 'X' failed: provider authentication error. Full details."
+        failure = session_kv_server.scheduler_failure_line("platform", "obtainability-audit", self.TITLE, line)
+        self.assertEqual(
+            failure.text,
+            "**The Workload Reliability Audit didn't run.** The AI model rejected its credentials. "
+            "An admin needs to fix this before it can run; the details are in the agent's log.",
+        )
+
+    def test_a_blocked_configuration_says_it_waits_for_a_fix(self):
+        line = "⛔ Cron 'X' blocked by configuration validation (no LLM call was made): bad model. This alert is sent once."
+        failure = session_kv_server.scheduler_failure_line("platform", "x", "Fleet Waste Audit", line)
+        self.assertEqual(
+            failure.text,
+            "**The Fleet Waste Audit didn't run.** Its configuration is invalid. "
+            "An admin needs to fix this before it can run; the details are in the agent's log.",
+        )
+
+    def test_a_daily_job_tries_again_tomorrow(self):
+        self.roster("50 6 * * *")
+        failure = session_kv_server.scheduler_failure_line("platform", "obtainability-audit", self.TITLE, self.QUOTA)
+        self.assertEqual(
+            failure.text,
+            "**The Workload Reliability Audit didn't run.** The AI model's usage limit was reached. "
+            "It will try again tomorrow.",
+        )
+
+    def test_any_other_schedule_tries_again_at_its_next_run(self):
+        for expr in ("20 7 * * 1", "*/10 * * * *"):
+            with self.subTest(expr=expr):
+                self.roster(expr)
+                failure = session_kv_server.scheduler_failure_line("platform", "obtainability-audit", self.TITLE, self.QUOTA)
+                self.assertTrue(failure.text.endswith("It will try again at its next scheduled run."))
+
+    def test_every_leg_gets_the_same_line_with_no_clock_time(self):
+        self.roster("50 6 * * *")
+        _, sent = self.post(platforms=("slack", "google_chat"))
+        self.assertEqual(len({text for _, text in sent}), 1)
+        self.assertTrue(sent[0][1].endswith("It will try again tomorrow."))
+
+    def test_a_job_that_is_not_an_audit_gets_the_plain_line_too(self):
+        response, sent = self.post()
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(
+            sent,
+            [("google_chat", "**The Workload Reliability Audit didn't run.** The AI model's usage limit was "
+              "reached. It will try again at its next scheduled run.")],
+        )
+
+    def test_the_same_failure_posts_once_until_a_clean_run(self):
+        self.ledger(("obtainability-audit", "failed", "2026-10-21T06:50:00+00:00"))
+        self.post()
+        response, sent = self.post()
+        self.assertEqual(response.json()["status"], session_kv_server.CRON_REPORT_SUPPRESSED)
+        self.assertEqual(sent, [])
+        # A run that finished cleanly since the post makes the next failure news.
+        self.ledger(("obtainability-audit", "completed", datetime.now(timezone.utc).isoformat()))
+        _, sent = self.post()
+        self.assertEqual(len(sent), 1)
+
+    def test_a_different_failure_is_posted(self):
+        self.ledger(("obtainability-audit", "failed", "2026-10-21T06:50:00+00:00"))
+        self.post()
+        _, sent = self.post(report="⚠️ Cron 'Workload Reliability Audit' failed: provider timeout. Full details.")
+        self.assertEqual(len(sent), 1)
+        self.assertIn("didn't answer in time", sent[0][1])
+
+    def test_a_delivery_that_is_not_a_failure_clears_the_record(self):
+        self.ledger(("obtainability-audit", "failed", "2026-10-21T06:50:00+00:00"))
+        self.post()
+        _, sent = self.post(report="Workload Reliability Audit: 1 new; 2 findings across 3 clusters.", failure=False)
+        self.assertEqual(len(sent), 1)
+        _, sent = self.post()
+        self.assertEqual(len(sent), 1)
+
+    def test_an_unreadable_ledger_posts_rather_than_withholds(self):
+        self.post()
+        # No executions.db under the profile home: whether the job ran since is unknown.
+        _, sent = self.post()
+        self.assertEqual(len(sent), 1)
+
+    def test_a_profile_that_is_not_one_segment_reads_no_ledger(self):
+        self.ledger(("obtainability-audit", "failed", "2026-10-21T06:50:00+00:00"))
+        for profile in ("..", "../..", "/var/lib/x", "a/b"):
+            with self.subTest(profile=profile), patch.object(session_kv_server.sqlite3, "connect") as connect:
+                self.assertTrue(session_kv_server._run_completed_since(profile, "obtainability-audit", 0.0))
+                connect.assert_not_called()
+
+    def test_a_clean_run_is_one_that_started_after_the_post(self):
+        self.ledger(
+            ("obtainability-audit", "completed", "2026-10-20T06:50:00+00:00"),
+            ("obtainability-audit", "running", "2026-10-22T06:50:00+00:00"),
+            ("other-job", "completed", "2026-10-22T06:50:00+00:00"),
+        )
+        since = datetime(2026, 10, 21, tzinfo=timezone.utc).timestamp()
+        self.assertFalse(session_kv_server._run_completed_since("platform", "obtainability-audit", since))
+        self.ledger(("obtainability-audit", "completed", "2026-10-22T07:00:00+00:00"))
+        self.assertTrue(session_kv_server._run_completed_since("platform", "obtainability-audit", since))
+
+    def test_a_failure_from_outside_the_scheduler_is_posted_as_written(self):
+        sent = []
+
+        def send(platform, message, chat_id="", thread_id="", timeout=None):
+            sent.append(message)
+            return "spaces/S/threads/T"
+
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat"]), \
+             patch.object(session_kv_server, "_send_to_chat", side_effect=send):
+            self.client.post(
+                "/v1/cron-reports",
+                json={"job_id": "obtainability-audit", "title": self.TITLE, "report": self.QUOTA, "scheduler_failure": True},
+            )
+        self.assertEqual(sent, [self.QUOTA])
 
 
 class TestSlackAuditHeadline(unittest.TestCase):
@@ -6987,7 +7665,9 @@ class TestCardStop(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         body = response.json()
         self.assertEqual(len(body["stopped"]), 4)
-        self.assertTrue(any("database is locked" in error for error in body["errors"]))
+        # The body names the error's class; its message stays in the server log.
+        self.assertTrue(any(error == "the late-pid sweep: OperationalError" for error in body["errors"]))
+        self.assertFalse(any("database is locked" in error for error in body["errors"]))
 
     def test_a_rescan_read_error_is_reported_not_a_503(self):
         import sqlite3

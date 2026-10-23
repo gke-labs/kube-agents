@@ -397,7 +397,7 @@ inject transport ends as infrastructure. That is the correct reading of that ins
 why a task nobody took is infrastructure rather than a failed case. The bridge accepts a task by
 publishing `submitted` and queues it behind `BRIDGE_CONCURRENCY` workers, default 2, and
 publishes `working` only when a worker starts the task's turn; the presubmit fans units out at
-`EVAL_TASK_PARALLELISM`, default 4, the nightly at 8. At those defaults two of every four
+`EVAL_TASK_PARALLELISM`, default 4, the next-mode nightlies at 6. At those defaults two of every four
 concurrent units wait in the bridge's queue carrying an executor event and no turn, for as
 long as the two ahead of them run. The eval install's bridge therefore runs
 `BRIDGE_CONCURRENCY` of at least `EVAL_TASK_PARALLELISM`, set through the operator's
@@ -545,7 +545,7 @@ spec's "Coexistence is by mode").
 The operator render kept the three conditions the A2A owner set on it: it cites the gateway
 spec's sections; the Google Chat adapter's `verifiedBy: chat-event-topic-iam` and its
 allowed-users gate are exactly as "The Google Chat adapter" section has them, the gate carried
-as `A2A_GCHAT_ALLOWED_USERS` and `A2A_GCHAT_ALLOW_ALL_USERS` from the CR's list; Google Chat enabled on the CR is a backend the operator's own check (`a2aGatewayBackend`) recognises, so a Chat install's
+as `A2A_GCHAT_ALLOWED_USERS` and `A2A_GCHAT_ALLOW_ALL_USERS` from the CR's list; Google Chat enabled on the CR is a backend the operator's own check (`a2aGatewayBackend`; removed 2026-10-22, when every next install began running a console-only gateway) recognises, so a Chat install's
 gateway renders and starts without a Discord Secret; and the one-backend guard is settled by
 precedence rather than by a guard change: the render omits the Discord reference when Chat is
 armed, the relay URL beside a Slack credential stays the gateway's refusal, and the inject door
@@ -711,19 +711,22 @@ refuses `EVAL_ROLLBACK_LANE=1` without the flag, before anything is built.
 The flag admits those jobs by name and nothing else without a pull request: section 2b of the
 deploy accepts `EVAL_MODE_NEXT=1` on a run that carries a `PULL_NUMBER` or whose `JOB_NAME` is
 listed in `EVAL_MODE_NEXT_JOB_NAMES` in `hack/ci-deploy.sh` (the merge-blocking presubmit, for
-its Tide batch runs, the today lane's periodic, the full-catalog next-mode nightly that runs beside a
-today-mode nightly on the same agent model, the GitLab lane's nightly under next, and the
-release-candidate eval's postsubmit, which grades a candidate in the mode a new install gets), and
-refuses it on any other Prow run, so the flag
-mis-set on the today nightly or another postsubmit still stops the deploy before anything is built. A
-next-mode run has a record of its own: the baseline version key carries the mode, which
+its Tide batch runs, the today lane's periodic, the main nightly's two parts
+`ci-kube-agents-eval-nightly` and `ci-kube-agents-eval-nightly-writers`, the GitLab lane's nightly
+under next, and the release-candidate eval's postsubmit, which grades a candidate in the mode a new
+install gets), and refuses it on any other Prow run, so the flag mis-set on the today-mode nightly
+`ci-kube-agents-eval-nightly-today` or another postsubmit still stops the deploy before anything is
+built. A next-mode run has a record of its own: the baseline version key carries the mode, which
 `bench-gate` reads off the inject transport ([`bench/baselines/README.md`](../../bench/baselines/README.md)),
-so the next-mode nightly on `main` appends under a `next` key that today's window never reads, and
-rung 6 on the inject lane compares only with next-mode history at its own key (agent model
-included, so the presubmit, on another model than that nightly, has none yet). The today lane stays out of the
+so the main nightly appends under a `next` key that today's window never reads, and rung 6 on the
+inject lane compares only with next-mode history at its own key (agent model included; the main
+nightly and the presubmit run the same one). `ci-kube-agents-eval-nightly-today` grades the full
+catalogue on a fresh `today` install over the agent API once a night and records today's window,
+which is what the rollback to `today` is measured against. The today lane stays out of the
 recorder and the dashboard publisher (`EVAL_ROLLBACK_LANE=1`): its key reads `today`, but it grades
-a rolled-back install. The dashboard's Trend page keeps a series per mode, drawing today's; the
-next-mode nightly's Prow runs are not collected onto the dashboard's run pages yet.
+a rolled-back install. The dashboard's Trend page keeps a series per mode, drawing today's; its
+Nightly page reads the main nightly's runs, so it shows `next`, and the today-mode nightly's Prow
+runs are not collected onto the run pages.
 
 ## Open questions
 

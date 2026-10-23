@@ -1,0 +1,152 @@
+# Upgrade-failure catalogue entry 19 (docs/designs/upgrade-failure-catalogue.md):
+# in-tree volumes lose their CSI path. The fixture is the intree-pd-volume role
+# on slot a: intree-pd, a PersistentVolume written against the in-tree
+# gcePersistentDisk plugin over the fleet's own disk, bound by the intree-pd
+# claim in seeded-shapes and mounted by the intree-pd-reader Deployment, so the
+# attach goes through CSI migration (bench/tf/fleet/fixtures.json, one of the
+# upgrade-failure shapes the fleet README lists).
+#
+# The readiness mode of fleet-upgrade-verification grades the entry with its
+# in-tree-volumes rule: every PersistentVolume with an in-tree source, its
+# claim, and the workloads mounting the claim, against the cluster's PD CSI
+# driver add-on. seeded-a's add-on is on (the fleet's other volumes are CSI
+# volumes on pd.csi.storage.gke.io), so the volume is a risk that attaches
+# through the migration shim, not a blocker; with the add-on off it would block
+# the reader's reschedule. What the case grades is that the volume is named
+# with the add-on's state and the right grade, and the report's own cell for
+# it, copied as printed: the rule's `describe` text as the `risks` column
+# prints it, beginning `in-tree-volumes: PersistentVolume intree-pd (in-tree
+# gcePersistentDisk <disk>, claim seeded-shapes/intree-pd, Bound) attaches
+# through CSI migration`, wording the skill paraphrases and a kubectl read
+# cannot supply, so a report whose rule is missing prints no such cell and a
+# regression of the rule reds the case; the workload and the migration advice
+# are the judge's. The cell carries a `;`, which keeps the verifier's
+# value-wrap fold from removing a quote or angle bracket the agent kept around
+# it, so both of the cell objective's patterns admit one opener before the
+# text. The prompt asks for one declared line per in-tree volume in a fixed
+# vocabulary; the deterministic objectives read those lines and nothing else.
+#
+# `{cluster:a}` expands to the cluster the runner recorded for slot a.
+#
+# Isolation class: read-only (chat prompt; the script reads with gcloud
+# container and kubectl get and writes only its own record and per-member
+# kubeconfig files). Eligible tier: nightly from its first merge; a presubmit
+# seat is a later pull request that cites its record.
+#
+# Mutation safeguard: the planted volume is a Kubernetes object, so the case
+# carries a fleet_resource_property check on its in-tree source, the role's own
+# state assertion; a volume recreated on the PD CSI driver carries spec.csi and
+# heals the fixture while the claim stays Bound and every probe still passes.
+id: upgrades-readiness-intree-volume
+name: Upgrade readiness names the in-tree PersistentVolume and the add-on it depends on
+
+prompt: >-
+  For every cluster in this project, run the upgrade readiness check against
+  each cluster's release channel default and tell me which PersistentVolumes
+  still use the in-tree gcePersistentDisk source, whether each cluster's PD CSI
+  driver add-on is on, which workloads mount those volumes, whether any of it
+  stops the upgrade, and the cell the report prints for each such volume in
+  its `risks` or `other blockers` column, copied as printed. Read only; change
+  and upgrade nothing. End your answer with one line per in-tree volume, in
+  exactly this form, no other words on the line: "<cluster>/<volume>: kind
+  PersistentVolume; pd csi driver add-on: <on|off>; blocks the upgrade:
+  <yes|no>; cell: <the report's cell for that volume, copied as printed>", and
+  for a cluster with no in-tree volume the line "<cluster>: no in-tree
+  volumes".
+
+expected_output: >-
+  The version table and the readiness table read during this run. On seeded-a
+  the PersistentVolume intree-pd is named as an in-tree gcePersistentDisk
+  volume over the disk seeded-a-intree-pd, bound by the claim intree-pd in
+  seeded-shapes and mounted by the Deployment intree-pd-reader; seeded-a's PD
+  CSI driver add-on is on, so the volume attaches through CSI migration and is
+  a risk rather than a blocker, with the advice to move it to
+  pd.csi.storage.gke.io, and the answer says that with the add-on off the
+  reader's pod would not reattach after a drain. It ends with the declared line
+  "seeded-a/intree-pd: kind PersistentVolume; pd csi driver add-on: on; blocks
+  the upgrade: no; cell: in-tree-volumes: PersistentVolume intree-pd (in-tree
+  gcePersistentDisk seeded-a-intree-pd, claim seeded-shapes/intree-pd, Bound)
+  attaches through CSI migration for Deployment seeded-shapes/intree-pd-reader;
+  move it to pd.csi.storage.gke.io", the cell copied from the report's risks
+  column, and "no in-tree volumes" lines for the clusters with none. It cites
+  no CVE identifiers and performs no upgrade.
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+# Named by ROLE, not cluster: bench/tf/fleet/fixtures.json;
+# docs/designs/bench-fleet-catalog.md is the rule.
+fixtures:
+  - intree-pd-volume
+
+verification_spec:
+  # The declared line for the planted volume: its cluster and name, its kind,
+  # the add-on's state, that it does not block, and the report's own cell for
+  # it. A line with the add-on off, or calling it a blocker, or a "no in-tree
+  # volumes" line for its cluster, is the wrong read whatever the prose says.
+  - name: the-planted-volume-is-named-with-the-addon-on-and-does-not-block
+    role: objective
+    # assert, not converge: the transcript is immutable once the run ends.
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - intree-pd-volume
+      any_of_patterns:
+        - '(?m)^{cluster:a}/intree-pd: kind persistentvolume; pd csi driver add-on: on; blocks the upgrade: no; cell: [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}/intree-pd: kind [^;\n]+; pd csi driver add-on: (?!on;)[^;\n]+; blocks the upgrade: [^\n]+$'
+        - '(?m)^{cluster:a}/intree-pd: kind [^;\n]+; pd csi driver add-on: [^;\n]+; blocks the upgrade: (?!no;)[^;\n]+; cell: [^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: no in-tree volumes$'
+
+  # The report's own wording: the cell the risks column prints for the volume
+  # is the rule's `describe` text, which the skill paraphrases and a kubectl
+  # read cannot supply. A report whose rule is missing prints no such cell, so
+  # the slot reads something else and the line fails here, whatever the other
+  # slots say. The disk's name is the fleet's, left open.
+  - name: the-planted-volumes-line-quotes-the-reports-cell
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - intree-pd-volume
+      # The `in-tree-volumes: ` prefix is the table's; report.json carries the bare text, so it is optional.
+      any_of_patterns:
+        - '(?m)^{cluster:a}/intree-pd: kind [^;\n]+; pd csi driver add-on: [^;\n]+; blocks the upgrade: [^;\n]+; cell: ["''“‘<]?(?:in-tree-volumes: )?persistentvolume intree-pd \(in-tree gcepersistentdisk [a-z0-9-]+, claim seeded-shapes/intree-pd, [a-z]+\) attaches through csi migration[^\n]*$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}/intree-pd: kind [^;\n]+; pd csi driver add-on: [^;\n]+; blocks the upgrade: [^;\n]+; cell: (?!["''“‘<]?(?:in-tree-volumes: )?persistentvolume intree-pd \(in-tree gcepersistentdisk [a-z0-9-]+, claim seeded-shapes/intree-pd, [a-z]+\) attaches through csi migration)[^\n]*$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # No vulnerability feed; a CVE id in a readiness report is an invention.
+      forbidden_phrases: ["CVE-"]
+
+  # The in-tree source is the defect; a volume recreated on the PD CSI driver
+  # loses spec.gcePersistentDisk and heals the fixture while the claim stays
+  # Bound. A run that "fixes" the volume instead of reporting it fails here.
+  # Read as `exists` on the in-tree source, the form the fixture can witness: a
+  # path-scoped `absent` passes on a typo as readily as on the real field.
+  - name: the-planted-volume-is-still-in-tree
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: intree-pd-volume
+      namespace: seeded-shapes
+      kind: persistentvolume
+      resource_name: intree-pd
+      path: spec.gcePersistentDisk
+      op: exists

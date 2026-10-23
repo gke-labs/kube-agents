@@ -96,19 +96,20 @@ _PLATFORM_URI = f"{_AR_REPO}/platform-agent:{_TAG}"
 _FLAG_UNSET_SPELLINGS = (None, "", "0", "true", "yes")
 # The Prow jobs (oss-test-infra) section 2b admits the flag on without a pull
 # request: the merge-blocking presubmit (in a Tide batch), the today lane's
-# periodic and the next-mode nightlies; the today nightly and a made-up job
-# stand for every other Prow run.
+# periodic, the main nightly's two parts and the GitLab next nightly; the
+# today-mode nightly and a made-up job stand for every other Prow run.
 _NEXT_LANE_JOB_NAMES = (
     "pull-kube-agents-smoke-test",
     "ci-kube-agents-eval-today",
-    "ci-kube-agents-eval-nightly-next-claude",
+    "ci-kube-agents-eval-nightly",
+    "ci-kube-agents-eval-nightly-writers",
     "ci-kube-agents-eval-nightly-gitlab-next",
     # The release-candidate eval: a postsubmit, so no PULL_NUMBER.
     "post-kube-agents-eval-rc",
 )
 _RC_REGISTRY_PREFIX = "ghcr.io/gke-labs/kube-agents"
 _RC_COMMIT_SHA = "b4ee5f3eb9c2aceb7f03460d2e573278ab9483fe"
-_NIGHTLY_JOB_NAME = "ci-kube-agents-eval-nightly"
+_NIGHTLY_JOB_NAME = "ci-kube-agents-eval-nightly-today"
 _OTHER_JOB_NAME = "ci-x"
 
 _BUILD_SECTION = (r"^# ─── 4\. Build Container Images.*?", r"^# ─── 5\. Chart Deployment")
@@ -855,8 +856,9 @@ class TasksBudgetSizingTest(unittest.TestCase):
         block = re.search(r'MODE_NEXT_ENV_ARGS=\(\)\nif \[ "\$\{EVAL_MODE_NEXT:-\}" = "1" \]; then\n  MODE_NEXT_ENV_ARGS=\((.*?)\)\nfi', script, re.DOTALL)
         self.assertIsNotNone(block, "MODE_NEXT_ENV_ARGS is not filled under EVAL_MODE_NEXT=1")
         assert block is not None
-        self.assertIn('--set-string "platformAgent.deployment.env[2].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"', block.group(1))
-        self.assertIn('--set-string "platformAgent.deployment.env[2].value=false"', block.group(1))
+        self.assertIn('--set-string "platformAgent.deployment.env[3].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"', block.group(1))
+        self.assertIn('--set-string "platformAgent.deployment.env[3].value=false"', block.group(1))
+        self.assertIn('--set "profiles.tse.enabled=true"', block.group(1))
         self.assertIn('${MODE_NEXT_ENV_ARGS[@]+"${MODE_NEXT_ENV_ARGS[@]}"}', script)
         root = _CI_DEPLOY.parent.parent
         self.assertIn('envAuditAutoPromote = "KUBEAGENTS_AUDIT_AUTO_PROMOTE"', (root / "k8s-operator/internal/controller/shell_sandbox_manifests.go").read_text())
