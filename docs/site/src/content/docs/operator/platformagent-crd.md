@@ -69,6 +69,8 @@ the agent a usable kubectl context) when it has the complete triple; with one mi
 | `tuning.<persona>.maxTurns`                    | int      | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below).                                                                                                                                  |
 | `tuning.maxInProgress`                         | int      | Board-wide cap on concurrent kanban workers. Unset = operator default `6`.                                                                                                                                                        |
 | `tuning.maxSessions`                           | int      | Install-wide cap on concurrent A2A session pods (1–10000). Unset = operator default `10`. Inert under `mode: today`; a separate lane from `maxInProgress`. A stream too small for it makes the provision Job refuse.              |
+| `tuning.profiles.ceiling`                      | int      | Install-wide cap on concurrent AgentProfile tasks (1–1000). Unset = `8`. Inert under `mode: today`. Sizes the profile namespace's pod quota with `warmReplicas`.                                                                  |
+| `tuning.profiles.warmReplicas`                 | int      | Warm worker pods kept per interactive (profile, tier) (0–100). Unset = `1`. Inert under `mode: today`.                                                                                                                            |
 | `experimental.platformFrontDoor`               | bool     | **Unsupported.** Run the gateway as the Platform Agent, so chat reaches it directly. Default `false`. See below.                                                                                                                  |
 
 `dashboardEnabled` publishes port `9119` on the agent Service, but nothing answers there: `hermes
@@ -346,7 +348,8 @@ Helm install, set the block in your values file.
 
 Execution limits per agent persona, where `<persona>` is one of `default` (the Planning Agent front
 door), `platform` (the Platform Agent), or `cluster` (**every** Cluster Agent), plus the board-wide
-`maxInProgress` and the mode-next session-pod cap `maxSessions`.
+`maxInProgress`, the mode-next session-pod cap `maxSessions`, and the AgentProfile knobs under
+`profiles` (`ceiling` and `warmReplicas`; see [AgentProfile](./agentprofile-crd.md)).
 
 **The per-run limits are opt-in.** The operator pins nothing of its own there: what a fleet needs
 depends on its model quota and on what its agents actually do, so a deployment doing short

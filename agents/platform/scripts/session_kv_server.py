@@ -33,6 +33,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from agent_common_server import _run_env, CONFIG_PATH, DOTENV_PATH
 import board_snapshot
 import chat_notify
+import cron_schedule
 import findings_queue
 import gitops_workspace
 import slack_audit_report
@@ -185,6 +186,14 @@ CONVERSATION_FIELD_MAX_CHARS = 512
 # a card needs.
 CONVERSATION_ROUTE_ASK_KEY = "ask"
 CONVERSATION_ASK_TOKEN = re.compile(r"[a-z0-9-]{1,16}")
+# The gateway's salted HMAC pseudonym for the speaker (`authority.requester.principal`)
+# and the conversation's audience kind (`authority.audience.kind`, "dm" or "group").
+# Both are optional. The memory provider reads them to isolate personal memory per
+# user and disable personal memory in group conversations.
+CONVERSATION_ROUTE_USER_KEY = "user_id"
+CONVERSATION_ROUTE_USER_TOKEN = re.compile(r"hmac:[0-9a-f]{32}")
+CONVERSATION_ROUTE_CHAT_TYPE_KEY = "chat_type"
+CONVERSATION_ROUTE_CHAT_TYPES = frozenset({"dm", "group"})
 
 # Hermes' managed scope, the administrator-pinned layer `load_hermes_dotenv`
 # applies LAST with override=True. The operator mounts it at /etc/hermes and
@@ -241,6 +250,42 @@ SCHEDULER_LEG_KEY = "also_delivered_to"
 # deploy/docker/plugins/chat/adapter.py: SCHEDULER_FAILURE_FIELD, set when the
 # delivery is the scheduler's failure line for the run.
 SCHEDULER_FAILURE_KEY = "scheduler_failure"
+# What the scheduler's failure line is posted as (`scheduler_failure_line`):
+# what did not happen, why, and when the job runs next. The scheduler's own
+# line names a CLI and a config file nobody in the channel can reach, so it
+# goes to this process's log instead.
+SCHEDULER_FAILURE_HEAD = "**The {title} didn't run.**"
+# When the job runs next, with no clock time (`cron_schedule`): "tomorrow"
+# only for a job whose schedule fires once a day, every day.
+SCHEDULER_FAILURE_NEXT_DAILY = "It will try again tomorrow."
+SCHEDULER_FAILURE_NEXT_UNKNOWN = "It will try again at its next scheduled run."
+# A failure no retry clears ends with this instead of a promise to try again:
+# the scheduler's line, with the details, is in this server's log, which
+# fluent-bit ships with the agent's other logs.
+SCHEDULER_FAILURE_NEEDS_ADMIN = "An admin needs to fix this before it can run; the details are in the agent's log."
+SCHEDULER_FAILURE_ERROR = "It hit an error"
+SCHEDULER_FAILURE_BLOCKED = "Its configuration is invalid"
+SCHEDULER_FAILURE_BLOCKED_MARK = "blocked by configuration validation"
+# The scheduler's reasons (cron/scheduler.py: _summarize_cron_failure_for_delivery),
+# each by the words its line carries after the job's name, said in plain words,
+# and whether a person has to act before the job can run (True) or the next
+# run may clear it (False). A line that matches none is `SCHEDULER_FAILURE_ERROR`,
+# and is promised a retry: nothing in it says which it is.
+SCHEDULER_FAILURE_REASONS = (
+    ("failed: script timed out", "It ran too long and was stopped", False),
+    ("failed: provider rate limit", "The AI model's usage limit was reached", False),
+    ("failed: provider weekly usage limit", "The AI model's usage limit was reached", False),
+    ("failed: provider quota limit", "The AI model's usage limit was reached", False),
+    ("failed: the job itself stalled", "It stopped making progress", False),
+    ("failed: provider timeout", "The AI model didn't answer in time", False),
+    ("failed: provider authentication error", "The AI model rejected its credentials", True),
+)
+# The ledger status of a run that finished without failing. One after a failure
+# was posted means the job recovered, so its next failure is news again.
+RUN_LEDGER_COMPLETED = "completed"
+# The route's status for a failure line it did not post, because the same
+# failure was posted and the job has not run cleanly since.
+CRON_REPORT_SUPPRESSED = "suppressed"
 AUDIT_REPOS_SUMMARY_LINE = "{label}: {count} repositories reported in this run."
 # `audit_report.CHAT_REPORT_LEDGER_LINE`, read back for a truncation notice.
 AUDIT_LEDGER_LINE_RE = re.compile(r"^Ledger: (\S+)$", re.MULTILINE)
@@ -866,6 +911,37 @@ DRIFT_BACKLOG_LEASE_MARGIN_SECONDS = 30
 DRIFT_BACKLOG_LEASE_NAME = "digest"
 # Principals and objects the digest names before it counts the rest.
 DRIFT_BACKLOG_MAX_PRINCIPALS = 8
+# On an install with no chat route the digest is one card on the task board,
+# filed through the Hermes CLI with no assignee and status blocked: no agent
+# turn files it or reads it, so a principal-chosen name in its body is never a
+# prompt, and it stays in view until a person acts on it. The CLI rather than
+# hermes_cli.kanban.run_slash: it returns an exit code, takes a timeout, and is
+# safe to call from this threaded server.
+DRIFT_BACKLOG_CARD_TITLE = "Drift backlog: {count} {noun} reached drift detection late"
+DRIFT_BACKLOG_CARD_KEY_PREFIX = "drift-backlog-"
+DRIFT_BACKLOG_CARD_CREATED_BY = "drift-detector"
+DRIFT_BACKLOG_CARD_STATUS = "blocked"
+# The CLI timeout is the send timeout, so the lease (sized from it) outlives
+# the call. A timeout counts as no card, unlike the chat send, because the rows
+# must not be marked without a task id; a create that committed before the kill
+# is returned by the key on the retry, so no second card follows unless the set
+# of pending rows changed in between.
+DRIFT_BACKLOG_CARD_TIMEOUT_SECONDS = DRIFT_BACKLOG_SEND_TIMEOUT_SECONDS
+# Below the CLI timeout, so a busy board answers (with an error) inside it
+# instead of Hermes' two-minute default lock wait outliving the call.
+DRIFT_BACKLOG_CARD_BUSY_TIMEOUT_MS = "30000"
+# Rows the card lists one by one before it counts the rest.
+DRIFT_BACKLOG_CARD_MAX_ROWS = 100
+# A name the card shows as is. Names come from the cluster and the audit log,
+# so one that fails this (a space, a quote, a backtick) is shown as a placeholder.
+_DRIFT_BACKLOG_NAME_RE = re.compile(r"^[A-Za-z0-9._:@+-]{1,200}$")
+DRIFT_BACKLOG_NAME_PLACEHOLDER = "<name of {length} characters, not shown>"
+# How the card tells a reader to get the full list.
+DRIFT_BACKLOG_FEED_COMMAND = (
+    "kubectl -n kubeagents-system exec deployment/platform-agent-gateway -c platform-agent -- "
+    "sh -c 'curl -s -H \"Authorization: Bearer $SESSION_KV_API_KEY\" "
+    "\"http://127.0.0.1:8699/v1/intercepted-events?limit=200\"'"
+)
 DRIFT_BACKLOG_MAX_OBJECTS = 5
 DRIFT_BACKLOG_EMOJI = "🗂️"
 # How many times the digest tries to mark its rows after a post, and the pause
@@ -1089,6 +1165,20 @@ def init_db() -> None:
                     job_id    TEXT NOT NULL,
                     run       TEXT NOT NULL,
                     posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (profile, job_id)
+                )
+                """
+            )
+            # The failure each job last posted, and when, so a failure that
+            # repeats is posted once: the next post is a different failure, or
+            # the same one after a run that finished cleanly.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS scheduler_failure_posts (
+                    profile   TEXT NOT NULL,
+                    job_id    TEXT NOT NULL,
+                    reason    TEXT NOT NULL,
+                    posted_at REAL NOT NULL,
                     PRIMARY KEY (profile, job_id)
                 )
                 """
@@ -4016,6 +4106,123 @@ def audit_chat_report(profile: str, job_id: str, title: str) -> tuple[str, str]:
     return CHAT_REPORT_PARTS_SEPARATOR.join(finished), run
 
 
+class SchedulerFailure(NamedTuple):
+    """The scheduler's failure line said plainly (:func:`scheduler_failure_line`): `reason` is what the repeat check compares."""
+
+    reason: str
+    text: str
+
+
+def _profile_home(profile: str) -> str:
+    """`profile`'s home under the agent home, where its cron roster and run ledger live."""
+    from gitops_workspace import agent_home
+
+    return agent_home() if profile == DEFAULT_PROFILE else os.path.join(agent_home(), PROFILES_DIR, profile)
+
+
+def _runs_daily(profile: str, job_id: str) -> bool:
+    """Whether `job_id` in `profile`'s cron roster fires once a day, every day; False when it cannot be read."""
+    if not _PROFILE_SEGMENT_RE.match(profile):
+        return False
+    try:
+        return cron_schedule.job_runs_daily(_profile_home(profile), job_id)
+    except Exception as exc:
+        logger.warning(f"Relay for {profile}/{job_id}: cron schedule unreadable: {exc}")
+        return False
+
+
+def scheduler_failure_line(profile: str, job_id: str, title: str, report: str) -> SchedulerFailure:
+    """The scheduler's failure line for a run of `job_id`, as one plain line.
+
+    "**The <title> didn't run.** <why>. It will try again tomorrow." The why is
+    the scheduler's reason in plain words (`SCHEDULER_FAILURE_REASONS`), or
+    `SCHEDULER_FAILURE_ERROR` for one it does not name. "tomorrow" is for a job
+    that fires once a day, every day; any other says
+    `SCHEDULER_FAILURE_NEXT_UNKNOWN`. A failure no retry clears (rejected
+    credentials, or a job the scheduler blocked on its configuration, which it
+    runs no more until it is fixed) ends with `SCHEDULER_FAILURE_NEEDS_ADMIN`.
+    """
+    head = SCHEDULER_FAILURE_HEAD.format(title=title or job_id)
+    lower = report.lower()
+    if SCHEDULER_FAILURE_BLOCKED_MARK in lower:
+        return SchedulerFailure(SCHEDULER_FAILURE_BLOCKED, f"{head} {SCHEDULER_FAILURE_BLOCKED}. {SCHEDULER_FAILURE_NEEDS_ADMIN}")
+    reason, needs_admin = next(
+        ((plain, admin) for words, plain, admin in SCHEDULER_FAILURE_REASONS if words in lower),
+        (SCHEDULER_FAILURE_ERROR, False),
+    )
+    if needs_admin:
+        then = SCHEDULER_FAILURE_NEEDS_ADMIN
+    else:
+        then = SCHEDULER_FAILURE_NEXT_DAILY if _runs_daily(profile, job_id) else SCHEDULER_FAILURE_NEXT_UNKNOWN
+    return SchedulerFailure(reason, f"{head} {reason}. {then}")
+
+
+def _run_completed_since(profile: str, job_id: str, since: float) -> bool:
+    """Whether the scheduler's ledger has a run of `job_id` that started after `since` and finished cleanly.
+
+    True when the ledger cannot say, so a failure that cannot be told from a
+    repeat is posted rather than withheld; that includes a `profile` that is not
+    one path segment, since it is caller-supplied and a path that leaves the
+    profiles directory is no ledger.
+    """
+    if not _PROFILE_SEGMENT_RE.match(profile):
+        return True
+    path = os.path.join(_profile_home(profile), *RUN_LEDGER)
+    if not os.path.exists(path):
+        return True
+    try:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=AUDIT_RUNS_DB_TIMEOUT_S)) as conn:
+            rows = conn.execute(
+                "SELECT started_at FROM executions WHERE job_id = ? AND status = ?",
+                (job_id, RUN_LEDGER_COMPLETED),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        logger.warning(f"Relay for {profile}/{job_id}: run ledger unreadable: {exc}")
+        return True
+    for (started,) in rows:
+        try:
+            if datetime.fromisoformat(str(started)).timestamp() > since:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _failure_already_posted(profile: str, job_id: str, reason: str) -> bool:
+    """Whether `reason` is the failure `job_id` last posted, with no clean run since."""
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=AUDIT_RUNS_DB_TIMEOUT_S)) as conn:
+            row = conn.execute(
+                "SELECT reason, posted_at FROM scheduler_failure_posts WHERE profile = ? AND job_id = ?",
+                (profile, job_id),
+            ).fetchone()
+    except Exception as exc:
+        logger.warning(f"Relay for {profile}/{job_id}: last posted failure unreadable: {exc!r}")
+        return False
+    if not row or row[0] != reason:
+        return False
+    return not _run_completed_since(profile, job_id, float(row[1]))
+
+
+def _record_failure_posted(profile: str, job_id: str, reason: str | None) -> None:
+    """Remember the failure `job_id` posted, or forget it when `reason` is None (the job ran)."""
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=AUDIT_RUNS_DB_TIMEOUT_S)) as conn:
+            with conn:
+                if reason is None:
+                    conn.execute(
+                        "DELETE FROM scheduler_failure_posts WHERE profile = ? AND job_id = ?", (profile, job_id)
+                    )
+                else:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO scheduler_failure_posts (profile, job_id, reason, posted_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (profile, job_id, reason, time.time()),
+                    )
+    except Exception as exc:
+        logger.error(f"Relay for {profile}/{job_id}: posted failure not recorded: {exc!r}")
+
+
 def relay_cron_report(
     session_id: str,
     profile: str,
@@ -4318,19 +4525,44 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
     # Only the scheduler's delivery leg sends `also_delivered_to`; a mid-run
     # `report_to_chat` does not, and its text is posted as written.
     from_scheduler = SCHEDULER_LEG_KEY in request_data
+    failure_flagged = from_scheduler and request_data.get(SCHEDULER_FAILURE_KEY) is True
+    failure: SchedulerFailure | None = None
     failure_run = ""
     if from_scheduler and _is_fleet_audit_job(profile, job_id) and _is_shipped_audit_job(job_id):
-        if request_data.get(SCHEDULER_FAILURE_KEY) is True and not _record_written_by_this_run(profile, job_id):
-            # The scheduler's line for a failed run, posted as written, as on
-            # main: it says why the run failed, and the record on disk is an
-            # earlier run's. Marking that record posted keeps a later run that
-            # never reached `start` from posting it as its own.
+        if failure_flagged and not _record_written_by_this_run(profile, job_id):
+            # The scheduler's line for a failed run: it says why the run
+            # failed, and the record on disk is an earlier run's. Marking that
+            # record posted keeps a later run that never reached `start` from
+            # posting it as its own.
             failure_run = _record_run(job_id)
+            failure = scheduler_failure_line(profile, job_id, title, report)
         else:
             # The flag is read off the text, which the model can also write:
             # a run that wrote its own record reached `finish`, so its report
             # is posted whatever its last message says.
             report, audit_run = audit_chat_report(profile, job_id, title)
+    elif failure_flagged:
+        failure = scheduler_failure_line(profile, job_id, title, report)
+    if failure is not None:
+        logger.warning(f"Relay for {profile}/{job_id}: the run failed; the scheduler said: {report}")
+        if _failure_already_posted(profile, job_id, failure.reason):
+            # Posted once already, with no clean run since: the channel knows.
+            if failure_run:
+                _mark_run_posted(profile, job_id, failure_run)
+            logger.info(f"Relay for {profile}/{job_id}: the same failure was posted already; not posting it again")
+            return {
+                "status": CRON_REPORT_SUPPRESSED,
+                "session_id": "",
+                "relay": "ok",
+                "relay_detail": "",
+                "undelivered": "",
+                "truncated": "",
+            }
+        report = failure.text
+    elif from_scheduler:
+        # The job delivered something other than a failure, so it ran, and
+        # its next failure is news; its report is the "working again" signal.
+        _record_failure_posted(profile, job_id, None)
     report, truncation_notice = _truncate_report(report, profile, job_id, audit_record=bool(audit_run))
 
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -4347,6 +4579,8 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
         raise HTTPException(status_code=502, detail=f"chat relay failed: {error}")
     if audit_run or failure_run:
         _mark_run_posted(profile, job_id, audit_run or failure_run)
+    if failure is not None:
+        _record_failure_posted(profile, job_id, failure.reason)
     # 200, because the report is in the channel and the run did its job. `relay`
     # and `relay_detail` reported a degraded delivery, which only a failed Chat
     # Agent turn produced; no turn runs now, so they always read ok, and they
@@ -4702,6 +4936,103 @@ def _drift_backlog_digest_text(rows: Sequence[Dict[str, Any]]) -> str:
     )
 
 
+def _drift_backlog_card_name(value: Any) -> str:
+    """A name for the card body: shown when it matches the allowlist, else a placeholder."""
+    text = str(value or "")
+    if not text:
+        return DRIFT_UNKNOWN_FIELD
+    if _DRIFT_BACKLOG_NAME_RE.fullmatch(text):
+        return text
+    return DRIFT_BACKLOG_NAME_PLACEHOLDER.format(length=len(text))
+
+
+def _drift_backlog_card_body(rows: Sequence[Dict[str, Any]]) -> str:
+    """The card's body: the digest's count by principal, then every row up to a cap.
+
+    Both lists are capped because the body travels as one argv element, which the
+    kernel limits to 128 KiB; an uncapped body would fail to file and retry forever.
+    """
+    by_principal: Dict[str, int] = {}
+    for row in rows:
+        principal = row["principal"] or DRIFT_UNKNOWN_FIELD
+        by_principal[principal] = by_principal.get(principal, 0) + 1
+    ranked = sorted(by_principal.items(), key=lambda item: (-item[1], item[0]))
+    principals = ", ".join(f"{_drift_backlog_card_name(p)} ({n})" for p, n in ranked[:DRIFT_BACKLOG_MAX_PRINCIPALS])
+    if len(ranked) > DRIFT_BACKLOG_MAX_PRINCIPALS:
+        principals += f", and {len(ranked) - DRIFT_BACKLOG_MAX_PRINCIPALS} more"
+    lines = [
+        f"{len(rows)} {'change' if len(rows) == 1 else 'changes'} reached drift detection late (they queued "
+        f"before it started pulling, or waited over {DRIFT_BACKLOG_MAX_WAIT_TEXT}). This install has no chat "
+        "platform enabled, so this card is the digest. No agent acts on it: a person reads it and archives it.",
+        "",
+        "By principal: " + principals,
+        "",
+        "Changes:",
+    ]
+    for row in rows[:DRIFT_BACKLOG_CARD_MAX_ROWS]:
+        obj = "/".join(_drift_backlog_card_name(part) for part in (row["namespace"], row["object_kind"], row["workload"]) if part)
+        lines.append(
+            f"- {_drift_backlog_card_name(row['principal'])} changed {obj} on "
+            f"{_drift_backlog_card_name(row['cluster'])} (recorded {row['created_at']} UTC)"
+        )
+    if len(rows) > DRIFT_BACKLOG_CARD_MAX_ROWS:
+        lines.append(f"- and {len(rows) - DRIFT_BACKLOG_CARD_MAX_ROWS} more")
+    lines += ["", f"Full list (the `{FEED_STATUS_BACKLOG}` rows): {DRIFT_BACKLOG_FEED_COMMAND}"]
+    return "\n".join(lines)
+
+
+def _file_drift_backlog_card(rows: Sequence[Dict[str, Any]]) -> str:
+    """File the digest as one unassigned, blocked card and return its id, or "" when no card exists.
+
+    The idempotency key names the rows, so a retry over the same rows gets the
+    card that exists back rather than a second one.
+    """
+    noun = "change" if len(rows) == 1 else "changes"
+    cmd = [
+        chat_notify.HERMES_CLI, "kanban", "create",
+        DRIFT_BACKLOG_CARD_TITLE.format(count=len(rows), noun=noun),
+        "--body", _drift_backlog_card_body(rows),
+        "--initial-status", DRIFT_BACKLOG_CARD_STATUS,
+        "--idempotency-key", f"{DRIFT_BACKLOG_CARD_KEY_PREFIX}{rows[0]['id']}-{rows[-1]['id']}",
+        "--created-by", DRIFT_BACKLOG_CARD_CREATED_BY,
+        "--json",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            env=_run_env({"HERMES_KANBAN_BUSY_TIMEOUT_MS": DRIFT_BACKLOG_CARD_BUSY_TIMEOUT_MS}),
+            timeout=DRIFT_BACKLOG_CARD_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        logger.error(f"Drift backlog card: `hermes kanban create` did not answer in {DRIFT_BACKLOG_CARD_TIMEOUT_SECONDS}s")
+        return ""
+    except Exception as exc:
+        logger.error(f"Drift backlog card: could not run `hermes kanban create`: {exc}")
+        return ""
+    if proc.returncode != 0:
+        logger.error(
+            f"Drift backlog card: `hermes kanban create` exited {proc.returncode}: "
+            f"{(proc.stderr or proc.stdout or '').strip()[:LEDGER_MESSAGE_MAX_CHARS]}"
+        )
+        return ""
+    # The board's own stderr can share the buffer, so find the JSON object
+    # rather than parsing the whole string as one.
+    out = proc.stdout or ""
+    start, end = out.find("{"), out.rfind("}")
+    task_id = ""
+    if start != -1 and end > start:
+        try:
+            task_id = str((json.loads(out[start:end + 1]) or {}).get("id") or "")
+        except ValueError:
+            task_id = ""
+    if not task_id:
+        logger.error(f"Drift backlog card: no task id in the board's answer: {out.strip()[:LEDGER_MESSAGE_MAX_CHARS]}")
+    return task_id
+
+
 def _refund_alert_quota(severity: str) -> None:
     """Give back one of today's alerts for `severity`, claimed for a post that
     never happened. Best-effort: a failed refund costs one unit of the day's
@@ -4725,7 +5056,7 @@ def _card_drift_backlog_minorities(rows: Sequence[Dict[str, Any]]) -> list[Dict[
     A carded row gets what a live drift record gets, less field ownership (its
     join was skipped): a quota claim, a session, the alert and the triage turn.
     A row the ceiling refuses stays in the digest, so the change is still named
-    in chat. The row is marked DRIFT_BACKLOG_CARDED before the turn starts, so a
+    in the digest. The row is marked DRIFT_BACKLOG_CARDED before the turn starts, so a
     crash after it cannot card it twice; a turn that fails after that is lost as
     a live one would be. A row whose session or mark cannot be written goes to
     the digest too, so it is named and marked with the rest rather than left
@@ -4831,8 +5162,8 @@ def _post_drift_backlog_digest() -> bool:
     """Claim the pending rows, post one digest for them, and mark them.
 
     Returns False when the post failed or another holder has the lease, so the
-    worker waits DRIFT_BACKLOG_RETRY_SECONDS. A headless install marks the rows
-    with no post, as the alert path does for its own rows.
+    worker waits DRIFT_BACKLOG_RETRY_SECONDS. An install with no chat route
+    files the digest as one board card instead (_file_drift_backlog_card).
     """
     global _drift_backlog_unfinished
     if _drift_backlog_unfinished is not None:
@@ -4858,8 +5189,12 @@ def _post_drift_backlog_digest() -> bool:
         if not rows:
             return True
         if headless:
+            task_id = _file_drift_backlog_card(rows)
+            if not task_id:
+                logger.error(f"Drift backlog card for {len(rows)} record(s) was not filed; retrying in {DRIFT_BACKLOG_RETRY_SECONDS}s")
+                return False
             outcome = DRIFT_BACKLOG_HEADLESS
-            logger.info(f"Drift backlog: {len(rows)} record(s) recorded with no digest posted (no chat platform enabled)")
+            logger.info(f"Drift backlog card {task_id} filed for {len(rows)} record(s) (no chat route)")
             return True
         message = _drift_backlog_digest_text(rows)
         active = get_active_platform(platforms)
@@ -5358,11 +5693,22 @@ def put_conversation_route(session_id: str, request_data: Dict[str, Any]) -> Dic
     conversation = str(request_data.get("conversation") or "").strip()
     context_id = str(request_data.get("context_id") or "").strip()
     ask = str(request_data.get(CONVERSATION_ROUTE_ASK_KEY) or "").strip()
-    prefix = CONVERSATION_KEY_PREFIXES.get(platform)
-    if prefix is None:
-        raise HTTPException(status_code=400, detail=f"platform {platform!r} is not one the gateway holds")
-    if not conversation.startswith(prefix) or len(conversation) == len(prefix):
-        raise HTTPException(status_code=400, detail=f"conversation is not a {platform} conversation key ({prefix}...)")
+    user_id = str(request_data.get(CONVERSATION_ROUTE_USER_KEY) or "").strip()
+    chat_type = str(request_data.get(CONVERSATION_ROUTE_CHAT_TYPE_KEY) or "").strip().lower()
+    if platform:
+        prefix = CONVERSATION_KEY_PREFIXES.get(platform)
+        if prefix is None:
+            raise HTTPException(status_code=400, detail=f"platform {platform!r} is not one the gateway holds")
+        if not conversation.startswith(prefix) or len(conversation) == len(prefix):
+            raise HTTPException(status_code=400, detail=f"conversation is not a {platform} conversation key ({prefix}...)")
+    else:
+        if not (CONVERSATION_ROUTE_USER_TOKEN.fullmatch(user_id) or chat_type in CONVERSATION_ROUTE_CHAT_TYPES):
+            raise HTTPException(
+                status_code=400,
+                detail="an identity-only route (no platform) needs a user_id of the form hmac:<32-hex> or a chat_type of 'dm' or 'group'",
+            )
+        if not conversation:
+            raise HTTPException(status_code=400, detail="conversation is required")
     if not context_id:
         raise HTTPException(status_code=400, detail="context_id is required")
     if max(len(conversation), len(context_id)) > CONVERSATION_FIELD_MAX_CHARS:
@@ -5389,6 +5735,10 @@ def put_conversation_route(session_id: str, request_data: Dict[str, Any]) -> Dic
             }
             if CONVERSATION_ASK_TOKEN.fullmatch(ask):
                 route[CONVERSATION_ROUTE_ASK_KEY] = ask
+            if CONVERSATION_ROUTE_USER_TOKEN.fullmatch(user_id):
+                route[CONVERSATION_ROUTE_USER_KEY] = user_id
+            if chat_type in CONVERSATION_ROUTE_CHAT_TYPES:
+                route[CONVERSATION_ROUTE_CHAT_TYPE_KEY] = chat_type
             meta[CONVERSATION_ROUTE_KEY] = route
             conn.execute(
                 "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?) "

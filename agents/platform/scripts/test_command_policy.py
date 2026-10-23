@@ -756,7 +756,11 @@ class GcloudReadOnlyTest(unittest.TestCase):
                 self.assertEqual("gcp.unreadable-command", decision.rule_id)
                 self.assertNotIn("global", decision.message)
                 # The advice has to be something the reader can act on alone.
-                self.assertIn("without the flag", decision.message)
+                # Both argvs are writes, so that advice is that the retry is
+                # refused too: inviting a flagless retry sent the cluster agent
+                # into the bare `clusters update`, refused regardless (#2979).
+                self.assertIn(command_policy._STILL_REFUSED, decision.message)
+                self.assertNotIn("Re-run without", decision.message)
 
     def test_multiple_flags_before_command(self):
         # Multiple flags should be correctly skipped.
@@ -2211,6 +2215,252 @@ class LocalRenderTests(unittest.TestCase):
             ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=client", "--dry-run=none"],
         ):
             self.assertFalse(command_policy.local_render(argv), argv)
+
+
+class NoRetryInvitationForAWriteTest(unittest.TestCase):
+    """A refusal invites a retry without a flag only when that retry would be allowed (#2979).
+
+    Seen live: refused for an unknown-arity flag on `gcloud container clusters
+    update` and told to "re-run without the flag", the cluster agent did, seven
+    times, ending with a bare `clusters update` that is refused as a write
+    regardless. The invitation is now made only when the remainder is allowed.
+
+    kubectl keeps the invitation: its flagless retry, refused under
+    `kubernetes.read-only`, is the refusal the runtime stop halts on (#3380).
+    """
+
+    INVITATIONS = ("without the flag", "Re-run without", "Remove ", "Drop the flag", "Expand flags manually")
+    WRITE_PHRASE = command_policy._STILL_REFUSED
+
+    # The live argv, verbatim in shape.
+    LIVE = ["gcloud", "container", "clusters", "update", "prod", "--location", "us-east4",
+            "--binauthz-evaluation-mode=PROJECT_SINGLETON_POLICY_ENFORCE"]
+
+    def test_the_live_unknown_flag_on_a_write_says_stop_and_report(self):
+        decision = evaluate(self.LIVE)
+        self.assertFalse(decision.allowed)
+        self.assertEqual("gcp.unreadable-command", decision.rule_id)
+        self.assertEqual(
+            "gcloud used a flag whose arity is unknown to this module, but the command is refused "
+            "whatever that flag is. " + command_policy._STILL_REFUSED + " "
+            + command_policy._GCLOUD_READ_ONLY_MESSAGE
+            + " For its synopsis only, --help with no other flags is allowed.",
+            decision.message,
+        )
+        self.assertIsNone(decision.verb_tuple)
+        self.assertEqual("--binauthz-evaluation-mode", decision.offending_flag)
+        # And the retry it used to invite is refused, which is why it is not invited.
+        self.assertFalse(evaluate(self.LIVE[:-1]).allowed)
+
+    def test_an_unknown_flag_on_what_could_still_be_a_read_keeps_the_retry(self):
+        for argv in (
+            ["gcloud", "container", "clusters", "describe", "prod", "--brand-new-flag=x"],
+            ["gcloud", "container", "--brand-new-flag", "clusters", "list"],
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertEqual("gcp.unreadable-command", decision.rule_id)
+                self.assertIn("Re-run without the flag", decision.message)
+                self.assertIsNone(decision.verb_tuple)
+
+    def test_no_help_clause_where_help_is_not_an_escape(self):
+        decision = evaluate(["gcloud", "config", "set", "project", "p", "--brand-new-flag=x"])
+        self.assertEqual("gcp.unreadable-command", decision.rule_id)
+        self.assertTrue(decision.message.startswith(command_policy._UNREADABLE_WRITE_LEAD),
+                        "the refused-retry variant stopped firing; this test would be vacuous")
+        self.assertNotIn("--help", decision.message)
+
+    def test_the_help_clause_follows_the_surface_after_a_leading_unknown_flag(self):
+        # With the unknown flag ahead of the surface there are no words before
+        # it; the clause must follow the surface of the retry, which for
+        # `config` has no help escape.
+        for argv, offered in (
+            (["gcloud", "--new-flag", "config", "set", "project", "p"], False),
+            (["gcloud", "--log-http", "config", "set", "project", "p"], False),
+            (["gcloud", "--new-flag", "container", "clusters", "update", "prod"], True),
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertTrue(decision.message.startswith(command_policy._UNREADABLE_WRITE_LEAD))
+                self.assertEqual(offered, "--help" in decision.message)
+                if offered:
+                    retry = [a for a in argv if not a.startswith("--new")] + ["--help"]
+                    self.assertTrue(evaluate(retry).allowed, f"the offered retry {retry} is refused")
+
+    def test_a_help_flag_beside_two_unknown_flags_keeps_the_retry(self):
+        # The SOP's own shape: confirm a remediation flag with --help. The
+        # reading drops one unknown flag and stops at the next, so only the
+        # prefix check judges it, and --help can still make it a synopsis
+        # wherever it sits: before, between or after the two flags.
+        head = ["gcloud", "container", "clusters", "upgrade", "c"]
+        flags = ["--node-pool=pool", "--image-type=t"]
+        for at in range(len(flags) + 1):
+            argv = head + flags[:at] + ["--help"] + flags[at:]
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.message.startswith(command_policy._UNREADABLE_WRITE_LEAD))
+                self.assertIn("Re-run without the flag", decision.message)
+        self.assertTrue(evaluate(head + ["--help"]).allowed)
+
+    def test_the_unreadable_variant_names_no_positional(self):
+        # On a two-word surface the third word is the caller's positional; the
+        # variant carries no verb at all, as the flag refusals do not.
+        decision = evaluate(["gcloud", "projects", "delete", "acme-prod", "--new-flag=x"])
+        self.assertTrue(decision.message.startswith(command_policy._UNREADABLE_WRITE_LEAD))
+        self.assertIsNone(decision.verb_tuple)
+
+    def test_a_bare_gcloud_with_an_unknown_flag_invites_no_refused_retry(self):
+        # The retry, bare `gcloud` or `gcloud beta`, is refused; an answer of
+        # "every reading is refused" must not be lost for having no verb words.
+        for argv in (["gcloud", "--new-flag"], ["gcloud", "beta", "--new-flag"]):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertTrue(decision.message.startswith(command_policy._UNREADABLE_WRITE_LEAD))
+                self.assertNotIn("Re-run without", decision.message)
+                self.assertFalse(evaluate([a for a in argv if a != "--new-flag"]).allowed)
+
+    def test_a_synopsis_request_after_an_unknown_flag_keeps_the_retry(self):
+        # Dropping the unknown flag leaves `update x -h`, which the help escape
+        # allows, so the retry is invited even though the words name a write.
+        decision = evaluate(["gcloud", "container", "clusters", "update", "x", "--brand-new-flag", "-h"])
+        self.assertEqual("gcp.unreadable-command", decision.rule_id)
+        self.assertIn("Re-run without the flag", decision.message)
+        self.assertTrue(evaluate(["gcloud", "container", "clusters", "update", "x", "-h"]).allowed)
+
+    # Each kubectl flag refusal on a write, and its flagless retry.
+    KUBECTL_WRITE_FLAG_REFUSALS = (
+        (["kubectl", "delete", "pod", "web-0", "--as", "system:admin"], "identity.caller-supplied-impersonation"),
+        (["kubectl", "--kuberc", "/workspace/kr.yaml", "delete", "pod", "web-0"], "kubernetes.kuberc-forbidden"),
+        (["kubectl", "delete", "pod", "web-0", "--token", "t"], "kubernetes.identity-change-forbidden"),
+        (["kubectl", "delete", "pod", "web-0", "--profile-output", "/workspace/x"],
+         "kubernetes.file-write-forbidden"),
+        (["kubectl", "exec", "my-secret-pod", "--as=u", "--", "sh"], "identity.caller-supplied-impersonation"),
+    )
+
+    def test_a_kubectl_flag_refusal_on_a_write_keeps_the_retry_the_runtime_halts_on(self):
+        # The runtime stop does not count a flag refusal's rule id; it halts on
+        # the retry's `kubernetes.read-only` refusal of the write, so telling
+        # the agent not to retry would give the halt up (#3380).
+        for argv, rule_id in self.KUBECTL_WRITE_FLAG_REFUSALS:
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertEqual(rule_id, decision.rule_id)
+                self.assertIn("without the flag", decision.message)
+                self.assertNotIn(self.WRITE_PHRASE, decision.message)
+                self.assertIsNone(decision.verb_tuple)
+                retry = evaluate(command_policy._strip_refused_flags(argv))
+                self.assertEqual(command_policy.KUBERNETES_READ_ONLY_RULE, retry.rule_id)
+
+    def test_a_local_render_with_a_refused_flag_keeps_the_retry(self):
+        # A local render is guidance at runtime, not a refusal, and keeps the
+        # invitation like every kubectl flag refusal.
+        for argv in (
+            ["kubectl", "apply", "-f", "x.yaml", "--dry-run=client", "--as=u"],
+            ["kubectl", "apply", "view-last-applied", "deploy/x", "--as=u"],
+            ["kubectl", "delete", "pod", "p", "--help", "--as=u"],
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertIn("without the flag", decision.message)
+                self.assertNotIn(self.WRITE_PHRASE, decision.message)
+
+    def test_an_unlisted_read_is_not_told_it_changes_state(self):
+        # gcp.read-only also refuses reads missing from the allowlist; the
+        # remainder's own message says so, and nothing claims a state change.
+        decision = evaluate(["gcloud", "beta", "container", "clusters", "list", "--account=a"])
+        self.assertIn(self.WRITE_PHRASE, decision.message)
+        self.assertIn("missing from GCLOUD_READ_COMMANDS", decision.message)
+        self.assertNotIn("would still change", decision.message)
+
+    # Each gcloud flag refusal on a write: the same rule, the flag's reason, and
+    # the write notice instead of the removal hint and the flag notice.
+    WRITE_FLAG_REFUSALS = (
+        (["gcloud", "--flags-file", "/workspace/f.yaml", "container", "clusters", "update", "prod"],
+         "gcp.flags-file-forbidden",
+         "--flags-file reads from a file under the agent's control. We cannot read that file without "
+         "a race condition, so we refuse it outright."),
+        (["gcloud", "container", "clusters", "update", "prod", "--account", "x@example.com"],
+         "gcp.identity-change-forbidden",
+         "Identity belongs to the broker."),
+        (["gcloud", "container", "clusters", "update", "prod", "--log-http-log-file", "/workspace/l"],
+         "gcp.file-write-forbidden",
+         "--output-path and --log-http-log-file write a file inside the credential proxy's own "
+         "container, not the agent workspace."),
+    )
+
+    def test_a_flag_refusal_on_a_write_states_the_write_and_invites_nothing(self):
+        for argv, rule_id, reason in self.WRITE_FLAG_REFUSALS:
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed)
+                self.assertEqual(rule_id, decision.rule_id)
+                self.assertEqual(
+                    f"{reason} {command_policy._STILL_REFUSED} {command_policy._GCLOUD_READ_ONLY_MESSAGE}",
+                    decision.message,
+                )
+                self.assertIsNone(decision.verb_tuple)
+                for invitation in self.INVITATIONS:
+                    self.assertNotIn(invitation, decision.message)
+
+    def test_a_flag_refusal_on_a_read_keeps_its_removal_hint(self):
+        # The mirror of RefusalsSayTheBoundaryIsFinal.FLAG_REFUSALS: on a read, the
+        # remainder is allowed, so the invitation stays and the write notice
+        # does not appear.
+        for argv, rule_id in RefusalsSayTheBoundaryIsFinal.FLAG_REFUSALS:
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertEqual(rule_id, decision.rule_id)
+                self.assertIn("without the flag", decision.message)
+                self.assertNotIn(self.WRITE_PHRASE, decision.message)
+                self.assertIsNone(decision.verb_tuple)
+
+    # A corpus across both tools: every refused flag, in both spellings, on a
+    # read and on a write, plus unknown flags in several positions.
+    READS = (["kubectl", "get", "pods"], ["gcloud", "container", "clusters", "list"], ["gcloud", "info"])
+    WRITES = (["kubectl", "delete", "pod", "web-0"], ["kubectl", "rollout", "restart", "deploy/web"],
+              ["gcloud", "container", "clusters", "update", "prod"], ["gcloud", "projects", "delete", "p"],
+              ["gcloud", "beta", "container", "clusters", "update", "prod"])
+
+    def _corpus(self):
+        for base in self.READS + self.WRITES:
+            tool = base[0]
+            booleans = command_policy._KUBECTL_BOOLEAN_FLAGS | command_policy._GCLOUD_BOOLEAN_FLAGS
+            for flag in sorted(command_policy._refused_flags(tool)):
+                spelled = [flag] if flag in booleans else [flag, "value"]
+                yield base + spelled
+                yield base + [f"{flag}=value"]
+                yield [base[0]] + spelled + base[1:]
+            if tool == "gcloud":
+                for position in range(1, len(base) + 1):
+                    yield base[:position] + ["--brand-new-flag=x"] + base[position:]
+                    yield base[:position] + ["--brand-new-flag", "x"] + base[position:]
+
+    def test_no_gcloud_refusal_invites_a_retry_the_policy_would_refuse_as_a_write(self):
+        # kubectl is held to the opposite, above: its invited retry is the halt.
+        checked = 0
+        for argv in self._corpus():
+            if argv[0] == "kubectl":
+                continue
+            decision = evaluate(argv)
+            if decision.allowed or not any(i in decision.message for i in self.INVITATIONS):
+                continue
+            checked += 1
+            with self.subTest(argv=argv, rule=decision.rule_id):
+                retry = command_policy._strip_refused_flags(argv)
+                if decision.rule_id == "gcp.unreadable-command":
+                    # The retry it invites is the argv without the unknown flag
+                    # and its value. An attached value goes with the token; a
+                    # separate one is a reading the caller makes, so the claim
+                    # is that some reading of the retry is not a refused write.
+                    index = next(i for i, t in enumerate(argv) if t.startswith("--brand-new-flag"))
+                    retries = [argv[:index] + argv[index + 1:]]
+                    if "=" not in argv[index]:
+                        retries.append(argv[:index] + argv[index + 2:])
+                else:
+                    retries = [retry]
+                refused = [evaluate(c).rule_id in ("gcp.read-only", "kubernetes.read-only") for c in retries]
+                self.assertFalse(all(refused), f"every reading of the invited retry {retries} is a refused write")
+        self.assertGreater(checked, 20, "the corpus stopped reaching the inviting refusals")
 
 
 class TheDeletionSectionStaysInsideThePolicy(unittest.TestCase):

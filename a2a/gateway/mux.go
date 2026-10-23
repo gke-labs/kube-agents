@@ -222,6 +222,21 @@ func (m *MultiAdapter) MarkChanged(conversation, ask, settle string) {
 	}
 }
 
+// PostTerminal goes to the backend that owns the conversation
+// (TerminalPoster); one that does not implement it answers
+// errNoTerminalFrames, which the caller treats as nothing to do.
+func (m *MultiAdapter) PostTerminal(conversation string, t ConsoleTerminal) error {
+	a, err := m.pick(conversation)
+	if err != nil {
+		return err
+	}
+	poster, ok := a.(TerminalPoster)
+	if !ok {
+		return errNoTerminalFrames
+	}
+	return poster.PostTerminal(conversation, t)
+}
+
 // ShowsTaskStatus answers for the backend that owns the conversation
 // (StatusShower); one that does not implement it keeps the rolling line.
 func (m *MultiAdapter) ShowsTaskStatus(conversation string) bool {

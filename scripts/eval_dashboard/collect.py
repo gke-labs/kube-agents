@@ -208,7 +208,10 @@ except ImportError:  # run as a script: scripts/ is not on sys.path yet
 SCHEMA_VERSION = 1
 
 # The nightly periodic (oss-test-infra: ci-kube-agents-eval-nightly, the
-# EVAL_TIER=nightly companion of the presubmit) and where Prow archives it.
+# EVAL_TIER=nightly companion of the presubmit, on spec.mode next like it)
+# and where Prow archives it. The today-mode nightly kept as the rollback
+# check (ci-kube-agents-eval-nightly-today) logs to the same bucket and is
+# not collected.
 # A periodic's log prefix holds one directory per build and a
 # latest-build.txt, so listing it is the directory index; there is no
 # pointer object to follow. The bucket is the nightly's own, not the
@@ -499,6 +502,12 @@ _ADMITTED_RATE = re.compile(
     r"(?:\s*\(main:\s*(?P<baseline>-?[0-9.]+)%,\s*margin\s*(?P<margin>-?[0-9.]+)%\))?"
 )
 
+# hack/ci-eval-pr.sh's line for a case the inject lane drops from the matrix
+# before the fan-out (hack/eval/inject-lane-exclusions.txt). A next-mode
+# nightly never records those cases, so the run carries their names
+# (`lane_excluded`) and nightly.py does not count them as missing.
+_LANE_EXCLUDED = re.compile(r"^AGENT_TRANSPORT=\S+: (?P<name>\S+) leaves the matrix -- excluded on this lane")
+
 _RESULT_BY_VERDICT = {
     "PASSED": "pass",
     "FAILED": "fail",
@@ -608,6 +617,7 @@ def parse_build_log(text: str) -> dict:
     eval_verdict = None
     eval_duration_s = None
     not_evaluated_line = False
+    lane_excluded: list[str] = []
     for line in text.splitlines():
         # The agent's own words first, and consumed whole: every other
         # pattern below that is an unanchored `search` (the lease, the final
@@ -627,6 +637,11 @@ def parse_build_log(text: str) -> dict:
         m = _LEASE.search(line)
         if m:
             project = m.group(1)
+            continue
+        m = _LANE_EXCLUDED.match(line)
+        if m:
+            if m.group("name") not in lane_excluded:
+                lane_excluded.append(m.group("name"))
             continue
         m = _TASK_LINE.match(line)
         if m:
@@ -667,6 +682,7 @@ def parse_build_log(text: str) -> dict:
         "eval_verdict": eval_verdict,
         "eval_duration_s": eval_duration_s,
         "not_evaluated_line": not_evaluated_line,
+        "lane_excluded": lane_excluded,
     }
 
 
@@ -985,6 +1001,9 @@ def build_run(
         "eval_verdict": _EVAL_VERDICT_BY_WORD.get(parsed["eval_verdict"]),
         "duration_s": duration_s,
         "tasks": parsed["tasks"],
+        # Only on a run whose matrix dropped cases on the inject lane, so
+        # every other run's document is unchanged.
+        **({"lane_excluded": parsed["lane_excluded"]} if parsed["lane_excluded"] else {}),
         **suite,
         **ended,
     }

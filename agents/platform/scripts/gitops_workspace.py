@@ -763,7 +763,13 @@ def ensure_scratch_workspace(
 
 
 def _now_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    # The argument is deliberate. `time.gmtime()` with none reads the C
+    # `time()` call, the coarse clock on Linux, which trails `time.time()`
+    # by a second for a moment after each second boundary. The fleet audit's
+    # in-flight note stamps `started_at` from `time.time()` and accepts a
+    # lease only if `refreshed_at` is not older than that, so the two stamps
+    # have to come from one clock or the run disowns the lease it just wrote.
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time()))
 
 
 def _remove_tree(path: Path) -> None:

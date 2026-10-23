@@ -2832,8 +2832,8 @@ export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-${BLOCKING_ROSTER_DEFAULT}}"
 # It defaults to unset because arming is a Prow-config decision, never a
 # default here: a laptop run must not read, let alone write, the production
 # store. Both Prow jobs export it since oss-test-infra#2698 (2026-09-14) --
-# the nightly periodic (ci-kube-agents-eval-nightly, EVAL_TIER=nightly) as
-# eval-baseline-recorder with objectViewer and objectCreator on
+# the nightly periodics (ci-kube-agents-eval-nightly, EVAL_TIER=nightly, and
+# its siblings) as eval-baseline-recorder with objectViewer and objectCreator on
 # gs://kube-agents-evals-bench, the presubmit as prowjob-default-sa with
 # objectViewer only. Pointing at a bucket that is unreachable is not fatal --
 # the store degrades to advisory with a banner -- but it is a banner on every
@@ -2911,8 +2911,8 @@ unit_cost_hint() {
     gpu-stress-test-diagnosis | autoops-warning-event-triage) echo 900 ;;
     # The third tofu case, nightly-only from the start (#1827). Unmeasured:
     # priced with the two above it because it is the same shape -- infra lock,
-    # a plant that blocks on a card appearing, then an agent turn that waits on
-    # that card finishing. A wrong hint costs packing, not correctness.
+    # a plant that blocks on a card appearing and then finishing, then an agent
+    # turn that reads it. A wrong hint costs packing, not correctness.
     gitops-drift-out-of-band-triage) echo 900 ;;
     # The #612 cases on the same stack: the stamp case is the incumbent's
     # shape; the quiet case's plant waits out the 15m quiet period before a
@@ -3078,6 +3078,10 @@ unit_cost_hint() {
     # the worker to its retries after the refusal (#1948); priced at the
     # middle so it is not the last tier a deadline cut truncates.
     stop-on-permission-refusal) echo 1200 ;;
+    # Measured on ka-fleet-dev-1 for #3260: 916s for main's red run (the
+    # worker retries before it proposes), 169-468s for the nine branch runs.
+    # Priced like stop-on-permission-refusal's shape at the red's length.
+    stop-on-unknown-flag-write-refusal) echo 1000 ;;
     # The upgrade-failure catalogue's scenario cases: read-only chat prompts
     # over the seeded clusters (entries 1 and 2 one Cluster Agent card per
     # cluster; entries 6 and 16 one declared line per cluster; entry 5 one
@@ -3125,6 +3129,14 @@ unit_cost_hint() {
     upgrades-removed-api-callers-distinguished | upgrades-network-policy-enforcement-stated) echo 900 ;;
     upgrades-stale-client-skew-named | upgrades-multi-process-oom-group-named) echo 900 ;;
     upgrades-cuda-pinned-gpu-job-named) echo 900 ;;
+    # Nightly-only since #3524. One of the five readiness-line cases of that
+    # change, each the same read-only run (three project list reads, the
+    # server config per location, the per-member kubectl reads); unmeasured.
+    # Priced at the knowledge probe's band rather than the 200s default as the
+    # one of the five that launches first, so a full-fleet run that outgrows
+    # the default is cut from this tier rather than from all five; the four
+    # siblings pack at the default until the nightly record prices them.
+    upgrades-audit-control-plane-capacity) echo 600 ;;
     *) echo 200 ;;
   esac
 }
@@ -4037,12 +4049,14 @@ profile_begin "record + final gate"
 # so its key reads today; but a rolled-back install is not the fresh today
 # install today's window measures. `bench-gate record` refuses it too.
 #
-# A next-mode run on main does record. The next-mode nightly
-# (ci-kube-agents-eval-nightly-next-claude) is a periodic with no PULL_NUMBER,
-# and its matrix runs over the inject transport, which `bench-gate` reads as
-# the version key's `next` mode: its lines file under a key of their own,
-# never today's, and are the window an inject-lane run at the same agent model
-# (setupId) is compared with.
+# A next-mode run on main does record. The main nightly
+# (ci-kube-agents-eval-nightly and its -writers part, EVAL_MODE_NEXT=1) is a
+# periodic with no PULL_NUMBER, and its matrix runs over the inject transport,
+# which `bench-gate` reads as the version key's `next` mode: its lines file
+# under a key of their own, never today's, and are the window an inject-lane
+# run at the same agent model (setupId) is compared with. Today's window is
+# recorded by ci-kube-agents-eval-nightly-today, the today-mode nightly kept
+# as the rollback check, over the api transport.
 # (ci-kube-agents-eval-nightly-gitlab-next stays out on the GitLab condition
 # above.) Whether the job's identity may append is a grant in oss-test-infra
 # this script cannot see; without it the append fails, is logged, and the

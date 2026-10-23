@@ -192,8 +192,9 @@ domain: incident-triage
 #
 # The three instructions are the sibling cases', each arrived at the hard way:
 # the status filter on kanban_list (a bare call pages oldest-first and misses
-# the newest card), the instruction to keep waiting (the stack returns when the
-# card is FILED, not when it is finished), and verbatim reproduction (a summary
+# the newest card), the instruction to keep waiting (the stack now waits for
+# the card to finish, up to a ceiling, so this is the fallback for a card
+# handed over still running), and verbatim reproduction (a summary
 # drops exactly the "What to do" section the delivery objective reads).
 #
 # It names the namespace, because that is how the card is found, and nothing
@@ -306,7 +307,10 @@ expected_output: |
     its runAsNonRoot setting having been turned off outside GitOps.
   - It names 'kubectl-edit' as the field manager that took the setting, against
     'argocd-controller' which owns the declared spec.
-  - It names the principal who made the change, 'eval-operator@example.com'.
+  - It names the principal who made the change: either the one the card
+    records, 'eval-operator@example.com', or the principal the Cloud Logging
+    entry for the change records, together with the observation that it
+    differs from the card.
   - It establishes that the change is load-bearing -- that the state git
     declares does not run -- and cites at least one piece of cluster evidence
     for that. Any one of these is sufficient: the pods are healthy now under
@@ -371,11 +375,19 @@ verification_spec:
       type: report_contains
       # CUJ 1's first clause, graded. The long note on the objective of the
       # same name in gitops-drift-deleted-policy-triage carries the argument:
-      # why the sibling leaves this judged, the five-run measurement that says
-      # asserting it is safe, and the order to diagnose a red in -- the drift
-      # card versus a neighbouring event card first, the template's "Done when"
-      # clause second, and never this objective.
-      required_phrases: ["eval-operator@example.com"]
+      # why the sibling leaves this judged, the measurement that says asserting
+      # it is safe, why it accepts the identities the nightly plants under as
+      # well as the planted principal -- an agent that checks the card against
+      # Cloud Logging finds the real caller and reports that, which is a pass
+      # -- and the order to diagnose a red in: the drift card versus a
+      # neighbouring event card, then a dev install, then a CI identity, and
+      # only then the template's "Done when" clause.
+      any_of_phrases:
+        - "eval-operator@example.com"
+        # The recorder nightly plants under this identity, so the audit log names it.
+        - "eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
+        # The Claude nightly twins plant under this identity.
+        - "prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com"
 
   - name: triage-names-the-loosened-setting
     role: objective

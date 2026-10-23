@@ -11587,7 +11587,7 @@ class TestKustomizeOverlayDeclarations(unittest.TestCase):
 class TestReleaseDeclarationsSurviveMalformedDocuments(unittest.TestCase):
     """One malformed file in the clone must not crash the run before the
     manifest prints: each is skipped and the well-formed release indexes.
-    `fleet_waste.py` carries a copy of this function and the same test."""
+    `fleet_waste.py` imports this function and runs the same test."""
 
     GOOD = (
         "kind: HelmRelease\nmetadata: {name: web, namespace: apps}\n"

@@ -6116,20 +6116,6 @@ _INLINE_OPTIONS_WITH_VALUE = {
 _INTERPRETER_FAMILIES = {"python": "python", "python2": "python", "python3": "python", "nodejs": "node"}
 
 
-def _container_argv(container: dict) -> list[str]:
-    """`command` then `args`, the order the kubelet hands them to the process.
-
-    `command` overrides the image's ENTRYPOINT and `args` its CMD, so this is the
-    process's real argv. The order is load-bearing for anything reading a flag's
-    value out of the next token: a `--model` ending `command` takes its value from
-    the first element of `args`, and the reversed concatenation this replaced
-    reported the flag with nothing beside it.
-    """
-    return [str(t) for t in (container.get("command") or [])] + [
-        str(t) for t in (container.get("args") or [])
-    ]
-
-
 class _Argv(NamedTuple):
     """How one container's `command`/`args` resolve for the checks that read them.
 
