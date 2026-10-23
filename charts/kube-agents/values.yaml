@@ -274,9 +274,10 @@ litellm:
   # model-default routes to <modelProvider>/<modelDefaultName>. Providers with
   # a default model: gemini, anthropic, openai, vertex_ai, sap (SAP AI Core).
   # The provider's API key must exist in the credentials Secret — except
-  # vertex_ai, which authenticates with Workload Identity instead;
-  # openai_compatible, whose key (OPENAI_COMPATIBLE_API_KEY) is optional (see
-  # openaiCompatible below); and sap, whose credentials arrive through
+  # vertex_ai, which authenticates with Workload Identity by default (or a
+  # service-account key Secret when litellm.vertex.credentialsSecretRef is
+  # set); openai_compatible, whose key (OPENAI_COMPATIBLE_API_KEY) is optional
+  # (see openaiCompatible below); and sap, whose credentials arrive through
   # envFromSecret. Any other LiteLLM provider slug (azure, bedrock, ...) is
   # accepted when modelDefaultName names the model; its credentials arrive
   # through envFromSecret too.
@@ -305,13 +306,19 @@ litellm:
   # the key out, so the rendered config and its rollout checksum are what they
   # were. Set it for a backend with one combined prompt-plus-output budget
   # (vLLM, SGLang, TGI, llama.cpp), which refuses a request whose max_tokens
-  # alone fills the served window. A request that carries its own max_tokens
+  # alone fills the served window. On non-adaptive Anthropic Claude models
+  # (claude-sonnet-4-5, claude-3-7-sonnet), LiteLLM turns
+  # fallback.reasoningEffort low, medium or high into thinking.budget_tokens
+  # 1024, 2048 or 4096, and Anthropic refuses a max_tokens at or below that
+  # budget: if maxTokens is set beside a fallback, set it above the budget for
+  # the effort (e.g. 8192 for high). A request that carries its own max_tokens
   # keeps it: what that means for the agent's own traffic is on the site's
   # inference-gateway page, "Setting the output-token budget". Chart-only;
   # the kustomize dev base carries no such key.
   maxTokens: 0
   # Reasoning effort the gateway asks for on a request that names none,
-  # rendered as reasoning_effort under every model_list alias: low, medium or
+  # rendered as reasoning_effort under every primary model_list alias (the
+  # fallback alias, when set, carries fallback.reasoningEffort): low, medium or
   # high. Empty leaves the key out, so the rendered config and its rollout
   # checksum are what they were and the model uses its own default. LiteLLM
   # translates it per provider; on Gemini 3.x it becomes thinkingLevel. What
@@ -321,9 +328,40 @@ litellm:
   # to get Gemini's thoughts back ("Gemini's thoughts" on the same page); both
   # ask for them. Chart-only; the kustomize dev base carries no such key.
   reasoningEffort: ""
+  # Renders litellm_settings.drop_params: true (also enabled automatically when
+  # fallback.reasoningEffort is set), so a parameter the
+  # provider does not accept (such as temperature != 1.0 with Claude thinking
+  # or reasoning_effort on a model LiteLLM's cost map does not list as a
+  # reasoning model) is dropped instead of failing the request.
+  # It is dropped silently: check the model is in the map before relying on
+  # fallback.reasoningEffort with this on. Chart-only; the kustomize dev base
+  # carries no such key.
+  dropParams: false
+  # A second alias the router retries on when a primary alias fails, at a
+  # specified reasoning effort ("low", "medium", or "high"; "minimal" is omitted
+  # because Vertex AI Gemini 3.x Flash rejects thinkingLevel: "minimal" with
+  # HTTP 400). Setting fallback.reasoningEffort renders the
+  # alias (named modelName, default <model>-<reasoningEffort>) and a
+  # router_settings.fallbacks entry for every primary alias. A fallback is
+  # visible in the x-litellm-attempted-fallbacks response header. The fallback
+  # alias carries this reasoning_effort and never the Gemini thinking key, which
+  # the primary aliases keep. Chart-only; the kustomize dev base carries no such
+  # key.
+  fallback:
+    modelName: ""
+    reasoningEffort: ""
+    # router_settings.timeout and num_retries, which apply to every alias
+    # whether or not a fallback is set; 0 leaves each key out (deferring
+    # to LiteLLM's default or a client-side first-byte/idle bound). On Vertex
+    # gemini-3.5-flash, a total request timeout of 600s covers 99.96% of streams
+    # (300s covers 99.57%, 120s covers 97.9%).
+    timeoutSeconds: 0
+    numRetries: 0
   # modelProvider: vertex_ai only. The gateway calls
   # projects/<projectId>/locations/<location> as a GSA reached through Workload
-  # Identity, so the chart always creates this KSA — no operator reconciles it.
+  # Identity by default (or a service-account key Secret when
+  # credentialsSecretRef is set); the chart always creates this KSA — no
+  # operator reconciles it.
   vertex:
     serviceAccountName: kubeagents-litellm
     #   iam.gke.io/gcp-service-account: <GSA>@<project>.iam.gserviceaccount.com
@@ -337,6 +375,19 @@ litellm:
     # region here for either reason.
     projectId: ""
     location: ""
+    # A service-account key read from a Secret, for an install that cannot
+    # use Workload Identity. The key is mounted read-only at
+    # /var/run/secrets/vertex/sa.json and named by
+    # GOOGLE_APPLICATION_CREDENTIALS, which wins over the KSA's Workload
+    # Identity binding. Empty name leaves the pod spec as it was.
+    credentialsSecretRef:
+      name: ""
+      key: ""
+    # VERTEXAI_PROJECT read from a Secret instead of projectId, so the
+    # project id does not appear in the pod spec. Empty name uses projectId.
+    projectSecretRef:
+      name: ""
+      key: ""
   # modelProvider: openai_compatible only: any server speaking the OpenAI
   # chat-completions API (vLLM, TGI, an internal gateway), self-hosted or
   # private. Nothing here has a default, and modelDefaultName is required too:

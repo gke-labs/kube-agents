@@ -178,6 +178,30 @@
           "type": "string",
           "enum": ["", "low", "medium", "high"]
         },
+        "dropParams": {
+          "type": "boolean"
+        },
+        "fallback": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "modelName": {
+              "type": "string"
+            },
+            "reasoningEffort": {
+              "type": "string",
+              "enum": ["", "low", "medium", "high"]
+            },
+            "timeoutSeconds": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "numRetries": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
         "vertex": {
           "type": "object",
           "additionalProperties": false,
@@ -193,6 +217,30 @@
             },
             "location": {
               "type": "string"
+            },
+            "credentialsSecretRef": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "key": {
+                  "type": "string"
+                }
+              }
+            },
+            "projectSecretRef": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "key": {
+                  "type": "string"
+                }
+              }
             }
           }
         },
