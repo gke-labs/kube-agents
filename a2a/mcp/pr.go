@@ -182,7 +182,7 @@ func askAgainSmaller(ctx context.Context, viewer ProposalViewer, req ProposalVie
 	req.Diff = false
 	view, err2 := viewer.ProposalView(ctx, req)
 	if err2 == nil {
-		return view, diffRetryNote(err, view), "", nil
+		return view, diffRetryNote(err, view, false), "", nil
 	}
 	if !answerTooLarge(err2) || ctx.Err() != nil {
 		return nil, "", "", err
@@ -203,17 +203,25 @@ func askAgainSmaller(ctx context.Context, viewer ProposalViewer, req ProposalVie
 	}
 	// err3 is the refusal of the diff without the comments, so it is the
 	// evidence for the diff's note.
-	return view, diffRetryNote(err3, view), commentsNote, nil
+	return view, diffRetryNote(err3, view, true), commentsNote, nil
 }
 
 // diffRetryNote says why the diff is missing from a view fetched again
-// without it. "Too large" is said only where the error shows it: the broker's
-// FORGE_RESPONSE_TOO_LARGE, or this client's own cap. A bare 502 is the
-// broker's catch-all for a forge failure, which is how GitHub's 406 for a diff
-// past its limits arrives, but also how an unreachable forge or a dropped
-// connection does, so for that the size is only a possibility.
-func diffRetryNote(err error, v *ProposalView) string {
+// without it. "Too large" is said of the diff only where the error shows it:
+// the broker's FORGE_RESPONSE_TOO_LARGE, or this client's own cap, on a
+// request for the diff without the comments (alone). A too-large refusal of
+// the view with both may be the comments' doing, so it says only that the
+// answer was too large. A bare 502 is the broker's catch-all for a forge
+// failure, which is how GitHub's 406 for a diff past its limits arrives, but
+// also how an unreachable forge or a dropped connection does, so for that the
+// size is only a possibility.
+func diffRetryNote(err error, v *ProposalView, alone bool) string {
 	if answerTooLarge(err) {
+		if !alone {
+			return "the answer with the diff was too large to fetch through the credential broker (" + err.Error() + "), " +
+				"so the view was fetched again without the diff. " +
+				"Read the diff on the forge, or check the branch out locally."
+		}
 		return "the diff is too large to fetch through the credential broker (" + err.Error() + "). " +
 			"The broker and this server cap the size of the answer. " +
 			"Read it on the forge, or check the branch out locally."

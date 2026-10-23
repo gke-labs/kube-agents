@@ -459,7 +459,10 @@ func TestLongLinesAndBodiesAreCapped(t *testing.T) {
 // only where the refusal shows it; a bare 502 may be GitHub's 406 for a diff
 // past its limits, or a forge that failed for another reason.
 func TestInspectPRAsksAgainWithoutATooLargeDiff(t *testing.T) {
-	const sure, maybe = "_Diff not available: the diff is too large", "_Diff not available: the forge call with the diff failed (possibly too large): "
+	// The first refusal is of the view with the diff and the comments, so a
+	// size refusal there may be the comments': the note says the answer was
+	// too large, never that the diff is.
+	const sure, maybe = "_Diff not available: the answer with the diff was too large to fetch through the credential broker (", "_Diff not available: the forge call with the diff failed (possibly too large): "
 	for name, tc := range map[string]struct {
 		refusal   error
 		note, not string
@@ -489,8 +492,10 @@ func TestInspectPRAsksAgainWithoutATooLargeDiff(t *testing.T) {
 					t.Errorf("output lacks %q", want)
 				}
 			}
-			if strings.Contains(out, tc.not) {
-				t.Errorf("output says %q", tc.not)
+			for _, not := range []string{tc.not, "the diff is too large"} {
+				if strings.Contains(out, not) {
+					t.Errorf("output says %q", not)
+				}
 			}
 		})
 	}
@@ -499,7 +504,7 @@ func TestInspectPRAsksAgainWithoutATooLargeDiff(t *testing.T) {
 // GitHub's limit is GitHub's: a GitLab view fetched again after a bare 502
 // does not cite it.
 func TestTheDiffNoteCitesGitHubsLimitOnlyOnGitHub(t *testing.T) {
-	note := diffRetryNote(&BrokerError{Status: http.StatusBadGateway, Code: brokerCodeFailed}, &ProposalView{Forge: forgeGitLab})
+	note := diffRetryNote(&BrokerError{Status: http.StatusBadGateway, Code: brokerCodeFailed}, &ProposalView{Forge: forgeGitLab}, false)
 	if strings.Contains(note, "GitHub") || !strings.Contains(note, "possibly too large") {
 		t.Errorf("note = %q", note)
 	}
@@ -678,6 +683,25 @@ func TestInspectPRDoesNotRetryAfterATimeout(t *testing.T) {
 		}
 		if len(f.reqs) != 1 {
 			t.Errorf("%d requests, want 1", len(f.reqs))
+		}
+	})
+	t.Run("the diff alone refused for something other than size: no fourth call", func(t *testing.T) {
+		first := fmt.Errorf("%w (4194304 bytes)", ErrBrokerResponseTooLarge)
+		notFound := &BrokerError{Status: http.StatusNotFound, Code: "FORGE_NOT_FOUND"}
+		f := &fakeViewer{fn: func(req ProposalViewRequest) (*ProposalView, error) {
+			switch {
+			case req.Comments:
+				return nil, first
+			case req.Diff:
+				return nil, notFound
+			}
+			return viewOf(t, githubViewJSON), nil
+		}}
+		if _, err := callInspect(t, f, `{"repository":"acme/widgets","number":12}`); !errors.Is(err, first) {
+			t.Errorf("err = %v, want the first refusal", err)
+		}
+		if len(f.reqs) != 3 {
+			t.Errorf("requests = %+v, want 3", f.reqs)
 		}
 	})
 	t.Run("at most three requests after the first, the last with neither diff nor comments", func(t *testing.T) {
