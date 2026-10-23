@@ -1374,6 +1374,11 @@ platformAgent:
       allowedUsers: []
       homeChannel: ""
       homeChannelName: ""
+      # Under mode next with homeChannel empty: "auto" (also empty) lets the
+      # A2A gateway make the channel of the first admitted mention the home
+      # channel; "manual" keeps homeChannel the only source, so with it empty
+      # the agent posts nothing unprompted. homeChannel, when set, always wins.
+      homeChannelPolicy: ""
     teams:
       # Microsoft Teams ChatOps integration via Microsoft Bot Framework / Entra ID.
       # App ID and App Password are read from credentials.secretName under

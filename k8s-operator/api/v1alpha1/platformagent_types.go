@@ -321,6 +321,18 @@ type SlackSpec struct {
 	// HomeChannelName is the human-readable name for the home channel.
 	// +optional
 	HomeChannelName string `json:"homeChannelName,omitempty"`
+
+	// HomeChannelPolicy says how the home channel is chosen under mode next
+	// when HomeChannel is empty. "auto" (also absent): the A2A gateway makes
+	// the channel of the first admitted mention the home channel and records
+	// it; HomeChannel, when set, wins over the record. "manual": only
+	// HomeChannel counts, nothing is learned, and with it empty the agent
+	// posts nothing unprompted. No schema default: the API server would apply
+	// one to every stored object it reads, so absent is read as "auto" by the
+	// operator instead.
+	// +kubebuilder:validation:Enum=auto;manual
+	// +optional
+	HomeChannelPolicy string `json:"homeChannelPolicy,omitempty"`
 }
 
 // TeamsSpec contains the configuration for the Microsoft Teams integration.

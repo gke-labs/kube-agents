@@ -1301,7 +1301,14 @@ func a2aSlackHomeChannel(agent *agentv1alpha1.PlatformAgent) string {
 	if !slackEnabled(agent) {
 		return ""
 	}
-	home := strings.TrimSpace(agent.Spec.Integration.Slack.HomeChannel)
+	return slackChannelID(agent.Spec.Integration.Slack.HomeChannel)
+}
+
+// slackChannelID is s trimmed when it is a public ("C...") or private
+// ("G...") Slack channel id, and "" otherwise. The same rule reads the CR
+// field and the learned record (platformagent_home_channel_record.go).
+func slackChannelID(s string) string {
+	home := strings.TrimSpace(s)
 	if len(home) < a2aSlackMinChannelIDLen || (home[0] != 'C' && home[0] != 'G') {
 		return ""
 	}
@@ -4096,7 +4103,7 @@ func buildA2AGatewayServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.S
 //
 // Namespaced: pods, its own Deployment and its own PlatformAgent, the last two
 // pinned by name. The gateway creates and reaps one pod per delegated task in
-// its own namespace; it reads no Secret, no ConfigMap and no other namespace.
+// its own namespace; it reads no Secret, no ConfigMap but the one home-channel record it patches, and no other namespace.
 //
 // What it does NOT bound, stated because the next reader will otherwise take
 // this rule for a ceiling: `create` on pods is a privilege-escalation
@@ -4145,6 +4152,15 @@ func buildA2AGatewayRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 				Resources:     []string{"platformagents"},
 				ResourceNames: []string{agent.Name},
 				Verbs:         []string{"get"},
+			},
+			// The home-channel record, one named ConfigMap: read at boot and
+			// patched (data keys only) when the first admitted mention in a
+			// channel sets the home channel (platformagent_home_channel_record.go).
+			{
+				APIGroups:     []string{""},
+				Resources:     []string{"configmaps"},
+				ResourceNames: []string{a2aHomeChannelRecordName(agent)},
+				Verbs:         []string{"get", "patch"},
 			},
 		},
 	}
@@ -4680,6 +4696,17 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		if home := strings.TrimSpace(slack.HomeChannel); home != "" {
 			backendEnv = append(backendEnv, corev1.EnvVar{Name: a2aSlackHomeChannelEnvVar, Value: home})
 		}
+		// The learned-home contract (platformagent_home_channel_record.go):
+		// whether the gateway may learn a home channel from the first
+		// admitted mention, the record it writes, and its own image for the
+		// record's writer key. The gateway's home env above stays the CR's:
+		// a learned value reaches the gateway through the record, not
+		// through a re-render, so learning restarts no gateway.
+		backendEnv = append(backendEnv,
+			corev1.EnvVar{Name: a2aSlackHomePolicyEnvVar, Value: slackHomeChannelPolicy(agent)},
+			corev1.EnvVar{Name: a2aHomeChannelRecordEnvVar, Value: a2aHomeChannelRecordName(agent)},
+			corev1.EnvVar{Name: a2aGatewaySelfImageEnvVar, Value: a2aGatewayImage()},
+		)
 	}
 	var chatEnv []corev1.EnvVar
 	var chatMounts []corev1.VolumeMount
@@ -5386,10 +5413,14 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 
 	// Identity before workload: the gateway pod must not start before the
 	// ServiceAccount its pod spec names exists.
+	// The home-channel record rides with them: the Role above names it, and
+	// the teardown list, which every rendered pass must cover, lists it
+	// whatever chat backend the stack holds (platformagent_home_channel_record.go).
 	for _, obj := range []client.Object{
 		buildA2AGatewayServiceAccount(agent),
 		buildA2AGatewayRole(agent),
 		buildA2AGatewayRoleBinding(agent),
+		buildHomeChannelRecord(agent),
 	} {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
 			return state, err
@@ -5947,6 +5978,7 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 	doorMeta := metav1.ObjectMeta{Name: a2aDoorName(agent), Namespace: agent.Namespace}
 	return []a2aTeardownEntry{
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aHomeChannelRecordName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The inject door's four, listed whatever the flag says: a flip to
 		// today has to clean up after an operator that WAS deployed with the
 		// flag, and the reads are cheap (three are Owns() kinds) and find

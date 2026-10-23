@@ -898,6 +898,9 @@ spec:
       {{- with $integ.slack.homeChannelName }}
       homeChannelName: {{ . | quote }}
       {{- end }}
+      {{- with $integ.slack.homeChannelPolicy }}
+      homeChannelPolicy: {{ . | quote }}
+      {{- end }}
     {{- end }}
     {{- if $integ.teams.enabled }}
     teams:

@@ -1570,11 +1570,26 @@ arrive.
 Slack has the same route on its own subject, `chat.notify.slack`. Home posts are armed when the
 gateway holds Slack (`a2aSlackArmed`) and `slack.homeChannel`, carried as
 `A2A_SLACK_HOME_CHANNEL`, is a channel id (`C...`, or `G...` for a private channel);
-`A2A_NOTIFY_PLATFORM` is then `slack`. Conversation posts are armed whenever the gateway holds
+`A2A_NOTIFY_PLATFORM` is then `slack`. The agent's `A2A_NOTIFY_PLATFORM` and `SLACK_HOME_CHANNEL`
+are rendered from the CR field, else from the home-channel record ("The home-channel record"
+below); the gateway's own `A2A_SLACK_HOME_CHANNEL` stays the CR's. Conversation posts are armed whenever the gateway holds
 Slack, `homeChannel` set or not, and `A2A_NOTIFY_CONVERSATIONS` is then `slack`
 (`a2aSlackNotifyArmed`); a `homeChannel` that is set but is not a channel id turns the whole
 route off, as on Chat. Chat holds the single-backend gateway when both are enabled, so at most
-one platform is ever routed. A conversation request carries no `blocks`; its layout is the `chat` field instead ("Chat messages" under the Slack adapter). A Slack `thread` is `<channel>/<ts>`, admitted only when the channel is the home channel
+one platform is ever routed.
+
+**The home-channel record.** Under `next` with Slack on the gateway, the operator owns a ConfigMap
+`<agent>-home-channel` with no data, applied beside the gateway Role and torn down with the stack.
+The gateway Role reaches that one name with `get` and `patch`. `spec.integration.slack.homeChannelPolicy`
+(`auto`, also absent, or `manual`) is rendered to the gateway as `A2A_SLACK_HOME_POLICY`, with the
+record's name as `A2A_HOME_CHANNEL_RECORD` and the gateway's own image as `A2A_SELF_IMAGE`. A record
+counts when `data.slack` is a channel id, `data.writer` is the gateway image the operator renders,
+and the policy is `auto`; the operator then renders the agent's `SLACK_HOME_CHANNEL` and
+`A2A_NOTIFY_PLATFORM` from it and clears `HomeChannelUnset`. The CR field, when set, wins. A record
+another image wrote (a rollback) arms nothing and the condition names it; `data.slack.refused` is one
+of `shared`, `archived`, `not-member`, `direct-message`, mapped to a fixed sentence in the condition.
+The gateway side that learns a channel from the first admitted mention and writes the record is a
+separate change; `patch` on the object is the RBAC bound, data-only writes are the gateway's contract. A conversation request carries no `blocks`; its layout is the `chat` field instead ("Chat messages" under the Slack adapter). A Slack `thread` is `<channel>/<ts>`, admitted only when the channel is the home channel
 and posted on the `ts`, or a bare `ts`, which names no channel, so the gateway checks it only for
 shape and posts it into the home channel: a `ts` from elsewhere can only ever thread (or fail to
 thread) there. The kanban notifier sends the qualified form, with the card's own channel, so a

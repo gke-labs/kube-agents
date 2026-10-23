@@ -18,6 +18,10 @@ package controller
 
 import (
 	"context"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"strings"
 	"testing"
 
@@ -40,20 +44,20 @@ func TestHomeChannelUnsetMessageFollowsTheGatewaysBackend(t *testing.T) {
 		return func() string {
 			a := slackTestAgent(mode, true)
 			a.Spec.Integration.Slack.HomeChannel = home
-			return homeChannelUnsetMessage(a)
+			return homeChannelUnsetMessage(a, homeChannelRecord{})
 		}
 	}
 	chatHome := func(mode, home string) func() string {
 		return func() string {
 			a := gchatTestAgent(mode, true)
 			a.Spec.Integration.GoogleChat.HomeChannel = home
-			return homeChannelUnsetMessage(a)
+			return homeChannelUnsetMessage(a, homeChannelRecord{})
 		}
 	}
 	bothChatHomeOnly := func() string {
 		a := chatAndSlackTestAgent("next")
 		a.Spec.Integration.GoogleChat.HomeChannel = "spaces/AAA"
-		return homeChannelUnsetMessage(a)
+		return homeChannelUnsetMessage(a, homeChannelRecord{})
 	}
 	for _, tc := range []struct {
 		name  string
@@ -68,7 +72,7 @@ func TestHomeChannelUnsetMessageFollowsTheGatewaysBackend(t *testing.T) {
 		{"next chat, home set", chatHome("next", "spaces/AAA"), nil},
 		{"today chat, no home", chatHome("", ""), nil},
 		{"next chat and slack, chat home set", bothChatHomeOnly, nil},
-		{"next, no chat", func() string { return homeChannelUnsetMessage(a2aTestAgent()) }, nil},
+		{"next, no chat", func() string { return homeChannelUnsetMessage(a2aTestAgent(), homeChannelRecord{}) }, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := tc.msg()
@@ -94,7 +98,7 @@ func TestHomeChannelUnsetMessageFollowsTheGatewaysBackend(t *testing.T) {
 // message, read back as current, and removed once the message is "".
 func TestHomeChannelUnsetConditionSetsAndClears(t *testing.T) {
 	a := slackTestAgent("next", true)
-	msg := homeChannelUnsetMessage(a)
+	msg := homeChannelUnsetMessage(a, homeChannelRecord{})
 	if homeChannelUnsetConditionCurrent(a, msg) {
 		t.Fatal("a CR with no condition reads as current for a non-empty message")
 	}
@@ -210,5 +214,219 @@ func TestPlatformAgentReconciler_Reconcile_HomeChannelUnsetOnADegradedPark(t *te
 	if cond := meta.FindStatusCondition(got.Status.Conditions, homeChannelUnsetConditionType); cond == nil || cond.Status != metav1.ConditionTrue {
 		t.Fatalf("expected %s True on a Degraded park with the stack rendered, got %+v (conditions %+v)",
 			homeChannelUnsetConditionType, cond, got.Status.Conditions)
+	}
+}
+
+// TestHomeChannelRecordStandsInForTheField: under next with Slack on the
+// gateway and the CR field empty, the record the gateway wrote decides the
+// agent's env and the condition, on the terms the CR page states: the CR
+// wins when set; an admitted learned channel clears the condition and arms
+// the agent; manual ignores the record; a record another gateway image wrote
+// (a rollback) arms nothing and is named; a refusal is named.
+func TestHomeChannelRecordStandsInForTheField(t *testing.T) {
+	image := a2aGatewayImage()
+	record := func(data map[string]string) *corev1.ConfigMap {
+		return &corev1.ConfigMap{Data: data}
+	}
+	learned := map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordWriterKey: image}
+	for _, tc := range []struct {
+		name      string
+		crHome    string
+		policy    string
+		cm        *corev1.ConfigMap
+		wantHome  string // the agent's SLACK_HOME_CHANNEL, "" for none
+		wantCond  bool
+		condNames []string
+	}{
+		{"no record", "", "", nil, "", true, nil},
+		{"learned", "", "", record(learned), "C0LEARNED", false, nil},
+		{"learned, policy auto spelled out", "", "auto", record(learned), "C0LEARNED", false, nil},
+		{"cr wins over the record", "C0CR", "", record(learned), "C0CR", false, nil},
+		{"manual ignores the record", "", "manual", record(learned), "", true, []string{"manual"}},
+		{"manual with the cr set", "C0CR", "manual", record(learned), "C0CR", false, nil},
+		{"stale writer", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordWriterKey: "ghcr.io/x/a2a-gateway:old"}), "", true, []string{"C0LEARNED", "ghcr.io/x/a2a-gateway:old", image}},
+		{"malformed learned id", "", "", record(map[string]string{homeChannelRecordSlackKey: "D0DM", homeChannelRecordWriterKey: image}), "", true, nil},
+		{"refused, known reason", "", "", record(map[string]string{homeChannelRecordSlackRefusedKey: "shared"}), "", true, []string{"refused", "Slack Connect"}},
+		{"refused, unknown reason is not echoed", "", "", record(map[string]string{homeChannelRecordSlackRefusedKey: strings.Repeat("x", 40000)}), "", true, []string{"refused", "does not know"}},
+		{"malformed learned id is named, not echoed", "", "", record(map[string]string{homeChannelRecordSlackKey: "general " + strings.Repeat("y", 40000), homeChannelRecordWriterKey: image}), "", true, []string{"not a channel id"}},
+		{"stale with no writer", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED"}), "", true, []string{"C0LEARNED", "no gateway image"}},
+		{"malformed cr value does not fall through to the record", "general", "", record(learned), "", false, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := slackTestAgent("next", true)
+			a.Spec.Integration.Slack.HomeChannel = tc.crHome
+			a.Spec.Integration.Slack.HomeChannelPolicy = tc.policy
+			rec := readHomeChannelRecord(a, tc.cm, image)
+			if got := a2aSlackHomeEffective(a, rec); got != tc.wantHome {
+				t.Errorf("effective home = %q, want %q", got, tc.wantHome)
+			}
+			pod := buildPodTemplateSpec(a, "h", "h", "h", "h", nil, renderOptions{slackHomeRecord: rec})
+			env := envMapOf(brokerContainerNamed(pod.Spec.Containers, "platform-agent").Env)
+			if got := env["SLACK_HOME_CHANNEL"].Value; got != tc.wantHome {
+				t.Errorf("SLACK_HOME_CHANNEL = %q, want %q", got, tc.wantHome)
+			}
+			if _, routed := env[a2aNotifyPlatformEnvVar]; routed != (tc.wantHome != "") {
+				t.Errorf("%s present = %v, want %v", a2aNotifyPlatformEnvVar, routed, tc.wantHome != "")
+			}
+			msg := homeChannelUnsetMessage(a, rec)
+			if (msg != "") != tc.wantCond {
+				t.Fatalf("condition message = %q, want set=%v", msg, tc.wantCond)
+			}
+			if len(msg) > 1024 {
+				t.Errorf("condition message is %d bytes; a record value must not reach the status verbatim", len(msg))
+			}
+			for _, want := range tc.condNames {
+				if !strings.Contains(msg, want) {
+					t.Errorf("message does not name %q: %q", want, msg)
+				}
+			}
+		})
+	}
+}
+
+// TestHomeChannelRecordObjectAndRole: the record is an owned ConfigMap with
+// no data (the gateway owns the keys), rendered under next with Slack on the
+// gateway, torn down with the stack, and the gateway Role reaches that one
+// name with get and patch only. The gateway Deployment carries the policy,
+// the record's name and its own image for the record's writer key.
+func TestHomeChannelRecordObjectAndRole(t *testing.T) {
+	a := slackTestAgent("next", true)
+	if !homeChannelRecordWanted(a) {
+		t.Fatal("record not wanted on a next Slack install")
+	}
+	if homeChannelRecordWanted(slackTestAgent("today", true)) {
+		t.Fatal("record wanted under today")
+	}
+	if !homeChannelRecordWanted(a2aTestAgent()) {
+		t.Fatal("record not wanted on a next install without Slack: the teardown list must hold for every rendered pass")
+	}
+	cm := buildHomeChannelRecord(a)
+	if cm.Name != a.Name+"-home-channel" || cm.Namespace != a.Namespace || len(cm.Data) != 0 {
+		t.Fatalf("record object = %+v", cm.ObjectMeta)
+	}
+	rule := buildA2AGatewayRole(a).Rules[3]
+	if len(rule.Resources) != 1 || rule.Resources[0] != "configmaps" ||
+		len(rule.ResourceNames) != 1 || rule.ResourceNames[0] != cm.Name ||
+		strings.Join(rule.Verbs, ",") != "get,patch" {
+		t.Errorf("record rule = %+v", rule)
+	}
+	var torn bool
+	r := &PlatformAgentReconciler{}
+	for _, e := range r.a2aNamespacedTeardown(a) {
+		if c, ok := e.obj.(*corev1.ConfigMap); ok && c.Name == cm.Name {
+			torn = true
+		}
+	}
+	if !torn {
+		t.Error("the record is not in the next stack's teardown list")
+	}
+	gw := buildA2AGatewayDeployment(a)
+	env := envMapOf(gw.Spec.Template.Spec.Containers[0].Env)
+	if env[a2aSlackHomePolicyEnvVar].Value != "auto" || env[a2aHomeChannelRecordEnvVar].Value != cm.Name || env[a2aGatewaySelfImageEnvVar].Value != a2aGatewayImage() {
+		t.Errorf("gateway env: policy=%q record=%q self=%q", env[a2aSlackHomePolicyEnvVar].Value, env[a2aHomeChannelRecordEnvVar].Value, env[a2aGatewaySelfImageEnvVar].Value)
+	}
+	a.Spec.Integration.Slack.HomeChannelPolicy = "manual"
+	if got := envMapOf(buildA2AGatewayDeployment(a).Spec.Template.Spec.Containers[0].Env)[a2aSlackHomePolicyEnvVar].Value; got != "manual" {
+		t.Errorf("gateway policy env = %q, want manual", got)
+	}
+}
+
+// TestPlatformAgentReconciler_Reconcile_HomeChannelRecordDrivesEnvAndCondition
+// goes through the reconciler: with the CR field empty, a record an in-date
+// gateway image wrote arms the agent's env and clears the condition; the same
+// record under another writer arms nothing and the condition names it.
+func TestPlatformAgentReconciler_Reconcile_HomeChannelRecordDrivesEnvAndCondition(t *testing.T) {
+	scheme := setupScheme()
+	agent := slackTestAgent("next", true)
+	agent.Name = "test-agent-home-record"
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{
+		ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster",
+	}
+	// The fake's apply is a full Update, which would wipe the data keys the
+	// gateway owns on every pass; the real server-side apply keeps a field the
+	// applier did not set. The interceptor keeps the record's data the way
+	// the API server does.
+	ssa := fakeServerSideApplyInterceptors()
+	applyKeepingRecordData := func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+		if cm, ok := obj.(*corev1.ConfigMap); ok && cm.Name == a2aHomeChannelRecordName(agent) && len(cm.Data) == 0 {
+			existing := &corev1.ConfigMap{}
+			if err := c.Get(ctx, client.ObjectKeyFromObject(cm), existing); err == nil {
+				cm.Data = existing.Data
+			}
+		}
+		return ssa.Patch(ctx, c, obj, patch, opts...)
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(interceptor.Funcs{Patch: applyKeepingRecordData}).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+	reconcile := func() {
+		t.Helper()
+		for i := 1; i <= 2; i++ {
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("Reconcile %d failed: %v", i, err)
+			}
+		}
+	}
+	agentEnv := func() map[string]corev1.EnvVar {
+		t.Helper()
+		dep := &appsv1.Deployment{}
+		if err := cl.Get(ctx, types.NamespacedName{Name: agent.Name + "-gateway", Namespace: agent.Namespace}, dep); err != nil {
+			t.Fatalf("get agent Deployment: %v", err)
+		}
+		return envMapOf(brokerContainerNamed(dep.Spec.Template.Spec.Containers, "platform-agent").Env)
+	}
+	condition := func() *metav1.Condition {
+		t.Helper()
+		got := &agentv1alpha1.PlatformAgent{}
+		if err := cl.Get(ctx, req.NamespacedName, got); err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		return meta.FindStatusCondition(got.Status.Conditions, homeChannelUnsetConditionType)
+	}
+	setRecord := func(data map[string]string) {
+		t.Helper()
+		cm := &corev1.ConfigMap{}
+		key := types.NamespacedName{Name: a2aHomeChannelRecordName(agent), Namespace: agent.Namespace}
+		if err := cl.Get(ctx, key, cm); err != nil {
+			t.Fatalf("the record was not rendered: %v", err)
+		}
+		cm.Data = data
+		if err := cl.Update(ctx, cm); err != nil {
+			t.Fatalf("write the record: %v", err)
+		}
+	}
+
+	reconcile()
+	if _, ok := agentEnv()[agentSlackHomeChannelEnvVar]; ok {
+		t.Fatal("SLACK_HOME_CHANNEL rendered with no CR field and an empty record")
+	}
+	if condition() == nil {
+		t.Fatal("no HomeChannelUnset with an empty record")
+	}
+
+	setRecord(map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordWriterKey: a2aGatewayImage()})
+	reconcile()
+	env := agentEnv()
+	if env[agentSlackHomeChannelEnvVar].Value != "C0LEARNED" || env[a2aNotifyPlatformEnvVar].Value != a2aNotifyPlatformSlack {
+		t.Fatalf("the record did not reach the agent env: home=%q platform=%q", env[agentSlackHomeChannelEnvVar].Value, env[a2aNotifyPlatformEnvVar].Value)
+	}
+	if c := condition(); c != nil {
+		t.Fatalf("HomeChannelUnset survived an admitted record: %+v", c)
+	}
+
+	setRecord(map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordWriterKey: "ghcr.io/x/a2a-gateway:rolled-back"})
+	reconcile()
+	if _, ok := agentEnv()[agentSlackHomeChannelEnvVar]; ok {
+		t.Fatal("a record another gateway image wrote armed the agent")
+	}
+	c := condition()
+	if c == nil || !strings.Contains(c.Message, "rolled-back") {
+		t.Fatalf("stale record not named in the condition: %+v", c)
 	}
 }
