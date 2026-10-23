@@ -931,8 +931,8 @@
 # filed a card stops the card before it opens its pull request. Next lane
 # only (api-lane-exclusions.txt): the harness sends the stop through the
 # inject door, and hack/ci-deploy.sh arms the card stop there. deployer: noop,
-# the no-pdb-workload fixture, one card, a 900s observation window. A
-# next-lane run writes no evidence-store record, so the case builds none.
+# the no-pdb-workload fixture, one card, a 900s observation window. Its
+# record files under the version key's `next` mode, the inject lane's.
 ./tasks/chat-stop-halts-delegated-remediation/task.yaml
 
 # The front door's "what can you do?" calls a per-cluster agent "the <cluster>

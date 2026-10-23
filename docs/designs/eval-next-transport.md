@@ -669,12 +669,12 @@ changes nothing else about the run except what hangs off that transport switch: 
 lane's exclusion list (`hack/eval/inject-lane-exclusions.txt`, keyed on `AGENT_TRANSPORT` rather
 than on this flag) leaves out the cases whose premise needs the chat front door, and its mirror
 (`hack/eval/api-lane-exclusions.txt`) keeps the cases only the door can carry off every other
-lane; the deploy also arms the card stop (`A2A_CARD_STOP`) for them; the lane's
+lane; the deploy also arms the card stop (`A2A_CARD_STOP`) on the install, which those cases grade; the lane's
 safeguards (`hack/eval/inject-lane-safeguards.yaml`) are appended to a scratch copy of every
 remaining task file, which the unit hands devops-bench, over the leased project's GitOps
 repository exported as `BENCH_GITOPS_REPO` (the lane refuses to start without one), with the
-cases that request a pull request run in a second phase after every other unit, one at a time
-and each after a settle, so no repetition that requests nothing shares the repository with one
+cases that request a pull request, and the stopped asks, run in a second phase after every
+other unit, one at a time and each after a settle, so no repetition that requests nothing shares the repository with one
 that writes by design and no window reaches back into the unit before; and after the
 fan-out the script lists in the job log what the run left on that repository, closing nothing.
 With the flag unset both scripts are byte for byte what

@@ -2363,6 +2363,22 @@ else
   fi
   echo "cases that request a pull request, run after every other unit and each after the repository is reset: ${INJECT_LANE_REQUESTING:-none}"
 fi
+# The cases API_LANE_EXCLUDED names that are still in the matrix (so only on
+# the inject lane) run in the same second phase although they request no
+# pull request. Each is a stopped ask, and a stop that fails leaves its card
+# to open a pull request mid-run, which the lane's write safeguard would
+# charge to every case whose window it overlaps. Alone in the second phase,
+# a failed stop reds only itself.
+STOPPED_ASK_CASES=""
+for ENTRY in "${TASKS[@]}"; do
+  NAME="$(basename "$(dirname "${ENTRY}")")"
+  if grep -qxF -- "${NAME}" <<< "${API_LANE_EXCLUDED}"; then
+    STOPPED_ASK_CASES="${STOPPED_ASK_CASES:+${STOPPED_ASK_CASES},}${NAME}"
+  fi
+done
+if [ -n "${STOPPED_ASK_CASES}" ]; then
+  echo "stopped asks, run after every other unit with the cases that request a pull request: ${STOPPED_ASK_CASES}"
+fi
 
 # The task file a unit hands devops-bench: the lane's copy when the step
 # above made one for this case, the file under bench/tasks/ otherwise. Its
@@ -2459,7 +2475,7 @@ if [ "${EVAL_TIER}" = "nightly" ]; then
     NIGHTLY_PART_KEPT=()
     for ENTRY in "${TASKS[@]}"; do
       NAME="$(basename "$(dirname "${ENTRY}")")"
-      case ",${INJECT_LANE_REQUESTING}," in
+      case ",${INJECT_LANE_REQUESTING},${STOPPED_ASK_CASES:-}," in
         *",${NAME},"*) ENTRY_PART="writers" ;;
         *) ENTRY_PART="main" ;;
       esac
@@ -3904,8 +3920,8 @@ scheduled_audits pause "fan-out"
 # are not waited for, and a write from one of those can land in the next
 # unit's window (docs/designs/eval-next-transport.md, "What the lane
 # grades"; per-case attribution is #2611).
-unit_phase() { # <task-name> -> 1 for a case that requests a pull request, 0 otherwise
-  case ",${INJECT_LANE_REQUESTING:-}," in
+unit_phase() { # <task-name> -> 1 for a case that requests a pull request or a stopped ask, 0 otherwise
+  case ",${INJECT_LANE_REQUESTING:-},${STOPPED_ASK_CASES:-}," in
     *",$1,"*) echo 1 ;;
     *) echo 0 ;;
   esac
@@ -3962,7 +3978,7 @@ profile_begin "task fan-out: $((UNIT_TOTAL + WRITER_TOTAL)) units, parallelism=$
 launch_units "${UNIT_QUEUE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
 wait
 if [ "${WRITER_TOTAL}" -gt 0 ]; then
-  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${WRITER_TOTAL} unit(s) of the cases that request a pull request (${INJECT_LANE_REQUESTING}), one at a time, each after a ${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}s pause"
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${WRITER_TOTAL} unit(s) of the cases that request a pull request (${INJECT_LANE_REQUESTING:-none}) and the stopped asks (${STOPPED_ASK_CASES:-none}), one at a time, each after a ${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}s pause"
   launch_units "${UNIT_QUEUE_WRITERS}" 1 "${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}"
   wait
 fi

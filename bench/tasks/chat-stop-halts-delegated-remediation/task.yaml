@@ -1,7 +1,7 @@
 # Registered in hack/eval/nightly-cases.txt (nightly tier), and in
 # hack/eval/api-lane-exclusions.txt: it needs the inject door, so it runs on
-# the next lane only (EVAL_MODE_NEXT=1, where hack/ci-deploy.sh arms the card
-# stop).
+# the inject lane only (AGENT_TRANSPORT=inject; hack/ci-deploy.sh arms the card
+# stop on every EVAL_MODE_NEXT=1 install).
 #
 # Domain: chat-and-routing.
 # Journey: a person asks for a change the Planning Agent hands to a kanban card
@@ -25,9 +25,9 @@
 #
 # The stop lands while the card is still being dispatched, minutes before a
 # change reaches its pull request, so no write window is needed. A stop that
-# fails lets the card write while siblings run beside it; the lane's
-# safeguard then charges that write to this case and to any sibling running
-# beside it, which the safeguards file treats as the red it exists for.
+# fails lets the card write, and the lane's safeguard charges that write to
+# every case whose window it overlaps; hack/ci-eval-pr.sh therefore runs a
+# stopped ask in the second phase, one unit at a time, so it reds only itself.
 #
 # Planted defect required: the no-pdb-workload fixture's two-replica
 # Deployment checkout-gateway in namespace seeded-reliability. Nothing is

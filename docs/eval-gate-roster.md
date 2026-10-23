@@ -502,6 +502,14 @@ side effect of an exclusion entry.
 The file needs an `eval-crew` approval, as `presubmit-cases.txt` does: it changes what every
 pull request runs.
 
+Its mirror, `hack/eval/api-lane-exclusions.txt`, names the cases only the inject door can carry,
+today the stopped asks (a `stop` sent on the conversation after the opening turn,
+[`bench/kube_agents_bench/stop_hook.py`](../bench/kube_agents_bench/stop_hook.py)), and
+`hack/ci-eval-pr.sh` drops them on every other transport. None is on the roster, so the file
+needs only the normal approvers. On the inject lane a stopped ask runs in the second phase with
+the cases that request a pull request, so a stop that fails and lets its card write reds only
+that case.
+
 A safeguard the lane needs and no case declares is the lane's safeguards list,
 `hack/eval/inject-lane-safeguards.yaml`. The door's task can reach the platform persona, whose
 own rule for a change is a pull request (through a card the Planning Agent files, under the

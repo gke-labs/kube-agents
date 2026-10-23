@@ -311,12 +311,13 @@ class TwoPhaseFanOutTest(unittest.TestCase):
         """
     )
 
-    def run_fanout(self, requesting: str) -> list[str]:
+    def run_fanout(self, requesting: str, stopped: str = "") -> list[str]:
         body = "\n".join(
             [
                 "set -euo pipefail",
                 self.STUBS,
                 f'INJECT_LANE_REQUESTING="{requesting}"',
+                f'STOPPED_ASK_CASES="{stopped}"',
                 lifted_block(r"^# Two phases on the inject lane.*?^fi$"),
                 'echo "TOTAL=$((UNIT_TOTAL + WRITER_TOTAL))"',
             ]
@@ -348,6 +349,17 @@ class TwoPhaseFanOutTest(unittest.TestCase):
         self.assertFalse(any("every other unit is done" in line for line in lines))
         self.assertEqual(sum(1 for line in lines if line.startswith("END ")), 8)
 
+    def test_a_stopped_ask_runs_in_the_second_phase_without_requesting(self):
+        """A failed stop lets its card open a pull request; in the first
+        phase the write safeguard would charge it to every case beside it."""
+        lines = self.run_fanout("", stopped="v")
+        self.assertIn("TOTAL=8", lines)
+        v_starts = [i for i, line in enumerate(lines) if line.startswith("START v")]
+        others_ended = [i for i, line in enumerate(lines) if line.startswith("END ") and not line.startswith("END v")]
+        self.assertEqual(len(v_starts), 2)
+        self.assertLess(max(others_ended), min(v_starts))
+        self.assertTrue(any("the stopped asks (v)" in line for line in lines))
+
     def test_the_settle_equals_the_safeguards_clock_skew_default(self):
         """The settle exists so a write in the last seconds of the unit before
         is outside the next window, whose lower edge is the check's default
@@ -369,6 +381,15 @@ class WiringTest(unittest.TestCase):
         names = src.index("TASK_NAMES=()")
         self.assertLess(exclusions, step)
         self.assertLess(step, names)
+
+    def test_the_stopped_asks_are_named_from_the_api_lane_list_before_the_nightly_part(self):
+        src = SCRIPT.read_text(encoding="utf-8")
+        excluded = src.index('API_LANE_EXCLUDED="$(roster_entries')
+        stopped = src.index('STOPPED_ASK_CASES=""')
+        part = src.index("# ─── The nightly part")
+        self.assertLess(excluded, stopped)
+        self.assertLess(stopped, part)
+        self.assertIn('grep -qxF -- "${NAME}" <<< "${API_LANE_EXCLUDED}"', src[stopped:part])
 
     def test_the_unit_hands_the_bench_the_resolved_path(self):
         src = SCRIPT.read_text(encoding="utf-8")
