@@ -29870,6 +29870,10 @@ class TestPlainChatLines(unittest.TestCase):
         finding = make_finding(check="workload-identity-off", obj="NodePool/pool-1", namespace="")
         self.assertEqual(audit_report.summary_row(finding), "`critical` prod-us-east: Workload Identity is off (pool-1)")
 
+    def test_a_kinded_object_named_like_its_cluster_is_still_the_object(self):
+        finding = make_finding(fid="p", check="legacy-metadata", obj="NodePool/prod-us-east", namespace="")
+        self.assertNotEqual(audit_report._object_name(finding), "")
+
     def test_a_row_without_a_phrase_keeps_the_title(self):
         unknown = make_finding(check="not-a-check", title="Something  odd")
         self.assertEqual(audit_report.summary_row(unknown), "`critical` prod-us-east: Something odd")

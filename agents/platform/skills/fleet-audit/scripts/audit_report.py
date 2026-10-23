@@ -19369,7 +19369,7 @@ def _object_name(finding: dict) -> str:
     """The name of the object a finding judged, or "" when it is the cluster itself."""
     kind, _, name = str(finding.get("object") or "").rpartition("/")
     cluster = str(finding.get("cluster") or "").rpartition("/")[2]
-    if kind.rpartition("/")[2] == CLUSTER_OBJECT_KIND or name == cluster:
+    if kind.rpartition("/")[2] == CLUSTER_OBJECT_KIND or (not kind and name == cluster):
         return ""
     return name
 
