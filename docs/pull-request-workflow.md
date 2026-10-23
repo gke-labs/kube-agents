@@ -2,7 +2,7 @@
 
 **Scope:** The commands for getting a branch from "about to start" to "merged" in this repository —
 finding work already in flight, measuring drift from `main`, validating locally, working the
-automated review, the labels Tide merges on, re-running a check that flaked, and whose move it is
+automated review, the labels the merge queue reads, re-running a check that flaked, and whose move it is
 at any point in between.
 
 **Owns:** the mechanics. Every _requirement_ — that you scan for duplicate work, run the pre-PR
@@ -453,7 +453,7 @@ thread back to you to resolve, citing it; a reply that asks for the fix is a dis
 the fix with the thread left open ([green is settled](#green-is-settled), _who counts_); with a user
 in the loop you may resolve it earlier once the reply and **Self-Review** give the reason. A pull request carrying
 both `lgtm` and `approved` with a thread still open also carries the `do-not-merge` label,
-applied by a workflow so that Tide does not spend the queue retrying a merge GitHub will refuse;
+applied by a workflow so that the enqueue sweep keeps it out of the merge queue until then;
 resolving the last thread is what removes it ([how a change merges](#how-a-change-merges)).
 
 ```bash
@@ -516,16 +516,40 @@ Five ways that goes wrong quietly:
 
 ## How a change merges
 
-Nobody presses Merge. This is a Prow repository: `google-oss-prow` squash-merges a pull request on
-its own once Tide's query matches it, and that query wants the labels `lgtm` and `approved` both
-present, with `do-not-merge`, `do-not-merge/hold`, `do-not-merge/invalid-owners-file`, and
-`do-not-merge/work-in-progress` all absent. The configuration is
-[`prow/oss/config.yaml`](https://github.com/GoogleCloudPlatform/oss-test-infra/blob/master/prow/oss/config.yaml)
-and
-[`prow/oss/plugins.yaml`](https://github.com/GoogleCloudPlatform/oss-test-infra/blob/master/prow/oss/plugins.yaml)
-in `GoogleCloudPlatform/oss-test-infra` — another repository, which is why nothing here can be
-authoritative about it. Read it there when the answer matters, and
-[oss.gprow.dev/command-help](https://oss.gprow.dev/command-help) for the full command set.
+Nobody presses Merge. `main` merges through a GitHub merge queue, and a pull request gets there in
+four steps:
+
+1. Prow sets the labels from the commands and reviews below. The enqueue sweep (step 2) takes a pull request that is
+   not a draft and carries `lgtm` and `approved`, with `do-not-merge`, `do-not-merge/hold`,
+   `do-not-merge/invalid-owners-file`, and `do-not-merge/work-in-progress` all absent. Prow's
+   configuration is
+   [`prow/oss/plugins.yaml`](https://github.com/GoogleCloudPlatform/oss-test-infra/blob/master/prow/oss/plugins.yaml)
+   in `GoogleCloudPlatform/oss-test-infra` — another repository, which is why nothing here can be
+   authoritative about it. Read it there when the answer matters, and
+   [oss.gprow.dev/command-help](https://oss.gprow.dev/command-help) for the full command set.
+2. The enqueue sweep, [`auto-enqueue.yml`](../.github/workflows/auto-enqueue.yml) running
+   `scripts/merge_gate.py sweep`, turns auto-merge on for such a pull request, which with a queue
+   means "enqueue once the required checks pass". It runs every five minutes, and at once when a
+   person or Prow changes one of those labels. It turns auto-merge off and takes the pull request
+   out of the queue when it loses a label or gains a hold. No author here has write access, the
+   robot included, so nobody else can do this.
+3. GitHub adds the pull request to the queue when every required check (listed below) is green on
+   its head.
+4. The queue builds its own commit on a `gh-readonly-queue/main/pr-<number>-<sha>` branch: `main`,
+   the pull requests ahead of it, and this one. It runs the required checks again on that commit,
+   and squash-merges the pull request when they pass.
+
+**When the queue removes a pull request** — a failed or cancelled required check on the queue
+commit (`failed_checks`), a conflict (`merge_conflict`), or a person (`manual`) — the sweep leaves it
+out until its head moves. Its head checks are still green, so putting it back would put the same
+failing tree in the queue again. One exception: after the first `failed_checks` removal since the
+last push, the sweep puts it back once, because a flake gets the same reason as a real failure. A
+second `failed_checks` removal keeps it out, and a `manual` or `merge_conflict` removal is never
+retried. When the sweep leaves a pull request out, it posts one comment with the reason and what to
+do. The first step is always a push: a fix, a rebase onto `main`, or an empty commit. For a failed
+check, or a reason the comment does not name, a write user can re-add it with the command in the
+comment if the push does not work. To keep a pull request out past its next push, add a hold
+(`/hold`).
 
 The two labels are the two people:
 
@@ -544,6 +568,10 @@ The two labels are the two people:
   change needs one other person from those lists however it is approved.
   `trusted_team_for_sticky_lgtm: Googlers` is configured, which means a push after the label lands
   strips it again unless the author is in that team, and the reviewer has to give it a second time.
+  `store_tree_hash: true` keeps it for every author across a push that leaves the tree unchanged,
+  such as the empty commit that puts a pull request back in the queue
+  (GoogleCloudPlatform/oss-test-infra#2748). An `lgtm` given before that change reached Prow
+  (2026-10-22 14:43Z) has no stored tree, and a push still strips it.
 - **`approved` is an `OWNERS` approver's.** `/approve`, from someone in the `OWNERS` file governing
   the changed paths — [`OWNERS`](../OWNERS) at the root and [`hack/OWNERS`](../hack/OWNERS) for the
   presubmit eval rosters (`hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt`)
@@ -580,74 +608,52 @@ Before any of that, a pull request from an author Prow does not already trust is
 Prow's jobs, not the GitHub Actions checks, so a pull request can look fully green and still be
 waiting on it.
 
-`/hold` parks an otherwise-mergeable pull request without withdrawing anything else, and
-`/hold cancel` releases it — #1045 held that way for a smoke test. The bare `do-not-merge` label is
-a different thing: [`hold-unresolved-threads.yml`](../.github/workflows/hold-unresolved-threads.yml)
-puts it on any pull request in the pool whose review threads are not all resolved, and takes it off
-at the next five-minute sweep after the last resolution. Tide does not read the
-conversation-resolution rule, so without the label it picks such a pull request, fails the merge,
-and retries it every ~85 seconds ahead of everyone else — #608 and #1197 held the queue that way
-for an hour on 2026-09-05. `/hold cancel` does not remove this label; resolving the threads does.
-A person who applies the same label by hand keeps it: the workflow removes only what it added.
-`/override <context>`, which only
-a repository admin can use, forces a check that cannot pass on its own, required or not. The forced status
-embeds the base SHA at override time, so by itself it would expire on the next merge to `main` and
-Tide would re-run the job — which is how an override came to need repeating whenever `main` moved
-before Tide merged (#1202). The re-pin below carries it across merges the way it carries a green,
-and when the re-pin loses its race with Tide's sync, the retest's step 0 reads the override off the
-head and reuses it the way it reuses a green. So an override holds for the head it was given until a
-push. This Prow build has no `/override-cancel` (step 0 would honour one). A retest that cannot
-reuse it — a status read refused on its first page or stopped (by a failed later page, or by step
-0's page cap) before it reached the override's event, a run with nowhere to record the reuse, or the
-operator's `EVAL_SKIP_REVALIDATION=1` lever below — runs the matrix instead, and its red does not
-withdraw the override. The next retest reads it off the head again when the cause was transient; an
-override that has fallen behind the page cap stays out of reach until a new `/override` or a push. Prow's `/override-sticky` would hold it without the race, with the `[prow:skip-retest]`
-sentinel Tide accepts regardless of base — but it is
-not in the Prow build this repository merges through: the
+`/hold` parks an otherwise-mergeable pull request without withdrawing anything else: the sweep
+takes it out of the queue. `/hold cancel` releases it — #1045 held that way for a smoke test. The
+bare `do-not-merge` label is a different thing:
+[`hold-unresolved-threads.yml`](../.github/workflows/hold-unresolved-threads.yml) puts it on any
+pull request carrying `lgtm` and `approved` whose review threads are not all resolved, and takes it off at the next
+five-minute sweep after the last resolution. The enqueue sweep reads it as a hold, the same as
+`/hold`. `/hold cancel` does not remove this label; resolving the threads does. A person who applies
+the same label by hand keeps it: the workflow removes only what it added. `/override <context>`,
+which only a repository admin can use, forces a check that cannot pass on its own: Prow posts a
+green status for that context on the head. `Smoke gate` reads an override of the smoke as a green,
+so it holds for the head it was given until a push. The queue runs the other required checks again
+on its own commit, so an override of one of those on the head does not carry into the queue. This
+Prow build has no `/override-cancel` (step 0 would honour one), and no `/override-sticky`: the
 [plugin help](https://oss.gprow.dev/command-help?repo=gke-labs%2Fkube-agents) lists only
-`/override`, and the command is silently ignored.
+`/override`.
 
-**Branch protection is not the gate and reads as though there is none.** `main` requires these
-contexts — `cla/google`, `actionlint`, `build`, `prettier`, `validate`, `Run Controller Tests`,
-`Run Python Unit Tests`, `Documentation Checks`, `Validate Conventional Commit PR Title`,
-`Agent instructions cite assets that exist`, and `Run A2A Module Tests` — and conversation
-resolution, but **zero** approving
-reviews, because approval is Tide's business rather than GitHub's. A reader who checks the
-repository settings for the review requirement therefore finds nothing and concludes wrongly.
+**`main`'s required checks are in a ruleset, and it requires no review.** The `main-merge-queue`
+ruleset requires these checks — on the head for a pull request to enter the queue, and on the queue
+commit for it to merge: `cla/google`, `actionlint`, `build`, `prettier`, `validate`,
+`Run Controller Tests`, `Run Python Unit Tests`, `Documentation Checks`,
+`Validate Conventional Commit PR Title`, `Agent instructions cite assets that exist`,
+`Run A2A Module Tests`, `Smoke gate`, and `Merge labels`. It also requires conversation resolution,
+but **zero** approving reviews, because approval is the labels' business, which `Merge labels`
+checks. A reader who checks the repository settings for the review requirement therefore finds
+nothing and concludes wrongly. Only these checks block a merge: a red or cancelled check outside
+the list does not, and `AI Review` is not in it.
 
 `Run Python Unit Tests`, `Documentation Checks`, `Validate Conventional Commit PR Title` and
 `Agent instructions cite assets that exist` joined the set on 2026-09-02, and
 `Run A2A Module Tests` on 2026-10-13; before its date, a pull request one of them had not run on
-could merge without it.
-
-Those contexts are not the whole required set either. Tide also requires every Prow presubmit not marked
-`optional`, and those are configured in `oss-test-infra` rather than in branch protection —
-`pull-kube-agents-smoke-test` dropped its `optional: true` on 2026-09-02
-(GoogleCloudPlatform/oss-test-infra#2677), so the behavioural presubmit gates every merge from that
-date. The command below therefore answers part of the question, and the two lists together still do
-not answer all of it: they say which contexts must be _present_ and green, but Tide also refuses any
-posted context that is not green, required or not, unless Prow marks it `optional`: Tide reads a
-check name whose every check run is cancelled or failed as a failing context (one success under the
-same name clears it; one still running holds it as pending), and with no Tide context policy for this repository
-an unknown context is not optional. A `classify` run cancelled by a superseding event held #1364
-unmerged with `lgtm` and `approved` on it, though `classify` is in neither list. `tide`'s own status
-names the offending context; `/retest` ([below](#re-running-a-check-that-failed)) re-runs such a
-run whole, and with Write access `gh run rerun <run-id> --job <job-id>` clears it by job ID, since
-`--failed` re-runs failed jobs and a cancelled one is not failed.
+could merge without it. `Smoke gate` and `Merge labels` joined with the move to the merge queue. The ruleset holds the full set, so read it from the rules for the branch:
 
 ```bash
-gh api repos/gke-labs/kube-agents/branches/main/protection \
-  --jq '.required_status_checks.contexts'
+gh api repos/gke-labs/kube-agents/rules/branches/main \
+  --jq '.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context'
 ```
 
-Every workflow behind one of those contexts also runs for a pull request whose base is a `release/`
-branch, and `tests/test_merge_group_triggers.py` fails if one is filtered back to `main`. A backport
-pull request branches from `upstream/release/<X.Y>` and targets it; the release runbook in
-`scripts/release/README.md` ("Patch releases from a release line") is what happens after it merges.
-A `release/` branch requires the same contexts, but through a ruleset rather than its branch
-protection rule, so the command above prints nothing for a line: its protection rule has no
-`required_status_checks` at all. Read a line's contexts back with the branch substituted,
-URL-encoded:
+Every workflow behind one of those checks, bar `Smoke gate` and `Merge labels`, also runs for a
+pull request whose base is a `release/` branch, and `tests/test_merge_group_triggers.py` fails if one is filtered back to `main`.
+A backport pull request branches from `upstream/release/<X.Y>` and targets it; the release runbook
+in `scripts/release/README.md` ("Patch releases from a release line") is what happens after it
+merges. A `release/` branch requires the same contexts bar `Smoke gate` and `Merge labels`, also
+through a ruleset; its branch protection rule has no `required_status_checks` at all. No queue
+runs on a `release/` branch and Tide no longer merges in this repository, so nothing merges a
+backport yet. How one merges is still open, and `scripts/release/README.md` still describes Tide. Read a line's
+contexts back with the branch substituted, URL-encoded:
 
 ```bash
 gh api repos/gke-labs/kube-agents/rules/branches/release%2F0.8 \
@@ -657,85 +663,75 @@ gh api repos/gke-labs/kube-agents/rules/branches/release%2F0.8 \
 The runbook section above says why the two differ, which three settings carry a line's
 protection, and what has to follow when `main`'s set changes.
 
-**A green smoke run stays valid when `main` moves.** Tide credits a Prow presubmit only against
-the base SHA it ran on — crier records it as a `BaseSHA:<sha>` suffix on the commit status — so on
-its own every merge to `main` would invalidate every other pull request's green
-`pull-kube-agents-smoke-test` and re-run the whole job for a pull request whose head has not
-changed (#1179, #1202); the header of `hack/ci-revalidate.sh` keeps the record of what that cost
-over the three weeks before it was answered. Two things answer it.
-[`smoke-test-sticky.yml`](../.github/workflows/smoke-test-sticky.yml) re-pins that suffix to the
-new head of `main` — for every open pull request against `main` on each push to `main`, and for
-one commit when its green arrives after `main` has already moved — with a note in the description
-saying so, and Tide reads the result as current. It is a race against Tide's roughly once-a-minute
-sync, and the sweep sometimes loses it; when it does, Tide starts the retest as before (a
-batch, when two or more qualify), crier's `pending` is then the newer status, and the sweep leaves
-it alone. That retest is what [`hack/ci-revalidate.sh`](../hack/ci-revalidate.sh), the job's step 0,
-makes cheap: before the job leases an evaluation project it looks for a green build of this job — at
-the pull request's head, or at an earlier head from which every change since is inert — attested by
-the Prow-posted success status, or failing both an admin `/override` of this job at the pull
-request's current head, and reuses that verdict whatever `main` has done since — a batch pull by pull, every one or none — so a lost race
-costs the minutes of a pod start and a clone rather than the 1.5 to 3.5 hours of the matrix. A push
-still starts a fresh run, and a run it is: step 0 reuses an earlier head's green only when
-everything since, on the pull request's side and on `main`'s, is inert.
-`/test pull-kube-agents-smoke-test` on the same head posts `pending`, which wins until that run
-reports (`/retest` does not, because it reruns only failed contexts), and that run too reuses the
-head's green: a genuine re-run of the matrix at an unchanged head is not something a pull request
-can ask for — a non-inert push is, and `EVAL_SKIP_REVALIDATION=1` in the job's env in
-`oss-test-infra` is the operator's lever. The re-pin never touches a red; step 0 prefers the newest
-green at the head, so a newer red at the same head is overridden on the next trigger, and the
-script's header says why to read such a red as flake or as a real break, not as noise. An admin
-`/override` is carried by the re-pin the same way as a green, because crier stamps the same
-`BaseSHA:` suffix on it, and by step 0 as the third kind of verdict: the success status the Prow bot
-posts at the head for an admin's `/override`, pointing at that comment on this pull request, counts
-(a later `/override-cancel` would withdraw it, where a Prow build has that command), so a retest or a batch
-after an override reuses it in seconds, and so does the retest Tide starts on a pull request it has
-just merged by override. The reused run reports as an ordinary `Job succeeded.`, so from then on the
-check and the re-pin read like a green; the `/override` comment, the build log's `REVALIDATED` line
-and a key the run leaves in its `finished.json` metadata are the record that it was one, and step 0
-reads the key so that such a run is never itself taken for a green. What this trades
-away, on every retest and not only when the sweep wins: the combination of a head with the `main`
-it lands on, and in a batch with the other pulls, is not tested before the merge; the nightly eval
-on `main` is what finds a bad combination, as is the next smoke run that actually starts after it.
-Neither carries a verdict across a change to what the job grades. When the blocking job's
-`spec.mode` changes in `oss-test-infra` (the swap to `next`, or a rollback to `today`), set the
-repository variable `SMOKE_PIN_NOT_BEFORE` right after it merges, to that merge time plus the job's
-360-minute timeout (a run in flight at the change reports afterwards; later only costs retests),
-then dispatch `smoke-test-sticky.yml` by hand: the re-pin then never pins an older green, and makes
-one Tide still credits stale, which the change itself would not, as it moves nothing on `main`.
-Then move `main` once, with a docs-only pull request the job skips: Tide also credits a live
-ProwJob at `main`'s head, and a retest that started under the old mode stays credited that way
-until `main` moves. Ship the change with `EVAL_SKIP_REVALIDATION=1` on the job, so the retests Tide then starts run the
-matrix instead of reusing the old green. The follow-up that drops that lever sets
-`EVAL_REVALIDATION_NOT_BEFORE` on the job to the same time as the variable, so step 0 never reuses
-a green first reported before it, however long its pull request sat.
-Prow's own form of the re-pin — a `[prow:skip-retest]` sentinel written by `/override-sticky` — is
-upstream but not in the Prow build this repository merges through; `scripts/pin_smoke_status.py`
-says when to switch.
+**The smoke reaches the queue through `Smoke gate`.** `pull-kube-agents-smoke-test` is a Prow
+presubmit, not a required check, and the queue does not run it on its own commit. `Smoke gate` is
+green when the latest smoke status on the pull request head is green (an `/override` included), or
+when there is none and the change touches only paths the smoke skips. It reads the head whatever
+base the run had, so **a green smoke run stays valid when `main` moves**, and nothing re-runs it.
+What this trades away: the head is not smoke-tested together with the `main` it lands on, or with
+the pull requests ahead of it in the queue. The nightly eval on `main` is what finds a bad
+combination, as is the next smoke run that starts after it.
+[`merge-gate.yml`](../.github/workflows/merge-gate.yml) posts `Smoke gate` and `Merge labels` as
+statuses on the head when an input changes — a push, a label, a new smoke status — and only when
+green, so a gate missing from the head has not passed yet. Its `merge_group` jobs decide the same
+two again on the queue commit, and the enqueue sweep re-posts the head statuses of approved pull
+requests on its schedule. `scripts/merge_gate.py` is the reference for what each one reads.
+[`smoke-test-sticky.yml`](../.github/workflows/smoke-test-sticky.yml) still re-pins a green's
+`BaseSHA:` suffix to the new head of `main`, which only Tide read.
 
-**A pull request on `main` can also carry `Smoke gate` and `Merge labels` statuses.** They
-are the gate checks of a GitHub merge queue that `main` does not use yet, posted by
-[`merge-gate.yml`](../.github/workflows/merge-gate.yml), and each restates something Tide already
-decides: the smoke result (or that the change touches only paths the smoke skips), and the label
-query above. Nothing requires them. Because Tide holds on any posted context
-that is not green, each is posted only when it is green, and a green can go stale until the next
-event. `scripts/merge_gate.py` is the reference for what each one reads.
+A push starts a fresh smoke run.
+[`hack/ci-revalidate.sh`](../hack/ci-revalidate.sh), the job's step 0, makes some runs cheap: before
+the job leases an evaluation project it looks for a green build of this job — at the pull request's
+head, at an earlier head with the same tree, or at an earlier head from which every change since is
+inert — attested by the Prow-posted success status, or failing all three an admin `/override` of
+this job at the pull request's current head, and reuses that verdict whatever `main` has done since.
+Such a run costs the minutes of a pod start and a clone rather than the 1.5 to 3.5 hours of the
+matrix. So after a push, step 0 reuses an earlier head's green only when that head has the same tree
+(an empty commit, or a message-only rewrite), or when everything since, on the pull request's side
+and on `main`'s, is inert. `EVAL_SKIP_REVALIDATION=1` in the job's env in `oss-test-infra` is the
+operator's lever: while it is set, step 0 is skipped and every run, an empty commit's included, runs
+the matrix. `/test pull-kube-agents-smoke-test` on the same head posts `pending`, which wins until
+that run reports (`/retest` does not, because it reruns only failed contexts), and that run too
+reuses the head's green: a genuine re-run of the matrix at an unchanged head is not something a pull
+request can ask for — a non-inert push is. Step 0 prefers the newest green at the head, so a newer
+red at the same head is overridden on the next trigger, and the script's header says why to read
+such a red as flake or as a real break, not as noise. The success status the Prow bot posts at the
+head for an admin's `/override`, pointing at that comment on this pull request, counts as the third
+kind of verdict, so a run after an override reuses it in seconds. The reused run reports as an
+ordinary `Job succeeded.`; the `/override` comment, the build log's `REVALIDATED` line and a key the
+run leaves in its `finished.json` metadata are the record that it was one, and step 0 reads the key
+so that such a run is never itself taken for a green.
 
-**`mergeStateStatus` cannot answer "is this ready to merge" here, and it is the natural thing to
-reach for.** Every open pull request reads `BLOCKED` or `DIRTY` and none ever reads `CLEAN`, because
-`main` restricts pushes to the `google-oss-prow` app and GitHub scores that restriction as a block
-on the querying user. #1065 read `BLOCKED` while carrying both labels and while `tide` reported
-`In merge pool.` Ask Tide instead — its status on the head commit states its own reason — and
-[oss.gprow.dev/tide](https://oss.gprow.dev/tide) shows the queue. One reason the status omits: a
-merge attempt that failed — an unresolved review thread, most often — is retried every ~85
-seconds and recorded only in the `err` field of
-[tide-history](https://oss.gprow.dev/tide-history); #1122 sat approved for 5h46m and 231
-attempts that way — the case the `do-not-merge` label above now keeps out of the pool.
+No verdict carries across a change to what the job grades. When the blocking job's `spec.mode`
+changes in `oss-test-infra` (the swap to `next`, or a rollback to `today`), set the repository
+variable `SMOKE_PIN_NOT_BEFORE` right after it merges, to that merge time plus the job's 360-minute
+timeout (a run in flight at the change reports afterwards). `Smoke gate` then stays pending on a
+green whose build first reported before that time, until a run from after it replaces it, and its
+pending text asks for a push. Check the value before you set it: an unparsable one exits
+`merge_gate.py` before it decides anything, so it fails `Smoke gate` on every queue commit and
+stops the enqueue sweep, which then turns auto-merge on or off for nobody until the value is
+fixed. A head `Smoke gate` already posted green stays green, so such a
+pull request enters the queue, fails its group, and stays out after its one retry until a push.
+Ship the change with `EVAL_SKIP_REVALIDATION=1` on the job, so its runs do not reuse the old green.
+The follow-up that drops that lever sets `EVAL_REVALIDATION_NOT_BEFORE` on the job to the same time
+as the variable, so step 0 never reuses a green first reported before it, however long its pull
+request sat.
+
+**To see what a pull request is waiting for,** read the two gates and the smoke on its head, then
+its labels and whether auto-merge is on. The gates are posted only when green; the log of a
+`Merge Gate` run names the reason for one that is not (a run that a smoke status started is listed
+under `main` in the Actions tab, not on the pull request). Once the labels pass, the sweep turns
+auto-merge on, at once on a label event or within five minutes. Once every required check is also
+green on the head, GitHub adds the pull request to the queue, and
+[the queue page](https://github.com/gke-labs/kube-agents/queue/main) lists it. A pull
+request the queue removed carries the sweep's comment with the reason.
 
 ```bash
-# Why Tide has not merged it: its own reason first, then the labels it wants.
+# The gates and the smoke on the head (a gate shows only when green), then labels and auto-merge.
 gh api repos/gke-labs/kube-agents/commits/<head-sha>/status \
-  --jq '.statuses[] | select(.context == "tide") | "\(.state): \(.description)"'
-gh pr view <number> --repo gke-labs/kube-agents --json labels --jq '[.labels[].name]'
+  --jq '.statuses[] | select(.context == "Smoke gate" or .context == "Merge labels" or .context == "pull-kube-agents-smoke-test") | "\(.context): \(.state): \(.description)"'
+gh pr view <number> --repo gke-labs/kube-agents --json labels,autoMergeRequest \
+  --jq '{labels: [.labels[].name], auto_merge: (.autoMergeRequest != null)}'
 ```
 
 ## Re-running a check that failed
@@ -744,12 +740,11 @@ A GitHub Actions check that fails on a pull request whose diff cannot have cause
 re-run. Comment `/retest` on the pull request, as the first thing in the comment: Prow re-runs its
 failed jobs, and [`retest-actions.yml`](../.github/workflows/retest-actions.yml) re-runs the GitHub
 Actions runs behind the red checks at the head commit (a cancelled or timed-out run whole, since
-Tide blocks on it the same way) for any owner, member or collaborator. Prow also reads the command
+a required check blocks on it the same way) for any owner, member or collaborator. Prow also reads the command
 at the start of a later line; the Actions re-run, like `/request-review`, reads the start of the
 comment only, so a `/retest` under a line of explanation re-runs the Prow jobs alone. It re-runs
 only the pull request's own runs: a head commit that is also a commit on `main` or a release line
-carries that line's push runs too, and a red one of those is named and left alone. It reads the checks as Tide does, the best
-state per check name, so a run a newer success superseded or one cancelled while still queued is
+carries that line's push runs too, and a red one of those is named and left alone. It reads the best state per check name, so a run a newer success superseded or one cancelled while still queued is
 not re-run: neither blocks anything. GitHub's own re-run button needs Write access, which most
 collaborators here do not hold. The comment gets 👀 when something was re-run and 😕 when nothing
 was, with the reason on the workflow run (a `Retest Actions Checks` run in the Actions tab; it is
@@ -785,8 +780,8 @@ a smoke green after a red at the same head may be step 0 reusing the older green
 Every open pull request has exactly one party whose move it is, and the commonest way one sits for
 a fortnight is that both sides believe it is the other's. The rule:
 
-**The author owns it while it is blocked on them** — a draft, a failing or cancelled check that
-`tide` names, merge conflicts, unresolved review threads (bar a `kube-agents-bot` thread whose last
+**The author owns it while it is blocked on them** — a draft, a failing or cancelled required check,
+a pull request the sweep left out of the merge queue, merge conflicts, unresolved review threads (bar a `kube-agents-bot` thread whose last
 comment is the author's `declined:` or `deferred to #N` reply, which waits for the reviewer's
 ruling; an approval, or a reply in the thread that accepts the decline, is that ruling, and the
 thread is the author's again, to resolve citing it; a reply that asks for the fix is theirs to
@@ -812,11 +807,10 @@ Four states that look like somebody else's problem and are not:
   override. Answering every bot thread does not summon one by itself. The hand-off comment the
   workflow posts on its first request is the sign one has been asked: after it, reply in the
   threads (with the fixing commit for any 🔴 High) and wait rather than typing `/review` again.
-- **A red check that is not required.** It still blocks the merge if it is red on the head: Tide
-  refuses any posted context that is not green unless Prow marks it `optional`, not only the ones on
-  the two lists above, so a cancelled run of a non-required job is the author's problem too. `tide`
-  is what actually knows —
-  ask it before treating a failing job as work owed, and before concluding one is not.
+- **A pull request the sweep left out of the merge queue.** It still carries `lgtm` and `approved`
+  and its head checks are green, so it looks ready, but the sweep keeps it out until its head moves
+  ([how a change merges](#how-a-change-merges)). The sweep's comment names the reason, and the next
+  step is a push from the author.
 - **`mergeable: UNKNOWN`.** GitHub computes mergeability lazily and the first query only triggers
   the job, so a conflict reads as conflict-free until you ask twice.
 

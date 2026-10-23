@@ -108,6 +108,53 @@ the weekly audit. `burst-ingest` in `seeded-headroom` requests far more memory t
 design: it is sized for an ingest burst the measured week does not show. The obtainability,
 compliance, upgrade readiness and waste audits list the five postures under Declared intent rather
 than as findings.'
+# checkout-gateway's declaration, the file the remediation cases propose a
+# PodDisruptionBudget beside (GITOPS_WORKLOAD_MANIFEST_CASES in the verifier).
+# With no manifest in the repository the agent finds nothing to fix and refuses
+# to open a pull request. It is bench/tf/fleet/defects-a.tf's Deployment as
+# YAML, at the path collect.py's workload_declarations reads a cluster off
+# (clusters/<cluster>/...), which is also the tie #2228's cases wait for. No
+# word about the budget: a note saying it is missing on purpose reads as
+# declared intent and silences the finding.
+readonly GITOPS_WORKLOAD_MANIFEST_PATH="clusters/seeded-a/seeded-reliability/checkout-gateway.yaml"
+readonly GITOPS_WORKLOAD_MANIFEST_MESSAGE="Declare seeded-a's checkout-gateway Deployment in seeded-reliability"
+readonly GITOPS_WORKLOAD_MANIFEST_CONTENT='apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout-gateway
+  namespace: seeded-reliability
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: checkout-gateway
+  template:
+    metadata:
+      labels:
+        app: checkout-gateway
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: checkout-gateway
+      containers:
+        - name: gateway
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 32Mi'
 
 # The host cluster's name is not a preference: scripts/verify_ci_pool_project.py
 # asserts it, hack/ci-env.sh selects it, and the Boskos lease resolves to it.
@@ -416,9 +463,14 @@ done
 
 # compute.viewer: the GKE provider lists each node pool's instance group
 # managers on refresh, which no other role here carries (seen live 2026-09-28).
+# compute.loadBalancerAdmin: the stack plants a backend service and a health
+# check on the default pool's instance group (readiness-lb-drain-timeout,
+# defects-b.tf), and the create needs compute.backendServices.*,
+# compute.healthChecks.* and compute.instanceGroups.use.
 echo "Granting the seeded-fleet reconciler access to ${PROJECT_ID}..."
 for role in \
   roles/compute.instanceAdmin.v1 \
+  roles/compute.loadBalancerAdmin \
   roles/compute.securityAdmin \
   roles/compute.storageAdmin \
   roles/compute.viewer \
@@ -524,22 +576,27 @@ if [ -z "${GITOPS_DEFAULT_BRANCH}" ]; then
     -f content="$(printf '%s\n' "${GITOPS_SEED_CONTENT}" | base64 | tr -d '\n')" >/dev/null
 fi
 
-# The declaration the declared-intent eval case reads. A PUT without `sha` on a
-# path that exists fails, so the read comes first, and only a 404 means
-# "absent": any other failure stops the step, as the branch read above does,
-# rather than PUT over a note that may be there. A note someone edited by
-# hand is left as it is.
-if GITOPS_INTENT_NOTE_READ_ERROR="$(gh api "repos/${GITOPS_REPO}/contents/${GITOPS_INTENT_NOTE_PATH}" 2>&1 >/dev/null)"; then
-  :
-elif printf '%s' "${GITOPS_INTENT_NOTE_READ_ERROR}" | grep -q "${GITOPS_NOTE_ABSENT_PATTERN}"; then
-  echo "Seeding ${GITOPS_REPO} with ${GITOPS_INTENT_NOTE_PATH} (the declared-intent note)..."
-  gh api -X PUT "repos/${GITOPS_REPO}/contents/${GITOPS_INTENT_NOTE_PATH}" \
-    -f message="${GITOPS_INTENT_NOTE_MESSAGE}" \
-    -f content="$(printf '%s\n' "${GITOPS_INTENT_NOTE_CONTENT}" | base64 | tr -d '\n')" >/dev/null
-else
-  echo "ERROR: could not read ${GITOPS_INTENT_NOTE_PATH} in ${GITOPS_REPO} (${GITOPS_INTENT_NOTE_READ_ERROR}); not seeding it blind." >&2
-  exit 1
-fi
+# The two files the eval cases read: the declared-intent note and
+# checkout-gateway's declaration. A PUT without `sha` on a path that exists
+# fails, so the read comes first, and only a 404 means "absent": any other
+# failure stops the step, as the branch read above does, rather than PUT over
+# a file that may be there. A file someone edited by hand is left as it is.
+seed_gitops_file() {
+  local path="$1" message="$2" content="$3" what="$4" read_error
+  if read_error="$(gh api "repos/${GITOPS_REPO}/contents/${path}" 2>&1 >/dev/null)"; then
+    return 0
+  elif printf '%s' "${read_error}" | grep -q "${GITOPS_NOTE_ABSENT_PATTERN}"; then
+    echo "Seeding ${GITOPS_REPO} with ${path} (${what})..."
+    gh api -X PUT "repos/${GITOPS_REPO}/contents/${path}" \
+      -f message="${message}" \
+      -f content="$(printf '%s\n' "${content}" | base64 | tr -d '\n')" >/dev/null
+  else
+    echo "ERROR: could not read ${path} in ${GITOPS_REPO} (${read_error}); not seeding it blind." >&2
+    exit 1
+  fi
+}
+seed_gitops_file "${GITOPS_INTENT_NOTE_PATH}" "${GITOPS_INTENT_NOTE_MESSAGE}" "${GITOPS_INTENT_NOTE_CONTENT}" "the declared-intent note"
+seed_gitops_file "${GITOPS_WORKLOAD_MANIFEST_PATH}" "${GITOPS_WORKLOAD_MANIFEST_MESSAGE}" "${GITOPS_WORKLOAD_MANIFEST_CONTENT}" "checkout-gateway's declaration"
 
 INST_JSON="$(gh api /orgs/gke-agentic/installations --jq ".installations[] | select(.app_id==${APP_ID})" 2>/dev/null || echo "")"
 if [ -n "${INST_JSON}" ]; then

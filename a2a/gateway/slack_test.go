@@ -36,10 +36,13 @@ type fakeSlackAPI struct {
 	// postValues is every chat.postMessage's full form, for the fields
 	// posted does not name.
 	postValues []url.Values
-	updated    []struct{ channel, ts, text string }
-	members    []string
-	cursor     string
-	openedIM   string
+	// postOptions is every chat.postMessage's options as given, for the
+	// blocks (sentUpdateForm reads them off the wire).
+	postOptions [][]slack.MsgOption
+	updated     []struct{ channel, ts, text string }
+	members     []string
+	cursor      string
+	openedIM    string
 	// updatedBlocks and updatedAttachments are each update's blocks and
 	// attachments fields as sent, beside updated.
 	updatedBlocks      []string
@@ -53,6 +56,12 @@ type fakeSlackAPI struct {
 	userInfoCalls int
 	// prompts records setSuggestedPrompts calls.
 	prompts []slack.AssistantThreadsSetSuggestedPromptsParameters
+	// onPost, when set, runs at the start of every chat.postMessage, so a
+	// test can look at the adapter's state while a post is in flight.
+	onPost func()
+	// conversations and conversationErr answer conversations.info.
+	conversations   map[string]*slack.Channel
+	conversationErr error
 	// views records views.publish calls by member.
 	views []publishedView
 }
@@ -93,6 +102,27 @@ func (f *fakeSlackAPI) GetUserInfo(user string, _ ...slack.GetUserInfoOption) (*
 	return nil, errors.New("user_not_found")
 }
 
+func (f *fakeSlackAPI) GetUserInfoContext(_ context.Context, user string, options ...slack.GetUserInfoOption) (*slack.User, error) {
+	return f.GetUserInfo(user, options...)
+}
+
+// GetConversationInfoContext answers conversations.info from conversations:
+// a conversation it names, conversationErr for one it does not, or a channel
+// the bot is a member of when neither is set.
+func (f *fakeSlackAPI) GetConversationInfoContext(_ context.Context, input *slack.GetConversationInfoInput) (*slack.Channel, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if ch, ok := f.conversations[input.ChannelID]; ok {
+		return ch, nil
+	}
+	if f.conversationErr != nil {
+		return nil, f.conversationErr
+	}
+	ch := &slack.Channel{}
+	ch.ID, ch.IsMember = input.ChannelID, true
+	return ch, nil
+}
+
 func (f *fakeSlackAPI) SetAssistantThreadsSuggestedPrompts(p slack.AssistantThreadsSetSuggestedPromptsParameters) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -105,6 +135,9 @@ func (f *fakeSlackAPI) AuthTestContext(context.Context) (*slack.AuthTestResponse
 }
 
 func (f *fakeSlackAPI) PostMessage(channelID string, options ...slack.MsgOption) (string, string, error) {
+	if f.onPost != nil {
+		f.onPost()
+	}
 	_, values, err := slack.UnsafeApplyMsgOptions("tok", channelID, "https://slack.example/api/", options...)
 	if err != nil {
 		return "", "", err
@@ -115,6 +148,7 @@ func (f *fakeSlackAPI) PostMessage(channelID string, options ...slack.MsgOption)
 		values.Get("channel"), values.Get("thread_ts"), values.Get("text"),
 	})
 	f.postValues = append(f.postValues, values)
+	f.postOptions = append(f.postOptions, options)
 	return channelID, "999.001", nil
 }
 

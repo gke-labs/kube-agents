@@ -11,11 +11,8 @@ import urllib.request
 import urllib.error
 import urllib.parse
 import subprocess
-import ipaddress
-import tempfile
 from typing import Any
 from pathlib import Path
-from datetime import datetime
 from mcp.server import MCPServer
 import sandbox_exec
 from agent_common_server import _run_env
@@ -433,7 +430,7 @@ def _cluster_agent_roster() -> list[dict]:
         return []
     roster = []
     for home in sorted(base.iterdir()):
-        if home.name in RESERVED_PROFILES or not is_ready_profile(home):
+        if home.name in RESERVED_PROFILES or home.name.startswith(".") or not is_ready_profile(home):
             continue
         entry = {"name": home.name}
         try:
@@ -802,8 +799,8 @@ def get_cc_pod_diagnostics(
         results.append(f"=== POD LOGS (PREVIOUS TAIL=100) ===\n{_sanitize_log_text(res.stdout)}\n")
     except subprocess.TimeoutExpired:
         results.append("=== POD LOGS (PREVIOUS TAIL=100) TIMEOUT ===\nCommand timed out after 30 seconds.\n")
-    except subprocess.CalledProcessError as e:
-        results.append(f"=== POD LOGS (PREVIOUS TAIL=100) ===\nNo previous container logs available (container has not restarted or previous logs expired).\n")
+    except subprocess.CalledProcessError:
+        results.append("=== POD LOGS (PREVIOUS TAIL=100) ===\nNo previous container logs available (container has not restarted or previous logs expired).\n")
     except sandbox_exec.SandboxUnavailable as e:
         # Not folded into the clause above: "no previous logs" is a statement
         # about the pod, and the sandbox being gone is not evidence for it.

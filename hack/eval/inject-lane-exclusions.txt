@@ -15,7 +15,9 @@
 # only under AGENT_TRANSPORT=inject, drops the named cases from TASKS before the fan-out
 # and says so in the log; on the api transport the file changes nothing,
 # and the api lane's rosters (presubmit-cases.txt, blocking-roster.txt,
-# nightly-cases.txt) are untouched -- an entry here is not a demotion. The
+# nightly-cases.txt) are untouched -- an entry here is not a demotion, and
+# the case still runs every night on ci-kube-agents-eval-nightly-today, the
+# nightly that grades spec.mode today. The
 # same shape as the validator's FIXTURE_NOT_READY: an exclusion with a
 # reason, not a marker on the case (docs/eval-gate-roster.md, "The inject
 # lane").
@@ -143,3 +145,9 @@ chat-answer-declares-next-step
 # #2039: grades the worker's answer under the door's one card, as
 # chat-answer-declares-next-step does. Returns to the lane with agent-kanban-smoke.
 chat-answer-tangent-offer-declares-no-step
+# #2619: grades the platform worker's answer to a request for every fleet
+# audit's latest report, which on the api lane the harness folds into the
+# reply from the card the chat front door files. Under the api executor the lane's delegation
+# wait settles on the card's receipt and the worker's answer never reaches
+# the A2A thread, so the reply carries no report to grade.
+fleet-audit-request-line

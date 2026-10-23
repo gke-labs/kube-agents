@@ -267,7 +267,9 @@ calls rather than reimplements.
   and an `is_ignored` property.** Which branch prefix marks an agent's own work, and which label
   opts a pull request out, are harness policy — they would be identical on every forge, and a
   provider that filtered on them would make each new forge re-implement the same rule. The provider
-  answers "what is open"; the caller answers "which of those are mine".
+  answers "what is open"; the caller answers "which of those are mine". A forge with no labels
+  (Bitbucket; `capabilities` answers `labels: false`) has no label to opt out with, so there
+  `agent:ignore` on a line of its own in the description is the opt-out, and only there.
 - **`self_login(pr)` became `viewer_login()`.** Deriving identity from the pull request being judged
   is circular: it answers "is this ours" with "whoever opened it", so any pull request looks
   self-authored to the marker scan. `viewer_login()` asks the credential instead, and the answer
@@ -301,14 +303,15 @@ account and the order the layers have to be unwound in; this section records onl
 protocol above them.
 
 "Bitbucket" is two providers, which is the limit of how far one provider class stretches. Cloud
-(`/2.0/repositories/…`) and Data Center (`/rest/api/1.0/projects/…`) share almost nothing, so a class
+(`/2.0/repositories/…`) and Data Center (`/rest/api/…/projects/…`) share almost nothing, so a class
 branching on which one it is talking to would be two implementations in a trench coat. Two separate
 providers are cheap here because neither of them is on this side of the boundary: a forge module is
 something the broker registers, and `BrokerProvider` above it does not change. That was the
 argument's original point in reverse — a forge with no CLI to shell could only be reached through a
 sidecar route, and Bitbucket has no `gh` equivalent at all — and the migration made the route the
-only one there is. Its tokens come from OAuth refresh flows, so it would want a third token strategy
-again.
+only one there is. Its recommended tokens are static strings sent as a Bearer header, so it needs no
+new token strategy ([`version-control-support.md`](version-control-support.md) §8, "The Bitbucket
+credential").
 
 ## 4. The pull-request sweep
 

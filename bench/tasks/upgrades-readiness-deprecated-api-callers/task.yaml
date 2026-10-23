@@ -1,0 +1,264 @@
+# The readiness report names the caller that writes through a deprecated but still served API
+#
+# One of the upgrade-failure catalogue's scenario cases
+# (docs/designs/upgrade-failure-catalogue.md, entry 9: a feature is deprecated
+# but still served). It grades the readiness report's `deprecated-api-callers`
+# rule in the fleet-upgrade-verification skill
+# (scripts/readiness_rules/deprecated_api_callers.py), through the agent's
+# answer to the fleet readiness question.
+#
+# The rule reads the cluster's audit log over the seven days before the run
+# (a paged `gcloud logging read`, writes only, the provider's principals
+# excluded in the filter) for the `k8s.io/deprecated=true` stamp the API
+# server puts on every write through a deprecated API version, and files each
+# operator caller as a risk named with its principal, user agent and API, with
+# the successor where the tables name one; the provider's own callers
+# (kube-system's endpoint-controller is stamped on every Service's Endpoints
+# it writes) are counted in the rule's note, not filed. The seeded fleet
+# plants the shape as the deprecated-api-caller role on slot a: the CronJob
+# legacy-endpoints-writer in seeded-deprecation merge-patches the hand-written
+# Endpoints v1 object legacy-endpoints-lane every ten minutes, and Endpoints
+# is deprecated since 1.33 and still served, so every write is stamped and no
+# removal is scheduled. Nothing breaks on upgrade day, which is why the rule
+# never blocks: the next removal is the outage, and the count is the early
+# notice. The case therefore grades a declared line per seeded cluster that
+# counts the callers the report names, names the rule, grades it a risk
+# (never a blocker) and quotes the rule's entry for the cluster.
+#
+# Why this form, and not the chat question. The entry's chat form, which asks
+# for the deprecated API versions in use and their callers, is answerable from
+# the audit log or the namespace alone: an agent that names Endpoints v1 and
+# legacy-endpoints-writer from `gcloud logging read` passes it on a report
+# that has no such rule, so it grades nothing about the rule. The cell slot
+# here is what proves the report ran: its pattern is wording only the rule's
+# own text produces (`deprecated-api-callers:
+# system:serviceaccount:seeded-deprecation:legacy-endpoints-writer via
+# <user agent> writes core/v1 endpoints (<n> writes in 7d, last <time>):
+# deprecated and still served; the next removal is the outage, so plan the
+# migration now; successor discovery.k8s.io/v1 EndpointSlice ...`), which the
+# skill paraphrases and a hand log read cannot supply; a report whose rule is
+# missing prints no such entry, so the slot reads `none` or another rule's
+# text and the line fails there whatever the other slots say.
+#
+# What the deterministic checks read, and what they leave to the judge. The
+# prompt asks for one fixed-form line per seeded cluster; every pattern
+# matches the whole declared frame, anchored at both ends, with the line's
+# decoration folded first, and the cluster placeholders are the roles' slots.
+# The checks on slot a's line read its four slots: the count (one or more; the
+# fleet's count, so the judge reads the writer's name from the prose), the
+# rule id, the grade and the cell. The cell's required text stops after the
+# API (`writes core/v1 endpoints`): the user agent, the write count and the
+# last write are the fleet's, and the rule's own text carries `; ` twice after
+# that point, the separator the note column joins its entries on, so an agent
+# that cuts the entry there still passes. The fold spaces the principal's
+# colons (`system: serviceaccount: ...`), which the patterns admit, and the
+# `;` inside the cell keeps the verifier's value-wrap fold from removing a
+# quote or angle bracket the agent kept around it, so the patterns admit one
+# opener before the text. The other clusters' lines are graded on the frame
+# alone: they carry no such writer, and what the rule prints for them (its
+# note counting the provider's callers, or none) is theirs to state. The
+# prose, the reason the rule gives, and the recommended remedy (move the
+# writer to EndpointSlice before a removal lands) are the judge's, against
+# `expected_output`.
+#
+# Planted defect required: on slot a, the CronJob legacy-endpoints-writer in
+# seeded-deprecation on its own ServiceAccount, patching legacy-endpoints-lane
+# every ten minutes (role `deprecated-api-caller` in
+# bench/tf/fleet/fixtures.json). The safeguard reads that the CronJob is not
+# suspended after the run: a suspended writer stops the stamped writes, and
+# the audit trail ages out for every later case. The three other roles are
+# one per slot, and they are how the declared-line objectives tell a cluster
+# the agent missed from a cluster the project does not have. No
+# `worker_commands` objective: it reads delegated workers' terminals only and
+# errors on a run the router answered itself, so the report's own output is
+# graded through the cell slot instead, as
+# upgrades-readiness-zonal-control-plane does.
+#
+# Isolation class: read-only (chat prompt; the readiness script reads with
+# gcloud container, gcloud logging read and kubectl get and writes only its
+# own record and per-member kubeconfig files). Eligible tier: nightly from
+# its first merge.
+id: upgrades-readiness-deprecated-api-callers
+name: Upgrade readiness names the caller writing through a deprecated but still served API
+prompt: >-
+  Check every cluster in this project for its readiness to upgrade to its
+  release channel's default version. For each cluster, report what blocks the
+  upgrade and what is at risk, and say which callers write through Kubernetes
+  API versions that are deprecated but still served, as the readiness report
+  reads them from the cluster's audit log. Read only: do not change, upgrade
+  or remove anything. End your answer with one line per seeded cluster, in
+  exactly this form and with no other words on the line: "<cluster>: kind
+  Cluster; deprecated-api callers the report names: <count>; readiness rule:
+  <the id of the report's rule that graded them|none>; graded as:
+  <blocker|risk|note|none>; cell: <the entry the report prints for that rule
+  on the cluster in its other blockers, risks or note column, copied as
+  printed|none>". Write each cluster name exactly as the API shows it, with no
+  brackets, quotes or parentheses around it. When a column holds several
+  entries separated by "; ", copy the first one from the
+  deprecated-api-callers rule. Put any aside on a line of its own.
+expected_output: >-
+  A per-cluster readiness report read during this run. For seeded-a it names
+  the writer the report's deprecated-api-callers rule read from the audit
+  log: the principal system:serviceaccount:seeded-deprecation/legacy-endpoints-writer
+  (the CronJob legacy-endpoints-writer in seeded-deprecation), its user agent,
+  and the API it writes, core/v1 endpoints, with the number of writes in the
+  seven-day window and the last one. It says Endpoints v1 is deprecated since
+  1.33 in favour of discovery.k8s.io/v1 EndpointSlice and still served, that
+  no removal is scheduled, and that the report carries the caller as a risk,
+  not a blocker: nothing breaks on upgrade day, and the next removal is the
+  outage. It separates GKE's own endpoint-controller, which the same stamp
+  marks on every cluster and which the rule counts in its note rather than
+  filing, from the operator's caller. It recommends moving the writer to
+  EndpointSlice before a removal lands. Other clusters' blockers and risks
+  come from the same run. It ends with one declared line per seeded cluster;
+  seeded-a's counts at least one caller, names deprecated-api-callers, reads
+  "graded as: risk", and its cell is the rule's entry for the cluster,
+  beginning "deprecated-api-callers:
+  system:serviceaccount:seeded-deprecation:legacy-endpoints-writer via <user
+  agent> writes core/v1 endpoints", with or without the
+  "deprecated-api-callers: " prefix. It cites no CVE identifiers and changes
+  nothing.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+# Named by ROLE, not cluster: bench/tf/fleet/fixtures.json;
+# docs/designs/bench-fleet-catalog.md is the rule. The first role is the
+# planted writer on slot a; the other three are one per remaining slot.
+fixtures:
+  - deprecated-api-caller
+  - version-laggard
+  - drift-outlier
+  - zonal-skew-scheduling
+
+verification_spec:
+  # One line per seeded cluster, fixed vocabulary, the cluster named at the
+  # start of the line; every pattern matches the whole declared frame, anchored
+  # at both ends, with the line's decoration folded first.
+  - name: every-seeded-cluster-has-a-declared-line
+    role: objective
+    # assert, not converge: the transcript is immutable once the run ends.
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - deprecated-api-caller
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: kind cluster; deprecated-api callers the report names: [^;\n]+; readiness rule: [^;\n]+; graded as: [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: kind cluster; deprecated-api callers the report names: [^;\n]+; readiness rule: [^;\n]+; graded as: [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: kind cluster; deprecated-api callers the report names: [^;\n]+; readiness rule: [^;\n]+; graded as: [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: kind cluster; deprecated-api callers the report names: [^;\n]+; readiness rule: [^;\n]+; graded as: [^\n]+$)'
+
+  # The fact the entry turns on: slot a carries a caller writing through a
+  # deprecated API. The count is the fleet's (one today), so the pattern asks
+  # for one or more; a line that counts none denies the planted writer.
+  - name: the-planted-clusters-line-counts-the-writer
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - deprecated-api-caller
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: kind cluster; deprecated-api callers the report names: [1-9][0-9]*; readiness rule: [^;\n]+; graded as: [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: kind cluster; deprecated-api callers the report names: (?![1-9][0-9]*;)[^;\n]+; readiness rule: [^;\n]+; graded as: [^\n]+$'
+
+  # The report's own output: the rule id the risks column, the note and the JSON
+  # carry. An agent that read the log without the report has no id to give,
+  # and a report whose rule has regressed gives none, so the slot reads `none`.
+  - name: the-planted-clusters-line-names-the-reports-rule
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - deprecated-api-caller
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: kind cluster; deprecated-api callers the report names: [^;\n]+; readiness rule: deprecated-api-callers; graded as: [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: kind cluster; deprecated-api callers the report names: [^;\n]+; readiness rule: (?!deprecated-api-callers;)[^;\n]+; graded as: [^\n]+$'
+
+  # The grade is the rule's own: a caller of a deprecated API is a risk, never
+  # a blocker, since nothing breaks on upgrade day; `note` or `none` denies
+  # the rule filed the planted writer.
+  - name: the-planted-clusters-line-grades-it-a-risk
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - deprecated-api-caller
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: kind cluster; deprecated-api callers the report names: [^;\n]+; readiness rule: [^;\n]+; graded as: risk; cell: [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: kind cluster; deprecated-api callers the report names: [^;\n]+; readiness rule: [^;\n]+; graded as: (?!risk;)[^;\n]+; cell: [^\n]+$'
+
+  # The report's own wording: the rule's risk for the writer, its principal,
+  # user agent and API in the rule's order. The skill paraphrases it and a
+  # hand log read supplies none of it. A report whose rule is missing prints
+  # no such text, so the slot reads `none` or something else and the line
+  # fails here, whatever the other slots say. The required text stops after
+  # the API: the user agent, the count and the last write are the fleet's,
+  # and the rule's own `; ` come after. The fold spaces the principal's
+  # colons, and the pattern admits one opener before the text, a quote or
+  # angle bracket the agent kept.
+  - name: the-planted-clusters-line-quotes-the-reports-cell
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - deprecated-api-caller
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      # The `deprecated-api-callers: ` prefix is the table's; report.json carries the bare text, so it is optional.
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: kind cluster; deprecated-api callers the report names: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: ["''“‘<]?(?:deprecated-api-callers: )?system:\s?serviceaccount:\s?seeded-deprecation:\s?legacy-endpoints-writer via [^\n]*? writes core/v1 endpoints[^\n]*$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: kind cluster; deprecated-api callers the report names: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: (?!["''“‘<]?(?:deprecated-api-callers: )?system:\s?serviceaccount:\s?seeded-deprecation:\s?legacy-endpoints-writer via [^\n]*? writes core/v1 endpoints)[^\n]*$'
+
+  # The prompt's "read only", grounded: the writer still runs. A suspended
+  # writer stops the stamped writes, so the audit trail ages out while every
+  # probe still passes, and every later case reads an empty trail.
+  - name: the-planted-writer-survived-the-run
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: deprecated-api-caller
+      kind: cronjob
+      resource_name: legacy-endpoints-writer
+      namespace: seeded-deprecation
+      path: spec.suspend
+      op: eq
+      value: false
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # No vulnerability feed; a CVE id in a readiness report is an invention.
+      forbidden_phrases: ["CVE-"]

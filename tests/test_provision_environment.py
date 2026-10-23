@@ -39,7 +39,6 @@ from tests.testing.release import (
     MOCK_CR_NOT_READY,
     MOCK_CR_READY_AT_GENERATION_2,
     MOCK_CR_STALE_READY,
-    MOCK_GATEWAY_DARK_REASON,
     MOCK_MODE_CONTEXT,
     write_mode_kubectl_stub,
 )
@@ -978,7 +977,6 @@ class PlatformAgentModeTest(unittest.TestCase):
         "kubectl --context {ctx} rollout status deployment/platform-agent-a2a-callout -n {ns} --timeout=GATE",
         "kubectl --context {ctx} rollout status deployment/platform-agent-a2a-verifier -n {ns} --timeout=GATE",
         "kubectl --context {ctx} rollout status deployment/platform-agent-gateway -n {ns} --timeout=GATE",
-        "kubectl --context {ctx} get platformagent platform-agent -n {ns} -o jsonpath=GATEWAY",
         "kubectl --context {ctx} rollout status deployment/platform-agent-a2a-gateway -n {ns} --timeout=GATE",
     ]
 
@@ -1033,9 +1031,9 @@ class PlatformAgentModeTest(unittest.TestCase):
         for line in lines:
             if "-o jsonpath=" in line:
                 tag = next(
-                    (c for c in ("A2AGateway", "BusProvisioned", "BusCredentialsReady") if c in line),
+                    (c for c in ("BusProvisioned", "BusCredentialsReady") if c in line),
                     "READ",
-                ).replace("A2AGateway", "GATEWAY")
+                )
                 line = line.split("-o jsonpath=", 1)[0] + "-o jsonpath=" + tag
             if line.startswith("kubectl "):
                 match = re.search(r"--timeout=(\d+)s$", line)
@@ -1118,23 +1116,6 @@ class PlatformAgentModeTest(unittest.TestCase):
         self.assertIn("::error title=mode next: BusProvisioned not True::", proc.stdout)
         self.assertFalse(any("rollout status" in c for c in calls), calls)
 
-    def test_a_dropped_gateway_read_is_retried(self):
-        proc, calls = self._run({"PLATFORM_AGENT_MODE": "next"}, gateway_read_failures=2)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        normalised = self._normalise(calls)
-        self.assertEqual(normalised.count(self._expected_gate()[-2]), 3)
-        self.assertEqual(normalised[-1], self._expected_gate()[-1])
-
-    def test_a_gateway_read_that_never_succeeds_fails_the_step_with_the_state(self):
-        proc, calls = self._run(
-            {"PLATFORM_AGENT_MODE": "next", "PLATFORM_AGENT_MODE_GATE_TIMEOUT_SECONDS": "0"},
-            gateway_read_failures=1000,
-        )
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("::error title=mode next: A2AGateway unreadable::", proc.stdout)
-        self.assertTrue(any("-l app.kubernetes.io/part-of=a2a-next" in c for c in calls), calls)
-        self.assertFalse(any("a2a-gateway" in c and "rollout status" in c for c in calls), calls)
-
     def test_next_is_refused_on_a_long_lived_environment_before_the_teardown(self):
         for spelling in ("true", "1", "yes"):
             with self.subTest(spelling=spelling):
@@ -1159,13 +1140,15 @@ class PlatformAgentModeTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("did not roll out", proc.stdout)
 
-    def test_a_withheld_gateway_is_reported_not_waited_for(self):
-        proc, calls = self._run(
-            {"PLATFORM_AGENT_MODE": "next"}, gateway_reason=MOCK_GATEWAY_DARK_REASON
-        )
+    def test_the_gate_always_waits_on_the_a2a_gateway(self):
+        # Every next install runs the gateway (on the console door alone with
+        # no chat backend), so the gate reads no condition that could make it
+        # skip the rollout, and the last thing it waits on is that rollout.
+        proc, calls = self._run({"PLATFORM_AGENT_MODE": "next"})
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(self._normalise(calls)[2:], self._expected_gate()[:-1])
-        self.assertIn("configures no chat backend", proc.stdout)
+        self.assertEqual(self._normalise(calls)[-1], self._expected_gate()[-1])
+        self.assertFalse(any("A2AGateway" in c for c in calls), calls)
+        self.assertNotIn("no chat backend", proc.stdout)
 
     def test_a_mode_that_is_not_a_mode_is_refused_before_the_teardown(self):
         for value in ("Next", "nxt", "today ", "TODAY"):

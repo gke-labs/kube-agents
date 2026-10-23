@@ -247,8 +247,47 @@ its issue is closed afterwards.
   does; the broker's and the gateway's link constants equal the persona's.
 - `make docs-generate` refreshes the skills catalog; `make docs-check` passes.
 
+### 7. `/feedback summary` (added 2026-10-21, issue #3428)
+
+The one `/feedback <text>` the gateway answers itself: `chattext.IsFeedbackSummaryCommand`
+is true when the text after the word is exactly `summary`, and `IsCommand` reports it, so a
+chat message's button may not carry it either. The dispatch case sits beside the bare form,
+ahead of `/session`, status, stop and steer, and changes nothing about the record's task
+state. `a2a/gateway/feedback_summary.go` renders the install's usage and feedback summary
+deterministically, with the environment, usage and feedback sections `scripts/feedback-summary.sh`
+prints from a workstation (epic #3426's share surface; the script adds the model, the performance
+figures and recent task rows): environment (tag, mode, Kubernetes version, install age,
+readiness, active interfaces), the `status.usage` counters, a roll-up of the gateway's own
+task records, and the feedback template. That roll-up is labelled `chat turns`, not `tasks`:
+the script's `tasks` line counts kanban cards, and two pastes from one install must not
+disagree under one label. The roll-up splits by what a `TaskRef` holds: the
+record's `ActiveTask` names the running task, `Canceled` marks a published cancel, and the
+rest ended (the ordinary relay path writes no end marker; `TerminalObserved` is the heal
+path's dedupe flag, not an outcome), so its buckets are `ended`, `cancelled`, `active` where
+the script's kanban read tells `done` from `failed`. Its window is fourteen days clamped to
+`SessionTTL`, because the reaper deletes a record, tasks and all, once idle past it, and the
+label prints the window it used, never under one day. The records are read as the busy count reads them, through one
+KV watch stream rather than a Get per record, under a ten-second budget inside the turn; past
+that the line reads `unavailable`. It reads the
+`PlatformAgent` resource through the gateway's ServiceAccount, which the operator's Role
+grants one `get` on, pinned by `resourceNames` to this agent's resource; the server version
+needs no grant. Tokens, spend and latency are not the gateway's to see and the block says
+where they are. Before posting, the block is audited as the script audits its own: every
+string leaf of the spec's naming subtrees plus the resource's name and namespace, as whole
+tokens, with booleans, numbers, short strings and the template's own vocabulary skipped; a
+hit posts a fixed refusal instead, and a resource that cannot be read posts a fixed
+unavailability notice. No error text reaches chat. The web console classifies the turn as
+settled, like the bare form, sends it from a `usage summary` button in the chat footer, and puts
+a `copy` button on any gateway notice that holds a fenced block, so the block reaches the
+clipboard in one click (the third surface #3428 asks for). No model is in the loop, so the eval
+loop does not apply.
+
 ## Calls made in the build
 
+- `/feedback summary` is answered by the gateway rather than by a platform card: a block a
+  customer pastes must be a function of the sources alone, which a model-composed answer
+  cannot promise, and the gateway is the one component that both sees the resource and
+  posts into the conversation.
 - The bare-`/feedback` branch is the first case of the gateway's dispatch switch, ahead of
   `/session`, status, stop and steer, gated on a message with no programmatic intent.
 - The sandbox client keeps one marker per payload hash in the task workspace. A broker that

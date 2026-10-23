@@ -143,8 +143,8 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "A1-refusal-content",
         "agents/platform/scripts/command_policy.py",
-        ('                "Identity and API server address belong to the broker. Remove "',
-         '                f"Identity belongs to the broker; {argv} was refused. Remove "'),
+        ('                "Identity and API server address belong to the broker.",\n',
+         '                f"Identity belongs to the broker; {argv} was refused.",\n'),
         "test_A1_a_refusal_names_no_caller_supplied_value",
         "make the refusal more helpful by naming what was refused -- the "
         "obvious improvement that turns a denial into an oracle",
@@ -166,14 +166,8 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "A1-refusal-emptied",
         "agents/platform/scripts/command_policy.py",
-        ('                message=(\n'
-         '                    "Identity and API server address belong to the broker. Remove "\n'
-         '                    "--server, --token, --user, --client-certificate, "\n'
-         '                    "--insecure-skip-tls-verify and the other credential flags to "\n'
-         '                    "use the cluster and identity the proxy configured. "\n'
-         '                    + _FLAG_BOUNDARY_NOTICE\n'
-         '                ),\n',
-         '                message="",\n'),
+        ('    return Decision(allowed=False, rule_id=rule_id, message=" ".join(parts), offending_flag=flag)\n',
+         '    return Decision(allowed=False, rule_id=rule_id, message="", offending_flag=flag)\n'),
         "test_A1_a_refusal_names_the_rule_that_fired",
         "collapse a refusal onto its rule id -- the cheapest way to satisfy "
         "A1's no-caller-supplied-byte bound is to stop saying anything, and an "
@@ -637,6 +631,46 @@ Mutation(
         "watch for a namespace nobody excluded",
     ),
     Mutation(
+        "C1-watcher-reads-a-reconciler-kind-the-agent-cannot",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        ("configsync.gke.io", "reposyncs"),\n',
+         '        ("configsync.gke.io", "reposyncs"),\n        ("helm.toolkit.fluxcd.io", "helmreleases"),\n'),
+        "test_C1_the_watcher_reads_by_name_only_the_reconciler_kinds_the_agent_can_read",
+        "let the drift join read Flux HelmReleases too, for richer drift context "
+        "-- the broker relays an object, inline values and all, that the agent's "
+        "own role was deliberately never granted",
+    ),
+    Mutation(
+        "C1-watcher-relays-a-custom-kind-outside-the-reconciler-table",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        ("rbac.authorization.k8s.io", "roles"),\n',
+         '        ("rbac.authorization.k8s.io", "roles"),\n        ("cert-manager.io", "certificates"),\n'),
+        "test_C1_the_watcher_reads_by_name_only_the_reconciler_kinds_the_agent_can_read",
+        "add cert-manager Certificates to the watcher table for drift on TLS "
+        "objects -- straight into WATCHER_NAMED_READS, so the reconciler table "
+        "and the agent's role never hear about it",
+    ),
+    Mutation(
+        "C1-watcher-relays-a-crd-under-a-k8s-io-group",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        ("rbac.authorization.k8s.io", "roles"),\n',
+         '        ("rbac.authorization.k8s.io", "roles"),\n        ("gateway.networking.k8s.io", "httproutes"),\n'),
+        "test_C1_the_watcher_reads_by_name_only_the_reconciler_kinds_the_agent_can_read",
+        "add Gateway API HTTPRoutes to the watcher table, which look built-in by "
+        "their .k8s.io suffix -- the broker relays a CRD the agent's role was "
+        "never granted, and a suffix rule waves it through",
+    ),
+    Mutation(
+        "C1-agent-role-drops-a-reconciler-kind",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ("      - rootsyncs\n      - reposyncs\n",
+         "      - rootsyncs\n"),
+        "test_C1_the_watcher_reads_by_name_only_the_reconciler_kinds_the_agent_can_read",
+        "trim RepoSyncs from the agent's role as unused by the Helm skill -- "
+        "the drift join still enriches them, so the two grants no longer say "
+        "the same thing",
+    ),
+    Mutation(
         "C1-watcher-route-allows-a-list",
         "agents/platform/scripts/watcher_policy.py",
         ('_EVENTS_LIST = re.compile(r"api/v1/events")\n',
@@ -688,11 +722,43 @@ Mutation(
     Mutation(
         "C1-watcher-subscription-unpinned",
         "agents/platform/scripts/watcher_policy.py",
-        ('        if not subscription or match.group("sub") != subscription:\n',
-         '        if not subscription:\n'),
+        ('    if match.group("sub") not in subscriptions:\n',
+         '    if not subscriptions:\n'),
         "test_C1_the_watcher_pubsub_routes_reach_only_the_configured_subscription",
-        "drop the equality check when renaming the subscription env -- the "
-        "relay then pulls and acks any subscription the broker can reach",
+        "drop the membership check when renaming the subscription env -- the "
+        "relay then pulls and acks any subscription the broker can reach "
+        "(the platform relay shares the check, so its test goes red too)",
+    ),
+    Mutation(
+        "C1-platform-pubsub-pinned-to-project-not-subscription",
+        "agents/platform/scripts/watcher_policy.py",
+        ('    return _evaluate_subscription_call(method, path, body, subscriptions, _PLATFORM_SUBSCRIPTION_RULES)\n',
+         '    match = _PUBSUB_SUBSCRIPTION.fullmatch(path)\n'
+         '    if match and any(match.group("sub").rsplit("/", 2)[0] == s.rsplit("/", 2)[0] for s in subscriptions):\n'
+         '        subscriptions = subscriptions | {match.group("sub")}\n'
+         '    return _evaluate_subscription_call(method, path, body, subscriptions, _PLATFORM_SUBSCRIPTION_RULES)\n'),
+        "test_C1_the_platform_pubsub_relay_reaches_only_the_configured_subscriptions",
+        "let a plugin pull any subscription in a project it already has one in, "
+        "so a new route needs no operator render -- the gateway then reads the "
+        "drift watcher's and every other subscription in the harness project",
+    ),
+    Mutation(
+        "C1-platform-pubsub-route-opened-to-shell",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    (watcher_policy.PLATFORM_PUBSUB_PREFIX, (CALLER_ROLE_CHAT,)),\n",
+         "    (watcher_policy.PLATFORM_PUBSUB_PREFIX, (CALLER_ROLE_CHAT, CALLER_ROLE_SHELL)),\n"),
+        "test_C1_only_the_chat_role_reaches_the_platform_pubsub_relay",
+        "let a skill in the shell sandbox pull the stockout subscription directly "
+        "-- the agent's own commands then drain a queue meant for the gateway",
+    ),
+    Mutation(
+        "C1-platform-adapter-default-credential",
+        "agentplugins/pubsub-platform/files/platforms/pubsub/adapter.py",
+        ("import json\n",
+         "import json\n\nimport google.auth  # the project id from the pod's default credential when the env is unset\n"),
+        "test_C1_no_shipped_platform_adapter_holds_a_google_credential_path",
+        "fall back to google.auth.default() for the project id -- the path that "
+        "failed quietly for every alert once the gateway lost Workload Identity",
     ),
     Mutation(
         "C1-watcher-routes-opened-to-chat",
@@ -1013,6 +1079,37 @@ Mutation(
         "every IAM principal in a tool result then reaches the model as "
         "[REDACTED_EMAIL], which is the over-eager shape that gets redaction "
         "turned off",
+    ),
+    Mutation(
+        "A1-flag-refusal-invites-a-write-retry",
+        "agents/platform/scripts/command_policy.py",
+        ("    stripped = _strip_refused_flags(argv)\n",
+         "    return None\n    stripped = _strip_refused_flags(argv)\n"),
+        "test_A1_a_refusal_invites_no_retry_it_would_refuse",
+        "skip the remainder check to save an evaluation per refusal -- every "
+        "flag refusal on a write invites the flagless retry again, and the "
+        "agent runs the bare write it was always going to be refused",
+    ),
+    Mutation(
+        "A1-kubectl-flag-refusal-forbids-the-halting-retry",
+        "agents/platform/scripts/command_policy.py",
+        ('    if argv[0] == "kubectl":\n        return None\n    stripped = _strip_refused_flags(argv)\n',
+         "    stripped = _strip_refused_flags(argv)\n"),
+        "test_A1_a_refusal_invites_no_retry_it_would_refuse",
+        "apply the refused-retry wording to kubectl too, for consistency -- "
+        "a kubectl write refused for a flag tells the agent not to retry, the "
+        "flag refusal does not count toward the runtime halt, and the retry "
+        "that would have halted the turn is never made",
+    ),
+    Mutation(
+        "A1-unknown-flag-invites-a-write-retry",
+        "agents/platform/scripts/command_policy.py",
+        ("        if retry_refused:\n",
+         "        if False and retry_refused:\n"),
+        "test_A1_a_refusal_invites_no_retry_it_would_refuse",
+        "drop the write variant of the unreadable refusal as an edge case -- "
+        "an unknown flag on clusters update says re-run without the flag, "
+        "seven times over",
     ),
     Mutation(
         "C2-unknown-flag-fail-open",

@@ -231,7 +231,7 @@ The other ten checks say whether a cluster is **due** an upgrade. This one says 
 would **go**, which is the difference between a report an operator reads and one an operator can
 act on. A cluster three minors behind with a healthy drain path is a scheduling decision. The same
 cluster with a budget that refuses eviction is a workload GKE forces off its node an hour into the
-drain, and the same cluster with a pool past the skew ceiling is an upgrade GKE refuses to start;
+drain, the same cluster with a pool past the skew ceiling is an upgrade GKE refuses to start, and the same cluster with a readiness rule's block (a load balancer draining longer than GKE waits per node, a Node whose instance is gone, a cluster held by an operation, a withdrawn target patch) is an upgrade that would not go through cleanly;
 each is waiting for whoever schedules it.
 
 - **Command:** the collector runs it; do not re-implement the detection, and do not run it by hand
@@ -240,7 +240,7 @@ each is waiting for whoever schedules it.
   `python3 <skills>/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --project <p> --cluster <loc>/<cluster> --readiness --output /opt/data/scratch/upgrade-readiness_<p>_<loc>_<cluster>.json --state-dir /opt/data/scratch/upgrade-readiness-state/<p>` — and joins its `members[]` row to the cluster. The reporter writes to a per-run file beside that path, which the collector moves onto the path once the row is graded, so a run that times out or fails leaves last week's report where the command points, and nothing stale is read back. On an install that declares a scope the collector puts `--scope-projects <p>`, naming the one project it is reading, between `--project` and `--cluster`: the reporter is a collector too and refuses a bare `--project` there, and with `--project` it reads the scope only to see that the project is inside it, so the one project is the whole scope it needs. The full `collector_args` stay with the collector: a sweep of fifty to a hundred and fifty project ids would push the recorded command past the 2000-character limit `finish` holds every `checks_run` command to, and refuse the whole document. The `commands` entry it records for `upgrade-blocked` is that invocation with that path, flags and all; copy it with the rest. The report stays at that path if you
   need the row behind a candidate.
 - **Flag when:** a behind cluster's `readiness.status` is `blocked` **and** the block comes from
-  `readiness.pdbs.blocking` (a drain-blocking PodDisruptionBudget) or `readiness.skew.blocking`.
+  `readiness.pdbs.blocking` (a drain-blocking PodDisruptionBudget), `readiness.skew.blocking` or `readiness.rule_blocking` (a per-entry readiness rule's block, each row carrying the rule's id, its one-line text and `holds`, the moves its mechanism stops; it counts for the move the lag makes due, a node-pool rule on a pool move and a cluster rule on both, and a failed budget read beside it is no gap).
   The collector applies this rule, and the candidate it emits is the finding.
 - **Do NOT flag:** a block that rests only on `readiness.maintenance.blocking_exclusions`. The
   skill grades a `NO_MINOR_UPGRADES` exclusion as blocking; 3.8 here deliberately does not, because
@@ -273,7 +273,7 @@ each is waiting for whoever schedules it.
   target the reporter failed to fetch this run: those entries have the check in
   `checks_unevaluated` instead.
 - **Unevaluated:** a behind cluster the reporter could not grade — its objects could not be
-  read, the reporter failed for that cluster or ran out of its four-minute budget, or it graded
+  read, a readiness rule that can block could not read on the move due (the row's `unknown`, with the rule's reason), the reporter failed for that cluster or ran out of its four-minute budget, or it graded
   `blocked` for a cause this check does not know — and a cluster 3.1 or 3.2 never judged, carry
   `upgrade-blocked` in the entry's `checks_unevaluated` with the reason. An `unknown` the reporter owes to a maintenance exclusion it could not decide is not one of these: the exclusion is 3.8's subject, the budget read answered and the ceiling was graded, so the check ran clean, in `commands`, as on a block resting on an exclusion alone. A `blocked` grade whose
   cause is node-pool skew is a finding even when the budget read failed beside it, when the
@@ -286,15 +286,15 @@ each is waiting for whoever schedules it.
   not back.
 - **Severity:** **critical**. The only check here whose subject is how an upgrade would go rather
   than whether one is late: a budget's hold ends in a forced eviction of the workload it protects,
-  and a skew ceiling stops the upgrade outright.
+  a skew ceiling stops the upgrade outright, and a readiness rule's block says in its own text what stops it.
 - **Object and evidence:** `object` is `Cluster/<cluster>`, like every finding in this audit (§2:
   `namespace` is `""`), so the finding keeps one identity week over week. The candidate's
   `excerpt` carries the blocking budgets in name order, each with its field, the workloads it
   covers and `disruptionsAllowed`, taken from the `members[].readiness.pdbs.blocking[]` entries;
   past what the ledger's evidence clip can hold it names the first eight and counts the rest,
   pointing at the readiness report that lists every one. When a skew ceiling blocks on the same
-  row, the pool clause comes first and the budgets follow it. Paste it as it is.
-- **Impact:** the candidate's, whose tail names the mechanism for its cause, and the two causes
+  row, the pool clause comes first; a readiness rule's block follows it as `readiness rule <id> blocks it: <the rule's text>`, one clause per rule (past the clip, the first eight and a count of the rest), and the budgets follow the rules. Paste it as it is.
+- **Impact:** the candidate's, whose tail names the mechanism for its cause, and the three causes
   make different claims. A budget delays the upgrade and costs the workload its pod; it does not
   stop the upgrade: a surge upgrade respects the budget for up to an hour per node and then
   evicts anyway. For a budget: "`<cluster>` is `<n>` minor(s) behind and its upgrade would be
@@ -306,7 +306,7 @@ each is waiting for whoever schedules it.
   does stop it. For skew: "`<cluster>` is `<n>` minor(s) behind and its upgrade would not
   complete: node pool(s) `<pool>` would exceed
   the version-skew ceiling against the target control plane, so GKE will not move the control
-  plane until the pool moves." When both block on one row, the ceiling governs, because GKE
+  plane until the pool moves." For a readiness rule's block the rule's text is the claim and the tail adds none of its own: "`<cluster>` is `<n>` minor(s) behind and its upgrade would not go through cleanly: readiness rule `<id>` blocks it: `<the rule's text>`." Alone or beside budgets the rule's arm governs the sentence, since a rule's block stops the upgrade where a budget only holds it, and the budget clauses follow the rule's in the cause; under a skew ceiling the ceiling's tail stands and the rule's clause sits in the cause after the pool clause. When a ceiling and budgets block on one row, the ceiling governs, because GKE
   refuses the move before any drain starts, and the tail names both in that order: "`<cluster>`
   is `<n>` minor(s) behind and its upgrade would not complete: node pool(s) `<pool>` would exceed
   the version-skew ceiling against the target control plane; PodDisruptionBudget
@@ -315,7 +315,7 @@ each is waiting for whoever schedules it.
   holds each node's drain for up to an hour and then evicts `<workload>` anyway." Never write
   "would not complete" or "stalls" on the budget arm: an operator reads it as a drain that waits
   for them, and the forced eviction is what they need to know about. Never write "held, not
-  stopped" on a row the reporter graded refused.
+  stopped" on a row the reporter graded refused, nor on one a readiness rule blocks.
 - **Remediation:** `kind: manual`, and for a budget the fix is not filed here a second time. The
   obtainability audit owns PodDisruptionBudgets: its 3.4 `blocking-pdb` reports the same budget
   daily in its own ledger as `critical`, with the `maxUnavailable: 1` manifest that `/remediate`
@@ -325,7 +325,7 @@ each is waiting for whoever schedules it.
   here is sent to the finding that carries the manifest rather than refused with no pointer. Never
   propose deleting a PodDisruptionBudget, which trades a held drain for an unprotected workload.
   For skew, name the pool and the version it has to reach before the control plane can move; no
-  other ledger carries that. When both block, do both: the pool and its version here, and the
+  other ledger carries that. For a readiness rule's block, carry the action in the rule's text (the `gcloud compute backend-services update` command, `kubectl delete node`, the support case for a held cluster, the active patch to retarget); no other ledger carries it either. When more than one blocks, do each: the pool and its version and the rule's action here, and the
   pointer to the obtainability finding for the budget.
 
 **Why this is a join and not a new detector.** Drain safety is the obtainability audit's subject,
@@ -398,9 +398,10 @@ One JSON line comes back with `status`, `issue_url`, `new`, `resolved`, `prs_ope
 
 **`silent_ok` decides silence. Do not re-derive it.** `finish` returns `silent_ok: true` only when this run moved nothing an operator needs to hear about: nothing new, nothing resolved, no new or changed coverage gap, no remediation PR opened or closed. Read the flag rather than reassembling that from `status`, `new`, `resolved`, and `partial` yourself — that arithmetic is where a run talks itself into silence it has not earned. Two rules, and they are the whole rule:
 
-- On a **scheduled** run, `silent_ok: true` → your final response is **exactly** `[SILENT]`. Otherwise report, and every report carries `issue_url` in full, except a `NO_FORGE` run, which has none (below).
+- On a **scheduled** run, `silent_ok: true` → your final response is **exactly** `[SILENT]`. Otherwise report, and every report carries `issue_url` in full, except a `NO_FORGE` or `STORE_LEDGER` run, which has none (below).
 - **An on-demand run is never silent.** If a person dispatched this job — from a kanban card or straight from chat — someone is waiting on the answer, and `[SILENT]` throws it away. Report the outcome and the ledger URL whatever `silent_ok` says.
 - `status == "NO_FORGE"` → no forge is configured, or the broker cannot reach the repository, so nothing was published and there is no ledger URL: unless the run is silent by the rule above, your report is `summary` verbatim (the skill's "No forge configured" section, `/opt/data/profiles/platform/skills/fleet-audit/references/finish.md`).
+- `status == "STORE_LEDGER"` → the forge has no issue tracker, or no labels, so the ledger is in the report store and there is no ledger URL: unless the run is silent by the rule above, your report is `summary` verbatim, which names the remediation pull requests (the skill's "A forge with no issue tracker" section, `/opt/data/profiles/platform/skills/fleet-audit/references/finish.md`).
 
 What to report in each case:
 

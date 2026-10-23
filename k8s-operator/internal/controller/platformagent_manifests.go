@@ -536,7 +536,7 @@ func buildConfigMap(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1a
 func buildConfigMapData(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) map[string]string {
 	data := map[string]string{
 		managedConfigKey:  renderConfigYAML(agent, agentPlugins),
-		managedEnvKey:     renderManagedEnv(agent),
+		managedEnvKey:     renderManagedEnvForPlugins(agent, agentPlugins),
 		"leader_elect.py": leaderElectScript,
 	}
 	data[scopeConfigKey] = renderScopeJSON(agent)
@@ -594,7 +594,12 @@ func buildConfigMapData(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agen
 	return data
 }
 
-// renderManagedEnv pins the platform settings that decide whether the agent can reach
+// renderManagedEnv is renderManagedEnvForPlugins with no plugins.
+func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
+	return renderManagedEnvForPlugins(agent, nil)
+}
+
+// renderManagedEnvForPlugins pins the platform settings that decide whether the agent can reach
 // chat at all, for the ones that have no config.yaml equivalent.
 //
 // The config layer alone would not hold them. load_gateway_config applies the managed
@@ -620,7 +625,11 @@ func buildConfigMapData(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agen
 // that names a missing key fails the mount and the pod never starts. Since API_SERVER_KEY
 // below is unconditional it is no longer ever empty in practice, but the projection still
 // depends on the key existing, not on it having content.
-func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
+//
+// The AgentPlugins resolved for the agent pin one more key, the Pub/Sub
+// platform relay's URL, when one of their routes names a subscription the
+// operator can qualify. renderManagedEnv is this with none.
+func renderManagedEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) string {
 	// Fixed order, not map iteration: this render feeds the config hash, and a hash that
 	// reshuffles on every reconcile would roll the pod for no reason.
 	var lines []string
@@ -742,6 +751,16 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	add(stallWatchExcludeNamespacesEnvKey, strings.Join(stallWatch.ExcludeNamespaces, stallWatchListSeparator))
 	add(stallWatchMinAgeEnvKey, stallWatchMinAge)
 	add(stallWatchKindsEnvKey, strings.Join(stallWatch.Kinds, stallWatchListSeparator))
+
+	// The Pub/Sub platform adapter's relay URL, on the same terms as the chat
+	// relays below: pinned so the agent cannot write its own and pull from
+	// somewhere else. Pinned on every render, empty when no plugin configures a
+	// Pub/Sub platform, so the agent cannot supply one either (pubsubRelayURL).
+	// Before the integration guard: a Pub/Sub platform needs no chat
+	// integration. Not a "platform" for the gateway-wide allowlist pair below,
+	// which is about chat users.
+	add(pubsubRelayURLEnvVar, pubsubRelayURL(agent, agentPlugins))
+	add(pubsubRelayProjectEnvVar, pubsubRelayProject(agent))
 
 	integration := agent.Spec.Integration
 	if integration == nil {
@@ -1495,6 +1514,14 @@ func buildPluginStagingInitContainer(homeDir string, plugin *agentv1alpha1.Agent
 			"/bin/sh",
 			"-c",
 			stageScript,
+		},
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceEphemeralStorage: resource.MustParse(pluginStagingEphemeralRequest),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceEphemeralStorage: resource.MustParse(pluginStagingEphemeralRequest),
+			},
 		},
 		VolumeMounts: []corev1.VolumeMount{
 			{
@@ -2421,7 +2448,14 @@ type renderOptions struct {
 	// heldGitHubOrg is the GITHUB_ORG the live gateway carries, set only while
 	// the declaration cannot name the organisation (see heldGitHubOrg).
 	heldGitHubOrg string
+	// enabledProfiles is the sorted list of resolved, non-terminating optional
+	// built-in Hermes specialist AgentProfile names (such as "tse") bound to this
+	// PlatformAgent in `mode: next`. Empty when no optional profiles are bound,
+	// so the zero value renders byte-identical manifests.
+	enabledProfiles []string
 }
+
+const enabledProfilesEnvVar = "KUBE_AGENTS_ENABLED_PROFILES"
 
 // lastWinsEnv drops every entry a later entry of the same name supersedes, keeping the
 // surviving one where it already sits. Order is otherwise untouched, so on the ordinary
@@ -3032,7 +3066,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		if a2aAgentSurface(agent) {
 			kept := extEnvs[:0]
 			for _, e := range extEnvs {
-				if e.Name == "NATS_URL" || e.Name == a2aBusUserEnv ||
+				if e.Name == "NATS_URL" || e.Name == a2aNATSCAFileEnv || e.Name == a2aNATSTLSServerNameEnv || e.Name == a2aBusUserEnv ||
 					e.Name == a2aBusTokenFileEnv ||
 					e.Name == "NATS_USER" || e.Name == "NATS_PASSWORD" {
 					continue
@@ -3041,14 +3075,17 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			}
 			extEnvs = kept
 		}
-		// A2A_NOTIFY_PLATFORM and A2A_NOTIFY_CONVERSATIONS are dropped on
-		// every install, not only while the A2A surface is up: on a today
-		// install a plugin's value would reroute Google Chat posts from
-		// hermes send to a chat.notify route that does not exist there. The
-		// operator renders them only under next, after this merge.
+		// A2A_NOTIFY_PLATFORM, A2A_NOTIFY_CONVERSATIONS, and
+		// KUBE_AGENTS_ENABLED_PROFILES are dropped on every install, not only
+		// while the A2A surface is up: on a today install a plugin's notify value
+		// would reroute Google Chat posts from hermes send to a chat.notify route
+		// that does not exist there, and a plugin's KUBE_AGENTS_ENABLED_PROFILES
+		// would scaffold or archive optional specialist profiles outside the
+		// operator's AgentProfile reconciliation. The operator renders them only
+		// under next, after this merge.
 		kept := extEnvs[:0]
 		for _, e := range extEnvs {
-			if e.Name != a2aNotifyPlatformEnvVar && e.Name != a2aNotifyConversationsEnvVar {
+			if e.Name != a2aNotifyPlatformEnvVar && e.Name != a2aNotifyConversationsEnvVar && e.Name != enabledProfilesEnvVar {
 				kept = append(kept, e)
 			}
 		}
@@ -3178,6 +3215,28 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Name:  mcpRelayURLEnvVar,
 		Value: mcpRelayURL(agent),
 	})
+	// The Pub/Sub platform adapter's relay, whatever the chat integration:
+	// the broker's URL exactly when the broker is told the subscription set
+	// (buildCredentialProxyEnvForPlugins), so the two cannot disagree, and
+	// empty otherwise. Unconditional and after the plugin merge for the reason
+	// the MCP relay URL above is: a name the operator never emits leaves an
+	// AgentPlugin's spec.env as the only writer, and this one names where the
+	// adapter presents the token above. Pinned in the managed .env too
+	// (renderManagedEnvForPlugins).
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  pubsubRelayURLEnvVar,
+		Value: pubsubRelayURL(agent, agentPlugins),
+	})
+	// The project the adapter qualifies a short route name with: the one the
+	// operator composed the broker's set with, so the two cannot disagree.
+	// GCP_PROJECT_ID above is on the overridable side of the plugin merge; a
+	// plugin that set it would have the adapter ask for a subscription the
+	// broker refuses, and the route would deliver nothing. Pinned in the
+	// managed .env too.
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  pubsubRelayProjectEnvVar,
+		Value: pubsubRelayProject(agent),
+	})
 	// The A2A bus, under `next` only: the address, and the name this container
 	// authenticates as. There is no password here since A5. The credential is
 	// the projected ServiceAccount token mounted below, the callout resolves it
@@ -3207,8 +3266,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// container at all — the SensitiveEnvVars membership is what turns the
 	// attempt into a webhook rejection instead of a silent no-op.
 	//
-	// Nothing here is Optional any more and nothing needs to be, which is the
-	// one thing the token makes simpler: the skew branch of a2aAgentSurface
+	// Nothing here is Optional, which is the one thing the token makes
+	// simpler (the bus CA bundle volume further down is, for the skew branch's
+	// sake, and says why): the skew branch of a2aAgentSurface
 	// used to need Optional on the SecretKeyRef so a today-lineage install that
 	// hit skew would not roll the pod into CreateContainerConfigError against a
 	// Secret that had never existed. A projected token volume has no such
@@ -3217,15 +3277,24 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// inert env vars and a mount.
 	if a2aAgentSurface(agent) {
 		envVars = append(envVars,
+			// The same URL every other client is handed: tls://, on the
+			// Service name the bus certificate carries.
 			corev1.EnvVar{
 				Name:  "NATS_URL",
-				Value: fmt.Sprintf("nats://%s.%s.svc:4222", a2aNATSName(agent), agent.Namespace),
+				Value: a2aNATSClientURL(agent),
 			},
+			a2aNATSCAFileEnvVar(),
 			corev1.EnvVar{
 				Name:  a2aBusUserEnv,
 				Value: a2aAgentBusUser,
 			},
 		)
+		if len(opts.enabledProfiles) > 0 {
+			envVars = append(envVars, corev1.EnvVar{
+				Name:  enabledProfilesEnvVar,
+				Value: strings.Join(opts.enabledProfiles, ","),
+			})
+		}
 	}
 	// The Hermes Google Chat platform is off under next (legacyChatConsumer),
 	// so the agent-side callers that used to `hermes send` a proactive post
@@ -3366,6 +3435,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// exactly that reason — see bridgeIdentity.
 	if a2aAgentSurface(agent) {
 		mountIntoContainer(containers, "platform-agent", a2aBusTokenVolumeMount())
+		// The bus CA, which, unlike the token, the bridge sidecar inherits
+		// from this container: trusting the bus is not an identity.
+		mountIntoContainer(containers, "platform-agent", a2aNATSCABundleMount())
 	}
 	// The bridge, rendered from the finished agent container (every mount
 	// above included, the bus token then dropped) when the CR declares none
@@ -3413,7 +3485,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			volumes = append(volumes, corev1.Volume{
 				Name: buildPluginVolumeName(plugin.Name),
 				VolumeSource: corev1.VolumeSource{
-					EmptyDir: &corev1.EmptyDirVolumeSource{},
+					EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(pluginStagingSizeLimit))},
 				},
 			})
 		}
@@ -3427,6 +3499,13 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	volumes = append(volumes, buildWatcherTokenVolume())
 	if a2aAgentSurface(agent) {
 		volumes = append(volumes, a2aBusTokenVolumeSource())
+		// Optional here and only here: a2aAgentSurface also holds on the skew
+		// branch, where the bus, and so the bundle, may never have been
+		// rendered, and a required ConfigMap volume would hold the agent pod
+		// in ContainerCreating for a bus it cannot use anyway.
+		ca := a2aNATSCABundleVolume(agent)
+		ca.ConfigMap.Optional = ptr.To(true)
+		volumes = append(volumes, ca)
 	}
 	if len(sidecarVolumes) > 0 {
 		volumes = append(volumes, sidecarVolumes...)
@@ -4258,7 +4337,16 @@ func harnessOnKind(harness *agentv1alpha1.HarnessSpec) bool {
 	return harness != nil && harness.Location == kindLocation
 }
 
+// buildCredentialProxyEnv is buildCredentialProxyEnvForPlugins with no plugins:
+// every variable but the platform Pub/Sub relay's subscription set.
 func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	return buildCredentialProxyEnvForPlugins(agent, nil)
+}
+
+// buildCredentialProxyEnvForPlugins renders the broker's environment for an
+// agent and the AgentPlugins resolved for it. The plugins contribute one
+// variable: the subscriptions the Pub/Sub platform relay may reach.
+func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) []corev1.EnvVar {
 	envVars := []corev1.EnvVar{
 		{Name: "PLATFORM_AGENT_HOME", Value: "/tmp/credential-proxy"},
 		{Name: "HOME", Value: "/tmp/credential-proxy/home"},
@@ -4495,6 +4583,10 @@ kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMES
 	// is what enforces the base, and the agent and the shell sandbox get no
 	// copy they could be mistaken for the authority over.
 	envVars = append(envVars, credentialProxyBaseEnv(agent)...)
+	// The Pub/Sub platform relay's subscription set, from the AgentPlugin
+	// configs (platformagent_pubsub_relay.go). Absent when no plugin configures
+	// a Pub/Sub platform, and the broker refuses every relayed Pub/Sub call.
+	envVars = append(envVars, platformPubsubEnv(pluginPubsubSubscriptions(agent, agentPlugins))...)
 	if agent.Spec.Deployment != nil {
 		envVars = mergeCredentialProxyEnv(envVars, agent.Spec.Deployment.Env)
 	}
@@ -4588,6 +4680,12 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		watcherSubscriptionEnvVar,
 		watcherBrokerURLEnvVar,
 		watcherBrokerTokenFileEnvVar,
+		// The platform Pub/Sub relay's set, by name: it is rendered only
+		// when a plugin configures a Pub/Sub platform, so the managed-names
+		// loop does not protect it on an install without one, and a CR
+		// that set it would open the relay to whatever the broker's
+		// credential can pull.
+		platformPubsubSubscriptionsEnvVar,
 		"A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME",
 		// And the legacy subscription name by name, not only as a managed
 		// name: under next with Chat the render no longer sets it, and a
@@ -4841,6 +4939,13 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		"FINDINGS_FIRST_REPORT_CRITICALS": {},
 		"FINDINGS_NONCRITICAL_AFTER_HOUR": {},
 		"FINDINGS_NONCRITICAL_MAX":        {},
+
+		// Seconds a workload's admitted event folds its later events into
+		// one incident (INCIDENT_WORKLOAD_DEDUP_SECONDS in
+		// session_kv_server.py). Parsed as a whole number and capped at a
+		// day, and a value that does not parse means off, so it bounds a
+		// count of chat messages and triage turns and reaches nothing else.
+		"INCIDENT_WORKLOAD_DEDUP_SECONDS": {},
 	}
 	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the
 	// default suggested prompts (`apply_slack_agent_view.py`), under the same
@@ -5564,7 +5669,7 @@ func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 		{
 			Name: "fluent-bit-state",
 			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{},
+				EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(fluentBitStateSizeLimit))},
 			},
 		},
 		{
