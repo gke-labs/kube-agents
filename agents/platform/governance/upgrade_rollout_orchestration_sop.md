@@ -51,24 +51,28 @@ rollout-sequence precheck: host <project>; existing <n>; plan <clear|blocked>
 
 For each family, the **canary** is the member with `readiness.verdict: ready` and the fewest `readiness.risks[]`; when no member is `ready`, the member with the fewest `rule_blocking[]` rows, and its blockers are the plan's first prerequisites, quoted from the report with the rule's own remedy. Name the canary and the reason in one sentence per family. A family of one is its own canary.
 
-A RolloutSequence selects clusters by label, not by name, so the canary needs a label the other members do not carry. The plan proposes the label `upgrade-stage=canary` on the canary and `upgrade-stage=rest` on every other member of the family (the key on every member, so the fleet consistency audit's label-keys facet sees no drift): one pull request through the `submit-suggestion` skill editing `spec.resourceLabels` of each `ContainerCluster` in the managed repository, or, for a cluster outside it, the operator step `gcloud container clusters update <name> --location <location> --project <project> --update-labels upgrade-stage=<canary|rest>`, one per cluster.
+A RolloutSequence selects clusters by label, not by name, and a stage's selector is one equality `resource.labels.<key>=='<value>'`, with a key the expression grammar accepts (letters, digits and underscores; a hyphenated key is refused as `cluster_selector is invalid`). So the plan proposes the label `upgrade_stage` on every member of the family: `<family>-canary` on the canary and `<family>-rest` on every other member (the key on every member, so the fleet consistency audit's label-keys facet sees no drift; `upgrade-family` stays the family's name for the collector and cannot carry a selector). The label is one pull request through the `submit-suggestion` skill editing `spec.resourceLabels` of each `ContainerCluster` in the managed repository, or, for a cluster outside it, the operator step `gcloud container clusters update <name> --location <location> --project <project> --update-labels upgrade_stage=<family>-canary` (or `-rest`), one per cluster.
 
-The stage configuration the operator creates, one file per sequence, in the format `gcloud container fleet rolloutsequences create --stage-config` reads (a list of stages; `fleet-projects` and `soak-duration` are required; `label-selector` is a CEL expression over `resource.labels`):
+The stage configuration the operator creates, one file per sequence, in the format `gcloud container fleet rolloutsequences create --stage-config` reads: a list of stages, each with `fleet-projects` and `soak-duration` (both required) and an optional `label-selector`; the keys sit at the item's level beside `stage:`, as the command's help shows. The API refuses a sequence whose fleet project has no catch-all stage, so the last stage carries no selector; it picks up a member that none of the labels name and does nothing for one already at the version:
 
 ```yaml
 - stage:
-    fleet-projects:
-      - projects/<host project>
-    soak-duration: 7d
-    label-selector: resource.labels.upgrade-family=='<family>' && resource.labels.upgrade-stage=='canary'
+  fleet-projects:
+    - projects/<host project>
+  soak-duration: 7d
+  label-selector: resource.labels.upgrade_stage=='<family>-canary'
 - stage:
-    fleet-projects:
-      - projects/<host project>
-    soak-duration: 7d
-    label-selector: resource.labels.upgrade-family=='<family>'
+  fleet-projects:
+    - projects/<host project>
+  soak-duration: 7d
+  label-selector: resource.labels.upgrade_stage=='<family>-rest'
+- stage:
+  fleet-projects:
+    - projects/<host project>
+  soak-duration: 7d
 ```
 
-The first stage's soak is seven days because the gate of section 4 compares the seven days after the upgrade with the seven days before; a shorter soak ends before the gate can read `clear`. One sequence carries several families as further stage pairs, in the order the request gives or, without one, the family with the fewest blocking findings first. The operator steps, quoted verbatim and never run here:
+The first stage's soak is seven days because the gate of section 4 compares the seven days after the upgrade with the seven days before; a shorter soak ends before the gate can read `clear`. One sequence carries several families as further stage pairs before the catch-all stage, in the order the request gives or, without one, the family with the fewest blocking findings first. The host project must hold a fleet (`gcloud container fleet describe --project <host project>`); a project with none answers `fleet not found` at creation, and creating the fleet is an operator step (`gcloud container fleet create --project <host project>`). The operator steps, quoted verbatim and never run here:
 
 ```bash
 gcloud container fleet rolloutsequences create <sequence name> --project <host project> --stage-config <file>

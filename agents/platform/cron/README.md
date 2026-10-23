@@ -592,8 +592,8 @@ pods, nodes, events and budgets, classifies what it finds against the upgrade
 failure catalogue, and writes the three-section report (Errors, Warnings, Info)
 to `/opt/data/upgrade-retrospective/` on the shell sandbox's volume, with
 `upgrade-retro-report.md` pointing at the newest full run. The SOP's half is
-the judgement: it confirms every candidate against the six checks in its
-section 3 and copies the collector's grade, tailors the catalogue's mitigation
+the judgement: it confirms every candidate against the seven checks in its
+section 3 and copies the collector's grade (the gate per reviewed cluster included: `clear`, `risk` or `pending` from the pod and node diff plus Cloud Logging ingestion bytes by container, seven days after against seven days before), tailors the catalogue's mitigation
 text to the cluster's own objects, files the stream's one ledger issue where a repository is configured, and reaches `finish`, whose record is what chat receives (the relay posts what `finish` rendered, not the run's final message): the headline and the most severe findings, each with its cluster and object; the counts per cluster and the Errors and Warnings entries are the report's. A quiet weekend, with no cluster new or upgraded, posts nothing.
 
 Two things set it apart from the streams beside it. With no GitHub repository in `managed_repos` it takes the skill's no-forge path as they do (`start` and `finish` with no ledger issue, the findings kept in the report store), and keeps its own store on the volume beside it: the ledger, the guards and the dated reports the on-demand route reads. The Chat Agent's

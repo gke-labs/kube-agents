@@ -496,6 +496,7 @@ AUDITS: dict[str, AuditSpec] = {
             "upgrade-symptom-tentative",
             "upgrade-symptom-unclassified",
             "symptom-predates-upgrade",
+            "upgrade-log-volume-rose",
         ),
     ),
 }

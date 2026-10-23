@@ -6820,6 +6820,7 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
     "upgrade-retrospective": (
         "upgrade-operation-failed", "upgrade-broke-workload", "node-broken-after-upgrade",
         "upgrade-symptom-tentative", "upgrade-symptom-unclassified", "symptom-predates-upgrade",
+        "upgrade-log-volume-rose",
     ),
 }
 
