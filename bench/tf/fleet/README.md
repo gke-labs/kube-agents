@@ -247,6 +247,15 @@ finding, and churning eval clusters would randomize the audit run to run. The la
 value `seeded` is reserved for the clusters in this stack; labeling any other cluster
 with it changes the vote.
 
+The `upgrade-family` resource label is the rollout-family membership the upgrade rollout
+reads: the retrospective's family gate groups clusters by `resourceLabels.upgrade-family`,
+upgrades one member of a family first and holds the rest on that member's post-upgrade
+diff. `seeded-a`, `seeded-c` and `seeded-d` carry `upgrade-family=seeded-regular`;
+`seeded-b`, held a minor behind, carries `upgrade-family=seeded-held`, a family of its own,
+so the regular family's rollout never waits on the lag. The key is on every cluster in
+this stack because the drift audit's label-keys facet compares label keys across the
+cohort: a key on three clusters and not the fourth would be a drift finding.
+
 `seeded-b`'s lag is derived at apply time (the newest patch REGULAR itself offers one
 minor behind its default, read by `seeded_b_pin.py`), so the pin re-computes each
 reconcile instead of rotting — and `seeded-b` is enrolled in the REGULAR channel on purpose: the upgrade
