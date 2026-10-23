@@ -48,3 +48,11 @@ gitops-drift-backlog-digest
 # main". This line is inert until they exist, which is why it is placed on
 # the arithmetic alone.
 gitops-drift-load-bearing-change-triage
+
+# The two recorded-weeks cases of #3535 (upgrades-retrospective-log-volume-gate
+# and upgrades-rollout-family-held-by-canary-gate) share one stack that seeds
+# the retrospective's report store, priced at 600s each. Both here: with them
+# in main-a the halves read 12450s against 9600s, past the 1800s the balance
+# test allows; here they read 11250s against 10800s.
+upgrades-retrospective-log-volume-gate
+upgrades-rollout-family-held-by-canary-gate

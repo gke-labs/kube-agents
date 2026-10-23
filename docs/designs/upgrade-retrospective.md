@@ -1167,8 +1167,16 @@ comes from the collector's JSON, which keeps the per-cluster data and the same t
   lines (`<cluster>/<object>: entry <n>`), red on `main` where the report does not exist, green
   three times on the branch; one case for the on-demand route, a generic question ("did anything
   break in the last upgrades") that must be answered from the report; registered in the nightly
-  roster. The out-of-the-box path (collector
-  alone, no model) is a test, not an eval.
+  roster. The gate and the families add three cases on a recorded-weeks report the stack
+  `bench/tf/prebuilt/upgrade-retro-recorded-weeks` seeds in the store (the collector's own
+  rendering of a synthetic run, pinned to the renderer by a unit test): the per-cluster gate line
+  (`upgrades-retrospective-log-volume-gate`), the rollout orchestration SOP's family line
+  (`upgrades-rollout-family-held-by-canary-gate`), and the precheck's line against a standing
+  RolloutSequence (`upgrades-readiness-rollout-sequence-precheck`, parked until the pool projects
+  carry the fixture); the six after-upgrade cases (entries 7, 10, 14, 15, 16, 18) grade the
+  report's lines for the seeded shapes, three of them `expected_fail` until the collector carries
+  a shape for their entry. The out-of-the-box path (collector alone, no model) is a test, not an
+  eval.
 - **Live.** The first run on a dev install: the first-run stage producing the baseline report; a
   weekend tick after an upgrade producing an incident with all four parts; a guard appearing in the
   next readiness report once the collector merges; the ledger issue where a repository is linked.
