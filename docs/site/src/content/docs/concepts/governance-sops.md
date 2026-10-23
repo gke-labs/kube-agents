@@ -83,6 +83,8 @@ The SOPs behind the five watchdogs [retired from the roster](/kube-agents/concep
 
 `upgrade_readiness_brief_sop.md` is not a fleet audit either. It is the procedure behind `upgrade-readiness-weekly-brief`, the Saturday model turn that composes the week's upgrade readiness brief from the weekly review's summary and the findings queue: what needs a decision, what else the week found, and where the full report is. It registers nothing and opens no ledger; the queue the review writes to is the durable record, and the review itself is a `no_agent` script with no SOP.
 
+`upgrade_rollout_orchestration_sop.md` is not a fleet audit either, and no cron job runs it. It is the procedure behind a request to plan or run an upgrade across cluster families, or with a RolloutSequence: the precheck of the fleet host project's existing sequences (the platform allows one per host project), one cluster per family first, a seven-day soak, the upgrade retrospective's scoped diff on that cluster with its gate (`clear`, `risk` or `pending`), then the rest; and the same order per cluster through the `gke-upgrades` skill's runbook steps when the sequence cannot be created. It registers nothing and writes nothing: the operator creates the sequence and runs every upgrade, and each cluster change is a pull request.
+
 The k8s-event-watcher daily recap has no SOP here: it is a `no_agent` script, `eod_report_generator.py`, that renders the recap deterministically from the session ledger and prompts no model, so its description is a design note rather than agent material — [`docs/designs/eod-event-watcher-daily-report.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/eod-event-watcher-daily-report.md).
 
 ## How SOPs work
