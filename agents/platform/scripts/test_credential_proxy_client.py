@@ -1389,6 +1389,28 @@ class TestConnectTimeout(unittest.TestCase):
             "a long-running proxied command must not be cut off by a client timeout",
         )
 
+    def test_an_explicit_timeout_is_preserved_once_connected(self):
+        connection = credential_proxy_client.BrokerConnection(
+            "broker", 8765, timeout=2.5
+        )
+        observed = {}
+
+        class FakeSocket:
+            def settimeout(self, value):
+                observed["after_connect"] = value
+
+        def fake_connect(self):
+            observed["during_connect"] = self.timeout
+            self.sock = FakeSocket()
+
+        with patch.object(
+            credential_proxy_client.http.client.HTTPConnection, "connect", fake_connect
+        ):
+            connection.connect()
+
+        self.assertEqual(2.5, observed["during_connect"])
+        self.assertEqual(2.5, observed["after_connect"])
+
     def test_the_opener_does_not_follow_a_redirect(self):
         # urllib re-sends Authorization across a cross-host redirect, so a 302
         # from a compromised broker would hand the projected token to whatever

@@ -4946,6 +4946,14 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// day, and a value that does not parse means off, so it bounds a
 		// count of chat messages and triage turns and reaches nothing else.
 		"INCIDENT_WORKLOAD_DEDUP_SECONDS": {},
+
+		// "true" has an event triage also file a card that opens the
+		// report's recommended fix as a GitOps pull request, without waiting
+		// for a human `apply` (INCIDENT_TRIAGE_OPEN_PULL_REQUEST in
+		// session_kv_server.py). Any other value, unset included, is off. It
+		// changes which cards the front door files and nothing else: the pull
+		// request still goes through submit-suggestion and a human merges it.
+		"INCIDENT_TRIAGE_OPEN_PULL_REQUEST": {},
 	}
 	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the
 	// default suggested prompts (`apply_slack_agent_view.py`), under the same

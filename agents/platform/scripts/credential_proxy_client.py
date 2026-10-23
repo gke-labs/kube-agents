@@ -9,6 +9,7 @@ import http.client
 import json
 import os
 import re
+import socket
 import stat
 import sys
 import tempfile
@@ -143,9 +144,18 @@ class BrokerConnection(http.client.HTTPConnection):
     """
 
     def connect(self) -> None:
-        self.timeout = BROKER_CONNECT_TIMEOUT_SECONDS
+        read_timeout = (
+            None
+            if self.timeout is socket._GLOBAL_DEFAULT_TIMEOUT
+            else self.timeout
+        )
+        self.timeout = (
+            BROKER_CONNECT_TIMEOUT_SECONDS
+            if read_timeout is None
+            else min(BROKER_CONNECT_TIMEOUT_SECONDS, float(read_timeout))
+        )
         super().connect()
-        self.sock.settimeout(None)
+        self.sock.settimeout(read_timeout)
 
 
 class _BrokerHTTPHandler(urllib.request.HTTPHandler):
@@ -173,8 +183,12 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _BROKER_OPENER = urllib.request.build_opener(_BrokerHTTPHandler, _NoRedirect())
 
 
-def open_broker_request(request: urllib.request.Request):
-    """Send `request` to the broker with a bounded connect."""
+def open_broker_request(
+    request: urllib.request.Request, *, timeout: float | None = None
+):
+    """Send `request` to the broker with a bounded connect (and optional read timeout)."""
+    if timeout is not None:
+        return _BROKER_OPENER.open(request, timeout=float(timeout))
     return _BROKER_OPENER.open(request)
 
 
@@ -1235,7 +1249,13 @@ def _workspace_call(endpoint: str, verb: str, payload: dict) -> dict:
         raise WorkspaceRequestError(exc.code, answer) from exc
 
 
-def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
+def vcs_call(
+    endpoint: str,
+    verb: str,
+    payload: dict,
+    *,
+    timeout: float | None = None,
+) -> dict:
     """One `POST /v1/vcs/<verb>`.
 
     Its own function rather than a parameter on `_workspace_call`, because the
@@ -1261,7 +1281,8 @@ def vcs_call(endpoint: str, verb: str, payload: dict) -> dict:
         method="POST",
     )
     try:
-        with open_broker_request(request) as response:
+        opener_kwargs = {"timeout": timeout} if timeout is not None else {}
+        with open_broker_request(request, **opener_kwargs) as response:
             return json.load(response)
     except urllib.error.HTTPError as exc:
         try:

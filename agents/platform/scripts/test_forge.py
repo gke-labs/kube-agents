@@ -117,9 +117,11 @@ class FakeBroker:
         self.answers = dict(answers or {})
         self.refuse = dict(refuse or {})
         self.calls: list[tuple[str, dict]] = []
+        self.timeouts: list[tuple[str, float | None]] = []
 
-    def __call__(self, verb, payload):
+    def __call__(self, verb, payload, *, timeout=None):
         self.calls.append((verb, dict(payload)))
+        self.timeouts.append((verb, timeout))
         if verb in self.refuse:
             raise self.refuse[verb]
         answer = self.answers.get(verb, {})
@@ -519,6 +521,20 @@ class CallTest(BrokerCase):
             forge.call("proposal-comment", {}, REPO)
         self.assertEqual(len(ctx.exception.value), forge.MAX_DETAIL_CHARS)
 
+    def test_a_custom_timeout_travels_to_the_direct_broker_and_floors_at_point_one(self):
+        self.broker.answers["proposal-list"] = {"proposals": []}
+        forge.call("proposal-list", {}, REPO, timeout=2.5)
+        forge.call("proposal-list", {}, REPO, timeout=0.01)
+        forge.call("proposal-list", {}, REPO)
+        self.assertEqual(
+            self.broker.timeouts,
+            [
+                ("proposal-list", 2.5),
+                ("proposal-list", 0.1),
+                ("proposal-list", None),
+            ],
+        )
+
 
 # ---- the hop ----------------------------------------------------------------
 
@@ -575,6 +591,20 @@ class ForwardTest(unittest.TestCase):
         run = self._run(stdout=json.dumps({"answer": {}}))
         forge.call("capabilities", {}, REPO)
         self.assertEqual(run.call_args.kwargs["timeout"], forge.FORWARD_TIMEOUT_S)
+
+    def test_a_custom_timeout_bounds_the_hop_and_floors_at_point_one(self):
+        run = self._run(stdout=json.dumps({"answer": {}}))
+        forge.call("proposal-list", {}, REPO, timeout=2.5)
+        self.assertEqual(run.call_args.kwargs["timeout"], 2.5)
+        forge.call("proposal-list", {}, REPO, timeout=0.01)
+        self.assertEqual(run.call_args.kwargs["timeout"], 0.1)
+
+    def test_a_timed_out_custom_hop_names_the_rounded_timeout(self):
+        self._run(side_effect=subprocess.TimeoutExpired(cmd="ssh", timeout=2.5))
+        with self.assertRaises(forge.ForgeError) as ctx:
+            forge.call("proposal-list", {}, REPO, timeout=2.5)
+        self.assertEqual(ctx.exception.reason, forge.REASON_SANDBOX_UNREACHABLE)
+        self.assertIn("2.5s", ctx.exception.value)
 
     def test_a_refusal_survives_the_crossing_with_its_code(self):
         """Flattening it to "the far side exited 1" loses what the callers act on."""

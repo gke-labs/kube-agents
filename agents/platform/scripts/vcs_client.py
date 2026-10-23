@@ -185,9 +185,13 @@ def _on_the_wire(repository: object) -> object:
     return _registered_urls().get(repository.lower(), repository)
 
 
-def call(verb: str, payload: dict) -> dict:
+def call(verb: str, payload: dict, *, timeout: float | None = None) -> dict:
     """`POST /v1/vcs/<verb>`, and the stderr record of a proposal it opened (`PROPOSAL_OPENED_KEY`)."""
-    answer = _call(verb, payload)
+    answer = (
+        _call(verb, payload, timeout=timeout)
+        if timeout is not None
+        else _call(verb, payload)
+    )
     if verb.replace("_", "-") == PROPOSAL_CREATE_VERB:
         _say_opened(answer)
     return answer
@@ -217,7 +221,7 @@ def _say_opened(answer: object) -> None:
         pass
 
 
-def _call(verb: str, payload: dict) -> dict:
+def _call(verb: str, payload: dict, *, timeout: float | None = None) -> dict:
     if "repository" in payload:
         payload = {**payload, "repository": _on_the_wire(payload["repository"])}
     endpoint = os.environ.get(BROKER_ENDPOINT_VAR, "").strip()
@@ -227,6 +231,10 @@ def _call(verb: str, payload: dict) -> dict:
             "This skill runs in the shell sandbox."
         )
     try:
+        if timeout is not None:
+            return credential_proxy_client.vcs_call(
+                endpoint, verb, payload, timeout=timeout
+            )
         return credential_proxy_client.vcs_call(endpoint, verb, payload)
     except credential_proxy_client.WorkspaceUnavailable as exc:
         # The broker served `/v1/vcs/` and answered that version control is not
@@ -1228,7 +1236,13 @@ def discard(spec: str | None = None, key: str | None = None) -> dict:
 # ---- collaboration verbs --------------------------------------------------
 
 
-def forge(verb: str, payload: dict, repository: str | None = None) -> dict:
+def forge(
+    verb: str,
+    payload: dict,
+    repository: str | None = None,
+    *,
+    timeout: float | None = None,
+) -> dict:
     """Every forge call: name the repository, POST, print what comes back.
 
     The repository is the only thing resolved locally, and only so a caller
@@ -1240,4 +1254,7 @@ def forge(verb: str, payload: dict, repository: str | None = None) -> dict:
         payload["repository"] = repository
     else:
         payload["repository"] = resolve_session(None)["spec"]
-    return call(verb, {key: value for key, value in payload.items() if value is not None})
+    cleaned = {key: value for key, value in payload.items() if value is not None}
+    if timeout is not None:
+        return call(verb, cleaned, timeout=timeout)
+    return call(verb, cleaned)

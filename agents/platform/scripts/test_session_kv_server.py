@@ -2412,7 +2412,7 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             ("_chat_platforms_disabled", lambda: False),
             ("_register_session_routing", MagicMock()),
             ("_post_initial_alert", MagicMock(return_value="spaces/A/threads/B")),
-            ("_build_agent_query", lambda payload: "q"),
+            ("_build_agent_query", lambda payload, session_id="": "q"),
             ("_triage_sleep", MagicMock()),
         ):
             p = patch.object(session_kv_server, name, value)
@@ -2564,6 +2564,309 @@ class TestWorkloadIncidentFold(unittest.TestCase):
         ]
         self.assertEqual([e["status"] for e in events], ["folded", "injected"])
         self.assertEqual([e["duplicate_of"] for e in events], [events[1]["id"], None])
+
+
+class TestPullRequestInReview(unittest.TestCase):
+    """An unfixed fault starts no new incident while its agent pull request is in review.
+
+    The watcher's rolling window lapses on a fault nobody has merged a fix for
+    yet, and FailedScheduling repeats on a back-off longer than the workload
+    window, so each lapse used to become a new session, a new diagnosis and a
+    new pull request. With `INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true`, the inject
+    route asks the forge whether the workload's branch has a pull request open
+    (or ended within the grace period) and, if so, folds the event into the
+    workload's root admitted row.
+    """
+
+    _rows = TestWorkloadIncidentFold._rows
+    _age = TestWorkloadIncidentFold._age
+
+    def setUp(self):
+        TestWorkloadIncidentFold.setUp(self)
+        os.environ[session_kv_server.INCIDENT_TRIAGE_OPEN_PR_ENV] = "true"
+
+    def tearDown(self):
+        os.environ.pop(session_kv_server.INCIDENT_TRIAGE_OPEN_PR_ENV, None)
+        TestWorkloadIncidentFold.tearDown(self)
+
+    def _inject(
+        self,
+        session_id,
+        *,
+        name="pr-api-6cfdb6b98b-aaaaa",
+        reason="BackOff",
+        namespace="fold-ns",
+        kind="Pod",
+        cluster="c1",
+        event_type="Warning",
+        features="policy-filtered",
+    ):
+        payload = {
+            "reason": reason,
+            "namespace": namespace,
+            "kind_of_object": kind,
+            "name": name,
+            "uid": f"uid-{session_id}-{name}-{reason}",
+            "message": "Back-off restarting failed container",
+            "type": event_type,
+            "cluster": cluster,
+        }
+        headers = {"X-Watcher-Features": features} if features else {}
+        resp = self.client.post(
+            f"/sessions/{session_id}/inject",
+            json={"message": json.dumps(payload)},
+            headers=headers,
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        return resp
+
+    def _anchor(self, session_id, name, **overrides):
+        with patch.object(session_kv_server, "_lookup_incident_pull_request", return_value=""):
+            first = self._inject(session_id, name=name, **overrides)
+        self.assertEqual(first.json()["status"], "injected")
+        return first.json()
+
+    def test_proposal_in_review(self):
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime(2026, 10, 6, 21, 0, tzinfo=timezone.utc)
+        grace = session_kv_server.INCIDENT_PR_REVIEW_GRACE_SECONDS
+
+        def stamp(seconds_ago):
+            return (now - timedelta(seconds=seconds_ago)).isoformat().replace("+00:00", "Z")
+
+        self.assertTrue(session_kv_server._proposal_in_review({"state": "open"}, now))
+        self.assertTrue(session_kv_server._proposal_in_review({"state": "merged", "closed": stamp(grace // 2)}, now))
+        self.assertTrue(session_kv_server._proposal_in_review({"state": "closed", "updated": stamp(60)}, now))
+        self.assertFalse(session_kv_server._proposal_in_review({"state": "merged", "closed": stamp(grace * 2)}, now))
+        self.assertFalse(session_kv_server._proposal_in_review({"state": "closed"}, now))
+        self.assertFalse(session_kv_server._proposal_in_review({"state": "merged", "closed": "not-a-time"}, now))
+
+    def test_lookup_reads_every_managed_forge_and_skips_ended_proposals(self):
+        calls = []
+
+        def call(verb, payload, repo, *, timeout=None):
+            calls.append((verb, payload, repo, timeout))
+            if repo == "github.com/down/repo":
+                raise RuntimeError("forge unavailable")
+            return {
+                "proposals": [
+                    {"state": "merged", "closed": "2020-01-01T00:00:00Z", "url": "old"},
+                    {"state": "open", "url": "https://gitlab.example.com/demo/repo/-/merge_requests/9"},
+                ]
+            }
+
+        fake_forge = MagicMock(call=call)
+        repo_keys = [
+            "github:github.com/down/repo",
+            "github:",
+            "gitlab:gitlab.example.com/demo/repo",
+        ]
+        with patch.dict(sys.modules, {"forge": fake_forge}), patch(
+            "gitops_workspace.get_managed_repo_keys", return_value=repo_keys
+        ):
+            url = session_kv_server._lookup_incident_pull_request("platform-agent/incident-x")
+        self.assertEqual(url, "https://gitlab.example.com/demo/repo/-/merge_requests/9")
+        self.assertEqual([c[2] for c in calls], ["github.com/down/repo", "gitlab.example.com/demo/repo"])
+        self.assertEqual(
+            calls[0][1],
+            {
+                "source": "platform-agent/incident-x",
+                "state": "all",
+                "limit": session_kv_server.INCIDENT_PR_LOOKUP_LIMIT,
+            },
+        )
+        self.assertIsNotNone(calls[0][3])
+        self.assertGreater(calls[0][3], 0.0)
+
+    def test_lookup_stops_walking_repositories_once_budget_expires(self):
+        calls = []
+
+        def call(verb, payload, repo, *, timeout=None):
+            calls.append(repo)
+            return {"proposals": []}
+
+        fake_forge = MagicMock(call=call)
+        repo_keys = [
+            "github:github.com/first/repo",
+            "github:github.com/second/repo",
+        ]
+        with patch.dict(sys.modules, {"forge": fake_forge}), patch(
+            "gitops_workspace.get_managed_repo_keys", return_value=repo_keys
+        ):
+            url = session_kv_server._lookup_incident_pull_request(
+                "platform-agent/incident-expired",
+                deadline=time.monotonic() - 0.01,
+            )
+        self.assertEqual(url, "")
+        self.assertEqual(calls, [])
+
+    def test_a_lapsed_window_with_a_pull_request_in_review_is_folded(self):
+        self._anchor("k8s-evt-pr-1", "pr-api-6cfdb6b98b-aaaaa", reason="FailedScheduling")
+        anchor_id = self._rows("pr-api")[0][0]
+        self._age(anchor_id, 900)
+        url = "https://github.com/demo/repo/pull/7"
+        with patch.object(session_kv_server, "_lookup_incident_pull_request", return_value=url) as lookup:
+            second = self._inject("k8s-evt-pr-2", name="pr-api-6cfdb6b98b-aaaaa", reason="FailedScheduling")
+        self.assertEqual(second.json()["status"], "folded")
+        self.assertEqual(second.json().get("duplicate_of"), str(anchor_id))
+        expected_branch = session_kv_server._incident_branch(
+            "",
+            {
+                "cluster": "c1",
+                "namespace": "fold-ns",
+                "kind_of_object": "Pod",
+                "name": "pr-api-6cfdb6b98b-aaaaa",
+            },
+        )
+        self.assertEqual(lookup.call_count, 1)
+        self.assertEqual(lookup.call_args.args, (expected_branch,))
+        self.assertEqual(self.trigger.call_count, 1)
+        self.assertEqual([row[3] for row in self._rows("pr-api")], [None, anchor_id])
+
+    def test_a_warning_anchor_with_a_pull_request_in_review_does_not_silence_a_critical_escalation(self):
+        self._anchor("k8s-evt-presc-1", "presc-api-6cfdb6b98b-aaaaa", reason="BackOff")
+        anchor_id = self._rows("presc-api")[0][0]
+        self._age(anchor_id, 900)
+        url = "https://github.com/demo/repo/pull/77"
+        with patch.object(session_kv_server, "_lookup_incident_pull_request", return_value=url) as lookup:
+            second = self._inject("k8s-evt-presc-2", name="presc-api-6cfdb6b98b-aaaaa", reason="CrashLoopBackOff")
+        lookup.assert_not_called()
+        self.assertEqual(second.json()["status"], "injected")
+        self.assertEqual(self.trigger.call_count, 2)
+
+    def test_headless_anchor_folds_post_window_repeat_while_pull_request_is_in_review(self):
+        self._anchor("k8s-evt-prhl-1", "prhl-api-6cfdb6b98b-aaaaa", reason="FailedScheduling")
+        anchor_id = self._rows("prhl-api")[0][0]
+        session_kv_server.mark_delivery_headless(anchor_id)
+        self._age(anchor_id, 900)
+        url = "https://github.com/demo/repo/pull/88"
+        with patch.object(session_kv_server, "_lookup_incident_pull_request", return_value=url):
+            second = self._inject("k8s-evt-prhl-2", name="prhl-api-6cfdb6b98b-aaaaa", reason="FailedScheduling")
+        self.assertEqual(second.json()["status"], "folded")
+        self.assertEqual(second.json().get("duplicate_of"), str(anchor_id))
+        self.assertEqual(self.trigger.call_count, 1)
+
+    def test_folded_rows_refresh_anchor_beyond_seven_days(self):
+        # Critical root anchor (`CrashLoopBackOff`), followed by a Warning
+        # carrier (`BackOff`), then a Critical repeat (`CrashLoopBackOff`) after
+        # the root anchor is older than 7 days: the severity check grades the
+        # root anchor (`root.severity`), not the Warning carrier, so the repeat
+        # still folds into the open pull request's root anchor.
+        self._anchor("k8s-evt-prlong-1", "prlong-api-6cfdb6b98b-aaaaa", reason="CrashLoopBackOff")
+        anchor_id = self._rows("prlong-api")[0][0]
+        self._age(anchor_id, 900)
+        url = "https://github.com/demo/repo/pull/8"
+        with patch.object(session_kv_server, "_lookup_incident_pull_request", return_value=url) as lookup:
+            second = self._inject("k8s-evt-prlong-2", name="prlong-api-6cfdb6b98b-aaaaa", reason="BackOff")
+            self.assertEqual(second.json()["status"], "folded")
+            folded_id = self._rows("prlong-api")[1][0]
+            # Age the original admitted row past the 7-day anchor window while keeping
+            # the folded Warning carrier row inside the 7-day window.
+            self._age(anchor_id, session_kv_server.INCIDENT_PR_ANCHOR_SECONDS + 3600)
+            self._age(folded_id, 900)
+            third = self._inject("k8s-evt-prlong-3", name="prlong-api-6cfdb6b98b-aaaaa", reason="CrashLoopBackOff")
+        self.assertEqual(third.json()["status"], "folded")
+        self.assertEqual(third.json().get("duplicate_of"), str(anchor_id))
+        self.assertEqual(lookup.call_count, 2)
+        self.assertEqual(self.trigger.call_count, 1)
+        self.assertEqual([row[3] for row in self._rows("prlong-api")], [None, anchor_id, anchor_id])
+
+    def test_anchor_aborted_between_pre_read_and_lock_does_not_fold(self):
+        self._anchor("k8s-evt-prabort-1", "prabort-api-6cfdb6b98b-aaaaa")
+        anchor_id = self._rows("prabort-api")[0][0]
+        # Fold one sibling so there is also a carrier row pointing at anchor_id.
+        self.assertEqual(
+            self._inject("k8s-evt-prabort-fold", name="prabort-api-6cfdb6b98b-bbbbb").json()["status"],
+            "folded",
+        )
+        folded_id = self._rows("prabort-api")[1][0]
+        # Age both past the 300s workload window so the next inject takes the
+        # post-window open-PR lookup path.
+        self._age(anchor_id, 900)
+        self._age(folded_id, 900)
+
+        def abort_during_lookup(branch, *, deadline=None):
+            # Simulates the anchor's triage failing to start while the unlocked
+            # forge lookup is in flight before _WORKLOAD_FOLD_LOCK is re-entered.
+            session_kv_server.mark_triage_not_started(anchor_id)
+            return "https://github.com/demo/repo/pull/99"
+
+        with patch.object(session_kv_server, "_lookup_incident_pull_request", side_effect=abort_during_lookup):
+            second = self._inject("k8s-evt-prabort-2", name="prabort-api-6cfdb6b98b-ccccc")
+        self.assertEqual(second.json()["status"], "injected")
+        self.assertEqual(self.trigger.call_count, 2)
+
+    def test_a_watcher_without_policy_filtered_is_still_answered_folded(self):
+        self._anchor("k8s-evt-pro-1", "pro-api-6cfdb6b98b-aaaaa")
+        self._age(self._rows("pro-api")[0][0], 900)
+        with patch.object(session_kv_server, "_lookup_incident_pull_request", return_value="u"):
+            second = self._inject("k8s-evt-pro-2", features=None, name="pro-api-6cfdb6b98b-aaaaa")
+        self.assertEqual(second.json()["status"], "folded")
+        self.assertEqual(self.trigger.call_count, 1)
+
+    def test_no_pull_request_in_review_is_a_new_incident(self):
+        self._anchor("k8s-evt-prn-1", "prn-api-6cfdb6b98b-aaaaa")
+        self._age(self._rows("prn-api")[0][0], 900)
+        with patch.object(session_kv_server, "_lookup_incident_pull_request", return_value=""):
+            second = self._inject("k8s-evt-prn-2", name="prn-api-6cfdb6b98b-aaaaa")
+        self.assertEqual(second.json()["status"], "injected")
+        self.assertEqual(self.trigger.call_count, 2)
+
+    def test_a_slow_forge_admits_the_event(self):
+        self._anchor("k8s-evt-prs-1", "prs-api-6cfdb6b98b-aaaaa")
+        self._age(self._rows("prs-api")[0][0], 900)
+
+        def slow(branch, *, deadline=None):
+            time.sleep(0.5)
+            return "late"
+
+        with patch.object(session_kv_server, "INCIDENT_PR_LOOKUP_TIMEOUT_S", 0.05), patch.object(
+            session_kv_server, "_lookup_incident_pull_request", side_effect=slow
+        ):
+            second = self._inject("k8s-evt-prs-2", name="prs-api-6cfdb6b98b-aaaaa")
+        self.assertEqual(second.json()["status"], "injected")
+        self.assertEqual(self.trigger.call_count, 2)
+
+    def test_a_failing_forge_admits_the_event(self):
+        self._anchor("k8s-evt-prf-1", "prf-api-6cfdb6b98b-aaaaa")
+        self._age(self._rows("prf-api")[0][0], 900)
+        with patch.object(session_kv_server, "_lookup_incident_pull_request", side_effect=RuntimeError("down")):
+            second = self._inject("k8s-evt-prf-2", name="prf-api-6cfdb6b98b-aaaaa")
+        self.assertEqual(second.json()["status"], "injected")
+        self.assertEqual(self.trigger.call_count, 2)
+
+    def test_without_an_anchor_row_the_event_is_admitted(self):
+        with patch.object(session_kv_server, "_lookup_incident_pull_request", return_value="u") as lookup:
+            first = self._inject("k8s-evt-pra-1", name="pra-api-6cfdb6b98b-aaaaa")
+        lookup.assert_not_called()
+        self.assertEqual(first.json()["status"], "injected")
+        self.assertEqual(self.trigger.call_count, 1)
+
+    def test_a_busy_lookup_pool_admits_the_event_without_queueing(self):
+        import threading
+
+        self._anchor("k8s-evt-prb-1", "prb-api-6cfdb6b98b-aaaaa")
+        self._age(self._rows("prb-api")[0][0], 900)
+        exhausted = threading.BoundedSemaphore(1)
+        exhausted.acquire(blocking=False)
+        with patch.object(session_kv_server, "_INCIDENT_PR_LOOKUP_SEMAPHORE", exhausted), patch.object(
+            session_kv_server, "_lookup_incident_pull_request", return_value="u"
+        ) as lookup:
+            second = self._inject("k8s-evt-prb-2", name="prb-api-6cfdb6b98b-aaaaa")
+        lookup.assert_not_called()
+        self.assertEqual(second.json()["status"], "injected")
+        self.assertEqual(self.trigger.call_count, 2)
+
+    def test_with_the_opt_in_off_the_forge_is_not_asked(self):
+        os.environ.pop(session_kv_server.INCIDENT_TRIAGE_OPEN_PR_ENV, None)
+        with patch.object(session_kv_server, "_lookup_incident_pull_request", return_value="u") as lookup:
+            self._inject("k8s-evt-pro-off-1", name="proff-api-6cfdb6b98b-aaaaa")
+            self._age(self._rows("proff-api")[0][0], 900)
+            second = self._inject("k8s-evt-pro-off-2", name="proff-api-6cfdb6b98b-aaaaa")
+        lookup.assert_not_called()
+        self.assertEqual(second.json()["status"], "injected")
+        self.assertEqual(self.trigger.call_count, 2)
 
 
 class TestSessionKvServerQueryBuilding(unittest.TestCase):
@@ -2962,6 +3265,369 @@ class TestFrontDoorDelegation(unittest.TestCase):
         self.assertIn("`goal_mode`: leave it unset", query)
         self.assertIn("**Leave `goal_mode` off.**", query)
         self.assertLess(query.index("Leave `goal_mode` off"), query.index("--- BEGIN TASK BODY"))
+
+
+class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
+    """INCIDENT_TRIAGE_OPEN_PULL_REQUEST, the opt-in set through spec.deployment.env.
+
+    Off is the shipped behaviour and must not move: one card, the footer that
+    leaves the pull request to a human's reply. On, the front door files a
+    second card for the Platform Agent, parented on the triage card, that opens
+    the pull request on a branch keyed to the incident.
+    """
+
+    PAYLOAD = {
+        "reason": "OOMKilled",
+        "namespace": "test-ns",
+        "kind_of_object": "Pod",
+        "name": "test-pod",
+        "message": "some message",
+        "cluster": "prod-us-central1",
+    }
+    SESSION = "evt-Prod_us/OOM:42"
+    ENV = "INCIDENT_TRIAGE_OPEN_PULL_REQUEST"
+    OFF_FOOTER = "A human reads your options and the agent that holds the GitOps write path opens the Pull Request"
+
+    def query(self, value):
+        env = {self.ENV: value} if value is not None else {}
+        with patch.dict(os.environ, env, clear=False):
+            if value is None:
+                os.environ.pop(self.ENV, None)
+            return session_kv_server._build_agent_query(self.PAYLOAD, self.SESSION)
+
+    def test_unset_and_false_leave_the_default_query_alone(self):
+        default = self.query(None)
+        self.assertEqual(default, self.query("false"))
+        self.assertEqual(default, self.query(""))
+        self.assertIn("Make exactly one `kanban_create` call", default)
+        self.assertIn(self.OFF_FOOTER, default)
+        self.assertNotIn("parents", default)
+        self.assertNotIn("platform-agent/incident-", default)
+
+    def _load_dotenv(self, content: bytes, keys):
+        with tempfile.NamedTemporaryFile("wb", suffix=".env", delete=False) as f:
+            f.write(content)
+            dotenv_path = f.name
+        try:
+            with patch.dict(os.environ, {"PREEXISTING_VAR": "from_env"}, clear=False):
+                for key in (self.ENV, *keys):
+                    os.environ.pop(key, None)
+                session_kv_server._load_dotenv_ignoring_operator_switches(dotenv_path)
+                return {key: os.environ.get(key) for key in (self.ENV, "PREEXISTING_VAR", *keys)}
+        finally:
+            os.remove(dotenv_path)
+
+    def test_the_pvc_dotenv_cannot_turn_the_switch_on(self):
+        loaded = self._load_dotenv(
+            b"INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true\n"
+            b"export SAFE_KEY='loaded_ok'\n"
+            b"COMMENTED=value # an inline comment\n"
+            b"PREEXISTING_VAR=from_dotenv\n",
+            ("SAFE_KEY", "COMMENTED"),
+        )
+        self.assertIsNone(loaded[self.ENV])
+        self.assertEqual(loaded["SAFE_KEY"], "loaded_ok")
+        self.assertEqual(loaded["COMMENTED"], "value")
+        self.assertEqual(loaded["PREEXISTING_VAR"], "from_env")
+
+    def test_an_undecodable_pvc_dotenv_does_not_stop_the_import(self):
+        loaded = self._load_dotenv(b"# caf\xe9\nSAFE_KEY=1\n", ("SAFE_KEY",))
+        self.assertIsNone(loaded["SAFE_KEY"])
+        self.assertEqual(loaded["PREEXISTING_VAR"], "from_env")
+
+    def test_the_default_body_is_the_one_the_old_signature_built(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(self.ENV, None)
+            body = session_kv_server._triage_task_body(self.PAYLOAD)
+            self.assertEqual(
+                body,
+                session_kv_server._triage_task_body(self.PAYLOAD, open_pull_request=False),
+            )
+            self.assertIn(
+                "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with this fix.\n"
+                "No Recommended line, and nothing after **'apply'** in the call to action — a bare 'apply' is unambiguous when there is one fix.",
+                body,
+            )
+            self.assertIn(
+                "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix, "
+                "or name one directly with **'apply Option A'** / **'apply Option B'**.",
+                body,
+            )
+            self.assertIn(
+                "**Who acts on this:**\n"
+                "A human reads your options and the agent that holds the GitOps write path opens the Pull Request — not you, and not from this card. "
+                "Your job is to make that possible: name the manifest change each option needs precisely enough that someone can open the Pull Request from your report alone. "
+                "Two things are true whoever acts on it — the fix ships as a Pull Request against the GitOps repository, and nothing is written to the live cluster directly "
+                "(no `kubectl scale`, `patch`, or `apply`).",
+                body,
+            )
+
+    def test_on_asks_for_two_cards_the_second_parented_on_the_first(self):
+        query = self.query("true")
+        self.assertIn("Make exactly two `kanban_create` calls", query)
+        self.assertIn("`assignee`: `platform`", query)
+        self.assertIn("`parents`: a list holding the one card id call 1 returned", query)
+        self.assertIn("`title`: `Open GitOps PR for test-ns/Pod/test-pod (OOMKilled) on prod-us-central1`", query)
+        self.assertIn("`title`: `Triage test-ns/Pod/test-pod (OOMKilled) on prod-us-central1`", query)
+        self.assertIn("do not file a third card", query)
+        self.assertIn("**Leave `goal_mode` off.**", query)
+
+    def test_on_carries_both_bodies_whole_between_their_markers(self):
+        query = self.query("TRUE ")
+        triage = query.split("--- BEGIN TASK BODY (copy verbatim) ---\n", 1)[1].split("\n--- END TASK BODY ---", 1)[0]
+        self.assertEqual(triage, session_kv_server._triage_task_body(self.PAYLOAD, open_pull_request=True))
+        pr = query.split("--- BEGIN PULL REQUEST TASK BODY (copy verbatim) ---\n", 1)[1]
+        pr = pr.split("\n--- END PULL REQUEST TASK BODY ---", 1)[0]
+        self.assertEqual(pr, session_kv_server._triage_pr_task_body(self.PAYLOAD, self.SESSION))
+
+    def test_on_keeps_the_report_template_the_notifier_gates_on(self):
+        body = session_kv_server._triage_task_body(self.PAYLOAD, open_pull_request=True)
+        self.assertNotIn(self.OFF_FOOTER, body)
+        self.assertIn("To authorize", body)
+        self.assertNotIn("reply **'apply'** to open a GitOps Pull Request", body)
+        self.assertIn("a GitOps Pull Request for the recommended fix is being opened automatically", body)
+        self.assertIn("a GitOps Pull Request for this fix is being opened automatically", body)
+        self.assertIn("Keep the words `is being opened automatically` exactly as written", body)
+        self.assertIn("do not tell the reader to reply **'apply'** to open the recommended Pull Request", body)
+        self.assertIn("## What to do", body)
+        headings = [line for line in body.splitlines() if line.startswith("## ")]
+        self.assertEqual(len(headings), 3, headings)
+
+    def test_every_reader_keys_on_the_same_marker_words(self):
+        import kanban_board_health
+        self.assertEqual(session_kv_server.TRIAGE_OPEN_PR_MARKER, "is being opened automatically")
+        self.assertEqual(kanban_board_health.TRIAGE_OPEN_PR_MARKER, session_kv_server.TRIAGE_OPEN_PR_MARKER)
+        self.assertIn(f"'%{session_kv_server.TRIAGE_OPEN_PR_MARKER}%'", kanban_board_health.MISSING_PR_CHILD_SQL)
+        slack = (Path(__file__).resolve().parents[3] / "deploy/docker/patches/slack_ux_incident.py").read_text()
+        self.assertIn(r"\bis\s+being\s+opened\s+automatically\b", slack)
+        task = (Path(__file__).resolve().parents[3] / "bench/tasks/autoops-warning-event-triage-open-pr/task.yaml").read_text()
+        self.assertIn(session_kv_server.TRIAGE_OPEN_PR_MARKER, task)
+        off = session_kv_server._triage_task_body(self.PAYLOAD, open_pull_request=False)
+        self.assertNotIn(session_kv_server.TRIAGE_OPEN_PR_MARKER, off)
+
+    def test_the_pull_request_card_names_the_branch_and_forbids_cluster_writes(self):
+        body = session_kv_server._triage_pr_task_body(self.PAYLOAD, self.SESSION)
+        expected_branch = session_kv_server._incident_branch(self.SESSION, self.PAYLOAD)
+        self.assertIn(f"`{expected_branch}`", body)
+        self.assertRegex(
+            expected_branch,
+            r"^platform-agent/incident-prod-us-central1-test-ns-test-pod-[0-9a-f]{8}$",
+        )
+        self.assertIn("keyed to this workload", body)
+        self.assertIn("do not run `submit-suggestion prepare`", body)
+        self.assertIn("push nothing", body)
+        self.assertIn("**submit-suggestion**", body)
+        self.assertIn("Never pass `--force` to `prepare` while another `Open GitOps PR` card is `running`", body)
+        # The refusal is quoted the way vcs_client._refuse_to_discard words it.
+        self.assertIn("`there is already a copy at <path> with ...`", body)
+        self.assertIn("`Publish it, or re-run with --force to replace it.`", body)
+        self.assertNotIn("with uncommitted work on branch", body)
+        import vcs_client
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp)
+            (dest / "stray").write_text("x")
+            with patch.object(vcs_client, "all_sessions", return_value=[]), patch.object(
+                vcs_client, "local_git",
+                return_value=MagicMock(returncode=0, stdout=" M stray\n"),
+            ):
+                with self.assertRaises(vcs_client.VcsError) as refused:
+                    vcs_client._refuse_to_discard(dest, force=False)
+        self.assertTrue(str(refused.exception).startswith(f"there is already a copy at {dest} with "))
+        self.assertTrue(str(refused.exception).endswith("Publish it, or re-run with --force to replace it."))
+        self.assertIn("`kanban_show` this card's parent", body)
+        self.assertIn("If the parent card has no report (`result` is empty or its `status` is not `done`)", body)
+        self.assertIn("Never change the live cluster directly", body)
+        self.assertIn("open nothing", body)
+
+    def test_the_branch_is_stable_and_one_safe_segment(self):
+        first = session_kv_server._incident_branch(self.SESSION, self.PAYLOAD)
+        self.assertEqual(first, session_kv_server._incident_branch("k8s-evt-retried9", self.PAYLOAD))
+        self.assertRegex(
+            first,
+            r"^platform-agent/incident-prod-us-central1-test-ns-test-pod-[0-9a-f]{8}$",
+        )
+        fallback = session_kv_server._incident_branch("", self.PAYLOAD)
+        self.assertEqual(fallback, first)
+        nameless = dict(self.PAYLOAD, name="")
+        self.assertRegex(
+            session_kv_server._incident_branch(self.SESSION, nameless),
+            r"^platform-agent/incident-evt-prod-us-oom-42-[0-9a-f]{8}$",
+        )
+        self.assertRegex(
+            session_kv_server._incident_branch("", nameless),
+            r"^platform-agent/incident-prod-us-central1-test-ns-pod--oomkilled-[0-9a-f]{8}$",
+        )
+        # Sibling or replaced Deployment pods share their Deployment's name on the branch,
+        # the same identity the incident fold uses (_fold_key).
+        replica_a = {**self.PAYLOAD, "name": "test-pod-6cfdb6b98b-zwv24"}
+        replica_b = {**self.PAYLOAD, "name": "test-pod-6cfdb6b98b-k8m12"}
+        self.assertEqual(
+            session_kv_server._incident_branch(self.SESSION, replica_a),
+            session_kv_server._incident_branch("k8s-evt-other", replica_b),
+        )
+        self.assertEqual(session_kv_server._incident_branch(self.SESSION, replica_a), first)
+        # Any other pod keeps its own name: StatefulSet ordinals, numerically suffixed bare
+        # pods, a bare pod beside a same-prefix StatefulSet, DaemonSet, Job and CronJob pods.
+        # The name cannot prove they are one workload, and a wrong merge would land one
+        # object's fix on another's pull request.
+        for name_a, name_b in (
+            ("cache-0", "cache-1"),
+            ("worker-1", "worker-2"),
+            ("cache-7", "cache"),
+            ("fluentd-k2x9p", "fluentd-m7q4z"),
+            ("backup-29312345-abcde", "backup-29312346-fghij"),
+        ):
+            with self.subTest(pair=(name_a, name_b)):
+                self.assertNotEqual(
+                    session_kv_server._incident_branch(self.SESSION, {**self.PAYLOAD, "name": name_a}),
+                    session_kv_server._incident_branch(self.SESSION, {**self.PAYLOAD, "name": name_b}),
+                )
+        for name in ("cache-0", "worker-1", "fluentd-k2x9p", "backup-29312345-abcde"):
+            with self.subTest(name=name):
+                self.assertEqual(session_kv_server._incident_branch_workload("Pod", name), name)
+        self.assertEqual(session_kv_server._incident_branch_workload("Pod", "test-pod-6cfdb6b98b-zwv24"), "test-pod")
+        self.assertEqual(session_kv_server._incident_branch_workload("Deployment", "api-6cfdb6b98b-zwv24"), "api-6cfdb6b98b-zwv24")
+        # Distinct bare pods ending in 5-character words stay on distinct branches.
+        bare_a = {**self.PAYLOAD, "name": "redis-cache"}
+        bare_b = {**self.PAYLOAD, "name": "redis-proxy"}
+        self.assertNotEqual(
+            session_kv_server._incident_branch(self.SESSION, bare_a),
+            session_kv_server._incident_branch(self.SESSION, bare_b),
+        )
+        other = session_kv_server._incident_branch(self.SESSION, {**self.PAYLOAD, "name": "other-pod"})
+        self.assertNotEqual(first, other)
+        hostile = session_kv_server._incident_branch("../`x` y\n", {})
+        self.assertRegex(hostile.removeprefix("platform-agent/incident-"), r"^[a-z0-9-]+$")
+
+    def test_the_branch_does_not_collide_across_boundary_shifts_or_punctuation(self):
+        shift_a = dict(self.PAYLOAD, namespace="test", name="ns-pod")
+        shift_b = dict(self.PAYLOAD, namespace="test-ns", name="pod")
+        self.assertNotEqual(
+            session_kv_server._incident_branch("s1", shift_a),
+            session_kv_server._incident_branch("s1", shift_b),
+        )
+        deploy_a = dict(self.PAYLOAD, namespace="prod", name="payments-api", kind_of_object="Deployment")
+        deploy_b = dict(self.PAYLOAD, namespace="prod-payments", name="api", kind_of_object="Deployment")
+        self.assertNotEqual(
+            session_kv_server._incident_branch("s1", deploy_a),
+            session_kv_server._incident_branch("s1", deploy_b),
+        )
+        dot_name = dict(self.PAYLOAD, name="api.v2", kind_of_object="CronJob")
+        dash_name = dict(self.PAYLOAD, name="api-v2", kind_of_object="CronJob")
+        self.assertNotEqual(
+            session_kv_server._incident_branch("s1", dot_name),
+            session_kv_server._incident_branch("s1", dash_name),
+        )
+
+    def test_every_incident_on_one_workload_shares_the_branch(self):
+        # The watcher opens a new session each time its window lapses on an
+        # unfixed fault, and sibling replicas carry their own pod names. All of
+        # them must land on one branch, so they revise one open pull request.
+        replica_a = dict(self.PAYLOAD, kind_of_object="Pod", name="auth-service-67756c6f76-hn9mm", reason="FailedScheduling")
+        replica_b = dict(self.PAYLOAD, kind_of_object="Pod", name="auth-service-67756c6f76-zxg5p", reason="FailedScheduling")
+        branches = {
+            session_kv_server._incident_branch("k8s-evt-aaaa1111", replica_a),
+            session_kv_server._incident_branch("k8s-evt-bbbb2222", replica_b),
+            session_kv_server._incident_branch("k8s-evt-cccc3333", dict(replica_a, reason="BackOff")),
+        }
+        self.assertEqual(len(branches), 1)
+        (shared_branch,) = branches
+        self.assertRegex(
+            shared_branch,
+            r"^platform-agent/incident-prod-us-central1-test-ns-auth-service-[0-9a-f]{8}$",
+        )
+        other = dict(replica_a, name="checkout-gateway-66d545794c-f9dd5")
+        self.assertNotIn(session_kv_server._incident_branch("k8s-evt-aaaa1111", other), branches)
+
+    def test_a_long_key_is_cut_with_a_digest(self):
+        from providers import validate as provider_validate
+
+        long_a = dict(self.PAYLOAD, name="w" * 200 + "a", kind_of_object="Deployment")
+        long_b = dict(self.PAYLOAD, name="w" * 200 + "b", kind_of_object="Deployment")
+        full_a = session_kv_server._incident_branch("", long_a)
+        full_b = session_kv_server._incident_branch("", long_b)
+        self.assertNotEqual(full_a, full_b)
+        self.assertLessEqual(len(full_a), session_kv_server.INCIDENT_BRANCH_MAX_LEN)
+        self.assertLessEqual(len(full_b), session_kv_server.INCIDENT_BRANCH_MAX_LEN)
+        self.assertEqual(provider_validate.validate_branch(full_a), full_a)
+        self.assertEqual(provider_validate.validate_branch(full_b), full_b)
+        a = full_a.removeprefix("platform-agent/incident-")
+        b = full_b.removeprefix("platform-agent/incident-")
+        self.assertLessEqual(len(a), session_kv_server.INCIDENT_BRANCH_KEY_MAX_LEN)
+        self.assertNotEqual(a, b)
+        self.assertRegex(a, r"^[a-z0-9-]+$")
+
+    def test_open_pull_request_defaults_workload_window_so_concurrent_replicas_fold(self):
+        # With INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true and INCIDENT_WORKLOAD_DEDUP_SECONDS
+        # unset/0, the server still applies a 300s workload window so two replicas of one
+        # Deployment failing together do not start two concurrent PR cards sharing one
+        # branch and scratch working copy.
+        dedup_env = session_kv_server.INCIDENT_WORKLOAD_DEDUP_SECONDS_ENV
+        with patch.dict(os.environ, {self.ENV: "true"}, clear=False):
+            os.environ.pop(dedup_env, None)
+            self.assertEqual(
+                session_kv_server._workload_dedup_seconds(),
+                session_kv_server.INCIDENT_PR_DEFAULT_WORKLOAD_DEDUP_SECONDS,
+            )
+            os.environ[dedup_env] = "0"
+            self.assertEqual(
+                session_kv_server._workload_dedup_seconds(),
+                session_kv_server.INCIDENT_PR_DEFAULT_WORKLOAD_DEDUP_SECONDS,
+            )
+            with self.assertLogs(session_kv_server.logger, level="WARNING") as cm:
+                os.environ[dedup_env] = "not-an-int"
+                self.assertEqual(
+                    session_kv_server._workload_dedup_seconds(),
+                    session_kv_server.INCIDENT_PR_DEFAULT_WORKLOAD_DEDUP_SECONDS,
+                )
+            self.assertTrue(any("using the 300s fallback" in line for line in cm.output), cm.output)
+            os.environ[dedup_env] = "120"
+            self.assertEqual(session_kv_server._workload_dedup_seconds(), 120)
+
+            os.environ.pop(dedup_env, None)
+            helper = TestWorkloadIncidentFold()
+            helper.setUp()
+            try:
+                first = helper._inject("auth-service-67756c6f76-hn9mm")
+                second = helper._inject("auth-service-67756c6f76-zxg5p")
+                self.assertEqual(first["status"], "injected")
+                self.assertEqual(second["status"], "folded")
+                self.assertEqual(helper.trigger.call_count, 1)
+            finally:
+                helper.tearDown()
+                helper.doCleanups()
+
+    def test_non_folding_kinds_for_one_name_do_not_share_a_branch(self):
+        # `_workload_incident_anchor` keeps a Pod/Deployment incident and an HPA
+        # with the same name as separate incidents. `_incident_branch` includes
+        # the non-Pod/Deployment kind so the two admitted sessions never file PR
+        # cards on one branch.
+        with patch.dict(os.environ, {self.ENV: "true"}, clear=False):
+            os.environ.pop(session_kv_server.INCIDENT_WORKLOAD_DEDUP_SECONDS_ENV, None)
+            helper = TestWorkloadIncidentFold()
+            helper.setUp()
+            try:
+                pod_resp = helper._inject("hpa-branch-api-6cfdb6b98b-zwv24", kind="Pod")
+                hpa_resp = helper._inject("hpa-branch-api", kind="HorizontalPodAutoscaler")
+                self.assertEqual(pod_resp["status"], "injected")
+                self.assertEqual(hpa_resp["status"], "injected")
+                self.assertEqual(helper.trigger.call_count, 2)
+                pod_payload = helper.trigger.call_args_list[0].args[2]
+                hpa_payload = helper.trigger.call_args_list[1].args[2]
+                pod_branch = session_kv_server._incident_branch("k8s-evt-kind-1", pod_payload)
+                hpa_branch = session_kv_server._incident_branch("k8s-evt-kind-2", hpa_payload)
+                self.assertNotEqual(pod_branch, hpa_branch)
+                self.assertIn("horizontalpodautoscaler", hpa_branch)
+            finally:
+                helper.tearDown()
+                helper.doCleanups()
+
+    def test_drift_records_ignore_the_setting(self):
+        drift = {"kind": session_kv_server.INJECT_KIND_DRIFT, "summary": "s"}
+        with patch.object(session_kv_server, "_drift_agent_query", return_value="drift") as drift_query:
+            with patch.dict(os.environ, {self.ENV: "true"}):
+                self.assertEqual(session_kv_server._build_agent_query(drift, self.SESSION), "drift")
+        drift_query.assert_called_once_with(drift)
 
 
 class TestGatewaySessionBody(unittest.TestCase):
@@ -10686,7 +11352,7 @@ class TestTriageStartRetry(unittest.TestCase):
         for target, value in (
             ("time", MagicMock(monotonic=self.clock.monotonic, time=time.time)),
             ("_triage_sleep", self.clock.sleep),
-            ("_build_agent_query", lambda payload: "q"),
+            ("_build_agent_query", lambda payload, session_id="": "q"),
             ("_gateway_api_token", lambda: "tok"),
         ):
             p = patch.object(session_kv_server, target, value)
@@ -11076,7 +11742,7 @@ class TestTriageStartBurst(unittest.TestCase):
             patch.dict(os.environ, {"PLATFORM_API_URL": f"http://127.0.0.1:{self.server.server_port}"}),
             patch.object(session_kv_server, "enabled_chat_platforms", lambda: [session_kv_server.DEFAULT_CHAT_PLATFORM]),
             patch.object(session_kv_server, "_chat_platforms_disabled", lambda: True),
-            patch.object(session_kv_server, "_build_agent_query", lambda payload: "q"),
+            patch.object(session_kv_server, "_build_agent_query", lambda payload, session_id="": "q"),
             patch.object(session_kv_server, "_gateway_api_token", lambda: "tok"),
             # A real pool, not the parked stand-in, and retry waits on the same scale.
             patch.object(session_kv_server, "_TRIAGE_START_POOL", None),
