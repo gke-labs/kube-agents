@@ -646,7 +646,7 @@ class Filer:
             open_issue = tracking_issue(open_issues, case, KIND_INFRA)
             if open_issue:
                 body_text = open_issue.get("body") or ""
-                tracked[case] = nightly.PART_WRITERS if f"`{nightly.NIGHTLY_WRITERS_JOB}`" in body_text else nightly.PART_MAIN
+                tracked[case] = next((part for job, part in nightly.PART_JOBS.items() if f"`{job}`" in body_text), nightly.PART_MAIN)
         for case, verdicts in sorted(nightly_infra.case_verdicts(parts, candidates, tracked).items()):
             fields = task_fields(case, self.repo_root)
             if fields is None:
