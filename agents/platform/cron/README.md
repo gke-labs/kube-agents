@@ -319,8 +319,8 @@ cannot hold the run past the hour before it writes its record. The queue's ident
 its rubric sets the severity (a budget over a single replica, a pool past the skew ceiling and a
 webhook in the upgrade's path are critical; a budget over several replicas, a pool at the ceiling
 and a webhook refusing only what it matches today are major; a covering exclusion is minor; a
-readiness rule's blocker is critical, and its risk is minor for catalogue entries 9, 10, 11, 13 and 16 and major for every other entry, as the rubric's
-entry table sets it); a row
+readiness rule's blocker is critical, and its risk is minor for catalogue entries 9, 10, 11, 13 and 16 and major for every other entry, and minor for the plan-level `rollout-sequence-precheck`, as the rubric's
+tables set it); a row
 the user dismissed stays dismissed; and the hourly nudge paces what is named and reminds daily of
 undecided criticals. A cluster read in full sends its batch with a `scope` naming the job's check
 family (`upgrade-`) and its own source, an empty batch when nothing was found, so a finding the week

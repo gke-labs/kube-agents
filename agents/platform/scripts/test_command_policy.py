@@ -654,6 +654,9 @@ class PreviouslyAllowedReadsTest(unittest.TestCase):
             ["gcloud", "projects", "describe", "myproj"],
             ["gcloud", "compute", "disks", "list"],
             ["gcloud", "container", "operations", "list"],
+            ["gcloud", "container", "fleet", "rolloutsequences", "list", "--project=acme-fleet-host", "--format=json"],
+            ["gcloud", "container", "fleet", "rolloutsequences", "describe", "prod-train", "--project=acme-fleet-host"],
+            ["gcloud", "container", "fleet", "rollouts", "list", "--project=acme-fleet-host"],
             ["gcloud", "auth", "list"],
             ["gcloud", "info"],
             ["gcloud", "version"],
@@ -767,6 +770,32 @@ class GcloudReadOnlyTest(unittest.TestCase):
     def test_config_list_is_allowed(self):
         # Test individual listed commands from GCLOUD_READ_COMMANDS.
         self.assertTrue(evaluate(["gcloud", "config", "list"]).allowed)
+
+    def test_fleet_rollout_sequencing_reads_are_allowed_and_their_writes_are_refused(self):
+        # The readiness report's rollout-sequence precheck runs exactly this argv through the
+        # proxy (fleet-upgrade-verification's readiness_rules/rollout_sequence_precheck.py),
+        # and the upgrade SOP's stage check the other two; `--project` and `--format` take a
+        # value, so an unlisted flag would hide the command path and refuse it silently.
+        self.assertTrue(evaluate(["gcloud", "container", "fleet", "rolloutsequences", "list", "--project=acme-fleet-host", "--format=json"]).allowed)
+        self.assertTrue(evaluate(["gcloud", "container", "fleet", "rolloutsequences", "list", "--project", "acme-fleet-host", "--format", "json"]).allowed)
+        self.assertTrue(evaluate(["gcloud", "container", "fleet", "rolloutsequences", "describe", "prod-train", "--project=acme-fleet-host"]).allowed)
+        self.assertTrue(evaluate(["gcloud", "container", "fleet", "rollouts", "list", "--project=acme-fleet-host", "--format=json"]).allowed)
+        # The writes that drive a train stay refused, by whichever rule fires first: the verb
+        # check, or the unknown-flag refusal on a write's own flags.
+        for argv in (
+            ["gcloud", "container", "fleet", "rolloutsequences", "create", "prod-train", "--project=acme-fleet-host"],
+            ["gcloud", "container", "fleet", "rolloutsequences", "upgrade", "prod-train", "--project=acme-fleet-host"],
+            ["gcloud", "container", "fleet", "rolloutsequences", "delete", "prod-train", "--project=acme-fleet-host"],
+            ["gcloud", "container", "fleet", "rollouts", "pause", "rollout-1", "--project=acme-fleet-host"],
+            ["gcloud", "container", "fleet", "rollouts", "resume", "rollout-1", "--project=acme-fleet-host"],
+            ["gcloud", "container", "fleet", "rollouts", "cancel", "rollout-1", "--project=acme-fleet-host"],
+            ["gcloud", "container", "fleet", "rollouts", "force-complete-stage", "rollout-1", "--project=acme-fleet-host"],
+            ["gcloud", "container", "fleet", "rollouts", "delete", "rollout-1", "--project=acme-fleet-host"],
+            ["gcloud", "container", "fleet", "rolloutsequences"],
+            ["gcloud", "container", "fleet", "rollouts"],
+            ["gcloud", "container", "fleet"],
+        ):
+            self.assertFalse(evaluate(argv).allowed, argv)
 
     def test_asset_search_is_allowed_with_its_selectors_and_asset_writes_are_refused(self):
         # The Cluster Agent reconcile resolves a folder or organisation in spec.scope with
@@ -1133,6 +1162,9 @@ class GcloudReadOnlyTest(unittest.TestCase):
             (["gcloud", "container", "node-pools", "describe", "default", "--cluster=c", "--location=l"], "container node-pools describe with --cluster"),
             (["gcloud", "container", "node-pools", "list", "--cluster=c", "--location=l"], "container node-pools list with --cluster"),
             (["gcloud", "container", "operations", "list"], "container operations list"),
+            (["gcloud", "container", "fleet", "rolloutsequences", "list", "--project=acme-fleet-host", "--format=json"], "container fleet rolloutsequences list"),
+            (["gcloud", "container", "fleet", "rolloutsequences", "describe", "prod-train"], "container fleet rolloutsequences describe"),
+            (["gcloud", "container", "fleet", "rollouts", "list"], "container fleet rollouts list"),
             (["gcloud", "info"], "info"),
             (["gcloud", "logging", "read"], "logging read"),
             (["gcloud", "projects", "describe", "myproj"], "projects describe"),
