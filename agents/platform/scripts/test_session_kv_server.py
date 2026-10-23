@@ -267,6 +267,21 @@ class TestSessionKvServerApi(unittest.TestCase):
             self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=body).status_code, 200, bad)
             self.assertNotIn("ask", self.client.get(f"/v1/sessions/{sid}/metadata").json()["conversation_route"], bad)
 
+    def test_a_console_route_keeps_the_turns_task_when_it_is_a_task_id(self):
+        # A console conversation's route carries the turn's gateway task,
+        # which a card the turn files snapshots for its report's reply_to;
+        # anything but a task id's shape is dropped, and the route recorded.
+        sid = "a2a-ctx-0123abcd"
+        body = {"platform": "console", "conversation": "console:tab-1", "context_id": "ctx-0123abcd", "task_id": "task-7"}
+        self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=body).status_code, 200)
+        self.assertEqual(self.client.get(f"/v1/sessions/{sid}/metadata").json()["conversation_route"],
+                         {"platform": "console", "conversation": "console:tab-1", "context_id": "ctx-0123abcd",
+                          "task_id": "task-7"})
+        for bad in ("Task-7", "task 7", "task#7", "-task", "x" * 64):
+            body["task_id"] = bad
+            self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=body).status_code, 200, bad)
+            self.assertNotIn("task_id", self.client.get(f"/v1/sessions/{sid}/metadata").json()["conversation_route"], bad)
+
     def test_a_route_keeps_valid_user_id_and_chat_type(self):
         sid = "a2a-ctx-0123abcd"
         hmac_user = "hmac:0123456789abcdef0123456789abcdef"
@@ -348,6 +363,7 @@ class TestSessionKvServerApi(unittest.TestCase):
             ("k8s-evt-12345678", good, "an alert session cannot be re-addressed"),
             ("a2a-ctx-1", dict(good, platform="discord"), "a backend the gateway cannot hold for notify"),
             ("a2a-ctx-1", dict(good, conversation="slack:C1/1.2"), "a key for the other backend"),
+            ("a2a-ctx-1", dict(good, platform="console"), "a chat key on the console route"),
             ("a2a-ctx-1", dict(good, conversation="gchat:"), "an empty key"),
             ("a2a-ctx-1", dict(good, context_id=""), "no context id"),
             ("a2a-ctx-1", dict(good, context_id="x" * 600), "an oversized context id"),
@@ -9165,6 +9181,22 @@ class TestCardStop(unittest.TestCase):
         self.assertEqual(body["stopped"][0]["via"], "subscription")
         for task_id in ("t_other_thread", "t_other_session", "t_explicit"):
             self.assertEqual(self.status(task_id), "running", task_id)
+
+    def test_a_console_card_whose_thread_names_its_turn_is_found(self):
+        # A console card's thread is the conversation key plus its turn's
+        # task ("console:<token>#<taskId>"), so the seed matches it by the key
+        # before the separator; another console conversation's, or a key
+        # that merely starts the same, is left alone.
+        conversation = "console:tab-1"
+        self.card("t_console", "running", session=None)
+        self.subscribe("t_console", thread_id=conversation + "#task-7")
+        self.card("t_console_bare", "running", session=None)
+        self.subscribe("t_console_bare", thread_id=conversation)
+        self.card("t_other_tab", "running", session=None)
+        self.subscribe("t_other_tab", thread_id="console:tab-10#task-8")
+        body = self.stop(conversation=conversation).json()
+        self.assertEqual(self.stopped_ids(body), ["t_console", "t_console_bare"])
+        self.assertEqual(self.status("t_other_tab"), "running")
 
     def test_link_children_that_inherited_our_subscription_are_left_alone(self):
         """Hermes copies our card's subscription onto every link child, from

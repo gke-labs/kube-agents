@@ -220,7 +220,7 @@ CONVERSATION_HASHED_HEX_CHARS = 32
 # The conversation key's prefix for each platform the A2A gateway can hold, as
 # the gateway spells its session-record keys (gchatConversationID,
 # slackConversationID); a key for another backend is refused.
-CONVERSATION_KEY_PREFIXES = {"google_chat": "gchat:", "slack": "slack:"}
+CONVERSATION_KEY_PREFIXES = {"google_chat": "gchat:", "slack": "slack:", "console": "console:"}
 # The metadata key the route is kept under. Its own key, not the row's
 # platform/chat_id/thread_id: those are a chat thread's address, which other
 # readers (send_notification, the delegation headers) use as one, and a
@@ -245,6 +245,19 @@ CONVERSATION_ROUTE_USER_KEY = "user_id"
 CONVERSATION_ROUTE_USER_TOKEN = re.compile(r"hmac:[0-9a-f]{32}")
 CONVERSATION_ROUTE_CHAT_TYPE_KEY = "chat_type"
 CONVERSATION_ROUTE_CHAT_TYPES = frozenset({"dm", "group"})
+# A console conversation's route also carries the gateway task its turn runs,
+# which a card the turn files snapshots so its report names the turn it
+# answers. Kept only when it is a task id's shape: one DNS-1123 label, as the
+# gateway's lib.ValidSubjectToken requires of a task id.
+CONVERSATION_ROUTE_TASK_KEY = "task_id"
+# A console card's subscription thread is "console:<token>#<taskId>": the
+# conversation key and the turn's task, joined by this separator
+# (kanban_event_routing.CONSOLE_THREAD_TASK_SEP and
+# kanban_chat_notify.CONSOLE_THREAD_TASK_SEP spell it too). The card stop
+# matches such a thread to its conversation by the key before it.
+CONSOLE_CONVERSATION_PREFIX = "console:"
+CONSOLE_THREAD_TASK_SEP = "#"
+CONVERSATION_TASK_ID_TOKEN = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
 
 # Hermes' managed scope, the administrator-pinned layer `load_hermes_dotenv`
 # applies LAST with override=True. The operator mounts it at /etc/hermes and
@@ -5820,7 +5833,8 @@ def put_conversation_route(session_id: str, request_data: Dict[str, Any]) -> Dic
     the turn files subscribes to `api_server` and this session id, and
     `deploy/docker/patches/kanban_event_routing.py` reads what this stores under
     `conversation_route` (`platform`, `conversation`, the gateway's key, and
-    `context_id`) and addresses the subscription to the conversation; `ask`,
+    `context_id`, and on a console conversation `task_id`, the turn's gateway
+    task) and addresses the subscription to the conversation; `ask`,
     when the bridge sends a valid token, is the kind of the turn's ask, which
     the notifier's chat messages keep marked while the cards run. The
     kanban notifier then posts the card's report with `a2a notify
@@ -5836,6 +5850,7 @@ def put_conversation_route(session_id: str, request_data: Dict[str, Any]) -> Dic
     conversation = str(request_data.get("conversation") or "").strip()
     context_id = str(request_data.get("context_id") or "").strip()
     ask = str(request_data.get(CONVERSATION_ROUTE_ASK_KEY) or "").strip()
+    task_id = str(request_data.get(CONVERSATION_ROUTE_TASK_KEY) or "").strip()
     user_id = str(request_data.get(CONVERSATION_ROUTE_USER_KEY) or "").strip()
     chat_type = str(request_data.get(CONVERSATION_ROUTE_CHAT_TYPE_KEY) or "").strip().lower()
     if platform:
@@ -5882,6 +5897,8 @@ def put_conversation_route(session_id: str, request_data: Dict[str, Any]) -> Dic
                 route[CONVERSATION_ROUTE_USER_KEY] = user_id
             if chat_type in CONVERSATION_ROUTE_CHAT_TYPES:
                 route[CONVERSATION_ROUTE_CHAT_TYPE_KEY] = chat_type
+            if CONVERSATION_TASK_ID_TOKEN.fullmatch(task_id):
+                route[CONVERSATION_ROUTE_TASK_KEY] = task_id
             meta[CONVERSATION_ROUTE_KEY] = route
             conn.execute(
                 "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?) "
@@ -8048,12 +8065,19 @@ def _collect_card_tree(
 
     frontier = reach([r[0] for r in _ids_where_in(conn, "SELECT id FROM tasks WHERE session_id IN ({marks})", sessions)], "session")
     if conversation and _has_table(conn, "kanban_notify_subs"):
+        # A console card's thread carries its turn's task after the key
+        # (CONSOLE_THREAD_TASK_SEP), so it is matched by that prefix too.
+        thread_match, thread_args = "s.thread_id = ?", [conversation]
+        if conversation.startswith(CONSOLE_CONVERSATION_PREFIX):
+            prefix = conversation + CONSOLE_THREAD_TASK_SEP
+            thread_match = "(s.thread_id = ? OR substr(s.thread_id, 1, ?) = ?)"
+            thread_args = [conversation, len(prefix), prefix]
         subscribed = conn.execute(
             "SELECT s.task_id FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
-            "WHERE s.chat_id = ? AND s.thread_id = ? AND t.session_id IS NULL "
+            f"WHERE s.chat_id = ? AND {thread_match} AND t.session_id IS NULL "
             "AND NOT EXISTS (SELECT 1 FROM task_links l JOIN kanban_notify_subs p ON p.task_id = l.parent_id "
             "                WHERE l.child_id = s.task_id AND p.chat_id = s.chat_id AND p.thread_id = s.thread_id)",
-            (session_id, conversation),
+            (session_id, *thread_args),
         )
         frontier += reach([r[0] for r in subscribed], "subscription")
     children_table = _has_table(conn, CARD_STOP_CHILDREN_TABLE)

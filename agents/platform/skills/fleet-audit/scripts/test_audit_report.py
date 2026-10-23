@@ -907,6 +907,14 @@ class BaseTestCase(unittest.TestCase):
         """
         self.without_run_record = True
 
+    def keep_findings_mtime(self):
+        """Let this test's findings file keep the age the test gave it.
+
+        `run_main` otherwise stamps it from the run record's clock before
+        `finish`, so a document aged on purpose would read as this run's.
+        """
+        self.findings_mtime_kept = True
+
     def run_main(self, argv):
         """Invoke the CLI, capturing stdout/stderr into self.out / self.err."""
         if (
@@ -920,10 +928,25 @@ class BaseTestCase(unittest.TestCase):
             # against; the generic stream declares postures now, so a run
             # that never called `start` here needs it or reads as no search.
             self.record_run(audit=AUDIT)
-            # `start` precedes the findings a real run writes; a document older
-            # than the record reads as an earlier run's.
-            if "--findings-file" in argv:
-                os.utime(argv[argv.index("--findings-file") + 1])
+        if (
+            argv
+            and argv[0] == "finish"
+            and "--findings-file" in argv
+            and not getattr(self, "findings_mtime_kept", False)
+        ):
+            # `start` precedes the findings a real run writes, and `finish`
+            # refuses a document older than the run record as an earlier
+            # run's. The file is stamped here, after every record a test or
+            # the branch above wrote, from the clock the record read: left to
+            # the kernel, a write or a bare `utime` takes the coarse clock,
+            # which trails that one by up to a tick, so for a few milliseconds
+            # after each second boundary the file would land below the
+            # record's whole-second stamp. A test about a document that is
+            # older on purpose calls `keep_findings_mtime`.
+            findings_file = argv[argv.index("--findings-file") + 1]
+            if os.path.exists(findings_file):
+                now = time.time_ns()
+                os.utime(findings_file, ns=(now, now))
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = audit_report.main(argv)
@@ -20434,6 +20457,7 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
 
     def test_a_findings_file_written_before_start_is_refused(self):
         self.harness.replies = {"issue-list": issues_view([])}
+        self.keep_findings_mtime()
         doc_path = self.write_findings(make_doc())
         os.utime(doc_path, (1, 1))
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
@@ -21668,6 +21692,32 @@ class TestFinishManifestFlag(HarnessTestCase):
         payload = self.stdout_json()
         for key in ("unpublished_candidates", "wholly_unpublished_checks", "uncorroborated_findings"):
             self.assertNotIn(key, payload)
+
+    def test_a_finish_just_after_a_second_boundary_is_not_refused_as_predating(self):
+        """The run record is stamped to the whole second, and the findings file
+        is written moments later. A file stamp from a clock that trails the
+        record's by a few milliseconds reads as an earlier run's document for a
+        moment after every second boundary, whoever wrote the record, and the
+        run is refused."""
+        self.harness.replies = {"issue-list": issues_view([])}
+        record = Path(audit_report.run_record_path_for(AUDIT))
+        # `run_main` writes the record when none is there; a test that writes
+        # it first, as `record_run` does, is the other path to `finish`.
+        openers = [("run_main", lambda: None), ("the test", lambda: self.record_run(audit=AUDIT))]
+        for boundary in range(3):
+            who, open_run = openers[boundary % len(openers)]
+            with self.subTest(boundary=boundary, record_by=who):
+                # A fresh record each time, so the opener writes it again.
+                record.unlink(missing_ok=True)
+                # Sleep to just short of the boundary, spin the last stretch.
+                next_second = int(time.time()) + 1
+                time.sleep(max(0.0, next_second - time.time() - 0.005))
+                while time.time() < next_second:
+                    pass
+                open_run()
+                rc = self.run_finish(make_doc(findings=[]))
+                self.assertNotIn("was last written before this run", self.err)
+                self.assertEqual(rc, 0, self.err)
 
     def test_a_manifest_adds_the_collector_keys_to_the_payload(self):
         self.harness.replies = {"issue-list": {"issues": []}}
