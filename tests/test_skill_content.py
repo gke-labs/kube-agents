@@ -126,6 +126,17 @@ class SubmitSuggestionHandsEditsToTheirAuthoringSkillTest(unittest.TestCase):
         for skill in ("gcp-terraform", "gcp-config-connector", "gitops-helm-chart"):
             self.assertIn(f"**{skill}**", step2)
         self.assertIn("follow it from its Step 1", step2)
+        # The authoring skill submits its own branch; editing this skill's copy
+        # would leave submit with nothing to find.
+        self.assertIn("Leave the copy you prepared here unused", step2)
+
+    def test_review_rounds_apply_the_same_table(self):
+        # Step 5 is where pr-conversation enters; a .tf edit in a review round
+        # takes the authoring skill's rules too.
+        content = (REPO_ROOT / "agents/platform/skills/submit-suggestion/SKILL.md").read_text(encoding="utf-8")
+        step5 = content[content.index("### Step 5: Addressing Review Feedback"):]
+        self.assertIn("authoring skill's rules here too (Step 2's table)", step5)
+        self.assertIn("`tofu fmt` after any `.tf` edit", step5)
 
 if __name__ == "__main__":
     unittest.main()
