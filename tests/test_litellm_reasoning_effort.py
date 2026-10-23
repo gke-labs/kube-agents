@@ -24,6 +24,7 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CHART = _REPO_ROOT / "charts" / "kube-agents"
 _VALUE = "litellm.reasoningEffort"
 _ALIASES = ("model-default", "hermes-agent")
+_GEMINI_THINKING_KEY = "thinking"
 _HELM_BASE_ARGS = [
     "helm",
     "template",
@@ -96,9 +97,14 @@ class TestReasoningEffortRender(unittest.TestCase):
                 for alias, entry in params.items():
                     with self.subTest(alias=alias):
                         self.assertEqual(entry["reasoning_effort"], "high")
-                # Only the key was added: the rest of each alias is untouched.
+                # Only the key was added: the rest of each alias is untouched,
+                # except that on a Gemini model it replaces the thinking key
+                # (test_litellm_gemini_thoughts.py), which LiteLLM refuses
+                # beside it.
                 for alias, entry in self._params_by_alias(unset_cm).items():
-                    self.assertEqual({k: v for k, v in params[alias].items() if k != "reasoning_effort"}, entry)
+                    self.assertNotIn(_GEMINI_THINKING_KEY, params[alias])
+                    unset_rest = {k: v for k, v in entry.items() if k != _GEMINI_THINKING_KEY}
+                    self.assertEqual({k: v for k, v in params[alias].items() if k != "reasoning_effort"}, unset_rest)
                 self.assertNotEqual(self._checksum(unset_deploy), self._checksum(set_deploy))
 
     def test_it_sits_beside_max_tokens_and_the_openai_compatible_keys(self) -> None:

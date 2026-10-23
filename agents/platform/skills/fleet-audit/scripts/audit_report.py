@@ -13152,6 +13152,13 @@ def written_in_this_run(audit_id: str, stamp: object) -> bool:
     older than the note's `started_at`, which `start` writes before it writes
     anything else. The stamps have whole seconds, so the note's time is
     compared to the second.
+
+    The note reads `time.time()`, so a stamp handed here must come from that
+    clock too (`time.gmtime(time.time())` or `datetime.now(timezone.utc)`),
+    never from `time.gmtime()` with no argument: that reads the coarse C
+    clock, which trails `time.time()` by a second for a moment after each
+    second boundary, and a record stamped in that moment would be disowned
+    by the run that wrote it.
     """
     started = inflight_started_at(audit_id, time.time())
     written = _utc_seconds(stamp)

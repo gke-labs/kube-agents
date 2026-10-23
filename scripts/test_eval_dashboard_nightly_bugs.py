@@ -21,7 +21,6 @@ import typing
 import unittest
 
 import yaml
-
 from eval_dashboard import nightly_bugs
 
 TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_nightly_bugs"
@@ -705,6 +704,44 @@ class InfraCaseTest(Harness):
         [issue] = self.filed(gh, infra=True)
         self.assertIn("no line for the case", issue["body"])
         self.assertNotIn("eval_case-red_rep1.log", issue["body"], "no transcript link for a run that recorded nothing")
+
+    def test_a_case_the_inject_lane_dropped_is_not_kept_from_running(self):
+        # case-red ran on the 14th (today mode), then the nightly moved to
+        # next, whose inject lane drops it before the fan-out: not kept.
+        nights = [night(d, []) for d in (15, 16, 17)]
+        for run in nights:
+            run["lane_excluded"] = ["case-red"]
+        gh, _, _ = self.run_once(data(night(14, [green("case-red")]), *nights))
+        self.assertEqual(self.filed(gh, infra=True), [])
+
+    def test_lane_excluded_cases_do_not_count_toward_a_pool_wide_night(self):
+        # The 14th ran four cases the next-mode lane drops from the 15th on.
+        # Each later night has 2 of 5 cases infra: 40%, not pool-wide, though
+        # it would read as 6 of 9 if the dropped four counted as no line.
+        gone = ("gone-1", "gone-2", "gone-3", "gone-4")
+        before = night(14, [green("case-red"), *(green(n) for n in gone)])
+        after = []
+        for d in (15, 16, 17):
+            run = night(d, [infra_task("case-red"), infra_task("filler-1"), *(green(n) for n in FILLER[1:])], filler=False)
+            run["lane_excluded"] = list(gone)
+            after.append(run)
+        gh, _, _ = self.run_once(data(before, *after))
+        [issue] = self.filed(gh, infra=True)
+        self.assertIn("case-red", issue["title"])
+
+    def test_a_post_flip_matrix_larger_than_the_pre_flip_one_sizes_the_night(self):
+        # The post-flip matrix (11) outgrew the pre-flip one less its dropped
+        # four (5). A later night with 6 lines, 2 infra, misses 5 of 11:
+        # 7 of 11 ungraded is pool-wide and skipped, never 3 of 7.
+        gone = ("gone-1", "gone-2", "gone-3", "gone-4")
+        new = tuple(f"new-{i}" for i in range(1, 7))
+        before = night(14, [green("case-red"), *(green(n) for n in gone)])
+        full = night(15, [green("case-red"), *(green(n) for n in new)])
+        short = [night(d, [infra_task("case-red"), infra_task("new-1")]) for d in (16, 17, 18)]
+        for run in (full, *short):
+            run["lane_excluded"] = list(gone)
+        gh, _, _ = self.run_once(data(before, full, *short))
+        self.assertEqual(self.filed(gh, infra=True), [])
 
     def test_nights_before_a_case_first_ran_do_not_count(self):
         gh, _, _ = self.run_once(data(night(15, []), night(16, []), night(17, [infra_task("case-red")])))

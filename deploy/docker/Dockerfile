@@ -481,8 +481,9 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-run-workdir/apply_cron_run_workdir.p
 # Security: cron risk gate, execute_code refuse, and content checks (THREAT-002).
 # Must run after cron_tirith_scan: anchors into tools/approval.py at the point
 # introduced by apply_cron_tirith_scan.py.
-COPY --chmod=0644 agents/platform/scripts/command_policy.py /opt/hermes/tools/command_policy.py
-COPY --chmod=0644 deploy/docker/patches/cron_risk_gate.py /opt/hermes/tools/cron_risk_gate.py
+COPY --chmod=0644 agents/platform/scripts/command_policy.py \
+     deploy/docker/patches/cron_risk_gate.py \
+     /opt/hermes/tools/
 COPY deploy/docker/patches/apply_cron_risk_gate.py \
      deploy/docker/patches/verify_cron_risk_gate.py \
      deploy/docker/patches/patchlib.py \
@@ -1000,13 +1001,14 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
 # verify_kanban_worker_tools.py proves the gate answers correctly against the
 # real agent.delegation_context and that the schemas actually disappear.
 # See the module docstring in deploy/docker/patches/kanban_worker_tools.py.
-COPY deploy/docker/patches/kanban_worker_tools.py /opt/hermes/tools/kanban_worker_tools.py
 # The three ownership predicates -- dispatcher worker, delegate_task child, cron
 # run -- shared with hermes_cli/kanban_guardrail_exit.py further down, which asks
 # the same two questions with the opposite `on_unknown`. Landed in this block
 # because it is the first that needs it; the guardrail block imports the same
 # tools.kanban_ownership and adds no COPY of its own.
-COPY deploy/docker/patches/kanban_ownership.py /opt/hermes/tools/kanban_ownership.py
+COPY deploy/docker/patches/kanban_worker_tools.py \
+     deploy/docker/patches/kanban_ownership.py \
+     /opt/hermes/tools/
 # Also staged next to the applier: it imports WORKER_ONLY_TOOLS from
 # kanban_worker_tools, which imports kanban_ownership, and only the script's own
 # directory is on sys.path.
@@ -1455,6 +1457,19 @@ RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes
 # agent's container used a few percent of its own limit. The sample now uses the
 # container's cgroup v2 limit when one is set. See the module docstring in
 # deploy/docker/patches/apply_cgroup_memory_sample.py.
+#
+# reasoning_not_reply rides it too: the chart's gateway asks a Gemini model for
+# its thoughts, so they arrive as reasoning_content, and three Hermes fallbacks
+# turn that channel into the reply when the reply is empty (a reasoning-only
+# clean stop is promoted to the answer and persisted, the terminal empty reply
+# quotes 500 characters of it, a content_filter refusal with no text gives it
+# as the explanation). Each now takes the path a model without reasoning
+# takes. The gateway's display of reasoning goes too: /reasoning show is
+# refused, and the prepend of the last reasoning block to a reply never fires.
+# Its verifier also fails the build on a new direct call of _extract_reasoning
+# (or extract_reasoning) under agent/ or in run_agent.py, so a Hermes bump
+# that adds a fourth such site gets read. See the module
+# docstring in deploy/docker/patches/apply_reasoning_not_reply.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_guardrail_exit.py \
      deploy/docker/patches/rate_limit_retry_delay.py \
      deploy/docker/patches/permission_refusal_stop.py \
@@ -1480,6 +1495,8 @@ COPY deploy/docker/patches/apply_kanban_guardrail_exit.py \
      deploy/docker/patches/verify_policy_refusal_hint.py \
      deploy/docker/patches/apply_permission_refusal_stop.py \
      deploy/docker/patches/verify_permission_refusal_stop.py \
+     deploy/docker/patches/apply_reasoning_not_reply.py \
+     deploy/docker/patches/verify_reasoning_not_reply.py \
      deploy/docker/patches/patchlib.py \
      /tmp/kanban-guardrail-exit/
 RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_synchronous_full.py /opt/hermes && \
@@ -1492,6 +1509,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_cluster_dns_not_local.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_cgroup_memory_sample.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_permission_refusal_stop.py /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_reasoning_not_reply.py /opt/hermes && \
     grep -q 'if sys.platform == "linux":  # kube-agents patch: state-db-synchronous-full' /opt/hermes/hermes_state_wal.py && \
     grep -q "if _kanban_halt_nudge:" /opt/hermes/agent/turn_tool_round.py && \
     grep -q "_kube_observe_refusal(" /opt/hermes/agent/tool_guardrails.py && \
@@ -1509,6 +1527,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     grep -q '"ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"' /opt/hermes/tools/environments/ssh.py && \
     grep -q 'kube-agents patch: cluster-dns-not-local' /opt/hermes/agent/model_metadata.py && \
     grep -q 'kube-agents patch: cgroup-memory-sample' /opt/hermes/gateway/lifecycle_ledger.py && \
+    grep -q 'kube-agents patch: reasoning_not_reply' /opt/hermes/agent/turn_final_response.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_state_db_synchronous_full.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_kanban_guardrail_exit.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_rate_limit_retry_delay.py && \
@@ -1520,6 +1539,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_cgroup_memory_sample.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_policy_refusal_hint.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_permission_refusal_stop.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_reasoning_not_reply.py && \
     rm -rf /tmp/kanban-guardrail-exit
 
 # Perf: let a board mutation wake the kanban watchers instead of waiting out a
@@ -2270,6 +2290,10 @@ COPY --chown=hermes:hermes agents/platform/hindsight/ /opt/platform-template/hin
 # into per-cluster Hermes profiles at runtime by scripts/cluster_agent_profile.py.
 COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 
+# Copy the GKE Support Agent (tse) profile TEMPLATE (persona, config, skills),
+# scaffolded into the optional `tse` Hermes profile at runtime when enabled.
+COPY --chown=hermes:hermes agents/tse/ /opt/tse-template/
+
 # Platform config is self-contained (scaffold does not merge again): build it by
 # merging the shared defaults base with the platform overrides and bake it into
 # the template. This reproduces the exact config the platform ran with as the
@@ -2335,6 +2359,7 @@ assert cfg.get('agent', {}).get('max_turns') == 250, 'iteration budget lost: %r'
         --tirith-bin /usr/local/bin/tirith \
         agents/platform/skills=/opt/platform-template/skills \
         agents/cluster/skills=/opt/cluster-template/skills \
+        agents/tse/skills=/opt/tse-template/skills \
         a2a/persona/platform/skills=/opt/a2a-template/skills && \
     rm -rf /tmp/platform-config
 
@@ -2546,19 +2571,19 @@ COPY agents/platform/plugins/ agents/chat/plugins/ /tmp/repo-plugins/
 # account for.
 RUN set -eu; \
     chown -R hermes:hermes /opt/defaults; \
-    for d in /opt/defaults /opt/hermes/skills /opt/cluster-template /opt/platform-template /opt/chat-template /opt/a2a-template /tmp/repo-plugins; do \
+    for d in /opt/defaults /opt/hermes/skills /opt/cluster-template /opt/tse-template /opt/platform-template /opt/chat-template /opt/a2a-template /tmp/repo-plugins; do \
         find "$d" -type d -exec chmod 755 {} + ; \
         find "$d" -type f -exec chmod 644 {} + ; \
     done; \
     find /opt/defaults/scripts -type f -exec chmod 755 {} + ; \
-    for d in /opt/hermes/skills /opt/platform-template /opt/cluster-template; do \
+    for d in /opt/hermes/skills /opt/platform-template /opt/cluster-template /opt/tse-template; do \
         find "$d" -path '*/scripts/*' -type f -exec chmod 755 {} + ; \
     done; \
     cp -a /tmp/repo-plugins/. /opt/hermes/plugins/; \
     rm -rf /tmp/repo-plugins; \
     /opt/hermes/.venv/bin/python3 -m compileall -q /opt/hermes \
       || echo "WARN: some modules under /opt/hermes did not precompile; they will compile at import, as they do without this step" >&2; \
-    for d in /opt/hermes/skills /opt/platform-template/skills /opt/cluster-template/skills /opt/a2a-template/skills; do \
+    for d in /opt/hermes/skills /opt/platform-template/skills /opt/cluster-template/skills /opt/tse-template/skills /opt/a2a-template/skills; do \
         [ -d "$d" ] \
             || { echo "$d does not exist at manifest generation; the boot check refuses to start a pod whose skill tree has no manifest inside it, so shipping this image would crash-loop the fleet" >&2; exit 1; }; \
         [ -z "$(find "$d" -type l -print -quit)" ] \
@@ -2570,7 +2595,7 @@ RUN set -eu; \
             || { echo "manifest for $d has $(wc -l < "$d/skills_manifest.sha256") entries, expected $n" >&2; exit 1; }; \
         chmod 644 "$d/skills_manifest.sha256"; \
     done; \
-    chown -R root:root /opt/hermes/skills /opt/platform-template /opt/cluster-template /opt/chat-template /opt/a2a-template /opt/defaults/scripts; \
+    chown -R root:root /opt/hermes/skills /opt/platform-template /opt/cluster-template /opt/tse-template /opt/chat-template /opt/a2a-template /opt/defaults/scripts; \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 -m tools.skill_manage_image_owned --check-roots
 
 # Guard: nothing that carries a cluster credential may come back into this image.
@@ -2619,7 +2644,7 @@ RUN set -eu; \
       fi; \
     done; \
     /opt/hermes/.venv/bin/python3 /opt/defaults/scripts/terminal_env_pin.py --build-check; \
-    for profile in /opt/chat-template:/opt/defaults /opt/platform-template:/opt/platform-template /opt/cluster-template:/opt/cluster-template; do \
+    for profile in /opt/chat-template:/opt/defaults /opt/platform-template:/opt/platform-template /opt/cluster-template:/opt/cluster-template /opt/tse-template:/opt/tse-template; do \
       config_dir="${profile%%:*}"; soul="${profile#*:}/SOUL.md"; \
       scratch="$(mktemp -d)"; \
       cp "${config_dir}/config.yaml" "${scratch}/config.yaml"; \

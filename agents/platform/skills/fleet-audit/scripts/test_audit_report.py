@@ -28548,6 +28548,23 @@ class TestLedgerRepositoryChoice(BaseTestCase):
         self.lease("acme/terraform")
         self.assertEqual(audit_report.resolve_repo(audit_id=AUDIT), "acme/terraform")
 
+    def test_this_runs_lease_is_kept_when_the_coarse_clock_lags_the_note(self):
+        # The note's `started_at` comes from `time.time()`. A lease stamped
+        # from `time.gmtime()` with no argument reads the coarse C clock
+        # instead, which trails `time.time()` by a second for a moment after
+        # each second boundary; a lease written in that moment carried an
+        # earlier second than the note and the run disowned it. Running
+        # `time.time()` a few seconds ahead of the wall clock makes that
+        # moment the whole test: the lease is this run's only if its stamp
+        # reads the clock the note read.
+        self.register(_repo_entries(self.GITOPS, self.TERRAFORM), self.gitops_key(self.GITOPS))
+        real_time = time.time
+        ahead = 5.0
+        with patch("time.time", lambda: real_time() + ahead):
+            self.claim()
+            self.lease("acme/terraform")
+            self.assertEqual(audit_report.resolve_repo(audit_id=AUDIT), "acme/terraform")
+
     def test_within_one_run_finish_follows_starts_repo(self):
         self.register(_repo_entries(self.GITOPS, self.TERRAFORM), self.gitops_key(self.GITOPS))
         recorder = Recorder()

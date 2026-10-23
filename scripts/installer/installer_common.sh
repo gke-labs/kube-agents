@@ -249,12 +249,15 @@ readonly GCHAT_SPACE_PREFIX="spaces/"
 # whitespace, U+0085, U+00A0, U+1680, U+2000-U+200A, U+2028, U+2029, U+202F,
 # U+205F and U+3000. The operator and the gateway trim a home channel this
 # way, so a value pasted with a no-break space is still the space they use.
-readonly -a GO_TRIMSPACE_CHARS=(
+# Assigned, then marked readonly: a `readonly -a` here is local to the
+# function the front doors source this file from, on bash 3.2 (macOS).
+GO_TRIMSPACE_CHARS=(
   $'\t' $'\n' $'\v' $'\f' $'\r' ' ' $'\xc2\x85' $'\xc2\xa0' $'\xe1\x9a\x80'
   $'\xe2\x80\x80' $'\xe2\x80\x81' $'\xe2\x80\x82' $'\xe2\x80\x83' $'\xe2\x80\x84' $'\xe2\x80\x85'
   $'\xe2\x80\x86' $'\xe2\x80\x87' $'\xe2\x80\x88' $'\xe2\x80\x89' $'\xe2\x80\x8a'
   $'\xe2\x80\xa8' $'\xe2\x80\xa9' $'\xe2\x80\xaf' $'\xe2\x81\x9f' $'\xe3\x80\x80'
 )
+readonly GO_TRIMSPACE_CHARS
 # What platform_agent_mode_in_values and platform_agent_mode_on_cr print for
 # a field that is not there: a record that carries no platformAgent.mode, or a
 # CR with no spec.mode. Told apart from printing nothing, which means there is

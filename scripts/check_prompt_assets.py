@@ -92,8 +92,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 
 # The profile source trees. `chat` is the Chat Agent (the `default` profile),
-# `cluster` is the per-cluster template the Platform Agent scaffolds at runtime.
-PROFILES = ("platform", "chat", "cluster")
+# `cluster` is the per-cluster template the Platform Agent scaffolds at runtime,
+# and `tse` is the GKE Support Agent (Customer-Side Technical Solutions Engineer).
+PROFILES = ("platform", "chat", "cluster", "tse")
 
 # Extensions an asset reference can end in. Anything else -- `.admin`,
 # `.global-static-ip-name`, `.conf` -- is a GCP role, an annotation key or an
@@ -137,19 +138,20 @@ OPT_DEFAULTS: tuple[tuple[str, str], ...] = (
 # What a specialist profile home actually contains, which is not the whole of
 # its source tree and is not /opt/defaults either. Each is built from its
 # template by an explicit item list: `profile_scaffold.py --items` in
-# docker-entrypoint.sh for platform, OVERLAY_ITEMS in cluster_agent_profile.py
-# for a cluster. A path whose first segment is outside that list is absent at
-# runtime however plainly it exists in the checkout.
+# docker-entrypoint.sh for platform and tse, OVERLAY_ITEMS in
+# cluster_agent_profile.py for a cluster. A path whose first segment is outside
+# that list is absent at runtime however plainly it exists in the checkout.
 #
 # agents/platform/docs is the live case: the Dockerfile copies it to
 # /opt/defaults/docs and nowhere else, so it reaches the default profile and no
-# specialist. `scripts` is here because the entrypoint makes it the one
-# exception, symlinking $TARGET_DIR/scripts into profiles/platform (line 538)
-# -- a link it would not need if that layer reached the profile on its own.
+# specialist. `scripts` is here because the entrypoint makes it the exception
+# for platform and tse, symlinking $TARGET_DIR/scripts into profiles/platform
+# and profiles/tse -- links they would not need if that layer reached those
+# profiles on its own.
 #
 # `chat` is deliberately absent: it *is* the default profile, so its home is
 # $TARGET_DIR and the /opt/defaults layer resolves there in full.
-# `test_profile_home_items_match_the_entrypoint` re-derives both lists.
+# `test_profile_home_items_match_the_entrypoint` re-derives all three lists.
 PROFILE_HOME_ITEMS: dict[str, frozenset[str]] = {
     "platform": frozenset(
         {
@@ -167,6 +169,9 @@ PROFILE_HOME_ITEMS: dict[str, frozenset[str]] = {
     "cluster": frozenset(
         {"SOUL.md", "AGENTS.md", "CAPABILITIES.md", "config.yaml", "skills"}
     ),
+    "tse": frozenset(
+        {"SOUL.md", "AGENTS.md", "CAPABILITIES.md", "config.yaml", "skills", "scripts"}
+    ),
 }
 
 # The platform profile's home in a running pod, and a file in the platform
@@ -181,6 +186,7 @@ OPT_TEMPLATES: tuple[tuple[str, str], ...] = (
     ("/opt/platform-template/", "agents/platform"),
     ("/opt/cluster-template/", "agents/cluster"),
     ("/opt/chat-template/", "agents/chat"),
+    ("/opt/tse-template/", "agents/tse"),
 )
 
 # Top-level repository directories. These make a token count as a *path* --

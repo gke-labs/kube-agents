@@ -6,6 +6,7 @@ import shutil
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 import unittest
 from unittest.mock import MagicMock, patch
 from pathlib import Path
@@ -265,6 +266,69 @@ class TestSessionKvServerApi(unittest.TestCase):
             body["ask"] = bad
             self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=body).status_code, 200, bad)
             self.assertNotIn("ask", self.client.get(f"/v1/sessions/{sid}/metadata").json()["conversation_route"], bad)
+
+    def test_a_route_keeps_valid_user_id_and_chat_type(self):
+        sid = "a2a-ctx-0123abcd"
+        hmac_user = "hmac:0123456789abcdef0123456789abcdef"
+        body = {
+            "platform": "google_chat",
+            "conversation": "gchat:spaces/DM1",
+            "context_id": "ctx-0123abcd",
+            "user_id": hmac_user,
+            "chat_type": "dm",
+        }
+        self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=body).status_code, 200)
+        route = self.client.get(f"/v1/sessions/{sid}/metadata").json()["conversation_route"]
+        self.assertEqual(route["user_id"], hmac_user)
+        self.assertEqual(route["chat_type"], "dm")
+
+        # Invalid user_id or chat_type tokens are dropped without refusing a chat route.
+        body["user_id"] = "alice@example.com"
+        body["chat_type"] = "channel"
+        self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=body).status_code, 200)
+        route = self.client.get(f"/v1/sessions/{sid}/metadata").json()["conversation_route"]
+        self.assertNotIn("user_id", route)
+        self.assertNotIn("chat_type", route)
+
+        # An identity-only record (platform == "") is accepted for inject doors when user_id is a valid hmac token.
+        inject_body = {
+            "platform": "",
+            "conversation": "inject:eval/run-1",
+            "context_id": "ctx-0123abcd",
+            "user_id": hmac_user,
+            "chat_type": "dm",
+        }
+        self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=inject_body).status_code, 200)
+        route = self.client.get(f"/v1/sessions/{sid}/metadata").json()["conversation_route"]
+        self.assertEqual(route["platform"], "")
+        self.assertEqual(route["user_id"], hmac_user)
+        self.assertEqual(route["chat_type"], "dm")
+
+        # An identity-only record with chat_type and no user_id (e.g. console door) is also accepted.
+        console_body = {
+            "platform": "",
+            "conversation": "console:tok-1",
+            "context_id": "ctx-0123abcd",
+            "user_id": "",
+            "chat_type": "dm",
+        }
+        self.assertEqual(self.client.put(f"/v1/sessions/{sid}/route", json=console_body).status_code, 200)
+        route = self.client.get(f"/v1/sessions/{sid}/metadata").json()["conversation_route"]
+        self.assertEqual(route["platform"], "")
+        self.assertNotIn("user_id", route)
+        self.assertEqual(route["chat_type"], "dm")
+
+        # Empty platform without a valid hmac user_id or chat_type is refused with a clear message.
+        bad_id_body = {
+            "platform": "",
+            "conversation": "inject:eval/run-1",
+            "context_id": "ctx-0123abcd",
+            "user_id": "",
+            "chat_type": "",
+        }
+        bad_resp = self.client.put(f"/v1/sessions/{sid}/route", json=bad_id_body)
+        self.assertEqual(bad_resp.status_code, 400)
+        self.assertIn("identity-only route", bad_resp.json()["detail"])
 
     def test_a_hashed_session_takes_its_own_context(self):
         # The bridge hashes a context id that is not path-safe
@@ -3987,6 +4051,7 @@ class TestAuditChatReport(unittest.TestCase):
             conn.execute("DELETE FROM session_metadata")
             conn.execute("DELETE FROM incidents")
             conn.execute("DELETE FROM audit_report_runs")
+            conn.execute("DELETE FROM scheduler_failure_posts")
 
     def leave(self, parts, run="20261015T062000.000000Z", updated=None, job="compliance-audit"):
         record = {
@@ -4068,12 +4133,16 @@ class TestAuditChatReport(unittest.TestCase):
         "⚠️ Cron 'Security & RBAC Posture Audit' failed: provider quota limit. "
         "Fallback chain exhausted. Full details saved in cron output."
     )
+    PLAIN_FAILURE = (
+        "**The Security & RBAC Posture Audit didn't run.** The AI model's usage limit was reached. "
+        "It will try again at its next scheduled run."
+    )
 
     def test_a_failed_runs_line_is_posted_in_place_of_an_unposted_record(self):
         # A silent run left a finished record; this run died before `start`.
         self.leave([self.REPORT])
         _, sent = self.post(report=self.FAILURE, failure=True)
-        self.assertEqual(sent, [self.FAILURE])
+        self.assertEqual(sent, [self.PLAIN_FAILURE])
 
     def test_the_failure_marks_the_record_so_a_later_run_does_not_post_it(self):
         self.leave([self.REPORT])
@@ -4093,7 +4162,16 @@ class TestAuditChatReport(unittest.TestCase):
         self.leave([self.REPORT], updated=time.time() - 600)
         with patch.object(session_kv_server, "_delivering_run_start", return_value=time.time() - 60):
             _, sent = self.post(report=self.FAILURE, failure=True)
-        self.assertEqual(sent, [self.FAILURE])
+        self.assertEqual(sent, [self.PLAIN_FAILURE])
+
+    def test_a_repeated_failure_still_marks_the_record_posted(self):
+        self.leave([self.REPORT])
+        self.post(report=self.FAILURE, failure=True)
+        with patch.object(session_kv_server, "_run_completed_since", return_value=False):
+            response, sent = self.post(report=self.FAILURE, failure=True)
+        self.assertEqual(response.json()["status"], session_kv_server.CRON_REPORT_SUPPRESSED)
+        self.assertEqual(sent, [])
+        self.assertEqual(session_kv_server._last_posted_run("platform", "compliance-audit"), "20261015T062000.000000Z")
 
     def test_the_delivering_run_start_reads_only_running_rows(self):
         import gitops_workspace
@@ -4327,6 +4405,210 @@ class TestAuditChatReport(unittest.TestCase):
         self.assertEqual(
             read.call_args.args[0], os.path.join(self.scratch, "chat_report_compliance-audit.json")
         )
+
+
+class TestSchedulerFailureLine(unittest.TestCase):
+    """The scheduler's failure line, posted as one plain line, once until the job runs cleanly."""
+
+    TITLE = "Workload Reliability Audit"
+    QUOTA = (
+        "⚠️ Cron 'Workload Reliability Audit' failed: provider quota limit. No fallback chain configured — "
+        "add one with `hermes fallback add`, or set a cron fleet default via `cron.model` + "
+        "`cron.model_provider` in config.yaml. Full details saved in cron output."
+    )
+
+    def setUp(self):
+        import sqlite3
+
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(os.environ.pop, "SESSION_KV_API_KEY", None)
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home, True)
+        import gitops_workspace
+
+        home = patch.object(gitops_workspace, "agent_home", return_value=self.home)
+        home.start()
+        self.addCleanup(home.stop)
+        with sqlite3.connect(temp_db_path) as conn, conn:
+            conn.execute("DELETE FROM session_metadata")
+            conn.execute("DELETE FROM incidents")
+            conn.execute("DELETE FROM scheduler_failure_posts")
+
+    def roster(self, expr, job="obtainability-audit"):
+        cron = os.path.join(self.home, "profiles", "platform", "cron")
+        os.makedirs(cron, exist_ok=True)
+        with open(os.path.join(cron, "jobs.json"), "w", encoding="utf-8") as handle:
+            json.dump({"jobs": [{"id": job, "name": self.TITLE, "schedule": {"kind": "cron", "expr": expr}}]}, handle)
+
+    def ledger(self, *rows):
+        import sqlite3
+
+        cron = os.path.join(self.home, "profiles", "platform", "cron")
+        os.makedirs(cron, exist_ok=True)
+        with sqlite3.connect(os.path.join(cron, "executions.db")) as conn, conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS executions (job_id TEXT, status TEXT, started_at TEXT)")
+            conn.executemany("INSERT INTO executions VALUES (?, ?, ?)", rows)
+
+    def post(self, report=None, failure=True, platforms=("google_chat",), routes=False, job="obtainability-audit"):
+        sent = []
+
+        def send(platform, message, chat_id="", thread_id="", timeout=None):
+            sent.append((platform, message))
+            return "spaces/S/threads/T"
+
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=list(platforms)), \
+             patch.object(session_kv_server, "_is_fleet_audit_job", return_value=False), \
+             patch.object(chat_notify, "routes", return_value=routes), \
+             patch.object(session_kv_server, "_send_to_chat", side_effect=send):
+            response = self.client.post(
+                "/v1/cron-reports",
+                json={
+                    "job_id": job, "title": self.TITLE, "report": report or self.QUOTA,
+                    "also_delivered_to": [],
+                    **({"scheduler_failure": True} if failure else {}),
+                },
+            )
+        return response, sent
+
+    def test_each_scheduler_reason_reads_in_plain_words(self):
+        cases = {
+            "⚠️ Cron 'X' failed: script timed out. No model was invoked.": "It ran too long and was stopped",
+            "⚠️ Cron 'X' failed: provider rate limit. Full details saved in cron output.": "The AI model's usage limit was reached",
+            "⚠️ Cron 'X' failed: provider weekly usage limit. Full details.": "The AI model's usage limit was reached",
+            "⚠️ Cron 'X' failed: provider quota limit. Full details.": "The AI model's usage limit was reached",
+            "⚠️ Cron 'X' failed: the job itself stalled — no tool/API activity.": "It stopped making progress",
+            "⚠️ Cron 'X' failed: provider timeout. Full details.": "The AI model didn't answer in time",
+            "⚠️ Cron 'X' failed: provider authentication error. Full details.": "The AI model rejected its credentials",
+            "⚠️ Cron 'X' failed: RuntimeError: HTTP 400 cache expired": "It hit an error",
+        }
+        for line, reason in cases.items():
+            with self.subTest(line=line):
+                failure = session_kv_server.scheduler_failure_line("platform", "x", "Fleet Waste Audit", line)
+                self.assertEqual(failure.reason, reason)
+                then = (
+                    session_kv_server.SCHEDULER_FAILURE_NEEDS_ADMIN
+                    if reason == "The AI model rejected its credentials"
+                    else "It will try again at its next scheduled run."
+                )
+                self.assertEqual(failure.text, f"**The Fleet Waste Audit didn't run.** {reason}. {then}")
+
+    def test_a_failure_a_retry_does_not_clear_promises_no_retry(self):
+        self.roster("50 6 * * *")
+        line = "⚠️ Cron 'X' failed: provider authentication error. Full details."
+        failure = session_kv_server.scheduler_failure_line("platform", "obtainability-audit", self.TITLE, line)
+        self.assertEqual(
+            failure.text,
+            "**The Workload Reliability Audit didn't run.** The AI model rejected its credentials. "
+            "An admin needs to fix this before it can run; the details are in the agent's log.",
+        )
+
+    def test_a_blocked_configuration_says_it_waits_for_a_fix(self):
+        line = "⛔ Cron 'X' blocked by configuration validation (no LLM call was made): bad model. This alert is sent once."
+        failure = session_kv_server.scheduler_failure_line("platform", "x", "Fleet Waste Audit", line)
+        self.assertEqual(
+            failure.text,
+            "**The Fleet Waste Audit didn't run.** Its configuration is invalid. "
+            "An admin needs to fix this before it can run; the details are in the agent's log.",
+        )
+
+    def test_a_daily_job_tries_again_tomorrow(self):
+        self.roster("50 6 * * *")
+        failure = session_kv_server.scheduler_failure_line("platform", "obtainability-audit", self.TITLE, self.QUOTA)
+        self.assertEqual(
+            failure.text,
+            "**The Workload Reliability Audit didn't run.** The AI model's usage limit was reached. "
+            "It will try again tomorrow.",
+        )
+
+    def test_any_other_schedule_tries_again_at_its_next_run(self):
+        for expr in ("20 7 * * 1", "*/10 * * * *"):
+            with self.subTest(expr=expr):
+                self.roster(expr)
+                failure = session_kv_server.scheduler_failure_line("platform", "obtainability-audit", self.TITLE, self.QUOTA)
+                self.assertTrue(failure.text.endswith("It will try again at its next scheduled run."))
+
+    def test_every_leg_gets_the_same_line_with_no_clock_time(self):
+        self.roster("50 6 * * *")
+        _, sent = self.post(platforms=("slack", "google_chat"))
+        self.assertEqual(len({text for _, text in sent}), 1)
+        self.assertTrue(sent[0][1].endswith("It will try again tomorrow."))
+
+    def test_a_job_that_is_not_an_audit_gets_the_plain_line_too(self):
+        response, sent = self.post()
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(
+            sent,
+            [("google_chat", "**The Workload Reliability Audit didn't run.** The AI model's usage limit was "
+              "reached. It will try again at its next scheduled run.")],
+        )
+
+    def test_the_same_failure_posts_once_until_a_clean_run(self):
+        self.ledger(("obtainability-audit", "failed", "2026-10-21T06:50:00+00:00"))
+        self.post()
+        response, sent = self.post()
+        self.assertEqual(response.json()["status"], session_kv_server.CRON_REPORT_SUPPRESSED)
+        self.assertEqual(sent, [])
+        # A run that finished cleanly since the post makes the next failure news.
+        self.ledger(("obtainability-audit", "completed", datetime.now(timezone.utc).isoformat()))
+        _, sent = self.post()
+        self.assertEqual(len(sent), 1)
+
+    def test_a_different_failure_is_posted(self):
+        self.ledger(("obtainability-audit", "failed", "2026-10-21T06:50:00+00:00"))
+        self.post()
+        _, sent = self.post(report="⚠️ Cron 'Workload Reliability Audit' failed: provider timeout. Full details.")
+        self.assertEqual(len(sent), 1)
+        self.assertIn("didn't answer in time", sent[0][1])
+
+    def test_a_delivery_that_is_not_a_failure_clears_the_record(self):
+        self.ledger(("obtainability-audit", "failed", "2026-10-21T06:50:00+00:00"))
+        self.post()
+        _, sent = self.post(report="Workload Reliability Audit: 1 new; 2 findings across 3 clusters.", failure=False)
+        self.assertEqual(len(sent), 1)
+        _, sent = self.post()
+        self.assertEqual(len(sent), 1)
+
+    def test_an_unreadable_ledger_posts_rather_than_withholds(self):
+        self.post()
+        # No executions.db under the profile home: whether the job ran since is unknown.
+        _, sent = self.post()
+        self.assertEqual(len(sent), 1)
+
+    def test_a_profile_that_is_not_one_segment_reads_no_ledger(self):
+        self.ledger(("obtainability-audit", "failed", "2026-10-21T06:50:00+00:00"))
+        for profile in ("..", "../..", "/var/lib/x", "a/b"):
+            with self.subTest(profile=profile), patch.object(session_kv_server.sqlite3, "connect") as connect:
+                self.assertTrue(session_kv_server._run_completed_since(profile, "obtainability-audit", 0.0))
+                connect.assert_not_called()
+
+    def test_a_clean_run_is_one_that_started_after_the_post(self):
+        self.ledger(
+            ("obtainability-audit", "completed", "2026-10-20T06:50:00+00:00"),
+            ("obtainability-audit", "running", "2026-10-22T06:50:00+00:00"),
+            ("other-job", "completed", "2026-10-22T06:50:00+00:00"),
+        )
+        since = datetime(2026, 10, 21, tzinfo=timezone.utc).timestamp()
+        self.assertFalse(session_kv_server._run_completed_since("platform", "obtainability-audit", since))
+        self.ledger(("obtainability-audit", "completed", "2026-10-22T07:00:00+00:00"))
+        self.assertTrue(session_kv_server._run_completed_since("platform", "obtainability-audit", since))
+
+    def test_a_failure_from_outside_the_scheduler_is_posted_as_written(self):
+        sent = []
+
+        def send(platform, message, chat_id="", thread_id="", timeout=None):
+            sent.append(message)
+            return "spaces/S/threads/T"
+
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat"]), \
+             patch.object(session_kv_server, "_send_to_chat", side_effect=send):
+            self.client.post(
+                "/v1/cron-reports",
+                json={"job_id": "obtainability-audit", "title": self.TITLE, "report": self.QUOTA, "scheduler_failure": True},
+            )
+        self.assertEqual(sent, [self.QUOTA])
 
 
 class TestSlackAuditHeadline(unittest.TestCase):

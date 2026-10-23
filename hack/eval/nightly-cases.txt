@@ -11,12 +11,14 @@
 # night). The registration lint (scripts/validate_bench_cases.py) reads this
 # file as well as the presubmit one; the domain-coverage lint reads only
 # blocking-roster.txt, so neither an entry here nor a held-out presubmit
-# seat counts as coverage. The Gemini nightly runs as two periodics:
-# ci-kube-agents-eval-nightly with EVAL_NIGHTLY_PART=main, and
-# ci-kube-agents-eval-nightly-writers with EVAL_NIGHTLY_PART=writers, the
-# cases that request a pull request, on a second project (the variable's
-# comment in the script says why). EVAL_NIGHTLY_PART=main-a and main-b halve
-# the main part again, for two jobs on two projects (#3384).
+# seat counts as coverage. The main nightly grades spec.mode next
+# (EVAL_MODE_NEXT=1) as two periodics: ci-kube-agents-eval-nightly with
+# EVAL_NIGHTLY_PART=main, and ci-kube-agents-eval-nightly-writers with
+# EVAL_NIGHTLY_PART=writers, the cases that request a pull request, on a
+# second project (the variable's comment in the script says why).
+# EVAL_NIGHTLY_PART=main-a and main-b halve the main part again, for two jobs
+# on two projects (#3384). ci-kube-agents-eval-nightly-today runs the whole
+# matrix on spec.mode today as the rollback check.
 #
 # WHO APPROVES. The normal approvers (root OWNERS). Only the presubmit files
 # beside this one carry the eval-crew rule (#1546, decided 2026-09-15).
@@ -894,6 +896,13 @@
 # Add a case at its place in that order, so two pull requests that each add
 # a case don't edit the same lines. scripts/test_eval_rosters.py checks both.
 
+# A crash loop that outlasts the settle period is forwarded, the pod recovers,
+# and 15m after its last event the watcher's quiet follow-up lands on the
+# alert's thread and card ("Quiet since HH:MM UTC", #612). deployer: tofu, the
+# autoops-incident stack's transient shape; the plant waits out the quiet
+# period. Nightly from its first merge; a presubmit seat waits on its record.
+./tasks/autoops-quiet-followup/task.yaml
+
 # autoops-warning-event-no-action-triage (#3267): a Warning event that cleared
 # by itself is triaged to one "No action needed" bullet, with no Option
 # letters and no "To authorize:" call to action. Its stack plants a healthy
@@ -905,6 +914,12 @@
 # serial minutes to it. 900s hint, unmeasured (the shape of
 # autoops-warning-event-triage).
 ./tasks/autoops-warning-event-no-action-triage/task.yaml
+
+# The event triage re-reads the object and opens "What's wrong" with
+# "State at HH:MM UTC:" (#612), so a card read hours later says what was true
+# when. deployer: tofu, the autoops-incident stack's OOM shape in its own
+# namespace; the incumbent's delivery checks and safeguards.
+./tasks/autoops-warning-event-triage-state-stamp/task.yaml
 
 # #3090: the first onboarding report opens with the scan counts and the line
 # `inventory_findings.py select` prints, graded by equality. The
@@ -1023,6 +1038,18 @@
 # autoops-warning-event-triage; hinted at that case's 900s until the nightly
 # record measures it.
 ./tasks/incident-triage-workload-fold/task.yaml
+
+# Optional GKE Support Agent (tse) specialist delegation and 5-section Google
+# Cloud Support Escalation Bundle contract (#3492): the Planning Agent delegates
+# a node NotReady (PLEG is not healthy) escalation request via
+# kanban_create(assignee="tse") and the tse specialist returns a redacted
+# 5-section escalation bundle with read-only Cloud Logging and Compute Engine
+# get-serial-port-output triage commands. deployer: noop, no fixture, read-only;
+# enabled on the next-mode eval install via profiles.tse.enabled=true in
+# hack/ci-deploy.sh's MODE_NEXT_ENV_ARGS (on the today-mode nightly where
+# AgentProfile/tse renders nothing, it fails and appends evidence keeping it out
+# of presubmit per the header's L40-45 rule). Nightly from its first merge.
+./tasks/tse-node-notready-pleg-probe/task.yaml
 
 # Catalogue entry 12 (a node label is removed): seeded-a's
 # seeded-shapes/arch-pinned-worker (deprecated-label-selector), a
