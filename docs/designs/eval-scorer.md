@@ -1042,7 +1042,9 @@ It is `ci-kube-agents-eval-nightly` in
 export. Its schedule, budget and fan-out are the decisions recorded on
 [gke-labs/kube-agents#1491](https://github.com/gke-labs/kube-agents/issues/1491). The YAML is not
 reproduced here — a copy in a second repository is a copy that goes stale, and the shape below is
-the part that matters.
+the part that matters. It and its `-writers` part grade `spec.mode: next` (`EVAL_MODE_NEXT=1`) and
+so record under the version key's `next` mode; `ci-kube-agents-eval-nightly-today` in the same file
+is the same recorder on a `today` install, and keeps today's window.
 
 **Its script body is the presubmit's, byte-for-byte, plus its exports** — `EVAL_TIER` to select
 the nightly matrix, `EVAL_BASELINE_STORE` to close the loop, and `EVAL_REPETITIONS` only if the
@@ -1574,9 +1576,9 @@ actually lives, with rung 6 as the collapse alarm underneath it.
 - The `bench/tf/fleet` drift-reconcile schedule — a drifted fixture silently changes what a
   baseline means.
 - **The aggregate's sample floor is a placeholder for a real test.**
-  `EVAL_AGGREGATE_MIN_SCORED` (default 30) refuses to compare below ten admitted cases' worth of
-  repetitions, because a flat margin at `n = 3` measures luck. It is a floor rather than a wider
-  margin because no single flat margin is right at both `n = 3` and `n = 600`, and the fix that
+  `EVAL_AGGREGATE_MIN_SCORED` (default 30, ten admitted cases' worth when it was set) refuses to
+  compare below that many scored repetitions, because a flat margin at `n = 3` measures luck. It
+  is a floor rather than a wider margin because no single flat margin is right at both `n = 3` and `n = 600`, and the fix that
   actually scales is a two-proportion test. The store now holds the variance estimate that test
   needs, and [Sizing the aggregate margin](#sizing-the-aggregate-margin-measured-2026-09-29)
   priced it: on 2026-09-29 it reds nothing the flat 0.10 does not, one failed repetition

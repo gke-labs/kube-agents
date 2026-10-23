@@ -208,7 +208,7 @@ Every finding must conform to the full findings schema:
   --findings-file /opt/data/scratch/findings_gcp-networking-fabric-audit.json \
   --manifest-file /opt/data/scratch/manifest_gcp-networking-fabric-audit.json \
   [--repo "<owner>/<repo>"]
-# -> {"status":"CLEAN"|"HELD"|"OPENED"|"UPDATED"|"NO_FORGE","issue_url":...,"new":n,"resolved":m,
+# -> {"status":"CLEAN"|"HELD"|"OPENED"|"UPDATED"|"NO_FORGE"|"STORE_LEDGER","issue_url":...,"new":n,"resolved":m,
 #     "prs_opened":[...],"prs_closed":[...],"partial":false,"coverage_gaps":[],
 #     "silent_ok":true}
 ```
@@ -216,6 +216,7 @@ Every finding must conform to the full findings schema:
 - On a **scheduled** run, `silent_ok: true` -> your final response is exactly `[SILENT]`.
 - **An on-demand run is never silent.** If a person dispatched this job, report the outcome and the ledger URL whatever `silent_ok` says.
 - `status == "NO_FORGE"` → no forge is configured, or the broker cannot reach the repository, so nothing was published and there is no ledger URL: unless the run is silent by the rule above, your report is `summary` verbatim (the skill's "No forge configured" section, `/opt/data/profiles/platform/skills/fleet-audit/references/finish.md`).
+- `status == "STORE_LEDGER"` → the forge has no issue tracker, or no labels, so the ledger is in the report store and there is no ledger URL: unless the run is silent by the rule above, your report is `summary` verbatim, which names the remediation pull requests (the skill's "A forge with no issue tracker" section, `/opt/data/profiles/platform/skills/fleet-audit/references/finish.md`).
 - Repo writers can trigger remediation by commenting `/remediate <finding-id>` or `/remediate all` on the ledger issue.
 
 ---

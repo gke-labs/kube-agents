@@ -247,6 +247,8 @@ func TestPodUsageSource_CountsTheBrokersProposals(t *testing.T) {
 		`kubeagents_vcs_requests_total{verb="issue-create",status="success"} 5`,
 		"# TYPE kubeagents_vcs_proposals_merged_total counter",
 		"kubeagents_vcs_proposals_merged_total 2",
+		"# TYPE kubeagents_vcs_proposals_closed_unmerged_total counter",
+		"kubeagents_vcs_proposals_closed_unmerged_total 1",
 		"# TYPE kubeagents_broker_execution_failures_total counter",
 		`kubeagents_broker_execution_failures_total{kind="exec_timeout"} 3`,
 		`kubeagents_broker_execution_failures_total{kind="vcs_failed"} 1`,
@@ -259,8 +261,8 @@ func TestPodUsageSource_CountsTheBrokersProposals(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scrape: %v", err)
 	}
-	if reading.Samples[usageCounterToolExecutions] != 6 || reading.Samples[usageCounterToolExecutionsBlocked] != 9 || reading.Samples[usageCounterRemediationsProposed] != 3 || reading.Samples[usageCounterRemediationsMerged] != 2 || reading.Samples[usageCounterBrokerFailures] != 4 {
-		t.Fatalf("samples = %v, want 6 tool executions, 9 refused, 3 proposals, 2 merged and 4 broker failures over every kind", reading.Samples)
+	if reading.Samples[usageCounterToolExecutions] != 6 || reading.Samples[usageCounterToolExecutionsBlocked] != 9 || reading.Samples[usageCounterRemediationsProposed] != 3 || reading.Samples[usageCounterRemediationsMerged] != 2 || reading.Samples[usageCounterBrokerFailures] != 4 || reading.Samples[usageCounterRemediationsClosedUnmerged] != 1 {
+		t.Fatalf("samples = %v, want 6 tool executions, 9 refused, 3 proposals, 2 merged, 4 broker failures over every kind and 1 closed unmerged", reading.Samples)
 	}
 	if reading.StartTime == nil || *reading.StartTime != 1759400000.25 {
 		t.Errorf("start time = %v", reading.StartTime)
@@ -286,7 +288,7 @@ func TestPodUsageSource_ReadsTheA2AGatewaysInboundFamilyAsTheChatCounter(t *test
 		"",
 	}, "\n")
 	addr := serveBody(t, http.StatusOK, body)
-	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageChatCounters)
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageA2AChatCounters)
 	if err != nil {
 		t.Fatalf("Scrape: %v", err)
 	}
@@ -297,7 +299,7 @@ func TestPodUsageSource_ReadsTheA2AGatewaysInboundFamilyAsTheChatCounter(t *test
 		t.Fatalf("start time = %v, want the gateway's", reading.StartTime)
 	}
 	empty := serveBody(t, http.StatusOK, "# TYPE process_start_time_seconds gauge\nprocess_start_time_seconds 1\n")
-	reading, err = newPodUsageSource().Scrape(context.Background(), empty, usageChatCounters)
+	reading, err = newPodUsageSource().Scrape(context.Background(), empty, usageA2AChatCounters)
 	if err != nil || reading.Samples[usageCounterChatMessagesInbound] != 0 {
 		t.Fatalf("a body with neither family: %v, %v; want 0 and no error", reading.Samples, err)
 	}
@@ -346,6 +348,10 @@ func TestPodUsageSource_ReadsTheSessionsFamiliesIntoTheChatSessions(t *testing.T
 		"# TYPE kubeagents_chat_turns_errored_total counter",
 		`kubeagents_chat_turns_errored_total{platform="slack"} 2`,
 		`kubeagents_chat_turns_errored_total{platform="googlechat"} 1`,
+		"# TYPE kubeagents_kanban_tasks_gave_up_total counter",
+		"kubeagents_kanban_tasks_gave_up_total 2",
+		"# TYPE kubeagents_chat_feedback_negative_total counter",
+		`kubeagents_chat_feedback_negative_total{platform="slack"} 2`,
 		"# TYPE process_start_time_seconds gauge",
 		"process_start_time_seconds 1759400000.25",
 		"",
@@ -354,8 +360,8 @@ func TestPodUsageSource_ReadsTheSessionsFamiliesIntoTheChatSessions(t *testing.T
 	if err != nil {
 		t.Fatalf("Scrape of the chat listener: %v", err)
 	}
-	if reading.Samples[usageCounterChatMessagesInbound] != 9 || reading.Samples[usageCounterSessionsChat] != 3 || reading.Samples[usageCounterChatTurnsErrored] != 3 {
-		t.Fatalf("chat samples = %v, want 9 messages, 3 sessions and 3 turns errored", reading.Samples)
+	if reading.Samples[usageCounterChatMessagesInbound] != 9 || reading.Samples[usageCounterSessionsChat] != 3 || reading.Samples[usageCounterChatTurnsErrored] != 3 || reading.Samples[usageCounterBackgroundTasksGaveUp] != 2 || reading.Samples[usageCounterNegativeFeedback] != 2 {
+		t.Fatalf("chat samples = %v, want 9 messages, 3 sessions, 3 turns errored, 2 cards given up and 2 thumbs-downs", reading.Samples)
 	}
 	a2a := strings.Join([]string{
 		"# TYPE kubeagents_a2a_gateway_messages_inbound_total counter",
@@ -372,7 +378,7 @@ func TestPodUsageSource_ReadsTheSessionsFamiliesIntoTheChatSessions(t *testing.T
 		`kubeagents_a2a_gateway_task_terminals_total{state="canceled",source="gateway"} 4`,
 		"",
 	}, "\n")
-	reading, err = newPodUsageSource().Scrape(context.Background(), serveBody(t, http.StatusOK, a2a), usageChatCounters)
+	reading, err = newPodUsageSource().Scrape(context.Background(), serveBody(t, http.StatusOK, a2a), usageA2AChatCounters)
 	if err != nil {
 		t.Fatalf("Scrape of the A2A gateway: %v", err)
 	}
@@ -381,6 +387,14 @@ func TestPodUsageSource_ReadsTheSessionsFamiliesIntoTheChatSessions(t *testing.T
 	// completed, not canceled.
 	if reading.Samples[usageCounterChatTurnsErrored] != 4 {
 		t.Fatalf("a2a samples = %v, want 4 turns errored (2 + 1 failed, 1 rejected)", reading.Samples)
+	}
+	if _, asked := reading.Samples[usageCounterBackgroundTasksGaveUp]; asked {
+		t.Fatalf("the A2A gateway was asked for the board's counter it never serves: %v", reading.Samples)
+	}
+	// The A2A gateway carries no reactions, so its target is not asked for the
+	// feedback counter: no sample, no idle baseline entry, no field in its Warning.
+	if _, asked := reading.Samples[usageCounterNegativeFeedback]; asked {
+		t.Fatalf("the A2A gateway was asked for the feedback counter it never serves: %v", reading.Samples)
 	}
 	if reading.Samples[usageCounterChatMessagesInbound] != 5 || reading.Samples[usageCounterSessionsChat] != 5 {
 		t.Fatalf("A2A samples = %v, want 5 messages and 5 sessions", reading.Samples)

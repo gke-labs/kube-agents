@@ -639,6 +639,10 @@ SOURCES: dict[str, Source] = {
         "agents/cluster/config.yaml",
         ("mcp_servers:", "KUBE_AGENTS_MCP_RELAY_URL"),
     ),
+    "tse_config": Source(
+        "agents/tse/config.yaml",
+        ("mcp_servers:", "KUBE_AGENTS_MCP_RELAY_URL"),
+    ),
     # --- the tool-call audit ---------------------------------------------
     # D1 reads that every profile config enables tool_call_audit. The Planning
     # Agent's config is the one the image ships as the default profile. A
@@ -668,6 +672,7 @@ SOURCES: dict[str, Source] = {
             "COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml",
             "merge_configs.py /tmp/platform-config/base.yaml /tmp/platform-config/config.yaml",
             "COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/",
+            "COPY --chown=hermes:hermes agents/tse/ /opt/tse-template/",
         ),
     ),
     # --- supply chain -----------------------------------------------------

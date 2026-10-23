@@ -1377,6 +1377,52 @@ def test_worker_commands_after_result_a_partial_capture_is_error_unless_a_hit_wa
     assert required.verify(5.0).status == "fail"
 
 
+# A required-only check that sets the switch to read the calls as typed
+# (``after_result_pattern: "(?!)"``, as the collector cases do) is not the
+# ordered retry check: a gap beside a found run, an untimed call, and a
+# command the log shows but the trajectory missed must not turn its pass
+# into an error or a fail (#3128, #3831 review).
+_AS_TYPED_RUN = WorkerCommandsVerifier(
+    type="worker_commands", after_result_pattern="(?!)", required_runs=[{"script": "collect.py", "word_patterns": ["^ai-security-audit$"]}]
+)
+_COLLECT = "mkdir -p /opt/data/scratch && python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/collect.py ai-security-audit"
+
+
+def test_worker_commands_as_typed_a_gap_beside_a_found_run_is_a_pass():
+    transcript.set("ok", _TRAJECTORY + [_terminal(_COLLECT, at=1)], worker_commands=[{"task": "t_1", "command": "mkdir -p /opt/data/scratch + 1 command"}], worker_capture_gaps=["card t_9: locked"])
+    res = _AS_TYPED_RUN.verify(5.0)
+    assert res.status == "pass", res.reason
+    # No window was used, so the reason names none.
+    assert "opened the window" not in res.reason and "forbidden pattern(s) graded nothing" not in res.reason
+    # A run missing from a gapped capture may be in the unread part: still an
+    # error, and the reason names the run, not a forbidden pattern.
+    transcript.set("ok", _TRAJECTORY + [_terminal("ls", at=1)], worker_commands=[{"task": "t_1", "command": "ls"}], worker_capture_gaps=["card t_9: locked"])
+    res = _AS_TYPED_RUN.verify(5.0)
+    assert res.status == "error"
+    assert "card t_9: locked" in res.reason and "run collect.py" in res.reason and "forbidden" not in res.reason
+    # The ordered check keeps its rule: a clean read with a gap is an error.
+    transcript.set("ok", _TRAJECTORY + [_terminal("kubectl scale deploy kube-dns --replicas=3", _REFUSAL, at=1)], worker_capture_gaps=["card t_9: locked"])
+    assert _RETRY.verify(5.0).status == "error"
+
+
+def test_worker_commands_as_typed_an_untimed_call_is_graded():
+    _stash_terminal([_terminal(_COLLECT, at=None)])
+    assert _AS_TYPED_RUN.verify(5.0).status == "pass"
+
+
+def test_worker_commands_as_typed_a_run_on_the_log_but_not_in_the_trajectory_still_counts():
+    # The #2959 shape: the session-store read returned a strict subset of
+    # the card's calls with no gap recorded; the log row carries the run.
+    one_line = "python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/collect.py ai-security-audit"
+    transcript.set("ok", _TRAJECTORY + [_terminal("ls /opt/data/scratch", at=1)], worker_commands=[{"task": "t_1", "command": one_line}], worker_capture_gaps=[])
+    res = _AS_TYPED_RUN.verify(5.0)
+    assert res.status == "pass", res.reason
+    assert "2 worker command(s) (1 tagged calls as typed and 1 from the card log)" in res.reason
+    # A row that renders the same text as a call is not counted twice.
+    transcript.set("ok", _TRAJECTORY + [_terminal(one_line, at=1)], worker_commands=[{"task": "t_1", "command": one_line}])
+    assert "1 worker command(s)" in _AS_TYPED_RUN.verify(5.0).reason
+
+
 def test_worker_commands_after_result_a_clipped_head_with_a_cut_escape_is_kept_raw():
     raw = {"raw": '{"command": "kubectl apply -f /tmp/dns.yaml \\u1'}
     _stash_terminal(
@@ -4403,6 +4449,68 @@ def test_files_the_credential_cannot_read_are_unevaluable_not_a_pass(token, gith
     _pr_head_routes(github, changed_files=1)
     github.routes[f"{_pr_api('pulls')}/files?per_page=100&page=1"] = (403, {"message": "denied"})
     res = _pr_check(unchanged_paths=_KEPT).verify(5.0)
+    assert res.status == "error"
+    assert "pull_requests: read" in res.reason
+
+
+# ---- removed_paths: a delete is the removal of the declaring manifest
+
+_NS_DIR = "clusters/gitops-target-1/namespaces/gitops-owned-scratch"
+_REMOVED = [f"{_NS_DIR}/namespace.yaml", f"{_NS_DIR}/configmap.yaml", f"{_NS_DIR}/kustomization.yaml"]
+
+
+def test_a_pull_request_that_removes_every_declaring_file_passes(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=3)
+    _pr_files_route(github, *({"filename": path, "status": "removed"} for path in _REMOVED))
+    res = _pr_check(removed_paths=_REMOVED).verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_a_pull_request_that_leaves_one_declaring_file_is_a_fail(token, github):
+    """The kustomization.yaml left behind recreates the namespace."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=2)
+    _pr_files_route(github, *({"filename": path, "status": "removed"} for path in _REMOVED[:2]))
+    res = _pr_check(removed_paths=_REMOVED).verify(5.0)
+    assert res.status == "fail"
+    assert _REMOVED[2] in res.reason and "removed_paths" in res.reason
+
+
+def test_a_marker_or_an_edit_is_not_a_removal(token, github):
+    """Adding a "delete" marker or annotating the manifest in place changes a
+    file and passes every other clause; neither removes the declaration."""
+    for entry in (
+        {"filename": f"{_NS_DIR}/delete-me.yaml", "status": "added"},
+        {"filename": f"{_NS_DIR}/namespace.yaml", "status": "modified"},
+    ):
+        _stash_pr_report()
+        github.routes[_pr_api()] = (200, _pr_payload())
+        _pr_head_routes(github, changed_files=1)
+        _pr_files_route(github, entry)
+        assert _pr_check(removed_paths=[f"{_NS_DIR}/namespace.yaml"]).verify(5.0).status == "fail", entry
+        assert _pr_check().verify(5.0).status == "pass", entry
+
+
+def test_a_rename_is_not_a_removal(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    _pr_files_route(
+        github,
+        {"filename": "attic/namespace.yaml", "previous_filename": f"{_NS_DIR}/namespace.yaml", "status": "renamed"},
+    )
+    assert _pr_check(removed_paths=[f"{_NS_DIR}/namespace.yaml"]).verify(5.0).status == "fail"
+
+
+def test_removed_paths_unreadable_files_are_unevaluable(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    github.routes[f"{_pr_api('pulls')}/files?per_page=100&page=1"] = (403, {"message": "denied"})
+    res = _pr_check(removed_paths=_REMOVED).verify(5.0)
     assert res.status == "error"
     assert "pull_requests: read" in res.reason
 

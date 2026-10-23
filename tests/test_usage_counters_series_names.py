@@ -75,6 +75,9 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
     def test_the_brokers_merged_counter_is_the_one_the_poller_sums(self):
         self.assertEqual(_py_const("VCS_MERGED_METRIC"), _go_const(_SCRAPE_GO, "vcsMergedSeries"))
 
+    def test_the_closed_unmerged_series_is_the_brokers(self):
+        self.assertEqual(_py_const("VCS_CLOSED_UNMERGED_METRIC"), _go_const(_SCRAPE_GO, "vcsClosedUnmergedSeries"))
+
     def test_the_a2a_gateways_inbound_counter_is_the_chat_counters_other_family(self):
         """On a next-mode install the A2A gateway counts the chat messages it accepts;
         the poller folds that family into chatMessagesInboundTotal beside the plugin's,
@@ -177,6 +180,9 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         self.assertEqual(name, _go_const(_SCRAPE_GO, "a2aTaskTerminalsSeries"))
         self.assertEqual(_go_const(_A2A_METRICS_GO, "labelState"), _go_const(_SCRAPE_GO, "a2aTerminalStateLabel"))
 
+    def test_the_chat_plugins_negative_feedback_family_is_the_one_the_poller_sums_into_negative_feedback(self):
+        self.assertEqual(_py_const("CHAT_FEEDBACK_NEGATIVE_METRIC", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "chatFeedbackNegativeSeries"))
+
     def test_the_errored_states_the_poller_filters_on_are_the_a2a_libs_failed_and_rejected(self):
         """The state values are the A2A library's constants; the gateway emits them
         through its terminal list, and the operator's map is the second copy."""
@@ -188,6 +194,9 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         self.assertIsNotNone(terminals, "metricsTerminalStates not found")
         for name in ("StateFailed", "StateRejected"):
             self.assertIn(f"lib.{name}", terminals.group(1))
+
+    def test_the_chat_plugins_gave_up_family_is_the_one_the_poller_sums_into_kanban_tasks_gave_up(self):
+        self.assertEqual(_py_const("KANBAN_GAVE_UP_METRIC", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "kanbanGaveUpSeries"))
 
     def test_the_status_label_key_the_broker_writes_is_the_one_the_poller_filters_on(self):
         self.assertEqual(_py_const("TOOL_STATUS_LABEL"), _go_const(_SCRAPE_GO, "toolInvocationsStatusLabel"))

@@ -2,14 +2,19 @@
 readiness_rules — the per-entry rules `upgrade_readiness.EXTRA_RULES` runs after the PDB,
 maintenance and skew rules of `fleet_upgrade_report.py --readiness`.
 
-One module per entry of docs/designs/upgrade-failure-catalogue.md. Each module exposes:
+One or more modules per entry of docs/designs/upgrade-failure-catalogue.md (entry 10 has two,
+the version side and the add-on matrix). Each module exposes:
 
 - `RULE_ID`, the slug the report keys the rule's counts under and stamps on its findings;
   `ENTRY`, the catalogue entry number; `CAN_BLOCK`, whether a finding of the rule can ever
   block the upgrade. A rule with `CAN_BLOCK = False` files risks and notes; an `unknown` it
   files is reported in the note and never moves the member's verdict, since the finding it
   could not make would not have blocked either, and a blocker it files is demoted to a risk
-  with a note saying so.
+  with a note saying so. `HOLDS` (optional), the moves a blocking finding of the rule stops:
+  `HOLDS_CLUSTER` (a control-plane move), `HOLDS_NODE_POOL` (a node-pool move), or both,
+  which a module that declares none holds; the fold stamps it on each blocking finding as
+  `holds`, and the Monday audit's `upgrade-blocked` join counts the block for the move the
+  cluster's lag makes due.
 - `evaluate(cluster, member, read, target, context) -> dict`, a pure function over what the
   report has already read, returning `blocking`, `risks`, `unknown` and `notes`, each a list
   (`new_result()` is the empty one; a key left out is an empty list, a key outside the four
@@ -45,8 +50,17 @@ reads the same thing once; the audit-log reads live under `audit_log.CACHE_KEY`)
 whole listing of the projects even when `--cluster` narrows which members are graded, since
 narrowing selects whom to grade, not whom a rule may see),
 `pools` (the member's pools: `name`, `version`, `parsed`, the record's `config` and
-`autoscaling`), `target_text`, `master` (the parsed control-plane version) and `autopilot`;
-tests may add `clock`, a monotonic clock for a read's time budget.
+`autoscaling`), `target_text`, `master` (the parsed control-plane version), `autopilot` and
+`project_reads`, the gcloud reads the report makes once per project or location for the
+rules (PROJECT_READS: the project's backend services, compute instances and GKE operations,
+and the location's server config), each `{"data": <parsed JSON>, "error": None}` or
+`{"data": None, "error": <why>}`, with `read_at`, the instant the report made the read, on
+the project reads (each list is made once per project, at its first graded member, after that
+member's own kubectl reads and before the later members'); a rule
+asks `project_read(context, name)` and files one `unknown` naming the reason when the read it
+needs failed or was not made, grading what it has, and `project_read_at(context, name)` for
+the instant; `addons`, the member's add-on inventory (`known_issues_matrix.inventory`, which the
+report builds once per member and writes to the JSON), None on a context built by hand. Tests may add `clock`, a monotonic clock for a read's time budget.
 
 A finding is a dict the rule shapes; the fold copies it before it stamps it, so a rule may
 return the same object twice or cache what it returns. The fold in
@@ -79,10 +93,17 @@ unknown).
 
 import math
 import re
+from datetime import datetime, timedelta, timezone
 
 import upgrade_shape_tables as tables
 
 RESULT_KEYS = ("blocking", "risks", "unknown", "notes")
+# What a blocking rule's mechanism stops, declared per module as `HOLDS` and stamped on each
+# blocking finding as `holds`: a control-plane move, a node-pool move, or both (the default).
+HOLDS_CLUSTER = "cluster"
+HOLDS_NODE_POOL = "node-pool"
+HOLDS_VALUES = (HOLDS_CLUSTER, HOLDS_NODE_POOL)
+HOLDS_BOTH = HOLDS_VALUES
 # A table cell is one line. Text that reaches a cell (a finding's `text`, an unknown's
 # reason, a note, a read's error) is collapsed to one line here, and a reason or an error is
 # cut to this many characters; the JSON keeps the whole text.
@@ -138,6 +159,7 @@ CONTEXT_PROJECT = "project"
 CONTEXT_LOCATION = "location"
 CONTEXT_CLUSTER_NAME = "cluster_name"
 CONTEXT_RUN_CMD = "run_cmd"
+GCLOUD = "gcloud"  # the binary a rule's own read runs through the context's runner
 CONTEXT_TIMEOUT_SECONDS = "timeout_seconds"
 CONTEXT_AT = "at"
 CONTEXT_CACHE = "cache"
@@ -147,6 +169,8 @@ CONTEXT_POOLS = "pools"
 CONTEXT_TARGET_TEXT = "target_text"
 CONTEXT_MASTER = "master"
 CONTEXT_AUTOPILOT = "autopilot"
+CONTEXT_PROJECT_READS = "project_reads"
+CONTEXT_ADDONS = "addons"  # the member's add-on inventory (known_issues_matrix.inventory), built once by the report
 CONTEXT_KEYS = (
     CONTEXT_PROJECT,
     CONTEXT_LOCATION,
@@ -160,7 +184,42 @@ CONTEXT_KEYS = (
     CONTEXT_TARGET_TEXT,
     CONTEXT_MASTER,
     CONTEXT_AUTOPILOT,
+    CONTEXT_PROJECT_READS,
+    CONTEXT_ADDONS,
 )
+# The reads under `project_reads`, named once for the report that makes them and the rules
+# that ask for them: three per project (`gcloud compute backend-services list`, `gcloud
+# compute instances list`, `gcloud container operations list`) and one per location (`gcloud
+# container get-server-config`, the read the version table already makes). Each entry is a
+# dict with `data` (the parsed JSON, None when the read failed) and `error` (None, or why).
+PROJECT_READ_BACKEND_SERVICES = "backend_services"
+PROJECT_READ_INSTANCES = "instances"
+PROJECT_READ_OPERATIONS = "operations"
+LOCATION_READ_SERVER_CONFIG = "server_config"
+PROJECT_READS = (PROJECT_READ_BACKEND_SERVICES, PROJECT_READ_INSTANCES, PROJECT_READ_OPERATIONS, LOCATION_READ_SERVER_CONFIG)
+PROJECT_READ_DATA_KEY = "data"
+PROJECT_READ_ERROR_KEY = "error"
+PROJECT_READ_AT_KEY = "read_at"  # the instant the report made the read, as it formats timestamps; absent on a context built by hand
+PROJECT_READ_AT_UNKNOWN = "an unrecorded time"
+# What a rule reports when the context carries no such read at all (a context built by hand,
+# or a report older than the read): the rule grades what it has and says so.
+PROJECT_READ_NOT_MADE_REASON = "the {read} read was not made, so the rule could not grade it"
+# An operation record as `gcloud container operations list` returns it, and how its
+# `targetLink` names what it works on: `.../zones/<zone>/clusters/<name>` or
+# `.../locations/<location>/clusters/<name>` for the cluster itself, with `/nodePools/<pool>`
+# appended for one of its node pools (an UPGRADE_NODES, a resize, a repair). The segment
+# before `clusters` is the location as the cluster record spells it.
+OPERATION_NAME_KEY = "name"
+OPERATION_TYPE_KEY = "operationType"
+OPERATION_STATUS_KEY = "status"
+OPERATION_START_KEY = "startTime"
+OPERATION_TARGET_KEY = "targetLink"
+OPERATION_STATUS_RUNNING = "RUNNING"
+OPERATION_STATUS_DONE = "DONE"
+TARGET_CLUSTERS_SEGMENT = "clusters"
+TARGET_NODE_POOLS_SEGMENT = "nodePools"
+TARGET_CLUSTER_TAIL_PARTS = 3  # <location>/clusters/<name>
+TARGET_NODE_POOL_TAIL_PARTS = 5  # <location>/clusters/<name>/nodePools/<pool>
 
 # The kinds the reads carry, as `kind` spells them.
 KIND_POD = "Pod"
@@ -199,6 +258,13 @@ MIRROR_POD_ANNOTATION = "kubernetes.io/config.mirror"
 TERMINAL_PHASES = ("Succeeded", "Failed")
 NODE_READY_CONDITION = "Ready"
 CONDITION_TRUE = "True"
+# `spec.providerID` as GKE sets it, `gce://<project>/<zone>/<instance>`: the compute instance
+# behind the Node. The zone label is the fallback when a record carries no providerID.
+NODE_PROVIDER_ID_KEY = "providerID"
+PROVIDER_ID_SEPARATOR = "/"
+PROVIDER_ID_PARTS = 2  # the zone and the instance name, the last two path components
+NODE_ZONE_LABEL = "topology.kubernetes.io/zone"
+NODE_CREATION_TIMESTAMP_KEY = "creationTimestamp"  # `metadata.creationTimestamp`, when the Node object registered
 # Kubernetes resource quantities: a decimal number with an optional SI or binary suffix.
 QUANTITY_RE = re.compile(r"^([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*([A-Za-z]*)$")
 BINARY_SUFFIXES = {"Ki": 1024, "Mi": 1024**2, "Gi": 1024**3, "Ti": 1024**4, "Pi": 1024**5, "Ei": 1024**6}
@@ -321,6 +387,23 @@ SHELL_OPTIONS_WITH_ARGUMENT = ("-o", "+o", "-O", "+O", "--rcfile", "--init-file"
 SHELL_OPTION_ARGUMENT_GROUP_RE = re.compile(r"^[-+][a-zA-Z]*[oO]$")
 SHELL_WORD_SPLIT_RE = re.compile("[" + re.escape(SHELL_OPERATOR_CHARS + SHELL_QUOTES + SHELL_BACKTICK) + r"\s]+")
 
+# RFC 3339 as the GKE and Compute APIs write it (`2026-10-09T16:04:01.300210096Z`): a fraction
+# of up to nine digits, which `datetime.fromisoformat` does not read whole, so the fraction is
+# cut to the six it reads; `Z` is UTC.
+RFC3339_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$")
+RFC3339_FRACTION_DIGITS = 6
+RFC3339_UTC_SUFFIX = "Z"
+ISO_UTC_OFFSET = "+00:00"
+# How an age prints in a finding: the two largest units that are not zero (`6d 3h`, `3h 12m`,
+# `12m`), and `under a minute` below one.
+SECONDS_PER_MINUTE = 60
+SECONDS_PER_HOUR = 3600
+SECONDS_PER_DAY = 86400
+DURATION_UNITS = ((SECONDS_PER_DAY, "d"), (SECONDS_PER_HOUR, "h"), (SECONDS_PER_MINUTE, "m"))
+DURATION_UNITS_SHOWN = 2
+DURATION_UNDER_A_MINUTE = "under a minute"
+DURATION_JOIN = " "
+
 
 # -------------------------------------------------------------------- results and reads
 
@@ -411,6 +494,77 @@ def workloads_unread_detail(read, kinds) -> str | None:
 
 def items_of_kind(items, kind: str) -> list[dict]:
     return [item for item in items or [] if isinstance(item, dict) and item.get("kind") == kind]
+
+
+def parse_rfc3339(text) -> datetime | None:
+    """An aware datetime from an RFC 3339 timestamp as the GKE and Compute APIs write it,
+    or None when the text is not one."""
+    if not isinstance(text, str):
+        return None
+    m = RFC3339_RE.match(text.strip())
+    if not m:
+        return None
+    base, fraction, offset = m.groups()
+    fraction = (fraction or "")[:RFC3339_FRACTION_DIGITS]
+    offset = ISO_UTC_OFFSET if offset == RFC3339_UTC_SUFFIX else offset
+    try:
+        parsed = datetime.fromisoformat(f"{base}{'.' + fraction if fraction else ''}{offset}")
+    except ValueError:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def format_duration(seconds) -> str:
+    """`6d 3h`, `3h 12m`, `12m`: the two largest non-zero units of a duration in seconds;
+    `under a minute` below one minute."""
+    remaining = max(0, int(seconds))
+    parts = []
+    for unit_seconds, label in DURATION_UNITS:
+        count, remaining = divmod(remaining, unit_seconds)
+        if count:
+            parts.append(f"{count}{label}")
+    return DURATION_JOIN.join(parts[:DURATION_UNITS_SHOWN]) if parts else DURATION_UNDER_A_MINUTE
+
+
+def age_seconds(at: datetime, started: datetime) -> int:
+    """Seconds from `started` to `at`, never negative."""
+    return max(0, int((at - started).total_seconds()))
+
+
+def project_read(context, name: str) -> tuple:
+    """(data, error) of one of the report's project or location reads (PROJECT_READS) as the
+    context carries it: `(None, <reason>)` when the read failed, or when the context carries no
+    such read (PROJECT_READ_NOT_MADE_REASON), so a rule files one `unknown` either way."""
+    reads = context.get(CONTEXT_PROJECT_READS) if isinstance(context, dict) else None
+    entry = reads.get(name) if isinstance(reads, dict) else None
+    if not isinstance(entry, dict):
+        return None, PROJECT_READ_NOT_MADE_REASON.format(read=name)
+    error = entry.get(PROJECT_READ_ERROR_KEY)
+    if error:
+        return None, str(error)
+    return entry.get(PROJECT_READ_DATA_KEY), None
+
+
+def project_read_at(context, name: str) -> str:
+    """When the report made one of its project reads, as the context carries it, or
+    PROJECT_READ_AT_UNKNOWN for a context that does not say."""
+    reads = context.get(CONTEXT_PROJECT_READS) if isinstance(context, dict) else None
+    entry = reads.get(name) if isinstance(reads, dict) else None
+    return str((entry or {}).get(PROJECT_READ_AT_KEY) or PROJECT_READ_AT_UNKNOWN) if isinstance(entry, dict) else PROJECT_READ_AT_UNKNOWN
+
+
+def operation_target(operation, name: str, location: str) -> tuple[bool, str | None]:
+    """(whether the operation's `targetLink` names the cluster `name` at `location` or one of
+    its node pools, the pool's name or None for the cluster itself); (False, None) for any
+    other target or a record that is not a dict."""
+    if not isinstance(operation, dict):
+        return False, None
+    parts = str(operation.get(OPERATION_TARGET_KEY) or "").rstrip(PATH_SEPARATOR).split(PATH_SEPARATOR)
+    if len(parts) >= TARGET_NODE_POOL_TAIL_PARTS and parts[-2] == TARGET_NODE_POOLS_SEGMENT and parts[-4] == TARGET_CLUSTERS_SEGMENT and parts[-3] == name and parts[-5] == location and parts[-1]:
+        return True, parts[-1]
+    if len(parts) >= TARGET_CLUSTER_TAIL_PARTS and parts[-2] == TARGET_CLUSTERS_SEGMENT and parts[-1] == name and parts[-3] == location:
+        return True, None
+    return False, None
 
 
 # ------------------------------------------------------------------------- quantities
@@ -706,6 +860,38 @@ def node_extended_allocatable(node: dict) -> dict | None:
 
 def node_pool(node: dict) -> str:
     return ((node.get("metadata") or {}).get("labels") or {}).get(tables.NODEPOOL_LABEL, "")
+
+
+def node_provider_id(node: dict) -> str:
+    """The node's `spec.providerID`, or an empty string."""
+    return str((node.get("spec") or {}).get(NODE_PROVIDER_ID_KEY) or "")
+
+
+def node_instance(node: dict) -> tuple[str, str]:
+    """(zone, instance name) of the compute instance behind a Node: from `spec.providerID`
+    (`gce://<project>/<zone>/<instance>`), else the node's zone label and its name, since a
+    GKE node is named for its instance; the zone is an empty string when neither says."""
+    provider_id = node_provider_id(node)
+    parts = provider_id.rstrip(PROVIDER_ID_SEPARATOR).split(PROVIDER_ID_SEPARATOR)
+    if provider_id and len(parts) > PROVIDER_ID_PARTS and parts[-1]:
+        return parts[-PROVIDER_ID_PARTS], parts[-1]
+    meta = node.get("metadata") or {}
+    return str((meta.get("labels") or {}).get(NODE_ZONE_LABEL) or ""), str(meta.get("name") or "")
+
+
+def node_created_at(node: dict) -> datetime | None:
+    """When the Node object registered (`metadata.creationTimestamp`), or None when the record
+    does not say or the timestamp does not parse."""
+    return parse_rfc3339((node.get("metadata") or {}).get(NODE_CREATION_TIMESTAMP_KEY))
+
+
+def node_ready(node: dict) -> str:
+    """The Ready condition's status as the record spells it (`True`, `False`, `Unknown`), or
+    an empty string when the node carries none."""
+    for condition in (node.get("status") or {}).get("conditions") or []:
+        if isinstance(condition, dict) and condition.get("type") == NODE_READY_CONDITION:
+            return str(condition.get("status") or "")
+    return ""
 
 
 def node_schedulable(node: dict) -> bool:

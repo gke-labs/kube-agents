@@ -107,35 +107,27 @@ DEFAULT_CORRECTNESS_FLOOR = 1.0
 #: fires. Measured, not guessed: 0.10 was sized on 2026-09-29 against 94
 #: green presubmit runs since 2026-09-26 and the four clean nightlies at
 #: parallelism 8 (docs/designs/eval-scorer.md, "Sizing the aggregate
-#: margin"). With twelve admitted cases at three repetitions the pull
-#: request's side was 36 units, so the rate moved in steps of 1/36 = 0.028
-#: and the margin is really a count of failed repetitions: at main's window
-#: rate of 0.924 (2026-09-29) it tolerated six failures out of 36 and redded
-#: the seventh; once the outage-era lines leave the window and main sits
-#: near 0.94 it tolerates five and reds the sixth. Since 2026-10-14
-#: (pdb-remediation-pr on the roster) the side is 39 units, steps of 1/39 =
-#: 0.026: six failures still pass at 0.924 and at 0.94, five at 0.96.
-#: Since 2026-10-17 (two demotions, #3269 and #3120) it is 33 units, steps
-#: of 1/33 = 0.030: five failures pass at 0.924 and at 0.94, four at 0.96,
-#: and five red once main's window rate passes about 0.948. Since
-#: 2026-10-21 (a third demotion, #3598) it is 30 units, steps of 1/30 =
-#: 0.033: five failures pass at 0.924, four at 0.94 and at 0.96, and five red
-#: once main's window rate passes about 0.933. The worst green
+#: margin"). The margin is really a count of failed repetitions. The pull
+#: request's side is the blocking roster's cases times the repetitions, the
+#: "blocking roster" count of ``python3 scripts/eval_rosters.py --summary``
+#: times EVAL_REPETITIONS (one case fewer on the inject lane, which excludes
+#: agent-kanban-smoke). At ``n`` units and main's window rate ``r``, a run
+#: passes with ``f`` failures while ``(n - f) / n >= r - 0.10``. When it was
+#: sized the side was 36 units (twelve admitted cases): at main's window rate
+#: of 0.924 it tolerated six failures and redded the seventh. The worst green
 #: run in the sample had five (0.861 against 0.924, a deficit of 0.063, which
-#: the old 0.05 would have redded); the next worst had four. 0.10 leaves
-#: 0.037 of headroom over that worst run, still more than one unit of 30
-#: (0.033), but a five-failure run like it now reds above 0.933. The two-proportion
-#: test at one-sided 5% reds none of the same runs either (its largest z
-#: was 1.26, on that five-failure run); it sits one failed repetition
-#: stricter than 0.10 at today's window. Revisit if main's window rate
-#: exceeds 0.96 or the roster leaves ten (the three demoted cases' returns
-#: restore 39 units). At 30 units the side is exactly
-#: DEFAULT_AGGREGATE_MIN_SCORED below, so one infra or blocked repetition
-#: leaves the aggregate advisory on that run, and on the inject lane (nine
-#: roster cases, 27 units, agent-kanban-smoke excluded), which the presubmit
-#: runs since #3156, it cannot block at all. The aggregate is not armed by default
-#: (EVAL_AGGREGATE_ARMED); re-check these counts, and that floor, before
-#: arming it.
+#: the old 0.05 would have redded); the next worst had four. The
+#: two-proportion test at one-sided 5% reds none of the same runs either (its
+#: largest z was 1.26, on that five-failure run); it sat one failed repetition
+#: stricter than 0.10 at that window. Revisit if main's window rate exceeds
+#: 0.96 or the side falls to DEFAULT_AGGREGATE_MIN_SCORED: a side at or under
+#: that floor leaves the aggregate advisory whenever one repetition is infra
+#: or blocked, and a side under it can't block at all. As of 2026-10-21
+#: (#3598's demotion) the today lane's side sat on the floor and the inject
+#: lane's, which the presubmit runs, under it, so the aggregate couldn't
+#: block a pull request; recompute before relying on that either way. It is not armed by
+#: default (EVAL_AGGREGATE_ARMED); recompute the side, and check it against
+#: that floor, before arming it.
 DEFAULT_AGGREGATE_MARGIN = 0.10
 
 #: Scored repetitions the aggregate needs before it may BLOCK. Below this it
@@ -156,8 +148,10 @@ DEFAULT_AGGREGATE_MARGIN = 0.10
 #: to compare rather than by widening the margin, because no single flat
 #: margin is right at both n=3 and n=600.
 #:
-#: 30 is ten admitted cases at three repetitions, and it tolerates six failed
-#: repetitions at the 0.80 threshold. The properly-sized fix is a two-proportion
+#: 30 was ten admitted cases at three repetitions when it was set. It is a
+#: floor on scored repetitions, not a roster count, and it doesn't move when
+#: the roster does. At the 0.80 threshold it tolerates six failed
+#: repetitions. The properly-sized fix is a two-proportion
 #: test with a real variance estimate; the 2026-09-29 measurement priced it
 #: against the same runs and it drew the same line the flat margin does at
 #: today's window, so the flat margin stays for its legibility. The normal

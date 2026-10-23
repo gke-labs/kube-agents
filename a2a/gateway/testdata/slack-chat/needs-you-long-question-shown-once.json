@@ -1,0 +1,47 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "Which GitOps repository should I open the pull request against to revert the ConfigMap change?",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      }
+    ],
+    "attachments": [
+      {
+        "blocks": [
+          {
+            "elements": [
+              {
+                "elements": [
+                  {
+                    "text": "The GitOps state ConfigMap currently lists no managed repositories, so I cannot tell which one holds the change.",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              }
+            ],
+            "type": "rich_text"
+          }
+        ],
+        "color": "#ECB22E",
+        "fallback": "(the text fallback)"
+      }
+    ]
+  }
+]

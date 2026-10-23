@@ -22,7 +22,9 @@ to put in a diff otherwise. Three paths lead there:
   request the harness itself closed as stale (that one is re-openable) and includes one a human
   closed or merged (those are not).
 - **`/remediate <finding-id>`**, or `/remediate all`, commented on the ledger by someone with write
-  access to the repository. This path is uncapped: a human asked for that one by name.
+  access to the repository. This path is uncapped: a human asked for that one by name. When `start`
+  printed `"ledger": "store"` (a forge with no issue tracker, or no labels), there is no ledger to
+  comment on: the person asks in chat, and that is a direct ask (below).
 - **A direct ask.** A collaborator asking the agent, in the agent's own task, to fix a named
   finding; the agent answers with the `remediate` subcommand. Uncapped for the same reason as
   `/remediate` — and distinct from a comment read on the ledger, which is the harness's to answer
@@ -112,7 +114,9 @@ It prints one JSON line — `status`, `prs_opened`, `already_open`, `superseded`
 subcommand does not re-propose them. Revival belongs to the write-gated `/remediate` comment
 (§ above, honoured by `finish` on the comment's own timestamp) — or to `--override-human-close`,
 which exists for the person at the terminal who could have written that comment themselves. An
-agent relaying an ask it cannot tie to a GitHub identity never passes that flag.
+agent relaying an ask it cannot tie to a GitHub identity never passes that flag. On a forge with no
+ledger issue there is no such comment, so a human close stands until a person at the terminal
+passes that flag. There `remediate` looks up no ledger issue, and the pull request links none.
 
 `refused` names the targets whose remediation is not a readable file inside the workspace — either the
 audit promised a manifest and never wrote it, or the path does not resolve inside the repository at

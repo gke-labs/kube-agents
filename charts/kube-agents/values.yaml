@@ -306,8 +306,10 @@ litellm:
   # checksum are what they were and the model uses its own default. LiteLLM
   # translates it per provider; on Gemini 3.x it becomes thinkingLevel. What
   # it maps to, and when a request's own value wins, is on the site's
-  # inference-gateway page, "Setting the reasoning effort". Chart-only; the
-  # kustomize dev base carries no such key.
+  # inference-gateway page, "Setting the reasoning effort". On a Gemini 2.5 or
+  # 3.x model a value also replaces the thinking key the chart renders there
+  # to get Gemini's thoughts back ("Gemini's thoughts" on the same page); both
+  # ask for them. Chart-only; the kustomize dev base carries no such key.
   reasoningEffort: ""
   # modelProvider: vertex_ai only. The gateway calls
   # projects/<projectId>/locations/<location> as a GSA reached through Workload
@@ -440,13 +442,21 @@ litellm:
   # smaller request to meet it, so there this 2Gi request is billed at roughly
   # 315m of CPU per replica whatever this line says; that is accepted rather
   # than fought with a request Standard does not need.
+  # Ephemeral storage is the tmp emptyDir's 1Gi sizeLimit (templates/litellm.yaml)
+  # plus 256Mi for the container's logs, twice the 86 MiB peak measured over seven
+  # days on the dev installs (2026-10-22). Stated, because a namespace quota on
+  # requests.ephemeral-storage refuses a pod without one and Autopilot bills it;
+  # the limit equals it, because a LimitRange defaulting a smaller limit would
+  # refuse a request with none.
   resources:
     requests:
       cpu: 100m
       memory: 2Gi
+      ephemeral-storage: 1280Mi
     limits:
       cpu: 500m
       memory: 3Gi
+      ephemeral-storage: 1280Mi
   # NetworkPolicy and GKE managed-Prometheus PodMonitoring for the gateway;
   # when platformAgent.enabled and operator.enabled are true (the default), litellm-policy is managed
   # dynamically by the operator with cluster-discovered DNS VIPs. When either
@@ -495,6 +505,29 @@ litellm:
     #     literal: prod-eu-1
     #     action: pseudonym
     rules: []
+  # Pass-through JSONL trajectory logger callback. When enabled, registers
+  # llm_trace_logger.proxy_handler_instance in LiteLLM's callbacks and mounts
+  # llm_trace_logger.py plus the shared redactor.py module beside config.yaml.
+  # Every upstream model invocation (messages, tools, responses, reasoning
+  # content, token usage, latency) is redacted through AuditRedactor (built-in
+  # credential patterns, Secret data blocks, sensitive keys, emails, and IP
+  # literals, plus any operator rules when redaction.enabled is also true) and
+  # appended as one JSONL record to traceLogPath. IP literals are pseudonymised
+  # by default; with redaction.enabled they follow redaction.ip instead ("off"
+  # writes them verbatim, mask masks them, allowCidrs addresses pass through).
+  # The file rotates at 5 MiB across 3 backups (.1-.3) under an flock on
+  # <path>.lock; a record over 1 MiB keeps its metadata and drops messages,
+  # tools and response behind a truncated marker, caller-chosen strings are
+  # clipped, and a line that would still pass the file cap is refused, so the
+  # trail holds at most 20 MiB. Each record is written on one writer thread, off the proxy's
+  # event loop. Pass-through only: does not alter live requests or responses, and
+  # logs a once-per-path warning to stderr on I/O failure rather than breaking
+  # inference.
+  traceLogEnabled: false
+  # Normalised file path under /tmp/ where the trajectory log is written: no
+  # . or .. component, no doubled or trailing slash (the gateway container runs
+  # with readOnlyRootFilesystem: true and only /tmp is writable).
+  traceLogPath: "/tmp/litellm_traces.jsonl"
 
 # The Hindsight memory store: the API the agents call for long-term memory,
 # the Postgres/pgvector StatefulSet behind it, a NetworkPolicy standing in for
@@ -555,13 +588,18 @@ hindsight:
       repository: docker.io/pgvector/pgvector
       tag: "0.8.6-pg15@sha256:a947c45cdc5906a1bc951f20a8709e321256343ee0f251e4ae00b5e7def4e6da"
       pullPolicy: IfNotPresent
+    # Ephemeral storage is the run and tmp emptyDirs' sizeLimits (64Mi and 1Gi,
+    # templates/hindsight.yaml) plus 64Mi for the container's logs; the limit
+    # equals the request, as LiteLLM's does.
     resources:
       requests:
         cpu: 250m
         memory: 256Mi
+        ephemeral-storage: 1152Mi
       limits:
         cpu: "1"
         memory: 1Gi
+        ephemeral-storage: 1152Mi
     # volumeClaimTemplate size. Immutable once the StatefulSet exists.
     storage: 8Gi
   # Disable podMonitoring off-GKE, same caveat as litellm.podMonitoring.
@@ -854,6 +892,14 @@ platformAgent:
       # maxSessions caps the A2A session pods a "next" install runs at once;
       # the operator's default applies when it is unset, and "today" ignores it.
       # maxSessions: 10
+      # profiles sizes AgentProfile work on a "next" install: ceiling is the most
+      # profile tasks running at once across every profile (default 8), and
+      # warmReplicas the warm workers kept per interactive (profile, tier)
+      # (default 1). The <release namespace>-profiles namespace's pod quota is
+      # the warm workers, a surge pod per warm pool, and the ceiling.
+      # profiles:
+      #   ceiling: 8
+      #   warmReplicas: 1
       # platform:
       #   apiMaxRetries: 8
       #   maxTurns: 200
@@ -1031,9 +1077,13 @@ platformAgent:
     image:
       repository: docker.io/alpine/k8s
       tag: "1.36.5"
-    # How long to wait for the finalizer to clear.
+    # How long to wait for AgentProfile finalizers to clear before deleting
+    # the PlatformAgent CR.
+    agentProfileTimeout: 30s
+    # How long to wait for the PlatformAgent finalizer to clear.
     timeout: 120s
-    # Bounds the Job itself (image pull, scheduling) above that wait.
+    # Bounds the Job itself (image pull, scheduling) above the combined
+    # agentProfileTimeout + timeout waits.
     activeDeadlineSeconds: 300
   security:
     # Kubernetes ServiceAccount the credential broker pod runs as; the agent
@@ -1311,7 +1361,14 @@ platformAgent:
       mode: default
     slack:
       # Bot/app tokens are read from credentials.secretName under the
-      # SLACK_BOT_TOKEN / SLACK_APP_TOKEN keys.
+      # SLACK_BOT_TOKEN / SLACK_APP_TOKEN keys by default.
+      # Custom Secret references can be specified if tokens live in separate Secrets:
+      # botTokenSecretRef:
+      #   name: ""    # defaults to credentials.secretName
+      #   key: ""     # defaults to SLACK_BOT_TOKEN
+      # appTokenSecretRef:
+      #   name: ""    # defaults to credentials.secretName
+      #   key: ""     # defaults to SLACK_APP_TOKEN
       enabled: false
       # Slack member IDs (U0123ABCD), not emails. Empty list = all users allowed.
       allowedUsers: []
@@ -1320,7 +1377,14 @@ platformAgent:
     teams:
       # Microsoft Teams ChatOps integration via Microsoft Bot Framework / Entra ID.
       # App ID and App Password are read from credentials.secretName under
-      # TEAMS_APP_ID and TEAMS_APP_PASSWORD.
+      # TEAMS_APP_ID and TEAMS_APP_PASSWORD by default.
+      # Custom Secret references can be specified if credentials live in separate Secrets:
+      # appIdSecretRef:
+      #   name: ""    # defaults to credentials.secretName
+      #   key: ""     # defaults to TEAMS_APP_ID
+      # appPasswordSecretRef:
+      #   name: ""    # defaults to credentials.secretName
+      #   key: ""     # defaults to TEAMS_APP_PASSWORD
       enabled: false
       # Microsoft Entra ID Tenant ID for single-tenant enterprise lock-down.
       tenantId: ""
@@ -1373,3 +1437,50 @@ plugins:
       sink: gke-stockout-alerts-sink
       thresholdCount: 1
       thresholdWindowSeconds: 300
+
+# Optional built-in specialist AgentProfiles deployed into the cluster (`spec.mode: next`).
+# When `profiles.tse.enabled` is true, the operator reconciles the `tse` AgentProfile's
+# ServiceAccount, NATS auth-callout identity, and agent card (`a2a.agents.tse`), and
+# passes `tse` to the gateway pod via KUBE_AGENTS_ENABLED_PROFILES so its Hermes
+# profile home (`/opt/data/profiles/tse`) is scaffolded from `/opt/tse-template` at startup.
+profiles:
+  # GKE Support Agent (TSE): customer-side L1 GKE support case deflection and
+  # structured incident triage specialist (`agents/tse/`, `/opt/tse-template`).
+  tse:
+    enabled: false
+    description: >-
+      Customer-side GKE Technical Solutions Engineer (TSE) for L1 support case
+      deflection and cross-layer incident triage. Performs read-only diagnostics
+      across Kubernetes (kubectl) and GCP control-plane telemetry (Cloud Logging,
+      Cloud Monitoring, GKE operations) using sanitized Google Cloud support
+      skills, returning either a grounded Root Cause Analysis with a proposed
+      GitOps fix or a redacted Google Cloud Support Escalation Bundle.
+    persona:
+      # Placeholder image reference required by the AgentProfile CRD schema;
+      # today the gateway scaffolds `tse` from `/opt/tse-template` in the
+      # platform-agent image until the per-profile Job dispatcher lands.
+      image:
+        repository: ghcr.io/gke-labs/kube-agents/platform-agent
+        tag: "" # defaults to platformAgent.deployment.image.tag or Chart.appVersion
+    harness:
+      image:
+        repository: ghcr.io/gke-labs/kube-agents/a2a-worker
+        tag: "" # defaults to platformAgent.deployment.image.tag or Chart.appVersion
+      model: model-default
+      maxTurns: 90
+    bus:
+      publishTopics: []
+      subscribeTopics:
+        - shared.blueprint
+        - agent.platform.upgrade-readiness
+    lifecycle:
+      activeDeadlineSeconds: 1800
+      ttlSecondsAfterFinished: 600
+    concurrency: 2
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 2Gi

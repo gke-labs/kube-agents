@@ -199,6 +199,13 @@ func unverifiedRemedyFor(backend string) string {
 	return "the principal map"
 }
 
+// unverifiedNotice is what a sender the gateway cannot place is told, once:
+// their own backend-asserted id and what an admin edits to admit them.
+func unverifiedNotice(backend, authorID string) string {
+	return "⛔ I can't verify who you are on " + backend + " (id " + authorID +
+		"), so I can't take asks from you yet — an admin has to add you to " + unverifiedRemedyFor(backend) + "."
+}
+
 // gchatLinkRe matches markdown links for rewriteLinks to turn into Chat's
 // <url|text> form. The URL class (chatLinkURLPattern, which the executor's
 // own <url|text> links are read with too) excludes `<`, `>` and `|` so a
