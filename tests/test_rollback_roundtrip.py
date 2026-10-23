@@ -579,8 +579,9 @@ class _Door(http.server.BaseHTTPRequestHandler):
     def _today_leg(self, state: dict) -> str:
         # The today turn is the same request on every leg, so the leg is read
         # from the state: the first flip to today is leg 1's, the second leg 3's
-        # (ROLLBACK_END_MODE=today). Declared up front in the scenario, so no
-        # one rewrites the state file while the script runs.
+        # (ROLLBACK_END_MODE=today). `today_turn_fails_on` names the one leg
+        # whose turn the door refuses, declared up front in the scenario, so
+        # nothing rewrites the state file while the script runs.
         flips = state["patches"].count({"spec": {"mode": "today"}})
         return "leg3" if flips >= 2 else "leg1"
 
@@ -590,8 +591,7 @@ class _Door(http.server.BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length) or b"{}")
         auth = self.headers.get("Authorization", "")
         if self.path == "/v1/responses":
-            fails = state["scenario"].get("today_turn_fails") or state["scenario"].get("today_turn_fails_on") == self._today_leg(state)
-            if auth != f"Bearer {_API_KEY}" or fails:
+            if auth != f"Bearer {_API_KEY}" or state["scenario"].get("today_turn_fails_on") == self._today_leg(state):
                 self._reply(401, {"error": "no"})
                 return
             self._reply(200, {"output": [{"role": "assistant", "content": "pong"}]})
@@ -1175,7 +1175,7 @@ class FailureTest(RoundTripTest):
         self.assertLess(time.monotonic() - started, 120)
 
     def test_no_answer_on_the_today_path(self) -> None:
-        result, _, _ = self.run_sim(healthy_next_state(today_turn_fails=True))
+        result, _, _ = self.run_sim(healthy_next_state(today_turn_fails_on="leg1"))
         self.assert_fails_at(result, "leg1.today-turn", "no answer from /v1/responses in 2 attempts")
 
     def test_a_bus_task_that_does_not_complete_after_the_flip_back(self) -> None:
