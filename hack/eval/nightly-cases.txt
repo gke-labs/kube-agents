@@ -190,8 +190,9 @@
 # takes the infra lock, plants a Deployment whose replica count was taken out
 # of band, hands the Session KV daemon the audit record that change would have
 # produced, and blocks until the resulting triage card is on the board
-# (bounded at 5 minutes) -- then the agent turn waits on the card itself, as
-# autoops does. Hinted at 900s with them, unmeasured.
+# (bounded at 5 minutes) and then until it finishes (bounded at 15), so the
+# agent turn reads a finished card rather than polling a running one. Hinted
+# at 900s with them, unmeasured.
 #
 # The daemon also has a drift alert ceiling that the other two do not have.
 # It allows ALERT_DAILY_LIMIT_DRIFT drift alerts a day per install and
@@ -808,10 +809,9 @@
 # drift audit's collector (#2386), and answers in chat without publishing.
 # deployer: noop; reads the seeded fleet's drift-outlier role (slot c).
 # Nightly rather than presubmit: consistency-authorized-networks-probe held
-# the domain's presubmit seat (nightly too since 2026-10-21, #3598). Red on
-# main: no SOUL.md row routes the question to fleet_drift.py. Marked
-# expected_fail: true, so the nightly records it as EXPECTED_FAIL and also
-# records whether the outlier and facet reply checks pass on seeded-c. The follow-up that adds the drift row removes the marker.
+# the domain's presubmit seat (nightly too since 2026-10-21, #3598). Green on
+# the SOUL.md drift row (#3398, #3609); ran as expected_fail from #3135 until
+# then.
 ./tasks/drift-chat-request-runs-collector/task.yaml
 
 # A plain chat request about the security of the fleet's AI and
@@ -979,7 +979,8 @@
 # detector is not pulling are digested, not triaged one card each. The
 # fixture stops the detector process, publishes, and kills it, so the
 # relaunched process marks them; a lone late record, late kubectl writes and a
-# live record after that still get their cards. Graded on the fixture's read
+# live record after that still get their cards, and on the eval install, which
+# has no chat route, the digest is one unassigned board card. Graded on the fixture's read
 # of the ledger and the board. Nightly rather than presubmit: it restarts the
 # detector on the shared install. Each repetition spends five drift alerts
 # (three kubectl cards, one lone-principal card, the live card): fifteen for
@@ -1039,6 +1040,11 @@
 # record measures it.
 ./tasks/incident-triage-workload-fold/task.yaml
 
+# A gcloud write the command policy refuses for a flag it cannot read: the
+# report claims no success and no delegated worker re-runs the write without
+# the flag after it (#2979, #3260). deployer: noop, transcript-only.
+./tasks/stop-on-unknown-flag-write-refusal/task.yaml
+
 # Optional GKE Support Agent (tse) specialist delegation and 5-section Google
 # Cloud Support Escalation Bundle contract (#3492): the Planning Agent delegates
 # a node NotReady (PLEG is not healthy) escalation request via
@@ -1050,6 +1056,14 @@
 # AgentProfile/tse renders nothing, it fails and appends evidence keeping it out
 # of presubmit per the header's L40-45 rule). Nightly from its first merge.
 ./tasks/tse-node-notready-pleg-probe/task.yaml
+
+# Catalogue entry 23 through the readiness report's control-plane-upgrade-history
+# rule: the capacity failures among each seeded cluster's upgrade and repair
+# operations, against its maintenance window (#3524). Read-only; no planted
+# fixture. Priced at 600s in unit_cost_hint as the first of the five
+# readiness-line cases of that change to launch; every one of the five makes
+# the same reads, and the figure is a ceiling until the nightly record prices them.
+./tasks/upgrades-audit-control-plane-capacity/task.yaml
 
 # Catalogue entry 12 (a node label is removed): seeded-a's
 # seeded-shapes/arch-pinned-worker (deprecated-label-selector), a
@@ -1167,6 +1181,11 @@
 # declared line: its verdict and the rule's cell. Nightly from its first merge.
 ./tasks/upgrades-readiness-client-addon-skew/task.yaml
 
+# Catalogue entry 24 through the readiness report's cluster-status-age rule: the
+# status, newest operation and age on every seeded cluster (#3524). Read-only; no planted
+# fixture; three units at the 200s default.
+./tasks/upgrades-readiness-cluster-status-age/task.yaml
+
 # Catalogue entry 13 through the readiness report's container-runtime rule:
 # node-runtime-probe on slot a mounts the containerd socket (role
 # containerd-socket-agent) and no pool's containerd major changes at the
@@ -1191,11 +1210,22 @@
 # lines. Nightly from its first merge.
 ./tasks/upgrades-readiness-intree-volume/task.yaml
 
+# Catalogue entry 26 through the readiness report's known-issues-matrix rule: the
+# add-on inventory and the rule's table over it, one declared line per seeded
+# cluster (#3524). Read-only; no planted fixture;
+# three units at the 200s default.
+./tasks/upgrades-readiness-known-issues/task.yaml
+
 # Catalogue entry 16 through the readiness report's network-dataplane rule: the
 # seeded clusters' legacy dataplane with the network policy add-on off and
 # default-deny policies that apply nowhere until enforcement turns on. Read-only;
 # the fleet's own shape, no planted fixture. Nightly from its first merge.
 ./tasks/upgrades-readiness-legacy-dataplane/task.yaml
+
+# Catalogue entry 22 through the readiness report's orphan-node-objects rule:
+# the Nodes without an instance behind them, counted on every seeded cluster
+# (#3524). Read-only; no planted fixture; three units at the 200s default.
+./tasks/upgrades-readiness-orphan-node/task.yaml
 
 # Upgrade-failure catalogue entry 2 through the readiness report's surge-capacity
 # rule: no-surge-pool on slot b removes its only node before a replacement exists
@@ -1203,6 +1233,12 @@
 # seeded fleet's readiness-surge-blocked and readiness-pinned-workload roles,
 # graded on declared lines. Nightly from its first merge.
 ./tasks/upgrades-readiness-surge-capacity/task.yaml
+
+# Catalogue entry 25 through the readiness report's target-patch-valid rule: its
+# re-read of the target and the running patch against the channel's valid
+# versions, on every seeded cluster (#3524).
+# Read-only; no planted fixture; three units at the 200s default.
+./tasks/upgrades-readiness-target-patch-valid/task.yaml
 
 # Catalogue entry 20 (images on a retired registry): seeded-a's
 # seeded-shapes/legacy-registry-pull (retired-registry-image),

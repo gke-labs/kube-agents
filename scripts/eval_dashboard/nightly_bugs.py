@@ -66,6 +66,14 @@ assigned to ``infra_owner`` in domains.yaml with ``infra_backup`` mentioned:
 The domain streak is untouched by either: an infrastructure repetition is
 dropped before a night counts as failing.
 
+**A listing it cannot trust files nothing.** Both issue listings are
+cross-checked against the same issues read through GraphQL
+(``Filer.listing_doubt``); when GraphQL cannot be read, or names more issues
+than the listing holds, the listings are read again (LISTING_ATTEMPTS),
+and when no read agrees the tick writes nothing and logs why; the next tick
+retries. Comments are read the same way: an issue whose listing counts
+more comments than the read returned is not commented on that tick.
+
 All GitHub traffic goes through ``ghcli.Gh``. **Dry run is the default**:
 reads happen, every write is printed instead of sent. ``--live`` sends them;
 the workflow passes it only when the repository variable
@@ -81,6 +89,7 @@ import json
 import pathlib
 import re
 import sys
+import time
 
 try:
     import yaml
@@ -130,6 +139,28 @@ OPEN_ISSUES_PATH = f"issues?labels={LABEL}&state=open&per_page=100"
 # handed off as not planned counts only while its close is on record
 # (``still_tracks``), so nothing older is needed.
 CLOSED_ISSUES_PATH = f"issues?labels={LABEL}&state=closed&since={{since}}&per_page=100"
+# The cross-check on both listings: the same issues read through GraphQL.
+# On 2026-10-22 the REST issue listing (any filter) and the search API both
+# answered 200 with no issues about half the time while the issues existed,
+# and the filer filed six duplicates (#3754-#3759); GraphQL and a single-issue
+# GET answered correctly every time. A REST listing that lacks an issue
+# GraphQL returns, or holds fewer issues than its totalCount, is not trusted.
+# A listing GraphQL disagrees with is read again, up to this many times in
+# one pass, before the pass writes nothing: the empty answers came about
+# half the time, so most passes still find a good read.
+LISTING_ATTEMPTS = 4
+# The pause between those reads: the empty answers came in bursts, so reads
+# back to back can all land in one.
+LISTING_RETRY_DELAY_S = 3
+GRAPHQL_PATH = "graphql"
+GRAPHQL_FIRST = 100
+LISTING_QUERY = """\
+query($owner: String!, $name: String!, $label: String!, $since: DateTime, $closed: Boolean!) {
+  repository(owner: $owner, name: $name) {
+    open: issues(labels: [$label], states: OPEN, first: %(first)d) { totalCount nodes { number } }
+    closed: issues(labels: [$label], states: CLOSED, first: %(first)d, filterBy: {since: $since}) @include(if: $closed) { totalCount nodes { number } }
+  }
+}""" % {"first": GRAPHQL_FIRST}
 # `since` in UTC with a Z: a `+00:00` offset would reach GitHub as a space.
 GITHUB_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 ISSUES_PATH = "issues"
@@ -558,25 +589,68 @@ class Filer:
     def closed_issues(self, since: str) -> list[dict] | None:
         return self.gh.call("GET", self.gh.path(CLOSED_ISSUES_PATH.format(since=since)), paginate=True)
 
-    def commented(self, number: int, marker: str) -> bool | None:
+    def listing_doubt(self, open_issues: list, closed_issues: list, since: str | None) -> str | None:
+        """Why the REST listings cannot be trusted, or None when GraphQL
+        agrees with them (LISTING_QUERY). A dedupe that reads an empty list
+        files every case again."""
+        owner, _, name = self.gh.repo.partition("/")
+        variables = {"owner": owner, "name": name, "label": LABEL, "since": since, "closed": bool(since)}
+        found = self.gh.call("POST", GRAPHQL_PATH, {"query": LISTING_QUERY, "variables": variables}, read=True)
+        repo = ((found or {}).get("data") or {}).get("repository") if isinstance(found, dict) else None
+        if not isinstance(repo, dict) or (found or {}).get("errors"):
+            return "the GraphQL cross-check could not be read"
+        for state, listed in (("open", open_issues), ("closed", closed_issues)):
+            if state == "closed" and not since:
+                continue
+            conn = repo.get(state)
+            if not isinstance(conn, dict) or not isinstance(conn.get("totalCount"), int) or not isinstance(conn.get("nodes"), list):
+                return f"the GraphQL cross-check of the {state} issues could not be read"
+            numbers = {i.get("number") for i in listed if isinstance(i, dict) and not i.get("pull_request")}
+            missing = sorted(n.get("number") for n in conn["nodes"] if isinstance(n, dict) and isinstance(n.get("number"), int) and n.get("number") not in numbers)
+            if missing or len(numbers) < conn["totalCount"]:
+                return (f"the {state} listing holds {len(numbers)} issues, GraphQL {conn['totalCount']}"
+                        + (f" (missing {', '.join(f'#{n}' for n in missing)})" if missing else ""))
+        return None
+
+    def commented(self, issue: dict, marker: str) -> bool | None:
+        """Whether a comment on ``issue`` carries ``marker``; None when the
+        comments cannot be read, or the read returned fewer than the issue
+        listing counts (the REST listings have answered empty while the
+        items existed, LISTING_QUERY)."""
+        number = issue["number"]
         comments = self.gh.call("GET", self.gh.path(COMMENTS_READ_PATH.format(number=number)), paginate=True)
         if comments is None:
+            return None
+        if isinstance(issue.get("comments"), int) and len(comments) < issue["comments"]:
+            log(f"warning: #{number} lists {issue['comments']} comments and the read returned {len(comments)}")
             return None
         return any(marker in (c.get("body") or "") for c in comments if isinstance(c, dict))
 
     def run(self, data: dict) -> dict:
         """One pass: ``{filed, recovered, tracked, skipped, failed}``, each a
         list of what was (or, dry, would be) done. Nothing is written when
-        the issues cannot be read: a dedupe that cannot see is not a dedupe."""
+        the issues cannot be read, or when GraphQL disagrees with the
+        listing (``listing_doubt``): a dedupe that cannot see is not a dedupe."""
         result = {"filed": [], "recovered": [], "noted": [], "tracked": [], "skipped": [], "failed": []}
         nights = graded_nights(data)
         parts = nightly_infra.part_nights(data, LOOKBACK_NIGHTS)
         starts = [nightly.parse_iso(n.get("started")) for ns in parts.values() for n in ns]
         self.horizon = min((t for t in starts if t), default=None)
-        open_issues = self.open_issues()
-        closed_issues = self.closed_issues(self.horizon.strftime(GITHUB_TIME_FORMAT)) if self.horizon else []
-        if open_issues is None or closed_issues is None:
-            log("warning: could not list the nightly-red issues; nothing filed or commented this pass")
+        since = self.horizon.strftime(GITHUB_TIME_FORMAT) if self.horizon else None
+        for attempt in range(1, LISTING_ATTEMPTS + 1):
+            open_issues = self.open_issues()
+            closed_issues = self.closed_issues(since) if since else []
+            if open_issues is None or closed_issues is None:
+                log("warning: could not list the nightly-red issues; nothing filed or commented this pass")
+                return result
+            doubt = self.listing_doubt(open_issues, closed_issues, since)
+            if not doubt:
+                break
+            log(f"warning: the nightly-red issue listing is not trusted ({doubt}); read {attempt} of {LISTING_ATTEMPTS}")
+            if attempt < LISTING_ATTEMPTS:
+                time.sleep(LISTING_RETRY_DELAY_S)
+        else:
+            log("warning: no trusted nightly-red issue listing this pass; nothing filed or commented, retried next tick")
             return result
         active = set(nightly.expected_cases(data))
         for case, verdicts in sorted(nights.items()):
@@ -700,7 +774,7 @@ class Filer:
             return
         marker = NIGHT_MARKER.format(kind=kind, field=field, key=key, date=night["date"])
         comment = INFRA_NIGHT_COMMENT.format(marker=marker, date=night["date"], what=what, run_url=night["run_url"])
-        done = self.comment_once(issue["number"], marker, comment)
+        done = self.comment_once(issue, marker, comment)
         if done is not None:
             result["noted" if done else "failed"].append({"case": key, "issue": issue["number"], "night": night["date"], "run": night["run_url"]})
 
@@ -736,16 +810,17 @@ class Filer:
             return
         marker = INFRA_RECOVERY_MARKER.format(kind=kind, field=field, key=key, date=night["date"])
         comment = INFRA_RECOVERY_COMMENT.format(marker=marker, what=what, date=night["date"], run_url=night["run_url"])
-        done = self.comment_once(issue["number"], marker, comment)
+        done = self.comment_once(issue, marker, comment)
         if done is not None:
             result["recovered" if done else "failed"].append({"case": key, "issue": issue["number"], "night": night["date"], "run": night["run_url"]})
 
-    def comment_once(self, number: int, marker: str, body: str) -> bool | None:
+    def comment_once(self, issue: dict, marker: str, body: str) -> bool | None:
         """Post ``body`` unless a comment already carries ``marker``: None
         when it is already there, else whether the post went through (or,
         dry, would be sent). Comments that cannot be read are a failure:
         the post is owed and was not attempted."""
-        already = self.commented(number, marker)
+        number = issue["number"]
+        already = self.commented(issue, marker)
         if already:
             return None
         if already is None:
@@ -801,7 +876,7 @@ class Filer:
             return None
         marker = RECOVERY_MARKER.format(case=case, date=night["date"])
         body = RECOVERY_COMMENT.format(marker=marker, case=case, passed=night["passed"], graded=night["graded"], date=night["date"], run_url=night["run_url"])
-        posted = self.comment_once(issue["number"], marker, body)
+        posted = self.comment_once(issue, marker, body)
         if posted is None:
             return None
         return {"case": case, "issue": issue["number"], "night": night["date"], "run": night["run_url"], "ok": posted}

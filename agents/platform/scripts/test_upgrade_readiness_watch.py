@@ -2729,11 +2729,11 @@ class Loader(unittest.TestCase):
         self.assertTrue(shipped["readiness_rules"][2])
         self.assertFalse(shipped[watch.REPORT_MODULE][2])
         self.assertTrue(all(Path(entry[1]).is_file() for entry in shipped.values()))
-        # The data files beside the modules ship too (the removal table), the test fixtures do not.
+        # The data files beside the modules ship too (the removal table and the known-issues table), the test fixtures do not.
         data = watch.shipped_data()
-        self.assertEqual(sorted(Path(path).name for path in data), ["removed_apis.json"])
+        self.assertEqual(sorted(Path(path).name for path in data), ["known_issues.json", "removed_apis.json"])
         self.assertTrue(all(Path(path).is_file() for path in data))
-        self.assertEqual(sorted(Path(path).name for path in watch.shipped_data(root="/elsewhere")), ["removed_apis.json"])
+        self.assertEqual(sorted(Path(path).name for path in watch.shipped_data(root="/elsewhere")), ["known_issues.json", "removed_apis.json"])
         self.assertTrue(all(path.startswith("/elsewhere/") for path in watch.shipped_data(root="/elsewhere")))
 
     def test_a_replacement_is_read_from_the_shipped_set_alone(self) -> None:
@@ -2758,6 +2758,28 @@ class Loader(unittest.TestCase):
             completed = subprocess.run([sys.executable, "-I", "-"], input=without_data, capture_output=True, text=True, cwd=scratch, env=env, timeout=120)
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("removed_apis.json could not be read beside upgrade_shape_tables", completed.stderr)
+
+    def test_the_known_issues_table_is_read_from_the_shipped_set_alone(self) -> None:
+        """The known-issues rule reads its table through the module loader, as the shape tables
+        read the removal table: re-rooted to a directory that does not exist, the table still
+        comes from the shipped data; without the data, the rule's loader says so."""
+        with tempfile.TemporaryDirectory() as scratch:
+            absent = os.path.join(scratch, "absent")
+            program = watch.loader_preamble(root=absent) + "\n".join(
+                [
+                    "matrix = importlib.import_module('readiness_rules.known_issues_matrix')",
+                    "table, error = matrix.load_table()",
+                    "print(error or len(table['issues']))",
+                ]
+            )
+            env = {"PATH": os.environ.get("PATH", ""), "HOME": scratch, "TMPDIR": scratch}
+            completed = subprocess.run([sys.executable, "-I", "-"], input=program, capture_output=True, text=True, cwd=scratch, env=env, timeout=120)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertTrue(completed.stdout.strip().splitlines()[-1].isdigit(), completed.stdout)
+            without_data = program.replace("DATA = {", "DATA = {}  # ", 1)
+            completed = subprocess.run([sys.executable, "-I", "-"], input=without_data, capture_output=True, text=True, cwd=scratch, env=env, timeout=120)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("known_issues.json could not be read beside upgrade_shape_tables", completed.stdout)
 
     def test_the_report_imports_from_the_shipped_set_alone(self) -> None:
         """The finder alone, in an empty directory under ``-I``: every import the report

@@ -856,7 +856,8 @@ spec:
             name: platformagent-settings
             optional: true
           name: settings
-        - emptyDir: {}
+        - emptyDir:
+            sizeLimit: 1Mi
           name: hermes-sync-block
         - name: credential-proxy-token
           projected:
@@ -1677,9 +1678,11 @@ spec:
           resources:
             limits:
               cpu: 100m
+              ephemeral-storage: 65Mi
               memory: 64Mi
             requests:
               cpu: 10m
+              ephemeral-storage: 65Mi
               memory: 16Mi
           securityContext:
             allowPrivilegeEscalation: false
@@ -1821,7 +1824,8 @@ spec:
             defaultMode: 420
             name: platformagent-fluent-bit-config
           name: fluent-bit-config
-        - emptyDir: {}
+        - emptyDir:
+            sizeLimit: 128Mi
           name: fluent-bit-state
         - name: system-metadata
           persistentVolumeClaim:
@@ -1886,7 +1890,8 @@ spec:
                 path: id_ed25519
             optional: true
             secretName: platform-agent-secrets
-        - emptyDir: {}
+        - emptyDir:
+            sizeLimit: 1Mi
           name: sandbox-ssh
 status: {}
 ---

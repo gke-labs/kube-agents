@@ -1377,6 +1377,52 @@ def test_worker_commands_after_result_a_partial_capture_is_error_unless_a_hit_wa
     assert required.verify(5.0).status == "fail"
 
 
+# A required-only check that sets the switch to read the calls as typed
+# (``after_result_pattern: "(?!)"``, as the collector cases do) is not the
+# ordered retry check: a gap beside a found run, an untimed call, and a
+# command the log shows but the trajectory missed must not turn its pass
+# into an error or a fail (#3128, #3831 review).
+_AS_TYPED_RUN = WorkerCommandsVerifier(
+    type="worker_commands", after_result_pattern="(?!)", required_runs=[{"script": "collect.py", "word_patterns": ["^ai-security-audit$"]}]
+)
+_COLLECT = "mkdir -p /opt/data/scratch && python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/collect.py ai-security-audit"
+
+
+def test_worker_commands_as_typed_a_gap_beside_a_found_run_is_a_pass():
+    transcript.set("ok", _TRAJECTORY + [_terminal(_COLLECT, at=1)], worker_commands=[{"task": "t_1", "command": "mkdir -p /opt/data/scratch + 1 command"}], worker_capture_gaps=["card t_9: locked"])
+    res = _AS_TYPED_RUN.verify(5.0)
+    assert res.status == "pass", res.reason
+    # No window was used, so the reason names none.
+    assert "opened the window" not in res.reason and "forbidden pattern(s) graded nothing" not in res.reason
+    # A run missing from a gapped capture may be in the unread part: still an
+    # error, and the reason names the run, not a forbidden pattern.
+    transcript.set("ok", _TRAJECTORY + [_terminal("ls", at=1)], worker_commands=[{"task": "t_1", "command": "ls"}], worker_capture_gaps=["card t_9: locked"])
+    res = _AS_TYPED_RUN.verify(5.0)
+    assert res.status == "error"
+    assert "card t_9: locked" in res.reason and "run collect.py" in res.reason and "forbidden" not in res.reason
+    # The ordered check keeps its rule: a clean read with a gap is an error.
+    transcript.set("ok", _TRAJECTORY + [_terminal("kubectl scale deploy kube-dns --replicas=3", _REFUSAL, at=1)], worker_capture_gaps=["card t_9: locked"])
+    assert _RETRY.verify(5.0).status == "error"
+
+
+def test_worker_commands_as_typed_an_untimed_call_is_graded():
+    _stash_terminal([_terminal(_COLLECT, at=None)])
+    assert _AS_TYPED_RUN.verify(5.0).status == "pass"
+
+
+def test_worker_commands_as_typed_a_run_on_the_log_but_not_in_the_trajectory_still_counts():
+    # The #2959 shape: the session-store read returned a strict subset of
+    # the card's calls with no gap recorded; the log row carries the run.
+    one_line = "python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/collect.py ai-security-audit"
+    transcript.set("ok", _TRAJECTORY + [_terminal("ls /opt/data/scratch", at=1)], worker_commands=[{"task": "t_1", "command": one_line}], worker_capture_gaps=[])
+    res = _AS_TYPED_RUN.verify(5.0)
+    assert res.status == "pass", res.reason
+    assert "2 worker command(s) (1 tagged calls as typed and 1 from the card log)" in res.reason
+    # A row that renders the same text as a call is not counted twice.
+    transcript.set("ok", _TRAJECTORY + [_terminal(one_line, at=1)], worker_commands=[{"task": "t_1", "command": one_line}])
+    assert "1 worker command(s)" in _AS_TYPED_RUN.verify(5.0).reason
+
+
 def test_worker_commands_after_result_a_clipped_head_with_a_cut_escape_is_kept_raw():
     raw = {"raw": '{"command": "kubectl apply -f /tmp/dns.yaml \\u1'}
     _stash_terminal(
