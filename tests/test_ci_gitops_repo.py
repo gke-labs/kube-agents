@@ -492,6 +492,14 @@ class CiDeployGitopsRepoTest(unittest.TestCase):
                     self.assertNotIn("is not a forge this deploy knows", err)
                     self.assertNotIn("forges[0]", out)
 
+    def test_a_relative_state_dir_is_refused_before_anything(self):
+        # The grader runs under bench/, so a relative state directory would pass
+        # both preflights and lose the CA there; refused where the variable is read.
+        rc, out, err = self._resolve("kube-agents-evals-2", PULL_NUMBER="123", EVAL_FORGE="ghes", EVAL_GITHUB_APP_ID="123456", EVAL_FORGE_STATE_DIR="eval-forge")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("EVAL_FORGE_STATE_DIR='eval-forge' must be an absolute path", err)
+        self.assertNotIn("forges[0]", out)
+
     def test_a_ca_file_that_is_not_a_ca_is_refused_before_anything(self):
         # A leaf certificate copied into place, or a CA made without CA:TRUE
         # (the macOS/LibreSSL shape), passes -s and fails the grader after the

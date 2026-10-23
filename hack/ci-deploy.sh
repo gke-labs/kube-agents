@@ -1118,6 +1118,10 @@ EVAL_FORGE="${EVAL_FORGE:-github}"
 # private directory of the job's pod, never under the artifacts, so none of it
 # is uploaded.
 EVAL_FORGE_STATE_DIR="${EVAL_FORGE_STATE_DIR:-/tmp/eval-forge}"
+case "${EVAL_FORGE_STATE_DIR}" in
+  /*) ;;
+  *) echo "ERROR: EVAL_FORGE_STATE_DIR='${EVAL_FORGE_STATE_DIR}' must be an absolute path: the grader runs under bench/ and reads the CA by this path (kube-agents#3682)." >&2; exit 1 ;;
+esac
 FORGE_CA_FILE="${EVAL_FORGE_STATE_DIR}/ca.crt"
 # The Secret the forge's caBundleRef names, per kind: the installer's names,
 # so an install made by hand and one made here read the same way.

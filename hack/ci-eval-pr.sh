@@ -500,6 +500,10 @@ fi
 # helpers trust for that host, and on a per-run GitLab the token pair the
 # lane step minted. Never under the artifacts.
 EVAL_FORGE_STATE_DIR="${EVAL_FORGE_STATE_DIR:-/tmp/eval-forge}"
+case "${EVAL_FORGE_STATE_DIR}" in
+  /*) ;;
+  *) echo "ERROR: EVAL_FORGE_STATE_DIR='${EVAL_FORGE_STATE_DIR}' must be an absolute path: the grader runs under bench/ and reads the CA by this path (kube-agents#3682)." >&2; exit 1 ;;
+esac
 EVAL_FORGE_CA_FILE=""
 if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
   EVAL_FORGE_CA_FILE="${EVAL_FORGE_STATE_DIR}/ca.crt"
