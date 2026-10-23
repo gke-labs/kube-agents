@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -290,7 +291,9 @@ func (r *PlatformAgentReconciler) ensureA2AMCPToken(ctx context.Context, agent *
 		if !metav1.IsControlledBy(existing, agent) {
 			return fmt.Errorf("refusing to adopt unowned Secret %s/%s as the MCP server's token; delete it, or give it a controller reference to this PlatformAgent", name.Namespace, name.Name)
 		}
-		if len(existing.Data[a2aMCPAccessKey]) > 0 {
+		// The server trims the token file and refuses an empty one, so a
+		// whitespace-only value is empty here too and is minted over.
+		if strings.TrimSpace(string(existing.Data[a2aMCPAccessKey])) != "" {
 			return nil
 		}
 		token, err := randomA2AInjectToken()
@@ -358,6 +361,13 @@ func (r *PlatformAgentReconciler) removeA2AMCP(ctx context.Context, agent *agent
 	fence := objs[a2aMCPFenceIndex]
 	for i, entry := range objs {
 		if i == a2aMCPFenceIndex {
+			continue
+		}
+		// With the flag off this runs on every next reconcile, so an object
+		// under a reserved name that this PlatformAgent does not own is not
+		// ours to remove and must not stop the rest of the reconcile: it is
+		// skipped. Only the flag's own path refuses it (ensureA2AMCPToken).
+		if err := entry.reader.Get(ctx, client.ObjectKeyFromObject(entry.obj), entry.obj); err == nil && !metav1.IsControlledBy(entry.obj, agent) {
 			continue
 		}
 		if err := r.deleteOwnedA2AObject(ctx, agent, entry.obj, entry.reader); err != nil {

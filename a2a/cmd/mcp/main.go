@@ -49,8 +49,11 @@ const (
 	// a caller may ask for: send_message waits for the gateway's submission
 	// and then up to the longest answer wait (mcp.MaxTurnWait). A streamed
 	// answer, if a later tool adds one, has to revisit this.
-	writeTimeout  = mcp.MaxTurnWait + time.Minute
-	shutdownGrace = 5 * time.Second
+	writeTimeout = mcp.MaxTurnWait + time.Minute
+	// shutdownGrace outlasts a status read (mcp's statusTimeout, 8 s), well
+	// inside the pod's default 30 s termination grace. A turn still waiting
+	// at a stop outlasts it; tying request contexts to the stop is #3841.
+	shutdownGrace = 10 * time.Second
 	// dialTimeout bounds one attempt at the first connect to the bus.
 	dialTimeout = 30 * time.Second
 	// The first connect is retried, from dialBackoff doubling to
