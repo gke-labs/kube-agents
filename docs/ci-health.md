@@ -34,8 +34,8 @@ describes it. When the section cannot be built, the digest carries one line on
 the night instead (the cases recorded, how many passed all reps, partial and
 failed, what is newly failing against the night before, the opening chat
 turn's p50 and p95 as advice beside the p95 < 10 s target
-([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md); empty since the nightly grades
-`spec.mode: next`, because the harness times the opening turn on the agent API only),
+([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md); on the inject door the next-mode nightly
+grades through, the opening task from the door accepting it to its terminal),
 and the wall clock, or that the night was cut short, still running or missing),
 a link to the dashboard's Nightly report (`nightly.html`), and a line saying why
 the section was skipped. A night can be the builds of up to three periodics
@@ -44,6 +44,10 @@ writers job), reported as one night: the line names a part that is missing,
 still running or cut short, and the night counts as cut short when its main or
 main-b part is. `scripts/eval_dashboard/nightly.py` derives that line
 and the report from the same nightly runs.
+Whether or not the section was built, a further line says the same of the
+today-mode nightly kept as the rollback check (`ci-kube-agents-eval-nightly-today`, tier
+`nightly-today` in `data.json`), compared with its own night before and linked to its Prow job
+history, since the dashboard has no page for it.
 The same tick reads the eval evidence store (`gs://kube-agents-evals-bench/evidence`,
 the records the nightly appends; `scripts/eval_dashboard/store.py`, best-effort
 and incremental) and renders the dashboard's Trend page (`trend.html`,
@@ -211,7 +215,8 @@ forge-grading cases of `hack/eval/gitlab-cases.txt` (registered cases, not only 
 nightly, `ci-kube-agents-eval-nightly-gitlab`, runs the same list and lands as the
 section's nights, read from its own log prefix), against a pool project's GitLab repository, listed in the Brief's "GitLab
 lane" section with its own counts and links, and in no gate number, case
-history or digest line.
+history or digest line. The today-mode nightly's runs (`tier: nightly-today`) reach only the
+digest's rollback line.
 
 ## Hysteresis
 

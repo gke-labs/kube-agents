@@ -121,6 +121,11 @@ Sources:
               DEFAULT_NIGHTLY_MAIN_B_PREFIX; read, watermarked and warned
               about as the writers prefix is, against
               DEFAULT_NIGHTLY_MAIN_B_JOB.
+  --nightly-today-prefix  the same, for the today-mode nightly kept as
+              the rollback check (DEFAULT_NIGHTLY_TODAY_PREFIX given without
+              a value; omitted, no scan). Its runs are tier
+              `nightly-today`, a night of their own on a watermark of their
+              own, read only by the digest's rollback line.
   --index-prefix  Prow's per-job directory index, gs://<bucket>/pr-logs/
               directory/<job>/: one small `<build_id>.txt` object per build
               holding the gs:// path of that build's directory (plus a
@@ -216,8 +221,7 @@ SCHEMA_VERSION = 1
 # The nightly periodic (oss-test-infra: ci-kube-agents-eval-nightly, the
 # EVAL_TIER=nightly companion of the presubmit, on spec.mode next like it)
 # and where Prow archives it. The today-mode nightly kept as the rollback
-# check (ci-kube-agents-eval-nightly-today) logs to the same bucket and is
-# not collected.
+# check logs to the same bucket (DEFAULT_NIGHTLY_TODAY_JOB below).
 # A periodic's log prefix holds one directory per build and a
 # latest-build.txt, so listing it is the directory index; there is no
 # pointer object to follow. The bucket is the nightly's own, not the
@@ -248,6 +252,12 @@ DEFAULT_NIGHTLY_MAIN_B_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_MAIN_B_JO
 # archived as a periodic beside the GitHub nightly, tier gitlab, pr null.
 DEFAULT_GITLAB_NIGHTLY_JOB = "ci-kube-agents-eval-nightly-gitlab"
 DEFAULT_GITLAB_NIGHTLY_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_GITLAB_NIGHTLY_JOB}/"
+# The today-mode nightly kept as the rollback check (#3783): the full
+# catalogue on a spec.mode today install at 06:00 UTC. Tier nightly-today,
+# its own night and watermark, so nothing that reads the main nightly's
+# next-mode runs counts it.
+DEFAULT_NIGHTLY_TODAY_JOB = "ci-kube-agents-eval-nightly-today"
+DEFAULT_NIGHTLY_TODAY_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_TODAY_JOB}/"
 # Where Prow's Spyglass shows a build directory: the gs:// path after the
 # scheme, so a link follows the bucket the build was read from.
 SPYGLASS_VIEW = "https://oss.gprow.dev/view/gs/"
@@ -466,7 +476,8 @@ _REP_REPORT_LINE = re.compile(r"^\s+rep (?P<n>\d+) report: (?P<text>.*)$")
 # grading line, printed by `bench-gate case` with each of two values it knows,
 # one decimal each -- `agent_s` the agent run's wall clock (results.json's
 # `latency`: no provisioning, verification or judge in it),
-# `turn1_s` the opening chat turn on the api transport. Its own shape, `rep N
+# `turn1_s` the opening chat turn (on the inject transport, the opening task
+# to its terminal). Its own shape, `rep N
 # timing:`, so `_REP_LINE` never matches it.
 #   rep 2 timing: agent_s=143.2 turn1_s=6.4
 _REP_TIMING_LINE = re.compile(r"^\s+rep (?P<n>\d+) timing: (?P<fields>.*)$")
@@ -2097,6 +2108,7 @@ def collect(
     rc_limit: int = RC_RELEASES_MAX,
     gitlab_globs: list[str] | None = None,
     gitlab_nightly_prefix: str | None = None,
+    nightly_today_prefix: str | None = None,
 ) -> dict:
     # gh=None skips pr_merged resolution entirely (runs carry no key), which
     # keeps library callers and unit tests hermetic; the CLI passes its --gh
@@ -2118,6 +2130,7 @@ def collect(
     # the presubmit's (the Grid) can keep a night in flight off them.
     nightly_pending: set[str] = set()
     gitlab_pending: set[str] = set()
+    today_pending: set[str] = set()
     # And where each of those sits, as Spyglass shows it: the prior's entry
     # when it carried one, else the prefix this scan listed the build under.
     nightly_pending_urls: dict[str, str] = {}
@@ -2167,6 +2180,7 @@ def collect(
     main_b_after = None
     gitlab_after = None
     gitlab_night_after = None
+    today_after = None
     if merge_with is not None:
         prior_data = load_prior(merge_with, gsutil)
         if prior_data is not None:
@@ -2179,6 +2193,7 @@ def collect(
             # of one tier, each above its own watermark; `pr` tells them apart.
             gitlab_after = newest_build_id([r for r in tiers.gitlab_runs(prior) if r.get("pr") is not None])
             gitlab_night_after = newest_build_id([r for r in tiers.gitlab_runs(prior) if r.get("pr") is None])
+            today_after = newest_build_id(tiers.nightly_today_runs(prior))
             for build_id, first_seen in pending_from_prior(prior_data).items():
                 if _pending_expired(first_seen, now_dt):
                     print(
@@ -2196,6 +2211,10 @@ def collect(
                         nightly_pending_urls[entry["build_id"]] = entry["log_url"]
                 elif isinstance(entry, dict) and entry.get("build_id") in retry and tiers.is_gitlab(entry):
                     gitlab_pending.add(entry["build_id"])
+                elif isinstance(entry, dict) and entry.get("build_id") in retry and tiers.is_nightly_today(entry):
+                    today_pending.add(entry["build_id"])
+                    if isinstance(entry.get("log_url"), str):
+                        nightly_pending_urls[entry["build_id"]] = entry["log_url"]
         # No usable prior -- or a prior that yields no numeric watermark --
         # means the incremental scan cannot resume, and an unbounded cold
         # sweep is ~3 gsutil calls per archived build. Bound the recovery
@@ -2234,7 +2253,7 @@ def collect(
             indexes.append(prefix)
     # The presubmit's retries are its own pending builds; a GitLab or nightly
     # one is retried by its source, which knows where it lives.
-    presubmit_retry = frozenset(b for b in retry if b not in gitlab_pending and b not in nightly_pending)
+    presubmit_retry = frozenset(b for b in retry if b not in gitlab_pending and b not in nightly_pending and b not in today_pending)
     for prefix in indexes:
         fresh.extend(
             runs_from_index(
@@ -2352,6 +2371,23 @@ def collect(
         for build_id in unfinished - listed_before:
             nightly_pending_urls.setdefault(build_id, spyglass_url(prefix.rstrip("/") + f"/{build_id}/"))
         fresh.extend(out)
+    # The today-mode nightly, the rollback check: the same periodic read
+    # above a watermark of its own, tagged its own tier, so its night never
+    # joins the main nightly's and no reader of tier nightly counts it.
+    today_fresh: list[dict] = []
+    if nightly_today_prefix:
+        listed_before = set(unfinished)
+        today_fresh.extend(
+            runs_from_periodic(
+                nightly_today_prefix, gsutil, after_build=today_after, since_cutoff=since_cutoff,
+                retry_builds=frozenset(b for b in retry if b in today_pending), unfinished=unfinished,
+                tier=tiers.TIER_NIGHTLY_TODAY,
+            )
+        )
+        today_pending |= unfinished - listed_before
+        for build_id in unfinished - listed_before:
+            nightly_pending_urls.setdefault(build_id, spyglass_url(nightly_today_prefix.rstrip("/") + f"/{build_id}/"))
+        fresh.extend(today_fresh)
     if merge_with is not None:
         print(
             f"note: merged {len(prior)} prior runs with {len(fresh)} newly"
@@ -2388,6 +2424,12 @@ def collect(
                 if gitlab_nightly_prefix
                 else ""
             )
+            + (
+                f"; today nightly resumed above build {today_after},"
+                f" {len(today_fresh)} new"
+                if nightly_today_prefix
+                else ""
+            )
             + ")",
             file=sys.stderr,
         )
@@ -2420,7 +2462,12 @@ def collect(
             {
                 "build_id": build_id,
                 "first_seen": pending[build_id],
-                **({tiers.TIER_KEY: tiers.TIER_NIGHTLY} if build_id in nightly_pending else {tiers.TIER_KEY: tiers.TIER_GITLAB} if build_id in gitlab_pending else {}),
+                **(
+                    {tiers.TIER_KEY: tiers.TIER_NIGHTLY} if build_id in nightly_pending
+                    else {tiers.TIER_KEY: tiers.TIER_GITLAB} if build_id in gitlab_pending
+                    else {tiers.TIER_KEY: tiers.TIER_NIGHTLY_TODAY} if build_id in today_pending
+                    else {}
+                ),
                 **({"log_url": nightly_pending_urls[build_id]} if nightly_pending_urls.get(build_id) else {}),
             }
             for build_id in sorted(pending, key=int)
@@ -2552,6 +2599,17 @@ def main(argv: list[str] | None = None) -> int:
         " a watermark of their own",
     )
     parser.add_argument(
+        "--nightly-today-prefix",
+        nargs="?",
+        const=DEFAULT_NIGHTLY_TODAY_PREFIX,
+        default=None,
+        metavar="GS_PREFIX",
+        help="also collect the today-mode nightly, the rollback check, from this"
+        f" Prow log prefix (given without a value: {DEFAULT_NIGHTLY_TODAY_PREFIX})."
+        " Omitted: no scan. Its runs carry tier=nightly-today, pr=null, job the"
+        " prefix's last segment, and their own watermark",
+    )
+    parser.add_argument(
         "--from-dir",
         type=pathlib.Path,
         help="local directory of <build_id>/ subdirs with build-log.txt,"
@@ -2636,11 +2694,12 @@ def main(argv: list[str] | None = None) -> int:
         and args.rc_from_dir is None
         and not args.gitlab_pr_glob
         and args.gitlab_nightly_prefix is None
+        and args.nightly_today_prefix is None
     ):
         parser.error(
             "nothing to collect: pass --pr-glob, --gitlab-pr-glob, --gitlab-nightly-prefix,"
             " --nightly-prefix, --nightly-writers-prefix, --nightly-main-b-prefix,"
-            " --from-dir, --rc-glob,"
+            " --nightly-today-prefix, --from-dir, --rc-glob,"
             " --rc-from-dir and/or --merge-with"
         )
     if args.rc_limit < 1:
@@ -2665,13 +2724,15 @@ def main(argv: list[str] | None = None) -> int:
         rc_limit=args.rc_limit,
         gitlab_globs=args.gitlab_pr_glob,
         gitlab_nightly_prefix=args.gitlab_nightly_prefix,
+        nightly_today_prefix=args.nightly_today_prefix,
     )
     args.out.write_text(json.dumps(data, indent=2) + "\n")
     nightly = len(tiers.nightly_runs(data["runs"]))
     gitlab = len(tiers.gitlab_runs(data["runs"]))
+    today = len(tiers.nightly_today_runs(data["runs"]))
     print(
-        f"wrote {args.out}: {len(data['runs'])} runs ({len(data['runs']) - nightly - gitlab} presubmit,"
-        f" {nightly} nightly, {gitlab} gitlab), {len(data['cases'])} cases,"
+        f"wrote {args.out}: {len(data['runs'])} runs ({len(data['runs']) - nightly - gitlab - today} presubmit,"
+        f" {nightly} nightly, {gitlab} gitlab, {today} nightly-today), {len(data['cases'])} cases,"
         f" {len(data.get('releases') or [])} releases,"
         f" {data['coverage']['domains_covered']}/{data['coverage']['domains_total']}"
         " domains covered",
