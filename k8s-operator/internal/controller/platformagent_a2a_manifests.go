@@ -2746,7 +2746,7 @@ func a2aOperatorNATSPeers() []networkingv1.NetworkPolicyPeer {
 }
 
 // a2aProvisionScript is the provisioning payload: the four streams, three KV
-// buckets, and three starter topics from the deployment spec, created
+// buckets, and four starter topics from the deployment spec, created
 // idempotently with the nats CLI. Topics are provisioned-only (payload spec):
 // which topics exist is exactly the subject lists rendered here.
 func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
@@ -3000,7 +3000,7 @@ $NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY --allo
   --max-msgs-per-subject=1 --max-bytes=1073741824 --discard=old --replicas=1 --max-consumers=64 --defaults
 
 # TOPICS-STATE: current answer plus short history, no age limit. 1GiB cap.
-# State-class topics (provisioned registry): upgrade-readiness, blueprint, probe.
+# State-class topics (provisioned registry): upgrade-readiness, topology-skew, blueprint, probe.
 #
 # The probe subject is the one here with NO writer, deliberately, and it is the
 # single exception to the rule that a topic's subject list and its writer's
@@ -3016,7 +3016,7 @@ $NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY --allo
 # hold" is the assumption the web user already broke once. A writerless
 # subject makes the failure mode land nowhere.
 $NATS stream info TOPICS-STATE >/dev/null 2>&1 || $NATS stream add TOPICS-STATE --allow-direct \
-  --subjects='a2a.topics.agent.platform.upgrade-readiness,a2a.topics.shared.blueprint,a2a.topics.shared.probe' \
+  --subjects='a2a.topics.agent.platform.upgrade-readiness,a2a.topics.agent.platform.topology-skew,a2a.topics.shared.blueprint,a2a.topics.shared.probe' \
   --storage=file --retention=limits \
   --max-msgs-per-subject=8 --max-bytes=1073741824 --discard=old --replicas=1 --max-consumers=64 --defaults
 
@@ -3119,6 +3119,18 @@ elif [ "${live_subject_cap}" != "` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `
   echo "  stream and does not assume the difference is unintended. To align it anyway, knowing that" >&2
   echo "  lowering it evicts every subject already over the new value, oldest event first:" >&2
   echo "    nats stream edit TASKS --max-msgs-per-subject=` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `" >&2
+fi
+# TOPICS-STATE older than this render: check that topology-skew is in its subject list.
+# Provisioning is create-only convergence, so an existing TOPICS-STATE stream keeps
+# the subject list it was created with.
+topics_state_json="$($NATS stream info TOPICS-STATE --json | tr -d ' \t\r\n')"
+topics_state_subjects="$(printf '%s' "${topics_state_json}" \
+  | grep -o '"subjects":\[[^]]*\]' | head -n1 | sed 's/^"subjects":\[//;s/\]$//;s/"//g' || true)"
+if [ -n "${topics_state_subjects}" ] && \
+   ! printf '%s' "${topics_state_json}" | grep -Eq '"a2a\.topics\.(>|agent\.(>|platform\.(>|\*|topology-skew)))"'; then
+  echo "NOTE: TOPICS-STATE does not carry subject a2a.topics.agent.platform.topology-skew." >&2
+  echo "  Provisioning does not edit an existing stream; to append the subject to its current subjects:" >&2
+  echo "    nats stream edit TOPICS-STATE --subjects=\"${topics_state_subjects},a2a.topics.agent.platform.topology-skew\"" >&2
 fi
 # Written only where the kubelet has mounted the file: outside a pod there is
 # nothing to write to, and a copy of a report is not a reason to fail a fully

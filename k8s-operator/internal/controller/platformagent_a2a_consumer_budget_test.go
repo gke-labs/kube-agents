@@ -1030,6 +1030,24 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 			wantExit:   1,
 			wantStderr: []string{"could not read max_msgs_per_subject"},
 		},
+		{
+			name:       "an existing TOPICS-STATE missing topology-skew prints the stream edit note preserving existing subjects",
+			liveJSON:   `{"name":"TASKS","max_consumers":332,"max_msgs_per_subject":4096,"subjects":["a2a.topics.agent.platform.upgrade-readiness","a2a.topics.shared.blueprint","a2a.topics.shared.probe","a2a.topics.custom.extra"]}`,
+			wantExit:   0,
+			wantStderr: []string{"NOTE: TOPICS-STATE does not carry subject a2a.topics.agent.platform.topology-skew", `nats stream edit TOPICS-STATE --subjects="a2a.topics.agent.platform.upgrade-readiness,a2a.topics.shared.blueprint,a2a.topics.shared.probe,a2a.topics.custom.extra,a2a.topics.agent.platform.topology-skew"`},
+		},
+		{
+			name:      "an existing TOPICS-STATE that already carries topology-skew prints no note",
+			liveJSON:  `{"name":"TASKS","max_consumers":332,"max_msgs_per_subject":4096,"subjects":["a2a.topics.agent.platform.upgrade-readiness","a2a.topics.agent.platform.topology-skew","a2a.topics.shared.blueprint","a2a.topics.shared.probe"]}`,
+			wantExit:  0,
+			notStderr: []string{"NOTE: TOPICS-STATE"},
+		},
+		{
+			name:      "an existing TOPICS-STATE covered by a platform wildcard prints no note",
+			liveJSON:  `{"name":"TASKS","max_consumers":332,"max_msgs_per_subject":4096,"subjects":["a2a.topics.agent.platform.>","a2a.topics.shared.>"]}`,
+			wantExit:  0,
+			notStderr: []string{"NOTE: TOPICS-STATE"},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
