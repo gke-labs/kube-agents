@@ -2363,19 +2363,23 @@ else
   fi
   echo "cases that request a pull request, run after every other unit and each after the repository is reset: ${INJECT_LANE_REQUESTING:-none}"
 fi
-# The cases API_LANE_EXCLUDED names that are still in the matrix (so only on
-# the inject lane) run in the same second phase although they request no
-# pull request. Each is a stopped ask, and a stop that fails leaves its card
-# to open a pull request mid-run, which the lane's write safeguard would
-# charge to every case whose window it overlaps. Alone in the second phase,
-# a failed stop reds only itself.
+# The stopped asks in the matrix (a prompt opening with the harness's stop
+# directive, bench/kube_agents_bench/stop_hook.py; only the inject lane
+# carries one) run in the same second phase although they request no pull
+# request: a stop that fails leaves its card to open a pull request mid-run,
+# which the lane's write safeguard would charge to every case whose window
+# it overlaps. Alone in the second phase, a failed stop reds only itself.
+# Read from the prompt, as the harness reads it, not from
+# api-lane-exclusions.txt, which may come to list door-only cases of other
+# kinds.
 STOPPED_ASK_CASES=""
-for ENTRY in "${TASKS[@]}"; do
-  NAME="$(basename "$(dirname "${ENTRY}")")"
-  if grep -qxF -- "${NAME}" <<< "${API_LANE_EXCLUDED}"; then
-    STOPPED_ASK_CASES="${STOPPED_ASK_CASES:+${STOPPED_ASK_CASES},}${NAME}"
+if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ]; then
+  if ! STOPPED_ASK_CASES="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.stop_hook "${TASKS[@]}" \
+      | awk '{ printf "%s%s", sep, $0; sep = "," }')"; then
+    echo "ERROR: could not read which cases are stopped asks (kube_agents_bench.stop_hook, above); the fan-out cannot run them after every other unit, so the run does not start." >&2
+    exit 1
   fi
-done
+fi
 if [ -n "${STOPPED_ASK_CASES}" ]; then
   echo "stopped asks, run after every other unit with the cases that request a pull request: ${STOPPED_ASK_CASES}"
 fi

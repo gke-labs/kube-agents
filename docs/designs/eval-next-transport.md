@@ -110,8 +110,9 @@ the presubmit exports nothing new until it chooses to. The exchange:
    reached the bus; and the bound expiring without `ActiveTask` appearing, whatever else the
    record holds. The harness classifies a refusal as the gateway refusing the injection or
    failing to publish it, infrastructure. The prompt is routed like any text, the gateway's
-   literal affordances included, `Delegate` among them; the harness sends none, and a case whose
-   prompt opens with one is the case's defect. The adapter dedupes on the backend message id,
+   literal affordances included, `Delegate` among them; the harness sends none as a prompt, and a
+   case whose prompt opens with one is the case's defect. The one it sends itself is the `stop`
+   after a stopped ask's opening turn (`bench/kube_agents_bench/stop_hook.py`). The adapter dedupes on the backend message id,
    bounded the way the Chat adapter bounds its seen set: a repeated `POST` with an id it has
    already accepted gets the answer the first one got, the record's task id or the same refusal,
    and starts nothing. Because the id
@@ -138,8 +139,8 @@ the presubmit exports nothing new until it chooses to. The exchange:
    cancels whenever that state still holds an active task, whether or not an executor has
    touched it; the cancel goes through an explicit cancel route that takes the task id the
    adapter answered with, whether or not the record still holds it, and lands on the bus as
-   `kind: cancel` exactly as the text route's `stop` does, and the harness never sends the stop
-   text. The harness sends no message at the deadline, so nothing it does there can mint a
+   `kind: cancel` exactly as the text route's `stop` does, and the timeout never sends the stop
+   text (a stopped ask does, on purpose, to reach the cards). The harness sends no message at the deadline, so nothing it does there can mint a
    task or spend a model turn. The failure edit of step 2 can also arrive after the answer,
    when the record showed the active task before the publish failed; the harness is already
    reading the conversation, so it treats that edit as the terminal: infrastructure, the

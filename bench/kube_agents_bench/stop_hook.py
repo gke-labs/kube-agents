@@ -33,7 +33,11 @@ block (``|-``), since a folded one joins the directive to the ask.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
+from pathlib import Path
+
+import yaml
 
 #: The first line that makes a prompt a stopped ask.
 STOP_DIRECTIVE = "[bench:stop-after-first-card]"
@@ -97,3 +101,18 @@ def parse(prompt: str) -> Stop | None:
     if not ask:
         raise ValueError(f"{STOP_DIRECTIVE} needs the ask on the lines after it")
     return Stop(prompt=ask, observe_seconds=observe)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Print the case id (its directory) of every task file given whose
+    prompt is a stopped ask, one per line: the list hack/ci-eval-pr.sh runs
+    in its second phase. An unreadable task file is an error."""
+    for task in sys.argv[1:] if argv is None else argv:
+        doc = yaml.safe_load(Path(task).read_text(encoding="utf-8")) or {}
+        if is_stopped_ask(str(doc.get("prompt") or "")):
+            print(Path(task).parent.name)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

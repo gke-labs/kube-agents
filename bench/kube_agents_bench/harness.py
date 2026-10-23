@@ -2661,6 +2661,9 @@ class KubeAgentsHarness(AgentHarness):
                 f"{stop.observe_seconds:.0f}s after the stop; archived now"
             )
             _archive_stalled_cards(still, _EXEC_TIMEOUT)
+        # As every other path that learns card ids ends: the pod outlives the
+        # run, and a worker log left on it is there for the next run to find.
+        _purge_card_state(cards, _EXEC_TIMEOUT)
 
     def _await_delegated_cards(
         self,

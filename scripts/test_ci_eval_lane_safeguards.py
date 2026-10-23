@@ -382,14 +382,44 @@ class WiringTest(unittest.TestCase):
         self.assertLess(exclusions, step)
         self.assertLess(step, names)
 
-    def test_the_stopped_asks_are_named_from_the_api_lane_list_before_the_nightly_part(self):
+    def test_the_stopped_asks_are_named_after_the_lane_step_and_before_the_nightly_part(self):
         src = SCRIPT.read_text(encoding="utf-8")
-        excluded = src.index('API_LANE_EXCLUDED="$(roster_entries')
+        step = src.index("# ─── The inject lane's safeguards")
         stopped = src.index('STOPPED_ASK_CASES=""')
         part = src.index("# ─── The nightly part")
-        self.assertLess(excluded, stopped)
+        self.assertLess(step, stopped)
         self.assertLess(stopped, part)
-        self.assertIn('grep -qxF -- "${NAME}" <<< "${API_LANE_EXCLUDED}"', src[stopped:part])
+
+
+class StoppedAsksTest(unittest.TestCase):
+    """The second phase's stopped asks are read from each task's prompt by
+    the harness's own grammar, on the inject lane only."""
+
+    STOP_CASE = "./tasks/chat-stop-halts-delegated-remediation/task.yaml"
+    OTHER_CASE = "./tasks/agent-kanban-smoke/task.yaml"
+
+    def run_block(self, transport: str) -> str:
+        body = "\n".join(
+            [
+                "set -euo pipefail",
+                UV_STUB,
+                f'BENCH_DIR="{BENCH_DIR}"',
+                'EVAL_INJECT_TRANSPORT="inject"',
+                f'AGENT_TRANSPORT="{transport}"',
+                f'TASKS=("{self.STOP_CASE}" "{self.OTHER_CASE}")',
+                lifted_block(r'^STOPPED_ASK_CASES="".*?^fi$'),
+                'echo "STOPPED=${STOPPED_ASK_CASES}"',
+            ]
+        )
+        result = subprocess.run(["bash", "-c", body], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return next(line for line in result.stdout.splitlines() if line.startswith("STOPPED="))
+
+    def test_the_inject_lane_names_the_stopped_ask_and_nothing_else(self):
+        self.assertEqual(self.run_block("inject"), "STOPPED=chat-stop-halts-delegated-remediation")
+
+    def test_another_lane_names_none(self):
+        self.assertEqual(self.run_block("api"), "STOPPED=")
 
     def test_the_unit_hands_the_bench_the_resolved_path(self):
         src = SCRIPT.read_text(encoding="utf-8")

@@ -55,12 +55,18 @@ def _cards(statuses):
                               cards={t: {"status": s} for t, s in statuses.items()})
 
 
+# The card ids the last _run purged off the pod.
+PURGED = []
+
+
 def _run(monkeypatch, reads, send=(True, "stopped")):
     """Run the stop with board reads answered from ``reads`` in order."""
     calls = iter(reads)
     monkeypatch.setattr(harness.board, "read_session_cards", lambda *a, **k: next(calls))
     archived = []
     monkeypatch.setattr(harness, "_archive_stalled_cards", lambda ids, timeout: archived.extend(ids))
+    PURGED.clear()
+    monkeypatch.setattr(harness, "_purge_card_state", lambda ids, timeout: PURGED.extend(ids))
     monkeypatch.setattr(harness.time, "sleep", lambda s: None)
     sent = []
     result = AgentResult(output="on it", trajectory=[])
@@ -87,6 +93,11 @@ def test_a_filed_card_is_stopped_and_recorded(monkeypatch):
 
 def _stopped(result):
     return next(e for e in result.trajectory if e["name"] == stop_hook.CARDS_STOPPED_ENTRY)
+
+
+def test_every_filed_card_is_purged_off_the_pod_whatever_the_stop_did(monkeypatch):
+    _run(monkeypatch, [_cards({"t_1": "running", "t_2": "running"}), _cards({"t_1": "archived", "t_2": "done"})])
+    assert PURGED == ["t_1", "t_2"]
 
 
 def test_a_card_that_finished_instead_of_stopping_fails_the_stop(monkeypatch):
