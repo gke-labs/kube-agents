@@ -1392,9 +1392,14 @@ def test_worker_commands_as_typed_a_gap_beside_a_found_run_is_a_pass():
     transcript.set("ok", _TRAJECTORY + [_terminal(_COLLECT, at=1)], worker_commands=[{"task": "t_1", "command": "mkdir -p /opt/data/scratch + 1 command"}], worker_capture_gaps=["card t_9: locked"])
     res = _AS_TYPED_RUN.verify(5.0)
     assert res.status == "pass", res.reason
-    # A run missing from a gapped capture may be in the unread part: still an error.
+    # No window was used, so the reason names none.
+    assert "opened the window" not in res.reason and "forbidden pattern(s) graded nothing" not in res.reason
+    # A run missing from a gapped capture may be in the unread part: still an
+    # error, and the reason names the run, not a forbidden pattern.
     transcript.set("ok", _TRAJECTORY + [_terminal("ls", at=1)], worker_commands=[{"task": "t_1", "command": "ls"}], worker_capture_gaps=["card t_9: locked"])
-    assert _AS_TYPED_RUN.verify(5.0).status == "error"
+    res = _AS_TYPED_RUN.verify(5.0)
+    assert res.status == "error"
+    assert "card t_9: locked" in res.reason and "run collect.py" in res.reason and "forbidden" not in res.reason
     # The ordered check keeps its rule: a clean read with a gap is an error.
     transcript.set("ok", _TRAJECTORY + [_terminal("kubectl scale deploy kube-dns --replicas=3", _REFUSAL, at=1)], worker_capture_gaps=["card t_9: locked"])
     assert _RETRY.verify(5.0).status == "error"
@@ -1412,7 +1417,7 @@ def test_worker_commands_as_typed_a_run_on_the_log_but_not_in_the_trajectory_sti
     transcript.set("ok", _TRAJECTORY + [_terminal("ls /opt/data/scratch", at=1)], worker_commands=[{"task": "t_1", "command": one_line}], worker_capture_gaps=[])
     res = _AS_TYPED_RUN.verify(5.0)
     assert res.status == "pass", res.reason
-    assert "2 worker command(s)" in res.reason
+    assert "2 worker command(s) (1 tagged calls as typed and 1 from the card log)" in res.reason
     # A row that renders the same text as a call is not counted twice.
     transcript.set("ok", _TRAJECTORY + [_terminal(one_line, at=1)], worker_commands=[{"task": "t_1", "command": one_line}])
     assert "1 worker command(s)" in _AS_TYPED_RUN.verify(5.0).reason

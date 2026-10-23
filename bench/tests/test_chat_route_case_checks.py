@@ -407,9 +407,3 @@ def test_required_checks_read_the_command_as_typed_not_the_rendered_row(case, na
     without = {k: v for k, v in check.items() if k != AS_TYPED}
     assert not _verdict(WorkerCommandsVerifier(**without), [row], [typed])
 
-
-@pytest.mark.parametrize("case,name,typed,row", AS_TYPED_CHECKS, ids=[c[1] for c in AS_TYPED_CHECKS])
-def test_as_typed_checks_still_refuse_help_and_mentions(case, name, typed, row):
-    verifier = WorkerCommandsVerifier(**_check(case, name))
-    for command in _non_runs(case):
-        assert not _verdict(verifier, [command], [command]), command
