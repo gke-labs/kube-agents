@@ -1578,8 +1578,9 @@ Slack, `homeChannel` set or not, and `A2A_NOTIFY_CONVERSATIONS` is then `slack`
 route off, as on Chat. Chat holds the single-backend gateway when both are enabled, so at most
 one platform is ever routed.
 
-**The home-channel record.** Under `next` with Slack on the gateway, the operator owns a ConfigMap
+**The home-channel record.** Under `next`, Slack on the gateway or not, the operator owns a ConfigMap
 `<agent>-home-channel` with no data, applied beside the gateway Role and torn down with the stack.
+It is read only where the gateway holds Slack.
 The gateway Role reaches that one name with `get` and `patch`. `spec.integration.slack.homeChannelPolicy`
 (`auto`, also absent, or `manual`) is rendered to the gateway as `A2A_SLACK_HOME_POLICY`, with the
 record's name as `A2A_HOME_CHANNEL_RECORD` and the gateway's own image as `A2A_SELF_IMAGE`. A record

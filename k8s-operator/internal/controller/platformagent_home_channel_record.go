@@ -60,6 +60,10 @@ const (
 	homeChannelUnsetRefusedFormat   = " The last mention that could have set it was refused: %s."
 	homeChannelRecordWriterMax      = 160
 	homeChannelRecordMalformed      = "<not a channel id>"
+	// homeChannelRecordIDMax bounds the learned id: Slack channel ids are
+	// about eleven characters, and the grammar alone has no upper bound, so
+	// a grammar-valid id of any length would otherwise reach the condition.
+	homeChannelRecordIDMax = 32
 	// The refusal vocabulary the gateway writes into slack.refused.
 	homeChannelRefusedShared    = "shared"
 	homeChannelRefusedArchived  = "archived"
@@ -85,10 +89,12 @@ type homeChannelRecord struct {
 	channel string
 	// recorded is the raw learned id, admitted or not.
 	recorded string
-	// writer is the image that wrote the record; stale says it is not the
-	// one this operator renders for the gateway.
-	writer string
-	stale  bool
+	// writer is the image that wrote the record, compared in full; stale
+	// says it is not the one this operator renders for the gateway.
+	// writerShown is the copy the condition prints, cut for display.
+	writer      string
+	writerShown string
+	stale       bool
 	// refused is the gateway's reason for refusing the last candidate.
 	refused string
 }
@@ -135,7 +141,8 @@ func readHomeChannelRecord(agent *agentv1alpha1.PlatformAgent, cm *corev1.Config
 		return rec
 	}
 	raw := strings.TrimSpace(cm.Data[homeChannelRecordSlackKey])
-	rec.writer = boundedRunes(strings.TrimSpace(cm.Data[homeChannelRecordWriterKey]), homeChannelRecordWriterMax)
+	rec.writer = strings.TrimSpace(cm.Data[homeChannelRecordWriterKey])
+	rec.writerShown = boundedRunes(rec.writer, homeChannelRecordWriterMax)
 	if reason := strings.TrimSpace(cm.Data[homeChannelRecordSlackRefusedKey]); reason != "" {
 		rec.refused = homeChannelRefusedReasons[reason]
 		if rec.refused == "" {
@@ -145,7 +152,9 @@ func readHomeChannelRecord(agent *agentv1alpha1.PlatformAgent, cm *corev1.Config
 	if raw == "" {
 		return rec
 	}
-	rec.recorded = slackChannelID(raw)
+	if len([]rune(raw)) <= homeChannelRecordIDMax {
+		rec.recorded = slackChannelID(raw)
+	}
 	if rec.recorded == "" {
 		rec.recorded = homeChannelRecordMalformed
 		return rec

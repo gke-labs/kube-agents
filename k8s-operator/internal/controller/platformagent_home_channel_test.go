@@ -250,6 +250,9 @@ func TestHomeChannelRecordStandsInForTheField(t *testing.T) {
 		{"refused, unknown reason is not echoed", "", "", record(map[string]string{homeChannelRecordSlackRefusedKey: strings.Repeat("x", 40000)}), "", true, []string{"refused", "does not know"}},
 		{"malformed learned id is named, not echoed", "", "", record(map[string]string{homeChannelRecordSlackKey: "general " + strings.Repeat("y", 40000), homeChannelRecordWriterKey: image}), "", true, []string{"not a channel id"}},
 		{"stale with no writer", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED"}), "", true, []string{"C0LEARNED", "no gateway image"}},
+		// A grammar-valid id of any length must not reach the status: bounded, then named as malformed.
+		{"over-long grammar-valid id is not echoed", "", "", record(map[string]string{homeChannelRecordSlackKey: "C" + strings.Repeat("A", 40000), homeChannelRecordWriterKey: image}), "", true, []string{"not a channel id"}},
+		{"stale writer over the display bound is cut, not echoed", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordWriterKey: "ghcr.io/x/" + strings.Repeat("w", 5000)}), "", true, []string{"C0LEARNED"}},
 		{"malformed cr value does not fall through to the record", "general", "", record(learned), "", false, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -285,8 +288,8 @@ func TestHomeChannelRecordStandsInForTheField(t *testing.T) {
 }
 
 // TestHomeChannelRecordObjectAndRole: the record is an owned ConfigMap with
-// no data (the gateway owns the keys), rendered under next with Slack on the
-// gateway, torn down with the stack, and the gateway Role reaches that one
+// no data (the gateway owns the keys), rendered on every next stack, Slack on
+// the gateway or not, torn down with the stack, and the gateway Role reaches that one
 // name with get and patch only. The gateway Deployment carries the policy,
 // the record's name and its own image for the record's writer key.
 func TestHomeChannelRecordObjectAndRole(t *testing.T) {
@@ -428,5 +431,28 @@ func TestPlatformAgentReconciler_Reconcile_HomeChannelRecordDrivesEnvAndConditio
 	c := condition()
 	if c == nil || !strings.Contains(c.Message, "rolled-back") {
 		t.Fatalf("stale record not named in the condition: %+v", c)
+	}
+}
+
+// TestHomeChannelRecordWriterIsComparedInFull: an image reference longer than
+// the display bound (a regional registry, a long path, a digest) still matches
+// the writer it wrote, so the learned channel is admitted; only the condition's
+// copy is cut.
+func TestHomeChannelRecordWriterIsComparedInFull(t *testing.T) {
+	long := "us-east4-docker.pkg.dev/some-project/some-repository/kube-agents/a2a-gateway@sha256:" + strings.Repeat("ab", 64) + "-" + strings.Repeat("x", 100)
+	if len([]rune(long)) <= homeChannelRecordWriterMax {
+		t.Fatalf("test image is %d runes, not over the display bound", len([]rune(long)))
+	}
+	a := slackTestAgent("next", true)
+	rec := readHomeChannelRecord(a, &corev1.ConfigMap{Data: map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordWriterKey: long}}, long)
+	if rec.stale || rec.channel != "C0LEARNED" {
+		t.Fatalf("a writer equal to the rendered image in full reads as stale: %+v", rec)
+	}
+	if len([]rune(rec.writerShown)) != homeChannelRecordWriterMax {
+		t.Errorf("writerShown is %d runes, want %d", len([]rune(rec.writerShown)), homeChannelRecordWriterMax)
+	}
+	stale := readHomeChannelRecord(a, &corev1.ConfigMap{Data: map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordWriterKey: long + "!"}}, long)
+	if !stale.stale || stale.channel != "" {
+		t.Fatalf("a writer that differs past the display bound reads as current: %+v", stale)
 	}
 }

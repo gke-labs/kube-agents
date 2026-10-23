@@ -4389,7 +4389,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	replicasLimitedMsg := replicasLimitedMessage(agent)
 	replicasLimitedUnchanged := replicasLimitedConditionCurrent(agent, replicasLimitedMsg)
 
-	// The home-channel advisory, from the spec alone, compared on its message
+	// The home-channel advisory, from the spec and the record, compared on its message
 	// for the same reason EventWatcher's is.
 	homeRec, err := r.homeChannelRecordFor(ctx, agent)
 	if err != nil {
@@ -4437,7 +4437,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	degradedUnchanged := (degradedStatus == metav1.ConditionFalse && existingDegradedCond == nil) || rbacDegradedPreserved ||
 		(degradedStatus == metav1.ConditionTrue && existingDegradedCond != nil && existingDegradedCond.Status == metav1.ConditionTrue && existingDegradedCond.Reason == degradedReason && existingDegradedCond.Message == degradedMsg)
 
-	// From the spec alone, so it is resolved here rather than passed in like the
+	// From the spec and the record, so it is resolved here rather than passed in like the
 	// telemetry and policy results, which take a discovery to produce.
 	newActiveInterfaces := resolveActiveInterfaces(agent)
 
@@ -4638,7 +4638,7 @@ func homeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeChannel
 		case rec.recorded != "" && rec.stale && rec.writer == "":
 			msg += fmt.Sprintf(homeChannelUnsetStaleNoWriter, rec.recorded)
 		case rec.recorded != "" && rec.stale:
-			msg += fmt.Sprintf(homeChannelUnsetStaleFormat, rec.recorded, rec.writer, a2aGatewayImage())
+			msg += fmt.Sprintf(homeChannelUnsetStaleFormat, rec.recorded, rec.writerShown, boundedRunes(a2aGatewayImage(), homeChannelRecordWriterMax))
 		case rec.refused != "":
 			msg += fmt.Sprintf(homeChannelUnsetRefusedFormat, rec.refused)
 		}
