@@ -7599,6 +7599,30 @@ class TestConfigSyncReconcilerStalled(unittest.TestCase):
         )
         self.assertEqual(hits, [])
 
+    def test_a_mixed_stage_quotes_the_real_error_not_the_transient_one(self):
+        """A render in flight writes KNV2016 beside a real error. The check
+        fires on the real one, and the excerpt must quote it, not the
+        transient line that clears by itself."""
+        hits = self.run_on(
+            configsync_object(
+                "RootSync", "root-sync",
+                syncing_refs=["status.rendering.errors", "status.source.errors"], syncing_message="Source error",
+                stage_errors={
+                    "rendering": [{"code": "2016", "errorMessage": "The rendering is still in progress"}],
+                    "source": [{"code": "2004", "errorMessage": self.SOURCE_ERROR}],
+                },
+            )
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertIn("could not read Username", hits[0]["excerpt"])
+        self.assertNotIn("still in progress", hits[0]["excerpt"])
+
+    def test_an_empty_error_source_ref_falls_back_to_the_condition_without_a_stage_list(self):
+        hits = self.run_on(configsync_object("RootSync", "root-sync", syncing_refs=[""], syncing_message="Sync error"))
+        self.assertEqual(len(hits), 1)
+        self.assertIn("Sync error", hits[0]["excerpt"])
+        self.assertNotIn("errors in", hits[0]["excerpt"])
+
     def test_a_syncing_ref_with_no_readable_error_still_counts_and_quotes_the_condition(self):
         hits = self.run_on(configsync_object("RootSync", "root-sync", syncing_refs=["status.sync.errors"], syncing_message="Sync error"))
         self.assertEqual(len(hits), 1)

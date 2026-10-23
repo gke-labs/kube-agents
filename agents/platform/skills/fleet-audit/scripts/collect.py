@@ -7719,11 +7719,13 @@ def check_configsync_reconciler_stalled(context: dict) -> list[dict]:
         elif syncing is not None and syncing.get("errorSourceRefs"):
             refs = [str(r) for r in syncing["errorSourceRefs"] if r]
             errors = [e for ref in refs for e in _configsync_stage_errors(item, ref)]
-            if errors and all(str(e.get("code")) in CONFIGSYNC_TRANSIENT_ERROR_CODES for e in errors):
+            real = [e for e in errors if str(e.get("code")) not in CONFIGSYNC_TRANSIENT_ERROR_CODES]
+            if errors and not real:
                 continue
-            first = next((str(e.get("errorMessage") or "").strip() for e in errors if e.get("errorMessage")), "")
+            first = next((str(e.get("errorMessage") or "").strip() for e in real if e.get("errorMessage")), "")
             why = _condition_why({"reason": syncing.get("reason"), "message": first or syncing.get("message")})
-            why = f"{why} (errors in {', '.join(refs)})"
+            if refs:
+                why = f"{why} (errors in {', '.join(refs)})"
         if not why:
             continue
         hits.append(
