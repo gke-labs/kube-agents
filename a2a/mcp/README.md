@@ -40,13 +40,13 @@ To rotate the token, write a new value into the Secret. The server reads it on e
 
 ## Conversations
 
-Each call names its conversation with `conversation` (a name; `default` if omitted) or `conversation_token` (the token an earlier answer reported, as `<token>` or `console:<token>`). A token given where a name goes, in either form, names that conversation too. There is no server-wide active conversation.
+Each call names its conversation with `conversation` (a name; `default` if omitted) or `conversation_token` (the token an earlier answer reported, as `<token>` or `console:<token>`). A token given where a name goes, in either form, names that conversation too, whether or not this server still holds a name for it. There is no server-wide active conversation.
 
 Names are this server's memory only, and they're shared:
 
 - A restart forgets them, and so does the table itself past 1024 names, starting with the least recently used. A conversation resumes by its token either way.
 - Every caller holds the same bearer token, so every caller sees and can use every name.
-- A name is at most 128 characters, and holds nothing `list` couldn't show back as typed: no backticks, pipes, control or invisible characters, or spaces at either end or doubled.
+- A name is at most 128 characters, and holds nothing `list` couldn't show back as typed: no backticks, pipes, control or invisible characters, spaces at either end, doubled or other than the plain space, and nothing spelled like a token (`mcp` and 24 hex digits).
 
 `manage_session` handles the names and the console's control turns:
 

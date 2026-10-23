@@ -25,9 +25,9 @@ const (
 
 	// The console texts the control actions send, as a person would type
 	// them. The gateway settles /session and /session off with a notice
-	// (turnFate). status and help are messages to the agent: status gets the
-	// gateway's replay notice while a task runs and is a new turn otherwise,
-	// and help is always a message, so while a task runs it steers that task.
+	// (turnFate). status and help are messages to the agent, sent as any
+	// turn is: while the conversation's turn is still running they wait for
+	// it to end (SendTurn), so neither reaches the running task (#3895).
 	// sendAndWait takes a notice or a task either way.
 	sessionOnText  = "/session"
 	sessionOffText = "/session off"
@@ -98,7 +98,7 @@ func ManageSessionTool(bus TurnBus, convs *Conversations) Tool {
 			Name: ToolManageSession,
 			Description: "Manage this server's named conversations: list them, create one (new), forget one (delete), " +
 				"or send a control turn on one: start a /session worker (session_on), end it (session_off), " +
-				"or send the agent the message status or help (while a task runs, status replays its progress and help steers it). " +
+				"or send the agent the message status or help (like any message, these wait for the conversation's running turn to end first). " +
 				"Names are this server's memory only; " +
 				"a conversation resumes by its token after a restart.",
 			InputSchema: map[string]any{
@@ -194,6 +194,8 @@ func deleteConversation(convs *Conversations, a manageSessionArgs) (string, erro
 		}
 		return "", errors.New("delete needs the conversation's name")
 	}
+	// Trimmed as new trims it, so the name new made is the name forgotten.
+	a.Conversation = strings.TrimSpace(a.Conversation)
 	if !convs.Forget(a.Conversation) {
 		return "", fmt.Errorf("no conversation named %s", cell(a.Conversation))
 	}

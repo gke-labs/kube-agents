@@ -144,7 +144,8 @@ func TestManageSessionRendersCallerTextInert(t *testing.T) {
 // is the same name; and a token is never taken as a new name spelled like one.
 func TestManageSessionRefusesNamesListCannotShowBack(t *testing.T) {
 	s, _ := busless(t)
-	for _, bad := range []string{"a`b", "a|b", "a\nb", "a\tb", "rtl\u202eexe", "zero\u200bwidth", "two  spaces", "console:mcpabc"} {
+	for _, bad := range []string{"a`b", "a|b", "a\nb", "a\tb", "rtl\u202eexe", "zero\u200bwidth", "two  spaces", "console:mcpabc",
+		"ops\u00a0prod", "a \u00a0 b", "ideo\u3000space", "line\u2028sep", "mcp0123456789abcdef01234567"} {
 		mustFail(t, callTool(t, s, ToolManageSession, map[string]any{"action": actionNew, "conversation": bad}))
 	}
 	// new trims a name, as the original did; a send does not, so it refuses.
@@ -370,5 +371,86 @@ func TestManageSessionRefusesBadInput(t *testing.T) {
 	}
 	if got := frames.all(); len(got) != 0 {
 		t.Errorf("a refused call reached the gateway: %+v", got)
+	}
+}
+
+// A token the table no longer holds a name for, given bare where a name
+// goes, still names that conversation: it is never minted as a new name.
+func TestAnUnknownBareTokenIsThatConversation(t *testing.T) {
+	s, convs, frames := sessionServer(t)
+	token, _ := convs.Resolve("ops", "")
+	mustSucceed(t, callTool(t, s, ToolManageSession, map[string]any{"action": actionDelete, "conversation": "ops"}))
+	n := len(frames.all())
+	out := mustSucceed(t, callTool(t, s, ToolManageSession, map[string]any{"action": actionSessionOff, "conversation": token}))
+	if got := frames.all()[n:]; len(got) != 1 || got[0].token != token {
+		t.Errorf("sent %+v, want it on %s", got, token)
+	}
+	mustContain(t, out, "Conversation by token `"+token+"`")
+	if rows := convs.List(); len(rows) != 0 {
+		t.Errorf("an unknown token given as a name minted %+v", rows)
+	}
+	mustFail(t, callTool(t, s, ToolManageSession, map[string]any{"action": actionNew, "conversation": token}))
+}
+
+// A call naming a conversation by its token, in either form, counts as a
+// use of the name holding it.
+func TestACallByTokenIsAUse(t *testing.T) {
+	s, convs, _ := sessionServer(t)
+	opsToken, _ := convs.Resolve("ops", "")
+	_, _ = convs.Resolve("dev", "")
+	mustSucceed(t, callTool(t, s, ToolManageSession, map[string]any{"action": actionSessionOff, "conversation": consoleConversationPrefix + opsToken}))
+	if rows := convs.List(); len(rows) != 2 || rows[0].Alias != "ops" {
+		t.Errorf("after a call by console:<token>, list = %+v, want ops first", rows)
+	}
+	_, _ = convs.Resolve("dev", "")
+	if _, err := convs.Resolve("", opsToken); err != nil {
+		t.Fatal(err)
+	}
+	if rows := convs.List(); rows[0].Alias != "ops" {
+		t.Errorf("after a call by conversation_token, list = %+v, want ops first", rows)
+	}
+}
+
+// delete takes the name new made from a padded one, padded as it was sent.
+func TestDeleteTrimsAsNewDoes(t *testing.T) {
+	s, convs := busless(t)
+	mustSucceed(t, callTool(t, s, ToolManageSession, map[string]any{"action": actionNew, "conversation": "  padded  "}))
+	mustSucceed(t, callTool(t, s, ToolManageSession, map[string]any{"action": actionDelete, "conversation": "  padded  "}))
+	if rows := convs.List(); len(rows) != 0 {
+		t.Errorf("delete left %+v", rows)
+	}
+}
+
+// Every way a call names its conversation by token labels the answer by the
+// token: send_message with a known bare token, and stop with console:<token>.
+func TestEveryCallByTokenIsLabelledByIt(t *testing.T) {
+	url, js := testBus(t)
+	runFakeGateway(t, url, js, gatewayScenario{finish: true})
+	b := dial(t, url)
+	convs := NewConversations()
+	s := mustServer(t, SendMessageTool(b, convs), TaskControlTool(b, convs))
+	token, _ := convs.Resolve("ops", "")
+	out := mustSucceed(t, callTool(t, s, ToolSendMessage, map[string]any{"text": "hi", "conversation": token, "wait_seconds": 10}))
+	mustContain(t, out, "Conversation by token `"+token+"`")
+	out = mustSucceed(t, callTool(t, s, ToolTaskControl, map[string]any{"action": actionStop, "conversation": consoleConversationPrefix + token}))
+	mustContain(t, out, "Conversation by token `"+token+"`")
+}
+
+// The tool's description promises nothing about steering a running task:
+// status and help wait for it like any message.
+func TestTheSchemaDoesNotPromiseASteer(t *testing.T) {
+	d := ManageSessionTool(nil, NewConversations()).Definition.Description
+	mustNotContain(t, d, "steers", "replays its progress")
+	mustContain(t, d, "wait for the conversation's running turn")
+}
+
+// Only a token's own spelling is a token: upper-case hex is a name, since
+// this server mints lower-case tokens.
+func TestOnlyAMintedSpellingIsAToken(t *testing.T) {
+	convs := NewConversations()
+	upper := "mcp0123456789ABCDEF01234567"
+	tok, byToken, err := convs.ResolveCall(upper, "")
+	if err != nil || byToken || tok == upper {
+		t.Errorf("ResolveCall(%q) = %q, %v, %v; want a new name", upper, tok, byToken, err)
 	}
 }
