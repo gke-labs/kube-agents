@@ -14768,6 +14768,225 @@ class FeedbackRouteTest(_ExecRouteServer):
         self.assertIn("error", body)
 
 
+class GitAllowProtocolForHttpForgeTest(unittest.TestCase):
+    """`_execute` widens `GIT_ALLOW_PROTOCOL` to `https:http` for an `http` forge across both `execute_vcs_git` and `execute_workspace_git`."""
+
+    def test_git_allow_protocol_widens_for_allow_http_or_http_credential_helper(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_CONTENT_WORKSPACE": "1"}):
+                executor = CommandExecutor(
+                    timeout_seconds=5,
+                    max_output_bytes=4096,
+                    state_dir=root / "state",
+                )
+            executor.vcs_root.mkdir(parents=True, exist_ok=True)
+            executor.content_workspace_root.mkdir(parents=True, exist_ok=True)
+            captured_envs = []
+
+            class FakeProcess:
+                returncode = 0
+
+            def fake_popen(argv, *, cwd=None, env=None, **_kwargs):
+                captured_envs.append(dict(env or {}))
+                return FakeProcess()
+
+            fake_captured = credential_proxy._CapturedOutput(
+                stdout=b"", stderr=b"", truncated=False, timed_out=False, abandoned=False
+            )
+            with (
+                mock.patch.object(subprocess, "Popen", side_effect=fake_popen),
+                mock.patch.object(credential_proxy, "_capture_output", return_value=fake_captured),
+            ):
+                executor.execute_vcs_git(
+                    ["git", "init"],
+                    executor.vcs_root,
+                    config=(
+                        ("credential.helper", ""),
+                        ("credential.https://gitea.example.test.helper", "/bin/true"),
+                    ),
+                )
+                executor.execute_vcs_git(
+                    ["git", "init"],
+                    executor.vcs_root,
+                    config=(("credential.helper", ""),),
+                    allow_http=True,
+                )
+                executor.execute_workspace_git(
+                    [
+                        "git",
+                        "clone",
+                        "--quiet",
+                        "http://gitea.gitea.svc.cluster.local:3000/acme/infra.git",
+                        str(executor.content_workspace_root / "repo"),
+                    ],
+                    executor.content_workspace_root,
+                    config=(),
+                    allow_http=True,
+                )
+            self.assertEqual("https", captured_envs[0]["GIT_ALLOW_PROTOCOL"])
+            self.assertEqual("https:http", captured_envs[1]["GIT_ALLOW_PROTOCOL"])
+            self.assertEqual("https:http", captured_envs[2]["GIT_ALLOW_PROTOCOL"])
+
+    def test_content_workspace_store_open_on_http_gitea_forge_widens_git_allow_protocol(self):
+        import content_workspace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            token_file = root / "gitea-token"
+            token_file.write_text("gitea-pat-token\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_CONTENT_WORKSPACE": "1"}):
+                executor = CommandExecutor(
+                    timeout_seconds=5,
+                    max_output_bytes=4096,
+                    state_dir=root / "state",
+                )
+            executor.content_workspace_root.mkdir(parents=True, exist_ok=True)
+            agent_dir = root / "agent"
+            agent_dir.mkdir(parents=True, exist_ok=True)
+
+            gitea_forge = providers.build_forges({
+                "forges": [
+                    {
+                        "provider": "gitea",
+                        "name": "gitea",
+                        "host": "gitea.gitea.svc.cluster.local",
+                        "scheme": "http",
+                        "port": 3000,
+                        "token_path": str(token_file),
+                        "allowed_paths": ["acme"],
+                    }
+                ]
+            })[-1]
+
+            captured_clone_envs = []
+
+            class FakeProcess:
+                returncode = 0
+
+            def fake_popen(argv, *, cwd=None, env=None, **_kwargs):
+                if "clone" in argv:
+                    captured_clone_envs.append(dict(env or {}))
+                    Path(argv[-1]).mkdir(parents=True, exist_ok=True)
+                return FakeProcess()
+
+            def fake_capture(_proc, *_args, **_kwargs):
+                return credential_proxy._CapturedOutput(
+                    stdout=b"refs/remotes/origin/main\n" + (b"a" * 40) + b"\n",
+                    stderr=b"",
+                    truncated=False,
+                    timed_out=False,
+                    abandoned=False,
+                )
+
+            for label, cred_fn in (
+                ("managed stored credential", lambda _repo: gitea_forge.credential),
+                ("context or unregistered NoCredential", lambda _repo: providers.NoCredential()),
+            ):
+                with self.subTest(case=label):
+                    captured_clone_envs.clear()
+                    store = content_workspace.ContentWorkspaceStore(
+                        executor.content_workspace_root,
+                        agent_dir,
+                        executor.execute_workspace_git,
+                        credential_for=cred_fn,
+                        locate=lambda _repo: (
+                            "gitea.gitea.svc.cluster.local/acme/infra",
+                            gitea_forge.clone_url("acme/infra"),
+                        ),
+                    )
+                    with (
+                        mock.patch.object(subprocess, "Popen", side_effect=fake_popen),
+                        mock.patch.object(credential_proxy, "_capture_output", side_effect=fake_capture),
+                    ):
+                        ws = store.open("gitea.gitea.svc.cluster.local/acme/infra")
+                    self.assertEqual("gitea.gitea.svc.cluster.local/acme/infra", ws.repo)
+                    self.assertEqual(1, len(captured_clone_envs))
+                    self.assertEqual("https:http", captured_clone_envs[0]["GIT_ALLOW_PROTOCOL"])
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_every_remote_verb_of_an_http_workspace_asks_for_http(self):
+        """`ls-remote`, `clone`, `fetch` and `push` all hand the runner `allow_http`.
+
+        The workspace's remote is the `http` Gitea URL, rewritten by
+        `url.insteadOf` to a local bare repository so real git answers. The
+        runner records which verbs asked for `allow_http`: the pinned-base probe
+        and the clone from `open`, then `fetch` from `commit` and `push` from
+        `push`, the last two reading `Workspace.allow_http`. The executor's
+        mapping from `allow_http` to `GIT_ALLOW_PROTOCOL=https:http` is pinned by
+        the first test in this class.
+        """
+        import content_workspace
+
+        host = "gitea.gitea.svc.cluster.local"
+        remote_prefix = f"http://{host}:3000/"
+        url = f"{remote_prefix}acme/infra.git"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plain_env = {
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "HOME": str(root),
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_AUTHOR_NAME": "Test",
+                "GIT_AUTHOR_EMAIL": "test@example.invalid",
+                "GIT_COMMITTER_NAME": "Test",
+                "GIT_COMMITTER_EMAIL": "test@example.invalid",
+            }
+
+            def plain_git(*argv, cwd):
+                subprocess.run(["git", *argv], cwd=str(cwd), env=plain_env, check=True, capture_output=True)
+
+            bare = root / "remotes" / "acme" / "infra.git"
+            bare.parent.mkdir(parents=True)
+            plain_git("init", "--quiet", "--bare", "--initial-branch=main", str(bare), cwd=root)
+            seed = root / "seed"
+            plain_git("init", "--quiet", "--initial-branch=main", str(seed), cwd=root)
+            (seed / "README.md").write_text("seed\n", encoding="utf-8")
+            plain_git("add", "README.md", cwd=seed)
+            plain_git("commit", "--quiet", "-m", "seed", cwd=seed)
+            plain_git("push", "--quiet", str(bare), "main", "main:release", cwd=seed)
+
+            asked: list[tuple[str, bool]] = []
+
+            def runner(argv, cwd, config=(), allow_http=False):
+                asked.append((argv[1], allow_http))
+                rewritten = [
+                    "git",
+                    "-c",
+                    f"url.{(root / 'remotes').as_uri()}/.insteadOf={remote_prefix}",
+                    *argv[1:],
+                ]
+                done = subprocess.run(rewritten, cwd=str(cwd), env=plain_env, capture_output=True, text=True)
+                return types.SimpleNamespace(exit_code=done.returncode, stdout=done.stdout, stderr=done.stderr)
+
+            agent_dir = root / "agent"
+            agent_dir.mkdir()
+            store = content_workspace.ContentWorkspaceStore(
+                root / "trees",
+                agent_dir,
+                runner,
+                credential_for=lambda _repo: providers.NoCredential(),
+                locate=lambda _repo: (f"{host}/acme/infra", url),
+                pinned_bases={(host, "acme/infra"): "release"},
+            )
+            ws = store.open(f"{host}/acme/infra")
+            self.assertTrue(ws.allow_http)
+            store.commit(
+                ws.handle,
+                "platform-agent/change",
+                "feat: a change",
+                [content_workspace.Change(content_workspace.repo_relative("manifests/mine.yaml"), b"kind: Mine\n")],
+            )
+            store.push(ws.handle, "platform-agent/change")
+
+            remote_verbs = {"ls-remote", "clone", "fetch", "push"}
+            seen = {verb for verb, _ in asked if verb in remote_verbs}
+            self.assertEqual(remote_verbs, seen)
+            for verb, allow_http in asked:
+                if verb in remote_verbs:
+                    self.assertTrue(allow_http, f"git {verb} did not ask for allow_http")
+
 
 if __name__ == "__main__":
     unittest.main()

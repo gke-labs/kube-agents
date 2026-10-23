@@ -479,7 +479,9 @@ ids count, so a case
 graded this way needs a fleet whose findings stay under it.
 
 **Credential.** A GitHub token in the verifier process's environment: `BENCH_GITHUB_TOKEN`
-preferred, `GITHUB_TOKEN` as a fallback. It needs `issues: read` on the eval GitOps repositories —
+preferred, `GITHUB_TOKEN` as a fallback, both outranked by a non-empty file that
+`BENCH_GITHUB_TOKEN_FILE` names, which CI renews while a unit runs
+([`docs/ci-pool-projects.md`](../docs/ci-pool-projects.md) 5.4). It needs `issues: read` on the eval GitOps repositories —
 private, ours, and throwaway, which is what makes reading them from CI acceptable — and
 `pull_requests: read` for the clauses that say so; the CI grading mint asks for both. Deliberately **not** the agent's own credential: the in-cluster `github-token-minter`
 mints a write-scoped installation token held by the credential-proxy sidecar, and reaching into the

@@ -5978,6 +5978,34 @@ def test_a_commits_page_github_would_not_serve_is_an_error_not_a_pass(token, git
     assert names in res.reason and "commits page" in res.reason, res.reason
 
 
+@pytest.mark.parametrize(
+    "status, body, says",
+    [
+        (401, {"message": "Bad credentials"}, "is not valid"),
+        (403, {"message": "Resource not accessible by integration"}, "needs `pull_requests: read`"),
+    ],
+)
+def test_a_refused_credential_is_named_as_the_one_the_request_carried(
+    token, github, monkeypatch, tmp_path, status, body, says
+):
+    """After a renewal BENCH_GITHUB_TOKEN_FILE and BENCH_GITHUB_TOKEN hold
+    different tokens and the request carries the file's, so a 401 or 403 that
+    blamed the variable sent the reader to a token nobody sent."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
+    github.routes[f"{_pr_api('pulls')}/commits?per_page=100&page=1"] = (status, body)
+    res = _pr_check().verify(5.0)
+    assert f"the token in BENCH_GITHUB_TOKEN {says}" in res.reason, res.reason
+    token_file = tmp_path / "ledger-token"
+    token_file.write_text("ghs_renewed\n", encoding="utf-8")
+    monkeypatch.setenv("BENCH_GITHUB_TOKEN_FILE", str(token_file))
+    res = _pr_check().verify(5.0)
+    assert res.status == "error", res.reason
+    assert f"the token in the file BENCH_GITHUB_TOKEN_FILE names ({token_file}) {says}" in res.reason, res.reason
+    assert "in BENCH_GITHUB_TOKEN " not in res.reason, res.reason
+
+
 def test_a_repository_the_agent_invented_is_a_fail_not_an_error(token, github):
     """A repository the credential cannot see answers 404 exactly as a missing
     number does, and nothing in the API separates them. Graded as absence: the

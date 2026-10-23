@@ -1305,8 +1305,12 @@ platformAgent:
     #
     # forges:
     #   - name: github            # what repositories[].forge refers to
-    #     provider: github        # github or gitlab; required when host is not github.com
-    #     host: ""                # empty is github.com; or a GitHub Enterprise Server hostname
+    #     provider: github        # github (default), gitlab, or gitea; required when host is not github.com
+    #     host: ""                # empty is the provider's default (github.com), or a GitHub Enterprise
+    #                             # Server hostname; required for gitea, which has none
+    #     scheme: https           # https (default); http only for gitea on an
+    #                             # in-cluster Service (*.svc or *.svc.cluster.local)
+    #     port: 3000              # gitea only, when not the scheme's default port
     #     namespace: my-org       # default owner for this forge's repositories
     #     credentialsRef:         # Secret for providers that need one; ignored
     #       name: ""              # for github, which uses the GitHub App
@@ -1314,12 +1318,13 @@ platformAgent:
     #     provider: gitlab
     #     host: ""                # gitlab.com, or a self-managed instance's hostname
     #     namespace: my-group     # group path; bounds which projects the agent may reach
-    #     credentialsRef:         # required for gitlab: a Secret holding an access
-    #       name: gitlab-token    # token under the key `token`, created out of band
-    #     caBundleRef:            # optional, self-managed GitLab or GitHub Enterprise Server only: a Secret holding
-    #       name: gitlab-forge-ca # the PEM CA that signed the instance's certificate, created out of band;
-    #       key: ca.crt           # the broker trusts it for this host only. On a GitHub Enterprise Server
-    #                             # forge, the token minter also gets it and trusts it for all of its calls
+    #     credentialsRef:         # required for gitlab and gitea: a Secret holding an
+    #       name: gitlab-token    # access token under the key `token`, created out of band
+    #     caBundleRef:            # optional, self-managed GitLab, GitHub Enterprise Server, or https gitea:
+    #       name: gitlab-forge-ca # a Secret holding the PEM CA that signed the instance's certificate,
+    #       key: ca.crt           # created out of band; the broker trusts it for this host only. On a
+    #                             # GitHub Enterprise Server forge, the token minter also gets it and trusts
+    #                             # it for all of its calls
     forges: []
     # repositories:
     #   - forge: github

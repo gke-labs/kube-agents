@@ -3083,11 +3083,24 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		// would scaffold or archive optional specialist profiles outside the
 		// operator's AgentProfile reconciliation. The operator renders them only
 		// under next, after this merge.
+		// Drop any plugin env entry that references a forge credentialsRef
+		// Secret, matching the reconcile-time refusal in
+		// validateExtraVolumeMounts so buildPodTemplateSpec never renders a
+		// forge Secret into the platform-agent container even when called
+		// directly in unit tests.
+		var forgeSecrets []string
+		if agent.Spec.Integration != nil {
+			forgeSecrets = agent.Spec.Integration.ForgeCredentialSecretNames()
+		}
 		kept := extEnvs[:0]
 		for _, e := range extEnvs {
-			if e.Name != a2aNotifyPlatformEnvVar && e.Name != a2aNotifyConversationsEnvVar && e.Name != enabledProfilesEnvVar {
-				kept = append(kept, e)
+			if e.Name == a2aNotifyPlatformEnvVar || e.Name == a2aNotifyConversationsEnvVar || e.Name == enabledProfilesEnvVar {
+				continue
 			}
+			if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil && slices.Contains(forgeSecrets, e.ValueFrom.SecretKeyRef.Name) {
+				continue
+			}
+			kept = append(kept, e)
 		}
 		extEnvs = kept
 		if len(extEnvs) > 0 {

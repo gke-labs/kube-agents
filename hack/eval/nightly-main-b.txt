@@ -54,11 +54,16 @@ gitops-drift-load-bearing-change-triage
 # (main-b) with gpu-stress-test-diagnosis kept above; moved to main-a they
 # are 1950s apart, over the one-case tolerance.
 triage-start-burst
+# monitoring-alert-policy-read joined the nightly on 2026-10-23 as a stack
+# case at the script's default hint. In main-a it put the halves 1850s apart
+# (11450s against 9600s), over the one-case tolerance; here they are 1450s
+# apart. Placed on the arithmetic alone, like the line above.
+monitoring-alert-policy-read
 
 # The two recorded-weeks cases of #3535 (upgrades-retrospective-log-volume-gate
 # and upgrades-rollout-family-held-by-canary-gate) share one stack that seeds
 # the retrospective's report store, priced at 600s each; each run applies and
-# tears it down, so the halves may split them. One here: with both here the
-# halves read 11250s (main-a) against 13200s, past the 1800s the balance test
-# allows; with the family case in main-a they read 11850s against 12600s.
+# tears it down, so the halves may split them. One here, the family case in
+# main-a: the halves read 13300s (main-a) against 12800s; both here they would
+# read 12700s against 13400s, also inside the 1800s the balance test allows.
 upgrades-retrospective-log-volume-gate
