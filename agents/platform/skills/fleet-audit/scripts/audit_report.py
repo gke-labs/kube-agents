@@ -181,6 +181,7 @@ AUDITS: dict[str, AuditSpec] = {
             "unbound-sa-automount",
             "lb-world-open",
             "anonymous-rbac-binding",
+            "configsync-reconciler-stalled",
         ),
         # The two compliance checks that judge a posture an owner may choose:
         # a namespace that talks to nothing and so carries no NetworkPolicy
