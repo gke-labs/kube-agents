@@ -2646,24 +2646,43 @@ class KubeAgentsHarness(AgentHarness):
                     time.sleep(max(0.0, poll_interval))
             return None
 
-        seen = _read()
+        # Every card id any trusted read showed, so a failed last read still
+        # leaves the finish something to archive and purge.
+        known: list[str] = []
+
+        def _note(got: board.SessionCards | None) -> None:
+            if got is not None and got.session_found:
+                known.extend(t for t in got.card_ids if t not in known)
+
+        seen: board.SessionCards | None = None
         if sent:
+            # The deadline is set before the first read, so a slow read does
+            # not start the window late; the loop's last read is the verdict.
             deadline = time.monotonic() + stop.observe_seconds
-            while (left := deadline - time.monotonic()) > 0:
-                time.sleep(min(left, max(poll_interval, 1.0)))
+            while True:
                 seen = _read()
+                _note(seen)
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                time.sleep(min(left, max(poll_interval, 1.0)))
+        else:
+            seen = _read()
+            _note(seen)
 
         # 3. One finish.
         cards = list(seen.card_ids) if seen is not None and seen.session_found else []
         entry["args"]["cards"] = cards
         statuses = {t: str(seen.cards.get(t, {}).get("status") or "unknown") for t in cards} if seen else {}
         result.metadata["stop_card_statuses"] = statuses
-        still = [t for t in cards if statuses.get(t) not in _TERMINAL_STATUSES]
+        # A card the last read did not show (it failed, or lost the session)
+        # but an earlier one did is archived too: nothing says it ended.
+        still = [t for t in known if statuses.get(t) not in _TERMINAL_STATUSES]
         if still:
             _archive_stalled_cards(still, _EXEC_TIMEOUT)
         # As every other path that learns card ids ends: the pod outlives the
         # run, and a worker log left on it is there for the next run to find.
-        _purge_card_state(cards, _EXEC_TIMEOUT)
+        _purge_card_state(known, _EXEC_TIMEOUT)
 
         if unreachable is not None:
             # The door, not the agent: infrastructure, never graded.

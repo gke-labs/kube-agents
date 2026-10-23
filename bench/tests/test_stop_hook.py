@@ -194,9 +194,12 @@ def test_an_unreadable_session_still_sends_the_stop_and_is_infrastructure(monkey
         _stop(monkeypatch, [None])
 
 
-def test_a_window_whose_last_read_fails_is_infrastructure(monkeypatch):
+def test_a_window_whose_last_read_fails_is_infrastructure_and_still_archives(monkeypatch):
+    """The card an earlier read learned is archived and purged even though
+    the last read failed: nothing says it ended."""
     with pytest.raises(harness._TransportError, match="could not be read"):
         _stop(monkeypatch, [_cards({"t_1": "running"})] + [None] * 10, observe=30.0)
+    assert ARCHIVED == ["t_1"] and PURGED == ["t_1"]
 
 
 def test_a_session_not_in_the_store_still_sends_the_stop_and_is_infrastructure(monkeypatch):
