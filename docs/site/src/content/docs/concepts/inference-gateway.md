@@ -193,6 +193,31 @@ A pseudonym is the first twelve hex characters of an HMAC-SHA256 over the value,
 
 What this covers is the request body on its way to the provider. It does not touch responses, so an identifier the model already knows from an earlier, unredacted turn can still come back. The same switch reaches the agent pod: the chart projects this rule file there at a fixed path, and the image applies the IP and operator-rule layers, after its own credential masking, to what the agent writes to its volume, `agent.log`, the terminal-output cache, the worker transcript, the session store (`state.db`) and the kanban board; [Security and IAM](/kube-agents/reference/security-and-iam/#what-leaves-for-the-model-provider) lists what that covers and what it does not. Each process reads the file once at start: a changed rule file reaches the gateway on its next roll, and in the agent pod a long-lived process keeps the rules it started with while each new worker process reads the current file, so roll the pod to move them all. The image parses the file with the grammar it shipped with, so keep the chart and the agent image at one version when this switch is on. It does not touch chat egress. A rule that fails to load stops the gateway pod at startup rather than forwarding requests unredacted, and the render fails on a name, action or source it does not accept; an exception inside the hook fails that request. Each redacted request writes one line of substitution counts by rule name to the gateway pod's log, never the payload.
 
+### Pass-through trajectory logging
+
+For offline evaluation, fine-tuning, latency analysis, and audit trails, `litellm.traceLogEnabled=true` enables pass-through JSONL trajectory capture at the gateway.
+
+When enabled, the chart mounts `llm_trace_logger.py` and the shared `redactor.py` module beside `config.yaml`, registers `llm_trace_logger.proxy_handler_instance` under `litellm_settings.callbacks`, and passes `LITELLM_TRACE_LOG_PATH` (default: `/tmp/litellm_traces.jsonl`, which must reside under `/tmp/` because the gateway container runs with `readOnlyRootFilesystem: true` and only mounts an `emptyDir` at `/tmp`) plus `SESSION_KV_SALT` to the container.
+
+Before any record is written to disk, `AuditRedactor` runs over `api_base`, `messages`, `tools`, `response`, and `error` to mask built-in credential patterns, Kubernetes `Secret` `data:`/`stringData:` payloads, secret-shaped keys, and e-mail addresses, and to pseudonymise IP literals (plus any operator rules from `redaction.yaml` when `litellm.redaction.enabled` is also on). With `litellm.redaction.enabled` on, IP literals follow `litellm.redaction.ip` instead: `"off"` writes them verbatim, `mask` masks them, and addresses in `allowCidrs` pass through. Because `redaction.enabled` only rewrites outbound requests, running `AuditRedactor` inside the trajectory logger ensures assistant responses and reasoning traces are also scrubbed before hitting `/tmp`.
+
+Every completed or failed LLM invocation appends one JSON object containing:
+
+- `timestamp`: UTC ISO 8601 timestamp.
+- `status`: `"success"` or `"failure"`.
+- `model_alias`: The requested model alias (e.g. `model-default`).
+- `custom_llm_provider`: Upstream provider (`vertex_ai`, `hosted_vllm`, `gemini`, etc.).
+- `api_base`: Backend URL (if configured, with URL userinfo passwords masked).
+- `reasoning_effort`: Requested reasoning effort (e.g. `high`, `medium`, `low`).
+- `latency_ms`: Round-trip invocation latency in milliseconds.
+- `messages`: Redacted input messages and tool outputs.
+- `tools`: Redacted tool schemas provided to the model.
+- `response`: Redacted upstream response payload, including `choices`, `usage`, and `reasoning_content`.
+- `error`: Redacted error message if the call failed.
+- `truncated`: Present only on a record that was over `1 MiB` serialised: names the payload fields dropped (`messages`, `tools`, `response`) and the size the whole record had. The metadata fields above stay.
+
+To bound disk consumption on the gateway pod's `/tmp` `emptyDir`, the logger rotates the trace file at `5 MiB` across `3` numbered backups (`.1`–`.3`) under an exclusive `flock` on `<path>.lock`, caps one record at `1 MiB` as described above, clips every caller-chosen string, and refuses to append a line that would carry a file past its cap (the once-per-path warning records it), so the on-pod trail holds at most `20 MiB`. Each record is serialised, redacted and written on one writer thread, off the proxy's event loop and in order, so a slow write holds neither other requests nor the readiness probe, and records never contend for the file. `litellm.traceLogPath` must be a normalised path under `/tmp/`: a `.` or `..` component, or a doubled or trailing slash, is refused at render time. The logger is strictly pass-through: it never mutates live request or response payloads in place, and write exceptions emit a once-per-path `WARNING` to stderr (`kube_agents.llm_trace_logger`) so logging I/O issues are observable in pod logs without failing model calls. When `litellm.traceLogEnabled` is `false` (default), the callback is omitted and the default ConfigMap checksum remains byte-identical.
+
 ### Vertex AI and Model Garden
 
 `MODEL_PROVIDER=vertex_ai` routes `model-default` to Vertex AI in your own GCP project — the same first-party Gemini models, plus every Model Garden publisher model your project has access to (Anthropic Claude, Llama, Mistral, and the rest). Requests stay inside your project's billing and data boundary, and no model API key exists anywhere in the cluster. That boundary is a project, not a geography: the default location is the global endpoint, which makes no promise about the region a request is processed in — see the location bullet below.

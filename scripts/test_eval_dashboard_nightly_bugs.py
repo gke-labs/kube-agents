@@ -19,6 +19,7 @@ import sys
 import tempfile
 import typing
 import unittest
+import unittest.mock
 
 import yaml
 from eval_dashboard import nightly_bugs
@@ -84,7 +85,15 @@ class FakeGh:
     """A `gh api` runner: open issues and per-issue comments for reads, a
     freshly numbered object for writes; records every call."""
 
-    def __init__(self, open_issues=(), closed_issues=(), comments=None, fail_list=False, fail_closed=False, refuse_assignees=False, lands_then_fails=False, fail_writes=False, fail_comments=False):
+    def __init__(self, open_issues=(), closed_issues=(), comments=None, fail_list=False, fail_closed=False, refuse_assignees=False, lands_then_fails=False, fail_writes=False, fail_comments=False,
+                 empty_open=False, empty_closed=False, empty_comments=False, graphql=None):
+        # empty_*: the REST read answers 200 with nothing while the items
+        # exist (2026-10-22). graphql: "fail", "errors", or None for an
+        # answer that agrees with the issues held.
+        self.empty_open = empty_open
+        self.empty_closed = empty_closed
+        self.empty_comments = empty_comments
+        self.graphql = graphql
         self.calls = []
         self.open_issues = list(open_issues)
         self.closed_issues = list(closed_issues)
@@ -105,14 +114,36 @@ class FakeGh:
             number = int(path.split("/issues/")[1].split("/")[0])
             if self.fail_comments:
                 return GhResult(rc=1, stderr="HTTP 502")
+            if self.empty_comments:
+                return GhResult()
             return GhResult(stdout="\n".join(json.dumps(c) for c in self.comments.get(number, [])))
+        if method == "POST" and path == "graphql":
+            if self.graphql == "fail":
+                return GhResult(rc=1, stderr="HTTP 502")
+            if self.graphql == "errors":
+                return GhResult(stdout=json.dumps({"data": None, "errors": [{"message": "Something went wrong"}]}))
+
+            def conn(held):
+                items = [i for i in held if not i.get("pull_request")]
+                return {"totalCount": len(items), "nodes": [{"number": i["number"]} for i in items[:nightly_bugs.GRAPHQL_FIRST]]}
+            repo = {"open": conn(self.open_issues)}
+            if body["variables"]["closed"]:
+                repo["closed"] = conn(self.closed_issues)
+            return GhResult(stdout=json.dumps({"data": {"repository": repo}}))
         if method == "GET" and "state=closed" in path:
+            if self.empty_closed:
+                return GhResult()
             if self.fail_closed:
                 return GhResult(rc=1, stderr="HTTP 502")
             return GhResult(stdout="\n".join(json.dumps(i) for i in self.closed_issues))
         if method == "GET":
             if self.fail_list:
                 return GhResult(rc=1, stderr="HTTP 502")
+            if self.empty_open:
+                # True: empty every time; an int: that many empty answers first.
+                if self.empty_open is not True:
+                    self.empty_open -= 1
+                return GhResult()
             return GhResult(stdout="\n".join(json.dumps(i) for i in self.open_issues))
         if self.fail_writes:
             return GhResult(rc=1, stderr="HTTP 403")
@@ -131,7 +162,7 @@ class FakeGh:
         return GhResult(stdout=json.dumps({"number": number, "html_url": f"https://github.com/{REPO}/issues/{number}"}))
 
     def writes(self):
-        return [(m, p, b) for m, p, b in self.calls if m != "GET"]
+        return [(m, p, b) for m, p, b in self.calls if m != "GET" and p != "graphql"]
 
 
 class Harness(unittest.TestCase):
@@ -141,6 +172,9 @@ class Harness(unittest.TestCase):
         self.root = pathlib.Path(tmp.name) / "repo"
         shutil.copytree(TESTDATA, self.root)
         self.dir = pathlib.Path(tmp.name)
+        sleep = unittest.mock.patch.object(nightly_bugs.time, "sleep")
+        self.slept = sleep.start()
+        self.addCleanup(sleep.stop)
 
     def run_once(self, doc, gh=None, live=True):
         gh = gh or FakeGh()
@@ -320,6 +354,70 @@ class DedupeTest(Harness):
             self.assertEqual(gh.writes(), [])
             self.assertIn("could not list the nightly-red issues", err)
 
+    def test_an_empty_listing_while_issues_exist_files_nothing(self):
+        # 2026-10-22: the REST listing came back [] with the bugs open, and
+        # the filer filed six duplicates. GraphQL still sees them: no write.
+        issue = {"number": 3667, "title": "t", "body": nightly_bugs.MARKER.format(case="case-red")}
+        gh, out, err = self.run_once(self.THREE_RED(), FakeGh(open_issues=[issue], empty_open=True))
+        self.assertEqual(gh.writes(), [])
+        self.assertIn("listing is not trusted (the open listing holds 0 issues, GraphQL 1 (missing #3667))", err)
+        self.assertIn("filed 0,", out)
+        # The same for a closed bug that still tracks the streak.
+        closed = {"number": 3996, "title": "t", "body": nightly_bugs.MARKER.format(case="case-red"), "closed_at": "2026-10-17T12:00:00Z"}
+        gh, _, err = self.run_once(self.THREE_RED(), FakeGh(closed_issues=[closed], empty_closed=True))
+        self.assertEqual(gh.writes(), [])
+        self.assertIn("the closed listing holds 0 issues, GraphQL 1", err)
+        # And for an infra issue: a lost job's open issue hidden by the listing.
+        lost = data(night(15, [], lost=True), night(16, [green()]), night(17, [], lost=True))
+        job_issue = {"number": 3715, "title": "t", "body": nightly_bugs.BOT_MARKER.format(kind=nightly_bugs.KIND_LOST, field=nightly_bugs.KEY_JOB, key=JOB)}
+        self.assertEqual(len(self.filed(self.run_once(lost)[0], infra=True)), 1, "files when nothing tracks it")
+        gh, _, _ = self.run_once(lost, FakeGh(open_issues=[job_issue], empty_open=True))
+        self.assertEqual(gh.writes(), [])
+
+    def test_a_listing_that_reads_right_on_a_later_attempt_is_used(self):
+        issue = {"number": 3667, "title": "t", "body": nightly_bugs.MARKER.format(case="case-red")}
+        gh, out, err = self.run_once(self.THREE_RED(), FakeGh(open_issues=[issue], empty_open=nightly_bugs.LISTING_ATTEMPTS - 1))
+        self.assertEqual(gh.writes(), [])
+        self.assertIn("tracked: case-red by #3667", out)
+        self.assertEqual(err.count("listing is not trusted"), nightly_bugs.LISTING_ATTEMPTS - 1)
+        reads = [p for m, p, _ in gh.calls if m == "GET" and "state=open" in p]
+        self.assertEqual(len(reads), nightly_bugs.LISTING_ATTEMPTS)
+        self.assertEqual(self.slept.call_count, nightly_bugs.LISTING_ATTEMPTS - 1, "a pause between reads")
+        # Empty on every attempt: nothing written, and the pass says so.
+        gh, _, err = self.run_once(self.THREE_RED(), FakeGh(open_issues=[issue], empty_open=True))
+        self.assertEqual(gh.writes(), [])
+        self.assertIn("no trusted nightly-red issue listing this pass", err)
+
+    def test_a_graphql_cross_check_that_fails_files_nothing(self):
+        for mode in ("fail", "errors"):
+            with self.subTest(mode=mode):
+                gh, _, err = self.run_once(self.THREE_RED(), FakeGh(graphql=mode))
+                self.assertEqual(gh.writes(), [])
+                self.assertIn("the GraphQL cross-check could not be read", err)
+
+    def test_the_cross_check_reads_both_states_in_dry_run_too(self):
+        gh, _, _ = self.run_once(self.THREE_RED(), live=False)
+        [(_, _, body)] = [c for c in gh.calls if c[1] == "graphql"]
+        self.assertEqual(body["variables"], {"owner": "gke-labs", "name": "kube-agents", "label": "nightly-red",
+                                             "since": "2026-10-15T00:00:30Z", "closed": True})
+        gh, _, _ = self.run_once(self.THREE_RED())
+        self.assertEqual(len(self.filed(gh)), 1, "an empty listing GraphQL agrees with still files")
+
+    def test_a_pull_request_in_the_listing_does_not_count_as_an_issue(self):
+        # A labelled pull request pads the REST listing; GraphQL's issues
+        # exclude it, so a listing of the pull request alone is short.
+        pr = {"number": 3990, "title": "t", "body": "", "pull_request": {"url": "https://api.github.com/pulls/3990"}}
+        hidden = {"number": 3667, "title": "t", "body": nightly_bugs.MARKER.format(case="case-red")}
+        filer = nightly_bugs.Filer(nightly_bugs.ghcli.Gh(REPO, FakeGh(open_issues=[pr, hidden])), self.root)
+        self.assertEqual(filer.listing_doubt([pr], [], None), "the open listing holds 0 issues, GraphQL 1 (missing #3667)")
+        self.assertIsNone(filer.listing_doubt([pr, hidden], [], None))
+
+    def test_a_listing_short_of_graphqls_total_beyond_its_first_page_is_untrusted(self):
+        listed = [{"number": n, "title": "t", "body": ""} for n in range(1, 101)]
+        fake = FakeGh(open_issues=listed + [{"number": 101, "title": "t", "body": ""}])
+        filer = nightly_bugs.Filer(nightly_bugs.ghcli.Gh(REPO, fake), self.root)
+        self.assertIsNotNone(filer.listing_doubt(listed, [], None))
+
     def test_a_bug_closed_after_the_newest_red_night_is_not_filed_again(self):
         marker = nightly_bugs.MARKER.format(case="case-red")
         # Closed on the 17th after that night's run started (a fix merged).
@@ -418,6 +516,16 @@ class RecoveryTest(Harness):
         [(_, path, body)] = gh.writes()
         self.assertEqual(path, f"{ISSUES}/3989/comments")
         self.assertIn("2026-10-19 nightly", body["body"])
+
+    def test_an_empty_comment_read_on_an_issue_with_comments_does_not_comment_again(self):
+        # The comment read answers [] while the listing counts the bot's
+        # recovery comment: not commented again, retried next tick.
+        issue = dict(self.ISSUE, comments=1)
+        posted = {"body": nightly_bugs.RECOVERY_MARKER.format(case="case-red", date="2026-10-17")}
+        gh, out, err = self.run_once(self.recovered_data(), FakeGh(open_issues=[issue], comments={3990: [posted]}, empty_comments=True))
+        self.assertEqual(gh.writes(), [])
+        self.assertIn("#3990 lists 1 comments and the read returned 0", err)
+        self.assertIn("failed: case-red", out)
 
     def test_unreadable_comments_are_reported_failed(self):
         _, out, err = self.run_once(self.recovered_data(), FakeGh(open_issues=[self.ISSUE], fail_comments=True))

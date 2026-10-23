@@ -4400,6 +4400,11 @@ FLEET_RESOURCE_ROLES = {
     "google_compute_disk": {"roles/compute.storageAdmin"},
     "google_compute_firewall": {"roles/compute.securityAdmin", "roles/compute.viewer"},
     "google_compute_instance": {"roles/compute.instanceAdmin.v1", "roles/compute.viewer"},
+    # The lb-drain fixture: a health check and a backend service on the default pool's instance
+    # group (compute.instanceGroups.use is in loadBalancerAdmin; the GKE provider's refresh of the
+    # pool's group is compute.viewer's, above).
+    "google_compute_health_check": {"roles/compute.loadBalancerAdmin"},
+    "google_compute_backend_service": {"roles/compute.loadBalancerAdmin"},
     "google_service_account": {"roles/iam.serviceAccountAdmin"},
     "google_service_account_iam_member": {"roles/iam.serviceAccountAdmin"},
     "google_project_iam_member": {"roles/resourcemanager.projectIamAdmin"},

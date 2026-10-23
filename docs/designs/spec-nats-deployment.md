@@ -528,7 +528,10 @@ Layout:
   labels, the provision Job,
   and the hand-applied seed Job; **amended 10/6:** and the operator's own pod, by the
   `kubeagents.x-k8s.io/a2a-bus-client: operator` label from the operator's namespace,
-  which need not be the agent's), and ~~**no pod-network peer for 8222 or 9222**~~ **no
+  which need not be the agent's; **amended 10/22 (#3655):** and every pod in the
+  AgentProfile namespace `<agent-ns>-profiles`, matched by its name and the chart's
+  `app.kubernetes.io/component: profiles` label, admitted only once that namespace's own
+  fence (DNS, the bus and LiteLLM out, nothing in) is in place), and ~~**no pod-network peer for 8222 or 9222**~~ **no
   pod-network peer for 8222, and one for 9222: the console server (amended 9/24,
   below)**. The demo's
   `kubectl port-forward` and the kubelet's readiness probe both enter from the node,

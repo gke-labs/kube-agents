@@ -1975,7 +1975,7 @@ AuditId = Literal[
 
 # Every `status` a fleet-audit `finish` stores, for `audit_report_stored`:
 # a typo fails at spec-load time, as `AuditId` does for the stream.
-AuditStatus = Literal["OPENED", "UPDATED", "CLEAN", "HELD", "NO_FORGE"]
+AuditStatus = Literal["OPENED", "UPDATED", "CLEAN", "HELD", "NO_FORGE", "STORE_LEDGER"]
 
 # Environment names carrying the read credential, in precedence order. See
 # LedgerIssueContainsVerifier's docstring for what it has to be. A literal
@@ -2272,9 +2272,9 @@ _NO_WORKER_COMMANDS_REASON = (
 _NO_WORKER_TERMINAL_CALLS_REASON = (
     "no delegated worker's terminal or execute_code calls are readable in the trajectory: no "
     "card was delegated, the worker-trajectory capture did not run, the card log could not be "
-    "read, or the pod withheld a call's arguments, so the ordered read cannot observe its "
-    "subject (a worker whose tagged calls are all MCP or board calls, with an empty card log, "
-    "grades as zero commands)"
+    "read, or the pod withheld a call's arguments, so the read of the calls as typed cannot "
+    "observe its subject (a worker whose tagged calls are all MCP or board calls, with an empty "
+    "card log, grades as zero commands)"
 )
 _UNTIMED_WORKER_CALLS_REASON = (
     "{count} worker terminal call(s) carry no numeric time ({shown}), so the ordered read "
@@ -2283,6 +2283,12 @@ _UNTIMED_WORKER_CALLS_REASON = (
 _PARTIAL_WORKER_CAPTURE_REASON = (
     "the worker-trajectory capture was partial ({gaps}), so the commands it did read "
     "cannot clear the forbidden pattern(s): a retry may sit in the part it did not read"
+)
+# The same gap on a check with no forbidden set: nothing is ordered, so the
+# only open question is the required command(s) it did not see.
+_PARTIAL_REQUIRED_CAPTURE_REASON = (
+    "the worker-trajectory capture was partial ({gaps}), so the required command(s) it did "
+    "not see may sit in the part it did not read: {unseen}"
 )
 _MAX_NAMED_COMMANDS = 5
 # How much of a named command the reason quotes.
@@ -2832,8 +2838,9 @@ class WorkerCommandsVerifier(BaseVerifier):
     the rendering can miss a worker-filed card's command behind a ``cd ... &&``
     or on a second line, and a capture gap on such a card does not change the
     result (#3406).
-    ``after_result_pattern`` (below) reads the tagged calls alone, as typed,
-    for every card.
+    ``after_result_pattern`` (below) reads the tagged calls as typed for
+    every card: alone for the ordered check it was built for, and beside the
+    card log's rows for a check with no forbidden set.
 
     ``required_patterns``: each must match at least one command.
     ``forbidden_patterns``: none may match any command.
@@ -2931,7 +2938,11 @@ class WorkerCommandsVerifier(BaseVerifier):
     withheld), is ``status="error"``, a withheld argument beside a readable call
     is skipped, a worker whose tagged calls are all MCP calls grades as zero
     commands, and a capture with gaps that found no forbidden command is
-    ``status="error"``. Fails closed like its siblings -- a run with no captured
+    ``status="error"``; a check with no forbidden set is not ordered, so an
+    untimed call and a gap beside a satisfied required set do not error it,
+    and the card log's rows join its typed set, so a command the trajectory
+    missed still counts (a case sets ``after_result_pattern: "(?!)"`` to
+    read the required commands as typed and nothing else). Fails closed like its siblings -- a run with no captured
     worker commands is ``status="error"``, not a pass.
     """
 
@@ -2982,6 +2993,7 @@ class WorkerCommandsVerifier(BaseVerifier):
         window = ""
         sources = ""
         result_hits: list[tuple[str, str]] = []
+        forbidding = bool(self.forbidden_patterns or self.forbidden_runs or self.forbidden_result_patterns)
         if self.after_result_pattern is None:
             # ``None`` stays an error even when the trajectory carries tagged calls: it
             # means a filed card's log could not be read (or nothing was filed), and
@@ -3044,8 +3056,21 @@ class WorkerCommandsVerifier(BaseVerifier):
                         reason=_NO_WORKER_TERMINAL_CALLS_REASON,
                     )
             typed = [command for _, _, command, _, _ in calls]
+            # The ordered check reads the calls alone: a log row has no time.
+            # A check with no forbidden set keeps the card log as a source for
+            # its required checks: the trajectory can be the narrower read (two
+            # #2959 runs had a command on the log and no tagged call), so a row
+            # the calls do not carry joins the typed set rather than becoming a miss.
+            if not forbidding:
+                seen = set(typed)
+                joined = [row for row in (str(r.get("command") or "") for r in snap.worker_commands or []) if row and row not in seen]
+                typed += joined
+                if joined:
+                    sources = f" ({len(calls)} tagged calls as typed and {len(joined)} from the card log)"
             untimed = [command for _, at, command, _, _ in calls if at is None]
-            if untimed:
+            # Only the window orders calls; a check with no forbidden set
+            # grades nothing by time, so an untimed call cannot mislead it.
+            if untimed and forbidding:
                 shown = "; ".join(repr(c[:_SHOWN_COMMAND_CHARS]) for c in untimed[:_MAX_NAMED_COMMANDS])
                 return VerificationResult(
                     success=False,
@@ -3056,7 +3081,9 @@ class WorkerCommandsVerifier(BaseVerifier):
             lineage = _card_lineages(snap.worker_card_parents or {}, [c for c, _, _, _, _ in calls])
             windowed = []
             opened: list[str] = []
-            for root in dict.fromkeys(lineage[c] for c, _, _, _, _ in calls):
+            # A check with no forbidden set has nothing to grade after the
+            # opener; its reasons say nothing about a window it never used.
+            for root in dict.fromkeys(lineage[c] for c, _, _, _, _ in calls) if forbidding else ():
                 mine = [call for call in calls if lineage[call[0]] == root]
                 opener = next((i for i, (_, _, _, result, _) in enumerate(mine) if re.search(self.after_result_pattern, result)), None)
                 if opener is None:
@@ -3067,7 +3094,9 @@ class WorkerCommandsVerifier(BaseVerifier):
                 for _, _, command, result, _ in later:
                     result_hits.extend((p, command) for p in self.forbidden_result_patterns if re.search(p, result))
                 opened.append(f"{len(later)} in the lineage of card {root} after {mine[opener][2][:_SHOWN_COMMAND_CHARS]!r}")
-            if not opened:
+            if not forbidding:
+                window = ""
+            elif not opened:
                 window = (
                     f"; no worker command opened the window ({self.after_result_pattern!r} in the result"
                     " of any command, failed or not), so no command is after it and the forbidden pattern(s) graded nothing"
@@ -3125,13 +3154,20 @@ class WorkerCommandsVerifier(BaseVerifier):
                 elapsed_time=time.monotonic() - start,
                 reason="; ".join(parts) + window,
             )
-        if partial:
+        # A required command that was read is conclusive the same way: a gap
+        # beside a satisfied required set errors only a check that also has a
+        # forbidden set to clear.
+        if partial and (forbidding or missing or unrun):
             unseen = f"; required pattern(s) {missing} not seen in what was read" if missing else ""
+            reason = _PARTIAL_WORKER_CAPTURE_REASON.format(gaps="; ".join(snap.worker_capture_gaps)) + unseen + window
+            if not forbidding:
+                not_seen = [f"pattern {p!r}" for p in missing] + [" ".join(["run", run.script, *run.flags]) for run in unrun]
+                reason = _PARTIAL_REQUIRED_CAPTURE_REASON.format(gaps="; ".join(snap.worker_capture_gaps), unseen=", ".join(not_seen))
             return VerificationResult(
                 success=False,
                 status="error",
                 elapsed_time=time.monotonic() - start,
-                reason=_PARTIAL_WORKER_CAPTURE_REASON.format(gaps="; ".join(snap.worker_capture_gaps)) + unseen + window,
+                reason=reason,
             )
         return VerificationResult(
             success=True,

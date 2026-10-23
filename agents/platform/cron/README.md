@@ -202,8 +202,10 @@ install's remedy, and the table carries each as that project's failure, and a ti
 refused fails, announced once. An install that declares none keeps the bare flag, and a scope
 render the pod cannot read fails the tick with the reason. The cluster read is `gcloud` cluster metadata
 for the version table and, on a report day, the readiness report's read set,
-the same as a run on request: one `get-credentials` and six `kubectl get`s
-per cluster (budgets, Deployments and StatefulSets; webhook configurations
+the same as a run on request: three `gcloud` list reads per project (backend
+services, instances and GKE operations, projected to the fields the rules read)
+beside the server config per location, then one `get-credentials` and six
+`kubectl get`s per cluster (budgets, Deployments and StatefulSets; webhook configurations
 with their Services, EndpointSlices and Namespaces; DaemonSets, CronJobs,
 claims, NetworkPolicies and Namespaces; every pod; the nodes through a
 jsonpath projection; StorageClasses and PersistentVolumes), plus
@@ -325,7 +327,7 @@ cannot hold the run past the hour before it writes its record. The queue's ident
 its rubric sets the severity (a budget over a single replica, a pool past the skew ceiling and a
 webhook in the upgrade's path are critical; a budget over several replicas, a pool at the ceiling
 and a webhook refusing only what it matches today are major; a covering exclusion is minor; a
-readiness rule's blocker is critical, and its risk is minor for catalogue entries 9, 10, 11, 13 and 16 and major for every other entry, as the rubric's
+readiness rule's blocker is critical, and its risk is minor for catalogue entries 9, 10, 11, 13, 16 and 25 and major for every other entry, as the rubric's
 entry table sets it); a row
 the user dismissed stays dismissed; and the hourly nudge paces what is named and reminds daily of
 undecided criticals. A cluster read in full sends its batch with a `scope` naming the job's check

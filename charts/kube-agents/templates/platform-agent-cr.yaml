@@ -193,7 +193,7 @@ spec:
     {{- $defaultStockoutTuning := dict "maxInProgress" 3 "platform" (dict "apiMaxRetries" 8 "maxTurns" 200) "cluster" (dict "apiMaxRetries" 8 "maxTurns" 150) }}
     {{- $tuning = merge $tuning $defaultStockoutTuning }}
     {{- end }}
-    {{- if or (hasKey $tuning "maxInProgress") (hasKey $tuning "maxSessions") $tuning.platform $tuning.cluster $tuning.default }}
+    {{- if or (hasKey $tuning "maxInProgress") (hasKey $tuning "maxSessions") $tuning.platform $tuning.cluster $tuning.default $tuning.profiles }}
     tuning:
       {{- if hasKey $tuning "maxInProgress" }}
       maxInProgress: {{ $tuning.maxInProgress }}
@@ -211,6 +211,10 @@ spec:
       {{- end }}
       {{- with $tuning.cluster }}
       cluster:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $tuning.profiles }}
+      profiles:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     {{- end }}
@@ -877,13 +881,13 @@ spec:
     slack:
       enabled: true
       # The CRD requires both token refs when Slack is enabled; they point
-      # into the credentials Secret by convention.
+      # into the credentials Secret by default unless custom refs are provided.
       botTokenSecretRef:
-        name: {{ .Values.platformAgent.credentials.secretName | quote }}
-        key: SLACK_BOT_TOKEN
+        name: {{ (dig "botTokenSecretRef" "name" "" $integ.slack) | default .Values.platformAgent.credentials.secretName | quote }}
+        key: {{ (dig "botTokenSecretRef" "key" "" $integ.slack) | default "SLACK_BOT_TOKEN" | quote }}
       appTokenSecretRef:
-        name: {{ .Values.platformAgent.credentials.secretName | quote }}
-        key: SLACK_APP_TOKEN
+        name: {{ (dig "appTokenSecretRef" "name" "" $integ.slack) | default .Values.platformAgent.credentials.secretName | quote }}
+        key: {{ (dig "appTokenSecretRef" "key" "" $integ.slack) | default "SLACK_APP_TOKEN" | quote }}
       {{- with $integ.slack.allowedUsers }}
       allowedUsers:
         {{- toYaml . | nindent 8 }}
@@ -899,11 +903,11 @@ spec:
     teams:
       enabled: true
       appIdSecretRef:
-        name: {{ .Values.platformAgent.credentials.secretName | quote }}
-        key: TEAMS_APP_ID
+        name: {{ (dig "appIdSecretRef" "name" "" $integ.teams) | default .Values.platformAgent.credentials.secretName | quote }}
+        key: {{ (dig "appIdSecretRef" "key" "" $integ.teams) | default "TEAMS_APP_ID" | quote }}
       appPasswordSecretRef:
-        name: {{ .Values.platformAgent.credentials.secretName | quote }}
-        key: TEAMS_APP_PASSWORD
+        name: {{ (dig "appPasswordSecretRef" "name" "" $integ.teams) | default .Values.platformAgent.credentials.secretName | quote }}
+        key: {{ (dig "appPasswordSecretRef" "key" "" $integ.teams) | default "TEAMS_APP_PASSWORD" | quote }}
       {{- with $integ.teams.tenantId }}
       tenantId: {{ . | quote }}
       {{- end }}

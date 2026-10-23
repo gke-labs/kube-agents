@@ -1069,8 +1069,15 @@ func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 		{labelPartOf: a2aPartOf, a2aComponentLabel: "provision"},
 		{labelPartOf: a2aPartOf, a2aComponentLabel: "seed"},
 	}
-	if len(rule.From) != len(wantPeers) {
-		t.Fatalf("expected %d peers, got %d: %+v", len(wantPeers), len(rule.From), rule.From)
+	// After the same-namespace pods, one namespace-crossing peer: every pod
+	// in the profile namespace (#3655). That namespace's own fence keeps
+	// its pods to the bus, LiteLLM and DNS, and the bus grants do the rest.
+	if len(rule.From) != len(wantPeers)+1 {
+		t.Fatalf("expected %d peers, got %d: %+v", len(wantPeers)+1, len(rule.From), rule.From)
+	}
+	if profile := rule.From[len(wantPeers)]; profile.PodSelector != nil || profile.IPBlock != nil || profile.NamespaceSelector == nil ||
+		!reflect.DeepEqual(profile.NamespaceSelector.MatchLabels, map[string]string{corev1.LabelMetadataName: "test-ns-profiles", "app.kubernetes.io/component": "profiles"}) {
+		t.Errorf("the last 4222 peer = %+v, want every pod in namespace test-ns-profiles, carrying the chart's component label", profile)
 	}
 	for i, want := range wantPeers {
 		peer := rule.From[i]
@@ -2653,11 +2660,11 @@ func TestHandleDeletionSkipsUnownedCalloutClusterRoleBinding(t *testing.T) {
 	}
 }
 
-// TestCleanupA2ACostsElevenReadsWhenThereIsNothingToClean measures the thing
+// TestCleanupA2ACostsTwelveReadsWhenThereIsNothingToClean measures the thing
 // the change was for. Counting is the only honest check here: the early exit
 // is a cost optimisation, and a correctness test passes just as well with the
 // reads still happening one object at a time.
-func TestCleanupA2ACostsElevenReadsWhenThereIsNothingToClean(t *testing.T) {
+func TestCleanupA2ACostsTwelveReadsWhenThereIsNothingToClean(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 
@@ -2681,7 +2688,7 @@ func TestCleanupA2ACostsElevenReadsWhenThereIsNothingToClean(t *testing.T) {
 	if err := r.cleanupA2A(context.Background(), agent); err != nil {
 		t.Fatalf("cleanupA2A on a never-rendered install: %v", err)
 	}
-	// Ten sentinel Gets and nothing else: no per-object walk, and in
+	// Twelve sentinel Gets and nothing else: no per-object walk, and in
 	// particular no Job List, which is the uncached one that ran every
 	// reconcile of every today install before this.
 	//
@@ -2692,17 +2699,19 @@ func TestCleanupA2ACostsElevenReadsWhenThereIsNothingToClean(t *testing.T) {
 	// pair under the other flag, 8 -> 9 when the console fence did, for
 	// the same reason again, and 9 -> 10 when the gateway's own fence did
 	// (#2473: it now renders on every next gateway, and the same
-	// hand-deleted pair leaves it alone), and 10 -> 11 when the MCP server's
-	// fence did, for the console fence's reason (#3653); the fences are Owns
-	// kinds, so those seven reads come from the cache and only the two
-	// Secrets are uncached.
+	// hand-deleted pair leaves it alone), 10 -> 11 when the MCP server's
+	// fence did, for the console fence's reason (#3653), and 11 -> 12 when
+	// the profile namespace's fence did (#3655: it is the first write of the
+	// fence pass, and carries no owner reference, so a pass that dies after
+	// it leaves it alone); the fences are NetworkPolicies, so those eight
+	// reads come from the cache and only the two Secrets are uncached.
 	// Raising it is a
 	// real decision — every today install pays it on every reconcile,
 	// forever — so it is spelled out rather than derived. The inequality
 	// below is the part that must hold whatever the literal is: the exit is
 	// only worth having while it costs less than the walk.
-	if gets != 11 {
-		t.Errorf("Gets = %d, want 11 (the sentinels); the per-object walk is running on a no-op", gets)
+	if gets != 12 {
+		t.Errorf("Gets = %d, want 12 (the sentinels); the per-object walk is running on a no-op", gets)
 	}
 	if walk := len(r.a2aNamespacedTeardown(agent)); gets >= walk {
 		t.Errorf("Gets = %d for an exit that saves a %d-object walk; the exit has stopped paying for itself", gets, walk)
@@ -2828,7 +2837,7 @@ func TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere(t *testing.T) {
 			}
 			fences := 0
 			unobstructed := &PlatformAgentReconciler{Client: buildClient(next, 0, &fences), Scheme: scheme}
-			if _, err := unobstructed.reconcileA2ANetworkFences(context.Background(), next.DeepCopy()); err != nil {
+			if _, _, err := unobstructed.reconcileA2ANetworkFences(context.Background(), next.DeepCopy()); err != nil {
 				t.Fatalf("unobstructed guardrail render: %v", err)
 			}
 			if fences == 0 {
@@ -2845,7 +2854,7 @@ func TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere(t *testing.T) {
 					r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 					ctx := context.Background()
 
-					_, err := r.reconcileA2ANetworkFences(ctx, next.DeepCopy())
+					_, _, err := r.reconcileA2ANetworkFences(ctx, next.DeepCopy())
 					if n <= fences && err == nil {
 						t.Fatal("want the injected error, got nil: the guardrail render did not die where this case says it did")
 					}
@@ -2893,7 +2902,7 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnARefusedInstall(t *testing.T) {
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(next.DeepCopy()).
 			WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
 		r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-		if _, err := r.reconcileA2ANetworkFences(context.Background(), next.DeepCopy()); err != nil {
+		if _, _, err := r.reconcileA2ANetworkFences(context.Background(), next.DeepCopy()); err != nil {
 			t.Fatalf("guardrail render: %v", err)
 		}
 		return countA2ALabelled(context.Background(), t, cl)
@@ -2921,7 +2930,7 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnARefusedInstall(t *testing.T) {
 				Build()
 			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 			ctx := context.Background()
-			if _, err := r.reconcileA2ANetworkFences(ctx, next.DeepCopy()); err != nil {
+			if _, _, err := r.reconcileA2ANetworkFences(ctx, next.DeepCopy()); err != nil {
 				t.Fatalf("guardrail render: %v", err)
 			}
 
