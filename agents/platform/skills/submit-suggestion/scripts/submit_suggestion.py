@@ -72,6 +72,10 @@ PROTECTED_BRANCH_PREFIXES = ("run/",)
 # same reason: what the file holds is posted publicly, so a path the model
 # supplies is a way to publish any file the agent container can read.
 SCRATCH_DIR = "/opt/data/scratch"
+DECISION_MEMORY_DIRS = ("knowledge/decisions", "knowledge/lessons")
+DECISION_MEMORY_SCRIPT_REL = Path("decision-memory/scripts/decision_memory.py")
+DECISION_MEMORY_HEADING = "### Prior decisions and lessons"
+DECISION_MEMORY_VALID_EXIT_CODES = (0, 2)
 
 
 def _short_branch(branch: str) -> str:
@@ -562,20 +566,96 @@ def handle_prepare(args) -> int:
                 )
         started_from = base
 
-    print(json.dumps({
+    ws = Path(cloned["path"])
+    has_dm = any((ws / rel).is_dir() for rel in DECISION_MEMORY_DIRS)
+    if has_dm:
+        log(
+            "Decision Memory records exist in knowledge/. Run "
+            '`python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py '
+            f"--repo {ws} why <path>` before modifying governed files."
+        )
+    out_payload = {
         "workspace": cloned["path"],
         "repo": repo,
         "branch": branch,
         "base": base,
         "started_from": started_from,
         "proposal": (proposal or {}).get("url", ""),
-    }))
+    }
+    if has_dm:
+        out_payload["decision_memory"] = True
+    print(json.dumps(out_payload))
     return 0
 
 
 def pending_changes(session: dict) -> str:
     """What the working copy holds that its revision does not."""
     return vcs_client.local(session, ["status", "--porcelain"], "status")["stdout"].strip()
+
+
+def _resolve_decision_memory_base(session: dict, ws: Path, base: str) -> str:
+    """Return a revision in `ws` to diff against `HEAD` for Decision Memory checks."""
+    for candidate in (base, f"origin/{base}", session.get("baseRevision", "")):
+        if not candidate:
+            continue
+        chk = subprocess.run(
+            ["git", "-C", str(ws), "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"],
+            capture_output=True, text=True, check=False,
+        )
+        if chk.returncode == 0 and chk.stdout.strip():
+            return candidate
+    return session.get("baseRevision") or base
+
+
+def _check_decision_memory(
+    session: dict,
+    base: str,
+    override: str | None = None,
+    repo: str | None = None,
+    copy_key: str | None = None,
+) -> dict | None:
+    """Run Decision Memory check on the staged/committed change before publishing."""
+    ws = Path(session["path"])
+    if not any((ws / rel).is_dir() for rel in DECISION_MEMORY_DIRS):
+        return None
+    dm_script = Path(__file__).resolve().parents[2] / DECISION_MEMORY_SCRIPT_REL
+    if not dm_script.is_file():
+        return None
+    diff_base = _resolve_decision_memory_base(session, ws, base)
+    res = subprocess.run(
+        [sys.executable, str(dm_script), "--repo", str(ws), "check", "--base", diff_base, "--head", "HEAD"],
+        capture_output=True, text=True, check=False,
+    )
+    if res.returncode not in DECISION_MEMORY_VALID_EXIT_CODES or not res.stdout.strip():
+        detail = (res.stderr or res.stdout or f"exit code {res.returncode}").strip()
+        raise RuntimeError(f"Decision Memory check failed on {ws} (base {diff_base}): {detail}")
+    try:
+        out = json.loads(res.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Decision Memory check returned invalid JSON: {exc}") from exc
+    if out.get("verdict") == "block":
+        blocking_ids = [f["id"] for f in out.get("findings", []) if f.get("severity") == "block"]
+        overrides = {s.strip() for s in str(override or "").split(",") if s.strip()}
+        if not blocking_ids or not set(blocking_ids).issubset(overrides):
+            if repo and copy_key:
+                with contextlib.suppress(Exception):
+                    vcs_client.discard(repo, key=copy_key)
+            msg = (
+                "DECISION MEMORY GUARD BLOCKED THIS CHANGE:\n\n"
+                f"{out.get('markdown', '')}\n\n"
+                "Do NOT open this Pull Request. The working copy has been discarded. "
+                "In your final response (and kanban_complete result), you MUST quote the record IDs "
+                "(DEC-... / LES-...), Breaking PR (#...), Incident Issue (#...), Revert/Fix PR (#...), "
+                "and the technical root-cause details from the block above verbatim."
+            )
+            log(msg)
+            raise PermissionError(msg)
+    elif out.get("findings"):
+        log(
+            "DECISION MEMORY CONTEXT (include the record IDs, superseding PR #, and superseded incident/PR # in your final summary):\n"
+            f"{out.get('markdown', '')}"
+        )
+    return out
 
 
 def handle_submit(args) -> int:
@@ -747,6 +827,14 @@ def handle_submit(args) -> int:
             )
         log(f"Recording {len(pending.splitlines())} pending change(s)...")
         vcs_client.commit(args.title, spec=repo, key=copy_key)
+
+    dm_out = _check_decision_memory(
+        session, base, getattr(args, "override_decision", None), repo=repo, copy_key=copy_key
+    )
+    if dm_out and dm_out.get("findings") and not args.keep_description:
+        md_section = dm_out.get("markdown", "")
+        if md_section and DECISION_MEMORY_HEADING not in body:
+            body = body.rstrip() + "\n\n" + md_section + "\n"
 
     if vcs_client.already_published(session, branch):
         # The state a retry has to be able to walk back into: the publish landed
@@ -1004,6 +1092,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--base", default=None,
         help="The branch this merges into (default: the open proposal's, else "
              "the base the broker pins, else the branch the copy was taken of)",
+    )
+    submit.add_argument(
+        "--override-decision", default=None,
+        help="Explicitly override a blocking Decision Memory record ID when instructed by an operator",
     )
 
     for command in (prepare, submit):

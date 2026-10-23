@@ -41,7 +41,8 @@ try:
 except (ImportError, ValueError):
     import _stubs  # type: ignore # noqa: F401
 
-from kube_agents_memory import SHARED_TAG, KubeAgentsMemoryProvider  # noqa: E402
+from unittest.mock import patch
+from kube_agents_memory import SHARED_TAG, KubeAgentsMemoryProvider, client as memory_client  # noqa: E402
 
 PLUGIN_DIR = os.path.join(
     _REPO, "agents", "chat", "plugins", "memory", "kube_agents_memory"
@@ -150,6 +151,29 @@ class TestRecallReporting(unittest.TestCase):
         self.assertIn("Memory is a search, not an index", p.system_prompt_block())
         p._user_tag = ""  # shared-only variant
         self.assertIn("Memory is a search, not an index", p.system_prompt_block())
+
+    def test_prefetch_and_recall_merge_nats_decisions(self):
+        """Prefetch and shared recall include structured DEC-*/LES-* records from NATS."""
+        p, _ = provider(results=[])
+        p._hindsight.prefetch = lambda query, session_id="": ""
+        dec_text = "[DEC-2026-004] [STATUS: REJECTED — do not enforce as active policy]\nNo infrastructure PR merges on Fridays"
+        with patch.object(memory_client, "recall_decisions", return_value=[dec_text]):
+            prefetched = p.prefetch("Can we merge on Friday?", session_id="s1")
+            self.assertIn("# Memory", prefetched)
+            self.assertIn("DEC-2026-004", prefetched)
+            self.assertIn("STATUS: REJECTED", prefetched)
+
+            shared_res = json.loads(
+                p.handle_tool_call("memory_recall", {"query": "Friday", "scope": "shared"})
+            )
+            self.assertEqual(shared_res["status"], "found")
+            self.assertEqual(shared_res["matches"], 1)
+            self.assertIn("DEC-2026-004", shared_res["result"])
+
+            personal_res = json.loads(
+                p.handle_tool_call("memory_recall", {"query": "Friday", "scope": "personal"})
+            )
+            self.assertEqual(personal_res["status"], "no_match")
 
 
 if __name__ == "__main__":

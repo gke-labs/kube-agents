@@ -1956,5 +1956,84 @@ class LiftedNameReachesTheBrokerTest(unittest.TestCase):
         self.assertEqual(["github.com/acme/fleet"], seen)
 
 
+class DecisionMemoryGuardTest(unittest.TestCase):
+    """Tests for `_check_decision_memory` pre-submit verification."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="ka-dm-guard-test-"))
+        self.repo = self.tmp / "repo"
+        self.repo.mkdir()
+        git(self.repo, "init", "--quiet", "-b", "main")
+        (self.repo / "clusters" / "prod").mkdir(parents=True)
+        (self.repo / "clusters" / "prod" / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        resources:\n          requests:\n            memory: 2Gi\n"
+        )
+        (self.repo / "knowledge" / "lessons").mkdir(parents=True)
+        (self.repo / "knowledge" / "lessons" / "LES-2026-001-checkout-memory.md").write_text(
+            "---\n"
+            "type: lesson\n"
+            "id: LES-2026-001\n"
+            "title: Keep checkout memory request >= 2Gi\n"
+            "status: active\n"
+            "date: 2026-03-01\n"
+            "scope:\n"
+            "  paths:\n"
+            "    - clusters/prod/checkout.yaml\n"
+            "guard:\n"
+            "  rule: Keep checkout memory request >= 2Gi.\n"
+            "  severity: block\n"
+            "  expect:\n"
+            "    file: clusters/prod/checkout.yaml\n"
+            "    path: spec.template.spec.containers[name=checkout].resources.requests.memory\n"
+            "    op: '>='\n"
+            "    value: 2Gi\n"
+            "evidence:\n"
+            "  pull_request: '#10'\n"
+            "---\n\n"
+            "## What happened\n\nOOMKilled below 2Gi.\n"
+        )
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "--quiet", "-m", "initial")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_blocking_guard_raises_permission_error_unless_overridden(self):
+        git(self.repo, "checkout", "--quiet", "-b", "platform-agent/lower-mem")
+        (self.repo / "clusters" / "prod" / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        resources:\n          requests:\n            memory: 512Mi\n"
+        )
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "--quiet", "-m", "lower memory to 512Mi")
+
+        session = {"path": str(self.repo), "baseRevision": "main"}
+        with self.assertRaises(PermissionError) as caught:
+            submit_suggestion._check_decision_memory(session, "main", None)
+        self.assertIn("DECISION MEMORY GUARD BLOCKED THIS CHANGE", str(caught.exception))
+        self.assertIn("LES-2026-001", str(caught.exception))
+
+        # Explicit `--override-decision LES-2026-001` allows the submission
+        out = submit_suggestion._check_decision_memory(session, "main", "LES-2026-001")
+        self.assertEqual(out["verdict"], "block")
+
+    def test_consistent_change_passes_guard(self):
+        git(self.repo, "checkout", "--quiet", "-b", "platform-agent/raise-mem")
+        (self.repo / "clusters" / "prod" / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        resources:\n          requests:\n            memory: 4Gi\n"
+        )
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "--quiet", "-m", "raise memory to 4Gi")
+
+        session = {"path": str(self.repo), "baseRevision": "main"}
+        out = submit_suggestion._check_decision_memory(session, "main", None)
+        self.assertEqual(out["verdict"], "ok")
+
+
 if __name__ == "__main__":
     unittest.main()

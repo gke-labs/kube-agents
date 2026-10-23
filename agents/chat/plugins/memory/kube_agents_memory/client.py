@@ -17,7 +17,11 @@ something the model reads is `session.py`'s job — see `prompts.py` for why the
 three outcomes must stay distinguishable.
 """
 
+import json
 import logging
+import os
+import shutil
+import subprocess
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
@@ -247,3 +251,106 @@ def reflect(provider: MemoryProvider, query: str, tags: List[str]) -> str:
         )
     )
     return str(getattr(response, "text", "") or "").strip()
+
+
+def _resolve_curator_bin() -> str:
+    """Return the path to the ``curator`` CLI binary if installed, else ``""``."""
+    configured = os.environ.get("CURATOR_BIN", "").strip()
+    if configured:
+        return configured
+    if os.path.isfile("/usr/local/bin/curator") and os.access("/usr/local/bin/curator", os.X_OK):
+        return "/usr/local/bin/curator"
+    return shutil.which("curator") or ""
+
+
+def recall_decisions(query: str, max_results: int = 4) -> List[str]:
+    """Query structured DEC-*/LES-* records over NATS via ``curator recall``.
+
+    Returns an empty list when ``NATS_URL`` is unset or ``curator`` is not
+    installed so unit tests and environments without the NATS bus are
+    unaffected.
+    """
+    q = str(query or "").strip()
+    if not q or not os.environ.get("NATS_URL", "").strip():
+        return []
+    curator_bin = _resolve_curator_bin()
+    if not curator_bin:
+        return []
+    try:
+        proc = subprocess.run(
+            [curator_bin, "recall", q],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return []
+        payload = json.loads(proc.stdout)
+    except Exception as e:
+        logger.debug("%s: NATS decision recall failed: %s", PROVIDER_NAME, e)
+        return []
+
+    records_by_id = {
+        str(rec.get("id") or ""): rec
+        for rec in (payload.get("records") or [])
+        if isinstance(rec, dict) and rec.get("id")
+    }
+    formatted: List[str] = []
+    for item in payload.get("results") or []:
+        if not isinstance(item, dict):
+            continue
+        rec_id = str(item.get("id") or "").strip()
+        doc_id = str(item.get("document_id") or "").strip()
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        is_okf = (
+            rec_id.startswith(("DEC-", "LES-"))
+            or doc_id.startswith("okf:")
+            or rec_id in records_by_id
+        )
+        if not is_okf:
+            continue
+        rec_meta = records_by_id.get(rec_id) or {}
+        status = str(rec_meta.get("status") or "").strip().lower()
+        header = f"[{rec_id}]" if rec_id else "[Record]"
+        if status == "rejected":
+            reason = str(rec_meta.get("reviewer_reason") or "").strip()
+            note = f" (Reason: {reason})" if reason else ""
+            header = f"{header} [STATUS: REJECTED — do not enforce as active policy{note}]"
+        elif status:
+            header = f"{header} [status: {status}]"
+        formatted.append(f"{header}\n{text}")
+        if len(formatted) >= max_results:
+            break
+    return formatted
+
+
+def emit_shared_decision(content: str, context: str = "") -> None:
+    """Publish a ``chat.rule_stated`` outcome event over NATS when a shared rule is retained."""
+    text = str(content or "").strip()
+    if not text or not os.environ.get("NATS_URL", "").strip():
+        return
+    curator_bin = _resolve_curator_bin()
+    if not curator_bin:
+        return
+    title = text.splitlines()[0][:80].strip()
+    cmd = [
+        curator_bin,
+        "emit",
+        "--kind",
+        "proposed",
+        "--type",
+        "decision",
+        "--title",
+        title,
+        "--summary",
+        f"{text} ({context})" if context else text,
+        "--rule",
+        text,
+    ]
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=False)
+    except Exception as e:
+        logger.debug("%s: NATS decision emit failed: %s", PROVIDER_NAME, e)

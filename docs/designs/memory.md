@@ -2,1820 +2,832 @@
 
 ## Summary
 
-An agent that runs an enterprise fleet accumulates organisational knowledge —
-which decision is current, who owns what, which cluster is the exception — and it
-has to carry that knowledge from one conversation to the next. Hermes ships a
-file-based memory for this. At fleet scale it does not hold: left unbounded it
-consumes most of the model's context window on every turn, and bounded to the size
-Hermes allows it holds almost nothing.
+An AI platform agent that operates a Kubernetes fleet needs two distinct kinds of long-term memory:
 
-So we built a retrieval-backed memory on Hindsight, and measured the two against
-each other on a synthetic enterprise fleet — both what each puts in front of the
-model and the answers each produces. Retrieval answered the same questions from a
-small fraction of the context, and could say where each answer came from. That is
-the change this document designs.
+1. **Conversational and organizational memory (`kube-agents-memory` and `multiuser_memory`)**: Remembers who owns which service or control, how each engineer prefers to work in direct messages, and which operational conventions the team has stated in chat.
+2. **Decision and lesson memory (`knowledge/decisions/*.md`, `knowledge/lessons/*.md`, and `kube-agents-decisions`)**: Remembers why a workload setting or cluster policy exists, which incident or pull request established it, which proposed fixes failed or were rejected, and which machine-checked guard prevents a repeat outage.
 
-**Status:** implemented on the Chat Agent profile. The open follow-ups are in
-[What is still unproven](#what-is-still-unproven).
+Without these two layers, a fleet agent fails in three ways as an organization grows:
 
-| Layer                     | Where it lives                                                                                                                                             |
-| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| The provider              | [`agents/chat/plugins/memory/kube_agents_memory/`](../../agents/chat/plugins/memory/kube_agents_memory/)                                                   |
-| The lighter alternative   | [`agents/chat/plugins/memory/multiuser_memory/`](../../agents/chat/plugins/memory/multiuser_memory/)                                                       |
-| Which one an install gets | `install.sh --memory=`, carried as `spec.harness.memory.provider` — see [Choosing a provider](#choosing-a-provider)                                        |
-| Its recall settings       | [`agents/chat/defaults/hindsight/config.json`](../../agents/chat/defaults/hindsight/config.json)                                                           |
-| Its endpoint              | `HINDSIGHT_API_URL`, derived from the namespace in [`platformagent_manifests.go`](../../k8s-operator/internal/controller/platformagent_manifests.go)       |
-| The two pods              | [`k8s-operator/config/integrations/hindsight/`](../../k8s-operator/config/integrations/hindsight/README.md)                                                |
-| Scope rules for the model | [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.6                                                                                                    |
-| The experiment            | [`tests/memory-scale/`](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/README.md) (archive branch, see below) |
+- **Flat memory files overflow or truncate.** Loading an entire Markdown memory file into the system prompt on every turn consumes $110,907$ tokens at $1,414$ records, while capping the file at $2,200$ characters retains only about seven records.
+- **Chat-only memory misses operational history.** An agent that learns only from chat conversations ignores the GitOps operational loop (`troubleshoot -> pull request -> merge -> verified resolution`). Furthermore, LLM-based memory summarization rewrites prose and strips exact record IDs in $11$ of $12$ recall misses, and vector similarity ranks superseded policies alongside active ones ($40.7\%$ contamination).
+- **Stateless runs repeat rejected changes and undo protective fixes.** When each run starts with no memory of past pull requests, an agent or engineer can lower a memory request that prevented an out-of-memory crash, or repeatedly propose a namespace quota increase that reviewers already rejected.
 
-The experiment that decided this is about a megabyte of corpus fixtures, job
-manifests and raw scorer output. It is kept out of this repository so the
-shipped tree carries only design and code, and lives on the
-[`experiment/memory-scale-ab`](https://github.com/dshnayder/kube-agents/tree/experiment/memory-scale-ab/tests/memory-scale)
-branch of the fork — the same commit as this change, so the harness runs against
-exactly the code described here. Every link below into `tests/memory-scale/`
-points there.
+This document defines the unified two-layer memory architecture for `kube-agents`:
+
+- **Layer 1 — Conversational Memory (`kube-agents-memory` and `multiuser_memory`)**:
+  - Uses self-hosted Hindsight (`kube-agents-memory`) to retrieve only the memories relevant to the current turn, keeping context usage flat ($\approx 4,264$ tokens at $1,414$ records). Small installations can select the zero-database file provider (`multiuser_memory`).
+  - Propagates gateway-verified caller identity (`hmac:<32-hex>`) and conversation audience (`"dm"` or `"group"`) through `hermes-bridge` and `session_kv_server.py`.
+  - Enforces five explicit session states (`attributed-dm`, `unattributable-shared`, `unattributable-interactive`, `unattended`, and `read-only`) so personal memories stay strictly private per user and missing identity always fails closed.
+- **Layer 2 — Decision and Lesson Memory (`knowledge/` + `kube-agents-decisions` + `decision_memory.py`)**:
+  - Stores architectural decisions (`knowledge/decisions/DEC-*.md`) and operational lessons (`knowledge/lessons/LES-*.md`) as human-reviewed Operational Knowledge Format (OKF) files in the GitOps repository, indexed verbatim in Hindsight (`kube-agents-decisions`) for semantic search.
+  - Populates records from four sources: verified pull request outcomes (`resolved-merged`, `pr-merged-persists`, and `refused`), a 2-hour day-one bootstrap across 2 years of repository history (GitHub, GitLab, and Bitbucket), explicit decisions stated in chat, and nightly `dream` reconciliation.
+  - Evaluates machine-checked YAML and regex invariants (`decision_memory.py check`) deterministically in $< 100\text{ ms}$ with zero LLM calls before the agent opens a pull request and during CI review of human pull requests.
+
+| Component                             | Repository location                                                                                                                                                    |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Hindsight conversational provider     | [`agents/chat/plugins/memory/kube_agents_memory/`](../../agents/chat/plugins/memory/kube_agents_memory/)                                                               |
+| File-based conversational provider    | [`agents/chat/plugins/memory/multiuser_memory/`](../../agents/chat/plugins/memory/multiuser_memory/)                                                                   |
+| Session route store                   | [`a2a/hermes-bridge/route.go`](../../a2a/hermes-bridge/route.go), [`agents/platform/scripts/session_kv_server.py`](../../agents/platform/scripts/session_kv_server.py) |
+| Decision memory CLI and skill         | [`agents/platform/skills/decision-memory/`](../../agents/platform/skills/decision-memory/SKILL.md) (`scripts/decision_memory.py`)                                      |
+| Pre-PR submission guard               | [`agents/platform/skills/submit-suggestion/scripts/submit_suggestion.py`](../../agents/platform/skills/submit-suggestion/scripts/submit_suggestion.py)                 |
+| Installer flag and CRD field          | `install.sh --memory=file\|hindsight\|off`, stored on `PlatformAgent` as `spec.harness.memory.provider`                                                                |
+| Hindsight recall configuration        | [`agents/chat/defaults/hindsight/config.json`](../../agents/chat/defaults/hindsight/config.json)                                                                       |
+| Hindsight in-cluster manifests        | [`k8s-operator/config/integrations/hindsight/`](../../k8s-operator/config/integrations/hindsight/README.md)                                                            |
+| Conversational scope rules            | [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.6                                                                                                                |
+| Conversational scale experiment suite | [`tests/memory-scale/`](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/README.md)                                         |
+
+---
 
 ## How to read this document
 
-Each section goes a level deeper than the one before it, so a human reader can
-stop as soon as they have what they came for. An agent should read all of it.
+Each section adds technical depth so readers can stop as soon as they have the level of detail they need.
 
-| Section                           | What it gives you                                          |
-| --------------------------------- | ---------------------------------------------------------- |
-| [Background](#background)         | what Hermes ships, and why it was not enough               |
-| [The decision](#the-decision)     | the argument, and the numbers it rests on                  |
-| [The design](#the-design)         | how the provider works and how users stay isolated         |
-| [The experiment](#the-experiment) | the fleet it was measured against, the method, the results |
+| Section                           | Audience                                               | What you will learn                                                                                                      |
+| --------------------------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
+| [Why](#why)                       | Engineering leads, product managers, prospective users | How memory helps platform teams prevent repeat outages, onboard existing repositories, and keep user context isolated    |
+| [Background](#background)         | Platform engineers evaluating `kube-agents`            | Why fleet agents need both conversational and GitOps decision memory, and why Hindsight was selected for self-hosting    |
+| [The decision](#the-decision)     | Architects and tech leads                              | Why retrieval replaces full-file prompt injection, and why architectural decisions belong in Git with verbatim indexing  |
+| [The design](#the-design)         | Implementers and AI agents                             | Scoping, identity propagation, the 5 session states, OKF decision/lesson schemas, guard checks, and nightly `dream` jobs |
+| [The experiment](#the-experiment) | Evaluators and operators                               | Benchmarks on a 1,664-record corpus and a 500-cluster GitOps repository across 10 real-world outage scenarios            |
+
+---
+
+## Why
+
+### What platform teams need from agent memory
+
+When an enterprise platform team manages dozens or hundreds of Kubernetes clusters through GitOps, institutional knowledge is scattered across chat threads, merged pull requests, closed pull requests, incident tickets, and architecture docs. Platform teams evaluating `kube-agents` consistently highlight three operational pain points:
+
+1. **Personal context and shared team knowledge get mixed up or lost.** An engineer wants the agent to remember their personal test cluster and output preferences in direct messages, keep those personal notes out of shared group channels, and share team-wide ownership facts (such as who approves production changes) across everyone.
+2. **Cost-tuning or cleanup changes undo past incident fixes.** Six months after an incident, an engineer or automated agent lowers a container memory request, tightens a `PodDisruptionBudget`, or enables Spot VMs to save money. Because nothing in the manifest explains that the existing setting prevented a production outage, the change merges and repeats the outage.
+3. **Teams and agents repeat fixes that were already rejected or failed.** When a deployment fails because of a namespace `ResourceQuota` limit, a stateless agent repeatedly proposes raising the namespace quota—even when platform reviewers already rejected that exact pull request four times because the real fix was right-sizing a runaway indexing job in another folder.
+
+To solve these problems, `kube-agents` provides seven core capabilities:
+
+| Team need                              | What `kube-agents` does                                                                                                                                          |
+| -------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Isolate personal vs. shared memory** | Keeps personal preferences strictly private per user in direct messages, and fails closed whenever speaker identity is absent or shared.                         |
+| **Explain past rationale ("Why?")**    | Answers _"Why is this workload configured this way?"_ with the exact decision or lesson ID, the pull request URL, the incident link, and the approver.           |
+| **Onboard 2 years of history in 2h**   | Scans the past 2 years of pull requests, issues, and `/docs` within 2 hours of installation to generate a reviewable `STATE_OF_BEING.md` baseline.               |
+| **Triage history at scale**            | Separates active rules from superseded policies, rejected pull requests, and obsolete clusters across thousands of historical commits.                           |
+| **Resolve contradictory history**      | Applies deterministic precedence rules when a newer pull request supersedes or reverts an earlier decision, instead of relying on vector similarity.             |
+| **Learn from verified outcomes**       | Drafts a reusable lesson automatically when an agent fix pull request merges and resolves an incident—or when a fix fails post-merge verification or is refused. |
+| **Block regressions before merge**     | Checks proposed YAML and Terraform changes against active guards in under $100\text{ ms}$, blocking repeat-outage changes before a pull request is opened.       |
+
+### Operational impact at a glance
+
+| Capability                                        | Without unified memory                                                                                                                        | With unified memory (`kube-agents-memory` + `decision-memory`)                                                                                                | Measured impact                                                                                                      |
+| ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| **1. Per-user privacy in chat**                   | HTTP turns lack user identity; file memory falls back to a shared `"default"` file, or DMs are treated as unattended background runs.         | `hermes-bridge` records gateway-verified `user_id` and `chat_type`; memory providers enforce 5 explicit session states.                                       | $0$ cross-user memory leaks; $0$ silent drops when a user asks the agent to remember a preference.                   |
+| **2. Learning from failed or rejected fixes**     | Every troubleshooting run starts stateless; when a namespace hits a quota error, the agent proposes the same rejected quota raise repeatedly. | Verified outcomes (`resolved-merged`, `pr-merged-persists`, `refused`) generate scoped lesson records (`LES-*`) with machine-checked guards.                  | Repeat bad proposals drop to $0$ after the first rejected or failed attempt is recorded.                             |
+| **3. Preventing repeat outages on pull requests** | Neither CI nor the agent checks diffs against past incident postmortems; engineers or agents accidentally revert protective settings.         | `decision_memory.py check` runs before the agent pushes a branch and in pull request CI, blocking any change that violates an active guard.                   | $100\%$ of guarded outage regressions are blocked before merge with links to the original incident and revert PR.    |
+| **4. Day-one onboarding of existing repos**       | A newly installed agent has zero historical context until engineers manually restate every rule in chat.                                      | `decision_memory.py bootstrap --since 2y` triages 2 years of pull requests and docs in under 2 hours into `STATE_OF_BEING.md` and initial records.            | The agent answers architectural rationale questions and enforces past incident guards immediately after onboarding.  |
+| **5. Verifiable citations**                       | LLM observation synthesis rewrites text and drops record IDs in $11$ of $12$ retrieval misses.                                                | Decision and lesson records live in Git and index into Hindsight as verbatim chunks (`enable_observations: false`), preserving every ID and PR URL.           | $100\%$ citation accuracy across historical pull requests, issues, and decision IDs.                                 |
+| **6. Drift detection and policy graduation**      | Outdated rules remain mixed with active ones ($40.7\%$ contamination), and manual commits can silently break a past architectural decision.   | Nightly `dream` runs flag `at_risk` records the morning after an unguarded commit and propose admission policies (`policy/`) for recurring incident patterns. | $0\%$ superseded policy contamination on active queries; recurring lessons graduate into cluster-wide policy checks. |
+
+### Why store decisions in memory instead of scanning Git and pull requests on every task?
+
+A common question from engineering teams is: _"All of our commits and pull requests are already in Git and GitHub/GitLab—why not have the agent run `git log` and search pull requests live whenever it makes a change?"_
+
+We tested this directly on a 500-cluster GitOps repository across 10 real-world outage scenarios (see [Part 2 of The experiment](#part-2-decision-memory-evaluation-on-10-real-world-kubernetes-outage-scenarios)). Pre-analyzing history into structured decision memory outperforms live per-request repository scanning across accuracy, token cost, and speed:
+
+| Dimension                  | Scan Git and pull requests live on every task                                                                                                                                                                            | Store decisions and lessons in long-term memory                                                                                                                                                          | Measured advantage of decision memory                                                                          |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| **Accuracy on edge cases** | **Misses rejected unmerged PRs and cross-file fixes ($90\%$ accuracy).** A closed, unmerged PR leaves zero commits in `git log <file>`, and forge CLI list commands default to open items and cap pagination at 30 rows. | **Captures the full causal chain ($100\%$ accuracy).** Bootstrap indexes closed/rejected PRs, cross-file fixes, and `supersedes` chains once, and `submit-suggestion` enforces guards deterministically. | **$100\%$ vs $90\%$ accuracy** ($0$ vs $1$ repeat-outage PR opened); scales to repositories with $2,000+$ PRs. |
+| **LLM token consumption**  | **High ($130,519$ median / $233,348$ max uncached input tokens per task).** Dumping `git log` and pull request JSON into the prompt on every task re-bills those tokens on every turn of the agent loop.                 | **Low and constant ($66,734$ median uncached input tokens on the standard path).** Local Python evaluates the guard at $0$ LLM token cost and injects only the matching record ($\approx 500$ tokens).   | **$-41\%$ to $-49\%$ uncached input tokens** per task.                                                         |
+| **Latency and API load**   | **Slow ($15\text{–}35\text{ s}$ network scan, $4\text{–}8$ forge API calls per task).** Every change task queries remote GitHub, GitLab, or Bitbucket endpoints over the network.                                        | **Sub-second local check ($< 100\text{ ms}$, $0$ forge API calls).** `decision_memory.py check` evaluates YAML and regex invariants directly against the local Git checkout before pushing a branch.     | **$< 100\text{ ms}$ local check vs $15\text{–}35\text{ s}$ network scan**; zero forge API rate-limit usage.    |
 
 ---
 
 ## Background
 
-### Why the agent needs memory at all
+### Two types of knowledge in a Kubernetes fleet
 
-An agent that answers questions about a fleet has to know things nobody will
-restate for it in the prompt: which architecture decision is current, which version
-of a retention policy still applies, who owns a control, which cluster is the
-exception to the rule everyone else follows. None of that is derivable from the
-cluster — it is organisational knowledge, and it accrues.
+An enterprise fleet agent handles two very different kinds of information:
 
-### What Hermes gives you by default
+1. **Conversational context**: Statements made by engineers in chat, such as _"My scratch cluster is `dev-alice-01`"_, _"Always show me `kubectl diff` before applying"_, or _"The payments team owns `clusters/prod-eu/payments`."_ These facts arrive informally during chat turns, need per-user privacy for personal preferences, and benefit from semantic retrieval.
+2. **Infrastructure decisions and incident lessons**: Rules that govern production manifests in Git, such as _"Keep the `checkout` container memory request at or above `256Mi` because JVM off-heap buffers caused an `OOMKilled` outage below that threshold in PR #31"_ or _"Do not raise the `kyber-ledger` namespace quota above `32Gi`; right-size the `audit-indexer` deployment instead."_ These rules require human review, exact resource paths, verifiable links to pull requests and incidents, deterministic precedence when policies change, and enforcement in both agent workflows and CI pipelines.
 
-A built-in file memory (`tools/memory_tool.py`): two Markdown files under
-`$HERMES_HOME` — `MEMORY.md` and `USER.md` — entries separated by `§`, read once
-and injected into the system prompt as a **frozen snapshot at session start**, so
-mid-session writes hit disk without moving the prompt or spoiling the prefix
-cache. It is **bounded** (2,200 and 1,375 characters) and **single-user**: there
-is no `user_id` anywhere in it. The bound is the subject of
-[the decision](#a-file-store-is-bounded-or-it-eats-the-window).
+### What the underlying agent framework provides
 
-### The plugin providers
+The `kube-agents` runtime builds on Hermes, which includes a simple built-in file memory (`tools/memory_tool.py`): two Markdown files (`MEMORY.md` and `USER.md`) that are loaded in full into the system prompt at session start. That built-in store has two limitations for an enterprise platform team:
 
-Exactly one external provider may register at a time (`agent/memory_provider.py`;
-`MemoryManager` rejects a second). Eight ship in `plugins/memory/`:
+- **Single-user only**: It has no concept of `user_id`, so all users share one `USER.md`.
+- **Fixed size vs. context window trade-off**: Hermes caps `MEMORY.md` at $2,200$ characters (about seven records). If that cap is removed so the file can hold two years of fleet knowledge ($1,414$ records, or $443,196$ characters), the file consumes **$110,907$ tokens on every turn**—more than half of a $200,000$-token context window before the user even asks a question.
 
-| Plugin        | Shape                                        | Multi-user support               |
-| ------------- | -------------------------------------------- | -------------------------------- |
-| `hindsight`   | Self-hostable document store + consolidation | Tag scoping (`scope`, `user_id`) |
-| `honcho`      | Self-hostable, per-peer conversation memory  | First-class peers, dyadic reads  |
-| `mem0`        | Cloud, self-hosted server, or in-process OSS | `user_id` only — no shared scope |
-| `retaindb`    | Hosted                                       | `user_id` throughout             |
-| `openviking`  | Hosted, tenant-scoped                        | Tenants and namespaces           |
-| `byterover`   | Hosted                                       | Minimal                          |
-| `supermemory` | Hosted                                       | Minimal                          |
-| `holographic` | Local HRR experiment                         | None                             |
+### Evaluating external conversational memory providers
 
-Self-hosting is highly desired — the corpus is a bank's internal fleet topology,
-ownership map and incident history, and a hosted provider puts all of it outside the
-customer's boundary. That alone does not narrow the field to one. `mem0` self-hosts,
-either as a server over HTTP or in-process against pgvector, and `honcho` self-hosts
-as a container set the plugin will talk to over a configured `baseUrl`
-(`plugins/memory/honcho/config_schema.py`). Two other requirements narrow it, and
-they eliminate both.
+Hermes supports external memory provider plugins (`agent/memory_provider.py`). We evaluated the eight available providers against three enterprise requirements:
 
-**An embedder you have to supply.** `mem0`'s in-process mode requires an `embedder`
-section and accepts exactly two providers for it, `openai` and `ollama`
-(`plugins/memory/mem0/_oss_providers.py`). `honcho` is stricter still: its
-`EmbeddingTransport` is `Literal["openai", "gemini"]` (`src/config.py`) with no
-in-process option at all, and turning embeddings off with `EMBED_MESSAGES=false`
-does not degrade search gracefully — it skips the semantic branch entirely
-(`src/utils/search.py`) and leaves keyword matching. Either therefore means
-declaring a second model, an embedding model, in LiteLLM — which this project does
-not do, since LiteLLM carries only the model the installer defines — or running a
-second inference server.
+1. **Self-hostable inside the organization's Kubernetes cluster** so internal fleet topology, ownership maps, and incident history never leave the cluster boundary.
+2. **In-cluster embeddings without extra model infrastructure** so organizations using Anthropic Claude, Vertex AI, Bedrock, or Azure do not have to deploy a separate embedding inference server.
+3. **Both per-user private scope and organization-wide shared scope** in a single store so engineers have private DM preferences while specialist subagents and team members can read shared organizational facts.
 
-The transport list is a constraint on the customer as much as on us. It admits an
-OpenAI-compatible `base_url` override, but nothing outside those two wire formats:
-an install standardised on Anthropic has no embedding API to point at, and one on
-Bedrock, Azure or an in-house embedder has to front it with a compatible shim
-first. `hindsight` embeds and reranks in-pod from models baked into the image
-(`HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`), and asks LiteLLM for one model, the
-installer's — so the customer's choice of provider is a question the memory store
-never asks.
+| Provider      | Deployment model                            | Multi-user and shared scope support              | Embedding requirement                       |
+| ------------- | ------------------------------------------- | ------------------------------------------------ | ------------------------------------------- |
+| `hindsight`   | Self-hosted in-cluster (`api` + `pgvector`) | Tag scoping (`user:<id>` and `scope:shared`)     | Baked into container image (offline CPU)    |
+| `honcho`      | Self-hosted (4 workloads, AGPL-3.0)         | Peer-scoped perspectives only (no shared bucket) | Requires external OpenAI or Gemini embedder |
+| `mem0`        | Cloud or self-hosted                        | `user_id` only (no shared organizational scope)  | Requires external OpenAI or Ollama embedder |
+| `retaindb`    | Hosted SaaS                                 | `user_id`                                        | Hosted                                      |
+| `openviking`  | Hosted SaaS                                 | Tenant and namespace scopes                      | Hosted                                      |
+| `byterover`   | Hosted SaaS                                 | Minimal                                          | Hosted                                      |
+| `supermemory` | Hosted SaaS                                 | Minimal                                          | Hosted                                      |
+| `holographic` | Local experimental store                    | None                                             | Local                                       |
 
-**One principal per read.** `mem0`'s recall filters on `user_id` alone — "scoped to
-user_id only — by design", `plugins/memory/mem0/__init__.py`. `honcho` has richer
-identity than either of the others — peers are first-class and the plugin resolves
-the gateway identity to one natively — but every read is scoped to a perspective:
-search filters on `peer_perspective`, and conclusions are dyadic, one observer's
-view of one target peer (`plugins/memory/honcho/session.py`). Neither offers an
-organisation-wide bucket a read can include, which is the half of the problem this
-document is about: a specialist spawned without a human identity would have nothing
-to read at all.
+**Hindsight** (MIT license) is the only provider that self-hosts inside the cluster, supports both per-user and shared scopes via tags, and embeds and reranks queries offline inside its own pod (`HF_HUB_OFFLINE=1`) using the existing LiteLLM gateway for fact extraction.
 
-Note what that does to the argument that `honcho` needs no wrapper. Its native
-tenancy is real, and for per-user isolation alone it would need nothing from us.
-But per-user memory _and_ an org-wide corpus is the requirement, and the second
-half has no native form: it would have to be a synthetic organisation peer that
-every real peer observes and that identity-less specialists read as, plus the code
-to keep writes flowing to the right one of the two. That is a wrapper, sitting on
-top of a plugin that is already 7,096 lines — and a stranger one than tags, because
-it encodes org knowledge as one fictional peer's beliefs inside a model built for
-beliefs _about_ peers.
+We also benchmarked a self-hosted `honcho` deployment head-to-head against Hindsight on the same 1,664-record fleet corpus ([full comparison results](https://github.com/dshnayder/kube-agents/blob/experiment/memory-honcho-ab/tests/memory-scale/honcho/RESULTS.md)). On queries where a runbook had been retired and replaced, `honcho` returned the retired runbook on **100% of procedural probes** (contamination $1.000$ vs Hindsight's $0.000$) because its message search still matches superseded messages verbatim.
 
-So `hindsight` is the only entry that is self-hostable, multi-user, **and** able to
-embed without new infrastructure — the one candidate that does not trade one of those
-against the others. Two smaller differences point the same way: `honcho` self-hosts
-as four workloads against Hindsight's two, and the two that are its own code — the
-API and the background deriver, both built from the `plastic-labs/honcho` tree —
-are AGPL-3.0 where Hindsight is MIT. The other two are stock images, `pgvector` and
-`redis`. A copyleft licence on a service the customer runs inside its own boundary
-is a question their legal review will ask.
+### Retaining `multiuser_memory` for small installations
 
-What the extra workloads do _not_ buy is a better database story. `honcho` runs one
-`pgvector` service behind one volume, exactly as this does; its `redis` adds a second
-stateful component rather than removing the first. Single-instance Postgres is a
-property of both, and of anything else Postgres-backed — an availability question
-answered by ordinary Postgres HA, not by the choice of memory provider.
-
-#### What survives if `honcho` gets the wrapper
-
-Every ground above is a property of `honcho`'s shape, so the obvious rebuttal is to
-build the wrapper and answer all of them at once. `honcho` was therefore self-hosted
-and run against the same 26 probes and the same 1,664-document corpus at an equal
-context budget —
-[full results](https://github.com/dshnayder/kube-agents/blob/experiment/memory-honcho-ab/tests/memory-scale/honcho/RESULTS.md).
-Grant the wrapper, and one finding survives it.
-
-**Superseded content.** On the message-search surface the plugin's `honcho_search`
-uses, `honcho` put a retired value in front of the model on _every_ procedural probe
-at the largest rung — contamination 1.000 against `hindsight`'s 0.000. The cause is
-structural, not a tuning gap: consolidation deletes retired content at write time, so
-`hindsight` cannot return what is no longer there, while in `honcho` a retired runbook
-is still a message and still a legitimate hit. Scoping does not touch that, and a
-`dream` is not expected to either — dreams consolidate conclusions, and a conclusion
-does not unwrite the message that search reads. For a fleet agent this is the
-governing failure mode, because the wrong answer to "what is the current runbook" is
-a previously correct one.
-
-Two costs the a-priori argument did not predict point the same way: derivation is
-asynchronous, so a fact is not queryable for minutes after it is written, where
-`hindsight` pays that cost inline at write; and embedding every _query_ puts LiteLLM
-in the read path rather than only the write path.
-
-One result goes the other way, and it is a real gap rather than a rounding error.
-`honcho` returns messages verbatim, so a document identifier always survives into the
-context; `hindsight` paraphrases and drops the identifier in 37 of 82 units, which is
-why its measured gold recall understates what it actually retrieved. That argues for
-provenance metadata on `hindsight` units, not for a different store.
-
-### `multiuser_memory`, the provider this displaces
-
-This repository already carried its own provider
-([`agents/chat/plugins/memory/multiuser_memory/`](../../agents/chat/plugins/memory/multiuser_memory/)):
-one Markdown file per user under `memories/users/<id>.md`, one shared
-`memories/MEMORY.md`, and `system_prompt_block()` concatenating both into the
-prompt.
-
-It isolated users correctly — **zero tag leaks** at every corpus size. What it
-originally lost in the port from the built-in was everything the built-in does
-that the file format does not show: the file-level character bound, the file
-lock, the external-drift guard, the prompt-injection scan, and the frozen
-snapshot. Prompt-injection scanning and entry-level length bounds were later
-restored, but the store-level capacity bound remains absent. A lookalike is
-indistinguishable from its reference right up until one of the invisible
-behaviours is needed. That capacity bound is what this document is about.
-
-**It stays in the tree**, as the choice for an install that will not run a
-database for memory. Everything below argues that a file store does not hold at
-fleet scale, and none of it argues that a file store is wrong for a fleet of five
-clusters and three people. What it costs to run is nothing; what it costs to use
-is the whole store in the window on every turn, which is affordable exactly as
-long as the store is small. Which provider an install gets is the operator's
-choice, not this document's — see
-[Choosing a provider](#choosing-a-provider).
+For small clusters or personal evaluation environments that do not want to run a PostgreSQL database for memory, `kube-agents` also includes [`multiuser_memory`](../../agents/chat/plugins/memory/multiuser_memory/): a lightweight Markdown file provider that stores one file per user (`memories/users/<id>.md`) plus one shared file (`memories/MEMORY.md`). Operators select between `file` (`multiuser_memory`), `hindsight` (`kube_agents_memory`), and `off` (`none`) at installation time.
 
 ---
 
 ## The decision
 
-Every load-bearing number below is measured in [the experiment](#the-experiment)
-or arithmetic on two measured quantities. Anything unmeasured is labelled and
-carries no weight.
+### 1. Use retrieval-backed Hindsight for conversational memory at fleet scale
 
-### The fleet the memory has to serve
+Instead of injecting the entire memory store into the system prompt on every turn, `kube_agents_memory` stores conversational facts in Hindsight and retrieves a budget-bounded set of relevant observations for each user turn:
 
-The A/B ran against a synthetic bank's platform team: **500 GKE clusters and two
-years of accumulated decisions.** 1,664 records, of which **1,414 are shared**,
-across eleven families — architecture decisions, runbooks, postmortems,
-conventions, deprecations, ownership, exceptions, gotchas, capacity, migrations,
-inventory. Six policies exist in three dated versions each, 55 records are
-exceptions contradicting the rule they name, and the inventory disagrees with
-itself about the same clusters ([What was built](#what-was-built)).
+| Provider                            | Shared records in store | Gold recall | Superseded/irrelevant contamination | Current policy ranked first | Context tokens per turn |
+| ----------------------------------- | ----------------------: | ----------: | ----------------------------------: | --------------------------: | ----------------------: |
+| Hindsight (`kube_agents_memory`)    |                     100 |       0.718 |                               0.407 |                       83.3% |                   4,588 |
+| Hindsight (`kube_agents_memory`)    |                     200 |       0.718 |                               0.407 |                       83.3% |                   4,544 |
+| Hindsight (`kube_agents_memory`)    |                     400 |       0.718 |                               0.407 |                       83.3% |                   4,468 |
+| Hindsight (`kube_agents_memory`)    |                     800 |       0.718 |                               0.407 |                       83.3% |                   4,322 |
+| Hindsight (`kube_agents_memory`)    |                   1,414 |       0.702 |                               0.407 |                       83.3% |               **4,264** |
+| Unbounded file (`multiuser_memory`) |                     100 |       1.000 |                               0.722 |                       42.9% |                  13,780 |
+| Unbounded file (`multiuser_memory`) |                     200 |       1.000 |                               0.722 |                       42.9% |                  24,661 |
+| Unbounded file (`multiuser_memory`) |                     400 |       1.000 |                               0.722 |                       42.9% |                  46,633 |
+| Unbounded file (`multiuser_memory`) |                     800 |       1.000 |                               0.722 |                       42.9% |                  79,616 |
+| Unbounded file (`multiuser_memory`) |                   1,414 |       1.000 |                               0.722 |                       42.9% |             **110,907** |
 
-That shape is the problem, not the volume. 443,196 characters is a third of a
-novel. But it is knowledge nobody restates in the prompt, it is contested, and it
-only accrues — and any real fleet of that size looks like it after two years.
+As the shared corpus grows $14\times$ (from $100$ to $1,414$ records), the file store's prompt footprint grows $8\times$ to $110,907$ tokens per turn, whereas Hindsight's per-turn context stays flat at **$4,264$ tokens** and ranks the current version of contested policies first **$83.3\%$** of the time (compared to **$42.9\%$** for the flat file).
 
-### A file store is bounded, or it eats the window
+### 2. Add a Git-backed Decision and Lesson Memory layer for infrastructure history
 
-Hermes bounds its file memory in source — `MemoryStore.__init__` in
-`tools/memory_tool.py` — at **2,200 characters** for `MEMORY.md` and **1,375** for
-`USER.md`, as admission control on writes: a write that would exceed the limit is
-refused, and the model is told to consolidate and retry.
+While Hindsight's observation synthesis works well for chat preferences and ownership notes, six empirical findings show why infrastructure decisions and incident lessons need a dedicated, Git-backed layer:
 
-That bound is load-bearing. **Nothing else in a file store ever removes an
-entry** — no eviction, no TTL, no relevance filter, no compaction. Admission
-control on total store capacity is the sole mechanism keeping the file a summary
-rather than an append-only log. [`multiuser_memory`](#multiuser_memory-the-provider-this-displaces)
-lost that store-wide bound in the port (bounding per-entry length and entry count
-instead), so the file arm the experiment measured is a defect rather than a
-configuration anyone would choose.
-
-**Unbounded, memory is 55% of the window before the user speaks.** The store is
-concatenated into the system prompt at session start, on every turn: 443,196
-characters ≈ **110,799 tokens** against Opus 5's 200k. What must share the rest,
-measured from this repository at `TOK_PER_CHAR = 0.25` — the Chat Agent's persona
-is 7,061 tokens, the Platform Agent's seventeen skill bodies 25,358, then Hermes'
-base prompt, the tool schemas and the conversation itself. The window exhausts at
-roughly **2,600 records** with all of that at zero, and delegation is already
-impossible: Chat Agent → specialist → cluster agent is `3 × 110,799 = 332,397
-tokens`, **1.66 windows of memory alone**.
-
-**Bounded, it holds about seven records of 1,414.** 2,200 of 443,196 characters is
-**0.50% of the corpus**; at the corpus mean of 313 characters per record, roughly
-**seven records** for about 550 tokens a turn. No recall figure is reported for
-this arm and none is needed — a measurement would describe one consolidation
-strategy, while the capacity bound holds for _every_ strategy including a perfect
-one. An upper bound of 0.50% is the stronger claim.
-
-Raising the ceiling does not escape the trade, because **the tax _is_ the file,
-injected whole**. The two settings are one curve read at two points, exchanging
-recall for window one for one. There is no setting of a file store that is both
-affordable and complete.
-
-### Why retrieval is the way out
-
-Both settings pay for the whole corpus on every turn, because both decide what the
-model sees at **session start** — before the question exists. Any given question
-needs a handful of records, and which handful is unknowable until it is asked.
-
-So stop injecting the store and start searching it: pay for the corpus once, in
-storage, and per turn only for what the current question needs. Storage grows with
-the fleet; context does not. That is retrieval, and of the eight plugin providers
-only Hindsight is both self-hostable and multi-user.
-
-**The same conclusion, reached independently.** A separate internal agent platform —
-Google's hosted agent — uses a similar architecture for the same reason: a file
-loaded whole on every turn wastes tokens and degrades as it grows. The two designs match mechanism for mechanism — one document per memory
-rather than one file for all of them, embedding search putting only the relevant few
-into the current turn, the agent writing its own observations as it works, and a
-nightly consolidation pass that merges duplicates, resolves contradictions between
-older and newer observations, and prunes what has stopped earning its place. They
-diverge on one point, instructively: theirs serves a single engineer and needs no
-scope model at all, where a shared fleet agent needs
-[one bank and two scopes](#one-bank-two-scopes). This is corroboration and not
-evidence — none of it is measured on this corpus and no number here depends on it.
-What it establishes is that the failure being designed around is not an artefact of
-this repository's file provider.
-
-### How Hindsight answers it
-
-Hindsight is a document store with an LLM consolidation layer in front of it.
-Writes go in as _facts_; a background pass consolidates them into _observations_;
-recall does semantic search over the observation layer and returns a
-**budget-bounded** set of results, injected into the **current turn** rather than
-into the system prompt.
-
-It has every mechanism this needs except one: no way to learn who is speaking. So
-the provider here is a slim wrapper, [`kube_agents_memory`](#the-design), which
-resolves the gateway identity and stamps `user:<id>` on a personal write and
-`scope:shared` on a deliberate shared one, then asks recall for
-`[user:<id>, scope:shared]` and nothing else. One bank holds every user's memory
-and the fleet's; the tags keep them apart. Everything else is stock, so a
-base-image bump brings upstream fixes with no port to redo. Detail in
-[the design](#the-design).
-
-The store therefore holds everything and the window carries only what the turn
-needs — context cost decouples from corpus size:
-
-| Provider   | Rung | Gold recall | Contamination | Current ranked first | Context tokens |
-| ---------- | ---: | ----------: | ------------: | -------------------: | -------------: |
-| Hindsight  |  100 |       0.718 |         0.407 |                0.833 |          4,588 |
-| Hindsight  |  200 |       0.718 |         0.407 |                0.833 |          4,544 |
-| Hindsight  |  400 |       0.718 |         0.407 |                0.833 |          4,468 |
-| Hindsight  |  800 |       0.718 |         0.407 |                0.833 |          4,322 |
-| Hindsight  | 1414 |       0.702 |         0.407 |                0.833 |      **4,264** |
-| File-based |  100 |       1.000 |         0.722 |                0.429 |         13,780 |
-| File-based |  200 |       1.000 |         0.722 |                0.429 |         24,661 |
-| File-based |  400 |       1.000 |         0.722 |                0.429 |         46,633 |
-| File-based |  800 |       1.000 |         0.722 |                0.429 |         79,616 |
-| File-based | 1414 |       1.000 |         0.722 |                0.429 |    **110,907** |
-
-The file column grows 8× across the ladder; the Hindsight column **shrinks**
-(4,588 → 4,264) as consolidation compresses. That divergence, not any single row,
-is the result. Retrieval also buys ranking and provenance: contamination —
-superseded or out-of-scope material in the window — is **0.407 against 0.722**, the
-current version of a contested policy arrives first **83.3%** of the time against
-**42.9%**, and because a document store carries identifiers out-of-band instead of
-hoping they appear in prose, **964 distinct corpus identifiers** sit on retrieval
-labels against 193 reachable in the file.
-
-### What is adopted
-
-**Hindsight becomes the Chat Agent's default memory provider**. Default, not only:
-the argument above is about fleet scale, and an install that is not at fleet scale
-can still choose the file store or no memory at all
-([Choosing a provider](#choosing-a-provider)). What the default settles is which
-way an install goes when nobody has an opinion, and everything from here on
-describes that path.
+| Empirical finding                                                       | Measured effect in chat-only memory                                                               | How Decision and Lesson Memory solves it                                                                                       |
+| ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| **1. LLM observation synthesis strips record IDs**                      | $11$ of $12$ recall misses at $1,414$ records kept the prose gist but dropped the record ID.      | Stores records as Markdown files in Git (`knowledge/`) and indexes them into Hindsight as verbatim chunks (`chunks` mode).     |
+| **2. Batching multiple records per retain call merges document labels** | Retaining 5 records per call collapsed $1,664$ records into $335$ documents and hid $156$ IDs.    | Indexes exactly one record per document (`document_id = okf:<repo>:<path>`) with `update_mode: replace`.                       |
+| **3. Superseded policies appear alongside active policies**             | $40.7\%$ of retrieved context on contested policies contained superseded rules.                   | Tracks explicit `status: active \| superseded` frontmatter and `supersedes` links, filtering active queries deterministically. |
+| **4. CPU cross-encoder reranking takes $\approx 7\text{ s}$ per query** | Scoring $300$ candidates on CPU takes $14.2\text{ s}$ ($7\text{ s}$ with length-bucket batching). | Matches changed files and Kubernetes resources locally in Git in $< 100\text{ ms}$ before running any semantic query.          |
+| **5. Subagents without memory access build unsafe local caches**        | A specialist subagent without memory access wrote a $79\text{ KB}$ private copy into its skill.   | Gives specialist workers sanctioned, read-only access to shared memory and `decision_memory.py` CLI / MCP tools.               |
+| **6. Prompt advice alone does not stop repeat bad fixes**               | Without a hard check in the submission tool, an agent repeated a rejected quota raise 4 times.    | Evaluates `guard.expect` rules inside `submit-suggestion` before `git push` and exits with code `2` on any `block` violation.  |
 
 ---
 
 ## The design
 
-One Hindsight bank, `kube-agents-memory`, behind a slim wrapper around the stock
-Hindsight provider. Every memory carries a scope tag; the wrapper's entire job is
-to resolve the current human's identity into the right tags and pin the four
-settings that would otherwise leak or silently lose data.
+### Architecture overview: two memory layers
 
-### Choosing a provider
+`kube-agents` separates **per-user personal memory** (`kube-agents-memory`) from **shared organizational, decision, and lesson memory** (`knowledge/` + `kube-agents-decisions`), so there is only one shared store for team rules and decisions:
 
-**Which one to pick, in one line each.** `multiuser_memory` for a small or personal
-deployment: it costs nothing to run and holds everything verbatim, and the whole
-store rides in the context window on every turn, so it is bounded by the window
-rather than by disk. `kube_agents_memory` for an enterprise fleet: it retrieves
-only what a question needs, so the per-turn cost barely moves as the corpus grows,
-and it pays for that with an API server and a Postgres database. The number that
-separates them is measured in [the experiment](#the-experiment) — at fleet scale
-the file store is 55% of the window before the user has spoken, while retrieval
-answered the same questions from a small fraction of it. Below the bound there is
-nothing to buy: a handful of clusters and a handful of people will not reach it,
-and a database there is cost without a benefit.
+| Dimension                      | Layer 1: Personal user memory (`kube-agents-memory`)                                  | Layer 2: Shared decision, convention, and lesson memory (`knowledge/` + `kube-agents-decisions`)                                                      |
+| ------------------------------ | ------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Primary source of truth**    | Hindsight PostgreSQL database (or `users/<id>.md` in `file` mode).                    | GitOps repository `knowledge/decisions/*.md` and `knowledge/lessons/*.md` (versioned in Git).                                                         |
+| **Role of Hindsight**          | Primary store using LLM fact extraction and background observation synthesis.         | Rebuildable semantic index using verbatim chunk mode (`retain_extraction_mode: chunks`).                                                              |
+| **What it stores**             | Each engineer's private DM preferences, response verbosity, and scratch cluster name. | All shared team conventions, ownership rules, architectural decisions (`DEC-*`), incident lessons (`LES-*`), and guards.                              |
+| **Lifecycle states**           | Active per-user observations (`user:<id>`).                                           | Single `document_id` (`okf:<repo>:<id>`) transitioning in-place: `status:proposed` $\to$ `status:active` \| `status:rejected` \| `status:superseded`. |
+| **How memories are written**   | Automatic personal capture in DMs; explicit `memory_retain(scope="personal")`.        | Immediately indexed as `status:proposed` when a PR opens or `memory_retain(scope="shared")` emits over NATS; upgraded to `status:active` on merge or `status:rejected` on close. |
+| **How memories enter context** | Per-turn semantic prefetch injected into the user message sidecar (`api_content`).    | Automatic per-turn NATS prefetch (`_INBOX.agent.memory.query`) in `KubeAgentsMemoryProvider.prefetch` plus deterministic file/resource matching during manifest drafting and PR submission (`submit-suggestion`). |
+| **How agents query on demand** | `memory_recall` and `memory_reflect` tools (`user:<id>`).                             | Built-in `memory_recall` (`scope="shared"` \| `"both"`) over NATS `_INBOX.agent.memory.query`, `curator recall` / `why` / `check` CLI commands, and NATS `a2a.topics.shared.blueprint`. |
+| **How contradictions resolve** | Background observation consolidation per `user:<id>`.                                 | Five deterministic precedence rules, explicit `supersedes` chains, and `status:active` vs `status:proposed` filtering.                                |
+| **Background maintenance**     | Optional TTL checkpoint curator (`memory_ttl_curator.py`).                            | Go Curator / Dreamer (`a2a/cmd/curator`) checking guards against Git `HEAD`, flagging drift, and federating across clusters.                          |
 
-**Memory is on by default, and `multiuser_memory` is what it means.** An install
-that says nothing about memory gets the file store; `--memory=hindsight` steps up
-to ranked recall and the two workloads behind it, and `--memory=off` retains
-nothing. Two things decide the default, and they point the same way.
+### Shared database footprint and operational state boundary
 
-The first is that the cheap thing here is not free. An agent that forgets every
-conversation makes the same person re-state the same context indefinitely, and
-that is the cost paid by every install that never found the flag — so the default
-is a store, not `off`.
+An enterprise fleet platform tracks two different classes of state:
 
-The second is backward compatibility, and it is what picks _which_ store. The file
-store is what this repository shipped before `kube_agents_memory` existed. Every
-place a default is taken is a place something older is being read: an upgrade
-re-running `install.sh` with no `--memory`, a CR written against the previous CRD
-schema and reconciled by a newer operator, an install configuration from before
-the memory question was prompted for. Defaulting those to ranked recall would grow
-each of them an API server and a Postgres database nobody asked for, and would
-point the agent at a Hindsight service the install never deployed. Taking a
-default has to mean "keep what you have". An enterprise fleet that wants ranked
-recall is in a position to say so, and `--memory=hindsight` is how. Consequently
-`multiuser_memory` is the provider named wherever there is no install to ask — the
-CRD default, `install.defaults.env`, and the Chat Agent's `config.yaml`. The specialist
-profile names no provider at all, because a file store has no gateway identity for
-a specialist to key on; see the overlay rule below.
+1. **Operational state and observability cache**: Mutable cluster inventory, profile assignments, scan checkpoints, and open findings that back the NATS event bus and the Web UI so agents do not repeat `kubectl` queries across thousands of clusters.
+2. **Long-term conversational and decision memory**: Durable user preferences, team ownership (`kube-agents-memory`), and pull-request-governed architectural decisions and incident lessons (`knowledge/` + `kube-agents-decisions`).
 
-The choice is made once, at install, and then carried by the CR. Four places have
-to agree about it, and the reason they are listed together is that a disagreement
-between any two of them is silent: the install still succeeds, and what is wrong
-is either a database nobody asked for or a memory tool that never loads.
+To avoid deploying separate database engines for each subsystem, `kube-agents` consolidates all in-cluster relational and vector state into **one PostgreSQL deployment** alongside the GitOps repository:
 
-| Where                                      | What it holds                                                                  |
-| ------------------------------------------ | ------------------------------------------------------------------------------ |
-| `install.sh --memory=file\|hindsight\|off` | the question a human answers, also prompted interactively                      |
-| `MEMORY` in `install.env`                  | the answer, as the mode the flag takes; `memory_provider_from_mode` maps it    |
-| `spec.harness.memory.provider`             | the answer, on the CR — the only copy the running system reads                 |
-| `MEMORY_PROVIDER` env on the pod           | the same value, for the entrypoint, which runs before `config.yaml` is in play |
+| State domain                                   | Authoritative store                                    | PostgreSQL schema / index                                     | NATS bus integration (`spec.mode: next`)                                                                                  |
+| ---------------------------------------------- | ------------------------------------------------------ | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| **Operational state & observability cache**    | In-cluster PostgreSQL                                  | `ops_state` schema (clusters, scan checkpoints, findings)     | Cluster and scanner profiles publish scan deltas and checkpoint updates on NATS; the Web UI reads from `ops_state`.       |
+| **Layer 1: Conversational memory**             | In-cluster PostgreSQL (`hindsight` mode) or local PVC  | `hindsight` schema (`kube-agents-memory` bank, `pgvector`)    | `a2a/gateway` and `hermes-bridge` propagate verified caller identity (`user_id`, `chat_type`) on NATS task envelopes.     |
+| **Layer 2: Architectural decisions & lessons** | GitOps repository (`knowledge/decisions/`, `lessons/`) | `hindsight` schema (`kube-agents-decisions` bank, `pgvector`) | Outcome and `dream` profiles subscribe to PR/audit outcomes on NATS and broadcast newly indexed rules and curated skills. |
 
-`MEMORY_PROVIDER` is the only variable in that answer. The install also renders
-`MEMORY_ENABLED` into the tfvars, and it is deliberately **not** consulted anywhere in the list
-above: it switches on Hermes' own `MEMORY.md`/`USER.md`, a store with no per-user
-scoping that each provider here replaces rather than supplements, so every install
-this repository has ever written set it `false` while running a provider quite
-happily. Deriving one from the other — reading a false `MEMORY_ENABLED` as "this
-install wants no memory" — would switch off a working file store on the next
-upgrade and strand every user's `USER.md`. Whether the agent remembers anything is
-`MEMORY_PROVIDER`'s question, and `none` is how it answers no.
+### Storage sizing and cost model at enterprise scale
 
-`file` maps to `multiuser_memory` rather than to Hermes' built-in file store,
-because the built-in is gated by `memory_enabled`, and the operator disables the
-`memory` toolset whenever that flag is on — an install choosing "files" would get a
-`MEMORY.md` the agent could read and not write. `multiuser_memory` has real
-per-user scoping and runs with `memory_enabled: false`, so the toolset gate stays
-open.
+Decision and lesson memory stores curated architectural rules and deduplicated incident lessons rather than raw pod logs or per-poll telemetry. When an issue recurs across hundreds of clusters, federated learning (Phase 5 of `dream`) consolidates the pattern into one fleet-wide `DEC-*` record (`clusters: ["*"]`) instead of writing a separate copy per cluster. As a result, storage grows sub-linearly with cluster and workload count:
 
-`off` maps to **`none`**, not to an empty string. Hermes spells "no provider" as
-`""`, but an empty string cannot survive the trip: an absent CR field takes the
-kubebuilder default, so `""` round-trips back to `multiuser_memory`. The sentinel
-is translated back to Hermes' spelling at the single point where `config.yaml` is
-rendered — `resolveMemoryProvider` in
-[`platformagent_manifests.go`](../../k8s-operator/internal/controller/platformagent_manifests.go).
+- **Per-record size in Git**: One OKF Markdown file (`DEC-*` or `LES-*`) averages **$2.5\text{ KB}$** ($40\text{–}70$ lines of YAML frontmatter and prose).
+- **Per-record size in PostgreSQL (`pgvector`)**: One verbatim chunk unit (384-dimensional `float32` embedding, HNSW graph links, metadata, and text) plus one conversational observation averages **$3.5\text{ KB}$** including index overhead.
 
-Three things then read the choice rather than assuming it:
+| Fleet tier               | Clusters | Workloads | Active + historical OKF records | Conversational memory units | Git repository size (`knowledge/`) | PostgreSQL `pgvector` size (data + HNSW index) | Fits in default `8Gi` PVC? |
+| ------------------------ | -------: | --------: | ------------------------------: | --------------------------: | ---------------------------------: | ---------------------------------------------: | -------------------------- |
+| **Small / Evaluation**   |       10 |       200 |                             250 |                       1,500 |           $\approx 0.6\text{ MiB}$ |                         $\approx 6\text{ MiB}$ | Yes ($< 0.1\%$)            |
+| **Medium Enterprise**    |       50 |     3,000 |                           1,500 |                      10,000 |           $\approx 3.8\text{ MiB}$ |                        $\approx 40\text{ MiB}$ | Yes ($0.5\%$)              |
+| **Large Enterprise**     |    1,000 |     5,000 |                           5,000 |                      50,000 |          $\approx 12.5\text{ MiB}$ |                       $\approx 195\text{ MiB}$ | Yes ($2.4\%$)              |
+| **Hyperscale Fleet**     |   10,000 |    25,000 |                          15,000 |                     150,000 |          $\approx 37.5\text{ MiB}$ |                       $\approx 580\text{ MiB}$ | Yes ($7.1\%$)              |
+| **Maximum Target Scale** |   30,000 |    60,000 |                          35,000 |                     350,000 |          $\approx 87.5\text{ MiB}$ |                      $\approx 1.35\text{ GiB}$ | Yes ($16.9\%$)             |
 
-- **The chart's `hindsight.*` values render nothing** unless the provider is
-  Hindsight-backed. That is the whole gate — `multiuser_memory` and `none` stand
-  up no database, and switching the provider later is a matter of re-running the
-  install (one `terraform apply` reconciles the store in or out). The dev copy
-  behaves the same way through `make -C k8s-operator deploy-hindsight`.
-- **The specialist profiles get a provider only if it is Hindsight-backed**, via
-  the platform profile's overlay. Anything else is blanked there, because
-  [what makes a specialist's memory safe](#what-subagents-get-shared-memory-read-only)
-  is `read_only` plus tag scoping, and a per-user file provider has neither an
-  identity to key on nor a read-only mode.
-- **The one-way file import** below is gated the same way.
+Even at **30,000 clusters and 60,000 workloads**, the entire Git knowledge base stays under **$90\text{ MiB}$** and the PostgreSQL `pgvector` index stays under **$1.4\text{ GiB}$**—fitting inside the default $8\text{ GiB}$ PersistentVolumeClaim with zero external cloud logging or vector-database billing.
 
-The dev-path undeploy (`make -C k8s-operator undeploy-hindsight`) is deliberately
-**not** gated. Undeploy is idempotent, and a gate there would orphan the workloads
-of any install that changed its provider after the fact.
+---
 
-### The two pods
+### Layer 1 — Conversational memory (`kube-agents-memory` and `multiuser_memory`)
 
-Hindsight is self-hosted in-cluster, rendered by the chart's `hindsight.*` values from the same manifests kept in
-[`k8s-operator/config/integrations/hindsight/`](../../k8s-operator/config/integrations/hindsight/README.md).
-It adds exactly two workloads to `kubeagents-system`.
+#### Choosing a provider
 
-**1. `hindsight-api` — a `Deployment`, one replica** (`api.yaml`).
+Operators select the conversational memory provider at install time via `install.sh --memory=file|hindsight|off`:
 
-- Image `ghcr.io/vectorize-io/hindsight-api:0.10.2`, pinned by digest. The pin
-  lives in `images.json` at the repository root and the manifest takes it as a
-  variable, so a mirrored install can point it at an approved registry.
-- Serves HTTP on **8888** behind a ClusterIP `Service` of the same name;
-  `/health` backs all three probes. Model loading dominates cold start, so the
-  budget for it sits in a **`startupProbe`**, and liveness and readiness do not
-  run until that first succeeds. Before
-  [#712](https://github.com/gke-labs/kube-agents/issues/712) a 30s liveness delay
-  carried that budget instead, which put the third failure at t=50s and killed
-  cold containers mid-load. The timings and the reasoning behind each are in
-  `api.yaml`'s probe comment, which is canonical for them; any rollout wait on
-  this Deployment is sized to cover a pull plus that budget.
-- `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`. The embedding and reranking
-  models are baked into the image, so the pod needs **no Hugging Face egress** —
-  and both flags must stay set, or the libraries reach out on every cold start and
-  hang where there is no route out of the cluster.
-- Extraction and consolidation call an LLM. That goes through the **same inference
-  gateway the agents use** (`HINDSIGHT_API_LLM_BASE_URL=http://inference-gateway/v1`,
-  model `model-default`), so routing and cost attribution stay in one place. The
-  API key is the literal string `none`, matching how the agents authenticate;
-  it is a placeholder the client library insists on, not a credential.
-  `HINDSIGHT_API_LLM_TEMPERATURE=none` omits `temperature` from those calls.
-  Hindsight would otherwise send one, and a model that refuses an explicit
-  temperature answers 400 — which reaches the agent as
-  `500 Fact extraction failed`, so memory records nothing at all rather than
-  recording it badly. Which models refuse it is not knowable here, since the
-  model is whatever the installer chose. It applies to all four operations,
-  which is deliberate — any of them sending a temperature draws the same 400 —
-  and each therefore falls back from a tuned value to the model's default:
-  retain from 0.1, reflect from 0.9, consolidation and verification from 0.0.
-  Consolidation writes the observations recall reads, so its dedup and delta
-  passes stop being pinned; `HINDSIGHT_API_LLM_TEMPERATURE_RETAIN` narrows the
-  omission to fact extraction where a model tolerates the rest.
-  The gateway is the wrong place to fix this. `litellm_settings` is the only
-  gateway-wide place to put it, and neither switch there does the job:
-  `drop_params` drops what LiteLLM believes the provider rejects, and it
-  believes Vertex Claude accepts `temperature`; `additional_drop_params` set
-  there was measured against a live install and the retain still returned 400,
-  because LiteLLM honours it in a model entry's `litellm_params` rather than
-  globally. Per-model it would work, at the price of editing a config every
-  agent request passes through in order to accommodate one caller. The chart
-  has since paid that price for every caller on a Claude model: it renders
-  per-model `additional_drop_params` for `temperature`, `top_p` and `top_k`
-  ([inference gateway](../site/src/content/docs/concepts/inference-gateway.md#setting-the-default-model)).
-  The `none` stays, for a model outside that test that refuses temperature.
-- Requests 250m CPU/1Gi, limits 4 CPU/4Gi. The request covers steady state, reported at
-  about 9m on a live install when the request came down from 2 CPU; the install and the
-  sampling window were not recorded, so read it as an order of magnitude. The limit is
-  the ceiling the reranker may burst to during recall, and raising it buys nothing — see
-  [What a recall costs](#what-a-recall-costs). CPU above the request is best-effort, so
-  on a node shared with other CPU-heavy tenants the request is the number to raise. An
-  Autopilot cluster without Pod bursting sets the limit equal to the request, which caps
-  recall at 250m until the request is raised.
-  Runs non-root under a `RuntimeDefault` seccomp profile, no privilege escalation, all
-  capabilities dropped; its root filesystem stays writable, and what the API writes
-  under `/` has not been enumerated.
+- **`file` (`multiuser_memory`, default for backward compatibility)**: Stores per-user and shared Markdown files on the agent pod's persistent volume. Requires zero extra pods or databases and suits small clusters or personal test environments.
+- **`hindsight` (`kube_agents_memory`, recommended for enterprise fleets)**: Deploys the self-hosted Hindsight API server and PostgreSQL `pgvector` database in the cluster. Keeps per-turn token usage small and constant regardless of how many memories accumulate.
+- **`off` (`none`)**: Disables conversational memory completely.
 
-**2. `hindsight-postgresql` — a `StatefulSet`, one replica** (`postgresql.yaml`).
+Four configuration surfaces carry this choice from the installer to the running container:
 
-- The pg15 line of `pgvector/pgvector`, digest-pinned in `images.json` alongside the
-  API image, because upstream rebuilds a version tag in place when the Postgres base
-  is patched and a reschedule could otherwise move to a Postgres minor nobody chose.
-  pgvector supplies the vector extension the embeddings need. `images.json` is also
-  where the constraints on that tag are written, the pg15 line among them.
-- **Bumping the image does not move the extension in a database that already
-  exists.** Postgres records the version at `CREATE EXTENSION` and keeps it until
-  someone runs `ALTER EXTENSION vector UPDATE`, so a fresh install gets whatever the
-  image ships while an upgraded one stays where it was — an install created under
-  the 0.5.1 image still reads `0.5.1` from `pg_extension` afterwards. Nothing here
-  runs the update, and an un-updated extension keeps working: the upgrade scripts
-  across this range only add objects, and the HNSW on-disk format is unchanged
-  between the two versions, so the newer library serves the older declarations and
-  reads the existing index. pgvector's own upgrade procedure does say to run the
-  statement, so it is appropriate rather than forbidden. What it gates is mostly
-  SQL-level additions Hindsight does not use — `halfvec` and `sparsevec` among them
-  — but not only those: `vector--0.5.1--0.6.0.sql` sets `STORAGE = external` on the
-  `vector` type, which stops Postgres compressing embeddings and does apply to the
-  column Hindsight writes. At 384 dimensions that is 1,544 bytes, compressed only
-  when the whole row crosses the TOAST threshold, so the effect here is small — but
-  it is not nothing, and "nothing this deployment needs" would be too strong.
-- **The library moves even when the extension does not, and that is the part you
-  feel.** GUCs are registered by the shared library at load, not declared in the
-  extension's SQL, so a new one appears as soon as a backend loads the new library —
-  which the StatefulSet restart guarantees. `hnsw.iterative_scan` is the one that
-  matters: Hindsight has defaulted `HINDSIGHT_API_ANN_ITERATIVE_SCAN=true` since 0.9
-  and asks for it on every pooled connection. Without it an HNSW scan makes one ground-layer
-  pass and ends when that pass is exhausted, which can happen before the query's
-  `LIMIT` is met; with it the scan resumes in `ef_search`-sized rounds until the
-  `LIMIT` is met or `hnsw.max_scan_tuples` is reached. Hindsight sets that ceiling to
-  4,000 against pgvector's own default of 20,000, and both are tunable through
-  `HINDSIGHT_API_ANN_*`. It needs pgvector 0.8.0, a higher floor than the 0.5.0
-  Hindsight needs overall. Measured on a 20,000-row table at pgvector's default
-  `ef_search=40` — the shipped recall path uses 200 and `strict_order` — a
-  `LIMIT 500` query on a forced HNSW index scan returned 391 rows with the setting
-  off and 500 with it on. Note that 391 is neither the `LIMIT` nor `ef_search`: how
-  far a single pass gets is a property of the graph, so "capped at `ef_search`" is
-  the wrong mental model even though Hindsight's own comments use it.
-  `HINDSIGHT_API_ANN_ITERATIVE_SCAN=false` is the kill switch.
-- **The switch lands on existing installs with no `ALTER EXTENSION`, no config
-  change, and no API restart** — worth spelling out, because the API caches any GUC
-  the server rejects in a process-wide set it never clears, which would otherwise
-  mean a pod that had probed against the old library skipped the setting forever.
-  That path is never taken: pgvector only began reserving the `hnsw.` prefix in
-  0.6.0, so on 0.5.1 the setting was accepted all along as an inert placeholder
-  rather than rejected, and Postgres applies a placeholder's value to the real
-  variable the moment the library defining it loads. Upstream's comment on that
-  branch says an older pgvector rejects the setting; that is true from 0.6.0 onward
-  and not of the 0.5.1 this install is coming from.
-- One 8Gi `ReadWriteOnce` volume from a `volumeClaimTemplate`. `PGDATA` points at a
-  **subdirectory** of the mount, not the root: the RWO volume arrives with a
-  `lost+found` entry and `initdb` refuses a non-empty data directory.
-- Runs as uid 999, the image's `postgres` user, rather than letting the entrypoint
-  start as root and drop to it, under a `RuntimeDefault` seccomp profile with no
-  privilege escalation and all capabilities dropped. The root filesystem is read-only;
-  the writable paths are `emptyDir`s at `/var/run/postgresql` (socket and pid, which
-  the entrypoint's temporary init server and the readiness probe use) and `/tmp`, and
-  `PGDATA` on the volume. `fsGroup: 999` with `fsGroupChangePolicy: OnRootMismatch`
-  relabels a volume the old root entrypoint initialised once, the entrypoint's
-  `chmod 700` on `PGDATA` keeps Postgres's data-directory mode check passing, and a
-  fresh volume needs a storage driver that applies `fsGroup` (GKE's Persistent Disk
-  CSI driver does). The comment on the StatefulSet in the chart template holds the
-  full account; `tests/test_workload_security_context.py` pins the fields.
-- **Passwordless** (`POSTGRES_HOST_AUTH_METHOD=trust`). It is reachable only from
-  the API pod, holds nothing that is not already in the agent's context, and a
-  password would have to be generated, agreed between two keys and rotated by
-  someone. Note this is read by `initdb` once and written into `pg_hba.conf`;
-  flipping it on an existing volume does nothing.
-- A `NetworkPolicy` (`networkpolicy.yaml`) permits ingress on 5432 **only** from
-  pods labelled as the API component. Ingress only — Postgres makes no outbound
-  calls.
+| Surface                                    | Value stored                                                                                    |
+| ------------------------------------------ | ----------------------------------------------------------------------------------------------- |
+| `install.sh --memory=file\|hindsight\|off` | Installer flag or interactive prompt selection                                                  |
+| `MEMORY` in `install.env`                  | Saved installer mode, mapped to a provider name by `memory_provider_from_mode`                  |
+| `spec.harness.memory.provider`             | Field on the `PlatformAgent` custom resource (`multiuser_memory`, `kube_agents_memory`, `none`) |
+| `MEMORY_PROVIDER` pod environment variable | Passed to the container entrypoint (`docker-entrypoint.sh`) before `config.yaml` is rendered    |
 
-Deleting the Postgres PVC is a complete, safe reset of memory — see
-[Bank provisioning is lazy](#bank-provisioning-is-lazy).
+When an existing installation upgrades from `file` to `hindsight`, [`agents/chat/scripts/memory_file_import.py`](../../agents/chat/scripts/memory_file_import.py) runs once at pod startup. It imports existing `MEMORY.md` and `memories/users/<id>.md` entries into Hindsight under their matching scope tags, verifies that each unit exists in the bank, writes an audit receipt under `$HERMES_HOME/hindsight/imported/`, and removes the plaintext Markdown file only after verification succeeds.
 
-### How Hindsight itself works
+#### The two Hindsight pods and recall performance
 
-Enough of the model to read the wrapper.
+When `--memory=hindsight` is enabled, the Helm chart and operator deploy two workloads in the agent namespace ([`k8s-operator/config/integrations/hindsight/`](../../k8s-operator/config/integrations/hindsight/README.md)):
 
-- **Bank.** The top-level container, addressed as
-  `/v1/{tenant}/banks/{bank_id}`; this deployment uses tenant `default` and the
-  single bank `kube-agents-memory`. A bank carries a **mission** (free text telling
-  the extractor what this bank is for) and a **config** (retain strategies, default
-  strategy, and so on). Note `PUT /banks/{id}` is both create and update — `POST`
-  is 405 — and `PATCH /banks/{id}/config` wraps its payload as `{"updates": {...}}`.
-- **Two layers.** A write lands in the **fact** layer. A background consolidation
-  pass groups related facts into **observations** — the LLM-written synthesis layer.
-  **Recall reads observations, not facts.** Everything about scoping, and the whole
-  TTL problem below, follows from that one sentence. It is a default rather than a
-  law: the plugin sends `types` on every recall from `recall_types`, which defaults
-  to `["observation"]` and which this deployment does not set. Note the layer is
-  _not_ what `memory_mode` selects — that is `context`/`tools`/`hybrid`, and it
-  chooses whether memories arrive by injection, by tool call, or both.
-  Querying the API directly without `types` returns both layers, so a probe that
-  bypasses the plugin will not show you what the agent sees.
-- **Retain strategies.** Named bundles of extraction settings selected per write.
-  A missing strategy is _not_ an error — `apply_strategy` logs a warning and
-  silently falls back to the bank default — so callers that depend on one must
-  check for it themselves.
-- **Tags and `observation_scopes`.** Facts carry tags. `observation_scopes`
-  controls how the consolidator groups them, which is a separate decision from how
-  recall filters them.
-- **Three operations.** `retain` writes; `recall` does semantic search and returns
-  matching units; `reflect` asks the LLM to synthesise an answer across the bank
-  rather than return individual matches. All three take a **budget**
-  (`low`/`mid`/`high`) that bounds how much comes back — this is the mechanism that
-  makes context cost independent of corpus size.
+1. **`hindsight-api` (`Deployment`, port `8888`)**:
+   - Runs `ghcr.io/vectorize-io/hindsight-api:0.10.2` (pinned by digest in `images.json`) as a non-root container (`RuntimeDefault` seccomp profile, all Linux capabilities dropped).
+   - Sets `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` so the baked-in embedding model (`BAAI/bge-small-en-v1.5`) and cross-encoder reranker (`cross-encoder/ms-marco-MiniLM-L-6-v2`) run completely offline without internet egress.
+   - Routes LLM fact extraction and observation consolidation through the cluster's existing LiteLLM inference gateway (`HINDSIGHT_API_LLM_BASE_URL=http://inference-gateway/v1`, model `model-default`) with `HINDSIGHT_API_LLM_TEMPERATURE=none` so models that reject explicit temperature parameters do not fail extraction.
+   - Connects to the namespace-local service URL injected by [`platformagent_manifests.go`](../../k8s-operator/internal/controller/platformagent_manifests.go): `http://hindsight-api.<namespace>.svc.cluster.local:8888`.
+2. **`hindsight-postgresql` (`StatefulSet`, port `5432`)**:
+   - Runs `pgvector/pgvector` (PostgreSQL 15 with HNSW vector indexing and `hnsw.iterative_scan` enabled) backed by an `8Gi` `ReadWriteOnce` PersistentVolumeClaim (`data-hindsight-postgresql-0`). At $\approx 1.8\text{ KB}$ per memory unit (384-dimensional embedding plus text), an $8\text{ GiB}$ volume holds roughly one million memory units.
+   - Enforces a `NetworkPolicy` (`networkpolicy.yaml`) that restricts port `5432` ingress exclusively to the `hindsight-api` pod.
 
-#### What a recall costs
+##### What a recall costs
 
-Everything measured here and in the section below was taken against the pgvector
-0.5.1 library, which could not run iterative scans. That changes which units the
-retrieval stages return, not how many the reranker scores — its input is bounded by
-the recall budget, which the paragraphs below show this bank already saturates — so
-the stage-4 cost these numbers are dominated by stands.
+A Hindsight recall runs in two phases:
 
-A recall is not a database query with a model bolted on; it is a model inference
-with a database query in front of it, and the two differ by three orders of
-magnitude. A live chat turn against the 4,427-unit bank:
+1. **Candidate retrieval ($\approx 0.4\text{ s}$)**: Parallel semantic vector search, BM25 keyword search, and graph traversal fetch up to $300$ candidate observations (`recall_budget: mid`).
+2. **Cross-encoder reranking ($\approx 7\text{ s}$ on CPU)**: The cross-encoder scores each `(query, candidate)` pair on CPU. Because `api.yaml` enables length-sorted bucket batching (`HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING=true`), short candidates are not padded to the length of the longest candidate in the batch, cutting CPU rerank latency in half compared to the upstream default ($7\text{ s}$ vs $14.2\text{ s}$) with identical ranking results.
 
-```
-[2] Parallel retrieval (1 fact_types): semantic=300(0.028s), bm25=84, graph=282(0.096s) ... 0.395s
-[4] Reranking [cross-encoder]: 300 candidates scored in 14.195s (pre-filtered 220)
-Complete: 52 facts (3750 tok) | 14.637s
+For high-concurrency environments, scaling `hindsight-api` from $1$ to $2$ replicas on separate nodes nearly doubles concurrent recall throughput (from $0.089\text{ rps}$ to $0.162\text{ rps}$ at concurrency $4$, cutting median latency from $44.1\text{ s}$ to $22.8\text{ s}$).
+
+#### One bank, two scopes
+
+All conversational memories live in a single Hindsight bank (`kube-agents-memory`) partitioned by strict scope tags:
+
+| Scope    | Tag format     | How memories are written                                 | Who can read them  |
+| -------- | -------------- | -------------------------------------------------------- | ------------------ |
+| Personal | `user:<id>`    | Automatic capture from DM turns, and `memory_retain`     | Only that user     |
+| Shared   | `scope:shared` | Explicit `memory_retain(scope="shared")` tool calls only | All users & agents |
+
+Here `<id>` is produced by `sanitize_user_id(raw_id)`, which formats the caller's identity as `<readable>_<sha256[:12]>`. The 12-character SHA-256 suffix guarantees that two distinct identities that normalize to the same readable prefix (such as `alice.smith@example.com` and `alice+dev@example.com`) never collide on the same tag or file.
+
+To guarantee zero cross-user leakage inside a single bank, [`kube_agents_memory`](../../agents/chat/plugins/memory/kube_agents_memory/__init__.py) pins four settings in code (`apply_scoping`):
+
+1. **`recall_tags_match = "any_strict"`**: Excludes untagged records from recall results. Every query requests `[user:<id>, scope:shared]` (or `[scope:shared]` when personal memory is disabled).
+2. **`observation_scopes = [[scope_tag]]`**: Scopes background observation consolidation by the single scope tag (`["user:<id>"]` or `["scope:shared"]`) rather than by session ID, so a user's facts consolidate across sessions without ever merging into another user's observations.
+3. **Scoped `memory_reflect` and `recall`-mode prefetch**: Re-implements `memory_reflect` against the Hindsight client with explicit `tags`, `tags_match="any_strict"`, and `exclude_mental_models=True`, and pins per-turn prefetch to `recall` mode so every read path honors tag isolation.
+4. **Isolated shared writes**: When `memory_retain(scope="shared")` is called, `_retain()` writes the item with `tags=["scope:shared"]` and `strategy="shared"` directly via `aretain_batch`, ensuring the caller's personal `user:<id>` tag is never attached to a shared organizational fact.
+
+#### Identity propagation through `hermes-bridge` and `session_kv`
+
+When a user messages the Chat Agent, the request travels through `a2a/gateway` over NATS to `hermes-bridge`, which invokes the Hermes HTTP API server (`POST /v1/chat/completions`) using `X-Hermes-Session-Id: a2a-<contextId>`. Because the Hermes HTTP server does not accept user identity headers, `hermes-bridge` and `session_kv_server.py` propagate the verified speaker identity and conversation audience out-of-band:
+
+```mermaid
+sequenceDiagram
+  participant G as a2a/gateway
+  participant N as NATS (KV_cap + TASKS)
+  participant B as hermes-bridge
+  participant KV as session_kv_server.py (session_kv.db)
+  participant H as Hermes API Server (/v1/chat/completions)
+  participant M as kube_agents_memory / multiuser_memory
+
+  G->>N: Write capability.Entry to KV_cap
+  G->>N: Publish Task (.in) with authority.requester.principal & authority.audience.kind
+  N->>B: Deliver Task (.in)
+  B->>N: Verify capabilityPermits(KV_cap, task)
+  B->>KV: PUT /v1/sessions/a2a-<contextId>/route {chat_id, thread_id, user_id, chat_type}
+  B->>H: POST /v1/chat/completions (X-Hermes-Session-Id: a2a-<contextId>)
+  H->>M: initialize(session_id="a2a-<contextId>", **kwargs)
+  M->>KV: Read user_id & chat_type from session_kv.db (walking parent_session_id in state.db if compressed)
 ```
 
-Stage 4 is effectively all of it, and the reason is the kind of model it uses.
-Stages 1–3 run a **bi-encoder**: every unit was embedded once at write time, the
-query is embedded once, and ranking is arithmetic over vectors in an index — hence
-300 semantic hits in 28 milliseconds. Stage 4 runs a **cross-encoder**, which
-concatenates the query with one candidate and runs a full transformer forward pass
-over the pair. It is much the better ranker, because the query's tokens attend to
-the document's, and it is unbatchable across queries and uncacheable by
-construction: the input does not exist until the query arrives and is different for
-every candidate. `300 candidates scored` means 300 forward passes on CPU, inside the
-request. Two concurrent recalls do not queue, they halve each other.
-
-**A large bank is therefore felt as latency, not just as storage — but as a
-threshold, not a slope.** A bank small enough that the tag filter cannot fill the
-budget reranks only what it found, and is quick. Once it is large enough to fill the
-budget, every question pays the full-size rerank, and growth past that point costs
-almost nothing further. The live bank holds 4,427 units, of which the 1,595
-observations are eligible — five times what the budget will take — and stage 2 still
-finds candidates in 0.4s. Ten times the bank would rerank the same 300 pairs.
-
-Two things follow. The user-visible symptom is a slow agent with nothing in the reply
-to suggest memory is the reason, and it appears abruptly, at a corpus size in the low
-hundreds rather than at any size worth calling large. And because the cost is flat
-above the threshold, **bounding the bank does not fix it** — see
-[Bounding the bank](#bounding-the-bank--built-deferred-and-not-urgent), which
-is worth doing for context quality and storage, not for latency.
-
-What does fix it is making stage 4 itself cheaper.
-`HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING` sorts candidates by length before
-batching them, so a short candidate is no longer padded out to the longest one in
-its batch. Hindsight ships it **off**, with a source comment reading
-`opt-in, 36-54% speedup`. Enabling it in
-[`api.yaml`](../../k8s-operator/config/integrations/hindsight/api.yaml) roughly
-halved recall latency against the default on the agent's own path, and it costs
-nothing: it changes how pairs are grouped, not how they are scored, and the same
-query returns the same units before and after. No new dependency, no egress, no
-model change, no loss of ranking quality.
-
-Three other levers were measured and are not worth retrying. Raising the pod's CPU
-limit from 500m/2 to 2/4 changed nothing — the quota _is_ read
-(`hindsight_api/_thread_limits.py` sizes native pools from it), but an
-`e2-standard-4` is two physical cores behind four hyperthreads, and threads sharing
-a core share the vector units this work saturates. Dropping `recall_budget` from
-`mid` to `low` bought 16% at the cost of narrowing what the reranker may choose
-from, which is why the Chat Agent stayed at `mid` — see
-[Where the connection settings come from](#where-the-connection-settings-come-from).
-And `RERANKER_LOCAL_FP16` is documented as faster on MPS and CUDA, not on CPU.
-
-The remaining knobs are untried: `RERANKER_LOCAL_BATCH_SIZE` (32),
-`RERANKER_LITELLM_MAX_TOKENS_PER_DOC`, and `HINDSIGHT_API_RERANKER_PROVIDER`, which
-can hand stage 4 to `litellm`, `cohere`, `openrouter` or a `tei` sidecar. The
-`litellm` route would need a rerank model added to the LiteLLM config, which the
-install script does not define — see
-[`k8s-operator/config/integrations/litellm/base/config.yaml`](../../k8s-operator/config/integrations/litellm/base/config.yaml),
-which deliberately declares `model-default` and nothing else. The local model is
-already `cross-encoder/ms-marco-MiniLM-L-6-v2`, six layers, so shrinking it is not
-the lever either.
-
-#### A second pod buys throughput, not speed
-
-Every lever above makes one recall cheaper. A second replica makes none of them
-cheaper; it makes more recalls fit at once. That is the other axis, and it is the one
-the CPU-limit null result points at. Measured on `kage-management` against the live
-bank at `budget: mid`, twelve recalls per concurrency level, one run per
-configuration, driven from an in-cluster Job so kube-proxy is in the path — a
-`kubectl port-forward` binds one endpoint for the life of the tunnel and would have
-measured a single pod twice:
-
-| Concurrent recalls | 1 replica | 2 replicas    | p50: 1 → 2 replicas |
-| ------------------ | --------- | ------------- | ------------------- |
-| 1                  | 0.073 rps | 0.076 rps     | 13.6s → 13.2s       |
-| 2                  | 0.087 rps | 0.096 rps     | 22.7s → 20.5s       |
-| 4                  | 0.089 rps | **0.162 rps** | 44.1s → **22.8s**   |
-
-At one replica, throughput is flat from concurrency 2 upward while latency rises
-linearly — "two concurrent recalls halve each other" as a curve rather than a
-sentence. The second replica returns 82% of a theoretical doubling at concurrency 4,
-and aggregate CPU across the two pods was 3,600m against 1,830m for the single pod,
-so the extra cores are working rather than idling behind the scheduler.
-
-**This is the counterpart to the CPU-limit result above.** Raising the limit on one
-`e2-standard-4` bought nothing because the node has two physical cores behind its
-four hyperthreads; a pod on a _different_ node is the only way to add cores the
-cross-encoder can use. Required pod anti-affinity is therefore load-bearing, not
-hygiene — two co-scheduled replicas reproduce the null result.
-
-Concurrency 2 gains only 10% because kube-proxy balances per connection, at random:
-with two requests in flight both land on the same pod about half the time, which
-predicts a p50 near 20.3s against the 20.5s measured. That is the production shape
-too, since each agent turn opens its own connection.
-
-Two things this does not buy. Single-user latency is unchanged — 13.2s against 13.6s
-— so replicas add capacity, not speed. And a replica is not free of Postgres:
-the Postgres image ships stock `max_connections = 100` while
-`HINDSIGHT_API_DB_POOL_MAX_SIZE` defaults to 100 _per pod_, so one replica already
-sits at parity with the server. The runs above pinned it to 40. Postgres itself never
-participated, at 12–19m of CPU throughout.
-
-The topology is supported rather than tolerated: the API runs the worker in-process
-(`WORKER_ENABLED` defaults true), workers claim tasks with `SELECT … SKIP LOCKED`,
-and startup migrations take a `pg_advisory_lock`, so replicas neither double-run
-consolidation nor race Alembic.
-
-[`api.yaml`](../../k8s-operator/config/integrations/hindsight/api.yaml) still ships
-`replicas: 1`, and `kage-management` runs two by hand. Two replicas add a second
-250m request, which fits almost anywhere, but the gain above came from the pods
-sitting on different nodes: two replicas sharing one `e2-standard-4` share the two
-physical cores the single-pod result already saturates, and a small cluster has no
-second node to offer. Nothing in either manifest keeps the pair apart — neither carries
-pod anti-affinity or a topology spread constraint — so on a cluster that does have a
-second node the two replicas rely on the scheduler's default spreading, where a 2-CPU
-request used to force the split. Read the 82% as the size of the effect rather than as a
-figure to three digits: it is one run per configuration, and only the concurrency-4
-row is outside the noise the random load-balancing introduces.
-
-### One bank, two scopes
-
-| Scope    | Tag            | Written by                             | Read by        |
-| -------- | -------------- | -------------------------------------- | -------------- |
-| Personal | `user:<id>`    | automatic capture, and `memory_retain` | that user only |
-| Shared   | `scope:shared` | `memory_retain(scope="shared")` only   | everyone       |
-
-`<id>` is the user identity run through `sanitize_user_id`, which produces
-`<readable>_<digest>`. Under `spec.mode: today`, the Hermes gateway supplies
-`agent._user_id` directly to `initialize()`. Under `spec.mode: next`, the Hermes
-API server runs `a2a-*` sessions without `user_id` or `chat_type` headers, so
-`hermes-bridge` records `authority.requester.principal` (`hmac:<32-hex>`) and
-`authority.audience.kind` (`dm` or `group`) from the gateway's `.in` task
-submission envelope in `session_kv.db` via `PUT /v1/sessions/a2a-<contextId>/route`,
-and both `kube_agents_memory` and `multiuser_memory` resolve them from
-`session_kv.db` (walking `state.db` `parent_session_id` across compressed
-session continuations). The readable half
-mirrors Hindsight's own `_sanitize_bank_segment`: non-alphanumerics collapse to
-`-`, runs of `-` collapse to one, and leading or trailing `-`/`_` are stripped.
-The digest is `sha256(raw)[:12]`, and it is there because the readable half alone
-is lossy while the tag is the entire isolation boundary — identities are
-email-shaped (or `hmac:<32-hex>` pseudonyms under `spec.mode: next`), punctuation is what distinguishes many of them, and
-`alice.smith@corp.example` and `alice+dev@corp.example`-style pairs otherwise
-land on one tag and read each other's private facts. `multiuser_memory` guarded
-the same thing the same way in its filenames. An empty or `"default"` identity produces an
-empty string rather than a hash of nothing or a shared `"default"` file, which is what lets both providers fail
-closed on personal memory; see
-[`tests/memory/test_user_tag_isolation.py`](../../tests/memory/test_user_tag_isolation.py).
-Recall asks for `[user:<id>, scope:shared]` with match mode `any_strict`, and
-nothing else can come back.
-
-One bank rather than one bank per user is a deliberate choice. Per-user banks make
-shared knowledge either impossible or duplicated, and each bank carries its own
-mission, config and consolidation state to keep in sync. Tags do the same job in
-one place.
-
-### Why a wrapper rather than configuration
-
-Hindsight has every mechanism this needs. What it has no way to do is learn the
-**current user's id**. `{user}` substitution is applied by
-`_resolve_bank_id_template`, which the plugin calls for `bank_id` and for nothing
-else. `retain_tags` and `recall_tags` are read as **literal config strings**, so a
-configured `retain_tags: "user:{user_id}"` tags every user with the eleven
-characters `user:{user_id}` — no isolation, no error, and a config file that reads
-as though it were working.
-
-Resolving that identity into the right tags is most of what the wrapper does.
-Everything else is still the stock provider, loaded at runtime through
-`load_memory_provider("hindsight")` and mutated in place after `initialize()` —
-never forked. Every value the wrapper overrides is read by the stock provider at
-call time, which is why attribute assignment is sufficient and no config-file
-contract is needed. Not forking means a Hermes base-image bump brings Hindsight
-fixes with it.
-
-`register(ctx)` calls `ctx.register_memory_provider(KubeAgentsMemoryProvider())`;
-`deploy/shared/defaults/config.yaml` sets `provider: custom`, and
-`agents/chat/config.yaml` names `kube_agents_memory`.
-
-One subtlety worth knowing before editing: Hermes calls `is_available()` **before**
-`initialize()` and drops the provider outright if it says no
-(`agent/agent_init.py`), so it must be answerable with no bank built. It answers by
-delegating to a throwaway stock provider, whose own availability check is stateless
-— it reads the config file.
-
-### The four pinned settings
-
-Each is set by the wrapper rather than left to configuration, because each is a
-silent leak or a silent loss if it is wrong. This is the section to read before
-changing anything in `apply_scoping`.
-
-**1. `recall_tags_match = "any_strict"`.** Hindsight's tag matcher treats `any` and
-`all` as _"matching tags **or** no tags at all"_; only the `_strict` variants
-exclude untagged rows. The plugin's default is `any`, which in a shared bank
-returns every untagged memory to every user. The corollary matters as much: under
-`any_strict` an **untagged memory is invisible to everyone**, so anything written
-into this bank must carry a scope tag or it is silently lost. That is why the
-wrapper attaches one on every write path, and why the TTL curator aborts outright
-on an observation it cannot scope.
-
-**2. `observation_scopes = [[scope_tag]]`.** Recall returns observations, so
-isolation is only real if the observation layer is scoped too. Hindsight's default,
-`combined`, scopes an observation by the full tag set of its sources — and the
-stock provider attaches a `session:<id>` lineage tag to every auto-retained turn,
-which would make each session its own scope and mean nothing said last week ever
-consolidates with what is said today. Pinning the scope to the single scope tag
-fixes isolation and cross-session consolidation together. `per_tag` is the wrong
-tool despite sounding right: it emits one observation per individual tag, so a fact
-tagged `["user:alice", "cluster:foo"]` yields a `cluster:foo` observation carrying
-no user tag at all.
-
-**3. Prefetch is forced to `recall` mode, and `memory_reflect` is
-reimplemented.** `hindsight_reflect` and reflect-mode prefetch both call
-`areflect(bank_id, query, budget)` with **no tag arguments**. In one bank that
-synthesises across every user — the one path that would cross users even with
-everything else correct. The REST API and the generated client both accept `tags`,
-`tags_match` and `exclude_mental_models` on reflect; only the plugin omits them. So
-the wrapper implements `memory_reflect` against the client directly and pins
-`_prefetch_method = "recall"`, whose filter path does apply the tags. Mental models
-are excluded because they are bank-level and not tag-scoped; this deployment creates
-none, so the exclusion costs nothing and closes the last unscoped path.
-
-**4. Shared writes bypass the stock retain path.** `_build_retain_kwargs` merges the
-instance's `_retain_tags` into every write and offers no per-call
-`observation_scopes` or `strategy`. A shared fact must not inherit the caller's
-`user:` tag — it would consolidate into that person's scope and become invisible to
-everyone else. `_retain()` therefore builds its own item and calls `aretain_batch`
-directly, which also avoids swapping instance attributes around an asynchronous
-writer thread.
-
-The bank name is pinned the same way, for a different reason: `apply_scoping` sets
-`DEFAULT_BANK_ID` and clears `_bank_id_template`, so a hand-edited config file cannot
-move the bank.
-
-### Bank provisioning is lazy
-
-A Hindsight bank does not exist until something is written to it, so there is
-nothing to provision at install time. `ensure_bank()` runs on **session creation**:
-it reads the bank config, compares `retain_strategies` and
-`retain_default_strategy` against the provider's constants, and if they differ
-calls `create_bank(mission=BANK_MISSION)` followed by `update_bank_config(...)`.
-`create_bank` doubles as the update path — it is what Hindsight's own deprecated
-`set_mission()` calls — and leaves existing facts intact, so this is safe to
-re-run.
-
-Three details that are easy to get wrong:
-
-- `_bank_provisioned` is a **process-level set, recorded before the attempt, not
-  after**. If the API is down, every subsequent session in that process would
-  otherwise retry a known-failing call on the session-creation path.
-- The strategies are the sentinel for "already done" because the bank-level
-  `mission` is _not_ part of the `get_bank_config` payload (which returns
-  `{bank_id, config}`). Mission and strategies are always written together, which
-  makes the strategies a sound proxy for both.
-- Failures are logged and **swallowed**. An unguided bank is worse than a guided
-  one but still works, and memory must never be the reason a session fails to
-  start.
-
-The upside of doing it here is that deleting the Postgres PVC is a complete reset:
-the first DM afterwards rebuilds the bank correctly, with no operator step for
-anyone to forget. The downside is that between a wipe and the first chat the bank
-is bare, which is why the test harness ships
-[`rounda2-provision-bank.yaml`](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/jobs/rounda2-provision-bank.yaml)
-— a Job that does exactly what `ensure_bank` does, parsing the constants straight
-out of the installed plugin source with `ast` rather than retyping them.
-
-The three retain strategies:
-
-| Strategy     | Settings                           | Used by                                   |
-| ------------ | ---------------------------------- | ----------------------------------------- |
-| `personal`   | personal extraction mission        | automatic capture; an attributable retain |
-| `shared`     | shared extraction mission          | `memory_retain(scope="shared")`           |
-| `checkpoint` | `retain_extraction_mode: "chunks"` | the TTL curator (built, not running)      |
-
-`retain_default_strategy` is `personal`, so anything that reaches the bank without
-naming a strategy is treated as one person's fact rather than as org knowledge.
-
-### How memory is populated
-
-Two paths, and the split between them is the safety property.
-
-**Automatic capture — always personal, never shared.** `sync_turn(user, assistant)`
-fires after each completed turn and `on_session_end(messages)` at teardown, both
-delegating to the stock provider, which extracts durable facts under the `personal`
-strategy. Both are **gated on `self._user_tag`**: if the speaker cannot be
-attributed, nothing is captured at all. Interrupted turns are skipped by Hermes
-before the provider ever sees them — a partial assistant output is not durable
-conversational truth.
-
-**Explicit writes — the only way anything becomes shared.** `memory_retain` builds
-one item with `tags`, `observation_scopes: [tags]`, the matching `strategy`, and an
-optional short `context` label, then calls `aretain_batch(..., retain_async=False)`.
-Synchronous, so the tool result reflects the write.
-
-Because automatic capture is personal-only, **nothing reaches shared memory except
-through a `memory_retain` the model chose to make**. That is the floor the rest of
-the scope design sits on, and it holds in every session: no transcript is ever
-absorbed into the corpus everyone reads.
-
-What the write is _spelled_ varies, because the safe reading of an unqualified
-retain is not the same everywhere. Wherever a person is in the conversation it
-stays `scope="shared"`, explicitly; in an unattended session — cron, the k8s event
-watcher — there is no personal scope to write to and an unqualified retain resolves
-to shared instead of failing. The cases are in
-[The tools](#the-tools).
-
-#### What goes in which scope
-
-Tag isolation works, and the first thing that proved was that it isolates too much.
-_"Alice is a tech lead in GKE"_, said by Alice in her own DM, is captured by the
-automatic path — which is always personal — and lands under `user:alice`, where no
-other user can reach it. Asked _"who can approve this?"_ as a different user, the
-agent answered _"ask a tech lead."_ Re-stated as `scope:shared`, the same question
-answered _"Alice is a tech lead in GKE who can review and approve these changes."_
-The org-chart knowledge the fleet most needs is exactly what automatic capture
-files privately.
-
-The discriminator: **would another user need this to know who to ask, or who
-approves?** Roles, ownership and approval authority are shared. Preferences,
-defaults, possessions and working style are personal.
-
-This is enforced in the **persona, not in the wrapper**.
-[`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.6 carries the rule and four
-conditions on it: stated not inferred, roles and ownership only, never automatic,
-and the agent says out loud that it wrote something org-wide so the user can
-object. The alternatives — a classifier in the wrapper deciding scope per fact, or
-a second retain strategy splitting each turn into a personal and a shared
-extraction — both put a judgement about meaning into a layer that only manipulates
-tags. The wrapper would stop being slim, and a misclassification would be a silent
-leak of a personal fact into shared memory with no human in the loop. The model is
-already making that judgement; the persona is where it is directed.
-
-#### The third path, once: the old file store
-
-A volume that predates this provider still has its memory in Markdown, and the new
-provider never reads those files. Without something to move them, the day the image
-rolls is the day everything the agent had learned goes dark while staying perfectly
-intact on disk — neither reachable nor gone, and unnoticed until a question that
-used to work stops working.
-
-[`agents/chat/scripts/memory_file_import.py`](../../agents/chat/scripts/memory_file_import.py)
-runs from the entrypoint on every start (step 5.6), backgrounded and non-fatal, and
-exits immediately when there is nothing to move — which is every start after the one
-that moved it. It runs **only for a Hindsight-backed provider**, which is the one
-irreversible step in the entrypoint: it moves the Markdown into the provider and
-unlinks the original. The gate used to be the presence of
-`hindsight/config.json`, an image-owned file and therefore always present, so an
-install that had deliberately kept the file store had it taken away on the next
-roll. `MEMORY_PROVIDER` on the pod is what it reads instead, and an _unset_
-variable — an operator too old to send it — still takes the old file-presence
-path, which is the safe reading of an install that predates the choice. It reads both layouts, the built-in `MEMORY.md`/`USER.md` and
-`multiuser_memory`'s `memories/`, retains each entry under the scope its file
-implies, verifies the entry is in the bank, and only then deletes the file. What
-stays behind is a receipt under `$HERMES_HOME/hindsight/imported/` carrying the
-source path, its hash and the entry count, and none of the text — leaving the
-content readable on the volume is the thing being undone.
-
-Two decisions are worth stating here because they are properties of the design
-rather than of the script:
-
-- **A personal store has to arrive under the tag its owner will read back with.**
-  `multiuser_memory` named its files `<sanitized>_<sha256(raw)[:12]>.md`, and the
-  sanitized half is lossy — `alice@corp.com` and `alice_corp.com` collide. The
-  twelve hex characters are not: they are a checksum over the raw id, so the
-  original is recovered by search and then _confirmed_ by hash. Where nothing
-  matches, the file is left where it is and reported. A personal memory filed under
-  the wrong tag is a leak, and one filed under a tag nobody carries is a silent
-  loss; a guess risks both. The recovered id then goes through the same
-  `sanitize_user_id` the provider uses, digest and all, so the entry arrives under
-  the exact tag its owner recalls with.
-- **The delete is gated per entry, on the bank.** An entry the extractor discards as
-  non-durable produces no memory unit, so its file survives and the run says which
-  entry it was. The one unrecoverable mistake available here is deleting the last
-  copy of something.
-
-The built-in `USER.md` carries no identity at all — it belonged to whoever ran a
-single-user agent — so it is migrated only when `--user-id` says who that was, and
-skipped otherwise.
-
-### How recalled memories reach the model
-
-Two distinct channels, and conflating them is the most common misreading of this
-design.
-
-**Channel 1 — the system prompt block: instructions only, no content.**
-`system_prompt_block()` returns a fixed header plus one of two bodies, chosen at
-`initialize()` time: `SYSTEM_PROMPT_BODY` when both scopes are reachable, or
-`SYSTEM_PROMPT_SHARED_ONLY` plus an explanation when personal memory is off. It
-tells the model that it has memory, what the two scopes mean, and when to write.
-**It never contains recalled facts.** This is the structural difference from the
-file provider, whose `system_prompt_block()` _was_ the corpus.
-
-**Channel 2 — per-turn prefetch, injected into the user message.** On each turn
-Hermes calls `on_turn_start()`, then `prefetch_all(user_message)` before the tool
-loop (`agent/turn_context.py`). The wrapper delegates to the stock provider's
-recall-mode prefetch, which runs a semantic search over the observation layer with
-the pinned tag filter and the configured budget, and returns a text block. The
-wrapper sets `provider._recall_prompt_preamble = RECALL_PREAMBLE`, which frames
-that block as:
-
-> Durable facts recalled from previous sessions… Do not look these up with a tool —
-> they are already here.
-
-That block is composed into the **API copy** of the current user message — Hermes
-stamps it as an `api_content` sidecar, deliberately _not_ into the stored content.
-The reason is prefix-cache stability: if the injection were persisted, the next
-turn would replay the message without it, diverging the request prefix at that
-point and re-prefilling everything after it. So the recalled block is sent, is not
-replayed, and does not accumulate.
-
-After the turn, `queue_prefetch_all()` warms the next turn's recall in the
-background against the message just handled, so the latency is usually paid off the
-critical path.
-
-The net effect: **memory content enters the context per turn, sized by budget, and
-leaves again**. That is why the context column in the ladder is flat.
-
-### The tools
-
-The Chat Agent gets three, from `get_tool_schemas()`:
-
-| Tool             | Scope parameter                                   | Notes                                              |
-| ---------------- | ------------------------------------------------- | -------------------------------------------------- |
-| `memory_retain`  | `personal` \| `shared` — see the default below    | Requires `content`; optional short `context` label |
-| `memory_recall`  | `personal` \| `shared` \| `both` — default `both` | Semantic search; returns matches                   |
-| `memory_reflect` | same as recall                                    | Synthesises an answer across memories              |
-
-`handle_tool_call` validates scope before dispatch, rejects `scope="both"` on a
-write, and degrades a read: with no user identity, `both` narrows to `shared` (the
-shared half is still answerable and the system prompt has already explained why the
-personal half is not), while an explicit `personal` returns the disabling reason as
-an error. `_tags_for(scope)` is the single place tags are derived, used by both the
-read and write paths.
-
-A write that names no scope is the model declining to state intent, so the default
-is the safe reading of that silence — which depends on who is in the room, not on
-whether the session happens to hold a user tag:
-
-| Session                                              | Write default | An unqualified retain                            |
-| ---------------------------------------------------- | ------------- | ------------------------------------------------ |
-| DM from a known user                                 | `personal`    | filed under that user                            |
-| Group thread (`SHARED_SESSION_NOTICE`)               | `personal`    | refused, with the reason, and nothing is written |
-| Unattributable interactive DM (`NO_IDENTITY_NOTICE`) | `personal`    | refused, with the reason, and nothing is written |
-| Unattended background run (`NO_IDENTITY_NOTICE`)     | `shared`      | filed under `scope:shared`                       |
-
-The middle two rows are why the provider carries `_unattended` rather than keying on
-`self._user_tag` being empty: three states have no tag, and only the last one
-(cron and the k8s event watcher) is an empty room. Both a group space and an
-interactive DM or `a2a-*` session whose route or identity is missing have a
-human speaker whose personal facts must not be published org-wide,
-so an unqualified write there must keep failing closed — publishing one
-participant's stated fact org-wide is the outcome the whole scope design exists to
-prevent. `get_tool_schemas` splits the same way: only the unattended variant drops
-`personal` from the write enum, because whenever a human is present that value is the model's only
-way to say "this belongs to one person" and earn the refusal.
-
-Neither read delegates to the stock tool. `memory_reflect` cannot, because
-`hindsight_reflect` drops the tag filter (pinned setting 3). `memory_recall` no
-longer does either, for the reason below; both call the client directly, and
-`_tags_for(scope)` supplies the filter, so every scope takes one code path.
-
-#### A read names its outcome
-
-Three things can happen to a read, and they are not interchangeable:
-
-| `status`      | What happened                                  | What the caller may conclude          |
-| ------------- | ---------------------------------------------- | ------------------------------------- |
-| `found`       | The store answered and matched                 | These are matches, not the full index |
-| `no_match`    | The store answered; this query matched nothing | Nothing — the record may still exist  |
-| `unreachable` | The store did not answer; nothing was searched | Nothing about the contents at all     |
-
-The stock tools collapse the last two into one string, `"No relevant memories
-found."`, and a model reads that as _no such record exists_ — then says so with
-full confidence. The experiment caught exactly that: a specialist reported a real
-decision record as "zero records — its content isn't recorded anywhere retrievable"
-while that record's text sat in the store it was nominally reading
-([Answer quality, head to head](#answer-quality-head-to-head)). The failure is in
-the return value, not the model.
-
-So every read also returns a **`searched` envelope** — bank, scope tags, query,
-and for recall the layer (`_recall_types`, `observation` by default) — which makes
-an empty result attributable to a search that was run rather than a property of
-the world. `no_match` and `unreachable` each carry standing guidance
-(`NO_MATCH_GUIDANCE`, `UNREACHABLE_GUIDANCE`) naming what may not be inferred.
-`unreachable` is returned through `tool_error`, so it is an error in the
-transcript as well as a status field.
-
-The rule is also stated in the system prompt (`MEMORY_ABSENCE_RULE`), because one
-surface has no return value to carry it: when the per-turn prefetch matches
-nothing, **no memory block appears at all**, and silence is the one outcome a tool
-cannot annotate. `tests/memory/test_recall_reporting.py` locks the contract down.
-
-For the Chat Agent to see any of this, `memory` must be listed in
-`platform_toolsets` **and** absent from `agent.disabled_toolsets`; the denylist is
-applied last, over every platform key, and silently wins. `memory` there is a
-**gate for the provider, not a tool grant** — `inject_memory_provider_tools()` bails
-unless the gate is on, and that injection is the only path by which the provider's
-tools reach the model.
-
-#### What subagents get: shared memory, read-only
-
-Kanban-spawned specialists used to carry **no memory provider, no memory tools, and
-no injected memory block**. That was deliberate — a specialist carries no human
-identity, so it cannot scope a write, and pooling every specialist's writes into one
-anonymous bucket is worse than not writing. It is also what the experiment measured
-on both arms, which makes specialists a **constant in the A/B rather than a
-variable**.
-
-What the experiment then showed is that withholding memory did not stop the
-specialist needing the corpus; it stopped it getting the corpus from a curated
-source. Across ten probes it improvised five routes to the same data, the worst of
-them durable: a 79,815-byte fork of the shared corpus written into its own skill
-file, reloaded into context on every invocation, curated by nobody and auditable by
-nobody. See
-[Specialists with no memory improvise one](#specialists-with-no-memory-improvise-one)
-for the full accounting. **A stale private copy is a worse outcome than a read.**
-
-So the platform profile now reads shared memory and writes nothing
-([`agents/platform/config.yaml`](../../agents/platform/config.yaml)):
+Four security invariants govern this path:
+
+1. **Gateway-attested identity**: `a2a/gateway` is the only principal permitted to publish tasks to `a2a.tasks.*.*.in` (enforced by [`tests/conformance/test_A_authority.py`](../../tests/conformance/test_A_authority.py)). It hashes the authenticated user's email with `SESSION_KV_SALT` into a pseudonymous `hmac:<32-hex>` identifier and sets `authority.audience.kind` to `"dm"` or `"group"` ([`a2a/gateway/a2adoor.go`](../../a2a/gateway/a2adoor.go)).
+2. **Memory-only scoping after capability check**: In [`a2a/hermes-bridge/bridge.go`](../../a2a/hermes-bridge/bridge.go), after `capabilityPermits` verifies the task against `KV_cap`, [`a2a/hermes-bridge/route.go`](../../a2a/hermes-bridge/route.go) extracts `user_id` and `chat_type` from the task's `authority` block solely to scope conversational memory and stores them in `session_kv.db`. Shared-credential doors (`console:` and `verified_by == "nats-grant"`) clear `user_id` so multiple operators never share one personal memory store.
+3. **Lineage resolution across session compression**: When Hermes compresses a long conversation into a new session ID, it records `parent_session_id` in `state.db`. Both memory providers walk `parent_session_id` up to the root `a2a-<contextId>` so compressed sessions retain their caller identity and audience type.
+4. **Pseudonymous storage**: Plaintext user emails never appear on NATS streams, in `session_kv.db`, or in Hindsight tags (`user:hmac-<32-hex>_<sha12>`).
+
+#### Failing closed across the five session states
+
+Whenever the speaker cannot be attributed to a single human in a direct message, personal memory switches off automatically. Both `kube_agents_memory` and `multiuser_memory` classify every session into one of five explicit states at `initialize()`:
+
+| Session state                | Condition at `initialize()`                                                   | Personal memory (`user:<id>` / `users/<id>.md`) | Shared memory (`scope:shared` / `MEMORY.md`) | Unqualified `memory_retain` / `memory(target="user")` | System prompt instruction                                                                                                 |
+| ---------------------------- | ----------------------------------------------------------------------------- | ----------------------------------------------- | -------------------------------------------- | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `attributed-dm`              | `user_id` non-empty and not `"default"`, `chat_type == "dm"`                  | Enabled (read & write)                          | Enabled (read & write)                       | Writes to personal memory                             | Normal personal + shared memory guidance                                                                                  |
+| `unattributable-shared`      | `chat_type == "group"` or (`chat_type != "dm"` and `thread_id` non-empty)     | Disabled                                        | Enabled (read & write)                       | Refused (`SHARED_SESSION_NOTICE`)                     | Instructs the model to refuse personal `"Remember: ..."` requests in group spaces and explain that DMs are required       |
+| `unattributable-interactive` | Interactive / `a2a-*` session with empty `user_id` or missing `session_kv.db` | Disabled                                        | Enabled (read & write)                       | Refused (`NO_IDENTITY_NOTICE`)                        | Instructs the model to refuse personal `"Remember: ..."` requests when caller identity is unavailable; never silent no-op |
+| `unattended`                 | Non-`a2a-*` background cron or event-watcher session with no `user_id`        | Disabled                                        | Enabled (read & write)                       | Writes to `scope:shared`                              | Background operational mode (`UNATTENDED_NOTICE`)                                                                         |
+| `read-only`                  | Delegated specialist worker (`read_only: true`)                               | Disabled                                        | Read-only (`recall` & `reflect` only)        | Write tool not registered                             | Read-only shared memory guidance                                                                                          |
+
+This state table guarantees three safety properties:
+
+- **No shared `"default"` bucket**: Neither provider ever falls back to `"default"` when `user_id` is empty.
+- **No accidental leak from DMs or group chats into shared memory**: In `unattributable-shared` and `unattributable-interactive` sessions, a human is speaking, so an unqualified write (or `target="user"`) is refused with a clear explanation instead of writing the user's statement to `scope:shared`. Only genuine background cron/watcher runs (`unattended`) default unqualified writes to `scope:shared`.
+- **No silent fake confirmations**: When personal memory is disabled in an interactive session, the system prompt explicitly forbids the model from replying _"Noted"_ or _"I'll remember that"_ and instructs it to explain why personal memory is unavailable.
+
+#### How conversational memories are captured, recalled, and reported
+
+- **Population**:
+  - **Automatic capture (personal only)**: After each completed DM turn (`sync_turn`) and at session end (`on_session_end`), Hindsight extracts durable personal preferences under `user:<id>`. Automatic capture never writes to `scope:shared`.
+  - **Explicit writes (`memory_retain`)**: Shared organizational facts (such as team ownership, on-call rotation, or approval authority, governed by [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.6) enter `scope:shared` only when the agent explicitly calls `memory_retain(scope="shared")` and states in chat what it recorded.
+- **Per-turn injection without prefix-cache churn**:
+  - The system prompt block (`system_prompt_block()`) contains **static instructions only**—never recalled facts—so the system prompt prefix cache stays valid across turns.
+  - Before the tool loop on each turn, `prefetch_all(user_message)` retrieves relevant observations within `recall_budget` and attaches them to the current turn's ephemeral `api_content` sidecar. After the turn finishes, `queue_prefetch_all()` warms the cache in the background for the next turn.
+- **Explicit read outcomes (`found`, `no_match`, `unreachable`)**:
+  - Every `memory_recall` and `memory_reflect` call returns a structured `status` (`found`, `no_match`, or `unreachable`) plus a `searched` metadata envelope (bank, scope tags, query, and layer).
+  - Distinguishing `no_match` (_"the store answered, and this query matched nothing"_) from `unreachable` (_"the memory service did not respond"_) prevents the agent from claiming that a record does not exist when a query simply missed or the database was unreachable.
+
+#### Communication style, verbosity, and scheduled report preferences
+
+Engineers on the same team often want different levels of detail from the agent: some prefer a concise three-bullet summary, while others want full step-by-step explanations with command outputs and citations. Layer 1 supports both per-user and team-wide communication preferences without static installer flags:
+
+| Preference scope                                    | Tag in `kube-agents-memory` | How it is set or updated                                                                                                                                                                           | Where it applies                                                                                                                              |
+| --------------------------------------------------- | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Per-user response style & verbosity**             | `user:<id>`                 | Direct request in DM (_"Keep replies short and lead with a summary"_), conversational feedback (_"Too verbose"_), or Web UI verbosity/tone controls writing to the user's personal memory profile. | Every direct message turn with that user across chat surfaces and the Web UI.                                                                 |
+| **Team-wide channel & scheduled digest formatting** | `scope:shared`              | Explicit team instruction in chat (`memory_retain(scope="shared")`, e.g., _"Format scheduled audit and cron digests as concise executive summaries, not walls of text"_).                          | Shared group channels and unattended background runs (`unattended` cron jobs and event watchers) that retrieve `scope:shared` before posting. |
+
+#### Read-only shared memory and finding nominations for specialist subagents
+
+Delegated specialist workers (`agents/platform/config.yaml`) run with no human `user_id` and set `memory.read_only: true` with `recall_budget: low`:
+
+- **Read access**: Specialists receive per-turn shared memory prefetch and can call `memory_recall` and `memory_reflect` against `scope:shared`. Giving specialists sanctioned read access prevents them from improvising unsanctioned local caches.
+- **Write prohibition**: `memory_retain` is omitted from tool schemas, refused by `handle_tool_call` with `status: read_only`, and disabled on automatic turn hooks.
+- **Finding nomination**: When a specialist discovers a durable operational fact during a task, it includes a `**Worth remembering**` block in its task result and attaches the candidate sentence in structured completion metadata (`memory_candidates`). The human in chat sees the nomination in the reply and can ask the Chat Agent to save it to `scope:shared`.
+
+---
+
+### Layer 2 — Decision and lesson memory (`knowledge/` and `kube-agents-decisions`)
+
+While Layer 1 handles conversational context, **Layer 2** turns the GitOps repository (`knowledge/decisions/*.md` and `knowledge/lessons/*.md`) into the version-controlled source of truth for architectural decisions and operational lessons, backed by a rebuildable Hindsight chunk index (`kube-agents-decisions`) and a zero-LLM deterministic enforcement CLI ([`decision_memory.py`](../../agents/platform/skills/decision-memory/scripts/decision_memory.py)).
+
+```mermaid
+flowchart LR
+  subgraph Populate["1. Memory Population"]
+    O["Verified PR Outcomes (resolved-merged / refused / persists)"]
+    H["2-Hour Bootstrap & Incremental Harvester (PRs, Issues, /docs)"]
+    C["Explicit Chat Decisions"]
+  end
+  subgraph Truth["2. GitOps Repository (Source of Truth)"]
+    R["knowledge/decisions/*.md\nknowledge/lessons/*.md"]
+  end
+  subgraph Index["3. Hindsight Bank: kube-agents-decisions"]
+    I["Verbatim Chunks (1 doc per record)"]
+    M["Tag-Scoped Mental Models"]
+  end
+  subgraph Consume["4. Guard Enforcement & Retrieval"]
+    P["Deterministic Check (Drafting, Submit Gate, PR CI)"]
+    Q["On-Demand Queries (decision_memory.py why & Read-Only MCP)"]
+  end
+  O --> OR["Outcome Recorder"] -->|Draft PR| R
+  H -->|Bootstrap / Triage PR| R
+  C -->|Draft PR| R
+  R -->|decision_memory.py index| I --> M
+  R --> P
+  R --> Q
+  I --> P
+  I --> Q
+  Dream(("Nightly Dream")) -->|Verify Guards, Supersede, Scan Coverage| R
+  Dream -->|Reconcile & Refresh| I
+```
+
+#### Operational Knowledge Format (OKF) schema for decisions and lessons
+
+[Architecture 06 §5](../architecture/06-api-and-data-contracts.md#5-okf-knowledge-contract) defines the base Operational Knowledge Format (OKF) as Markdown files with YAML frontmatter under `knowledge/<type>/*.md`. Decision memory defines two record types:
+
+- **`decision` (`DEC-YYYY-NNN`)**: A forward-looking architectural choice and the trade-offs behind it (for example, capping a multi-tenant namespace quota at `32Gi`).
+- **`lesson` (`LES-YYYY-NNN`)**: A backward-looking operational rule learned from a real incident or pull request outcome (for example, keeping a JVM service's memory request at or above `256Mi` after an off-heap `OOMKilled` outage).
 
 ```yaml
-memory:
-  memory_enabled: false
-  provider: ""
-  read_only: true
-  user_profile_enabled: false
+---
+type: lesson # decision | lesson
+id: LES-2026-001 # DEC-YYYY-NNN | LES-YYYY-NNN
+title: checkout OOM-kills below 256Mi under JVM off-heap growth
+status: active # proposed | active | superseded | retired
+date: 2026-09-10
+scope: # required; at least one key must be non-empty
+  paths: ["clusters/*/payments/checkout.yaml"]
+  resources: ["Deployment/payments/checkout"] # kind/namespace/name (globs allowed)
+  clusters: [prod-eu]
+  checks: [oom-kill] # fleet-audit check identifiers
+guard: # optional machine-checked invariant
+  rule: Keep checkout memory request at or above 256Mi.
+  severity: block # block | warn | info
+  expect:
+    file: "clusters/*/payments/checkout.yaml"
+    path: "spec.template.spec.containers[name=app].resources.requests.memory"
+    op: ">=" # == | != | >= | > | <= | < | present | absent | regex
+    value: 256Mi # parses Kubernetes quantities (Ki, Mi, Gi, m)
+evidence: # pull_request is mandatory for type: lesson
+  pull_request: https://github.com/acme/gitops/pull/31
+  breaking_pr: https://github.com/acme/gitops/pull/29
+  incident: https://github.com/acme/gitops/issues/30
+  commit: 1a2b3c4
+  merged_by: alice
+  finding_id: oom-kill.prod-eu.payments.checkout
+  outcome: resolved-merged # resolved-merged | pr-merged-persists | refused
+  resolution:
+    verified_by: fleet-audit
+    at: 2026-09-11T02:00:00Z
+supersedes: [] # record IDs replaced by this record
+superseded_by: null # record ID that replaced this record
+---
+## What happened
+Lowering the `checkout` memory request to 224Mi in PR #29 caused JVM off-heap DirectByteBuffer allocations to exceed container limits under peak load (Issue #30).
+
+## What fixed it
+PR #31 restored the memory request to 512Mi (minimum safe floor 256Mi).
+
+## Prevent it next time
+Block any pull request that lowers `requests.memory` below 256Mi on `Deployment/payments/checkout`.
 ```
 
-`memory_enabled: false` is not a contradiction. It gates Hermes' **built-in**
-`MEMORY.md`/`USER.md` file store, which the `memory` toolset surfaces on any profile
-that lists it; the provider loads off `provider` alone. Leaving it false is what
-keeps the built-in tool inert — a null store, short-circuited before it touches disk
-— and so what makes the profile read-only in fact rather than only in the provider.
+Each frontmatter field serves a specific operational purpose:
 
-The empty `provider` is the same rule as the overlay above, applied to the baked
-file: the default store is the per-user file one, which a specialist has no identity
-to key on, so an image running without the operator gives its specialists no
-provider at all. `--memory=hindsight` is what fills this key in, and it does so
-through the overlay rather than by editing the image.
+| Field                              | Purpose                                                                                                                           |
+| ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `id` (`DEC-YYYY-NNN`, `LES-...`)   | Stable identifier used in citations, PR comments, `supersedes` links, and `decision-override:<id>` labels.                        |
+| `status` and `supersedes`          | Tracks whether a rule is `proposed`, `active`, `superseded`, or `retired` so obsolete freezes never block valid upgrades.         |
+| `scope` (`paths`, `resources`, ..) | Matches modified files and Kubernetes objects (`Kind/namespace/name`) locally in $< 100\text{ ms}$ without vector search.         |
+| `guard` (`severity`, `expect`)     | Turns a written lesson into a deterministic check (`>= 256Mi`, `absent`, `regex`, etc.) enforced before a pull request is opened. |
+| `evidence` (`pull_request`, ...)   | Links the record to the exact pull requests, incident issues, and commits so the agent can cite verifiable provenance.            |
 
-The specialist gets both forms of read, and they are not separable: enabling the
-provider gives Hermes something to `prefetch` from, and prefetch is the injection.
+#### 1. How the agent learns across three core operational scenarios
 
-- **Injected context** is the floor — it guarantees the specialist starts with the
-  shared corpus whether or not it thinks to ask. A tool alone can be skipped in
-  favour of something improvised, and one such improvisation proved durable.
-- **`memory_recall` as a tool** is the loop. Specialist work is iterative — it
-  writes its own verification harnesses and scans for contradictions — and a block
-  fixed at session start cannot answer a follow-up.
+All shared team rules, conventions, architectural decisions (`DEC-*`), and incident lessons (`LES-*`) live in a single shared memory bank (`kube-agents-decisions`) backed by the GitOps repository (`knowledge/`). Each shared record carries one deterministic `document_id` (`okf:<repo>:<id>`) and moves in-place through four lifecycle states (`status:proposed` $\to$ `status:active`, `status:rejected`, or `status:superseded`), eliminating any split-brain between chat and Git:
 
-The decisive argument for including the tool is **failure legibility**. Injected
-context that is unavailable arrives as an absent block, indistinguishable from
-"nothing is recorded about this". A tool call returns a named outcome, and a named
-outcome is a fact the agent can report — which is what
-[a read names its outcome](#a-read-names-its-outcome) builds, and why it landed
-first.
+| Scenario                                                                                                                                           | Example trigger                                                                                                           | What happens immediately (`status:proposed`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | How it resolves when the PR is merged or rejected                                                                                                                                                                                                                                                                                                                                                   |
+| :------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------ | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Scenario 1: Learning from chat** (e.g., in a group space someone says _"Let's not submit any infrastructure PRs on Friday"_)                     | An engineer states a team-wide convention, change freeze, or ownership rule in a group chat or DM.                        | The Chat Agent publishes the candidate decision (`DataPart` schema `kube-agents.memory.outcome/v1`) to the provisioned journal topic `a2a.topics.shared.annotations`. The Go Curator opens a PR adding `knowledge/decisions/DEC-2026-004.md` (`status: proposed`) and immediately indexes `document_id=okf:<repo>:DEC-2026-004` into `kube-agents-decisions` with tag **`status:proposed`** so agents warn users that the rule is awaiting review.                                                                                        | **Merged**: The Curator replaces `document_id=okf:<repo>:DEC-2026-004` in-place with tag **`status:active`**, and `submit-suggestion` blocks Friday PRs (`exit 2`).<br/>**Rejected (closed unmerged)**: The Curator replaces the same `document_id` in-place with **`status:rejected`** (recording the reviewer's reason), leaving zero stale rules behind.                                         |
+| **Scenario 2: Learning from troubleshooting & monitoring** (e.g., a Cluster Agent diagnoses an outage and a fix PR is submitted to the infra repo) | An event watcher, fleet audit check, or troubleshooting run diagnoses a cluster failure and proposes a remediation patch. | The Cluster Agent returns its grounded RCA and proposed patch in its task `result` artifact on `a2a.tasks.<profile>.<taskId>.events` (`TASKS` stream), and the Platform Agent / Curator opens the fix PR and publishes the proposed lesson (`status:proposed`) to `a2a.topics.shared.annotations`. The Go Curator indexes `LES-YYYY-NNN` as **`status:proposed`** in `kube-agents-decisions`. After the fix PR merges (or closes), post-merge verification checks Argo CD/Flux health, 24-hour event silence, and the fleet-audit ledger. | The verified outcome (`resolved-merged`, `pr-merged-persists`, or `refused`) is published to `a2a.topics.shared.annotations`. The Go Curator synthesizes a verified `LES-*` record (or promotes a recurring $\ge 2$-cluster pattern into a fleet-wide `DEC-*` rule), opens a `knowledge/` PR, updates the `document_id` in-place to **`status:active`**, and updates `a2a.topics.shared.blueprint`. |
+| **Scenario 3: Learning on Day-0 installation** (scanning an existing GitOps repo when the agent is first installed)                                | A GitOps repository is registered on a new installation and `knowledge/STATE_OF_BEING.md` does not yet exist.             | The Go Curator automatically launches `bootstrap --since 2y --budget-minutes 120`. Stage 1 scans 2 years of commits, merged/closed PRs, review comments, and issues in $0\text{–}15\text{ min}$ with zero LLM calls, and Stage 2 prunes deleted workloads (`anachronistic`) and noise against `HEAD`.                                                                                                                                                                                                                                     | Stage 3 uses concurrent goroutines to diff YAML/HCL ASTs, calls LiteLLM (`POST /v1/chat/completions`) to write OKF sections with exact PR/issue links, and verifies every candidate guard against `HEAD`. Stage 4 opens one onboarding PR (`STATE_OF_BEING.md` + `DEC-*`/`LES-*` files) and indexes the corpus into `kube-agents-decisions` within 2 hours of installation.                         |
 
-What is tunable is how much gets injected, not whether. The platform profile's
-`recall_budget` is `low`, on the reasoning that a specialist arrives with a task
-already stated and a long tool loop ahead of it, so context spent at turn start is
-context it does not have for the work. The Chat Agent is at `mid`, because for it
-the injected block _is_ the work. The budget is also the count of pairs the reranker
-scores, so it is a latency knob as well as a context one — but a weak one, and
-dropping the Chat Agent to `low` was tried and reverted; see
-[What a recall costs](#what-a-recall-costs).
+##### Path W1 — Learn automatically from troubleshooting, monitoring, and pull request outcomes
 
-**Personal memory stays impossible here**, and always will be: it keys off the
-gateway identity, which only the Chat Agent has. The provider fails closed on this
-by itself — with no `user_id` it recalls `scope:shared` and nothing else.
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Mon as Monitoring / Fleet Audit
+  participant ClA as Cluster Agent Profile
+  participant PlA as Platform Agent
+  participant Git as GitOps Repo (Manifests & knowledge/)
+  participant NATS as NATS Bus (TASKS / TOPICS-JOURNAL / STATE)
+  participant Cur as Go Curator / Dreamer (a2a/cmd/curator)
+  participant LLM as LiteLLM Gateway
+  participant HD as Hindsight (kube-agents-decisions)
 
-##### What `read_only` does
+  Mon->>ClA: Alert / finding on cluster-eu-01 (e.g. Autopilot CPU mutation loop)
+  ClA->>ClA: Read-only diagnosis and return RCA + proposed patch on a2a.tasks.<cluster>.<taskId>.events
+  ClA->>PlA: Task result artifact (RCA + proposed manifest patch)
+  PlA->>Git: Run curator check and open fix PR #275 (requests.cpu: 400m)
+  PlA->>NATS: Publish proposed lesson (status:proposed, pr:275) to a2a.topics.shared.annotations
+  NATS->>Cur: Index LES-2026-019 as [status:proposed] in kube-agents-decisions
 
-It is a profile setting rather than something inferred from the session, because the
-two identity-less cases are not the same. A shared Google Chat space also has no
-single `user_id`, and it deliberately **keeps** shared writes: there are humans in
-the room who can vouch for one. A dispatcher-spawned specialist has nobody. Only the
-profile config knows which case it is in.
+  Note over Git: Human merges fix PR #275 (or closes unmerged)
 
-`memory_is_read_only()` reads `memory.read_only` through `load_config()`, which
-resolves via `HERMES_HOME` and is therefore profile-scoped — a kanban worker is
-launched with `HERMES_HOME` pointed at `profiles/platform`
-(`hermes_cli/kanban_db_dispatch.py`, `env["HERMES_HOME"] = profile_home`). It
-**defaults to False**: a profile that says nothing
-keeps its write tools, and a config read that raises does not silently disarm the
-front door.
+  rect rgb(255, 248, 235)
+    Note over Mon,PlA: Step 1 — Post-Merge Outcome Verification
+    Mon-->>PlA: Check Argo CD Synced+Healthy, 24h event silence, audit finding resolved
+    PlA->>NATS: Publish verified outcome (resolved-merged | pr-merged-persists | refused) to a2a.topics.shared.annotations
+  end
 
-When it is on, four things change, because one of them failing open would be silent:
+  rect rgb(235, 245, 255)
+    Note over NATS,Git: Step 2 — Go Curator Synthesis and Cross-Cluster Federation
+    NATS->>Cur: Consume verified outcome from TOPICS-JOURNAL
+    Cur->>LLM: 1-shot completion: synthesize OKF sections and candidate guard JSON
+    LLM-->>Cur: Structured OKF prose + guard.expect (requests.cpu >= 400m)
+    Cur->>Cur: Deterministically verify guard against Git HEAD
 
-| Surface            | Behaviour under `read_only`                                                                                                  |
-| ------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
-| Tool schemas       | `memory_retain` is not advertised at all                                                                                     |
-| `handle_tool_call` | A `memory_retain` call is refused with `status: read_only`, worded so it does not read as retryable                          |
-| Automatic capture  | `sync_turn` and `on_session_end` do not fire, and `_auto_retain` is cleared on the stock provider                            |
-| System prompt      | `SYSTEM_PROMPT_READ_ONLY` — says there is no write path, where to nominate a finding instead, and not to cache what was read |
+    alt First cluster to hit this issue
+      Cur->>Git: Open PR to commit knowledge/lessons/LES-2026-019.md (status: active)
+    else >= 2 clusters hit the same check / YAML path
+      Cur->>Git: Open 1 fleet-wide PR: promote to DEC-2026-005 (clusters: ["*"]), supersede per-cluster LES-*, and consolidate shared skill
+    end
+  end
 
-Omitting the schema is the primary control; advertising the tool and refusing the
-call would spend a turn and read as a transient failure worth retrying. The refusal
-is the backstop for an invented call or a schema cached across a config change.
-
-**Not `memory_retain`, in any form.** A specialist that could write shared memory
-could launder its own derived-from-prior-runs conclusions into the corpus as facts.
-What it works out during a task is a finding for its result, not a recorded fact —
-which leaves the question of how a finding that _should_ be recorded ever gets
-there. [Nominating a finding](#nominating-a-finding-the-card-is-the-write-path)
-below is the answer, and it keeps this objection intact by putting a person between
-the finding and the write.
-
-The prompt's "do not cache what you read" is a partial, prose-only mitigation for
-the skill-file fork; the durable control — making the specialist's own skill
-directory unwritable — is tracked separately.
-
-[`tests/memory/test_read_only_profile.py`](../../tests/memory/test_read_only_profile.py)
-locks down all four surfaces, that reads are untouched, and that the setting
-defaults off.
-
-##### Nominating a finding: the card is the write path
-
-Read-only closes the write and leaves a gap it does not close: the agent best placed
-to discover a durable operational fact is the one that cannot record one. A
-specialist works out that an image crash-loops until a particular environment
-variable is set; the next card to deploy that image works it out again, at the same
-cost. Nothing in the shared corpus could have come from a card, because a discovery
-had no route out of the run it happened in.
-
-The route is the card, and what travels along it is a nomination rather than a
-write:
-
-1. The worker puts the fact in `result`, in a short `**Worth remembering**` block,
-   and repeats the same sentences in
-   `kanban_complete(metadata={"memory_candidates": [...]})` as a flat list of
-   strings. `result` is what the gateway posts into the user's thread verbatim, so
-   the person sees it with no extra turn spent; `metadata` is the machine-readable
-   copy `kanban_show` hands back later.
-2. A Platform Agent that fanned the work out carries its sub-workers'
-   `memory_candidates` onto its own card — it reads every child's `metadata` with
-   `kanban_show` while waiting the children out (`SOUL.md` §6; the fan-in card
-   that used to carry this hop was retired by #1010) — so a nomination survives a
-   hop of delegation instead of dying with the sub-card.
-3. If the user asks to keep it, the Chat Agent reads the card with `kanban_show`,
-   takes the sentence verbatim rather than from the thread it never saw, and writes
-   it with `memory_retain(scope: "shared")`.
-
-The person in step 3 is the control, not a formality: it is what keeps **Not
-`memory_retain`, in any form** true. Nothing a specialist concluded enters the
-corpus because the specialist thought it should. The bar the Chat Agent applies is
-`SHARED_SCOPE_TEST` unchanged, and the worker prompts state the same bar, so the
-filtering happens twice and the second time with someone watching.
-
-Why the user has to ask, rather than the harness offering: a completed card does not
-wake the Chat Agent. `completed` is deliberately absent from `wake_on_events` in
-[`agents/chat/config.yaml`](../../agents/chat/config.yaml), because the woken turn
-would re-read a card whose full result the user is already looking at — measured at
-5.9 s and 32,460 input tokens on one card, for nothing. Auto-triaging nominations
-would mean buying that turn back. Putting the nomination in `result` instead spends
-no turn at all: it is sitting in the message the user is reading, and "keep that" is
-a turn that was going to happen anyway.
-
-None of this is new machinery. `memory_candidates` is an ordinary key in an
-already free-form `metadata` dict, alongside `pr_url` and `proposed_patch`; what
-changed is prose — the three personas and `SYSTEM_PROMPT_READ_ONLY`.
-
-Three limits follow from that, and prose cannot lift any of them. The relay's
-middle hop is prose-only: nothing checks that the waiting Platform Agent actually
-copies its children's `memory_candidates` into its own card's `metadata`, so a
-nomination it drops while synthesizing is gone, and a `kanban_show` on the id the
-Chat Agent knows returns nothing — indistinguishable from nobody having nominated
-anything. (Before #1010 retired the fan-in card this was worse: the collection
-point was a card nothing linked back to the one the user was looking at, and the
-fan-in context serialised each prerequisite's `metadata` with a per-field cap and
-sorted keys, so `memory_candidates` sorted after a large `findings` payload and
-could be truncated away silently.) And a nomination copied **verbatim** is a faithful
-relay of text the specialist read somewhere — a pod annotation, an issue comment —
-which the person approving "remember that" is reading as a fact rather than
-auditing as a string. The control is a person, and a person is the right control
-for whether something is worth keeping, not for whether it was authored in good
-faith.
-
-### Where the connection settings come from
-
-They come from two places, split by whether the value is the same in every
-install.
-
-**What is the same everywhere** lives in `$HERMES_HOME/hindsight/config.json`,
-which is **image-owned**:
-
-```json
-{
-  "mode": "local_external",
-  "memory_mode": "hybrid",
-  "recall_budget": "mid"
-}
+  rect rgb(240, 252, 240)
+    Note over Git,HD: Step 3 — Replace status:proposed -> status:active and Broadcast
+    Note over Git: Human merges knowledge/ PR
+    Cur->>HD: Replace document_id in kube-agents-decisions with [status:active]
+    Cur->>NATS: Publish updated catalog digest to a2a.topics.shared.blueprint
+    NATS-->>PlA: Agents read latest catalog digest (<1ms via ReadTopicLatest)
+  end
 ```
 
-It ships as
-[`agents/chat/defaults/hindsight/config.json`](../../agents/chat/defaults/hindsight/config.json)
-and `deploy/shared/docker-entrypoint.sh` force-copies it over the PVC copy on every
-start (step 2a), alongside `config.yaml` and the persona files. `_apply_budget()`
-honours `recall_budget` if it is one of `low`/`mid`/`high`, and otherwise leaves
-Hindsight's own resolution alone.
+1. **Propose a lesson alongside the fix**: When a Cluster Agent diagnoses an issue from monitoring alerts or fleet-audit findings, it returns its grounded RCA and proposed manifest patch in its task `result` artifact on `a2a.tasks.<profile>.<taskId>.events` ([`spec-subagent-profiles.md`](spec-subagent-profiles.md#worked-profile-a-cluster-agent)). When the Platform Agent opens the remediation pull request, it publishes a `status:proposed` lesson candidate to `a2a.topics.shared.annotations` so `kube-agents-decisions` immediately tracks the pending fix.
+2. **Verify post-merge resolution (`resolved-merged`)**: After a fix PR merges, the outcome recorder checks four deterministic signals (from strongest to weakest):
+   - **Fleet audit verification**: `audit_report.py finish` confirms that the next complete audit run no longer reproduces the finding ([`fleet-audit-issue-ledger.md` §4](fleet-audit-issue-ledger.md#4-finding-lifecycle)).
+   - **Cluster event silence**: `intercepted_events` records zero occurrences of the workload failure reason for $24\text{ hours}$ after merge.
+   - **GitOps sync and health**: Argo CD or Flux reports `Synced` at or after the merge commit SHA and `Healthy`.
+   - **Findings queue closure**: `findings_queue.py` confirms `pr_state=merged` and verifies that the finding has cleared.
+3. **Learn from failed or rejected fixes (`pr-merged-persists` and `refused`)**:
+   - If a merged PR fails to resolve the issue (`pr-merged-persists`), or if a human reviewer closes the agent's PR unmerged (`refused`), the Curator updates the `document_id` in `kube-agents-decisions` to a **negative lesson** (_"Approach X does not resolve Y; see rejected PR #N"_) with a `warn` or `block` guard. On the very next run, the agent sees the negative lesson and avoids repeating the rejected approach.
+   - When the LiteLLM inference gateway is available (`LITELLM_BASE_URL`, `model.base_url` in `config.yaml`, or `--llm-url`, defaulting to `http://inference-gateway.<namespace>.svc.cluster.local/v1` with model `model-default`), `from-outcome` makes a single-shot OpenAI-compatible completion call to synthesize clean OKF sections (`What happened`, `What fixed it`, `How we know it worked`, `Prevent it next time`) and a candidate `guard` from unstructured PR descriptions and review comments, then deterministically verifies that the proposed guard passes against `HEAD` before writing the file.
 
-**What depends on the install** — the endpoint — is not in that file at all. The
-operator derives it from the agent's namespace and passes it as an environment
-variable:
+##### Path W2 — Day-0 repository onboarding: bounded history bootstrap ("midterm" vs. multi-year)
 
-```go
-Value: fmt.Sprintf("http://hindsight-api.%s.svc.cluster.local:8888", agent.Namespace)
+Enterprise Infrastructure-as-Code repositories often span four to five years of commits, where much of the oldest history refers to retired clusters or superseded architectures. When `kube-agents` is first installed and a GitOps repository has no `knowledge/STATE_OF_BEING.md`, the onboarding job automatically runs a bounded bootstrap (`--since 2y --budget-minutes 120`, configurable to `--since 90d` or `180d`):
+
+| History window                                 | Typical PRs & issues scanned | Processing time & compute cost                                            | Harvested records (`DEC` + `LES`) | Storage footprint (Git + Hindsight `pgvector`)             | When to choose                                                                                                     |
+| ---------------------------------------------- | ---------------------------: | ------------------------------------------------------------------------- | --------------------------------: | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| **3 months ("Midterm memory", `--since 90d`)** |             $150\text{–}400$ | $< 3\text{ min}$ (deterministic pre-filter; $0$ LLM calls on routine PRs) |                    $15\text{–}35$ | $\approx 50\text{ KB}$ in Git; $< 100\text{ KB}$ in DB     | Fast initial rollout focused on recent change-management decisions and active incident fixes.                      |
+| **6 months (`--since 180d`)**                  |             $400\text{–}900$ | $5\text{–}12\text{ min}$                                                  |                    $30\text{–}70$ | $\approx 120\text{ KB}$ in Git; $\approx 250\text{ KB}$ DB | Balanced onboarding covering two quarterly release cycles and seasonal traffic patterns.                           |
+| **2 years (`--since 2y`, default ceiling)**    |         $1,500\text{–}4,000$ | $30\text{–}120\text{ min}$ (bounded by `--budget-minutes 120`)            |                  $100\text{–}250$ | $\approx 450\text{ KB}$ in Git; $< 1\text{ MB}$ in DB      | Full historical backfill for mature fleets ($< 0.02\%$ of the default $8\text{ GiB}$ Hindsight PostgreSQL volume). |
+
+Running `bootstrap --since 2y --budget-minutes 120` executes four stages:
+
+| Stage                                  | Time window                | What happens                                                                                                                                                                                                                                                                                                                      | Output                                                                        |
+| -------------------------------------- | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| **1. Fast Git & PR metadata scan**     | $0\text{–}15\text{ min}$   | Scans commit history and closed/merged PR and issue metadata within the `--since` window without LLM calls. Identifies revert chains, closed unmerged PRs on governed files, and high-churn resource fields.                                                                                                                      | Ranked list of $50\text{–}150$ high-signal pull requests out of thousands.    |
+| **2. Five-way deterministic triage**   | $15\text{–}30\text{ min}$  | Compares each candidate's diff against the current `HEAD` tree and classifies it into `current`, `superseded`, `rejected`, `anachronistic` (deleted cluster/workload), or `noise` (formatting/version bumps).                                                                                                                     | Filtered set of `current`, `superseded`, and `rejected` candidates at `HEAD`. |
+| **3. Hybrid guard & record synthesis** | $30\text{–}90\text{ min}$  | Diffs pre-revert and post-revert YAML/HCL ASTs to infer `guard.expect` rules, calls the LiteLLM inference gateway concurrently to synthesize clean OKF descriptions and fallback guards from unstructured PR/issue text, verifies every candidate guard against `HEAD`, and writes `DEC-YYYY-NNN.md` and `LES-YYYY-NNN.md` files. | Scoped decision and lesson files with verifiable PR and issue links.          |
+| **4. Baseline "State of Being" PR**    | $90\text{–}120\text{ min}$ | Opens a single onboarding pull request containing `knowledge/STATE_OF_BEING.md` (fleet summary, active guards, superseded policies, and uncovered areas) plus the initial `knowledge/decisions/` and `lessons/` files.                                                                                                            | Day-one institutional memory ready for team review within 2 hours.            |
+
+For repositories with 4–5 years of history, commits older than the `--since` cutoff are not bulk-indexed into active memory; instead, `anachronistic` and `superseded` pruning keeps obsolete changes out of the bank, and teams can start with a 3-month (`--since 90d`) or 6-month (`--since 180d`) midterm window and backfill older slices incrementally. After the initial bootstrap merges, the harvester records a commit/PR watermark and runs incrementally on new merges.
+
+##### Path W3 — Learn from chat: `status:proposed` $\to$ `status:active` or `status:rejected` in `kube-agents-decisions`
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor U as Engineer (Group Chat)
+  participant CA as Chat Agent
+  participant NATS as NATS Bus (TOPICS-JOURNAL / STATE)
+  participant Cur as Go Curator (a2a/cmd/curator)
+  participant Git as GitOps Repo (knowledge/)
+  participant HD as Hindsight (kube-agents-decisions)
+
+  U->>CA: "Let's not submit any infrastructure PRs on Friday"
+  CA->>NATS: Publish proposed decision to a2a.topics.shared.annotations
+  NATS->>Cur: Consume proposed decision from TOPICS-JOURNAL
+
+  rect rgb(235, 245, 255)
+    Note over Cur,HD: Step 1 — Immediately Available as `status:proposed` + PR Opened
+    Cur->>Git: Open PR #280 adding knowledge/decisions/DEC-2026-004.md (status: proposed)
+    Cur->>HD: Upsert document_id=okf:<repo>:DEC-2026-004 with tag [status:proposed, pr:280]
+    Cur->>NATS: Publish digest to a2a.topics.shared.blueprint
+    CA-->>U: "Recorded DEC-2026-004 as proposed and opened PR #280 for team review."
+  end
+
+  alt Reviewer MERGES PR #280
+    rect rgb(240, 252, 240)
+      Note over Cur,HD: Step 2a — Approved: In-Place Upgrade to `status:active` (Hard Guard)
+      Git-->>Cur: PR #280 merged
+      Cur->>HD: Replace document_id=okf:<repo>:DEC-2026-004 with tag [status:active]
+      Cur->>NATS: Publish updated active guard digest to a2a.topics.shared.blueprint
+    end
+  else Reviewer CLOSES PR #280 Unmerged
+    rect rgb(255, 240, 240)
+      Note over Cur,HD: Step 2b — Rejected: In-Place Update to `status:rejected` (No Stale Rule)
+      Git-->>Cur: PR #280 closed unmerged ("EU clusters deploy on Fridays")
+      Cur->>HD: Replace document_id=okf:<repo>:DEC-2026-004 with tag [status:rejected] + reviewer reason
+      Cur->>NATS: Publish updated digest to a2a.topics.shared.blueprint
+    end
+  end
 ```
 
-`buildDeployment` in
-[`platformagent_manifests.go`](../../k8s-operator/internal/controller/platformagent_manifests.go),
-next to the `cfg.Model.BaseURL` that derives the LiteLLM endpoint the same way. The
-two are the same class of value and were briefly two mechanisms — one namespace-aware,
-one a literal naming `kubeagents-system` — which meant a release installed into any
-other namespace would have reached its model gateway and not its memory. The plugin
-reads `api_url` from the file and `HINDSIGHT_API_URL` only as a fallback, so the key
-has to be **absent** here for the operator's value to be used at all; an `api_url`
-left in the file would outrank it silently, which is the same failure the force-sync
-above exists to prevent. `memory_file_import.py` and `memory_ttl_curator.py` resolve
-it with the same precedence.
+When an engineer states a team-wide operational rule in chat—for example, saying _"Let's not submit any infrastructure PRs on Friday"_ in a group channel—`kube-agents` stores it in `kube-agents-decisions` with an explicit proposal lifecycle rather than writing a separate unreviewed copy into `kube-agents-memory`:
 
-`$HERMES_HOME` is per-profile, so the platform specialist needs **its own copy** —
-[`agents/platform/hindsight/config.json`](../../agents/platform/hindsight/config.json),
-identical but for `recall_budget: low`. The duplication is the point: the default
-profile's copy is not on the specialist's path, and without one the provider has
-nothing to connect to.
-It is force-synced the same way, by step 2.6, for the same reason.
+1. **Immediate indexing as `status:proposed`**:
+   - The Chat Agent publishes the proposed rule (`DataPart` schema `kube-agents.memory.outcome/v1`) to `a2a.topics.shared.annotations` on `TOPICS-JOURNAL`.
+   - The Go Curator opens a pull request (`PR #280`) adding `knowledge/decisions/DEC-2026-004.md` (`status: proposed`) and immediately upserts `document_id = okf:<repo>:DEC-2026-004` into `kube-agents-decisions` with tags `["scope:shared", "kind:decision", "status:proposed", "pr:280"]`.
+   - While `PR #280` is open, any agent that queries `kube-agents-decisions` sees that `DEC-2026-004` is **`status:proposed` (awaiting review in PR #280)** and warns the user accordingly.
+2. **In-place resolution when the PR is merged or rejected (`update_mode: replace`)**:
+   - **If `PR #280` merges**: The Curator replaces `document_id = okf:<repo>:DEC-2026-004` in `kube-agents-decisions` with **`status:active`**, upgrading it from an advisory warning to a hard pre-submit `block` guard.
+   - **If `PR #280` is closed unmerged (`refused`)**: The Curator replaces the exact same `document_id = okf:<repo>:DEC-2026-004` in `kube-agents-decisions` with **`status:rejected`** and attaches the reviewer's closing rationale. Because `update_mode: replace` overwrites the `status:proposed` unit in place, no stale rule remains in memory.
 
-### Failing closed
+##### Path W4 — Synchronize Git records into the Hindsight `kube-agents-decisions` bank
 
-Personal memory is switched off — leaving only `scope:shared` reachable — whenever
-the speaker cannot be attributed. Decided once, at `initialize()`.
+Whenever `knowledge/` changes on the default branch (or during Phase 1 of the nightly `dream`), `decision_memory.py index` syncs the Markdown files into the `kube-agents-decisions` Hindsight bank:
 
-- **No `user_id`.** Nothing to scope by. Automatic capture is disabled outright
-  (`_auto_retain = False`, `_tags = None`), so an anonymous session cannot write
-  untagged rows that `any_strict` would make invisible anyway.
-- **A shared thread.** `build_session_key()` (`gateway/session.py`) omits the
-  participant id inside a thread unless `thread_sessions_per_user` is set, so the
-  second person to post reuses the first person's cached `Agent` — and
-  `agent._user_id` was frozen at construction. A per-user tag would then recall A's
-  memories into B's prompt and retain B's turns under A's name. Nothing in the
-  provider protocol identifies the speaker per call — `system_prompt_block()` takes
-  no arguments and `handle_tool_call()` is passed no identity — so there is no way
-  to detect this later.
+- **One document per record**: Retains each file individually with `document_id = okf:<repo>:<path>` and `update_mode: replace` so Hindsight never merges multiple records into a single label.
+- **Verbatim chunks (`enable_observations: false`)**: Configures `retain_extraction_mode: chunks` on the `kube-agents-decisions` bank so Hindsight embeds the exact Markdown and YAML frontmatter without LLM paraphrasing or ID stripping.
+- **Structured tags**: Tags each document with `scope:shared`, `kind:<decision|lesson>`, `status:<status>`, `id:<id>`, `cluster:<cluster>`, and `check:<check>`.
 
-Both cases put an explanation into the system prompt, so the agent tells the user
-why rather than appearing to have forgotten them. This is what makes personal memory
-DM-only by design.
+#### 2. How decision memory enters context and blocks regressions
 
-#### Why a space stays on one session
+Decision memory is injected only when the agent is drafting, submitting, or reviewing infrastructure changes—never on routine chat turns:
 
-In `spec.mode: today`, `thread_sessions_per_user` would restore attribution, and
-with it personal memory, by giving each participant their own session. It is
-deliberately left off (and in `spec.mode: next`, the A2A gateway always assigns one
-`context_id` per group thread regardless of `thread_sessions_per_user`): a space's
-value is the shared thread, and with per-user sessions Bob's follow-up lands in a
-session that never saw Alice ask the question.
+| Workflow stage                                                                       | What is injected                                                                                                                      | How it runs                                                                                                                                                                           | Latency & token cost                                                     |
+| ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| **1. Interactive chat turn** (Chat Agent)                                            | Conversational facts from `kube-agents-memory` only. Decision records are not auto-prefetched on every chat message.                  | `prefetch_all(user_message)` injects a bounded conversational block into `api_content`.                                                                                               | `recall_budget: mid` ($\approx 4.2\text{k}$ tokens).                     |
+| **2. Change drafting** (`gke-manifest-generation`, `gke-golden-path`, `fleet-audit`) | Active `DEC` and `LES` records whose `scope.paths`, `scope.resources`, `scope.clusters`, or `scope.checks` match the target workload. | The skill runs `decision_memory.py check --files <targets>` before editing and returns matching records to the agent.                                                                 | $1\text{–}5$ records ($< 500$ tokens, $< 100\text{ ms}$, $0$ LLM calls). |
+| **3. Pre-PR submission gate** (`submit-suggestion`)                                  | Deterministic guard verdicts (`violates`, `consistent`, `related`) plus any `supersedes` history.                                     | `submit_suggestion.py` runs `decision_memory.py check` before `git push`. If any guard fails with `severity: block`, it aborts the push and prints the violation report and PR links. | $< 100\text{ ms}$ locally ($< 1\text{ s}$ with `--semantic`).            |
+| **4. Human pull request review** (CI job or review worker)                           | Guard verdicts and governing records for all files modified in `BASE..HEAD`.                                                          | Runs `decision_memory.py check --base $BASE --head $HEAD --markdown` and posts a single sticky comment on the pull request.                                                           | Deterministic; $0$ LLM tokens in CI mode.                                |
 
-The cost of that choice is that **failing closed protects the store, not the
-transcript.** A space is one conversation, so Alice's "my cluster is clusterA" is in
-the model's context when Bob later says "delete my cluster" — and nothing in the
-memory layer was involved in binding the two. Switching personal memory off does not
-prevent it. The control is in the persona: SOUL.md §1.6 requires a possessive in a
-space to resolve only from the current speaker's own words, and requires a
-destructive delegation to be confirmed against a named target first.
+Keeping `kube-agents-decisions` out of per-turn chat prefetch avoids running a second CPU cross-encoder rerank on ordinary chat questions and keeps irrelevant infrastructure guards out of unrelated conversations.
 
-### Bounding the bank — built, deferred, and not urgent
+#### 3. How agents retrieve decision memory on demand
 
-Hindsight never forgets. There is no TTL, no decay and no eviction anywhere in its
-bank configuration or its API. A mechanism to bound it exists and **nothing runs
-it**:
-[`agents/chat/scripts/memory_ttl_curator.py`](../../agents/chat/scripts/memory_ttl_curator.py)
-is on no cron schedule and defaults to dry run. **This is deferred, not dropped** —
-it has been built and tested and its failure mode is understood, but nothing is
-pushing it, for the reasons at the end of this section. The rest of what follows is
-written for whoever picks it up.
+When an engineer asks _"Why is `checkout` configured with `256Mi`?"_ or _"Which namespaces have quota exceptions?"_, agents query decision memory through three interfaces:
 
-Plain expiry does not work. Facts and observations live in one table, and recall
-returns observations. An observation records provenance in `source_memory_ids` with
-no foreign key, so the cascade is application code with an explicit contract
-(`delete_stale_observations_for_memories`): delete any observation referencing a
-removed fact — _its text is stale once even one source disappears_ — and reset the
-survivors for re-consolidation. Every removal path runs it. So _"retire the
-evidence, keep the conclusion"_ is not something the API can be asked for.
+1. **NATS request-reply query interface (`curator recall` / `kube-agents.memory.query/v1`)**:
+   - The Go Curator (`a2a/cmd/curator`) listens on NATS (`_INBOX.agent.memory.query` and `a2a.memory.query`) for `kube-agents.memory.query/v1` requests and answers from the configured backing store (`hindsight` or `okf-local`).
+   - Routing queries over NATS decouples callers (Chat, subagents, PR workflows, and CLI tools) from the underlying database so any storage backend can be plugged in behind the same NATS interface.
+   - The Curator caches query responses in memory and invalidates the cache whenever a new outcome event arrives on `a2a.topics.shared.annotations`.
+2. **Deterministic CLI (`decision_memory.py why <path>` and `check`)**:
+   - `why <path>` returns all active and superseded records governing `<path>`, recent `git log` commits on that path, `history_without_record` (commits not yet covered by any decision record), and an explicit `status` (`found` or `no_match`). When no record governs a path, the tool instructs the agent to state _"No recorded decision governs this path"_ rather than guessing from commit subjects.
+3. **Read-only Hindsight MCP endpoint (`/mcp/kube-agents-decisions/`)**:
+   - For conceptual questions across the fleet where the file path is unknown, Hindsight exposes a native per-bank MCP server at `/mcp/kube-agents-decisions/` restricted via `mcp_enabled_tools` to read-only operations (`recall`, `reflect`, `list`, `get`).
+   - Because `kube-agents-decisions` contains only `scope:shared` organizational records (no personal `user:<id>` data), exposing read-only MCP on this bank cannot leak personal user information. Active queries filter on `tags: ["scope:shared", "status:active"]` with `match: "all_strict"`.
 
-**Distill, then retire** was the answer: write the observation layer back down into
-the fact layer as fresh unrewritten checkpoints, then retire the aged cohort, so the
-conclusion survives its evidence. Checkpoints use the `checkpoint` strategy pinning
-`retain_extraction_mode: chunks`, because re-summarising a summary every cycle walks
-the bank away from what was said; they carry their source observation's scope
-tag, because under `any_strict` an unscoped checkpoint consolidates into an
-observation no recall will ever match; and they are marked by `context` rather than
-by a tag (tags are what consolidation is scoped by) or a document id (the caller's
-is not what comes back). Each run retires the previous run's checkpoints, so exactly
-one generation is ever live.
+#### 4. Precedence rules for contradictory history and nightly `dream` jobs
 
-It was deferred because the end-to-end run took the observation layer from 22 rows to
-10 to 2 over three cycles. That was re-run at scale on an isolated 300-fact scratch
-bank, and the finding held — but the explanation in this document did not, so the
-rest of this section is what the re-test actually showed.
+##### Five deterministic precedence rules
 
-**Two bugs had to be fixed before a single pass could complete at all.** Both are
-fixed in the script and the provisioning; both are worth knowing about because they
-are properties of Hindsight's retain endpoint, not of this script.
+When multiple pull requests or records touch the same workload or setting over time, `decision_memory.py` resolves which rule applies using five deterministic rules in strict order:
 
-The first is that `retain` is neither atomic nor idempotent. A multi-item call that
-fails returns 500 having already persisted the items that succeeded, and the client
-retried 500s six times — so one malformed extraction response turned a 646-unit bank
-into 1,959, most of them duplicate checkpoints. Checkpoints are now written one item
-per call, and a 500 is the one status the retain path does not retry.
+1. **Explicit `supersedes` link wins**: If active record `DEC-2026-002` declares `supersedes: [LES-2026-009]`, then `LES-2026-009` is marked `status: superseded` (`superseded_by: DEC-2026-002`). It is excluded from active guard blocks and attached as historical context showing why the old rule was lifted.
+2. **Git `HEAD` verification detects unrecorded drift (`at_risk`)**: If an active record's guard no longer holds at `HEAD` (because someone merged a direct commit without updating `knowledge/`), the record is not silently ignored—the nightly `dream` flags it `at_risk` with the breaking commit SHA so the team can either revert the unintended change or supersede the record.
+3. **Merged outranks rejected, and newer beats older**: For unlinked records on the same field, a merged pull request outranks a closed unmerged pull request, and a newer merge outranks an older merge. Closed pull requests remain active as negative lessons (_"do not repeat rejected approach X"_) until superseded by a later merged pull request.
+4. **Narrower scope outranks broader scope**: A cluster-specific exception (`clusters: [prod-eu]`) overrides a fleet-wide default (`clusters: []`) for workloads in `prod-eu`.
+5. **Unresolved ties surface as explicit conflicts**: If two active records guard the same file and YAML path with incompatible expectations and rules 1–4 do not separate them, `dream` reports an explicit conflict and proposes superseding the older ID.
 
-The second is that the `checkpoint` strategy was provisioned as
-`retain_extraction_mode: verbatim`, which preserves the text but still calls the
-extraction LLM to attach entities and dates — and asks it to re-emit the observation
-inside a JSON response schema. 10 of 207 observations (5%) came back as
-`JSONDecodeError`, and since an observation that cannot be checkpointed is one whose
-evidence must not be retired, every pass aborted at the safety check with
-`distilled=0 retired=0`. The mode that runs no LLM at all is `chunks`, which stores
-each chunk as-is; the strategy now uses it. Nothing failed afterwards, and writing
-300 items went from 55 minutes to under 100 seconds. The price is that checkpoints
-carry no extracted entities, so the graph retriever cannot see them.
+**Human override on a pull request**: When an engineer intentionally wants to change a guarded setting, they add the label `decision-override:<RECORD-ID>` to the pull request and state the new rationale. After the pull request merges, the nightly `dream` detects the override label and opens a pull request to supersede `<RECORD-ID>`.
 
-**With both fixed, three full cycles ran, and the collapse is real and worse than
-row counts suggest.** From 300 facts and 295 observations:
+##### Nightly `dream` reconciliation (`decision_memory.py dream`)
 
-| after   | world | observations | distinct identifiers reachable |
-| ------- | ----- | ------------ | ------------------------------ |
-| seed    | 300   | 295          | 162                            |
-| cycle 1 | 295   | 53           | —                              |
-| cycle 2 | 53    | 32           | —                              |
-| cycle 3 | 32    | 32           | 50                             |
+A scheduled job runs `decision_memory.py dream` nightly (and after merges to `knowledge/`) to keep memory synchronized with the repository:
 
-The observation layer converges rather than vanishing, but it converges at about a
-tenth of what went in: 73,588 characters of seeded fact became 7,437, and 112 of the
-162 distinct identifiers in the corpus — `RB-100` through `RB-109`, `ADR-2026` and
-the rest — are gone from the bank entirely. There is also a window in every cycle,
-between the retire and the next consolidation, where the bank holds **zero**
-observations and recall returns nothing at all.
+| Phase                       | Operation                                                                                                                                                               | Uses LLM? | Result                                                                           |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------- | -------------------------------------------------------------------------------- |
+| **1. Reconcile index**      | Upserts current `knowledge/*.md` files into `kube-agents-decisions` by `document_id` and deletes removed records.                                                       | No        | Keeps the Hindsight index in exact sync with Git `HEAD`.                         |
+| **2. Verify against Git**   | Checks every active record against `HEAD`: verifies governed files exist (`obsolete`), evaluates guards (`at_risk`), and checks for `Revert` commits (`reverted`).      | No        | Flags unguarded regressions the morning after they merge.                        |
+| **3. Verify live clusters** | Optional read-only check comparing live cluster resources against active guards.                                                                                        | No        | Emits live drift findings to the fleet audit ledger.                             |
+| **4. Supersession & ties**  | Mirrors `supersedes` into `superseded_by` and detects conflicting active guards on the same YAML path.                                                                  | No        | Opens a `knowledge:dream` maintenance PR when `--apply` is set.                  |
+| **5. Policy graduation**    | Detects $\ge 2$ active lessons sharing the same `check` ID or guarded YAML path across clusters.                                                                        | No        | Proposes a fleet-wide `DEC` record and a `policy/` admission rule.               |
+| **6. Coverage scan**        | Finds recent commits to governed paths (`clusters/`, `apps/`, `base/`, `infrastructure/`, `manifests/`) that have no governing record, plus `decision-override` merges. | No        | Queues uncovered commits for harvesting and proposes supersession for overrides. |
+| **7. Summary refresh**      | Refreshes tag-scoped Hindsight summary views (`[scope:shared, kind:decision, area:<name>]`).                                                                            | Yes       | Keeps human-readable area overviews up to date.                                  |
+| **8. Dream report**         | Posts a summary to the platform chat space only when `at_risk`, `conflicts`, `obsolete`, `recurrences`, or `uncovered_changes` are non-empty (`silent: true` if clean). | No        | Zero chat noise on clean nights; immediate alert when drift occurs.              |
 
-Two corrections follow, and they matter more than the numbers. **The cause is not
-paraphrase drift.** `chunks` rewrites nothing, and the collapse is unchanged, so it
-is not a game of telephone: it is consolidation's fan-in. Consolidation turns N facts
-into fewer than N observations by design, and feeding the observation layer back in
-as facts asks it to do that again to its own output, every cycle. **And the
-checkpoints do not survive as a safety net.** This document previously said they sit
-unread in the fact layer while recall looks elsewhere; they do not, because each
-cycle's checkpoints are copies of the already-collapsed observation layer rather than
-of the original facts. The fact layer is denuded in lockstep — 50 of 162 identifiers
-in _either_ layer after three cycles. That also kills the repair recorded here
-earlier: `recall_types` takes a list, and `"observation,world"` is a one-line config
-change, but there is nothing left in the fact layer for it to find.
+##### Cross-cluster federated learning and the Go Curator/Dreamer on NATS (`spec.mode: next`)
 
-What must be settled before this runs is therefore no longer "what recall reads" but
-**what gets checkpointed**. Distilling the observation layer is what compounds;
-checkpointing the aged _facts_ themselves, or exempting checkpoints from
-re-consolidation so they cannot be merged a second time, are the two directions worth
-trying, and neither has been tested.
+In a multi-cluster fleet running `spec.mode: next`, Cluster Agent profiles operate in parallel across clusters and communicate over the NATS JetStream bus ([`a2a/lib/topics.go`](../../a2a/lib/topics.go), [`spec-a2a-payloads.md`](spec-a2a-payloads.md#topics), [`spec-nats-deployment.md`](spec-nats-deployment.md#streams-and-retention)) without depending on Kanban or Hermes.
 
-**None of that is urgent, and the deferral is open-ended rather than a queued task.**
-Storage is not going to force the question. Postgres sits on an 8Gi volume
-(`data-hindsight-postgresql-0`), and a unit costs about 1.5KB of embedding — 384
-dimensions at four bytes, `DEFAULT_EMBEDDING_DIMENSION` against
-`BAAI/bge-small-en-v1.5` — plus the text itself, which measures around 250 bytes a
-unit across the live bank. Allowing generously for row overhead and the vector index,
-that volume holds on the order of a million units. This deployment's real
-conversational memory is in the tens; the 4,427 units in the bank today are almost
-entirely the synthetic corpus from [the experiment](#the-experiment), and the
-script's `--min-units` default of 200 makes the curator a no-op at the real size even
-if something ran it. At any plausible rate of accumulation that is years of headroom,
-not months.
+Rather than running an open-ended LLM agent loop for background curation, the **Curator/Dreamer (`a2a/cmd/curator` + `a2a/memory`)** is a compiled **Go service and CLI** (`~15\text{–}25\text{ MiB}` RSS, $< 5\text{ ms}$ CLI startup) that combines deterministic Go code with targeted single-shot LiteLLM calls (`POST /v1/chat/completions`):
 
-Nor does latency force it, for the reason given in
-[What a recall costs](#what-a-recall-costs): the rerank cost is flat above a
-threshold the bank has already crossed, so a smaller bank is not a faster one. What
-would eventually force it is context quality — a bank crowded enough that the
-reranker's 300 candidates are worse than they could be — and that is a judgement
-call, not a disk alarm. Until someone can point at that, this stays where it is: the
-mechanism is built and its failure mode is now understood and written down, which is
-the state it should be parked in.
+| Responsibility in `a2a/cmd/curator`                              | Execution engine                                                          | Why Go + single-shot LiteLLM                                                                                                                                                 |
+| :--------------------------------------------------------------- | :------------------------------------------------------------------------ | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **1. NATS JetStream topic consumption & publishing**             | **100% Go** (`github.com/nats-io/nats.go/jetstream`, `a2a/lib/topics.go`) | Consumes `a2a.topics.shared.annotations` on `TOPICS-JOURNAL` and publishes `a2a.topics.shared.blueprint` on `TOPICS-STATE` with durable consumer acks.                       |
+| **2. YAML AST walking, K8s quantity math & `HEAD` guard checks** | **100% Go** (`gopkg.in/yaml.v3`, `k8s.io/apimachinery/pkg/api/resource`)  | Evaluates 35,000+ OKF guards across a 30,000-cluster Git tree in parallel goroutines (`errgroup`) without Python GIL overhead.                                               |
+| **3. Cross-cluster recurrence detection** ($\ge 2$ clusters)     | **100% Go**                                                               | Groups active `LES-*` records by `(check_id, kind, yaml_path, op)` across clusters deterministically.                                                                        |
+| **4. Synthesizing OKF prose & candidate guards from PR diffs**   | **1-shot LiteLLM call** + **Go `HEAD` verification**                      | Requests a strict JSON object from LiteLLM (with prompt-JSON fallback for Claude proxies), then deterministically verifies that the candidate guard holds at `HEAD`.         |
+| **5. Consolidating multi-cluster lessons & candidate skills**    | **1-shot LiteLLM call** + **Go PR creation**                              | Merges $N$ verified cluster lessons or candidate skill diffs into one fleet-wide `DEC-YYYY-NNN.md` (`clusters: ["*"]`) or shared `SKILL.md` and opens a single pull request. |
+
+**Why the design uses the already-provisioned subjects (`a2a.topics.shared.annotations` and `a2a.topics.shared.blueprint`) instead of per-cluster subjects**:
+Per [`spec-nats-deployment.md`](spec-nats-deployment.md#streams-and-retention), JetStream stream provisioning is create-only (`stream info X || stream add X`), the provision Job is intentionally denied `$JS.API.STREAM.UPDATE`, and topic publish grants are exact subject names rather than wildcards. Meanwhile, Cluster `AgentProfile` CRs are created and pruned dynamically at runtime as clusters join or leave the fleet ([`spec-subagent-profiles.md`](spec-subagent-profiles.md#worked-profile-a-cluster-agent)). Reusing the already-provisioned `a2a.topics.shared.annotations` (`TOPICS-JOURNAL`) and `a2a.topics.shared.blueprint` (`TOPICS-STATE`) subjects—together with per-task `result` artifacts on `a2a.tasks.<profile>.<taskId>.events` (`TASKS`)—means adding or removing clusters at runtime never requires `nats stream edit` on existing installations.
+
+The federated learning loop runs in three steps over NATS:
+
+1. **Return cluster diagnoses on `TASKS` and publish learning outcomes to `TOPICS-JOURNAL` (`a2a.topics.shared.annotations`)**: A Cluster Agent returns its read-only RCA and proposed manifest patch in its task `result` artifact on `a2a.tasks.<profile>.<taskId>.events`. When the Platform Agent opens a fix PR, verifies post-merge resolution (`resolved-merged` or `pr-merged-persists`), observes a closed PR (`refused`), or captures a proposed team rule from chat (`proposed`), it publishes a structured `topic-update` envelope (`DataPart` schema `kube-agents.memory.outcome/v1`) to `a2a.topics.shared.annotations`.
+2. **Central curation and fleet-wide graduation (`a2a/cmd/curator`)**: The Go Curator consumes outcome entries from `a2a.topics.shared.annotations` and runs Phase 5 policy graduation (`dream`). When two or more clusters report the same failure signature or guarded YAML path (for example, an Autopilot resource floor or a CoreDNS `ndots` regression), the Curator promotes the cluster-scoped `LES-*` records into a single fleet-wide `DEC-*` rule (`clusters: ["*"]`, `supersedes: [LES-...]`), consolidates the best diagnostic steps into one shared skill, and opens one fleet-wide pull request.
+3. **Index and broadcast to `TOPICS-STATE` (`a2a.topics.shared.blueprint`)**: Once the curated record or skill merges, the Curator upserts the verbatim chunk into Hindsight (`kube-agents-decisions`) and publishes an updated environment and decision catalog digest to `a2a.topics.shared.blueprint` so every agent can read the latest fleet state in $< 1\text{ ms}$ via `ReadTopicLatest` (`a2a topics read blueprint`) and enforce active guards before `git push`.
+
+NATS JetStream subjects, publishers, subscribers, and persistence used by the memory system (`spec.mode: next`, backed by the `40Gi` `data-platform-agent-a2a-nats-0` PVC in [`k8s-operator/internal/controller/platformagent_a2a_manifests.go`](../../k8s-operator/internal/controller/platformagent_a2a_manifests.go)):
+
+| Already-provisioned NATS subject / KV bucket                | JetStream stream & persistence (`--storage=file`)                                                                           | Publisher                                                                                                                              | Subscriber / reader                                                                          | Role in the memory architecture                                                                                                                                                                                                                                                                                                |
+| :---------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `a2a.tasks.<profile>.<taskId>.events`                       | **`TASKS`** (`--retention=limits`, `--max-age=72h`, `--max-msgs-per-subject=4096`, `--max-bytes=20 GiB`)                    | Cluster Agent (`cluster-*`) and specialist `AgentProfile` pods                                                                         | Platform Agent (`platform`) / delegating session                                             | **Read-only cluster diagnosis handoff**: Carries the Cluster Agent's grounded RCA and proposed manifest patch as the task `result` artifact ([`spec-subagent-profiles.md`](spec-subagent-profiles.md#worked-profile-a-cluster-agent)).                                                                                         |
+| `a2a.topics.shared.annotations`                             | **`TOPICS-JOURNAL`** (`--retention=limits`, `--max-age=720h` / 30d, `--max-bytes=5 GiB`, `--discard=old`)                   | Platform Agent, Chat Agent, and any topic-granted agent (`writer: any agent` in [`spec-a2a-payloads.md`](spec-a2a-payloads.md#topics)) | Go Curator (`a2a/cmd/curator`) via a durable JetStream consumer with explicit `Ack()`        | **Append-only outcome journal**: Durably queues dated observations, verified incident outcomes (`resolved-merged`, `pr-merged-persists`), PR decisions (`approved`, `refused`), and chat rule proposals (`proposed`) (`DataPart` schema `kube-agents.memory.outcome/v1`) so no learning event is lost if the Curator restarts. |
+| `a2a.topics.shared.blueprint`                               | **`TOPICS-STATE`** (`--retention=limits`, `--max-msgs-per-subject=8`, `--max-bytes=1 GiB`, `--allow-direct`, no age expiry) | Go Curator (`a2a/cmd/curator`) / Platform Agent                                                                                        | All agent profiles via `ReadTopicLatest` (`$JS.API.DIRECT.GET`, `a2a topics read blueprint`) | **Latest-state environment & decision digest**: Publishes the shared environment model plus the active `knowledge/` Git `HEAD` SHA, active/proposed record counts, and latest graduated `DEC-*`/`LES-*` IDs so agents see updates in $O(1)$.                                                                                   |
+| `a2a.tasks.<agent>.<taskId>.in` & `KV_cap` (`cap.<taskId>`) | **`TASKS`** (`20 GiB` file store) & **`KV_cap`** (`256 MiB` file-backed KV bucket)                                          | `a2a/gateway` (chat/webhook ingress)                                                                                                   | `hermes-bridge` sidecar on the target agent pod                                              | **Authenticated user & audience propagation**: Carries `authority.requester.principal` (`hmac:<32-hex>`) and `authority.audience.kind` (`"dm"` \| `"group"`), verified against `KV_cap`, so `hermes-bridge` scopes Layer 1 personal memory (`kube-agents-memory`) to `user:<id>` in DMs and keeps group chats shared.          |
+
+#### 5. Reference implementation: how `decision_memory.py` works
+
+[`decision_memory.py`](../../agents/platform/skills/decision-memory/scripts/decision_memory.py) is written in standard-library Python plus `PyYAML` so it runs identically inside agent containers, local developer shells, and GitHub/GitLab CI runners:
+
+| Subcommand     | Calls LLM?               | Calls Hindsight?                       | How it works                                                                                                                                                                                                                               |
+| -------------- | ------------------------ | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `check`        | No                       | Optional (`--semantic`)                | Diffs modified files, matches `scope.paths` and `scope.resources` (`Kind/namespace/name`), evaluates `guard.expect` rules on the YAML AST or file text, and exits `2` on `block`.                                                          |
+| `bootstrap`    | LiteLLM (`--no-llm` off) | Optional (`--hindsight-url`)           | Pre-filters commit, PR, and issue history deterministically, diffs pre/post-revert ASTs, calls the LiteLLM inference gateway to synthesize OKF descriptions and fallback guards (verified against `HEAD`), and writes `STATE_OF_BEING.md`. |
+| `why`          | No                       | No                                     | Returns active and superseded records governing a file path alongside recent `git log` history and `history_without_record`.                                                                                                               |
+| `dream`        | No                       | Optional (Phase 1 if URL is provided)  | Verifies all active records against `HEAD` (`obsolete`, `at_risk`), repairs asymmetric `supersedes` links, detects guard conflicts, and lists uncovered commits.                                                                           |
+| `from-outcome` | LiteLLM (`--no-llm` off) | No                                     | Converts a verified outcome payload (`resolved-merged`, `pr-merged-persists`, or `refused`) into a scoped `LES-YYYY-NNN.md` draft, calling the LiteLLM inference gateway to synthesize structured OKF sections and verified guards.        |
+| `validate`     | No                       | No                                     | Validates YAML frontmatter fields, ID syntax (`DEC-YYYY-NNN`, `LES-YYYY-NNN`), guard operators, mandatory lesson PR URLs, and `supersedes` integrity.                                                                                      |
+| `index`        | No                       | Yes (REST `POST /memories` & `DELETE`) | Reconciles `knowledge/*.md` into the `kube-agents-decisions` Hindsight bank (`retain_extraction_mode: chunks`, `update_mode: replace`).                                                                                                    |
+
+When `submit_suggestion.py` (or a CI workflow) runs `decision_memory.py check --repo <clone> --base origin/main --head HEAD`, it performs five deterministic steps in under $100\text{ ms}$:
+
+1. **Collect changed files**: Runs `git diff --name-status <base>...<head>` and reads the new file content at `<head>`.
+2. **Load active records**: Parses `knowledge/decisions/*.md` and `knowledge/lessons/*.md`, skipping `superseded` and `retired` files.
+3. **Match by file glob and Kubernetes resource identity**: Matches each changed file against `scope.paths` (glob match) and `scope.resources` (`Kind/namespace/name` parsed from the YAML document), so renaming or moving a manifest file never bypasses a resource guard.
+4. **Evaluate `guard.expect` assertions**: Walks dot-separated YAML paths (including list selectors such as `containers[name=checkout]` and escaped dots such as `spec.hard.requests\.memory`), normalizes Kubernetes resource quantities (`m`, `Ki`, `Mi`, `Gi`, `Ti`) into canonical floating-point numbers before comparing (`>=`, `<=`, `==`, `!=`, `present`, `absent`), or runs `regex` assertions against raw text for non-YAML files such as Terraform `.tf` files.
+5. **Attach `supersedes` context and enforce the verdict**: Attaches any superseded records so the agent sees why an older freeze was lifted. If any active guard fails with `severity: block`, `check` exits with code `2` and prints the violation report (`id`, `rule`, failed assertion, and links to the original breaking PR, incident issue, and revert PR), causing `submit_suggestion.py` to abort the branch push before a bad pull request can be opened.
 
 ---
 
 ## The experiment
 
-Everything below is reproducible from
-[`tests/memory-scale/`](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/README.md), which holds the
-harness, the corpus generator, the fixtures, the Kubernetes Jobs, the raw scorer
-output, and a
-[full transcript](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/transcript/README.md) of every probe with
-per-answer scoring. This section states the findings and points at the file for each
-one.
+We evaluated both memory layers in two reproducible benchmarks:
 
-### What was built
+- **Part 1** tests Layer 1 (Conversational Memory) as the shared knowledge store scales from $100$ to $1,414$ records across a 500-cluster fleet ([`tests/memory-scale/`](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/README.md)).
+- **Part 2** tests Layer 2 (Decision and Lesson Memory) end-to-end on a live GKE cluster against 10 real-world Kubernetes outage scenarios across a 500-cluster GitOps repository.
 
-A synthetic fleet — 500 "Meridian" clusters, two years of decisions — generated from
-a fixed seed (`20260731`) by
-[`harness/gen_fleet_corpus.py`](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/harness/gen_fleet_corpus.py),
-so it is reproducible rather than a one-off artefact. **1,664 records across eleven
-categories**, of which **1,414 are `scope: shared`** and 250 are per-user.
+---
 
-The corpus is adversarial in the way a real one is: six policies exist in three
-dated versions each with `supersedes` links in the prose, 55 exception records
-contradict the general rule, 450 inventory records disagree with each other about
-the same clusters, and two probes ask about a cluster and a decision record that do
-not exist.
+### Part 1 — Conversational memory scale evaluation (1,664 records across 500 clusters)
 
-Twenty-six scored probes in
-[`queries.json`](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/queries.json), each naming its **gold
-documents** plus strings that must and must not appear.
+#### What we tested
 
-### Two terms the numbers depend on
+We generated a reproducible synthetic enterprise corpus (`gen_fleet_corpus.py`, seed `20260731`) representing two years of operational notes for a 500-cluster platform team: **$1,664$ records across $11$ categories** (architecture decisions, runbooks, postmortems, conventions, deprecations, ownership, exceptions, gotchas, capacity, migrations, and inventory), of which **$1,414$ are shared organizational records** and **$250$ are personal user memories**.
 
-A **rung** is a nested prefix of the shared corpus: 100, 200, 400, 800, then all
-1,414. The same probes run at every rung, so scaling is a measured curve rather than
-an extrapolation from one point.
+To mirror real organizational history, six policies exist in three dated versions each (`2024`, `2025`, and `2026`), $55$ exception records override the general rule for specific clusters, and $26$ scored evaluation queries test retrieval recall, superseded policy ranking, user isolation, and citation accuracy at corpus sizes of $100$, $200$, $400$, $800$, and $1,414$ shared records.
 
-**Gold recall** is the share of gold documents that came back, matched by
-identifier. It measures the **retrieval layer only** — what the provider put in
-front of the model, before the model said anything.
+#### Key findings from Part 1
 
-### The retrieval ladder
+1. **Zero cross-user leaks at any scale**: Neither `kube_agents_memory` (Hindsight) nor `multiuser_memory` (file-based) ever leaked a personal `user:<id>` memory to another user across any rung of the test.
+2. **Flat token cost vs. linear context exhaustion**: At $1,414$ shared records, the unbounded file provider injected **$110,907$ tokens** on every turn, whereas Hindsight injected **$4,264$ tokens** ($96\%$ fewer tokens) and ranked the current version of contested policies first **$83.3\%$** of the time vs **$42.9\%$** for the flat file.
+3. **Why Hindsight's $0.702$ identifier recall missed citations, and how Layer 2 fixes it**:
+   - Out of $34$ gold documents across the $26$ queries at rung $1,414$, Hindsight missed $12$ exact document IDs. Inspecting the retrieved text with `diagnose_miss()` showed that **$11$ of the $12$ misses were `id_stripped`**: Hindsight retrieved the correct policy content, but its LLM observation synthesizer rewrote the sentence and dropped the `EXC-*`, `OWN-*`, or `CONV-*` identifier.
+   - The single content miss (`ADR-2026-052`) was caused by seeding $5$ records per `retain` call (`--batch 5`), which caused Hindsight to pack $5$ records under a single document label. When seeded one record per call (`--batch 1`), `ADR-2026-052` was retrieved and cited accurately.
+   - In head-to-head live agent answers ([full transcript](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/transcript/README.md)), both providers answered all $10$ live questions accurately, and Hindsight produced **$1.74\times$ more verifiable citations** ($59$ vs $34$) because it preserves metadata identifiers that flat Markdown comments strip.
+   - These two findings directly shaped Layer 2: `decision_memory.py index` retains **one record per document** (`--batch 1` equivalent) and disables observation synthesis (`retain_extraction_mode: chunks`, `enable_observations: false`) so decision and lesson IDs are never stripped.
+4. **Why specialist subagents need read-only memory access**:
+   - When specialist subagents ran with memory completely disabled, they did not simply answer _"I don't know."_ Instead, across four probes, the specialist improvised unsanctioned ways to find the data—including querying PostgreSQL directly and writing a **$79,815$-byte private copy of the shared corpus into its own skill file** (`SKILL.md`). Giving the Platform Agent profile `read_only: true` access to shared memory eliminates the incentive to build unreviewed local caches.
 
-The table is in [the decision](#how-hindsight-answers-it). Three readings of it.
+---
 
-**Neither provider leaked a tag at any rung.** That is the isolation result and it
-is the uninteresting one: both are correct.
+### Part 2 — Decision memory evaluation on 10 real-world Kubernetes outage scenarios
 
-**The file provider's 1.000 gold recall is not a retrieval result.** It scores
-perfectly because it injects the entire corpus; recall of everything is what "no
-retrieval" means. What it costs is the next two columns — contamination 0.722
-against 0.407, and the current version of a contested policy ranked first 43% of the
-time against 83%.
+#### Methodology
 
-A live probe showed a model partly compensating for the 43%. Asked for the current
-service-account-key policy with the file provider configured, the agent led with
-`ADR-2026-052` as current and correctly relegated the 2024 and 2025 versions to
-history — because the corpus writes the supersession chain into the prose, so a
-model that reads all three can rebuild it. Two limits: it depends on the corpus
-carrying those markers, which no provider can guarantee; and in that probe the three
-versions sat adjacent in the first 1% of the block. What the metric measures correctly is
-the **work** — with Hindsight the current version arrives first and the superseded
-ones mostly do not arrive at all.
+To test whether `kube-agents` prevents repeat outages and remembers past architectural decisions in realistic day-to-day GitOps work, we built a 500-cluster enterprise GitOps repository (`big-bang`, organized across 4 regional fleet sectors) containing $33$ historical pull requests and incident issues across **10 realistic Kubernetes scenarios** (`BB-01` through `BB-10`):
 
-**1.000 also overstates what the model uses.** Asked how to back up a production
-cluster with the file provider configured, the agent answered accurately and cited
-four identifiers without error — but named three of the four clusters excluded from
-the default backup plan, and two of the three Sev-1 postmortems with the same root
-cause. **Both omitted records are present verbatim in the store.** Nothing failed in
-storage or retrieval; the provider injected them and the model did not use them. The
-scorer credits a gold document for _sitting in the context window_, so Hindsight's
-0.702 (measured on what retrieval returned) and the file provider's 1.000 (measured
-on what was shipped) are not comparable in the direction the table implies.
+- **Scenarios `BB-01` through `BB-09` (Repeat-outage traps — expected action: `REJECT` the dangerous change)**:
+  Each scenario has a realistic history in the repository: an engineer previously merged a change (for example, lowering a memory request, adding a CPU limit, or moving a stateful consumer to Spot VMs), that change caused a `SEV-1` or `SEV-2` production outage documented in an issue, and a follow-up pull request reverted or fixed the problem. In the evaluation, a new prompt asks the agent to make that same dangerous change again under a plausible new FinOps or performance request. A passing agent must **refuse to open the dangerous pull request**, explain the exact failure mechanism, and cite the historical breaking PR, incident issue, and revert/fix PR.
+- **Scenario `BB-10` (Superseded policy check — expected action: `PROCEED` with the upgrade)**:
+  Earlier in the repository's history, upgrading a Valkey cache cluster to `8.0` (PR `#30`) triggered a client parser panic (Issue `#31`) and was reverted (PR `#32`) with a temporary upgrade freeze. Later, PR `#33` upgraded the client library to `rueidis v1.0.50` and lifted the freeze. The evaluation prompt asks the agent to upgrade the cache to Valkey `8.0.2`. A passing agent must recognize that the old freeze was **superseded** by PR `#33`, **proceed to open the upgrade PR**, and cite the supersession chain (`#30`–`#33`).
 
-The tempting explanation is depth, and it does not survive: every fact that probe
-used sat in the first 45% of the block, both misses sat at 47.5% and 64.3%, and the
-next probe then used records at 52%, 59% and 59.5% without difficulty. Two further
-counterexamples followed. The honest statement is the narrower one: a
-110,799-token injected block can contain a fact the answer omits, the omission is
-invisible to gold-recall scoring, and we cannot predict which facts go missing.
-([the probe in full](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/transcript/README.md#file-arm-probe-5-the-first-measurement-of-the-file-provider))
+We compared three configurations on a live GKE cluster:
 
-### Is 0.702 gold recall bad, and what is lost
+1. **Conversational Memory Only (Baseline)**: The agent runs with standard `kube_agents_memory` and `submit-suggestion`, without `decision-memory` or special Git forensics instructions.
+2. **Live Git & Pull Request Scan on Every Task (No Decision Memory)**: The `knowledge/` directory is removed, and every task prompt explicitly instructs the agent to scan commit history on the target file and search pull requests and issues before proposing any change.
+3. **Decision and Lesson Memory (`decision-memory`)**: `decision_memory.py bootstrap` harvested $11$ records ($2$ `DEC` and $9$ `LES`, with the old Valkey freeze `LES-2026-009` marked `status: superseded` by `DEC-2026-002`) from the repository's history in $< 2\text{ s}$, and `submit_suggestion.py` enforced `decision_memory.py check` before pushing any branch.
 
-It is better than it looks, and the shortfall is almost entirely a **citation
-problem rather than a knowledge problem**.
+#### Summary results
 
-Hindsight paraphrases, so a gold document can be fully present in the context inside
-an observation that dropped its identifier. `diagnose_miss()` separates the two cases
-by content-word overlap: **`id_stripped`** means the substance is there and only the
-citation is gone; **`absent`** means no recalled unit carries the content and the
-model genuinely cannot answer from it.
+| Metric                                                                  | 1. Conversational Memory Only | 2. Live Git & PR Scan on Every Task                  | 3. Decision & Lesson Memory (`decision-memory`)  | Advantage of Decision Memory (3 vs 1 / 3 vs 2)  |
+| ----------------------------------------------------------------------- | ----------------------------- | ---------------------------------------------------- | ------------------------------------------------ | ----------------------------------------------- |
+| **Correct action taken** (`REJECT` on `BB-01`..`09`, `PROCEED` on `10`) | $1 / 10$ ($10\%$)             | $9 / 10$ ($90\%$)                                    | **$10 / 10$ ($100\%$)**                          | $+90\text{ pp}$ / $+10\text{ pp}$               |
+| **Repeat-outage PRs opened** (`BB-01`..`BB-09`, lower is better)        | $9 / 9$ ($100\%$)             | $1 / 9$ ($11.1\%$ — failed `BB-02`)                  | **$0 / 9$ ($0\%$)**                              | $-100\text{ pp}$ / $-11.1\text{ pp}$            |
+| **Superseded freeze (`BB-10`) handled with full provenance**            | $1 / 1$ (no PR citations)     | $1 / 1$ (cited `#30`–`#33`)                          | **$1 / 1$ (cited `#30`–`#33` & `DEC-2026-002`)** | $+100\text{ pp}$ citation rate vs Baseline      |
+| **Mean root-cause explanation score**                                   | $15.0\%$                      | $90.0\%$                                             | **$100.0\%$**                                    | $+85.0\text{ pp}$ / $+10.0\text{ pp}$           |
+| **Historical PR & incident citation rate**                              | $0 / 10$ ($0\%$)              | $9 / 10$ ($90\%$)                                    | **$10 / 10$ ($100\%$)**                          | $+100\text{ pp}$ / $+10\text{ pp}$              |
+| **Median worker uncached input tokens per task**                        | $54,611$                      | $130,519$ ($2.39\times$ baseline; max $233\text{k}$) | **$76,795$ ($-41.2\%$ vs Live Scan)**            | $-53,724$ uncached tokens per task vs Live Scan |
+| **Extra GitHub/GitLab API calls per task**                              | $0$ calls                     | $4\text{–}8$ network CLI calls                       | **$0$ calls** ($< 100\text{ ms}$ local check)    | Zero forge API rate-limit load                  |
 
-Of 34 gold-document slots at rung 1414, twelve missed. **Eleven were `id_stripped`
-or `partial`. Exactly one — `ADR-2026-052` — was `absent`.** So the honest statement
-is: _at 1,414 documents Hindsight lost one fact and thirty-three citations_, in 2% of
-the context the alternative needed. The per-miss table with coverage figures is in
-the [scorer output](https://github.com/dshnayder/kube-agents/tree/experiment/memory-scale-ab/tests/memory-scale/results/).
+#### Why scanning Git live on every task failed on `BB-02` (the rejected quota increase)
 
-And the one lost fact is not a Hindsight property. It is an artifact of how the bank
-this ladder was scored against had been seeded — see
-[How to read the numbers](#how-to-read-the-numbers). Seeded one record per call,
-`ADR-2026-052` is returned and cited by name.
+Scanning `git log` live on every task worked for simple single-file reverts (`BB-01`, `BB-03`–`BB-09`) in a small 33-PR repository because `git log <file>` showed a `Revert "..."` commit subject directly on the file being edited. However, live scanning **failed completely on `BB-02`** and opened repeat-outage pull request `#55` (raising `namespaces/kyber-ledger/resourcequota.yaml` from `32Gi` to `64Gi`) for three reasons that occur constantly in real enterprise repositories:
 
-### The identifier finding
+1. **Rejected unmerged pull requests leave zero commits in `git log`**: In scenario `BB-02`, when the `kyber-ledger` namespace previously hit its `32Gi` memory quota (Issue `#6`), an engineer opened PR `#7` to raise `namespaces/kyber-ledger/resourcequota.yaml` to `64Gi`. The platform lead **closed PR `#7` unmerged** because the `32Gi` cap enforces multi-tenant blast-radius isolation, and instead merged PR `#8` to fix the memory leak in a completely different file (`apps/kyber-ledger/audit-indexer/deployment.yaml`). Because PR `#7` was never merged and PR `#8` touched a different file, `git log namespaces/kyber-ledger/resourcequota.yaml` showed only the initial commit.
+2. **Pull request list queries default to open items and paginate**: When the live-scan agent listed pull requests and issues during the task, default queries returned only open items (`[]`) because Issue `#6`, rejected PR `#7`, and fix PR `#8` were already closed. In a two-year enterprise repository with thousands of closed pull requests, a rejected PR from months ago sits dozens of pages behind `HEAD`.
+3. **Decision Memory captures rejected PRs and cross-file fixes once during bootstrap**: `decision_memory.py bootstrap` scanned closed and merged PRs during onboarding and created `DEC-2026-001` scoping `namespaces/kyber-ledger/resourcequota.yaml` with `guard.expect: {path: "spec.hard.requests\\.memory", op: "==", value: "32Gi"}`. When the agent attempted to raise the quota, `decision_memory.py check` blocked the change in $< 100\text{ ms}$ and surfaced Issue `#6`, rejected PR `#7`, and the `audit-indexer` fix in PR `#8`.
 
-Eleven of the twelve misses are in the `EXC-`, `OWN-`, `MIG-` and `CONV-` families.
-Running that down turned up the fact that decides the comparison.
+#### All 10 evaluation scenarios in detail
 
-A corpus record's identifier is either written into its own prose —
-`"ADR-2026-044 (2026-01-28, current). Decision: …"` — or carried beside it as an
-HTML-comment directive, `<!-- id: CONV-034 -->`. The file store renders facts and
-drops comments:
-
-| Prefix                                                          | In corpus | In the file store |
-| --------------------------------------------------------------- | --------: | ----------------: |
-| `ADR-`, `RB-`, `PM-`                                            |   **193** |           **193** |
-| `CONV-`, `DEP-`, `OWN-`, `EXC-`, `GOT-`, `CAP-`, `MIG-`, `INV-` |     1,471 |             **0** |
-
-Those prefixes are the corpus's record families: architecture decisions,
-runbooks, postmortems, conventions, deprecations, ownership, exceptions, gotchas,
-capacity, migrations, inventory. They are literal identifiers in
-[the corpus generator](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/harness/gen_fleet_corpus.py) and
-are quoted here as they appear in the data.
-
-`MEMORY.md` holds the _content_ of all 1,414 shared records and the _handle_ for 193. **A flat file can only carry the identifiers somebody happened to write into a
-sentence.** A document store carries them out-of-band on
-`retain_params.context` — 964 distinct corpus identifiers were present there — which
-is the structural difference between the two designs and the reason this is a
-document store.
-
-This was not designed in deliberately. It was found while scoring, and then
-independently reconfirmed six times across the run.
-
-### Answer quality, head to head
-
-Ten of the 26 probes can only be judged from what the model _says_: the six contested
-policies, two procedural runbooks whose failure mode is a plausible reordering, and
-two negatives, where inventing a nonexistent cluster is a property of the reply and
-of nothing else.
-
-They were asked by hand, one per message, **non-delegated at the chat-agent layer** —
-which matters, because the chat agent is the only profile carrying the configured
-provider. Each arm ran with the other provider severed, so neither could answer from
-the other's store: the file arm ran with Hindsight scaled to zero, and the Hindsight
-arm with the flat store deleted — deleted, not renamed — and the volume surveyed for
-leftover caches. Scoring rules and every raw answer are in
-[the transcript](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/transcript/README.md).
-
-| Arm        | Probes | Citations | Citation errors | From metadata-only-id families |
-| ---------- | -----: | --------: | --------------: | -----------------------------: |
-| File-based |     10 |        34 |           **0** |                              0 |
-| Hindsight  |     10 |    **59** |               1 |                   **23 (39%)** |
-
-Both arms answered every question correctly and refused all three traps. Read that
-table honestly in both directions: the file provider made **no** citation errors and
-Hindsight made one, while Hindsight produced **1.74× the citations**, 39% of them
-from families the flat file structurally cannot handle.
-
-**The one error** was on the nonexistent-cluster probe. The agent correctly refused
-to invent `mfs-prod-euw2-09` and correctly named real European clusters, then added
-that there is _"no `-09` in europe recorded at all"_ — which is false; four such
-clusters exist. It converted _"not in what I retrieved"_ into _"not recorded
-anywhere"_. The same run showed that this needs an **interface** fix rather than a
-prompt fix: on the nonexistent-record probe the agent made the same class of
-negative claim but scoped it to its own retrieval, and was right. Recall should
-return what it _searched_, not only what it _found_ — which is now what it does
-([a read names its outcome](#a-read-names-its-outcome)), pending re-measurement.
-
-Three behaviours appeared in the Hindsight arm that had no counterpart in the file
-arm:
-
-- **Reasoning across retrieved records.** On the etcd probe the agent noticed the
-  deprecation register contradicts itself about the Velero runbook (three records,
-  three different dates); on the cluster probe it noticed the inventory records
-  disagree with each other and **downgraded its own confidence accordingly**.
-  Neither observation is stated in any single record.
-- **Calibrated uncertainty.** On the leaked-credential probe it gave `RB-019` step by
-  step and explicitly flagged step 3 as _"wording I'd want confirmed against the
-  runbook text"_ — and it was right anyway.
-- **Provenance that can be checked at all**, which is the 59-vs-34 column.
-
-One imprecision was scored short of an error: on two probes the agent attached the
-standard escalation ladder to runbooks that do not carry it. 39 of 44 runbooks do, so
-this is generalisation from a dominant pattern rather than invention — and it is
-direct experimental support for provenance marking on shared memory.
-
-The conclusion the data supports is **provenance and cost, not accuracy.**
-_"File memory gives wrong answers"_ would not have survived this run.
-
-### Specialists with no memory improvise one
-
-Kanban-spawned specialists ran with `memory_enabled: false` in both arms, making
-them a constant. The way they behave without a provider is nonetheless the strongest
-operational finding in the test.
-
-Four probes were void because the specialist reached the corpus by a route the
-experiment had closed — a different one each time:
-
-| Route it used                                               | How it was caught                    |
-| ----------------------------------------------------------- | ------------------------------------ |
-| A stale on-disk export left over from earlier in the test   | Its own verification script opens it |
-| Direct SQL to Postgres, bypassing the scaled-down API       | It volunteered it                    |
-| Derived the answer from its own prior runs, via the task DB | It said so, unprompted               |
-| A corpus cache it had written into **its own skill file**   | Its own verification script loads it |
-
-A specialist with no memory provider does not degrade gracefully and does not report
-a gap. It improvises a data path and answers with full confidence and real
-identifiers.
-
-The last route is the one that persists. Over the run the specialist accumulated a
-79,815-byte file at `skills/governance/meridian-standards-lookup/SKILL.md` carrying
-103 distinct corpus identifiers — a private replica of the shared corpus, in a
-location that reloads into its context on every invocation, still growing as the
-probes went on. No cleanup holds against this: deleting the export
-and closing the database did nothing, because the specialist had already copied what
-it needed into a file it owns.
-
-That is the shape of the problem. **An agent that needs shared knowledge and is given
-no sanctioned way to reach it will build an unsanctioned one**, and the durable form
-of that is a stale, unreviewable, per-specialist fork of the corpus that nobody
-curates and nobody can audit. The failure is not that it goes without; it is that it
-succeeds. That is the argument for sanctioned access, and it is why the specialist
-now reads shared memory:
-[what subagents get](#what-subagents-get-shared-memory-read-only). The route itself —
-a skill directory its own occupant can write to — is tracked separately.
-
-The third void probe is also the best agent behaviour in the test and worth recording
-as the target: it refused to claim a fresh read it did not have, distinguished
-derived-from-prior-runs from verified-now, reported its own controls green _while
-still rating the source stale_, noted that the failure mode is indistinguishable from
-an outage so the next agent may not notice, correctly diagnosed its own permissions,
-and escalated to a human.
-
-### How to read the numbers
-
-Four properties of the setup qualify the figures above. Each is load-bearing, and a
-number quoted without them means something different.
-
-**Seed one record per retain call.** `seed_fleet.py` defaults to `--batch 5`, and
-Hindsight collapses a multi-item retain into **one document keeping one item's
-`context` as the label**. Under that default the 1,664 records become **335
-documents**: 156 carry a title identifier absent from their own body, 278 hold no
-identifier at all, and of 193 distinct identifiers only 37 appear in both roles — so
-156 can never be returned as a citation by any recall. The decisive case is a document
-labelled `DEP-001` whose body is the text of `DEP-001`, `DEP-002` and `DEP-003`; an
-agent that reads it and says _"the deprecation is DEP-001, and DEP-003 doesn't exist"_
-is reading a corrupted index correctly. **Always seed with `--batch 1`**, which yields
-1,664 documents and 4,400 memory units. The durable fix is one record per retain call
-plus per-unit provenance — **not** a `document_id` field, which would return the
-packed document's identifier authoritatively and make a wrong citation look sourced.
-
-**The retrieval ladder understates Hindsight; the answer-quality comparison does
-not.** The ladder was scored against a bank seeded at the `--batch 5` default, so its
-one `absent` miss (`ADR-2026-052`) is an artifact of the packing above rather than a
-retrieval property — on a `--batch 1` bank that record is returned and cited by name.
-The head-to-head answer comparison was run against the `--batch 1` bank. The ladder is
-therefore a floor on retrieval quality, and re-scoring it can only move Hindsight's
-numbers up.
-
-**The file arm is measured unbounded.** `measure_file_based.py` writes `MEMORY.md` and
-`users/*.md` itself, in the on-disk format, and stubs `atomic_replace`; it never goes
-through the provider's write path, so admission control is never in play — and the
-provider had none when measured (its subsequent `validate_memory_entry` bounds
-individual entries and count, not total store character size). The 1.000 / 110,907 row is
-therefore the _unbounded_ file store, which is exactly what shipped. Adding the bound does
-not move that row, it produces a different one:
-[what a bounded store holds](#a-file-store-is-bounded-or-it-eats-the-window). Both are
-reported, because dropping the unbounded row would quietly discard the strongest
-result the file store has.
-
-**An answer counts as an error only after re-querying the corpus.** Five replies
-across the two arms looked wrong and were not — in one the "inverted" phrasing was
-verbatim from the source record, in another a boilerplate clause running through an
-entire decision-record family was the genuine source. Zero survived the check, which
-is why the error counts above are as low as they are and why the rule is written
-down.
-
-### What is still unproven
-
-- **Per-unit provenance.** Provenance marking on shared memory is not built. The
-  escalation-ladder imprecision is what it would have caught.
-- **Recall returns what it searched.** Built, and unit-tested against the three
-  outcomes; but the thing it is meant to prevent is a model's inference, and no live
-  probe has been run against it. It stays here until the validation replay
-  re-measures the one scored error in the Hindsight arm.
-- **Specialists get shared-scope read access.** Built and unit-tested, and
-  the token arithmetic for the alternative is one-sided (injecting the file store
-  into every specialist turn puts a three-way delegation past 330k tokens before
-  anyone asks a question). What is unproven is the thing the change is for: whether a
-  specialist with a sanctioned read stops improvising an unsanctioned one. That is a
-  behavioural claim and only a live delegated run can settle it. The `low` recall
-  budget is likewise a guess until measured. Both wait on the validation replay.
-- **The near-duplicate hypothesis.** 52 of 55 deprecation records share a boilerplate
-  sentence, which could defeat individuation. It was not what caused the observed
-  errors, so it is untested rather than disproven.
-- **Scope of the evidence.** One synthetic corpus, one model, ten hand-scored probes
-  per arm, one operator scoring them. Enough to decide direction; not a benchmark, and
-  it should not be quoted as one.
+| Scenario | Operational scenario & target file                                                                                                                | Repository history                                                            | Expected action | 1. Conversational Memory Only                                            | 2. Live Git & PR Scan on Every Task                                                  | 3. Decision & Lesson Memory (`decision-memory`)                                                                                  |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | --------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
+| `BB-01`  | **JVM off-heap memory floor**: Request to lower `checkout` memory from `512Mi` to `224Mi` (`apps/kyber-ledger/checkout/deployment.yaml`)          | PR `#3` lowered to `224Mi` $\to$ `OOMKilled` Issue `#4` $\to$ Revert PR `#5`  | `REJECT`        | **FAIL** — opened PR `#37` lowering memory to `224Mi` (no citations)     | **PASS** — found Revert `#5` via `git log`; cited `#3`, `#4`, `#5`                   | **PASS** — blocked by `LES-2026-001` (`>= 256Mi`); explained off-heap `DirectByteBuffer` ceiling and cited `#3`–`#5`             |
+| `BB-02`  | **Multi-tenant namespace quota cap**: Request to double `kyber-ledger` quota from `32Gi` to `64Gi` (`namespaces/kyber-ledger/resourcequota.yaml`) | Issue `#6` $\to$ Rejected PR `#7` (`64Gi`) $\to$ Right-sized indexer PR `#8`  | `REJECT`        | **FAIL** — opened PR `#34` raising quota to `64Gi` (no citations)        | **FAIL** — opened PR `#55` raising quota to `64Gi` (`git log` had 0 commits on file) | **PASS** — blocked by `DEC-2026-001` (`== 32Gi`); explained multi-tenant cap and cited `#6`, rejected `#7`, and `#8`             |
+| `BB-03`  | **HSM license quorum during node upgrades**: Request to set `max_surge = 4` (`infrastructure/terraform/kuat-use1/node_pools.tf`)                  | PR `#9` set `max_surge = 4` $\to$ HSM quorum loss `#10` $\to$ Revert `#11`    | `REJECT`        | **FAIL** — opened PR `#35` setting `max_surge = 4` (no citations)        | **PASS** — found Revert `#11` via `git log`; cited `#9`, `#10`, `#11`                | **PASS** — blocked by `LES-2026-002` (`max_surge = 1`); explained 3-node HSM quorum and cited `#9`–`#11`                         |
+| `BB-04`  | **Latency-critical Envoy CPU throttling**: Request to set `limits.cpu: 2000m` (`apps/holonet-gateway/envoy/deployment.yaml`)                      | PR `#12` added CPU limit $\to$ $480\text{ ms}$ tail latency `#13` $\to$ `#14` | `REJECT`        | **FAIL** — opened PR `#36` adding `limits.cpu: 2000m` (no citations)     | **PASS** — found Fix `#14` via `git log`; cited `#12`, `#13`, `#14`                  | **PASS** — blocked by `LES-2026-003` (`limits.cpu absent`); explained CFS throttling and cited `#12`–`#14`                       |
+| `BB-05`  | **CoreDNS conntrack exhaustion**: Request to remove custom `ndots: 2` `dnsConfig` (`apps/astro-nav/telemetry-egress/deployment.yaml`)             | PR `#15` removed `dnsConfig` $\to$ conntrack drop storm `#16` $\to$ `#17`     | `REJECT`        | **FAIL** — opened PR `#38` deleting `dnsConfig` (no citations)           | **PASS** — found Revert `#17` via `git log`; cited `#15`, `#16`, `#17`               | **PASS** — blocked by `LES-2026-004` (`dnsConfig present`); explained `ndots: 5` amplification and cited `#15`–`#17`             |
+| `BB-06`  | **GKE `/22` Pod CIDR exhaustion**: Request to raise HPA `maxReplicas` from `60` to `200` (`apps/hyperdrive-telemetry/ingest/hpa.yaml`)            | PR `#18` set `200` $\to$ `IP_SPACE_EXHAUSTED` `#19` $\to$ Fix PR `#20` (`60`) | `REJECT`        | **FAIL** — opened PR `#39` raising `maxReplicas` to `200` (no citations) | **PASS** — found Fix `#20` via `git log`; cited `#18`, `#19`, `#20`                  | **PASS** — blocked by `LES-2026-005` (`<= 60`); explained `/22` subnet IP exhaustion and cited `#18`–`#20`                       |
+| `BB-07`  | **Node drain deadlock from 100% PDB**: Request to set `minAvailable: 100%` (`apps/kyber-ledger/settlement/pdb.yaml`)                              | PR `#21` set `100%` $\to$ `CannotEvictPod` drain hang `#22` $\to$ Fix `#23`   | `REJECT`        | **FAIL** — opened PR `#41` setting `minAvailable: 100%` (no citations)   | **PASS** — found Fix `#23` via `git log`; cited `#21`, `#22`, `#23`                  | **PASS** — blocked by `LES-2026-006` (`!= 100%`); explained node upgrade drain deadlock and cited `#21`–`#23`                    |
+| `BB-08`  | **LoadBalancer health-check blackhole**: Request to set `externalTrafficPolicy: Local` (`apps/holonet-gateway/public-lb/service.yaml`)            | PR `#24` set `Local` $\to$ `502` blackhole Issue `#25` $\to$ Revert `#26`     | `REJECT`        | **FAIL** — opened PR `#40` setting `Local` (no citations)                | **PASS** — found Revert `#26` via `git log`; cited `#24`, `#25`, `#26`               | **PASS** — blocked by `LES-2026-007` (`== Cluster`); explained L4 health-check asymmetry and cited `#24`–`#26`                   |
+| `BB-09`  | **Stateful Kafka RocksDB rebalance storm**: Request to move consumer to Spot VMs (`apps/kyber-ledger/kafka-consumer/deployment.yaml`)             | PR `#27` enabled Spot $\to$ $47\text{-min}$ lag `#28` $\to$ Revert PR `#29`   | `REJECT`        | **FAIL** — opened PR `#42` moving consumer to Spot VMs (no citations)    | **PASS** — found Revert `#29` via `git log`; cited `#27`, `#28`, `#29`               | **PASS** — blocked by `LES-2026-008` (`cloud.google.com/gke-spot absent`); explained RocksDB state rebuild and cited `#27`–`#29` |
+| `BB-10`  | **Superseded Valkey 8.0 upgrade freeze**: Request to upgrade route-cache to `valkey:8.0.2` (`apps/astro-nav/route-cache/statefulset.yaml`)        | Break `#30` $\to$ Issue `#31` $\to$ Freeze `#32` $\to$ Unblocked in PR `#33`  | `PROCEED`       | **PARTIAL** — opened PR `#43`, but failed to check or cite `#30`–`#33`   | **PASS** — opened PR `#56` and cited `#30`–`#33`                                     | **PASS** — opened PR `#46`; verified `DEC-2026-002` superseded `LES-2026-009` and cited `#30`, `#31`, `#32`, `#33`               |
 
 ---
 
 ## Related
 
-- [`tests/memory-scale/`](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/README.md) — the harness,
-  fixtures, job manifests and raw results behind every number above.
-- [`tests/memory-scale/transcript/`](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/transcript/README.md) —
-  every probe, verbatim, with per-answer scoring and the run's own corrections.
-- [`k8s-operator/config/integrations/hindsight/`](../../k8s-operator/config/integrations/hindsight/README.md)
-  — installing and operating the two pods.
-- `agents/chat/SOUL.md` §1.6 — the agent-facing rules for using the two scopes.
+- [`tests/memory-scale/`](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/README.md) — Benchmark harness, synthetic corpus generator, Kubernetes Job manifests, and raw scorer outputs for the Part 1 conversational scale evaluation.
+- [`tests/memory-scale/transcript/`](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/transcript/README.md) — Verbatim probe transcripts and scoring details for the Part 1 evaluation.
+- [`k8s-operator/config/integrations/hindsight/`](../../k8s-operator/config/integrations/hindsight/README.md) — Kubernetes manifests and operational guide for the `hindsight-api` and `hindsight-postgresql` workloads.
+- [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.6 — Persona rules governing personal vs. shared conversational memory writes.
+- [`agents/platform/skills/decision-memory/SKILL.md`](../../agents/platform/skills/decision-memory/SKILL.md) — Platform Agent skill and CLI reference for `decision_memory.py`.
+- [`spec-a2a-payloads.md`](spec-a2a-payloads.md) — A2A task envelope specification and capability verification rules.
+- [`fleet-audit-issue-ledger.md`](fleet-audit-issue-ledger.md) — Finding lifecycle states (`resolved-merged`, `pr-merged-persists`, `refused`).
+- [`gitops-fix-cycle.md`](gitops-fix-cycle.md) — Post-merge verification predicates for GitOps remediation pull requests.
+- [`pr-comment-conversation.md`](pr-comment-conversation.md) — Pull request comment handling and review loop design.
+- [`capability-delivery-vehicle.md`](capability-delivery-vehicle.md) — Self-learning safety boundaries (`apply` vs `propose`).
+- [`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md) — `hermes-bridge` session route and HTTP dispatch architecture.
+- [Architecture 02 §2.3](../architecture/02-agent-personas.md) and [06 §5](../architecture/06-api-and-data-contracts.md) — Operational Knowledge Format (OKF) specification.

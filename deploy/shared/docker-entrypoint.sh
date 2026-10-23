@@ -2255,6 +2255,25 @@ if [ -f "$TARGET_DIR/scripts/memory_file_import.py" ] && memory_import_wanted; t
     ) &
 fi
 
+# 5.6b. Start the Go OKF Curator daemon when running on the A2A bus with Hindsight.
+#
+# The Curator subscribes to a2a.topics.shared.annotations (TOPICS-JOURNAL), maintains
+# OKF decision and lesson records (DEC-* and LES-*) in $TARGET_DIR/memory/knowledge-store,
+# upserts them into the kube-agents-decisions Hindsight bank with in-place status
+# transitions (status:proposed -> status:active | status:rejected | status:superseded),
+# graduates multi-cluster recurrences into fleet-wide decisions, and publishes the
+# active blueprint digest to a2a.topics.shared.blueprint (TOPICS-STATE).
+if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -n "${NATS_URL:-}" ] && [ -n "${HINDSIGHT_API_URL:-}" ] && command -v curator >/dev/null 2>&1 && memory_import_wanted; then
+    echo "Starting Go OKF Curator daemon on $NATS_URL..."
+    (
+        curator daemon \
+            --repo "$TARGET_DIR/memory/knowledge-store" \
+            --hindsight-url "$HINDSIGHT_API_URL" \
+            >>"$TARGET_DIR/logs/curator.log" 2>&1 \
+            || echo "WARN: curator daemon exited; check logs/curator.log" >&2
+    ) &
+fi
+
 # 5.7. Mirror the profile layout into the shell sandbox, and move the model's
 # existing files across the first time.
 #

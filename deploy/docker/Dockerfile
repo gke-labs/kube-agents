@@ -123,7 +123,9 @@ WORKDIR /workspace
 COPY a2a/ /workspace/a2a/
 WORKDIR /workspace/a2a
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
-    go build -ldflags="-w -s" -o /workspace/bin/a2a ./cmd/a2a/
+    go build -ldflags="-w -s" -o /workspace/bin/a2a ./cmd/a2a/ && \
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
+    go build -ldflags="-w -s" -o /workspace/bin/curator ./cmd/curator/
 
 # tirith joins a2a in /workspace/bin, so agent-base copies both with the one
 # COPY it already has and the image gains no layer. The download is verified
@@ -2128,9 +2130,9 @@ COPY --chmod=0755 deploy/shared/docker-entrypoint.sh /usr/local/bin/agent-entryp
 # of the pod, on a pod that stays Ready while it does.
 COPY --from=watcher-builder --chmod=0755 /workspace/k8s-event-watcher /workspace/drift-detector /usr/local/bin/
 
-# The a2a CLI, ungated (see the a2a-builder stage for why that is safe), and the
-# pinned tirith (see the a2a-tools stage).
-COPY --from=a2a-tools --chmod=0755 /workspace/bin/a2a /workspace/bin/tirith /usr/local/bin/
+# The a2a CLI and curator daemon, ungated (see the a2a-builder stage for why that is safe),
+# and the pinned tirith (see the a2a-tools stage).
+COPY --from=a2a-tools --chmod=0755 /workspace/bin/a2a /workspace/bin/curator /workspace/bin/tirith /usr/local/bin/
 
 # 6. Expose ports shared by all agent gateways
 EXPOSE 8642

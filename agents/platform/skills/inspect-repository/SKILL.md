@@ -20,7 +20,12 @@ object on stdout.
   implement this controller?", "which release added this flag?"
 - **Reading a dependency or an upstream project** named in an issue, a design
   doc, or a user's question.
-- **Reading the GitOps repository for context** when you are not editing it.
+- **Reading the GitOps repository for context** when you are not editing it. If
+  the checkout contains `knowledge/decisions/` or `knowledge/lessons/` and you
+  are answering why a manifest or field is configured a certain way, check the
+  recorded `DEC-YYYY-NNN` and `LES-YYYY-NNN` files under `knowledge/` (or run
+  `decision_memory.py --repo <clone> why <path>` on a full `vcs.py clone`) and
+  cite those record IDs in your answer.
 
 ## When NOT to Use
 

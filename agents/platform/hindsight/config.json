@@ -1,5 +1,6 @@
 {
   "mode": "local_external",
   "memory_mode": "hybrid",
-  "recall_budget": "low"
+  "recall_budget": "low",
+  "recall_types": ["observation", "world", "experience"]
 }
