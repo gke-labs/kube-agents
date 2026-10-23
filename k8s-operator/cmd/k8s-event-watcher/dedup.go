@@ -46,6 +46,51 @@ type dedupEntry struct {
 	// window, and is deliberately not cleared when it does. It bounds the
 	// escape hatch at one extra session per window per key.
 	Reopened bool `json:"reopened,omitempty"`
+	// Namespace, Kind and Name describe the involved object, and
+	// EventFirstSeen and EventCount the alerted event's own first sighting
+	// and kubelet count, written by BindObject once the alert has gone out,
+	// so the quiet follow-up can describe the incident as the alert did
+	// without an event in hand (FirstSeen above is the watcher's clock at the
+	// forwarding sighting, after the gates, and Count the window's). Empty on
+	// an entry no alert was sent for, and on one restored from a snapshot an
+	// older binary wrote.
+	Namespace      string    `json:"namespace,omitempty"`
+	Kind           string    `json:"kind,omitempty"`
+	Name           string    `json:"name,omitempty"`
+	EventFirstSeen time.Time `json:"event_first_seen,omitzero"`
+	EventCount     int       `json:"event_count,omitempty"`
+	// FollowupSupported records that the daemon answered this incident's
+	// inject listing the followup feature (injectResponse.Features), so a
+	// k8s-event-followup on its session lands in the alert's thread rather
+	// than opening a second alert on a daemon that predates the kind's handler.
+	FollowupSupported bool `json:"followup_supported,omitempty"`
+	// QuietNotified records that the quiet follow-up for this incident has been
+	// sent (dispatcher.Sweep), and is sticky for the entry's life: one
+	// follow-up per incident, however long the window keeps the entry.
+	QuietNotified bool `json:"quiet_notified,omitempty"`
+	// LastDelivered is the watcher's clock at the last sighting the informer
+	// delivered for this key whose event timestamp advanced, whichever gate
+	// took it. LastSeen above moves only for the sightings Observe accepts,
+	// and an alerted object a hold keeps from Observe (a Pending pod under
+	// the scale-up hold) is still being sighted. Written by Sighted, read by
+	// QuietIncidents beside LastSeen.
+	LastDelivered time.Time `json:"last_delivered,omitzero"`
+}
+
+// quietIncident is an incident whose alert went out and whose object has
+// not been sighted for the quiet period: what dispatcher.Sweep sends the
+// follow-up for. Key carries the canonical reason; FirstSeen and Count are
+// the alerted event's own (BindObject), LastSeen the watcher's clock at the
+// last real sighting.
+type quietIncident struct {
+	Key       EventKey
+	SessionID string
+	Namespace string
+	Kind      string
+	Name      string
+	FirstSeen time.Time
+	LastSeen  time.Time
+	Count     int
 }
 
 // dedupResult dictates whether an event should trigger a new session or be suppressed.
@@ -74,7 +119,11 @@ const (
 // of memory, the cache is limited to a maximum of 10,000 active incidents. If this limit
 // is reached, the oldest (least recently seen) incidents are automatically evicted to make room.
 type dedupCache struct {
-	mu          sync.Mutex
+	mu sync.Mutex
+	// writeMu serialises Snapshot's encode-write-rename: the snapshot loop and
+	// the dispatcher's sweep both call it, and two writers on one .tmp path
+	// would interleave into a file neither wrote.
+	writeMu     sync.Mutex
 	entries     map[EventKey]*dedupEntry
 	window      time.Duration
 	max         int
@@ -197,6 +246,99 @@ func (c *dedupCache) BindSession(key EventKey, message string, sessionID string)
 	if entry, ok := c.entries[key]; ok {
 		entry.SessionID = sessionID
 	}
+}
+
+// BindObject records the involved object, and the alerted event's own first
+// sighting and count, on the entry created by the preceding Observe, so a
+// quiet follow-up sent long after the event has gone can describe the
+// incident as the alert did. Canonicalizes the reason as BindSession does.
+// No-op if the entry has since been evicted.
+func (c *dedupCache) BindObject(key EventKey, message, namespace, kind, name string, firstSeen time.Time, count int) {
+	key.Reason = canonicalizeReason(key.Reason, message)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if entry, ok := c.entries[key]; ok {
+		entry.Namespace, entry.Kind, entry.Name = namespace, kind, name
+		entry.EventFirstSeen, entry.EventCount = firstSeen, count
+	}
+}
+
+// MarkFollowupSupported records that the daemon will post a follow-up for
+// key's incident (canonicalizes the reason as BindSession does). No-op if the
+// entry is gone.
+func (c *dedupCache) MarkFollowupSupported(key EventKey, message string) {
+	key.Reason = canonicalizeReason(key.Reason, message)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if entry, ok := c.entries[key]; ok {
+		entry.FollowupSupported = true
+	}
+}
+
+// QuietIncidents lists the incidents whose alert went out (a session is
+// bound) to a daemon that posts follow-ups, that the daemon did not grade
+// Info, whose follow-up has not been sent, and whose last real sighting is
+// at least after ago: the later of LastSeen (Observe, case 3) and
+// LastDelivered (Sighted, a sighting a gate stopped). Both move only on a
+// sighting whose timestamp advanced, so an informer replay after a restart
+// does not make a quiet object look live, and the clock is the watcher's
+// own, as the window's is.
+func (c *dedupCache) QuietIncidents(now time.Time, after time.Duration) []quietIncident {
+	if after <= 0 {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []quietIncident
+	for key, e := range c.entries {
+		last := e.LastSeen
+		if e.LastDelivered.After(last) {
+			last = e.LastDelivered
+		}
+		if e.SessionID == "" || !e.FollowupSupported || e.PolicyFiltered || e.QuietNotified || now.Sub(last) < after {
+			continue
+		}
+		first, count := e.EventFirstSeen, e.EventCount
+		if first.IsZero() {
+			first = e.FirstSeen // an entry an older binary wrote
+		}
+		if count == 0 {
+			count = e.Count
+		}
+		out = append(out, quietIncident{
+			Key: key, SessionID: e.SessionID, Namespace: e.Namespace, Kind: e.Kind, Name: e.Name,
+			FirstSeen: first, LastSeen: last, Count: count,
+		})
+	}
+	return out
+}
+
+// MarkQuietNotified records that the follow-up for key (canonical, as
+// QuietIncidents returned it) has been sent. No-op if the entry is gone.
+func (c *dedupCache) MarkQuietNotified(key EventKey) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if entry, ok := c.entries[key]; ok {
+		entry.QuietNotified = true
+	}
+}
+
+// Sighted records a sighting of key that a gate stopped short of Observe:
+// the informer delivered it, so the object is not quiet. Only a sighting
+// whose timestamp advanced counts, as in Observe, so a relist's replay moves
+// nothing; the timestamp is consumed here too, so the same event is a replay
+// to Observe afterwards. No-op for a key with no entry.
+func (c *dedupCache) Sighted(key EventKey, message string, eventLastTS time.Time) {
+	key.Reason = canonicalizeReason(key.Reason, message)
+	now := c.clock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[key]
+	if !ok || !eventLastTS.After(entry.EventLastTS) {
+		return
+	}
+	entry.EventLastTS = eventLastTS
+	entry.LastDelivered = now
 }
 
 // MarkPolicyFiltered flags the entry for a key as being held on behalf
@@ -361,6 +503,8 @@ func (c *dedupCache) Snapshot() error {
 	if c.persistPath == "" {
 		return nil
 	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	c.mu.Lock()
 	// Copy values under lock; encode outside so we don't hold the mutex during I/O.
 	snapshot := make(map[string]dedupEntry, len(c.entries))

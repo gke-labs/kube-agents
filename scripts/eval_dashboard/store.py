@@ -15,7 +15,7 @@ at, named by its ``recorded_at`` stamp and the Prow build that wrote it::
 
     <location>/<case>/<setup-id>/<judge-model>/<sv>-f<n>-v<n>[-<mode>]/<stamp>-<build>.jsonl
 
-(``-<mode>`` only for a key whose mode is not today: the next-mode nightly's.)
+(``-<mode>`` only for a key whose mode is not today: the main nightly's.)
 
 This reader is the dashboard's, not the gate's: ``bench/kube_agents_bench/
 baselines.py`` reads the same layout to decide admission and must stop on a

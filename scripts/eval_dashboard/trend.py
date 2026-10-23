@@ -58,14 +58,18 @@ night is a marker naming the components that changed. Pooling (the
 trailing window, the spread) never crosses a key: a baseline measured on
 other software is not evidence about this one.
 
-ONE SERIES PER MODE. The today-mode nightly and the next-mode nightly both
-record every night, so one series per case would change key twice a night.
+ONE SERIES PER MODE. The main nightly (next) and the today-mode nightly
+(``ci-kube-agents-eval-nightly-today``) both record every night, so one
+series per case would change key twice a night.
 The top-level document is today's records alone (a record with no ``mode``
 is today, as every record before the component existed is), exactly what
 it was before next-mode records existed; ``next`` holds the same per-case
 and per-domain blocks built from the next-mode records, or null when the
 store holds none (a mode this module does not know is in neither).
-Latency stays top-level: it is read from the today nightly's runs.
+Latency stays top-level: it is read from the main nightly's runs, the ones
+the collector gathers, which grade next. The harness times the opening turn
+on the api transport only, so on those nights the turn-1 series is empty and
+only the agent time is drawn.
 
 Only stdlib, like ``nightly.py``.
 """
