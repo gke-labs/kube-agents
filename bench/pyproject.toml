@@ -79,6 +79,7 @@ report_manifest = "kube_agents_bench.verifiers:ReportManifestVerifier"
 sandbox_tree_matches_image = "kube_agents_bench.verifiers:SandboxTreeMatchesImageVerifier"
 worker_commands = "kube_agents_bench.verifiers:WorkerCommandsVerifier"
 tool_called = "kube_agents_bench.verifiers:ToolCalledVerifier"
+workload_incident_folded = "kube_agents_bench.incidents:WorkloadIncidentFoldedVerifier"
 
 # Required for the git-URL dependency pin above.
 [tool.hatch.metadata]

@@ -2653,11 +2653,11 @@ func TestHandleDeletionSkipsUnownedCalloutClusterRoleBinding(t *testing.T) {
 	}
 }
 
-// TestCleanupA2ACostsTenReadsWhenThereIsNothingToClean measures the thing
+// TestCleanupA2ACostsElevenReadsWhenThereIsNothingToClean measures the thing
 // the change was for. Counting is the only honest check here: the early exit
 // is a cost optimisation, and a correctness test passes just as well with the
 // reads still happening one object at a time.
-func TestCleanupA2ACostsTenReadsWhenThereIsNothingToClean(t *testing.T) {
+func TestCleanupA2ACostsElevenReadsWhenThereIsNothingToClean(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 
@@ -5767,6 +5767,7 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 		"callout Deployment": buildA2ACalloutDeployment(agent).Spec.Template.Spec,
 		"agent pod":          buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{}).Spec,
 		"console Deployment": buildA2AConsoleDeployment(agent).Spec.Template.Spec,
+		"MCP Deployment":     buildA2AMCPDeployment(agent).Spec.Template.Spec,
 	} {
 		for _, ref := range a2aPodSpecEnvSecretRefs(spec) {
 			if ref.secret == credsSecret && (ref.key == a2aSysPasswordKey || ref.key == "*") {
@@ -7888,5 +7889,51 @@ func TestGatewayRendersABlankPlatformAllowlistAsNobody(t *testing.T) {
 		if e.Value != "" || e.ValueFrom != nil {
 			t.Fatalf("%s = %+v, want rendered empty", name, e)
 		}
+	}
+}
+
+// TestTheGatewayAlwaysArmsTheConsoleDoor: every next gateway carries
+// A2A_CONSOLE_DOOR=true, backend or not. With no backend it is what lets the
+// gateway start (a2a/gateway/config.go); beside one it changes nothing, and
+// it means a backend taken away leaves a console-only gateway rather than a
+// crash loop. The name is spelled out so the test reads the gateway's
+// contract rather than the constant it checks.
+func TestTheGatewayAlwaysArmsTheConsoleDoor(t *testing.T) {
+	cases := []struct {
+		name   string
+		inject string
+		door   string
+		agent  func() *agentv1alpha1.PlatformAgent
+		// backendEnv is an env var the case's backend renders, so the case
+		// proves the backend is really there beside the console door.
+		backendEnv string
+	}{
+		// Discord has no case of its own: its env is an optional Secret
+		// reference rendered on every gateway, so it renders exactly as
+		// "no backend" does, which covers it.
+		{"no backend", "", "", a2aTestAgent, ""},
+		{"google chat", "", "", func() *agentv1alpha1.PlatformAgent { return gchatTestAgent("next", true) }, a2aGchatRelayURLEnvVar},
+		{"slack", "", "", func() *agentv1alpha1.PlatformAgent { return slackTestAgent("next", true) }, a2aSlackAppTokenEnvVar},
+		{"inject door", "true", "", a2aTestAgent, a2aInjectListenEnvVar},
+		{"a2a door", "", "true", a2aTestAgent, a2aDoorListenEnvVar},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(a2aInjectBackendEnvVar, tc.inject)
+			t.Setenv(a2aAgentDoorEnvVar, tc.door)
+			dep := buildA2AGatewayDeployment(tc.agent())
+			env := envMapOf(dep.Spec.Template.Spec.Containers[0].Env)
+			if got, ok := env["A2A_CONSOLE_DOOR"]; !ok || got.Value != "true" || got.ValueFrom != nil {
+				t.Errorf("A2A_CONSOLE_DOOR = %+v (set=%v), want the literal \"true\"", got, ok)
+			}
+			if tc.backendEnv != "" {
+				if _, ok := env[tc.backendEnv]; !ok {
+					t.Errorf("precondition: the %s backend's %s is not rendered", tc.name, tc.backendEnv)
+				}
+			}
+			if dep.Spec.Replicas != nil && *dep.Spec.Replicas != 1 {
+				t.Errorf("the render asks for %d replicas, want 1", *dep.Spec.Replicas)
+			}
+		})
 	}
 }

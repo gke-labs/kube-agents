@@ -120,20 +120,6 @@ func a2aMCPAccessName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Name + a2aMCPAccessSuffix
 }
 
-// a2aMCPGatewayConsoleDoorEnv is the gateway's switch for starting on the
-// console door alone (a2a/gateway/config.go, ConsoleDoor).
-const a2aMCPGatewayConsoleDoorEnv = "A2A_CONSOLE_DOOR"
-
-// a2aMCPGatewayEnv is what the MCP flag adds to the gateway: leave to start on
-// the console door alone, since the MCP server's turns go through it and an
-// install may configure no chat backend. Off, nothing.
-func a2aMCPGatewayEnv() []corev1.EnvVar {
-	if !a2aMCPDoorEnabled() {
-		return nil
-	}
-	return []corev1.EnvVar{{Name: a2aMCPGatewayConsoleDoorEnv, Value: "true"}}
-}
-
 // a2aMCPNATSPeers is the MCP pod as a 4222 peer of the bus fence, under the
 // flag. Off, it is nothing, so the fence admits exactly what it did.
 func a2aMCPNATSPeers(agent *agentv1alpha1.PlatformAgent) []networkingv1.NetworkPolicyPeer {
