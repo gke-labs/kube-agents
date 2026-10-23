@@ -14,9 +14,10 @@
 # And one derived file whose source is NOT under config/:
 #   - charts/kube-agents/files/footprint.yaml holds the resource totals of the pods the operator
 #     renders, which the chart's quota preflight cannot compute for itself. It is summed
-#     from the operator's golden manifest for the default example CR, not from config/ and
-#     not from a live render, so the golden is what you edit: change the operator, re-bless
-#     the golden, then sync. Syncing before re-blessing regenerates the old numbers.
+#     from the operator's golden manifests for the default example CR (platformagent.yaml,
+#     and platformagent-next.yaml for what spec.mode: next adds), not from config/ and
+#     not from a live render, so the goldens are what you edit: change the operator, re-bless
+#     the goldens, then sync. Syncing before re-blessing regenerates the old numbers.
 # Run with --check (CI, `make chart-check`) to fail instead of rewriting.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -155,8 +156,8 @@ if $check; then
   footprint_rc=0
   python3 "$FOOTPRINT_GEN" --check || footprint_rc=$?
   if [[ $footprint_rc -eq 1 ]]; then
-    echo "ERROR: $FOOTPRINT_DST has drifted from $FOOTPRINT_SRC (see the diff above)." >&2
-    echo "       $FOOTPRINT_SRC is a golden, so re-bless it before syncing:" >&2
+    echo "ERROR: $FOOTPRINT_DST has drifted from $FOOTPRINT_SRC or its next-mode sibling (see the diff above)." >&2
+    echo "       Both are goldens, so re-bless them before syncing:" >&2
     echo "       (cd k8s-operator && go test ./internal/testing/... -update), then 'make chart-sync'." >&2
     echo "       That package, not ./internal/controller/..., writes this golden; the latter has an" >&2
     echo "       unrelated -update flag of its own that exits 0 and leaves this golden stale." >&2

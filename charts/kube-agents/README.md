@@ -970,6 +970,15 @@ declare it (or a `LimitRange` to default it), and will reject the pod if omitted
 The two data claims are counted at `platformAgent.storage.size` when it is set: footprint.yaml
 records how many claims follow it (`dataClaims`) and their default size, and each one moves by
 the difference, so a raise of 30Gi adds 60Gi to `requests.storage`.
+With `platformAgent.mode: next` it also counts what that mode adds, from footprint.yaml's
+`nextMode`: NATS and its 40Gi JetStream claim, the two auth callouts, the two capability
+verifiers, the console, the A2A gateway, the provisioning Job (counted although it runs to
+completion, because the operator runs it again whenever its spec changes and about daily once
+its TTL removes it, with the rest of the release standing), and the
+`hermes-bridge` container in each agent pod. The mode is read from the values, so a mode set
+on the `PlatformAgent` by hand while `platformAgent.mode` stays null is counted as `today`.
+The session pods a next install spawns on demand are not counted; the operator caps those with
+a `ResourceQuota` of its own.
 The one value it will not guess is `hindsight.postgresql.storage`: the schema permits
 `null`, a claim sized from it would be counted as zero, so an empty one fails the check
 by name.
@@ -1164,8 +1173,9 @@ helm uninstall kube-agents -n kubeagents-system
   its webhooks or Service `targetPort` differ from `k8s-operator/config/webhook`
   (`hack/check_chart_webhooks.py`); fix that one by editing the template.
 - `files/footprint.yaml` is generated too, but from a different source: it is summed from
-  the operator's **golden manifest**
-  (`k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml`),
+  the operator's **golden manifests**
+  (`k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml`, and
+  `platformagent-next.yaml` for its `nextMode` section),
   not from `k8s-operator/config/` and not from a live render. Changing the operator's
   resources therefore takes two steps in order — re-bless the goldens
   (`cd k8s-operator && go test ./internal/testing/... -update`), then `make chart-sync`.

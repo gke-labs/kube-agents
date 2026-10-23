@@ -1990,6 +1990,18 @@ The defaults carry no ephemeral-storage request because the operator renders non
          whole template exists to prevent. An absent value means the operator's own
          default of 1; an explicit 0 means 0, and the CRD allows it. */ -}}
   {{- $agentReplicas := include "kube-agents.replicaCount" (((.Values.platformAgent.deployment | default dict).availability | default dict).replicas) | int64 -}}
+  {{- /* platformAgent.mode: next renders the A2A stack beside the today-mode one, and
+         footprint.yaml's nextMode holds exactly what it adds (the generator refuses a
+         next-mode golden whose today-mode part differs). The mode is read from the values,
+         as platform-agent-cr.yaml writes it: a mode set on the CR by hand while this stays
+         null is not seen here. */ -}}
+  {{- $next := dict -}}
+  {{- if eq (toString (.Values.platformAgent.mode | default "")) "next" -}}
+    {{- $next = (index $footprint "nextMode") | default dict -}}
+    {{- if not $next -}}
+      {{- fail "quota preflight: platformAgent.mode is next but footprint.yaml has no nextMode section, so the A2A stack cannot be counted. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
+    {{- end -}}
+  {{- end -}}
   {{- $base := (index $op "agentPod" "base") | default dict -}}
   {{- $podReqCpu := $base.cpuMillisRequest | default 0 | int64 -}}
   {{- $podLimCpu := $base.cpuMillisLimit | default 0 | int64 -}}
@@ -2096,6 +2108,19 @@ The defaults carry no ephemeral-storage request because the operator renders non
     {{- $podLimEph = include "kube-agents.satAdd" (dict "a" $podLimEph "b" ($dash.ephemeralStorageBytesLimit | default 0 | int64)) | int64 -}}
   {{- end -}}
 
+  {{- /* Next mode's hermes-bridge is another container of the agent pod, so like the
+         dashboard it scales with the agent's replicas and adds no pod. Its footprint is the
+         default api executor's; the operator's A2A_BRIDGE_EXECUTOR and A2A_BRIDGE_RESOURCES
+         env can change it, and the chart does not see either. */ -}}
+  {{- with (index ($next.agentPod | default dict) "hermesBridge") -}}
+    {{- $podReqCpu = include "kube-agents.satAdd" (dict "a" $podReqCpu "b" (.cpuMillisRequest | default 0 | int64)) | int64 -}}
+    {{- $podLimCpu = include "kube-agents.satAdd" (dict "a" $podLimCpu "b" (.cpuMillisLimit | default 0 | int64)) | int64 -}}
+    {{- $podReqMem = include "kube-agents.satAdd" (dict "a" $podReqMem "b" (.memoryBytesRequest | default 0 | int64)) | int64 -}}
+    {{- $podLimMem = include "kube-agents.satAdd" (dict "a" $podLimMem "b" (.memoryBytesLimit | default 0 | int64)) | int64 -}}
+    {{- $podReqEph = include "kube-agents.satAdd" (dict "a" $podReqEph "b" (.ephemeralStorageBytesRequest | default 0 | int64)) | int64 -}}
+    {{- $podLimEph = include "kube-agents.satAdd" (dict "a" $podLimEph "b" (.ephemeralStorageBytesLimit | default 0 | int64)) | int64 -}}
+  {{- end -}}
+
   {{- /* satMul/satAdd: the pod sum times the replica count is where an admitted
          override most easily passes int64 -- a figure under 2^63 doubles over it at
          two replicas -- so both the multiply and the accumulation saturate. */ -}}
@@ -2155,6 +2180,37 @@ The defaults carry no ephemeral-storage request because the operator renders non
       {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" ($workload.ephemeralStorageBytesRequest | default 0 | int64)) | int64 -}}
       {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" ($workload.ephemeralStorageBytesLimit | default 0 | int64)) | int64 -}}
     {{- end -}}
+  {{- end -}}
+
+  {{- /* Next mode's own workloads: NATS, the auth callouts, the verifiers, the console,
+         the A2A gateway and the provisioning Job, each a total over its replicas, plus the
+         JetStream claim. None has a sizing override in the chart. An entry marked `surges`
+         (the callouts and verifiers, which roll RollingUpdate with maxUnavailable 0) sizes
+         the patch's surge room by one of its pods: with LiteLLM off, the chart's own
+         workloads may leave less room than a callout needs to roll. */ -}}
+  {{- range $key, $workload := $next -}}
+    {{- if and (ne $key "agentPod") (ne $key "storage") -}}
+      {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" (include "kube-agents.replicaCount" $workload.pods | int64)) | int64 -}}
+      {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" ($workload.cpuMillisRequest | default 0 | int64)) | int64 -}}
+      {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" ($workload.cpuMillisLimit | default 0 | int64)) | int64 -}}
+      {{- $reqMem = include "kube-agents.satAdd" (dict "a" $reqMem "b" ($workload.memoryBytesRequest | default 0 | int64)) | int64 -}}
+      {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" ($workload.memoryBytesLimit | default 0 | int64)) | int64 -}}
+      {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" ($workload.ephemeralStorageBytesRequest | default 0 | int64)) | int64 -}}
+      {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" ($workload.ephemeralStorageBytesLimit | default 0 | int64)) | int64 -}}
+      {{- $pods := $workload.pods | default 0 | int64 -}}
+      {{- if and $workload.surges (gt $pods (int64 0)) -}}
+        {{- $surgeCpuReq = max $surgeCpuReq (div ($workload.cpuMillisRequest | default 0 | int64) $pods) -}}
+        {{- $surgeCpuLim = max $surgeCpuLim (div ($workload.cpuMillisLimit | default 0 | int64) $pods) -}}
+        {{- $surgeMemReq = max $surgeMemReq (div ($workload.memoryBytesRequest | default 0 | int64) $pods) -}}
+        {{- $surgeMemLim = max $surgeMemLim (div ($workload.memoryBytesLimit | default 0 | int64) $pods) -}}
+        {{- $surgeEphReq = max $surgeEphReq (div ($workload.ephemeralStorageBytesRequest | default 0 | int64) $pods) -}}
+        {{- $surgeEphLim = max $surgeEphLim (div ($workload.ephemeralStorageBytesLimit | default 0 | int64) $pods) -}}
+      {{- end -}}
+    {{- end -}}
+  {{- end -}}
+  {{- with $next.storage -}}
+    {{- $reqPvc = add $reqPvc (.persistentVolumeClaims | default 0 | int64) -}}
+    {{- $reqStorage = add $reqStorage (.storageBytesRequest | default 0 | int64) -}}
   {{- end -}}
 
   {{- /* Claims are release-scoped rather than per-replica, so they are not multiplied. */ -}}

@@ -1,0 +1,4298 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  annotations:
+    iam.gke.io/gcp-service-account: kubeagents-platform-gsa@kube-agents-gkedemos.iam.gserviceaccount.com
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: kubeagents-platform-agent
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-gateway-agent
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: kubeagents:minimal:kubeagents-system:platformagent
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - nodes
+      - namespaces
+      - pods
+      - pods/log
+      - services
+      - endpoints
+      - events
+      - persistentvolumes
+      - persistentvolumeclaims
+      - resourcequotas
+      - limitranges
+      - configmaps
+      - serviceaccounts
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - metrics.k8s.io
+    resources:
+      - nodes
+      - pods
+    verbs:
+      - get
+      - list
+  - apiGroups:
+      - apps
+    resources:
+      - deployments
+      - statefulsets
+      - daemonsets
+      - replicasets
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - batch
+    resources:
+      - jobs
+      - cronjobs
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - networkpolicies
+      - ingresses
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - autoscaling
+    resources:
+      - horizontalpodautoscalers
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - policy
+    resources:
+      - poddisruptionbudgets
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - apiextensions.k8s.io
+    resources:
+      - customresourcedefinitions
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - argoproj.io
+    resources:
+      - applications
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - kustomize.toolkit.fluxcd.io
+    resources:
+      - kustomizations
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - source.toolkit.fluxcd.io
+    resources:
+      - gitrepositories
+      - ocirepositories
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - configsync.gke.io
+    resources:
+      - rootsyncs
+      - reposyncs
+    verbs:
+      - get
+      - list
+      - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+    kubeagents.x-k8s.io/agent-name: platformagent
+    kubeagents.x-k8s.io/agent-namespace: kubeagents-system
+  name: kubeagents:minimal:kubeagents-system:platformagent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubeagents:minimal:kubeagents-system:platformagent
+subjects:
+  - kind: ServiceAccount
+    name: kubeagents-platform-agent
+    namespace: kubeagents-system
+  - kind: ServiceAccount
+    name: platformagent-gateway-agent
+    namespace: kubeagents-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: kubeagents:local:kubeagents-system:platformagent
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+rules:
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
+      - platformagents
+      - platformagents/status
+    verbs:
+      - get
+      - list
+      - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+    kubeagents.x-k8s.io/agent-name: platformagent
+    kubeagents.x-k8s.io/agent-namespace: kubeagents-system
+  name: kubeagents:local:kubeagents-system:platformagent
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubeagents:local:kubeagents-system:platformagent
+subjects:
+  - kind: ServiceAccount
+    name: kubeagents-platform-agent
+    namespace: kubeagents-system
+  - kind: ServiceAccount
+    name: platformagent-gateway-agent
+    namespace: kubeagents-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: kubeagents:leader:kubeagents-system:platformagent
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+rules:
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: kubeagents:leader:kubeagents-system:platformagent
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubeagents:leader:kubeagents-system:platformagent
+subjects:
+  - kind: ServiceAccount
+    name: platformagent-gateway-agent
+    namespace: kubeagents-system
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-data
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+status: {}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: system-metadata
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+status: {}
+---
+apiVersion: v1
+data:
+  leader_elect.py: <OMITTED_FOR_TESTS>
+  managed-config.yaml: |
+    approvals:
+      cron_mode: approve
+    display:
+      platforms:
+        google_chat:
+          busy_ack_detail: false
+          interim_assistant_messages: false
+          long_running_notifications: true
+          memory_notifications: "off"
+          tool_progress: "off"
+    hooks:
+      outbound:
+      - events:
+        - pre_tool_call
+        - post_tool_call
+        - post_api_request
+        name: a2a-bridge-activity
+        secret_env: A2A_ACTIVITY_SECRET
+        timeout: 10
+        url: http://127.0.0.1:8651/hermes/tool-events
+    kanban:
+      max_in_progress: 6
+    model:
+      api_key: none
+      api_mode: chat_completions
+      base_url: http://inference-gateway.kubeagents-system.svc.cluster.local/v1
+      default: model-default
+      model: model-default
+      provider: custom
+    platforms:
+      google_chat:
+        enabled: false
+      slack:
+        enabled: false
+        extra:
+          rich_blocks: true
+      teams:
+        enabled: false
+        extra:
+          adaptive_cards: true
+    terminal:
+      backend: ssh
+      lifetime_seconds: 2592000
+      ssh_host: platformagent-shell-0.platformagent-shell.kubeagents-system.svc.cluster.local
+      ssh_key: /etc/sandbox-ssh/id_ed25519
+      ssh_port: 2222
+      ssh_user: agent
+      workspace_root: /opt/data
+  managed.env: |
+    API_SERVER_KEY=cluster-internal-trusted
+    HERMES_HOME_MODE=2770
+    KUBEAGENTS_MODE=next
+    KUBEAGENTS_SCOPE_FILE=/etc/kube-agents/scope.json
+    RECONCILE_PROJECT=
+    GKE_PROJECT_ID=example-project
+    STALL_WATCH_EXCLUDE_NAMESPACES=
+    STALL_WATCH_MIN_AGE_MINUTES=
+    STALL_WATCH_KINDS=
+    PUBSUB_RELAY_URL=
+    PUBSUB_RELAY_PROJECT=example-project
+  profile-platform.overlay.yaml: |
+    memory:
+      provider: ""
+  scope.json: |
+    {
+      "present": false,
+      "projects": [],
+      "folders": [],
+      "organizations": [],
+      "sharedVpcHosts": [],
+      "metricsScopes": [],
+      "maxProjects": 100,
+      "exclude": {
+        "projects": [],
+        "clusters": []
+      }
+    }
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-config
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Flush         1
+        Daemon        Off
+        Log_Level     info
+        Parsers_File  parsers.conf
+
+    [INPUT]
+        Name              tail
+        Tag               agent.logs
+        Path              /opt/data/logs/*.log
+        DB                /fluent-bit/state/fluent-bit.db
+        Refresh_Interval  5
+        Rotate_Wait       30
+        Mem_Buf_Limit     20MB
+        Skip_Long_Lines   On
+        Read_from_Head    On
+        Path_Key          file_path
+
+    [INPUT]
+        Name              tail
+        Tag               agent.audit
+        Path              /opt/data/logs/audit.jsonl,/opt/data/profiles/*/logs/audit.jsonl
+        Parser            audit_json
+        DB                /fluent-bit/state/fluent-bit-audit.db
+        Refresh_Interval  5
+        Rotate_Wait       30
+        Mem_Buf_Limit     20MB
+        Skip_Long_Lines   On
+        Read_from_Head    On
+        Path_Key          file_path
+
+    [FILTER]
+        Name          parser
+        Match         agent.logs
+        Key_Name      log
+        Parser        gchat_event
+        Reserve_Data  On
+        Preserve_Key  On
+
+    [FILTER]
+        Name              record_modifier
+        Match             agent.*
+        Record            app agent
+        Record            log_source agent-file
+
+    [OUTPUT]
+        Name              stdout
+        Match             agent.*
+        Format            json_lines
+  parsers.conf: |
+    [PARSER]
+        Name    gchat_event
+        Format  regex
+        Regex   User=(?<gchat_user>[^,\s]+),\s*Session=(?<gchat_session>[^,\s]+)
+
+    [PARSER]
+        Name    audit_json
+        Format  json
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-fluent-bit-config
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
+data:
+  SETTINGS.md: |
+    # GKE Scope Configuration
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-settings
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-gitops-state
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
+data:
+  policy.json: |-
+    {
+      "apiVersion": "cli.proxy.kubeagents.io/v1alpha1",
+      "blockedMessage": "Command blocked for security reasons.",
+      "rules": [
+        {"id":"gcp.access-token-disclosure","pattern":"\\bgcloud\\b(?:\\s+\\S+)*?\\s+auth\\b(?:\\s+\\S+)*?\\s+print-(?:access|identity)-token\\b"},
+        {"id":"gcp.config-helper-disclosure","pattern":"\\bgcloud\\b(?:\\s+\\S+)*?\\s+config\\b(?:\\s+\\S+)*?\\s+config-helper\\b"},
+        {"id":"github.token-disclosure","pattern":"\\bgh\\b(?:\\s+\\S+)*?\\s+auth\\b(?:\\s+\\S+)*?\\s+token\\b|\\bgh\\b(?:\\s+\\S+)*?\\s+auth\\b(?:\\s+\\S+)*?\\s+status\\b(?:\\s+\\S+)*?\\s+(?:--show-token|-t)\\b"},
+        {"id":"kubernetes.token-disclosure","pattern":"\\bkubectl\\b(?:\\s+\\S+)*?\\s+create\\b(?:\\s+\\S+)*?\\s+token\\b|\\bkubectl\\b(?:\\s+\\S+)*?\\s+config\\b(?:\\s+\\S+)*?\\s+view\\b(?:\\s+\\S+)*?\\s+--raw\\b"},
+        {"id":"git.credential-disclosure","pattern":"\\bgit\\b(?:\\s+\\S+)*?\\s+credential\\b(?:\\s+\\S+)*?\\s+fill\\b"},
+        {"id":"gcp.credential-replacement","pattern":"\\bgcloud\\b(?:\\s+\\S+)*?\\s+auth\\b(?:\\s+\\S+)*?\\s+(?:login|activate-service-account)\\b"},
+        {"id":"github.credential-replacement","pattern":"\\bgh\\b(?:\\s+\\S+)*?\\s+auth\\b(?:\\s+\\S+)*?\\s+(?:login|refresh|switch|logout)\\b"},
+        {"id":"tool.self-modification","pattern":"\\bgcloud\\b(?:\\s+\\S+)*?\\s+components\\b(?:\\s+\\S+)*?\\s+(?:install|update|remove)\\b|\\bgh\\b(?:\\s+\\S+)*?\\s+extension\\b(?:\\s+\\S+)*?\\s+(?:install|upgrade|remove)\\b|\\bgh\\b(?:\\s+\\S+)*?\\s+(?:alias|config)\\b(?:\\s+\\S+)*?\\s+(?:set|import|delete)\\b"},
+        {"id":"github.merge","pattern":"\\bgh\\b(?:\\s+\\S+)*?\\s+pr\\b(?:\\s+\\S+)*?\\s+merge\\b"},
+        {"id":"github.assent","pattern":"\\bgh\\b(?:\\s+\\S+)*?\\s+pr\\b(?:\\s+\\S+)*?\\s+review\\b(?:\\s+\\S+)*?\\s+(?:--approve|-a)\\b"},
+        {"id":"github.api-mutation","pattern":"\\bgh\\b(?:\\s+\\S+)*?\\s+api\\b(?:\\s+\\S+)*?\\s+(?:-X|--method)(?:\\s+|=)(?:POST|PUT|PATCH|DELETE)\\b|\\bgh\\b(?:\\s+\\S+)*?\\s+api\\b(?:\\s+\\S+)*?\\s+(?:-f|-F|--field|--raw-field|--input)\\b"},
+        {"id":"github.pipeline-trigger","pattern":"\\bgh\\b(?:\\s+\\S+)*?\\s+(?:workflow|run)\\b(?:\\s+\\S+)*?\\s+(?:run|rerun|cancel|enable|disable|delete)\\b|\\bgh\\b(?:\\s+\\S+)*?\\s+release\\b(?:\\s+\\S+)*?\\s+(?:create|delete|upload|edit)\\b"},
+        {"id":"github.repo-administration","pattern":"\\bgh\\b(?:\\s+\\S+)*?\\s+(?:secret|variable)\\b(?:\\s+\\S+)*?\\s+(?:set|delete|remove)\\b|\\bgh\\b(?:\\s+\\S+)*?\\s+repo\\b(?:\\s+\\S+)*?\\s+(?:delete|archive|edit)\\b"}
+      ]
+    }
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-credential-proxy-policy
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
+automountServiceAccountToken: false
+kind: ServiceAccount
+metadata:
+  labels:
+    app: platformagent-shell
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-shell
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: platformagent-shell
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-shell
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  clusterIP: None
+  ports:
+    - name: ssh
+      port: 2222
+      protocol: TCP
+      targetPort: 2222
+  publishNotReadyAddresses: true
+  selector:
+    app: platformagent-shell
+status:
+  loadBalancer: {}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    app: platformagent-shell
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-shell
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  replicas: 1
+  selector:
+    matchLabels:
+      app: platformagent-shell
+      app.kubernetes.io/instance: kubeagents-system-platformagent
+      app.kubernetes.io/managed-by: platformagent-controller
+      app.kubernetes.io/name: platform-agent
+      app.kubernetes.io/part-of: kube-agents
+  serviceName: platformagent-shell
+  template:
+    metadata:
+      annotations:
+        kubeagents.x-k8s.io/settings-config-hash: <SHA256_FOR_TESTS>
+      labels:
+        app: platformagent-shell
+        app.kubernetes.io/instance: kubeagents-system-platformagent
+        app.kubernetes.io/managed-by: platformagent-controller
+        app.kubernetes.io/name: platform-agent
+        app.kubernetes.io/part-of: kube-agents
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - env:
+            - name: CREDENTIAL_PROXY_URL
+              value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
+            - name: CREDENTIAL_PROXY_TOKEN_FILE
+              value: /var/run/secrets/kubeagents/credential-proxy/token
+            - name: GKE_PROJECT_ID
+              value: example-project
+            - name: GKE_CLUSTER_NAME
+              value: cluster-a
+            - name: GKE_LOCATION
+              value: us-central1-a
+            - name: KUBE_CONTEXT_NAME
+              value: gke_example-project_us-central1-a_cluster-a
+            - name: KUBEAGENTS_SCOPE_DECLARED
+              value: "false"
+            - name: SANDBOX_IMAGE_TREES
+              value: read-only-mounts
+            - name: SANDBOX_HOME_ROOTS
+              value: . profiles/platform
+          image: ghcr.io/gke-labs/kube-agents/agent-sandbox:latest
+          name: shell
+          ports:
+            - containerPort: 2222
+              name: ssh
+          readinessProbe:
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            tcpSocket:
+              port: 2222
+          resources:
+            limits:
+              cpu: "2"
+              memory: 2Gi
+            requests:
+              cpu: 200m
+              memory: 512Mi
+          securityContext:
+            capabilities:
+              drop:
+                - NET_RAW
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - mountPath: /etc/ssh-authorized
+              name: authorized-keys
+              readOnly: true
+            - mountPath: /opt/data
+              name: data
+            - mountPath: /var/lib/sandbox-sshd
+              name: sshd
+            - mountPath: /home/agent/.hermes
+              name: hermes-sync-block
+              readOnly: true
+            - mountPath: /var/run/secrets/kubeagents/credential-proxy
+              name: credential-proxy-token
+              readOnly: true
+            - mountPath: /opt/data/SETTINGS.md
+              name: settings
+              readOnly: true
+              subPath: SETTINGS.md
+            - mountPath: /etc/gitops
+              name: gitops-state-volume
+              readOnly: true
+            - mountPath: /opt/data/profiles
+              name: data
+              subPath: profiles
+            - mountPath: /opt/data/profiles/platform
+              name: data
+              subPath: profiles/platform
+            - mountPath: /opt/data/skills
+              name: data
+              readOnly: true
+              subPath: skills
+            - mountPath: /opt/data/scripts
+              name: data
+              readOnly: true
+              subPath: scripts
+            - mountPath: /opt/data/governance
+              name: data
+              readOnly: true
+              subPath: governance
+            - mountPath: /opt/data/profiles/platform/skills
+              name: data
+              readOnly: true
+              subPath: profiles/platform/skills
+            - mountPath: /opt/data/profiles/platform/scripts
+              name: data
+              readOnly: true
+              subPath: profiles/platform/scripts
+            - mountPath: /opt/data/profiles/platform/governance
+              name: data
+              readOnly: true
+              subPath: profiles/platform/governance
+      enableServiceLinks: false
+      initContainers:
+        - args:
+            - --prepare-image-trees
+          env:
+            - name: SANDBOX_HOME_ROOTS
+              value: . profiles/platform
+          image: ghcr.io/gke-labs/kube-agents/agent-sandbox:latest
+          name: prepare-image-trees
+          resources:
+            limits:
+              cpu: 500m
+              memory: 256Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              add:
+                - CHOWN
+                - DAC_OVERRIDE
+                - FOWNER
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - mountPath: /opt/data
+              name: data
+      serviceAccountName: platformagent-shell
+      shareProcessNamespace: false
+      volumes:
+        - name: authorized-keys
+          secret:
+            items:
+              - key: authorized_keys
+                path: authorized_keys
+            secretName: platformagent-shell-authorized-keys
+        - configMap:
+            name: platformagent-settings
+            optional: true
+          name: settings
+        - emptyDir: {}
+          name: hermes-sync-block
+        - name: credential-proxy-token
+          projected:
+            defaultMode: 292
+            sources:
+              - serviceAccountToken:
+                  audience: kubeagents-credential-proxy
+                  expirationSeconds: 3600
+                  path: token
+        - configMap:
+            defaultMode: 420
+            name: platformagent-gitops-state
+          name: gitops-state-volume
+  updateStrategy: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 50Gi
+      status: {}
+    - metadata:
+        name: sshd
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi
+      status: {}
+status:
+  availableReplicas: 0
+  replicas: 0
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  labels:
+    app: platformagent-shell
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-shell
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: node-local-dns
+        - ipBlock:
+            cidr: 169.254.20.10/32
+        - ipBlock:
+            cidr: 169.254.169.254/32
+        - ipBlock:
+            cidr: 10.96.0.10/32
+    - ports:
+        - port: 8765
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app: platformagent-credential-proxy
+              kubeagents.x-k8s.io/component: credential-proxy
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: platformagent-gateway
+      ports:
+        - port: 2222
+          protocol: TCP
+  podSelector:
+    matchLabels:
+      app: platformagent-shell
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: kubeagents:tokenreview:kubeagents-system:platformagent
+rules:
+  - apiGroups:
+      - authentication.k8s.io
+    resources:
+      - tokenreviews
+    verbs:
+      - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+    kubeagents.x-k8s.io/agent-name: platformagent
+    kubeagents.x-k8s.io/agent-namespace: kubeagents-system
+  name: kubeagents:tokenreview:kubeagents-system:platformagent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubeagents:tokenreview:kubeagents-system:platformagent
+subjects:
+  - kind: ServiceAccount
+    name: kubeagents-platform-agent
+    namespace: kubeagents-system
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-credential-proxy
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  ports:
+    - name: cred-proxy
+      port: 8765
+      targetPort: cred-proxy
+  selector:
+    app: platformagent-credential-proxy
+    kubeagents.x-k8s.io/component: credential-proxy
+status:
+  loadBalancer: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: platformagent-credential-proxy
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-credential-proxy
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: platformagent-credential-proxy
+      kubeagents.x-k8s.io/component: credential-proxy
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      annotations:
+        kubeagents.x-k8s.io/proxy-policy-hash: <SHA256_FOR_TESTS>
+      labels:
+        app: platformagent-credential-proxy
+        app.kubernetes.io/instance: kubeagents-system-platformagent
+        app.kubernetes.io/managed-by: platformagent-controller
+        app.kubernetes.io/name: platform-agent
+        app.kubernetes.io/part-of: kube-agents
+        kubeagents.x-k8s.io/component: credential-proxy
+        kubeagents.x-k8s.io/has-credential-proxy: "true"
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - command:
+            - /usr/local/bin/start-services
+          env:
+            - name: PLATFORM_AGENT_HOME
+              value: /tmp/credential-proxy
+            - name: HOME
+              value: /tmp/credential-proxy/home
+            - name: CREDENTIAL_PROXY_POLICY
+              value: /etc/credential-proxy/policy.json
+            - name: CREDENTIAL_PROXY_MAX_OUTPUT_BYTES
+              value: "8388608"
+            - name: CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS
+              value: "8"
+            - name: CREDENTIAL_PROXY_MEMORY_LIMIT_BYTES
+              valueFrom:
+                resourceFieldRef:
+                  containerName: envoy-credential-proxy
+                  divisor: "1"
+                  resource: limits.memory
+            - name: CREDENTIAL_PROXY_STATE_DIR
+              value: /var/lib/credential-proxy
+            - name: CREDENTIAL_PROXY_UNIX_SOCKET
+              value: /var/run/credential-proxy/backend.sock
+            - name: CREDENTIAL_PROXY_PORT
+              value: "8765"
+            - name: CREDENTIAL_PROXY_METRICS_PORT
+              value: "8766"
+            - name: KUBECONFIG
+              value: /var/run/event-watcher/watcher.config
+            - name: KSA_TOKEN_FILE
+              value: /var/run/secrets/kubeagents/serviceaccount/token
+            - name: TOKEN_BROKER_URL
+              value: http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token
+            - name: GITOPS_STATE_CONFIGMAP
+              value: platformagent-gitops-state
+            - name: GITOPS_STATE_PATH
+              value: /etc/gitops/managed_repos
+            - name: API_SERVER_KEY
+              value: cluster-internal-trusted
+            - name: CREDENTIAL_PROXY_SCOPED_SA_POOL
+              value: "0"
+            - name: CREDENTIAL_PROXY_ROLE
+              value: broker
+            - name: CREDENTIAL_PROXY_ENVOY_ADDRESS
+              value: 0.0.0.0
+            - name: CREDENTIAL_PROXY_AUTH_MODE
+              value: serviceaccount
+            - name: CREDENTIAL_PROXY_AUDIENCE
+              value: kubeagents-credential-proxy
+            - name: CREDENTIAL_PROXY_CHAT_AUDIENCE
+              value: kubeagents-credential-proxy-chat
+            - name: CREDENTIAL_PROXY_ALLOWED_CALLERS
+              value: system:serviceaccount:kubeagents-system:platformagent-gateway-agent,system:serviceaccount:kubeagents-system:platformagent-shell,system:serviceaccount:kubeagents-system:platformagent-a2a-gateway
+            - name: CREDENTIAL_PROXY_WATCHER_AUDIENCE
+              value: kubeagents-credential-proxy-watcher
+            - name: CREDENTIAL_PROXY_KUBE_CA_FILE
+              value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+            - name: CREDENTIAL_PROXY_KUBE_TOKEN_FILE
+              value: /var/run/secrets/kubernetes.io/serviceaccount/token
+            - name: CREDENTIAL_PROXY_CONTENT_WORKSPACE
+              value: "1"
+            - name: GKE_PROJECT_ID
+              value: example-project
+            - name: GKE_CLUSTER_NAME
+              value: cluster-a
+            - name: GKE_LOCATION
+              value: us-central1-a
+            - name: KUBE_CONTEXT_NAME
+              value: gke_example-project_us-central1-a_cluster-a
+            - name: KUBE_DEFAULT_NAMESPACE
+              value: kubeagents-system
+            - name: CREDENTIAL_PROXY_BOOTSTRAP_COMMAND
+              value: |-
+                gcloud config set project "$GKE_PROJECT_ID" >/dev/null &&
+                GKE_DNS_FLAG="$(gcloud container clusters describe "$GKE_CLUSTER_NAME" --location "$GKE_LOCATION" --project "$GKE_PROJECT_ID" --format='value(controlPlaneEndpointsConfig.dnsEndpointConfig.endpoint,controlPlaneEndpointsConfig.dnsEndpointConfig.allowExternalTraffic)' 2>/dev/null | awk -F'\t' '$1 != "" && $2 == "True" { print "--dns-endpoint" }')" &&
+                gcloud container clusters get-credentials "$GKE_CLUSTER_NAME" --location "$GKE_LOCATION" --project "$GKE_PROJECT_ID" $GKE_DNS_FLAG &&
+                kubectl config use-context "$KUBE_CONTEXT_NAME" >/dev/null &&
+                kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMESPACE" >/dev/null
+            - name: GOOGLE_CHAT_PROJECT_ID
+              value: kube-agents-gkedemos
+            - name: A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME
+              value: projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub
+            - name: CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE
+              value: kubeagents-credential-proxy-a2a-chat
+          image: ghcr.io/gke-labs/kube-agents/credential-proxy:latest
+          imagePullPolicy: IfNotPresent
+          name: envoy-credential-proxy
+          ports:
+            - containerPort: 8765
+              name: cred-proxy
+            - containerPort: 8766
+              name: cred-metrics
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /healthz
+              port: cred-proxy
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources:
+            limits:
+              cpu: "1"
+              ephemeral-storage: 2Gi
+              memory: 2Gi
+            requests:
+              cpu: 500m
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - mountPath: /etc/credential-proxy/policy.json
+              name: credential-proxy-policy
+              readOnly: true
+              subPath: policy.json
+            - mountPath: /tmp
+              name: credential-proxy-tmp
+            - mountPath: /var/lib/credential-proxy
+              name: credential-proxy-state
+            - mountPath: /var/run/credential-proxy
+              name: credential-proxy-runtime
+            - mountPath: /var/run/event-watcher
+              name: event-watcher-kubeconfig
+            - mountPath: /var/run/secrets/kubeagents/serviceaccount
+              name: credential-proxy-ksa-token
+              readOnly: true
+            - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              name: event-watcher-ksa-token
+              readOnly: true
+            - mountPath: /etc/gitops
+              name: gitops-state-volume
+              readOnly: true
+      securityContext:
+        fsGroup: 10000
+        runAsNonRoot: true
+        runAsUser: 10000
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: kubeagents-platform-agent
+      volumes:
+        - configMap:
+            name: platformagent-credential-proxy-policy
+          name: credential-proxy-policy
+        - emptyDir:
+            sizeLimit: 2Gi
+          name: credential-proxy-tmp
+        - emptyDir:
+            sizeLimit: 5Gi
+          name: credential-proxy-state
+        - emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
+          name: credential-proxy-runtime
+        - emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+          name: event-watcher-kubeconfig
+        - name: credential-proxy-ksa-token
+          projected:
+            defaultMode: 256
+            sources:
+              - serviceAccountToken:
+                  audience: kubeagents-credential-proxy
+                  expirationSeconds: 3600
+                  path: token
+        - name: event-watcher-ksa-token
+          projected:
+            defaultMode: 256
+            sources:
+              - serviceAccountToken:
+                  expirationSeconds: 3600
+                  path: token
+              - configMap:
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+                  name: kube-root-ca.crt
+              - downwardAPI:
+                  items:
+                    - fieldRef:
+                        apiVersion: v1
+                        fieldPath: metadata.namespace
+                      path: namespace
+        - configMap:
+            defaultMode: 420
+            name: platformagent-gitops-state
+          name: gitops-state-volume
+status: {}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-credential-proxy
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: platformagent-shell
+        - podSelector:
+            matchLabels:
+              app: platformagent-gateway
+        - podSelector:
+            matchLabels:
+              app: platformagent-a2a-gateway
+      ports:
+        - port: 8765
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gmp-system
+      ports:
+        - port: 8766
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kubeagents-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kube-agents-operator
+      ports:
+        - port: 8766
+          protocol: TCP
+  podSelector:
+    matchLabels:
+      app: platformagent-credential-proxy
+      kubeagents.x-k8s.io/component: credential-proxy
+  policyTypes:
+    - Ingress
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: platformagent-gateway
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-gateway
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  progressDeadlineSeconds: 1800
+  replicas: 1
+  selector:
+    matchLabels:
+      app: platformagent-gateway
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      annotations:
+        kubeagents.x-k8s.io/config-hash: <SHA256_FOR_TESTS>
+        kubeagents.x-k8s.io/fluent-bit-config-hash: <SHA256_FOR_TESTS>
+        kubeagents.x-k8s.io/proxy-policy-hash: <SHA256_FOR_TESTS>
+        kubeagents.x-k8s.io/secret-env-hash: <SHA256_FOR_TESTS>
+        kubeagents.x-k8s.io/settings-config-hash: <SHA256_FOR_TESTS>
+      labels:
+        app: platformagent-gateway
+        app.kubernetes.io/instance: kubeagents-system-platformagent
+        app.kubernetes.io/managed-by: platformagent-controller
+        app.kubernetes.io/name: platform-agent
+        app.kubernetes.io/part-of: kube-agents
+        kubeagents.io/is-leader: "true"
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - env:
+            - name: PLATFORM_AGENT_HOME
+              value: /opt/data
+            - name: HOME
+              value: /opt/data/home
+            - name: PLATFORM_AGENT_PLUGINS_DEBUG
+              value: "0"
+            - name: API_SERVER_ENABLED
+              value: "true"
+            - name: API_SERVER_HOST
+              value: 127.0.0.1
+            - name: API_SERVER_KEY
+              value: cluster-internal-trusted
+            - name: SESSION_KV_DB_PATH
+              value: /var/lib/kube-agents/session/session_kv.db
+            - name: GITOPS_STATE_CONFIGMAP
+              value: platformagent-gitops-state
+            - name: GITOPS_STATE_PATH
+              value: /etc/gitops/managed_repos
+            - name: SESSION_KV_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: SESSION_KV_API_KEY
+                  name: platform-agent-secrets
+                  optional: true
+            - name: SESSION_KV_SALT
+              valueFrom:
+                secretKeyRef:
+                  key: SESSION_KV_SALT
+                  name: platform-agent-secrets
+                  optional: true
+            - name: OTEL_SERVICE_NAME
+              value: platformagent-gateway
+            - name: OTEL_SDK_DISABLED
+              value: "true"
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: service.namespace=kubeagents-system,k8s.namespace.name=kubeagents-system,kubeagents.agent_type=platform,kubeagents.agent_name=platformagent
+            - name: GKE_PROJECT_ID
+              value: example-project
+            - name: GKE_CLUSTER_NAME
+              value: cluster-a
+            - name: GKE_LOCATION
+              value: us-central1-a
+            - name: GCP_PROJECT_ID
+              value: example-project
+            - name: KUBE_CONTEXT_NAME
+              value: gke_example-project_us-central1-a_cluster-a
+            - name: KUBE_DEFAULT_NAMESPACE
+              value: kubeagents-system
+            - name: HERMES_MANAGED_DIR
+              value: /etc/hermes
+            - name: KUBEAGENTS_SCOPE_FILE
+              value: /etc/kube-agents/scope.json
+            - name: RECONCILE_PROJECT
+            - name: HERMES_HOME_MODE
+              value: "2770"
+            - name: HERMES_WRITE_SAFE_ROOT
+              value: /opt/data
+            - name: TERMINAL_CWD
+              value: /opt/data
+            - name: CREDENTIAL_PROXY_URL
+            - name: CREDENTIAL_PROXY_TOKEN_FILE
+              value: /var/run/secrets/kubeagents/credential-proxy/token
+            - name: KUBE_AGENTS_MCP_RELAY_URL
+              value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765/v1/mcp
+            - name: PUBSUB_RELAY_URL
+            - name: PUBSUB_RELAY_PROJECT
+              value: example-project
+            - name: NATS_URL
+              value: tls://platformagent-a2a-nats.kubeagents-system.svc:4222
+            - name: NATS_CA_FILE
+              value: /etc/a2a-nats-ca/ca.crt
+            - name: A2A_BUS_USER
+              value: agent
+            - name: A2A_NOTIFY_CONVERSATIONS
+              value: google_chat
+            - name: A2A_ACTIVITY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  key: bridge-activity-key
+                  name: platformagent-a2a-nats-creds
+                  optional: true
+            - name: PATH
+              value: /opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            - name: PYTHONPATH
+              value: /opt/defaults/scripts
+            - name: HINDSIGHT_API_URL
+              value: http://hindsight-api.kubeagents-system.svc.cluster.local:8888
+            - name: MEMORY_PROVIDER
+              value: multiuser_memory
+            - name: AGENT_SHARED_STATE_SETUP
+              value: owner
+            - name: API_SERVER_MODEL_NAME
+              value: model-default
+            - name: HERMES_GATEWAY_PROFILE
+            - name: CHAT_METRICS_PORT
+              value: "9097"
+          image: ghcr.io/gke-labs/kube-agents/platform-agent:latest
+          imagePullPolicy: IfNotPresent
+          name: platform-agent
+          ports:
+            - containerPort: 8642
+              name: api
+            - containerPort: 9097
+              name: chat-metrics
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - 'curl --fail --silent --show-error -o /dev/null -H "Authorization: Bearer
+                  $API_SERVER_KEY" http://127.0.0.1:8642/api/sessions?limit=1; rc=$?;
+                  [ "$rc" -eq 0 ] && exit 0; [ "$rc" -eq 7 ] && [ "$ENABLE_LEADER_ELECTION"
+                  = "true" ] && exit 0; exit "$rc"'
+            failureThreshold: 3
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 5
+          resources:
+            limits:
+              cpu: "3"
+              memory: 8Gi
+            requests:
+              cpu: "1"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          startupProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - 'curl --fail --silent --show-error -o /dev/null -H "Authorization: Bearer
+                  $API_SERVER_KEY" http://127.0.0.1:8642/api/sessions?limit=1; rc=$?;
+                  [ "$rc" -eq 0 ] && exit 0; [ "$rc" -eq 7 ] && [ "$ENABLE_LEADER_ELECTION"
+                  = "true" ] && exit 0; exit "$rc"'
+            failureThreshold: 90
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+          volumeMounts:
+            - mountPath: /opt/data
+              name: platform-agent-data-vol
+            - mountPath: /opt/data/leader_elect.py
+              name: platform-agent-config-vol
+              subPath: leader_elect.py
+            - mountPath: /etc/hermes
+              name: platform-agent-managed-vol
+              readOnly: true
+            - mountPath: /etc/kube-agents
+              name: platform-agent-scope-vol
+              readOnly: true
+            - mountPath: /opt/agent-config
+              name: platform-agent-config-vol
+              readOnly: true
+            - mountPath: /opt/data/SETTINGS.md
+              name: settings-volume
+              readOnly: true
+              subPath: SETTINGS.md
+            - mountPath: /var/lib/kube-agents/session
+              name: system-metadata
+              subPath: session
+            - mountPath: /etc/gitops
+              name: gitops-state-volume
+              readOnly: true
+            - mountPath: /tmp
+              name: tmp-scratch
+            - mountPath: /etc/sandbox-ssh
+              name: sandbox-ssh
+              readOnly: true
+            - mountPath: /var/run/secrets/kubeagents/credential-proxy
+              name: agent-credential-proxy-token
+              readOnly: true
+            - mountPath: /var/run/secrets/a2a-bus
+              name: a2a-bus-token
+              readOnly: true
+            - mountPath: /etc/a2a-nats-ca
+              name: a2a-nats-ca
+              readOnly: true
+        - args:
+            - hermes
+            - dashboard
+          env:
+            - name: PLATFORM_AGENT_HOME
+              value: /opt/data
+            - name: HERMES_MANAGED_DIR
+              value: /etc/hermes
+            - name: HERMES_HOME_MODE
+              value: "2770"
+            - name: HOME
+              value: /opt/data/home
+            - name: SESSION_KV_DB_PATH
+              value: /var/lib/kube-agents/session/session_kv.db
+            - name: AGENT_SHARED_STATE_SETUP
+              value: skip
+            - name: PLATFORM_AGENT_ROLE
+              value: sidecar
+          image: ghcr.io/gke-labs/kube-agents/platform-agent:latest
+          imagePullPolicy: IfNotPresent
+          name: platform-agent-dashboard
+          ports:
+            - containerPort: 9119
+              name: dashboard
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - curl --silent --show-error --max-time 3 -o /dev/null http://127.0.0.1:9119/
+            failureThreshold: 3
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 5
+          resources:
+            limits:
+              cpu: "1"
+              memory: 2Gi
+            requests:
+              cpu: 256m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - mountPath: /opt/data
+              name: platform-agent-data-vol
+            - mountPath: /etc/hermes
+              name: platform-agent-managed-vol
+              readOnly: true
+            - mountPath: /var/lib/kube-agents/session
+              name: system-metadata
+              subPath: session
+            - mountPath: /tmp
+              name: tmp-scratch
+        - args:
+            - -c
+            - /fluent-bit/etc/fluent-bit.conf
+          image: fluent/fluent-bit:5.1.2
+          name: fluent-bit
+          resources:
+            limits:
+              cpu: 500m
+              ephemeral-storage: 1Gi
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              ephemeral-storage: 1Gi
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - mountPath: /opt/data
+              name: platform-agent-data-vol
+              readOnly: true
+            - mountPath: /fluent-bit/etc/fluent-bit.conf
+              name: fluent-bit-config
+              readOnly: true
+              subPath: fluent-bit.conf
+            - mountPath: /fluent-bit/etc/parsers.conf
+              name: fluent-bit-config
+              readOnly: true
+              subPath: parsers.conf
+            - mountPath: /fluent-bit/state
+              name: fluent-bit-state
+        - env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: PLATFORM_AGENT_HOME
+              value: /opt/data
+            - name: HOME
+              value: /opt/data/home
+            - name: PLATFORM_AGENT_PLUGINS_DEBUG
+              value: "0"
+            - name: API_SERVER_ENABLED
+              value: "true"
+            - name: API_SERVER_HOST
+              value: 127.0.0.1
+            - name: SESSION_KV_DB_PATH
+              value: /var/lib/kube-agents/session/session_kv.db
+            - name: GITOPS_STATE_CONFIGMAP
+              value: platformagent-gitops-state
+            - name: GITOPS_STATE_PATH
+              value: /etc/gitops/managed_repos
+            - name: SESSION_KV_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: SESSION_KV_API_KEY
+                  name: platform-agent-secrets
+                  optional: true
+            - name: SESSION_KV_SALT
+              valueFrom:
+                secretKeyRef:
+                  key: SESSION_KV_SALT
+                  name: platform-agent-secrets
+                  optional: true
+            - name: OTEL_SERVICE_NAME
+              value: platformagent-gateway
+            - name: OTEL_SDK_DISABLED
+              value: "true"
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: service.namespace=kubeagents-system,k8s.namespace.name=kubeagents-system,kubeagents.agent_type=platform,kubeagents.agent_name=platformagent
+            - name: GKE_PROJECT_ID
+              value: example-project
+            - name: GKE_CLUSTER_NAME
+              value: cluster-a
+            - name: GKE_LOCATION
+              value: us-central1-a
+            - name: GCP_PROJECT_ID
+              value: example-project
+            - name: KUBE_CONTEXT_NAME
+              value: gke_example-project_us-central1-a_cluster-a
+            - name: KUBE_DEFAULT_NAMESPACE
+              value: kubeagents-system
+            - name: HERMES_MANAGED_DIR
+              value: /etc/hermes
+            - name: KUBEAGENTS_SCOPE_FILE
+              value: /etc/kube-agents/scope.json
+            - name: RECONCILE_PROJECT
+            - name: HERMES_HOME_MODE
+              value: "2770"
+            - name: HERMES_WRITE_SAFE_ROOT
+              value: /opt/data
+            - name: TERMINAL_CWD
+              value: /opt/data
+            - name: CREDENTIAL_PROXY_URL
+            - name: CREDENTIAL_PROXY_TOKEN_FILE
+              value: /var/run/secrets/kubeagents/credential-proxy/token
+            - name: KUBE_AGENTS_MCP_RELAY_URL
+              value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765/v1/mcp
+            - name: PUBSUB_RELAY_URL
+            - name: PUBSUB_RELAY_PROJECT
+              value: example-project
+            - name: NATS_CA_FILE
+              value: /etc/a2a-nats-ca/ca.crt
+            - name: A2A_NOTIFY_CONVERSATIONS
+              value: google_chat
+            - name: PATH
+              value: /opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            - name: PYTHONPATH
+              value: /opt/defaults/scripts
+            - name: HINDSIGHT_API_URL
+              value: http://hindsight-api.kubeagents-system.svc.cluster.local:8888
+            - name: MEMORY_PROVIDER
+              value: multiuser_memory
+            - name: API_SERVER_MODEL_NAME
+              value: model-default
+            - name: HERMES_GATEWAY_PROFILE
+            - name: CHAT_METRICS_PORT
+              value: "9097"
+            - name: AGENT_SHARED_STATE_SETUP
+              value: skip
+            - name: NATS_URL
+              value: tls://platformagent-a2a-nats.kubeagents-system.svc:4222
+            - name: NATS_USER
+              value: bridge
+            - name: NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: bridge-password
+                  name: platformagent-a2a-nats-creds
+            - name: BRIDGE_CONCURRENCY
+              value: "10"
+            - name: A2A_ACTIVITY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  key: bridge-activity-key
+                  name: platformagent-a2a-nats-creds
+                  optional: true
+            - name: API_SERVER_KEY
+              value: cluster-internal-trusted
+            - name: A2A_CAPABILITY_REQUIRED
+              value: "true"
+          image: ghcr.io/gke-labs/kube-agents/hermes-bridge:latest
+          imagePullPolicy: IfNotPresent
+          name: hermes-bridge
+          resources:
+            limits:
+              cpu: "1"
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - mountPath: /opt/data
+              name: platform-agent-data-vol
+            - mountPath: /opt/data/leader_elect.py
+              name: platform-agent-config-vol
+              subPath: leader_elect.py
+            - mountPath: /etc/hermes
+              name: platform-agent-managed-vol
+              readOnly: true
+            - mountPath: /etc/kube-agents
+              name: platform-agent-scope-vol
+              readOnly: true
+            - mountPath: /opt/agent-config
+              name: platform-agent-config-vol
+              readOnly: true
+            - mountPath: /opt/data/SETTINGS.md
+              name: settings-volume
+              readOnly: true
+              subPath: SETTINGS.md
+            - mountPath: /var/lib/kube-agents/session
+              name: system-metadata
+              subPath: session
+            - mountPath: /etc/gitops
+              name: gitops-state-volume
+              readOnly: true
+            - mountPath: /tmp
+              name: tmp-scratch
+            - mountPath: /etc/sandbox-ssh
+              name: sandbox-ssh
+              readOnly: true
+            - mountPath: /var/run/secrets/kubeagents/credential-proxy
+              name: agent-credential-proxy-token
+              readOnly: true
+            - mountPath: /etc/a2a-nats-ca
+              name: a2a-nats-ca
+              readOnly: true
+      initContainers:
+        - args:
+            - |-
+              rm -rf -- \
+                /workspace/home/.config/gcloud \
+                /workspace/home/.config/gh \
+                /workspace/home/.aws/credentials \
+                /workspace/home/.aws/cli/cache \
+                /workspace/home/.aws/sso/cache \
+                /workspace/home/.azure \
+                /workspace/home/.docker/config.json \
+                /workspace/home/.git-credentials \
+                /workspace/home/.hermes/.env \
+                /workspace/home/.kube/config \
+                /workspace/home/.netrc \
+                /workspace/home/.npmrc \
+                /workspace/home/.pypirc
+          command:
+            - sh
+            - -ec
+          image: ghcr.io/gke-labs/kube-agents/platform-agent:latest
+          imagePullPolicy: IfNotPresent
+          name: sandbox-credential-cleanup
+          resources:
+            limits:
+              cpu: 200m
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - mountPath: /workspace
+              name: platform-agent-data-vol
+        - args:
+            - |-
+              set -eu
+              if [ -r /etc/sandbox-ssh-secret/id_ed25519 ]; then
+                install -m 0600 /etc/sandbox-ssh-secret/id_ed25519 /etc/sandbox-ssh/id_ed25519
+                echo "sandbox ssh key staged at /etc/sandbox-ssh/id_ed25519"
+              else
+                echo "no SANDBOX_SSH_PRIVATE_KEY in the agent credentials Secret; the shell sandbox will be unreachable"
+              fi
+          command:
+            - /bin/sh
+            - -c
+          image: ghcr.io/gke-labs/kube-agents/platform-agent:latest
+          imagePullPolicy: IfNotPresent
+          name: sandbox-ssh-key
+          resources:
+            limits:
+              cpu: 100m
+              memory: 64Mi
+            requests:
+              cpu: 10m
+              memory: 16Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - mountPath: /etc/sandbox-ssh-secret
+              name: sandbox-ssh-secret
+              readOnly: true
+            - mountPath: /etc/sandbox-ssh
+              name: sandbox-ssh
+        - command:
+            - /usr/local/bin/start-services
+          env:
+            - name: PLATFORM_AGENT_HOME
+              value: /tmp/credential-proxy
+            - name: HOME
+              value: /tmp/credential-proxy/home
+            - name: KUBECONFIG
+              value: /var/run/event-watcher/watcher.config
+            - name: AGENT_API_PROXY_PORT
+              value: "8643"
+            - name: AGENT_API_UPSTREAM_KEY
+              value: cluster-internal-trusted
+            - name: API_SERVER_KEY
+              value: cluster-internal-trusted
+            - name: API_SERVER_EXTERNAL_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: api-key
+                  name: platformagent-secrets
+            - name: SESSION_KV_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: SESSION_KV_API_KEY
+                  name: platform-agent-secrets
+                  optional: true
+            - name: WATCHER_BROKER_URL
+              value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
+            - name: WATCHER_BROKER_TOKEN_FILE
+              value: /var/run/secrets/kubeagents/watcher-proxy/token
+            - name: CREDENTIAL_PROXY_WORKSPACE_ROOT
+              value: /opt/data
+            - name: EVENT_WATCHER_CLUSTER_NAME
+              value: cluster-a
+            - name: EVENT_WATCHER_MEMORY_LIMIT_BYTES
+              valueFrom:
+                resourceFieldRef:
+                  containerName: agent-api-auth
+                  divisor: "1"
+                  resource: limits.memory
+            - name: EVENT_WATCHER_ENABLED
+              value: "true"
+            - name: EVENT_WATCHER_METRICS_PORT
+              value: "9095"
+            - name: DRIFT_DETECTOR_ENABLED
+              value: "false"
+            - name: CREDENTIAL_PROXY_ROLE
+              value: api-proxy
+          image: ghcr.io/gke-labs/kube-agents/credential-proxy:latest
+          imagePullPolicy: IfNotPresent
+          name: agent-api-auth
+          ports:
+            - containerPort: 8643
+              name: proxy-api
+            - containerPort: 9095
+              name: event-metrics
+          readinessProbe:
+            failureThreshold: 3
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            tcpSocket:
+              port: proxy-api
+            timeoutSeconds: 3
+          resources:
+            limits:
+              cpu: "1"
+              ephemeral-storage: 2Gi
+              memory: 2Gi
+            requests:
+              cpu: 150m
+              memory: 384Mi
+          restartPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - mountPath: /tmp
+              name: credential-proxy-tmp
+            - mountPath: /var/run/event-watcher
+              name: event-watcher-kubeconfig
+            - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              name: event-watcher-ksa-token
+              readOnly: true
+            - mountPath: /opt/data
+              name: platform-agent-data-vol
+            - mountPath: /var/run/secrets/kubeagents/watcher-proxy
+              name: watcher-credential-proxy-token
+              readOnly: true
+      securityContext:
+        fsGroup: 10000
+        runAsGroup: 10000
+        runAsNonRoot: true
+        runAsUser: 10000
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: platformagent-gateway-agent
+      volumes:
+        - name: platform-agent-data-vol
+          persistentVolumeClaim:
+            claimName: platformagent-data
+        - configMap:
+            defaultMode: 493
+            name: platformagent-config
+          name: platform-agent-config-vol
+        - configMap:
+            defaultMode: 292
+            items:
+              - key: managed-config.yaml
+                path: config.yaml
+              - key: managed.env
+                path: .env
+            name: platformagent-config
+          name: platform-agent-managed-vol
+        - configMap:
+            defaultMode: 292
+            items:
+              - key: scope.json
+                path: scope.json
+            name: platformagent-config
+            optional: true
+          name: platform-agent-scope-vol
+        - configMap:
+            defaultMode: 420
+            name: platformagent-fluent-bit-config
+          name: fluent-bit-config
+        - emptyDir: {}
+          name: fluent-bit-state
+        - name: system-metadata
+          persistentVolumeClaim:
+            claimName: system-metadata
+        - configMap:
+            defaultMode: 420
+            name: platformagent-settings
+          name: settings-volume
+        - configMap:
+            defaultMode: 420
+            name: platformagent-gitops-state
+          name: gitops-state-volume
+        - emptyDir:
+            sizeLimit: 2Gi
+          name: tmp-scratch
+        - emptyDir:
+            sizeLimit: 2Gi
+          name: credential-proxy-tmp
+        - emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+          name: event-watcher-kubeconfig
+        - name: event-watcher-ksa-token
+          projected:
+            defaultMode: 256
+            sources:
+              - serviceAccountToken:
+                  expirationSeconds: 3600
+                  path: token
+              - configMap:
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+                  name: kube-root-ca.crt
+              - downwardAPI:
+                  items:
+                    - fieldRef:
+                        apiVersion: v1
+                        fieldPath: metadata.namespace
+                      path: namespace
+        - name: agent-credential-proxy-token
+          projected:
+            defaultMode: 256
+            sources:
+              - serviceAccountToken:
+                  audience: kubeagents-credential-proxy-chat
+                  expirationSeconds: 3600
+                  path: token
+        - name: watcher-credential-proxy-token
+          projected:
+            defaultMode: 256
+            sources:
+              - serviceAccountToken:
+                  audience: kubeagents-credential-proxy-watcher
+                  expirationSeconds: 3600
+                  path: token
+        - name: a2a-bus-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: a2a-bus
+                  expirationSeconds: 3600
+                  path: token
+        - configMap:
+            name: platformagent-a2a-nats-ca-bundle
+            optional: true
+          name: a2a-nats-ca
+        - name: sandbox-ssh-secret
+          secret:
+            defaultMode: 292
+            items:
+              - key: SANDBOX_SSH_PRIVATE_KEY
+                path: id_ed25519
+            optional: true
+            secretName: platform-agent-secrets
+        - emptyDir: {}
+          name: sandbox-ssh
+status: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  ports:
+    - name: api
+      port: 8642
+      targetPort: 8643
+    - name: dashboard
+      port: 9119
+      targetPort: dashboard
+  selector:
+    app: platformagent-gateway
+status:
+  loadBalancer: {}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: platformagent-gateway
+status:
+  currentHealthy: 0
+  desiredHealthy: 0
+  disruptionsAllowed: 0
+  expectedPods: 0
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  labels:
+    app: platformagent-gateway
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-gateway-netpol
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: node-local-dns
+        - ipBlock:
+            cidr: 169.254.20.10/32
+        - ipBlock:
+            cidr: 169.254.169.254/32
+        - ipBlock:
+            cidr: 10.96.0.10/32
+    - ports:
+        - port: 80
+          protocol: TCP
+        - port: 4000
+          protocol: TCP
+        - port: 8080
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app: litellm
+        - podSelector:
+            matchLabels:
+              app: standalone-replay
+    - ports:
+        - port: 80
+          protocol: TCP
+        - port: 8000
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app: gemma-server
+    - ports:
+        - port: 443
+          protocol: TCP
+        - port: 6443
+          protocol: TCP
+        - port: 8443
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 10.96.0.1/32
+    - ports:
+        - port: 443
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16
+        - ipBlock:
+            cidr: ::/0
+            except:
+              - fc00::/7
+              - fe80::/10
+              - ff00::/8
+    - ports:
+        - port: 8080
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app: github-token-minter
+    - ports:
+        - port: 8888
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: api
+              app.kubernetes.io/name: hindsight
+    - ports:
+        - port: 2222
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app: platformagent-shell
+    - ports:
+        - port: 8765
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app: platformagent-credential-proxy
+              kubeagents.x-k8s.io/component: credential-proxy
+    - ports:
+        - port: 4222
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: a2a-next
+              kubeagents.x-k8s.io/a2a-component: nats
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 8642
+          protocol: TCP
+        - port: 8643
+          protocol: TCP
+        - port: 9119
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gmp-system
+      ports:
+        - port: 9095
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kubeagents-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kube-agents-operator
+      ports:
+        - port: 9095
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gmp-system
+      ports:
+        - port: 9097
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kubeagents-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kube-agents-operator
+      ports:
+        - port: 9097
+          protocol: TCP
+  podSelector:
+    matchLabels:
+      app: platformagent-gateway
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: v1
+data:
+  bridge-activity-key: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  bridge-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  callout-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  console-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  gateway-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  seed-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  sys-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  web-password: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+kind: Secret
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: nats-creds
+  name: platformagent-a2a-nats-creds
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
+data:
+  issuer-public: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  issuer-seed: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  xkey-public: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  xkey-seed: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+kind: Secret
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: callout-keys
+  name: platformagent-a2a-callout-keys
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
+data:
+  ca.crt: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  ca.key: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+kind: Secret
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: nats-ca
+  name: platformagent-a2a-nats-ca
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+type: Opaque
+---
+apiVersion: v1
+data:
+  ca.crt: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  tls.crt: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+  tls.key: PEdFTkVSQVRFRF9GT1JfVEVTVFM+
+kind: Secret
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: nats-tls
+  name: platformagent-a2a-nats-tls
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+type: kubernetes.io/tls
+---
+apiVersion: v1
+data:
+  ca.crt: <GENERATED_FOR_TESTS>
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: nats-ca-bundle
+  name: platformagent-a2a-nats-ca-bundle
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
+data:
+  identities.json: |
+    {
+      "version": "72b81cbcb7a7a0e1",
+      "identities": [
+        {
+          "serviceAccount": "system:serviceaccount:kubeagents-system:platformagent-a2a-provision",
+          "user": "provision",
+          "account": "APP",
+          "grants": {
+            "publish": [
+              "a2a.topics.agent.platform.upgrade-readiness",
+              "a2a.topics.shared.blueprint",
+              "a2a.topics.shared.annotations",
+              "$JS.API.INFO",
+              "$JS.API.STREAM.NAMES",
+              "$JS.API.STREAM.LIST",
+              "$JS.API.STREAM.CREATE.TASKS",
+              "$JS.API.STREAM.CREATE.DIRECTORY",
+              "$JS.API.STREAM.CREATE.TOPICS-STATE",
+              "$JS.API.STREAM.CREATE.TOPICS-JOURNAL",
+              "$JS.API.STREAM.CREATE.KV_runtime-state",
+              "$JS.API.STREAM.CREATE.KV_session-state",
+              "$JS.API.STREAM.CREATE.KV_cap",
+              "$JS.API.STREAM.INFO.TASKS",
+              "$JS.API.STREAM.INFO.DIRECTORY",
+              "$JS.API.STREAM.INFO.TOPICS-STATE",
+              "$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+              "$JS.API.STREAM.INFO.KV_runtime-state",
+              "$JS.API.STREAM.INFO.KV_session-state",
+              "$JS.API.STREAM.INFO.KV_cap",
+              "_INBOX.provision.>"
+            ],
+            "subscribe": [
+              "a2a.topics.>",
+              "_INBOX.provision.>"
+            ]
+          }
+        },
+        {
+          "serviceAccount": "system:serviceaccount:kubeagents-system:platformagent-a2a-session",
+          "user": "session",
+          "account": "APP",
+          "grants": {
+            "publish": null,
+            "subscribe": null
+          },
+          "narrowing": "pod"
+        },
+        {
+          "serviceAccount": "system:serviceaccount:kubeagents-system:platformagent-gateway-agent",
+          "user": "agent",
+          "account": "APP",
+          "grants": {
+            "publish": [
+              "a2a.topics.agent.platform.upgrade-readiness",
+              "a2a.topics.shared.blueprint",
+              "a2a.topics.shared.annotations",
+              "$JS.API.STREAM.INFO.TOPICS-STATE",
+              "$JS.API.DIRECT.GET.TOPICS-STATE.>",
+              "$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+              "$JS.API.DIRECT.GET.TOPICS-JOURNAL.>",
+              "chat.notify.gchat",
+              "chat.notify.slack",
+              "_INBOX.agent.>"
+            ],
+            "subscribe": [
+              "a2a.topics.>",
+              "chat.notify.reply.agent.>",
+              "_INBOX.agent.>"
+            ]
+          }
+        },
+        {
+          "serviceAccount": "system:serviceaccount:kubeagents-system:platformagent-a2a-verifier",
+          "user": "verifier",
+          "account": "APP",
+          "grants": {
+            "publish": [
+              "a2a.cap.reply.>",
+              "$JS.API.STREAM.INFO.KV_cap",
+              "$JS.API.DIRECT.GET.KV_cap",
+              "$JS.API.STREAM.MSG.GET.KV_cap",
+              "_INBOX.verifier.>"
+            ],
+            "subscribe": [
+              "a2a.cap.verify.*",
+              "_INBOX.verifier.>"
+            ]
+          }
+        }
+      ]
+    }
+kind: ConfigMap
+metadata:
+  annotations:
+    kubeagents.x-k8s.io/a2a-authmap-version: 72b81cbcb7a7a0e1
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: authmap
+  name: platformagent-a2a-authmap
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
+data:
+  nats.conf: IyBQTEFZR1JPVU5EIFBPU1RVUkUgKHN0YWdlIDEpOiBzaW5nbGUtbm9kZSBSMSBKZXRTdHJlYW0gKHByb2R1Y3Rpb246IDMtbm9kZQojIFIzKSwgbm8gYXVkaXQgZXhwb3J0ZXIsIG5vIGJyZWFrZXIsIGdhdGV3YXkgc3dlZXAgYXMgdGhlIG9ubHkgamFuaXRvci4gRWFjaAojIGhhcyBhIGRlY2lkZWQgZGVzaWduIGluIHRoZSBzcGVjcyAoc3BlYy1uYXRzLWRlcGxveW1lbnQubWQpOyBub25lIGdhdGVzCiMgbGV0dGluZyBwZW9wbGUgcGxheS4KIwojIEF1dGhlbnRpY2F0aW9uIGlzIE5PVCBvbiB0aGF0IGxpc3QgYW55IG1vcmUuIFRoZSBhdXRoIGNhbGxvdXQgaXMgYXJtZWQ6IGEKIyBjbGllbnQgcHJlc2VudHMgYSBwcm9qZWN0ZWQgS3ViZXJuZXRlcyBTZXJ2aWNlQWNjb3VudCB0b2tlbiwgdGhlIGNhbGxvdXQKIyB2YWxpZGF0ZXMgaXQgYWdhaW5zdCB0aGUgY2x1c3RlciB3aXRoIGEgVG9rZW5SZXZpZXcsIGFuZCBhbnN3ZXJzIHdpdGggdGhlCiMgcGVybWlzc2lvbiBzZXQgdGhlIG9wZXJhdG9yIG1hcHBlZCB0aGF0IGlkZW50aXR5IHRvLiBTZXNzaW9uIHBvZHMgZ28gdGhyb3VnaAojIGl0LCBhbmQgYSBzZXNzaW9uJ3MgZ3JhbnRzIGFyZSBkZXJpdmVkIGZyb20gdGhlIHBvZCB0aGUgQVBJIHNlcnZlciBhdHRlc3RlZAojIHJhdGhlciB0aGFuIHJlYWQgZnJvbSBhIG1hcCwgc28gdHdvIHNlc3Npb25zIG9uIG9uZSBhY2NvdW50IGNhbm5vdCByZWFjaCBlYWNoCiMgb3RoZXIuCiMKIyBUaGUgdXNlcnMgdGhhdCByZW1haW4gc3RhdGljIGJlbG93IGFyZSBvZiB0d28ga2luZHMsIGFuZCBlYWNoIHNheXMgd2hpY2ggaXQKIyBpcyB3aGVyZSBpdCBpcyBkZWZpbmVkLiBTb21lIGhhdmUgbm90aGluZyB0byBwcmVzZW50OiBhIGJyb3dzZXIsIGFuIG9wZXJhdG9yCiMgYXQgYSBwb3J0LWZvcndhcmQsIHRoZSBjYWxsb3V0IGl0c2VsZiwgd2hpY2ggY2Fubm90IGF1dGhlbnRpY2F0ZSB0aHJvdWdoCiMgaXRzZWxmLiBUaGUgcmVzdCBoYXZlIGEgU2VydmljZUFjY291bnQgYW5kIGNvdWxkIG1vdmUgdG9tb3Jyb3csIGJ1dCBubyBjbGllbnQKIyB0aGF0IHNlbmRzIGEgdG9rZW4geWV0IC0gbW92aW5nIHRoZSBpZGVudGl0eSBiZWZvcmUgdGhlIHByb2dyYW0gdGhhdCB1c2VzIGl0CiMgd291bGQgcmVmdXNlIHRoZSB3b3JrbG9hZCBhdCBjb25uZWN0LgoKc2VydmVyX25hbWU6IHBsYXRmb3JtYWdlbnQtYTJhLW5hdHMKcG9ydDogNDIyMgpodHRwOiA4MjIyCgojIFRMUyBvbiB0aGUgY2xpZW50IGxpc3RlbmVyLCByZXF1aXJlZCBvZiBldmVyeSBjb25uZWN0aW9uOiB0aGUgc2VydmVyCiMgYWR2ZXJ0aXNlcyB0bHNfcmVxdWlyZWQsIHNvIGEgY2xpZW50IHRoYXQgZGlhbHMgbmF0czovLyBpcyB0b2xkIHRvIHVwZ3JhZGUKIyBhbmQgb25lIHRoYXQgY2Fubm90IHZlcmlmeSB0aGlzIGNlcnRpZmljYXRlIGlzIHJlZnVzZWQuIFRoZSBzZXJ2aW5nIHBhaXIgaXMKIyB0aGUgb3BlcmF0b3ItbWludGVkIG9uZSBpbiB0aGUgcGxhdGZvcm1hZ2VudC1hMmEtbmF0cy10bHMgU2VjcmV0LAojIG1vdW50ZWQgYXMgYSBkaXJlY3RvcnkgKHBsYXRmb3JtYWdlbnRfYTJhX3Rscy5nbykuIFRoZSBtb25pdG9yaW5nIHBvcnQgYWJvdmUKIyBzdGF5cyBwbGFpbiBIVFRQOiBpdCBjYXJyaWVzIGhlYWx0aCBhbmQgc3RhdHMsIG5vdCBwYXlsb2FkcyBvciB0b2tlbnMuCnRscyB7CiAgY2VydF9maWxlOiAiL2V0Yy9uYXRzLXRscy90bHMuY3J0IgogIGtleV9maWxlOiAiL2V0Yy9uYXRzLXRscy90bHMua2V5Igp9CgojIEEgU2VydmljZUFjY291bnQgdG9rZW4gdHJhdmVscyBpbnNpZGUgdGhlIGNsaWVudCdzIENPTk5FQ1QgZnJhbWUsIGFuZCB0aGUKIyBkZWZhdWx0IG1heF9jb250cm9sX2xpbmUgb2YgNDA5NiBib3VuZHMgdGhhdCB3aG9sZSBmcmFtZSAtIG1lYXN1cmVkLCB0aGUKIyB1c2FibGUgcm9vbSBmb3IgdGhlIHRva2VuIGl0c2VsZiBpcyBhcm91bmQgMzkyMCBieXRlcyBvbmNlIHRoZSByZXN0IG9mIHRoZQojIENPTk5FQ1QgSlNPTiBpcyBhY2NvdW50ZWQgZm9yLiBBIHBsYWluIHByb2plY3RlZCB0b2tlbiBmaXRzIHdpdGggcm9vbSB0bwojIHNwYXJlOyBvbmUgYm91bmQgdG8gc2V2ZXJhbCBhdWRpZW5jZXMsIGZyb20gYSBjbGllbnQgd2l0aCBhIGxvbmcgbmFtZSwgZG9lcwojIG5vdC4gVGhlIGZhaWx1cmUgaXMgbm90IGdyYWNlZnVsOiB0aGUgc2VydmVyIGNsb3NlcyB0aGUgY29ubmVjdGlvbiB3aXRoCiMgIk1heGltdW0gQ29udHJvbCBMaW5lIEV4Y2VlZGVkIiBiZWZvcmUgYXV0aGVudGljYXRpb24gaGFwcGVucyBhdCBhbGwsIHNvIGl0CiMgcmVhZHMgYXMgdGhlIGJ1cyByZWZ1c2luZyBhIHdvcmtsb2FkIHJhdGhlciB0aGFuIGFzIGEgc2l6ZSBsaW1pdC4KbWF4X2NvbnRyb2xfbGluZTogNjU1MzYKCiMgV2Vic29ja2V0IGxpc3RlbmVyIGZvciB0aGUgY29uc29sZSBwYWdlIGFuZCB0aGUgcmVhZC1vbmx5IHdlYiB1c2VyLgojCiMgVExTLCBmcm9tIHRoZSBzYW1lIHNlcnZpbmcgcGFpciBhcyB0aGUgY2xpZW50IGxpc3RlbmVyICh0aGUgdGxzIGJsb2NrCiMgYWJvdmUpOiB0aGUgQ09OTkVDVCBmcmFtZSBjYXJyaWVzIGEgcGFzc3dvcmQsIHNvIHRoZSBwb2QtbmV0d29yayBsZWcgZnJvbQojIHRoZSBjb25zb2xlIHNlcnZlciBpcyBlbmNyeXB0ZWQgYW5kIHZlcmlmaWVkIGFnYWluc3QgdGhlIGJ1cyBDQS4gVGhlCiMgU2VydmljZSBpcyBDbHVzdGVySVAsIHNvIG5vdGhpbmcgT1VUU0lERSB0aGUgY2x1c3RlciByZWFjaGVzIHRoaXMgbGlzdGVuZXIuCiMgQW4gaW5ncmVzcyBOZXR3b3JrUG9saWN5IGZlbmNlcyB0aGUgcG9kIG5ldHdvcmsgdG9vOiA0MjIyIGZyb20gdGhlCiMgZW51bWVyYXRlZCBidXMgY2xpZW50cywgOTIyMiBmcm9tIHRoZSBjb25zb2xlIHNlcnZlciBhbG9uZSwgYW5kIG5vCiMgcG9kLW5ldHdvcmsgcGVlciBmb3IgODIyMi4gVGhlIGNvbnNvbGUgc2VydmVyIGlzIGFkbWl0dGVkIGJlY2F1c2UgaXQgaXMgdGhlCiMgcGFnZSdzIHByb3h5LiBBIGJyb3dzZXIgcmVhY2hlcyBpdCB0aHJvdWdoIGEga3ViZWN0bCBwb3J0LWZvcndhcmQgYW5kIGl0CiMgZm9yd2FyZHMgdGhlIHdlYnNvY2tldCBoZXJlIG92ZXIgd3NzLCB3aXRoIHRoZSBicm93c2VyJ3MgaGVhZGVycyBpbnRhY3QuIEl0CiMgaXMgbm90IGFuIGluLWNsdXN0ZXIgZG9vciBmb3IgYW55dGhpbmcgZWxzZS4gQSBwb3J0LWZvcndhcmQgc3RyYWlnaHQgdG8KIyA5MjIyIHN0aWxsIGVudGVycyBmcm9tIHRoZSBub2RlLCB3aGljaCBOZXR3b3JrUG9saWN5IGRvZXMgbm90IGdvdmVybiwgYnV0IGl0CiMgbm93IG5lZWRzIGEgVExTIGNsaWVudCB0aGF0IHRydXN0cyB0aGUgYnVzIENBIGFuZCBuYW1lcyB0aGUgU2VydmljZSBhcyBpdHMKIyBzZXJ2ZXIgbmFtZTogYSBicm93c2VyIGNhbm5vdCwgc28gdGhlIHBhZ2UgYWx3YXlzIGdvZXMgdGhyb3VnaCB0aGUgY29uc29sZS4KIwojIFRoZSBvcmlnaW4gYWxsb3ctbGlzdCBpcyB0aGUgY29uc29sZSBzZXJ2ZXIncyBvcmlnaW4gYXMgdGhlIGJyb3dzZXIgc2VlcyBpdAojIHRocm91Z2ggdGhlIGRvY3VtZW50ZWQgcG9ydC1mb3J3YXJkLiBUaGUgcHJveHkgZm9yd2FyZHMgT3JpZ2luIHVuY2hhbmdlZCwKIyBzbyB0aGUgbGlzdCBzdGlsbCBhcHBsaWVzLiBXZWJTb2NrZXRzIGFyZSBleGVtcHQgZnJvbSBDT1JTLCBhbmQgZm9yIGFzIGxvbmcKIyBhcyBhIHBvcnQtZm9yd2FyZCBydW5zLCBldmVyeSBwYWdlIHRoZSBvcGVyYXRvcidzIGJyb3dzZXIgdmlzaXRzIGNhbiB0cnkgdG8KIyBvcGVuIGEgc29ja2V0IHRocm91Z2ggaXQuCiMKIyBhbGxvd2VkX29yaWdpbnMsIE5PVCBzYW1lX29yaWdpbjogc2FtZV9vcmlnaW4gY29tcGFyZXMgdGhlIGJyb3dzZXIncyBPcmlnaW4KIyBhZ2FpbnN0IHRoZSBIb3N0IHRoaXMgbGlzdGVuZXIgc2VlcywgYW5kIGJlaGluZCB0aGUgcHJveHkgdGhhdCBpcyB0aGUgYnVzJ3MKIyBvd24gc2VydmljZSBuYW1lLCB3aGljaCBubyBicm93c2VyIHBhZ2UgaXMgc2VydmVkIGZyb20uIEEgQ0xJIG9yIE5vZGUgY2xpZW50CiMgc2VuZHMgbm8gT3JpZ2luIGhlYWRlciBhdCBhbGwsIHdoaWNoIGJvdGggc2V0dGluZ3MgcGVybWl0LgojCiMgT3JpZ2luIGlzIGJyb3dzZXItYXNzZXJ0ZWQsIHNvIHRoaXMgc3RvcHMgYSBicm93c2VyIHBhZ2UgYW5kIG5vdGhpbmcgZWxzZS4KIyBUaGUgYm91bmRhcnkgaXMgdGhlIGdyYW50IGxpc3RzIGJlbG93Lgp3ZWJzb2NrZXQgewogIHBvcnQ6IDkyMjIKICB0bHMgewogICAgY2VydF9maWxlOiAiL2V0Yy9uYXRzLXRscy90bHMuY3J0IgogICAga2V5X2ZpbGU6ICIvZXRjL25hdHMtdGxzL3Rscy5rZXkiCiAgfQogIGFsbG93ZWRfb3JpZ2luczogWyJodHRwOi8vbG9jYWxob3N0OjgwODAiLCAiaHR0cDovLzEyNy4wLjAuMTo4MDgwIl0KfQoKamV0c3RyZWFtIHsKICBzdG9yZV9kaXI6IC9kYXRhCiAgIyBVbmRlciB0aGUgNDBHaSBQVjsgdGhlIHN0cmVhbSBtYXhfYnl0ZXMgY2FwcyAoMjArNSsxKzEgR2lCKSBwbHVzIEtWIGxpdmUKICAjIGluc2lkZSB0aGlzLgogIG1heF9maWxlX3N0b3JlOiAzNDM1OTczODM2OAp9CmFjY291bnRzIHsKICAjIEFVVEg6IHRoZSBhdXRoIGNhbGxvdXQgc2VydmljZSBhbmQgbm90aGluZyBlbHNlLgogICMKICAjIEEgZGVkaWNhdGVkIGFjY291bnQsIGFuZCB0aGF0IGlzIGEgYm91bmRhcnkgcmF0aGVyIHRoYW4gdGlkaW5lc3MuIFRoZQogICMgc2VydmVyIHB1Ymxpc2hlcyBlYWNoIGF1dGhvcml6YXRpb24gcmVxdWVzdCBpbnRvIFRISVMgYWNjb3VudCBhbmQgdGFrZXMKICAjIHRoZSBmaXJzdCBhbnN3ZXIgdGhhdCBjb21lcyBiYWNrIG9uIHRoZSByZXBseSBpbmJveCDigJQgYW5kIGl0IGRvZXMgbm90CiAgIyBjaGVjayB0aGF0IHRoZSBhbnN3ZXIncyBvdXRlciBlbnZlbG9wZSB3YXMgc2lnbmVkIGJ5IHRoZSBjb25maWd1cmVkCiAgIyBpc3N1ZXIgKG1lYXN1cmVkOyB0aGUgaW5uZXIgdXNlciBKV1QncyBzaWduYXR1cmUgSVMgY2hlY2tlZCkuIFNvIGFueXRoaW5nCiAgIyBhYmxlIHRvIHB1Ymxpc2ggaW50byB0aGlzIGFjY291bnQncyAkU1lTLl9JTkJPWC4+IGFuZCB3aW4gdGhlIHJhY2UgY2FuCiAgIyBhbnN3ZXIgYW4gYXV0aG9yaXphdGlvbiByZXF1ZXN0LiBJdCBjb3VsZCBub3QgZm9yZ2UgYSBncmFudCB3aXRob3V0IHRoZQogICMgaXNzdWVyIHNlZWQsIGJ1dCBpdCBjb3VsZCByZWZ1c2Ugb25lLiBOb3RoaW5nIGVsc2UgYmVsb25ncyBpbiBoZXJlLgogIEFVVEggewogICAgdXNlcnMgWwogICAgICB7CiAgICAgICAgIyBUaGUgY2FsbG91dCBjYW5ub3QgYXV0aGVudGljYXRlIHRocm91Z2ggaXRzZWxmLCBzbyBpdCBpcyBleGVtcHQgdmlhCiAgICAgICAgIyBhdXRoX3VzZXJzIGJlbG93IGFuZCBjYXJyaWVzIGEgcGFzc3dvcmQuIFRoaXMgcGVybWlzc2lvbiBwYWlyIGlzCiAgICAgICAgIyB0aGUgZW50aXJlIHN1cmZhY2UgaXQgbmVlZHM6IHJlYWQgdGhlIHJlcXVlc3RzLCBhbnN3ZXIgdGhlbS4KICAgICAgICB1c2VyOiBjYWxsb3V0CiAgICAgICAgcGFzc3dvcmQ6ICI8R0VORVJBVEVEOnBsYXRmb3JtYWdlbnQtYTJhLW5hdHMtY3JlZHMvY2FsbG91dC1wYXNzd29yZD4iCiAgICAgICAgcGVybWlzc2lvbnMgewogICAgICAgICAgc3Vic2NyaWJlIHsgYWxsb3cgPSBbICIkU1lTLlJFUS5VU0VSLkFVVEgiIF0gfQogICAgICAgICAgcHVibGlzaCB7IGFsbG93ID0gWyAiJFNZUy5fSU5CT1guPiIgXSB9CiAgICAgICAgfQogICAgICB9CiAgICBdCiAgfQogIEFQUCB7CiAgICBqZXRzdHJlYW06IGVuYWJsZWQKICAgIHVzZXJzIFsKICAgICAgIyB0YXNrIHJlcXVlc3RlciwgY2hhdC1zZXNzaW9uIHN1cGVydmlzb3IsIHNlc3Npb24tcmVnaXN0cnkgb3duZXIuCiAgICAgICMgU1RBVElDLCBhbmQgdGhpcyBvbmUgaXMgYSBzZXF1ZW5jaW5nIGZhY3QgcmF0aGVyIHRoYW4gYSBwcm9wZXJ0eSBvZgogICAgICAjIHRoZSBnYXRld2F5LiBJdCBoYXMgYSBTZXJ2aWNlQWNjb3VudCBhbmQgY291bGQgYXV0aGVudGljYXRlIHdpdGggaXQKICAgICAgIyB0b21vcnJvdzsgd2hhdCBpdCBkb2VzIG5vdCB5ZXQgaGF2ZSBpcyBhIGNsaWVudCB0aGF0IHByZXNlbnRzIGEgdG9rZW4KICAgICAgIyBpbnN0ZWFkIG9mIGEgcGFzc3dvcmQsIGJlY2F1c2UgdGhlIGdhdGV3YXkgcHJvZ3JhbSBsYW5kcyBzZXBhcmF0ZWx5CiAgICAgICMgZnJvbSB0aGlzIHJlbmRlci4gTW92aW5nIHRoZSBpZGVudGl0eSBiZWZvcmUgdGhlIHByb2dyYW0gdGhhdCB1c2VzIGl0CiAgICAgICMgd291bGQgcmVmdXNlIHRoZSBnYXRld2F5IGF0IGNvbm5lY3Qgb24gZXZlcnkgaW5zdGFsbC4KICAgICAgIyBJdHMgJEpTLkFQSSBncmFudCBpcyBzY29wZWQgdG8gd2hhdCBpdCBlbWl0cywgYnkgbmFtZSBhbmQgYnkgdmVyYgogICAgICAjICgjMTY2Nik6IElORk8sIENPTlNVTUVSLkNSRUFURSwgQ09OU1VNRVIuTVNHLk5FWFQgYW5kIERJUkVDVC5HRVQgb24KICAgICAgIyBUQVNLUywgYW5kIElORk8sIERJUkVDVC5HRVQgYW5kIGNvbnN1bWVyIGNyZWF0ZS9kZWxldGUgb24KICAgICAgIyBLVl9zZXNzaW9uLXN0YXRlLCBpdHMgb3duIHJlZ2lzdHJ5LiBTbyBubyBTVFJFQU0uREVMRVRFLCBQVVJHRSwKICAgICAgIyBVUERBVEUgb3IgTVNHLkRFTEVURSBvbiBhbnkgc3RyZWFtIC0gb25lIFNUUkVBTS5ERUxFVEUuVEFTS1MgaGVyZQogICAgICAjIHVzZWQgdG8gZGVzdHJveSBldmVyeSB0YXNrJ3MgaGlzdG9yeSBhbmQgdGhlIGZpdmUgY29uc3VtZXJzIG9uIGl0IC0KICAgICAgIyBubyBDT05TVU1FUi5ERUxFVEUgb24gVEFTS1MsIGFuZCBub3RoaW5nIGF0IGFsbCBvbiBESVJFQ1RPUlksIHRoZQogICAgICAjIHRvcGljIHN0cmVhbXMgb3IgdGhlIG90aGVyIHR3byBidWNrZXRzLgogICAgICB7CiAgICAgICAgdXNlcjogZ2F0ZXdheQogICAgICAgIHBhc3N3b3JkOiAiPEdFTkVSQVRFRDpwbGF0Zm9ybWFnZW50LWEyYS1uYXRzLWNyZWRzL2dhdGV3YXktcGFzc3dvcmQ+IgogICAgICAgIHBlcm1pc3Npb25zIHsKICAgICAgICAgIHB1Ymxpc2ggewogICAgICAgICAgICBhbGxvdyA9IFsKICAgICAgICAgICAgICAiYTJhLnRhc2tzLiouKi5pbiIsCiAgICAgICAgICAgICAgImEyYS50YXNrcy4qLiouc3VwZXJ2aXNvciIsCiAgICAgICAgICAgICAgIiRLVi5zZXNzaW9uLXN0YXRlLj4iLAogICAgICAgICAgICAgICJjaGF0LmNvbnNvbGUuKi5vdXQiLAogICAgICAgICAgICAgICJjaGF0Lm5vdGlmeS5yZXBseS5hZ2VudC4+IiwKICAgICAgICAgICAgICAiJEtWLmNhcC5yb290LioiLAogICAgICAgICAgICAgICJjaGF0LmJvYXJkIiwKICAgICAgICAgICAgICAiJEpTLkFQSS5TVFJFQU0uSU5GTy5UQVNLUyIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuQ09OU1VNRVIuQ1JFQVRFLlRBU0tTLj4iLAogICAgICAgICAgICAgICIkSlMuQVBJLkNPTlNVTUVSLk1TRy5ORVhULlRBU0tTLioiLAogICAgICAgICAgICAgICIkSlMuQVBJLkRJUkVDVC5HRVQuVEFTS1MuPiIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuU1RSRUFNLklORk8uS1Zfc2Vzc2lvbi1zdGF0ZSIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuRElSRUNULkdFVC5LVl9zZXNzaW9uLXN0YXRlLj4iLAogICAgICAgICAgICAgICIkSlMuQVBJLkNPTlNVTUVSLkNSRUFURS5LVl9zZXNzaW9uLXN0YXRlLj4iLAogICAgICAgICAgICAgICIkSlMuQVBJLkNPTlNVTUVSLkRFTEVURS5LVl9zZXNzaW9uLXN0YXRlLioiLAogICAgICAgICAgICAgICIkSlMuQUNLLlRBU0tTLj4iLAogICAgICAgICAgICAgICIkSlMuRkMuPiIsCiAgICAgICAgICAgICAgIl9JTkJPWC5nYXRld2F5Lj4iCiAgICAgICAgICAgIF0KICAgICAgICAgICAgZGVueSA9IFsKICAgICAgICAgICAgICAiJEpTLkFQSS4qLiouS1ZfY2FwIiwKICAgICAgICAgICAgICAiJEpTLkFQSS4qLiouS1ZfY2FwLj4iLAogICAgICAgICAgICAgICIkSlMuQVBJLiouKi4qLktWX2NhcCIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuKi4qLiouS1ZfY2FwLj4iCiAgICAgICAgICAgIF0KICAgICAgICAgIH0KICAgICAgICAgIHN1YnNjcmliZSB7CiAgICAgICAgICAgIGFsbG93ID0gWwogICAgICAgICAgICAgICJhMmEudGFza3MuKi4qLmV2ZW50cyIsCiAgICAgICAgICAgICAgImEyYS50YXNrcy4qLiouc3VwZXJ2aXNvciIsCiAgICAgICAgICAgICAgImEyYS5hZ2VudHMuPiIsCiAgICAgICAgICAgICAgImFnZW50cy5oYi4+IiwKICAgICAgICAgICAgICAiJEtWLnNlc3Npb24tc3RhdGUuPiIsCiAgICAgICAgICAgICAgImNoYXQuY29uc29sZS4qLmluIiwKICAgICAgICAgICAgICAiY2hhdC5ub3RpZnkuZ2NoYXQiLAogICAgICAgICAgICAgICJjaGF0Lm5vdGlmeS5zbGFjayIsCiAgICAgICAgICAgICAgImNoYXQuYm9hcmQucmVwbHkuZ2F0ZXdheS4+IiwKICAgICAgICAgICAgICAiX0lOQk9YLmdhdGV3YXkuPiIKICAgICAgICAgICAgXQogICAgICAgICAgICBkZW55ID0gWwogICAgICAgICAgICAgICIkS1YuY2FwLj4iCiAgICAgICAgICAgIF0KICAgICAgICAgIH0KICAgICAgICB9CiAgICAgIH0KICAgICAgIyB0aGUgSGVybWVzIGJyaWRnZSBzaWRlY2FyOiBleGVjdXRvciBmb3IgdGhlIGBwbGF0Zm9ybWAgYWRkcmVzc2VlIG9ubHkuCiAgICAgICMgU1RBVElDIGJlY2F1c2UgaXQgc2hhcmVzIHRoZSBhZ2VudCBwb2QsIGFuZCBhIFNlcnZpY2VBY2NvdW50IHRva2VuIG5hbWVzIGEKICAgICAgIyBwb2QgcmF0aGVyIHRoYW4gYSBjb250YWluZXIg4oCUIGEgY2FsbG91dCBpZGVudGl0eSBoZXJlIHdvdWxkIGJlIHRoZSBhZ2VudAogICAgICAjIGNvbnRhaW5lcidzIGdyYW50cyBhbmQgdGhpcyBvbmUncyBhZGRlZCB0b2dldGhlciwgd2hpY2ggaXMgdGhlIGNyZWRlbnRpYWwKICAgICAgIyB0aGUgcmV0aXJlZCBgd29ya2VyYCB1c2VyIHdhcy4gSXRzIFdSSVRFIGlzIG5hcnJvd2VkIHRvIG9uZSBhZGRyZXNzZWU6CiAgICAgICMgcHVibGlzaGluZyBhbm90aGVyJ3MgZXZlbnRzIGlzIHJlZnVzZWQuIEl0cyBSRUFEIGlzIG5vdC4gVGhlIEpldFN0cmVhbQogICAgICAjIGdyYW50cyBiZWxvdyBuYW1lIHRoZSBUQVNLUyBzdHJlYW0sIGFuZCBib3RoIERJUkVDVC5HRVQgYW5kIGEgY29uc3VtZXIncwogICAgICAjIGZpbHRlcl9zdWJqZWN0IHJlYWNoIGV2ZXJ5IGFkZHJlc3NlZSBvbiBpdCwgc28gYSBob2xkZXIgb2YgdGhpcyBwYXNzd29yZAogICAgICAjIGNhbiByZWFkIGV2ZXJ5IHNlc3Npb24ncyBwcm9tcHRzLiBgd29ya2VyYCBoZWxkIHRoZSBpZGVudGljYWwgdHdvIGdyYW50cy4KICAgICAgewogICAgICAgIHVzZXI6IGJyaWRnZQogICAgICAgIHBhc3N3b3JkOiAiPEdFTkVSQVRFRDpwbGF0Zm9ybWFnZW50LWEyYS1uYXRzLWNyZWRzL2JyaWRnZS1wYXNzd29yZD4iCiAgICAgICAgcGVybWlzc2lvbnMgewogICAgICAgICAgcHVibGlzaCB7CiAgICAgICAgICAgIGFsbG93ID0gWwogICAgICAgICAgICAgICJhMmEudGFza3MucGxhdGZvcm0uKi5ldmVudHMiLAogICAgICAgICAgICAgICIkS1YucnVudGltZS1zdGF0ZS4+IiwKICAgICAgICAgICAgICAiJEpTLkFQSS5TVFJFQU0uSU5GTy5UQVNLUyIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuQ09OU1VNRVIuQ1JFQVRFLlRBU0tTLj4iLAogICAgICAgICAgICAgICIkSlMuQVBJLkNPTlNVTUVSLk1TRy5ORVhULlRBU0tTLioiLAogICAgICAgICAgICAgICIkSlMuQVBJLkRJUkVDVC5HRVQuVEFTS1MuPiIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuU1RSRUFNLklORk8uS1ZfcnVudGltZS1zdGF0ZSIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuQ09OU1VNRVIuQ1JFQVRFLktWX3J1bnRpbWUtc3RhdGUuPiIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuQ09OU1VNRVIuREVMRVRFLktWX3J1bnRpbWUtc3RhdGUuKiIsCiAgICAgICAgICAgICAgIiRKUy5BQ0suVEFTS1MuPiIsCiAgICAgICAgICAgICAgIiRKUy5GQy4+IiwKICAgICAgICAgICAgICAiX0lOQk9YLmJyaWRnZS4+IiwKICAgICAgICAgICAgICAiYTJhLmNhcC52ZXJpZnkucGxhdGZvcm0iLAogICAgICAgICAgICAgICJjaGF0LmJvYXJkLnJlcGx5LmdhdGV3YXkuPiIKICAgICAgICAgICAgXQogICAgICAgICAgICBkZW55ID0gWwogICAgICAgICAgICAgICIkSlMuQVBJLiouKi5LVl9jYXAiLAogICAgICAgICAgICAgICIkSlMuQVBJLiouKi5LVl9jYXAuPiIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuKi4qLiouS1ZfY2FwIiwKICAgICAgICAgICAgICAiJEpTLkFQSS4qLiouKi5LVl9jYXAuPiIKICAgICAgICAgICAgXQogICAgICAgICAgfQogICAgICAgICAgc3Vic2NyaWJlIHsKICAgICAgICAgICAgYWxsb3cgPSBbCiAgICAgICAgICAgICAgImEyYS50YXNrcy5wbGF0Zm9ybS4qLmluIiwKICAgICAgICAgICAgICAiJEtWLnJ1bnRpbWUtc3RhdGUuPiIsCiAgICAgICAgICAgICAgImEyYS5jYXAucmVwbHkucGxhdGZvcm0uPiIsCiAgICAgICAgICAgICAgImNoYXQuYm9hcmQiLAogICAgICAgICAgICAgICJfSU5CT1guYnJpZGdlLj4iCiAgICAgICAgICAgIF0KICAgICAgICAgICAgZGVueSA9IFsKICAgICAgICAgICAgICAiJEtWLmNhcC4+IgogICAgICAgICAgICBdCiAgICAgICAgICB9CiAgICAgICAgfQogICAgICB9CiAgICAgICMgaGFuZC1hcHBsaWVkIHNlZWQgdG9vbGluZy4gU1RBVElDIGJlY2F1c2UgaXQgaXMgYXBwbGllZCByYXRoZXIgdGhhbgogICAgICAjIHJlbmRlcmVkOiBpdCBleGlzdHMgb24gaW5zdGFsbHMgdG9kYXksIGFuZCByZW1vdmluZyBpdHMgdXNlciB3b3VsZCByZWZ1c2UKICAgICAgIyBpdCBhdCBjb25uZWN0IHRoZSBuZXh0IHRpbWUgaXQgcmFuLiBUaGUgcmVuZGVyZWQgcHJvdmlzaW9uZXIgYmVzaWRlIGl0CiAgICAgICMgZG9lcyB0aGUgc2FtZSBqb2IgdGhyb3VnaCB0aGUgY2FsbG91dC4KICAgICAgIyBJdHMgJEpTLkFQSSBncmFudCBpcyBzY29wZWQgdG8gdGhlIHN0cmVhbXMgdGhhdCBwcm92aXNpb25pbmcgY3JlYXRlcywgYnkKICAgICAgIyBuYW1lIGFuZCBieSB2ZXJiICgjMTMwNik6IENSRUFURSBhbmQgSU5GTyBvbiB0aG9zZSBhbmQgbm90aGluZyBlbHNlLCBzbyBubwogICAgICAjIFJFU1RPUkUsIG5vIE1TRy5ERUxFVEUgb3IgUFVSR0UsIG5vIENPTlNVTUVSLkNSRUFURSBhbmQgbm8gU1RSRUFNLkRFTEVURS4KICAgICAgIyBObyBhY2sgZ3JhbnQgZWl0aGVyIC0gc2VlZCBjcmVhdGVzIG5vIGNvbnN1bWVycywgc28gb25lIHdvdWxkIGJlIHB1cmUKICAgICAgIyB1bnVzZWQgY2FwYWJpbGl0eSB0byArVEVSTSBvdGhlciBwcmluY2lwYWxzJyBkZWxpdmVyaWVzICh0aGUgc2FtZSBkZWxldGlvbgogICAgICAjIHRoZSB3ZWIgdXNlciBnb3QpLgogICAgICAjIFNlZWQgYWxzbyByZWFkcyBubyB0b3BpY3MuICJhMmEgdG9waWNzIHJlYWQiIGlzIGEgc3RyZWFtIEFQSSBjYWxsCiAgICAgICMgKEdldExhc3RNc2dGb3JTdWJqZWN0LCBzbyAkSlMuQVBJLkRJUkVDVC5HRVQuPHN0cmVhbT4uPHN1YmplY3Q+IG9uIHRoZXNlCiAgICAgICMgc3RyZWFtcywgb3IgU1RSRUFNLk1TRy5HRVQgYXMgdGhlIGZhbGxiYWNrKSBhbmQgdGhlIHNjb3BlZCBncmFudCBiZWxvdwogICAgICAjIHJlZnVzZXMgYm90aC4gTm90aGluZyBydW5zIGl0IGFzIHNlZWQ6IHRoZSBzZWVkIHRvb2xpbmcgZG9lcyB3cml0ZXMgYW5kCiAgICAgICMgaW5mbyBjaGVja3Mgb25seSwgYW5kIHRoZSBhMmEgQ0xJIHJ1bnMgaW4gdGhlIGFnZW50IHBvZCBhcyBhZ2VudC4KICAgICAgewogICAgICAgIHVzZXI6IHNlZWQKICAgICAgICBwYXNzd29yZDogIjxHRU5FUkFURUQ6cGxhdGZvcm1hZ2VudC1hMmEtbmF0cy1jcmVkcy9zZWVkLXBhc3N3b3JkPiIKICAgICAgICBwZXJtaXNzaW9ucyB7CiAgICAgICAgICBwdWJsaXNoIHsKICAgICAgICAgICAgYWxsb3cgPSBbCiAgICAgICAgICAgICAgImEyYS50b3BpY3MuYWdlbnQucGxhdGZvcm0udXBncmFkZS1yZWFkaW5lc3MiLAogICAgICAgICAgICAgICJhMmEudG9waWNzLnNoYXJlZC5ibHVlcHJpbnQiLAogICAgICAgICAgICAgICJhMmEudG9waWNzLnNoYXJlZC5hbm5vdGF0aW9ucyIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuSU5GTyIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuU1RSRUFNLk5BTUVTIiwKICAgICAgICAgICAgICAiJEpTLkFQSS5TVFJFQU0uQ1JFQVRFLlRBU0tTIiwKICAgICAgICAgICAgICAiJEpTLkFQSS5TVFJFQU0uSU5GTy5UQVNLUyIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuU1RSRUFNLkNSRUFURS5ESVJFQ1RPUlkiLAogICAgICAgICAgICAgICIkSlMuQVBJLlNUUkVBTS5JTkZPLkRJUkVDVE9SWSIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuU1RSRUFNLkNSRUFURS5UT1BJQ1MtU1RBVEUiLAogICAgICAgICAgICAgICIkSlMuQVBJLlNUUkVBTS5JTkZPLlRPUElDUy1TVEFURSIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuU1RSRUFNLkNSRUFURS5UT1BJQ1MtSk9VUk5BTCIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuU1RSRUFNLklORk8uVE9QSUNTLUpPVVJOQUwiLAogICAgICAgICAgICAgICIkSlMuQVBJLlNUUkVBTS5DUkVBVEUuS1ZfcnVudGltZS1zdGF0ZSIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuU1RSRUFNLklORk8uS1ZfcnVudGltZS1zdGF0ZSIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuU1RSRUFNLkNSRUFURS5LVl9zZXNzaW9uLXN0YXRlIiwKICAgICAgICAgICAgICAiJEpTLkFQSS5TVFJFQU0uSU5GTy5LVl9zZXNzaW9uLXN0YXRlIiwKICAgICAgICAgICAgICAiJEpTLkFQSS5TVFJFQU0uQ1JFQVRFLktWX2NhcCIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuU1RSRUFNLklORk8uS1ZfY2FwIiwKICAgICAgICAgICAgICAiX0lOQk9YLnNlZWQuPiIKICAgICAgICAgICAgXQogICAgICAgICAgfQogICAgICAgICAgc3Vic2NyaWJlIHsKICAgICAgICAgICAgYWxsb3cgPSBbCiAgICAgICAgICAgICAgImEyYS50b3BpY3MuPiIsCiAgICAgICAgICAgICAgIl9JTkJPWC5zZWVkLj4iCiAgICAgICAgICAgIF0KICAgICAgICAgIH0KICAgICAgICB9CiAgICAgIH0KICAgICAgIyB0aGUgcmVhZCBzdXJmYWNlLCBhbmQgb25lIG9mIHRoZSB0d28gY3JlZGVudGlhbHMgcHVibGlzaGVkIHRvIGEKICAgICAgIyBicm93c2VyIGJ5IGRlc2lnbiAtIGNvbnNvbGUgaXMgdGhlIG90aGVyLiBTVEFUSUMgcGVybWFuZW50bHk6IGEgYnJvd3NlciBob2xkcyBubyBTZXJ2aWNlQWNjb3VudCB0b2tlbiBhbmQKICAgICAgIyB0aGVyZSBpcyBubyBtZWNoYW5pc20gYnkgd2hpY2ggaXQgY291bGQuIFJlYWQtb25seSBpcyBub3QgZXhwcmVzc2libGUgYXMKICAgICAgIyBhIHN1YmplY3QgbGlzdCAtIEpldFN0cmVhbSBwdXRzIHRoZSByZWFjaCBpbiB0aGUgcmVxdWVzdCBCT0RZIC0gc28gdGhlIEpTCiAgICAgICMgQVBJIGdyYW50cyBhcmUgZW51bWVyYXRlZCBwZXIgc3RyZWFtIGFuZCB0aGVyZSBpcyBubyBhY2sgZ3JhbnQuCiAgICAgIHsKICAgICAgICB1c2VyOiB3ZWIKICAgICAgICBwYXNzd29yZDogIjxHRU5FUkFURUQ6cGxhdGZvcm1hZ2VudC1hMmEtbmF0cy1jcmVkcy93ZWItcGFzc3dvcmQ+IgogICAgICAgIHBlcm1pc3Npb25zIHsKICAgICAgICAgIHB1Ymxpc2ggewogICAgICAgICAgICBhbGxvdyA9IFsKICAgICAgICAgICAgICAiJEpTLkFQSS5JTkZPIiwKICAgICAgICAgICAgICAiJEpTLkFQSS5TVFJFQU0uSU5GTy5UQVNLUyIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuU1RSRUFNLklORk8uRElSRUNUT1JZIiwKICAgICAgICAgICAgICAiJEpTLkFQSS5TVFJFQU0uSU5GTy5UT1BJQ1MtU1RBVEUiLAogICAgICAgICAgICAgICIkSlMuQVBJLlNUUkVBTS5JTkZPLlRPUElDUy1KT1VSTkFMIiwKICAgICAgICAgICAgICAiJEpTLkFQSS5DT05TVU1FUi5DUkVBVEUuVEFTS1MuPiIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuQ09OU1VNRVIuQ1JFQVRFLkRJUkVDVE9SWS4+IiwKICAgICAgICAgICAgICAiJEpTLkFQSS5DT05TVU1FUi5DUkVBVEUuVE9QSUNTLVNUQVRFLj4iLAogICAgICAgICAgICAgICIkSlMuQVBJLkNPTlNVTUVSLkNSRUFURS5UT1BJQ1MtSk9VUk5BTC4+IiwKICAgICAgICAgICAgICAiJEpTLkFQSS5DT05TVU1FUi5JTkZPLlRBU0tTLioiLAogICAgICAgICAgICAgICIkSlMuQVBJLkNPTlNVTUVSLklORk8uRElSRUNUT1JZLioiLAogICAgICAgICAgICAgICIkSlMuQVBJLkNPTlNVTUVSLklORk8uVE9QSUNTLVNUQVRFLioiLAogICAgICAgICAgICAgICIkSlMuQVBJLkNPTlNVTUVSLklORk8uVE9QSUNTLUpPVVJOQUwuKiIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuQ09OU1VNRVIuTVNHLk5FWFQuVEFTS1MuKiIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuQ09OU1VNRVIuTVNHLk5FWFQuRElSRUNUT1JZLioiLAogICAgICAgICAgICAgICIkSlMuQVBJLkNPTlNVTUVSLk1TRy5ORVhULlRPUElDUy1TVEFURS4qIiwKICAgICAgICAgICAgICAiJEpTLkFQSS5DT05TVU1FUi5NU0cuTkVYVC5UT1BJQ1MtSk9VUk5BTC4qIiwKICAgICAgICAgICAgICAiX0lOQk9YLndlYi4+IgogICAgICAgICAgICBdCiAgICAgICAgICB9CiAgICAgICAgICBzdWJzY3JpYmUgewogICAgICAgICAgICBhbGxvdyA9IFsKICAgICAgICAgICAgICAiYTJhLj4iLAogICAgICAgICAgICAgICJfSU5CT1gud2ViLj4iCiAgICAgICAgICAgIF0KICAgICAgICAgICAgZGVueSA9IFsKICAgICAgICAgICAgICAiYTJhLmNhcC4+IgogICAgICAgICAgICBdCiAgICAgICAgICB9CiAgICAgICAgfQogICAgICB9CiAgICAgICMgdGhlIHdlYiBjb25zb2xlOiB3ZWIncyByZWFkIHN1cmZhY2UgcGx1cyBvbmUgcHVibGlzaCwgY2hhdC5jb25zb2xlLiouaW4sCiAgICAgICMgd2hpY2ggaXMgdGhlIGdhdGV3YXkncyBjb25zb2xlIGFkYXB0ZXIncyBpbmJvdW5kIHN1YmplY3QuIFNUQVRJQyBmb3IKICAgICAgIyB3ZWIncyByZWFzb24uIE5vIEpldFN0cmVhbSB2ZXJiIG9uIGFueSBLVl8qIHN0cmVhbTogU1RSRUFNLklORk8ncwogICAgICAjIHN1YmplY3RzX2ZpbHRlciB3b3VsZCBsaXN0IGV2ZXJ5IGtleS4KICAgICAgewogICAgICAgIHVzZXI6IGNvbnNvbGUKICAgICAgICBwYXNzd29yZDogIjxHRU5FUkFURUQ6cGxhdGZvcm1hZ2VudC1hMmEtbmF0cy1jcmVkcy9jb25zb2xlLXBhc3N3b3JkPiIKICAgICAgICBwZXJtaXNzaW9ucyB7CiAgICAgICAgICBwdWJsaXNoIHsKICAgICAgICAgICAgYWxsb3cgPSBbCiAgICAgICAgICAgICAgIiRKUy5BUEkuSU5GTyIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuU1RSRUFNLklORk8uVEFTS1MiLAogICAgICAgICAgICAgICIkSlMuQVBJLlNUUkVBTS5JTkZPLkRJUkVDVE9SWSIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuU1RSRUFNLklORk8uVE9QSUNTLVNUQVRFIiwKICAgICAgICAgICAgICAiJEpTLkFQSS5TVFJFQU0uSU5GTy5UT1BJQ1MtSk9VUk5BTCIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuQ09OU1VNRVIuQ1JFQVRFLlRBU0tTLj4iLAogICAgICAgICAgICAgICIkSlMuQVBJLkNPTlNVTUVSLkNSRUFURS5ESVJFQ1RPUlkuPiIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuQ09OU1VNRVIuQ1JFQVRFLlRPUElDUy1TVEFURS4+IiwKICAgICAgICAgICAgICAiJEpTLkFQSS5DT05TVU1FUi5DUkVBVEUuVE9QSUNTLUpPVVJOQUwuPiIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuQ09OU1VNRVIuSU5GTy5UQVNLUy4qIiwKICAgICAgICAgICAgICAiJEpTLkFQSS5DT05TVU1FUi5JTkZPLkRJUkVDVE9SWS4qIiwKICAgICAgICAgICAgICAiJEpTLkFQSS5DT05TVU1FUi5JTkZPLlRPUElDUy1TVEFURS4qIiwKICAgICAgICAgICAgICAiJEpTLkFQSS5DT05TVU1FUi5JTkZPLlRPUElDUy1KT1VSTkFMLioiLAogICAgICAgICAgICAgICIkSlMuQVBJLkNPTlNVTUVSLk1TRy5ORVhULlRBU0tTLioiLAogICAgICAgICAgICAgICIkSlMuQVBJLkNPTlNVTUVSLk1TRy5ORVhULkRJUkVDVE9SWS4qIiwKICAgICAgICAgICAgICAiJEpTLkFQSS5DT05TVU1FUi5NU0cuTkVYVC5UT1BJQ1MtU1RBVEUuKiIsCiAgICAgICAgICAgICAgIiRKUy5BUEkuQ09OU1VNRVIuTVNHLk5FWFQuVE9QSUNTLUpPVVJOQUwuKiIsCiAgICAgICAgICAgICAgImNoYXQuY29uc29sZS4qLmluIiwKICAgICAgICAgICAgICAiX0lOQk9YLmNvbnNvbGUuPiIKICAgICAgICAgICAgXQogICAgICAgICAgfQogICAgICAgICAgc3Vic2NyaWJlIHsKICAgICAgICAgICAgYWxsb3cgPSBbCiAgICAgICAgICAgICAgImEyYS4+IiwKICAgICAgICAgICAgICAiY2hhdC5jb25zb2xlLioub3V0IiwKICAgICAgICAgICAgICAiX0lOQk9YLmNvbnNvbGUuPiIKICAgICAgICAgICAgXQogICAgICAgICAgfQogICAgICAgIH0KICAgICAgfQogICAgXQogIH0KICAjICRTWVM6IGh1bWFuIG9wZXJhdG9ycyBhbmQgbW9uaXRvcmluZyBvbmx5OyBubyBhZ2VudCBhdXRoZW50aWNhdGVzIGhlcmUuCiAgU1lTIHsKICAgIHVzZXJzIFsKICAgICAgIyBodW1hbiBvcGVyYXRvcnMgYW5kIG1vbml0b3JpbmcuIE5vIGFnZW50IGV2ZXIgYXV0aGVudGljYXRlcyBoZXJlLgogICAgICAjIFNUQVRJQzogdGhlIGhvbGRlciBpcyBhIHBlcnNvbiB3aXRoIGEgcG9ydC1mb3J3YXJkIG9yIGEgc2NyYXBlIGNvbmZpZy4KICAgICAgewogICAgICAgIHVzZXI6IHN5cwogICAgICAgIHBhc3N3b3JkOiAiPEdFTkVSQVRFRDpwbGF0Zm9ybWFnZW50LWEyYS1uYXRzLWNyZWRzL3N5cy1wYXNzd29yZD4iCiAgICAgIH0KICAgIF0KICB9Cn0Kc3lzdGVtX2FjY291bnQ6IFNZUwoKIyBUaGUgYXV0aCBjYWxsb3V0OiB3aG8gYSBjb25uZWN0aW9uIGlzLCBkZWNpZGVkIGFnYWluc3QgdGhlIGNsdXN0ZXIgdGhhdAojIGlzc3VlZCBpdHMgaWRlbnRpdHkgcmF0aGVyIHRoYW4gYWdhaW5zdCBhIHBhc3N3b3JkIHRoaXMgZmlsZSByZW5kZXJlZC4KIwojIFdoYXQgY2hhbmdlcyBmb3IgYSBjbGllbnQ6IGl0IHByZXNlbnRzIGEgcHJvamVjdGVkIFNlcnZpY2VBY2NvdW50IHRva2VuCiMgaW5zdGVhZCBvZiBhIHBhc3N3b3JkLCB0aGUgY2FsbG91dCB2YWxpZGF0ZXMgdGhhdCB0b2tlbiB3aXRoIGEgVG9rZW5SZXZpZXcKIyBhZ2FpbnN0IHRoZSBsb2NhbCBBUEkgc2VydmVyLCBhbmQgdGhlIGdyYW50cyBpdCBnZXRzIGJhY2sgYXJlIHRoZSBvbmVzIHRoZQojIG9wZXJhdG9yIHJlbmRlcmVkIGZvciB0aGF0IFNlcnZpY2VBY2NvdW50LiBXaGF0IGRvZXMgTk9UIGNoYW5nZSBpcyB3aGVyZQojIGVuZm9yY2VtZW50IGhhcHBlbnMg4oCUIHRoZSBwZXJtaXNzaW9uIHNldCBzdGlsbCBhcnJpdmVzIGJlZm9yZSB0aGUgY29ubmVjdGlvbgojIGlzIHVzYWJsZSwgYW5kIHRoZSBzZXJ2ZXIgc3RpbGwgcmVmdXNlcyBvbiBpdCB3aXRob3V0IGNvbnN1bHRpbmcgYW55CiMgYXBwbGljYXRpb24gY29kZS4KYXV0aG9yaXphdGlvbiB7CiAgIyBUd28gc2Vjb25kcywgYW5kIHRoaXMgaXMgYSBjZWlsaW5nIHJhdGhlciB0aGFuIGEgcHJlZmVyZW5jZS4KICAjCiAgIyBUaGUgc2VydmVyIHN0YXJ0cyBhIGZpcnN0LXBpbmcgdGltZXIgb24gYSBjb25uZWN0aW9uIHRoYXQgaGFzIG5vdCB5ZXQKICAjIGF1dGhlbnRpY2F0ZWQsIGF0IHJvdWdobHkgdHdvIHNlY29uZHMuIElmIHRoZSBjYWxsb3V0IGhhcyBub3QgYW5zd2VyZWQgYnkKICAjIHRoZW4gdGhlIGNsaWVudCByZWNlaXZlcyBhIFBJTkcgd2hlcmUgdGhlIEdvIGNsaWVudCBsaWJyYXJ5IHJlcXVpcmVzIGEKICAjIFBPTkcsIGFuZCBpdCBhYm9ydHMgdGhlIGNvbm5lY3QgcmVwb3J0aW5nICJleHBlY3RlZCAnUE9ORycsIGdvdCAnUElORyciIOKAlAogICMgd2hpY2ggbmFtZXMgbm90aGluZyBhYm91dCBhdXRob3JpemF0aW9uIGFuZCBzZW5kcyB3aG9ldmVyIGlzIGRlYnVnZ2luZyBpdAogICMgdG8gdGhlIG5ldHdvcmsgbGF5ZXIuIE1lYXN1cmVkOiBhdCB0aW1lb3V0IDIgdGhlIGZhaWx1cmUgaXMgYSBjbGVhbgogICMgQXV0aG9yaXphdGlvbiBWaW9sYXRpb24gYXQgYSBwcmVkaWN0YWJsZSBkZWFkbGluZTsgYXQgMyBvciBhYm92ZSBpdCBpcwogICMgdGhhdCBtZXNzYWdlIGluc3RlYWQuIEEgbWVyZWx5IFNMT1cgY2FsbG91dCBoaXRzIGl0IHRvbywgc28gdGhlIHJlYWwKICAjIGJ1ZGdldCBmb3IgYSBUb2tlblJldmlldyByb3VuZCB0cmlwIGlzIHVuZGVyIHR3byBzZWNvbmRzIHdoYXRldmVyIHRoaXMKICAjIG51bWJlciBzYXlzLgogIHRpbWVvdXQ6IDIKCiAgYXV0aF9jYWxsb3V0IHsKICAgICMgUHVibGljIGhhbHZlcyBvbmx5LiBUaGUgc2VlZHMgbGl2ZSBpbiB0aGUgY2FsbG91dCdzIG93biBTZWNyZXQsIHJlYWQgYnkKICAgICMgdGhlIGNhbGxvdXQgRGVwbG95bWVudCBhbmQgbm90aGluZyBlbHNlLiBUaGUgaXNzdWVyIHNpZ25zIHRoZSB1c2VyIEpXVHMKICAgICMgdGhhdCBjYXJyeSB0aGUgcGVybWlzc2lvbnMgdGhpcyBzZXJ2ZXIgZW5mb3JjZXMsIHNvIGl0cyBob2xkZXIgY2FuIG1pbnQgYQogICAgIyB1c2VyIHdpdGggYW55IGdyYW50cyBhdCBhbGwg4oCUIGluY2x1ZGluZyBwdWJsaXNoIG9uICRLVi5jYXAucm9vdC4+IGFuZCByZWFkCiAgICAjIG9uICRLVi5jYXAuPiwgd2hpY2ggaXMgdGhlIHdob2xlIGNhcGFiaWxpdHkgc3RvcmUuIFNlZSB0aGUgY2FsbG91dC1rZXlzCiAgICAjIFNlY3JldCBmb3IgdGhlIGN1c3RvZHkgbm90ZS4KICAgIGlzc3VlcjogPEdFTkVSQVRFRDpwbGF0Zm9ybWFnZW50LWEyYS1jYWxsb3V0LWtleXMvaXNzdWVyLXB1YmxpYz4KICAgIGFjY291bnQ6IEFVVEgKCiAgICAjIFRoZSByZXF1ZXN0IGNhcnJpZXMgdGhlIGNsaWVudCdzIHJhdyBTZXJ2aWNlQWNjb3VudCB0b2tlbiwgc28gaXQgaXMKICAgICMgZW5jcnlwdGVkIGluIGZsaWdodCB0byB0aGUgY2FsbG91dC4gTm90ZSB0aGUgc2VydmVyIGRvZXMgbm90IHJlcXVpcmUgdGhlCiAgICAjIFJFU1BPTlNFIHRvIGJlIGVuY3J5cHRlZCBldmVuIHdpdGggdGhpcyBzZXQsIHNvIHJlc3BvbnNlIGNvbmZpZGVudGlhbGl0eQogICAgIyBpcyB0aGUgY2FsbG91dCdzIG93biBkaXNjaXBsaW5lIHJhdGhlciB0aGFuIHNvbWV0aGluZyBlbmZvcmNlZCBoZXJlLgogICAgeGtleTogPEdFTkVSQVRFRDpwbGF0Zm9ybWFnZW50LWEyYS1jYWxsb3V0LWtleXMveGtleS1wdWJsaWM+CgogICAgIyBFeGVtcHQgZnJvbSB0aGUgY2FsbG91dDogYXV0aGVudGljYXRlZCBmcm9tIHRoaXMgZmlsZSwgYnkgdXNlcm5hbWUuCiAgICAjCiAgICAjIFRoaXMgaXMgYSBieXBhc3MgYW5kIG5vdCBhIGZhbGxiYWNrIOKAlCBhIGxpc3RlZCB1c2VyIHdpdGggYSB3cm9uZwogICAgIyBwYXNzd29yZCBpcyByZWZ1c2VkIHN0YXRpY2FsbHkgYW5kIG5ldmVyIHJlYWNoZXMgdGhlIGNhbGxvdXQgYXQgYWxsLgogICAgIyBUaGUgbGlzdCBpcyB0aGUgY2FsbG91dCBpdHNlbGYsIHdoaWNoIGNhbm5vdCBhdXRoZW50aWNhdGUgdGhyb3VnaAogICAgIyBpdHNlbGYsIHBsdXMgZXZlcnkgaWRlbnRpdHkgbWFya2VkIFNUQVRJQyBhYm92ZS4gVGhlIHNlc3Npb24gZW50cnkgaXMKICAgICMgYWJzZW50IGV4YWN0bHkgYmVjYXVzZSBpdCBpcyBub3Qgb25lOiBhIHNlc3Npb24gcG9kIHByZXNlbnRzIGEKICAgICMgcG9kLWJvdW5kIFNlcnZpY2VBY2NvdW50IHRva2VuIGFuZCB0aGUgY2FsbG91dCBzY29wZXMgaXQgdG8gaXRzIG93bgogICAgIyB0YXNrLiBEbyBub3QgcmVhZCB0aGlzIGxpc3QgYXMgdGhlIHNlc3Npb24gcGF0aC4KICAgICMKICAgICMgQSBuYW1lIGlzIGhlcmUgZm9yIG9uZSBvZiB0aHJlZSByZWFzb25zLCBhbmQgZWFjaCBpZGVudGl0eSdzIG93biBjb21tZW50CiAgICAjIGFib3ZlIHNheXMgd2hpY2guIEl0IGNhbiBob2xkIG5vIHByb2plY3RlZCB0b2tlbiBhdCBhbGwg4oCUIHRoZSBicm93c2VyJ3MKICAgICMgdHdvIGNyZWRlbnRpYWxzLCB3ZWIgYW5kIGNvbnNvbGUsIHRoZSAkU1lTIGxvZ2luIGhlbGQgYnkgYSBwZXJzb24sIHRoZQogICAgIyBzZWVkIHRvb2xpbmcgdGhhdCBpcyBhcHBsaWVkIHJhdGhlciB0aGFuIHJ1bi4gT3IgaXQgaXMgYSBzaWRlY2FyLCB3aGljaAogICAgIyBhIFNlcnZpY2VBY2NvdW50IHRva2VuIGNhbm5vdCBuYW1lIGFwYXJ0IGZyb20gdGhlIGNvbnRhaW5lciBiZXNpZGUgaXQg4oCUCiAgICAjIHRoZSBicmlkZ2UsIHdob3NlIG93biBjb21tZW50IGFib3ZlIHNheXMgd2hhdCBhIGNhbGxvdXQgZW50cnkgdGhlcmUKICAgICMgd291bGQgbWVyZ2UuIE9yIGl0IGNvdWxkIG1vdmUgYW5kIGhhcyBub3Q6IGdhdGV3YXksIHdoaWNoIGlzIHRoZQogICAgIyByZW1haW5pbmcgbWlncmF0aW9uLiBUaGUgZmlyc3QgdHdvIHJlYXNvbnMgYXJlIHBlcm1hbmVudDsgb25seSB0aGUKICAgICMgdGhpcmQgaXMgYSBtaWdyYXRpb24uCiAgICBhdXRoX3VzZXJzOiBbIGNhbGxvdXQsIGdhdGV3YXksIGJyaWRnZSwgc2VlZCwgd2ViLCBjb25zb2xlLCBzeXMgXQogIH0KfQo=
+kind: Secret
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: nats-config
+  name: platformagent-a2a-nats-config
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: nats
+  name: platformagent-a2a-nats
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: platformagent-a2a-nats
+  serviceName: platformagent-a2a-nats
+  template:
+    metadata:
+      annotations:
+        kubeagents.x-k8s.io/a2a-config-hash: <SHA256_FOR_TESTS>
+      labels:
+        app: platformagent-a2a-nats
+        app.kubernetes.io/instance: kubeagents-system-platformagent
+        app.kubernetes.io/managed-by: platformagent-controller
+        app.kubernetes.io/name: platform-agent
+        app.kubernetes.io/part-of: a2a-next
+        kubeagents.x-k8s.io/a2a-component: nats
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - args:
+            - -c
+            - /etc/nats/nats.conf
+          image: nats:2.10-alpine
+          name: nats
+          ports:
+            - containerPort: 4222
+              name: client
+            - containerPort: 8222
+              name: monitor
+            - containerPort: 9222
+              name: websocket
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: monitor
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+            requests:
+              cpu: 250m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - mountPath: /etc/nats
+              name: config
+              readOnly: true
+            - mountPath: /etc/nats-tls
+              name: tls
+              readOnly: true
+            - mountPath: /data
+              name: data
+      securityContext:
+        fsGroup: 1000
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: config
+          secret:
+            secretName: platformagent-a2a-nats-config
+        - name: tls
+          secret:
+            secretName: platformagent-a2a-nats-tls
+  updateStrategy: {}
+  volumeClaimTemplates:
+    - metadata:
+        labels:
+          app.kubernetes.io/instance: kubeagents-system-platformagent
+          app.kubernetes.io/managed-by: platformagent-controller
+          app.kubernetes.io/name: platform-agent
+          app.kubernetes.io/part-of: a2a-next
+          kubeagents.x-k8s.io/a2a-component: nats
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 40Gi
+      status: {}
+status:
+  availableReplicas: 0
+  replicas: 0
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: nats
+  name: platformagent-a2a-nats
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  ports:
+    - name: client
+      port: 4222
+      targetPort: 0
+    - name: monitor
+      port: 8222
+      targetPort: 0
+    - name: websocket
+      port: 9222
+      targetPort: 0
+  selector:
+    app: platformagent-a2a-nats
+status:
+  loadBalancer: {}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: callout
+  name: platformagent-a2a-callout
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: provision
+  name: platformagent-a2a-provision
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: session
+  name: platformagent-a2a-session
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: callout
+  name: platformagent-a2a-callout
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+rules:
+  - apiGroups:
+      - ""
+    resourceNames:
+      - platformagent-a2a-authmap
+    resources:
+      - configmaps
+    verbs:
+      - get
+      - list
+      - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: callout
+  name: platformagent-a2a-callout
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: platformagent-a2a-callout
+subjects:
+  - kind: ServiceAccount
+    name: platformagent-a2a-callout
+    namespace: kubeagents-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: callout
+  name: platformagent-a2a-callout
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: platformagent-a2a-callout
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      annotations:
+        a2a.kubeagents.x-k8s.io/identity-map-schema: "3"
+      labels:
+        app: platformagent-a2a-callout
+        app.kubernetes.io/instance: kubeagents-system-platformagent
+        app.kubernetes.io/managed-by: platformagent-controller
+        app.kubernetes.io/name: platform-agent
+        app.kubernetes.io/part-of: a2a-next
+        kubeagents.x-k8s.io/a2a-component: callout
+    spec:
+      automountServiceAccountToken: true
+      containers:
+        - env:
+            - name: NATS_URL
+              value: tls://platformagent-a2a-nats.kubeagents-system.svc:4222
+            - name: NATS_CA_FILE
+              value: /etc/a2a-nats-ca/ca.crt
+            - name: NATS_USER
+              value: callout
+            - name: NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: callout-password
+                  name: platformagent-a2a-nats-creds
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: A2A_AUTHMAP_NAME
+              value: platformagent-a2a-authmap
+            - name: A2A_AUTHMAP_KEY
+              value: identities.json
+            - name: A2A_TOKEN_AUDIENCE
+              value: a2a-bus
+            - name: A2A_RESERVED_PRINCIPALS
+              value: callout,gateway,bridge,seed,web,console,sys
+            - name: A2A_RESERVED_ADDRESSEES
+              value: platform
+            - name: A2A_ISSUER_SEED
+              valueFrom:
+                secretKeyRef:
+                  key: issuer-seed
+                  name: platformagent-a2a-callout-keys
+            - name: A2A_XKEY_SEED
+              valueFrom:
+                secretKeyRef:
+                  key: xkey-seed
+                  name: platformagent-a2a-callout-keys
+          image: ghcr.io/gke-labs/kube-agents/a2a-authcallout:latest
+          livenessProbe:
+            failureThreshold: 6
+            httpGet:
+              path: /livez
+              port: 8080
+            periodSeconds: 10
+          name: callout
+          ports:
+            - containerPort: 8080
+              name: status
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /readyz
+              port: 8080
+            periodSeconds: 5
+          resources:
+            limits:
+              cpu: 500m
+              memory: 256Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - mountPath: /etc/a2a-nats-ca
+              name: a2a-nats-ca
+              readOnly: true
+          workingDir: /
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: platformagent-a2a-callout
+      topologySpreadConstraints:
+        - labelSelector:
+            matchLabels:
+              app: platformagent-a2a-callout
+          matchLabelKeys:
+            - pod-template-hash
+          maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+      volumes:
+        - configMap:
+            name: platformagent-a2a-nats-ca-bundle
+          name: a2a-nats-ca
+status: {}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: callout
+  name: platformagent-a2a-callout
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: platformagent-a2a-callout
+  unhealthyPodEvictionPolicy: AlwaysAllow
+status:
+  currentHealthy: 0
+  desiredHealthy: 0
+  disruptionsAllowed: 0
+  expectedPods: 0
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: callout
+  name: platformagent-a2a-callout
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  ports:
+    - name: status
+      port: 8080
+      targetPort: 8080
+  selector:
+    app: platformagent-a2a-callout
+  type: ClusterIP
+status:
+  loadBalancer: {}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: callout
+  name: kubeagents:a2a-callout-tokenreview:kubeagents-system:platformagent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: platformagent-a2a-callout
+    namespace: kubeagents-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: verifier
+  name: platformagent-a2a-verifier
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: verifier
+  name: platformagent-a2a-verifier
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: platformagent-a2a-verifier
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: platformagent-a2a-verifier
+        app.kubernetes.io/instance: kubeagents-system-platformagent
+        app.kubernetes.io/managed-by: platformagent-controller
+        app.kubernetes.io/name: platform-agent
+        app.kubernetes.io/part-of: a2a-next
+        kubeagents.x-k8s.io/a2a-component: verifier
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - env:
+            - name: NATS_URL
+              value: tls://platformagent-a2a-nats.kubeagents-system.svc:4222
+            - name: NATS_CA_FILE
+              value: /etc/a2a-nats-ca/ca.crt
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          image: ghcr.io/gke-labs/kube-agents/a2a-verifier:latest
+          livenessProbe:
+            failureThreshold: 6
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 10
+          name: verifier
+          ports:
+            - containerPort: 8080
+              name: status
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /readyz
+              port: 8080
+            periodSeconds: 5
+          resources:
+            limits:
+              cpu: 500m
+              memory: 256Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - mountPath: /var/run/secrets/a2a-bus
+              name: a2a-bus-token
+              readOnly: true
+            - mountPath: /etc/a2a-nats-ca
+              name: a2a-nats-ca
+              readOnly: true
+          workingDir: /
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: platformagent-a2a-verifier
+      topologySpreadConstraints:
+        - labelSelector:
+            matchLabels:
+              app: platformagent-a2a-verifier
+          matchLabelKeys:
+            - pod-template-hash
+          maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+      volumes:
+        - name: a2a-bus-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: a2a-bus
+                  expirationSeconds: 3600
+                  path: token
+        - configMap:
+            name: platformagent-a2a-nats-ca-bundle
+          name: a2a-nats-ca
+status: {}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: verifier
+  name: platformagent-a2a-verifier
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: platformagent-a2a-verifier
+  unhealthyPodEvictionPolicy: AlwaysAllow
+status:
+  currentHealthy: 0
+  desiredHealthy: 0
+  disruptionsAllowed: 0
+  expectedPods: 0
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: nats-netpol
+  name: platformagent-a2a-nats-netpol
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: platformagent-a2a-callout
+        - podSelector:
+            matchLabels:
+              app: platformagent-gateway
+        - podSelector:
+            matchLabels:
+              app: platformagent-a2a-gateway
+        - podSelector:
+            matchLabels:
+              app: platformagent-a2a-verifier
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: a2a-session
+              app.kubernetes.io/part-of: a2a-next
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: a2a-next
+              kubeagents.x-k8s.io/a2a-component: provision
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: a2a-next
+              kubeagents.x-k8s.io/a2a-component: seed
+      ports:
+        - port: 4222
+          protocol: TCP
+    - from:
+        - podSelector:
+            matchLabels:
+              app: platformagent-a2a-console
+      ports:
+        - port: 9222
+          protocol: TCP
+  podSelector:
+    matchLabels:
+      app: platformagent-a2a-nats
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: session-netpol
+  name: platformagent-a2a-session-netpol
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: node-local-dns
+        - ipBlock:
+            cidr: 169.254.20.10/32
+        - ipBlock:
+            cidr: 169.254.169.254/32
+        - ipBlock:
+            cidr: 10.96.0.10/32
+    - ports:
+        - port: 4222
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kubeagents-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: a2a-next
+              kubeagents.x-k8s.io/a2a-component: nats
+    - ports:
+        - port: 80
+          protocol: TCP
+        - port: 4000
+          protocol: TCP
+        - port: 8080
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kubeagents-system
+          podSelector:
+            matchLabels:
+              app: litellm
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: a2a-session
+      app.kubernetes.io/part-of: a2a-next
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: verifier-netpol
+  name: platformagent-a2a-verifier-netpol
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: node-local-dns
+        - ipBlock:
+            cidr: 169.254.20.10/32
+        - ipBlock:
+            cidr: 169.254.169.254/32
+        - ipBlock:
+            cidr: 10.96.0.10/32
+    - ports:
+        - port: 4222
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kubeagents-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: a2a-next
+              kubeagents.x-k8s.io/a2a-component: nats
+  podSelector:
+    matchLabels:
+      app: platformagent-a2a-verifier
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: console-netpol
+  name: platformagent-a2a-console-netpol
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  podSelector:
+    matchLabels:
+      app: platformagent-a2a-console
+  policyTypes:
+    - Ingress
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: console
+  name: platformagent-a2a-console
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: platformagent-a2a-console
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: platformagent-a2a-console
+        app.kubernetes.io/instance: kubeagents-system-platformagent
+        app.kubernetes.io/managed-by: platformagent-controller
+        app.kubernetes.io/name: platform-agent
+        app.kubernetes.io/part-of: a2a-next
+        kubeagents.x-k8s.io/a2a-component: console
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - env:
+            - name: CONSOLE_BUS_URL
+              value: https://platformagent-a2a-nats.kubeagents-system.svc:9222
+            - name: CONSOLE_USER
+              value: console
+            - name: CONSOLE_PASSWORD_FILE
+              value: /var/run/secrets/a2a-console/console-password
+            - name: CONSOLE_ALLOWED_HOSTS
+              value: localhost:8080,127.0.0.1:8080
+            - name: NATS_CA_FILE
+              value: /etc/a2a-nats-ca/ca.crt
+          image: ghcr.io/gke-labs/kube-agents/a2a-console:latest
+          livenessProbe:
+            failureThreshold: 6
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 10
+          name: console
+          ports:
+            - containerPort: 8080
+              name: http
+          readinessProbe:
+            failureThreshold: 3
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 5
+          resources:
+            limits:
+              memory: 128Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - mountPath: /var/run/secrets/a2a-console
+              name: console-key
+              readOnly: true
+            - mountPath: /etc/a2a-nats-ca
+              name: a2a-nats-ca
+              readOnly: true
+          workingDir: /
+      securityContext:
+        fsGroup: 1000
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: console-key
+          secret:
+            items:
+              - key: console-password
+                mode: 288
+                path: console-password
+            optional: true
+            secretName: platformagent-a2a-nats-creds
+        - configMap:
+            name: platformagent-a2a-nats-ca-bundle
+          name: a2a-nats-ca
+status: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: console
+  name: platformagent-a2a-console
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+  selector:
+    app: platformagent-a2a-console
+  type: ClusterIP
+status:
+  loadBalancer: {}
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: session-quota
+  name: platformagent-a2a-session-quota
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  hard:
+    pods: "26"
+status: {}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: gateway
+  name: platformagent-a2a-gateway
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: gateway
+  name: platformagent-a2a-gateway
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - create
+      - get
+      - list
+      - watch
+      - delete
+  - apiGroups:
+      - apps
+    resourceNames:
+      - platformagent-a2a-gateway
+    resources:
+      - deployments
+    verbs:
+      - get
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resourceNames:
+      - platformagent
+    resources:
+      - platformagents
+    verbs:
+      - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: gateway
+  name: platformagent-a2a-gateway
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: platformagent-a2a-gateway
+subjects:
+  - kind: ServiceAccount
+    name: platformagent-a2a-gateway
+    namespace: kubeagents-system
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: provision
+  name: platformagent-a2a-provision-758f0999
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  backoffLimit: 20
+  podFailurePolicy:
+    rules:
+      - action: FailJob
+        onExitCodes:
+          operator: In
+          values:
+            - 2
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/instance: kubeagents-system-platformagent
+        app.kubernetes.io/managed-by: platformagent-controller
+        app.kubernetes.io/name: platform-agent
+        app.kubernetes.io/part-of: a2a-next
+        kubeagents.x-k8s.io/a2a-component: provision
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - command:
+            - sh
+            - -c
+            - |
+              # PLAYGROUND POSTURE (stage 1): single-node R1 JetStream (production: 3-node
+              # R3), no audit exporter, no breaker, gateway sweep as the only janitor. Each
+              # has a decided design in the specs (spec-nats-deployment.md); none gates
+              # letting people play.
+              #
+              # Authentication is NOT on that list any more. The auth callout is armed: a
+              # client presents a projected Kubernetes ServiceAccount token, the callout
+              # validates it against the cluster with a TokenReview, and answers with the
+              # permission set the operator mapped that identity to. Session pods go through
+              # it, and a session's grants are derived from the pod the API server attested
+              # rather than read from a map, so two sessions on one account cannot reach each
+              # other.
+              #
+              # The users that remain static below are of two kinds, and each says which it
+              # is where it is defined. Some have nothing to present: a browser, an operator
+              # at a port-forward, the callout itself, which cannot authenticate through
+              # itself. The rest have a ServiceAccount and could move tomorrow, but no client
+              # that sends a token yet - moving the identity before the program that uses it
+              # would refuse the workload at connect.
+              set -euo pipefail
+              # This Job authenticates to the bus with its own projected ServiceAccount
+              # token, which the auth callout resolves against the cluster. It holds no
+              # password: there is no "provision" entry in nats.conf at all.
+              #
+              # The token goes in the PASSWORD field rather than a --token flag. NOT for
+              # secrecy: --password puts it on argv exactly as --token would, so it is in
+              # /proc/<pid>/cmdline for the life of each call either way, and the pod is the
+              # boundary that matters. The reason is that the username half then carries the
+              # ServiceAccount this Job claims to be - a claim the callout does not trust and
+              # does not need to, since it validates the token and derives the identity from
+              # the TokenReview. It travels because it costs nothing and makes a connection
+              # legible in a server-side log. The callout accepts the token in either field.
+              BUS_TOKEN="$(cat /var/run/secrets/a2a-bus/token)"
+
+              # --inbox-prefix: every stream/kv call here is a $JS.API request whose reply
+              # lands on an inbox, and this principal may only subscribe under
+              # _INBOX.provision.> — the CLI's default _INBOX.<nuid> would be refused and
+              # every call would time out.
+              NATS="nats --server tls://platformagent-a2a-nats.kubeagents-system.svc:4222 --tlsca /etc/a2a-nats-ca/ca.crt --user ${BUS_USER} --password ${BUS_TOKEN} --inbox-prefix=_INBOX.provision"
+
+              # max_consumers caps each stream. Consumer durability is a request-body
+              # field, so no permission list can hold web to ephemeral ones (see the web user
+              # in nats.conf); the cap is what stops an unreapable durable per page-load from
+              # growing the file store without bound. The failure it converts to is loud — a
+              # refused create — rather than silent disk growth. Note the trade: a client that
+              # burns the cap can also deny a legitimate consumer, which is the right way
+              # round for a playground and the wrong one for production, where the callout
+              # mints per-identity users and this becomes a per-user limit instead.
+              #
+              # Three streams keep the flat 64. TASKS does not: it is the one stream session
+              # pods create consumers on, three apiece, so its cap is derived from this CR's
+              # maxSessions (a2aTasksMaxConsumers) and a stream that cannot hold the
+              # configured concurrency is a refusal below rather than a task failure at load.
+
+              # Retention rule (deployment spec): acknowledgement must not delete — all
+              # message streams are limits-based with an age window; replay is a read.
+              # Every stream carries a hard max_bytes with discard old so a flood degrades
+              # replay oldest-first instead of filling the PV and stalling JetStream.
+              #
+              # --allow-direct is stated on every stream even though it is the CLI's
+              # default: the bus grants are written for the direct-get
+              # route (nats.go picks DIRECT.GET or STREAM.MSG.GET from the stream's own
+              # config), so the bit the grant rests on is set here, not inherited.
+
+              # TASKS: a2a.tasks.>, 72h dev window, 20GiB cap.
+              #
+              # max_msgs_per_subject bounds ONE SUBJECT, which on this stream is one class of
+              # one task: a2a.tasks.{addressee}.{taskId}.{in,events,supervisor}. Read what it
+              # does and does not buy, because the two are easy to swap.
+              #
+              # It buys: a runaway executor - a loop, a harness streaming forever - can no
+              # longer push 20GiB through the stream on one task and, with discard=old, evict
+              # every other session's history on the way. The runaway now pays for its own
+              # runaway and nobody else's.
+              #
+              # It does NOT buy containment of a session that means it. A session's publish
+              # grant is a2a.tasks.<pod>.*.events (authcallout/session.go, sessionGrants: the
+              # task id is not in the attested claim, so the grant cannot name one), so a
+              # session can mint unbounded distinct subjects by inventing task ids. A
+              # per-subject cap is not a per-publisher budget, and JetStream has no per-
+              # publisher budget to reach for. Closing that means putting the task id in the
+              # claim, which is a change to the callout's narrowing and not to a stream flag.
+              #
+              # 4096, sized against the publisher that means it rather than the well-behaved
+              # one: the render sets no max_payload, so NATS' 1MiB default is the per-message
+              # ceiling and 4096 messages is a ~4GiB worst case on one subject, a fifth of the
+              # stream. The worker adapter's own result chunks are resultChunkSize (256 KiB),
+              # so a task built out of those reaches nearer 1GiB at the same count - but that
+              # is a property of one publisher and not a bound the bus enforces. A chat-driven
+              # task emits single digits to low hundreds of events; reaching 4096 is already a
+              # loop or a gigabyte of streamed artifact text.
+              #
+              # What happens at the limit, because discard=old evicts the OLDEST message on
+              # the subject first: the oldest event on a task's ...events subject is its
+              # 'submitted' status-update, which assertion 9 requires and which FoldTask
+              # folds into StatusHistory[0]. A truncated task therefore replays without its
+              # head. That is only acceptable because the fold now SAYS so - lib.Task's
+              # SubmittedMissing is the assertion-9 observation, the sibling of
+              # PostFinalDropped for assertion 10 - so the eviction is a degradation a reader
+              # can see rather than a short history it cannot distinguish from a real one.
+              #
+              # The same eviction on the ...in class is quieter and worse, and this flag
+              # does not ship without the check that answers it. That subject's oldest
+              # message is the task's originating kind:message, which the worker re-reads on
+              # every start. Steers are kind:message too and nothing on the envelope marks
+              # the submission, so a scan past the cap returns the oldest surviving steer and
+              # the worker executes that as the request - with no SubmittedMissing to show
+              # for it, because nothing folds ...in. No stream flag closes that: per-subject
+              # discard:new would refuse the steer instead of the submission, which breaks
+              # steering, and there is no 'keep the head' policy. It is closed on the client
+              # side instead. The gateway publishes the submission before it spawns the pod,
+              # so the ack names the sequence; it passes that to the pod as A2A_ORIGIN_SEQ
+              # and the adapter opens its origin consumer there and refuses to run if the
+              # message it gets back is a different sequence. See a2a/worker-adapter
+              # fetchOriginAtSeq and docs/designs/spec-nats-deployment.md.
+              $NATS stream info TASKS >/dev/null 2>&1 || $NATS stream add TASKS --allow-direct \
+                --subjects='a2a.tasks.>' --storage=file --retention=limits \
+                --max-age=72h --max-bytes=21474836480 --discard=old --replicas=1 \
+                --max-msgs-per-subject=4096 \
+                --max-consumers=110 --defaults
+
+              # DIRECTORY: last-value — the tombstone replaces the card. 1GiB cap.
+              $NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY --allow-direct \
+                --subjects='a2a.agents.>' --storage=file --retention=limits \
+                --max-msgs-per-subject=1 --max-bytes=1073741824 --discard=old --replicas=1 --max-consumers=64 --defaults
+
+              # TOPICS-STATE: current answer plus short history, no age limit. 1GiB cap.
+              # State-class topics (provisioned registry): upgrade-readiness, blueprint, probe.
+              #
+              # The probe subject is the one here with NO writer, deliberately, and it is the
+              # single exception to the rule that a topic's subject list and its writer's
+              # grant travel together. It exists so that an authorization probe has a real
+              # provisioned subject to be refused ON: a refusal against an unprovisioned
+              # subject proves only that the subject does not exist, while a refusal here
+              # proves the grant. The web rail ships that probe as a button, so it is pressed
+              # in front of an audience rather than living in a test file.
+              #
+              # It was aimed at the blueprint topic first. That works right up until the
+              # grant is wrong, at which point the probe writes junk into a state-class
+              # topic the fleet actually reads - and "it cannot happen while the grants
+              # hold" is the assumption the web user already broke once. A writerless
+              # subject makes the failure mode land nowhere.
+              $NATS stream info TOPICS-STATE >/dev/null 2>&1 || $NATS stream add TOPICS-STATE --allow-direct \
+                --subjects='a2a.topics.agent.platform.upgrade-readiness,a2a.topics.shared.blueprint,a2a.topics.shared.probe' \
+                --storage=file --retention=limits \
+                --max-msgs-per-subject=8 --max-bytes=1073741824 --discard=old --replicas=1 --max-consumers=64 --defaults
+
+              # TOPICS-JOURNAL: append-only, ages out at 30d. 5GiB cap.
+              # Journal-class topics: annotations.
+              $NATS stream info TOPICS-JOURNAL >/dev/null 2>&1 || $NATS stream add TOPICS-JOURNAL --allow-direct \
+                --subjects='a2a.topics.shared.annotations' --storage=file --retention=limits \
+                --max-age=720h --max-bytes=5368709120 --discard=old --replicas=1 --max-consumers=64 --defaults
+
+              # Heartbeats (agents.hb.>) are core NATS, outside JetStream — no stream.
+
+              # KV buckets: runtime-state (who is alive), session-state (the gateway's
+              # registry; its user is the only writer), cap (the capability entries of
+              # docs/architecture/09-capability-envelope.md; the gateway writes one per
+              # task at ingress and only the verifier may read them). Capped at 256MiB
+              # each: the streams' max_bytes discipline applies to KV too, or unbounded
+              # bucket growth eats the file store's headroom and stalls every JetStream
+              # write.
+              #
+              # The cap bucket has no TTL and nothing deletes from it, so it fills — at a ~180-byte
+              # entry that is order 1.5M tasks. KV is discard=new, so the bucket REFUSES
+              # the write rather than evicting: the gateway cannot mint, and a gateway
+              # that cannot mint refuses the turn. That is the fail-closed direction, and
+              # it is the reason there is no TTL here — an entry that expired under a
+              # running task would refuse that task mid-flight instead. Reclaiming is a
+              # "nats kv del cap" against a finished task's key; no tooling ships for it
+              # and the runbook says so.
+              $NATS kv info runtime-state >/dev/null 2>&1 || $NATS kv add runtime-state --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
+              $NATS kv info session-state >/dev/null 2>&1 || $NATS kv add session-state --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
+              $NATS kv info cap           >/dev/null 2>&1 || $NATS kv add cap --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
+
+              # TASKS older than this render: the limits the create above could not apply.
+              #
+              # Provisioning is create-only convergence - the info-then-add guards never
+              # edit an existing stream, which buildA2AProvisionJob says in terms - so an
+              # install whose TASKS predates a limit keeps the stream it was created with
+              # and gains nothing from a re-run. Both limits this render puts on TASKS are
+              # in exactly that position on every install that already has the stream, and
+              # the two gaps are not the same kind:
+              #
+              #   max_consumers short is a capacity shortfall with a load-time failure
+              #   attached. A legitimate session's consumer create is refused, surfaced as
+              #   a task failure, with nothing in it pointing at the stream. Worth
+              #   refusing over here, where the number that caused it is in hand.
+              #
+              #   max_msgs_per_subject absent is a missing bound, not a broken one: the
+              #   install behaves exactly as it did before this render carried the flag.
+              #   Applying it would be a TIGHTENING, and a tightening evicts: a
+              #   stream edit that lowers max_msgs_per_subject drops every message over
+              #   the new limit on every subject the moment it lands. Truncating a running
+              #   install's task history as an automatic side effect of an operator
+              #   upgrade is not a decision this script takes on an operator's behalf. It
+              #   reports, names the edit and what the edit costs, and moves on.
+              #
+              # This runs LAST, after every other stream and bucket, so the refusal below
+              # leaves a fully provisioned bus short one limit rather than a bus missing
+              # DIRECTORY, the topic streams and the KV buckets. The refusal is reached on
+              # an operator upgrade alone, with no CR edit involved - an install already
+              # running maxSessions above what its stream holds has been under-provisioned
+              # the whole time, and this is the first thing that says so.
+              #
+              # Parsed with grep rather than jq: nats-box is the image, and grep is in
+              # busybox for certain. An unparseable answer FAILS - a check that silently
+              # skips when its extractor stops matching is not a check.
+              tasks_json="$($NATS stream info TASKS --json | tr -d ' \t\r\n')"
+
+              live_subject_cap="$(printf '%s' "${tasks_json}" \
+                | grep -o '"max_msgs_per_subject":-\{0,1\}[0-9]\{1,\}' | head -n1 | cut -d: -f2 || true)"
+              if [ -z "${live_subject_cap}" ]; then
+                echo "could not read max_msgs_per_subject off the TASKS stream; refusing to report this install as provisioned" >&2
+                exit 1
+              fi
+              #
+              # Unbounded and merely different are not the same report. An unbounded stream
+              # is the gap: nothing stops one task evicting another session's history, which
+              # is the whole reason the render carries the flag. A stream carrying some other
+              # finite cap is bounded already, and telling the operator who chose it that
+              # their stream "predates the limit" is telling them something false about their
+              # own install.
+              #
+              # report is the same finding for the operator, as one line of JSON written
+              # to the container's termination message below: the pod log goes with the
+              # Job's TTL, and the reconcile reads this off the pod and records it as an
+              # Event on the PlatformAgent (reportA2AProvisionFindings). An empty object
+              # says the check ran and found nothing.
+              report='{}'
+              if [ "${live_subject_cap}" = "-1" ] || [ "${live_subject_cap}" = "0" ]; then
+                report="{\"tasks_subject_cap\":{\"live\":${live_subject_cap},\"want\":4096}}"
+                echo "NOTE: TASKS carries max_msgs_per_subject=${live_subject_cap} - no per-subject limit; this render creates it at 4096." >&2
+                echo "  The stream predates the limit and provisioning does not edit an existing stream, so until" >&2
+                echo "  an operator applies it one task's events can still evict another session's history." >&2
+                echo "  Applying it evicts, on every subject already over the limit, oldest first - and a task's" >&2
+                echo "  oldest event is its 'submitted' one, so those tasks replay opening mid-history. Readers" >&2
+                echo "  report that rather than hiding it. With that understood:" >&2
+                echo "    nats stream edit TASKS --max-msgs-per-subject=4096" >&2
+              elif [ "${live_subject_cap}" != "4096" ]; then
+                echo "NOTE: TASKS carries max_msgs_per_subject=${live_subject_cap}; this render creates it at 4096." >&2
+                echo "  Bounded either way, so no task can evict another session's history - this is drift between" >&2
+                echo "  the stream and the render, not the unbounded gap. Provisioning does not edit an existing" >&2
+                echo "  stream and does not assume the difference is unintended. To align it anyway, knowing that" >&2
+                echo "  lowering it evicts every subject already over the new value, oldest event first:" >&2
+                echo "    nats stream edit TASKS --max-msgs-per-subject=4096" >&2
+              fi
+              # Written only where the kubelet has mounted the file: outside a pod there is
+              # nothing to write to, and a copy of a report is not a reason to fail a fully
+              # provisioned bus. Nor is a write that fails (a full or faulting disk under
+              # the kubelet's file): under set -e that would exit 1 on a bus this script
+              # just finished provisioning, and exit 1 matches no podFailurePolicy rule, so
+              # the Job would burn its backoff into BackoffLimitExceeded. A pod that has no
+              # file, or whose write failed, leaves no message, and the reconcile logs that
+              # rather than reading it as clean.
+              if [ -w "/dev/termination-log" ]; then
+                printf '%s' "${report}" > "/dev/termination-log" \
+                  || echo "WARNING: could not write the provision report to the termination log; the log above is this run's only record" >&2
+              fi
+
+              required_consumers=110
+              live_consumers="$(printf '%s' "${tasks_json}" \
+                | grep -o '"max_consumers":-\{0,1\}[0-9]\{1,\}' | head -n1 | cut -d: -f2 || true)"
+              if [ -z "${live_consumers}" ]; then
+                echo "could not read max_consumers off the TASKS stream; refusing to report this install as provisioned" >&2
+                exit 1
+              fi
+              if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_consumers}" ]; then
+                echo "TASKS holds max_consumers=${live_consumers} but this PlatformAgent needs ${required_consumers}:" >&2
+                echo "  spec.harness.tuning.maxSessions is 10, each session creates 3 consumers on TASKS," >&2
+                echo "  plus 80 reserved for the standing durables, the web rail and tasks/get replays." >&2
+                echo "  (the replay share of that reserve is sized for 10 bridge workers: the operator renders the bridge, at the" >&2
+                echo "  A2A_BRIDGE_CONCURRENCY in its own environment, or 10 when that is unset, 2 when it is not a count)." >&2
+                echo "Provisioning does not edit an existing stream, and this one limit could not be" >&2
+                echo "edited anyway: nats-server refuses a max_consumers change on a stream that exists," >&2
+                echo "  \"stream configuration update can not change MaxConsumers\"" >&2
+                echo "and the bus this operator renders is pinned to nats:2.10, where that refusal holds." >&2
+                fits=$(( (live_consumers - 80) / 3 ))
+                workers_fit=$(( (live_consumers - 30 - 20) / 6 ))
+                if [ "${fits}" -ge 1 ]; then
+                  echo "So either lower spec.harness.tuning.maxSessions to at most ${fits} - the most a" >&2
+                  echo "  stream holding ${live_consumers} consumers has room for, with 80 of them reserved and" >&2
+                  echo "  the rest going 3 to a session - or delete the TASKS stream and provision again." >&2
+                else
+                  echo "Lowering spec.harness.tuning.maxSessions will not fit it either: the field's" >&2
+                  echo "  minimum is 1, and one session still needs 83 at 10 bridge workers, more than this stream holds." >&2
+                fi
+                if [ "${workers_fit}" -ge 1 ]; then
+                  echo "Or keep spec.harness.tuning.maxSessions at 10 and set the operator's A2A_BRIDGE_CONCURRENCY to at most ${workers_fit}" >&2
+                  echo "  - the operator renders the bridge; unset, it runs 10 - which is" >&2
+                  echo "  the most this stream has room for beside those sessions: the reserve is 20 plus 6 a worker." >&2
+                else
+                  echo "Fewer bridge workers alone will not fit it beside spec.harness.tuning.maxSessions=10: one worker" >&2
+                  echo "  still needs 56, more than this stream holds. One session beside one worker needs 29;" >&2
+                  echo "  below that, only deleting the TASKS stream and provisioning again fits." >&2
+                fi
+                echo "This script creates every stream it does not find, and it does that before these" >&2
+                echo "  checks, so the next run recreates TASKS at 110. Deleting the stream discards the" >&2
+                echo "  tasks it is holding - the 72h task history the design treats as the audit" >&2
+                echo "  substrate - which is why provisioning will not do it on an operator's behalf." >&2
+                if [ "${fits}" -ge 1 ] || [ "${workers_fit}" -ge 1 ]; then
+                  echo "The ways out do not finish the same way. Lowering spec.harness.tuning.maxSessions, or the" >&2
+                  echo "  bridge's worker count, finishes on its own: this Job's name carries a digest of the rendered" >&2
+                  echo "  spec, the consumer count is part of that render, so either edit produces a new Job that" >&2
+                  echo "  runs by itself. Nothing below applies to them - there is nothing else to delete or restart." >&2
+                fi
+                echo "Deleting TASKS does not finish on its own. It takes three steps, in this order:" >&2
+                echo "  1. delete the stream." >&2
+                echo "  2. get provisioning to run again - that is what recreates it, and nothing re-reads" >&2
+                echo "     the bus until this Job runs. Delete the Job to re-run it now, or leave it and the" >&2
+                echo "     24h TTL will." >&2
+                echo "  3. once TASKS is back, restart the clients holding a durable consumer on it:" >&2
+                echo "       kubectl rollout restart deployment/platformagent-a2a-gateway -n kubeagents-system" >&2
+                echo "     and, where a Hermes bridge sidecar runs, the agent workload platformagent-gateway" >&2
+                echo "     (a Deployment or a StatefulSet, depending on the spec) with it." >&2
+                echo "     Deleting a stream deletes every consumer on it, and neither client re-creates" >&2
+                echo "     one: the consume underneath them carries no error handler, so a deleted consumer" >&2
+                echo "     ends the subscription with nothing logged. Skip this and the gateway goes on" >&2
+                echo "     accepting delegations and spawning session pods while relaying no events, the" >&2
+                echo "     bridge dispatches nothing, and the CR reads Ready over both. Session pods" >&2
+                echo "     recover by themselves, which hides it rather than helping." >&2
+                echo "     Restarting before TASKS is back only fails the subscribe, so the order holds." >&2
+                # Exit 2, and the convention it establishes: 2 means "this will fail the
+                # same way next time", anything else is worth retrying. The Job's
+                # podFailurePolicy matches on 2 and fails the Job from the first pod
+                # (buildA2AProvisionJob), so a refusal nothing about a re-run can change
+                # does not spend the backoffLimit before it is heard. This refusal is in
+                # that class: the budget's two inputs, maxSessions and the bridge's worker
+                # count, and the stream's max_consumers are all fixed until an operator
+                # lowers maxSessions, declares the bridge sidecar with fewer workers where
+                # it declared more than the default, or recreates the stream, and
+                # provisioning does none of those. Note that
+                # set -euo pipefail exits with the failing command's own status, which is
+                # not 2, so an unexpected failure stays on the retry budget.
+                exit 2
+              fi
+
+              echo "a2a provisioning complete"
+          env:
+            - name: HOME
+              value: /tmp
+            - name: XDG_CONFIG_HOME
+              value: /tmp
+            - name: BUS_USER
+              value: system:serviceaccount:kubeagents-system:platformagent-a2a-provision
+          image: natsio/nats-box:0.14.5
+          name: provision
+          resources:
+            limits:
+              cpu: 200m
+              memory: 256Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - mountPath: /tmp
+              name: tmp
+            - mountPath: /var/run/secrets/a2a-bus
+              name: a2a-bus-token
+              readOnly: true
+            - mountPath: /etc/a2a-nats-ca
+              name: a2a-nats-ca
+              readOnly: true
+          workingDir: /tmp
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: platformagent-a2a-provision
+      volumes:
+        - name: a2a-bus-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: a2a-bus
+                  expirationSeconds: 3600
+                  path: token
+        - configMap:
+            name: platformagent-a2a-nats-ca-bundle
+          name: a2a-nats-ca
+        - emptyDir: {}
+          name: tmp
+  ttlSecondsAfterFinished: 86400
+status: {}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: gateway-netpol
+  name: platformagent-a2a-gateway-netpol
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gmp-system
+      ports:
+        - port: 9096
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kubeagents-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kube-agents-operator
+      ports:
+        - port: 9096
+          protocol: TCP
+  podSelector:
+    matchLabels:
+      app: platformagent-a2a-gateway
+  policyTypes:
+    - Ingress
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: gateway
+  name: platformagent-a2a-gateway
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: platformagent-a2a-gateway
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      annotations:
+        kubeagents.x-k8s.io/secret-env-hash: <SHA256_FOR_TESTS>
+      labels:
+        app: platformagent-a2a-gateway
+        app.kubernetes.io/instance: kubeagents-system-platformagent
+        app.kubernetes.io/managed-by: platformagent-controller
+        app.kubernetes.io/name: platform-agent
+        app.kubernetes.io/part-of: a2a-next
+        kubeagents.x-k8s.io/a2a-component: gateway
+    spec:
+      automountServiceAccountToken: true
+      containers:
+        - env:
+            - name: NATS_URL
+              value: tls://platformagent-a2a-nats.kubeagents-system.svc:4222
+            - name: NATS_CA_FILE
+              value: /etc/a2a-nats-ca/ca.crt
+            - name: NATS_CA_CONFIGMAP
+              value: platformagent-a2a-nats-ca-bundle
+            - name: NATS_USER
+              value: gateway
+            - name: NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: gateway-password
+                  name: platformagent-a2a-nats-creds
+            - name: A2A_CONSOLE_DOOR
+              value: "true"
+            - name: A2A_MAX_SESSIONS
+              value: "10"
+            - name: A2A_BUSY_NOTICE_AT
+              value: "10"
+            - name: A2A_METRICS_PORT
+              value: "9096"
+            - name: A2A_SPAWN_SESSIONS
+              value: "true"
+            - name: A2A_WORKER_IMAGE
+              value: ghcr.io/gke-labs/kube-agents/a2a-worker:latest
+            - name: A2A_STRICT_EVENTS_WRITER
+              value: "false"
+            - name: A2A_CAPABILITY_REQUIRED
+              value: "true"
+            - name: A2A_CARD_STOP
+              value: "false"
+            - name: A2A_CARD_STOP_TIMEOUT
+              value: 75s
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: SESSION_KV_SALT
+              valueFrom:
+                secretKeyRef:
+                  key: SESSION_KV_SALT
+                  name: platform-agent-secrets
+                  optional: true
+            - name: A2A_OWNER_DEPLOYMENT
+              value: platformagent-a2a-gateway
+            - name: A2A_SESSION_SERVICE_ACCOUNT
+              value: platformagent-a2a-session
+            - name: A2A_PRINCIPAL_MAP
+              value: /etc/a2a/principal-map
+            - name: A2A_GCHAT_RELAY_URL
+              value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
+            - name: A2A_GCHAT_ALLOWED_USERS
+            - name: A2A_GCHAT_ALLOW_ALL_USERS
+              value: "true"
+            - name: A2A_CHAT_DISPLAY_MODE
+              value: default
+            - name: A2A_GCHAT_TOKEN_PATH
+              value: /var/run/secrets/a2a-chat-relay/token
+          image: ghcr.io/gke-labs/kube-agents/a2a-gateway:latest
+          name: gateway
+          ports:
+            - containerPort: 9096
+              name: a2a-metrics
+          resources:
+            limits:
+              cpu: 500m
+              memory: 512Mi
+            requests:
+              cpu: 50m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - mountPath: /etc/a2a/principal-map
+              name: principal-map
+              readOnly: true
+            - mountPath: /etc/a2a-nats-ca
+              name: a2a-nats-ca
+              readOnly: true
+            - mountPath: /var/run/secrets/a2a-chat-relay
+              name: a2a-chat-relay-token
+              readOnly: true
+          workingDir: /
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      serviceAccountName: platformagent-a2a-gateway
+      volumes:
+        - configMap:
+            name: principal-map
+            optional: true
+          name: principal-map
+        - configMap:
+            name: platformagent-a2a-nats-ca-bundle
+          name: a2a-nats-ca
+        - name: a2a-chat-relay-token
+          projected:
+            defaultMode: 256
+            sources:
+              - serviceAccountToken:
+                  audience: kubeagents-credential-proxy-a2a-chat
+                  expirationSeconds: 3600
+                  path: token
+status: {}

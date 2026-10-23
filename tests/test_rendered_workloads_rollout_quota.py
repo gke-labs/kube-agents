@@ -18,12 +18,10 @@ untested. This suite reads the output side instead:
                                                emit (golden_test.go keeps these
                                                equal to the operator's output)
 
-The golden half reaches only what the golden cases render. All seven set
-`spec.mode: default`, so the `mode: next` stack is in none of them: the A2A
-gateway's strategy is asserted by `TestBuildA2AGatewayIdentityAndOwnerWiring`
-in `k8s-operator/internal/controller/`, and the two surge-first pairs -- the
-A2A auth callout and the capability verifier, two replicas each -- are asserted
-by nothing here. A `mode: next` golden case would bring all three into this
+The golden half reaches only what the golden cases render. The
+`platformagent-next.yaml` case renders the `mode: next` stack at its steady
+state, so the A2A gateway, the console and the two surge-first pairs -- the
+A2A auth callout and the capability verifier, two replicas each -- are in this
 sweep.
 
 Every Deployment in both must be `Recreate` or resolve `maxUnavailable >= 1`,
@@ -78,8 +76,9 @@ _HELM_SET_VALUES = (
 # offenders", so the count is asserted, and a new chart Deployment fails here
 # until its author looks at its strategy and bumps the number.
 _EXPECTED_RENDERED_DEPLOYMENTS = 4
-# Seven golden cases, each emitting an agent gateway and a credential proxy.
-_EXPECTED_GOLDEN_DEPLOYMENTS = 14
+# Eight golden cases, each emitting an agent gateway and a credential proxy, and the
+# next-mode case adding the A2A callout, verifier, console and gateway.
+_EXPECTED_GOLDEN_DEPLOYMENTS = 20
 
 # Single-replica workloads that deliberately keep `maxUnavailable: 0` and so
 # stall under a zero-headroom quota. The reasons are the ones
@@ -97,6 +96,19 @@ _SURGE_FIRST_BY_DESIGN = {
         "admission webhook backend with failurePolicy Fail: at replicas 1, "
         "maxUnavailable 1 terminates the only webhook server before its replacement "
         "is Ready, and every guarded write in the namespace fails until it is"
+    ),
+    # Operator-rendered under spec.mode: next, so these are golden names. The quota
+    # preflight's patch leaves room for one surge Pod, and either of these is smaller
+    # than the chart workloads that size it.
+    "platformagent-a2a-callout": (
+        "two replicas that never drop below the running count: a moment with zero "
+        "ready callouts is a moment nothing new can connect to the bus, and the "
+        "clients see an Authorization Violation they cannot tell from a bad token"
+    ),
+    "platformagent-a2a-verifier": (
+        "two replicas that never drop below the running count: a moment with zero "
+        "ready verifiers refuses every task submission, and the executor does not "
+        "retry the refusal"
     ),
 }
 
@@ -195,21 +207,24 @@ class RenderedDeploymentsRollUnderAFullQuota(unittest.TestCase):
     def test_every_exception_is_still_rendered_surge_first(self):
         """An entry whose workload no longer surges first is stale; drop it.
 
-        Only the chart render carries the two listed workloads today, so a
-        missing helm skips this the same way; with CI set the render raises.
+        The chart render carries two of the listed workloads and the next-mode
+        golden the other two, so both are read; a missing helm skips this the
+        same way; with CI set the render raises.
         """
         rendered = _render_chart()
         if rendered is None:
             self.skipTest("helm not installed and CI is unset")
         deployments = _deployments(rendered)
+        for doc in _golden_deployments().values():
+            deployments.setdefault((doc.get("metadata") or {}).get("name"), doc)
         for name, reason in sorted(_SURGE_FIRST_BY_DESIGN.items()):
             with self.subTest(deployment=name):
                 self.assertIn(
                     name,
                     deployments,
-                    f"_SURGE_FIRST_BY_DESIGN names {name!r} but the chart renders no "
-                    "such Deployment: the workload was renamed or removed, so the entry "
-                    "shields nothing",
+                    f"_SURGE_FIRST_BY_DESIGN names {name!r} but neither the chart nor a "
+                    "golden renders such a Deployment: the workload was renamed or "
+                    "removed, so the entry shields nothing",
                 )
                 self.assertEqual(
                     _resolve_max_unavailable(deployments[name]),
