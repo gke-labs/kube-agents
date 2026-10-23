@@ -252,7 +252,8 @@ func rollupRecords(each func(func(*SessionRecord)) error, now time.Time, window 
 
 // usageWindow is the roll-up's window: the script's fourteen days, or
 // SessionTTL when that is shorter, since records idle past it are gone;
-// never under a day.
+// never under a day, and rounded down to whole days so the label, which
+// prints days, names the window the count used.
 func usageWindow(sessionTTL time.Duration) time.Duration {
 	switch {
 	case sessionTTL <= 0 || sessionTTL >= usageSummaryWindow:
@@ -260,7 +261,7 @@ func usageWindow(sessionTTL time.Duration) time.Duration {
 	case sessionTTL < usageSummaryWindowFloor:
 		return usageSummaryWindowFloor
 	}
-	return sessionTTL
+	return time.Duration(windowDays(sessionTTL)) * hoursPerDay * time.Hour
 }
 
 func windowDays(window time.Duration) int {

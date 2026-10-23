@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"crypto/hkdf"
 	"crypto/sha256"
 	"fmt"
@@ -57,6 +58,7 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("A2A_DOOR_TOKEN", "")
 	t.Setenv("A2A_DOOR_PRINCIPAL_MAP", "")
 	t.Setenv("A2A_DOOR_PUBLIC_URL", "")
+	t.Setenv("A2A_CONSOLE_DOOR", "")
 }
 
 // TestFromEnvSaltPrecedence: the salt is SESSION_KV_SALT, the one the
@@ -1040,5 +1042,72 @@ func TestFromEnvRefusesHalfTheBusTrust(t *testing.T) {
 	}
 	if cfg.NATSCAFile != "/etc/a2a-nats-ca/ca.crt" || cfg.NATSCAConfigMap != "agent-a2a-nats-ca-bundle" {
 		t.Errorf("cfg = %q / %q", cfg.NATSCAFile, cfg.NATSCAConfigMap)
+	}
+}
+
+// The console door alone starts a gateway (A2A_CONSOLE_DOOR=true), as a door
+// does: no backend name, and never in place of a real backend. Anything but
+// "true" leaves the no-backend refusal as it was.
+func TestFromEnvConsoleDoor(t *testing.T) {
+	for value, wantErr := range map[string]bool{"true": false, "": true, "1": true, "TRUE": true} {
+		t.Run("alone/"+value, func(t *testing.T) {
+			setBaseEnv(t)
+			t.Setenv("DISCORD_TOKEN", "")
+			t.Setenv("A2A_CONSOLE_DOOR", value)
+			cfg, err := FromEnv()
+			if wantErr {
+				if err == nil || !strings.Contains(err.Error(), "A2A_CONSOLE_DOOR") {
+					t.Fatalf("A2A_CONSOLE_DOOR=%q: err = %v, want the no-backend refusal naming it", value, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !cfg.ConsoleDoor || cfg.Backend() != "" {
+				t.Errorf("console door = %v, backend = %q; want the door and no backend", cfg.ConsoleDoor, cfg.Backend())
+			}
+		})
+	}
+	t.Run("beside a backend", func(t *testing.T) {
+		setBaseEnv(t)
+		t.Setenv("A2A_CONSOLE_DOOR", "true")
+		t.Setenv("DISCORD_TOKEN", "x")
+		cfg, err := FromEnv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Backend() != discordBackend {
+			t.Errorf("Backend() = %q; the console door must not displace a real backend", cfg.Backend())
+		}
+	})
+}
+
+// A gateway whose only ingress is the console door attributes to the console,
+// never "": New's default must say what the backend is.
+func TestNewDefaultsAConsoleOnlyGatewayToTheConsole(t *testing.T) {
+	s := startServer(t)
+	url := s.ClientURL()
+	provision(t, url)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	client, err := lib.Connect(ctx, url, lib.WithName("gateway-test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(client.Close)
+	cfg := &Config{
+		NATSURL:          url,
+		DefaultAddressee: "platform",
+		IdleTTL:          30 * time.Minute,
+		AttributionSalt:  []byte("test-salt"),
+		ConsoleDoor:      true,
+	}
+	g, err := New(Options{Client: client, Adapter: newFakeAdapter(), Config: cfg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.backend != consoleBackend {
+		t.Fatalf("a console-only gateway attributes to %q, want %q", g.backend, consoleBackend)
 	}
 }

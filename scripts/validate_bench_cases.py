@@ -317,6 +317,12 @@ FIXTURE_NOT_READY = {
         "fleet question reaches the ten-card fan-out bound; the seeded fleet and "
         "every dev install have five or fewer"
     ),
+    "upgrades-readiness-lb-drain-timeout": (
+        "#3524: needs bench/tf/fleet's drain-timeout backend service on seeded-b's default "
+        "pool (the readiness-lb-drain-timeout role) applied to every pool project (fleet "
+        "re-apply); no pool project has a backend service draining longer than the 600 s "
+        "GKE waits per node"
+    ),
     "scope-excluded-cluster-not-listed": (
         "#3213: needs an eval install whose PlatformAgent spec.scope.exclude.clusters "
         "names seeded-b (seeded-a and seeded-c in scope); no pool install declares a "

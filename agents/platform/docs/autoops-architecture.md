@@ -53,7 +53,7 @@ flowchart TB
     DRIFT -->|change + attribution| DDET
     CAP -->|alert| PSUB
 
-    WATCH -->|inject · kind: k8s-event| SESS
+    WATCH -->|inject · kind: k8s-event, later k8s-event-followup| SESS
     DDET -->|inject · kind: gitops-drift| SESS
     PSUB -->|inject · kind: capacity| SESS
     STALLW -->|inject · kind: controller-stall| SESS
@@ -147,8 +147,10 @@ a different constant rather than a different path.
 The Go event watcher marshals an `InjectPayload`, wraps it as `{"message": "<escaped JSON>"}`, and
 `POST`s it to `/sessions/{id}/inject` (`k8s-operator/cmd/k8s-event-watcher/injector.go`). The watcher
 sends **no prompt** — it sends facts. Noise control lives here too: namespace allow/deny rules, a
-flapping guard, and a 24h dedup window keyed on `EventKey{UID, Reason}`, so a crashlooping pod is one
-incident rather than forty.
+flapping guard, a two-minute settle period for the crash-loop family (a back-off that clears sooner
+is not forwarded), and a 24h dedup window keyed on `EventKey{UID, Reason}`, so a crashlooping pod
+is one incident rather than forty. Once an alerted object has been quiet for fifteen minutes the
+watcher sends a `k8s-event-followup` on the same session, which lands in the alert's thread.
 
 **A new domain supplies:** an adapter that detects its signal, filters its own noise, and emits the
 inject envelope with its own `kind`.
@@ -241,6 +243,11 @@ Analyze the following Kubernetes event warning on GKE cluster '{cluster}'.
 • *Resource:* {namespace}/{kind}/{name}
 • *Event Reason:* {reason}
 • *Warning Message:* {message}
+• *Last seen by the watcher:* {HH:MM UTC}
+
+**Read the object's current state before you conclude anything.** ... open the 'What's wrong'
+sentence with `State at HH:MM UTC:` where HH:MM is the time of that read ... **If the object has
+recovered** ... make 'What to do' the single bullet '**No action needed:** ... has recovered'.
 
 **Finish by calling `kanban_complete(result=<your full report>, summary=<one line>)`.**
 Pass the entire report as `result`, not a summary of it: this card is subscribed to the chat
@@ -253,7 +260,7 @@ Format the report you pass to `kanban_complete`'s `result` exactly like this —
 `##` sections are the only ones, and there is no fourth:
 
 ## What's wrong
-<1-sentence description of the problem>
+State at <HH:MM> UTC: <1-sentence description of the problem>
 
 ## Why
 - <key constraint mismatch or log finding, with the evidence that proves it>
@@ -386,7 +393,7 @@ than a live write, a new domain inherits reviewability and rollback for free.
 The GKE-events path is live end to end:
 
 - **Detection** — `k8s-event-watcher` streams warning events in real time, with namespace deny/allow
-  rules and a flapping guard. The deployed watcher forwards eight reasons, which
+  rules, a flapping guard and a settle period. The deployed watcher forwards eight reasons, which
   `deploy/shared/start-services.sh` passes as `--reason` and no environment variable overrides:
   `Failed`, `FailedToDrainNode`, `CrashLoopBackOff`, `BackOff`, `ImagePullBackOff`, `ErrImagePull`,
   `OOMKilled`, `FailedScheduling`. The same list admits two more, cluster-autoscaler's

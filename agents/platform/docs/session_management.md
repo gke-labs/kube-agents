@@ -31,7 +31,7 @@ The session lands on the front door and cannot land anywhere else. Hermes select
 
 Delivery is the card itself. Hermes subscribes every card to the session it was filed from, and posts a subscribed card's `result` to chat when it turns terminal — so the Cluster Agent finishes with `kanban_complete` and nothing else, and the report reaches the thread the alert was raised in. The body's whole job on that point is to insist the entire report goes in `result`, since `result` is verbatim what the reader sees.
 
-Two more things travel in that prompt since #656. The call is made without `goal_mode`: a goal-mode card is graded by Hermes's judge against its title and body before `kanban_complete` is allowed through, and a body that is a report template cannot be satisfied that way — on 2026-08-12 a worker whose correct report the judge rejected had no exit but a sticky `needs_input` block with `result = NULL`. And the body states a **Done when** (the root cause with evidence, at least one GitOps option or an explicit no-change finding, the report recorded via `kanban_complete`) and asks for those three facts in the one-line `summary` too, because the judge grades `summary` before `result`; a card graded anyway then has something gradeable and an answer that states it. The backstop for a card that blocks regardless is the `kanban-board-health` job on the Platform Agent's roster (`agents/platform/cron/README.md`), which names any card blocked past a day in the home channel (newest first, grouped and bounded to chat relay limits with older cards listed by task ID).
+Two more things travel in that prompt since #656. The call is made without `goal_mode`: a goal-mode card is graded by Hermes's judge against its title and body before `kanban_complete` is allowed through, and a body that is a report template cannot be satisfied that way — on 2026-08-12 a worker whose correct report the judge rejected had no exit but a sticky `needs_input` block with `result = NULL`. And the body states a **Done when** (the `State at HH:MM UTC:` opener from the agent's own read, the root cause with evidence, at least one GitOps option or an explicit no-change finding, the report recorded via `kanban_complete`) and asks for those facts in the one-line `summary` too, because the judge grades `summary` before `result`; a card graded anyway then has something gradeable and an answer that states it. The backstop for a card that blocks regardless is the `kanban-board-health` job on the Platform Agent's roster (`agents/platform/cron/README.md`), which names any card blocked past a day in the home channel (newest first, grouped and bounded to chat relay limits with older cards listed by task ID).
 
 The address is what used to be wrong. An event-triage turn arrives over the REST gateway, whose single ingress chokepoint stamps `platform="api_server"` and puts the session id in `chat_id`, so the subscription was written well-formed and pointing at no chat platform that exists — the report was produced, stored on the card, and delivered nowhere. That is issue #630. `deploy/docker/patches/kanban_event_routing.py` closes it inside the image: it looks the session id up in `session_metadata`, which `_register_session_routing` wrote before the turn started, and substitutes the alert's real `platform`/`chat_id`/`thread_id` at subscription time. A session with no recorded route, or one recorded as non-chat, falls through unchanged. The hermes-bridge records a route the same way for its `a2a-*` sessions, so a card filed in a gateway conversation reports back to that conversation, and the lookup follows Hermes's compression lineage when the session has since been renamed; [the gateway spec](../../../docs/designs/spec-chatops-gateway.md) has the conversation route.
 
@@ -53,7 +53,7 @@ The watcher deduplicates on the involved object's UID and the reason, so one bro
 
 An admitted row is one with `notified` non-zero or a `delivery_error`. A failed chat post resets `notified` to `0` within seconds while its triage keeps running, so anchoring on `notified` alone would let every sibling open its own triage on an install whose chat route is broken. A row the gate filtered, the ceiling dropped, or that was itself folded never anchors a window, and neither does a row whose triage never started: when `trigger_agent_troubleshooter` cannot create the gateway session or the gateway refuses the turn (a 3xx, a 4xx, a 503, or an error while connecting or sending; a 2xx, any other 5xx or an error while waiting for the response counts as started, since the turn may have run; a draining gateway creates the session and answers the turn 503), it clears the row's `fold_key`, so a sibling that arrives after that is admitted and starts the triage. The same happens when that background task dies on an exception, and every start of the server clears all fold keys, because a row whose task never ran (the process died between the insert and the task) has nothing else to release it; a workload whose triage did start loses its window, at the cost of one more triage (one per severity, since a Critical folds only into a Critical) for a sibling that arrives after the restart. Siblings that folded into the row before it was released stay folded. For a refused turn they arrive within seconds of it, while the gateway that refused it is still refusing; for a task that died, they are the ones that landed while it ran. The daily recap does not count a folded row as withheld by the ceiling, and `GET /v1/intercepted-events` lists it as `folded`, with the anchor's id in its `duplicate_of`.
 
-A [`controller-stall` inject](#the-third-producer-controller-stall) claims no allowance at all: the stall watch caps itself at three alerts a tick, and that cap is its only bound. Neither does a drift backlog record that is digested (`POST /v1/drift-backlog`): it starts no turn and is counted in one digest. A late record that is carded instead — a late `kubectl` write, or a late row of a principal with fewer than three in the digest — bills `GitOpsDrift` as a live record does. A refused minority row stays in the digest; a refused late `kubectl` write is suppressed as a live record is.
+A [`controller-stall` inject](#the-third-producer-controller-stall) claims no allowance at all: the stall watch caps itself at three alerts a tick, and that cap is its only bound. Neither does a drift backlog record that is digested (`POST /v1/drift-backlog`): it starts no turn and is counted in one digest (a chat message, or one unassigned board card on an install with no chat platform enabled). A late record that is carded instead — a late `kubectl` write, or a late row of a principal with fewer than three in the digest — bills `GitOpsDrift` as a live record does. A refused minority row stays in the digest; a refused late `kubectl` write is suppressed as a live record is.
 
 | Bucket        | Env var                      | Default |
 | ------------- | ---------------------------- | ------- |
@@ -128,7 +128,9 @@ What the drift branch does differently:
   pulling, or waited over 30 minutes) goes to `POST /v1/drift-backlog` instead, with no session. The
   route writes a ledger row with `backlog = 1` and the record's `principal`, spends no quota and
   starts no turn. A worker thread posts one digest per burst, after 60 seconds with no new backlog
-  row or 10 minutes after the oldest, and marks the rows `2` (posted) or `3` (no chat platform). A
+  row or 10 minutes after the oldest, and marks the rows `2` (posted) or `3` (filed as one board card,
+  on an install with no chat platform enabled: unassigned and blocked, so no agent turn files or
+  reads it, and it stays in view until a person acts). A
   principal with fewer than three late rows is not digested: each of its rows gets a session, a quota
   claim and a card, as a live record does, rebuilt from the payload the row stores, and is marked
   `4`. A row the ceiling refuses stays in the digest. A row without a usable stored payload is
@@ -180,13 +182,18 @@ objects is six of them.
 The skew is an ordinary deployment window rather than a hypothetical: this script is copied to the
 shared PVC from the agent image while the Go producers ship in their own, so the two roll
 independently. The event watcher negotiates the same class of problem in the other direction with
-`X-Watcher-Features`.
+`X-Watcher-Features`, and the daemon answers in kind: its `injected` reply to an event lists what it
+does with the session beyond posting the alert (`features`, today `followup`), and `/healthz` lists
+the same under `features`, which the watcher's sweep reads again before each tick's
+follow-ups; together they are how the watcher knows a `k8s-event-followup` will reach the thread
+rather than open a second alert, whichever way the two images have rolled.
 
 It is on the unauthenticated `/healthz` so the probe is a precondition of starting rather than
 something a producer discovers only once it holds credentials, and the key's _absence_ is the
 signal: an old daemon answers `{"status": "ok"}` and nothing else, so a producer that requires its
-kind fails closed against one. A kind goes on the list only when the dispatch actually handles it —
-the watcher's two are there because the event path is a real answer for them rather than a fallback.
+kind fails closed against one. A kind goes on the list only when the dispatch actually handles it:
+`k8s-event` because the event path is a real answer for it rather than a fallback, and
+`k8s-event-followup` because it has a branch of its own (below).
 
 ### The third producer: `controller-stall`
 
@@ -214,6 +221,26 @@ these ways:
 
 The watch files no card itself and finds the one the Planning Agent filed by `tasks.session_id`, so it
 can comment on it when new objects stall and complete it when the stall clears.
+
+### The watcher's second record: `k8s-event-followup`
+
+The event watcher sends `kind: k8s-event-followup` on an alert's own session once the object has
+emitted no new event for the watcher's quiet period (`WATCHER_QUIET_AFTER`, 15m), and only to a
+daemon whose `injected` answer to the alert listed `followup` under `features`. `_inject_followup`
+reads the session's routing, posts one line into the alert's thread ("Quiet since HH:MM UTC …") and
+leaves the same line as a comment on the card the session filed, found by `tasks.session_id` as the
+stall watch finds its card. It writes no ledger row, claims no quota and starts no turn: nothing new
+happened, something stopped happening. The line says what it is, silence and not a confirmed recovery,
+since the watcher reads events only. A session nothing routed to a thread is answered `unrouted`. It
+is a reply rather than an edit of the alert: the gateway edits by update key only inside a
+conversation request, and the alert was a home-channel post whose key was never bound.
+
+An alert whose investigation never starts gets the same thread's line from `_triage_watchdog`,
+armed by `trigger_agent_troubleshooter` as soon as the alert is routed to its thread and before the
+gateway is contacted (`TRIAGE_WATCHDOG_SECONDS`, 3600, read like the ceilings so a bad value falls
+back): if an hour on the session has filed no card and no report has been stored for the thread, it
+says so there, stating those two facts and no cause. A board it cannot read is unknown and keeps it
+quiet. An in-process timer, so a daemon restart inside the hour drops it for the alerts before it.
 
 ---
 
@@ -403,7 +430,7 @@ CREATE TABLE intercepted_events(
   delivery_error TEXT NOT NULL DEFAULT '',  -- non-empty when the chat post failed after notified = 1
   session_id  TEXT NOT NULL DEFAULT '',  -- the session the inject arrived on, joining the row to GET /v1/sessions/{id}/tasks
   created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  backlog     INTEGER NOT NULL DEFAULT 0,  -- drift backlog: 1 owed a digest, 2 digested, 3 no chat platform, 4 carded
+  backlog     INTEGER NOT NULL DEFAULT 0,  -- drift backlog: 1 owed a digest, 2 digested, 3 filed as a board card (no chat platform), 4 carded
   principal   TEXT NOT NULL DEFAULT '',    -- written on drift backlog rows only, for the digest's count
   payload     TEXT NOT NULL DEFAULT '',    -- drift backlog rows only: the record, to card it from
   duplicate_of INTEGER,                    -- the admitted row this event was folded into; NULL otherwise

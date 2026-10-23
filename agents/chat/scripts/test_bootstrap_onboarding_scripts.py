@@ -101,7 +101,8 @@ SCORED = {"scores": {"f001": SCORE, "f002": SCORE, "f003": SCORE}, "complete_clu
 
 def delivered(report: str) -> str:
     """What delivery prints for a report with no oobe marker beside it: the report, then the audits note."""
-    return report.rstrip("\n") + "\n\n" + bootstrap_delivery.AUDITS_RUNNING_NOTE + "\n"
+    note = f"{bootstrap_delivery.AUDITS_RUNNING_NOTE} {bootstrap_delivery.AUDITS_HOME_SENTENCE}"
+    return report.rstrip("\n") + "\n\n" + note + "\n"
 
 
 class DeliveryDecisionTest(unittest.TestCase):
@@ -325,21 +326,26 @@ class DeliveryToConversationTest(unittest.TestCase):
         text = self.calls[0][self.calls[0].index("--") + 1]
         self.assertIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, text)
 
-    def test_no_home_says_not_posted_once_when_summaries_are_listed(self):
-        ran = bootstrap_delivery.AUDITS_RAN_NOTE.format(audits="The security and RBAC audit", have="has")
-        undelivered = bootstrap_delivery.AUDITS_UNDELIVERED_NOTE.format(audits="`fleet-wide-cost-analysis`")
-        with mock.patch.object(bootstrap_delivery, "_audits_state_note", return_value=f"{ran} {undelivered}"):
-            note = bootstrap_delivery._audits_note(self.d, False, home=False)
-        self.assertNotIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, note)
-        self.assertNotIn(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE, note)
-        self.assertIn(undelivered, note)
-        with mock.patch.object(bootstrap_delivery, "_audits_state_note", return_value=ran):
-            note = bootstrap_delivery._audits_note(self.d, False, home=False)
-        self.assertIn(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE, note)
+    def test_no_home_is_said_on_every_path(self):
+        # With no home channel, later summaries post nowhere; the note says so whatever the stage did.
+        for state in (
+            {},
+            {oobe.STATE_FIRED: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_DONE: True},
+            {oobe.STATE_HELD: {a: oobe.HOLD_PAUSED for a in oobe.FIRST_RUN_AUDITS}, oobe.STATE_DONE: True},
+            {oobe.STATE_DONE: True, oobe.STATE_SKIPPED: True, oobe.STATE_REASON: oobe.SKIP_NOT_NEW, oobe.STATE_AT: 1},
+        ):
+            with self.subTest(state=state):
+                oobe.write_state(self.d, state)
+                note = bootstrap_delivery._audits_note(self.d, False, home=False)
+                self.assertEqual(note.count(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE), 1)
+                self.assertNotIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, note)
 
-    def test_both_home_notes_carry_the_sentence_that_is_replaced(self):
-        self.assertIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, bootstrap_delivery.AUDITS_RUNNING_NOTE)
-        self.assertIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, bootstrap_delivery.AUDITS_RAN_NOTE)
+    def test_no_home_is_said_beside_listed_summaries(self):
+        oobe.write_state(self.d, {oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_DONE: True})
+        with mock.patch.object(bootstrap_delivery, "_lost_audits", return_value=[("compliance-audit", False)]):
+            note = bootstrap_delivery._audits_note(self.d, False, home=False)
+        self.assertIn("not posted to the chat: `compliance-audit`.", note)
+        self.assertTrue(note.endswith(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE))
 
     def test_the_card_posts_with_its_update_key_then_the_note(self):
         import inventory_presenter
@@ -2099,6 +2105,10 @@ class FirstRunAuditsTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.d = Path(self._tmp.name)
+        self.relay_db = self.d / "session_kv.db"
+        patcher = mock.patch.dict(os.environ, {bootstrap_delivery.SESSION_KV_DB_ENV: str(self.relay_db)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     @staticmethod
     def _slug_table() -> set[str]:
@@ -2139,7 +2149,9 @@ class FirstRunAuditsTest(unittest.TestCase):
 
     def test_no_marker_says_the_audits_will_run(self):
         # The stage writes its marker on its first tick after the ranking card, which delivery can beat.
-        self.assertEqual(self._note(), bootstrap_delivery.AUDITS_RUNNING_NOTE)
+        self.assertEqual(
+            self._note(), f"{bootstrap_delivery.AUDITS_RUNNING_NOTE} {bootstrap_delivery.AUDITS_HOME_SENTENCE}"
+        )
 
     def test_a_skip_says_the_report_does_not_cover_the_checks(self):
         for reason in (oobe.SKIP_NOT_NEW, oobe.SKIP_UNSETTLED, oobe.SKIP_NO_SWEEP):
@@ -2147,7 +2159,7 @@ class FirstRunAuditsTest(unittest.TestCase):
                 self._skipped(reason)
                 self.assertEqual(
                     self._note(),
-                    f"The first-run audits did not run: {reason}. {bootstrap_delivery.AUDITS_NOT_COVERED_NOTE}",
+                    f"The audits did not run as part of onboarding: {reason}. {bootstrap_delivery.AUDITS_NOT_COVERED_NOTE}",
                 )
 
     def test_a_skip_an_older_stage_recorded_for_no_repository_says_the_report_covers_them(self):
@@ -2156,13 +2168,13 @@ class FirstRunAuditsTest(unittest.TestCase):
         self._skipped(bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON)
         self.assertEqual(
             self._note(),
-            f"The first-run audits did not run: {bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON}. "
+            f"The audits did not run as part of onboarding: {bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON}. "
             f"{bootstrap_delivery.AUDITS_COVERED_NOTE}",
         )
         # A report no cluster's audit reached covers nothing, whatever the older stage recorded.
         self.assertEqual(
             self._note(no_coverage=True),
-            f"The first-run audits did not run: {bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON}. "
+            f"The audits did not run as part of onboarding: {bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON}. "
             f"{bootstrap_delivery.AUDITS_UNCHECKED_SCHEDULED_NOTE}",
         )
 
@@ -2172,7 +2184,7 @@ class FirstRunAuditsTest(unittest.TestCase):
         (self.d / SCAN_FILED).write_text("task_id=t_sweep2\nfiled_at=2000\n", encoding="utf-8")
         self.assertEqual(
             self._note(),
-            f"The first-run audits did not run: {bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON}. "
+            f"The audits did not run as part of onboarding: {bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON}. "
             f"{bootstrap_delivery.AUDITS_NOT_COVERED_NOTE}",
         )
 
@@ -2183,7 +2195,7 @@ class FirstRunAuditsTest(unittest.TestCase):
         self.assertIn(
             f"This report does not cover {inventory_findings.AUDIT_FAMILY_WORDS}", bootstrap_delivery.AUDITS_NOT_COVERED_NOTE
         )
-        for note in (bootstrap_delivery.AUDITS_UNCHECKED_SCHEDULED_NOTE, bootstrap_delivery.AUDITS_NONE_RAN_NOTE):
+        for note in (bootstrap_delivery.AUDITS_UNCHECKED_SCHEDULED_NOTE, bootstrap_delivery.AUDITS_NONE_STARTED_NOTE):
             self.assertNotIn("nothing has checked", note.lower())
             self.assertIn("this report", note.lower())
 
@@ -2201,7 +2213,8 @@ class FirstRunAuditsTest(unittest.TestCase):
             for name, value in vars(bootstrap_delivery).items()
             if name.startswith("AUDITS_") and isinstance(value, str) and name != "AUDITS_COVERED_NOTE"
         }
-        self.assertIn("AUDITS_RAN_NOTE", notes)
+        self.assertIn("AUDITS_STARTED_NOTE", notes)
+        self.assertIn("AUDITS_LOST_NOTE", notes)
         for name, value in notes.items():
             for words in old_scan:
                 with self.subTest(note=name, words=words):
@@ -2217,7 +2230,8 @@ class FirstRunAuditsTest(unittest.TestCase):
         self._skipped(oobe.SKIP_NOT_NEW)
         self.assertEqual(
             self._note(no_coverage=True),
-            f"The first-run audits did not run: {oobe.SKIP_NOT_NEW}. {bootstrap_delivery.AUDITS_UNCHECKED_SCHEDULED_NOTE}",
+            f"The audits did not run as part of onboarding: {oobe.SKIP_NOT_NEW}. "
+            f"{bootstrap_delivery.AUDITS_UNCHECKED_SCHEDULED_NOTE}",
         )
 
     def test_the_delivery_reads_no_coverage_off_the_hand_off_marker(self):
@@ -2228,57 +2242,60 @@ class FirstRunAuditsTest(unittest.TestCase):
         )
         (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n", encoding="utf-8")
         self._skipped(oobe.SKIP_NOT_NEW)
-        out = io.StringIO()
-        with (
-            mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False),
-            contextlib.redirect_stdout(out),
-            contextlib.redirect_stderr(io.StringIO()),
-        ):
-            self.assertEqual(bootstrap_delivery.main(self.d), 0)
         self.assertEqual(
-            out.getvalue(),
-            f"# Report\n\nThe first-run audits did not run: {oobe.SKIP_NOT_NEW}. "
+            self._deliver(),
+            f"# Report\n\nThe audits did not run as part of onboarding: {oobe.SKIP_NOT_NEW}. "
             f"{bootstrap_delivery.AUDITS_UNCHECKED_SCHEDULED_NOTE}\n",
         )
 
     def test_a_chain_under_way_says_the_audits_are_running(self):
         note = self._note({oobe.STATE_FIRED: ["fleet-wide-cost-analysis"], oobe.STATE_DONE: False})
-        self.assertEqual(note, bootstrap_delivery.AUDITS_RUNNING_NOTE)
+        self.assertEqual(note, f"{bootstrap_delivery.AUDITS_RUNNING_NOTE} {bootstrap_delivery.AUDITS_HOME_SENTENCE}")
 
-    def test_a_finished_chain_says_which_audits_ran(self):
+    def test_a_finished_chain_says_which_audits_the_stage_started(self):
         note = self._note({oobe.STATE_FIRED: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_DONE: True})
-        self.assertIn("The security and RBAC, reliability, capacity and cost audits have started.", note)
+        self.assertIn("The security and RBAC, reliability, capacity and cost audits started as part of onboarding.", note)
+        # The onboarding sentence names the audits by area; ids appear only where a request names one.
         self.assertNotIn("`", note)
-        self.assertIn("Each posts", note)
-        self.assertNotIn("Not run", note)
+        self.assertTrue(note.endswith(bootstrap_delivery.AUDITS_HOME_SENTENCE))
+        self.assertNotIn("Did not run", note)
 
-    def test_held_and_given_up_audits_are_named_as_not_run(self):
+    def test_held_and_given_up_audits_are_named_as_not_started(self):
         note = self._note({
             oobe.STATE_FIRED: ["fleet-wide-cost-analysis", "stockout-prevention"],
             oobe.STATE_HELD: {"compliance-audit": oobe.HOLD_DISABLED},
             oobe.STATE_GAVE_UP: ["obtainability-audit"],
             oobe.STATE_DONE: True,
         })
-        self.assertIn("The capacity and cost audits have started.", note)
-        self.assertTrue(note.endswith(
-            "Not run: the security and RBAC audit (disabled), "
-            f"the reliability audit ({bootstrap_delivery.AUDITS_GAVE_UP_REASON})."
-        ))
+        self.assertIn("The capacity and cost audits started as part of onboarding.", note)
+        self.assertIn(
+            "Did not run as part of onboarding: the security and RBAC audit (disabled), "
+            f"the reliability audit ({bootstrap_delivery.AUDITS_GAVE_UP_REASON}).", note
+        )
 
-    def test_a_chain_where_every_audit_was_held_or_given_up_says_none_ran(self):
+    def test_a_chain_where_every_audit_was_held_or_given_up_says_none_started(self):
         for state in (
             {oobe.STATE_HELD: {a: oobe.HOLD_PAUSED for a in oobe.FIRST_RUN_AUDITS}, oobe.STATE_DONE: True},
             {oobe.STATE_GAVE_UP: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_DONE: True},
         ):
             with self.subTest(state=state):
                 note = self._note(state)
-                self.assertTrue(note.startswith(bootstrap_delivery.AUDITS_NONE_RAN_NOTE))
-                self.assertIn("Not run: the security and RBAC audit (", note)
-                self.assertNotIn("now running", note)
-                self.assertNotIn("have started", note)
+                self.assertTrue(note.startswith(bootstrap_delivery.AUDITS_NONE_STARTED_NOTE))
+                self.assertIn("Did not run as part of onboarding: the security and RBAC audit (", note)
+                self.assertNotIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, note)
 
-    def _run(self, audit: str, claimed_at: float, outcome: str | None, columns: bool = True) -> None:
-        """A completed run of ``audit`` in the Platform Agent's cron store, ending a minute after its claim."""
+    def test_a_chain_under_way_names_a_held_audit_as_not_started(self):
+        note = self._note({oobe.STATE_FIRED: ["fleet-wide-cost-analysis"],
+                           oobe.STATE_HELD: {"compliance-audit": oobe.HOLD_MISSING}, oobe.STATE_DONE: False})
+        self.assertEqual(
+            note,
+            f"{bootstrap_delivery.AUDITS_RUNNING_NOTE} Did not run as part of onboarding: the security and RBAC audit "
+            f"({oobe.HOLD_MISSING}). {bootstrap_delivery.AUDITS_HOME_SENTENCE}",
+        )
+
+    def _run(self, audit: str, claimed_at: float, outcome: str | None, columns: bool = True,
+             status: str = "completed") -> None:
+        """An ended run of ``audit`` in the Platform Agent's cron store, ending a minute after its claim."""
         cron = self.d / oobe.PROFILES_DIR / oobe.PLATFORM_PROFILE / oobe.CRON_DIR
         cron.mkdir(parents=True, exist_ok=True)
         extra = ", finished_at TEXT, delivery_outcome TEXT" if columns else ""
@@ -2286,10 +2303,54 @@ class FirstRunAuditsTest(unittest.TestCase):
             conn.execute(f"CREATE TABLE IF NOT EXISTS executions (job_id TEXT, status TEXT, claimed_at TEXT{extra})")
             stamp = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat()  # noqa: E731
             if columns:
-                conn.execute("INSERT INTO executions VALUES (?, 'completed', ?, ?, ?)",
-                             (audit, stamp(claimed_at), stamp(claimed_at + 60), outcome))
+                conn.execute("INSERT INTO executions VALUES (?, ?, ?, ?, ?)",
+                             (audit, status, stamp(claimed_at), stamp(claimed_at + 60), outcome))
             else:
-                conn.execute("INSERT INTO executions VALUES (?, 'completed', ?)", (audit, stamp(claimed_at)))
+                conn.execute("INSERT INTO executions VALUES (?, ?, ?)", (audit, status, stamp(claimed_at)))
+
+    def _relay(self, audit: str, posted_at: float, run: str = "r1") -> None:
+        """The chat relay's record that it posted ``audit``'s report at ``posted_at``, as session-kv writes it.
+
+        ``run`` is the stamp of the report record it marked posted (``_stamp``), or a placeholder: the
+        note does not read it.
+        """
+        with sqlite3.connect(self.relay_db) as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS audit_report_runs (profile TEXT NOT NULL, job_id TEXT NOT NULL, "
+                         "run TEXT NOT NULL, posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+                         "PRIMARY KEY (profile, job_id))")
+            conn.execute("INSERT OR REPLACE INTO audit_report_runs VALUES ('platform', ?, ?, ?)",
+                         (audit, run, datetime.fromtimestamp(posted_at, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")))
+
+    @staticmethod
+    def _stamp(at: float) -> str:
+        """The ``run`` stamp the audit's ``start`` gives a report record written at ``at``."""
+        sys.path.insert(0, str(FLEET_AUDIT_SCRIPTS))
+        try:
+            import audit_report
+        finally:
+            sys.path.remove(str(FLEET_AUDIT_SCRIPTS))
+        return datetime.fromtimestamp(at, timezone.utc).strftime(audit_report.REPORT_STAMP_FORMAT)
+
+    def _filed(self, at: float) -> None:
+        (self.d / SCAN_FILED).write_text(f"task_id=t_sweep\nfiled_at={at}\n", encoding="utf-8")
+
+    def _deliver(self) -> str:
+        """What the text path prints: the report and its note."""
+        (self.d / INVENTORY).write_text("# Report\n", encoding="utf-8")
+        (self.d / ALIGNED).touch()
+        out = io.StringIO()
+        with (
+            mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(bootstrap_delivery.main(self.d), 0)
+        return out.getvalue()
+
+    @staticmethod
+    def _lost(note: str) -> str:
+        """The audits the note lists as not posted."""
+        return note.partition("not posted to the chat:")[2].partition(". To see them")[0]
 
     def _finished_chain(self, outcome: str | None) -> dict:
         """All four audits marked and completed after their marks, each run's delivery ending ``outcome``."""
@@ -2299,15 +2360,184 @@ class FirstRunAuditsTest(unittest.TestCase):
             self._run(audit, marks[audit] + 30, outcome)
         return {oobe.STATE_FIRED: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_MARKS: marks, oobe.STATE_DONE: True}
 
-    def test_audits_that_finished_before_a_home_channel_are_listed(self):
+    def test_audits_that_finished_before_a_home_channel_are_listed_with_a_request(self):
         note = self._note(self._finished_chain(bootstrap_delivery.DELIVERY_FAILED))
-        self.assertIn("The security and RBAC, reliability, capacity and cost audits have run.", note)
-        self.assertNotIn("have started", note)
-        # The ran note promises no home-channel post while summaries are missing.
-        self.assertNotIn("Each posts a summary to the home channel", note)
-        self.assertIn("but their summaries were not posted to the chat: "
-                      "`fleet-wide-cost-analysis`, `compliance-audit`, `obtainability-audit`, `stockout-prevention`. "
-                      "Ask me for any of these reports.", note)
+        self.assertIn("The security and RBAC, reliability, capacity and cost audits started as part of onboarding.", note)
+        # No home-channel promise beside summaries that were not posted.
+        self.assertNotIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, note)
+        self.assertIn(
+            "These ran, but their summaries were not posted to the chat: "
+            "`fleet-wide-cost-analysis`, `compliance-audit`, `obtainability-audit`, `stockout-prevention`. "
+            "To see them, send me: `Show me the latest report of each of these fleet audits from the report store: "
+            "fleet-wide-cost-analysis, compliance-audit, obtainability-audit, stockout-prevention.`", note)
+        self.assertNotIn("Ask me", note)
+
+    def test_a_skip_names_the_scheduled_runs_that_lost_their_summaries(self):
+        # SKIP_NOT_NEW fires a day after the sweep; the daily audits ran meanwhile with no home channel.
+        now = time.time()
+        self._filed(now - 2 * 86400)
+        self._run("compliance-audit", now - 86400, bootstrap_delivery.DELIVERY_FAILED)
+        self._run("stockout-prevention", now - 80000, "suppressed")
+        self._skipped(oobe.SKIP_NOT_NEW)
+        note = self._note()
+        self.assertTrue(note.startswith(f"The audits did not run as part of onboarding: {oobe.SKIP_NOT_NEW}."))
+        self.assertEqual(self._lost(note), " `compliance-audit`")
+        # Every "did not run" is scoped to onboarding, so it holds beside an audit that ran on its schedule.
+        self.assertEqual(note.count("did not run"), note.count("did not run as part of onboarding"))
+
+    def test_held_and_given_up_audits_that_ran_on_schedule_are_named(self):
+        # A held audit re-enabled by an operator, and a given-up one whose schedule recovered.
+        now = time.time()
+        self._filed(now - 7200)
+        self._run("compliance-audit", now - 3000, bootstrap_delivery.DELIVERY_FAILED)
+        self._run("obtainability-audit", now - 2000, bootstrap_delivery.DELIVERY_FAILED)
+        note = self._note({
+            oobe.STATE_FIRED: ["fleet-wide-cost-analysis"],
+            oobe.STATE_HELD: {"compliance-audit": oobe.HOLD_DISABLED},
+            oobe.STATE_GAVE_UP: ["obtainability-audit"],
+            oobe.STATE_DONE: True,
+        })
+        self.assertEqual(self._lost(note), " `compliance-audit`, `obtainability-audit`")
+        # The stage sentence reports the stage, so it does not contradict the list.
+        self.assertIn("Did not run as part of onboarding: the security and RBAC audit (disabled)", note)
+        self.assertNotIn("Not run", note)
+
+    def test_the_other_shipped_fleet_audits_are_named(self):
+        now = time.time()
+        self._filed(now - 7200)
+        self._run("gce-compute-fleet-audit", now - 3000, bootstrap_delivery.DELIVERY_FAILED)
+        self._run("compliance-audit", now - 2000, bootstrap_delivery.DELIVERY_FAILED)
+        note = self._note({oobe.STATE_FIRED: [], oobe.STATE_HELD: {a: oobe.HOLD_PAUSED for a in oobe.FIRST_RUN_AUDITS},
+                           oobe.STATE_DONE: True})
+        # First-run audits first, in chain order, then the rest in roster order.
+        self.assertEqual(self._lost(note), " `compliance-audit`, `gce-compute-fleet-audit`")
+        self.assertIn("report store: compliance-audit, gce-compute-fleet-audit.`", note)
+
+    def test_a_run_that_ended_before_the_sweep_is_not_this_onboardings(self):
+        now = time.time()
+        self._run("compliance-audit", now - 7200, bootstrap_delivery.DELIVERY_FAILED)
+        self._filed(now - 3600)
+        self._skipped(oobe.SKIP_NOT_NEW)
+        self.assertNotIn("not posted", self._note())
+
+    def test_a_failed_run_whose_notice_was_not_posted_is_named_apart_with_no_request(self):
+        # A failed run wrote no report, so the store request cannot fetch what was lost.
+        now = time.time()
+        self._filed(now - 7200)
+        self._run("ai-security-audit", now - 3000, bootstrap_delivery.DELIVERY_FAILED, status="failed")
+        self._run("compliance-audit", now - 2000, bootstrap_delivery.DELIVERY_FAILED)
+        self._skipped(oobe.SKIP_NOT_NEW)
+        note = self._note()
+        self.assertEqual(self._lost(note), " `compliance-audit`")
+        self.assertIn("report store: compliance-audit.`", note)
+        self.assertTrue(note.endswith(
+            "These failed, and their failure notices were not posted to the chat: `ai-security-audit`."
+        ))
+        self.assertNotIn("before anyone", note)  # nothing checks the crash against when the chat was opened
+
+    def test_a_crashed_run_does_not_hide_an_earlier_lost_summary(self):
+        # The earlier run's report is in the store; the crash after it is named, and so is that report.
+        now = time.time()
+        self._filed(now - 7200)
+        self._run("compliance-audit", now - 3000, bootstrap_delivery.DELIVERY_FAILED)
+        self._run("compliance-audit", now - 1000, bootstrap_delivery.DELIVERY_FAILED, status="failed")
+        self._run("obtainability-audit", now - 2000, bootstrap_delivery.DELIVERY_FAILED, status="failed")
+        self._run("obtainability-audit", now - 900, bootstrap_delivery.DELIVERY_FAILED, status="failed")
+        self._skipped(oobe.SKIP_NOT_NEW)
+        note = self._note()
+        self.assertEqual(self._lost(note), " `compliance-audit`")
+        self.assertIn("report store: compliance-audit.`", note)
+        self.assertTrue(note.endswith(
+            "their failure notices were not posted to the chat: `compliance-audit`, `obtainability-audit`."))
+
+    def test_a_posted_failure_notice_does_not_hide_an_earlier_lost_summary(self):
+        # The relay posted the crash's failure notice, not the earlier run's report, which is still in the store.
+        now = time.time()
+        self._filed(now - 7200)
+        self._run("compliance-audit", now - 3000, bootstrap_delivery.DELIVERY_FAILED)
+        self._run("compliance-audit", now - 1000, bootstrap_delivery.DELIVERY_FAILED, status="failed")
+        self._relay("compliance-audit", now - 940)
+        self._skipped(oobe.SKIP_NOT_NEW)
+        note = self._note()
+        self.assertEqual(self._lost(note), " `compliance-audit`")
+        self.assertNotIn("failure notices", note)
+
+    def test_a_consumed_failure_notice_settles_no_earlier_run(self):
+        # Oldest first: a lost summary, a delivered run that posted nothing (a silence marker the scheduler
+        # let through) after its `start` wrote the record, a crash before `start` whose notice posted. The
+        # notice replaced the relay's one row for the job with the record's stamp and its own time, which
+        # says nothing about the run between, so the lost summary is named. The same row is left when the
+        # delivered run did post; naming it then costs one question, not a report.
+        now = time.time()
+        self._filed(now - 7200)
+        self._run("compliance-audit", now - 3000, bootstrap_delivery.DELIVERY_FAILED)
+        self._run("compliance-audit", now - 2000, "delivered")
+        self._run("compliance-audit", now - 1000, bootstrap_delivery.DELIVERY_FAILED, status="failed")
+        self._relay("compliance-audit", now - 940, run=self._stamp(now - 1990))
+        self._skipped(oobe.SKIP_NOT_NEW)
+        note = self._note()
+        self.assertEqual(self._lost(note), " `compliance-audit`")
+        self.assertNotIn("failure notices", note)
+
+    def test_without_a_relay_record_a_crashed_run_whose_notice_was_delivered_does_not_hide_an_earlier_lost_summary(self):
+        # No session_kv.db to ask: the crashed run's delivered failure notice stands, and the earlier run's
+        # report, still in the store, is named.
+        now = time.time()
+        self._filed(now - 7200)
+        self._run("compliance-audit", now - 3000, bootstrap_delivery.DELIVERY_FAILED)
+        self._run("compliance-audit", now - 1000, "delivered", status="failed")
+        self._skipped(oobe.SKIP_NOT_NEW)
+        note = self._note()
+        self.assertEqual(self._lost(note), " `compliance-audit`")
+        self.assertNotIn("failure notices", note)
+
+    def test_a_scheduled_run_in_flight_does_not_hide_an_earlier_lost_summary(self):
+        # The running row is not an ended run; the completed one before it still lost its summary.
+        state = self._finished_chain(bootstrap_delivery.DELIVERY_FAILED)
+        cron = self.d / oobe.PROFILES_DIR / oobe.PLATFORM_PROFILE / oobe.CRON_DIR
+        with sqlite3.connect(cron / oobe.EXECUTIONS_DB) as conn:
+            conn.execute("INSERT INTO executions VALUES ('compliance-audit', 'running', ?, NULL, NULL)",
+                         (datetime.fromtimestamp(time.time() - 30, timezone.utc).isoformat(),))
+        self.assertIn("`compliance-audit`", self._lost(self._note(state)))
+
+    def test_outcomes_are_read_by_name(self):
+        for outcome, lost in (("failed", True), ("delivered", False), ("queued", False), ("not_configured", False),
+                              ("suppressed", False), ("suppressed_acked", False), (None, False), ("new-value", True)):
+            with self.subTest(outcome=outcome):
+                self._tmp.cleanup()
+                self.d.mkdir()
+                note = self._note(self._finished_chain(outcome))
+                self.assertEqual("not posted" in note, lost)
+
+    def test_a_relay_post_settles_a_failed_outcome_as_posted(self):
+        # The plugin answers an error for a post that reached one platform and missed another.
+        state = self._finished_chain(bootstrap_delivery.DELIVERY_FAILED)
+        self._relay("compliance-audit", state[oobe.STATE_MARKS]["compliance-audit"] + 60)
+        lost = self._lost(self._note(state))
+        self.assertNotIn("`compliance-audit`", lost)
+        self.assertIn("`stockout-prevention`", lost)
+
+    def test_a_later_delivered_run_with_no_relay_post_does_not_hide_a_lost_summary(self):
+        # A silence marker the scheduler let through is recorded `delivered`, and the relay posts nothing.
+        state = self._finished_chain(bootstrap_delivery.DELIVERY_FAILED)
+        self._relay("compliance-audit", state[oobe.STATE_MARKS]["compliance-audit"] - 86400)
+        self._run("compliance-audit", time.time() - 10, "delivered")
+        self.assertIn("`compliance-audit`", self._lost(self._note(state)))
+
+    def test_a_later_delivered_run_the_relay_posted_clears_an_earlier_failure(self):
+        state = self._finished_chain(bootstrap_delivery.DELIVERY_FAILED)
+        self._run("compliance-audit", time.time() - 20, "delivered")
+        self._relay("compliance-audit", time.time() - 10)
+        lost = self._lost(self._note(state))
+        self.assertNotIn("`compliance-audit`", lost)
+        self.assertIn("`stockout-prevention`", lost)
+
+    def test_with_no_relay_record_a_later_delivered_run_clears_an_earlier_failure(self):
+        state = self._finished_chain(bootstrap_delivery.DELIVERY_FAILED)
+        self._run("compliance-audit", time.time() - 10, "delivered")
+        note = self._note(state)
+        self.assertNotIn("`compliance-audit`", self._lost(note))
+        self.assertIn("audits note takes each run's delivery outcome as it is", (self.d / oobe.STAGE_LOG).read_text())
 
     def test_a_run_going_at_the_mark_counts_by_its_finish(self):
         now = time.time()
@@ -2315,8 +2545,7 @@ class FirstRunAuditsTest(unittest.TestCase):
         self._run("compliance-audit", now - 960, bootstrap_delivery.DELIVERY_FAILED)
         note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 930},
                            oobe.STATE_DONE: True})
-        self.assertIn("The security and RBAC audit has run.", note)
-        self.assertIn("were not posted to the chat: `compliance-audit`", note)
+        self.assertEqual(self._lost(note), " `compliance-audit`")
 
     def test_a_suppressed_acked_run_is_silent(self):
         now = time.time()
@@ -2324,7 +2553,7 @@ class FirstRunAuditsTest(unittest.TestCase):
         self._run("compliance-audit", now - 600, "suppressed_acked")
         note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 1300},
                            oobe.STATE_DONE: True})
-        self.assertIn("were not posted to the chat: `compliance-audit`", note)
+        self.assertEqual(self._lost(note), " `compliance-audit`")
 
     def test_a_mark_that_is_not_a_number_reads_as_no_mark(self):
         now = time.time()
@@ -2333,8 +2562,7 @@ class FirstRunAuditsTest(unittest.TestCase):
             with self.subTest(mark=mark):
                 note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": mark},
                                    oobe.STATE_DONE: True})
-                self.assertIn("The security and RBAC audit has run.", note)
-                self.assertIn("were not posted to the chat: `compliance-audit`", note)
+                self.assertEqual(self._lost(note), " `compliance-audit`")
 
     def test_a_later_silent_run_does_not_hide_the_lost_summary(self):
         # Day 2: the first run's summary was refused; the next scheduled run found nothing new.
@@ -2344,24 +2572,7 @@ class FirstRunAuditsTest(unittest.TestCase):
             self._run("compliance-audit", now - 600, outcome)
         note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 86400 - 60},
                            oobe.STATE_DONE: True})
-        self.assertIn("were not posted to the chat: `compliance-audit`.", note)
-
-    def test_delivered_summaries_are_not_listed(self):
-        for outcome in ("delivered", "suppressed", None):
-            with self.subTest(outcome=outcome):
-                self._tmp.cleanup()
-                self.d.mkdir()
-                note = self._note(self._finished_chain(outcome))
-                self.assertIn("audits have run.", note)
-                self.assertNotIn("not posted", note)
-
-    def test_a_later_run_that_delivered_clears_an_earlier_failure(self):
-        state = self._finished_chain(bootstrap_delivery.DELIVERY_FAILED)
-        self._run("compliance-audit", time.time() - 10, "delivered")
-        note = self._note(state)
-        unposted = note.partition("not posted to the chat:")[2]
-        self.assertNotIn("`compliance-audit`", unposted)
-        self.assertIn("`stockout-prevention`", unposted)
+        self.assertEqual(self._lost(note), " `compliance-audit`")
 
     def test_each_outcome_lists_the_audit_by_its_class(self):
         # (listed when it is the only run, listed when it follows a refused run)
@@ -2379,18 +2590,19 @@ class FirstRunAuditsTest(unittest.TestCase):
         for outcome, (alone, after_failed) in expected.items():
             with self.subTest(outcome=outcome):
                 for runs, listed in (
-                    ([(1.0, 2.0, outcome)], alone),
-                    ([(1.0, 2.0, "failed"), (3.0, 4.0, outcome)], after_failed),
+                    ([(1.0, 2.0, outcome, "completed")], alone),
+                    ([(1.0, 2.0, "failed", "completed"), (3.0, 4.0, outcome, "completed")], after_failed),
                 ):
-                    got = bootstrap_delivery._undelivered_audits(["compliance-audit"], {"compliance-audit": runs})
-                    self.assertEqual(got, ["`compliance-audit`"] if listed else [])
+                    # No relay record, so each outcome is read as it stands.
+                    got = bootstrap_delivery._lost_audits(("compliance-audit",), {"compliance-audit": runs}, {}, None)
+                    self.assertEqual(got, [("compliance-audit", False)] if listed else [])
 
     def test_a_run_from_before_the_mark_is_not_the_first_run(self):
         now = time.time()
         self._run("compliance-audit", now - 86400, bootstrap_delivery.DELIVERY_FAILED)
         note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 900},
                            oobe.STATE_DONE: True})
-        self.assertIn("The security and RBAC audit has started.", note)
+        self.assertIn("The security and RBAC audit started as part of onboarding.", note)
         self.assertNotIn("not posted", note)
 
     def test_a_store_without_the_outcome_column_lists_nothing(self):
@@ -2398,60 +2610,108 @@ class FirstRunAuditsTest(unittest.TestCase):
         self._run("compliance-audit", now - 600, None, columns=False)
         note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 900},
                            oobe.STATE_DONE: True})
-        self.assertIn("The security and RBAC audit has run.", note)
         self.assertNotIn("not posted", note)
         # The stage log says why no unposted summary can be named; stderr is dropped on exit 0.
         self.assertIn("no delivery_outcome column", (self.d / oobe.STAGE_LOG).read_text())
 
-    def test_an_unreadable_store_keeps_the_note_it_had(self):
+    def test_an_unreadable_store_says_the_records_could_not_be_read(self):
         cron = self.d / oobe.PROFILES_DIR / oobe.PLATFORM_PROFILE / oobe.CRON_DIR
         cron.mkdir(parents=True)
         (cron / oobe.EXECUTIONS_DB).write_text("not a database", encoding="utf-8")
-        with contextlib.redirect_stderr(io.StringIO()):
-            note = self._note({oobe.STATE_FIRED: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_DONE: True})
-        self.assertIn("audits have started.", note)
-        self.assertNotIn("not posted", note)
+        note = self._note({oobe.STATE_FIRED: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_DONE: True})
+        self.assertIn("The security and RBAC, reliability, capacity and cost audits started as part of onboarding.", note)
+        self.assertIn("I could not read the audit run records", note)
+        self.assertIn("report store: fleet-wide-cost-analysis, compliance-audit, obtainability-audit, "
+                      "stockout-prevention, security-patch-orchestrator, fleet-consistency-drift, ai-security-audit, "
+                      "gcp-networking-fabric-audit, gce-compute-fleet-audit.`", note)
         self.assertIn("cannot read", (self.d / oobe.STAGE_LOG).read_text())
 
-    def test_the_text_delivery_carries_the_undelivered_summaries(self):
-        oobe.write_state(self.d, self._finished_chain(bootstrap_delivery.DELIVERY_FAILED))
-        (self.d / INVENTORY).write_text("# Report\n", encoding="utf-8")
-        (self.d / ALIGNED).touch()
-        (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n", encoding="utf-8")
-        out = io.StringIO()
-        with (
-            mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False),
-            contextlib.redirect_stdout(out),
-            contextlib.redirect_stderr(io.StringIO()),
-        ):
-            self.assertEqual(bootstrap_delivery.main(self.d), 0)
-        self.assertIn("`stockout-prevention`. Ask me for any of these reports.", out.getvalue())
+    def test_an_unreadable_sweep_marker_keeps_the_coverage_caveat_on_the_legacy_skip(self):
+        # The legacy skip's own marker read raised past _audits_note, and the whole-note fallback lost the caveat.
+        (self.d / SCAN_FILED).write_bytes(b"task_id=t_\xff\nfiled_at=1\n")
+        self._skipped(bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON)
+        note = self._note()
+        self.assertTrue(note.startswith(f"The audits did not run as part of onboarding: "
+                                        f"{bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON}."))
+        self.assertIn(bootstrap_delivery.AUDITS_NOT_COVERED_NOTE, note)
+        self.assertNotIn("I could not read the audit run records", note)
 
-    def test_a_chain_under_way_names_a_held_audit_as_not_run(self):
-        note = self._note({oobe.STATE_FIRED: ["fleet-wide-cost-analysis"],
-                           oobe.STATE_HELD: {"compliance-audit": oobe.HOLD_MISSING}, oobe.STATE_DONE: False})
-        self.assertEqual(
-            note, f"{bootstrap_delivery.AUDITS_RUNNING_NOTE} Not run: the security and RBAC audit ({oobe.HOLD_MISSING})."
-        )
+    def test_an_unreadable_sweep_marker_reads_every_run(self):
+        now = time.time()
+        (self.d / SCAN_FILED).write_bytes(b"task_id=t_\xff\nfiled_at=1\n")
+        self._run("compliance-audit", now - 600, bootstrap_delivery.DELIVERY_FAILED)
+        self._skipped(oobe.SKIP_NOT_NEW)
+        self.assertEqual(self._lost(self._note()), " `compliance-audit`")
+
+    def test_a_note_that_raises_still_delivers_the_report_before_any_claim_is_lost(self):
+        with mock.patch.object(bootstrap_delivery, "_stage_sentences", side_effect=RuntimeError("boom")):
+            out = self._deliver()
+        self.assertIn("# Report", out)
+        self.assertIn("I could not read the audit run records", out)
+        self.assertIn("the audits note failed", (self.d / oobe.STAGE_LOG).read_text())
+
+    def test_a_raise_reading_the_runs_keeps_the_stage_sentence(self):
+        self._skipped(oobe.SKIP_NOT_NEW)
+        with mock.patch.object(bootstrap_delivery, "_relay_posts", side_effect=PermissionError("denied")):
+            note = self._note()
+        self.assertIn(bootstrap_delivery.AUDITS_NOT_COVERED_NOTE, note)
+        self.assertIn("I could not read the audit run records", note)
+        self.assertIn("could not tell which summaries were posted", (self.d / oobe.STAGE_LOG).read_text())
+
+    def test_the_note_is_built_before_the_claim(self):
+        claimed = []
+        real = bootstrap_delivery._claim_delivery
+        with mock.patch.object(bootstrap_delivery, "_claim_delivery",
+                               side_effect=lambda d: claimed.append(True) or real(d)), \
+                mock.patch.object(bootstrap_delivery, "_safe_audits_note",
+                                  side_effect=lambda *a, **k: self.assertEqual(claimed, []) or "NOTE-BUILT-FIRST"):
+            self.assertIn("NOTE-BUILT-FIRST", self._deliver())
+
+    def test_the_text_delivery_carries_the_lost_summaries(self):
+        oobe.write_state(self.d, self._finished_chain(bootstrap_delivery.DELIVERY_FAILED))
+        self._filed(1)
+        self.assertIn("stockout-prevention.`\n", self._deliver())
 
     def test_the_text_delivery_closes_with_the_skip(self):
-        (self.d / INVENTORY).write_text("# Report\n", encoding="utf-8")
-        (self.d / ALIGNED).touch()
-        (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n", encoding="utf-8")
+        self._filed(1)
         self._skipped(oobe.SKIP_NOT_NEW)
-        out = io.StringIO()
-        with (
-            mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False),
-            contextlib.redirect_stdout(out),
-            contextlib.redirect_stderr(io.StringIO()),
-        ):
-            self.assertEqual(bootstrap_delivery.main(self.d), 0)
         self.assertEqual(
-            out.getvalue(),
-            f"# Report\n\nThe first-run audits did not run: {oobe.SKIP_NOT_NEW}. "
+            self._deliver(),
+            f"# Report\n\nThe audits did not run as part of onboarding: {oobe.SKIP_NOT_NEW}. "
             f"{bootstrap_delivery.AUDITS_NOT_COVERED_NOTE}\n",
         )
 
+    def test_the_relay_record_it_reads_is_the_one_session_kv_writes(self):
+        server = (Path(__file__).resolve().parents[2] / "platform" / "scripts" / "session_kv_server.py").read_text()
+        table = server[server.index("CREATE TABLE IF NOT EXISTS audit_report_runs"):]
+        table = table[:table.index(")")]
+        for column in ("profile", "job_id", "posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"):
+            self.assertIn(column, table)
+        self.assertIn(f'os.getenv("{bootstrap_delivery.SESSION_KV_DB_ENV}", '
+                      f'"{bootstrap_delivery.DEFAULT_SESSION_KV_DB_PATH}")', server)
+
+    def test_the_request_covers_every_shipped_fleet_audit(self):
+        # A fleet audit added to the roster, or to the first-run chain, needs a request the note can send.
+        roster = json.loads((Path(__file__).resolve().parents[2] / "platform" / "cron" / "jobs.json").read_text())
+        jobs = roster["jobs"] if isinstance(roster, dict) else roster
+        shipped = {j["id"] for j in jobs if "fleet-audit" in (j.get("skills") or []) and j.get("deliver") == "chat"}
+        checked = set(bootstrap_delivery._checked_audits())
+        self.assertEqual(checked, shipped | set(oobe.FIRST_RUN_AUDITS))
+        # Each one the store request asks for has a report in the store.
+        sys.path.insert(0, str(FLEET_AUDIT_SCRIPTS))
+        try:
+            import audit_report
+        finally:
+            sys.path.remove(str(FLEET_AUDIT_SCRIPTS))
+        self.assertEqual(sorted(checked - set(audit_report.AUDITS)), [])
+
+    def test_the_request_is_the_nightly_cases_prompt(self):
+        # bench/tasks/fleet-audit-request-line grades the request on a live install; the two texts stay one.
+        import yaml
+
+        case = Path(__file__).resolve().parents[3] / "bench" / "tasks" / "fleet-audit-request-line" / "task.yaml"
+        data = yaml.safe_load(case.read_text(encoding="utf-8"))
+        self.assertEqual(data["prompt"], bootstrap_delivery._request(bootstrap_delivery._checked_audits()))
 
 if __name__ == "__main__":
     unittest.main()

@@ -224,11 +224,24 @@ def case_verdicts(parts: dict[str, list[dict]], cases: list[str], tracked: dict[
     open kept-case issue: one with no line anywhere in the window still has
     its nights read (on that part), from the window's start."""
     homes = case_homes(parts)
+    # The cases each date's inject lane dropped before the fan-out
+    # (runs[].lane_excluded, SCHEMA.md): a next-mode night was never going to
+    # run them, so their absence that date is not a night they were kept from.
+    lane_excluded: dict[str, set[str]] = {}
+    for nights in parts.values():
+        for n in nights:
+            names = n["run"].get("lane_excluded") or []
+            lane_excluded.setdefault(n["date"], set()).update(x for x in names if isinstance(x, str))
     eligible: dict[str, dict[str, dict]] = {}
     for part, nights in parts.items():
-        fullest = max((len(n["tasks"]) for n in nights), default=0)
+        # The fullest night as this date's lane would have run it: each
+        # night's cases less the ones this date's inject lane drops, so a
+        # pre-flip night does not count cases a next-mode night never runs.
+        def fullest(day: str, nights: list[dict] = nights) -> int:
+            dropped = lane_excluded.get(day, set())
+            return max((len(set(n["tasks"]) - dropped) for n in nights), default=0)
         eligible[part] = {n["date"]: n for n in nights if not n["lost"] and not n["unrescued"]
-                          and not infra_event([t for t, _ in n["tasks"].values()], fullest)}
+                          and not infra_event([t for t, _ in n["tasks"].values()], fullest(n["date"]))}
     every = {part: {n["date"]: n for n in nights} for part, nights in parts.items()}
     dates = sorted({n["date"] for nights in parts.values() for n in nights})
     out: dict[str, list[dict]] = {}
@@ -243,6 +256,8 @@ def case_verdicts(parts: dict[str, list[dict]], cases: list[str], tracked: dict[
             if first and datetime.date.fromisoformat(day) < first:
                 continue
             recorders = [p for p in nightly.PARTS if case in every.get(p, {}).get(day, {}).get("tasks", {})]
+            if not recorders and case in lane_excluded.get(day, ()):
+                continue
             # A graded line is direct evidence the case ran: it claims the
             # date even on a pool-wide or unrescued night (not a lost
             # one, whose lines the domain reader skips too), so "a graded

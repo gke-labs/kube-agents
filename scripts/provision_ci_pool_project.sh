@@ -463,9 +463,14 @@ done
 
 # compute.viewer: the GKE provider lists each node pool's instance group
 # managers on refresh, which no other role here carries (seen live 2026-09-28).
+# compute.loadBalancerAdmin: the stack plants a backend service and a health
+# check on the default pool's instance group (readiness-lb-drain-timeout,
+# defects-b.tf), and the create needs compute.backendServices.*,
+# compute.healthChecks.* and compute.instanceGroups.use.
 echo "Granting the seeded-fleet reconciler access to ${PROJECT_ID}..."
 for role in \
   roles/compute.instanceAdmin.v1 \
+  roles/compute.loadBalancerAdmin \
   roles/compute.securityAdmin \
   roles/compute.storageAdmin \
   roles/compute.viewer \

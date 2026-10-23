@@ -333,8 +333,42 @@ UPGRADE_BLOCKED_IMPACT_SKEW_FORMAT = (
 UPGRADE_BLOCKED_IMPACT_BOTH_FORMAT = (
     "{cluster} is {lag} and its upgrade would not complete: {cause}, so GKE will not move the control plane until the pool moves, and once it has, holds each node's drain for up to an hour and then evicts {workloads} anyway."
 )
+# A per-entry readiness rule's block (the reporter's `rule_blocking` rows, each
+# stamped with the rule's id and its one-line text): the rule's text is the
+# claim, so this arm's tail adds none of its own. Alone or beside budgets it
+# governs the sentence, since a rule's block stops the upgrade where a budget
+# only holds it; under a skew ceiling the ceiling's tail stands, as it does
+# over a budget, and the rule's clause sits in the cause.
+UPGRADE_BLOCKED_IMPACT_RULES_FORMAT = "{cluster} is {lag} and its upgrade would not go through cleanly: {cause}."
 UPGRADE_BLOCKED_PDB_CAUSE_FORMAT = "PodDisruptionBudget {pdb} ({field}, disruptionsAllowed {allowed}) refuses eviction of {workloads}"
 UPGRADE_BLOCKED_SKEW_CAUSE_FORMAT = "node pool(s) {pools} would exceed the version-skew ceiling against the target control plane"
+UPGRADE_BLOCKED_RULE_CAUSE_FORMAT = "readiness rule {rule} blocks it: {text}"
+# The reporter's rule rows, as fleet_upgrade_report.assess_readiness writes
+# them: `readiness.rule_blocking`, one dict per blocker with the registry's
+# `rule` id and the rule's `text` stamped by the fold.
+READINESS_RULE_BLOCKING_KEY = "rule_blocking"
+RULE_ROW_RULE_KEY = "rule"
+RULE_ROW_TEXT_KEY = "text"
+# What the rule's mechanism holds, as the fold stamps it on the row (`holds`, a list of the
+# reporter's readiness_rules.HOLDS_VALUES): the control-plane move, the node-pool move, or
+# both. A block counts for a lag only when it holds a move that lag makes due, as a budget
+# counts only where a node is drained; a row with no `holds` (a reporter older than the
+# stamp) counts on every lag.
+RULE_ROW_HOLDS_KEY = "holds"
+HOLDS_CLUSTER = "cluster"
+HOLDS_NODE_POOL = "node-pool"
+HOLDS_BOTH = (HOLDS_CLUSTER, HOLDS_NODE_POOL)
+# The reporter's `readiness.unknown` rows: a rule that could not read, each with the rule's id,
+# whether it could have blocked (`can_block`) and the fold's `holds`. One from a rule that can
+# block, on a move the lag makes due, is the gap a failed budget read is: unevaluated, never
+# clean; a block on the row still wins.
+READINESS_UNKNOWN_KEY = "unknown"
+RULE_ROW_CAN_BLOCK_KEY = "can_block"
+RULE_ROW_REASON_KEY = "reason"
+# The rules first, so their ids survive the reason clip; then each rule's reason.
+UNEVALUATED_RULE_UNKNOWN_FORMAT = "readiness rule(s) {rules} could not grade the move due: {reasons}"
+UNEVALUATED_RULE_UNKNOWN_RULES_SEPARATOR = ", "
+UNEVALUATED_RULE_UNKNOWN_SEPARATOR = "; "
 # Joins the clauses of one cause: every blocking budget, with the skew clause
 # before them when both block.
 CAUSE_SEPARATOR = "; "
@@ -353,6 +387,8 @@ EXCERPT_NAMED_LADDER = (None, 8, 5, 3, 1)
 EXCERPT_FORMAT = "readiness.status={status}: {cause}"
 CAUSE_MORE_FORMAT = "and {n} more"
 CAUSE_MORE_BUDGETS_FORMAT = "and {n} more drain-blocking PodDisruptionBudget(s); the readiness report at {path} lists every one"
+CAUSE_MORE_RULES_FORMAT = "and {n} more readiness rule block(s); the readiness report at {path} lists every one"
+CAUSE_RULES_COUNT_FORMAT = "{n} readiness rule block(s), listed in the readiness report at {path}"
 CAUSE_COUNTED_FORMAT = "{n} (listed in the readiness report at {path})"
 CAUSE_BUDGETS_COUNT_FORMAT = "{n} drain-blocking PodDisruptionBudget(s), listed in the readiness report at {path}, refuse eviction of {workloads}"
 CAUSE_WORKLOADS_COUNT_FORMAT = "{n} workload(s)"
@@ -429,7 +465,7 @@ IMPACT = {
     "blocking-exclusion": "A maintenance exclusion is currently suppressing upgrades on this cluster.",
     "stale-image-type": "This node pool's image type is no longer offered at this location and cannot take node-image patches.",
     "no-notifications": "This cluster publishes no GKE upgrade notifications; upgrade-available signals reach no one between audits.",
-    UPGRADE_BLOCKED_CHECK: "This cluster is behind, and the upgrade it needs would not go through cleanly: a drain-blocking budget holds each node's drain for up to an hour before GKE evicts the workload anyway, or a version-skew ceiling has GKE refuse the control-plane move.",
+    UPGRADE_BLOCKED_CHECK: "This cluster is behind, and the upgrade it needs would not go through cleanly: a drain-blocking budget holds each node's drain for up to an hour before GKE evicts the workload anyway, a version-skew ceiling has GKE refuse the control-plane move, or a readiness rule blocks it (a load balancer draining longer than GKE waits per node, a Node whose instance is gone, a cluster held by an operation, a withdrawn target patch).",
 }
 
 
@@ -1340,16 +1376,41 @@ class Cause(NamedTuple):
     """Why a member is blocked, in the parts the excerpt and the impact are
     built from: the arm's impact format, the pools past the ceiling (empty
     when skew does not block or does not apply), the blocking budgets in name
-    order (empty when none apply) and every covered workload once, in that
-    order."""
+    order (empty when none apply), every covered workload once, and the
+    readiness rules' blocks as `(rule id, text)` in the report's order (empty
+    when no rule blocks), in that order."""
 
     impact_format: str
     pools: list[str]
     budgets: list[dict]
     evicted: list[str]
+    rules: list[tuple[str, str]]
 
 
-def _readiness_cause(readiness: dict, *, budget_applies: bool = True, skew_applies: bool = True) -> Cause | None:
+def _holds_a_move(row: dict, moves) -> bool:
+    """Whether the row's rule holds one of `moves`; a row that declares no `holds` holds both."""
+    holds = row.get(RULE_ROW_HOLDS_KEY)
+    if not isinstance(holds, list) or not holds:
+        return True
+    return any(move in holds for move in moves)
+
+
+def _rule_unknowns(readiness: dict, moves=HOLDS_BOTH) -> list[tuple[str, str]]:
+    """`(rule id, reason)` for each `readiness.unknown` row from a rule that can block and holds
+    one of `moves`: the rule could not read what it grades, so the member is ungraded on it."""
+    rows = readiness.get(READINESS_UNKNOWN_KEY) or []
+    return [(str(row[RULE_ROW_RULE_KEY]), str(row.get(RULE_ROW_REASON_KEY) or row.get(RULE_ROW_TEXT_KEY) or "")) for row in rows if isinstance(row, dict) and row.get(RULE_ROW_RULE_KEY) and row.get(RULE_ROW_CAN_BLOCK_KEY) and _holds_a_move(row, moves)]
+
+
+def _rule_blocks(readiness: dict, moves=HOLDS_BOTH) -> list[tuple[str, str]]:
+    """`(rule id, text)` for each of the reporter's `rule_blocking` rows whose
+    rule holds one of `moves`, in the registry's order; a row that is not a
+    dict or carries no rule id is not one of them."""
+    rows = readiness.get(READINESS_RULE_BLOCKING_KEY) or []
+    return [(str(row[RULE_ROW_RULE_KEY]), str(row.get(RULE_ROW_TEXT_KEY) or "")) for row in rows if isinstance(row, dict) and row.get(RULE_ROW_RULE_KEY) and _holds_a_move(row, moves)]
+
+
+def _readiness_cause(readiness: dict, *, budget_applies: bool = True, skew_applies: bool = True, moves=HOLDS_BOTH) -> Cause | None:
     """Why the reporter graded a member blocked, in the forms 3.11 flags; None
     for a block that rests on a maintenance exclusion alone, which is 3.8's
     subject and neither a held drain nor a refused move, and None when nothing
@@ -1360,10 +1421,16 @@ def _readiness_cause(readiness: dict, *, budget_applies: bool = True, skew_appli
     causes can block the upgrade that is due: a control-plane move drains no
     node, so a budget cannot hold it (`budget_applies=False`); a pool moving
     toward its control plane is what closes a skew, so the ceiling does not
-    refuse it (`skew_applies=False`)."""
+    refuse it (`skew_applies=False`); a readiness rule's block counts when
+    its mechanism holds one of `moves`, the moves the lag makes due (a rule
+    that holds a node's removal, like a budget, cannot hold a control-plane
+    move), and its text says what stops it, so the row's `rule_blocking`
+    entries that hold are a cause, named after the ceiling and before the
+    budgets."""
     pdbs = [p for p in (readiness.get("pdbs") or {}).get("blocking") or [] if isinstance(p, dict)] if budget_applies else []
     pools = [str(p) for p in ((readiness.get("skew") or {}).get("blocking") or [])] if skew_applies else []
-    if not pdbs and not pools:
+    rules = _rule_blocks(readiness, moves)
+    if not pdbs and not pools and not rules:
         return None
     # Every blocking budget, in name order: the reporter lists them in the
     # API's order, and a cause that named only the first would make which
@@ -1372,11 +1439,13 @@ def _readiness_cause(readiness: dict, *, budget_applies: bool = True, skew_appli
     evicted = list(dict.fromkeys(_workload_name(w) for p in ordered for w in p.get("workloads") or []))
     if ordered and pools:
         impact_format = UPGRADE_BLOCKED_IMPACT_BOTH_FORMAT
-    elif ordered:
-        impact_format = UPGRADE_BLOCKED_IMPACT_PDB_FORMAT
-    else:
+    elif pools:
         impact_format = UPGRADE_BLOCKED_IMPACT_SKEW_FORMAT
-    return Cause(impact_format, pools, ordered, evicted)
+    elif rules:
+        impact_format = UPGRADE_BLOCKED_IMPACT_RULES_FORMAT
+    else:
+        impact_format = UPGRADE_BLOCKED_IMPACT_PDB_FORMAT
+    return Cause(impact_format, pools, ordered, evicted, rules)
 
 
 def _named(items: list[str], cap: int | None) -> str:
@@ -1397,13 +1466,16 @@ def _budget_clause(budget: dict, named: int | None) -> str:
 
 
 def _cause_text(cause: Cause, named: int | None, path: str) -> str:
-    """The cause clause: the ceiling first when it blocks, then the budgets.
-    `named` caps the pools, budgets and per-budget workloads it names and
-    counts the rest, pointing at the readiness report at `path`; None names
-    all."""
+    """The cause clause: the ceiling first when it blocks, then the readiness
+    rules' blocks, then the budgets. `named` caps the pools, rules, budgets
+    and per-budget workloads it names and counts the rest, pointing at the
+    readiness report at `path`; None names all."""
     parts = []
     if cause.pools:
         parts.append(UPGRADE_BLOCKED_SKEW_CAUSE_FORMAT.format(pools=_named(cause.pools, named)))
+    parts.extend(UPGRADE_BLOCKED_RULE_CAUSE_FORMAT.format(rule=rule, text=text) for rule, text in cause.rules[:named])
+    if named is not None and len(cause.rules) > named:
+        parts.append(CAUSE_MORE_RULES_FORMAT.format(n=len(cause.rules) - named, path=path))
     parts.extend(_budget_clause(b, named) for b in cause.budgets[:named])
     if named is not None and len(cause.budgets) > named:
         parts.append(CAUSE_MORE_BUDGETS_FORMAT.format(n=len(cause.budgets) - named, path=path))
@@ -1425,6 +1497,8 @@ def _counted_cause_text(cause: Cause, path: str) -> str:
     parts = []
     if cause.pools:
         parts.append(UPGRADE_BLOCKED_SKEW_CAUSE_FORMAT.format(pools=CAUSE_COUNTED_FORMAT.format(n=len(cause.pools), path=path)))
+    if cause.rules:
+        parts.append(CAUSE_RULES_COUNT_FORMAT.format(n=len(cause.rules), path=path))
     if cause.budgets:
         parts.append(CAUSE_BUDGETS_COUNT_FORMAT.format(n=len(cause.budgets), path=path, workloads=_counted_workloads(cause)))
     return CAUSE_SEPARATOR.join(parts)
@@ -1462,6 +1536,17 @@ def _applicable_causes(lag: str) -> tuple[bool, bool]:
     return lag != LAG_POOL_AHEAD, lag not in (LAG_POOL_ONLY, LAG_POOL_MAJOR)
 
 
+def _due_moves(lag: str) -> tuple[str, ...]:
+    """The moves the lag makes due, which a readiness rule's block has to hold to
+    count: the control plane's alone when a pool is ahead of it, the pool's alone
+    when a pool is behind a current control plane, both otherwise."""
+    if lag == LAG_POOL_AHEAD:
+        return (HOLDS_CLUSTER,)
+    if lag in (LAG_POOL_ONLY, LAG_POOL_MAJOR):
+        return (HOLDS_NODE_POOL,)
+    return HOLDS_BOTH
+
+
 class Due(NamedTuple):
     """What 3.11 knows about a cluster before the reporter runs, computed once
     per entry by `_due` and read by every arm that disposes of the check: the
@@ -1473,6 +1558,7 @@ class Due(NamedTuple):
     lag: str
     budget_applies: bool
     skew_applies: bool
+    moves: tuple
 
 
 def _due(entry: dict) -> Due:
@@ -1486,7 +1572,7 @@ def _due(entry: dict) -> Due:
     behind = judged and _is_behind(entry)
     lag = _lag_phrase(entry) if behind else LAG_BEHIND
     budget_applies, skew_applies = _applicable_causes(lag)
-    return Due(judged, behind, lag, budget_applies, skew_applies)
+    return Due(judged, behind, lag, budget_applies, skew_applies, _due_moves(lag))
 
 
 def _lag_phrase(entry: dict) -> str:
@@ -1518,7 +1604,7 @@ def _upgrade_blocked_hit(entry: dict, member: dict, report_path: str, due: Due) 
     readiness = member.get("readiness") or {}
     if readiness.get("status") != READINESS_BLOCKED:
         return None
-    cause = _readiness_cause(readiness, budget_applies=due.budget_applies, skew_applies=due.skew_applies)
+    cause = _readiness_cause(readiness, budget_applies=due.budget_applies, skew_applies=due.skew_applies, moves=due.moves)
     if cause is None:
         return None
     return {
@@ -1867,18 +1953,33 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
         ceiling_ungraded = due.skew_applies and (not (member or {}).get("target_version") or bool((readiness.get("skew") or {}).get("unknown")))
         budget_blocked = due.budget_applies and readiness.get("status") == READINESS_BLOCKED and bool((readiness.get("pdbs") or {}).get("blocking"))
         budget_ungraded = due.budget_applies and bool(readiness.get("read_error"))
-        # `blocked` for something that is neither a budget, skew, nor an
-        # exclusion: a cause the reporter learned after this join was written.
-        # Recording it as run-and-clean would publish an all-clear over an
-        # upgrade the reporter says is blocked; it is ungraded until this check
-        # knows the cause, on every row, the no-target one included.
+        # A readiness rule's block (`rule_blocking`: a load balancer draining
+        # longer than GKE waits per node, a Node whose instance is gone, a
+        # cluster held by an operation, a withdrawn target patch) is as
+        # definite as a budget's or the ceiling's on the lag whose move it
+        # holds (`holds`): blocked beats unknown here too, so a failed budget
+        # read beside it is no gap.
+        rule_blocked = readiness.get("status") == READINESS_BLOCKED and bool(_rule_blocks(readiness, due.moves))
+        # The symmetric gap: a rule that can block, on a move the lag makes due, could
+        # not read (a project list the agent's role cannot make or the proxy cut, a
+        # failed describe or server config). The reporter grades the member `unknown`
+        # with the rule's reason; like a failed budget read, that is unevaluated, never
+        # clean. A block on the row still wins, as it does over a failed budget read.
+        rule_unknowns = _rule_unknowns(readiness, due.moves)
+        rule_ungraded = bool(rule_unknowns)
+        # `blocked` for something that is neither a budget, skew, a readiness
+        # rule's block, nor an exclusion: a cause the reporter learned after
+        # this join was written. Recording it as run-and-clean would publish an
+        # all-clear over an upgrade the reporter says is blocked; it is
+        # ungraded until this check knows the cause, on every row, the
+        # no-target one included.
         unrecognised_block = readiness.get("status") == READINESS_BLOCKED and _readiness_cause(readiness) is None and not (readiness.get("maintenance") or {}).get("blocking_exclusions")
         why = None
         if not members:
             why = no_report
         elif member is None:
             why = UNEVALUATED_NO_ROW
-        elif no_target and due.budget_applies and not skew_blocked and not readiness.get("read_error") and not unrecognised_block:
+        elif no_target and due.budget_applies and not skew_blocked and not readiness.get("read_error") and not rule_ungraded and not unrecognised_block:
             # That row on a lag a budget can hold (a behind control plane,
             # or a pool behind its control plane): the target matters only to
             # the ceiling, so the budget half is all that is graded there, and
@@ -1899,7 +2000,7 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
             # Before the gap arms: a block of unknown cause is the fact to
             # publish, whatever else on the row went ungraded.
             why = UNEVALUATED_UNRECOGNISED_BLOCK
-        elif not skew_blocked and not budget_blocked and (budget_ungraded or ceiling_ungraded):
+        elif not skew_blocked and not budget_blocked and not rule_blocked and (budget_ungraded or ceiling_ungraded or rule_ungraded):
             # The reporter's own notes say why a row is `unknown`: the grade's
             # note (no target, so skew and exclusion scope ungraded) and the
             # row's (why there is no target: no channel, or a get-server-config
@@ -1910,7 +2011,8 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
             # The read error is the reason only where the budget read was the
             # gap; a pool-ahead row with a failed read and an ungraded ceiling
             # names the ceiling's note, not a read whose answer is discarded.
-            why = str((readiness.get("read_error") if budget_ungraded else None) or UNEVALUATED_STATUS_FORMAT.format(status=readiness.get("status"), note=f": {note}" if note else ""))[:UNEVALUATED_REPORT_MESSAGE_CHARS]
+            rule_reason = UNEVALUATED_RULE_UNKNOWN_FORMAT.format(rules=UNEVALUATED_RULE_UNKNOWN_RULES_SEPARATOR.join(rule for rule, _ in rule_unknowns), reasons=UNEVALUATED_RULE_UNKNOWN_SEPARATOR.join(reason for _, reason in rule_unknowns)) if rule_ungraded else None
+            why = str((readiness.get("read_error") if budget_ungraded else None) or rule_reason or UNEVALUATED_STATUS_FORMAT.format(status=readiness.get("status"), note=f": {note}" if note else ""))[:UNEVALUATED_REPORT_MESSAGE_CHARS]
         if why is not None:
             log(f"{project}/{entry['_bare_name']}: readiness not graded ({why}); upgrade-blocked unevaluated there")
             _unevaluated(entry, why)

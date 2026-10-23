@@ -52,7 +52,7 @@ worker follows `inventory.md` and lists the fleet, while the gate files one audi
 second card follows `inventory_prioritize_sop.md`, scoring and registering everything, and
 `inventory_findings.py select` chooses what it renders to `/opt/data/INVENTORY.md`: at most
 `FINDINGS_FIRST_REPORT_CRITICALS` (2) critical items and nothing below critical (§7.2);
-`bootstrap_delivery.py` posts that file to chat as written, followed by a note on the first-run audits (on Slack with `KAGE_SLACK_UX` on, laid out
+`bootstrap_delivery.py` posts that file to chat as written, followed by a note on the fleet audits (on Slack with `KAGE_SLACK_UX` on, laid out
 again by a fixed script that keeps every listed finding with its sentence as written) and marks the
 listed findings shown. The cap covers criticals too. A fleet with six criticals gets two in the report
 and the other four through the paced nudge; a fleet with one critical and forty gaps gets one, and the

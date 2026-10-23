@@ -13,6 +13,9 @@
   becomes decision-grade by resolution (the Authority section).
   Amended 10/8, again without a version bump: the chat message schema (the Chat messages
   section), a DataPart layout for chat renderers that adds no kind and no envelope field.
+  Amended 10/21, again without a version bump: the library's held subscriptions (#3655),
+  which hold each delivery for a task's life and expect redelivery, are outside the
+  at-most-once rule (the `envelopeId` row and assertion 5).
   Amended 10/22, without a version bump: a new task for a profile is submitted on its own
   subject, `a2a.tasks.{profile}.{tier}.{kind}.{taskId}.submit`, so the dispatcher's
   durables never see a follow-up (the Subjects section; the design is #3660).
@@ -144,7 +147,7 @@ lacked.
 | Field                  | Rules                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `protocol`             | Required. Major.minor; bump major on breaking change. Consumers MUST reject unknown majors and MUST ignore unknown envelope fields within a major.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `envelopeId`           | Required, unique per envelope. The dedup key: JetStream redelivery means consumers will see repeats, and this is how the library delivers each envelope to the application at most once. The dedup window is bounded - an LRU or time window sized to the redelivery horizon (`MaxAckPending` × ack wait, plus margin), never an unbounded set that grows for the life of the process.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `envelopeId`           | Required, unique per envelope. The dedup key: JetStream redelivery means consumers will see repeats, and this is how the library delivers each envelope to the application at most once. Held subscriptions are the exception: they expect redelivery and recognise it by task id (assertion 5). The dedup window is bounded - an LRU or time window sized to the redelivery horizon (`MaxAckPending` × ack wait, plus margin), never an unbounded set that grows for the life of the process.                                                                                                                                                                                                                                                                                                                                                                          |
 | `correlationId`        | Required. Minted once by the gateway at the user interaction that starts a task. Copied verbatim on every hop; never re-minted by an intermediary. A task spawned in service of another task inherits its parent's value, and a follow-up or steer to a running task carries the task's original value - the steer is attributed by its own envelope and `authority` block, not by a new correlation. This is the identifier that spans question, hops, and resulting change.                                                                                                                                                                                                                                                                                                                                                                                           |
 | `traceparent`          | Optional. W3C trace context, for OTel tooling. `correlationId` is authoritative; `traceparent` is a convenience and may be re-parented per span.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `taskId` / `contextId` | Required for kinds `message`, `status-update`, `artifact-update`, `cancel`. Optional for `topic-update` (present when a topic write happened in the course of a task - see Topics). Absent for `agent-card`, `agent-closed`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
@@ -259,11 +262,16 @@ A consumer implementing rule 2 is therefore checking an invariant the server alr
 and an install that widens `.in` or `…submit` publish to a second identity has broken the rule's premise
 before any consumer sees it.
 
-**What this does not give a consumer.** It does not answer "who is the human". The chain
-terminates at a request id, not a person; `authority.requester` names a pseudonymized
-principal and is advisory. It does not expire - 09 §5 is explicit that nothing carries an
-issue time or a use count, so a resolvable reference is resolvable indefinitely, and a
-consumer MUST NOT read a successful resolution as evidence the request is still live.
+**What this does not give a consumer.** It does not answer "who is the human" for
+authorization. The capability chain terminates at a request id, not a person;
+`authority.requester` names a pseudonymized principal (`hmac:<32-hex>`) and is advisory for
+access control. As an interim exception until the #1884 capability grant carries the
+pseudonymous requester subject directly, the bridge records `authority.requester.principal`
+and `authority.audience.kind` in `session-kv` on task submission (where the gateway is the
+sole `.in` publisher under rule 2 above) to key per-user memory isolation. It does not expire -
+09 §5 is explicit that nothing carries an issue time or a use count, so a resolvable
+reference is resolvable indefinitely, and a consumer MUST NOT read a successful resolution
+as evidence the request is still live.
 
 ### Kinds and payload types
 
@@ -969,6 +977,10 @@ Envelope:
    rule, `…events` and `…supervisor` included, which is where it already was. Nothing
    requires `to` to be present on any class, and event envelopes carry none.)
 5. A redelivered envelope (same `envelopeId`) reaches the application at most once.
+   (Amended 10/21: on the library's auto-ack subscriptions. A held subscription, whose
+   handler holds each delivery for the task's life (a profile's intake, #3655), expects
+   redelivery and leaves it to the caller, which recognises it by task id: a task that had
+   already started is failed, never re-run.)
 
 Payloads:
 

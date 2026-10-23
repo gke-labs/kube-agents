@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -185,6 +185,9 @@ class Base(unittest.TestCase):
             os.environ,
             {
                 watch.WATCH_HOME_ENV: str(self.home),
+                # The profile home holds no roster, so the failure line's ending
+                # does not depend on the machine's own HERMES_HOME.
+                watch.HOME_ENV: self.tmp.name,
                 watch.PROJECTS_ENV: "p1",
                 watch.REFRESH_DAYS_ENV: "",
                 watch.SKILL_SCRIPTS_DIR_ENV: "",
@@ -209,9 +212,22 @@ class Base(unittest.TestCase):
         self.env.stop()
         self.tmp.cleanup()
 
+    @staticmethod
+    def failed(detail: str, reason: str = watch.FAILED_REASON_ERROR, admin: bool | None = None) -> str:
+        """What a failed tick prints, stdout and stderr in turn: the plain line, then the detail.
+
+        No roster under this profile home, so a failure a retry may clear tries again at
+        the next scheduled run; any other says a person has to act."""
+        if admin is None:
+            admin = reason in watch.FAILED_REASONS_NEED_ADMIN
+        then = watch.FAILED_NEEDS_ADMIN if admin else watch.FAILED_NEXT_UNKNOWN
+        line = watch.FAILED_TICK_LINE.format(reason=reason, next=then)
+        return f"{line}\nupgrade readiness watch: the tick failed: {detail}\n"
+
     def run_tick(self, sandbox: FakeSandbox, argv: list[str] | None = None) -> tuple[int, str]:
+        """``main``'s exit code and what it printed, stdout and stderr in one buffer."""
         out = io.StringIO()
-        with mock.patch.object(watch.sandbox_exec, "run", side_effect=sandbox.run), redirect_stdout(out):
+        with mock.patch.object(watch.sandbox_exec, "run", side_effect=sandbox.run), redirect_stdout(out), redirect_stderr(out):
             code = watch.main(argv or [])
         return code, out.getvalue()
 
@@ -973,7 +989,7 @@ class Budget(Base):
             sandbox = FakeSandbox(versions, readiness, aliases={"123456": "my-proj"}, table_failing_projects={"123456", "my-proj"})
             code, out = self.run_tick(sandbox)
         self.assertEqual(code, 0)
-        self.assertEqual(out, "upgrade readiness watch: the tick failed: RuntimeError: sandbox exited 255 without a report: ssh: lost connection\n")
+        self.assertEqual(out, self.failed("RuntimeError: sandbox exited 255 without a report: ssh: lost connection"))
         self.assertEqual(sandbox.kinds(), ["versions"], "one project, one run, and no readiness run on a failed tick")
         self.assertEqual(self.ledger(), before, "a failed tick writes nothing to the ledger")
         self.assertTrue(self.marker().exists())
@@ -1045,20 +1061,23 @@ class Budget(Base):
             outs.append(out)
         self.assertEqual(
             outs[0],
-            "upgrade readiness watch: the tick failed: ProjectUnresolved: no project was read under a key; 123456: the project number did not "
-            "resolve to its id (`gcloud projects describe` failed), so its clusters are not keyed and earn no report until it does; grant the "
-            "credential `resourcemanager.projects.get` or name the project by its id\n",
+            self.failed(
+                "ProjectUnresolved: no project was read under a key; 123456: the project number did not "
+                "resolve to its id (`gcloud projects describe` failed), so its clusters are not keyed and earn no report until it does; grant the "
+                "credential `resourcemanager.projects.get` or name the project by its id",
+                watch.FAILED_REASON_UNRESOLVED,
+            ),
         )
         self.assertEqual(outs[1], "", "a standing failure is announced once")
         self.assertEqual(outs[2], "")
         self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists(), "a failed tick writes nothing")
         self.assertFalse((self.home / "reports").exists())
-        self.assertIn("resourcemanager.projects.get", self.marker().read_text(), "the standing failure is kept beside the ledger")
+        self.assertEqual(self.marker().read_text(), watch.FAILED_REASON_UNRESOLVED, "the standing failure is kept beside the ledger, by its kind")
         # The credential can describe at last: the recovery line, the id learned, the version reported under it.
         with mock.patch.dict(os.environ, env), mock.patch.object(watch, "now_utc", return_value=NOW + timedelta(days=3)):
             code, out = self.run_tick(FakeSandbox(versions, readiness, aliases={"123456": "my-proj"}))
         self.assertEqual(code, 0)
-        self.assertEqual(out.splitlines()[0], "upgrade readiness watch: the tick runs again")
+        self.assertEqual(out.splitlines()[0], watch.RECOVERED_LINE)
         self.assertIn(f"new target version {TARGET}, 1 cluster(s) pending (a): 0 blocked, 1 ready;", out)
         self.assertEqual(self.ledger()["project_ids"], {"123456": "my-proj"})
         self.assertEqual(self.ledger()["targets"][TARGET]["pending"], ["my-proj/us-central1-a/a"])
@@ -1081,7 +1100,7 @@ class Budget(Base):
             sandbox = FakeSandbox(versions, readiness, table_failing_projects={"p1", "p2"})
             code, out = self.run_tick(sandbox)
         self.assertEqual(code, 0)
-        self.assertEqual(out, "upgrade readiness watch: the tick failed: RuntimeError: sandbox exited 255 without a report: ssh: lost connection\n")
+        self.assertEqual(out, self.failed("RuntimeError: sandbox exited 255 without a report: ssh: lost connection"))
         self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists())
 
     def test_a_project_s_timeout_shrinks_to_what_is_left_of_the_budget(self) -> None:
@@ -1222,7 +1241,7 @@ class Failures(Base):
             return subprocess.CompletedProcess(argv, 1, stdout="", stderr="gcloud: permission denied")
 
         out = io.StringIO()
-        with mock.patch.object(watch.sandbox_exec, "run", side_effect=broken), redirect_stdout(out):
+        with mock.patch.object(watch.sandbox_exec, "run", side_effect=broken), redirect_stdout(out), redirect_stderr(out):
             code = watch.main([])
         self.assertEqual(code, 0)
         self.assertIn("upgrade readiness watch: the tick failed: RuntimeError: sandbox exited 1 without a report: gcloud: permission denied", out.getvalue())
@@ -1234,7 +1253,7 @@ class Failures(Base):
             return subprocess.CompletedProcess(argv, 0, stdout=f"{watch.ENVELOPE_SENTINEL}\n{json.dumps(body)}\n", stderr="no project: pass --project\n")
 
         out = io.StringIO()
-        with mock.patch.object(watch.sandbox_exec, "run", side_effect=usage), redirect_stdout(out):
+        with mock.patch.object(watch.sandbox_exec, "run", side_effect=usage), redirect_stdout(out), redirect_stderr(out):
             code = watch.main([])
         self.assertEqual(code, 0)
         self.assertIn("report script exited 2 and wrote no report: no project: pass --project", out.getvalue())
@@ -1244,10 +1263,13 @@ class Failures(Base):
             raise subprocess.TimeoutExpired(["ssh", "-F", "/dev/null", "hermes@sandbox"], timeout)
 
         out = io.StringIO()
-        with mock.patch.object(watch.sandbox_exec, "run", side_effect=slow), redirect_stdout(out):
+        with mock.patch.object(watch.sandbox_exec, "run", side_effect=slow), redirect_stdout(out), redirect_stderr(out):
             code = watch.main([])
         self.assertEqual(code, 0)
-        self.assertEqual(out.getvalue().strip(), f"upgrade readiness watch: the tick failed: SandboxTimedOut: the sandbox run timed out after {watch.VERSION_TABLE_TIMEOUT_SECONDS}s")
+        self.assertEqual(
+            out.getvalue(),
+            self.failed(f"SandboxTimedOut: the sandbox run timed out after {watch.VERSION_TABLE_TIMEOUT_SECONDS}s", watch.FAILED_REASON_TIMED_OUT),
+        )
         self.assertNotIn("ssh", out.getvalue())
 
     def test_a_failed_readiness_run_records_no_report_so_the_version_is_retried(self) -> None:
@@ -1292,7 +1314,7 @@ class Failures(Base):
             return subprocess.CompletedProcess(argv, 0, stdout=f"{watch.ENVELOPE_SENTINEL}\n{json.dumps(body)}\n", stderr="")
 
         out = io.StringIO()
-        with mock.patch.object(watch.sandbox_exec, "run", side_effect=run), redirect_stdout(out):
+        with mock.patch.object(watch.sandbox_exec, "run", side_effect=run), redirect_stdout(out), redirect_stderr(out):
             code = watch.main(["--dry-run"])
         self.assertEqual(code, 0)
         self.assertIn("dry run: would report", out.getvalue())
@@ -1314,7 +1336,7 @@ class Failures(Base):
         out = io.StringIO()
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "", watch.MANAGEMENT_PROJECT_ENV: ""}), mock.patch.object(
             watch, "roster_projects", return_value=set()
-        ), mock.patch.object(watch.sandbox_exec, "run", side_effect=slow), redirect_stdout(out):
+        ), mock.patch.object(watch.sandbox_exec, "run", side_effect=slow), redirect_stdout(out), redirect_stderr(out):
             code = watch.main([])
         self.assertEqual(code, 0)
         self.assertIn(f"timed out after {watch.PROJECT_LOOKUP_TIMEOUT_SECONDS}s", out.getvalue())
@@ -1327,7 +1349,7 @@ class Failures(Base):
         out = io.StringIO()
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "", watch.MANAGEMENT_PROJECT_ENV: ""}), mock.patch.object(
             watch, "roster_projects", return_value=set()
-        ), mock.patch.object(watch.sandbox_exec, "run", side_effect=unset), redirect_stdout(out):
+        ), mock.patch.object(watch.sandbox_exec, "run", side_effect=unset), redirect_stdout(out), redirect_stderr(out):
             code = watch.main([])
         self.assertEqual(code, 0)
         self.assertIn("the tick failed: RuntimeError: no GCP project: set UPGRADE_READINESS_PROJECTS or GCP_PROJECT_ID", out.getvalue())
@@ -1343,12 +1365,17 @@ class Failures(Base):
         outs = []
         for side_effect in (broken, broken, broken_otherwise, broken_otherwise):
             out = io.StringIO()
-            with mock.patch.object(watch.sandbox_exec, "run", side_effect=side_effect), redirect_stdout(out):
+            with mock.patch.object(watch.sandbox_exec, "run", side_effect=side_effect), redirect_stdout(out), redirect_stderr(out):
                 self.assertEqual(watch.main([]), 0)
             outs.append(out.getvalue())
         self.assertIn("the tick failed: RuntimeError: sandbox exited 1 without a report: gcloud: permission denied", outs[0])
+        self.assertTrue(outs[0].startswith(watch.FAILED_TICK_LINE.format(reason=watch.FAILED_REASON_ERROR, next=watch.FAILED_NEXT_UNKNOWN)))
+        log = Path(self.tmp.name) / "logs" / watch.WATCH_LOG_FILE
+        self.assertEqual(len(log.read_text(encoding="utf-8").splitlines()), 4, "every failed run is logged, posted or not")
         self.assertEqual(outs[1], "")
-        self.assertIn("the tick failed: RuntimeError: sandbox exited 1 without a report: gcloud: quota exceeded", outs[2])
+        # A changed error of the same kind is the same failure to the channel: the
+        # plain line would read the same, so it is not posted again.
+        self.assertEqual(outs[2], "")
         self.assertEqual(outs[3], "")
         self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists())
         self.assertTrue(self.marker().exists())
@@ -1358,7 +1385,7 @@ class Failures(Base):
         self.assertTrue(self.marker().exists())
         code, out = self.run_tick(FakeSandbox(envelope([member("a", "lagging")]), envelope([member("a", "lagging", readiness="ready")])))
         self.assertEqual(code, 0)
-        self.assertEqual(out.splitlines()[0], "upgrade readiness watch: the tick runs again")
+        self.assertEqual(out.splitlines()[0], watch.RECOVERED_LINE)
         self.assertIn("new target version", out)
         self.assertFalse(self.marker().exists())
         code, out = self.run_tick(FakeSandbox(envelope([member("a", "lagging")])))
@@ -1409,7 +1436,7 @@ class Failures(Base):
         outs = []
         for argv in (["--dry-run"], ["--dry-run"], []):
             out = io.StringIO()
-            with mock.patch.object(watch.sandbox_exec, "run", side_effect=broken), redirect_stdout(out):
+            with mock.patch.object(watch.sandbox_exec, "run", side_effect=broken), redirect_stdout(out), redirect_stderr(out):
                 self.assertEqual(watch.main(argv), 0)
             outs.append(out.getvalue())
         self.assertIn("the tick failed", outs[0])
@@ -1417,7 +1444,7 @@ class Failures(Base):
         self.assertIn("the tick failed", outs[2], "the scheduled tick's own line is not silenced by a dry run")
         self.assertTrue(self.marker().exists())
         out = io.StringIO()
-        with mock.patch.object(watch.sandbox_exec, "run", side_effect=broken), redirect_stdout(out):
+        with mock.patch.object(watch.sandbox_exec, "run", side_effect=broken), redirect_stdout(out), redirect_stderr(out):
             self.assertEqual(watch.main(["--dry-run"]), 0)
         self.assertIn("the tick failed", out.getvalue(), "a dry run on the failure being investigated says so")
 
@@ -1489,18 +1516,19 @@ class Failures(Base):
         text = (self.home / "reports" / TARGET / "latest.md").read_text()
         self.assertIn("The next scheduled refresh is after 2026-10-15 while any cluster is still pending; ask the Platform Agent", text)
 
-    def test_an_unsaveable_ledger_exits_non_zero(self) -> None:
+    def test_an_unsaveable_ledger_exits_zero_with_its_own_line(self) -> None:
         sandbox = FakeSandbox(envelope([member("a", "lagging")]), envelope([member("a", "lagging", readiness="ready")]))
         with mock.patch.object(watch, "save_ledger", side_effect=OSError("read-only file system")):
             code, out = self.run_tick(sandbox)
-        self.assertEqual(code, watch.WRITE_FAILED_EXIT)
+        self.assertEqual(code, 0, "the plain line, not the scheduler's own failure line")
         self.assertIn("writing the ledger or the report failed: read-only file system", out)
+        self.assertIn(watch.FAILED_NEEDS_ADMIN, out)
 
-    def test_an_unwritable_report_exits_non_zero_and_claims_nothing(self) -> None:
+    def test_an_unwritable_report_exits_zero_and_claims_nothing(self) -> None:
         sandbox = FakeSandbox(envelope([member("a", "lagging")]), envelope([member("a", "lagging", readiness="ready")]))
         with mock.patch.object(watch, "write_report", side_effect=OSError("disk full")):
             code, out = self.run_tick(sandbox)
-        self.assertEqual(code, watch.WRITE_FAILED_EXIT)
+        self.assertEqual(code, 0)
         self.assertIn("writing the ledger or the report failed: disk full", out)
         self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists())
 
@@ -1726,10 +1754,14 @@ class DeclaredScope(Base):
             code, out = self.run_tick(FakeSandbox(envelope([])))
         self.assertEqual(code, 0)
         self.assertEqual(
-            out.strip(),
-            "upgrade readiness watch: the tick failed: ReportRefused: refused by the report script: the install's declared scope does not list p2; "
-            "it lists p1; the remedy is on the install, not this job: name the project in spec.scope, "
-            "or take it out of the roster (its Cluster Agent profile, or UPGRADE_READINESS_PROJECTS)",
+            out,
+            self.failed(
+                "ReportRefused: refused by the report script: the install's declared scope does not list p2; "
+                "it lists p1; the remedy is on the install, not this job: name the project in spec.scope, "
+                "or take it out of the roster (its Cluster Agent profile, or UPGRADE_READINESS_PROJECTS)",
+                watch.FAILED_REASON_REFUSED,
+                admin=True,
+            ),
         )
         # The failed tick writes nothing of its own to the ledger but the standing-outside record (and any id it learned, none
         # here), which the next tick's hold reads.
@@ -1864,7 +1896,7 @@ class DeclaredScope(Base):
             self.declare_scope(["p1", "p2"], containers=[resolved])
             code, out = self.run_tick(FakeSandbox(envelope([])))
         self.assertEqual(code, 0)
-        self.assertEqual(out.splitlines(), ["upgrade readiness watch: the tick runs again"])
+        self.assertEqual(out.splitlines(), [watch.RECOVERED_LINE])
         self.assertEqual(self.ledger()["standing_outside"], {})
         self.assertFalse(self.marker().exists())
 
@@ -1900,7 +1932,7 @@ class DeclaredScope(Base):
             self.assertEqual(self.ledger()["standing_outside"], {"p2": ["folders/123456789012"]})
             self.declare_scope(["p1"], containers=[dict(resolved, outcome="unreachable")])
             code, out = self.run_tick(FakeSandbox(versions))
-            self.assertEqual(out.splitlines()[0], "upgrade readiness watch: the tick runs again")
+            self.assertEqual(out.splitlines()[0], watch.RECOVERED_LINE)
             self.assertIn("p2: version table for p2 refused by the report script: the install's declared scope does not list p2; it lists p1; the remedy is on the install, not this job: name the project in spec.scope", out)
             self.assertNotIn("the declaration is not fully resolved", out)
 
@@ -1928,7 +1960,7 @@ class DeclaredScope(Base):
             self.declare_scope(["p1"], containers=[resolved])
             with mock.patch.object(watch, "decide", side_effect=RuntimeError("boom")):
                 code, out = self.run_tick(FakeSandbox(versions, readiness), ["--dry-run"])
-            self.assertEqual((code, out.strip()), (0, "upgrade readiness watch: the tick failed: RuntimeError: boom"))
+            self.assertEqual((code, out), (0, self.failed("RuntimeError: boom")))
             self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists(), "a dry run changes nothing")
             for failure in ("the readiness hop raised", "the report could not be written"):
                 with self.subTest(failure):
@@ -1937,11 +1969,18 @@ class DeclaredScope(Base):
                     self.declare_scope(["p1"], containers=[resolved])
                     if failure == "the readiness hop raised":
                         code, out = self.run_tick(FakeSandbox(versions, readiness, readiness_error=OSError("sandbox: cannot fork")))
-                        self.assertEqual((code, out.strip()), (0, "upgrade readiness watch: the tick failed: OSError: sandbox: cannot fork"))
+                        self.assertEqual((code, out), (0, self.failed("OSError: sandbox: cannot fork")))
                     else:
                         with mock.patch.object(watch, "write_report", side_effect=OSError("disk full")):
                             code, out = self.run_tick(FakeSandbox(versions, readiness))
-                        self.assertEqual((code, out.strip()), (watch.WRITE_FAILED_EXIT, "upgrade readiness watch: writing the ledger or the report failed: disk full"))
+                        self.assertEqual(
+            (code, out),
+            (
+                0,
+                f"{watch.FAILED_WRITE_LINE.format(reason=watch.FAILED_REASON_WRITE, next=watch.FAILED_NEEDS_ADMIN)}\n"
+                "upgrade readiness watch: writing the ledger or the report failed: disk full\n",
+            ),
+        )
                     self.assertEqual(self.ledger()["standing_outside"], {"p2": ["folders/123456789012"]})
                     self.assertEqual((self.ledger()["last_tick"], self.ledger()["targets"], self.ledger()["announced"]), (None, {}, {}), "nothing else of the failed tick is written")
                     self.declare_scope(["p1"], containers=[failed])
@@ -1975,7 +2014,14 @@ class DeclaredScope(Base):
             with mock.patch.object(watch, "write_report", side_effect=OSError("disk full")), mock.patch.object(watch, "load_ledger", side_effect=load):
                 code, out = self.run_tick(FakeSandbox(versions, readiness))
         self.assertEqual(len(reads), 2, "the tick's read, then the handler's")
-        self.assertEqual((code, out.strip()), (watch.WRITE_FAILED_EXIT, "upgrade readiness watch: writing the ledger or the report failed: disk full"))
+        self.assertEqual(
+            (code, out),
+            (
+                0,
+                f"{watch.FAILED_WRITE_LINE.format(reason=watch.FAILED_REASON_WRITE, next=watch.FAILED_NEEDS_ADMIN)}\n"
+                "upgrade readiness watch: writing the ledger or the report failed: disk full\n",
+            ),
+        )
 
     def test_a_refusal_after_another_refusal_on_stderr_names_its_own_project(self) -> None:
         """One line per refused id, a number's ahead of an id's: the project is the
@@ -2508,6 +2554,8 @@ class DeclaredScope(Base):
         A comma is refused too: that source holds one project, and the parser's token stops at it."""
         for spelling in ("foo bar", "mgmt,x"):
             with self.subTest(spelling=spelling):
+                # Both are the same kind of failure, which the marker posts once.
+                self.marker().unlink(missing_ok=True)
                 sandbox = FakeSandbox(envelope([]))
                 with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "", watch.MANAGEMENT_PROJECT_ENV: spelling}), mock.patch.object(watch, "roster_projects", return_value=set()):
                     code, out = self.run_tick(sandbox)
@@ -2530,7 +2578,8 @@ class DeclaredScope(Base):
             code, out = self.run_tick(sandbox)
         self.assertEqual(code, 0)
         self.assertEqual(sandbox.calls, [])
-        self.assertIn("the tick failed: RuntimeError: the operator's scope render could not be read", out)
+        self.assertIn("the tick failed: ScopeUnreadable: the operator's scope render could not be read", out)
+        self.assertIn(watch.FAILED_TICK_LINE.format(reason=watch.FAILED_REASON_SCOPE_UNREADABLE, next=watch.FAILED_NEEDS_ADMIN), out)
         self.assertIn("absent.json", out)
         self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists())
 
@@ -2680,11 +2729,11 @@ class Loader(unittest.TestCase):
         self.assertTrue(shipped["readiness_rules"][2])
         self.assertFalse(shipped[watch.REPORT_MODULE][2])
         self.assertTrue(all(Path(entry[1]).is_file() for entry in shipped.values()))
-        # The data files beside the modules ship too (the removal table), the test fixtures do not.
+        # The data files beside the modules ship too (the removal table and the known-issues table), the test fixtures do not.
         data = watch.shipped_data()
-        self.assertEqual(sorted(Path(path).name for path in data), ["removed_apis.json"])
+        self.assertEqual(sorted(Path(path).name for path in data), ["known_issues.json", "removed_apis.json"])
         self.assertTrue(all(Path(path).is_file() for path in data))
-        self.assertEqual(sorted(Path(path).name for path in watch.shipped_data(root="/elsewhere")), ["removed_apis.json"])
+        self.assertEqual(sorted(Path(path).name for path in watch.shipped_data(root="/elsewhere")), ["known_issues.json", "removed_apis.json"])
         self.assertTrue(all(path.startswith("/elsewhere/") for path in watch.shipped_data(root="/elsewhere")))
 
     def test_a_replacement_is_read_from_the_shipped_set_alone(self) -> None:
@@ -2709,6 +2758,28 @@ class Loader(unittest.TestCase):
             completed = subprocess.run([sys.executable, "-I", "-"], input=without_data, capture_output=True, text=True, cwd=scratch, env=env, timeout=120)
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("removed_apis.json could not be read beside upgrade_shape_tables", completed.stderr)
+
+    def test_the_known_issues_table_is_read_from_the_shipped_set_alone(self) -> None:
+        """The known-issues rule reads its table through the module loader, as the shape tables
+        read the removal table: re-rooted to a directory that does not exist, the table still
+        comes from the shipped data; without the data, the rule's loader says so."""
+        with tempfile.TemporaryDirectory() as scratch:
+            absent = os.path.join(scratch, "absent")
+            program = watch.loader_preamble(root=absent) + "\n".join(
+                [
+                    "matrix = importlib.import_module('readiness_rules.known_issues_matrix')",
+                    "table, error = matrix.load_table()",
+                    "print(error or len(table['issues']))",
+                ]
+            )
+            env = {"PATH": os.environ.get("PATH", ""), "HOME": scratch, "TMPDIR": scratch}
+            completed = subprocess.run([sys.executable, "-I", "-"], input=program, capture_output=True, text=True, cwd=scratch, env=env, timeout=120)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertTrue(completed.stdout.strip().splitlines()[-1].isdigit(), completed.stdout)
+            without_data = program.replace("DATA = {", "DATA = {}  # ", 1)
+            completed = subprocess.run([sys.executable, "-I", "-"], input=without_data, capture_output=True, text=True, cwd=scratch, env=env, timeout=120)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("known_issues.json could not be read beside upgrade_shape_tables", completed.stdout)
 
     def test_the_report_imports_from_the_shipped_set_alone(self) -> None:
         """The finder alone, in an empty directory under ``-I``: every import the report
@@ -2796,6 +2867,132 @@ class Roster(unittest.TestCase):
         self.assertEqual(entry["schedule"]["expr"].split()[2:], ["*", "*", "*"], "a daily job")
         self.assertTrue(entry["enabled"])
         self.assertEqual(entry["risk"], "high")
+
+
+
+class PlainFailureLine(unittest.TestCase):
+    """Only the plain line reaches stdout, which the relay posts; the detail goes to stderr."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        for name in ("watch_home", "profile_home"):
+            home = mock.patch.object(watch, name, return_value=Path(self.tmp.name))
+            home.start()
+            self.addCleanup(home.stop)
+        env = mock.patch.dict(os.environ, {fleet_scope_targets.AGENT_HOME_ENV: self.tmp.name})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def roster(self, expr: str) -> None:
+        cron = Path(self.tmp.name) / "cron"
+        cron.mkdir(exist_ok=True)
+        (cron / "jobs.json").write_text(
+            json.dumps({"jobs": [{"id": watch.WATCH_JOB_ID, "schedule": {"kind": "cron", "expr": expr}}]}), encoding="utf-8"
+        )
+
+    def run_main(self, error: Exception) -> tuple[str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(watch, "tick", side_effect=error), redirect_stdout(out), redirect_stderr(err):
+            watch.main([])
+        return out.getvalue(), err.getvalue()
+
+    def test_stdout_is_the_plain_line_and_stderr_the_detail(self) -> None:
+        self.roster("10 10 * * *")
+        out, err = self.run_main(RuntimeError("report script exited 2 and wrote no report: ControlSocket /tmp/.sandbox-ssh/cm-1 already exists"))
+        self.assertEqual(out, "**The upgrade readiness check didn't run today.** It hit an error. It will try again tomorrow.\n")
+        self.assertIn("ControlSocket", err)
+        self.assertIn("ControlSocket", (Path(self.tmp.name) / "logs" / watch.WATCH_LOG_FILE).read_text(encoding="utf-8"))
+
+    def test_a_failure_a_retry_does_not_clear_says_an_admin_must_act(self) -> None:
+        self.roster("10 10 * * *")
+        for error in (watch.ProjectUnresolved("number"), watch.ReportRefused("refused", watch.REFUSAL_OUTSIDE), watch.ScopeUnreadable("render")):
+            with self.subTest(error=error):
+                (Path(self.tmp.name) / watch.FAILURE_MARKER_FILE_NAME).unlink(missing_ok=True)
+                out, _ = self.run_main(error)
+                self.assertTrue(out.endswith(" An admin needs to fix this before it can run; the details are in the agent's log.\n"))
+        (Path(self.tmp.name) / watch.FAILURE_MARKER_FILE_NAME).unlink(missing_ok=True)
+        out, _ = self.run_main(watch.WriteFailed("disk full"))
+        self.assertEqual(
+            out,
+            "**The upgrade readiness check didn't finish today.** It couldn't save its report. "
+            "An admin needs to fix this before it can run; the details are in the agent's log.\n",
+        )
+
+    def test_tomorrow_only_while_the_roster_runs_it_daily(self) -> None:
+        self.roster("10 10 * * 1")
+        out, _ = self.run_main(RuntimeError("boom"))
+        self.assertEqual(out, "**The upgrade readiness check didn't run today.** It hit an error. It will try again at its next scheduled run.\n")
+
+    def test_a_failure_whose_text_changes_every_run_is_posted_once(self) -> None:
+        first, _ = self.run_main(RuntimeError("ControlSocket /tmp/.sandbox-ssh/cm-1 already exists"))
+        second, _ = self.run_main(RuntimeError("ControlSocket /tmp/.sandbox-ssh/cm-2 already exists"))
+        self.assertTrue(first)
+        self.assertEqual(second, "")
+
+    def test_each_kind_has_its_reason(self) -> None:
+        cases = (
+            (watch.ReportRefused("refused", watch.REFUSAL_OUTSIDE), watch.FAILED_REASON_REFUSED),
+            (watch.ScopeUnreadable("render"), watch.FAILED_REASON_SCOPE_UNREADABLE),
+            (watch.ProjectUnresolved("number"), watch.FAILED_REASON_UNRESOLVED),
+            (watch.SandboxTimedOut("slow"), watch.FAILED_REASON_TIMED_OUT),
+            (watch.WriteFailed("disk full"), watch.FAILED_REASON_WRITE),
+            (OSError("cannot fork"), watch.FAILED_REASON_ERROR),
+        )
+        for error, reason in cases:
+            with self.subTest(error=error):
+                self.assertEqual(watch.failure_reason(error), reason)
+
+    def test_a_refusal_that_clears_on_its_own_promises_a_retry(self) -> None:
+        self.roster("10 10 * * *")
+        for cause in sorted(watch.REFUSAL_CAUSES_THAT_CLEAR):
+            with self.subTest(cause=cause):
+                (Path(self.tmp.name) / watch.FAILURE_MARKER_FILE_NAME).unlink(missing_ok=True)
+                out, _ = self.run_main(watch.ReportRefused("refused", cause))
+                self.assertTrue(out.endswith(" It will try again tomorrow.\n"), out)
+
+    def test_a_tick_with_any_refusal_that_needs_a_person_says_so(self) -> None:
+        self.roster("10 10 * * *")
+        refused = watch.ReportRefused("refused", watch.REFUSAL_SANDBOX)
+        refused.causes = [watch.REFUSAL_SANDBOX, watch.REFUSAL_OUTSIDE]
+        out, _ = self.run_main(refused)
+        self.assertTrue(out.endswith(watch.FAILED_NEEDS_ADMIN + "\n"))
+
+
+class SaveFailure(unittest.TestCase):
+    """A ledger save that keeps failing is announced once, as any standing failure is."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        env = mock.patch.dict(
+            os.environ,
+            {
+                watch.WATCH_HOME_ENV: str(self.home),
+                watch.HOME_ENV: self.tmp.name,
+                watch.PROJECTS_ENV: "p1",
+                fleet_scope_targets.AGENT_HOME_ENV: self.tmp.name,
+                fleet_scope_targets.SCOPE_FILE_ENV: "",
+            },
+        )
+        env.start()
+        self.addCleanup(env.stop)
+
+    def run_tick(self) -> str:
+        out = io.StringIO()
+        sandbox = FakeSandbox(envelope([member("a", "lagging")]), envelope([member("a", "lagging", readiness="ready")]))
+        with mock.patch.object(watch.sandbox_exec, "run", side_effect=sandbox.run), mock.patch.object(
+            watch, "save_ledger", side_effect=OSError("ledger.json.tmp is a directory")
+        ), redirect_stdout(out), redirect_stderr(io.StringIO()):
+            watch.main([])
+        return out.getvalue()
+
+    def test_a_save_that_keeps_failing_posts_once(self) -> None:
+        first = self.run_tick()
+        second = self.run_tick()
+        self.assertIn("didn't finish today", first)
+        self.assertEqual(second, "")
 
 
 if __name__ == "__main__":
