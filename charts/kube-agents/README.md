@@ -336,6 +336,7 @@ including `/v1`) are required, and the render fails without them. Set
   endpoint and no other.
 - **Egress.** The gateway's `litellm-policy` gets one rule derived from
   `apiBase`:
+
   - An in-cluster Service (`<svc>`, `<svc>.<ns>.svc`, or
     `<svc>.<ns>.svc.cluster.local`; a bare `<svc>` is the release namespace,
     and a two-label host such as `openrouter.ai` is a hostname, not
@@ -1039,18 +1040,30 @@ identity without that permission gets `error calling lookup: resourcequotas is
 forbidden` and no install rather than a quiet pass. Grant the permission, or install with
 `--set quotaPreflight.enabled=false`.
 
+### Optional AgentProfiles (`profiles.tse`)
+
+`profiles.tse.enabled` (default `false`) renders the optional `AgentProfile/tse`
+(GKE Support Agent — Customer-Side Technical Solutions Engineer) under `mode: next`
+(`templates/profiles.yaml`, gated on both `platformAgent.enabled` and
+`profiles.tse.enabled`), with `profiles.tse.{description,persona.image,harness,bus,lifecycle,concurrency,resources}`
+controlling its `AgentProfile` spec. When bound, the operator passes
+`KUBE_AGENTS_ENABLED_PROFILES=tse` to the gateway Deployment so the entrypoint
+scaffolds `/opt/data/profiles/tse` from `/opt/tse-template` on startup.
+
 ## Uninstalling
 
 ```bash
 helm uninstall kube-agents -n kubeagents-system
 ```
 
-The `PlatformAgent` resource carries a finalizer that only the operator can
-clear, and Helm deletes the CR and the operator in the same pass — so nothing
-would be left to clear it, the CR would strand, and the namespace would hang in
-`Terminating`. `platformAgent.cleanupHook` (on by default) prevents that with a
-`pre-delete` hook that deletes the CR and waits for the finalizer while the
-operator is still running.
+The `PlatformAgent` and `AgentProfile` resources carry finalizers that only the
+operator can clear, and Helm deletes the CRs and the operator in the same pass —
+so nothing would be left to clear them, the CRs would strand, and the namespace
+would hang in `Terminating`. `platformAgent.cleanupHook` (on by default)
+prevents that with a `pre-delete` hook that deletes all `AgentProfile` CRs first
+(while the `PlatformAgent` and NATS bus are still running so tombstone cards are
+published), then deletes the `PlatformAgent` CR and waits for the finalizers
+while the operator is still running.
 
 The hook runs `kubectl` from `alpine/k8s`, because the operator image is
 distroless and carries no client — and because the hook needs a shell: it is
@@ -1092,6 +1105,7 @@ entirely — any image with `kubectl` and `/bin/sh` works.
 With `platformAgent.cleanupHook.enabled=false`, the ordering is yours to keep:
 
 ```bash
+kubectl delete agentprofile --all -n kubeagents-system --ignore-not-found --wait
 kubectl delete platformagent platform-agent -n kubeagents-system --wait
 helm uninstall kube-agents -n kubeagents-system
 ```
@@ -1117,6 +1131,7 @@ helm uninstall kube-agents -n kubeagents-system
   `terraform/examples/full-install` does both in one apply.
 
   Two behaviours worth knowing before you enable them:
+
   - **`failurePolicy` defaults to `Ignore`, where the kustomize path uses
     `Fail`.** Helm applies the webhook configurations before both the
     `Certificate` and the `PlatformAgent` CR, so under `Fail` the API server

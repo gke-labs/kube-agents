@@ -340,6 +340,7 @@ type usageHarness struct {
 	pruningHuman      bool
 	pruningErrored    bool
 	pruningBackground bool
+	pruningFeedback   bool
 }
 
 func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...client.Object) *usageHarness {
@@ -353,8 +354,8 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 			// the echo, so the store is stripped with a second patch the poller
 			// never sees, and the echo the poller reads is stripped the same way.
 			pa, isAgent := obj.(*agentv1alpha1.PlatformAgent)
-			if err == nil && isAgent && (h.pruning || h.pruningGauges || h.pruningMerged || h.pruningChat || h.pruningBlocked || h.pruningFailures || h.pruningHuman || h.pruningErrored || h.pruningBackground) {
-				strip := `{"status":{"usage":{"clustersRegistered":null,"clustersMonitored":null,"remediationsMergedTotal":null,"chatMessagesInboundTotal":null,"toolExecutionsBlockedTotal":null,"brokerFailuresTotal":null,"lastHumanActiveTime":null,"chatTurnsErroredTotal":null,"backgroundTasksGaveUpTotal":null}}}`
+			if err == nil && isAgent && (h.pruning || h.pruningGauges || h.pruningMerged || h.pruningChat || h.pruningBlocked || h.pruningFailures || h.pruningHuman || h.pruningErrored || h.pruningBackground || h.pruningFeedback) {
+				strip := `{"status":{"usage":{"clustersRegistered":null,"clustersMonitored":null,"remediationsMergedTotal":null,"chatMessagesInboundTotal":null,"toolExecutionsBlockedTotal":null,"brokerFailuresTotal":null,"lastHumanActiveTime":null,"chatTurnsErroredTotal":null,"backgroundTasksGaveUpTotal":null,"negativeFeedbackTotal":null}}}`
 				if h.pruningMerged {
 					strip = `{"status":{"usage":{"remediationsMergedTotal":null}}}`
 				}
@@ -375,6 +376,9 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 				}
 				if h.pruningBackground {
 					strip = `{"status":{"usage":{"backgroundTasksGaveUpTotal":null}}}`
+				}
+				if h.pruningFeedback {
+					strip = `{"status":{"usage":{"negativeFeedbackTotal":null}}}`
 				}
 				if h.pruning {
 					strip = `{"status":{"usage":null}}`
@@ -409,6 +413,9 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 			}
 			if isAgent && (h.pruningGauges || h.pruningBackground) {
 				pa.Status.Usage.BackgroundTasksGaveUpTotal = 0
+			}
+			if isAgent && (h.pruningGauges || h.pruningFeedback) {
+				pa.Status.Usage.NegativeFeedbackTotal = 0
 			}
 			return err
 		},
@@ -703,7 +710,7 @@ func TestUsagePoller_RepairsAStatusBehindTheConfigMap(t *testing.T) {
 		Version:       usageDocumentVersion,
 		AgentUID:      usageTestAgentUID,
 		FirstRecorded: metav1.NewTime(usageClock(1)),
-		Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4, usageCounterRemediationsProposed: 0, usageCounterRemediationsMerged: 0, usageCounterChatMessagesInbound: 0, usageCounterSessionsTriage: 0, usageCounterSessionsChat: 0, usageCounterToolExecutionsBlocked: 0, usageCounterBrokerFailures: 0, usageCounterChatTurnsErrored: 0, usageCounterBackgroundTasksGaveUp: 0},
+		Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4, usageCounterRemediationsProposed: 0, usageCounterRemediationsMerged: 0, usageCounterChatMessagesInbound: 0, usageCounterSessionsTriage: 0, usageCounterSessionsChat: 0, usageCounterToolExecutionsBlocked: 0, usageCounterBrokerFailures: 0, usageCounterChatTurnsErrored: 0, usageCounterBackgroundTasksGaveUp: 0, usageCounterNegativeFeedback: 0},
 		LastMoved:     &moved,
 		Pods: map[string]*usagePodEntry{
 			usagePodEntryKey("gw-a", usageCounterEventsIngested):            {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterEventsIngested, Sample: 4, Marker: moved},
@@ -717,6 +724,7 @@ func TestUsagePoller_RepairsAStatusBehindTheConfigMap(t *testing.T) {
 			usagePodEntryKey("broker-b", usageCounterBrokerFailures):        {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterBrokerFailures, Sample: 0, Marker: moved},
 			usagePodEntryKey("gw-a", usageCounterChatTurnsErrored):          {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterChatTurnsErrored, Sample: 0, Marker: moved},
 			usagePodEntryKey("gw-a", usageCounterBackgroundTasksGaveUp):     {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterBackgroundTasksGaveUp, Sample: 0, Marker: moved},
+			usagePodEntryKey("gw-a", usageCounterNegativeFeedback):          {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterNegativeFeedback, Sample: 0, Marker: moved},
 		},
 	})
 	h.stub.set(gatewayAddr(), 4, nil)
@@ -1162,8 +1170,8 @@ func TestUsagePoller_ProposalsCountBesideToolExecutions(t *testing.T) {
 		t.Fatalf("the first poll wrote a counter: %+v", status)
 	}
 	doc := h.document()
-	if len(doc.Pods) != 11 {
-		t.Fatalf("the document holds %d entries, want 11 (gateway events, triage sessions, chat, chat sessions, turns errored and cards given up; broker tools, refusals, proposals, merged and failures): %+v", len(doc.Pods), doc.Pods)
+	if len(doc.Pods) != 12 {
+		t.Fatalf("the document holds %d entries, want 12 (gateway events, triage sessions, chat, chat sessions, turns errored and cards given up and thumbs-downs; broker tools, refusals, proposals, merged and failures): %+v", len(doc.Pods), doc.Pods)
 	}
 
 	// A proposal opened and no command run: the proposals counter moves alone.
@@ -2019,6 +2027,67 @@ func TestUsagePoller_AChatServingCRDWithoutTheBackgroundTasksCounterKeepsTheOthe
 	}
 	if h.r.usageStatusPruned(agent) {
 		t.Fatal("the background-tasks counter's absence was recorded as the counters' pruning")
+	}
+}
+
+// Thumbs-downs count into negativeFeedbackTotal from the chat listener and
+// nowhere else, and a thumbs-down alone is not activity.
+func TestUsagePoller_NegativeFeedbackCount(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, nil)
+	h.stub.set(chatAddr(), 0, ptr.To(1.0))
+	h.stub.setSample(chatAddr(), usageCounterNegativeFeedback, 1)
+	h.poll(5)
+	h.stub.setSample(chatAddr(), usageCounterNegativeFeedback, 4)
+	h.poll(10)
+	status := h.status()
+	if status.NegativeFeedbackTotal != 3 || status.ChatMessagesInboundTotal != 0 || status.ToolExecutionsTotal != 0 {
+		t.Fatalf("after three thumbs-downs: %+v, want 3 and nothing else", status)
+	}
+	if status.LastActiveTime != nil {
+		t.Fatalf("a thumbs-down alone moved lastActiveTime: %v", status.LastActiveTime)
+	}
+	if doc := h.document(); doc.Totals[usageCounterNegativeFeedback] != 3 {
+		t.Fatalf("document totals = %v, want 3", doc.Totals)
+	}
+}
+
+// A served CRD from the release before this one prunes negativeFeedbackTotal
+// alone: its absence is recorded against it, the others keep landing, and a
+// poll with it alone behind does not re-patch while the record is fresh.
+func TestUsagePoller_AChatServingCRDWithoutTheFeedbackCounterKeepsTheOthersFlowing(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
+	h.pruningFeedback = true
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(chatAddr(), 1, ptr.To(1.0))
+	h.stub.set(brokerAddr(), 10, nil)
+	h.stub.setSample(chatAddr(), usageCounterNegativeFeedback, 1)
+	h.poll(5)
+	h.stub.set(chatAddr(), 3, ptr.To(1.0))
+	h.stub.setSample(chatAddr(), usageCounterNegativeFeedback, 2)
+	h.poll(10)
+	if status := h.status(); status.ChatMessagesInboundTotal != 2 || status.NegativeFeedbackTotal != 0 {
+		t.Fatalf("after a message and a thumbs-down: %+v, want 2 messages and no feedback counter", status)
+	}
+	if h.p.newerFieldPruned(agent, usageCounterChatMessagesInbound) || !h.p.newerFieldPruned(agent, usageCounterNegativeFeedback) {
+		t.Fatal("the feedback counter's absence was not recorded against it alone")
+	}
+	patches := h.patches
+	h.poll(12)
+	if h.patches != patches {
+		t.Fatal("a poll with the feedback counter alone behind re-patched the status while its record was fresh")
+	}
+	h.stub.set(chatAddr(), 5, ptr.To(1.0))
+	h.poll(14)
+	if got := h.status().ChatMessagesInboundTotal; got != 4 {
+		t.Fatalf("a message waited on the feedback counter's record: %d, want 4", got)
+	}
+	if h.r.usageStatusPruned(agent) {
+		t.Fatal("the feedback counter's absence was recorded as the counters' pruning")
 	}
 }
 

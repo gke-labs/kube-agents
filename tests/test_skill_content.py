@@ -65,14 +65,14 @@ class DeleteRequestsRouteToTheDeletionSectionTest(unittest.TestCase):
     opened the deletion section; it probed a `kubectl delete` instead (#3077,
     #3086's repro runs). Both descriptions name the split."""
 
-    def test_submit_suggestion_claims_deletions_as_a_stop(self):
-        # The section answers every delete with a stated stop (the declared
-        # path is #3233), so the description must not promise a removal.
+    def test_submit_suggestion_claims_deletions(self):
+        # The section removes a declared object's manifest in a pull request
+        # and stops on anything else (#3233), and the description says both.
         description = _description("submit-suggestion")
         self.assertIn("delete a resource", description)
         self.assertIn("Deleting a resource", description)
-        self.assertIn("stated stop, never a pull request", description)
-        self.assertNotIn("removes the resource's manifest", description)
+        self.assertIn("pull request that removes the declaring manifest", description)
+        self.assertIn("stated stop when the repository does not declare it", description)
 
     def test_cluster_agent_lifecycle_disclaims_them(self):
         description = _description("cluster-agent-lifecycle")

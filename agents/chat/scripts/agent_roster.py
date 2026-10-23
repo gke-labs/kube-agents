@@ -157,7 +157,7 @@ def discover(base: Path | None = None) -> list[dict[str, str]] | None:
         return None
     for p in entries:
         try:
-            if not p.is_dir() or p.name == SELF_PROFILE:
+            if not p.is_dir() or p.name == SELF_PROFILE or p.name.startswith("."):
                 continue
             agent = {"name": p.name, "responsibilities": _responsibilities(p)}
             agent.update({IDENTITY_FIELD_PREFIX + k: v for k, v in _cluster_identity(p).items()})

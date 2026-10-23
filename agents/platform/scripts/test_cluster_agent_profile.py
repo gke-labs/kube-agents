@@ -1045,6 +1045,11 @@ class ListReadyProfilesTest(unittest.TestCase):
         cli_stamped = (p / "SOUL.md").read_text(encoding="utf-8")
         self.assertIn("- project: proj-cli\n- cluster: clus-cli\n- location: us-east1\n", cli_stamped)
 
+    def test_list_profiles_excludes_reserved_tse_and_dot_deleted(self):
+        for name in ("default", "platform", "tse", "cluster-demo", ".deleted"):
+            (self.tmp / name).mkdir(parents=True, exist_ok=True)
+        self.assertEqual(cap.list_profiles(), ["cluster-demo"])
+
 
 if __name__ == "__main__":
     unittest.main()
