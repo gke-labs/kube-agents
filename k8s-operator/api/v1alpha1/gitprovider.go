@@ -31,13 +31,17 @@ package v1alpha1
 // a table entry rather than widening a shared check.
 // `docs/designs/version-control-support.md` §6 is the design.
 //
-// GitHub and GitLab are registered, each with the agent-side provider that
-// honours it, because a provider the CRD accepts and the agent discards is a
-// worse failure than one the CRD refuses.
+// GitHub, GitLab, Bitbucket Cloud and Bitbucket Data Center are registered,
+// each with the agent-side provider that honours it, because a provider the
+// CRD accepts and the agent discards is a worse failure than one the CRD
+// refuses. This release refuses the two Bitbucket providers by name until the
+// fleet audit can keep its ledger on a forge with no issue tracker
+// (gitprovider_gate.go).
 
 import (
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -52,6 +56,17 @@ const (
 	// GitProviderGitLab names GitLab: gitlab.com, or a self-managed instance
 	// at the host the forge declares.
 	GitProviderGitLab = "gitlab"
+
+	// GitProviderBitbucket names Bitbucket Cloud, at bitbucket.org only.
+	GitProviderBitbucket = "bitbucket"
+
+	// GitProviderBitbucketDataCenter names a Bitbucket Data Center instance
+	// at the host the forge declares. It has no default host. Bitbucket Cloud
+	// and Data Center are two APIs, so they are two providers.
+	GitProviderBitbucketDataCenter = "bitbucket-datacenter"
+
+	// DefaultBitbucketHost is the bitbucket provider's one host.
+	DefaultBitbucketHost = "bitbucket.org"
 
 	// DefaultGitHubHost is the github provider's default host.
 	DefaultGitHubHost = "github.com"
@@ -77,6 +92,11 @@ const (
 	// group or user. Groups nest, so there is no ceiling.
 	gitlabMinPathDepth = 2
 
+	// bitbucketPathDepth is the rule of both Bitbucket providers: a
+	// repository is `workspace/slug` on Cloud and `KEY/slug` on Data Center.
+	// A Cloud project is not in the repository path.
+	bitbucketPathDepth = 2
+
 	// MaxGitHubRepoNameLength is GitHub's limit on a repository name. With
 	// the owner's 39 it also keeps the longest URL the operator renders,
 	// `https://github.com/` and `owner/name`, at 159 characters, inside the
@@ -90,6 +110,23 @@ const (
 // time, so the nested repetition cannot backtrack.
 var gitlabNamespaceRegex = regexp.MustCompile(
 	`^[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_-])?(/[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_-])?)*$`)
+
+// bitbucketWorkspaceRegex is a Bitbucket Cloud workspace ID: lowercase
+// letters, digits, `-` and `_`. One segment: a Cloud token is narrowed by
+// workspace, and the project is not in the path.
+var bitbucketWorkspaceRegex = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
+
+// bitbucketAccountUUIDRegex is a Bitbucket Cloud account UUID, with its braces
+// or without them; the broker writes it with braces, as Bitbucket writes every
+// author.
+var bitbucketAccountUUIDRegex = regexp.MustCompile(
+	`^(\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$`)
+
+// bitbucketProjectKeyRegex is a Bitbucket Data Center project key: a letter,
+// then letters, digits and `_`. The broker's
+// providers/bitbucket_datacenter package reads a key with the same rule. A
+// personal repository (`~user/slug`) is not served in this release.
+var bitbucketProjectKeyRegex = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*$`)
 
 // githubHosts is every spelling of github.com that can appear in a remote this
 // install produces. `ssh.github.com` is the SSH-over-443 endpoint. A GitHub
@@ -151,6 +188,24 @@ type GitProvider struct {
 	// administrator names in caBundleRef. A provider without it refuses the
 	// field: a CA that nothing reads would hide a certificate problem.
 	AcceptsCABundle bool
+	// LayoutSegments are first path segments that are the instance's URL
+	// layout, not a namespace: Bitbucket Data Center's clone URL is
+	// `/scm/KEY/slug.git`, its web page is `/projects/KEY/repos/slug`, and a
+	// personal repository's page is `/users/<user>/repos/slug`. The broker
+	// reads a first segment `users` as a personal repository and refuses it. A
+	// repository declared that way is refused with the form to write instead,
+	// where the depth check would only say it is too deep.
+	LayoutSegments []string
+	// IdentityPattern, when set, is the only form of identity this
+	// provider's broker accepts: its broker refuses any other at start, so
+	// the operator refuses it first. Bitbucket Cloud compares authors by
+	// account UUID.
+	IdentityPattern *regexp.Regexp
+	// AcceptsIdentity is a forge whose broker reads `identity`, the login its
+	// credential acts as, for a token that cannot name its own account. A
+	// provider without it refuses the field: an identity that nothing reads
+	// would hide the reason an ownership check is refused.
+	AcceptsIdentity bool
 	// ReservedDomains are domains under which the provider runs its own
 	// services. A host at one of them, or under one, is never a
 	// self-managed instance: `api.github.com` and `acme.ghe.com` are
@@ -208,6 +263,43 @@ var gitProviders = map[string]*GitProvider{
 		NeedsCredentials:        true,
 		AcceptsCABundle:         true,
 	},
+	GitProviderBitbucket: {
+		Name:        GitProviderBitbucket,
+		DefaultHost: DefaultBitbucketHost,
+		// www.bitbucket.org is a spelling of bitbucket.org, and folds to it.
+		Hosts:              map[string]bool{DefaultBitbucketHost: true, "www.bitbucket.org": true},
+		NamespacePattern:   bitbucketWorkspaceRegex,
+		MaxNamespaceLength: MaxGitNamespaceLength,
+		MinPathDepth:       bitbucketPathDepth,
+		MaxPathDepth:       bitbucketPathDepth,
+		// Clones are bitbucket.org itself, and the REST API is
+		// api.bitbucket.org, under the wildcard.
+		Egress: []string{DefaultBitbucketHost, "*.bitbucket.org"},
+		// One host, which the public CAs sign: no self-managed instance and
+		// no CA bundle. A Data Center instance is the other provider.
+		NeedsCredentials: true,
+		AcceptsIdentity:  true,
+		IdentityPattern:  bitbucketAccountUUIDRegex,
+		// bitbucket.org and its subdomains, and Atlassian's own domains: a
+		// Bitbucket Data Center forge declared at one would be handed
+		// Atlassian's traffic.
+		ReservedDomains: []string{DefaultBitbucketHost, "bitbucket.io", "atlassian.com", "atlassian.net"},
+	},
+	GitProviderBitbucketDataCenter: {
+		Name: GitProviderBitbucketDataCenter,
+		// No default host: an instance is always at the host the forge
+		// declares, so ValidateHost refuses an empty one.
+		NamespacePattern:   bitbucketProjectKeyRegex,
+		MaxNamespaceLength: MaxGitNamespaceLength,
+		MinPathDepth:       bitbucketPathDepth,
+		MaxPathDepth:       bitbucketPathDepth,
+		LayoutSegments:     []string{"scm", "projects", "users"},
+		// The declared host is added as a literal by EgressPatterns.
+		SelfManaged:      true,
+		NeedsCredentials: true,
+		AcceptsCABundle:  true,
+		AcceptsIdentity:  true,
+	},
 }
 
 // GitProviderNames lists the registered providers in sorted order, for an error
@@ -229,6 +321,9 @@ func providerNames(table map[string]*GitProvider) []string {
 // LookupGitProvider returns the rules for a declared provider name. An empty
 // name means the default, which is what the deprecated GitHub alias resolves to.
 func LookupGitProvider(name string) (*GitProvider, error) {
+	if err := unreleasedGitProvider(name); err != nil {
+		return nil, err
+	}
 	return lookupGitProvider(name, gitProviders)
 }
 
@@ -240,7 +335,7 @@ func lookupGitProvider(name string, table map[string]*GitProvider) (*GitProvider
 	provider, ok := table[strings.ToLower(trimmed)]
 	if !ok {
 		return nil, fmt.Errorf("unsupported git provider %q; must be one of %s",
-			name, strings.Join(providerNames(table), ", "))
+			name, strings.Join(releasedProviderNames(table), ", "))
 	}
 	return provider, nil
 }
@@ -256,8 +351,18 @@ func (p *GitProvider) ValidateHost(host string) error {
 
 func (p *GitProvider) validateHost(host string, table map[string]*GitProvider) error {
 	trimmed := lowerASCII(strings.TrimSpace(host))
+	if trimmed == "" && p.DefaultHost == "" {
+		return fmt.Errorf("provider %s has no default host; set host to the hostname of the instance", p.Name)
+	}
 	if trimmed == "" || p.Hosts[trimmed] {
 		return nil
+	}
+	// Said by name, not left to the hostname check: a self-managed instance
+	// at a context path or on another port is a real install, and the
+	// administrator must learn that it is not supported, not that the value
+	// is malformed.
+	if strings.ContainsAny(trimmed, ":/") {
+		return fmt.Errorf("host %q names a port or a path; write the hostname alone. The broker reaches a forge at the root path of its host on port 443, and an instance at a context path or on another port is not supported", host)
 	}
 	if !p.SelfManaged {
 		return fmt.Errorf("host %q is not a %s host", host, p.Name)
@@ -485,6 +590,16 @@ func (p *GitProvider) Resolve(host, repository, namespace string) (RepoRef, erro
 		return RepoRef{}, fmt.Errorf("repository %q resolves to a path starting with %q, which is a forge host, not a group",
 			repository, segments[0])
 	}
+	if len(segments) > 0 && slices.Contains(p.LayoutSegments, lowerASCII(segments[0])) {
+		if p.MaxPathDepth > 0 && len(segments) <= p.MaxPathDepth {
+			// Already KEY/repository, but with a key that the broker reads as
+			// the instance's URL layout (a personal repository for users/).
+			return RepoRef{}, fmt.Errorf("repository %q names the project key %q, which is a word of the %s URL layout (%s); this release does not serve a project with that key",
+				repository, segments[0], p.Name, strings.Join(p.LayoutSegments, ", "))
+		}
+		return RepoRef{}, fmt.Errorf("repository %q is a %s clone or web URL; write it as the project key and the repository slug, KEY/repository",
+			repository, p.Name)
+	}
 	for _, segment := range segments {
 		if !safeRepoSegment(segment) {
 			return RepoRef{}, fmt.Errorf("invalid repository path segment %q", segment)
@@ -532,7 +647,12 @@ func (p *GitProvider) ParseRepoRef(value string) (RepoRef, error) {
 
 // schemelessHosts is DefaultHost plus every alternative spelling in Hosts.
 func (p *GitProvider) schemelessHosts() map[string]bool {
-	hosts := map[string]bool{p.DefaultHost: true}
+	hosts := map[string]bool{}
+	// A provider with no default host lifts only the host the forge declares
+	// (liftableHosts).
+	if p.DefaultHost != "" {
+		hosts[p.DefaultHost] = true
+	}
 	for host := range p.Hosts {
 		hosts[host] = true
 	}

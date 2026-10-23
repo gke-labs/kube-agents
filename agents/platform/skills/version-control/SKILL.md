@@ -258,8 +258,8 @@ python3 $V proposal comment 17 --body 'Rebased on main.'
   not the same answer as one that returned nothing because the file has no
   history.
 - **Say which repository and which branch** in anything you report.
-- **`capabilities` before assuming a non-GitHub forge works.** Bitbucket, and
-  GitLab on an install that has not configured it, parse their specs and then
+- **`capabilities` before assuming a non-GitHub forge works.** Bitbucket and
+  GitLab, on an install that has not configured them, parse their specs and then
   tell you exactly what this install is missing. That is the answer, not a bug to work around.
 - **Link to a file with `capabilities`' `fileUrl`.** It is the file's web address
   on this forge, with `{ref}` and `{path}` to fill. Percent-encode each of them

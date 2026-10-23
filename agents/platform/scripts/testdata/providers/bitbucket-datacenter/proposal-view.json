@@ -1,0 +1,240 @@
+{
+  "payload": {
+    "number": 7,
+    "comments": true,
+    "diff": true
+  },
+  "responses": [
+    {
+      "id": 7,
+      "version": 3,
+      "title": "Raise the replica floor",
+      "description": "Body of the pull request.",
+      "state": "OPEN",
+      "open": true,
+      "closed": false,
+      "draft": false,
+      "locked": false,
+      "createdDate": 1792505000000,
+      "updatedDate": 1792508000000,
+      "fromRef": {
+        "id": "refs/heads/platform-agent/replicas",
+        "displayId": "platform-agent/replicas",
+        "latestCommit": "4e7a1c9b2d305f6e8a7b9c0d1e2f3a4b5c6d7e8f",
+        "type": "BRANCH",
+        "repository": {
+          "slug": "infra",
+          "id": 11,
+          "name": "infra",
+          "scmId": "git",
+          "state": "AVAILABLE",
+          "forkable": true,
+          "public": false,
+          "project": {
+            "key": "ACME",
+            "id": 3,
+            "name": "Acme",
+            "public": false,
+            "type": "NORMAL"
+          }
+        }
+      },
+      "toRef": {
+        "id": "refs/heads/main",
+        "displayId": "main",
+        "latestCommit": "9a8b7c6d5e4f00112233445566778899aabbccdd",
+        "type": "BRANCH",
+        "repository": {
+          "slug": "infra",
+          "id": 11,
+          "name": "infra",
+          "scmId": "git",
+          "state": "AVAILABLE",
+          "forkable": true,
+          "public": false,
+          "project": {
+            "key": "ACME",
+            "id": 3,
+            "name": "Acme",
+            "public": false,
+            "type": "NORMAL"
+          }
+        }
+      },
+      "author": {
+        "user": {
+          "name": "svc-kube-agents",
+          "emailAddress": "kube-agents@acme.example",
+          "id": 101,
+          "displayName": "kube-agents",
+          "active": true,
+          "slug": "svc-kube-agents",
+          "type": "SERVICE"
+        },
+        "role": "AUTHOR",
+        "approved": false,
+        "status": "UNAPPROVED"
+      },
+      "reviewers": [
+        {
+          "user": {
+            "name": "jdoe",
+            "emailAddress": "jdoe@acme.example",
+            "id": 7,
+            "displayName": "Jane Doe",
+            "active": true,
+            "slug": "jdoe",
+            "type": "NORMAL"
+          },
+          "role": "REVIEWER",
+          "approved": false,
+          "status": "UNAPPROVED"
+        }
+      ],
+      "participants": [],
+      "links": {
+        "self": [
+          {
+            "href": "https://bitbucket.acme.example/projects/ACME/repos/infra/pull-requests/7"
+          }
+        ]
+      }
+    },
+    {
+      "size": 3,
+      "limit": 100,
+      "isLastPage": true,
+      "start": 0,
+      "values": [
+        {
+          "id": 905,
+          "createdDate": 1792507200000,
+          "user": {
+            "name": "jdoe",
+            "emailAddress": "jdoe@acme.example",
+            "id": 7,
+            "displayName": "Jane Doe",
+            "active": true,
+            "slug": "jdoe",
+            "type": "NORMAL"
+          },
+          "action": "COMMENTED",
+          "commentAction": "ADDED",
+          "comment": {
+            "properties": {
+              "repositoryId": 11
+            },
+            "id": 204,
+            "version": 0,
+            "text": "This line should name the zone.",
+            "author": {
+              "name": "jdoe",
+              "emailAddress": "jdoe@acme.example",
+              "id": 7,
+              "displayName": "Jane Doe",
+              "active": true,
+              "slug": "jdoe",
+              "type": "NORMAL"
+            },
+            "createdDate": 1792507200000,
+            "updatedDate": 1792507200000,
+            "comments": [],
+            "severity": "NORMAL",
+            "state": "OPEN",
+            "threadResolved": false,
+            "anchor": {
+              "line": 12,
+              "lineType": "ADDED",
+              "fileType": "TO",
+              "path": "apps/ingest/deployment.yaml",
+              "diffType": "EFFECTIVE"
+            }
+          },
+          "commentAnchor": {
+            "line": 12,
+            "lineType": "ADDED",
+            "fileType": "TO",
+            "path": "apps/ingest/deployment.yaml",
+            "diffType": "EFFECTIVE"
+          }
+        },
+        {
+          "id": 904,
+          "createdDate": 1792506900000,
+          "user": {
+            "name": "jdoe",
+            "emailAddress": "jdoe@acme.example",
+            "id": 7,
+            "displayName": "Jane Doe",
+            "active": true,
+            "slug": "jdoe",
+            "type": "NORMAL"
+          },
+          "action": "APPROVED"
+        },
+        {
+          "id": 903,
+          "createdDate": 1792506000000,
+          "user": {
+            "name": "jdoe",
+            "emailAddress": "jdoe@acme.example",
+            "id": 7,
+            "displayName": "Jane Doe",
+            "active": true,
+            "slug": "jdoe",
+            "type": "NORMAL"
+          },
+          "action": "COMMENTED",
+          "commentAction": "ADDED",
+          "comment": {
+            "properties": {
+              "repositoryId": 11
+            },
+            "id": 202,
+            "version": 0,
+            "text": "Why one replica and not two?",
+            "author": {
+              "name": "jdoe",
+              "emailAddress": "jdoe@acme.example",
+              "id": 7,
+              "displayName": "Jane Doe",
+              "active": true,
+              "slug": "jdoe",
+              "type": "NORMAL"
+            },
+            "createdDate": 1792506000000,
+            "updatedDate": 1792506000000,
+            "comments": [
+              {
+                "properties": {
+                  "repositoryId": 11
+                },
+                "id": 203,
+                "version": 0,
+                "text": "Two would double the cost of the idle hours.",
+                "author": {
+                  "name": "svc-kube-agents",
+                  "emailAddress": "kube-agents@acme.example",
+                  "id": 101,
+                  "displayName": "kube-agents",
+                  "active": true,
+                  "slug": "svc-kube-agents",
+                  "type": "SERVICE"
+                },
+                "createdDate": 1792506600000,
+                "updatedDate": 1792506600000,
+                "comments": [],
+                "severity": "NORMAL",
+                "state": "OPEN",
+                "threadResolved": false
+              }
+            ],
+            "severity": "NORMAL",
+            "state": "OPEN",
+            "threadResolved": false
+          }
+        }
+      ]
+    }
+  ]
+}

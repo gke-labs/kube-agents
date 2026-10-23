@@ -126,6 +126,45 @@ func TestIntegrationSchemaRulesEnvtest(t *testing.T) {
 				CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gl-token"},
 				CABundleRef:    &agentv1alpha1.ForgeCABundleRef{Name: "gl-ca", Key: ".."}}},
 		}, "caBundleRef.key may not be . or start with .."},
+		// The Bitbucket rules the API server holds with the webhook off: a
+		// credential on both providers, a host on Data Center, no CA at
+		// bitbucket.org, identity on the Bitbucket providers only, and a host
+		// with no port and no path on every provider.
+		"bitbucket-no-secret": {agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "bb", Provider: "bitbucket", Namespace: "acme"}},
+		}, "a bitbucket or bitbucket-datacenter forge needs credentialsRef.name"},
+		"bitbucket-dc-no-secret": {agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "dc", Provider: "bitbucket-datacenter", Host: "bitbucket.example.com",
+				Namespace: "ACME"}},
+		}, "a bitbucket or bitbucket-datacenter forge needs credentialsRef.name"},
+		"bitbucket-dc-no-host": {agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "dc", Provider: "bitbucket-datacenter", Namespace: "ACME",
+				CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "dc-token"}}},
+		}, "a bitbucket-datacenter forge needs host"},
+		"bitbucket-org-ca": {agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "bb", Provider: "bitbucket", Host: "WWW.Bitbucket.org", Namespace: "acme",
+				CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "bb-token"},
+				CABundleRef:    &agentv1alpha1.ForgeCABundleRef{Name: "bb-ca"}}},
+		}, "caBundleRef is for a self-managed host"},
+		"host-port": {agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "dc", Provider: "bitbucket-datacenter", Host: "bitbucket.example.com:7990",
+				Namespace: "ACME", CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "dc-token"}}},
+		}, "host is the hostname alone, with no port and no path"},
+		"host-context-path": {agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "dc", Provider: "bitbucket-datacenter", Host: "bitbucket.example.com/bitbucket",
+				Namespace: "ACME", CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "dc-token"}}},
+		}, "host is the hostname alone, with no port and no path"},
+		"identity-on-gitlab": {agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "gl", Provider: "gitlab", Namespace: "acme", Identity: "agent",
+				CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gl-token"}}},
+		}, "identity is for a bitbucket or bitbucket-datacenter forge"},
+		"identity-on-github": {agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Namespace: "gke-labs", Identity: "agent"}},
+		}, "identity is for a bitbucket or bitbucket-datacenter forge"},
+		"identity-with-space": {agentv1alpha1.IntegrationSpec{
+			Forges: []agentv1alpha1.ForgeSpec{{Name: "bb", Provider: "bitbucket", Namespace: "acme", Identity: "two words",
+				CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "bb-token"}}},
+		}, "spec.integration.forges[0].identity"},
 		"bad-ca-key": {agentv1alpha1.IntegrationSpec{
 			Forges: []agentv1alpha1.ForgeSpec{{Name: "gl", Provider: "gitlab", Host: "gitlab.example.com", Namespace: "acme",
 				CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "gl-token"},
@@ -202,6 +241,15 @@ func TestIntegrationSchemaRulesEnvtest(t *testing.T) {
 		"ghes-ca": {Forges: []agentv1alpha1.ForgeSpec{{Name: "github", Provider: "github", Host: "ghe.example.com",
 			Namespace:   "acme",
 			CABundleRef: &agentv1alpha1.ForgeCABundleRef{Name: "ghe-ca"}}}},
+		// The API server admits both Bitbucket providers; this release's
+		// refusal is the operator's, in the status (gitprovider_gate.go).
+		"bitbucket": {Forges: []agentv1alpha1.ForgeSpec{{Name: "bb", Provider: "bitbucket", Namespace: "acme",
+			Identity:       "{0f3b2c1d-aaaa-bbbb-cccc-0123456789ab}",
+			CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "bb-token"}}}},
+		"bitbucket-datacenter": {Forges: []agentv1alpha1.ForgeSpec{{Name: "dc", Provider: "bitbucket-datacenter",
+			Host: "bitbucket.example.com", Namespace: "ACME", Identity: "svc-agent@example.com",
+			CredentialsRef: &agentv1alpha1.ForgeCredentialsRef{Name: "dc-token"},
+			CABundleRef:    &agentv1alpha1.ForgeCABundleRef{Name: "dc-ca"}}}},
 		"alias":    {GitHub: &agentv1alpha1.GitHubSpec{GitRepo: "gke-labs/kube-agents"}},
 		"base":     {Forges: gh, Repositories: gitops("release/2026")},
 		"base-max": {Forges: gh, Repositories: gitops(strings.Repeat("a", 200))},

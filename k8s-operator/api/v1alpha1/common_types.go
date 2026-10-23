@@ -1592,11 +1592,17 @@ var writeRoles = []string{RepositoryRoleGitOps, RepositoryRoleManaged}
 // same-named repository on this one. See
 // docs/designs/version-control-support.md §6.
 //
-// A gitlab forge's credentialsRef is required by the API server too, so it
-// holds with the webhook off -- the chart ships it off.
-// +kubebuilder:validation:XValidation:rule="has(self.provider) || !has(self.host) || size(self.host) == 0 || self.host.lowerAscii() in ['github.com', 'www.github.com', 'ssh.github.com']",message="a forge at a host other than github.com names its provider: github for a GitHub Enterprise Server, gitlab for a GitLab instance"
+// A gitlab or bitbucket forge's credentialsRef is required by the API server
+// too, so it holds with the webhook off -- the chart ships it off. So are a
+// bitbucket-datacenter forge's host, the hostname-only rule for host, and the
+// providers that read identity.
+// +kubebuilder:validation:XValidation:rule="has(self.provider) || !has(self.host) || size(self.host) == 0 || self.host.lowerAscii() in ['github.com', 'www.github.com', 'ssh.github.com']",message="a forge at a host other than github.com names its provider: github for a GitHub Enterprise Server, gitlab for a GitLab instance, bitbucket-datacenter for a Bitbucket Data Center instance"
 // +kubebuilder:validation:XValidation:rule="!has(self.provider) || self.provider != 'gitlab' || has(self.credentialsRef)",message="a gitlab forge needs credentialsRef.name: the Secret holding its access token under the key token"
-// +kubebuilder:validation:XValidation:rule="!has(self.caBundleRef) || (has(self.host) && size(self.host) > 0 && !(self.host.lowerAscii() in ['gitlab.com', 'www.gitlab.com', 'github.com', 'www.github.com', 'ssh.github.com']))",message="caBundleRef is for a self-managed host: gitlab.com and github.com present a certificate the public CAs sign, and a private CA must never vouch for it"
+// +kubebuilder:validation:XValidation:rule="!has(self.provider) || !(self.provider in ['bitbucket', 'bitbucket-datacenter']) || has(self.credentialsRef)",message="a bitbucket or bitbucket-datacenter forge needs credentialsRef.name: the Secret holding its access token under the key token"
+// +kubebuilder:validation:XValidation:rule="!has(self.provider) || self.provider != 'bitbucket-datacenter' || (has(self.host) && size(self.host) > 0)",message="a bitbucket-datacenter forge needs host: the hostname of the Bitbucket Data Center instance"
+// +kubebuilder:validation:XValidation:rule="!has(self.host) || !(self.host.contains(':') || self.host.contains('/'))",message="host is the hostname alone, with no port and no path: the broker reaches a forge at the root path of its host on port 443, and an instance at a context path or on another port is not supported"
+// +kubebuilder:validation:XValidation:rule="!has(self.identity) || size(self.identity) == 0 || (has(self.provider) && self.provider in ['bitbucket', 'bitbucket-datacenter'])",message="identity is for a bitbucket or bitbucket-datacenter forge: GitHub and GitLab name the account their credential acts as"
+// +kubebuilder:validation:XValidation:rule="!has(self.caBundleRef) || (has(self.host) && size(self.host) > 0 && !(self.host.lowerAscii() in ['gitlab.com', 'www.gitlab.com', 'github.com', 'www.github.com', 'ssh.github.com', 'bitbucket.org', 'www.bitbucket.org']))",message="caBundleRef is for a self-managed host: gitlab.com, github.com and bitbucket.org present a certificate the public CAs sign, and a private CA must never vouch for it"
 type ForgeSpec struct {
 	// Name identifies the forge within this PlatformAgent. Repositories refer
 	// to it by this name. The deprecated GitHub alias is the forge "github".
@@ -1610,22 +1616,30 @@ type ForgeSpec struct {
 	// the agent reads which forge was declared rather than guessing from the
 	// URL's text.
 	//
-	// "github" and "gitlab" are registered; the enum grows with each
-	// agent-side provider. Omitted, it is "github".
+	// "github", "gitlab", "bitbucket" (Bitbucket Cloud, at bitbucket.org)
+	// and "bitbucket-datacenter" (a Bitbucket Data Center instance at the
+	// declared host) are registered; the enum grows with each agent-side
+	// provider. Omitted, it is "github". This release refuses the two
+	// Bitbucket providers, with a reason in the status, until the fleet audit
+	// can keep its ledger on a forge with no issue tracker.
 	//
 	// A forge at a host other than a spelling of github.com must name it, so
 	// a forge written for another instance is never read as a GitHub
 	// Enterprise Server by default.
-	// +kubebuilder:validation:Enum=github;gitlab
+	// +kubebuilder:validation:Enum=github;gitlab;bitbucket;bitbucket-datacenter
 	// +optional
 	Provider string `json:"provider,omitempty"`
 
 	// Host is the forge hostname. Omit it for the provider's default
-	// ("github.com" for GitHub, "gitlab.com" for GitLab). A host the declared
+	// ("github.com" for GitHub, "gitlab.com" for GitLab, "bitbucket.org" for
+	// Bitbucket Cloud); a bitbucket-datacenter forge has no default and must
+	// set it. It is the hostname alone: a port or a path is refused, because
+	// the broker reaches every forge at the root path of its host on port
+	// 443. A host the declared
 	// provider does not serve is rejected, and an alternative spelling of one
 	// it does serve resolves to the provider's canonical host. It may also be a
-	// self-managed instance's hostname: a GitLab instance, or a GitHub
-	// Enterprise Server instance. Every repository on the forge must then name
+	// self-managed instance's hostname: a GitLab instance, a GitHub
+	// Enterprise Server instance, or a Bitbucket Data Center instance. Every repository on the forge must then name
 	// that host or leave it implied. A host another provider serves is
 	// rejected, and so is a host under a domain where the provider runs its own
 	// services (for GitHub: github.com, githubusercontent.com, ghe.com and
@@ -1655,7 +1669,9 @@ type ForgeSpec struct {
 	// agent's credentials to; a repository in another organisation is not
 	// given a token. On GitLab it, with the group of every repository declared
 	// on the forge, is the set of groups the credential broker serves, so a
-	// token that reaches further is still refused there.
+	// token that reaches further is still refused there. On Bitbucket it is
+	// the same set: workspaces on Bitbucket Cloud, project keys on Bitbucket
+	// Data Center.
 	//
 	// The schema pattern is every forge's grammar at once, not GitHub's: the
 	// tight rule depends on Provider and a CRD pattern cannot dispatch on a
@@ -1681,6 +1697,14 @@ type ForgeSpec struct {
 	// call, so rotating the token is updating the Secret. The Secret may also
 	// hold a read-only token under the key `read-token`; the broker presents it
 	// only to clone the forge's context repositories, never on a write.
+	//
+	// For Bitbucket the Secret has the same keys. On Bitbucket Cloud the token
+	// is a workspace access token, or the API token of an account that exists
+	// only for this install; a repository access token reaches one repository,
+	// so it serves an install with one repository only, because the broker
+	// holds one credential per host. On Bitbucket Data Center it is a project
+	// HTTP access token. The broker sends it as `Authorization: Bearer`, and
+	// to git with the username `x-token-auth`.
 	// +optional
 	CredentialsRef *ForgeCredentialsRef `json:"credentialsRef,omitempty"`
 
@@ -1691,9 +1715,9 @@ type ForgeSpec struct {
 	// its API client and in git. On a GitHub Enterprise Server forge, the
 	// chart also gives them to the token minter, which trusts them for all of
 	// its outbound calls. It is
-	// for a forge at a self-managed host, GitLab or GitHub Enterprise Server: it
-	// is refused when host is empty, gitlab.com or github.com, whose
-	// certificates the public CAs sign.
+	// for a forge at a self-managed host, GitLab, GitHub Enterprise Server or
+	// Bitbucket Data Center: it is refused when host is empty, gitlab.com,
+	// github.com or bitbucket.org, whose certificates the public CAs sign.
 	//
 	// The operator mounts the one key into the credential broker's pod only.
 	// The mount is optional: a missing Secret does not stop the broker, and
@@ -1702,6 +1726,24 @@ type ForgeSpec struct {
 	// restart.
 	// +optional
 	CABundleRef *ForgeCABundleRef `json:"caBundleRef,omitempty"`
+
+	// Identity is the login this forge's credential acts as, for a token
+	// that cannot name its own account through the forge's API. The broker
+	// compares it with the authors of proposals and comments, to tell this
+	// install's own from another person's. Without it, and with a token that
+	// the forge's current-user call refuses, every such check is refused with
+	// FORGE_IDENTITY_UNKNOWN.
+	//
+	// It is for bitbucket and bitbucket-datacenter forges only. On Bitbucket
+	// Cloud it is the account UUID, such as `{0f3b2c1d-...}`, with or without
+	// its braces, and any other value is refused: an access token has a bot
+	// account, which the current-user call refuses. On Bitbucket Data Center it is the username
+	// of the account the token acts as. GitHub and GitLab name the account
+	// through their own API, so they refuse the field.
+	// +kubebuilder:validation:MaxLength=255
+	// +kubebuilder:validation:Pattern=`^$|^[A-Za-z0-9._@+{}-]+$`
+	// +optional
+	Identity string `json:"identity,omitempty"`
 }
 
 // ForgeCABundleRef names the Secret key that holds a forge's CA certificates.

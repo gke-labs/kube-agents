@@ -1090,7 +1090,7 @@ class TestReadersIgnoreWorkerSources(WorkspaceTestCase):
 
     def test_a_registered_entry_this_image_cannot_use_is_not_called_unregistered(self):
         (self.mount / "managed_repos").write_text(
-            json.dumps([{"type": "bitbucket", "url": "https://bitbucket.org/acme/fleet"}]), encoding="utf-8")
+            json.dumps([{"type": "gitea", "url": "https://gitea.example.com/acme/fleet"}]), encoding="utf-8")
         with patch.dict(sys.modules, {"github_token_refresh": self.cwd_origin}):
             with self.assertRaises(RuntimeError) as caught:
                 gitops_workspace.resolve_repo()

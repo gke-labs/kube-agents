@@ -568,10 +568,21 @@ class ChartGitIntegrationTest(unittest.TestCase):
         """The CRD's enum would reject it at apply; the chart names the values
         key while the administrator is still looking at their values file."""
         result = _render(
-            _CR_TEMPLATE, *_forge(0, name="bitbucket", provider="bitbucket")
+            _CR_TEMPLATE, *_forge(0, name="gitea", provider="gitea")
         )
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn(f"{_P}forges[0].provider", result.stderr)
+
+    def test_a_bitbucket_provider_fails_the_render_in_this_release(self):
+        """The operator refuses both Bitbucket providers in this release, so
+        the chart does not render them either."""
+        for provider in ("bitbucket", "bitbucket-datacenter"):
+            with self.subTest(provider=provider):
+                result = _render(
+                    _CR_TEMPLATE, *_forge(0, name="bb", provider=provider)
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"{_P}forges[0].provider", result.stderr)
 
     def test_a_gitlab_forge_renders_as_the_lists_with_its_secret(self):
         """GitLab is never the alias: the alias has no provider, host or

@@ -23,27 +23,19 @@ import repo_ref
 from workspace_paths import WorkspaceError
 
 from .base import Forge, ForgeUnsupported, StubForge
+from .bitbucket import BitbucketCloudForge
+from .bitbucket_datacenter import BitbucketDataCenterForge
 from .github import GitHubForge
 from .gitlab import GitLabForge
 
-AVAILABLE: tuple[type[Forge], ...] = (GitHubForge, GitLabForge)
+AVAILABLE: tuple[type[Forge], ...] = (GitHubForge, GitLabForge, BitbucketCloudForge, BitbucketDataCenterForge)
 
 
 # Hosts this design has a name and a shape for but no implementation of yet.
 # Present rather than absent so a caller naming one is told what is missing
 # instead of being told its URL is not a repository of some forge it did not
 # ask about. Each entry is dropped the moment its package joins `AVAILABLE`.
-_UNIMPLEMENTED: tuple[tuple[str, tuple[str, ...], str, tuple[str, ...]], ...] = (
-    (
-        "bitbucket",
-        ("bitbucket.org",),
-        "pull request",
-        (
-            "no credential is configured for bitbucket.org",
-            "pull requests and issues need a Bitbucket client in the broker",
-        ),
-    ),
-)
+_UNIMPLEMENTED: tuple[tuple[str, tuple[str, ...], str, tuple[str, ...]], ...] = ()
 
 
 # Where the operator mounts the forges this install was configured with. Unset
@@ -56,13 +48,20 @@ FORGES_CONFIG_ENV = "VCS_FORGES_CONFIG"
 # `host:8443` would load and then match no request; until ports are carried
 # through resolution end to end, the misconfiguration stops the build.
 _HOST_RE = re.compile(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?")
+# One login, as a forge names an account: an account id may keep its braces
+# (`{...}`), and a username may hold `@`. The operator's schema holds the same
+# rule.
+_IDENTITY_RE = re.compile(r"[A-Za-z0-9._@+{}-]{1,255}")
 
 
 def load_forge_entries(path: str | None = None) -> list[dict[str, Any]] | None:
     """The configured forges, normalised, or None when nothing configures them.
 
     The file is `{"forges": [{"provider", "host", "tokenPath"?, "readTokenPath"?,
-    "allowedPaths"?, "caFile"?, "caSecret"?, "caKey"?}]}`. `readTokenPath` is
+    "allowedPaths"?, "caFile"?, "caSecret"?, "caKey"?, "identity"?}]}`.
+    `identity` is the login the forge's credential acts as, for a token that
+    cannot name its own account; a forge that reads it says so, and every
+    other forge ignores it. `readTokenPath` is
     where a read-only token may be: the file is there only when the Secret
     carries the key, so the forge checks for it on each call. `caFile` is an
     absolute path to PEM CA certificates that this forge's host, and no
@@ -106,6 +105,14 @@ def load_forge_entries(path: str | None = None) -> list[dict[str, Any]] | None:
         ca_file = item.get("caFile")
         if ca_file is not None and (not isinstance(ca_file, str) or not os.path.isabs(ca_file.strip())):
             raise ValueError(f"forges[{index}].caFile in {path} must be an absolute path")
+        identity = item.get("identity")
+        if identity is not None and (
+            not isinstance(identity, str) or not _IDENTITY_RE.fullmatch(identity.strip())
+        ):
+            raise ValueError(
+                f"forges[{index}].identity in {path} must be one login: letters, digits "
+                "and . _ @ + - { }, with no space"
+            )
         entries.append(
             {
                 "provider": provider,
@@ -114,6 +121,7 @@ def load_forge_entries(path: str | None = None) -> list[dict[str, Any]] | None:
                 "read_token_path": str(item.get("readTokenPath") or "").strip(),
                 "ca_file": (ca_file or "").strip(),
                 "ca_source": _ca_source(item),
+                "identity": (identity or "").strip(),
                 # Passed through unfiltered: an entry that trims to nothing is
                 # the forge's to refuse, not the loader's to drop.
                 "allowed_paths": None if allowed is None else tuple(allowed),

@@ -126,6 +126,23 @@ PROSELESS_WRITES = frozenset({"proposal-close", "issue-close"})
 
 TESTDATA = Path(__file__).resolve().parent / "testdata" / "providers"
 
+# How the fixtures' repository, `acme/infra`, appears in a forge's API path.
+REPOSITORY_IN_PATH = ("acme/infra", "acme%2Finfra", "acme/repos/infra")
+
+
+def strings_in(value: Any) -> list[str]:
+    """Every string in a request body, at any depth.
+
+    A forge's API may nest the text a caller wrote -- Bitbucket Cloud takes a
+    comment as `{"content": {"raw": ...}}` -- and it is still in the body, not
+    in the path or the query.
+    """
+    if isinstance(value, dict):
+        return [text for item in value.values() for text in strings_in(item)]
+    if isinstance(value, list):
+        return [text for item in value for text in strings_in(item)]
+    return [str(value)]
+
 
 def fixtures_dir(forge_class: type) -> Path:
     """Where this forge's recordings live: keyed by its `name`, never by module.
@@ -450,9 +467,10 @@ class ContractTest(unittest.TestCase):
                         self.assertFalse(path.startswith("/"))
                         # The repository, in the form the forge's API keys
                         # it by: GitLab's takes the whole path as one
-                        # URL-encoded segment.
+                        # URL-encoded segment, and Bitbucket Data Center's
+                        # puts `repos` between the project and the slug.
                         self.assertTrue(
-                            "acme/infra" in path or "acme%2Finfra" in path,
+                            any(spelling in path for spelling in REPOSITORY_IN_PATH),
                             f"{path} does not name the repository",
                         )
                         self.assertIsInstance(params, (dict, type(None)))
@@ -503,13 +521,13 @@ class ContractTest(unittest.TestCase):
                         carrying = [
                             c
                             for c in writes
-                            if text and text in [str(v) for v in (c[3] or {}).values()]
+                            if text and text in strings_in(c[3] or {})
                         ]
                         method, path, params, body, _raw = (carrying or writes)[0]
                         self.assertIn(method, {"POST", "PATCH", "PUT"})
                         self.assertIsInstance(body, dict)
                         if text:
-                            self.assertIn(text, [str(value) for value in body.values()])
+                            self.assertIn(text, strings_in(body))
                             self.assertNotIn(text, path)
                             self.assertNotIn(
                                 text, [str(value) for value in (params or {}).values()]
@@ -669,9 +687,14 @@ class ContractTest(unittest.TestCase):
                     # property is about the forges that give one.
                     continue
                 url = forge.capabilities(repo)["fileUrl"]
-                self.assertTrue(url.startswith(f"https://{forge.hosts[0]}/acme/infra/"))
+                self.assertTrue(url.startswith(f"https://{forge.hosts[0]}/"), url)
+                # The repository's own page: its path names the repository,
+                # however the forge lays the page out around it.
+                self.assertTrue(
+                    any(f"/{spelling}/" in url for spelling in REPOSITORY_IN_PATH), url
+                )
                 self.assertIn("{ref}", url)
-                self.assertTrue(url.endswith("{path}"))
+                self.assertIn("{path}", url)
                 self.assertNotIn("@", url)
 
     def test_a_github_file_url_is_exactly_the_blob_page(self):

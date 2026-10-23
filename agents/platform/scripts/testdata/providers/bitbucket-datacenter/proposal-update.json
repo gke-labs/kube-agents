@@ -1,0 +1,199 @@
+{
+  "payload": {
+    "number": 7,
+    "title": "Raise the replica floor to two",
+    "body": "Two replicas survive one eviction.\n"
+  },
+  "responses": [
+    {
+      "id": 7,
+      "version": 3,
+      "title": "Raise the replica floor",
+      "description": "Body of the pull request.",
+      "state": "OPEN",
+      "open": true,
+      "closed": false,
+      "draft": false,
+      "locked": false,
+      "createdDate": 1792505000000,
+      "updatedDate": 1792508000000,
+      "fromRef": {
+        "id": "refs/heads/platform-agent/replicas",
+        "displayId": "platform-agent/replicas",
+        "latestCommit": "4e7a1c9b2d305f6e8a7b9c0d1e2f3a4b5c6d7e8f",
+        "type": "BRANCH",
+        "repository": {
+          "slug": "infra",
+          "id": 11,
+          "name": "infra",
+          "scmId": "git",
+          "state": "AVAILABLE",
+          "forkable": true,
+          "public": false,
+          "project": {
+            "key": "ACME",
+            "id": 3,
+            "name": "Acme",
+            "public": false,
+            "type": "NORMAL"
+          }
+        }
+      },
+      "toRef": {
+        "id": "refs/heads/main",
+        "displayId": "main",
+        "latestCommit": "9a8b7c6d5e4f00112233445566778899aabbccdd",
+        "type": "BRANCH",
+        "repository": {
+          "slug": "infra",
+          "id": 11,
+          "name": "infra",
+          "scmId": "git",
+          "state": "AVAILABLE",
+          "forkable": true,
+          "public": false,
+          "project": {
+            "key": "ACME",
+            "id": 3,
+            "name": "Acme",
+            "public": false,
+            "type": "NORMAL"
+          }
+        }
+      },
+      "author": {
+        "user": {
+          "name": "svc-kube-agents",
+          "emailAddress": "kube-agents@acme.example",
+          "id": 101,
+          "displayName": "kube-agents",
+          "active": true,
+          "slug": "svc-kube-agents",
+          "type": "SERVICE"
+        },
+        "role": "AUTHOR",
+        "approved": false,
+        "status": "UNAPPROVED"
+      },
+      "reviewers": [
+        {
+          "user": {
+            "name": "jdoe",
+            "emailAddress": "jdoe@acme.example",
+            "id": 7,
+            "displayName": "Jane Doe",
+            "active": true,
+            "slug": "jdoe",
+            "type": "NORMAL"
+          },
+          "role": "REVIEWER",
+          "approved": false,
+          "status": "UNAPPROVED"
+        }
+      ],
+      "participants": [],
+      "links": {
+        "self": [
+          {
+            "href": "https://bitbucket.acme.example/projects/ACME/repos/infra/pull-requests/7"
+          }
+        ]
+      }
+    },
+    {
+      "id": 7,
+      "version": 4,
+      "title": "Raise the replica floor to two",
+      "description": "Two replicas survive one eviction.\n",
+      "state": "OPEN",
+      "open": true,
+      "closed": false,
+      "draft": false,
+      "locked": false,
+      "createdDate": 1792505000000,
+      "updatedDate": 1792508000000,
+      "fromRef": {
+        "id": "refs/heads/platform-agent/replicas",
+        "displayId": "platform-agent/replicas",
+        "latestCommit": "4e7a1c9b2d305f6e8a7b9c0d1e2f3a4b5c6d7e8f",
+        "type": "BRANCH",
+        "repository": {
+          "slug": "infra",
+          "id": 11,
+          "name": "infra",
+          "scmId": "git",
+          "state": "AVAILABLE",
+          "forkable": true,
+          "public": false,
+          "project": {
+            "key": "ACME",
+            "id": 3,
+            "name": "Acme",
+            "public": false,
+            "type": "NORMAL"
+          }
+        }
+      },
+      "toRef": {
+        "id": "refs/heads/main",
+        "displayId": "main",
+        "latestCommit": "9a8b7c6d5e4f00112233445566778899aabbccdd",
+        "type": "BRANCH",
+        "repository": {
+          "slug": "infra",
+          "id": 11,
+          "name": "infra",
+          "scmId": "git",
+          "state": "AVAILABLE",
+          "forkable": true,
+          "public": false,
+          "project": {
+            "key": "ACME",
+            "id": 3,
+            "name": "Acme",
+            "public": false,
+            "type": "NORMAL"
+          }
+        }
+      },
+      "author": {
+        "user": {
+          "name": "svc-kube-agents",
+          "emailAddress": "kube-agents@acme.example",
+          "id": 101,
+          "displayName": "kube-agents",
+          "active": true,
+          "slug": "svc-kube-agents",
+          "type": "SERVICE"
+        },
+        "role": "AUTHOR",
+        "approved": false,
+        "status": "UNAPPROVED"
+      },
+      "reviewers": [
+        {
+          "user": {
+            "name": "jdoe",
+            "emailAddress": "jdoe@acme.example",
+            "id": 7,
+            "displayName": "Jane Doe",
+            "active": true,
+            "slug": "jdoe",
+            "type": "NORMAL"
+          },
+          "role": "REVIEWER",
+          "approved": false,
+          "status": "UNAPPROVED"
+        }
+      ],
+      "participants": [],
+      "links": {
+        "self": [
+          {
+            "href": "https://bitbucket.acme.example/projects/ACME/repos/infra/pull-requests/7"
+          }
+        ]
+      }
+    }
+  ]
+}

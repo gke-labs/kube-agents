@@ -185,7 +185,12 @@ DEFAULT_PROPOSAL_NOUN = "pull request"
 #: broker's dependencies, and an import there would fail every consumer on
 #: every install. Kept in step with the forge classes by
 #: `test_gitops_workspace.TestForgeTable`, which runs where `providers` is.
-FORGE_PROPOSAL_NOUNS = {GITHUB_REPO_TYPE: "pull request", "gitlab": "merge request"}
+FORGE_PROPOSAL_NOUNS = {
+    GITHUB_REPO_TYPE: "pull request",
+    "gitlab": "merge request",
+    "bitbucket": "pull request",
+    "bitbucket-datacenter": "pull request",
+}
 
 #: How a host-qualified name's `/` is spelt in its workspace directory name.
 ENCODED_SEPARATOR = "%2F"

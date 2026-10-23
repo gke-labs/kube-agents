@@ -1,0 +1,31 @@
+{
+  "payload": {
+    "number": 7,
+    "body": "Rebased onto the new base image. <!-- agent:ack -->"
+  },
+  "responses": [
+    {
+      "properties": {
+        "repositoryId": 11
+      },
+      "id": 205,
+      "version": 0,
+      "text": "Rebased onto the new base image. <!-- agent:ack -->",
+      "author": {
+        "name": "svc-kube-agents",
+        "emailAddress": "kube-agents@acme.example",
+        "id": 101,
+        "displayName": "kube-agents",
+        "active": true,
+        "slug": "svc-kube-agents",
+        "type": "SERVICE"
+      },
+      "createdDate": 1792508400000,
+      "updatedDate": 1792508400000,
+      "comments": [],
+      "severity": "NORMAL",
+      "state": "OPEN",
+      "threadResolved": false
+    }
+  ]
+}

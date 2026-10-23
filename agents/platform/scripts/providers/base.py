@@ -229,13 +229,18 @@ class Forge:
     unconfigured: tuple[str, ...] = ()
     # The few statuses whose shared guidance this forge disagrees with.
     error_overrides: Mapping[int, Override] = {}
+    # What a clone or a push says when git over HTTPS refuses this forge's
+    # credential, for a forge whose refusal means more than "the token is not
+    # valid": a forge that answers 401 there for a repository the token
+    # cannot see says so. Empty keeps the broker's generic git failure.
+    git_refused = ""
     # Whether `proposal-acknowledge` does anything here. A capability rather
-    # than an assumption: Bitbucket Cloud has no reactions on pull-request
+    # than an assumption: some forges have no reactions on pull-request
     # comments, and a caller that assumed one would either crash there or
     # silently skip it. Read back from `capabilities`.
     acknowledges = False
     # Whether proposals and issues carry labels here. A capability for the
-    # same reason: Bitbucket has no labels at all, and label fields ride on
+    # same reason: a forge can have no labels at all, and label fields ride on
     # other verbs, so `verbs` cannot say it. A forge that declares none gets
     # every label field refused by name (`refuse_labels`), and its callers
     # find their own items by branch prefix and body marker. Off by default,

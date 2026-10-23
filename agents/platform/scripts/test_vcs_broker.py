@@ -3544,7 +3544,9 @@ class ForgeWithoutLabelsTest(unittest.TestCase):
         self.assertIs(self.broker.capabilities({"repository": "acme/infra"})["labels"], True)
         for forge in providers.AVAILABLE:
             with self.subTest(forge=forge.name):
-                self.assertIs(forge.labels, True)
+                # Bitbucket Cloud and Data Center have no labels; every other
+                # forge does.
+                self.assertIs(forge.labels, not forge.name.startswith("bitbucket"))
 
     def test_every_label_field_is_refused_before_the_forge_is_called(self):
         cases = (
@@ -3659,7 +3661,10 @@ class IdentityWithoutCurrentUserRouteTest(unittest.TestCase):
     def test_github_and_gitlab_do_not_require_an_identity(self):
         for forge in providers.AVAILABLE:
             with self.subTest(forge=forge.name):
-                self.assertFalse(forge.identity_required)
+                # A Bitbucket token always acts as an account, so an unknown
+                # login there is a fault; GitHub and GitLab keep "" as "do not
+                # compare".
+                self.assertIs(forge.identity_required, forge.name.startswith("bitbucket"))
                 self.assertEqual("", forge.identity)
 
 

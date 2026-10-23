@@ -1,0 +1,47 @@
+{
+  "payload": {
+    "number": 7,
+    "body": "Rebased onto the new base image. <!-- agent:ack -->"
+  },
+  "responses": [
+    {
+      "type": "pullrequest_comment",
+      "id": 304,
+      "created_on": "2026-10-20T15:00:00.000000+00:00",
+      "updated_on": "2026-10-20T15:00:00.000000+00:00",
+      "content": {
+        "type": "rendered",
+        "raw": "Rebased onto the new base image. <!-- agent:ack -->",
+        "markup": "markdown",
+        "html": ""
+      },
+      "user": {
+        "type": "app_user",
+        "uuid": "{2f7c1d0e-5b8a-4c3e-9f61-0a4b7d2e9c11}",
+        "display_name": "kube-agents",
+        "account_id": "712020:00000000-0000-0000-0000-000000000001",
+        "kind": "repository_access_token",
+        "links": {
+          "avatar": {
+            "href": "https://bitbucket.org/account/kube-agents/avatar/"
+          }
+        }
+      },
+      "deleted": false,
+      "pending": false,
+      "links": {
+        "self": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/7/comments/304"
+        },
+        "html": {
+          "href": "https://bitbucket.org/acme/infra/pull-requests/7/_/diff#comment-304"
+        }
+      },
+      "pullrequest": {
+        "type": "pullrequest",
+        "id": 7,
+        "title": "Raise the replica floor"
+      }
+    }
+  ]
+}

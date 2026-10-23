@@ -1,0 +1,106 @@
+{
+  "payload": {
+    "title": "Raise the replica floor on the ingest deployment",
+    "body": "The floor of one meant a single eviction took ingest offline.\n",
+    "source": "platform-agent/replicas",
+    "target": "main",
+    "draft": true
+  },
+  "responses": [
+    {
+      "id": 7,
+      "version": 0,
+      "title": "Raise the replica floor on the ingest deployment",
+      "description": "The floor of one meant a single eviction took ingest offline.\n",
+      "state": "OPEN",
+      "open": true,
+      "closed": false,
+      "draft": true,
+      "locked": false,
+      "createdDate": 1792505000000,
+      "updatedDate": 1792508000000,
+      "fromRef": {
+        "id": "refs/heads/platform-agent/replicas",
+        "displayId": "platform-agent/replicas",
+        "latestCommit": "4e7a1c9b2d305f6e8a7b9c0d1e2f3a4b5c6d7e8f",
+        "type": "BRANCH",
+        "repository": {
+          "slug": "infra",
+          "id": 11,
+          "name": "infra",
+          "scmId": "git",
+          "state": "AVAILABLE",
+          "forkable": true,
+          "public": false,
+          "project": {
+            "key": "ACME",
+            "id": 3,
+            "name": "Acme",
+            "public": false,
+            "type": "NORMAL"
+          }
+        }
+      },
+      "toRef": {
+        "id": "refs/heads/main",
+        "displayId": "main",
+        "latestCommit": "9a8b7c6d5e4f00112233445566778899aabbccdd",
+        "type": "BRANCH",
+        "repository": {
+          "slug": "infra",
+          "id": 11,
+          "name": "infra",
+          "scmId": "git",
+          "state": "AVAILABLE",
+          "forkable": true,
+          "public": false,
+          "project": {
+            "key": "ACME",
+            "id": 3,
+            "name": "Acme",
+            "public": false,
+            "type": "NORMAL"
+          }
+        }
+      },
+      "author": {
+        "user": {
+          "name": "svc-kube-agents",
+          "emailAddress": "kube-agents@acme.example",
+          "id": 101,
+          "displayName": "kube-agents",
+          "active": true,
+          "slug": "svc-kube-agents",
+          "type": "SERVICE"
+        },
+        "role": "AUTHOR",
+        "approved": false,
+        "status": "UNAPPROVED"
+      },
+      "reviewers": [
+        {
+          "user": {
+            "name": "jdoe",
+            "emailAddress": "jdoe@acme.example",
+            "id": 7,
+            "displayName": "Jane Doe",
+            "active": true,
+            "slug": "jdoe",
+            "type": "NORMAL"
+          },
+          "role": "REVIEWER",
+          "approved": false,
+          "status": "UNAPPROVED"
+        }
+      ],
+      "participants": [],
+      "links": {
+        "self": [
+          {
+            "href": "https://bitbucket.acme.example/projects/ACME/repos/infra/pull-requests/7"
+          }
+        ]
+      }
+    }
+  ]
+}

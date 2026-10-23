@@ -2068,17 +2068,17 @@ ways this design did not anticipate. It is also two products, Bitbucket Cloud
 and Bitbucket Data Center, with two APIs ([8. Bitbucket](#8-bitbucket)). The
 table is about both:
 
-| Bitbucket is different in                                                        | Absorbed by                                                                                                                                                     | Shared file changed      |
-| -------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ |
-| `workspace/repo` slugs and a UUID form (Cloud); `KEY/repo` and `~user/repo` (DC) | `parse`, `clone_url` in its own package                                                                                                                         | none                     |
-| pull requests, not MRs; comments are on an `/comments` sub-resource              | `translate.py` in its own package                                                                                                                               | none                     |
-| access tokens and API tokens, all static, all sent as `Authorization: Bearer`    | `StaticFileCredential` with the username `x-token-auth`, as it is                                                                                               | none                     |
-| no issue tracker at all                                                          | `verbs` omitting the six issue verbs, `ForgeUnsupported` for free; the ledgers that need issues read the omission — **[below](#not-every-provider-is-a-forge)** | the consumers            |
-| no labels on a pull request                                                      | the `labels` capability, refused by name in the broker; callers use a branch prefix and a body marker                                                           | `base.py`, the consumers |
-| no current-user route for some tokens                                            | `Forge.whoami` and `identity_required`                                                                                                                          | `base.py`, the broker    |
-| `values` pagination with an opaque `next` link (Cloud), or `start`/`limit` (DC)  | its own translation of listings                                                                                                                                 | none                     |
-| 401 from git over HTTPS on a hidden repository, where the REST API answers 404   | `error_overrides`, and clone text that says "or the token cannot see it"                                                                                        | none                     |
-| the `/scm/` clone path, a context path and a port (DC)                           | the root path on port 443 only; the other forms refused with a reason                                                                                           | none                     |
+| Bitbucket is different in                                                       | Absorbed by                                                                                                                                                     | Shared file changed      |
+| ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ |
+| `workspace/repo` (Cloud); `KEY/repo` (DC); `~user/repo` refused by name         | `parse`, `clone_url` in its own package                                                                                                                         | none                     |
+| pull requests, not MRs; comments are on an `/comments` sub-resource             | `translate.py` in its own package                                                                                                                               | none                     |
+| access tokens and API tokens, all static, all sent as `Authorization: Bearer`   | `StaticFileCredential` with the username `x-token-auth`, as it is                                                                                               | none                     |
+| no issue tracker at all                                                         | `verbs` omitting the six issue verbs, `ForgeUnsupported` for free; the ledgers that need issues read the omission — **[below](#not-every-provider-is-a-forge)** | the consumers            |
+| no labels on a pull request                                                     | the `labels` capability, refused by name in the broker; callers use a branch prefix and a body marker                                                           | `base.py`, the consumers |
+| no current-user route for some tokens                                           | `Forge.whoami` and `identity_required`                                                                                                                          | `base.py`, the broker    |
+| `values` pagination with an opaque `next` link (Cloud), or `start`/`limit` (DC) | its own translation of listings                                                                                                                                 | none                     |
+| 401 from git over HTTPS on a hidden repository, where the REST API answers 404  | `error_overrides`, and clone text that says "or the token cannot see it"                                                                                        | none                     |
+| the `/scm/` clone path, a context path and a port (DC)                          | the root path on port 443 only; the other forms refused with a reason                                                                                           | none                     |
 
 The table has three rows that change shared code, and each is at an edge, not in
 the middle. Every API difference lands in the forge's own directory. What does
@@ -2995,11 +2995,17 @@ that account:
   account's `uuid`, because a Cloud `nickname` is not unique.
 - A Cloud workspace, project or repository access token has no account
   permission, so `/2.0/user` is expected to refuse it.
-- DC has no current-user resource for a token, and a project or repository
-  token is not a user. The login is a user `slug`.
+- DC has no current-user resource in its REST API, and a project or repository
+  token is not a user. The login is the user `name`, which is what the
+  instance's `whoami` servlet (`/plugins/servlet/applinks/whoami`, outside the
+  REST API) answers for the caller and what its user search filters on.
 
 So the forge names the login (`Forge.whoami`, in [The protocol](#the-protocol)):
-from an identity configured on its forge entry, or from a lookup of its own.
+from the `identity` field of its forge entry, or from a lookup of its own. The
+field is for the two Bitbucket providers only; GitHub and GitLab refuse it,
+because their API names the account. The configured value answers first, with
+no call. On Cloud it is the account `uuid`, which the package writes with its
+braces, as Bitbucket writes every author, and any other value is refused.
 Both packages declare `identity_required`. An unknown login is then
 `FORGE_IDENTITY_UNKNOWN`, and the ownership checks refuse. They never fall back
 to "do not compare". Which source each token uses is the one a recorded
@@ -3035,8 +3041,11 @@ A DC host is supported at its root path on port 443. A context path
 them. The broker's loader takes no port, and it builds the API root from the
 host alone, so a context path needs a new field on the forge entry. A repository is named `KEY/repo`. A full DC URL
 (`https://host/scm/KEY/repo.git` or `https://host/projects/KEY/repos/repo`)
-has more path segments than a repository, so the package reads it or refuses it
-with a reason. A draft proposal needs DC 8.18 or later.
+has more path segments than a repository. The broker's package reads both forms
+as `KEY/repo`, because git reports the clone URL as the remote. A declared
+repository on the CR is refused in that form, with the form to write, so that
+the state ConfigMap holds one spelling. The broker refuses a personal repository
+(`~user/repo`) by name, and the operator refuses `~user` as a project key. A draft proposal needs DC 8.18 or later.
 
 ### Installing with Bitbucket
 

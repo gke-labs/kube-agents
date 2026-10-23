@@ -1,0 +1,59 @@
+{
+  "payload": {
+    "number": 7
+  },
+  "responses": [
+    {
+      "size": 2,
+      "limit": 100,
+      "isLastPage": true,
+      "start": 0,
+      "values": [
+        {
+          "id": "4e7a1c9b2d305f6e8a7b9c0d1e2f3a4b5c6d7e8f",
+          "displayId": "4e7a1c9b2d3",
+          "author": {
+            "name": "svc-kube-agents",
+            "emailAddress": "kube-agents@acme.example",
+            "displayName": "kube-agents"
+          },
+          "authorTimestamp": 1792506900000,
+          "committer": {
+            "name": "svc-kube-agents",
+            "emailAddress": "kube-agents@acme.example"
+          },
+          "committerTimestamp": 1792506900000,
+          "message": "Raise the replica floor to two",
+          "parents": [
+            {
+              "id": "9a8b7c6d5e4f00112233445566778899aabbccdd",
+              "displayId": "9a8b7c6d5e4"
+            }
+          ]
+        },
+        {
+          "id": "9a8b7c6d5e4f00112233445566778899aabbccdd",
+          "displayId": "9a8b7c6d5e4",
+          "author": {
+            "name": "svc-kube-agents",
+            "emailAddress": "kube-agents@acme.example",
+            "displayName": "kube-agents"
+          },
+          "authorTimestamp": 1792505000000,
+          "committer": {
+            "name": "svc-kube-agents",
+            "emailAddress": "kube-agents@acme.example"
+          },
+          "committerTimestamp": 1792505000000,
+          "message": "Raise the replica floor",
+          "parents": [
+            {
+              "id": "9a8b7c6d5e4f00112233445566778899aabbccdd",
+              "displayId": "9a8b7c6d5e4"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
