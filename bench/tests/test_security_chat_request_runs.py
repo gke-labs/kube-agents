@@ -83,9 +83,6 @@ def _ledger_flagged(command: str) -> bool:
     [
         # Seen in the recorded runs.
         f"python3 {COLLECT} compliance-audit --scope-projects fuxiaogao-gkedemos > /opt/data/scratch/chat_manifest_compliance-audit.json",
-        f'python3 {COLLECT} compliance-audit --scope-projects fuxiaogao-gkedemos --scope-unread declared-scope=unresolved > /opt/data/scratch/chat_manifest_compliance-audit.json && echo "DONE"',
-        f"mkdir -p /opt/data/scratch && python3 {COLLECT} compliance-audit --scope-projects fuxiaogao-gkedemos > /opt/data/scratch/chat_manifest_compliance-audit.json",
-        f"rm -f /opt/data/scratch/chat_manifest_compliance-audit.json && python3 {COLLECT} compliance-audit --scope-projects fuxiaogao-gkedemos --out /opt/data/scratch/chat_manifest_compliance-audit.json",
         f"python3 {COLLECT} compliance-audit --out /opt/data/scratch/chat_manifest_compliance-audit.json",
         "python3 /opt/defaults/skills/fleet-audit/scripts/collect.py compliance-audit",
         "python3 ./skills/fleet-audit/scripts/collect.py compliance-audit > /opt/data/scratch/manifest_compliance-audit.json",
@@ -101,11 +98,12 @@ def _ledger_flagged(command: str) -> bool:
         "./skills/fleet-audit/scripts/collect.py compliance-audit --workspace w",
         f'python3 "{COLLECT}" compliance-audit',
         f'bash -c "python3 {COLLECT} compliance-audit"',
-        f"! (test -f /opt/data/scratch/m.json) && python3 {COLLECT} compliance-audit",
-        f"! A |& B && python3 {COLLECT} compliance-audit",
         f"sudo FOO=bar python3 {COLLECT} compliance-audit",
         f"sudo --set-home python3 {COLLECT} compliance-audit",
         f"python3 {COLLECT} compliance-audit > /tmp/setsid",
+        f"(python3 {COLLECT} compliance-audit)",
+        f"python3 {COLLECT} compliance-audit 'quoted && inside; quotes'",
+        f"OUT=$(python3 {COLLECT} compliance-audit)",
     ],
 )
 def test_collector_run_is_credited(command):
@@ -126,6 +124,19 @@ def test_collector_run_is_credited(command):
         "python3 scripts/eval_dashboard/collect.py",
         f"python3 {COLLECT} obtainability-audit --scope-projects fuxiaogao-gkedemos",
         f"python3 {COLLECT} ai-security-audit --scope-projects fuxiaogao-gkedemos",
+        # Any other command or connective on the line means no credit under the literal rule.
+        f'python3 {COLLECT} compliance-audit --scope-projects fuxiaogao-gkedemos --scope-unread declared-scope=unresolved > /opt/data/scratch/chat_manifest_compliance-audit.json && echo "DONE"',
+        f"python3 {COLLECT} compliance-audit && echo ok",
+        f"mkdir -p /opt/data/scratch && python3 {COLLECT} compliance-audit > /opt/data/scratch/chat_manifest_compliance-audit.json",
+        f"rm -f /opt/data/scratch/chat_manifest_compliance-audit.json && python3 {COLLECT} compliance-audit --scope-projects fuxiaogao-gkedemos --out /opt/data/scratch/chat_manifest_compliance-audit.json",
+        f"cd /tmp && python3 {COLLECT} compliance-audit",
+        f"cd /tmp ; python3 {COLLECT} compliance-audit",
+        f"trap 'exit 0' EXIT; python3 {COLLECT} compliance-audit",
+        f'bash -c "trap \'exit 0\' EXIT; python3 {COLLECT} compliance-audit"',
+        f"python3(){{ :; }}; python3 {COLLECT} compliance-audit",
+        f"watch python3 {COLLECT} compliance-audit",
+        f"! (test -f /opt/data/scratch/m.json) && python3 {COLLECT} compliance-audit",
+        f"! A |& B && python3 {COLLECT} compliance-audit",
         # Trailing operators that mask failure (||, ;, |, &) are not credited under succeeded: true.
         f"python3 {COLLECT} compliance-audit > out.json || true",
         f'python3 {COLLECT} compliance-audit > /opt/data/scratch/m.json || echo "collector failed"',

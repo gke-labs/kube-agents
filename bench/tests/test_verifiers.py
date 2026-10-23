@@ -8871,13 +8871,29 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     from kube_agents_bench.verifiers import _shell_argvs_with_exit_propagation
 
     assert _shell_argvs_with_exit_propagation("python3 f.py --readiness") == [(["python3", "f.py", "--readiness"], True)]
+    assert _shell_argvs_with_exit_propagation("(python3 f.py --readiness)") == [(["python3", "f.py", "--readiness"], True)]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness > /tmp/out 2>&1") == [
+        (["python3", "f.py", "--readiness", ">", "/tmp/out", "2", ">&", "1"], True)
+    ]
+    assert _shell_argvs_with_exit_propagation("VAR=1 python3 f.py --readiness") == [
+        (["VAR=1", "python3", "f.py", "--readiness"], True)
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo python3 f.py --readiness") == [
+        (["sudo", "python3", "f.py", "--readiness"], True)
+    ]
+    assert _shell_argvs_with_exit_propagation("timeout 60 python3 f.py --readiness") == [
+        (["timeout", "60", "python3", "f.py", "--readiness"], True)
+    ]
+    assert _shell_argvs_with_exit_propagation('python3 f.py --readiness "quoted && and ;"') == [
+        (["python3", "f.py", "--readiness", "quoted && and ;"], True)
+    ]
     assert _shell_argvs_with_exit_propagation("python3 f.py --readiness && echo DONE") == [
-        (["python3", "f.py", "--readiness"], True),
-        (["echo", "DONE"], True),
+        (["python3", "f.py", "--readiness"], False),
+        (["echo", "DONE"], False),
     ]
     assert _shell_argvs_with_exit_propagation("mkdir -p /tmp && python3 f.py --readiness") == [
-        (["mkdir", "-p", "/tmp"], True),
-        (["python3", "f.py", "--readiness"], True),
+        (["mkdir", "-p", "/tmp"], False),
+        (["python3", "f.py", "--readiness"], False),
     ]
     assert _shell_argvs_with_exit_propagation("python3 f.py --readiness || echo failed") == [
         (["python3", "f.py", "--readiness"], False),
@@ -8885,11 +8901,11 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     ]
     assert _shell_argvs_with_exit_propagation("python3 f.py --readiness ; echo done") == [
         (["python3", "f.py", "--readiness"], False),
-        (["echo", "done"], True),
+        (["echo", "done"], False),
     ]
     assert _shell_argvs_with_exit_propagation("python3 f.py --readiness | tee /tmp/log") == [
         (["python3", "f.py", "--readiness"], False),
-        (["tee", "/tmp/log"], True),
+        (["tee", "/tmp/log"], False),
     ]
     assert _shell_argvs_with_exit_propagation("python3 f.py --readiness &") == [
         (["python3", "f.py", "--readiness"], False),
@@ -8915,8 +8931,8 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
         (["echo", "DONE"], False),
     ]
     assert _shell_argvs_with_exit_propagation("python3 f.py --readiness &&\necho DONE") == [
-        (["python3", "f.py", "--readiness"], True),
-        (["echo", "DONE"], True),
+        (["python3", "f.py", "--readiness"], False),
+        (["echo", "DONE"], False),
     ]
     assert _shell_argvs_with_exit_propagation("OUT=$(python3 f.py --readiness)") == [
         (["OUT=$(python3 f.py --readiness)"], True),
@@ -8954,7 +8970,7 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs_with_exit_propagation("test -d /x || mkdir -p /x && python3 f.py --readiness") == [
         (["test", "-d", "/x"], False),
         (["mkdir", "-p", "/x"], False),
-        (["python3", "f.py", "--readiness"], True),
+        (["python3", "f.py", "--readiness"], False),
     ]
     assert _shell_argvs_with_exit_propagation("test -d /x || (mkdir -p /x && python3 f.py --readiness)") == [
         (["test", "-d", "/x"], False),
@@ -8964,12 +8980,12 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs_with_exit_propagation("(test -d /x || mkdir -p /x) && python3 f.py --readiness") == [
         (["test", "-d", "/x"], False),
         (["mkdir", "-p", "/x"], False),
-        (["python3", "f.py", "--readiness"], True),
+        (["python3", "f.py", "--readiness"], False),
     ]
     assert _shell_argvs_with_exit_propagation("test -d /x || (mkdir -p /x) && python3 f.py --readiness") == [
         (["test", "-d", "/x"], False),
         (["mkdir", "-p", "/x"], False),
-        (["python3", "f.py", "--readiness"], True),
+        (["python3", "f.py", "--readiness"], False),
     ]
     assert _shell_argvs_with_exit_propagation("time ! ./f.py --readiness") == [
         (["time", "!", "./f.py", "--readiness"], False),
@@ -8983,10 +8999,10 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     ]
     assert _shell_argvs_with_exit_propagation("! (test -f /x) && python3 f.py --readiness") == [
         (["test", "-f", "/x"], False),
-        (["python3", "f.py", "--readiness"], True),
+        (["python3", "f.py", "--readiness"], False),
     ]
     assert _shell_argvs_with_exit_propagation("python3 f.py --readiness && ! (grep -q x out)") == [
-        (["python3", "f.py", "--readiness"], True),
+        (["python3", "f.py", "--readiness"], False),
         (["grep", "-q", "x", "out"], False),
     ]
     assert _shell_argvs_with_exit_propagation("! cat scope.json | python3 f.py --readiness") == [
@@ -9004,12 +9020,25 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs_with_exit_propagation("! A | B && python3 f.py --readiness") == [
         (["!", "A"], False),
         (["B"], False),
-        (["python3", "f.py", "--readiness"], True),
+        (["python3", "f.py", "--readiness"], False),
     ]
     assert _shell_argvs_with_exit_propagation("! A |& B && python3 f.py --readiness") == [
         (["!", "A"], False),
         (["B"], False),
-        (["python3", "f.py", "--readiness"], True),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("trap 'exit 0' EXIT; python3 f.py --readiness") == [
+        (["trap", "exit 0", "EXIT"], False),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3(){ :; }; python3 f.py --readiness") == [
+        (["python3"], False),
+        (["{", ":"], False),
+        (["}"], False),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("watch python3 f.py --readiness") == [
+        (["watch", "python3", "f.py", "--readiness"], False),
     ]
     assert _shell_argvs_with_exit_propagation("setsid -f python3 f.py --readiness") == [
         (["setsid", "-f", "python3", "f.py", "--readiness"], False),
@@ -9109,7 +9138,7 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     ]
     assert _shell_argvs_with_exit_propagation("python3 f.py --readiness\necho done") == [
         (["python3", "f.py", "--readiness"], False),
-        (["echo", "done"], True),
+        (["echo", "done"], False),
     ]
     assert _shell_argvs_with_exit_propagation("sudo python3 f.py --readiness") == [
         (["sudo", "python3", "f.py", "--readiness"], True),
@@ -9278,7 +9307,7 @@ def test_worker_commands_required_run_succeeded_flag():
     assert res_called.status == "fail" and "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded)" in res_called.reason
 
     # Trajectory entry where the command is joined with trailing ||, ;, |, &, or newline, preceded by || or !,
-    # or backgrounded with & is not credited even if exit_code is 0.
+    # backgrounded with &, or combined with other commands is not credited even if exit_code is 0.
     for joined_cmd in [
         f"python3 {_SCRIPT_PATH} --readiness || true",
         f'python3 {_SCRIPT_PATH} --readiness || echo "failed"',
@@ -9292,13 +9321,22 @@ def test_worker_commands_required_run_succeeded_flag():
         f"python3 {_SCRIPT_PATH} --readiness && echo DONE &",
         f"sudo -b python3 {_SCRIPT_PATH} --readiness",
         f"setsid -f python3 {_SCRIPT_PATH} --readiness",
+        f'python3 {_SCRIPT_PATH} --readiness && echo "DONE"',
+        f"python3 {_SCRIPT_PATH} --readiness && echo ok",
+        f"mkdir -p /tmp && python3 {_SCRIPT_PATH} --readiness",
+        f"cd /tmp ; python3 {_SCRIPT_PATH} --readiness",
+        f"python3 {_SCRIPT_PATH} --readiness &&\necho DONE",
+        f"test -d /tmp || mkdir -p /tmp && python3 {_SCRIPT_PATH} --readiness",
+        f"trap 'exit 0' EXIT; python3 {_SCRIPT_PATH} --readiness",
+        f"python3(){{ :; }}; python3 {_SCRIPT_PATH} --readiness",
+        f"watch python3 {_SCRIPT_PATH} --readiness",
     ]:
         traj_joined = [
             {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": joined_cmd}, "result": '{"exit_code": 0, "output": "ok"}', "exit_code": 0, "status": "completed", "at": 1.0}
         ]
         transcript.set("ok", traj_joined, worker_commands=[{"task": "t_1", "command": joined_cmd}])
         res_joined = v.verify(5.0)
-        assert res_joined.status == "fail" and "fleet_upgrade_report.py --readiness ran, but the dictated form is the command alone on its line (or followed only by &&); an operator on the line (a preceding || or !, a following |/;/||/&, a following newline, a background &, a command substitution, or a detaching wrapper such as setsid -f or sudo -b) means its exit is not credited" in res_joined.reason
+        assert res_joined.status == "fail" and "fleet_upgrade_report.py --readiness ran, but the dictated form is the command alone on its line; an operator on the line (a preceding or following &&, ||, |, ;, &, or newline, a preceding !, a command substitution, or a detaching wrapper such as setsid -f or sudo -b) means its exit is not credited" in res_joined.reason
 
     # Trajectory entry whose arguments were clipped in the pod (falling back to head regex)
     # is inconclusive under succeeded: true when the call succeeded (error status, not pass).
@@ -9336,14 +9374,16 @@ def test_worker_commands_required_run_succeeded_flag():
     res_succeeded_false = v_succeeded_false.verify(5.0)
     assert res_succeeded_false.status == "pass"
 
-    # Trajectory entry where the command is followed by && chains, preceded by commands,
-    # continued with newline after &&, preceded by || then &&, or wrapped in a lone assignment IS credited when the call exited 0.
+    # Trajectory entry where the command runs alone on its line (bare, with redirects, env vars,
+    # non-detaching wrappers, transparent subshell parens, quotes, or lone assignments) IS credited when the call exited 0.
     for valid_cmd in [
-        f'python3 {_SCRIPT_PATH} --readiness && echo "DONE"',
-        f"mkdir -p /tmp && python3 {_SCRIPT_PATH} --readiness",
-        f"cd /tmp ; python3 {_SCRIPT_PATH} --readiness",
-        f"python3 {_SCRIPT_PATH} --readiness &&\necho DONE",
-        f"test -d /tmp || mkdir -p /tmp && python3 {_SCRIPT_PATH} --readiness",
+        f"python3 {_SCRIPT_PATH} --readiness",
+        f"python3 {_SCRIPT_PATH} --readiness > /tmp/out 2>&1",
+        f"VAR=1 python3 {_SCRIPT_PATH} --readiness",
+        f"sudo python3 {_SCRIPT_PATH} --readiness",
+        f"timeout 60 python3 {_SCRIPT_PATH} --readiness",
+        f"(python3 {_SCRIPT_PATH} --readiness)",
+        f'python3 {_SCRIPT_PATH} --readiness "with && and ; in quotes"',
         f"OUT=$(python3 {_SCRIPT_PATH} --readiness)",
     ]:
         traj_valid = [

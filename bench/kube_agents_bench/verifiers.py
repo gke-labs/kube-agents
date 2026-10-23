@@ -2293,9 +2293,9 @@ _TRAJ_MISSING_NO_TRAJ_REASON = (
     "no card was delegated or the worker-trajectory capture did not run, so {named} could not be verified"
 )
 _UNRUN_MASKED_REASON = (
-    "{named} ran, but the dictated form is the command alone on its line (or followed only by &&); "
-    "an operator on the line (a preceding || or !, a following |/;/||/&, "
-    "a following newline, a background &, a command substitution, or a detaching wrapper such as setsid -f or sudo -b) "
+    "{named} ran, but the dictated form is the command alone on its line; "
+    "an operator on the line (a preceding or following &&, ||, |, ;, &, or newline, "
+    "a preceding !, a command substitution, or a detaching wrapper such as setsid -f or sudo -b) "
     "means its exit is not credited"
 )
 _UNRUN_CLIPPED_REASON = (
@@ -2407,14 +2407,12 @@ class WorkerRun(BaseModel):
     whole, and a quoted mention of the whole command is one word that is no command), and
     ``succeeded`` (for ``required_runs`` only), whether the command must have exited 0 (graded from
     the worker trajectory's terminal call exit status; a non-zero or unrecorded exit does not count;
-    to ensure the call's exit status faithfully reflects the command, the command segment must be
-    the last segment on the line or every segment following it must be ``&&``-joined; a following
-    ``||``, ``;``, ``|``, ``&``, or newline hands the line's exit to another command and is not credited as
-    succeeded; the connective immediately before the segment at its own parenthesis depth decides:
-    ``&&``, ``;``, newline, ``&`` or the line start credit; ``||`` or ``!`` do not, and a group inherits
-    its own preceding connective; non-lone command substitutions, a detaching wrapper (such as
-    ``setsid -f`` or ``sudo -b``), or a trailing background ``&`` do not credit exit; a required run with
-    ``succeeded: true`` and no worker trajectory to read is not credited)."""
+    to ensure the call's exit status faithfully reflects the command, the command segment must run
+    alone on its line; any connective before or after the command at depth 0, such as preceding or
+    following ``&&``, ``||``, ``|``, ``;``, ``&``, or newlines, or a preceding ``!``, or a detaching
+    or loop wrapper such as ``setsid`` without ``-w``, ``sudo -b``, or ``watch``, does not credit
+    exit; lone assignment command substitutions propagate exit status when the inner command runs
+    alone; a required run with ``succeeded: true`` and no worker trajectory to read is not credited)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -2682,6 +2680,8 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
         if cmd_idx is not None and idx >= cmd_idx:
             break
         base = os.path.basename(word)
+        if base == "watch":
+            return True
         if base == "setsid":
             saw_w = False
             inner_redirect_target = False
@@ -2760,14 +2760,15 @@ def _shell_argvs_with_exit_propagation(
 ) -> list[tuple[list[str], bool]]:
     """Like :func:`_shell_argvs`, but pairs each argv with a boolean indicating whether the
     shell line's final exit code faithfully reflects this segment's success or failure.
-    A segment's failure is preserved (short-circuiting subsequent execution) if and only if
-    it is the last segment on the line or every control operator following it is ``&&``,
-    is not backgrounded with ``&``, is not detached via a wrapper (such as ``setsid -f`` or ``sudo -b``),
-    is not preceded by ``||`` on the same pipeline, and is not negated with ``!``.
-    A following ``||``, ``;``, ``|``, ``&``, or newline hands the exit status to another command and may mask failure."""
+    Under the literal rule, a command carries exit if and only if it runs alone on its line:
+    no preceding or following connectives (``&&``, ``;``, ``||``, ``|``, ``|&``, bare newlines,
+    or trailing ``&``), no leading negation (``!``), and no detaching or loop wrappers
+    (such as ``setsid`` without ``-w``, ``sudo -b``, or ``watch``). Redirects (``>``, ``2>&1``),
+    environment assignments (``NAME=val``), non-detaching wrappers, transparent subshell parens
+    ``(cmd)``, and lone command substitutions ``VAR=$(cmd)`` where the inner command runs alone
+    propagate exit status."""
     words, spans = _shell_words_and_spans(command)
     segments: list[list[str]] = []
-    ops_after: list[list[str]] = []
     leading_ops: list[str] = []
     argv: list[str] = []
     current_ops: list[str] = []
@@ -2777,10 +2778,7 @@ def _shell_argvs_with_exit_propagation(
             op_str = str(word)
             if argv:
                 if op_str == "(" and (argv == ["!"] or _has_leading_negation(argv)):
-                    if segments:
-                        ops_after[-1].extend(["!", "("])
-                    else:
-                        leading_ops.extend(["!", "("])
+                    leading_ops.extend(["!", "("])
                     argv = []
                 else:
                     segments.append(argv)
@@ -2792,9 +2790,7 @@ def _shell_argvs_with_exit_propagation(
                 current_ops.append(op_str)
             continue
         if current_ops:
-            if segments:
-                ops_after.append(current_ops)
-            else:
+            if not segments:
                 leading_ops.extend(current_ops)
             current_ops = []
         argv.append(word)
@@ -2806,61 +2802,14 @@ def _shell_argvs_with_exit_propagation(
     trailing_bg = any(op == "&" for op in current_ops)
     handled_spans: list[str] = []
 
-    for i, seg in enumerate(segments):
-        carries_exit = not trailing_bg
+    for seg in segments:
+        carries_exit = len(segments) == 1 and not trailing_bg
         if carries_exit and _has_detaching_wrapper(seg):
             carries_exit = False
-
-        if carries_exit:
-            pipeline_start_idx = i
-            while pipeline_start_idx > 0:
-                prev_ops = ops_after[pipeline_start_idx - 1]
-                connective_ops = [op for op in prev_ops if op not in ("(", ")")]
-                if connective_ops in (["|"], ["|&"]):
-                    pipeline_start_idx -= 1
-                else:
-                    break
-            if _has_leading_negation(segments[pipeline_start_idx]):
-                carries_exit = False
-
-        if carries_exit:
-            depth = 0
-            min_depth = 0
-            depth0_resolved = False
-            preceding_groups = [leading_ops, *ops_after[:i]] if leading_ops else ops_after[:i]
-            for prev_ops in reversed(preceding_groups):
-                for op in reversed(prev_ops):
-                    if op == ")":
-                        depth += 1
-                    elif op == "(":
-                        depth -= 1
-                        if depth < min_depth:
-                            min_depth = depth
-                            depth0_resolved = False
-                    elif op == "!":
-                        if depth <= 0 and not depth0_resolved:
-                            carries_exit = False
-                            break
-                    elif depth <= 0:
-                        if not depth0_resolved:
-                            if op in (";", _SHELL_LINE_END, "&"):
-                                depth0_resolved = True
-                            elif op == "||":
-                                carries_exit = False
-                                break
-                            elif op == "&&":
-                                depth0_resolved = True
-                if not carries_exit:
-                    break
-
-        if carries_exit and i < len(segments) - 1:
-            for ops in ops_after[i:]:
-                connective_ops = [op for op in ops if op not in ("(", ")", "!")]
-                if connective_ops:
-                    if connective_ops[0] == "&&" and all(op in ("&&", _SHELL_LINE_END) for op in connective_ops):
-                        continue
-                    carries_exit = False
-                    break
+        if carries_exit and _has_leading_negation(seg):
+            carries_exit = False
+        if carries_exit and (any(op != "(" for op in leading_ops) or any(op != ")" for op in current_ops)):
+            carries_exit = False
 
         results.append((seg, carries_exit))
 
