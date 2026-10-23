@@ -272,10 +272,14 @@ channel can reach, so for any job, audit or not, the relay posts it as one plain
 line instead (`scheduler_failure_line`): "**The Workload Reliability Audit didn't
 run.** The AI model's usage limit was reached. It will try again tomorrow."
 The reason is the scheduler's own, in plain words, or "It hit an error" for one
-the relay does not name, and the scheduler's line goes to the server's log.
-"tomorrow" is for a job whose roster schedule fires once a day, every day
-(`cron_schedule.is_daily`); any other says "It will try again at its next
-scheduled run." There is no clock time: under `spec.mode: next`, the default
+the relay does not name, and the scheduler's line goes to the server's log
+(`logs/session_kv_server.log`, which fluent-bit ships). "tomorrow" is for a job
+whose roster schedule fires once a day, every day (`cron_schedule.is_daily`);
+any other says "It will try again at its next scheduled run." A failure no
+retry clears says so instead of promising one: rejected credentials, and the
+scheduler's blocked-configuration line (which it sends once, running the job no
+more until the configuration is fixed), end with "An admin needs to fix this
+before it can run; the details are in the agent's log." There is no clock time: under `spec.mode: next`, the default
 for a first install, the gateway escapes Slack's `<!date^…>` token, and a time
 in one zone is wrong for most readers. A failure posts once: `scheduler_failure_posts` keeps the reason each
 job last posted, and the same reason is withheld until the job's `completed` row

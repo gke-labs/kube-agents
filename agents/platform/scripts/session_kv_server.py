@@ -250,23 +250,26 @@ SCHEDULER_FAILURE_HEAD = "**The {title} didn't run.**"
 # only for a job whose schedule fires once a day, every day.
 SCHEDULER_FAILURE_NEXT_DAILY = "It will try again tomorrow."
 SCHEDULER_FAILURE_NEXT_UNKNOWN = "It will try again at its next scheduled run."
-# The scheduler sends its blocked-configuration line once and runs the job no
-# more until the configuration is fixed.
-SCHEDULER_FAILURE_NEXT_BLOCKED = "It won't run again until its configuration is fixed."
+# A failure no retry clears ends with this instead of a promise to try again:
+# the scheduler's line, with the details, is in this server's log, which
+# fluent-bit ships with the agent's other logs.
+SCHEDULER_FAILURE_NEEDS_ADMIN = "An admin needs to fix this before it can run; the details are in the agent's log."
 SCHEDULER_FAILURE_ERROR = "It hit an error"
 SCHEDULER_FAILURE_BLOCKED = "Its configuration is invalid"
 SCHEDULER_FAILURE_BLOCKED_MARK = "blocked by configuration validation"
 # The scheduler's reasons (cron/scheduler.py: _summarize_cron_failure_for_delivery),
-# each by the words its line carries after the job's name, said in plain words.
-# A line that matches none is `SCHEDULER_FAILURE_ERROR`.
+# each by the words its line carries after the job's name, said in plain words,
+# and whether a person has to act before the job can run (True) or the next
+# run may clear it (False). A line that matches none is `SCHEDULER_FAILURE_ERROR`,
+# and is promised a retry: nothing in it says which it is.
 SCHEDULER_FAILURE_REASONS = (
-    ("failed: script timed out", "It ran too long and was stopped"),
-    ("failed: provider rate limit", "The AI model's usage limit was reached"),
-    ("failed: provider weekly usage limit", "The AI model's usage limit was reached"),
-    ("failed: provider quota limit", "The AI model's usage limit was reached"),
-    ("failed: the job itself stalled", "It stopped making progress"),
-    ("failed: provider timeout", "The AI model didn't answer in time"),
-    ("failed: provider authentication error", "The AI model rejected its credentials"),
+    ("failed: script timed out", "It ran too long and was stopped", False),
+    ("failed: provider rate limit", "The AI model's usage limit was reached", False),
+    ("failed: provider weekly usage limit", "The AI model's usage limit was reached", False),
+    ("failed: provider quota limit", "The AI model's usage limit was reached", False),
+    ("failed: the job itself stalled", "It stopped making progress", False),
+    ("failed: provider timeout", "The AI model didn't answer in time", False),
+    ("failed: provider authentication error", "The AI model rejected its credentials", True),
 )
 # The ledger status of a run that finished without failing. One after a failure
 # was posted means the job recovered, so its next failure is news again.
@@ -4017,16 +4020,23 @@ def scheduler_failure_line(profile: str, job_id: str, title: str, report: str) -
     the scheduler's reason in plain words (`SCHEDULER_FAILURE_REASONS`), or
     `SCHEDULER_FAILURE_ERROR` for one it does not name. "tomorrow" is for a job
     that fires once a day, every day; any other says
-    `SCHEDULER_FAILURE_NEXT_UNKNOWN`. A job the scheduler blocked on its
-    configuration runs no more until it is fixed, and says so instead.
+    `SCHEDULER_FAILURE_NEXT_UNKNOWN`. A failure no retry clears (rejected
+    credentials, or a job the scheduler blocked on its configuration, which it
+    runs no more until it is fixed) ends with `SCHEDULER_FAILURE_NEEDS_ADMIN`.
     """
     head = SCHEDULER_FAILURE_HEAD.format(title=title or job_id)
     lower = report.lower()
     if SCHEDULER_FAILURE_BLOCKED_MARK in lower:
-        return SchedulerFailure(SCHEDULER_FAILURE_BLOCKED, f"{head} {SCHEDULER_FAILURE_BLOCKED}. {SCHEDULER_FAILURE_NEXT_BLOCKED}")
-    reason = next((plain for words, plain in SCHEDULER_FAILURE_REASONS if words in lower), SCHEDULER_FAILURE_ERROR)
-    when = SCHEDULER_FAILURE_NEXT_DAILY if _runs_daily(profile, job_id) else SCHEDULER_FAILURE_NEXT_UNKNOWN
-    return SchedulerFailure(reason, f"{head} {reason}. {when}")
+        return SchedulerFailure(SCHEDULER_FAILURE_BLOCKED, f"{head} {SCHEDULER_FAILURE_BLOCKED}. {SCHEDULER_FAILURE_NEEDS_ADMIN}")
+    reason, needs_admin = next(
+        ((plain, admin) for words, plain, admin in SCHEDULER_FAILURE_REASONS if words in lower),
+        (SCHEDULER_FAILURE_ERROR, False),
+    )
+    if needs_admin:
+        then = SCHEDULER_FAILURE_NEEDS_ADMIN
+    else:
+        then = SCHEDULER_FAILURE_NEXT_DAILY if _runs_daily(profile, job_id) else SCHEDULER_FAILURE_NEXT_UNKNOWN
+    return SchedulerFailure(reason, f"{head} {reason}. {then}")
 
 
 def _run_completed_since(profile: str, job_id: str, since: float) -> bool:

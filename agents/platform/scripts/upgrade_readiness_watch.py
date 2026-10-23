@@ -136,6 +136,7 @@ import fleet_scope_args  # noqa: E402
 import fleet_scope_targets  # noqa: E402
 import gitops_workspace  # noqa: E402
 import sandbox_exec  # noqa: E402
+import script_log  # noqa: E402
 
 # Where the job keeps its ledger and reports, under the agent home.
 HOME_ENV = "HERMES_HOME"
@@ -548,21 +549,31 @@ REPORT_LINE = (
     "{ready} ready{ungraded}; report on the gateway pod at {path}; next refresh after {next_date}"
 )
 BLOCKED_NAMES = " ({names})"
-# A failed tick posts one plain line: what did not happen, why, and when it
-# runs next. The exception and its text go to stderr as `FAILED_LINE`, which
-# the scheduler keeps in the run's output; the channel never sees them.
+# A failed tick posts one plain line: what did not happen, why, and what
+# happens next. The exception and its text go to `WATCH_LOG_FILE` under the
+# agent home (`script_log`), and to stderr for a person running it by hand;
+# the scheduler keeps a zero-exit script's stderr nowhere.
 FAILED_TICK_LINE = "**The upgrade readiness check didn't run today.** {reason}. {next}"
-FAILED_WRITE_LINE = "**The upgrade readiness check didn't finish today.** It couldn't save its report. {next}"
-# When it runs next, with no clock time (`cron_schedule`): "tomorrow" only
-# while its roster entry fires once a day, every day.
+FAILED_WRITE_LINE = "**The upgrade readiness check didn't finish today.** {reason}. {next}"
+# What happens next, with no clock time (`cron_schedule`): "tomorrow" only
+# while its roster entry fires once a day, every day, and for a failure no
+# retry clears, that a person has to act.
 FAILED_NEXT_DAILY = "It will try again tomorrow."
 FAILED_NEXT_UNKNOWN = "It will try again at its next scheduled run."
+FAILED_NEEDS_ADMIN = "An admin needs to fix this before it can run; the details are in the agent's log."
 WATCH_JOB_ID = "upgrade-readiness-watch"
+WATCH_LOG_FILE = "upgrade_readiness_watch.log"
 FAILED_REASON_REFUSED = "It couldn't read the clusters in the install's scope"
 FAILED_REASON_SCOPE_UNREADABLE = "It couldn't read the install's scope"
 FAILED_REASON_UNRESOLVED = "It couldn't look up the fleet's projects"
+FAILED_REASON_WRITE = "It couldn't save its report"
 FAILED_REASON_TIMED_OUT = "Reading the fleet took too long"
 FAILED_REASON_ERROR = "It hit an error"
+# The reasons a retry does not clear: the install's scope, the roster or the
+# disk has to change first.
+FAILED_REASONS_NEED_ADMIN = frozenset(
+    {FAILED_REASON_REFUSED, FAILED_REASON_SCOPE_UNREADABLE, FAILED_REASON_UNRESOLVED, FAILED_REASON_WRITE}
+)
 FAILED_LINE = "{prefix} watch: {what} failed: {detail}"
 FAILED_WHAT_TICK = "the tick"
 FAILED_WHAT_WRITE = "writing the ledger or the report"
@@ -634,7 +645,6 @@ DRY_RUN_NOTHING_DUE = "dry run: nothing due; pending versions: {versions}"
 NONE_WORD = "none"
 MAX_NAMES_IN_LINE = 6
 NAMES_OVERFLOW = ", +{more} more"
-WRITE_FAILED_EXIT = 2
 DATE_FORMAT = "%Y-%m-%d"
 
 
@@ -2201,13 +2211,21 @@ def sweep(started: float, home: Path, ledger: dict, dry_run: bool) -> list[str]:
     return lines
 
 
-def next_attempt() -> str:
-    """When the watch runs next, in the channel's words: tomorrow for a daily roster entry, else its next run."""
+def next_attempt(reason: str) -> str:
+    """What happens after a failure, in the channel's words: a person acts, or the watch tries again.
+
+    Tomorrow for a daily roster entry, else its next run, and no retry promise
+    for a failure in `FAILED_REASONS_NEED_ADMIN`.
+    """
+    if reason in FAILED_REASONS_NEED_ADMIN:
+        return FAILED_NEEDS_ADMIN
     return FAILED_NEXT_DAILY if cron_schedule.job_runs_daily(profile_home(), WATCH_JOB_ID) else FAILED_NEXT_UNKNOWN
 
 
 def failure_reason(exc: Exception) -> str:
     """Why a tick failed, in the channel's words: the kind of failure, never its text."""
+    if isinstance(exc, WriteFailed):
+        return FAILED_REASON_WRITE
     if isinstance(exc, ReportRefused):
         return FAILED_REASON_REFUSED
     if isinstance(exc, ScopeUnreadable):
@@ -2245,23 +2263,26 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         lines = tick(dry_run=args.dry_run)
-    except WriteFailed as exc:
-        print(FAILED_WRITE_LINE.format(next=next_attempt()))
-        print(FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_WRITE, detail=exc), file=sys.stderr)
-        return WRITE_FAILED_EXIT
     except Exception as exc:  # noqa: BLE001 - one line to chat, never a traceback
-        detail = f"{type(exc).__name__}: {exc}"
+        # Exit 0 for a write failure too: a non-zero exit makes the scheduler
+        # post its own failure line in place of this one, and that line can
+        # only promise a retry the disk will not grant.
+        write = isinstance(exc, WriteFailed)
+        detail = str(exc) if write else f"{type(exc).__name__}: {exc}"
+        failed_line = FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_WRITE if write else FAILED_WHAT_TICK, detail=detail)
         reason = failure_reason(exc)
         # Keyed on the kind of failure, never its text: a sandbox's stderr
         # carries paths that change every run, and keyed on it the same
         # failure was posted every day. A refused tick keeps its signature,
         # so a refusal whose cause changes is posted again.
         key = exc.signature if isinstance(exc, ReportRefused) and exc.signature else reason
-        # A dry run changes nothing, the marker included, and is never silenced
-        # by it: the operator running one is looking at the failure.
+        # A dry run changes nothing, the marker and the log included, and is
+        # never silenced by it: the operator running one is looking at the failure.
+        if not args.dry_run:
+            script_log.append(WATCH_LOG_FILE, [failed_line])
         if args.dry_run or announce_failure_once(detail, key):
-            print(FAILED_TICK_LINE.format(reason=reason, next=next_attempt()))
-            print(FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_TICK, detail=detail), file=sys.stderr)
+            print((FAILED_WRITE_LINE if write else FAILED_TICK_LINE).format(reason=reason, next=next_attempt(reason)))
+            print(failed_line, file=sys.stderr)
         return 0
     for line in lines:
         print(line)

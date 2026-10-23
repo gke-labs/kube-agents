@@ -74,6 +74,7 @@ from pathlib import Path
 import forge
 import gitops_workspace
 import pr_triggers
+import script_log
 
 # Which sweeps run, and in what order, is `SWEEP_ORDER` — derived from the
 # `SWEEPS` registry near the bottom of this file rather than written out twice.
@@ -120,8 +121,10 @@ PR_MAX_REFUSALS_DEFAULT = pr_triggers.MAX_REFUSALS_DEFAULT
 
 # A pull request whose conversation could not be read is one plain line, posted
 # the tick it first fails and once more the tick it reads again; the reason
-# code goes to stderr. This job runs every ten minutes, so without the record
-# below a failure that persists was the same line 144 times a day.
+# code goes to `WATCHER_LOG_FILE` under the agent home (`script_log`), since
+# the scheduler keeps a zero-exit script's stderr nowhere. This job runs every
+# ten minutes, so without the record below a failure that persists was the
+# same line 144 times a day.
 UNREADABLE_LINE = "**Comments on {pr} aren't being answered.** {why}"
 READABLE_AGAIN_LINE = "**Comments on {pr} are being answered again.**"
 UNREADABLE_WHY_DEFAULT = (
@@ -144,9 +147,11 @@ PR_LINK = "[{name}#{number}]({url})"
 PR_REF = "{repo}#{number}"
 PR_REF_SEPARATOR = "#"
 REPO_NAME_SEPARATOR = "/"
-# The pull requests last posted as unreadable, with the reason, under the
-# profile home: `{"owner/name#12": "FORGE_CALL_FAILED"}`.
+# The pull requests last posted as unreadable, under the profile home, each
+# with the sentence it was posted with, so two codes that read the same do not
+# post twice: `{"owner/name#12": "GitHub didn't respond ..."}`.
 UNREADABLE_RECORD = Path("github-repo-watcher") / "unreadable-prs.json"
+WATCHER_LOG_FILE = "github_repo_watcher.log"
 
 
 @dataclass
@@ -744,19 +749,24 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
             "could not be determined this tick\n"
         )
     # One line per pull request whose conversation could not be read, the tick
-    # it first fails or fails for a new reason, and one more the tick it reads
-    # again. A dry run changes no record and posts every one: the operator
-    # running it is looking at the failures.
+    # it first fails or fails with a sentence it was not posted with, and one
+    # more the tick it reads again. A dry run changes no record or log and
+    # posts every one: the operator running it is looking at the failures.
     previous = _load_unreadable()
     urls = {(repo, pr.number): pr.url for repo, pr in prs}
     current: dict[str, str] = {}
+    details = []
     for repo, n, reason in sorted(unreadable):
         key = PR_REF.format(repo=repo, number=n)
-        current[key] = reason
-        sys.stderr.write(f"github_scan_gate: could not read {key} ({reason}); its conversation was skipped this tick\n")
-        if dry_run or previous.get(key) != reason:
-            why = UNREADABLE_WHY.get(reason, UNREADABLE_WHY_DEFAULT)
+        why = UNREADABLE_WHY.get(reason, UNREADABLE_WHY_DEFAULT)
+        current[key] = why
+        details.append(f"github_scan_gate: could not read {key} ({reason}); its conversation was skipped this tick")
+        if dry_run or previous.get(key) != why:
             warnings.append(UNREADABLE_LINE.format(pr=_pr_ref(repo, n, urls.get((repo, n), "")), why=why))
+    if dry_run:
+        sys.stderr.writelines(f"{line}\n" for line in details)
+    else:
+        script_log.append(WATCHER_LOG_FILE, details)
     # Read this tick: the pull requests the sweep listed. One that closed, or that
     # a refusal kept the sweep out of its repository, is not "being answered
     # again"; the record keeps the second until its repository is read.

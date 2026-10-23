@@ -748,7 +748,7 @@ class PrCommentsSweepTest(unittest.TestCase):
         home = tempfile.TemporaryDirectory()
         self.addCleanup(home.cleanup)
         self.home = home.name
-        env = mock.patch.dict(os.environ, {"HERMES_HOME": home.name})
+        env = mock.patch.dict(os.environ, {"HERMES_HOME": home.name, "PLATFORM_AGENT_HOME": home.name})
         env.start()
         self.addCleanup(env.stop)
 
@@ -1393,11 +1393,21 @@ class PrCommentsSweepTest(unittest.TestCase):
 
     # -- an unreadable pull request posts once, and once when it reads again --
     def _unreadable_tick(self, fail_on=(12,), reason="FORGE_CALL_FAILED", prs=None, dry_run=False, **kwargs):
+        """The tick's warnings, and what it logged: stderr on a dry run, the watcher's log file otherwise."""
+        import os
+
+        log = os.path.join(self.home, "logs", gate.WATCHER_LOG_FILE)
+        before = os.path.getsize(log) if os.path.exists(log) else 0
         provider = FakeProvider(prs=prs or [make_pr(12)], fail_on=fail_on, fail_reason=reason)
         stderr = io.StringIO()
         with mock.patch("sys.stderr", stderr):
             result = self._sweep(provider, dry_run=dry_run, **kwargs)
-        return result.warnings, stderr.getvalue()
+        logged = ""
+        if os.path.exists(log):
+            with open(log, encoding="utf-8") as handle:
+                handle.seek(before)
+                logged = handle.read()
+        return result.warnings, stderr.getvalue() + logged
 
     def test_an_unreadable_pr_is_one_plain_line(self):
         pr = dataclasses.replace(make_pr(19), url="https://github.com/acme/toolkit/pull/19")
@@ -1417,6 +1427,14 @@ class PrCommentsSweepTest(unittest.TestCase):
         self.assertEqual(len(first), 1)
         self.assertEqual(second, [])
         self.assertIn("FORGE_CALL_FAILED", stderr, "every tick still logs it")
+
+    def test_two_codes_that_read_the_same_post_once(self):
+        first, _ = self._unreadable_tick(reason="FORGE_CALL_FAILED")
+        for code in ("BROKER_UNREACHABLE", "FORGE_CALL_FAILED", "BROKER_UNREACHABLE"):
+            warnings, logged = self._unreadable_tick(reason=code)
+            self.assertEqual(warnings, [], f"{code} reads the same sentence, so it is not news")
+            self.assertIn(code, logged)
+        self.assertEqual(len(first), 1)
 
     def test_a_new_reason_posts_again(self):
         self._unreadable_tick()
@@ -1459,7 +1477,7 @@ class PrCommentsSweepTest(unittest.TestCase):
 
         record = os.path.join(self.home, str(gate.UNREADABLE_RECORD))
         with open(record, encoding="utf-8") as handle:
-            self.assertEqual(json.load(handle), {"acme/toolkit#12": "FORGE_CALL_FAILED"})
+            self.assertEqual(json.load(handle), {"acme/toolkit#12": gate.UNREADABLE_WHY_DEFAULT})
         os.remove(record)
         self._unreadable_tick(dry_run=True)
         self.assertFalse(os.path.exists(record))

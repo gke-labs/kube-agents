@@ -217,10 +217,13 @@ learned on its first table run. A number the credential cannot resolve is
 never a key, so its clusters earn no report until it resolves: when nothing
 was read under a key (it is the only project, or every other is an unresolved
 number too), the tick fails, posted once as a plain line ("The upgrade readiness
-check didn't run today", why, and that it tries again tomorrow, or at its next
-scheduled run when its roster entry is not daily) with the reason
-and the remedy on stderr, and kept in `last-failure.txt` by the kind of failure
-until the next clean tick posts the recovery;
+check didn't run today", why, and that an admin needs to fix it, since no retry
+resolves the number) with the reason and the remedy in
+`logs/upgrade_readiness_watch.log` under the agent home, which fluent-bit
+ships, and kept in `last-failure.txt` by the kind of failure until the next
+clean tick posts the recovery. A failure a retry may clear (a timeout, a
+sandbox that failed) says instead that it tries again tomorrow, or at its next
+scheduled run when its roster entry is not daily;
 beside projects that were keyed, the table is partial, posted once with the
 reason, and the ledger's `table_errors` keeps it. The remedy is
 `resourcemanager.projects.get` on the credential (every read role the install
@@ -289,7 +292,7 @@ the hops refused as outside the declared scope and the ids it learned for
 numbered spellings, kept at whichever step the tick failed unless the ledger
 itself cannot be written or re-read, so the next tick files them under the same cause)
 keeps its key in
-`last-failure.txt` beside it (its line, or, for a tick whose every run was refused, the
+`last-failure.txt` beside it (the plain reason, or, for a tick whose every run was refused, the
 refused projects and their causes), and the next line is the recovery. A version
 none of whose clusters can be read is retried
 three days running and then recorded, so an unreachable cluster costs its
@@ -560,8 +563,10 @@ operator's allowlist, are the whole configuration surface: `FEEDBACK_PROMPT_ENAB
 on later still gets exactly one) and `FEEDBACK_PROMPT_DELAY` (default `7d`;
 `<n>d`, `<n>h` or `<n>m`). A hand edit of the CR's `spec.deployment.env` can
 be lost at the next chart apply. A delay that does not parse is a failed run, exit 1
-with the reason on stderr, which the scheduler reports in chat like any other
-script failure until the value is fixed; it does not fall back, because the
+with the reason on stderr. The scheduler turns that into its failure line, which
+the relay posts once in plain words ("The Feedback Prompt didn't run. It hit an
+error."), and the run's output, which the scheduler saves under the profile's
+`cron/output/`, keeps the reason; it does not fall back, because the
 scheduler keeps a zero-exit script's stderr nowhere and a silent fallback
 would leave no trace but the message arriving a week early. The schedule is
 daily, so whatever the delay, the message lands on the first 13:00 UTC tick

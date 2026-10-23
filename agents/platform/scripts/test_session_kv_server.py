@@ -4333,10 +4333,22 @@ class TestSchedulerFailureLine(unittest.TestCase):
             with self.subTest(line=line):
                 failure = session_kv_server.scheduler_failure_line("platform", "x", "Fleet Waste Audit", line)
                 self.assertEqual(failure.reason, reason)
-                self.assertEqual(
-                    failure.text,
-                    f"**The Fleet Waste Audit didn't run.** {reason}. It will try again at its next scheduled run.",
+                then = (
+                    session_kv_server.SCHEDULER_FAILURE_NEEDS_ADMIN
+                    if reason == "The AI model rejected its credentials"
+                    else "It will try again at its next scheduled run."
                 )
+                self.assertEqual(failure.text, f"**The Fleet Waste Audit didn't run.** {reason}. {then}")
+
+    def test_a_failure_a_retry_does_not_clear_promises_no_retry(self):
+        self.roster("50 6 * * *")
+        line = "⚠️ Cron 'X' failed: provider authentication error. Full details."
+        failure = session_kv_server.scheduler_failure_line("platform", "obtainability-audit", self.TITLE, line)
+        self.assertEqual(
+            failure.text,
+            "**The Workload Reliability Audit didn't run.** The AI model rejected its credentials. "
+            "An admin needs to fix this before it can run; the details are in the agent's log.",
+        )
 
     def test_a_blocked_configuration_says_it_waits_for_a_fix(self):
         line = "⛔ Cron 'X' blocked by configuration validation (no LLM call was made): bad model. This alert is sent once."
@@ -4344,7 +4356,7 @@ class TestSchedulerFailureLine(unittest.TestCase):
         self.assertEqual(
             failure.text,
             "**The Fleet Waste Audit didn't run.** Its configuration is invalid. "
-            "It won't run again until its configuration is fixed.",
+            "An admin needs to fix this before it can run; the details are in the agent's log.",
         )
 
     def test_a_daily_job_tries_again_tomorrow(self):
