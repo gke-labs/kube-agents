@@ -8856,7 +8856,7 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
         (["sudo", "2", ">", "/dev/null", "python3", "f.py", "--readiness"], True),
     ]
     assert _shell_argvs_with_exit_propagation("setsid 2>/dev/null python3 f.py --readiness") == [
-        (["setsid", "2", ">", "/dev/null", "python3", "f.py", "--readiness"], True),
+        (["setsid", "2", ">", "/dev/null", "python3", "f.py", "--readiness"], False),
     ]
     assert _shell_argvs_with_exit_propagation("setsid -fw python3 f.py --readiness") == [
         (["setsid", "-fw", "python3", "f.py", "--readiness"], True),
@@ -8870,6 +8870,12 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs_with_exit_propagation("sudo -gbin python3 f.py --readiness") == [
         (["sudo", "-gbin", "python3", "f.py", "--readiness"], True),
     ]
+    assert _shell_argvs_with_exit_propagation("sudo --backg python3 f.py --readiness") == [
+        (["sudo", "--backg", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("setsid --fo python3 f.py --readiness") == [
+        (["setsid", "--fo", "python3", "f.py", "--readiness"], False),
+    ]
     assert _shell_argvs_with_exit_propagation("python3 f.py --readiness\necho done") == [
         (["python3", "f.py", "--readiness"], False),
         (["echo", "done"], True),
@@ -8878,7 +8884,7 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
         (["sudo", "python3", "f.py", "--readiness"], True),
     ]
     assert _shell_argvs_with_exit_propagation("setsid python3 f.py --readiness") == [
-        (["setsid", "python3", "f.py", "--readiness"], True),
+        (["setsid", "python3", "f.py", "--readiness"], False),
     ]
     assert _shell_argvs_with_exit_propagation("echo $(python3 f.py --readiness)") == [
         (["echo", "$(python3 f.py --readiness)"], True),
@@ -9514,7 +9520,7 @@ def test_worker_commands_required_run_succeeded_with_after_result_pattern():
     from kube_agents_bench.verifiers import WorkerRun
 
     run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
-    v = WorkerCommandsVerifier(type="worker_commands", after_result_pattern=r"OPEN", required_runs=[run])
+    v = WorkerCommandsVerifier(type="worker_commands", after_result_pattern=r"OPEN", forbidden_patterns=[r"never_matches"], required_runs=[run])
 
     # Trajectory entry with status="completed" passes.
     traj_completed = [

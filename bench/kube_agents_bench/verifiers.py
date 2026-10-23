@@ -2651,17 +2651,24 @@ _SUDO_VAL_OPTS = {
     "--user", "--group", "--prompt", "--close-from", "--chdir", "--chroot",
     "--command-timeout", "--other-user", "--host", "--role", "--type",
 }
+_SUDO_SHORT_VAL_OPTS = {opt[1:] for opt in _SUDO_VAL_OPTS if opt.startswith("-") and not opt.startswith("--")}
 _SUDO_VAL_LESS_FLAGS = set("AbBEHiKklnNPSsVv")
+_SUDO_LONG_VAL_LESS_OPTS = {
+    "--askpass", "--bell", "--edit", "--help", "--login",
+    "--remove-timestamp", "--reset-timestamp", "--list",
+    "--non-interactive", "--stdin", "--shell", "--version", "--validate",
+}
 _SETSID_VAL_LESS_FLAGS = set("cwf")
 
 
 def _has_detaching_wrapper(seg: list[str]) -> bool:
     """True if seg invokes an exec wrapper with options that detach the process
-    (e.g. `setsid -f`/`--fork` or `sudo -b`/`--background`)."""
+    or do not guarantee exit propagation (e.g. `setsid` without `-w`/`--wait`,
+    or `sudo` with `-b`/`--background` or non-whitelisted options)."""
     for idx, word in enumerate(seg):
         base = os.path.basename(word)
         if base == "setsid":
-            saw_f = False
+            saw_w = False
             redirect_target = False
             for i, w in enumerate(seg[idx + 1:], start=idx + 1):
                 if redirect_target:
@@ -2672,21 +2679,15 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
                     continue
                 if w == "--":
                     break
-                if w in ("-w", "--wait"):
-                    saw_f = False
-                    break
-                if w in ("-f", "--fork"):
-                    saw_f = True
+                if w in ("-w", "--wait") or ("--wait".startswith(w) and len(w) >= 3):
+                    saw_w = True
                 elif w.startswith("-") and not w.startswith("--") and len(w) > 1:
                     if all(c in _SETSID_VAL_LESS_FLAGS for c in w[1:]):
                         if "w" in w[1:]:
-                            saw_f = False
-                            break
-                        if "f" in w[1:]:
-                            saw_f = True
+                            saw_w = True
                 if not w.startswith("-") and not _SHELL_ASSIGNMENT_RE.match(w):
                     break
-            if saw_f:
+            if not saw_w:
                 return True
         elif base == "sudo":
             prev_opt_takes_val = False
@@ -2703,32 +2704,35 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
                     continue
                 if w == "--":
                     break
-                if w in ("-b", "--background"):
+                if not w.startswith("-") and not _SHELL_ASSIGNMENT_RE.match(w):
+                    break
+                if w.startswith("--"):
+                    opt_name, _, _ = w.partition("=")
+                    if opt_name in _SUDO_VAL_OPTS:
+                        if "=" not in w:
+                            prev_opt_takes_val = True
+                        continue
+                    if opt_name in _SUDO_LONG_VAL_LESS_OPTS or opt_name == "--preserve-env":
+                        continue
                     return True
-                if w.startswith("-") and not w.startswith("--") and len(w) > 1:
-                    saw_b = False
+                elif w.startswith("-") and len(w) > 1:
                     val_opt_end = False
                     for ci, c in enumerate(w[1:]):
                         if c == "b":
-                            saw_b = True
+                            return True
                         if c in _SUDO_VAL_LESS_FLAGS:
                             continue
-                        if "-" + c in _SUDO_VAL_OPTS:
+                        if c in _SUDO_SHORT_VAL_OPTS:
                             val_opt_end = True
                             rest = w[1 + ci + 1:]
                             if not rest:
                                 prev_opt_takes_val = True
                             break
-                        continue
-                    if saw_b:
                         return True
                     if val_opt_end:
                         continue
-                if w.startswith("-"):
-                    prev_opt_takes_val = w in _SUDO_VAL_OPTS
-                    continue
-                if not _SHELL_ASSIGNMENT_RE.match(w):
-                    break
+                else:
+                    return True
     return False
 
 
