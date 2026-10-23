@@ -859,6 +859,18 @@ class ResolutionModelTests(unittest.TestCase):
             "cluster home model has drifted from cluster_agent_profile.py",
         )
 
+        optional_items = re.search(r'OPTIONAL_SYNC_ITEMS="([^"]+)"', entrypoint)
+        self.assertIsNotNone(optional_items, "OPTIONAL_SYNC_ITEMS moved or changed shape")
+        self.assertEqual(
+            set(optional_items.group(1).split()) | {"skills", "scripts"},
+            set(cpa.PROFILE_HOME_ITEMS["tse"]),
+            "tse home model has drifted from docker-entrypoint.sh OPTIONAL_SYNC_ITEMS",
+        )
+        self.assertIn(
+            'ln -sfn "$TARGET_DIR/scripts" "$_opt_home/scripts"',
+            entrypoint,
+        )
+
 
 class CheckoutPathTests(unittest.TestCase):
     """A path that addresses the checkout is the one spelling always wrong.

@@ -36,6 +36,8 @@ const DELEGATE_TRIM_RE = /^[:,\-\u2014 \t\n]+/;
 const SLASH = "/";
 const SESSION_WORD = "session";
 const FEEDBACK_WORD = "feedback";
+/** The one `/feedback <text>` the gateway answers itself (chattext.IsFeedbackSummaryCommand). */
+const FEEDBACK_SUMMARY_WORD = "summary";
 const SESSION_OFF_WORD = "off";
 /** The one non-ASCII rune whose simple case fold (Go strings.EqualFold) is an ASCII letter of "session". */
 const LONG_S = /\u017f/g;
@@ -176,6 +178,13 @@ export function feedbackCommandRest(text: string): string | null {
   return slashWordRest(text, FEEDBACK_WORD);
 }
 
+/** Mirrors chattext.IsFeedbackSummaryCommand: `/feedback summary`, case-insensitively, and nothing after it. */
+export function isFeedbackSummaryCommand(text: string): boolean {
+  const rest = feedbackCommandRest(text);
+  // The same long-s fold as the slash word: Go's EqualFold reads ſummary as summary.
+  return rest !== null && rest.replace(LONG_S, "s").toLowerCase() === FEEDBACK_SUMMARY_WORD;
+}
+
 /** Mirrors commands.go slashWord: a leading `/`, the word case-insensitively, then the end or whitespace. */
 function slashWordRest(text: string, expected: string): string | null {
   const trimmed = goTrim(text);
@@ -195,7 +204,7 @@ export function isSessionOffArg(rest: string): boolean {
 /**
  * What the gateway can make of a console turn, judged from its text alone.
  * `settled`: no branch of the gateway's switch ever publishes it as a task
- * message (a stop word, a bare `/session`, `/session off`, `/session stop`, a bare `/feedback`).
+ * message (a stop word, a bare `/session`, `/session off`, `/session stop`, a bare `/feedback`, `/feedback summary`).
  * `task`: it may become a task, and the submission's text is one of `texts`.
  * The gateway may still answer a `task` turn with only a notice (a status
  * question, a session-cap refusal, a full queue): that depends on state the
@@ -206,14 +215,15 @@ export type TurnFate = { kind: "settled" } | { kind: "task"; texts: string[] };
 /** Follows a2a/gateway/gateway.go's switch: slash commands first, then stop, then delegate. */
 export function turnFate(text: string): TurnFate {
   const trimmed = goTrim(text);
-  // A bare /feedback is answered with a notice and never becomes a task; with text it is an ordinary turn, prefix and all.
-  if (feedbackCommandRest(trimmed) === "") return { kind: "settled" };
+  // A bare /feedback is answered with a notice and /feedback summary with the usage block; neither becomes a task.
+  // With any other text it is an ordinary turn, prefix and all.
+  if (feedbackCommandRest(trimmed) === "" || isFeedbackSummaryCommand(trimmed)) return { kind: "settled" };
   const sessionRest = sessionCommandRest(trimmed);
   if (sessionRest !== null) {
     // Pre-flip the argument is the first turn as written; post-flip it is
     // unwrapped into an ordinary turn, which the delegate rule then reads.
-    // The one divergence from the gateway: a bare /feedback behind /session is the notice post-flip (the prefix is
-    // stripped before /feedback is read) and a session's first turn pre-flip. The page cannot tell the modes apart, so
+    // The divergence from the gateway: a bare /feedback or /feedback summary behind /session is the notice or the
+    // summary post-flip (the prefix is stripped before /feedback is read) and a session's first turn pre-flip. The page cannot tell the modes apart, so
     // it keeps the conservative reading and lets the post-flip turn get the "no task yet" note.
     if (sessionRest === "" || isSessionOffArg(sessionRest) || isStopTurn(sessionRest)) return { kind: "settled" };
     return { kind: "task", texts: withDelegate(sessionRest) };

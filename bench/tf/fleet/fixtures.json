@@ -354,6 +354,21 @@
         }
       ]
     },
+    "readiness-lb-drain-timeout": {
+      "cluster_slot": "b",
+      "namespace": null,
+      "probes": ["node?cloud.google.com/gke-nodepool=default-pool"],
+      "fixture": "drain-timeout-<prefix>-b backend service on the default pool's instance group with connectionDraining.drainingTimeoutSec 3600, six times GKE's 600-second per-node deregistration wait, behind a TCP health check and no forwarding rule, so it routes nothing. The backend service is a Compute Engine object the probe and state grammars cannot address (kubectl kinds and the cluster record only), so the role probes the pool's node and asserts the pool; the readiness report's lb-connection-draining rule is what reads the service, and its case grades that line",
+      "state": [
+        {
+          "subject": "cluster",
+          "path": "nodePools[?(@.name=='default-pool')].status",
+          "op": "any_eq",
+          "value": "RUNNING",
+          "why": "the backend group is this pool's instance group, which the rule matches by zone and name against the backend service; a pool mid-recreate is a different finding, and a pool replaced under another name would leave the service pointing at a group no cluster claims"
+        }
+      ]
+    },
     "zonal-skew-scheduling": {
       "cluster_slot": "d",
       "namespace": "seeded-topology",
@@ -532,6 +547,49 @@
           "op": "eq",
           "value": "128Mi",
           "why": "a resize anyone applies removes the posture the declaration covers, and the case then grades nothing"
+        }
+      ]
+    },
+    "guaranteed-qos-workload": {
+      "cluster_slot": "a",
+      "namespace": "seeded-qos",
+      "probes": ["deployment/ledger-writer"],
+      "fixture": "ledger-writer Deployment, two replicas whose container sets requests equal to limits (10m / 32Mi), so the pods are Guaranteed QoS and a lower request lowers the limit with it; the container burns its 10m CPU limit, so it is throttled there already. Behind a budget and a default-deny policy, under the waste audit's resize floor and out of its idle check, so no audit names it beyond the accepted background rows",
+      "state": [
+        {
+          "subject": "deployment/ledger-writer",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 2,
+          "why": "the dependency is a running Guaranteed workload; a Pending replica has no usage to size from"
+        },
+        {
+          "subject": "deployment/ledger-writer",
+          "path": "spec.template.spec.containers[0].resources.limits.cpu",
+          "op": "eq",
+          "value": "10m",
+          "why": "requests equal to limits is the posture; a resize anyone applies to the limit removes it, and the case then grades nothing"
+        },
+        {
+          "subject": "deployment/ledger-writer",
+          "path": "spec.template.spec.containers[0].resources.limits.memory",
+          "op": "eq",
+          "value": "32Mi",
+          "why": "the memory half of the same posture: Guaranteed needs requests equal to limits on both dimensions"
+        },
+        {
+          "subject": "deployment/ledger-writer",
+          "path": "spec.template.spec.containers[0].resources.requests.cpu",
+          "op": "eq",
+          "value": "10m",
+          "why": "the cut the case's prompt asks for: a lower request alone makes the pods Burstable, and the case then grades a premise that is gone"
+        },
+        {
+          "subject": "deployment/ledger-writer",
+          "path": "spec.template.spec.containers[0].resources.requests.memory",
+          "op": "eq",
+          "value": "32Mi",
+          "why": "the memory half of the same cut"
         }
       ]
     },

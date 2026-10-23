@@ -237,6 +237,9 @@ needs — a request's own `max_tokens` still wins. `litellm.reasoningEffort`
 (`low`/`medium`/`high`, default empty, meaning none) puts a `reasoning_effort`
 under every alias the same way; LiteLLM maps it to `thinkingLevel` on Gemini 3.x
 ([details](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-reasoning-effort)).
+On a Gemini 2.5 or 3.x model the gateway asks for the model's thoughts with a
+`thinking` key under every alias, which a `reasoningEffort` value replaces
+([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#geminis-thoughts)).
 On a Claude model the gateway
 drops `temperature`, `top_p` and `top_k` from every request
 ([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-default-model)),
@@ -280,6 +283,34 @@ owns what is redacted, what is not (responses, chat egress) and why a
 pseudonymised identifier is one the agent cannot act on; the site's
 [security and IAM page](../../docs/site/src/content/docs/reference/security-and-iam.md)
 owns what the image redacts in the files on the agent's volume.
+
+`litellm.traceLogEnabled=true` turns on pass-through trajectory logging across
+the gateway: the ConfigMap gains `llm_trace_logger.py` and the shared
+`redactor.py` module, mounted at `/app/llm_trace_logger.py` and
+`/app/redactor.py` beside `config.yaml`, registers
+`llm_trace_logger.proxy_handler_instance` under `litellm_settings.callbacks`, and sets
+`LITELLM_TRACE_LOG_PATH` (`litellm.traceLogPath`, default
+`"/tmp/litellm_traces.jsonl"`, which must be a normalised file path under `/tmp/`,
+with no `.` or `..` component, because the gateway runs with
+`readOnlyRootFilesystem: true`) plus an optional `SESSION_KV_SALT`
+from the credentials Secret. Every model request and response (model alias, custom
+LLM provider, messages, tool definitions, assistant responses, reasoning content,
+token usage, and latency) is redacted through `AuditRedactor` (credentials, Secret
+data blocks, sensitive keys, emails, and IP literals, plus operator rules when
+`litellm.redaction.enabled` is also set) before being appended as one JSONL line to
+the path. IP literals are pseudonymised by default; with `litellm.redaction.enabled`
+set, they follow `litellm.redaction.ip` instead: `"off"` writes them verbatim,
+`mask` masks them, and addresses in `allowCidrs` pass through. The trace file
+rotates at `5 MiB` across `3` backups (`.1`–`.3`) under an `flock` on `<path>.lock`;
+a record over `1 MiB` keeps its metadata and drops `messages`, `tools` and
+`response` behind a `truncated` marker, every caller-chosen string is clipped, and a
+line that would still carry a file past its cap is refused with the once-per-path
+warning, so the trail on the pod's `/tmp` `emptyDir` holds at most `20 MiB`. Each record is serialised, redacted and written on one
+writer thread, off the proxy's event loop and in order.
+Pass-through only: the logger never mutates live request or response payloads, and
+I/O failures log a once-per-path warning to stderr so inference never fails. Off by
+default, and the rendered default ConfigMap and rollout checksum are unchanged while
+it is off.
 
 #### Vertex AI (`litellm.modelProvider=vertex_ai`)
 
@@ -336,6 +367,7 @@ including `/v1`) are required, and the render fails without them. Set
   endpoint and no other.
 - **Egress.** The gateway's `litellm-policy` gets one rule derived from
   `apiBase`:
+
   - An in-cluster Service (`<svc>`, `<svc>.<ns>.svc`, or
     `<svc>.<ns>.svc.cluster.local`; a bare `<svc>` is the release namespace,
     and a two-label host such as `openrouter.ai` is a hostname, not
@@ -1039,18 +1071,30 @@ identity without that permission gets `error calling lookup: resourcequotas is
 forbidden` and no install rather than a quiet pass. Grant the permission, or install with
 `--set quotaPreflight.enabled=false`.
 
+### Optional AgentProfiles (`profiles.tse`)
+
+`profiles.tse.enabled` (default `false`) renders the optional `AgentProfile/tse`
+(GKE Support Agent — Customer-Side Technical Solutions Engineer) under `mode: next`
+(`templates/profiles.yaml`, gated on both `platformAgent.enabled` and
+`profiles.tse.enabled`), with `profiles.tse.{description,persona.image,harness,bus,lifecycle,concurrency,resources}`
+controlling its `AgentProfile` spec. When bound, the operator passes
+`KUBE_AGENTS_ENABLED_PROFILES=tse` to the gateway Deployment so the entrypoint
+scaffolds `/opt/data/profiles/tse` from `/opt/tse-template` on startup.
+
 ## Uninstalling
 
 ```bash
 helm uninstall kube-agents -n kubeagents-system
 ```
 
-The `PlatformAgent` resource carries a finalizer that only the operator can
-clear, and Helm deletes the CR and the operator in the same pass — so nothing
-would be left to clear it, the CR would strand, and the namespace would hang in
-`Terminating`. `platformAgent.cleanupHook` (on by default) prevents that with a
-`pre-delete` hook that deletes the CR and waits for the finalizer while the
-operator is still running.
+The `PlatformAgent` and `AgentProfile` resources carry finalizers that only the
+operator can clear, and Helm deletes the CRs and the operator in the same pass —
+so nothing would be left to clear them, the CRs would strand, and the namespace
+would hang in `Terminating`. `platformAgent.cleanupHook` (on by default)
+prevents that with a `pre-delete` hook that deletes all `AgentProfile` CRs first
+(while the `PlatformAgent` and NATS bus are still running so tombstone cards are
+published), then deletes the `PlatformAgent` CR and waits for the finalizers
+while the operator is still running.
 
 The hook runs `kubectl` from `alpine/k8s`, because the operator image is
 distroless and carries no client — and because the hook needs a shell: it is
@@ -1092,6 +1136,7 @@ entirely — any image with `kubectl` and `/bin/sh` works.
 With `platformAgent.cleanupHook.enabled=false`, the ordering is yours to keep:
 
 ```bash
+kubectl delete agentprofile --all -n kubeagents-system --ignore-not-found --wait
 kubectl delete platformagent platform-agent -n kubeagents-system --wait
 helm uninstall kube-agents -n kubeagents-system
 ```
@@ -1117,6 +1162,7 @@ helm uninstall kube-agents -n kubeagents-system
   `terraform/examples/full-install` does both in one apply.
 
   Two behaviours worth knowing before you enable them:
+
   - **`failurePolicy` defaults to `Ignore`, where the kustomize path uses
     `Fail`.** Helm applies the webhook configurations before both the
     `Certificate` and the `PlatformAgent` CR, so under `Fail` the API server

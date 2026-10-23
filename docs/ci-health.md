@@ -31,7 +31,8 @@ The digest also carries one line on last night's run of the nightly tier
 (`--data`, the `data.json` the tick collected): the cases recorded, how many
 passed all reps, partial and failed, what is newly failing against the night
 before, the opening chat turn's p50 and p95 as advice beside the p95 < 10 s
-target ([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md)), and the wall clock, with a link to the dashboard's Nightly report
+target ([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md); empty since the nightly grades
+`spec.mode: next`, because the harness times the opening turn on the agent API only), and the wall clock, with a link to the dashboard's Nightly report
 (`nightly.html`); a night Prow cut short, one still running, or no night
 since the day before yesterday, says so instead of numbers.
 `scripts/eval_dashboard/nightly.py` derives the line and the report from the
@@ -740,7 +741,16 @@ triager picks when handing an infra failure to the infra issue, keeps
 tracking the case until it passes on a night after the close; a red streak
 after that pass files a new issue. A hand-off closed before the 14 nights on
 record holds nothing back: the record can no longer show whether the case
-passed since. When the issues cannot be listed, nothing is written that tick. When a case with an open issue passes every graded
+passed since. When the issues cannot be listed, nothing is written that tick.
+Nor when the same issues read through GraphQL disagree with the listing:
+GraphQL names an open (or recently closed) `nightly-red` issue the listing
+lacks, counts more of them than the listing holds, or cannot be read. The REST
+listing, and GitHub's issue search with it, have answered with no issues while
+the issues existed, and a dedupe that reads an empty list files every case
+again. The step reads both listings again, up to 4 times in one pass, and
+when none agrees it logs why, writes nothing, and the next tick retries. When a comment read
+returns fewer comments than the issue listing counts, the step skips that
+issue for the tick, so a recovery or night comment is not posted twice. When a case with an open issue passes every graded
 repetition on a graded night after its last failing one, and that night
 finished after the issue was opened, the bot comments with that night's run link, keyed on the night so it comments once per recovery. It
 never closes an issue; the triager does.
@@ -945,7 +955,7 @@ The verifier is the one implementation; the scan runs it and reads its report.
 
 The secret is a fine-grained personal access token: resource owner `gke-agentic`, repository access the pool's `*-infra` repositories picked one by one (a fine-grained token has no wildcard, so a new pool project's repository is added to the token's list before the project is registered, as `docs/ci-pool-projects.md` 5.4 does for the ledger App's installation), permission Repository -> Metadata: read-only and nothing else, expiry one year at most. Whoever creates it records their name and the expiry date here: held by _(unset)_, expires _(unset)_. Its expiry is silent by design: the check goes "not checked" on every project and the hourly digest reads "35 checks not read in full", with no alert and no issue, so the owner puts the renewal on a calendar. The durable form is the one 5.4 chose for the ledger read, a third App holding Metadata: read-only on the selected repositories, its PEM as the repository secret and `actions/create-github-app-token` in the step exporting `GH_TOKEN`; the verifier reads only `GH_TOKEN`, so that swap is a workflow-step and docs change.
 Left out: the fleet fixtures (the fleet scan reads those), the warm-cache reader grants in the Prow project (`warm_cache`), the other GitHub-reading checks
-(`github_repo_and_app`, `gitops_declaration`, `ledger_read_credential`; each needs a credential the bot must not hold), the minter check's signing half (`token_minter`; the scan runs `token_minter_kms`), the mapping (about the checkout).
+(`github_repo_and_app`, `gitops_declaration`, `gitops_workload_manifest`, `ledger_read_credential`; each needs a credential the bot must not hold), the GitLab read of the same fixture (`gitlab_workload_manifest`, the pool's GitLab token), the minter check's signing half (`token_minter`; the scan runs `token_minter_kms`), the mapping (about the checkout).
 
 **The document.** `pool-state.json` has the fleet scan's shape. Per project,
 `checks` holds one `{state, detail}` per verifier check (`healthy`, `drifted`,
@@ -1104,3 +1114,12 @@ An incoming-webhook URL in Secret Manager
 (`ci-health-chat-webhook`, `kube-agents-prow`) is the optional alternative.
 
 `post_health.py --dry-run` prints the messages instead of posting them.
+
+The release-stage notifier (`.github/workflows/release-stage-broken-notify.yml`,
+`scripts/release/notify_release_stage_broken.py`) posts to the same space with
+the same app identity and variables when it opens or closes a
+`ci:release-stage-broken` issue for a failed run of a release pipeline
+([`scripts/release/README.md`](../scripts/release/README.md), "Pipeline Cadence &
+Execution Flow", the "When a stage fails" bullet). The workflow mints the app
+token and reads no webhook URL. `CI_HEALTH_MUTE=true` silences it too, and its
+issues still file.
