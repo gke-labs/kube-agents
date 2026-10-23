@@ -59,7 +59,6 @@ _NEXT_GATE = [
     f"kubectl rollout status deployment/platform-agent-a2a-callout -n {_NAMESPACE} --timeout=GATE",
     f"kubectl rollout status deployment/platform-agent-a2a-verifier -n {_NAMESPACE} --timeout=GATE",
     f"kubectl rollout status deployment/platform-agent-gateway -n {_NAMESPACE} --timeout=GATE",
-    f"kubectl get platformagent platform-agent -n {_NAMESPACE} -o jsonpath=GATEWAY",
     f"kubectl rollout status deployment/platform-agent-a2a-gateway -n {_NAMESPACE} --timeout=GATE",
 ]
 
@@ -70,9 +69,9 @@ def _normalise(lines):
     for line in lines:
         if "-o jsonpath=" in line:
             tag = next(
-                (c for c in ("A2AGateway", "BusProvisioned", "BusCredentialsReady", ".spec.mode") if c in line),
+                (c for c in ("BusProvisioned", "BusCredentialsReady", ".spec.mode") if c in line),
                 "READ",
-            ).replace("A2AGateway", "GATEWAY").replace(".spec.mode", "MODE")
+            ).replace(".spec.mode", "MODE")
             line = line.split("-o jsonpath=", 1)[0] + "-o jsonpath=" + tag
         match = re.search(r"--timeout=(\d+)s$", line)
         if match:

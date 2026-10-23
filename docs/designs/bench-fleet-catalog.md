@@ -94,9 +94,9 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Thirty-four fixtures: thirty-one across the four cluster slots and three project-scoped. Most in-cluster
-fixtures are on slot `a`, across the eleven seeded namespaces `seeded-debug`,
-`seeded-reliability`, `seeded-security`, `seeded-capacity`, `seeded-deprecation`, `seeded-intent`, `seeded-token`, `seeded-headroom`, `seeded-stall`, `seeded-shapes` and `seeded-defaults`, plus both
+Thirty-five fixtures: thirty-two across the four cluster slots and three project-scoped. Most in-cluster
+fixtures are on slot `a`, across the twelve seeded namespaces `seeded-debug`,
+`seeded-reliability`, `seeded-security`, `seeded-capacity`, `seeded-deprecation`, `seeded-intent`, `seeded-token`, `seeded-headroom`, `seeded-qos`, `seeded-stall`, `seeded-shapes` and `seeded-defaults`, plus both
 defect node pools. Slot `c` carries a GKE-level defect only and no workloads at all: it is the
 configuration outlier. Slot `b` is the held-back control plane, and also carries the
 upgrade-readiness drain defects, which belong with the cluster whose subject is upgrading. Slot
@@ -116,6 +116,7 @@ its roles are never published.
 | `declared-no-pdb-workload`      | a       | 0   | `deployment/notification-relay` in `seeded-intent`, two replicas, no PDB, in a namespace with no NetworkPolicy; both declared on purpose in the GitOps repository's `knowledge/`                                                  |
 | `declared-token-workload`       | a       | 0   | `deployment/token-reader` and `deployment/token-sidecar` in `seeded-token`, on the default ServiceAccount with the token mounted; `token-reader` declared on purpose in the GitOps repository's `knowledge/`, `token-sidecar` not |
 | `declared-overrequest-workload` | a       | 0   | `deployment/burst-ingest` in `seeded-headroom`, two pause replicas requesting `10m` / `128Mi` each and using almost none of the memory; declared on purpose in the GitOps repository's `knowledge/`                               |
+| `guaranteed-qos-workload`       | a       | 0   | `deployment/ledger-writer` in `seeded-qos`, two replicas with requests equal to limits (`10m` / `32Mi`), so Guaranteed QoS, burning the whole CPU limit                                                                           |
 | `stalled-controller`            | a       | 0   | `deployment/inventory-api` in `seeded-stall`, CreateContainerConfigError, ProgressDeadlineExceeded                                                                                                                                |
 | `crashloop-workload`            | a       | 0   | `deployment/payments-api` in `seeded-debug`, 64Mi limit, deterministic OOMKilled loop                                                                                                                                             |
 | `hpa-saturated`                 | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                                                                                                                                                             |
@@ -166,7 +167,7 @@ neither is going to be obvious from a slug.
 **A role slug is not the `seeded-role` label.** `bench/tf/fleet/main.tf` carries
 `seeded-role=pinned-inference` on the pinned pool's node label and taint, and
 `seeded-role=idle-batch` on the idle pool's taint, and `bench/tf/fleet/defects-b.tf`
-`seeded-role=no-surge` on the no-surge pool's — so three of the thirty-one roles are called one
+`seeded-role=no-surge` on the no-surge pool's — so three of the thirty-two roles are called one
 thing by the catalogue and another by the Terraform that plants them. They are
 different mechanisms and both are load-bearing: the label and taint are scheduling
 constraints that keep other workloads off those pools, and the role slug is what the

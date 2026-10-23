@@ -4915,6 +4915,13 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		"FINDINGS_FIRST_REPORT_CRITICALS": {},
 		"FINDINGS_NONCRITICAL_AFTER_HOUR": {},
 		"FINDINGS_NONCRITICAL_MAX":        {},
+
+		// Seconds a workload's admitted event folds its later events into
+		// one incident (INCIDENT_WORKLOAD_DEDUP_SECONDS in
+		// session_kv_server.py). Parsed as a whole number and capped at a
+		// day, and a value that does not parse means off, so it bounds a
+		// count of chat messages and triage turns and reaches nothing else.
+		"INCIDENT_WORKLOAD_DEDUP_SECONDS": {},
 	}
 	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the
 	// default suggested prompts (`apply_slack_agent_view.py`), under the same

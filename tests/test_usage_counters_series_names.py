@@ -189,6 +189,9 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         for name in ("StateFailed", "StateRejected"):
             self.assertIn(f"lib.{name}", terminals.group(1))
 
+    def test_the_chat_plugins_gave_up_family_is_the_one_the_poller_sums_into_kanban_tasks_gave_up(self):
+        self.assertEqual(_py_const("KANBAN_GAVE_UP_METRIC", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "kanbanGaveUpSeries"))
+
     def test_the_status_label_key_the_broker_writes_is_the_one_the_poller_filters_on(self):
         self.assertEqual(_py_const("TOOL_STATUS_LABEL"), _go_const(_SCRAPE_GO, "toolInvocationsStatusLabel"))
 

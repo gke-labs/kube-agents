@@ -1469,6 +1469,15 @@ func TestSafeSandboxEnvOverridesPassesFindingsPacingLimits(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesWorkloadDedupWindow(t *testing.T) {
+	// session_kv_server.py reads the window from its own environment; off the
+	// allowlist, the documented spec.deployment.env entry never reaches it.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{{Name: "INCIDENT_WORKLOAD_DEDUP_SECONDS", Value: "900"}})
+	if len(got) != 1 || got[0].Name != "INCIDENT_WORKLOAD_DEDUP_SECONDS" || got[0].Value != "900" {
+		t.Errorf("expected INCIDENT_WORKLOAD_DEDUP_SECONDS=900 to pass, got %#v", got)
+	}
+}
+
 func TestBuildCredentialProxyContainer(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
