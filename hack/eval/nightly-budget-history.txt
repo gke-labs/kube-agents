@@ -402,6 +402,6 @@
 # case, three units, deployer: noop on the seeded fleet's crashloop-workload
 # namespace, hinted at 1000s (main's red repetition took 916s while the
 # worker retried; the branch's ran 169-468s). Counted from the lists with
-# it: one hundred and forty-one cases (423 units) here, of a
-# one-hundred-and-fifty-two-case, 456-unit matrix with the presubmit
-# file's eleven.
+# it, after the merge of main on 2026-10-22: one hundred and forty-four
+# cases (432 units) here, of a one-hundred-and-fifty-five-case, 465-unit
+# matrix with the presubmit file's eleven.

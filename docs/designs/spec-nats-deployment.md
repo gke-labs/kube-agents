@@ -405,7 +405,8 @@ Layout:
   inbox; publish only the JetStream read API - account-level `INFO`, and `STREAM.INFO`,
   `CONSUMER.CREATE`, `CONSUMER.INFO`, `CONSUMER.MSG.NEXT` **enumerated per stream** over
   the four message streams - plus its own inbox. It rides a websocket listener on 9222
-  rendered plain (`no_tls: true`) with an `allowed_origins` allow-list.
+  ~~rendered plain (`no_tls: true`)~~ **amended 10/21 (#3651):** on TLS (see "Transport
+  encryption") with an `allowed_origins` allow-list.
 
   **"Read-only" is not expressible as a subject list, and the first version of this user
   proved it.** Subject permissions cannot see a request BODY, and JetStream puts the
@@ -515,6 +516,10 @@ Layout:
 
   Posture, stated accurately: plain ws puts the credential on the pod network in
   cleartext, and the Service is ClusterIP, so nothing outside the cluster reaches it.
+  **Amended 10/21 (#3651):** no longer plain. The listener serves TLS and the console
+  server dials it verified, so the credential crosses the pod network encrypted; the
+  browser's leg to the console server is still the port-forward's. See "Transport
+  encryption" below.
   Amended 8/31: the pod network is fenced too. The operator renders an ingress
   NetworkPolicy on the NATS pod granting **4222 to exactly the enumerated bus clients**
   (the auth callout, the agent pod - whose sidecars, the Hermes bridge included, share
@@ -578,7 +583,9 @@ Layout:
   sees the proxy's `Host`, not the browser's. The server answers only a `Host` naming that
   forwarded address, so a forward to any other local port gets a refusal naming the right
   one. The `web` user keeps the same posture it had: a 9222 port-forward and a page that
-  brings its own password. The access gate moves with the credential: before this, reading
+  brings its own password. **Amended 10/21 (#3651):** the `web` page now comes through the
+  console server as well, with `?ws=ws://localhost:8080/bus` (see "Transport
+  encryption" below). The access gate moves with the credential: before this, reading
   the `console` password needed `get` on the creds Secret, and now `pods/portforward` to
   the console pod is enough, because `/config.json` hands the password to the page, and to
   any other process running locally while the forward is open.
@@ -925,7 +932,7 @@ clear; a client that dials `nats://` is told to upgrade, and one that cannot ver
 certificate is refused. Every client the operator renders is handed `tls://` on the NATS
 Service name and trusts the bus CA. The monitoring port, 8222, stays plain HTTP: it carries
 health and stats, not payloads or tokens. The websocket listener on 9222, the console's
-door, is still rendered plain (`no_tls: true`).
+door, serves the same certificate from the same files (below).
 
 **Certificate source.** The operator mints the certificates itself, with no dependency on
 cert-manager, which the chart does not install. Three objects, all owned by the
@@ -959,6 +966,30 @@ check reads the controller ownerReference, which anyone able to create the Secre
 write, so it does not stop a caller with Secret write access in the namespace, who can
 already read the callout's issuer seed there. Anchoring the CA to something only the
 operator writes, such as a fingerprint in the status, is not done yet.
+
+**The websocket listener and the console (#3651).** The `websocket { }` block has its own
+`tls { }` on the same serving pair, since nats-server does not apply the top-level block
+to it. Its one in-cluster client is the console server, which dials it as `https` to the
+NATS Service name and verifies it against `NATS_CA_FILE`; it refuses to start with an
+`https` bus URL and no readable CA, and reads the file on each dial, so a bundle the
+kubelet updates in place applies without a restart. A browser cannot verify the bus CA,
+so every page, the read-only `web` view included, reaches the bus through the console
+server's `/bus`, which passes the page's own credential through. What is encrypted, path
+by path:
+
+| Path                             | Transport                                                                                                         |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| Browser → console server         | plain http/ws to `localhost:8080`, carried inside the `kubectl port-forward` tunnel; the page's password rides it |
+| Console server → bus `:9222`     | wss, verified against the bus CA under the Service name                                                           |
+| Port-forward straight to `:9222` | TLS only; the client must trust the bus CA and name the Service as its TLS server name                            |
+| Every other client → bus `:4222` | TLS, as above                                                                                                     |
+| Monitoring `:8222`               | plain HTTP, health and stats only                                                                                 |
+
+The browser leg is as private as the port-forward: the tunnel runs over the client's
+connection to the API server, and the console pod accepts nothing else. A TLS front for a
+path that leaves the port-forward model (an Ingress or Gateway in front of the console) is
+not rendered; it would terminate on its own certificate for an external name, not the bus
+CA.
 
 **Rotation.** The reconcile reissues either certificate once fewer than 30 days remain,
 and replaces whichever Secret it cannot use (unparseable, a key that is not the

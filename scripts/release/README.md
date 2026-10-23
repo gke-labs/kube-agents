@@ -466,8 +466,9 @@ line; a patch is validated by the RC pipeline and released by hand.
    requires conversation resolution and restricts pushes to Tide and the release bot. The
    `kube-agents-release-lines` ruleset lets only those two create, push or delete a line. The
    `kube-agents-release-lines-checks` ruleset requires `main`'s status contexts, copied in by
-   hand (the list is in `docs/pull-request-workflow.md`, "Branch protection is not the gate", and a
-   context added to `main`'s set has to be added to the ruleset too), with the release bot as its only
+   hand (the list is in `docs/pull-request-workflow.md`, "`main`'s required checks are in a ruleset";
+   `Smoke gate` and `Merge labels` stay off the lines, and any other context added to `main`'s set
+   has to be added to the ruleset too), with the release bot as its only
    bypass actor. `Run A2A Module Tests` joined both on 2026-10-13; the lines `release/0.1.0` to
    `release/0.4.0` predate `a2a-test.yml`, so a backport to one of them can never post that context
    and merges only through the release bot's bypass. The contexts live in a ruleset rather than on the branch

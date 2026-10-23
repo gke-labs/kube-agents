@@ -210,8 +210,8 @@ user" clauses here. Agents with a user in the loop follow this file.
   [its author's outstanding work](docs/pull-request-workflow.md#who-owns-an-open-pull-request), a
   declined bot thread excepted (below). Reply first, then resolve every addressed thread per
   [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#resolving-conversations).
-- **You do not merge it; Tide does** once a reviewer's `lgtm` and an `OWNERS` approver's `approved`
-  are present and required checks pass. Never post `/lgtm` or `/approve` on someone's behalf unless
+- **You do not merge it; the merge queue does** once a reviewer's `lgtm` and an `OWNERS` approver's
+  `approved` are present and required checks pass. Never post `/lgtm` or `/approve` on someone's behalf unless
   asked. Mechanics: [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#how-a-change-merges).
 - **Local Validation Checks:** Before committing, run the checks for what you touched:
   `prettier --write` on changed Markdown/YAML, `make shellcheck` on shell scripts, a
@@ -224,8 +224,8 @@ user" clauses here. Agents with a user in the loop follow this file.
 
 `pull-kube-agents-smoke-test` runs the eval matrix in `hack/ci-eval-pr.sh` on a `spec.mode: next`
 install (3 repetitions per active case, 1.5–3.5 hours against a 360-minute ceiling). Non-inert
-pushes restart it, so open the PR early and batch changes; a Tide retest after `main` moves reuses
-the head's green in minutes. It goes red when a case on `BOOTSTRAP_ADMITTED` fails all repetitions,
+pushes restart it, so open the PR early and batch changes; a green on the head stays valid when
+`main` moves. It goes red when a case on `BOOTSTRAP_ADMITTED` fails all repetitions,
 or any case trips an absolute rung (a forbidden cluster or GitHub write, verifier error,
 inconsistent liveness signals; a run-less record is infrastructure unless every case is one). Today
 mode and rollback: optional `pull-kube-agents-smoke-test-today` and a six-hourly periodic.

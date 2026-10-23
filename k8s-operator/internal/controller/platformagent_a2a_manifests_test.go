@@ -595,9 +595,9 @@ func TestHandleDeletionReapsOnlyTheLabeledJetStreamPVC(t *testing.T) {
 	})
 }
 
-// The web read surface: a websocket listener (still plain ws, unlike the TLS
-// client listener), a ClusterIP port
-// for it, and a `web` user that can watch everything and say nothing —
+// The web read surface: a websocket listener on TLS from the bus's serving
+// pair (#3651; TestTheRenderedWebsocketListenerServesTLS runs it), a ClusterIP
+// port for it, and a `web` user that can watch everything and say nothing —
 // subscribe on a2a.>, the JetStream read API, its own inbox, and no publish
 // reach beyond those. The read-only web rail is the consumer; kubectl
 // port-forward is the demo transport, which is why ClusterIP is enough.
@@ -607,8 +607,20 @@ func TestBuildA2ANATSConfigWebsocketAndWebUser(t *testing.T) {
 	if !strings.Contains(conf, "websocket {") {
 		t.Fatal("nats.conf has no websocket block")
 	}
-	if !strings.Contains(conf, "no_tls: true") {
-		t.Error("websocket block does not state plain ws (no_tls: true)")
+	// Slice the websocket block so a tls block elsewhere (the client
+	// listener's) cannot stand in for its own.
+	ws := conf[strings.Index(conf, "websocket {"):]
+	ws = ws[:strings.Index(ws, "\n}\n")]
+	if strings.Contains(ws, "no_tls") {
+		t.Error("websocket block still sets no_tls")
+	}
+	for _, line := range []string{
+		`cert_file: "` + a2aNATSTLSMountDir + "/" + a2aNATSTLSCertKey + `"`,
+		`key_file: "` + a2aNATSTLSMountDir + "/" + a2aNATSTLSKeyKey + `"`,
+	} {
+		if !strings.Contains(ws, line) {
+			t.Errorf("websocket block has no %s; it must serve the bus's serving pair", line)
+		}
 	}
 	if !strings.Contains(conf, "port: 9222") {
 		t.Error("websocket listener is not on 9222")
@@ -847,8 +859,8 @@ func TestBuildA2AGatewayIdentityAndOwnerWiring(t *testing.T) {
 	}
 
 	role := buildA2AGatewayRole(agent)
-	if len(role.Rules) != 2 {
-		t.Fatalf("gateway Role has %d rules, want the session-pod rule plus the pinned owner get", len(role.Rules))
+	if len(role.Rules) != 3 {
+		t.Fatalf("gateway Role has %d rules, want the session-pod rule, the pinned owner get and the pinned PlatformAgent get", len(role.Rules))
 	}
 	// The owner rule is one verb on one named object — a deployments read
 	// would be a finding.
@@ -858,6 +870,15 @@ func TestBuildA2AGatewayIdentityAndOwnerWiring(t *testing.T) {
 		len(owner.Verbs) != 1 || owner.Verbs[0] != "get" ||
 		len(owner.ResourceNames) != 1 || owner.ResourceNames[0] != "test-agent-a2a-gateway" {
 		t.Errorf("owner rule = %+v", owner)
+	}
+	// The PlatformAgent rule, for "/feedback summary", is the same shape:
+	// one verb on this agent's one resource.
+	usage := role.Rules[2]
+	if len(usage.APIGroups) != 1 || usage.APIGroups[0] != agentv1alpha1.GroupVersion.Group ||
+		len(usage.Resources) != 1 || usage.Resources[0] != "platformagents" ||
+		len(usage.Verbs) != 1 || usage.Verbs[0] != "get" ||
+		len(usage.ResourceNames) != 1 || usage.ResourceNames[0] != "test-agent" {
+		t.Errorf("PlatformAgent rule = %+v", usage)
 	}
 
 	rb := buildA2AGatewayRoleBinding(agent)

@@ -78,10 +78,10 @@
 # `Git Repo:` line of /opt/data/SETTINGS.md, and `finish` rewrites the ledger
 # issue and closes findings that stopped reproducing. `finish` can also open
 # remediation pull requests, but on this fixture it opens none: check 2.4's
-# fix is `kind: manual` by the SOP, the pool repo carries no manifests (a
-# README and the declared-intent note only), so no compliance fix has a
-# declaration or directory to anchor to and none is a `manifest` fix (each
-# is `manual` or `gcloud`). The
+# fix is `kind: manual` by the SOP, and the pool repo declares one workload
+# only (seeded-a's checkout-gateway, beside a README and the declared-intent
+# note), so no compliance fix has a declaration or directory to anchor to
+# and none is a `manifest` fix (each is `manual` or `gcloud`). The
 # promotion sweep opens only `manifest` fixes, so it has nothing to open
 # here. The case requests no pull request,
 # which matches. On the inject lane (spec.mode next), a remediation pull

@@ -132,12 +132,11 @@ When diagnosing failures or reporting incidents, name the specific job rather th
 ## Running on a pull request is not gating a merge
 
 The last column says what a trigger and its `if:` conditions support, which is a weaker claim than
-"blocks the merge". Which checks are actually required lives in branch protection on
-`gke-labs/kube-agents` and in Prow config in `GoogleCloudPlatform/oss-test-infra`; neither is a file
-in this repository, so this table asserts nothing about either.
-[`pull-request-workflow.md`](pull-request-workflow.md#how-a-change-merges) names the required
-contexts as they stand, gives the command to read them back, and says why that command sees only
-the branch-protection half of the set. `make verify` (the `verify` target in the root `Makefile`) is the
+"blocks the merge". Which checks are actually required lives in the `main-merge-queue` ruleset on
+`gke-labs/kube-agents`, which is not a file in this repository, so this table asserts nothing about
+it. [`pull-request-workflow.md`](pull-request-workflow.md#how-a-change-merges) names the required
+checks as they stand, gives the command to read them back, and says how the smoke presubmit reaches
+the set through `Smoke gate`. `make verify` (the `verify` target in the root `Makefile`) is the
 local answer to the same question — everything a pull request must pass offline, in one target —
 and [`pull-request-workflow.md`](pull-request-workflow.md#local-validation-before-committing) lists
 the individual targets to run when you have touched a given area.
