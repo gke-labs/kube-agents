@@ -921,9 +921,14 @@ class BaseTestCase(unittest.TestCase):
             # that never called `start` here needs it or reads as no search.
             self.record_run(audit=AUDIT)
             # `start` precedes the findings a real run writes; a document older
-            # than the record reads as an earlier run's.
+            # than the record reads as an earlier run's. The stamp is passed,
+            # not left to the kernel: a bare `utime` takes the coarse clock,
+            # which trails the one the record read by up to a tick, so for a
+            # few milliseconds after each second boundary it lands the file
+            # below the record's whole-second stamp and `finish` refuses it.
             if "--findings-file" in argv:
-                os.utime(argv[argv.index("--findings-file") + 1])
+                now = time.time_ns()
+                os.utime(argv[argv.index("--findings-file") + 1], ns=(now, now))
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = audit_report.main(argv)
@@ -21070,6 +21075,24 @@ class TestFinishManifestFlag(HarnessTestCase):
         payload = self.stdout_json()
         for key in ("unpublished_candidates", "wholly_unpublished_checks", "uncorroborated_findings"):
             self.assertNotIn(key, payload)
+
+    def test_a_finish_just_after_a_second_boundary_is_not_refused_as_predating(self):
+        """`run_main` writes the run record, stamped to the whole second, then
+        stamps the findings file. A stamp from a clock that trails the record's
+        by a few milliseconds reads as an earlier run's document for a moment
+        after every second boundary, and the run is refused."""
+        self.harness.replies = {"issue-list": {"issues": []}}
+        record = Path(audit_report.run_record_path_for(AUDIT))
+        for boundary in range(3):
+            with self.subTest(boundary=boundary):
+                # A fresh record each time, so `run_main` stamps both again.
+                record.unlink(missing_ok=True)
+                second = int(time.time())
+                while int(time.time()) == second:
+                    pass
+                rc = self.run_finish(make_doc(findings=[]))
+                self.assertNotIn("was last written before this run", self.err)
+                self.assertEqual(rc, 0, self.err)
 
     def test_a_manifest_adds_the_collector_keys_to_the_payload(self):
         self.harness.replies = {"issue-list": {"issues": []}}
