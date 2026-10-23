@@ -481,6 +481,7 @@ class CiDeployGitopsRepoTest(unittest.TestCase):
                 ("ghes.eval.internal:8443", "is not a dotted bare hostname"), ("https://ghes.dev", "is not a dotted bare hostname"),
                 ("ghes.dev example", "is not a dotted bare hostname"), ("-ghes.dev", "is not a dotted bare hostname"),
                 ("localhost", "is not a dotted bare hostname"), ("GitHub.com", "is a public forge"), ("gitlab.com", "is a public forge"),
+                ("www.github.com", "is a public forge"), ("ssh.github.com", "is a public forge"), ("www.gitlab.com", "is a public forge"),
             ):
                 with self.subTest(forge=forge, host=bad), tempfile.TemporaryDirectory() as tmp:
                     rc, out, err = self._resolve(
