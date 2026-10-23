@@ -19,6 +19,7 @@ matrix with ROLLBACK_END_MODE=today, where a failure stops the job.
 """
 
 import base64
+import fcntl
 import http.server
 import json
 import os
@@ -161,20 +162,28 @@ _LEG3_ORDER = [
 FAKE_KUBECTL = textwrap.dedent(
     r'''
     #!/usr/bin/env python3
-    import base64, json, os, sys, time
+    import base64, fcntl, json, os, sys, time
 
     STATE = os.environ["FAKE_KUBE_STATE"]
+    LOCK = os.environ["FAKE_KUBE_LOCK"]
     RECONCILE_TICKS = 3
     A2A = ["statefulset/platform-agent-a2a-nats", "deployment/platform-agent-a2a-callout",
            "deployment/platform-agent-a2a-gateway", "deployment/platform-agent-a2a-verifier",
            "secret/platform-agent-a2a-callout-keys", "secret/platform-agent-a2a-inject"]
+
+    def lock():
+        # Held from load to save: the script's port-forward runs in the
+        # background while the next calls read and write the same file.
+        fd = os.open(LOCK, os.O_RDWR | os.O_CREAT)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
 
     def load():
         with open(STATE) as f:
             return json.load(f)
 
     def save(s):
-        tmp = STATE + ".tmp"
+        tmp = "%s.%d.tmp" % (STATE, os.getpid())
         with open(tmp, "w") as f:
             json.dump(s, f)
         os.replace(tmp, STATE)
@@ -400,6 +409,7 @@ FAKE_KUBECTL = textwrap.dedent(
             threading.Thread(target=pump, args=(up, conn), daemon=True).start()
 
     def main(argv):
+        held = lock()
         s = load()
         tick(s)
         s["calls"].append(argv)
@@ -477,10 +487,12 @@ FAKE_KUBECTL = textwrap.dedent(
             n = s["counters"].get("port-forward", 0)
             s["counters"]["port-forward"] = n + 1
             save(s)
+            os.close(held)
             return port_forward(args, dead=bool(s["scenario"].get("dead_first_tunnel")) and n == 0)
         else:
             sys.exit("fake kubectl: unsupported " + " ".join(argv))
         save(s)
+        os.close(held)
         sys.stdout.write(out)
         return rc
 
@@ -633,13 +645,18 @@ class _Door(http.server.BaseHTTPRequestHandler):
 
 
 class Sim:
-    """One simulated install, its doors, and a run of the script against it."""
+    """One simulated install, its doors, and a run of the script against it.
+
+    The state file is the fake kubectl's: a test reads it through state(),
+    which is safe unlocked behind the atomic writes, and changes it through
+    edit_state() only, which takes the fake's lock."""
 
     def __init__(self, state: dict) -> None:
         self.dir = tempfile.TemporaryDirectory()
         root = pathlib.Path(self.dir.name)
-        self.state_path = root / "state.json"
-        self.state_path.write_text(json.dumps(state))
+        self._state_path = root / "state.json"
+        self._lock_path = root / "state.lock"
+        self._state_path.write_text(json.dumps(state))
         self.bin = root / "bin"
         self.bin.mkdir()
         kubectl = self.bin / "kubectl"
@@ -649,7 +666,7 @@ class Sim:
         self.pf_pids = root / "pf_pids"
         self.cancels = root / "cancels"
         self.cancels.touch()
-        handler = type("Door", (_Door,), {"state_path": self.state_path, "cancels_path": self.cancels})
+        handler = type("Door", (_Door,), {"state_path": self._state_path, "cancels_path": self.cancels})
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -666,7 +683,8 @@ class Sim:
         env.update(
             {
                 "PATH": f"{self.bin}:{env['PATH']}",
-                "FAKE_KUBE_STATE": str(self.state_path),
+                "FAKE_KUBE_STATE": str(self._state_path),
+                "FAKE_KUBE_LOCK": str(self._lock_path),
                 "ROLLBACK_AGENT_URL": url,
                 "ROLLBACK_INJECT_URL": url,
                 "ROLLBACK_RESULTS_FILE": str(self.results),
@@ -684,7 +702,22 @@ class Sim:
         )
 
     def state(self) -> dict:
-        return json.loads(self.state_path.read_text())
+        return json.loads(self._state_path.read_text())
+
+    def edit_state(self, change) -> None:
+        """Read, change and write the state under the fake kubectl's lock, and
+        in place: a plain write mid-run races the next kubectl's read."""
+        with open(self._lock_path, "a+") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            current = self.state()
+            change(current)
+            tmp = self._state_path.with_suffix(".edit.tmp")
+            tmp.write_text(json.dumps(current))
+            os.replace(tmp, self._state_path)
+
+
+def arm_today_turn_failure(current: dict) -> None:
+    current["scenario"]["today_turn_fails"] = True
 
 
 def passed(result: subprocess.CompletedProcess) -> list[str]:
@@ -837,9 +870,7 @@ class KeptRoundTripTest(RoundTripTest):
         for line in proc.stdout:
             out_lines.append(line)
             if line.startswith("PASS leg2.not-degraded"):
-                current = sim.state()
-                current["scenario"]["today_turn_fails"] = True
-                sim.state_path.write_text(json.dumps(current))
+                sim.edit_state(arm_today_turn_failure)
         proc.wait(timeout=180)
         out = "".join(out_lines)
         self.assertEqual(proc.returncode, 1, out)
@@ -1032,7 +1063,7 @@ class PortForwardTest(RoundTripTest):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(passed(result), _PASSING_ORDER)
         forwards = [call for call in state["calls"] if "port-forward" in call]
-        self.assertEqual(len(forwards), 3, forwards)
+        self.assertEqual(len(forwards), 3, (forwards, state["counters"], result.stdout, result.stderr))
         self.assertTrue(all(call[:2] == ["--context", "gke_test_ctx"] for call in forwards))
         pids = [int(line) for line in sim.pf_pids.read_text().split()]
         time.sleep(0.5)
@@ -1042,10 +1073,10 @@ class PortForwardTest(RoundTripTest):
         # The first port-forward (the pre bus task's) accepts and drops every
         # connection. The script's retry has to be a new tunnel on the same
         # port, which only binds if the dead one was really stopped.
-        result, _, _ = self.run_sim(healthy_next_state(dead_first_tunnel=True), **self.tunnel_env(), ROLLBACK_BUS_TASK_ATTEMPTS="2")
+        result, state, _ = self.run_sim(healthy_next_state(dead_first_tunnel=True), **self.tunnel_env(), ROLLBACK_BUS_TASK_ATTEMPTS="2")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("PASS pre.bus-task:", result.stdout)
-        self.assertIn("pre.bus-task: attempt 1/2", result.stdout)
+        self.assertIn("pre.bus-task: attempt 1/2", result.stdout, (state["counters"], result.stderr))
 
 
 class FailureTest(RoundTripTest):
@@ -1310,16 +1341,18 @@ class FailureTest(RoundTripTest):
     def test_a_signal_is_a_named_failure(self) -> None:
         sim = Sim(healthy_next_state(never_ready_on="today"))
         self.addCleanup(sim.close)
-        proc = subprocess.Popen(["bash", str(_SCRIPT), _NS, _CR], stdout=subprocess.PIPE, text=True, env=sim.env(ROLLBACK_READY_TIMEOUT="600"))
+        proc = subprocess.Popen(
+            ["bash", str(_SCRIPT), _NS, _CR], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=sim.env(ROLLBACK_READY_TIMEOUT="600")
+        )
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline and not any(p.get("spec", {}).get("mode") == "today" for p in sim.state()["patches"]):
             time.sleep(0.2)
         time.sleep(1)
         proc.send_signal(signal.SIGTERM)
-        out, _ = proc.communicate(timeout=60)
-        self.assertEqual(proc.returncode, 1)
-        self.assertIn("FAIL leg1.interrupted:", out)
-        self.assertEqual(out.strip().splitlines()[-1], "ROLLBACK ROUND TRIP FAILED at leg1.interrupted")
+        out, err = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 1, out + err)
+        self.assertIn("FAIL leg1.interrupted:", out, err)
+        self.assertEqual(out.strip().splitlines()[-1], "ROLLBACK ROUND TRIP FAILED at leg1.interrupted", out + err)
 
 
 _NATS = "platform-agent-a2a-nats"
