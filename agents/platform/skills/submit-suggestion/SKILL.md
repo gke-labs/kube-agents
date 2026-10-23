@@ -190,6 +190,13 @@ under its own branch name, and its last step submits that branch through
 Step 3 here. Leave the copy you prepared here unused. A plain Kubernetes
 manifest has no authoring skill; write it here.
 
+**When the branch is already decided, stay on it.** In a review round
+(Step 5), or when `prepare` returned a non-empty `proposal`, the revisions
+under review are on this copy's branch. Take the authoring skill's reads,
+writing rules and checks, but not its Step 1 `prepare`, its branch name or
+its submit: edit in this `workspace` and submit from Step 3 here, onto the
+same branch. Starting from its Step 1 would open a second pull request.
+
 Generate or edit the files **inside the returned `workspace`**.
 
 `git` here holds no credential and cannot reach a forge; it works on the
@@ -480,7 +487,8 @@ no token to refresh.
    branch is what you are being asked to change, and rewriting a file from
    memory loses the rest of it. A Terraform, Config Connector or Helm-chart
    file is edited by its authoring skill's rules here too (Step 2's table),
-   its checks included: `tofu fmt` after any `.tf` edit. Stage only those specific files
+   its checks included: `tofu fmt` after any `.tf` edit. Its Step 1 and its
+   submit do not apply: stay on `<source>` in this copy. Stage only those specific files
    (**never `git add .` / `-A`**).
 
    Pass `--title` and `--body-file` again so the description matches the

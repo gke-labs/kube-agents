@@ -129,6 +129,10 @@ class SubmitSuggestionHandsEditsToTheirAuthoringSkillTest(unittest.TestCase):
         # The authoring skill submits its own branch; editing this skill's copy
         # would leave submit with nothing to find.
         self.assertIn("Leave the copy you prepared here unused", step2)
+        # A review round or an open proposal already fixes the branch; the
+        # authoring skill's own prepare and submit would open a second PR.
+        self.assertIn("When the branch is already decided, stay on it.", step2)
+        self.assertIn("not its Step 1 `prepare`, its branch name or\nits submit", step2)
 
     def test_review_rounds_apply_the_same_table(self):
         # Step 5 is where pr-conversation enters; a .tf edit in a review round
@@ -137,6 +141,7 @@ class SubmitSuggestionHandsEditsToTheirAuthoringSkillTest(unittest.TestCase):
         step5 = content[content.index("### Step 5: Addressing Review Feedback"):]
         self.assertIn("authoring skill's rules here too (Step 2's table)", step5)
         self.assertIn("`tofu fmt` after any `.tf` edit", step5)
+        self.assertIn("submit do not apply: stay on `<source>` in this copy", step5)
 
 if __name__ == "__main__":
     unittest.main()
