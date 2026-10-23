@@ -25,6 +25,9 @@ const (
 
 	defaultWaitSeconds = 60
 	maxWaitSeconds     = 300
+	// minAnswerWait is the least a sent turn's answer is waited on, however
+	// much of the wait went on the conversation's running turn.
+	minAnswerWait = 2 * time.Second
 
 	// maxAnswerBytes caps the answer shown in one result; the full answer
 	// stays on the task.
@@ -38,7 +41,7 @@ const MaxTurnWait = submissionWait + noticeGrace + maxWaitSeconds*time.Second
 
 // TurnBus is what the turn tools need from the bus.
 type TurnBus interface {
-	SendTurn(ctx context.Context, convs *Conversations, token, text string) (TurnResult, *turnWatch, error)
+	SendTurn(ctx context.Context, convs *Conversations, token, text string, wait time.Duration) (TurnResult, *turnWatch, error)
 	WaitForTurn(ctx context.Context, w *turnWatch, root TaskRef, wait time.Duration) (TurnOutcome, error)
 	SendStop(ctx context.Context, convs *Conversations, token string) (TurnResult, error)
 	ReadTask(ctx context.Context, ref TaskRef) (*lib.Task, error)
@@ -60,7 +63,8 @@ func SendMessageTool(bus TurnBus, convs *Conversations) Tool {
 		Definition: ToolDefinition{
 			Name: ToolSendMessage,
 			Description: "Send a message to this kube-agents install, as a console user, and wait for the answer. " +
-				"A turn still running when the wait ends returns its task; read it later with task_control.",
+				"A turn still running when the wait ends returns its task; read it later with task_control. " +
+				"A message on a conversation whose turn is still running waits for that turn to end first, within the same wait.",
 			InputSchema: map[string]any{
 				"type":     "object",
 				"required": []string{"text"},
@@ -95,7 +99,10 @@ func sendAndWait(ctx context.Context, bus TurnBus, convs *Conversations, alias, 
 	if err != nil {
 		return "", err
 	}
-	res, w, err := bus.SendTurn(ctx, convs, token, text)
+	// The wait covers any wait for the conversation's running turn too, so
+	// a second message waits rather than being steered into it.
+	start := time.Now()
+	res, w, err := bus.SendTurn(ctx, convs, token, text, wait)
 	if err != nil {
 		return "", err
 	}
@@ -108,11 +115,12 @@ func sendAndWait(ctx context.Context, bus TurnBus, convs *Conversations, alias, 
 		}
 		return sb.String(), nil
 	}
-	out, err := bus.WaitForTurn(ctx, w, *res.Task, wait)
+	out, err := bus.WaitForTurn(ctx, w, *res.Task, max(wait-time.Since(start), minAnswerWait))
 	if err != nil {
 		fmt.Fprintf(&sb, "Task `%s` carries the turn, but reading it failed: %v\n", res.Task, err)
 		return sb.String(), nil
 	}
+	convs.setRunning(token, out.Unfinished())
 	writeOutcome(&sb, out)
 	return sb.String(), nil
 }
@@ -241,15 +249,17 @@ func writeConversation(sb *strings.Builder, alias, token string, byToken bool) {
 	fmt.Fprintf(sb, "Conversation %s (token `%s`).\n\n", cell(alias), token)
 }
 
+// writeNotices quotes each notice whole, line breaks and all: for a settled
+// turn the notice is the answer, and there is no task to read it from later.
 func writeNotices(sb *strings.Builder, notices []string) {
 	if len(notices) == 0 {
 		return
 	}
-	sb.WriteString("Gateway notices:\n")
+	sb.WriteString("Gateway notices:\n\n")
 	for _, n := range notices {
-		fmt.Fprintf(sb, "- %s\n", cell(n))
+		n = cutText(n, "\n…(notice shortened)")
+		sb.WriteString("> " + strings.ReplaceAll(n, "\n", "\n> ") + "\n\n")
 	}
-	sb.WriteString("\n")
 }
 
 // writeTask renders a task's state and, once it has one, its answer. The
@@ -339,6 +349,12 @@ func lastLine(s string) string {
 }
 
 func capText(s string) string {
+	return cutText(s, "\n\n…(answer shortened; the full answer is on the task)")
+}
+
+// cutText cuts s to maxAnswerBytes on a rune boundary, marking the cut with
+// suffix.
+func cutText(s, suffix string) string {
 	if len(s) <= maxAnswerBytes {
 		return s
 	}
@@ -346,5 +362,5 @@ func capText(s string) string {
 	for cut > 0 && !utf8.RuneStart(s[cut]) {
 		cut--
 	}
-	return s[:cut] + "\n\n…(answer shortened; the full answer is on the task)"
+	return s[:cut] + suffix
 }

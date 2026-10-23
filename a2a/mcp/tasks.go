@@ -131,8 +131,21 @@ func (b *NATSBus) ReadTask(ctx context.Context, ref TaskRef) (*lib.Task, error) 
 
 // WaitForTask folds a task until it is final or wait has passed, on one
 // consumer for the whole wait: the read follows the task's events as they
-// land rather than opening a consumer per look.
+// land rather than opening a consumer per look. A task with no events is not
+// found at once, as ReadTask says: waiting on a reference a caller named
+// would hold a reader for the whole wait to say the same.
 func (b *NATSBus) WaitForTask(ctx context.Context, ref TaskRef, wait time.Duration) (*lib.Task, error) {
+	return b.waitForTask(ctx, ref, wait, false)
+}
+
+// waitForSubmittedTask is WaitForTask for a task whose submission was seen:
+// its first event can trail the submission by a cold start, so having none
+// yet is not "not found" until the wait has passed.
+func (b *NATSBus) waitForSubmittedTask(ctx context.Context, ref TaskRef, wait time.Duration) (*lib.Task, error) {
+	return b.waitForTask(ctx, ref, wait, true)
+}
+
+func (b *NATSBus) waitForTask(ctx context.Context, ref TaskRef, wait time.Duration, submitted bool) (*lib.Task, error) {
 	ctx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
 	w, err := b.watchTask(ctx, ref)
@@ -140,6 +153,9 @@ func (b *NATSBus) WaitForTask(ctx context.Context, ref TaskRef, wait time.Durati
 		return nil, err
 	}
 	defer w.close()
+	if w.pending == 0 && !submitted {
+		return nil, ErrTaskNotFound
+	}
 	for {
 		t, ferr := w.fold()
 		if ferr == nil && t.Final {

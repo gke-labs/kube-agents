@@ -469,13 +469,26 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/apply_cron_tirith_scan.p
 # records <hermes home>/cron/runs/<job>_<execution> as the run's tool-layer cwd;
 # the session cwd, and so context-file loading, is unchanged, and script jobs
 # keep their cwd. kanban_workspace_gc.py prunes old run directories.
+#
+# Shares the block: per-job turn budget (gke-labs/kube-agents#1947). The
+# scheduler read a run's iteration cap from the profile's agent.max_turns alone,
+# so the 250 the fleet audits need reached every kanban worker spawned under the
+# platform profile. The patch reads a roster entry's own `max_turns` first
+# (mirroring NousResearch/hermes-agent#134059); the audits carry 250 and the
+# profile default drops to 150. Same staging directory, one COPY and one RUN,
+# for the layer budget at the top of this file.
 COPY deploy/docker/patches/apply_cron_run_workdir.py \
      deploy/docker/patches/verify_cron_run_workdir.py \
+     deploy/docker/patches/apply_cron_job_max_turns.py \
+     deploy/docker/patches/verify_cron_job_max_turns.py \
      deploy/docker/patches/patchlib.py \
      /tmp/cron-run-workdir/
 RUN /opt/hermes/.venv/bin/python3 /tmp/cron-run-workdir/apply_cron_run_workdir.py /opt/hermes && \
     grep -q "kube-agents patch: cron run workdir" /opt/hermes/cron/scheduler.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/cron-run-workdir/verify_cron_run_workdir.py /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/cron-run-workdir/apply_cron_job_max_turns.py /opt/hermes && \
+    grep -q "kube-agents patch: per-job turn budget" /opt/hermes/cron/scheduler.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/cron-run-workdir/verify_cron_job_max_turns.py /opt/hermes && \
     rm -rf /tmp/cron-run-workdir
 
 # Security: cron risk gate, execute_code refuse, and content checks (THREAT-002).
@@ -2352,7 +2365,7 @@ cfg = load_config_readonly(); \
 caps = ToolCallGuardrailConfig.from_mapping(cfg.get('tool_loop_guardrails', {})).loop_caps; \
 assert caps.max_web_searches == 200, 'per-card web_search budget lost: %r' % caps.max_web_searches; \
 assert caps.max_subagents == 50, 'overlay clobbered max_subagents: %r' % caps.max_subagents; \
-assert cfg.get('agent', {}).get('max_turns') == 250, 'iteration budget lost: %r' % cfg.get('agent', {}).get('max_turns')" && \
+assert cfg.get('agent', {}).get('max_turns') == 150, 'worker iteration budget lost: %r' % cfg.get('agent', {}).get('max_turns')" && \
     cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_slack_relay_registry_contract.py && \
     cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_card_stop.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/platform-config/check_skill_commands.py \

@@ -259,6 +259,21 @@ func (s *sideDoorAdapter) MarkChanged(conversation, ask, settle string) {
 	}
 }
 
+// PostTerminal reaches the primary for its own conversations when it
+// implements TerminalPoster; a door's conversations take no frames
+// (errNoTerminalFrames), and their callers read results through the
+// observer calls.
+func (s *sideDoorAdapter) PostTerminal(conversation string, t ConsoleTerminal) error {
+	if s.doorFor(conversation) != nil {
+		return errNoTerminalFrames
+	}
+	poster, ok := s.primary.(TerminalPoster)
+	if !ok {
+		return errNoTerminalFrames
+	}
+	return poster.PostTerminal(conversation, t)
+}
+
 // ShowsTaskStatus answers for the primary's own conversations; a door keeps
 // its rolling line, which its caller reads.
 func (s *sideDoorAdapter) ShowsTaskStatus(conversation string) bool {

@@ -107,6 +107,7 @@ export default defineConfig({
           items: [
             { label: 'Prerequisites', link: '/install/prerequisites/' },
             { label: 'Quick start (GKE)', link: '/install/quickstart-gke/' },
+            { label: 'First prompts', link: '/install/first-prompts/' },
             { label: 'Slack app setup', link: '/install/slack-app/' },
             { label: 'Manual install', link: '/install/manual/' },
             { label: 'Helm and Kind', link: '/install/helm-and-kind/' },

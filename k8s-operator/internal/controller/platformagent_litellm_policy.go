@@ -98,6 +98,8 @@ const (
 // Ingress:
 //   - Port 8080 from pods in the same namespace (the agent and sidecars)
 //   - Port 8080 from gke-gmp-system namespace (Prometheus scraping)
+//   - Port 8080 from the AgentProfile namespace, on next installs, once that
+//     namespace's own fence is in place (agentprofile_namespace.go)
 //
 // Egress:
 //   - Port 53 (UDP/TCP) to kube-dns, node-local-dns, 169.254.20.10/32, 169.254.169.254/32,
@@ -135,6 +137,17 @@ func buildLiteLLMNetworkPolicy(agent *agentv1alpha1.PlatformAgent, profile netpo
 				},
 			},
 		},
+	}
+
+	// Profile pods, from their own namespace, wherever the agent's bus
+	// surface renders (agentprofile_namespace.go). a2aAgentSurface rather
+	// than a2aStackRendering, so a version-skew pass, which freezes the bus
+	// fence with this peer on it, doesn't narrow LiteLLM's policy under it.
+	if a2aAgentSurface(agent) {
+		ingressRules = append(ingressRules, networkingv1.NetworkPolicyIngressRule{
+			Ports: []networkingv1.NetworkPolicyPort{tcpPort(litellmPort)},
+			From:  []networkingv1.NetworkPolicyPeer{profileNamespacePeer(agent)},
+		})
 	}
 
 	dnsPeers := []networkingv1.NetworkPolicyPeer{
@@ -518,6 +531,20 @@ func (r *PlatformAgentReconciler) reconcileLiteLLMNetworkPolicy(ctx context.Cont
 	}
 
 	netpol := buildLiteLLMNetworkPolicy(agent, profile)
+	// LiteLLM admits the profile namespace only once that namespace's own
+	// fence is in place (agentprofile_namespace.go). Asked only where the
+	// peer renders, so a today install pays no reads for it.
+	if a2aAgentSurface(agent) {
+		fenced, err := r.profileFenced(ctx, agent)
+		if err != nil {
+			// Read failures withhold the peer, the safe direction, and stop
+			// nothing else (profileNamespaceFailure).
+			r.profileNamespaceFailure(ctx, agent, "read for LiteLLM's policy", err)
+		}
+		if !fenced {
+			withoutProfilePeer(netpol, agent)
+		}
+	}
 	if agent.Spec.Telemetry != nil && agent.Spec.Telemetry.OTLPEndpoint != "" && otlpCollectorNamespace(agent.Spec.Telemetry.OTLPEndpoint) == "" {
 		if litellmOTLPCollectorNamespace(agent) == "" {
 			// Not a warning: an external endpoint on port 443 is a supported shape, and the

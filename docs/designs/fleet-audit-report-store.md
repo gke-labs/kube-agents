@@ -73,6 +73,36 @@ envelope in the ring that is not marked. A directory that holds only marked enve
 that no published run wrote, so the next run that reaches the repository seeds its memory once from
 the open ledger, as in §4.
 
+A repository on a forge with no issue tracker, or with issues and no labels, has no ledger issue
+([`version-control-support.md`](version-control-support.md#the-ledger-without-issues) §8), and the
+store is the ledger. Its run writes under the repository's own directory with `status:
+STORE_LEDGER`, `issue_number: null`, `ledger: store`, the PR URL lists of the fixes it opened, found
+and closed on the forge, and a `ledger_body`: the body the forge path would post, stored and never
+posted. The envelope is not marked, because the run published. The next run of that repository
+reads its memory as the forge path reads the memory of a ledger issue (§4), with no issue to check
+it against. It trusts `latest.json` when its `status` is `STORE_LEDGER`, its `repo` is this
+repository, and it has `current_ids` and a `ledger_body`. The identity scheme is not a trust
+condition: a body from an earlier scheme is re-spelled and `resolved` is withheld on a findings run,
+as in §4. A diverted `latest.json` defers to the newest envelope in the ring that is not marked. No
+store directory is a first run when no remediation proposal of the stream is open; with one open it
+is a lost memory, because the store is the only copy of this ledger. An absent or unreadable `latest.json` in a directory that exists is
+a lost memory, and so is an envelope that fails the checks: the ring is not searched for an older
+one, because a failed write drops `latest.json`, and the newest ring entry can then be the run
+before the one that failed. A directory that holds only marked envelopes, in a ring shorter than
+`REPORT_HISTORY`, is a first run on the same condition: no run stored a ledger there, and no fix can
+close. With a full ring, which can have aged a stored ledger out, or with an open proposal, it is a
+lost memory. The forge path seeds once from the issue there; this ledger has no other copy, so a
+findings run, which stores a new ledger, is the exit. The run takes the delta from `current_ids`, and the held
+set, the carried held rows and the locations of the findings from `ledger_body`, so the
+clean-close guard of §4 reads them as on the forge path. A previous finding the collector still
+flags holds the clean close as on the forge path. Held findings render on the stored
+body as on the issue. A clean run that does not close keeps the previous body and ids, with
+`ledger_held_open` true. A clean run over a lost memory has no body to keep: it stores
+`ledger_held_open` true and `delta_known` false, and the next run reads that envelope as a lost
+memory, not as an empty ledger.
+The no-forge path and the forge path do not read it as a memory: its `status` is not
+`NO_FORGE`, and it names no issue.
+
 Both writes are atomic (`os.replace` from a temp file in the same directory). The envelope carries
 `audit_id`, `repo` and `finished_at`, the run's outcome (`status`, `issue_number`, `issue_url`,
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, the PR URL lists, `silent_ok`,
@@ -286,6 +316,10 @@ returns one finding's prose. `checks` reaches `scope.clusters[].checks_run[]`, w
 ledger drops from its body with a notice pointing at the stored report. The reader is its own skill
 because skill selection runs off the description, and `fleet-audit`'s describes publishing; a
 question about a past run should not pull the publish procedure into context.
+
+A `STORE_LEDGER` envelope is read like any other. `streams` rows show its `status` and no PR URL;
+`show` carries the PR URLs (`prs_opened`, `prs_still_open`, `prs_closed`); the status view lists
+only the PRs opened. The agent gives those links where it would give the ledger URL.
 
 **The operator.** `make fleet-audit-view` streams `report_status.py` into the pod on stdin
 (`kubectl exec -i … -- python3 -`), so it works against an image built before the script was, and

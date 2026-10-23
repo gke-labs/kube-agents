@@ -2201,7 +2201,7 @@ esac
 # export below leaves them out too -- a roster name the suite never grades
 # would otherwise trip bench-gate's misspelled-roster banner on every run
 # of the lane. A check the transport blinds (tool_called, worker_commands,
-# worker_agents) is the scorer's to set aside, not this file's:
+# worker_agents, worker_budget) is the scorer's to set aside, not this file's:
 # docs/designs/eval-scorer.md, "The inject lane".
 INJECT_LANE_EXCLUSIONS_FILE="${SCRIPT_DIR}/${EVAL_INJECT_LANE_EXCLUSIONS_FILE}"
 INJECT_LANE_EXCLUDED="$(roster_entries "${INJECT_LANE_EXCLUSIONS_FILE}")"
@@ -2911,8 +2911,8 @@ unit_cost_hint() {
     gpu-stress-test-diagnosis | autoops-warning-event-triage) echo 900 ;;
     # The third tofu case, nightly-only from the start (#1827). Unmeasured:
     # priced with the two above it because it is the same shape -- infra lock,
-    # a plant that blocks on a card appearing, then an agent turn that waits on
-    # that card finishing. A wrong hint costs packing, not correctness.
+    # a plant that blocks on a card appearing and then finishing, then an agent
+    # turn that reads it. A wrong hint costs packing, not correctness.
     gitops-drift-out-of-band-triage) echo 900 ;;
     # The #612 cases on the same stack: the stamp case is the incumbent's
     # shape; the quiet case's plant waits out the 15m quiet period before a
@@ -2986,6 +2986,11 @@ unit_cost_hint() {
     # A plain chat request that runs the compliance collector's sweep (#2386):
     # the audit band, without the ledger write.
     security-chat-request-runs-collector) echo 900 ;;
+    # Written to outrun the worker turn budget: about 150 trivial model calls,
+    # twice (the dispatcher retries the timed-out card once), on the agent's
+    # own cluster. 13-26 min a repetition at 90 turns on a dev install on
+    # 2026-10-20; priced for 150.
+    platform-worker-turn-budget) echo 2400 ;;
     # A plain chat request that now runs the waste collector's sweep (#2386):
     # the waste audit's band, without the ledger write.
     cost-chat-request-runs-collector) echo 900 ;;
@@ -3078,6 +3083,10 @@ unit_cost_hint() {
     # the worker to its retries after the refusal (#1948); priced at the
     # middle so it is not the last tier a deadline cut truncates.
     stop-on-permission-refusal) echo 1200 ;;
+    # Measured on ka-fleet-dev-1 for #3260: 916s for main's red run (the
+    # worker retries before it proposes), 169-468s for the nine branch runs.
+    # Priced like stop-on-permission-refusal's shape at the red's length.
+    stop-on-unknown-flag-write-refusal) echo 1000 ;;
     # The upgrade-failure catalogue's scenario cases: read-only chat prompts
     # over the seeded clusters (entries 1 and 2 one Cluster Agent card per
     # cluster; entries 6 and 16 one declared line per cluster; entry 5 one
@@ -3125,6 +3134,14 @@ unit_cost_hint() {
     upgrades-removed-api-callers-distinguished | upgrades-network-policy-enforcement-stated) echo 900 ;;
     upgrades-stale-client-skew-named | upgrades-multi-process-oom-group-named) echo 900 ;;
     upgrades-cuda-pinned-gpu-job-named) echo 900 ;;
+    # Nightly-only since #3524. One of the five readiness-line cases of that
+    # change, each the same read-only run (three project list reads, the
+    # server config per location, the per-member kubectl reads); unmeasured.
+    # Priced at the knowledge probe's band rather than the 200s default as the
+    # one of the five that launches first, so a full-fleet run that outgrows
+    # the default is cut from this tier rather than from all five; the four
+    # siblings pack at the default until the nightly record prices them.
+    upgrades-audit-control-plane-capacity) echo 600 ;;
     *) echo 200 ;;
   esac
 }
@@ -3170,6 +3187,10 @@ unit_delegation_timeout() {
     fleet-audit-unchanged-finding-keeps-wording) echo 3000 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 3000 ;;
     obtainability-planted-orphan-service) echo 3000 ;;
+    # Two attempts of about 150 trivial calls each before the card settles; the
+    # default would cut the second attempt on a slow night and grade the
+    # repetition as infrastructure instead of reading the cap.
+    platform-worker-turn-budget) echo 3000 ;;
     *) echo "${AGENT_DELEGATION_TIMEOUT:-1800}" ;;
   esac
 }
