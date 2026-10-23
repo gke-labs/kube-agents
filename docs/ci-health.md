@@ -27,20 +27,23 @@ are refused a project and one when they stop ([below](#a-backed-up-pool)),
 plus, for the watched Prow
 periodics, one when a run fails or a job stops and one when it passes again
 ([below](#the-watched-periodics)).
-The digest also carries one line on last night's run of the nightly tier
-(`--data`, the `data.json` the tick collected): the cases recorded, how many
-passed all reps, partial and failed, what is newly failing against the night
-before, the opening chat turn's p50 and p95 as advice beside the p95 < 10 s
-target ([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md); empty since the nightly grades
-`spec.mode: next`, because the harness times the opening turn on the agent API only), and the wall clock, with a link to the dashboard's Nightly report
-(`nightly.html`); a night Prow cut short, one still running, or no night
-since the day before yesterday, says so instead of numbers. A night can be
-the builds of up to three periodics (the main job, the main-b job when the
-main part runs as two halves, and the writers job), reported as one night:
-the line names a part that is missing, still running or cut short, and the
-night counts as cut short when its main or main-b part is.
-`scripts/eval_dashboard/nightly.py` derives the line and the report from the
-same nightly runs.
+The digest also carries a section on last night's run of the nightly tier
+(`--data`, the `data.json` the tick collected), built by
+`scripts/eval_dashboard/nightly_digest.py`; [The nightly section](#the-nightly-section)
+describes it. When the section cannot be built, the digest carries one line on
+the night instead (the cases recorded, how many passed all reps, partial and
+failed, what is newly failing against the night before, the opening chat
+turn's p50 and p95 as advice beside the p95 < 10 s target
+([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md); empty since the nightly grades
+`spec.mode: next`, because the harness times the opening turn on the agent API only),
+and the wall clock, or that the night was cut short, still running or missing),
+a link to the dashboard's Nightly report (`nightly.html`), and a line saying why
+the section was skipped. A night can be the builds of up to three periodics
+(the main job, the main-b job when the main part runs as two halves, and the
+writers job), reported as one night: the line names a part that is missing,
+still running or cut short, and the night counts as cut short when its main or
+main-b part is. `scripts/eval_dashboard/nightly.py` derives that line
+and the report from the same nightly runs.
 The same tick reads the eval evidence store (`gs://kube-agents-evals-bench/evidence`,
 the records the nightly appends; `scripts/eval_dashboard/store.py`, best-effort
 and incremental) and renders the dashboard's Trend page (`trend.html`,
@@ -728,8 +731,10 @@ write (a timeout, a 5xx, a 403) files nothing that tick.
 
 `scripts/eval_dashboard/nightly_bugs.py` files an issue for a case that failed
 every graded repetition on its last 3 graded nightly nights, and comments on it
-once when the case passes every repetition again. It runs every tick after the
-post, on the same `data.json`.
+once when the case passes every repetition again. It runs every tick before the
+post, on the same `data.json`, so the digest's nightly section sees the issues
+it filed that tick; the step is capped at 3 minutes so a slow GitHub cannot
+hold the post past the job's timeout.
 
 A graded night, for one case, is a night where the part that ran the case (main
 or writers) was not cut off at the job deadline and at least one of the case's
@@ -836,6 +841,74 @@ Setting the repository variable `NIGHTLY_BUGS_LIVE=true` arms it;
 `CI_HEALTH_MUTE=true` disarms it again with every other write. Locally,
 `python3 scripts/eval_dashboard/nightly_bugs.py --data data.json` is a dry run
 against any `data.json`; `--live` writes.
+
+## The nightly section
+
+The 9 AM digest's nightly section lists what last night changed, from
+`data.json` and the open `nightly-red` issues, by the rules [Nightly
+bugs](#nightly-bugs) files by: a case's verdict for a night is the bug filer's
+(a part cut off at the deadline, a case with no graded repetition, and a night
+where nearly every case failed give none), and cases marked `expected_fail`,
+off the nightly matrix, or with no `task.yaml` on the checkout are left out. An
+issue tracks a case as the filer reads it: an open `nightly-red` issue naming
+it, or a closed one that still tracks the streak (closed after its newest
+night, or handed off as not planned). The issue listings are cross-checked
+against GraphQL and read again exactly as the filer reads them. The lists follow the filer's classifier,
+which drops repetitions it reads as infrastructure even when the collector
+recorded them as failures; the header's counts do not, so they match the
+Nightly report's.
+
+- The header: the night's date, how many of the recorded scenarios passed every
+  graded repetition, how many were not graded (lost to infrastructure, or on the
+  matrix with no line), the wall clock, and links to the run and the Nightly
+  report. The numbers are the Nightly report's "Passed all reps" and "Cases".
+- **🔴 New bugs filed:** red on 3 or more graded nights in a row, and its open
+  issue was opened after last night's run finished. A case kept from running
+  last night whose streak was filed only now is listed too. Domain name, issue,
+  assignee and the domain's backup.
+- **🔴 Owed a bug, not filed yet:** red on 3 or more graded nights in a row and
+  no issue tracks it (the filer is in dry run, or its filing failed). Night
+  count, owner and backup.
+- **🟠 Still red, already tracked:** red last night with any other issue that
+  tracks it, marked "(closed)" for a closed one. Night count, issue and owner
+  (the issue's assignee, else the owner the filer would assign).
+- **🆕 Red last night, no bug yet:** red on fewer than 3 nights in a row, with no
+  issue, and which night of the run it is.
+- **✅ Recovered:** every repetition passed last night after red nights, when the
+  case has an open issue or its red run reached 3 nights.
+- **⚙️ Infra:** each part of the nightly lost last night, with its run and issue,
+  and each case kept from running last night that has an open infra issue or a
+  3-night streak (`nightly_infra.py`); "none last night" otherwise.
+- A footer asking owners to reply in the thread.
+
+Each list shows at most 5 lines; the rest are one line linking to the Nightly
+report. A night with no new bug, no case owed a bug for the first time, no
+case red for the first night (a tracked case red again after a green night
+counts), no recovery, no infra item and no part cut off, missing or still running is
+one line instead: the date, the pass count and how many were not graded, "no
+new reds, nothing recovered", and how many are still red. A night whose main part was cut
+off at the deadline, or a run-level event, is labelled so, none of its cases are
+counted, and only the infra list follows; a writers part cut off, missing or still running is named in
+the header; a cut-off part's cases stay in the pass count, as on the Nightly page, but its reds are not listed.
+
+Domain names, owners and backups come from
+[`docs/designs/domains.yaml`](designs/domains.yaml) and the case's `task.yaml`
+(`scripts/case_owner.py`). An owner is a Chat mention, `<users/{id}>`, when the
+repository secret `CI_HEALTH_CHAT_MENTIONS` maps their GitHub login to a Chat
+user id: a JSON object, `{"login": "123456789012345678901"}` (the numeric id,
+with or without `users/`). The ids are internal, so the map lives only in the
+secret; without it, or for a login it does not hold, the login is printed as
+plain text. A mentioned person must be a member of the space.
+
+The section is skipped, and the digest carries its one-line nightly summary
+plus the reason, when it cannot be built truthfully: `data.json` unreadable, no
+night started in the last 36 hours, last night's run or either main half
+(main or main-b) still running or missing, no GitHub token, the issues unreadable or their
+listing not trusted (GraphQL disagreed on every read, as for the filer), pyyaml missing, a count that does not
+add up, or a link that is not a well-formed `https` URL (an issue link must
+point into this repository). Links are checked for form, not fetched: the
+dashboard's links sit behind a Google login a fetch from the job cannot pass.
+It never posts partial numbers.
 
 ## The seeded-fleet scan
 
@@ -1142,6 +1215,9 @@ sent stays sent. The dashboard is unaffected — the pool episode's start rides
 in `health.json`, which is written every tick, not in the state file.
 An incoming-webhook URL in Secret Manager
 (`ci-health-chat-webhook`, `kube-agents-prow`) is the optional alternative.
+The repository secret `CI_HEALTH_CHAT_MENTIONS` (optional) maps GitHub logins
+to Chat user ids for the digest's mentions ([The nightly
+section](#the-nightly-section)).
 
 `post_health.py --dry-run` prints the messages instead of posting them.
 
