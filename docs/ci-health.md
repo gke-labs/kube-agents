@@ -665,7 +665,9 @@ on past GREEN and is retried each tick until it does.
 Each tick re-reads every carried issue. One a human closed is dropped rather
 than cited; if its condition still fires (`health.json`'s `open_conditions`,
 every condition whose rule fires or whose scan could not read the whole pool,
-whatever condition the gate reports) on evidence newer than the close — a
+plus lost pods and deadline kills until 3 runs have landed after the last
+loss or kill, the gate's own exit for them, whatever condition the gate
+reports) on evidence newer than the close — a
 full, fresh scan after it for a scan condition, a loss or kill after it for
 lost pods and deadline kills — the adopt-or-file path runs again at once; a shared break's
 re-file waits for its next change message. A bot-filed issue for one of the

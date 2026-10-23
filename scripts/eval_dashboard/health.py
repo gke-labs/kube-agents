@@ -2167,6 +2167,16 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
         }
     else:
         incident = None
+    last_lost_pod = max((run.finished for run in visible if run.lost_pod), default=None)
+    last_deadline_kill = max((run.finished for run in visible if run.deadline_kill), default=None)
+    # Lost pods and deadline kills fire on a two-hour window; the gate leaves
+    # them only once RECOVERY_GREEN_RUNS runs have landed after the last loss
+    # or kill (recovered), and the list below holds them to the same bar, or
+    # a quiet night would read as the nodes healed.
+    awaiting_runs = {
+        LOST_PODS: last_lost_pod is not None and not _runs_landed_after(full_runs, last_lost_pod, verdict_only=False),
+        DEADLINE_KILL: last_deadline_kill is not None and not _runs_landed_after(full_runs, last_deadline_kill, verdict_only=True),
+    }
     return {
         "state": state,
         "condition": condition,
@@ -2178,20 +2188,35 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
         "current": current,
         "full_runs": full_runs,
         "last_setup_death": max((run.finished for run in visible if run.setup_death), default=None),
-        "last_lost_pod": max((run.finished for run in visible if run.lost_pod), default=None),
-        "last_deadline_kill": max((run.finished for run in visible if run.deadline_kill), default=None),
+        "last_lost_pod": last_lost_pod,
+        "last_deadline_kill": last_deadline_kill,
         "roster": roster,
         "fixture": r3c,
         "pool_state": r3e,
-        # Every condition whose rule still fires, or whose scan could not say,
-        # whatever condition won above: the poster closes a bot-filed tracking
-        # issue when its condition leaves this list (#3664).
+        # Every condition whose rule still fires, whose scan could not say, or
+        # whose run-based exit is not yet met, whatever condition won above:
+        # the poster closes a bot-filed tracking issue when its condition
+        # leaves this list (#3664).
         "open_conditions": [
             name
             for name, rule in ((SHARED_BREAK, r1), (DEADLINE_KILL, r3d), (LOST_PODS, r3b), (STORM, r2), (DELEGATION_CEILING, r2b), (SETUP_DEATHS, r3), (FIXTURE_DRIFT, r3c), (POOL_DRIFT, r3e))
-            if _unresolved(rule)
+            if _unresolved(rule) or awaiting_runs.get(name, False)
         ],
     }
+
+
+def _runs_landed_after(full_runs, after: datetime, verdict_only: bool) -> bool:
+    """recovered()'s run bar for a loss or a kill: the newest
+    RECOVERY_GREEN_RUNS full runs -- green ones for lost pods, ones with a
+    verdict either way for deadline kills -- all finished after `after`, on
+    distinct pull requests."""
+    pool = [run for run in full_runs if run.has_verdict] if verdict_only else full_runs
+    recent = pool[-RECOVERY_GREEN_RUNS:]
+    if len(recent) < RECOVERY_GREEN_RUNS or any(run.finished <= after for run in recent):
+        return False
+    if not verdict_only and any(run.result != RUN_SUCCESS for run in recent):
+        return False
+    return len(_prs(recent)) >= RECOVERY_GREEN_RUNS
 
 
 def _unresolved(rule: dict) -> bool:

@@ -3282,6 +3282,24 @@ class OpenConditions(unittest.TestCase):
         both = self.judge(lost_doc, scan(drifted={project(i): [DRIFT_ROLE] for i in (1, 2, 3)}), pool_scan())
         self.assertEqual((both["condition"], both["open_conditions"]), ("lost_pods", ["lost_pods", "fixture_drift"]))
 
+    def test_lost_pods_and_deadline_kills_stay_open_until_the_runs_land(self):
+        # Three losses four hours ago: the two-hour window has passed and no
+        # run has landed since, so nothing has shown the nodes healthy.
+        losses = [lost(100 + i, i, T0 - timedelta(hours=4, minutes=5 * i)) for i in range(3)]
+        quiet = self.judge(data(*losses), scan(), pool_scan())
+        self.assertEqual((quiet["condition"], quiet["open_conditions"]), (None, ["lost_pods"]))
+        greens = [run(200 + i, 20 + i, T0 - timedelta(minutes=30 * i), tasks=broken_tasks(set())) for i in range(3)]
+        self.assertEqual(self.judge(data(*losses, *greens), scan(), pool_scan())["open_conditions"], [])
+        two = self.judge(data(*losses, *greens[:2]), scan(), pool_scan())
+        self.assertEqual(two["open_conditions"], ["lost_pods"], "two runs are not the bar")
+        same_pr = [run(200 + i, 20, T0 - timedelta(minutes=30 * i), tasks=broken_tasks(set())) for i in range(3)]
+        self.assertEqual(self.judge(data(*losses, *same_pr), scan(), pool_scan())["open_conditions"], ["lost_pods"], "distinct pull requests")
+        # Deadline kills: a verdict either way counts, green is not required.
+        kills = [kill(300 + i, 30 + i, T0 - timedelta(hours=4, minutes=5 * i)) for i in range(3)]
+        self.assertEqual(self.judge(data(*kills), scan(), pool_scan())["open_conditions"], ["deadline_kill"])
+        reds = [graded(400 + i, 40 + i, T0 - timedelta(minutes=30 * i), verdict="RED") for i in range(3)]
+        self.assertNotIn("deadline_kill", self.judge(data(*kills, *reds), scan(), pool_scan())["open_conditions"], "three reds with a verdict end the kills (and open a break of their own)")
+
     def test_a_clean_fresh_scan_clears_and_an_unread_one_does_not(self):
         green = data(*(run(100 + i, 10 + i, T0 - timedelta(minutes=30 * i), tasks=broken_tasks(set())) for i in range(3)))
         self.assertEqual(self.judge(green, scan(), pool_scan())["open_conditions"], [])
