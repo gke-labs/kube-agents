@@ -256,7 +256,7 @@ func TestAProfileWithNoTopicsReachesNoTopic(t *testing.T) {
 func TestAProfileTokenWithoutAUsablePodIsRefusedAtConnect(t *testing.T) {
 	h := startHarness(t, profileMap, profileTokens())
 	for name, token := range map[string]string{"no pod": tokenAuditorNone, "dotted pod": tokenAuditorDots} {
-		if nc, err := nats.Connect(h.url, nats.Token(token), nats.CustomInboxPrefix("_INBOX."+auditorPod1)); err == nil {
+		if nc, err := nats.Connect(h.url, h.tls, nats.Token(token), nats.CustomInboxPrefix("_INBOX."+auditorPod1)); err == nil {
 			nc.Close()
 			t.Errorf("%s: connected; a profile entry must refuse a token whose pod it cannot use", name)
 		}
@@ -392,7 +392,7 @@ func TestANarrowedPodNamedAfterAMappedPrincipalIsRefused(t *testing.T) {
 	tokens := profileTokens()
 	tokens[tokenPodNamedLikeAnEntry] = Attested{ServiceAccount: auditorSA, PodName: "profile-cluster-a", PodUID: "uid-x"}
 	h := startHarness(t, profileMap, tokens)
-	if nc, err := nats.Connect(h.url, nats.Token(tokenPodNamedLikeAnEntry), nats.CustomInboxPrefix("_INBOX.profile-cluster-a")); err == nil {
+	if nc, err := nats.Connect(h.url, h.tls, nats.Token(tokenPodNamedLikeAnEntry), nats.CustomInboxPrefix("_INBOX.profile-cluster-a")); err == nil {
 		nc.Close()
 		t.Fatal("a pod named after a mapped principal connected; it would hold that principal's inbox")
 	}
@@ -435,7 +435,7 @@ func TestASessionPodNamedAfterAProfileIsRefused(t *testing.T) {
 	tokens := profileTokens()
 	tokens[tokenSessionNamedAuditor] = Attested{ServiceAccount: sessionSA, PodName: auditor, PodUID: "uid-s"}
 	h := startHarness(t, profileMap, tokens)
-	if nc, err := nats.Connect(h.url, nats.Token(tokenSessionNamedAuditor), nats.CustomInboxPrefix("_INBOX."+auditor)); err == nil {
+	if nc, err := nats.Connect(h.url, h.tls, nats.Token(tokenSessionNamedAuditor), nats.CustomInboxPrefix("_INBOX."+auditor)); err == nil {
 		nc.Close()
 		t.Fatal("a session pod named after the auditor profile connected; it would hold the profile's task plane")
 	}

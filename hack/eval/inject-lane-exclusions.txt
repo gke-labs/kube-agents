@@ -143,3 +143,9 @@ chat-answer-declares-next-step
 # #2039: grades the worker's answer under the door's one card, as
 # chat-answer-declares-next-step does. Returns to the lane with agent-kanban-smoke.
 chat-answer-tangent-offer-declares-no-step
+# #2619: grades the platform worker's answer to a request for every fleet
+# audit's latest report, which on the api lane the harness folds into the
+# reply from the card the chat front door files. Under the api executor the lane's delegation
+# wait settles on the card's receipt and the worker's answer never reaches
+# the A2A thread, so the reply carries no report to grade.
+fleet-audit-request-line

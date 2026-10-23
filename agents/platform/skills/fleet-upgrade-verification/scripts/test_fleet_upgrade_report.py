@@ -38,6 +38,9 @@ _fleet_scope_args = report.fleet_scope_args  # the collector's own import; one m
 _fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
 
 
+POD_RANGE = "10.0.0.0/14"
+
+
 def cluster(name, location, master, pools, channel="REGULAR", status="RUNNING"):
     record = {
         "name": name,
@@ -45,6 +48,7 @@ def cluster(name, location, master, pools, channel="REGULAR", status="RUNNING"):
         "status": status,
         "currentMasterVersion": master,
         "nodePools": [{"name": p, "version": v, "status": "RUNNING"} for p, v in pools],
+        "clusterIpv4Cidr": POD_RANGE,  # every GKE record carries one; the surge-capacity rule counts its free blocks
     }
     if channel is not None:
         record["releaseChannel"] = {"channel": channel}
@@ -1617,7 +1621,7 @@ PDB_READ_CMD = ["kubectl", "get", "pdb,deploy,statefulset", "-A", "-o", "json"]
 WEBHOOK_READ_CMD = ["kubectl", "get", "validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices,namespaces", "-A", "-o", "json"]
 NAMESPACED_READ_CMD = ["kubectl", "get", "daemonset,cronjob,pvc,networkpolicy,namespace", "-A", "-o", "json"]
 POD_READ_CMD = ["kubectl", "get", "pods", "-A", "-o", "json"]
-NODE_READ_CMD = ["kubectl", "get", "node", "-o", 'jsonpath={range .items[*]}{.metadata.name}{"\\t"}{.metadata.labels}{"\\t"}{.spec.taints}{"\\t"}{.spec.unschedulable}{"\\t"}{.status.nodeInfo}{"\\t"}{.status.allocatable}{"\\t"}{.status.conditions}{"\\n"}{end}']
+NODE_READ_CMD = ["kubectl", "get", "node", "-o", 'jsonpath={range .items[*]}{.metadata.name}{"\\t"}{.spec.podCIDR}{"\\t"}{.metadata.labels}{"\\t"}{.spec.taints}{"\\t"}{.spec.unschedulable}{"\\t"}{.status.nodeInfo}{"\\t"}{.status.allocatable}{"\\t"}{.status.conditions}{"\\n"}{end}']
 CLUSTER_READ_CMD = ["kubectl", "get", "storageclass,pv", "-o", "json"]
 MEMBER_READS = [PDB_READ_CMD, WEBHOOK_READ_CMD, NAMESPACED_READ_CMD, POD_READ_CMD, NODE_READ_CMD, CLUSTER_READ_CMD]
 CUT_AT_CAP = "output was cut at the credential proxy's output cap"
@@ -2259,22 +2263,26 @@ class ReadinessTest(unittest.TestCase):
             self.assertEqual(a["notes"], ["needs-pods: saw 3 pods(s)", "needs-netpol: saw 0 networkpolicy(s)"])
 
     def test_projected_nodes_are_parsed_and_a_malformed_line_fails_the_node_read_only(self):
-        nodes, error = report.parse_node_lines('n1\t{"cloud.google.com/gke-nodepool":"default-pool"}\t\t\t{"kubeletVersion":"v1.33.4-gke.1000"}\t{"cpu":"940m"}\t[{"type":"Ready","status":"True"}]\n\n')
+        nodes, error = report.parse_node_lines('n1\t10.4.0.0/24\t{"cloud.google.com/gke-nodepool":"default-pool"}\t\t\t{"kubeletVersion":"v1.33.4-gke.1000"}\t{"cpu":"940m"}\t[{"type":"Ready","status":"True"}]\n\n')
         self.assertIsNone(error)
-        self.assertEqual(nodes, [{"kind": "Node", "metadata": {"name": "n1", "labels": {"cloud.google.com/gke-nodepool": "default-pool"}}, "spec": {"taints": [], "unschedulable": False}, "status": {"nodeInfo": {"kubeletVersion": "v1.33.4-gke.1000"}, "allocatable": {"cpu": "940m"}, "conditions": [{"type": "Ready", "status": "True"}]}}])
+        self.assertEqual(nodes, [{"kind": "Node", "metadata": {"name": "n1", "labels": {"cloud.google.com/gke-nodepool": "default-pool"}}, "spec": {"taints": [], "unschedulable": False, "podCIDR": "10.4.0.0/24"}, "status": {"nodeInfo": {"kubeletVersion": "v1.33.4-gke.1000"}, "allocatable": {"cpu": "940m"}, "conditions": [{"type": "Ready", "status": "True"}]}}])
+        # A node with no block yet carries no podCIDR key, as the API's object does not.
+        nodes, error = report.parse_node_lines('n1\t\t{}\t\t\t{}\t{}\t[]\n')
+        self.assertEqual((error, nodes[0]["spec"]), (None, {"taints": [], "unschedulable": False}))
         self.assertEqual(report.parse_node_lines(""), ([], None))
-        nodes, error = report.parse_node_lines("n1\tnot-json\t\t\t\t\t\n")
+        nodes, error = report.parse_node_lines("n1\t\tnot-json\t\t\t\t\t\n")
         self.assertIsNone(nodes)
         self.assertIn("node line unparsable", error)
         nodes, error = report.parse_node_lines("n1\tonly two\n")
-        self.assertIn("field(s), not 7", error)
+        self.assertIn("field(s), not 8", error)
         # Only the template's newline ends a node: a NEL (U+0085) inside a free-text field,
         # which Go's JSON encoder leaves raw, is part of the line.
-        nodes, error = report.parse_node_lines('n1\t{"note":"a\u0085b"}\t\t\t{}\t{}\t[]\n')
+        nodes, error = report.parse_node_lines('n1\t\t{"note":"a\u0085b"}\t\t\t{}\t{}\t[]\n')
         self.assertIsNone(error)
         self.assertEqual(nodes[0]["metadata"]["labels"], {"note": "a\u0085b"})
         self.assertEqual(report.KUBECTL_NODE_JSONPATH.count('{"\\t"}'), report.NODE_FIELD_COUNT - 1)
         self.assertIn("{.spec.unschedulable}", report.KUBECTL_NODE_JSONPATH)
+        self.assertIn("{.spec.podCIDR}", report.KUBECTL_NODE_JSONPATH)
         # The template declares as many fields as the parser reads, name first; the fake renders
         # a node in the template's own field order and the report reads it back whole, so a
         # template or parser that moved a field fails here on a node whose every field differs;
@@ -2282,10 +2290,10 @@ class ReadinessTest(unittest.TestCase):
         # reads it answers from the report's own data.
         self.assertEqual(len(NODE_TEMPLATE_PATHS), report.NODE_FIELD_COUNT)
         self.assertEqual(NODE_TEMPLATE_PATHS[0], ["metadata", "name"])
-        node = {"kind": "Node", "metadata": {"name": "n1", "labels": {"cloud.google.com/gke-nodepool": "default-pool"}}, "spec": {"taints": [{"key": "k", "effect": "NoSchedule"}], "unschedulable": False}, "status": {"nodeInfo": {"containerRuntimeVersion": "containerd://2.0.10"}, "allocatable": {"cpu": "940m", "memory": "2Gi"}, "conditions": [{"type": "Ready", "status": "True"}]}}
+        node = {"kind": "Node", "metadata": {"name": "n1", "labels": {"cloud.google.com/gke-nodepool": "default-pool"}}, "spec": {"taints": [{"key": "k", "effect": "NoSchedule"}], "unschedulable": False, "podCIDR": "10.4.0.0/24"}, "status": {"nodeInfo": {"containerRuntimeVersion": "containerd://2.0.10"}, "allocatable": {"cpu": "940m", "memory": "2Gi"}, "conditions": [{"type": "Ready", "status": "True"}]}}
         self.assertEqual(report.parse_node_lines(node_line(node)), ([node], None))
         self.assertTrue(readiness_rules.node_schedulable(report.parse_node_lines(node_line(node))[0][0]))
-        cordoned = {**node, "spec": {"taints": [{"key": "node.kubernetes.io/unschedulable", "effect": "NoSchedule"}], "unschedulable": True}}
+        cordoned = {**node, "spec": {"taints": [{"key": "node.kubernetes.io/unschedulable", "effect": "NoSchedule"}], "unschedulable": True, "podCIDR": "10.4.1.0/24"}}
         self.assertEqual(report.parse_node_lines(node_line(cordoned)), ([cordoned], None))
         self.assertFalse(readiness_rules.node_schedulable(report.parse_node_lines(node_line(cordoned))[0][0]))
         # A malformed node line is the node read's failure alone: the other kinds reach the rules.
@@ -2296,7 +2304,7 @@ class ReadinessTest(unittest.TestCase):
             rc, _, data = self._run(fake)
         self.assertEqual(rc, report.EXIT_OK)
         a = data["members"][0]["readiness"]
-        self.assertIn("field(s), not 7", a["read_errors"]["node"])
+        self.assertIn("field(s), not 8", a["read_errors"]["node"])
         self.assertIsNone(a["read_errors"]["pods"])
         self.assertEqual([u["rule"] for u in a["unknown"]], ["needs-nodes"])
         self.assertEqual(a["notes"], ["needs-pods: saw 0 pods(s)"])

@@ -52,6 +52,8 @@ Three of the five are easy to misread:
   and the discriminator is the `audit:stale-closed` label the harness applies when it closes one as
   stale. Its finding is promotable again on the usual terms; a `refused` one is not. Do not strip
   that label — without it the close reads as a human rejection and the finding is never re-proposed.
+  On a forge with no labels, the harness writes `<!-- audit:stale-closed -->` into the description
+  instead, and the same rule applies to it.
 
 The escape hatch for a `refused` finding is `/remediate <id>` from someone with write access, and it
 must be written **after** the close. An older command in the thread is reported as _superseded_

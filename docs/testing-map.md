@@ -117,7 +117,7 @@ and purposes:
 | `rc-release-pipeline.yml`             | GitHub Actions  | `rc-scheduler.yml`, `cron: "17 */3 * * *"`              | A commit on `main`                        | `rc_<ts>_<sha>`, then `rc_<ts>_<sha>_validated`                                                                                             |
 | `staging-promotion-pipeline.yml`      | GitHub Actions  | `staging-promotion-scheduler.yml`, `cron: "17 2 * * *"` | A validated `rc_` tag                     | The E2E matrix, then an `evalcand_` tag that nominates the commit for the eval below, then, on a green verdict, the `staging_` tag          |
 | `post-kube-agents-eval-rc`            | Prow postsubmit | An `evalcand_` tag push                                 | Nominated candidate commit (`evalcand_*`) | A verdict on that candidate against the merge-blocking presubmit matrix, not the full catalog (360m budget, parallelism 4)                  |
-| `ci-kube-agents-eval-nightly`         | Prow periodic   | `cron: "0 0 * * *"`                                     | Latest `main`                             | Baseline evidence store and dashboard rows against the eval catalog less the cases that request a pull request (480m budget, parallelism 8) |
+| `ci-kube-agents-eval-nightly`         | Prow periodic   | `cron: "0 0 * * *"`                                     | Latest `main`                             | Baseline evidence store and dashboard rows against the eval catalog less the cases that request a pull request (720m budget, parallelism 6) |
 | `ci-kube-agents-eval-nightly-writers` | Prow periodic   | `cron: "0 0 * * *"`                                     | Latest `main`                             | The same for the cases that request a pull request, on a second leased project (240m budget)                                                |
 | `ci-kube-agents-pool-pressure`        | Prow periodic   | `cron: "23 * * * *"`                                    | None (leases nothing)                     | Pool health verification                                                                                                                    |
 
@@ -132,12 +132,11 @@ When diagnosing failures or reporting incidents, name the specific job rather th
 ## Running on a pull request is not gating a merge
 
 The last column says what a trigger and its `if:` conditions support, which is a weaker claim than
-"blocks the merge". Which checks are actually required lives in branch protection on
-`gke-labs/kube-agents` and in Prow config in `GoogleCloudPlatform/oss-test-infra`; neither is a file
-in this repository, so this table asserts nothing about either.
-[`pull-request-workflow.md`](pull-request-workflow.md#how-a-change-merges) names the required
-contexts as they stand, gives the command to read them back, and says why that command sees only
-the branch-protection half of the set. `make verify` (the `verify` target in the root `Makefile`) is the
+"blocks the merge". Which checks are actually required lives in the `main-merge-queue` ruleset on
+`gke-labs/kube-agents`, which is not a file in this repository, so this table asserts nothing about
+it. [`pull-request-workflow.md`](pull-request-workflow.md#how-a-change-merges) names the required
+checks as they stand, gives the command to read them back, and says how the smoke presubmit reaches
+the set through `Smoke gate`. `make verify` (the `verify` target in the root `Makefile`) is the
 local answer to the same question — everything a pull request must pass offline, in one target —
 and [`pull-request-workflow.md`](pull-request-workflow.md#local-validation-before-committing) lists
 the individual targets to run when you have touched a given area.

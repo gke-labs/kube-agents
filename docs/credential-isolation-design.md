@@ -117,7 +117,8 @@ contain credentials. A short allowlist may also be copied to the sandbox — the
 OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, the `ALERT_DAILY_LIMIT_*` alert ceilings, the
 `FEEDBACK_PROMPT_*` switch and delay, the four findings pacing limits
 (`FINDINGS_DAILY_CRITICALS`, `FINDINGS_FIRST_REPORT_CRITICALS`,
-`FINDINGS_NONCRITICAL_AFTER_HOUR`, `FINDINGS_NONCRITICAL_MAX`), and the `KAGE_SLACK_UX` flag —
+`FINDINGS_NONCRITICAL_AFTER_HOUR`, `FINDINGS_NONCRITICAL_MAX`), the `INCIDENT_WORKLOAD_DEDUP_SECONDS`
+window, and the `KAGE_SLACK_UX` flag —
 but only as literal values; all `valueFrom` sources are rejected. One name goes to the shell Pod
 instead: `KUBEAGENTS_AUDIT_AUTO_PROMOTE`, the fleet audits' auto-promotion switch, which the
 operator normalises to `true` or `false` before it reaches that Pod. A name earns a
@@ -837,6 +838,14 @@ Consequences:
   `${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_<project>_<cluster>_<location>.yaml`,
   and prints the `export KUBECONFIG=` and `--context` lines that reach that
   cluster from later commands.
+- A `kubectl` read that names no cluster that way and comes back empty or with
+  a server NotFound says where it looked. For `get`, `describe`, `events`,
+  `logs` and `top`, the broker appends one `[credential-proxy]` line to stderr
+  naming the host cluster and saying `--context <name>` reads another one.
+  Without it, a worker read a namespace on the host, got NotFound, and
+  reported it missing from the fleet (#3375). stdout and the exit code are
+  unchanged, any other result comes back as it was, and the line avoids the
+  words the refusal stop reads, so it's never counted as a refusal.
 - Proxied `kubectl` reads get `--request-timeout=30s` and a 60-second deadline,
   so an unreachable control plane fails in seconds rather than holding a broker
   worker for `kubectl`'s 300-second client default. Commands that are meant to

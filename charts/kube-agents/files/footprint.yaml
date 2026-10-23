@@ -73,3 +73,6 @@ operatorRendered:
     persistentVolumeClaims: 4
     storageRequest: 102Gi
     storageBytesRequest: 109521666048
+    dataClaims: 2
+    dataClaimRequest: 50Gi
+    dataClaimBytesRequest: 53687091200

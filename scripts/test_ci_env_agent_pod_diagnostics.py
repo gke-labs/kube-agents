@@ -31,7 +31,9 @@ WATCH_FILES = ("agent-pods-watch.txt", "agent-events-watch.txt")
 EXIT_DEADLINE_SECONDS = 10
 
 # A kubectl that records every call's arguments in $STUB_CALLS; answers the
-# Deployment's container-name read with $STUB_CONTAINERS; for a watch, prints
+# Deployment's container-name read with $STUB_CONTAINERS; answers the A2A pod
+# listings with nothing (tests/test_ci_a2a_component_logs.py covers them, and the
+# collector reads a listing byte by byte, so STUB_LINES of it cost seconds); for a watch, prints
 # its arguments, records its pid in $STUB_WATCH_PIDS and then either blocks
 # for STUB_WATCH_SECONDS (the apiserver holding the watch open, 60 unless
 # set, which is the request timeout cutting it) or, with STUB_WATCH_EXITS,
@@ -63,6 +65,7 @@ if [ -n "${STUB_FAIL:-}" ]; then
 fi
 case "$*" in
   *"containers[*].name"*) printf '%s' "${STUB_CONTAINERS:-platform-agent}"; exit 0 ;;
+  *" get pods "*" -l "*) exit 0 ;;
 esac
 echo "ARGS: $*"
 line=$(head -c "${STUB_LINE_BYTES:-100}" /dev/zero | tr '\\0' 'a')
