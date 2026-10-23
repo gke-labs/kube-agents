@@ -295,9 +295,24 @@ class TestCaseDerivation(unittest.TestCase):
         self.assertEqual(case["ov_history"], [])
 
 
+class TestLaneExcluded(unittest.TestCase):
+    def test_the_inject_lanes_dropped_cases_are_named_once_each(self):
+        log = (
+            "EVAL_MODE_NEXT=1: running the matrix through the inject door (AGENT_TRANSPORT=inject, token from x)\n"
+            "AGENT_TRANSPORT=inject: case-c leaves the matrix -- excluded on this lane; the reason is in inject-lane-exclusions.txt\n"
+            "AGENT_TRANSPORT=inject: case-d leaves the matrix -- excluded on this lane; the reason is in inject-lane-exclusions.txt\n"
+            "AGENT_TRANSPORT=inject: case-c leaves the matrix -- excluded on this lane; the reason is in inject-lane-exclusions.txt\n"
+            "AGENT_TRANSPORT=inject: 2 task(s) remain in the matrix\n"
+            "Task case-a Result: [PASSED] (Duration: 1s)\n"
+            "  rep 1 report: AGENT_TRANSPORT=inject: case-e leaves the matrix -- excluded on this lane\n"
+        )
+        self.assertEqual(collect.parse_build_log(log)["lane_excluded"], ["case-c", "case-d"], "a report line is the agent's words, never the script's")
+
+
 class TestResilience(unittest.TestCase):
     def test_garbage_log_parses_to_nothing(self):
         parsed = collect.parse_build_log("no eval here\n\x00\xff{]] Task Result:\n")
+        self.assertEqual(parsed["lane_excluded"], [])
         self.assertEqual(parsed["tasks"], [])
         self.assertIsNone(parsed["project"])
         self.assertIsNone(parsed["eval_verdict"])
@@ -1009,6 +1024,8 @@ FAKE_NIGHTLY_PREFIX = f"{FAKE_BUCKET}logs/{FAKE_NIGHTLY_JOB}/"
 # The writers periodic of a night split across two jobs, under its live job
 # name: nightly.py tells the parts apart by that name.
 FAKE_WRITERS_PREFIX = f"{FAKE_BUCKET}logs/{collect.DEFAULT_NIGHTLY_WRITERS_JOB}/"
+# The periodic that runs the main part's second half, under its live job name.
+FAKE_MAIN_B_PREFIX = f"{FAKE_BUCKET}logs/{collect.DEFAULT_NIGHTLY_MAIN_B_JOB}/"
 
 
 class TestNightlySource(_MergeBase):
@@ -1293,6 +1310,132 @@ class TestNightlySource(_MergeBase):
             merge_with=self.write_prior(prior_data), gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX,
         )
         self.assertIn(f"warning: gsutil ls failed for {FAKE_WRITERS_PREFIX}", stderr)
+
+    def test_the_main_b_prefix_is_collected_beside_the_others(self):
+        """A night whose main part runs as two jobs: the main-b prefix is
+        listed after the writers one, and its build is a nightly run with
+        its own job and link."""
+        gsutil, log = self.fake_gsutil([])
+        self.place_nightly_build(BUILD_956_TRUNCATED)
+        self.place_nightly_build(BUILD_998_INFRA, periodic=FAKE_WRITERS_PREFIX)
+        self.place_nightly_build(BUILD_998_FULL, periodic=FAKE_MAIN_B_PREFIX)
+        data, stderr = self.quiet_collect(
+            nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_writers_prefix=FAKE_WRITERS_PREFIX,
+            nightly_main_b_prefix=FAKE_MAIN_B_PREFIX, gsutil=gsutil, since_days=10000,
+        )
+        by_id = {run["build_id"]: run for run in data["runs"]}
+        self.assertEqual({b: (r["tier"], r["job"]) for b, r in by_id.items()}, {
+            BUILD_956_TRUNCATED: ("nightly", FAKE_NIGHTLY_JOB),
+            BUILD_998_INFRA: ("nightly", "ci-kube-agents-eval-nightly-writers"),
+            BUILD_998_FULL: ("nightly", "ci-kube-agents-eval-nightly-main-b"),
+        })
+        self.assertEqual(by_id[BUILD_998_FULL]["log_url"], f"https://oss.gprow.dev/view/gs/fake-prow/logs/ci-kube-agents-eval-nightly-main-b/{BUILD_998_FULL}")
+        self.assertEqual(nightly.night_part(by_id[BUILD_998_FULL]), nightly.PART_MAIN_B)
+        calls = log.read_text().splitlines()
+        self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {FAKE_NIGHTLY_PREFIX}", f"ls {FAKE_WRITERS_PREFIX}", f"ls {FAKE_MAIN_B_PREFIX}"])
+        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
+        self.assertEqual(collect.DEFAULT_NIGHTLY_MAIN_B_JOB, nightly.NIGHTLY_MAIN_B_JOB, "the collector and the report name one job")
+        self.assertEqual(collect.DEFAULT_NIGHTLY_MAIN_B_PREFIX, "gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-b/")
+        self.assertNotIn("--nightly-main-b-prefix", stderr)
+
+    def test_a_main_b_prefix_naming_another_job_is_warned_about(self):
+        gsutil, _ = self.fake_gsutil([])
+        other = f"{FAKE_BUCKET}logs/my-main-b/"
+        _, stderr = self.quiet_collect(nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_main_b_prefix=other, gsutil=gsutil)
+        self.assertIn(f"warning: --nightly-main-b-prefix {other} names job my-main-b, not ci-kube-agents-eval-nightly-main-b", stderr)
+        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
+
+    def test_the_writers_prefix_under_the_main_b_flag_is_named_as_writers_and_listed_once(self):
+        """The warning names the part the runs really file as, and one job
+        named by both flags is listed once, not twice above one watermark."""
+        gsutil, log = self.fake_gsutil([])
+        self.place_nightly_build(BUILD_998_INFRA, periodic=FAKE_WRITERS_PREFIX)
+        _, stderr = self.quiet_collect(
+            nightly_prefix=FAKE_NIGHTLY_PREFIX,
+            nightly_writers_prefix=FAKE_WRITERS_PREFIX,
+            nightly_main_b_prefix=FAKE_WRITERS_PREFIX,
+            gsutil=gsutil,
+        )
+        self.assertIn(f"names job {collect.DEFAULT_NIGHTLY_WRITERS_JOB}, not ci-kube-agents-eval-nightly-main-b; the report files its runs as the writers part", stderr)
+        self.assertIn("as --nightly-writers-prefix does; listing it once", stderr)
+        calls = log.read_text().splitlines()
+        self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {FAKE_NIGHTLY_PREFIX}", f"ls {FAKE_WRITERS_PREFIX}"])
+
+    def test_a_part_flag_naming_the_main_job_is_listed_once_and_keeps_the_main_watermark(self):
+        """The main job's prefix under a part flag is listed once, and the
+        main job's runs still set its watermark: the scan resumes above the
+        main build on record rather than re-reading every main build."""
+        gsutil, log = self.fake_gsutil([])
+        self.place_nightly_build(BUILD_956_TRUNCATED)
+        for flag in ("nightly_writers_prefix", "nightly_main_b_prefix"):
+            with self.subTest(flag=flag):
+                log.unlink(missing_ok=True)
+                prior_data = json.loads(pathlib.Path(self.prior_with([])).read_text())
+                prior_data["runs"] = [{"build_id": BUILD_956_TRUNCATED, "tier": "nightly", "job": FAKE_NIGHTLY_JOB, "pr": None, "tasks": []}]
+                prior = self.tmp / "prior-main-collision.json"
+                prior.write_text(json.dumps(prior_data))
+                _, stderr = self.quiet_collect(merge_with=str(prior), nightly_prefix=FAKE_NIGHTLY_PREFIX, gsutil=gsutil, **{flag: FAKE_NIGHTLY_PREFIX})
+                self.assertIn("as --nightly-prefix does; listing it once", stderr)
+                self.assertIn(f"nightly scan resumed above build {BUILD_956_TRUNCATED}", stderr)
+                calls = log.read_text().splitlines()
+                self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {FAKE_NIGHTLY_PREFIX}"])
+
+    def test_the_main_flag_naming_the_main_b_job_keeps_its_own_watermark(self):
+        """--nightly-prefix pointed at the main-b periodic: its runs are the
+        main source of this scan, so they set the main watermark rather than
+        being excluded from it as another flag's part."""
+        gsutil, log = self.fake_gsutil([])
+        main_b_prefix = f"{FAKE_BUCKET}logs/{collect.DEFAULT_NIGHTLY_MAIN_B_JOB}/"
+        self.place_nightly_build(BUILD_956_TRUNCATED, periodic=main_b_prefix)
+        prior_data = json.loads(pathlib.Path(self.prior_with([])).read_text())
+        prior_data["runs"] = [{"build_id": BUILD_956_TRUNCATED, "tier": "nightly", "job": collect.DEFAULT_NIGHTLY_MAIN_B_JOB, "pr": None, "tasks": []}]
+        prior = self.tmp / "prior-main-is-main-b.json"
+        prior.write_text(json.dumps(prior_data))
+        _, stderr = self.quiet_collect(merge_with=str(prior), nightly_prefix=main_b_prefix, gsutil=gsutil)
+        self.assertIn(f"--nightly-prefix names job {collect.DEFAULT_NIGHTLY_MAIN_B_JOB}, a part's job", stderr)
+        self.assertIn(f"nightly scan resumed above build {BUILD_956_TRUNCATED}", stderr)
+
+    def test_the_main_b_job_resumes_above_its_own_watermark(self):
+        """main-a and main-b start together and either may finish first: a
+        main-b id on record must not lift the main job's watermark, nor the
+        main job's the main-b one's."""
+        gsutil, _ = self.fake_gsutil([])
+        self.place_nightly_build(BUILD_956_TRUNCATED)  # main: below the main-b id on record
+        self.place_nightly_build(BUILD_998_INFRA, periodic=FAKE_MAIN_B_PREFIX)  # main-b: above the main id on record
+        prior_data = json.loads(pathlib.Path(self.prior_with([])).read_text())
+        prior_data["runs"] = [
+            {"build_id": "1", "tier": "nightly", "job": FAKE_NIGHTLY_JOB, "pr": None, "tasks": []},
+            {"build_id": "2093040000000000000", "tier": "nightly", "job": "ci-kube-agents-eval-nightly-main-b", "pr": None, "tasks": []},
+        ]
+        merged, stderr = self.quiet_collect(
+            nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_main_b_prefix=FAKE_MAIN_B_PREFIX,
+            merge_with=self.write_prior(prior_data), gsutil=gsutil, since_days=10000,
+        )
+        self.assertNotIn(BUILD_998_INFRA, {r["build_id"] for r in merged["runs"]}, "below main-b's own watermark")
+        self.assertIn(BUILD_956_TRUNCATED, {r["build_id"] for r in merged["runs"]}, "above the main job's own watermark")
+        self.assertIn("nightly scan resumed above build 1, 1 new", stderr)
+        self.assertIn("main-b scan resumed above build 2093040000000000000, 0 new", stderr)
+
+    def test_a_main_b_prefix_with_no_main_b_on_record_is_a_note(self):
+        """Dormant until its first build: the prefix failing to list is a
+        note while no main-b build is on record, the refusal line after."""
+        gsutil, _ = self.fake_gsutil([BUILD_998_FULL])
+        os.environ["FAKE_GSUTIL_DENY"] = FAKE_MAIN_B_PREFIX
+        self.place_nightly_build(BUILD_998_INFRA)
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_INFRA])).read_text())
+        prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="nightly", pr=None))
+        _, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_main_b_prefix=FAKE_MAIN_B_PREFIX,
+            merge_with=self.write_prior(prior_data), gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX,
+        )
+        self.assertIn(f"note: nightly prefix {FAKE_MAIN_B_PREFIX} did not list", stderr)
+        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
+        prior_data["runs"].append(dict(prior_data["runs"][0], build_id="2", tier="nightly", pr=None, job="ci-kube-agents-eval-nightly-main-b"))
+        _, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_main_b_prefix=FAKE_MAIN_B_PREFIX,
+            merge_with=self.write_prior(prior_data), gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX,
+        )
+        self.assertIn(f"warning: gsutil ls failed for {FAKE_MAIN_B_PREFIX}", stderr)
 
     def test_an_unfinished_writers_build_rides_pending_with_its_link(self):
         gsutil, _ = self.fake_gsutil([])

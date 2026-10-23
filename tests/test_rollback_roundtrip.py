@@ -576,13 +576,22 @@ class _Door(http.server.BaseHTTPRequestHandler):
     def _door_up(self, state: dict) -> bool:
         return state["cr"]["spec"].get("mode") == "next" and "deployment/platform-agent-a2a-gateway" in state["objects"]
 
+    def _today_leg(self, state: dict) -> str:
+        # The today turn is the same request on every leg, so the leg is read
+        # from the state: the first flip to today is leg 1's, the second leg 3's
+        # (ROLLBACK_END_MODE=today). `today_turn_fails_on` names the one leg
+        # whose turn the door refuses, declared up front in the scenario, so
+        # nothing rewrites the state file while the script runs.
+        flips = state["patches"].count({"spec": {"mode": "today"}})
+        return "leg3" if flips >= 2 else "leg1"
+
     def do_POST(self) -> None:
         state = self._state()
         length = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(length) or b"{}")
         auth = self.headers.get("Authorization", "")
         if self.path == "/v1/responses":
-            if auth != f"Bearer {_API_KEY}" or state["scenario"].get("today_turn_fails"):
+            if auth != f"Bearer {_API_KEY}" or state["scenario"].get("today_turn_fails_on") == self._today_leg(state):
                 self._reply(401, {"error": "no"})
                 return
             self._reply(200, {"output": [{"role": "assistant", "content": "pong"}]})
@@ -824,27 +833,13 @@ class KeptRoundTripTest(RoundTripTest):
 
     def test_a_today_turn_that_fails_on_the_third_leg_fails_there(self) -> None:
         # The door's today turn is the same request on every leg; failing it
-        # once leg 2 has passed shows leg 3 asserts it rather than inheriting
-        # leg 1's pass.
-        state = healthy_next_state(sidecars=[])
-        sim = Sim(state)
-        self.addCleanup(sim.close)
-        proc = subprocess.Popen(
-            ["bash", str(_SCRIPT), _NS, _CR], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=sim.env(ROLLBACK_END_MODE="today")
-        )
-        out_lines = []
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            out_lines.append(line)
-            if line.startswith("PASS leg2.not-degraded"):
-                current = sim.state()
-                current["scenario"]["today_turn_fails"] = True
-                sim.state_path.write_text(json.dumps(current))
-        proc.wait(timeout=180)
-        out = "".join(out_lines)
-        self.assertEqual(proc.returncode, 1, out)
-        self.assertEqual(re.findall(r"^FAIL (\S+):", out, re.MULTILINE), ["leg3.today-turn"], out)
-        self.assertIn("PASS leg1.today-turn", out)
+        # on the third leg only shows leg 3 asserts it rather than inheriting
+        # leg 1's pass. The leg is declared in the scenario rather than flipped
+        # mid-run: a rewrite of the state file while the script runs truncates
+        # it under the fake kubectl's next read.
+        result, _, _ = self.run_sim(healthy_next_state(sidecars=[], today_turn_fails_on="leg3"), ROLLBACK_END_MODE="today")
+        self.assert_fails_at(result, "leg3.today-turn", "no answer from /v1/responses in 2 attempts")
+        self.assertIn("PASS leg1.today-turn", result.stdout)
 
     def test_every_kubectl_call_is_pinned_to_the_context(self) -> None:
         _, state, _ = self.run_sim(healthy_next_state())
@@ -1180,7 +1175,7 @@ class FailureTest(RoundTripTest):
         self.assertLess(time.monotonic() - started, 120)
 
     def test_no_answer_on_the_today_path(self) -> None:
-        result, _, _ = self.run_sim(healthy_next_state(today_turn_fails=True))
+        result, _, _ = self.run_sim(healthy_next_state(today_turn_fails_on="leg1"))
         self.assert_fails_at(result, "leg1.today-turn", "no answer from /v1/responses in 2 attempts")
 
     def test_a_bus_task_that_does_not_complete_after_the_flip_back(self) -> None:

@@ -22,7 +22,7 @@ that store which runs `hermes cron tick` against every named profile with work d
 [`autonomous-watchdogs.md`](../../../docs/site/src/content/docs/concepts/autonomous-watchdogs.md)).
 
 An enabled entry here therefore fires in its own process, with this profile's
-persona, toolsets (unless the entry's `enabled_toolsets` replaces them), `skills`, `model` and `max_turns` — which is the whole reason
+persona and toolsets (unless the entry's `enabled_toolsets` replaces them) and the entry's own `skills`, `model` and `max_turns` — which is the whole reason
 the watchdogs live here rather than as kanban cards filed from the Chat Agent's
 roster. A card is not a cron run, and that indirection is what stopped `skills`,
 `model` and `deliver` reaching the thing that ran.
@@ -202,8 +202,10 @@ install's remedy, and the table carries each as that project's failure, and a ti
 refused fails, announced once. An install that declares none keeps the bare flag, and a scope
 render the pod cannot read fails the tick with the reason. The cluster read is `gcloud` cluster metadata
 for the version table and, on a report day, the readiness report's read set,
-the same as a run on request: one `get-credentials` and six `kubectl get`s
-per cluster (budgets, Deployments and StatefulSets; webhook configurations
+the same as a run on request: three `gcloud` list reads per project (backend
+services, instances and GKE operations, projected to the fields the rules read)
+beside the server config per location, then one `get-credentials` and six
+`kubectl get`s per cluster (budgets, Deployments and StatefulSets; webhook configurations
 with their Services, EndpointSlices and Namespaces; DaemonSets, CronJobs,
 claims, NetworkPolicies and Namespaces; every pod; the nodes through a
 jsonpath projection; StorageClasses and PersistentVolumes), plus
@@ -216,8 +218,14 @@ spelled by its number is keyed by the id `gcloud projects describe` resolves,
 learned on its first table run. A number the credential cannot resolve is
 never a key, so its clusters earn no report until it resolves: when nothing
 was read under a key (it is the only project, or every other is an unresolved
-number too), the tick fails with the reason and the remedy, posted once and
-kept in `last-failure.txt` until the next clean tick posts the recovery;
+number too), the tick fails, posted once as a plain line ("The upgrade readiness
+check didn't run today", why, and that an admin needs to fix it, since no retry
+resolves the number) with the reason and the remedy in
+`logs/upgrade_readiness_watch.log` under the agent home, which fluent-bit
+ships, and kept in `last-failure.txt` by the kind of failure until the next
+clean tick posts the recovery. A failure a retry may clear (a timeout, a
+sandbox that failed) says instead that it tries again tomorrow, or at its next
+scheduled run when its roster entry is not daily;
 beside projects that were keyed, the table is partial, posted once with the
 reason, and the ledger's `table_errors` keeps it. The remedy is
 `resourcemanager.projects.get` on the credential (every read role the install
@@ -286,7 +294,7 @@ the hops refused as outside the declared scope and the ids it learned for
 numbered spellings, kept at whichever step the tick failed unless the ledger
 itself cannot be written or re-read, so the next tick files them under the same cause)
 keeps its key in
-`last-failure.txt` beside it (its line, or, for a tick whose every run was refused, the
+`last-failure.txt` beside it (the plain reason, or, for a tick whose every run was refused, the
 refused projects and their causes), and the next line is the recovery. A version
 none of whose clusters can be read is retried
 three days running and then recorded, so an unreachable cluster costs its
@@ -319,7 +327,7 @@ cannot hold the run past the hour before it writes its record. The queue's ident
 its rubric sets the severity (a budget over a single replica, a pool past the skew ceiling and a
 webhook in the upgrade's path are critical; a budget over several replicas, a pool at the ceiling
 and a webhook refusing only what it matches today are major; a covering exclusion is minor; a
-readiness rule's blocker is critical, and its risk is minor for catalogue entries 9, 10, 11, 13 and 16 and major for every other entry, as the rubric's
+readiness rule's blocker is critical, and its risk is minor for catalogue entries 9, 10, 11, 13, 16 and 25 and major for every other entry, as the rubric's
 entry table sets it); a row
 the user dismissed stays dismissed; and the hourly nudge paces what is named and reminds daily of
 undecided criticals. A cluster read in full sends its batch with a `scope` naming the job's check
@@ -557,8 +565,10 @@ operator's allowlist, are the whole configuration surface: `FEEDBACK_PROMPT_ENAB
 on later still gets exactly one) and `FEEDBACK_PROMPT_DELAY` (default `7d`;
 `<n>d`, `<n>h` or `<n>m`). A hand edit of the CR's `spec.deployment.env` can
 be lost at the next chart apply. A delay that does not parse is a failed run, exit 1
-with the reason on stderr, which the scheduler reports in chat like any other
-script failure until the value is fixed; it does not fall back, because the
+with the reason on stderr. The scheduler turns that into its failure line, which
+the relay posts once in plain words ("The Feedback Prompt didn't run. It hit an
+error."), and the run's output, which the scheduler saves under the profile's
+`cron/output/`, keeps the reason; it does not fall back, because the
 scheduler keeps a zero-exit script's stderr nowhere and a silent fallback
 would leave no trace but the message arriving a week early. The schedule is
 daily, so whatever the delay, the message lands on the first 13:00 UTC tick
@@ -586,8 +596,8 @@ returns an **empty target list** for `"local"` — the outcome is written to
 `last_output` and delivered nowhere. A watchdog whose run failed would then be
 indistinguishable from a quiet fleet. Both audible values carry a failure: the
 scheduler builds one with `_summarize_cron_failure_for_delivery` and delivers it
-on the same leg, and the relay posts that line as written for a fleet-audit job
-too.
+on the same leg, and the relay posts it in plain words, once until the job runs
+again, for any job.
 
 Silence is still cheap: a run with no findings returns `[SILENT]` and the
 scheduler skips delivery, so a steadily clean fleet generates no chat traffic.
@@ -629,7 +639,8 @@ not the final message,
 which holds whatever else the model wrote in its last turn. A run publishes to
 one repository, the one with `role: gitops`; a run that a person ran for several
 repositories posts each finished repository's report, then a line naming any it
-did not finish. A failed run posts the scheduler's failure line, which says why,
+did not finish. A failed run posts the scheduler's failure line in plain words,
+once until the job runs again ([the relay design](../../../docs/designs/cron-report-relay.md)),
 and a run that finished no repository without failing posts a one-line notice
 that it did not finish. On Slack the report is then replaced by a headline linking its
 ledger issue when the run covered one repository; a message with that line, or
@@ -849,3 +860,17 @@ tier default fail-closed to `"high"` under `cron_run_scope.py` and `cron_risk_ga
   no agent loop and therefore no tool-approval surface to gate; `"high"` is a threat classification of
   the untrusted input the subprocess ingests (runtime isolation is tracked in #913; today the tier is
   metadata only for those jobs).
+
+## `max_turns` contract
+
+Every model-run entry (one without `no_agent`) declares `"max_turns"`, a positive integer, and
+no `no_agent` entry carries one; `scripts/check_prompt_assets.py` (`check_cron_max_turns`)
+enforces both. The image's scheduler reads it ahead of the profile's `agent.max_turns`
+(`deploy/docker/patches/apply_cron_job_max_turns.py`, the same change upstream Hermes has
+open, so the patch drops out on the tag bump that carries it). The audits carry the budget
+their by-hand per-cluster fallback needs; the profile's own value bounds the kanban workers,
+which never need that much. Required rather than optional because an absent key silently
+runs the job under the worker budget. Hermes reads 0, a negative number, a bool or a
+non-numeric string as unlimited; the patch ignores such a roster value and the profile's stands,
+so an entry the image does not ship cannot lift a cron run past every budget. `merge_cron_store` carries it to existing installs like any
+image-owned key. Raise an entry's number when its SOP outgrows it; do not raise the profile's.

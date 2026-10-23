@@ -94,6 +94,9 @@ _INTERPOLATIONS = {
     "var.memory_limit_mib": "64",
     "var.replicas": "1",
     "local.watcher_handled": "fire",
+    # The OOM shape and the incident wait: what the incumbent case plants.
+    "var.crash_seconds": "0",
+    "var.wait_for": "incident",
 }
 
 #: The label step 1 writes, and the value step 0b requires before it will

@@ -717,6 +717,7 @@ class SkillProvenanceContractTest(unittest.TestCase):
         "/opt/hermes/skills",
         "/opt/platform-template/skills",
         "/opt/cluster-template/skills",
+        "/opt/tse-template/skills",
     )
 
     def setUp(self):
@@ -826,6 +827,7 @@ class SkillProvenanceContractTest(unittest.TestCase):
             "/opt/hermes/plugins",
             "/opt/platform-template",
             "/opt/cluster-template",
+            "/opt/tse-template",
             "/opt/chat-template",
             "/opt/defaults/scripts",
         ):

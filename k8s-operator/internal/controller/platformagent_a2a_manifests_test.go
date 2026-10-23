@@ -1069,8 +1069,15 @@ func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 		{labelPartOf: a2aPartOf, a2aComponentLabel: "provision"},
 		{labelPartOf: a2aPartOf, a2aComponentLabel: "seed"},
 	}
-	if len(rule.From) != len(wantPeers) {
-		t.Fatalf("expected %d peers, got %d: %+v", len(wantPeers), len(rule.From), rule.From)
+	// After the same-namespace pods, one namespace-crossing peer: every pod
+	// in the profile namespace (#3655). That namespace's own fence keeps
+	// its pods to the bus, LiteLLM and DNS, and the bus grants do the rest.
+	if len(rule.From) != len(wantPeers)+1 {
+		t.Fatalf("expected %d peers, got %d: %+v", len(wantPeers)+1, len(rule.From), rule.From)
+	}
+	if profile := rule.From[len(wantPeers)]; profile.PodSelector != nil || profile.IPBlock != nil || profile.NamespaceSelector == nil ||
+		!reflect.DeepEqual(profile.NamespaceSelector.MatchLabels, map[string]string{corev1.LabelMetadataName: "test-ns-profiles", "app.kubernetes.io/component": "profiles"}) {
+		t.Errorf("the last 4222 peer = %+v, want every pod in namespace test-ns-profiles, carrying the chart's component label", profile)
 	}
 	for i, want := range wantPeers {
 		peer := rule.From[i]
@@ -1665,6 +1672,7 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 	callout := buildA2ACalloutDeployment(agent)
 	verifier := buildA2AVerifierDeployment(agent)
 	console := buildA2AConsoleDeployment(agent)
+	mcp := buildA2AMCPDeployment(agent)
 
 	cases := []struct {
 		render  string
@@ -1677,6 +1685,7 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 		{"callout", "buildA2ACalloutDeployment", callout.Spec.Template.Spec},
 		{"verifier", "buildA2AVerifierDeployment", verifier.Spec.Template.Spec},
 		{"console", "buildA2AConsoleDeployment", console.Spec.Template.Spec},
+		{"mcp", "buildA2AMCPDeployment", mcp.Spec.Template.Spec},
 	}
 	builders := make([]string, 0, len(cases))
 	for _, tc := range cases {
@@ -1748,6 +1757,7 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 	callout := buildA2ACalloutDeployment(agent)
 	verifier := buildA2AVerifierDeployment(agent)
 	console := buildA2AConsoleDeployment(agent)
+	mcp := buildA2AMCPDeployment(agent)
 
 	cases := []struct {
 		render    string
@@ -1808,6 +1818,11 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 		// dir and credential file by absolute path and writes nothing, so
 		// traversable is enough.
 		{render: "console", builder: "buildA2AConsoleDeployment", container: "console", spec: console.Spec.Template.Spec,
+			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
+		// The MCP server runs from the console image, so the same base and
+		// the same reasoning: it reads its token and credential files by
+		// absolute path and writes nothing.
+		{render: "mcp", builder: "buildA2AMCPDeployment", container: "mcp", spec: mcp.Spec.Template.Spec,
 			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
 	}
 	builders := make([]string, 0, len(cases))
@@ -2142,12 +2157,13 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 	// created and the "it is gone after cleanup" row below asserts the
 	// absence of an object the render never made.
 	theCalloutIsServing(t, ctx, cl, r, agent)
-	// The teardown list carries the two doors' four objects each, which
-	// render only under their operator flags; set both, so the precondition
-	// below covers them rather than failing on objects the render was told
-	// not to make.
+	// The teardown list carries the two doors' four objects each and the
+	// MCP server's, which render only under their operator flags; set all
+	// three, so the precondition below covers them rather than failing on
+	// objects the render was told not to make.
 	t.Setenv(a2aInjectBackendEnvVar, "true")
 	t.Setenv(a2aAgentDoorEnvVar, "true")
+	t.Setenv(a2aMCPDoorEnvVar, "true")
 
 	if _, err := r.reconcileA2A(ctx, agent); err != nil {
 		t.Fatalf("render: %v", err)
@@ -2644,11 +2660,11 @@ func TestHandleDeletionSkipsUnownedCalloutClusterRoleBinding(t *testing.T) {
 	}
 }
 
-// TestCleanupA2ACostsTenReadsWhenThereIsNothingToClean measures the thing
+// TestCleanupA2ACostsTwelveReadsWhenThereIsNothingToClean measures the thing
 // the change was for. Counting is the only honest check here: the early exit
 // is a cost optimisation, and a correctness test passes just as well with the
 // reads still happening one object at a time.
-func TestCleanupA2ACostsTenReadsWhenThereIsNothingToClean(t *testing.T) {
+func TestCleanupA2ACostsTwelveReadsWhenThereIsNothingToClean(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 
@@ -2672,7 +2688,7 @@ func TestCleanupA2ACostsTenReadsWhenThereIsNothingToClean(t *testing.T) {
 	if err := r.cleanupA2A(context.Background(), agent); err != nil {
 		t.Fatalf("cleanupA2A on a never-rendered install: %v", err)
 	}
-	// Ten sentinel Gets and nothing else: no per-object walk, and in
+	// Twelve sentinel Gets and nothing else: no per-object walk, and in
 	// particular no Job List, which is the uncached one that ran every
 	// reconcile of every today install before this.
 	//
@@ -2683,15 +2699,19 @@ func TestCleanupA2ACostsTenReadsWhenThereIsNothingToClean(t *testing.T) {
 	// pair under the other flag, 8 -> 9 when the console fence did, for
 	// the same reason again, and 9 -> 10 when the gateway's own fence did
 	// (#2473: it now renders on every next gateway, and the same
-	// hand-deleted pair leaves it alone); the fences are Owns kinds, so those
-	// six reads come from the cache and only the two Secrets are uncached.
+	// hand-deleted pair leaves it alone), 10 -> 11 when the MCP server's
+	// fence did, for the console fence's reason (#3653), and 11 -> 12 when
+	// the profile namespace's fence did (#3655: it is the first write of the
+	// fence pass, and carries no owner reference, so a pass that dies after
+	// it leaves it alone); the fences are NetworkPolicies, so those eight
+	// reads come from the cache and only the two Secrets are uncached.
 	// Raising it is a
 	// real decision — every today install pays it on every reconcile,
 	// forever — so it is spelled out rather than derived. The inequality
 	// below is the part that must hold whatever the literal is: the exit is
 	// only worth having while it costs less than the walk.
-	if gets != 10 {
-		t.Errorf("Gets = %d, want 10 (the sentinels); the per-object walk is running on a no-op", gets)
+	if gets != 12 {
+		t.Errorf("Gets = %d, want 12 (the sentinels); the per-object walk is running on a no-op", gets)
 	}
 	if walk := len(r.a2aNamespacedTeardown(agent)); gets >= walk {
 		t.Errorf("Gets = %d for an exit that saves a %d-object walk; the exit has stopped paying for itself", gets, walk)
@@ -2817,7 +2837,7 @@ func TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere(t *testing.T) {
 			}
 			fences := 0
 			unobstructed := &PlatformAgentReconciler{Client: buildClient(next, 0, &fences), Scheme: scheme}
-			if _, err := unobstructed.reconcileA2ANetworkFences(context.Background(), next.DeepCopy()); err != nil {
+			if _, _, err := unobstructed.reconcileA2ANetworkFences(context.Background(), next.DeepCopy()); err != nil {
 				t.Fatalf("unobstructed guardrail render: %v", err)
 			}
 			if fences == 0 {
@@ -2834,7 +2854,7 @@ func TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere(t *testing.T) {
 					r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 					ctx := context.Background()
 
-					_, err := r.reconcileA2ANetworkFences(ctx, next.DeepCopy())
+					_, _, err := r.reconcileA2ANetworkFences(ctx, next.DeepCopy())
 					if n <= fences && err == nil {
 						t.Fatal("want the injected error, got nil: the guardrail render did not die where this case says it did")
 					}
@@ -2882,7 +2902,7 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnARefusedInstall(t *testing.T) {
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(next.DeepCopy()).
 			WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
 		r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-		if _, err := r.reconcileA2ANetworkFences(context.Background(), next.DeepCopy()); err != nil {
+		if _, _, err := r.reconcileA2ANetworkFences(context.Background(), next.DeepCopy()); err != nil {
 			t.Fatalf("guardrail render: %v", err)
 		}
 		return countA2ALabelled(context.Background(), t, cl)
@@ -2910,7 +2930,7 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnARefusedInstall(t *testing.T) {
 				Build()
 			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 			ctx := context.Background()
-			if _, err := r.reconcileA2ANetworkFences(ctx, next.DeepCopy()); err != nil {
+			if _, _, err := r.reconcileA2ANetworkFences(ctx, next.DeepCopy()); err != nil {
 				t.Fatalf("guardrail render: %v", err)
 			}
 
@@ -3224,6 +3244,7 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 				{Name: a2aBusTokenFileEnv, Value: "/opt/data/attacker/token"},
 				{Name: a2aNotifyPlatformEnvVar, Value: "google_chat"},
 				{Name: a2aNotifyConversationsEnvVar, Value: "google_chat"},
+				{Name: enabledProfilesEnvVar, Value: "tse"},
 				{Name: "NATS_USER", Value: "gateway"},
 				{Name: "NATS_PASSWORD", Value: "hunter2"},
 				{Name: "PLUGIN_OWN_KEY", Value: "kept"},
@@ -3268,7 +3289,10 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 	// so the operator renders no value, and a plugin's would reroute the
 	// agent's proactive posts to a route with no gateway behind it.
 	// A2A_NOTIFY_CONVERSATIONS is the fifth, for the same reason.
-	for _, name := range []string{"NATS_USER", "NATS_PASSWORD", a2aBusTokenFileEnv, a2aNotifyPlatformEnvVar, a2aNotifyConversationsEnvVar} {
+	// KUBE_AGENTS_ENABLED_PROFILES is the sixth: no optional Hermes profile is
+	// bound on this install, so the operator renders no value, and a plugin's
+	// would scaffold an unapproved specialist profile on the gateway pod.
+	for _, name := range []string{"NATS_USER", "NATS_PASSWORD", a2aBusTokenFileEnv, a2aNotifyPlatformEnvVar, a2aNotifyConversationsEnvVar, enabledProfilesEnvVar} {
 		if counts[name] != 0 {
 			t.Errorf("a plugin's %s survived into the agent env under next", name)
 		}
@@ -3287,7 +3311,7 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 	if counts["PLUGIN_OWN_KEY"] != 1 || values["PLUGIN_OWN_KEY"].Value != "kept" {
 		t.Error("the bus-name reservation dropped a plugin variable it has no claim on")
 	}
-	for _, name := range []string{"NATS_URL", a2aNATSCAFileEnv, a2aBusUserEnv, a2aBusTokenFileEnv, a2aNotifyPlatformEnvVar, a2aNotifyConversationsEnvVar, "NATS_USER", "NATS_PASSWORD"} {
+	for _, name := range []string{"NATS_URL", a2aNATSCAFileEnv, a2aBusUserEnv, a2aBusTokenFileEnv, a2aNotifyPlatformEnvVar, a2aNotifyConversationsEnvVar, enabledProfilesEnvVar, "NATS_USER", "NATS_PASSWORD"} {
 		if _, sensitive := agentv1alpha1.SensitiveEnvVars[name]; !sensitive {
 			t.Errorf("%s is not in SensitiveEnvVars; the drop above covers plugin env only, and membership "+
 				"is what keeps the name out of the sidecar containers, which take spec.deployment.env "+
@@ -4157,6 +4181,20 @@ func TestAHandDeletedPairLeavesTheConsoleFenceToDriveTheFlip(t *testing.T) {
 		func(agent *agentv1alpha1.PlatformAgent) types.NamespacedName {
 			return types.NamespacedName{Name: a2aConsoleNetpolName(agent), Namespace: agent.Namespace}
 		}, nil)
+}
+
+// The MCP server's fence, under its flag, is the console fence's twin: a
+// hand-deleted NATS and session fence pair must leave it to drive the flip,
+// not behind.
+func TestAHandDeletedPairLeavesTheMCPFenceToDriveTheFlip(t *testing.T) {
+	t.Setenv(a2aMCPDoorEnvVar, "true")
+	handDeletedFenceFlip(t, false,
+		func(agent *agentv1alpha1.PlatformAgent) types.NamespacedName {
+			return types.NamespacedName{Name: a2aMCPNetpolName(agent), Namespace: agent.Namespace}
+		},
+		func(agent *agentv1alpha1.PlatformAgent) []types.NamespacedName {
+			return []types.NamespacedName{{Name: a2aConsoleNetpolName(agent), Namespace: agent.Namespace}}
+		})
 }
 
 // handDeletedFenceFlip refuses a next CR, deletes the NATS and session fences
@@ -5742,6 +5780,7 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 		"callout Deployment": buildA2ACalloutDeployment(agent).Spec.Template.Spec,
 		"agent pod":          buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{}).Spec,
 		"console Deployment": buildA2AConsoleDeployment(agent).Spec.Template.Spec,
+		"MCP Deployment":     buildA2AMCPDeployment(agent).Spec.Template.Spec,
 	} {
 		for _, ref := range a2aPodSpecEnvSecretRefs(spec) {
 			if ref.secret == credsSecret && (ref.key == a2aSysPasswordKey || ref.key == "*") {
@@ -7654,7 +7693,8 @@ func TestTheSessionFenceIsTheLastFenceTheTeardownDeletes(t *testing.T) {
 
 	// Without this the test passes vacuously on a list that lost its fences
 	// entirely, which is a worse bug than the one it is written to catch.
-	if want := 7; fences != want {
+	// 8 since the MCP server's fence (#3653), which sits above the console's.
+	if want := 8; fences != want {
 		t.Fatalf("the teardown walks %d NetworkPolicies, want %d — if a fence was added or removed, "+
 			"re-read the ordering argument above before changing this number", fences, want)
 	}
@@ -7862,5 +7902,51 @@ func TestGatewayRendersABlankPlatformAllowlistAsNobody(t *testing.T) {
 		if e.Value != "" || e.ValueFrom != nil {
 			t.Fatalf("%s = %+v, want rendered empty", name, e)
 		}
+	}
+}
+
+// TestTheGatewayAlwaysArmsTheConsoleDoor: every next gateway carries
+// A2A_CONSOLE_DOOR=true, backend or not. With no backend it is what lets the
+// gateway start (a2a/gateway/config.go); beside one it changes nothing, and
+// it means a backend taken away leaves a console-only gateway rather than a
+// crash loop. The name is spelled out so the test reads the gateway's
+// contract rather than the constant it checks.
+func TestTheGatewayAlwaysArmsTheConsoleDoor(t *testing.T) {
+	cases := []struct {
+		name   string
+		inject string
+		door   string
+		agent  func() *agentv1alpha1.PlatformAgent
+		// backendEnv is an env var the case's backend renders, so the case
+		// proves the backend is really there beside the console door.
+		backendEnv string
+	}{
+		// Discord has no case of its own: its env is an optional Secret
+		// reference rendered on every gateway, so it renders exactly as
+		// "no backend" does, which covers it.
+		{"no backend", "", "", a2aTestAgent, ""},
+		{"google chat", "", "", func() *agentv1alpha1.PlatformAgent { return gchatTestAgent("next", true) }, a2aGchatRelayURLEnvVar},
+		{"slack", "", "", func() *agentv1alpha1.PlatformAgent { return slackTestAgent("next", true) }, a2aSlackAppTokenEnvVar},
+		{"inject door", "true", "", a2aTestAgent, a2aInjectListenEnvVar},
+		{"a2a door", "", "true", a2aTestAgent, a2aDoorListenEnvVar},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(a2aInjectBackendEnvVar, tc.inject)
+			t.Setenv(a2aAgentDoorEnvVar, tc.door)
+			dep := buildA2AGatewayDeployment(tc.agent())
+			env := envMapOf(dep.Spec.Template.Spec.Containers[0].Env)
+			if got, ok := env["A2A_CONSOLE_DOOR"]; !ok || got.Value != "true" || got.ValueFrom != nil {
+				t.Errorf("A2A_CONSOLE_DOOR = %+v (set=%v), want the literal \"true\"", got, ok)
+			}
+			if tc.backendEnv != "" {
+				if _, ok := env[tc.backendEnv]; !ok {
+					t.Errorf("precondition: the %s backend's %s is not rendered", tc.name, tc.backendEnv)
+				}
+			}
+			if dep.Spec.Replicas != nil && *dep.Spec.Replicas != 1 {
+				t.Errorf("the render asks for %d replicas, want 1", *dep.Spec.Replicas)
+			}
+		})
 	}
 }

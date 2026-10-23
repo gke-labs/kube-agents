@@ -459,7 +459,8 @@ line each while they fit and, when it omits any, lists every filed id in a hidde
 `audit-findings-all` block.
 `every_finding_named: true` fails when a filed id is neither a finding heading nor a code span in
 the body a person reads. Collector-held ids, which the held span records in its own comment, are
-not graded. Above the block's 12,000-character cap the block is left out; the check then
+not graded. Nor are the ids under _Not re-checked this run_, which the held span records in a
+second comment, `<!-- audit-not-rechecked-ids: [...] -->`. Above the block's 12,000-character cap the block is left out; the check then
 fails on the renderer's omission notice instead.
 
 **`scope: finding_ids`.** Reach for it whenever the phrase is a **cluster** name. The rendered
@@ -467,12 +468,14 @@ body's Scope table enumerates every audited cluster on every run, so requiring `
 body would pass a run that swept the fleet and faulted nobody. The hidden
 `<!-- audit-findings: [...] -->` block carries the ids `audit_report.py` derived as
 `<check>.<cluster>.<namespace>.<object>`, so a name appears there only when a finding was actually
-filed against it. The same argument applies to any planted _object_ name that a clean inventory
+filed against it, by this run or a previous one: the block also lists the collector-held ids and,
+over a coverage gap, the ids of previous findings on a target the run did not check. The same argument applies to any planted _object_ name that a clean inventory
 table would also mention. On a body truncated for size the delta block lists only the findings the body names (in full or on one line), and the scope
 reads the `<!-- audit-findings-all: [...] -->` block the script adds there instead, so a filed
 finding that sorted last still counts. The script leaves that block out when it would exceed
 `ALL_FINDINGS_BLOCK_CAP` in `audit_report.py` (12,000 characters, roughly 160 ids of 70
-characters); past that only the named findings and the collector-held ids count, so a case
+characters); past that only the named findings, the collector-held ids and the not-re-checked
+ids count, so a case
 graded this way needs a fleet whose findings stay under it.
 
 **Credential.** A GitHub token in the verifier process's environment: `BENCH_GITHUB_TOKEN`

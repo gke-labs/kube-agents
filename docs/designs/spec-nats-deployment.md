@@ -289,7 +289,8 @@ client is handed so it can set its inbox prefix - is `platformagent_a2a_identiti
 before the callout those three lived in a config string, a Secret and a container env
 block with nothing but review connecting them. The one static block not in that file is
 the callout's own, rendered in the AUTH account template in
-`platformagent_a2a_manifests.go`.
+`platformagent_a2a_manifests.go` from `a2aCalloutConfIdentity` in
+`platformagent_a2a_confusers.go`.
 
 Those credentials belong in Secret data and nowhere else in the render: no rendered
 object name, label, or annotation may carry a password or a digest of one, truncated or
@@ -527,7 +528,10 @@ Layout:
   labels, the provision Job,
   and the hand-applied seed Job; **amended 10/6:** and the operator's own pod, by the
   `kubeagents.x-k8s.io/a2a-bus-client: operator` label from the operator's namespace,
-  which need not be the agent's), and ~~**no pod-network peer for 8222 or 9222**~~ **no
+  which need not be the agent's; **amended 10/22 (#3655):** and every pod in the
+  AgentProfile namespace `<agent-ns>-profiles`, matched by its name and the chart's
+  `app.kubernetes.io/component: profiles` label, admitted only once that namespace's own
+  fence (DNS, the bus and LiteLLM out, nothing in) is in place), and ~~**no pod-network peer for 8222 or 9222**~~ **no
   pod-network peer for 8222, and one for 9222: the console server (amended 9/24,
   below)**. The demo's
   `kubectl port-forward` and the kubelet's readiness probe both enter from the node,
@@ -589,6 +593,18 @@ Layout:
   the `console` password needed `get` on the creds Secret, and now `pods/portforward` to
   the console pod is enough, because `/config.json` hands the password to the page, and to
   any other process running locally while the forward is open.
+
+  **Amended 10/21 (#3653):** a second console client, the MCP server (`a2a/cmd/mcp`), under
+  the operator flag `A2A_MCP_DOOR=true` and only then. It runs in its own Deployment
+  (`<agent>-a2a-mcp`, from the console image) holding the `console` password, one key of the
+  creds Secret like the console's, and dials 4222 over TLS as `console`; the NATS fence
+  admits it on 4222 by label and never on 9222. It adds no principal and no grant: what an
+  MCP caller can do on the bus is what the console can. Callers authenticate to the server
+  with its own bearer token (`<agent>-a2a-mcp-token`, minted by the operator), never with a
+  bus credential, and reach it only through `kubectl port-forward`: the Service is ClusterIP
+  and the pod's ingress is deny-all. Reading the token needs `get` on that Secret, so the
+  access gate is the Secret's RBAC plus `pods/portforward`. That is a gate the console does
+  not have: its pod hands the password to whoever forwards to it.
 
 - **The notify route.** The agent's proactive posts to the chat home channel under `next`, and a
   kanban card's report back to the gateway conversation it was filed in

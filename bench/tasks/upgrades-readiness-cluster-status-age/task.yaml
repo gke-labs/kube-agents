@@ -1,0 +1,187 @@
+# A cluster whose status is not RUNNING is held by an operation (catalogue entry 24, a cluster held in a long reconcile).
+#
+# The rule reads a condition that cannot be planted on a healthy seeded cluster
+# (a status other than RUNNING needs a real operation in flight or wedged), so
+# this case does not grade a detection: it grades the rule's own entry for
+# every seeded cluster, in its "no finding" form, copied into a declared line;
+# the rule's unit tests (scripts/test_readiness_rules.py) carry the positive
+# detection on recorded inputs.
+#
+# Why the slot is the rule's text and not its values. The first form of this
+# case asked for the values the note carries (`status <STATUS>; newest
+# operation <id>; type <type>; started <time>; age <age>`), and on 2026-10-21
+# `main` 1093b74c5, which has no cluster-status-age rule, passed every
+# objective: the agent composed each line from `gcloud container operations
+# list` (`status RUNNING; newest operation operation-1792211331896-…; type
+# UPDATE_CLUSTER; started 2026-10-17T04:28:51Z; age 100h 21m 24s`), so the
+# case proved nothing about the rule. The slot is now the rule's entry copied
+# as printed from the readiness table's note column (behind
+# `cluster-status-age: `) or `readiness.notes` in the JSON: `status RUNNING;
+# newest operation <id> (<type>, <status>, started <time>, <age> ago)`
+# (RUNNING_NOTE_FORMAT and NEWEST_FORMAT in
+# scripts/readiness_rules/cluster_status_age.py), `status RUNNING; no
+# operation of this cluster or its node pools is listed`
+# (RUNNING_NO_OPERATION_NOTE), the under-threshold note for a reconcile in
+# progress (UNDER_THRESHOLD_NOTE_FORMAT) or the settled `status RUNNING now
+# (...)` note (SETTLED_RUNNING_NOTE_FORMAT). That wording is the rule's alone:
+# no gcloud output carries it, the skill's text paraphrases it, and a report
+# whose rule is missing prints no such entry, so the slot reads `none` or a
+# composed line and fails. The prompt asks for one declared line per seeded
+# cluster in that form; the deterministic objectives read those lines and
+# nothing else, the prose is the judge's.
+#
+# The patterns name the slots through `{cluster:<slot>}`, which the verifier
+# expands to the cluster the runner recorded for the slot, so a fleet applied
+# with another prefix is graded on its own names.
+#
+# Isolation class: read-only (chat prompt; the script reads with gcloud
+# container, gcloud compute and kubectl get and writes only its own record and
+# per-member kubeconfig files). Eligible tier: nightly from its first merge.
+#
+# No deterministic mutation safeguard, documented: nothing is planted for this
+# case; the four roles below stand for their slots, so the declared-line
+# objectives can tell a cluster the agent missed from a cluster the project
+# does not have. No `worker_commands` objective either: it reads delegated
+# workers' terminals only and errors on a run the router answered itself, so
+# the report's own output is graded through the declared lines instead.
+id: upgrades-readiness-cluster-status-age
+name: Upgrade readiness names the operation that holds a cluster, and its age, on every cluster
+
+prompt: >-
+  For every cluster in this project, run the upgrade readiness check against
+  each cluster's release channel default and include, per cluster, its status,
+  the newest GKE operation the report found on it and how long ago that
+  operation started, as the cluster-status-age rule states them: the rule's
+  entry for the cluster in the readiness table's note column (the text behind
+  `cluster-status-age: `) or in `readiness.notes` of the report's JSON, which
+  names the status and the newest operation (its id, type, status, start time
+  and age) or says that no operation of the cluster is listed; a cluster not
+  RUNNING for more than four hours is that rule's blocker in the other
+  blockers column, naming the operation that holds it. Read only; change and
+  upgrade nothing. A member may be blocked or carry risks from other rules on
+  the same report; the slot is about this rule only. End your answer with one
+  line per seeded cluster in exactly this form, no other words on the line:
+  "<cluster>: cluster-status-age: <the rule's note for that cluster, copied as
+  printed|none>". Copy the text from the report's note column (or its other
+  blockers column, for a held cluster) or the JSON, not a paraphrase and not
+  values you composed from gcloud; a cluster the rule prints nothing for reads
+  none.
+
+expected_output: >-
+  The version table and the readiness table read during this run, with every
+  seeded cluster RUNNING, or RECONCILING on an operation younger than four
+  hours during the fleet's 03:00 UTC maintenance window, and its newest
+  operation named from the report: the operation id, its type (an
+  UPGRADE_MASTER, UPGRADE_NODES, UPDATE_CLUSTER or similar), its status, its
+  start time and its age. The answer says what a status other than RUNNING for
+  hours would mean (no change can be applied; freeze changes and, past a few
+  hours, open a support case quoting the operation id) and that no cluster is
+  in that state. It ends with the declared lines, each carrying the rule's
+  note copied from the report: "cluster-status-age: status RUNNING; newest
+  operation <id> (<type>, <status>, started <time>, <age> ago)", or
+  "cluster-status-age: status RUNNING; no operation of this cluster or its
+  node pools is listed" for a cluster with no operation in the project's list,
+  or the rule's under-threshold note for a cluster reconciling inside its
+  window. It cites no CVE identifiers and performs no upgrade.
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+# No planted defect is read: the four roles are one per slot, and they are how the
+# declared-line objectives tell a cluster the agent missed from a cluster the
+# project does not have.
+fixtures:
+  - crashloop-workload
+  - version-laggard
+  - drift-outlier
+  - zonal-skew-scheduling
+
+verification_spec:
+  # One line per seeded cluster, fixed vocabulary, the cluster named at the
+  # start of the line; every pattern matches the whole declared frame, anchored
+  # at both ends, with the line's decoration folded first.
+  # The frame every cluster must satisfy: the rule id and a cell.
+  - name: every-seeded-cluster-has-a-declared-line
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: cluster-status-age: [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: cluster-status-age: [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: cluster-status-age: [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: cluster-status-age: [^\n]+$)'
+  # The rule's own wording, in whichever of its "no finding" forms the fleet
+  # produces: `status RUNNING; newest operation <id> (<type>, <status>, started
+  # <time>, <age> ago)`, `status RUNNING; no operation of this cluster or its
+  # node pools is listed`, the settled `status RUNNING now (<status> at list
+  # time; newest operation ...)`, or the under-threshold `status <STATUS> for
+  # <age> on <id> (<type>, RUNNING since <time>); under the 4h threshold a
+  # reconcile in progress is not a blocker`. The operation's parenthesis, its
+  # `(<type>, <status>, started <time>, <age> ago)`, is what no gcloud output
+  # prints and what the composed line `main` produced on 2026-10-21 (`newest
+  # operation <id>; type <type>; started <time>; age <age>`) lacks, so that
+  # line fails the forbidden pattern. The table's `cluster-status-age: ` prefix
+  # is optional (report.json carries the bare text); one opener before the text
+  # (a quote or angle bracket the agent kept) is admitted, since the cell's `;`
+  # keeps the verifier's value-wrap fold from removing it. The fold strips a
+  # closing parenthesis at the end of a line, so the trailing `)` is optional;
+  # an inner underscore (`UPDATE_CLUSTER`) folds to a hyphen; the whole line is
+  # lower-cased.
+  - name: the-declared-lines-quote-the-rules-note
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: cluster-status-age: ["''“‘<]?(?:cluster-status-age: )?(?:status running; newest operation operation-\d+-[0-9a-f-]+ \([a-z0-9-]+(?: on [a-z0-9-]+)?, [a-z-]+, started \d{4}-\d{2}-\d{2}t[0-9:.]+z, (?:under a minute|\d+[dhm](?: ?\d+[hm])?) ago\)?|status running; no operation of this cluster or its node pools is listed|status running now \([a-z-]+ at list time; newest operation (?:operation-\d+-[0-9a-f-]+ \([a-z0-9-]+(?: on [a-z0-9-]+)?, [a-z-]+, started \d{4}-\d{2}-\d{2}t[0-9:.]+z, (?:under a minute|\d+[dhm](?: ?\d+[hm])?) ago\)?|none listed)\)?|status [a-z-]+ for (?:under a minute|\d+[dhm](?: ?\d+[hm])?) on operation-\d+-[0-9a-f-]+ \([a-z0-9-]+(?: on [a-z0-9-]+)?, running since \d{4}-\d{2}-\d{2}t[0-9:.]+z\); under the \d+[dhm](?: ?\d+[hm])? threshold a reconcile in progress is not a blocker)$'
+      forbidden_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: cluster-status-age: (?!["''“‘<]?(?:cluster-status-age: )?(?:status running; newest operation operation-\d+-[0-9a-f-]+ \([a-z0-9-]+(?: on [a-z0-9-]+)?, [a-z-]+, started \d{4}-\d{2}-\d{2}t[0-9:.]+z, (?:under a minute|\d+[dhm](?: ?\d+[hm])?) ago\)?|status running; no operation of this cluster or its node pools is listed|status running now \([a-z-]+ at list time; newest operation (?:operation-\d+-[0-9a-f-]+ \([a-z0-9-]+(?: on [a-z0-9-]+)?, [a-z-]+, started \d{4}-\d{2}-\d{2}t[0-9:.]+z, (?:under a minute|\d+[dhm](?: ?\d+[hm])?) ago\)?|none listed)\)?|status [a-z-]+ for (?:under a minute|\d+[dhm](?: ?\d+[hm])?) on operation-\d+-[0-9a-f-]+ \([a-z0-9-]+(?: on [a-z0-9-]+)?, running since \d{4}-\d{2}-\d{2}t[0-9:.]+z\); under the \d+[dhm](?: ?\d+[hm])? threshold a reconcile in progress is not a blocker)$)[^\n]*$'
+  # RUNNING on every seeded cluster outside its maintenance window; inside it (03:00 UTC,
+  # four hours) a cluster under a patch roll is RECONCILING on an operation younger than
+  # the threshold, which the rule's note says in its own verdict (`under the 4h threshold
+  # a reconcile in progress is not a blocker`). What no line may carry is the blocker
+  # form: a cluster held past the threshold, or not RUNNING with nothing running on it.
+  # Any other status in the slot is a wrong read or a cell that is not the rule's.
+  - name: the-declared-lines-say-every-cluster-is-running-or-reconciling-under-the-threshold
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: cluster-status-age: ["''“‘<]?(?:cluster-status-age: )?status running(?:;| now \()[^\n]*$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: cluster-status-age: ["''“‘<]?(?:cluster-status-age: )?status [a-z-]+ for [^;\n]+; under the \d+[dhm](?: ?\d+[hm])? threshold a reconcile in progress is not a blocker$'
+      forbidden_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: cluster-status-age: (?!["''“‘<]?(?:cluster-status-age: )?status running(?:;| now \())(?!["''“‘<]?(?:cluster-status-age: )?status [a-z-]+ for [^;\n]+; under the \d+[dhm](?: ?\d+[hm])? threshold a reconcile in progress is not a blocker$)[^\n]*$'
+        - 'has been (?:reconciling|degraded|error|provisioning|stopping) for [^\n]*past the \d+[dhm](?: ?\d+[hm])? threshold'
+        - "is (?:reconciling|degraded|error|provisioning|stopping) with no operation running on it or its node pools"
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # No vulnerability feed; a CVE id in a readiness report is an invention.
+      forbidden_phrases: ["CVE-"]

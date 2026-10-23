@@ -359,3 +359,18 @@ func finalText(task *lib.Task) string {
 	}
 	return task.FinalMessage.Parts[0].Text
 }
+
+// No gateway reads a delegate request's parameters yet, so the adapter
+// refuses any rather than publish a request whose child would be minted
+// without the target it asked for. One without parameters goes as before.
+func TestValidateDelegateRefusesParametersUntilAGatewayReadsThem(t *testing.T) {
+	plain := lib.DelegateRequest{Addressee: "cluster", Text: "check web-1"}
+	if got := validateDelegate(plain); got != "" {
+		t.Fatalf("a request without parameters was refused: %s", got)
+	}
+	with := plain
+	with.Parameters = map[string]string{"cluster": "web-1"}
+	if got := validateDelegate(with); got != delegateParametersNotYet {
+		t.Fatalf("a request with parameters = %q, want the not-yet refusal", got)
+	}
+}

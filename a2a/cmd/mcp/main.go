@@ -1,0 +1,226 @@
+// The a2a MCP server: a Model Context Protocol endpoint for one `next`
+// install, as a console client of its bus. The operator renders it in its own
+// Deployment only when the install opts in, behind a ClusterIP Service, and a
+// person reaches it with kubectl port-forward. See package mcp.
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/gke-labs/kube-agents/a2a/mcp"
+)
+
+const (
+	exitFailure = 1
+
+	envListen       = "MCP_LISTEN"
+	envTokenFile    = "MCP_TOKEN_FILE"
+	envBusURL       = "NATS_URL"
+	envBusUser      = "MCP_BUS_USER"
+	envPasswordFile = "MCP_BUS_PASSWORD_FILE"
+	envAgent        = "MCP_AGENT_NAME"
+	envNamespace    = "MCP_NAMESPACE"
+	envCluster      = "MCP_CLUSTER_NAME"
+
+	defaultListen       = ":8089"
+	defaultTokenFile    = "/var/run/secrets/a2a-mcp/token"
+	defaultBusUser      = "console"
+	defaultPasswordFile = "/var/run/secrets/a2a-mcp-bus/console-password" // #nosec G101 -- a path, not a credential
+
+	networkTCP = "tcp"
+	busScheme  = "tls://"
+	// lineEndings are trimmed off the password file; a Secret written with
+	// `kubectl create secret --from-file` keeps the trailing newline.
+	lineEndings = "\r\n"
+
+	readHeaderTimeout = 10 * time.Second
+	idleTimeout       = 60 * time.Second
+	// writeTimeout bounds one response. Every answer here is one JSON
+	// document, and the slowest, connection_status, bounds its own read
+	// (mcp.statusTimeout); a streamed answer, if a later tool adds one,
+	// has to revisit this.
+	writeTimeout = 30 * time.Second
+	// shutdownGrace is how long a stop waits for the requests in flight,
+	// whose contexts the stop has already ended (serve), so a stop is a
+	// clean drain well inside the pod's default 30 s termination grace.
+	shutdownGrace = 10 * time.Second
+	// dialTimeout bounds one attempt at the first connect to the bus.
+	dialTimeout = 30 * time.Second
+	// The first connect is retried, from dialBackoff doubling to
+	// maxDialBackoff, rather than exiting: on a fresh install the bus comes
+	// up after this pod, and a crash loop says nothing a log line does not.
+	// The pod's startup probe bounds how long it may retry before it is
+	// restarted.
+	dialBackoff    = time.Second
+	maxDialBackoff = 30 * time.Second
+)
+
+func main() {
+	os.Exit(run())
+}
+
+func run() int {
+	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	slog.SetDefault(log)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := realMain(ctx, log, os.Getenv); err != nil {
+		return exitFailure
+	}
+	return 0
+}
+
+type settings struct {
+	listen    string
+	tokenFile string
+	bus       mcp.BusConfig
+}
+
+// configFromEnv reads the settings and the bus password. The token file is
+// checked here too, so a pod without one fails at start, visibly, rather
+// than serving 401s to everyone.
+func configFromEnv(getenv func(string) string) (settings, error) {
+	or := func(key, def string) string {
+		if v := strings.TrimSpace(getenv(key)); v != "" {
+			return v
+		}
+		return def
+	}
+	url := strings.TrimSpace(getenv(envBusURL))
+	if url == "" {
+		return settings{}, fmt.Errorf("%s is required", envBusURL)
+	}
+	// TLS by construction: the server sends the console password at
+	// connect, so a plaintext URL is refused rather than left to the bus to
+	// upgrade.
+	if !strings.HasPrefix(url, busScheme) {
+		return settings{}, fmt.Errorf("%s must be a %s URL, got %q", envBusURL, busScheme, url)
+	}
+	tokenFile := or(envTokenFile, defaultTokenFile)
+	if _, err := mcp.ReadToken(tokenFile); err != nil {
+		return settings{}, fmt.Errorf("%s: %w", envTokenFile, err)
+	}
+	passwordFile := or(envPasswordFile, defaultPasswordFile)
+	raw, err := os.ReadFile(passwordFile)
+	if err != nil {
+		return settings{}, fmt.Errorf("%s: %w", envPasswordFile, err)
+	}
+	password := strings.TrimRight(string(raw), lineEndings)
+	if password == "" {
+		return settings{}, fmt.Errorf("%s: %s is empty", envPasswordFile, passwordFile)
+	}
+	return settings{
+		listen:    or(envListen, defaultListen),
+		tokenFile: tokenFile,
+		bus: mcp.BusConfig{
+			URL:          url,
+			User:         or(envBusUser, defaultBusUser),
+			Password:     password,
+			PasswordFile: passwordFile,
+			Deployment: mcp.Deployment{
+				Agent:     getenv(envAgent),
+				Namespace: getenv(envNamespace),
+				Cluster:   getenv(envCluster),
+			},
+		},
+	}, nil
+}
+
+func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string) error {
+	s, err := configFromEnv(getenv)
+	if err != nil {
+		log.Error("mcp config", "err", err)
+		return err
+	}
+	s.bus.Logger = log
+	bus, err := dialWithRetry(ctx, log, dialBackoff, func(ctx context.Context) (*mcp.NATSBus, error) {
+		dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
+		defer cancel()
+		return mcp.DialBus(dialCtx, s.bus)
+	})
+	if err != nil {
+		// Stopped while still waiting for the bus (a rollout or a drain
+		// during an outage): a clean stop, as serve treats one.
+		if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+			log.Info("stopped before the bus was reachable")
+			return nil
+		}
+		log.Error("mcp bus", "err", err)
+		return err
+	}
+	defer bus.Close()
+	srv, err := mcp.NewServer(mcp.ConnectionStatusTool(bus))
+	if err != nil {
+		log.Error("mcp server", "err", err)
+		return err
+	}
+	ln, err := net.Listen(networkTCP, s.listen)
+	if err != nil {
+		log.Error("mcp listen", "addr", s.listen, "err", err)
+		return err
+	}
+	return serve(ctx, log, ln, mcp.Handler(srv, s.tokenFile, log))
+}
+
+// dialWithRetry calls dial until it succeeds, the bus refuses it for good
+// (mcp.DialRefused), or ctx is done, waiting backoff after the first failure
+// and doubling it to maxDialBackoff, and logs each failure with the wait
+// before the next attempt.
+func dialWithRetry[B any](ctx context.Context, log *slog.Logger, backoff time.Duration, dial func(context.Context) (B, error)) (B, error) {
+	for {
+		b, err := dial(ctx)
+		if err == nil {
+			return b, nil
+		}
+		// A refused credential or an untrusted certificate is no transient:
+		// fail now, under its own cause, so the pod restarts with that in its
+		// log rather than retrying for minutes as "not reachable yet".
+		if mcp.DialRefused(err) {
+			var zero B
+			return zero, fmt.Errorf("the bus refused the connection (check the console credential and the bus CA): %w", err)
+		}
+		log.Warn("the bus is not reachable yet; retrying", "in", backoff, "err", err)
+		select {
+		case <-ctx.Done():
+			var zero B
+			return zero, ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff = min(2*backoff, maxDialBackoff)
+	}
+}
+
+// serve runs until ctx is done or the server fails. Every request's context
+// derives from ctx, so a stop ends the requests in flight rather than waiting
+// them out past shutdownGrace.
+func serve(ctx context.Context, log *slog.Logger, ln net.Listener, h http.Handler) error {
+	srv := &http.Server{Handler: h, ReadHeaderTimeout: readHeaderTimeout, IdleTimeout: idleTimeout, WriteTimeout: writeTimeout,
+		BaseContext: func(net.Listener) context.Context { return ctx }}
+	errc := make(chan error, 1)
+	go func() { errc <- srv.Serve(ln) }()
+	log.Info("mcp serving", "addr", ln.Addr().String(), "path", mcp.Path)
+
+	select {
+	case err := <-errc:
+		log.Error("mcp server stopped", "err", err)
+		return err
+	case <-ctx.Done():
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Error("mcp shutdown", "err", err)
+		return err
+	}
+	return nil
+}

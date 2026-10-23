@@ -427,8 +427,8 @@ does, is itself a finding.
 ### Phase 3 — Find the candidates and verify them
 
 Run `$MAIN_ROOT/.agents/skills/review-adversarial/SKILL.md`. It is the repository's review method
-and the canonical home for the ten angles and the verification discipline; read it now and work it
-in order — intent, angles A–J, then the verification step, which is not optional.
+and the canonical home for the eleven angles and the verification discipline; read it now and work
+it in order — intent, angles A–K, then the verification step, which is not optional.
 
 Its step 1 is already satisfied: you are a subagent that did not write this change, which is the
 separation it asks for. Do not spawn another one. Start at its step 2.

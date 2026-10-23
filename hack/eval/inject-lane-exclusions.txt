@@ -15,13 +15,15 @@
 # only under AGENT_TRANSPORT=inject, drops the named cases from TASKS before the fan-out
 # and says so in the log; on the api transport the file changes nothing,
 # and the api lane's rosters (presubmit-cases.txt, blocking-roster.txt,
-# nightly-cases.txt) are untouched -- an entry here is not a demotion. The
+# nightly-cases.txt) are untouched -- an entry here is not a demotion, and
+# the case still runs every night on ci-kube-agents-eval-nightly-today, the
+# nightly that grades spec.mode today. The
 # same shape as the validator's FIXTURE_NOT_READY: an exclusion with a
 # reason, not a marker on the case (docs/eval-gate-roster.md, "The inject
 # lane").
 #
 # What does NOT belong here: a case whose only problem on the inject lane is
-# a `worker_commands` or `worker_agents` check, or a `tool_called` check on
+# a `worker_commands`, `worker_agents` or `worker_budget` check, or a `tool_called` check on
 # a door that shows no tool-call trace. The scorer sets such a check aside
 # as not applicable on that transport and grades the rest, so the case
 # still runs and still reports (docs/designs/eval-scorer.md). An entry here

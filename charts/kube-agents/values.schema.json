@@ -301,6 +301,13 @@
               }
             }
           }
+        },
+        "traceLogEnabled": {
+          "type": "boolean"
+        },
+        "traceLogPath": {
+          "type": "string",
+          "pattern": "^/tmp/([^\\x00/]*[^\\x00/.][^\\x00/]*/)*[^\\x00/]*[^\\x00/.][^\\x00/]*$"
         }
       }
     },
@@ -705,6 +712,22 @@
                   "minimum": 1,
                   "maximum": 10000
                 },
+                "profiles": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "ceiling": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 1000
+                    },
+                    "warmReplicas": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 100
+                    }
+                  }
+                },
                 "default": {
                   "type": "object"
                 },
@@ -820,6 +843,9 @@
                   "type": ["string", "integer"]
                 }
               }
+            },
+            "agentProfileTimeout": {
+              "type": "string"
             },
             "timeout": {
               "type": "string"
@@ -1096,6 +1122,44 @@
                 "enabled": {
                   "type": "boolean"
                 },
+                "botTokenSecretRef": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "maxLength": 253,
+                      "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+                    },
+                    "key": {
+                      "type": "string",
+                      "maxLength": 253,
+                      "pattern": "^$|^[-._a-zA-Z0-9]+$",
+                      "not": {
+                        "pattern": "^\\.$|^\\.\\."
+                      }
+                    }
+                  }
+                },
+                "appTokenSecretRef": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "maxLength": 253,
+                      "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+                    },
+                    "key": {
+                      "type": "string",
+                      "maxLength": 253,
+                      "pattern": "^$|^[-._a-zA-Z0-9]+$",
+                      "not": {
+                        "pattern": "^\\.$|^\\.\\."
+                      }
+                    }
+                  }
+                },
                 "allowedUsers": {
                   "type": "array",
                   "items": {
@@ -1116,6 +1180,44 @@
               "properties": {
                 "enabled": {
                   "type": "boolean"
+                },
+                "appIdSecretRef": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "maxLength": 253,
+                      "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+                    },
+                    "key": {
+                      "type": "string",
+                      "maxLength": 253,
+                      "pattern": "^$|^[-._a-zA-Z0-9]+$",
+                      "not": {
+                        "pattern": "^\\.$|^\\.\\."
+                      }
+                    }
+                  }
+                },
+                "appPasswordSecretRef": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "maxLength": 253,
+                      "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+                    },
+                    "key": {
+                      "type": "string",
+                      "maxLength": 253,
+                      "pattern": "^$|^[-._a-zA-Z0-9]+$",
+                      "not": {
+                        "pattern": "^\\.$|^\\.\\."
+                      }
+                    }
+                  }
                 },
                 "tenantId": {
                   "type": "string"
@@ -1234,6 +1336,129 @@
                 },
                 "thresholdWindowSeconds": {
                   "type": "integer"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "profiles": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tse": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "description": {
+              "type": "string"
+            },
+            "persona": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "image": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "repository": {
+                      "type": "string"
+                    },
+                    "tag": {
+                      "type": ["string", "integer"]
+                    }
+                  }
+                }
+              }
+            },
+            "harness": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "image": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "repository": {
+                      "type": "string"
+                    },
+                    "tag": {
+                      "type": ["string", "integer"]
+                    }
+                  }
+                },
+                "model": {
+                  "type": "string"
+                },
+                "maxTurns": {
+                  "type": "integer"
+                }
+              }
+            },
+            "bus": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "publishTopics": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "subscribeTopics": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "lifecycle": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "activeDeadlineSeconds": {
+                  "type": "integer"
+                },
+                "ttlSecondsAfterFinished": {
+                  "type": "integer"
+                }
+              }
+            },
+            "concurrency": {
+              "type": "integer"
+            },
+            "resources": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "requests": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "cpu": {
+                      "type": ["string", "number"]
+                    },
+                    "memory": {
+                      "type": ["string", "number"]
+                    }
+                  }
+                },
+                "limits": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "cpu": {
+                      "type": ["string", "number"]
+                    },
+                    "memory": {
+                      "type": ["string", "number"]
+                    }
+                  }
                 }
               }
             }

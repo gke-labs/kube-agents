@@ -172,7 +172,8 @@ var SensitiveEnvVars = map[string]struct{}{
 	// gateway conversation a card was filed in, on the same route, and names
 	// the platform in the cron relay's refusal when no home channel is set.
 	// The operator renders it exactly when the gateway arms the route.
-	"A2A_NOTIFY_CONVERSATIONS": {},
+	"A2A_NOTIFY_CONVERSATIONS":     {},
+	"KUBE_AGENTS_ENABLED_PROFILES": {},
 	// NATS_CA_FILE names the CA the client trusts the bus by. An override is
 	// the TLS half of a redirected NATS_URL: pointed at a CA of the setter's
 	// choosing, the client accepts a server that CA signed as the bus, and
@@ -827,7 +828,40 @@ type TuningSpec struct {
 	// +kubebuilder:validation:Maximum=10000
 	// +optional
 	MaxSessions *int `json:"maxSessions,omitempty"`
+
+	// Profiles sizes AgentProfile work (#3655): the install-wide ceiling on
+	// concurrent profile tasks and the warm workers kept per interactive
+	// (profile, tier). Until the sizing budget exists these are fixed,
+	// conservative defaults.
+	// +optional
+	Profiles *ProfileTuning `json:"profiles,omitempty"`
 }
+
+// ProfileTuning carries the AgentProfile knobs on the PlatformAgent.
+type ProfileTuning struct {
+	// Ceiling is the most profile tasks running at once across every profile
+	// on the install. The dispatcher enforces it, reserving max(1,
+	// ceil(Ceiling/3)) of it for interactive tiers so unattended work can't
+	// starve people, and the profile namespace's pod quota is derived from it.
+	// Absent means DefaultProfileCeiling.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=1000
+	// +optional
+	Ceiling *int `json:"ceiling,omitempty"`
+
+	// WarmReplicas is how many warm worker pods each interactive (profile,
+	// tier) keeps running. Absent means DefaultProfileWarmReplicas.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	// +optional
+	WarmReplicas *int `json:"warmReplicas,omitempty"`
+}
+
+// The ProfileTuning defaults.
+const (
+	DefaultProfileCeiling      = 8
+	DefaultProfileWarmReplicas = 1
+)
 
 // AgentLimits bounds a single agent run. Both limits exist because they fail the same
 // way — the run stops mid-task without calling a terminal kanban tool, which the
@@ -2313,6 +2347,40 @@ type AgentUsageStatus struct {
 	// LastActiveTime: a card giving up is not the agent at work.
 	// +optional
 	BackgroundTasksGaveUpTotal int64 `json:"backgroundTasksGaveUpTotal,omitempty"`
+	// NegativeFeedbackTotal is the cumulative count of thumbs-down reactions
+	// put on one of the bot's Slack messages: the chat_feedback_reactions hook
+	// on the Hermes gateway counts a -1 or thumbsdown reaction, skin tone or
+	// not, whose reactor is not the bot and whose message is the bot's, once
+	// per reactor and message within one gateway process (a thumbs-down taken
+	// off and put back is one; after a restart the same one counts again, and
+	// a reaction before the first inbound message after a start is not
+	// counted), into the
+	// chat_metrics plugin's kubeagents_chat_feedback_negative_total, which is
+	// read every five minutes and kept monotonic the same way as
+	// ToolExecutionsTotal. Slack through the Hermes gateway only: Google Chat
+	// delivers no reaction events, and the A2A gateway's Slack adapter does not
+	// subscribe to them, so on a next-mode install with Slack through A2A this
+	// stays at 0. Does not move LastActiveTime: the message the person
+	// reacted to already did.
+	// +optional
+	NegativeFeedbackTotal int64 `json:"negativeFeedbackTotal,omitempty"`
+	// RemediationsClosedUnmergedTotal is the cumulative count of proposals
+	// this install opened that the forge reported closed without a merge, by
+	// a person, a forge rule or a bot; a close the broker made itself, the
+	// fleet audit tidying a stale proposal, is not counted. The broker counts
+	// each once per broker process when one of its own reads, proposal-list
+	// or proposal-view, shows it closed, under the rules
+	// RemediationsMergedTotal uses: the author is the credential's login, the
+	// close is not before the process started, each proposal once. Read from the broker's
+	// kubeagents_vcs_proposals_closed_unmerged_total every five minutes and
+	// kept monotonic the same way as ToolExecutionsTotal. A close no read
+	// shows is not counted, so it under-counts; a proposal closed, reopened
+	// and merged counts here and in RemediationsMergedTotal once each. A high
+	// share of this against RemediationsMergedTotal says the agent's proposals
+	// are being rejected. Does not move LastActiveTime: a close is not the
+	// agent at work.
+	// +optional
+	RemediationsClosedUnmergedTotal int64 `json:"remediationsClosedUnmergedTotal,omitempty"`
 
 	// ClustersRegistered is the number of clusters the event watcher built a
 	// client for at its last start: the management cluster and the Cluster
@@ -2359,8 +2427,9 @@ type AgentUsageStatus struct {
 	// LastActiveTime is the time of the last poll in which a counter above
 	// moved: a brokered command ran or was refused, a proposal was opened or
 	// merged, a chat message reached the gateway, or an event was accepted
-	// for triage; BrokerFailuresTotal, ChatTurnsErroredTotal and BackgroundTasksGaveUpTotal
-	// alone leave it where it was.
+	// for triage; BrokerFailuresTotal, ChatTurnsErroredTotal,
+	// BackgroundTasksGaveUpTotal, NegativeFeedbackTotal and
+	// RemediationsClosedUnmergedTotal alone leave it where it was.
 	// Scheduled maintenance jobs that run brokered commands move it too --
 	// the Controller Stall Watch cron runs some every 30 minutes by default
 	// -- so it marks agent activity of any origin, not human or operator use
@@ -2375,7 +2444,8 @@ type AgentUsageStatus struct {
 	// so an unlisted sender is still a person. Nothing else moves it. Brokered
 	// commands and accepted events come from the stall-watch cron and the
 	// event watcher on their own, proposals from the fleet audits, which open
-	// them with nobody asking, and a merge can be a forge rule; all of those
+	// them with nobody asking, and a merge or a close can be a forge rule or
+	// a bot; all of those
 	// move LastActiveTime and leave this alone, so an install nobody has
 	// talked to in a month shows it. Absent until a person has sent a message
 	// since the operator that writes it started. Advances at most once per

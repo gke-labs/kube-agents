@@ -51,7 +51,7 @@ SCAN_MARKER = ".bootstrap_scan_filed"
 CLUSTER_KEY_PREFIX = "bootstrap-inventory-cluster-"
 
 # agents/platform/scripts/cluster_agent_profile.py: RESERVED_PROFILES.
-RESERVED_PROFILES = ("default", "platform")
+RESERVED_PROFILES = ("default", "platform", "tse")
 
 # profile_scaffold.PROFILE_MARKER and cluster_agent_reconcile.SCAFFOLD_ARTIFACTS:
 # a profile missing either is one the gate leaves out of Step 2, as
@@ -94,7 +94,7 @@ except ImportError:
 profiles = os.path.join(ROOT, "profiles")
 names = sorted(
     n for n in (os.listdir(profiles) if os.path.isdir(profiles) else [])
-    if n not in RESERVED and os.path.isdir(os.path.join(profiles, n))
+    if not n.startswith(".") and n not in RESERVED and os.path.isdir(os.path.join(profiles, n))
 )
 for name in names:
     if not all(os.path.isfile(os.path.join(profiles, name, f)) for f in READY.split(",")):
