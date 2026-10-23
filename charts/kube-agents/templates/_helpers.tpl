@@ -190,12 +190,19 @@ object it cannot apply. helm template alone has no cluster to ask: pass
 render, or --validate to ask the cluster the kubeconfig points at.
 */}}
 {{- define "kube-agents.platformAgentPodMonitoring" -}}
-{{- $explicit := .Values.platformAgent.podMonitoring -}}
-{{- if kindIs "invalid" $explicit -}}
+{{- include "kube-agents.podMonitoringTriState" (dict "explicit" .Values.platformAgent.podMonitoring "Capabilities" .Capabilities) -}}
+{{- end }}
+
+{{/*
+The tri-state behind every PodMonitoring knob: null follows the cluster, true
+and false decide. Takes a dict with "explicit" (the value) and "Capabilities".
+*/}}
+{{- define "kube-agents.podMonitoringTriState" -}}
+{{- if kindIs "invalid" .explicit -}}
 {{- if .Capabilities.APIVersions.Has "monitoring.googleapis.com/v1/PodMonitoring" -}}
 true
 {{- end -}}
-{{- else if $explicit -}}
+{{- else if .explicit -}}
 true
 {{- end -}}
 {{- end }}
@@ -910,6 +917,27 @@ selectors are immutable once the Deployment exists.
 {{- define "kube-agents.operatorSelectorLabels" -}}
 app.kubernetes.io/name: {{ .Chart.Name }}-operator
 app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{/*
+Whether the operator's PodMonitoring renders: the same tri-state as
+platformAgent.podMonitoring (null follows the cluster, true and false decide),
+and only while the manager serves metrics at all.
+*/}}
+{{- define "kube-agents.operatorPodMonitoring" -}}
+{{- $metrics := .Values.operator.metrics | default dict -}}
+{{- if $metrics.enabled -}}
+{{- include "kube-agents.podMonitoringTriState" (dict "explicit" $metrics.podMonitoring "Capabilities" .Capabilities) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+The manager's metrics port: the bind flag, the containerPort, the
+PodMonitoring endpoint and the NetworkPolicy rule read it here;
+tests/test_chart_operator_monitoring.py holds them together.
+*/}}
+{{- define "kube-agents.operatorMetricsPort" -}}
+8080
 {{- end }}
 
 {{/*

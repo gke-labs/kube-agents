@@ -1008,6 +1008,7 @@ those a scheduled job runs -- the Controller Stall Watch cron issues some every 
 default -- so a recent `lastActiveTime` is not evidence that a person used the agent; `lastHumanActiveTime` is. The counters the table above marks as unwritten stay absent until a
 series exists for each
 ([what lands them](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/usage-counters-producer.md#what-stays-unwritten-and-what-lands-it)).
+The operator also serves every counter, cluster gauge and time of this block, and `status.phase`, as Prometheus gauges on its own metrics port, so a collector reads them without a query against the status; the series are on [Observability](/kube-agents/concepts/observability/#prometheus-metrics).
 
 `usage.activeInterfaces` is `dashboard` unless `harness.hermes.dashboardEnabled` is `false`, plus
 `googlechat`, `slack` and `teams` for each `integration` entry with `enabled: true`. It is resolved

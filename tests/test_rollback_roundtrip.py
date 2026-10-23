@@ -1474,8 +1474,12 @@ class NamesMatchTheOperatorTest(unittest.TestCase):
         text = _CONTROLLER.read_text()
         for reason in c["CR_REFUSAL_REASONS"].split():
             self.assertIn(f'"{reason}"', text + _A2A_MANIFESTS.read_text(), reason)
-        self.assertIn('newPhase = "Ready"', text)
-        self.assertIn('newPhase = "Degraded"', text)
+        # The phases are constants the usage gauges' vocabulary shares
+        # (usage_gauges.go); the words themselves are in the declarations.
+        self.assertIn("newPhase = readyPhase", text)
+        self.assertIn("newPhase = degradedPhase", text)
+        self.assertRegex(text, r'readyPhase\s+= "Ready"')
+        self.assertRegex(text, r'degradedPhase\s+= "Degraded"')
 
 
 def ci_eval_function(name: str) -> str:

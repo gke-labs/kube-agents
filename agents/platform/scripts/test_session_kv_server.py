@@ -64,6 +64,37 @@ import chat_notify
 import session_kv_server
 from session_kv_server import clean_workload_name, clean_reason_label, clean_event_message, get_severity_details
 
+
+class ParkedTriagePool:
+    """Stands in for the triage start pool: holds each start until a test runs it.
+
+    The inject routes queue a real start, and a real pool would retry against
+    whatever answers on 127.0.0.1:8642 for minutes after the test ended.
+    """
+
+    def __init__(self):
+        self.starts = []
+
+    def submit(self, fn, *args):
+        self.starts.append((fn, args))
+
+    def run(self):
+        """Run every held start in order, as the pool would."""
+        starts, self.starts = self.starts, []
+        for fn, args in starts:
+            fn(*args)
+
+
+def park_triage_starts():
+    pool = ParkedTriagePool()
+    session_kv_server._TRIAGE_START_POOL = pool
+    return pool
+
+
+park_triage_starts()
+
+STARTED = session_kv_server._GatewayAttempt(session_kv_server.START_OK)
+
 # Every route that reads or writes stored data now requires this. /healthz is
 # the one exception and has its own test below.
 API_KEY = "test-session-kv-key"
@@ -1009,12 +1040,18 @@ class TestDeliveryFailureIsWrittenBack(unittest.TestCase):
         session_kv_server.trigger_agent_troubleshooter("sess-y", "msg", {}, row_id)
         self.assertEqual(self._row(row_id), (1, ""))
 
-    @patch.object(session_kv_server, "_start_agent_turn")
+    @patch.object(session_kv_server, "_start_agent_turn", return_value=STARTED)
+    @patch.object(session_kv_server, "_build_agent_query", return_value="q")
     @patch.object(session_kv_server, "_register_session_routing")
     @patch.object(session_kv_server, "_post_initial_alert", return_value="spaces/A/threads/B")
     def test_the_dispatcher_stamps_the_dispatch_before_creating_the_session(self, *_):
         """The pre-kanban read ages a turn from this stamp, so it is written
-        by the dispatcher itself, right before the gateway session, sub-second."""
+        by the dispatcher itself, right before the gateway session, sub-second.
+
+        The start runs on the triage pool, so the stamp is observed by running
+        the parked pool after the trigger returns: it is written at dispatch,
+        after the queue wait, not when the start is queued.
+        """
         import sqlite3
 
         row_id = self._record()
@@ -1025,8 +1062,12 @@ class TestDeliveryFailureIsWrittenBack(unittest.TestCase):
                 seen.append(conn.execute("SELECT dispatched_at FROM intercepted_events WHERE id = ?", (row_id,)).fetchone()[0])
             return True
 
+        pool = park_triage_starts()
+        self.addCleanup(park_triage_starts)
         with patch.object(session_kv_server, "_create_gateway_session", side_effect=create):
             session_kv_server.trigger_agent_troubleshooter("sess-stamp", "msg", {}, row_id)
+            self.assertEqual(seen, [], "the create waits for the pool")
+            pool.run()
         self.assertEqual(len(seen), 1)
         self.assertTrue(seen[0], "dispatched_at must be stamped before the gateway session is created")
         self.assertIn(".", seen[0])
@@ -1125,16 +1166,21 @@ class TestSlackIncidentAlertDelivery(unittest.TestCase):
         patcher = patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat", "slack"])
         patcher.start()
         self.addCleanup(patcher.stop)
-        for name in ("_register_session_routing", "_record_alert_title", "_create_gateway_session",
-                     "_start_agent_turn", "mark_delivery_failed"):
+        for name in ("_register_session_routing", "_record_alert_title", "mark_delivery_failed"):
             p = patch.object(session_kv_server, name)
+            p.start()
+            self.addCleanup(p.stop)
+        for name in ("_create_gateway_session", "_start_agent_turn"):
+            p = patch.object(session_kv_server, name, return_value=STARTED)
             p.start()
             self.addCleanup(p.stop)
 
     def _run(self, post):
+        pool = park_triage_starts()
         with patch.object(session_kv_server, "_post_initial_alert", side_effect=post) as alert:
             session_kv_server.trigger_agent_troubleshooter(
                 "s1", "alert", {}, 7, slack_alert_msg="slack alert", alert_title="the title")
+            pool.run()
         return alert
 
     def test_a_slack_thread_gets_the_slack_text_and_the_title(self):
@@ -1144,8 +1190,11 @@ class TestSlackIncidentAlertDelivery(unittest.TestCase):
         session_kv_server._record_alert_title.assert_called_once_with("s1", "the title")
 
     def test_the_title_is_recorded_before_the_turn_starts(self):
-        session_kv_server._start_agent_turn.side_effect = (
-            lambda *_args: session_kv_server._record_alert_title.assert_called_once_with("s1", "the title"))
+        def start(*_args):
+            session_kv_server._record_alert_title.assert_called_once_with("s1", "the title")
+            return STARTED
+
+        session_kv_server._start_agent_turn.side_effect = start
         self._run(lambda platform, _msg, _session: None if platform == "google_chat" else "1712345678.000100")
         session_kv_server._start_agent_turn.assert_called_once()
 
@@ -2355,39 +2404,73 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             status = self._inject("drifted-api", kind="Deployment", reason="ProgressDeadlineExceeded")["status"]
         self.assertEqual(status, "injected")
 
-    @patch.object(session_kv_server, "_create_gateway_session", return_value=False)
-    @patch.object(session_kv_server, "_register_session_routing")
-    @patch.object(session_kv_server, "_post_initial_alert", return_value="spaces/A/threads/B")
-    def test_an_anchor_whose_triage_never_started_does_not_fold_its_siblings(self, *_):
+    def _queue_real_start(self, session_id, anchor_id):
+        """Run the real background task with chat stubbed; the start lands in the parked pool."""
+        pool = park_triage_starts()
+        self.addCleanup(park_triage_starts)
+        for name, value in (
+            ("_chat_platforms_disabled", lambda: False),
+            ("_register_session_routing", MagicMock()),
+            ("_post_initial_alert", MagicMock(return_value="spaces/A/threads/B")),
+            ("_build_agent_query", lambda payload: "q"),
+            ("_triage_sleep", MagicMock()),
+        ):
+            p = patch.object(session_kv_server, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        send = patch.object(session_kv_server, "_send_to_chat", return_value="thread")
+        self.send = send.start()
+        self.addCleanup(send.stop)
+        self.real_trigger(session_id, "msg", {}, anchor_id)
+        return pool
+
+    def test_an_anchor_whose_triage_never_started_does_not_fold_its_siblings(self):
         with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
             self._inject("aborted-api-6cfdb6b98b-aaaaa")
-            anchor_id = self._rows("aborted-api")[0][0]
-            # What the background task does when the gateway session fails.
-            self.real_trigger("sess-aborted", "msg", {}, anchor_id)
+            pool = self._queue_real_start("sess-aborted", self._rows("aborted-api")[0][0])
+            # What the pool does when the gateway refuses the key on the create.
+            with patch("session_kv_server.urllib.request.urlopen", side_effect=[_http_error(401)]):
+                pool.run()
             self.assertEqual(self._inject("aborted-api-6cfdb6b98b-bbbbb")["status"], "injected")
 
     def test_a_5xx_other_than_503_or_a_wait_for_the_response_reads_as_a_started_turn(self):
         import urllib.error
+        S = session_kv_server
         # 503 is Hermes's gateway_draining and session_db_unavailable, both
-        # before the turn; a POST 307 is not followed.
-        for code, started in ((307, False), (400, False), (404, False), (500, True), (502, True), (503, False)):
+        # before the turn; a POST 307 is not followed; a 404 is a lost session,
+        # created again before the next attempt.
+        for code, outcome in (
+            (307, S.START_FATAL), (400, S.START_FATAL), (404, S.START_RETRY),
+            (500, S.START_UNKNOWN), (502, S.START_UNKNOWN), (503, S.START_RETRY),
+        ):
             with patch("urllib.request.urlopen", side_effect=urllib.error.HTTPError("http://gw", code, "x", {}, None)):
-                self.assertEqual(session_kv_server._start_agent_turn("http://gw", "s", "q", {}), started, code)
+                self.assertEqual(S._start_agent_turn("http://gw", "s", "q", {}).outcome, outcome, code)
         with patch("urllib.request.urlopen", side_effect=TimeoutError("read timed out")):
-            self.assertTrue(session_kv_server._start_agent_turn("http://gw", "s", "q", {}))
-        # Refused while connecting: the gateway never had the request.
-        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError(ConnectionRefusedError(111, "refused"))):
-            self.assertFalse(session_kv_server._start_agent_turn("http://gw", "s", "q", {}))
+            self.assertEqual(S._start_agent_turn("http://gw", "s", "q", {}).outcome, S.START_UNKNOWN)
+        # An error while connecting or sending: the gateway never had the request.
+        for exc in (
+            urllib.error.URLError(ConnectionRefusedError(111, "refused")),
+            urllib.error.URLError(TimeoutError("connect timed out")),
+        ):
+            with patch("urllib.request.urlopen", side_effect=exc):
+                self.assertEqual(S._start_agent_turn("http://gw", "s", "q", {}).outcome, S.START_RETRY)
 
-    @patch.object(session_kv_server, "_start_agent_turn", return_value=False)
-    @patch.object(session_kv_server, "_create_gateway_session", return_value=True)
-    @patch.object(session_kv_server, "_register_session_routing")
-    @patch.object(session_kv_server, "_post_initial_alert", return_value="spaces/A/threads/B")
-    def test_a_refused_turn_releases_the_anchor(self, *_):
+    def test_a_retry_that_never_starts_releases_the_anchor(self):
+        """A queued start anchors its siblings; one the pool gives up on stops anchoring them."""
         with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
             self._inject("refusedturn-api-6cfdb6b98b-aaaaa")
-            self.real_trigger("sess-refused", "msg", {}, self._rows("refusedturn-api")[0][0])
-            self.assertEqual(self._inject("refusedturn-api-6cfdb6b98b-bbbbb")["status"], "injected")
+            pool = self._queue_real_start("sess-refused", self._rows("refusedturn-api")[0][0])
+            # Queued and not yet started: a start is on its way, so a sibling folds.
+            self.assertEqual(self._inject("refusedturn-api-6cfdb6b98b-bbbbb")["status"], "folded")
+            # The gateway drains for longer than the retry budget.
+            with patch("session_kv_server.urllib.request.urlopen", side_effect=[_answered()] + [_http_error(503)] * 50):
+                pool.run()
+            self.assertEqual(self._inject("refusedturn-api-6cfdb6b98b-ccccc")["status"], "injected")
+            self.send.assert_called_once()
+            self.assertEqual(
+                [r[3] for r in self._rows("refusedturn-api")],
+                [None, self._rows("refusedturn-api")[0][0], None],
+            )
 
     @patch.object(session_kv_server, "_post_initial_alert", side_effect=RuntimeError("chat client blew up"))
     def test_a_task_that_dies_before_the_turn_releases_the_anchor(self, _):
@@ -3036,6 +3119,7 @@ class TestManagedDotenvPath(unittest.TestCase):
         # The reloads above rebind the module object the other tests hold; put
         # it back the way the file was imported.
         importlib.reload(session_kv_server)
+        park_triage_starts()
 
     def test_the_operator_set_directory_is_honoured(self):
         self.assertEqual(self._resolve("/mnt/managed"), "/mnt/managed/.env")
@@ -6864,6 +6948,9 @@ class TestReadOnlyActivityFeed(unittest.TestCase):
             by_name = {e["name"]: e["session_id"] for e in feed["events"]}
             self.assertEqual(by_name["old-pod"], "")
             self.assertEqual(by_name["new-pod"], "k8s-evt-migrated")
+        with sqlite3.connect(legacy_db) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(intercepted_events)")}
+        self.assertIn("triage_state", columns)
 
     @patch.object(session_kv_server, "trigger_agent_troubleshooter")
     def test_drift_and_stall_injects_stamp_session_id_in_feed(self, _mock_trigger):
@@ -6916,9 +7003,9 @@ class TestReadOnlyActivityFeed(unittest.TestCase):
         self.assertEqual(by_reason[session_kv_server.DRIFT_LEDGER_REASON], "drift-sess-1")
         self.assertEqual(by_reason[session_kv_server.STALL_LEDGER_REASON], "stall-sess-1")
 
-    @patch.object(session_kv_server, "_start_agent_turn")
+    @patch.object(session_kv_server, "_start_agent_turn", return_value=STARTED)
     @patch.object(session_kv_server, "_build_agent_query", return_value="q")
-    @patch.object(session_kv_server, "_create_gateway_session", return_value=True)
+    @patch.object(session_kv_server, "_create_gateway_session", return_value=STARTED)
     @patch.object(session_kv_server, "_post_initial_alert")
     @patch.object(session_kv_server, "mark_delivery_failed")
     def test_headless_install_with_chat_disabled_keeps_status_injected(
@@ -6965,7 +7052,9 @@ class TestReadOnlyActivityFeed(unittest.TestCase):
                 notified=True,
                 session_id="k8s-evt-headless",
             )
+            pool = park_triage_starts()
             session_kv_server.trigger_agent_troubleshooter("k8s-evt-headless", "alert", {}, row_id)
+            pool.run()
             mock_post.assert_not_called()
             mock_mark_failed.assert_not_called()
             mock_create_session.assert_called_once()
@@ -10483,6 +10572,498 @@ def subprocess_error(returncode):
     import subprocess as sp
 
     return sp.CalledProcessError(returncode, ["send"], output="", stderr="no")
+
+
+
+class _FakeClock:
+    """`time.monotonic` for the triage start loop; `_triage_sleep` moves it."""
+
+    def __init__(self):
+        self.now = 1000.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def _http_error(code, retry_after=None):
+    import email.message
+    import io
+    import urllib.error
+
+    headers = email.message.Message()
+    if retry_after is not None:
+        headers["Retry-After"] = str(retry_after)
+    return urllib.error.HTTPError("http://127.0.0.1:8642/x", code, "err", headers, io.BytesIO(b"{}"))
+
+
+def _refused():
+    import urllib.error
+
+    return urllib.error.URLError(ConnectionRefusedError(61, "Connection refused"))
+
+
+def _answered():
+    response = MagicMock(status=200)
+    response.__enter__.return_value = response
+    return response
+
+
+class TestTriageStartRetry(unittest.TestCase):
+    """A triage start that provably did not start is retried; a give-up is recorded and reported."""
+
+    def setUp(self):
+        import sqlite3
+
+        session_kv_server.init_db()
+        with sqlite3.connect(temp_db_path) as conn:
+            conn.execute("DELETE FROM intercepted_events")
+        self.clock = _FakeClock()
+        for target, value in (
+            ("time", MagicMock(monotonic=self.clock.monotonic, time=time.time)),
+            ("_triage_sleep", self.clock.sleep),
+            ("_build_agent_query", lambda payload: "q"),
+            ("_gateway_api_token", lambda: "tok"),
+        ):
+            p = patch.object(session_kv_server, target, value)
+            p.start()
+            self.addCleanup(p.stop)
+        self.send = patch.object(session_kv_server, "_send_to_chat", return_value="thread").start()
+        self.addCleanup(patch.stopall)
+        self.row_id = session_kv_server.record_intercepted_event(
+            cluster="gke-1", namespace="prod", workload="api", object_uid="u1", object_kind="Pod",
+            reason="BackOff", message="restarting", severity="Warning", occurrences=1, notified=True,
+            session_id="k8s-evt-1",
+        )
+
+    def _start(self, payload=None, notice=None, queued_at=None):
+        return session_kv_server._TriageStart(
+            "k8s-evt-1", payload or {}, self.row_id, notice,
+            self.clock.now if queued_at is None else queued_at,
+        )
+
+    def _run(self, urlopen_effects, **start):
+        with patch("session_kv_server.urllib.request.urlopen", side_effect=urlopen_effects) as urlopen, \
+                self.assertLogs("session_kv_server", level="INFO") as logs:
+            session_kv_server._run_triage_start(self._start(**start))
+        return urlopen, "\n".join(logs.output)
+
+    def _state(self):
+        import sqlite3
+
+        with sqlite3.connect(temp_db_path) as conn:
+            return conn.execute("SELECT triage_state FROM intercepted_events WHERE id = ?", (self.row_id,)).fetchone()[0]
+
+    def _urls(self, urlopen):
+        return [c.args[0].full_url.rsplit("/", 1)[-1] for c in urlopen.call_args_list]
+
+    def test_a_refused_create_is_retried_and_the_turn_starts(self):
+        urlopen, logs = self._run([_refused(), _answered(), _answered()])
+        self.assertEqual(self._urls(urlopen), ["sessions", "sessions", "chat"])
+        self.assertEqual(self._state(), session_kv_server.TRIAGE_STATE_STARTED)
+        self.assertIn("TRIAGE_STARTED session=k8s-evt-1", logs)
+        self.send.assert_not_called()
+
+    def test_a_create_that_timed_out_and_then_conflicts_counts_as_created(self):
+        """The timed-out create committed in Hermes; its retry gets 409."""
+        urlopen, _ = self._run([TimeoutError("timed out"), _http_error(409), _answered()])
+        self.assertEqual(self._urls(urlopen), ["sessions", "sessions", "chat"])
+        self.assertEqual(self._state(), session_kv_server.TRIAGE_STATE_STARTED)
+
+    def test_the_create_waits_past_the_gateway_lock_wait(self):
+        urlopen, _ = self._run([_answered(), _answered()])
+        self.assertEqual(urlopen.call_args_list[0].kwargs["timeout"], session_kv_server.TRIAGE_CREATE_TIMEOUT_S)
+        self.assertGreater(session_kv_server.TRIAGE_CREATE_TIMEOUT_S, 20)
+
+    def test_a_chat_call_that_got_no_answer_is_not_sent_again(self):
+        """The turn may be running; a second `/chat` would file a second card."""
+        urlopen, logs = self._run([_answered(), TimeoutError("timed out")])
+        self.assertEqual(self._urls(urlopen), ["sessions", "chat"])
+        self.assertEqual(self._state(), session_kv_server.TRIAGE_STATE_STARTED)
+        self.assertNotIn("TRIAGE_NOT_STARTED", logs)
+        self.send.assert_not_called()
+
+    def test_a_chat_5xx_other_than_503_is_not_sent_again(self):
+        urlopen, _ = self._run([_answered(), _http_error(502)])
+        self.assertEqual(self._urls(urlopen), ["sessions", "chat"])
+
+    def test_a_busy_or_draining_gateway_is_retried_after_its_retry_after(self):
+        urlopen, _ = self._run([_answered(), _http_error(503, retry_after=40), _answered()])
+        self.assertEqual(self._urls(urlopen), ["sessions", "chat", "chat"])
+        self.assertGreaterEqual(self.clock.sleeps[0], 40)
+
+    def test_a_lost_session_is_created_again_before_the_next_turn(self):
+        urlopen, _ = self._run([_answered(), _http_error(404), _answered(), _answered()])
+        self.assertEqual(self._urls(urlopen), ["sessions", "chat", "sessions", "chat"])
+
+    def test_a_refused_key_is_not_retried(self):
+        notice = session_kv_server._TriageNotice("google_chat", "spaces/A/threads/T", "")
+        urlopen, logs = self._run([_http_error(401)], notice=notice)
+        self.assertEqual(self._urls(urlopen), ["sessions"])
+        self.assertIn("TRIAGE_NOT_STARTED session=k8s-evt-1 source=event reason=http-401", logs)
+        self.assertEqual(self._state(), session_kv_server.TRIAGE_STATE_ABORTED)
+        self.send.assert_called_once()
+
+    def test_a_spent_budget_gives_up_once_with_one_notice(self):
+        notice = session_kv_server._TriageNotice("google_chat", "spaces/A/threads/T", "")
+        urlopen, logs = self._run([TimeoutError("timed out")] * 50, notice=notice)
+        self.assertLessEqual(urlopen.call_count, session_kv_server.TRIAGE_RETRY_MAX_ATTEMPTS)
+        self.assertEqual(logs.count("TRIAGE_NOT_STARTED"), 1)
+        self.assertIn("reason=timeout", logs)
+        self.assertEqual(self._state(), session_kv_server.TRIAGE_STATE_ABORTED)
+        self.send.assert_called_once()
+        self.assertEqual(self.send.call_args.args[2:], ("spaces/A", "spaces/A/threads/T"))
+
+    def test_the_budget_counts_time_not_only_attempts(self):
+        with patch.object(session_kv_server, "TRIAGE_RETRY_MAX_ATTEMPTS", 1000):
+            urlopen, _ = self._run([TimeoutError("timed out")] * 1000)
+        waited = sum(self.clock.sleeps)
+        self.assertAlmostEqual(min(waited, session_kv_server.TRIAGE_RETRY_BUDGET_S), waited)
+        self.assertLess(urlopen.call_count, 1000)
+
+    def test_the_time_an_answered_attempt_takes_spends_the_budget(self):
+        """Six 25 s create timeouts plus their waits must not run past the budget."""
+        def slow_timeout(*_args, **_kwargs):
+            self.clock.now += session_kv_server.TRIAGE_CREATE_TIMEOUT_S
+            raise TimeoutError("timed out")
+
+        with patch.object(session_kv_server, "TRIAGE_RETRY_MAX_ATTEMPTS", 1000):
+            urlopen, _ = self._run(slow_timeout)
+        spent = urlopen.call_count * session_kv_server.TRIAGE_CREATE_TIMEOUT_S + sum(self.clock.sleeps)
+        self.assertLess(spent, session_kv_server.TRIAGE_RETRY_BUDGET_S + 2 * session_kv_server.TRIAGE_CREATE_TIMEOUT_S)
+
+    def test_refused_connections_do_not_spend_the_budget(self):
+        """A gateway that is not listening yet (a restart) is waited for, up to the queue-wait limit."""
+        effects = [_refused()] * 15 + [_answered(), _answered()]
+        urlopen, _ = self._run(effects)
+        self.assertGreater(sum(self.clock.sleeps), session_kv_server.TRIAGE_RETRY_BUDGET_S)
+        self.assertEqual(self._urls(urlopen)[-1], "chat")
+        self.assertEqual(self._state(), session_kv_server.TRIAGE_STATE_STARTED)
+
+    def test_refused_connections_after_an_answer_do_not_spend_the_budget(self):
+        """A draining gateway answers 503, then refuses while it restarts."""
+        effects = [_answered(), _http_error(503)] + [_refused()] * 15 + [_answered()]
+        urlopen, _ = self._run(effects)
+        self.assertGreater(sum(self.clock.sleeps), session_kv_server.TRIAGE_RETRY_BUDGET_S)
+        self.assertEqual(self._state(), session_kv_server.TRIAGE_STATE_STARTED)
+
+    def test_a_restart_after_the_budget_is_spent_is_still_waited_for(self):
+        """Five long drains spend the budget; the restart that follows is refused, not answered."""
+        busy = [_http_error(503, retry_after=60)] * 5
+        urlopen, _ = self._run([_answered()] + busy + [_refused()] * 3 + [_answered(), _answered()])
+        self.assertEqual(self._urls(urlopen)[-1], "chat")
+        self.assertEqual(self._state(), session_kv_server.TRIAGE_STATE_STARTED)
+
+    def test_a_second_lost_session_is_not_retried(self):
+        urlopen, logs = self._run([_answered(), _http_error(404)] * 10)
+        self.assertEqual(self._urls(urlopen), ["sessions", "chat", "sessions", "chat"])
+        self.assertIn("reason=http-404", logs)
+
+    def test_refused_connections_stop_at_the_queue_wait_limit(self):
+        urlopen, logs = self._run([_refused()] * 1000)
+        self.assertAlmostEqual(min(sum(self.clock.sleeps), session_kv_server.TRIAGE_QUEUE_WAIT_LIMIT_S), sum(self.clock.sleeps))
+        self.assertIn("reason=refused", logs)
+
+    def test_a_start_that_waited_past_the_limit_still_gets_one_attempt(self):
+        """A long queue behind slow turns is not a gateway fault: the start is tried, as on main."""
+        queued_at = self.clock.now - session_kv_server.TRIAGE_QUEUE_WAIT_LIMIT_S - 1
+        urlopen, _ = self._run([_answered(), _answered()], queued_at=queued_at)
+        self.assertEqual(self._urls(urlopen), ["sessions", "chat"])
+        self.assertEqual(self._state(), session_kv_server.TRIAGE_STATE_STARTED)
+
+    def test_a_start_that_waited_past_the_limit_is_not_retried(self):
+        queued_at = self.clock.now - session_kv_server.TRIAGE_QUEUE_WAIT_LIMIT_S - 1
+        urlopen, logs = self._run([TimeoutError("timed out")] * 5, queued_at=queued_at)
+        self.assertEqual(self._urls(urlopen), ["sessions"])
+        self.assertIn("reason=timeout", logs)
+        self.assertEqual(self._state(), session_kv_server.TRIAGE_STATE_ABORTED)
+
+    def test_each_attempt_reads_the_key_again(self):
+        keys = iter(["old", "new"])
+        with patch.object(session_kv_server, "_gateway_api_token", side_effect=lambda: next(keys)):
+            urlopen, _ = self._run([_http_error(503), _answered(), _answered()])
+        self.assertEqual(urlopen.call_args_list[0].args[0].headers["Authorization"], "Bearer old")
+        self.assertEqual(urlopen.call_args_list[1].args[0].headers["Authorization"], "Bearer new")
+
+    def test_the_notice_names_what_happens_next_for_each_source(self):
+        notice = session_kv_server._TriageNotice("google_chat", "spaces/A/threads/T", "")
+        for kind, expected in (
+            (None, "not raised again while the workload keeps failing"),
+            (session_kv_server.INJECT_KIND_DRIFT, "not reported again"),
+            (session_kv_server.INJECT_KIND_STALL, "raised again after 24 hours"),
+        ):
+            with self.subTest(kind=kind):
+                self.send.reset_mock()
+                self._run([_http_error(403)], payload={"kind": kind} if kind else {}, notice=notice)
+                text = self.send.call_args.args[1]
+                self.assertTrue(text.startswith(session_kv_server.TRIAGE_NOTICE_HEAD))
+                self.assertIn(expected, text)
+
+    def test_a_notice_with_no_thread_quotes_the_alert(self):
+        notice = session_kv_server._TriageNotice("google_chat", "", "🟡 **Warning:** BackOff `prod/api`\nsecond line")
+        self._run([_http_error(401)], notice=notice)
+        self.assertEqual(self.send.call_args.args[0], "google_chat")
+        self.assertEqual(len(self.send.call_args.args), 2)
+        self.assertTrue(self.send.call_args.args[1].endswith("\n> 🟡 **Warning:** BackOff `prod/api`"))
+
+    def test_no_notice_without_a_delivered_alert(self):
+        _, logs = self._run([_http_error(401)], notice=None)
+        self.assertIn("TRIAGE_NOT_STARTED", logs)
+        self.send.assert_not_called()
+
+    def test_an_unexpected_error_is_recorded_as_not_started(self):
+        with patch.object(session_kv_server, "_build_agent_query", side_effect=RuntimeError("boom")):
+            _, logs = self._run([])
+        self.assertIn("reason=error-RuntimeError", logs)
+        self.assertEqual(self._state(), session_kv_server.TRIAGE_STATE_ABORTED)
+
+
+class TestTriageStartIsQueued(unittest.TestCase):
+    """The background task posts the alert, marks the row and hands the start to the pool."""
+
+    def setUp(self):
+        import sqlite3
+
+        session_kv_server.init_db()
+        with sqlite3.connect(temp_db_path) as conn:
+            conn.execute("DELETE FROM intercepted_events")
+        self.pool = park_triage_starts()
+        self.addCleanup(park_triage_starts)
+        for name, value in (
+            ("enabled_chat_platforms", lambda: ["google_chat"]),
+            ("_chat_platforms_disabled", lambda: False),
+            ("_register_session_routing", MagicMock()),
+            ("mark_delivery_failed", MagicMock()),
+        ):
+            p = patch.object(session_kv_server, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        self.row_id = session_kv_server.record_intercepted_event(
+            cluster="gke-1", namespace="prod", workload="api", object_uid="u1", object_kind="Pod",
+            reason="BackOff", message="restarting", severity="Warning", occurrences=1, notified=True,
+            session_id="k8s-evt-q",
+        )
+
+    def _trigger(self, post_result):
+        with patch.object(session_kv_server, "_post_initial_alert", return_value=post_result), \
+                patch.object(session_kv_server, "_create_gateway_session") as create:
+            session_kv_server.trigger_agent_troubleshooter("k8s-evt-q", "🟡 alert\nline 2", {}, self.row_id)
+        return create
+
+    def _state(self):
+        import sqlite3
+
+        with sqlite3.connect(temp_db_path) as conn:
+            return conn.execute("SELECT triage_state FROM intercepted_events WHERE id = ?", (self.row_id,)).fetchone()[0]
+
+    def test_the_task_returns_before_the_gateway_is_called(self):
+        create = self._trigger("spaces/A/threads/T")
+        create.assert_not_called()
+        self.assertEqual(len(self.pool.starts), 1)
+        self.assertEqual(self._state(), session_kv_server.TRIAGE_STATE_PENDING)
+
+    def test_a_threaded_alert_sends_its_notice_to_the_thread(self):
+        self._trigger("spaces/A/threads/T")
+        start = self.pool.starts[0][1][0]
+        self.assertEqual(start.notice, session_kv_server._TriageNotice("google_chat", "spaces/A/threads/T", ""))
+
+    def test_an_alert_sent_without_a_thread_is_quoted_in_its_notice(self):
+        self._trigger(session_kv_server.ALERT_SENT_WITHOUT_THREAD)
+        start = self.pool.starts[0][1][0]
+        self.assertEqual(start.notice, session_kv_server._TriageNotice("google_chat", "", "🟡 alert\nline 2"))
+
+    def test_an_undelivered_alert_gets_no_notice(self):
+        self._trigger(None)
+        self.assertIsNone(self.pool.starts[0][1][0].notice)
+
+    def test_a_headless_install_gets_no_notice(self):
+        with patch.object(session_kv_server, "_chat_platforms_disabled", lambda: True), \
+                patch.object(session_kv_server, "enabled_chat_platforms", lambda: [session_kv_server.DEFAULT_CHAT_PLATFORM]):
+            self._trigger("unused")
+        self.assertIsNone(self.pool.starts[0][1][0].notice)
+
+    def test_the_pool_runs_at_most_the_configured_number_of_starts(self):
+        import threading
+
+        with patch.object(session_kv_server, "_TRIAGE_START_POOL", None):
+            pool = session_kv_server._triage_start_pool()
+        self.assertEqual(session_kv_server.TRIAGE_START_WORKERS, 4)
+        self.assertEqual(len(pool.threads), session_kv_server.TRIAGE_START_WORKERS)
+        # Daemon threads: a daemon restart does not wait for a start that is retrying.
+        self.assertTrue(all(thread.daemon for thread in pool.threads))
+        gate, ran = threading.Event(), []
+        for n in range(session_kv_server.TRIAGE_START_WORKERS + 1):
+            pool.submit(lambda n=n: (ran.append(n), gate.wait(5)))
+        deadline = time.time() + 5
+        while len(ran) < session_kv_server.TRIAGE_START_WORKERS and time.time() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.05)
+        self.assertEqual(len(ran), session_kv_server.TRIAGE_START_WORKERS)
+        gate.set()
+
+    def _feed_status(self):
+        from fastapi.testclient import TestClient
+
+        with patch.dict(os.environ, {"SESSION_KV_API_KEY": API_KEY}):
+            feed = TestClient(session_kv_server.app, headers=AUTH_HEADERS).get("/v1/intercepted-events").json()
+        return {e["id"]: e["status"] for e in feed["events"]}[self.row_id]
+
+    def test_the_feed_reports_a_triage_that_never_started(self):
+        session_kv_server.mark_triage_state(self.row_id, session_kv_server.TRIAGE_STATE_ABORTED)
+        self.assertEqual(self._feed_status(), session_kv_server.FEED_STATUS_TRIAGE_ABORTED)
+
+    def test_an_undelivered_alert_stays_undelivered_when_its_triage_also_aborted(self):
+        """Nobody saw the alert: that is the fact the feed must not hide."""
+        import sqlite3
+
+        with sqlite3.connect(temp_db_path) as conn:
+            conn.execute(
+                "UPDATE intercepted_events SET notified = 0, delivery_error = 'no message id' WHERE id = ?",
+                (self.row_id,),
+            )
+        session_kv_server.mark_triage_state(self.row_id, session_kv_server.TRIAGE_STATE_ABORTED)
+        self.assertEqual(self._feed_status(), session_kv_server.FEED_STATUS_UNDELIVERED)
+
+
+
+class TestTriageStartBurst(unittest.TestCase):
+    """A burst of triage starts against a gateway with Hermes' shape of contention.
+
+    The fake gateway serves session creates and `/chat` turns from one pool of
+    `EXECUTOR_WORKERS` workers, and a turn holds its worker for `TURN_HOLD_S`,
+    as each Hermes `/chat` turn holds a worker of its default executor. A
+    create that waits for a worker past the client's timeout still commits
+    later, as a Hermes create does. A readiness request (`GET /api/sessions`)
+    queues on the same pool, as the probe does. Every client timeout is scaled
+    by `TIMEOUT_SCALE`, so the test runs in seconds; no model and no install.
+    """
+
+    EXECUTOR_WORKERS = 8
+    TURN_HOLD_S = 1.5
+    TIMEOUT_SCALE = 0.03
+    BURST = 20
+    STAGGER_S = 0.05
+    DEADLINE_S = 30.0
+    # Not on the client scale: a loaded runner must not time the probe out at
+    # cap 4, while cap 8 keeps every worker busy for TURN_HOLD_S, longer than this.
+    PROBE_TIMEOUT_S = 1.0
+    PROBE_INTERVAL_S = 0.1
+
+    def setUp(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        workers = threading.BoundedSemaphore(self.EXECUTOR_WORKERS)
+        lock = threading.Lock()
+        self.sessions, self.turns = set(), []
+        test = self
+
+        class Gateway(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def _answer(self, code):
+                try:
+                    self.send_response(code)
+                    self.end_headers()
+                    self.wfile.write(b"{}")
+                except OSError:
+                    pass  # the client gave up waiting
+
+            def do_GET(self):
+                with workers:
+                    pass
+                self._answer(200)
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                parts = self.path.strip("/").split("/")
+                with workers:
+                    if parts == ["api", "sessions"]:
+                        session_id = f"s{len(test.sessions)}"
+                        code = 201
+                    else:
+                        session_id = parts[2]
+                        time.sleep(test.TURN_HOLD_S)
+                        code = 200
+                    with lock:
+                        if parts[-1] == "chat":
+                            test.turns.append(session_id)
+                        else:
+                            test.sessions.add(session_id)
+                self._answer(code)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Gateway)
+        self.server.daemon_threads = True
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+        real_urlopen = session_kv_server.urllib.request.urlopen
+        # The probe below must not go through `scaled`, which the patch applies
+        # to every `urllib.request.urlopen` in the process.
+        self.real_urlopen = real_urlopen
+
+        def scaled(req, timeout=None):
+            return real_urlopen(req, timeout=timeout * self.TIMEOUT_SCALE)
+
+        patches = [
+            patch.object(session_kv_server.urllib.request, "urlopen", side_effect=scaled),
+            patch.dict(os.environ, {"PLATFORM_API_URL": f"http://127.0.0.1:{self.server.server_port}"}),
+            patch.object(session_kv_server, "enabled_chat_platforms", lambda: [session_kv_server.DEFAULT_CHAT_PLATFORM]),
+            patch.object(session_kv_server, "_chat_platforms_disabled", lambda: True),
+            patch.object(session_kv_server, "_build_agent_query", lambda payload: "q"),
+            patch.object(session_kv_server, "_gateway_api_token", lambda: "tok"),
+            # A real pool, not the parked stand-in, and retry waits on the same scale.
+            patch.object(session_kv_server, "_TRIAGE_START_POOL", None),
+            patch.object(session_kv_server, "_triage_sleep", lambda s: time.sleep(s * self.TIMEOUT_SCALE)),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_every_start_in_a_burst_reaches_the_gateway_once_and_the_probe_stays_answered(self):
+        import threading
+        import urllib.request
+
+        probe_timeouts, done = [], threading.Event()
+        probe_url = f"http://127.0.0.1:{self.server.server_port}/api/sessions?limit=1"
+
+        def probe():
+            while not done.is_set():
+                try:
+                    self.real_urlopen(probe_url, timeout=self.PROBE_TIMEOUT_S).close()
+                except OSError:
+                    probe_timeouts.append(time.time())
+                time.sleep(self.PROBE_INTERVAL_S)
+
+        prober = threading.Thread(target=probe, daemon=True)
+        prober.start()
+        triggers = []
+        for n in range(self.BURST):
+            thread = threading.Thread(
+                target=session_kv_server.trigger_agent_troubleshooter,
+                args=(f"k8s-evt-burst{n}", "alert", {}, None),
+                daemon=True,
+            )
+            thread.start()
+            triggers.append(thread)
+            time.sleep(self.STAGGER_S)
+        deadline = time.time() + self.DEADLINE_S
+        for thread in triggers:
+            thread.join(max(0.0, deadline - time.time()))
+        while len(set(self.turns)) < self.BURST and time.time() < deadline:
+            time.sleep(0.1)
+        done.set()
+        prober.join(self.DEADLINE_S)
+        started = set(self.turns)
+        self.assertEqual(len(started), self.BURST, f"{self.BURST - len(started)} triage starts were lost")
+        self.assertEqual(len(self.turns), len(started), "a session got a second /chat turn")
+        self.assertEqual(len(probe_timeouts), 0, "the readiness request timed out during the burst")
 
 
 if __name__ == "__main__":
