@@ -433,8 +433,8 @@ resource "null_resource" "incident" {
       echo "BackOff reached the debounce threshold after $${elapsed}s."
 
       # watcher_logged: has k8s-event-watcher logged a line matching the
-      # given regex since the plant? The seam step 3 reads, named once for
-      # its two callers, each of which names this namespace's pods.
+      # given regex since the plant? The same read as step 3's poll, for the
+      # follow-up wait in 3b; the regex names this namespace's pods.
       watcher_logged() {
         kubectl logs "deployment/${var.agent_deployment}" \
             -n "${var.agent_namespace}" -c "${var.agent_container}" \
@@ -466,7 +466,10 @@ resource "null_resource" "incident" {
       # loop is sequential. A leftover namespace on a DIFFERENT watched cluster,
       # which step 0b does not reach, or the concurrency of #637, would.
       elapsed=0
-      until watcher_logged "${local.watcher_handled} .*pod=${local.ns}/"; do
+      until kubectl logs "deployment/${var.agent_deployment}" \
+              -n "${var.agent_namespace}" -c "${var.agent_container}" \
+              --since-time="$started_at" --tail=-1 2>/dev/null \
+            | grep -qE "${local.watcher_handled} .*pod=${local.ns}/"; do
         if [ "$elapsed" -ge 300 ]; then
           echo "ERROR: the workload is crash-looping past the debounce, but k8s-event-watcher logged no '${local.watcher_handled}' for a pod in ${local.ns} within $${elapsed}s. The incident was detected by Kubernetes and not by the watcher, so nothing downstream will run. Its recent log follows." >&2
           kubectl logs "deployment/${var.agent_deployment}" -n "${var.agent_namespace}" \

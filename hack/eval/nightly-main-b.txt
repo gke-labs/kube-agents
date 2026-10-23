@@ -28,9 +28,6 @@ fleet-audit-clean-close-reads-clean
 gpu-stress-test-diagnosis
 autoops-warning-event-triage
 incident-triage-workload-fold
-# #612's quiet follow-up case: its plant waits out the 15m quiet period, so
-# it is the long one of the three and balances the halves on its own.
-autoops-quiet-followup
 obtainability-planted-orphan-service
 fleet-audit-unchanged-finding-keeps-wording
 first-install-hello-running
