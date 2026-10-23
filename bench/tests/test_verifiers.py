@@ -9225,6 +9225,33 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs_with_exit_propagation("setsid python3 f.py --readiness") == [
         (["setsid", "python3", "f.py", "--readiness"], False),
     ]
+    assert _shell_argvs_with_exit_propagation("stdbuf -oL setsid python3 f.py --readiness") == [
+        (["stdbuf", "-oL", "setsid", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("xargs -r python3 f.py --readiness < /dev/null") == [
+        (["xargs", "-r", "python3", "f.py", "--readiness", "<", "/dev/null"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("flock -n -E 0 /tmp/lock python3 f.py --readiness") == [
+        (["flock", "-n", "-E", "0", "/tmp/lock", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("(python3 f.py --readiness) > /tmp/out") == [
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("(python3 f.py --readiness) 2>&1") == [
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("(python3 f.py --readiness) >> /tmp/out") == [
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness;") == [
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness ;\n") == [
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("(python3 f.py --readiness;)") == [
+        (["python3", "f.py", "--readiness"], True),
+    ]
     assert _shell_argvs_with_exit_propagation("echo $(python3 f.py --readiness)") == [
         (["echo", "$(python3 f.py --readiness)"], True),
         (["python3", "f.py", "--readiness"], False),
@@ -9391,7 +9418,7 @@ def test_worker_commands_required_run_succeeded_flag():
         ]
         transcript.set("ok", traj_joined, worker_commands=[{"task": "t_1", "command": joined_cmd}])
         res_joined = v.verify(5.0)
-        assert res_joined.status == "fail" and "fleet_upgrade_report.py --readiness ran, but the dictated form is the command alone on its line; an operator on the line (a preceding or following &&, ||, |, ;, &, or newline, a preceding !, a command substitution, or a detaching wrapper such as setsid -f or sudo -b) means its exit is not credited" in res_joined.reason
+        assert res_joined.status == "fail" and "fleet_upgrade_report.py --readiness ran, but the dictated form is the command alone on its line; an operator on the line (a preceding or following &&, ||, |, ;, &, or newline, a preceding !, a command substitution, a detaching wrapper such as setsid -f or sudo -b, or a loop wrapper such as watch) means its exit is not credited" in res_joined.reason
 
     # Trajectory entry whose arguments were clipped in the pod (falling back to head regex)
     # is inconclusive under succeeded: true when the call succeeded (error status, not pass).

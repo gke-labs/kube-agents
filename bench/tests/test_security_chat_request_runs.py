@@ -102,6 +102,9 @@ def _ledger_flagged(command: str) -> bool:
         f"sudo --set-home python3 {COLLECT} compliance-audit",
         f"python3 {COLLECT} compliance-audit > /tmp/setsid",
         f"(python3 {COLLECT} compliance-audit)",
+        f"(python3 {COLLECT} compliance-audit) > /opt/data/scratch/m.json",
+        f"(python3 {COLLECT} compliance-audit) 2>&1",
+        f"python3 {COLLECT} compliance-audit;",
         f"python3 {COLLECT} compliance-audit 'quoted && inside; quotes'",
         f"OUT=$(python3 {COLLECT} compliance-audit)",
     ],
@@ -158,6 +161,9 @@ def test_collector_run_is_credited(command):
         f"sudo -r role -b python3 {COLLECT} compliance-audit > /opt/data/scratch/m.json",
         f"sudo -l python3 {COLLECT} compliance-audit > /opt/data/scratch/m.json",
         f"sudo --list python3 {COLLECT} compliance-audit > /opt/data/scratch/m.json",
+        f"stdbuf -oL setsid python3 {COLLECT} compliance-audit",
+        f"xargs -r python3 {COLLECT} compliance-audit < /dev/null",
+        f"flock -n -E 0 /tmp/lock python3 {COLLECT} compliance-audit",
     ],
 )
 def test_mention_help_or_other_script_is_not_credited(command):

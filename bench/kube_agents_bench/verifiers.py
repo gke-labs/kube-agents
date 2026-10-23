@@ -2294,7 +2294,8 @@ _TRAJ_MISSING_NO_TRAJ_REASON = (
 _UNRUN_MASKED_REASON = (
     "{named} ran, but the dictated form is the command alone on its line; "
     "an operator on the line (a preceding or following &&, ||, |, ;, &, or newline, "
-    "a preceding !, a command substitution, or a detaching wrapper such as setsid -f or sudo -b) "
+    "a preceding !, a command substitution, a detaching wrapper such as setsid -f or sudo -b, "
+    "or a loop wrapper such as watch) "
     "means its exit is not credited"
 )
 _UNRUN_CLIPPED_REASON = (
@@ -2666,7 +2667,8 @@ _SETSID_VAL_LESS_FLAGS = set("cwf")
 def _has_detaching_wrapper(seg: list[str]) -> bool:
     """True if seg invokes an exec wrapper with options that detach the process
     or do not guarantee exit propagation (e.g. `setsid` without `-w`/`--wait`,
-    or `sudo` with `-b`/`--background` or non-whitelisted options)."""
+    `sudo` with `-b`/`--background` or non-whitelisted options, `watch`, `xargs`,
+    or `flock`)."""
     idx = 0
     redirect_target = False
     while idx < len(seg):
@@ -2683,7 +2685,7 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
             idx += 1
             continue
         base = os.path.basename(word)
-        if base == "watch":
+        if base in ("watch", "xargs", "flock"):
             return True
         if base == "setsid":
             idx += 1
@@ -2792,15 +2794,17 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
                     inner_redirect_target = not w.isdigit()
                     idx += 1
                     continue
-                if takes_val:
-                    takes_val = False
-                    idx += 1
-                    continue
+                if os.path.basename(w) in _SHELL_EXEC_WRAPPERS:
+                    break
                 if w == "--":
                     idx += 1
                     break
                 if w.startswith(_SHELL_FLAG_PREFIX):
                     takes_val = (w != _SHELL_OPTIONS_END)
+                    idx += 1
+                    continue
+                if takes_val:
+                    takes_val = False
                     idx += 1
                     continue
                 if _SHELL_COUNT_RE.match(w) or w.startswith(_SHELL_EXPANSION_PREFIX):
@@ -2840,8 +2844,16 @@ def _shell_argvs_with_exit_propagation(
     leading_ops: list[str] = []
     argv: list[str] = []
     current_ops: list[str] = []
+    post_paren_redirect_target = False
 
-    for word in words:
+    for i, word in enumerate(words):
+        if post_paren_redirect_target:
+            post_paren_redirect_target = False
+            continue
+        if current_ops and current_ops[-1] == ")":
+            if _is_redirect(word) or (word.isdigit() and i + 1 < len(words) and _is_redirect(words[i + 1])):
+                post_paren_redirect_target = not word.isdigit()
+                continue
         if _is_control_operator(word):
             op_str = str(word)
             if argv:
@@ -2868,7 +2880,7 @@ def _shell_argvs_with_exit_propagation(
 
     results: list[tuple[list[str], bool]] = []
     leading_ops = [op for op in leading_ops if op != _SHELL_LINE_END]
-    current_ops = [op for op in current_ops if op != _SHELL_LINE_END]
+    current_ops = [op for op in current_ops if op not in (_SHELL_LINE_END, ";")]
     trailing_bg = any(op == "&" for op in current_ops)
     handled_spans: list[str] = []
 
