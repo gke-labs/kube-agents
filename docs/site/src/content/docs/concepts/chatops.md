@@ -335,7 +335,7 @@ The counter is fleet-wide, so the demand on it increases with the number of clus
 
 ### One incident per workload
 
-By default, each pod and each reason of a broken workload is its own alert: a Deployment with three replicas that cannot pull its image posts three alerts, starts three triage turns, and spends three units of the `Warning` budget. Set `INCIDENT_WORKLOAD_DEDUP_SECONDS` to fold them into one. Within that many seconds of an alert, a later Warning event for the same workload, or a later Critical one after a Critical alert, posts nothing, starts no triage turn and spends no budget. The same workload means the same cluster, namespace and kind, and either the same Deployment (a pod named with its ReplicaSet hash, such as `checkout-6cfdb6b98b-zwv24`) or the same name for an object that is not a Pod. About 1 in 400 Deployments has a hash shorter than 8 characters, and its pods do not fold. Other pods do not fold: the pods of a StatefulSet, a DaemonSet, a Job or a CronJob each still alert, so a Job's failure is never folded into a same-named Deployment's alert. A Critical event after a Warning alert is announced, so a workload that gets worse is announced again. A restart of the agent pod ends every open window, so the first event after one is announced again. The feed `GET /v1/intercepted-events` lists a folded event with the status `folded`. The value is a whole number of seconds; `0`, the default, turns folding off, a larger value than `86400` counts as `86400`, and a value that is negative or not a number counts as `0`.
+By default, each pod and each reason of a broken workload is its own alert: a Deployment with three replicas that cannot pull its image posts three alerts, starts three triage turns, and spends three units of the `Warning` budget. Set `INCIDENT_WORKLOAD_DEDUP_SECONDS` to fold them into one. Within that many seconds of an alert, a later Warning event for the same workload, or a later Critical one after a Critical alert, posts nothing, starts no triage turn and spends no budget. The same workload means the same cluster, namespace and kind, and either the same Deployment (a pod named with its ReplicaSet hash, such as `checkout-6cfdb6b98b-zwv24`) or the same name for an object that is not a Pod. About 1 in 400 Deployments has a hash shorter than 8 characters, and its pods do not fold. Other pods do not fold: the pods of a StatefulSet, a DaemonSet, a Job or a CronJob each still alert, so a Job's failure is never folded into a same-named Deployment's alert. A Critical event after a Warning alert is announced, so a workload that gets worse is announced again. A restart of the agent pod ends every open window, so the first event after one is announced again. The feed `GET /v1/intercepted-events` lists a folded event with the status `folded`. The value is a whole number of seconds; `0`, the default (`300` when `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` is `true`), turns folding off, a larger value than `86400` counts as `86400`, and a value that is negative or not a number counts as the default.
 
 Set it as an entry in the chart value `platformAgent.deployment.env`, or in the `PlatformAgent` CR's `spec.deployment.env` on an install that no chart manages:
 
@@ -348,6 +348,24 @@ platformAgent:
 ```
 
 [`session_management.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/docs/session_management.md#folding-a-workloads-repeat-events) describes which earlier alert a later event is folded into.
+
+### Opening the pull request without a reply
+
+By default, a triage report proposes GitOps fixes and stops. A human replies `apply` (or `apply Option B`), and the Platform Agent opens that fix as a pull request. Set `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` to `true` to skip the wait. The Planning Agent then files a second card beside the triage card. That card goes to the Platform Agent and names the triage card as its parent, so it waits in `todo` until the diagnosis is `done` or `archived`. If the triage card ends `blocked`, the second card waits too, and the board health check lists it under the blocked card. Once the report is complete, the second card opens the option the report marked Recommended, or the single proposed fix, through `submit-suggestion`. Any other value, or no value, keeps the default.
+
+Set it the same way as `INCIDENT_WORKLOAD_DEDUP_SECONDS`, as an entry in `platformAgent.deployment.env` or in `spec.deployment.env`:
+
+```yaml
+platformAgent:
+  deployment:
+    env:
+      - name: INCIDENT_TRIAGE_OPEN_PULL_REQUEST
+        value: "true"
+```
+
+A human still reviews and merges the pull request, and nothing is written to the live cluster. The branch is `platform-agent/incident-<cluster>-<namespace>-<workload>-<digest>` (including the object kind for non-Pod/Deployment kinds), keyed to the workload rather than to the event reason or session ID. The workload is named the way the fold above names it: a Deployment's pods share their Deployment's name, and any other pod keeps its own name. So a retried event or a new reason for the same Deployment revises the open pull request instead of opening a second one, and if the open pull request already carries the recommended change the card finishes without pushing a duplicate commit. StatefulSet, DaemonSet, Job and CronJob pods, and bare pods, each get a branch of their own, because the pod name alone cannot prove they belong to one workload. Turning the setting on also defaults `INCIDENT_WORKLOAD_DEDUP_SECONDS` to `300` seconds when it is unset or `0`, so a Deployment's repeat events inside the five-minute burst window start no second triage and file no second pull-request card. The second card's result, the pull request URL, is posted in the same thread as the report.
+
+The setting has limits. Drift and controller-stall reports are not covered; they still wait for a reply. On Slack with `KAGE_SLACK_UX` on, the report's button for the recommended or single fix is left off when the report says that fix's pull request `is being opened automatically`; buttons for the other options stay. A typed `apply Option B` still works and opens its own pull request. Changing the value rolls the agent pod. The agent ignores the variable in its own `.env` file, so only the install can turn it on. It is an environment variable for now and can move to a `PlatformAgent` field once it has proven itself.
 
 ## First-run onboarding
 
