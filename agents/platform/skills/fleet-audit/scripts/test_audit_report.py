@@ -5503,6 +5503,19 @@ class TestStart(HarnessTestCase):
         self.assertNotEqual(second["run"], first["run"])
         self.assertEqual(second["parts"], [{"repo": "acme/fleet", "text": None}])
 
+    def test_start_names_the_ledger_the_listing_left_out(self):
+        # `TestListingLeavesOutTheLedger` has the rule; this is `start`'s side.
+        self.seed_report("the ledger")
+        self.harness.replies = {
+            "issue-list": issues_view([]),
+            "issue-view !comments": issue_view(
+                {"number": 42, "state": "open", "labels": [f"audit:{AUDIT}"], "body": "the ledger"}
+            ),
+        }
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        self.assertEqual(self.stdout_json()["issue"], 42)
+        self.assertIn("left out #42", self.err)
+
     def test_emits_one_json_line(self):
         self.harness.replies = {"issue-list": self.issue_list()}
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
@@ -15744,6 +15757,187 @@ class TestFindExistingIssue(HarnessTestCase):
         self.harness.replies = {"issue-list": {"issues": [], "count": 0, "truncated": True}}
         with self.assertRaises(audit_report.GitHubLookupError):
             self.find()
+
+
+class TestListingLeavesOutTheLedger(HarnessTestCase):
+    """An empty label listing is checked against the issue the store names.
+
+    GitHub's label-filtered issue list can leave out an open, labelled issue
+    for a short time, most likely just after a label write, and `ensure_labels`
+    writes labels a second or two before every lookup. Read as "no ledger",
+    `finish` opened a second ledger and lost the first one's state.
+    """
+
+    LEDGER_URL = "https://github.com/acme/fleet/issues/42"
+
+    def find(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            result = audit_report.find_existing_issue("acme/fleet", AUDIT)
+        self.err = err.getvalue()
+        return result
+
+    def ledger(self, body="the ledger", state="open", labels=None, number=42):
+        """The `issue-view` answer for the issue the store names."""
+        return issue_view(
+            {
+                "number": number,
+                "url": self.LEDGER_URL,
+                "title": "Compliance audit: 1 finding",
+                "state": state,
+                "labels": [f"audit:{AUDIT}", "agent:audit"] if labels is None else labels,
+                "body": body,
+            }
+        )
+
+    def omitted(self, view=None):
+        """An empty listing, with `view` as the answer for the named issue."""
+        self.harness.replies = {"issue-list": issues_view([])}
+        if view is not None:
+            self.harness.replies["issue-view !comments"] = view
+
+    def test_an_open_labelled_issue_the_store_names_is_the_ledger(self):
+        self.seed_report("the ledger")
+        self.omitted(self.ledger())
+        self.assertEqual(
+            self.find(), (42, self.LEDGER_URL, "the ledger", "Compliance audit: 1 finding")
+        )
+        self.assertTrue(self.harness.forge_calls("issue-view", number=42))
+        self.assertIn("WARNING:", self.err)
+        self.assertIn("left out #42", self.err)
+
+    def test_a_closed_issue_the_store_names_is_not_reopened(self):
+        # A clean full run closes the ledger on purpose; the next finding opens
+        # a fresh one.
+        self.seed_report("the ledger")
+        self.omitted(self.ledger(state="closed"))
+        self.assertEqual(self.find(), (None, None, None, None))
+        self.assertNotIn("left out", self.err)
+
+    def test_an_issue_without_the_stream_label_is_not_the_ledger(self):
+        self.seed_report("the ledger")
+        self.omitted(self.ledger(labels=["agent:audit"]))
+        self.assertEqual(self.find(), (None, None, None, None))
+
+    def test_a_failed_read_of_the_named_issue_keeps_no_ledger(self):
+        self.seed_report("the ledger")
+        self.omitted()
+        self.harness.failures = {"issue-view": 1}
+        self.assertEqual(self.find(), (None, None, None, None))
+        self.assertIn("could not read #42", self.err)
+
+    def test_no_store_asks_for_nothing(self):
+        self.omitted(self.ledger())
+        self.assertEqual(self.find(), (None, None, None, None))
+        self.assertEqual(self.harness.forge_calls("issue-view"), [])
+
+    def test_a_store_for_another_repository_is_not_read(self):
+        self.seed_report("the ledger")
+        envelope_path = self.store_dir() / "latest.json"
+        envelope = json.loads(envelope_path.read_text(encoding="utf-8"))
+        envelope["repo"] = "acme/other"
+        envelope_path.write_text(json.dumps(envelope), encoding="utf-8")
+        self.omitted(self.ledger())
+        self.assertEqual(self.find(), (None, None, None, None))
+        self.assertEqual(self.harness.forge_calls("issue-view"), [])
+
+    def test_a_marked_envelope_is_not_used(self):
+        # A run diverted away from this repository wrote the store; it names no
+        # ledger it published, even when it carries a number.
+        self.seed_report(
+            "the ledger",
+            **{audit_report.UNREACHABLE_REPO_KEY: {"repo": "acme/fleet", "reason": "down"}},
+        )
+        self.omitted(self.ledger())
+        self.assertEqual(self.find(), (None, None, None, None))
+        self.assertEqual(self.harness.forge_calls("issue-view"), [])
+
+    def test_a_marked_envelope_falls_back_to_the_last_published_run(self):
+        # The same rule as `read_report_memory`: past a marked `latest.json`,
+        # the newest envelope a publishing run left in the ring.
+        runs = self.store_dir() / audit_report.REPORT_RUNS_DIR
+        runs.mkdir(parents=True)
+        (runs / "20260801T000000Z.json").write_text(
+            json.dumps({"audit_id": AUDIT, "repo": "acme/fleet", "issue_number": 42}),
+            encoding="utf-8",
+        )
+        self.seed_report(
+            "",
+            issue=None,
+            **{audit_report.UNREACHABLE_REPO_KEY: {"repo": "acme/fleet", "reason": "down"}},
+        )
+        self.omitted(self.ledger())
+        self.assertEqual(self.find()[0], 42)
+
+    def ring(self, stamp, number):
+        """Leave an envelope in the ring that names `number`."""
+        runs = self.store_dir() / audit_report.REPORT_RUNS_DIR
+        runs.mkdir(parents=True, exist_ok=True)
+        (runs / f"{stamp}.json").write_text(
+            json.dumps({"audit_id": AUDIT, "repo": "acme/fleet", "issue_number": number}),
+            encoding="utf-8",
+        )
+
+    def test_the_highest_open_ledger_the_store_names_wins(self):
+        # A full listing picks the highest open number. The fallback picks the
+        # same one, or the stream moves from #50 to #42 and back.
+        self.ring("20260801T000000Z", 50)
+        self.seed_report("the ledger")
+        self.omitted()
+        self.harness.replies["issue-view !comments number=50"] = self.ledger(number=50)
+        self.harness.replies["issue-view !comments number=42"] = self.ledger()
+        self.assertEqual(self.find()[0], 50)
+        self.assertEqual(self.harness.forge_calls("issue-view", number=42), [])
+        self.assertIn("left out #50", self.err)
+
+    def test_a_closed_higher_number_gives_way_to_the_open_one(self):
+        self.ring("20260801T000000Z", 50)
+        self.seed_report("the ledger")
+        self.omitted()
+        self.harness.replies["issue-view !comments number=50"] = self.ledger(number=50, state="closed")
+        self.harness.replies["issue-view !comments number=42"] = self.ledger()
+        self.assertEqual(self.find()[0], 42)
+
+    def test_a_failed_read_of_the_highest_number_keeps_no_ledger(self):
+        # A lower number is not the ledger when a higher one could still be.
+        self.ring("20260801T000000Z", 50)
+        self.seed_report("the ledger")
+        self.omitted()
+        self.harness.replies["issue-view !comments number=42"] = self.ledger()
+        self.harness.failures = {"issue-view number=50": 1}
+        self.assertEqual(self.find(), (None, None, None, None))
+        self.assertEqual(self.harness.forge_calls("issue-view", number=42), [])
+
+    def test_the_ring_names_the_ledger_when_latest_json_is_gone(self):
+        # A failed store write drops `latest.json`; the ring still names #42.
+        self.ring("20260801T000000Z", 42)
+        self.omitted(self.ledger())
+        self.assertEqual(self.find()[0], 42)
+
+    def test_finish_updates_the_ledger_the_listing_left_out(self):
+        # The previous run published `a` and `b`; this run finds `a` only. With
+        # the ledger left out of the listing, `finish` used to open a second
+        # ledger with no memory: `a` new, `b` never resolved, and the first
+        # ledger's state gone.
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        body = published_body(
+            make_doc(findings=[make_finding(fid="a"), make_finding(fid="b")]), generated_at=NOW
+        )
+        self.seed_report(body)
+        self.omitted(self.ledger(body=body))
+        self.harness.replies["issue-create"] = created(
+            "issue", "https://github.com/acme/fleet/issues/43"
+        )
+        self.assertEqual(self.run_finish(make_doc(findings=[make_finding(fid="a")])), 0, self.err)
+
+        self.assertEqual(self.harness.forge_calls("issue-create"), [])
+        self.assertTrue(self.harness.forge_calls("issue-update", number=42))
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "UPDATED")
+        self.assertEqual(payload["issue_url"], self.LEDGER_URL)
+        self.assertEqual(payload["new"], 0)
+        self.assertEqual(payload["resolved"], 1)
+        self.assertIn("left out #42", self.err)
 
 
 class TestReadCommentsAuthorship(HarnessTestCase):
@@ -26734,6 +26928,40 @@ class TestReportStore(HarnessTestCase):
         self.assertEqual(self.run_finish(gap), 0, self.err)
         self.assertEqual(self.harness.forge_calls("issue-close"), [])
         self.assertIsNone(self.stored()["issue_number"])
+
+    def test_a_ledger_held_open_over_a_lost_store_is_found_when_the_listing_lags(self):
+        # Run N holds #42 open over a gap with no trusted memory. Its envelope
+        # names no issue for the trust check, but it still names the open
+        # ledger, so run N+1 finds #42 when the label listing leaves it out
+        # and does not open a second ledger.
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.harness.failures = {"issue-view !comments": 1}
+        gap = make_doc(findings=[], skipped=[{"cluster": "dr-west", "reason": "API server unreachable"}])
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        stored = self.stored()
+        self.assertIsNone(stored["issue_number"])
+        self.assertEqual(stored[audit_report.OPEN_LEDGER_KEY], 42)
+        # The memory stays lost: the open ledger's number is not a trust claim.
+        self.assertIsNone(audit_report.read_report_memory(AUDIT, 42, "acme/fleet"))
+
+        self.harness.failures = {}
+        self.harness.replies = {
+            "issue-list": issues_view([]),
+            "issue-view !comments": issue_view(
+                {
+                    "number": 42,
+                    "url": "https://github.com/acme/fleet/issues/42",
+                    "state": "open",
+                    "labels": [f"audit:{AUDIT}"],
+                    "body": "the ledger",
+                }
+            ),
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/43"),
+        }
+        self.assertEqual(self.run_finish(gap), 0, self.err)
+        self.assertEqual(self.harness.forge_calls("issue-create"), [])
+        self.assertIn("left out #42", self.err)
+        self.assertEqual(self.stored()[audit_report.OPEN_LEDGER_KEY], 42)
 
     def test_a_clean_run_that_only_comments_keeps_the_memory_when_killed(self):
         # Held open over a gap, a clean run comments and leaves the body as the

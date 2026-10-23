@@ -45,6 +45,27 @@ Two tiers. The issue is the only always-on object.
 One open GitHub issue per audit stream, rewritten in place on every run.
 
 - Title, body, labels, and every timestamp are generated. The agent never hand-writes them.
+- The harness finds the ledger with one list of the open issues that carry the `audit:<audit-id>`
+  label. When the list has more than one issue, the highest number is the ledger. An empty list is
+  not always "no ledger": GitHub's label-filtered list can omit an open, labelled issue for a short
+  time, usually just after a label write. `start`, `finish` and `remediate` look up the ledger, and
+  each one ensures the labels just before the lookup. The forge writes a label only when its colour
+  or description changed, or, on GitHub, when the case of its name changed. If the list is empty,
+  the harness reads directly each issue that the stream's report store
+  ([`fleet-audit-report-store.md`](fleet-audit-report-store.md)) names for this repository, highest
+  number first, as the full list does. The first issue that is open and still carries the
+  `audit:<audit-id>` label is the ledger, and the run logs a warning that the list omitted it. A
+  closed issue stays closed. A failed read stops the search and gives "no ledger", because a lower
+  number is not the ledger while a higher one can still be. The store names an issue in each
+  envelope of `latest.json` and the ring: the `issue_number`, and the `open_issue_number` that a
+  clean run writes when it holds the ledger open with no trusted memory (that run stores no
+  `issue_number`, so the next run's memory stays lost). An envelope that a diverted run marked never
+  names the ledger. The store names no open ledger when it is absent or unreadable, when it was
+  written for another repository, or when every run that it keeps closed the ledger, ran with no
+  forge, or diverted. An open, labelled issue that no envelope names, for example one opened by
+  hand, stays unseen until the list shows it again. Read as "no ledger", an omitted ledger makes
+  `finish` open a second ledger with no memory and lose the state of the first one (held rows,
+  carried findings).
 - The run-over-run delta mechanism is carried over unchanged: the hidden
   `<!-- audit-findings: [...] -->` marker moves from the PR body to the issue body and
   `parse_delta_block` / `compute_delta` are reused verbatim. What the marker _lists_ is the set of

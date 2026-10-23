@@ -826,6 +826,13 @@ REPORT_STAMP_FORMAT = "%Y%m%dT%H%M%S.%fZ"
 # and the copy of the newest. report_status.py spells them the same way.
 REPORT_RUNS_DIR = "runs"
 REPORT_LATEST_NAME = "latest.json"
+# The neutral `state` of an open issue in the broker's `issue-view` answer.
+FORGE_ISSUE_OPEN = "open"
+# The envelope key that names the ledger issue a run left open when
+# `issue_number` cannot: a clean run that held the ledger open with no trusted
+# memory stores no `issue_number`, so the next run's trust check fails. This key
+# is not a trust claim; only the ledger lookup reads it.
+OPEN_LEDGER_KEY = "open_issue_number"
 # The chat report `finish` leaves for the relay: one record per stream in
 # SCRATCH_DIR, read over ssh by `session_kv_server.audit_chat_report`, which
 # spells these keys the same way.
@@ -3321,6 +3328,7 @@ def report_envelope(
     ledger_held_open: bool = False,
     delta_known: bool = True,
     reported_under_gap: list[str] | None = None,
+    open_issue_number: int | None = None,
     not_rechecked: list[dict] | None = None,
 ) -> dict:
     """One run's outcome, delta and document, as keys rather than paragraphs.
@@ -3346,6 +3354,10 @@ def report_envelope(
     open ledger: `new_ids` and `resolved_ids` are then empty because the delta
     was withheld, not because nothing changed, and a reader must say so
     rather than print a zero.
+    `open_issue_number` names the ledger issue the run left open when
+    `issue_number` is None for the trust check (`OPEN_LEDGER_KEY`). Only
+    `find_existing_issue` reads it, to find a ledger the label listing left
+    out; `read_report_memory` does not, so the memory stays lost.
     `not_rechecked` is the entries the run kept under _Not re-checked this
     run_; each is stored with its title and place (`NOT_RECHECKED_KEY`).
     `finished_at` is the run's own generation timestamp, the one the ledger
@@ -3378,6 +3390,7 @@ def report_envelope(
         "silent_ok": payload.get("silent_ok"),
         **({SILENT_FLOOR_KEY: True} if payload.get(SILENT_FLOOR_KEY) else {}),
         "ledger_held_open": ledger_held_open,
+        **({OPEN_LEDGER_KEY: open_issue_number} if open_issue_number is not None else {}),
         "delta_known": delta_known,
         "new_ids": sorted(new_ids),
         "resolved_ids": sorted(resolved_ids),
@@ -3963,20 +3976,26 @@ def read_report_memory(audit_id: str, issue_number: int | None, repo: str) -> di
     return envelope
 
 
-def _newest_published_envelope(runs: Path) -> dict | None:
-    """The newest envelope in the `runs/` ring that `is_diverted` does not mark, or None."""
+def _ring_envelopes(runs: Path) -> list[dict]:
+    """The readable envelopes in the `runs/` ring, newest first."""
     try:
         paths = sorted(runs.glob("*.json"), reverse=True)
     except OSError:
-        return None
+        return []
+    envelopes = []
     for path in paths:
         try:
             envelope = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if isinstance(envelope, dict) and not is_diverted(envelope):
-            return envelope
-    return None
+        if isinstance(envelope, dict):
+            envelopes.append(envelope)
+    return envelopes
+
+
+def _newest_published_envelope(runs: Path) -> dict | None:
+    """The newest envelope in the `runs/` ring that `is_diverted` does not mark, or None."""
+    return next((e for e in _ring_envelopes(runs) if not is_diverted(e)), None)
 
 
 def _envelope_document(envelope: object, key: str) -> dict | None:
@@ -14365,7 +14384,7 @@ def find_existing_issue(
             "issue was found; merge or close the remediation backlog on this label"
         )
     if not issues:
-        return None, None, None, None
+        return _ledger_the_listing_left_out(repo, audit_id)
     issues.sort(key=lambda p: int(p.get("number", 0)))
     chosen = issues[-1]
     if len(issues) > 1:
@@ -14384,6 +14403,94 @@ def find_existing_issue(
         body if isinstance(body, str) else None,
         title if isinstance(title, str) else None,
     )
+
+
+def _stored_ledger_numbers(audit_id: str, repo: str) -> list[int]:
+    """The ledger issues the report store names for this stream and `repo`, highest first.
+
+    Each envelope in `latest.json` and the `runs/` ring gives its
+    `issue_number`, and its `OPEN_LEDGER_KEY` when a run held the ledger open
+    with no trusted memory. An envelope that `is_diverted` marks never names a
+    ledger, and neither does one written for another repository. An absent or
+    unreadable store names none. The ring keeps `REPORT_HISTORY` envelopes, so
+    the list is short, and it usually has one number.
+    """
+    try:
+        directory = reports_dir_for(audit_id, repo)
+    except ValueError:
+        return []
+    envelopes = _ring_envelopes(directory / REPORT_RUNS_DIR)
+    try:
+        envelopes.append(json.loads((directory / REPORT_LATEST_NAME).read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        pass
+    numbers: set[int] = set()
+    for envelope in envelopes:
+        if not isinstance(envelope, dict) or is_diverted(envelope):
+            continue
+        if _ledger_key(envelope.get("repo")) != _ledger_key(repo):
+            continue
+        for key in ("issue_number", OPEN_LEDGER_KEY):
+            number = envelope.get(key)
+            if isinstance(number, int) and not isinstance(number, bool):
+                numbers.add(number)
+    return sorted(numbers, reverse=True)
+
+
+def _ledger_the_listing_left_out(
+    repo: str, audit_id: str
+) -> tuple[int | None, str | None, str | None, str | None]:
+    """The open ledger an empty label listing left out, or the four Nones.
+
+    GitHub's label-filtered issue list can leave out an open, labelled issue
+    for a short time, most likely just after a label write, and
+    `ensure_labels` runs a second or two before every lookup. Read as
+    "no ledger", `finish` opens a second ledger with no memory, and the first
+    ledger's state (its held rows, its carried findings) is lost.
+
+    So an empty listing is checked against the issues the report store names
+    (`_stored_ledger_numbers`), highest first, as a full listing picks the
+    highest number. Each issue is read directly, and the first one that is
+    still open and still carries `audit:<id>` is the ledger. A closed issue
+    stays closed: a clean full run closes the ledger on purpose, and the next
+    finding opens a fresh one. A failed read stops the search and gives the
+    empty listing it was: a lower number is not the ledger while a higher one
+    could still be.
+
+    An open, labelled issue that no envelope in the store names (opened by
+    hand, or by a run whose store write failed and that later runs did not
+    name) stays out of reach until the listing shows it again.
+    """
+    none: tuple[None, None, None, None] = (None, None, None, None)
+    label = f"audit:{audit_id}".lower()
+    for number in _stored_ledger_numbers(audit_id, repo):
+        answer = try_forge("issue-view", repo, {"number": number})
+        issue = (answer or {}).get("issue")
+        if not isinstance(issue, dict):
+            log(
+                f"The label listing for audit:{audit_id} in {repo} was empty, and this run "
+                f"could not read #{number}, which the report store names; treating the "
+                "stream as having no open ledger."
+            )
+            return none
+        labels = [str(name).lower() for name in issue.get("labels") or []]
+        if str(issue.get("state") or "").lower() != FORGE_ISSUE_OPEN or label not in labels:
+            continue
+        log(
+            f"WARNING: the label listing for audit:{audit_id} in {repo} left out #{number}, "
+            "which the report store names and which is open and carries the label; "
+            f"updating #{number}. The forge's label index can lag a label write."
+        )
+        body = issue.get("body")
+        title = issue.get("title")
+        url = issue.get("url")
+        return (
+            number,
+            url if isinstance(url, str) and url else None,
+            body if isinstance(body, str) else None,
+            title if isinstance(title, str) else None,
+        )
+    return none
 
 
 def fetch_issue_body(repo: str, number: int) -> str | None:
@@ -21390,7 +21497,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # next run a trusted memory of an empty ledger — every finding the body
         # carries would be announced as new. The previous body carries forward
         # instead; with no memory of it, the envelope names no issue, so the
-        # next run's trust check fails as a lost memory should.
+        # next run's trust check fails as a lost memory should. The open
+        # ledger's number goes in `OPEN_LEDGER_KEY`, which the trust check
+        # does not read.
         body_untouched = (
             bool(existing_issue)
             and bool(gaps or unaccounted or held_unread)
@@ -21401,6 +21510,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # document the untouched body renders rides alongside as
         # `ledger_document`, for the next run's titles.
         ledger_document = None
+        # The open ledger's number whatever the memory. Without it, a ledger
+        # held open with no memory is named nowhere in the store, and the next
+        # run cannot find it when the label listing leaves it out.
+        open_issue = existing_issue if body_untouched else None
         # The places of the findings the untouched body keeps as not
         # re-checked, as the stored run recorded them (`NOT_RECHECKED_KEY`).
         not_rechecked: list[dict] = []
@@ -21451,6 +21564,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 ledger_held_open=body_untouched,
                 delta_known=delta_known,
                 reported_under_gap=reported_under_gap,
+                open_issue_number=open_issue,
                 not_rechecked=not_rechecked,
             ),
             now,

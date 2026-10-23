@@ -1047,6 +1047,16 @@
 # record measures it.
 ./tasks/incident-triage-workload-fold/task.yaml
 
+# An alert-policy question is answered from Cloud Monitoring through the
+# broker (#3467): the planted policy is named, reported disabled, and read
+# with `monitoring policies list|describe`, not from the audit log. Its own
+# stack plants one disabled policy in the install's project, which needs
+# roles/monitoring.alertPolicyEditor on the runners (#3632, granted on every
+# pool project). Red on main, three greens on the fix, on a dev install.
+# Nightly from its first merge. A unit killed between apply and destroy
+# leaves its policy behind; the sweep for those is #3797.
+./tasks/monitoring-alert-policy-read/task.yaml
+
 # A delegated card written to outrun the worker budget: the worker runs under
 # the platform profile's 150 turns, read from Hermes' checkpoint notice in its
 # tool results or from the card's run row, not under the 250 the fleet audits

@@ -46,8 +46,8 @@ diff --git a/SKILL.md b/SKILL.md
 +    them) as the configuration the pull request will carry.
  6.  **Propose**: Write the configuration as a pull request in the format the
      GitOps repository's `provisioning/` path already holds: Config Connector
-     YAML through the `gcp-config-connector` skill. A Terraform repository, an
-@@ -46,8 +55,8 @@ for all new clusters.
+     YAML through the `gcp-config-connector` skill, Terraform HCL through the
+@@ -47,8 +56,8 @@ for all new clusters.
      `gcloud container clusters create`.
  7.  **Track**: Once the pull request merges and the reconciler starts the
      create, use `get_operation` to monitor its progress.
@@ -58,7 +58,7 @@ diff --git a/SKILL.md b/SKILL.md
  
  ## Mode Selection
  
-@@ -64,8 +73,11 @@ for all new clusters.
+@@ -65,8 +74,11 @@ for all new clusters.
  | Best for           | Most production workloads | Kernel tuning, custom OS, |
  :                    :                           : privileged workloads      :
  
