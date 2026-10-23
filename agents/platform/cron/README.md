@@ -22,7 +22,7 @@ that store which runs `hermes cron tick` against every named profile with work d
 [`autonomous-watchdogs.md`](../../../docs/site/src/content/docs/concepts/autonomous-watchdogs.md)).
 
 An enabled entry here therefore fires in its own process, with this profile's
-persona, toolsets, `skills`, `model` and `max_turns` — which is the whole reason
+persona, toolsets (unless the entry's `enabled_toolsets` replaces them), `skills`, `model` and `max_turns` — which is the whole reason
 the watchdogs live here rather than as kanban cards filed from the Chat Agent's
 roster. A card is not a cron run, and that indirection is what stopped `skills`,
 `model` and `deliver` reaching the thing that ran.
@@ -298,6 +298,82 @@ at the gateway's home. The three
 environment knobs (`UPGRADE_READINESS_REFRESH_DAYS`, `_PROJECTS`,
 `_WATCH_HOME`) are for a run started by hand in the pod; the operator's
 `spec.deployment.env` allowlist does not carry them.
+
+## `upgrade-readiness-weekly-review` and `upgrade-readiness-weekly-brief` are one Saturday in two jobs
+
+The daily watch reads a cluster only while a release channel offers it a version it is below, and
+posts one line per report. The weekly pair reads every cluster of the roster's projects whatever its
+version (a declared scope refuses a project outside it), and ends in one message a person reads.
+
+`upgrade-readiness-weekly-review` (`0 6 * * 6`) is a `no_agent` script on this pod. It runs the
+`fleet-upgrade-verification` readiness report in the sandbox through the watch's own loader, one
+run per project inside the watch's 45-minute tick budget (Hermes kills a `no_agent` script at an
+hour), and turns every blocker and risk the report names (a drain-blocking budget, a fail-closed
+webhook, a pool past or at the skew ceiling, a covering exclusion, and each readiness rule's rows
+once the report carries rules) into a finding on the findings queue, through the Session KV
+server's `POST /v1/findings` route, reached at the endpoint and with the key `findings_nudge.py`
+uses. Each project is registered as soon as its run returns, so a run the hour cuts short keeps
+what it registered. The sends have ten minutes of their own past the reads, each waiting no longer
+than what is left, and a batch with no time left is booked as not sent, so a queue that hangs
+cannot hold the run past the hour before it writes its record. The queue's identity rule makes next Saturday's run an update of the same row;
+its rubric sets the severity (a budget over a single replica, a pool past the skew ceiling and a
+webhook in the upgrade's path are critical; a budget over several replicas, a pool at the ceiling
+and a webhook refusing only what it matches today are major; a covering exclusion is minor; a
+readiness rule's blocker is critical, and its risk is minor for catalogue entries 9, 10, 11, 13 and 16 and major for every other entry, as the rubric's
+entry table sets it); a row
+the user dismissed stays dismissed; and the hourly nudge paces what is named and reminds daily of
+undecided criticals. A cluster read in full sends its batch with a `scope` naming the job's check
+family (`upgrade-`) and its own source, an empty batch when nothing was found, so a finding the week
+no longer reports loses confidence and stops being reminded without touching another family's rows
+on that cluster, or the `upgrade-` rows another writer filed there. Three kinds of cluster claim nothing: one
+with more findings than one batch holds (500), sent in pieces; two of one name in one project, whose
+claims the queue could not tell apart; and one with a row the queue would refuse, since the claim
+would book that finding's row absent. A cluster with no upgrade target (no release channel, or a
+server config that did not answer) is never read in full, since the grader cannot judge its pools'
+skew, so it claims nothing either: a budget or webhook row there that is fixed stays on the queue
+until the user decides it. The same holds for a cluster on which a readiness rule failed or left an
+`unknown`, even a rule that cannot block: a claim would lower that rule's own rows, which the run
+could not read again. A cluster the listing no longer returns (deleted, renamed or out of scope) is
+not in the run at all, so nothing is sent for it, and its rows stay until the user decides them. On an install with no declared scope, a roster that names one
+project both by number and by id runs it twice until the daily watch has learned the number's id,
+and on a Saturday `gcloud projects describe` fails, the number's run is booked as a project not
+read; name the project by its id alone to avoid both. The script writes the technical report under `upgrade-readiness/weekly/` beside the
+watch's ledger, keeps the newest eight runs, and places a copy of `latest.md` and `latest.json` in
+the sandbox at `/opt/data/upgrade-readiness/weekly/` so the agent can read it when asked. It prints
+nothing on success: the brief speaks for the week and the queue for each finding. A project it could
+not read is one line naming it; a batch the findings queue refused, or a sandbox copy that failed,
+is one line each, since both leave the week's findings where the brief cannot act on them; a
+failure of the run is one line, once per distinct failure (numbers aside), with the recovery line
+on the next clean run. The entry declares `risk: high` as the watch does: the budget, pool, exclusion and webhook names it reads are tenant-written, and they reach the queue, the report, the sandbox copy and, by queue id and object name, the brief in chat.
+
+`upgrade-readiness-weekly-brief` (`0 7 * * 6`, an hour after the review starts and past its
+budget) is the model turn, and the reason the pair is not one job: the review can rank by rubric
+but cannot tell that two criticals on one cluster are one problem, or that a critical whose clock
+ends next week outranks one with no date. Its SOP (`governance/upgrade_readiness_brief_sop.md`) has it
+read the review's summary, the queue's open backlog (the rows whose `check` starts with `upgrade-`)
+and its snoozed and dismissed rows (read by state, since the backlog never carries them), and
+compose a brief of at most twenty-five lines: the week's headline, the
+undecided criticals that need a decision (one line per cluster, at most ten, with one clause of
+why and one action each), the rest of the week as counts, what was decided earlier, any project the review could not
+read, and where the full report is with the sentence that opens it in chat. It never registers,
+never decides, never runs the report, and is never `[SILENT]`: the brief is owed every week, a
+quiet one in three lines. If the review's summary is missing or older than two days (the review
+did not run, the hour cut it short, or its copy did not land), the brief says so in its headline and
+composes **Decide now** from the queue alone. The entry declares `risk: high`: a prompt job over
+tenant-written names, so its terminal is held to read-only inspection commands. For the same
+reason the turn holds no queue tool and no file-writing tool: the entry's `enabled_toolsets` gives
+it the terminal tool alone and no MCP server (`no_mcp`), so nothing a name says can make it
+register or decide a finding through `platform_control`, or write a file the command policy would
+refuse. The queue reads are made before the turn by the entry's
+pre-run `script`, `upgrade_readiness_brief_queue.py`, whose JSON the scheduler puts above the
+prompt. An open backlog it cannot read is said there and in the brief's headline; a page of
+decided rows it cannot read leaves out only the brief's **Decided earlier** line. The `deliver: "chat"` relay posts it as written and stores it against the
+thread, so a reply with an id and `dismiss`, `snooze until <date>` or `accept` reaches the agent
+with the brief attached.
+
+Why the queue and not a weekly chat line per finding: a line is read once; the queue keeps asking
+until a person answers, keeps the answer, and stops. That is the contract the review needs for a
+finding a user may have missed, and the one that lets a user say "ignore this" once.
 
 ## `sa-role-watch` says when the agent's account holds more than `read-only`
 

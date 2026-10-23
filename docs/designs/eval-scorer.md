@@ -13,7 +13,7 @@
 
 **Scope:** How the eval scorer decides, where its results are stored, how a baseline is
 established, compared against and reset, and how a quality-over-time dashboard reads the same data.
-**Owns:** the verdict ladder as built, the JSONL record format, the five-component version key, the
+**Owns:** the verdict ladder as built, the JSONL record format, the six-component version key, the
 admission rule, the storage backends, and rung 6's comparison.
 
 **On the ladder and [`testing-strategy.md`](testing-strategy.md).** §4.2 of that document specifies
@@ -897,8 +897,8 @@ precisely to avoid this.
 
 ## The version key
 
-A baseline is valid for exactly one combination of five versions. Three are read off the run
-itself, so they cannot go stale:
+A baseline is valid for exactly one combination of five versions and one `spec.mode`. Three of the
+five versions are read off the run itself, so they cannot go stale:
 
 | Component         | Read from                      | Covers                                       |
 | ----------------- | ------------------------------ | -------------------------------------------- |
@@ -911,6 +911,11 @@ itself, so they cannot go stale:
 The judge model is its own component, pinned independently of the agent model, because a judge that
 tracks whatever the agent is running cannot be told apart from an agent that got better — and a
 drifting judge moves every baseline at once.
+
+A sixth component, `mode`, is the `spec.mode` the run graded (`today` or `next`), read off the
+transport (`AGENT_TRANSPORT=inject` is `next`). It is written only when it is not `today`, so the
+lines recorded before it existed match today's key unchanged. `bench/baselines/README.md` is
+canonical for it.
 
 `fleet` and `verifiers` are hand-bumped integers rather than content hashes: a hash changes on a
 comment typo. The trade-off is real — a behaviour change with no bump silently compares against a
@@ -958,10 +963,11 @@ is on `main` and carries no `PULL_NUMBER`, so both conditions above pass it thro
 is the third condition, enforced in the same two places, and it exists because `VersionKey` carries
 no field naming the build a sample came from: once written, a candidate's record and `main`'s are
 indistinguishable, and the candidate is then measured for non-inferiority against a window it just
-moved. A next-mode run (`EVAL_MODE_NEXT=1`) is the fourth condition and the second member of the
-class, for the same reason, enforced in `hack/ci-eval-pr.sh` alone until the key carries a mode
-field. `bench/baselines/README.md` is canonical for the rule; this paragraph records why the
-read-only class exists.
+moved. The today lane (`EVAL_ROLLBACK_LANE=1`) is the fourth condition and the second member of the
+class, enforced in the same two places: its key reads `today`, but it grades an install rolled back
+from `next`, which is not what today's window measures. A next-mode run on `main` is not in the
+class: the key's `mode` files it under a window of its own. `bench/baselines/README.md` is
+canonical for the rule; this paragraph records why the read-only class exists.
 
 Two independent reasons, and the weaker one is the one usually cited. The narrow reason is
 self-admission: a case that wrote its own evidence could be admitted by the very diff that makes it
@@ -1024,7 +1030,7 @@ match the presubmit's `EVAL_REPETITIONS`, on the grounds that "the baseline must
 the thing compared against it is measured." That is wrong as stated, and worth correcting because it
 would forfeit the whole gain above. The store holds a pass **rate**. A rate over ten runs and a rate
 over three estimate the same quantity, the second just more noisily. What has to match is how a
-single run is produced — same task, agent, judge, and five-version key — not how many were taken.
+single run is produced — same task, agent, judge, and version key — not how many were taken.
 More repetitions on the recording side is strictly better evidence.
 
 #### The job definition
@@ -1221,7 +1227,7 @@ blocks meanwhile; [The roster, and the mode](#the-roster-and-the-mode) below say
 
 Three resets, all of which happen without deleting anything.
 
-**Version bump (automatic).** Any of the five components changing means zero lines match the
+**Version bump (automatic).** Any of the six components changing means zero lines match the
 current key, so every case drops to unadmitted and re-screens itself over the next seven nights at
 the default three repetitions. Old lines stay — they are still true about the software they were
 measured on.
@@ -1568,9 +1574,9 @@ actually lives, with rung 6 as the collapse alarm underneath it.
 - The `bench/tf/fleet` drift-reconcile schedule — a drifted fixture silently changes what a
   baseline means.
 - **The aggregate's sample floor is a placeholder for a real test.**
-  `EVAL_AGGREGATE_MIN_SCORED` (default 30) refuses to compare below ten admitted cases' worth of
-  repetitions, because a flat margin at `n = 3` measures luck. It is a floor rather than a wider
-  margin because no single flat margin is right at both `n = 3` and `n = 600`, and the fix that
+  `EVAL_AGGREGATE_MIN_SCORED` (default 30, ten admitted cases' worth when it was set) refuses to
+  compare below that many scored repetitions, because a flat margin at `n = 3` measures luck. It
+  is a floor rather than a wider margin because no single flat margin is right at both `n = 3` and `n = 600`, and the fix that
   actually scales is a two-proportion test. The store now holds the variance estimate that test
   needs, and [Sizing the aggregate margin](#sizing-the-aggregate-margin-measured-2026-09-29)
   priced it: on 2026-09-29 it reds nothing the flat 0.10 does not, one failed repetition

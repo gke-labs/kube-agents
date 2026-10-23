@@ -454,7 +454,8 @@ site's `reference/security-and-iam.md` and `reference/credential-isolation.md`,
 paragraph of `agent-shell-sandboxing.md`. Any script in the sandbox can read the Monitoring,
 Managed Prometheus and Trace reads the table names through it.
 
-The first consumer is `agents/platform/skills/fleet-audit/scripts/fleet_waste.py`, the cost audit's collector,
+The first consumer is `agents/platform/skills/fleet-audit/scripts/fleet_waste.py`, the cost audit's collector
+(`fleet_health.py`, the chat-only fleet health sweep, reads the Managed Prometheus `query` route the same way),
 and the contract it follows binds any later one: a collector that needs Monitoring history obtains its `requests`-shaped session from
 `ApiSession()` instead of from `google.auth`, keeps its URL literals as the real endpoints,
 and treats a relay 403 — whose body names the `gcp.api.*` rule — as that cluster's

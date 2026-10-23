@@ -1368,6 +1368,72 @@ print_next_home_channel_unset_summary() {
   print_info "$(next_home_channel_unset_remedy "$NEXT_HOME_CHANNEL_UNSET_KEY" "${1:-}")"
 }
 
+# Set by print_chat_setup_checklists: "true" when it printed a checklist.
+CHAT_SETUP_CHECKLIST_PRINTED="false"
+
+# The commands that print the chat setup checklist for each chat platform that
+# is on, one per line, for a reader to paste later. They name the run's
+# install.env, which need not be the checkout's; the front door has made
+# INSTALL_ENV_FILE absolute.
+print_chat_checklist_commands() {
+  local printers
+  printers="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if is_truthy "${GOOGLE_CHAT_ENABLED:-}"; then
+    printf '    KUBE_AGENTS_INSTALL_ENV=%q bash %q\n' "${INSTALL_ENV_FILE:-}" "${printers}/print_instructions_gchat.sh"
+  fi
+  if is_truthy "${SLACK_ENABLED:-}"; then
+    printf '    KUBE_AGENTS_INSTALL_ENV=%q bash %q\n' "${INSTALL_ENV_FILE:-}" "${printers}/print_instructions_slack.sh"
+  fi
+  return 0
+}
+
+# The chat setup checklists after an apply, and the closing summary's key: $1
+# the spec.mode the CR is on after it. The chat keys, NAMESPACE, PROJECT_NUMBER
+# and INSTALL_ENV_FILE are read from the environment the apply rendered from,
+# which every caller has exported by then; what the apply used wins over
+# install.env in the printers. Returns 0 whatever it printed, because the
+# front doors call it bare under set -e.
+# shellcheck disable=SC2034  # both globals are read by install.sh
+print_chat_setup_checklists() {
+  local mode="${1:-}" printers failed="false"
+  printers="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  CHAT_SETUP_CHECKLIST_PRINTED="false"
+  NEXT_HOME_CHANNEL_UNSET_KEY="$(next_home_channel_unset_key "$mode" "${SLACK_ENABLED:-}" \
+    "${GOOGLE_CHAT_ENABLED:-}" "${SLACK_HOME_CHANNEL:-}" "${GOOGLE_CHAT_HOME_CHANNEL:-}")"
+  # --dry-run: a printer changes nothing, yet load_state would otherwise ask
+  # for REGISTRY_PREFIX on a terminal when no file records it, and write it to
+  # vars.sh, which no front door writes.
+  if is_truthy "${GOOGLE_CHAT_ENABLED:-}"; then
+    echo ""
+    KUBE_AGENTS_INSTALL_ENV="${INSTALL_ENV_FILE:-}" \
+      GCHAT_STEPS_PLATFORM_AGENT_MODE="$mode" \
+      GCHAT_STEPS_GOOGLE_CHAT_ENABLED="${GOOGLE_CHAT_ENABLED:-}" \
+      GCHAT_STEPS_HOME_CHANNEL="${GOOGLE_CHAT_HOME_CHANNEL:-}" \
+      GCHAT_STEPS_ALLOWED_USERS="${ALLOWED_USERS:-}" \
+      GCHAT_STEPS_TOPIC_NAME="${CHAT_TOPIC_NAME:-}" \
+      GCHAT_STEPS_SUB_NAME="${CHAT_SUB_NAME:-}" \
+      GCHAT_STEPS_NAMESPACE="${NAMESPACE:-}" \
+      bash "${printers}/print_instructions_gchat.sh" --dry-run || failed="true"
+    CHAT_SETUP_CHECKLIST_PRINTED="true"
+  fi
+  if is_truthy "${SLACK_ENABLED:-}"; then
+    echo ""
+    KUBE_AGENTS_INSTALL_ENV="${INSTALL_ENV_FILE:-}" \
+      SLACK_STEPS_PLATFORM_AGENT_MODE="$mode" \
+      SLACK_STEPS_SLACK_ENABLED="${SLACK_ENABLED:-}" \
+      SLACK_STEPS_GOOGLE_CHAT_ENABLED="${GOOGLE_CHAT_ENABLED:-false}" \
+      SLACK_STEPS_HOME_CHANNEL="${SLACK_HOME_CHANNEL:-}" \
+      SLACK_STEPS_NAMESPACE="${NAMESPACE:-}" \
+      bash "${printers}/print_instructions_slack.sh" --dry-run || failed="true"
+    CHAT_SETUP_CHECKLIST_PRINTED="true"
+  fi
+  if [ "$failed" = "true" ]; then
+    print_warning "A chat setup checklist did not print in full. Show it again with:"
+    print_chat_checklist_commands
+  fi
+  return 0
+}
+
 # Said when a read the notice needs failed, so the run does not go on as if
 # the notice had been weighed and found nothing to say. $1 what could not be
 # read, $2 the key, $3 namespace.

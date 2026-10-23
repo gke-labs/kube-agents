@@ -2509,6 +2509,39 @@ func TestIsImageVolumeSupported(t *testing.T) {
 	}
 }
 
+func TestUpdatePluginStatuses_NamesAPubsubRouteTheOperatorCannotQualify(t *testing.T) {
+	// The adapter's fatal line points the reader at this status; the wiring
+	// that puts the route there has to hold at the level the other status
+	// tests check.
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "target-agent", Namespace: "test-ns"},
+	}
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "stockout", Namespace: "test-ns"},
+		Spec: agentv1alpha1.AgentPluginSpec{
+			AgentRef: "target-agent", Image: "gcr.io/plugin:v1",
+			Config: "platforms:\n  pubsub:\n    enabled: true\n    extra:\n      subscriptions:\n        gke_stockout_alerts:\n          subscription: gke-stockout-alerts-sub\n",
+		},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(plugin).WithStatusSubresource(plugin).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	r.updatePluginStatuses(ctx, agent, []*agentv1alpha1.AgentPlugin{plugin}, true)
+
+	var updated agentv1alpha1.AgentPlugin
+	if err := cl.Get(ctx, types.NamespacedName{Name: plugin.Name, Namespace: plugin.Namespace}, &updated); err != nil {
+		t.Fatalf("failed to fetch updated plugin: %v", err)
+	}
+	cond := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+	if cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("expected a Ready=True condition, got %+v", cond)
+	}
+	if !strings.Contains(cond.Message, "spec.harness.projectId is empty") {
+		t.Errorf("the refused route is not on the plugin's status: %q", cond.Message)
+	}
+}
+
 func TestUpdatePluginStatuses_ImageVolumeUnsupported(t *testing.T) {
 	scheme := setupScheme()
 	agent := &agentv1alpha1.PlatformAgent{

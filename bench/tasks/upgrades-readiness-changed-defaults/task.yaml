@@ -1,0 +1,254 @@
+# The readiness report reads the namespace whose Pod Security version follows the running minor
+#
+# One of the upgrade-failure catalogue's scenario cases
+# (docs/designs/upgrade-failure-catalogue.md, entry 8: a default changes in the new minor).
+# It grades the readiness report's `changed-defaults` rule in the
+# fleet-upgrade-verification skill (scripts/readiness_rules/changed_defaults.py),
+# through the agent's answer to the fleet readiness question.
+#
+# The rule reads each namespace's Pod Security Admission labels against the
+# per-minor table of changed defaults (upgrade_shape_tables.py, with its
+# sources) for the minors the upgrade crosses. A namespace whose
+# enforce-version is `latest` or unset follows the running minor, so the rule
+# set applied to its pods changes under it at every minor that changes the
+# Pod Security Standards; a namespace pinned to a named version is the safe
+# case. The seeded fleet plants the shape as the moving-admission-default role
+# on slot a: the namespace seeded-defaults enforces baseline at version latest,
+# and baseline-edge-worker (one replica) is admitted by today's baseline. What
+# the rule prints for it depends on the minors the fleet crosses to its
+# channel default: a crossed minor that tightens baseline is a risk naming the
+# namespace and the setting; one that only widens an allowlist, or none at
+# all, is a note that counts the namespace (`1 namespace follows latest with
+# no enforced check changing between <from> and <to> per the table`). On the
+# fleet as it stands no crossed minor changes a baseline check, so the report
+# carries seeded-defaults in its note column, and the rule never blocks: a
+# changed default rejects a pod after the upgrade, it does not stop the
+# upgrade. The case therefore grades a declared line per seeded cluster that
+# counts the namespaces following the running minor, names the rule, grades it
+# a risk or a note (never a blocker), and quotes the rule's entry for the
+# cluster in whichever of its forms the fleet's versions produce: the three
+# about the namespace, or, once the channel default has passed the table's
+# last minor (DEFAULT_CHANGES_AS_OF in upgrade_shape_tables.py) and the rule
+# files its table-ends note first, that note; the prompt asks for the first
+# of the rule's entries, so the agent never has to choose between them.
+#
+# What the deterministic checks read, and what they leave to the judge. The
+# prompt asks for one fixed-form line per seeded cluster; every pattern
+# matches the whole declared frame, anchored at both ends, with the line's
+# decoration folded first, and the cluster placeholders are the roles' slots.
+# The checks on slot a's line read its four slots: the count (one or more; the
+# fleet's count, so the judge reads the namespace's name from the prose), the
+# rule id, the grade and the cell. The cell slot is what proves the report
+# ran: its pattern is wording only the rule's own text produces, which the
+# skill paraphrases and a hand kubectl survey cannot supply; a report whose
+# rule is missing prints no such entry, so the slot reads `none` or another
+# rule's text and the line fails there whatever the other slots say. The
+# other clusters' lines are graded on the frame alone: they carry no such
+# namespace, and the rule's count for them is theirs to state. The prose, the
+# reason the rule gives, and the recommended remedy (pin enforce-version to a
+# named minor; run the target minor's rule set in warn and audit before
+# enforce) are the judge's, against `expected_output`.
+#
+# Planted defect required: on slot a, the namespace seeded-defaults with
+# pod-security.kubernetes.io/enforce=baseline and enforce-version=latest, and
+# baseline-edge-worker in it (role `moving-admission-default` in
+# bench/tf/fleet/fixtures.json). The safeguard reads that the enforce-version
+# label still reads latest after the run, so an agent that pinned the
+# namespace fails the case whatever its answer says. The three other roles
+# are one per slot, and they are how the declared-line objectives tell a
+# cluster the agent missed from a cluster the project does not have. No
+# `worker_commands` objective: it reads delegated workers' terminals only and
+# errors on a run the router answered itself, so the report's own output is
+# graded through the cell slot instead, as
+# upgrades-readiness-zonal-control-plane does.
+#
+# Isolation class: read-only (chat prompt; the readiness script reads with
+# gcloud container, gcloud logging read and kubectl get and writes only its
+# own record and per-member kubeconfig files). Eligible tier: nightly from
+# its first merge.
+id: upgrades-readiness-changed-defaults
+name: Upgrade readiness reads the namespace whose Pod Security version follows the running minor
+prompt: >-
+  Check every cluster in this project for its readiness to upgrade to its
+  release channel's default version. For each cluster, report what blocks the
+  upgrade and what is at risk, and say which of its namespaces carry Pod
+  Security Admission labels whose version follows the running minor
+  (enforce-version latest, or unset) instead of naming one, so the rule set
+  applied to their workloads changes with the upgrade. Read only: do not
+  change, upgrade or remove anything. End your answer with one line per seeded
+  cluster, in exactly this form and with no other words on the line:
+  "<cluster>: kind Cluster; namespaces whose pod security version follows the
+  running minor: <count>; readiness rule: <the id of the report's rule that
+  graded them|none>; graded as: <blocker|risk|note|none>; cell: <the entry the
+  report prints for that rule on the cluster in its other blockers, risks or
+  note column, copied as printed|none>". Write each cluster name exactly as
+  the API shows it, with no brackets, quotes or parentheses around it. When a
+  column holds several entries separated by "; ", copy the first one from
+  the changed-defaults rule. Put any aside on a line of its own.
+expected_output: >-
+  A per-cluster readiness report read during this run. For seeded-a it names
+  the namespace seeded-defaults: its Pod Security Admission labels enforce
+  baseline at enforce-version latest, so the baseline rule set applied to its
+  workloads is whichever the running control plane ships and changes with the
+  upgrade without anyone editing the namespace; baseline-edge-worker (one
+  replica) is admitted by today's baseline and is what a stricter one would
+  refuse at its next rollout. It says what the report's changed-defaults rule
+  printed for the cluster: a note counting the namespace when no crossed minor
+  changes a baseline check, a risk naming the namespace and the setting when
+  one does; never a blocker, since a changed default rejects a pod after the
+  upgrade. It recommends pinning enforce-version to a named minor and running
+  the target minor's rule set in warn and audit before enforce. Other
+  clusters' blockers and risks come from the same run. It ends with one
+  declared line per seeded cluster; seeded-a's counts at least one namespace,
+  names changed-defaults, reads "graded as: note" or "graded as: risk", and
+  its cell is the first of the rule's entries for the cluster, with or without
+  the "changed-defaults: " prefix. It cites no CVE identifiers and changes
+  nothing.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+# Named by ROLE, not cluster: bench/tf/fleet/fixtures.json;
+# docs/designs/bench-fleet-catalog.md is the rule. The first role is the
+# planted namespace on slot a; the other three are one per remaining slot.
+fixtures:
+  - moving-admission-default
+  - version-laggard
+  - drift-outlier
+  - zonal-skew-scheduling
+
+verification_spec:
+  # One line per seeded cluster, fixed vocabulary, the cluster named at the
+  # start of the line; every pattern matches the whole declared frame, anchored
+  # at both ends, with the line's decoration folded first.
+  - name: every-seeded-cluster-has-a-declared-line
+    role: objective
+    # assert, not converge: the transcript is immutable once the run ends.
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - moving-admission-default
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: kind cluster; namespaces whose pod security version follows the running minor: [^;\n]+; readiness rule: [^;\n]+; graded as: [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: kind cluster; namespaces whose pod security version follows the running minor: [^;\n]+; readiness rule: [^;\n]+; graded as: [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: kind cluster; namespaces whose pod security version follows the running minor: [^;\n]+; readiness rule: [^;\n]+; graded as: [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: kind cluster; namespaces whose pod security version follows the running minor: [^;\n]+; readiness rule: [^;\n]+; graded as: [^\n]+$)'
+
+  # The fact the entry turns on: slot a carries a namespace whose Pod Security
+  # version follows the running minor. The count is the fleet's (one today),
+  # so the pattern asks for one or more; a line that counts none denies the
+  # planted namespace.
+  - name: the-planted-clusters-line-counts-the-namespace
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - moving-admission-default
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: kind cluster; namespaces whose pod security version follows the running minor: [1-9][0-9]*; readiness rule: [^;\n]+; graded as: [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: kind cluster; namespaces whose pod security version follows the running minor: (?![1-9][0-9]*;)[^;\n]+; readiness rule: [^;\n]+; graded as: [^\n]+$'
+
+  # The report's own output: the rule id the risks column, the note and the JSON
+  # carry. An agent that read the labels without the report has no id to give,
+  # and a report whose rule has regressed gives none, so the slot reads `none`.
+  - name: the-planted-clusters-line-names-the-reports-rule
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - moving-admission-default
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: kind cluster; namespaces whose pod security version follows the running minor: [^;\n]+; readiness rule: changed-defaults; graded as: [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: kind cluster; namespaces whose pod security version follows the running minor: [^;\n]+; readiness rule: (?!changed-defaults;)[^;\n]+; graded as: [^\n]+$'
+
+  # The grade is the rule's own: a note on the fleet as it stands, a risk when
+  # a crossed minor tightens baseline, never a blocker; `none` denies the rule
+  # ran on the planted namespace.
+  - name: the-planted-clusters-line-does-not-block
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - moving-admission-default
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: kind cluster; namespaces whose pod security version follows the running minor: [^;\n]+; readiness rule: [^;\n]+; graded as: (?:risk|note); cell: [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: kind cluster; namespaces whose pod security version follows the running minor: [^;\n]+; readiness rule: [^;\n]+; graded as: (?!(?:risk|note);)[^;\n]+; cell: [^\n]+$'
+
+  # The report's own wording, in whichever of the rule's forms the fleet's
+  # versions produce: the note that counts the namespaces following latest
+  # with no enforced check changing, the note that a crossed minor only widens
+  # the allowlist, the risk naming the namespace and its setting, or the note
+  # that the defaults table ends before the target, which the rule files first
+  # and the prompt therefore asks for. The skill paraphrases all four and a
+  # kubectl read supplies none. A report
+  # whose rule is missing prints no such text, so the slot reads `none` or
+  # something else and the line fails here, whatever the other slots say. The
+  # counts and minors are the fleet's, left open; the pattern admits one
+  # opener before the text, a quote or angle bracket the agent kept.
+  - name: the-planted-clusters-line-quotes-the-reports-cell
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - moving-admission-default
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      # The `changed-defaults: ` prefix is the table's; report.json carries the bare text, so it is optional.
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: kind cluster; namespaces whose pod security version follows the running minor: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: ["''“‘<]?(?:changed-defaults: )?(?:[0-9]+ namespaces? follows? latest with no enforced check changing between|seeded-defaults follows latest;|namespace seeded-defaults: pod-security\.kubernetes\.io/enforce=baseline, pod-security\.kubernetes\.io/enforce-version=latest: follows the running minor|the defaults table ends at [0-9.]+ \(read )[^\n]*$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: kind cluster; namespaces whose pod security version follows the running minor: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: (?!["''“‘<]?(?:changed-defaults: )?(?:[0-9]+ namespaces? follows? latest with no enforced check changing between|seeded-defaults follows latest;|namespace seeded-defaults: pod-security\.kubernetes\.io/enforce=baseline, pod-security\.kubernetes\.io/enforce-version=latest: follows the running minor|the defaults table ends at [0-9.]+ \(read ))[^\n]*$'
+
+  # The prompt's "read only", grounded: the namespace's enforce-version label
+  # still reads latest. The key carries dots, so it is quoted for the JSONPath
+  # parser. The namespace is cluster-scoped, and kubectl ignores the role's
+  # namespace for this kind.
+  - name: the-planted-version-pin-survived-the-run
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: moving-admission-default
+      kind: namespace
+      resource_name: seeded-defaults
+      namespace: seeded-defaults
+      path: 'metadata.labels."pod-security.kubernetes.io/enforce-version"'
+      op: eq
+      value: latest
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # No vulnerability feed; a CVE id in a readiness report is an invention.
+      forbidden_phrases: ["CVE-"]
