@@ -119,8 +119,8 @@ _DECIMAL_SI_HARD_BYTES = 1000000000
 _LITELLM_REPLICAS = 2
 _LITELLM_CPU_LIMIT_MILLIS = 500 * _LITELLM_REPLICAS
 _LITELLM_CPU_REQUEST_MILLIS = 100 * _LITELLM_REPLICAS
-# An ephemeral-storage request no chart workload sets by default, so the totals move by
-# exactly this much when one does.
+# An ephemeral-storage request set on LiteLLM in place of its 1280Mi default, so the
+# totals move by the difference, per replica.
 _EPHEMERAL_SET_GIB = 3
 # What the shell StatefulSet leaves behind: persistentVolumeClaimRetentionPolicy is
 # Retain/Retain, so these two claims survive `helm uninstall` and are in `used` on the

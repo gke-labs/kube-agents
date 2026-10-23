@@ -585,8 +585,10 @@ class A3TheGatewaysSlackPrincipalComesFromSlackOrTheMap(unittest.TestCase):
     map joins to the member id, or the member id Slack asserted, qualified
     `slack:`.  The map is an override and not a gate, so three things carry
     the invariant: a member of another workspace (a Slack Connect guest) is
-    not a turn at all, so admission never reaches past the install's own
-    workspace; an unlisted sender resolves to nothing whatever the map says;
+    not a turn unless the allowlist names that member of that workspace as
+    `T…:U…`, so admission never reaches past the install's own workspace
+    without an entry that says so (allow-all names nobody); an unlisted
+    sender resolves to nothing whatever the map says;
     and the map cannot assert the reserved prefix, so a principal that claims
     to be a bare member id always is one.
     """
@@ -607,14 +609,23 @@ class A3TheGatewaysSlackPrincipalComesFromSlackOrTheMap(unittest.TestCase):
         inbound = h.go_function_body(source, "inboundEvent")
         self.assertRegex(
             inbound,
-            r"if s\.foreignSender\(m\) \{\s*return InboundMessage\{\}, false",
+            r"refused, author := s\.foreignSender\(m\)\s*if refused \{\s*return InboundMessage\{\}, false",
             "the Slack ingress no longer refuses a member of another workspace before admission",
         )
         foreign = h.go_function_body(source, "foreignSender")
-        self.assertIn(
-            "if !s.otherWorkspace(m.UserTeam) && (m.Message == nil || !s.otherWorkspace(m.Message.Team)) {",
+        self.assertIn("if !s.otherWorkspace(m.UserTeam) && !s.otherWorkspace(messageTeam) {", foreign)
+        self.assertRegex(
             foreign,
+            r"if guest, ok := s\.admitGuest\(m\.UserTeam, messageTeam, m\.User\); ok \{\s*return false, guest",
+            "a member of another workspace is admitted by something other than an allowlist entry naming them",
         )
+        # Only an entry that names the member of that workspace admits them;
+        # two workspace fields that disagree match nothing.
+        admit = h.go_function_body(source, "admitGuest")
+        self.assertIn("return entry, s.guests[entry]", admit)
+        self.assertIn('if !ok || team == "" || user == "" {', admit)
+        workspace = h.go_function_body(source, "senderWorkspace")
+        self.assertIn('if userTeam != "" && otherTeam != "" && userTeam != otherTeam {', workspace)
         other = h.go_function_body(source, "otherWorkspace")
         self.assertIn('return team != "" && (s.teamID == "" || team != s.teamID)', other)
 
@@ -1058,6 +1069,7 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
 
     NOTIFY_PROBE = "chat.notify.gchat"
     NOTIFY_SLACK_PROBE = "chat.notify.slack"
+    NOTIFY_CONSOLE_PROBE = "chat.notify.console"
     NOTIFY_REPLY_PROBE = "chat.notify.reply.agent.r1"
 
     def test_A3_a_notify_has_one_writer_and_its_answer_has_one(self) -> None:
@@ -1065,7 +1077,8 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
 
         The gateway posts what arrives on `chat.notify.gchat` (or, on a
         Slack-armed gateway, `chat.notify.slack`) to the home channel as the
-        install's bot, so a second writer there is a second
+        install's bot, and what arrives on `chat.notify.console` into a console
+        conversation, so a second writer there is a second
         principal that can make the bot speak; and the agent takes the answer
         as the gateway's word on where the post landed, so a second writer on
         the reply namespace -- the agent itself included -- can forge it. The
@@ -1076,6 +1089,7 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         for probe, want in (
             (self.NOTIFY_PROBE, ["agent"]),
             (self.NOTIFY_SLACK_PROBE, ["agent"]),
+            (self.NOTIFY_CONSOLE_PROBE, ["agent"]),
             (self.NOTIFY_REPLY_PROBE, ["gateway"]),
         ):
             writers = sorted(

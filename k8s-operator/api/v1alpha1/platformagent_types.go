@@ -310,6 +310,9 @@ type SlackSpec struct {
 	AppTokenSecretRef *corev1.SecretKeySelector `json:"appTokenSecretRef,omitempty"`
 
 	// AllowedUsers is a list of allowed member IDs. If not present, all users will be allowed.
+	// A plain ID (U...) is a member of the install's own workspace. Under mode next, an entry
+	// T...:U... (a workspace ID, a colon, a member ID) admits that member of another workspace
+	// in a Slack Connect channel; nothing else admits one, an absent list included.
 	// +listType=set
 	// +optional
 	AllowedUsers []string `json:"allowedUsers,omitempty"`

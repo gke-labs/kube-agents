@@ -327,7 +327,19 @@ func (s *SlackAdapter) notePending(msg InboundMessage) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.addPendingLocked(slackPendingKey(msg.Conversation, msg.MessageID),
-		slackPending{conversation: msg.Conversation, author: msg.AuthorID, text: msg.Text})
+		slackPending{conversation: msg.Conversation, author: slackMemberOf(msg.AuthorID), text: msg.Text})
+}
+
+// slackMemberOf is the Slack member id behind an author id: the id itself for
+// our own member, the part after the workspace for an admitted guest's
+// "T…:U…" (slackGuestEntry). A pending turn keeps this raw id, because what it
+// feeds, the answered line's display name and the Home tab's asker, are Slack
+// API calls that take a member id.
+func slackMemberOf(author string) string {
+	if _, member, found := strings.Cut(author, slackGuestSep); found {
+		return member
+	}
+	return author
 }
 
 // The first entry under a key stands until the gateway's verdict takes it: a
@@ -351,7 +363,8 @@ func (s *SlackAdapter) addPendingLocked(key string, p slackPending) {
 
 // interactive turns one interactive envelope's payload into a turn, or
 // reports it is not one: a click on a choice button, from a member of the
-// bot's own workspace, on a question not already answered.
+// bot's own workspace or a guest the allowlist names as "T…:U…" (admitGuest),
+// on a question not already answered.
 func (s *SlackAdapter) interactive(raw json.RawMessage) (InboundMessage, bool) {
 	var p slackClickPayload
 	if err := json.Unmarshal(raw, &p); err != nil {
@@ -376,17 +389,21 @@ func (s *SlackAdapter) interactive(raw json.RawMessage) (InboundMessage, bool) {
 	if thread == "" {
 		thread = p.Message.TS
 	}
+	author := p.User.ID
 	if s.otherWorkspace(p.User.TeamID) || s.otherWorkspace(p.Team.ID) {
-		s.log.Info("slack: ignoring a click from another workspace's member",
-			"user", p.User.ID, "userTeam", p.User.TeamID, "team", s.teamID, "channel", p.Channel.ID)
-		// The same once-per-sender notice a refused message gets, in the
-		// question's thread: a button that does nothing looks broken.
-		team := p.User.TeamID
-		if team == "" {
-			team = p.Team.ID
+		// The message path's rule (foreignSender): a member of another
+		// workspace is admitted only when the allowlist names them by
+		// workspace, and their click then carries the same "T…:U…" author.
+		guest, ok := s.admitGuest(p.User.TeamID, p.Team.ID, p.User.ID)
+		author = guest
+		if !ok {
+			s.log.Info("slack: ignoring a click from another workspace's member",
+				"user", p.User.ID, "userTeam", p.User.TeamID, "team", s.teamID, "channel", p.Channel.ID)
+			// The same once-per-sender notice a refused message gets, in the
+			// question's thread: a button that does nothing looks broken.
+			s.noticeForeignSender(p.Channel.ID, thread, p.User.TeamID, p.Team.ID, p.User.ID)
+			return InboundMessage{}, false
 		}
-		s.noticeForeignSender(p.Channel.ID, thread, team, p.User.ID)
-		return InboundMessage{}, false
 	}
 	if s.alreadySeen("click:" + p.Channel.ID + "/" + p.ActionTS) {
 		return InboundMessage{}, false
@@ -420,7 +437,7 @@ func (s *SlackAdapter) interactive(raw json.RawMessage) (InboundMessage, bool) {
 	return InboundMessage{
 		Conversation: conversation,
 		Kind:         kind,
-		AuthorID:     p.User.ID,
+		AuthorID:     author,
 		MessageID:    p.ActionTS,
 		Text:         text,
 		Click:        true,
