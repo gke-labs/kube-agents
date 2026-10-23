@@ -111,6 +111,20 @@ fixtures:
       the posture is observable on apply day; its case still needs a ledger,
       which the idle pool supplies from day 7.
 
+  - role: guaranteed-qos-workload
+    slot: a
+    available_from_day: 0
+    objects:
+      - deployment/ledger-writer
+    namespace: seeded-qos
+    defect: >-
+      Two replicas whose container sets requests equal to limits (10m /
+      32Mi), so the pods are Guaranteed QoS and a lower request lowers the
+      limit with it. The container burns its 10m CPU limit, so it is
+      throttled there already. A request cut has to name this dependency;
+      the waste audit never names the workload (CPU in use, both dimensions
+      under its resize floor).
+
   - role: stalled-controller
     slot: a
     available_from_day: 0

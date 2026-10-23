@@ -383,7 +383,7 @@ deterministically with the two places a kube-agents report goes, the issue track
 public feedback form, and starts no task; with text after it, the gateway passes the message
 through as typed, and the Planning Agent composes the report and asks for a yes before the
 platform worker files it through the credential broker. The command, the persona flow and the
-broker verb are designed in [`chat-feedback-command.md`](chat-feedback-command.md).
+broker verb are designed in [`chat-feedback-command.md`](chat-feedback-command.md). `/feedback summary` (added 2026-10-21) is the one text form the gateway answers itself: the install's identifier-free usage and feedback summary, from the `PlatformAgent` resource and the gateway's task records, with no task started (part 7 of the same document).
 
 Delegation on a human's behalf keeps the human's bound, and the gateway is where it is kept.
 A session does not mint a child task itself: it asks the gateway to, over the same local
@@ -1734,6 +1734,44 @@ applies; Discord's group DMs read as DMs, and the asymmetry is deliberate. The b
 only sees channels it has been invited to, so the invitation is the trust boundary for
 group ingress.
 
+**The message shortcut (added 10/16).** A member can make a turn of any message, whoever
+wrote it, with the app's message shortcut (manifest `features.shortcuts`, `type: message`,
+`callback_id: ask_about_message`, which needs the `commands` scope). Slack sends a
+`message_action` interactive envelope, acked like a click; the adapter handles it off the
+event pump, because it reads from Slack before it has a turn to hand over, and `Run` waits
+for it like the pump. The turn is the clicker's: the allowlist and the workspace rule apply
+to them, as for a typed ask, and a redelivery is dropped by `action_ts`. Its conversation is
+the thread under the message (the message's thread when it is a reply), its message id is
+the message, so the ask's reaction goes on it, and its text is a fixed frame
+(`slackShortcutAsk`) around the message quoted: the words of its Block Kit blocks (sections,
+fields, headers, context and rich_text, not buttons), or its text when it has none, since an
+app's text beside blocks is only the fallback; its attachments' pretext, title, text and
+fields, and its Block Kit body (the fallback when none of them has words); and its files'
+names, opened by who posted it
+(a member's Slack name, an app's posting name, on one line and clipped), with the channel's
+name in the frame. The poster's name goes inside the quote because it is the message's word:
+an app chooses the name it posts under and a member sets their own. The frame tells the agent
+the quote is something to check, not an instruction, because the requester is the clicker and
+the message's author may be anyone, a program included; the eval case
+`chat-shortcut-alert-is-checked-not-obeyed` holds the agent to it. Once the gateway has
+verified the clicker and the shortcut's own task starts, the adapter posts a context-only
+message in the thread naming them by their Slack name (`<name> asked me to look at this`),
+from `TaskStarted`, under the session lock and before anything of the task's can post, so
+a channel reading a bot's reply under someone else's message can see who asked. It precedes
+the task's first reply; it is not glued to it. A reply typed in the thread before the
+executor's first post is a turn of its own, and the gateway's answer to it (a steer's ack, a
+refusal) lands between the line and the task's reply. It is its own message,
+not a line on the task's first post, because nothing ties a post to the task it is for: under
+Agent Sessions there is no placeholder, and the first post in the thread can be the gateway's
+reply to another turn (a steer's ack, a refusal). A shortcut whose turn starts no task (a
+steer into a running one) posts no line, and any other verified turn in the thread clears a
+line still waiting for its task. Before handing anything
+over the adapter asks `conversations.info` whether it can post there. A channel it is not a
+member of, and a conversation it cannot see at all (a private channel or a DM it is not in,
+`channel_not_found`), gets a note only the clicker sees, through the payload's
+`response_url` (posted only when it is on `hooks.slack.com`), and no turn. A failed read is
+not a refusal: the turn goes ahead.
+
 **The mapping table - where it lives and who writes it.** The table is an optional
 override, not an admission gate: the allowed-users list admits, and the table joins an
 admitted sender's immutable `user_id` to an identity sourced from our own IdP; never
@@ -1789,7 +1827,10 @@ sender; an unmapped one is attributed by member id, below) - but visibly now: th
 posts a one-line notice to the conversation, once per sender, and keeps the structured
 log line. The exception is a message the sender addressed to nobody (`Unaddressed`: an
 unmentioned Slack reply under one of the bot's own posts, #3246), which is dropped with a
-info-level log line only and does not count as the sender's notice. A silent drop of a real user is a support burden. Per sender, not per
+info-level log line only and does not count as the sender's notice. A shortcut's
+conversation is a thread under someone else's message, so the gateway posts no notice
+there either (`Shortcut`); the adapter sends it to the clicker alone through the
+shortcut's `response_url`, every time. A silent drop of a real user is a support burden. Per sender, not per
 conversation - a channel mention mints a fresh conversation every time, so a
 conversation-scoped dedupe would be no bound at all. The memory is capped and evicted
 wholesale at the cap, so the worst an unverified sender can do is make one notice

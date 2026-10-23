@@ -416,6 +416,93 @@ resource "kubernetes_pod_disruption_budget_v1" "burst_ingest" {
   }
 }
 
+# Posture (rightsizing dependency): a Guaranteed-QoS workload, the second
+# dependency a request cut must name besides inference-server's HPA. Two
+# replicas whose one container sets requests equal to limits on both
+# dimensions, 10m / 32Mi, so lowering a request lowers the limit with it.
+# The container burns its whole 10m CPU limit, so the pods are throttled at
+# that limit already, and a lower CPU figure throttles them harder. Both
+# numbers keep it out of the waste audit: CPU sits at 100% of its request,
+# so the idle-workload check (idle on every dimension) never reads it, and
+# both dimensions are under the right-sizing check's 50m / 64Mi floor, so
+# that check has nothing to shrink. 10m because the slot's default pool runs
+# above 70% CPU requested on both nodes. The budget, spread, default-deny
+# policy and restricted settings are burst-ingest's, so no other stream
+# names it beyond the README's accepted background rows. Asserted by
+# cost-rightsizing-names-dependencies.
+resource "kubernetes_namespace_v1" "seeded_qos" {
+  metadata {
+    name   = "seeded-qos"
+    labels = local.fleet_labels
+  }
+  depends_on = [google_container_node_pool.seeded_a_default]
+}
+
+resource "kubernetes_deployment_v1" "ledger_writer" {
+  metadata {
+    name      = "ledger-writer"
+    namespace = kubernetes_namespace_v1.seeded_qos.metadata[0].name
+  }
+  spec {
+    replicas = 2
+    selector {
+      match_labels = { app = "ledger-writer" }
+    }
+    template {
+      metadata {
+        labels = { app = "ledger-writer" }
+      }
+      spec {
+        topology_spread_constraint {
+          max_skew           = 1
+          topology_key       = "kubernetes.io/hostname"
+          when_unsatisfiable = "ScheduleAnyway"
+          label_selector {
+            match_labels = { app = "ledger-writer" }
+          }
+        }
+        automount_service_account_token = false
+        security_context {
+          run_as_non_root = true
+          run_as_user     = 65534
+          seccomp_profile {
+            type = "RuntimeDefault"
+          }
+        }
+        container {
+          name    = "writer"
+          image   = "busybox:1.36"
+          command = ["sh", "-c", "while true; do :; done"]
+          security_context {
+            allow_privilege_escalation = false
+            run_as_non_root            = true
+            capabilities {
+              drop = ["ALL"]
+            }
+          }
+          resources {
+            requests = { cpu = "10m", memory = "32Mi" }
+            limits   = { cpu = "10m", memory = "32Mi" }
+          }
+        }
+      }
+    }
+  }
+}
+
+resource "kubernetes_pod_disruption_budget_v1" "ledger_writer" {
+  metadata {
+    name      = "ledger-writer"
+    namespace = kubernetes_namespace_v1.seeded_qos.metadata[0].name
+  }
+  spec {
+    min_available = "1"
+    selector {
+      match_labels = { app = "ledger-writer" }
+    }
+  }
+}
+
 # Defect (security): the classic over-grant -- cluster-admin bound to a
 # namespace's default ServiceAccount. Asserted by compliance-rbac-overgrant.
 # A ClusterRoleBinding, not a RoleBinding, deliberately: the compliance
@@ -688,6 +775,7 @@ resource "kubernetes_network_policy_v1" "default_deny" {
     stall       = kubernetes_namespace_v1.seeded_stall.metadata[0].name
     token       = kubernetes_namespace_v1.seeded_token.metadata[0].name
     headroom    = kubernetes_namespace_v1.seeded_headroom.metadata[0].name
+    qos         = kubernetes_namespace_v1.seeded_qos.metadata[0].name
     shapes      = kubernetes_namespace_v1.seeded_shapes.metadata[0].name
     defaults    = kubernetes_namespace_v1.seeded_defaults.metadata[0].name
     # seeded-intent gets none on purpose: its missing policy is the compliance
