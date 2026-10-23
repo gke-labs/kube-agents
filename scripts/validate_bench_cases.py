@@ -439,6 +439,15 @@ FIXTURE_NOT_READY = {
         "the surge-capacity rule's two surge halves are covered by unit tests on "
         "a recorded cluster record and node list until the fixture lands"
     ),
+    "upgrades-readiness-rollout-sequence-precheck": (
+        "#3798: needs gkehub.googleapis.com enabled and roles/gkehub.viewer bound "
+        "for the agent's service account on every pool project, so a worker's "
+        "`gcloud container fleet rolloutsequences list` on the eval project "
+        "answers (the live answer there is existing 0, plan clear); no pool "
+        "project has the API or the role today, so the read fails for a reason "
+        "that is not the case's, and the blocked path is graded by the rule's "
+        "unit tests on a recorded list until then"
+    ),
 }
 
 # Cases graded by the judge alone. The OutcomeValidity >= 0.7 fallback in

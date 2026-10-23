@@ -3117,11 +3117,15 @@ unit_cost_hint() {
     upgrades-removed-api-callers-distinguished | upgrades-network-policy-enforcement-stated) echo 900 ;;
     upgrades-stale-client-skew-named | upgrades-multi-process-oom-group-named) echo 900 ;;
     upgrades-cuda-pinned-gpu-job-named) echo 900 ;;
-    # The upgrade retrospective's two cases: each holds the stream, and a
+    # The upgrade retrospective's cases: each holds the stream, and a
     # fleet-wide question with a stale report is a full collector run over the
     # seeded fleet. 540s and 360s a red repetition on a dev install
-    # (2026-10-15); priced at the audit band's floor.
+    # (2026-10-15); priced at the audit band's floor. The six after-upgrade
+    # cases ask the same fleet-wide question and take the same price.
     upgrades-retrospective-on-demand | upgrades-retrospective-drained-budget) echo 600 ;;
+    upgrades-retrospective-cgroup-blind-runtime | upgrades-retrospective-cuda-pinned-gpu-job) echo 600 ;;
+    upgrades-retrospective-failclosed-webhook | upgrades-retrospective-multi-process-container) echo 600 ;;
+    upgrades-retrospective-network-policy-enforcement | upgrades-retrospective-stale-client-skew) echo 600 ;;
     *) echo 200 ;;
   esac
 }
