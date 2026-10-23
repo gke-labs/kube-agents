@@ -601,6 +601,34 @@ def home_relative_paths(agent_home: Path) -> list[str]:
     return homes
 
 
+# Homes every --profile run pushes as well as the named ones: the machine home and the
+# platform profile, the two the sandbox's own entrypoint creates as roots
+# (SANDBOX_HOME_ROOTS) without their working directories. Two homes, so a scaffold stays
+# O(1), and a sandbox volume recreated under a running agent pod gets them back from the
+# reconcile's next re-scaffold, as it did when every scaffold pushed every home.
+FIXED_HOMES = ("", f"{PROFILES_DIR}/platform")
+
+
+def named_profile_homes(agent_home: Path, names: list[str]) -> tuple[list[str], list[str]]:
+    """The homes for ``--profile``: (profiles/<name> for each that exists, the rest).
+
+    A scaffold passes the one profile it just made, so the skeleton and identity
+    pushes touch that home alone instead of every profile on the volume: with
+    every home, each new profile re-sent the whole set, and onboarding N
+    clusters cost O(N^2) (#3701).
+    A name is a single path component, as Hermes makes it, and has to be a
+    directory under profiles/ already; anything else is reported, not guessed at.
+    """
+    homes: list[str] = []
+    rejected: list[str] = []
+    for name in names:
+        if not name or "/" in name or name.startswith(".") or not (agent_home / PROFILES_DIR / name).is_dir():
+            rejected.append(name)
+        else:
+            homes.append(f"{PROFILES_DIR}/{name}")
+    return homes, rejected
+
+
 def push_skeleton(ssh: list[str], remote_root: str, homes: list[str]) -> None:
     """Make every home's working directories exist, whatever is there now.
 
@@ -640,8 +668,9 @@ def push_skeleton(ssh: list[str], remote_root: str, homes: list[str]) -> None:
 def push_cluster_identities(
     ssh: list[str], agent_home: Path, remote_root: str, homes: list[str]
 ) -> None:
-    """Put every Cluster Agent's identity file on the sandbox's volume.
+    """Put each given Cluster Agent's identity file on the sandbox's volume.
 
+    Every one at start; on a scaffold, only the scaffolded profile's (``--profile``).
     Runs alongside the skeleton, on every start and on every scaffold, because
     both are cases where the sandbox has a profile home and nothing in it: a
     recreated sandbox volume, a profile created after the last start, a
@@ -974,6 +1003,14 @@ def main(argv: list[str] | None = None) -> int:
         help="create the directory layout and skip the one-shot migration",
     )
     parser.add_argument(
+        "--profile",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="push the layout for this profile only (repeatable); needs --skeleton-only. "
+        "Without it every home is pushed, as the entrypoint does at start",
+    )
+    parser.add_argument(
         "--force-migrate",
         action="store_true",
         help="migrate even if the sandbox already carries the marker",
@@ -999,7 +1036,26 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_OK
 
     ssh = ssh_base_command(terminal)
-    homes = home_relative_paths(agent_home)
+    if args.profile:
+        # The migration reads every home, so a partial set there would copy part
+        # of the model's files and then write the marker that stops the rest.
+        # EXIT_RETRY, not EXIT_OK, on both refusals here: the scaffold reads a zero
+        # exit as "pushed" and logs it, and only the scaffold passes --profile.
+        if not args.skeleton_only:
+            log("--profile pushes one profile's layout and needs --skeleton-only; refusing")
+            return EXIT_RETRY
+        named, rejected = named_profile_homes(agent_home, args.profile)
+        if rejected:
+            log(
+                f"not a profile directory under {agent_home / PROFILES_DIR} (one path "
+                f"component, no leading dot, already scaffolded): {', '.join(rejected)}; skipped"
+            )
+        if not named:
+            return EXIT_RETRY
+        fixed = [h for h in FIXED_HOMES if h == "" or (agent_home / h).is_dir()]
+        homes = fixed + [h for h in named if h not in fixed]
+    else:
+        homes = home_relative_paths(agent_home)
 
     if args.dry_run:
         include, skipped = migration_candidates(agent_home, homes)

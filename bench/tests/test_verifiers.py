@@ -63,6 +63,7 @@ from kube_agents_bench.verifiers import (
     ReplyIsSilentVerifier,
     ReportContainsVerifier,
     ToolCalledVerifier,
+    VerifiedClaimsBackedVerifier,
     _fold_line_decoration,
 )
 
@@ -338,12 +339,42 @@ def _write_fleet_dir(root: Path, reached: list[str], names: dict[str, str] | Non
     (root / "clusters").mkdir(exist_ok=True)
     roles = _catalog_roles()
     lines = ["project=kube-agents-evals"] + [f"slot.{role}={spec['cluster_slot']}" for role, spec in roles.items()]
-    for slot in sorted({roles[role]["cluster_slot"] for role in reached}):
+    # A role the catalogue lacks gets no slot credential; a case that names only
+    # such a role is parked and its table rows are skipped (`_live`), so this is
+    # reached by a hand-built call alone.
+    for slot in sorted({roles[role]["cluster_slot"] for role in reached if role in roles}):
         name = (names or {}).get(slot, f"seeded-{slot}")
         lines += [f"cluster.{slot}={name}", f"location.{slot}={location}"]
     (root / ".fleet-context").write_text("\n".join(lines) + "\n", encoding="utf-8")
     for role in reached:
+        if role not in roles:
+            continue
         (root / "clusters" / f"{roles[role]['cluster_slot']}.kubeconfig").write_text("apiVersion: v1\n", encoding="utf-8")
+
+
+def _parked_cases() -> set[str]:
+    """The validator's FIXTURE_NOT_READY set, loaded by path. A parked case's table
+    rows, dedicated tests and construction test drop out with its roster line:
+    the fleet README's exit for a retired role parks the cases that name it, and
+    their fleet directory could record no slot for a role the catalogue lacks."""
+    import importlib.util
+
+    validator = Path(__file__).resolve().parents[2] / "scripts" / "validate_bench_cases.py"
+    spec = importlib.util.spec_from_file_location("validate_bench_cases_for_verifier_tests", validator)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return set(module.FIXTURE_NOT_READY)
+
+
+def _live(table: dict) -> dict:
+    """A group table less the cases the validator parks."""
+    parked = _parked_cases()
+    return {case: rows for case, rows in table.items() if case not in parked}
+
+
+def _skip_if_parked(case: str) -> None:
+    if case in _parked_cases():
+        pytest.skip(f"{case} is parked in FIXTURE_NOT_READY")
 
 
 def _zonal_case_verdict(objective: str, text: str, reached: list[str] | None = None, names: dict[str, str] | None = None):
@@ -1071,7 +1102,6 @@ _RETRY = WorkerCommandsVerifier(
 )
 
 
-
 def test_worker_commands_after_result_a_write_after_the_refusal_fails_and_names_it():
     _stash_terminal(
         [
@@ -1260,7 +1290,6 @@ def test_worker_commands_after_result_opens_on_the_result_alone():
     assert res.status == "fail" and "after 'grep -rn read-only" in res.reason
 
 
-
 _WRITE_REFUSED = (
     '{"output": "Agents hold read-only access to Kubernetes. ...\\npolicy rule: kubernetes.read-only'
     '\\npolicy verb: scale deployment\\n", "exit_code": 77}'
@@ -1445,7 +1474,6 @@ def test_replay_card_errors_when_the_cards_status_was_not_read(status):
     res = _replay_card(status_not_in=["blocked"], comment_phrases=["seeded-b"]).verify(5.0)
     assert res.status == "error"
     assert "unknown" in res.reason
-
 
 
 def test_replay_card_passes_on_a_decoy_left_blocked():
@@ -3836,6 +3864,90 @@ def test_finding_ids_scope_fails_on_a_malformed_delta_payload(token, github):
     assert _ledger_check(scope="finding_ids", required_phrases=["x"]).verify(5.0).status == "fail"
 
 
+_NAMED_SHOWN = "rbac-overgrant.seeded-a._.debug-binding"
+_NAMED_CUT = "service-selects-nothing.seeded-c.ns.orders"
+
+
+def _cut_body(listed: str = "") -> str:
+    """A body that shows one finding in full and cut the other for space."""
+    body = _ledger_body(
+        findings=f"#### debug-binding grants cluster-admin <!-- finding:{_NAMED_SHOWN} -->\n{listed}",
+        finding_ids=[_NAMED_SHOWN],
+    )
+    payload = json.dumps(sorted([_NAMED_SHOWN, _NAMED_CUT]), separators=(",", ":"))
+    return body + f"<!-- audit-findings-all: {payload} -->\n"
+
+
+def test_every_finding_named_fails_on_an_id_only_the_hidden_blocks_carry(token, github):
+    _stash_report()
+    github.routes[_api()] = (200, _issue(_cut_body()))
+    res = _ledger_check(every_finding_named=True).verify(5.0)
+    assert res.status == "fail"
+    assert _NAMED_CUT in res.reason
+    assert _NAMED_SHOWN not in res.reason
+
+
+def test_every_finding_named_passes_when_the_cut_finding_is_listed(token, github):
+    _stash_report()
+    listed = f"\n### Listed without detail (1)\n\n- **minor** — Service selects nothing (`{_NAMED_CUT}`)\n"
+    github.routes[_api()] = (200, _issue(_cut_body(listed)))
+    res = _ledger_check(every_finding_named=True).verify(5.0)
+    assert res.status == "pass", res.reason
+    assert "visible name for every filed finding" in res.reason
+
+
+def test_every_finding_named_passes_on_an_untruncated_body(token, github):
+    _stash_report()
+    body = _ledger_body(findings=f"#### debug-binding <!-- finding:{_NAMED_SHOWN} -->\n")
+    github.routes[_api()] = (200, _issue(body))
+    assert _ledger_check(every_finding_named=True).verify(5.0).status == "pass"
+
+
+def test_every_finding_named_does_not_take_a_longer_id_for_a_cut_one(token, github):
+    _stash_report()
+    listed = f"\n- **minor** — Service selects nothing (`{_NAMED_CUT}-api`)\n"
+    github.routes[_api()] = (200, _issue(_cut_body(listed)))
+    res = _ledger_check(every_finding_named=True).verify(5.0)
+    assert res.status == "fail"
+    assert _NAMED_CUT in res.reason
+
+
+def test_every_finding_named_ignores_an_id_inside_an_html_comment(token, github):
+    _stash_report()
+    hidden = f"\n<!-- `{_NAMED_CUT}` -->\n"
+    github.routes[_api()] = (200, _issue(_cut_body(hidden)))
+    assert _ledger_check(every_finding_named=True).verify(5.0).status == "fail"
+
+
+def test_every_finding_named_does_not_grade_a_collector_held_id(token, github):
+    _stash_report()
+    held = f'\n<!-- audit-held:begin -->\n<!-- audit-held-ids: ["{_NAMED_CUT}"] -->\n<!-- audit-held:end -->\n'
+    github.routes[_api()] = (200, _issue(_cut_body(held)))
+    assert _ledger_check(every_finding_named=True).verify(5.0).status == "pass"
+
+
+def test_every_finding_named_fails_on_an_omission_notice_without_a_complete_block(token, github):
+    _stash_report()
+    body = _ledger_body(
+        findings=f"#### debug-binding <!-- finding:{_NAMED_SHOWN} -->\n\n"
+        "_3 further finding(s) are omitted from this description to stay inside GitHub's body limit._\n",
+        finding_ids=[_NAMED_SHOWN],
+    )
+    github.routes[_api()] = (200, _issue(body))
+    res = _ledger_check(every_finding_named=True).verify(5.0)
+    assert res.status == "fail"
+    assert "says 3 further finding(s) are omitted" in res.reason
+    assert "hidden id blocks" not in res.reason
+
+
+def test_every_finding_named_fails_without_a_delta_block(token, github):
+    _stash_report()
+    github.routes[_api()] = (200, _issue(_ledger_body(finding_ids=None)))
+    res = _ledger_check(every_finding_named=True).verify(5.0)
+    assert res.status == "fail"
+    assert "delta block" in res.reason
+
+
 def test_an_empty_finding_id_list_is_an_honest_empty_surface(token, github):
     _stash_report()
     github.routes[_api()] = (200, _issue(_ledger_body(finding_ids=[])))
@@ -4291,6 +4403,68 @@ def test_files_the_credential_cannot_read_are_unevaluable_not_a_pass(token, gith
     _pr_head_routes(github, changed_files=1)
     github.routes[f"{_pr_api('pulls')}/files?per_page=100&page=1"] = (403, {"message": "denied"})
     res = _pr_check(unchanged_paths=_KEPT).verify(5.0)
+    assert res.status == "error"
+    assert "pull_requests: read" in res.reason
+
+
+# ---- removed_paths: a delete is the removal of the declaring manifest
+
+_NS_DIR = "clusters/gitops-target-1/namespaces/gitops-owned-scratch"
+_REMOVED = [f"{_NS_DIR}/namespace.yaml", f"{_NS_DIR}/configmap.yaml", f"{_NS_DIR}/kustomization.yaml"]
+
+
+def test_a_pull_request_that_removes_every_declaring_file_passes(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=3)
+    _pr_files_route(github, *({"filename": path, "status": "removed"} for path in _REMOVED))
+    res = _pr_check(removed_paths=_REMOVED).verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_a_pull_request_that_leaves_one_declaring_file_is_a_fail(token, github):
+    """The kustomization.yaml left behind recreates the namespace."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=2)
+    _pr_files_route(github, *({"filename": path, "status": "removed"} for path in _REMOVED[:2]))
+    res = _pr_check(removed_paths=_REMOVED).verify(5.0)
+    assert res.status == "fail"
+    assert _REMOVED[2] in res.reason and "removed_paths" in res.reason
+
+
+def test_a_marker_or_an_edit_is_not_a_removal(token, github):
+    """Adding a "delete" marker or annotating the manifest in place changes a
+    file and passes every other clause; neither removes the declaration."""
+    for entry in (
+        {"filename": f"{_NS_DIR}/delete-me.yaml", "status": "added"},
+        {"filename": f"{_NS_DIR}/namespace.yaml", "status": "modified"},
+    ):
+        _stash_pr_report()
+        github.routes[_pr_api()] = (200, _pr_payload())
+        _pr_head_routes(github, changed_files=1)
+        _pr_files_route(github, entry)
+        assert _pr_check(removed_paths=[f"{_NS_DIR}/namespace.yaml"]).verify(5.0).status == "fail", entry
+        assert _pr_check().verify(5.0).status == "pass", entry
+
+
+def test_a_rename_is_not_a_removal(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    _pr_files_route(
+        github,
+        {"filename": "attic/namespace.yaml", "previous_filename": f"{_NS_DIR}/namespace.yaml", "status": "renamed"},
+    )
+    assert _pr_check(removed_paths=[f"{_NS_DIR}/namespace.yaml"]).verify(5.0).status == "fail"
+
+
+def test_removed_paths_unreadable_files_are_unevaluable(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github, changed_files=1)
+    github.routes[f"{_pr_api('pulls')}/files?per_page=100&page=1"] = (403, {"message": "denied"})
+    res = _pr_check(removed_paths=_REMOVED).verify(5.0)
     assert res.status == "error"
     assert "pull_requests: read" in res.reason
 
@@ -6037,7 +6211,6 @@ def test_the_ack_voice_objectives_read_the_whole_closing_message(final_message):
 )
 def test_the_ack_voice_objectives_stop_at_the_delivered_sections(final_message):
     assert not _ack_voice_hits(final_message), final_message
-
 
 
 # Hermes v2026.9.14 is_intentional_silence_response's verdicts on each reply,
@@ -8445,8 +8618,6 @@ def test_worker_commands_required_run_names_what_did_not_run():
     assert res.status == "fail" and "no worker command ran fleet_upgrade_report.py --readiness across 2 command(s)" in res.reason
 
 
-
-
 # The readiness case for the same catalogue entry grades the readiness report's
 # own output: a fifth declared-line slot quotes the cell the report prints for
 # the finding. That cell carries a `;`, which keeps `_VALUE_WRAP` from removing
@@ -8538,3 +8709,1928 @@ def test_readiness_case_accepts_the_cell_as_the_json_carries_it(objective, wrap)
 )
 def test_readiness_case_refuses_a_missing_or_foreign_cell(objective, text):
     assert not _readiness_case_grades(objective, text)
+
+
+# ------------------------------------------------ the group-3 catalogue cases
+#
+# Two declared-line cases read the way the zonal case is read: the objective
+# out of the task file, the fleet directory standing in for the runner's, the
+# renderings a report gives a line. The reviewer's counter-examples (a
+# `v`-prefixed or patch-bearing next minor; the singular `Endpoint`; a
+# dataplane value that contradicts "enforced: no"; a hedge after the last
+# value) are the rows.
+
+_GROUP3 = {
+    "upgrades-removed-api-callers-distinguished": (
+        [
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, flowcontrol.apiserver.k8s.io/v1beta3",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: policy/v1beta1, v1 endpoints",
+            "seeded-a: next minor 1.36; removed apis still called: none (audit log clean); deprecated but still served: v1 endpoints",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, flowschemas flowcontrol.apiserver.k8s.io/v1beta3",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints",
+            "seeded-a: next minor 1.36 (REGULAR channel); removed apis still called: none; deprecated but still served: v1 endpoints",
+            "seeded-a: next minor: 1.36; removed apis still called: none; deprecated but still served: endpoints v1",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints (deprecated since 1.33)",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints (deprecated since 1.33, replaced by EndpointSlice)",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: core/v1 endpoints api",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: policy/v1beta1 podsecuritypolicy, v1 endpoints",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints and flowcontrol.apiserver.k8s.io/v1beta3 flowschemas",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, policy/v1beta1/podsecuritypolicies",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, flowschemas.flowcontrol.apiserver.k8s.io",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: /apis/flowcontrol.apiserver.k8s.io/v1beta3/flowschemas, v1 endpoints",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: /api/v1/endpoints",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, /api/v1/componentstatuses",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, componentstatuses (core/v1, deprecated since 1.19)",
+            "seeded-a: next minor v1.36; removed apis still called: none; deprecated but still served: core/v1 Endpoint",
+            "seeded-a: next minor 1.36.4-gke.1391000; removed apis still called: none; deprecated but still served: endpoints (core/v1)",
+            "seeded-a: next minor none; removed apis still called: none; deprecated but still served: v1 endpoints",
+                    "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: endpoints v1 api",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: endpoints api v1",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: endpoints (core/v1) api",
+            "seeded-a: next minor 1.36; removed apis still called: (none); deprecated but still served: v1 endpoints",
+            "seeded-a: next minor 1.36; removed apis still called: none found; deprecated but still served: v1 endpoints",
+],
+        [
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, v1",
+            "seeded-a: next minor 1.36; removed apis still called: flowcontrol.apiserver.k8s.io/v1beta3 flowschemas; deprecated but still served: v1 endpoints",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: none",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: none (Endpoints is written only by kube-system's controller)",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: no (Endpoints is written only by kube-system's controller)",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: nothing (Endpoints is written only by kube-system's controller)",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: n/a — Endpoints is still served",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: flowcontrol.apiserver.k8s.io/v1beta3 flowschemas, not endpoints",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: there are none, though kube-system still writes endpoints",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints,none of the others",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, and not actually called by anything",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, which is not actually called by anything",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, never called",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, v1 none",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, null",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, never",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, false",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, nowhere",
+            # A bare second kind carries no version, path or dot: not an item.
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, componentstatuses",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints, n.a.",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: neither, endpoints is only kube-system's",
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: v1 endpoints?",
+                    "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: endpoints v2 api",
+],
+        "seeded-{s}: next minor 1.36; removed apis still called: none; deprecated but still served: none",
+    ),
+    "upgrades-network-policy-enforcement-stated": (
+        [
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability/default-deny, seeded-debug/default-deny, seeded-capacity/default-deny, seeded-deprecation/apiserver-egress-only",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: namespace/seeded-reliability, namespace/seeded-debug, namespace/seeded-capacity, namespace/seeded-deprecation",
+            "seeded-a: dataplane LEGACY_DATAPATH; networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation, zero-trust",
+            "seeded-a: dataplane legacy; network policies enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no (add-on off); namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
+            "seeded-a: dataplane: legacy; networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
+            "seeded-a: dataplane legacy; network policy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
+            "seeded-a: dataplane legacy; network-policy enforcement: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability (default-deny), seeded-debug (default-deny), seeded-capacity (default-deny), seeded-deprecation (apiserver-egress-only), seeded-shapes (default-deny, stale-kubectl-client-apiserver-egress), seeded-defaults (default-deny)",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 4 namespaces (seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation)",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: four (seeded-reliability, seeded-debug, seeded-capacity and seeded-deprecation)",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability (default-deny), seeded-debug (default-deny), seeded-capacity (default-deny) and seeded-deprecation (apiserver-egress-only)",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 4 (seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation)",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 4 namespaces: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: four — seeded-reliability, seeded-debug, seeded-capacity and seeded-deprecation",
+            "seeded-a: dataplane legacy (kube-proxy, no Calico); networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-stall, seeded-token, seeded-headroom and seeded-reliability",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 9 (seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation, seeded-stall, seeded-token, seeded-headroom, seeded-shapes, seeded-defaults)",
+                    "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability: default-deny, seeded-debug: default-deny, seeded-capacity: default-deny, seeded-deprecation: apiserver-egress-only",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: the seeded-reliability namespace, the seeded-debug namespace, the seeded-capacity namespace and the seeded-deprecation namespace",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability & seeded-debug & seeded-capacity & seeded-deprecation",
+],
+        [
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation, namespace/none",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation, zero",
+            "seeded-a: dataplane legacy no longer, now dataplane v2 (migrated at 1.33); networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation",
+            "seeded-a: dataplane legacy-free; networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation",
+            "seeded-a: dataplane GKE Dataplane V2; networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
+            "seeded-a: dataplane legacy; networkpolicy enforced: yes; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: none (seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability are unenforced)",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-capacity-x, seeded-debug-x, seeded-deprecation-x, seeded-reliability-x",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-reliability",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: no policies in seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 0 (seeded-reliability, seeded-debug, seeded-capacity and seeded-deprecation carry none)",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: 4 without (seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation)",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability/0, seeded-debug/0, seeded-capacity/0, seeded-deprecation/0",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation?",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation, null",
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability, seeded-debug, seeded-capacity, seeded-deprecation, n.a.",
+        ],
+        "seeded-{s}: dataplane legacy; networkpolicy enforced: no; namespaces with policies: none",
+    ),
+}
+
+
+def _group3_report(case: str, seeded_a_line: str) -> str:
+    _, _, other = _GROUP3[case]
+    return "\n".join([seeded_a_line] + [other.format(s=s) for s in "bcd"])
+
+
+def _group3_verdicts(case: str, text: str) -> dict[str, str]:
+    spec = yaml.safe_load((TASKS / case / "task.yaml").read_text(encoding="utf-8"))
+    out = {}
+    with tempfile.TemporaryDirectory(prefix="group3-fleet-") as root:
+        _write_fleet_dir(Path(root), list(spec["fixtures"]))
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            for entry in spec["verification_spec"]:
+                check = entry["check"]
+                if check.get("type") != "report_contains" or not check.get("any_of_patterns"):
+                    continue
+                v = parse_node(dict(check))
+                _stash(text)
+                out[entry["name"]] = v.verify(5.0).status
+    return out
+
+
+@pytest.mark.parametrize("case,line", [(c, l) for c, (ok, _, _) in _live(_GROUP3).items() for l in ok])
+def test_group3_case_accepts_the_declared_lines_as_rendered(case, line):
+    verdicts = _group3_verdicts(case, _group3_report(case, line))
+    assert verdicts and all(s == "pass" for s in verdicts.values()), verdicts
+
+
+@pytest.mark.parametrize("case,line", [(c, l) for c, (_, bad, _) in _live(_GROUP3).items() for l in bad])
+def test_group3_case_refuses_a_wrong_or_hedged_seeded_a_line(case, line):
+    verdicts = _group3_verdicts(case, _group3_report(case, line))
+    assert any(s != "pass" for s in verdicts.values()), verdicts
+
+
+# ------------------------------------------------ the group-5 catalogue cases
+#
+# Six declared-line cases on the seeded-a shape fixtures, read the way the
+# group-3 cases are read: the objectives out of the task file, the fleet
+# directory standing in for the runner's, the renderings a report gives a
+# line (bare, bulleted, backticked, bold, numbered, a parenthetical after the
+# cluster). The wrong rows are each graded value's exact wrong word, an
+# off-vocabulary value, and a hedge after the last value; the missing rows
+# are a report that names no line at all, which fails every declared-line
+# objective rather than erroring.
+
+_GROUP5 = {
+    "upgrades-pod-security-latest-pinned-named": (
+        [
+            "seeded-a/seeded-defaults: enforce baseline; enforce-version latest; rule set changes at the next minor: yes",
+            "seeded-a/seeded-defaults: enforce baseline (warn baseline); enforce-version latest (not pinned); rule set changes at the next minor: yes",
+            "seeded-a/seeded-defaults: enforce: baseline; enforce-version: latest; rule set changes at the next minor: yes",
+            "- `seeded-a/seeded-defaults`: enforce baseline; enforce-version `latest`; rule set changes at the next minor: yes.",
+            "**seeded-a/seeded-defaults: enforce baseline; enforce-version latest; rule set changes at the next minor: yes**",
+            "1. seeded-a (us-central1-a)/seeded-defaults: enforce baseline; enforce-version latest; rule set changes at the next minor: yes",
+                    "seeded-a/seeded-defaults: enforce pod-security.kubernetes.io/enforce=baseline; enforce-version pod-security.kubernetes.io/enforce-version=latest; rule set changes at the next minor: yes",
+            "seeded-a/seeded-defaults: enforce=baseline; enforce-version=latest; rule set changes at the next minor: yes",
+            "seeded-a/seeded-defaults: enforce baseline, warn baseline; enforce-version latest; rule set changes at the next minor: yes",
+            "seeded-a/seeded-defaults: enforce baseline, warn baseline; enforce-version latest, warn-version latest; rule set changes at the next minor: yes",
+            "seeded-a/seeded-defaults: enforce baseline, warn: baseline; enforce-version latest, warn-version: latest; rule set changes at the next minor: yes",
+            "seeded-a/seeded-defaults: enforce=baseline, warn=baseline, audit=baseline; enforce-version=latest, warn-version=latest, audit-version=latest; rule set changes at the next minor: yes",
+],
+        [
+            "seeded-a/seeded-defaults: enforce restricted; enforce-version latest; rule set changes at the next minor: yes",
+            "seeded-a/seeded-defaults: enforce baseline; enforce-version v1.33; rule set changes at the next minor: yes",
+            "seeded-a/seeded-defaults: enforce baseline; enforce-version latest; rule set changes at the next minor: no",
+            "seeded-a/seeded-defaults: enforce baseline; enforce-version latest; rule set changes at the next minor: yes?",
+                    "seeded-a/seeded-defaults: enforce pod-security.kubernetes.io/enforce=restricted; enforce-version latest; rule set changes at the next minor: yes",
+                    "seeded-a/seeded-defaults: enforce restricted, warn: baseline; enforce-version latest, warn-version: latest; rule set changes at the next minor: yes",
+],
+        "No namespace on the seeded clusters pins its Pod Security Admission version to the running minor; every enforce-version label names a minor.",
+    ),
+    "upgrades-stale-client-skew-named": (
+        [
+            "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl/v1.29.0; server v1.34.1-gke.1234000; within supported skew: no",
+            "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl v1.29.0; server v1.34.1-gke.1234000; within supported skew: no",
+            "seeded-a/seeded-shapes/stale-kubectl-client (CronJob): client kubectl v1.29.0 (registry.k8s.io/kubectl:v1.29.0); server v1.34.1-gke.1234000; within supported skew: no",
+            "seeded-a/seeded-shapes/stale-kubectl-client-29384756-tqbn7: client: kubectl v1.29.0; server: v1.34.1-gke.1234000; within supported skew: no",
+            "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl:v1.29.0; server v1.34.1-gke.1234000; within supported skew: no",
+            "seeded-a/seeded-shapes/stale-kubectl-client: client registry.k8s.io/kubectl:v1.29.0; server v1.34.1-gke.1234000; within supported skew: no",
+            "seeded-a/seeded-shapes/stale-kubectl-client: client image registry.k8s.io/kubectl:v1.29.0; server v1.34.1-gke.1234000; within supported skew: no",
+            "- `seeded-a/seeded-shapes/stale-kubectl-client`: client kubectl 1.29; server 1.34; within supported skew: no.",
+            "* **seeded-a/seeded-shapes/stale-kubectl-client**: client kubectl v1.29.0; server 1.34.1; within supported skew: no",
+                    "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl (v1.29.0); server v1.34.1-gke.1234000; within supported skew: no",
+            "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl (v1.29.0, image registry.k8s.io/kubectl:v1.29.0); server v1.34.1-gke.1234000; within supported skew: no",
+            "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl (registry.k8s.io/kubectl:v1.29.0); server v1.34.1-gke.1234000; within supported skew: no",
+            "seeded-a/seeded-shapes/stale-kubectl-client: client registry.k8s.io/kubectl:v1.29.0@sha256:0f1eaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; server v1.34.1-gke.1234000; within supported skew: no",
+],
+        [
+            "seeded-a/seeded-shapes/stale-kubectl-client-apiserver-egress: client kubectl v1.29.0; server v1.34.1-gke.1234000; within supported skew: no",
+            "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl v1.30.0 (was v1.29.0); server v1.34.1-gke.1234000; within supported skew: no",
+            "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl v1.34.1; server v1.34.1-gke.1234000; within supported skew: no",
+            "seeded-a/seeded-shapes/stale-kubectl-client: client helm v3.14.0; server v1.34.1-gke.1234000; within supported skew: no",
+            "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl v1.29.0; server v1.34.1-gke.1234000; within supported skew: yes",
+            "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl v1.29.0; server v1.34.1-gke.1234000; within supported skew: no (but still succeeds)",
+                    "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl (v1.29.1); server v1.34.1-gke.1234000; within supported skew: no",
+            "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl (v1.30.0, was v1.29.0); server v1.34.1-gke.1234000; within supported skew: no",
+],
+        "Every client in the seeded clusters is within one minor of its control plane; the kubectl CronJob succeeds on every run.",
+    ),
+    "upgrades-cgroup-blind-runtime-named": (
+        [
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit 192Mi",
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u302-b08-jre (jdk 8u302, pre-8u372); reads cgroup v2 limits: no (cgroup v1 only); memory limit 192Mi",
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/library/eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit 192Mi",
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime: eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit: 192Mi",
+            "- `seeded-a/seeded-shapes/cgroup-blind-jvm`: runtime `eclipse-temurin:8u302-b08-jre`; reads cgroup v2 limits: no; memory limit 192Mi.",
+            "1. seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit 192 MiB",
+        
+            "seeded-a/seeded-shapes/deployment.apps/cgroup-blind-jvm: runtime eclipse-temurin:8u302-b08-jre@sha256:a1b2cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc; reads cgroup v2 limits: no; memory limit 192Mi",
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/library/eclipse-temurin:8u302-b08-jre@sha256:0f1eaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; reads cgroup v2 limits: no; memory limit 192Mi",            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime image: eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit 192Mi",
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/library/eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit 192Mi (reads host memory)",
+],
+        [
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u372-b07-jre@sha256:0f1eaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; reads cgroup v2 limits: no; memory limit 192Mi",
+            # A gloss may not carry the line's own separator: the slots are read by `;`.
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u302-b08-jre (jdk 8; cgroup v2 support came in 8u372); reads cgroup v2 limits: no; memory limit 192Mi",
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: yes (since 8u372); memory limit 192Mi",
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u372-b07-jre; reads cgroup v2 limits: no; memory limit 192Mi",
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/library/eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: yes; memory limit 192Mi",
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/library/eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit none",
+        ],
+        "No workload on the seeded clusters runs a Java or .NET runtime older than the cgroup v2 releases.",
+    ),
+    "upgrades-multi-process-oom-group-named": (
+        [
+            "seeded-a/seeded-shapes/multi-process-worker: processes per container several; memory limit 32Mi; oom kills the whole container: yes",
+            "seeded-a/seeded-shapes/multi-process-worker: processes per container: several; memory limit: 32Mi; oom kills the whole container: yes",
+            "- `seeded-a/seeded-shapes/multi-process-worker`: processes per container several; memory limit `32Mi`; oom kills the whole container: yes.",
+            "**seeded-a/seeded-shapes/multi-process-worker**: processes per container several; memory limit 32 MiB; OOM kills the whole container: yes",
+        ],
+        [
+            "seeded-a/seeded-shapes/multi-process-worker: processes per container one; memory limit 32Mi; oom kills the whole container: yes",
+            "seeded-a/seeded-shapes/multi-process-worker: processes per container 3; memory limit 32Mi; oom kills the whole container: yes",
+            "seeded-a/seeded-shapes/multi-process-worker: processes per container several; memory limit 64Mi; oom kills the whole container: yes",
+            "seeded-a/seeded-shapes/multi-process-worker: processes per container several; memory limit 32Mi; oom kills the whole container: no",
+        ],
+        "Every container on the seeded clusters runs a single process; nothing changes for them at 1.28.",
+    ),
+    "upgrades-node-image-coupled-agent-named": (
+        [
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes (hostNetwork: true); host paths /etc/cni/net.d; coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /etc/cni/net.d; coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths: /etc/cni/net.d; coupled to the node image: yes",
+            "- `seeded-a/seeded-shapes/cni-shaped-agent`: host network: yes; host paths `/etc/cni/net.d` (read-only, mounted at /host/etc/cni/net.d); coupled to the node image: yes.",
+            "1. seeded-a (us-central1-a)/seeded-shapes/cni-shaped-agent: host network: yes; host paths /host/etc/cni/net.d; coupled to the node image: yes",
+                    "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /etc/cni/net.d:ro; coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /opt/cni/bin:/host/opt/cni/bin, /etc/cni/net.d:/host/etc/cni/net.d:ro; coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: true; host paths /etc/cni/net.d; coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: hostNetwork: true; host paths /etc/cni/net.d; coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: host-network: yes; host paths /etc/cni/net.d; coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths hostPath /etc/cni/net.d; coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths hostPath: /opt/cni/bin, hostPath: /etc/cni/net.d; coupled to the node image: yes",
+],
+        [
+            "seeded-a/seeded-shapes/cni-shaped-agent-legacy: host network: yes; host paths /etc/cni/net.d; coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: no (hostNetwork: false); host paths /etc/cni/net.d; coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: no; host paths /etc/cni/net.d; coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths none; coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths none (/etc/cni/net.d is read-only and does not count); coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /etc/cni/net.d, which is not mounted; coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /etc/cni/net.d, never mounted; coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /var/run/docker.sock; coupled to the node image: yes",
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /etc/cni/net.d; coupled to the node image: no",
+                    "seeded-a/seeded-shapes/cni-shaped-agent: host network: false; host paths /etc/cni/net.d; coupled to the node image: yes",
+],
+        "No DaemonSet outside kube-system on the seeded clusters uses host networking or mounts a host path.",
+    ),
+    "upgrades-cuda-pinned-gpu-job-named": (
+        [
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: true",
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: yes",
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator: nvidia-l4; cuda: 12.2; suspended: yes",
+            "- `seeded-a/seeded-shapes/cuda-pinned-trainer`: accelerator `nvidia-l4`; CUDA 12.2.0; suspended: yes.",
+            "**seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: yes**",
+                    "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator cloud.google.com/gke-accelerator=nvidia-l4; cuda 12.2.0-base-ubuntu22.04; suspended: yes",
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04; suspended: yes",
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator gke-accelerator=nvidia-l4; cuda 12.2; suspended: yes",
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4 GPU; cuda 12.2; suspended: yes",
+],
+        [
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: false",
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-tesla-t4; cuda 12.2; suspended: yes",
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.4; suspended: yes",
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: no",
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: yes (not running)",
+                    "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.4.1-base-ubuntu22.04; suspended: yes",
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda nvidia/cuda:12.4.1-base-ubuntu22.04; suspended: yes",
+],
+        "No running workload on the seeded clusters requests a GPU; there is nothing to check against the target image's driver.",
+    ),
+}
+
+
+def _group5_report(line: str) -> str:
+    return "\n".join(
+        [
+            "I read the seeded clusters' manifests and found one match.",
+            "",
+            line,
+            "",
+            "Nothing else on the seeded clusters matched.",
+        ]
+    )
+
+
+def _group5_verdicts(case: str, text: str) -> dict[str, str]:
+    spec = yaml.safe_load((TASKS / case / "task.yaml").read_text(encoding="utf-8"))
+    out = {}
+    with tempfile.TemporaryDirectory(prefix="group5-fleet-") as root:
+        _write_fleet_dir(Path(root), list(spec["fixtures"]))
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            for entry in spec["verification_spec"]:
+                check = entry["check"]
+                if check.get("type") != "report_contains" or not check.get("any_of_patterns"):
+                    continue
+                v = parse_node(dict(check))
+                _stash(text)
+                out[entry["name"]] = v.verify(5.0).status
+    return out
+
+
+@pytest.mark.parametrize("case,line", [(c, l) for c, (ok, _, _) in _live(_GROUP5).items() for l in ok])
+def test_group5_case_accepts_the_declared_line_as_rendered(case, line):
+    verdicts = _group5_verdicts(case, _group5_report(line))
+    assert verdicts and all(s == "pass" for s in verdicts.values()), verdicts
+
+
+@pytest.mark.parametrize("case,line", [(c, l) for c, (_, bad, _) in _live(_GROUP5).items() for l in bad])
+def test_group5_case_refuses_a_wrong_or_hedged_value(case, line):
+    verdicts = _group5_verdicts(case, _group5_report(line))
+    assert any(s != "pass" for s in verdicts.values()), verdicts
+
+
+@pytest.mark.parametrize("case", list(_live(_GROUP5)))
+def test_group5_case_fails_every_objective_without_the_declared_line(case):
+    _, _, missing = _GROUP5[case]
+    verdicts = _group5_verdicts(case, missing)
+    assert verdicts and all(s == "fail" for s in verdicts.values()), verdicts
+
+
+# ------------------------------------ the group-2 and group-4 catalogue cases
+#
+# The nine remaining declared-line cases of the catalogue series, read with
+# the group-5 helpers: each grades one planted object's line (seeded-b's
+# budget, pool and exclusion, seeded-d's zone-pinned workload, seeded-a's
+# shapes) and nothing else in the report, so a one-line report is the whole
+# test. Rows as in `_GROUP5`: the renderings a report gives a line, each
+# graded value's exact wrong word or an off-vocabulary value with a hedge
+# after the last value, and a report that names no line at all.
+
+_GROUP2 = {
+    "upgrades-drain-blocking-budget-named": (
+        [
+            "seeded-b/seeded-upgrade/pinned-batch-runner: maxUnavailable 0; minAvailable none; disruptionsAllowed 0; blocks a drain: yes",
+            "- `seeded-b/seeded-upgrade/pinned-batch-runner`: maxUnavailable: 0; minAvailable: none; disruptionsAllowed: 0; blocks a drain: yes.",
+            "**seeded-b/seeded-upgrade/pinned-batch-runner**: maxUnavailable 0%; minAvailable none; disruptionsAllowed 0; blocks a drain: yes",
+            "1. seeded-b (us-central1-a)/seeded-upgrade/pinned-batch-runner: maxUnavailable 0 (0); minAvailable none; disruptionsAllowed 0; blocks a drain: yes",
+        
+            "seeded-b/seeded-upgrade/pdb/pinned-batch-runner: maxUnavailable 0; minAvailable none; disruptionsAllowed 0; blocks a drain: yes",            "seeded-b/seeded-upgrade/pinned-batch-runner: max unavailable 0; min available none; allowed disruptions 0; blocks a drain: yes",
+            "seeded-b/seeded-upgrade/pinned-batch-runner: max-unavailable 0; min-available none; disruptions allowed 0; blocks a drain: yes",
+],
+        [
+            "seeded-b/seeded-upgrade/pinned-batch-runner: maxUnavailable 1; minAvailable none; disruptionsAllowed 0; blocks a drain: yes",
+            "seeded-b/seeded-upgrade/pinned-batch-runner: maxUnavailable 0; minAvailable none; disruptionsAllowed 1; blocks a drain: yes",
+            "seeded-b/seeded-upgrade/pinned-batch-runner: maxUnavailable 0; minAvailable none; disruptionsAllowed 0; blocks a drain: no",
+            "seeded-b/seeded-upgrade/pinned-batch-runner: maxUnavailable 0; minAvailable none; disruptionsAllowed 0; blocks a drain: yes while the pod is healthy",
+        ],
+        "No PodDisruptionBudget on the seeded clusters would stop a node drain; every budget allows at least one disruption.",
+    ),
+    "upgrades-no-surge-pool-recreate-warned": (
+        [
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner in the seeded-upgrade namespace",
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner from seeded-upgrade",
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner in namespace seeded-upgrade",
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner (Deployment) in seeded-upgrade",
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner, no-surge-canary",
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no (maxSurge 0); workloads pinned to this pool: pinned-batch-runner",
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner",
+            "seeded-b/no-surge-pool: nodes 1 (e2-medium, us-central1-a); replacement node first: no; workloads pinned to this pool: pinned-batch-runner",
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner in seeded-upgrade",
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: Deployment pinned-batch-runner, DaemonSet node-exporter",
+            "- `seeded-b/no-surge-pool`: nodes: 1; replacement node first: no; workloads pinned to this pool: seeded-upgrade/pinned-batch-runner.",
+            "**seeded-b/no-surge-pool**: nodes 1; replacement node first: no; workloads pinned to this pool: deployment pinned-batch-runner (1 replica)",
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: 1 (pinned-batch-runner)",
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: one workload: pinned-batch-runner",
+            "1. seeded-b (us-central1-a)/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner-7d9f8b6c4-tqbn7 and other-worker",
+        ],
+        [
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner-canary",
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: yes; workloads pinned to this pool: pinned-batch-runner",
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: none",
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: batch-runner",
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner, null",
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner, nope",
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: pinned-batch-runner, n.a.",
+            "seeded-b/no-surge-pool: nodes one; replacement node first: no; workloads pinned to this pool: pinned-batch-runner",
+        ],
+        "Every node pool on the seeded clusters brings a replacement node up before it drains; nothing is pinned to a single-node pool.",
+    ),
+    "upgrades-zonal-skew-replicas-warned": (
+        [
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes (both in us-central1-a); cause: node affinity",
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity",
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2/2; zones in use 1; all replicas in one zone: yes; cause: node affinity",
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node-affinity",
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2 (2/2 ready); zones in use 1; all replicas in one zone: yes; cause: topology-spread-constraint",
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1 (us-central1-a); all replicas in one zone: yes; cause: topology-spread-constraint",
+            "seeded-d/seeded-topology/zone-pinned-api-5f6d7c8b9-tqbn7: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity",
+            "- `seeded-d/seeded-topology/zone-pinned-api`: replicas: 2; zones in use: 1; all replicas in one zone: yes; cause: spread constraint.",
+            "**seeded-d/seeded-topology/zone-pinned-api**: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity and spread constraint",
+            "1. seeded-d (us-central1)/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: topology spread constraints",
+                    "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity (required) and spread constraint",
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: required node affinity",
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity and ScheduleAnyway spread constraint",
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity plus spread constraint",
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: both node affinity and spread constraint",
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity & spread constraint",
+],
+        [
+            "seeded-d/seeded-topology/zone-pinned-api-canary: replicas 2; zones in use 1; all replicas in one zone: yes; cause: topology-spread-constraint",
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 2 (us-central1-a, us-central1-b); all replicas in one zone: yes; cause: topology-spread-constraint",
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 2; all replicas in one zone: yes; cause: node affinity",
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: no; cause: node affinity",
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: capacity",
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: node affinity (required)",
+        ],
+        "Every multi-replica workload on the multi-zone cluster spreads its replicas over both zones; nothing holds a workload in one zone.",
+    ),
+    "upgrades-exclusion-end-date-named": (
+        [
+            "seeded-b: exclusion hold-the-minor-lag; scope NO_MINOR_UPGRADES; ends 2026-10-21; holds the automatic minor upgrade: yes",
+            "seeded-b: exclusion hold-the-minor-lag; scope NO_MINOR_UPGRADES; ends 2026-10-21T04:00:00.000Z; holds the automatic minor upgrade: yes",
+            "seeded-b: exclusion hold-the-minor-lag; scope NO_MINOR_UPGRADES; ends 2026-10-20 21:00 PDT; holds the automatic minor upgrade: yes",
+            "seeded-b: exclusion hold-the-minor-lag; scope NO_MINOR_UPGRADES; ends 2026-10-21 UTC; holds the automatic minor upgrade: yes",
+            "seeded-b: exclusion hold-the-minor-lag; scope NO_MINOR_UPGRADES; ends 2026-10-21 at 04:00 UTC; holds the automatic minor upgrade: yes",
+            "- `seeded-b`: exclusion: hold-the-minor-lag; scope: no-minor-upgrades; ends: 2026-10-21T00:00:00Z; holds the automatic minor upgrade: yes.",
+            "**seeded-b**: exclusion hold-the-minor-lag; scope NO_MINOR_UPGRADES; ends 2026-10-21 (seven days from now); holds the automatic minor upgrade: yes",
+            "1. seeded-b (us-central1-a): exclusion hold-the-minor-lag; scope NO MINOR UPGRADES; ends 2026-10-21 00:00 UTC; holds the automatic minor upgrade: yes",
+        ],
+        [
+            "seeded-b: exclusion hold-the-minor-lag; scope NO_UPGRADES; ends 2026-10-21; holds the automatic minor upgrade: yes",
+            "seeded-b: exclusion hold-the-minor-lag; scope NO_MINOR_UPGRADES; ends 21 October 2026; holds the automatic minor upgrade: yes",
+            "seeded-b: exclusion hold-the-minor-lag; scope NO_MINOR_UPGRADES; ends 2026-10-21?; holds the automatic minor upgrade: yes",
+            "seeded-b: exclusion hold-the-minor-lag; scope NO_MINOR_UPGRADES; ends 2026-10-21; holds the automatic minor upgrade: no",
+            "seeded-b: exclusion hold-the-minor-lag; scope NO_MINOR_UPGRADES; ends 2026-10-21; holds the automatic minor upgrade: yes, until then",
+        ],
+        "No seeded cluster carries a maintenance exclusion; every automatic minor upgrade follows the channel's schedule.",
+    ),
+}
+
+_GROUP4 = {
+    "upgrades-node-local-state-named": (
+        [
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue, no-cache; survives a node rebuild: no",
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes emptyDir queue; survives a node rebuild: no",
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue; survives a node rebuild: no",
+            "seeded-a/seeded-shapes/cache-on-emptydir-7c9d4b5f6-k2x8q: node-local volumes: queue; survives a node rebuild: no",
+            "- `seeded-a/seeded-shapes/cache-on-emptydir`: node-local volumes `queue` (emptyDir); survives a node rebuild: no.",
+            "**seeded-a/seeded-shapes/cache-on-emptydir**: node-local volumes queue (emptyDir at /var/lib/queue); survives a node rebuild: no",
+            "1. seeded-a (us-central1-a)/seeded-shapes/cache-on-emptydir: node-local volumes queue, scratch; survives a node rebuild: no",
+                    "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue:/var/cache/queue; survives a node rebuild: no",
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue(emptyDir); survives a node rebuild: no",
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes emptyDir: queue; survives a node rebuild: no",
+],
+        [
+            "seeded-a/seeded-shapes/cache-on-emptydir-shadow: node-local volumes queue; survives a node rebuild: no",
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes cache; survives a node rebuild: no",
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes none (the queue directory is scratch); survives a node rebuild: no",
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes cache (the queue directory); survives a node rebuild: no",
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue, though not strictly node-local; survives a node rebuild: no",
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue, never persisted; survives a node rebuild: no",
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue, null; survives a node rebuild: no",
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue, nope; survives a node rebuild: no",
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue, n.a.; survives a node rebuild: no",
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue-data; survives a node rebuild: no",
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue; survives a node rebuild: yes",
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue; survives a node rebuild: no (one replica)",
+                    "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue: none; survives a node rebuild: no",
+],
+        "No workload on the seeded clusters keeps state on the node; every emptyDir holds scratch the container rebuilds at start.",
+    ),
+    "upgrades-deprecated-node-label-selector-named": (
+        [
+            "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: yes; replacement kubernetes.io/arch",
+            "seeded-a/seeded-shapes/arch-pinned-worker-7d9f8b6c4-tqbn7: label: beta.kubernetes.io/arch; deprecated: yes; replacement: kubernetes.io/arch",
+            "- `seeded-a/seeded-shapes/arch-pinned-worker`: label `beta.kubernetes.io/arch`; deprecated: yes; replacement `kubernetes.io/arch`.",
+            "**seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: yes; replacement kubernetes.io/arch**",
+            "1. seeded-a (us-central1-a)/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: yes; replacement kubernetes.io/arch",
+                    "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch: amd64; deprecated: yes; replacement kubernetes.io/arch",
+            "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch=amd64; deprecated: yes; replacement kubernetes.io/arch",
+            "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch=amd64; deprecated: yes; replacement kubernetes.io/arch=amd64",
+            "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: yes; replacement kubernetes.io/arch (since 1.14)",
+],
+        [
+            "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/os; deprecated: yes; replacement kubernetes.io/arch",
+            "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: no; replacement kubernetes.io/arch",
+            "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: yes; replacement none",
+                    "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch=amd64; deprecated: yes; replacement kubernetes.io/os=linux",
+],
+        "No workload on the seeded clusters selects nodes by a deprecated label; every nodeSelector names a GA key.",
+    ),
+    "upgrades-containerd-socket-agent-named": (
+        [
+            "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path /run/containerd/containerd.sock",
+            "seeded-a/seeded-shapes/node-runtime-probe-x7k2q: runtime socket mounted: yes; path: /run/containerd/containerd.sock",
+            "- `seeded-a/seeded-shapes/node-runtime-probe`: runtime socket mounted: yes; path `/run/containerd/containerd.sock`.",
+            "**seeded-a/seeded-shapes/node-runtime-probe**: runtime socket mounted: yes; path /run/containerd/containerd.sock",
+            "1. seeded-a (us-central1-a)/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path /run/containerd/containerd.sock",
+                    "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path /run/containerd/containerd.sock:ro",
+            "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path hostPath /run/containerd/containerd.sock",
+            "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path unix:///run/containerd/containerd.sock",
+            "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path /run/containerd/containerd.sock (read-only)",
+],
+        [
+            "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: no; path /run/containerd/containerd.sock",
+            "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path /var/run/docker.sock",
+            "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path none",
+        ],
+        "No workload on the seeded clusters mounts the container runtime's socket from the host.",
+    ),
+    "upgrades-intree-volume-named": (
+        [
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by pvc seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through csi migration: yes",
+            "seeded-a/intree-pd: source: in-tree gcePersistentDisk; bound by: seeded-shapes/intree-pd; attaches through csi migration: yes",
+            "- `seeded-a/intree-pd`: source in-tree gcePersistentDisk; bound by `seeded-shapes/intree-pd`; attaches through CSI migration: yes.",
+            "**seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through csi migration: yes**",
+            "1. seeded-a (us-central1-a)/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through csi migration: yes",
+        
+            "seeded-a/pv/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",            "seeded-a/intree-pd: source gcePersistentDisk (in-tree); bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree (gcePersistentDisk); bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source gcePersistentDisk (in-tree, migrated to pd.csi.storage.gke.io); bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree kubernetes.io/gce-pd; bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree (gcePersistentDisk plugin); bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by pvc intree-pd in seeded-shapes; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by intree-pd (seeded-shapes); attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by pvc/intree-pd in seeded-shapes; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/pvc/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source kubernetes.io/gce-pd (in-tree); bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source gcePersistentDisk, in-tree; bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source gcePersistentDisk (legacy in-tree plugin); bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by intree-pd (namespace seeded-shapes); attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by intree-pd (seeded-shapes, Bound); attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source gcePersistentDisk (the in-tree plugin); bound by seeded-shapes/intree-pd; attaches through csi migration: yes",
+            "seeded-a/intree-pd: source gcePersistentDisk (an in-tree plugin); bound by seeded-shapes/intree-pd; attaches through csi migration: yes",
+            "seeded-a/intree-pd: source gcePersistentDisk, in-tree plugin; bound by seeded-shapes/intree-pd; attaches through csi migration: yes",
+],
+        [
+            "seeded-a/intree-pd: source csi; bound by seeded-shapes/intree-pd; attaches through csi migration: yes",
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by none; attaches through csi migration: yes",
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through csi migration: no",
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through csi migration: yes (pd.csi.storage.gke.io)",
+                    "seeded-a/intree-pd: source in-tree?; bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by other-claim in seeded-shapes; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree: no; bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree no longer, now csi; bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk, now csi; bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk migrated to csi; bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source gcePersistentDisk (not in-tree); bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source gcePersistentDisk (in-tree: no); bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source gce-pd (csi, formerly in-tree); bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source gcePersistentDisk (in-tree?); bound by seeded-shapes/intree-pd; attaches through CSI migration: yes",
+            "seeded-a/intree-pd: source gcePersistentDisk (the csi plugin); bound by seeded-shapes/intree-pd; attaches through csi migration: yes",
+            "seeded-a/intree-pd: source gcePersistentDisk, in-tree plugin, migrated; bound by seeded-shapes/intree-pd; attaches through csi migration: yes",
+],
+        "No PersistentVolume on the seeded clusters uses an in-tree plugin; a CSI driver provisioned every volume.",
+    ),
+    "upgrades-retired-registry-image-named": (
+        [
+            "seeded-a/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host k8s.gcr.io; retired: yes",
+            "seeded-a/seeded-shapes/legacy-registry-pull-6b7c8d9f5-tqbn7: image: k8s.gcr.io/pause:3.9; registry host: k8s.gcr.io; retired: yes",
+            "- `seeded-a/seeded-shapes/legacy-registry-pull`: image `k8s.gcr.io/pause:3.9`; registry host `k8s.gcr.io`; retired: yes.",
+            "**seeded-a/seeded-shapes/legacy-registry-pull**: image k8s.gcr.io/pause:3.9 (imagePullPolicy Always); registry host k8s.gcr.io; retired: yes",
+            "seeded-a/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host k8s.gcr.io (frozen 2023); retired: yes",
+            "1. seeded-a (us-central1-a)/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host k8s.gcr.io; retired: yes",
+                    "seeded-a/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host https://k8s.gcr.io; retired: yes",
+],
+        [
+            "seeded-a/seeded-shapes/legacy-registry-pull-mirror: image k8s.gcr.io/pause:3.9; registry host k8s.gcr.io; retired: yes",
+            "seeded-a/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host registry.k8s.io (formerly k8s.gcr.io); retired: yes",
+            "seeded-a/seeded-shapes/legacy-registry-pull: image registry.k8s.io/pause:3.9; registry host registry.k8s.io; retired: yes",
+            "seeded-a/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host k8s.gcr.io; retired: no",
+            "seeded-a/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host gcr.io; retired: yes",
+            "seeded-a/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host k8s.gcr.io; retired: yes (redirects today)",
+        ],
+        "No workload on the seeded clusters pulls from a retired registry host; every image reference names registry.k8s.io or Artifact Registry.",
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "case,line",
+    [(c, l) for table in (_GROUP2, _GROUP4) for c, (ok, _, _) in _live(table).items() for l in ok],
+)
+def test_group2_and_group4_case_accepts_the_declared_line_as_rendered(case, line):
+    verdicts = _group5_verdicts(case, _group5_report(line))
+    assert verdicts and all(s == "pass" for s in verdicts.values()), verdicts
+
+
+@pytest.mark.parametrize(
+    "case,line",
+    [(c, l) for table in (_GROUP2, _GROUP4) for c, (_, bad, _) in _live(table).items() for l in bad],
+)
+def test_group2_and_group4_case_refuses_a_wrong_or_hedged_value(case, line):
+    verdicts = _group5_verdicts(case, _group5_report(line))
+    assert any(s != "pass" for s in verdicts.values()), verdicts
+
+
+@pytest.mark.parametrize("case", list(_live(_GROUP2)) + list(_live(_GROUP4)))
+def test_group2_and_group4_case_fails_every_objective_without_the_declared_line(case):
+    _, _, missing = {**_GROUP2, **_GROUP4}[case]
+    verdicts = _group5_verdicts(case, missing)
+    assert verdicts and all(s == "fail" for s in verdicts.values()), verdicts
+
+
+# ------------------------------------------- the list slots, two more shapes
+#
+# An item's parenthetical is ungraded, so seeded-c's `none` carries one the
+# same way a seeded-a name does; and a list joined by ` and ` has one
+# partition, so a long wrong list is refused at once rather than after the
+# night (an item cannot contain ` and `).
+
+
+def test_group3_network_policy_seeded_c_none_admits_an_ungraded_gloss():
+    case = "upgrades-network-policy-enforcement-stated"
+    _skip_if_parked(case)
+    line_a = _GROUP3[case][0][0]
+    text = "\n".join(
+        [
+            line_a,
+            "seeded-b: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-upgrade",
+            "seeded-c: dataplane legacy; networkpolicy enforced: no; namespaces with policies: none (no NetworkPolicy objects)",
+            "seeded-d: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-topology",
+        ]
+    )
+    verdicts = _group3_verdicts(case, text)
+    assert verdicts and all(s == "pass" for s in verdicts.values()), verdicts
+
+
+def test_group3_removed_api_refuses_a_long_and_joined_list_at_once():
+    import time
+
+    case = "upgrades-removed-api-callers-distinguished"
+    _skip_if_parked(case)
+    items = " and ".join(f"group{i}.k8s.io/v1beta1 kind{i}" for i in range(25))
+    line = f"seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: {items}"
+    started = time.monotonic()
+    verdicts = _group3_verdicts(case, _group3_report(case, line))
+    assert time.monotonic() - started < 2.0
+    assert verdicts["seeded-a-keeps-the-endpoints-writer-under-deprecated"] != "pass", verdicts
+
+
+def test_group3_removed_api_refuses_a_long_comma_joined_list_at_once():
+    import time
+
+    case = "upgrades-removed-api-callers-distinguished"
+    _skip_if_parked(case)
+    items = ", ".join(f"group{i}.k8s.io/v1beta1 kind{i}" for i in range(25))
+    line = f"seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: {items}"
+    started = time.monotonic()
+    verdicts = _group3_verdicts(case, _group3_report(case, line))
+    assert time.monotonic() - started < 2.0
+    assert verdicts["seeded-a-keeps-the-endpoints-writer-under-deprecated"] != "pass", verdicts
+
+
+def test_group2_no_surge_refuses_nested_unclosed_parentheticals_at_once():
+    import time
+
+    case = "upgrades-no-surge-pool-recreate-warned"
+    _skip_if_parked(case)
+    items = " and ".join(f"worker{i} (note{i}" for i in range(20))
+    line = f"seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: {items}"
+    started = time.monotonic()
+    verdicts = _group5_verdicts(case, _group5_report(line))
+    assert time.monotonic() - started < 2.0
+    assert verdicts["the-declared-line-names-the-pinned-workload"] != "pass", verdicts
+
+
+def test_group3_removed_api_refuses_a_long_oxford_joined_list_at_once():
+    import time
+
+    case = "upgrades-removed-api-callers-distinguished"
+    _skip_if_parked(case)
+    items = ", and ".join(f"group{i}.k8s.io/v1beta1 kind{i}" for i in range(25))
+    line = f"seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: {items}"
+    started = time.monotonic()
+    verdicts = _group3_verdicts(case, _group3_report(case, line))
+    assert time.monotonic() - started < 2.0
+    assert verdicts["seeded-a-keeps-the-endpoints-writer-under-deprecated"] != "pass", verdicts
+
+
+@pytest.mark.parametrize("case", [c for t in (_GROUP2, _GROUP3, _GROUP4, _GROUP5) for c in _live(t)])
+def test_every_check_of_a_catalogue_case_constructs(case):
+    """Every entry of the seventeen files, the fleet safeguards included, builds
+    through the registry, so a typo in a check is a red test here and not a
+    spec-load error after the nightly's lease."""
+    spec = yaml.safe_load((TASKS / case / "task.yaml").read_text(encoding="utf-8"))
+    with tempfile.TemporaryDirectory(prefix="construct-fleet-") as root:
+        _write_fleet_dir(Path(root), list(spec["fixtures"]))
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            built = [parse_node(dict(entry["check"])) for entry in spec["verification_spec"]]
+    assert len(built) == len(spec["verification_spec"]) >= 3
+
+
+def test_a_parked_case_drops_out_of_the_tables():
+    """The fleet README's exit for a retired role parks the case that names it;
+    its rows leave the four tables with its roster line, so the suite stays
+    green with the role gone from the catalogue."""
+    import sys
+
+    case = "upgrades-retired-registry-image-named"
+    assert case in _GROUP4
+    with mock.patch.object(sys.modules[__name__], "_parked_cases", return_value={case}):
+        assert case not in _live(_GROUP4)
+        assert len(_live(_GROUP4)) == len(_GROUP4) - 1
+        assert set(_live(_GROUP3)) == set(_GROUP3)
+
+
+_FRAMED_CASES = [
+    c for c in [*_GROUP2, *_GROUP4, *_GROUP5] if c != "upgrades-exclusion-end-date-named"
+]
+
+
+@pytest.mark.parametrize("case", [c for c in _FRAMED_CASES if c not in _parked_cases()])
+def test_a_gloss_after_the_object_is_admitted(case):
+    """The frame admits a parenthetical after the cluster and after the object
+    alike: `seeded-b/no-surge-pool (e2-medium): ...` grades as the bare line."""
+    table = {**_GROUP2, **_GROUP4, **_GROUP5}
+    bare = table[case][0][0]
+    glossed = bare.replace(": ", " (object gloss, one node): ", 1)
+    verdicts = _group5_verdicts(case, _group5_report(glossed))
+    assert verdicts and all(s == "pass" for s in verdicts.values()), verdicts
+
+
+_TABLED_CASES = [*_GROUP2, *_GROUP3, *_GROUP4, *_GROUP5]
+
+
+def _bare_line(case: str) -> str:
+    rows = {**_GROUP2, **_GROUP3, **_GROUP4, **_GROUP5}[case][0]
+    return next(r for r in rows if "(" not in r and not r.startswith(("-", "*", "1.")))
+
+
+def _verdicts_for_line(case: str, line: str) -> dict[str, str]:
+    if case in _GROUP3:
+        return _group3_verdicts(case, _group3_report(case, line))
+    return _group5_verdicts(case, _group5_report(line))
+
+
+@pytest.mark.parametrize("case", _TABLED_CASES)
+def test_a_gloss_after_any_mid_line_value_is_admitted(case):
+    """A parenthetical after a value grades as the bare line wherever the value
+    sits before a `;`: the frame, the free slots and the graded literals and
+    verdicts alike. The line-end slot is outside this: the fold strips a
+    line-final `)`, and the hedge rows decide it."""
+    _skip_if_parked(case)
+    bare = _bare_line(case)
+    parts = bare.split("; ")
+    assert len(parts) > 1, bare
+    for k in range(len(parts) - 1):
+        for gloss in (" (object gloss)", "(object gloss)"):  # a space before the parenthesis, or none
+            glossed = "; ".join(parts[: k + 1]) + gloss + "; " + "; ".join(parts[k + 1 :])
+            verdicts = _verdicts_for_line(case, glossed)
+            assert verdicts and all(s == "pass" for s in verdicts.values()), (k, glossed, verdicts)
+
+
+# The framed cases whose object is a workload, so a pod of it names it: not
+# the no-surge pool, the pod-security namespace, the in-tree volume or the
+# drain case's budget.
+_POD_FRAMED_CASES = [
+    "upgrades-zonal-skew-replicas-warned",
+    "upgrades-node-local-state-named",
+    "upgrades-deprecated-node-label-selector-named",
+    "upgrades-containerd-socket-agent-named",
+    "upgrades-retired-registry-image-named",
+    "upgrades-stale-client-skew-named",
+    "upgrades-cgroup-blind-runtime-named",
+    "upgrades-multi-process-oom-group-named",
+    "upgrades-node-image-coupled-agent-named",
+    "upgrades-cuda-pinned-gpu-job-named",
+]
+
+
+@pytest.mark.parametrize("case", _POD_FRAMED_CASES)
+def test_a_pod_name_after_the_object_is_admitted(case):
+    """A pod of the planted workload grades as the workload: a Deployment's
+    hash and suffix, a Job's minute stamp and suffix, a DaemonSet's suffix, all
+    in Kubernetes' vowel-free alphabet."""
+    _skip_if_parked(case)
+    bare = _bare_line(case)
+    for suffix in ("-6kgp9sxz4-tqbn7", "-29384756-tqbn7", "-tqbn7"):
+        verdicts = _group5_verdicts(case, _group5_report(bare.replace(": ", suffix + ": ", 1)))
+        assert verdicts and all(s == "pass" for s in verdicts.values()), (suffix, verdicts)
+
+
+@pytest.mark.parametrize("case", _FRAMED_CASES)
+def test_a_sibling_name_after_the_object_is_refused(case):
+    """`zone-pinned-api-canary` is another object, not a pod of the planted one:
+    a vowel is outside the suffix alphabet, so no word list is needed."""
+    _skip_if_parked(case)
+    bare = _bare_line(case)
+    verdicts = _group5_verdicts(case, _group5_report(bare.replace(": ", "-canary: ", 1)))
+    assert verdicts and any(s != "pass" for s in verdicts.values()), verdicts
+
+
+# The kind word a `kubectl get` listing prints before each framed object.
+_OBJECT_KINDS = {
+    "upgrades-drain-blocking-budget-named": "pdb",
+    "upgrades-no-surge-pool-recreate-warned": "nodepool",
+    "upgrades-zonal-skew-replicas-warned": "deployment",
+    "upgrades-node-local-state-named": "deployment",
+    "upgrades-deprecated-node-label-selector-named": "deployment",
+    "upgrades-containerd-socket-agent-named": "daemonset",
+    "upgrades-intree-volume-named": "pv",
+    "upgrades-retired-registry-image-named": "deployment",
+    "upgrades-pod-security-latest-pinned-named": "namespace",
+    "upgrades-stale-client-skew-named": "cronjob",
+    "upgrades-cgroup-blind-runtime-named": "deployment",
+    "upgrades-multi-process-oom-group-named": "deployment",
+    "upgrades-node-image-coupled-agent-named": "daemonset",
+    "upgrades-cuda-pinned-gpu-job-named": "cronjob",
+}
+
+
+@pytest.mark.parametrize("case", _FRAMED_CASES)
+def test_a_kind_segment_before_the_object_is_admitted(case):
+    """`seeded-a/seeded-shapes/deployment/cgroup-blind-jvm` names the object as
+    `kubectl get` prints it; the kind word is ungraded."""
+    _skip_if_parked(case)
+    bare = _bare_line(case)
+    head, rest = bare.split(": ", 1)
+    parts = head.split("/")
+    parts.insert(len(parts) - 1, _OBJECT_KINDS[case])
+    verdicts = _group5_verdicts(case, _group5_report("/".join(parts) + ": " + rest))
+    assert verdicts and all(s == "pass" for s in verdicts.values()), verdicts
+
+
+# ------------------------------- the forbidden clauses, each pinned by a pair
+#
+# A table row above is one declared line, and one line is decided by
+# `any_of_patterns` alone, so no row depended on a case's `forbidden_patterns`
+# clause: the clause exists for a report that carries the accepted line and a
+# second line that contradicts it on the graded slot (two runtimes; `yes`
+# beside `no`). One row per forbidden pattern pairs the two: the case as
+# shipped refuses the pair, the pair passes with the clause removed, and the
+# pattern alone refuses it, so an edit that disables a clause fails here and
+# a task file that drops one fails the coverage test. A row's second line is
+# the accepted line with one graded slot wrong, as the `bad` rows above spell
+# it; the two group-3 cases take a second seeded-a line, or a seeded-c line,
+# beside the b/c/d lines `_group3_report` adds.
+
+_CONTRADICTIONS = {
+    "upgrades-drain-blocking-budget-named": {
+        "the-declared-line-carries-the-budgets-evidence": [
+            "seeded-b/seeded-upgrade/pinned-batch-runner: maxUnavailable 1; minAvailable none; disruptionsAllowed 0; blocks a drain: yes",
+            "seeded-b/seeded-upgrade/pinned-batch-runner: maxUnavailable 0; minAvailable none; disruptionsAllowed 1; blocks a drain: yes",
+        ],
+        "the-declared-line-says-the-budget-blocks-a-drain": [
+            "seeded-b/seeded-upgrade/pinned-batch-runner: maxUnavailable 0; minAvailable none; disruptionsAllowed 0; blocks a drain: no",
+        ],
+    },
+    "upgrades-no-surge-pool-recreate-warned": {
+        "the-declared-line-says-no-replacement-comes-first": [
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: yes; workloads pinned to this pool: pinned-batch-runner",
+        ],
+        "the-declared-line-names-the-pinned-workload": [
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: none",
+        ],
+    },
+    "upgrades-zonal-skew-replicas-warned": {
+        "the-declared-line-says-all-replicas-share-a-zone": [
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: no; cause: node affinity",
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 2; all replicas in one zone: yes; cause: node affinity",
+        ],
+        "the-declared-line-names-the-scheduling-cause": [
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: capacity",
+        ],
+    },
+    "upgrades-exclusion-end-date-named": {
+        "the-declared-line-states-the-scope": [
+            "seeded-b: exclusion hold-the-minor-lag; scope NO_UPGRADES; ends 2026-10-21; holds the automatic minor upgrade: yes",
+        ],
+        "the-declared-line-states-the-end-date": [
+            "seeded-b: exclusion hold-the-minor-lag; scope NO_MINOR_UPGRADES; ends 21 October 2026; holds the automatic minor upgrade: yes",
+        ],
+        "the-declared-line-says-it-holds-the-automatic-upgrade": [
+            "seeded-b: exclusion hold-the-minor-lag; scope NO_MINOR_UPGRADES; ends 2026-10-21; holds the automatic minor upgrade: no",
+        ],
+    },
+    "upgrades-removed-api-callers-distinguished": {
+        "no-seeded-cluster-is-said-to-call-a-removed-api": [
+            "seeded-a: next minor 1.36; removed apis still called: flowcontrol.apiserver.k8s.io/v1beta3 flowschemas; deprecated but still served: v1 endpoints",
+        ],
+        "seeded-a-keeps-the-endpoints-writer-under-deprecated": [
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: none",
+        ],
+    },
+    "upgrades-network-policy-enforcement-stated": {
+        "every-seeded-cluster-runs-the-legacy-dataplane": [
+            "seeded-a: dataplane GKE Dataplane V2; networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
+        ],
+        "no-seeded-cluster-is-said-to-enforce-policy-today": [
+            "seeded-a: dataplane legacy; networkpolicy enforced: yes; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
+        ],
+        "seeded-a-lists-its-four-policy-namespaces": [
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: none (seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability are unenforced)",
+        ],
+        "seeded-c-has-none": [
+            "seeded-c: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability/default-deny",
+        ],
+    },
+    "upgrades-node-local-state-named": {
+        "the-declared-line-names-the-queue-volume": [
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes cache; survives a node rebuild: no",
+        ],
+        "the-declared-line-says-the-state-does-not-survive": [
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue; survives a node rebuild: yes",
+        ],
+    },
+    "upgrades-deprecated-node-label-selector-named": {
+        "the-declared-line-names-the-beta-arch-label": [
+            "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/os; deprecated: yes; replacement kubernetes.io/arch",
+        ],
+        "the-declared-line-says-it-is-deprecated-and-names-the-replacement": [
+            "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: no; replacement kubernetes.io/arch",
+        ],
+    },
+    "upgrades-containerd-socket-agent-named": {
+        "the-declared-line-says-the-socket-is-mounted": [
+            "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: no; path /run/containerd/containerd.sock",
+        ],
+        "the-declared-line-names-the-containerd-socket-path": [
+            "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path /var/run/docker.sock",
+        ],
+    },
+    "upgrades-intree-volume-named": {
+        "the-declared-line-says-the-source-is-in-tree": [
+            "seeded-a/intree-pd: source csi; bound by seeded-shapes/intree-pd; attaches through csi migration: yes",
+        ],
+        "the-declared-line-names-the-claim-and-the-migration": [
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through csi migration: no",
+        ],
+    },
+    "upgrades-retired-registry-image-named": {
+        "the-declared-line-names-the-retired-host": [
+            "seeded-a/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host gcr.io; retired: yes",
+        ],
+        "the-declared-line-says-the-host-is-retired": [
+            "seeded-a/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host k8s.gcr.io; retired: no",
+        ],
+    },
+    "upgrades-pod-security-latest-pinned-named": {
+        "the-declared-line-says-the-level-is-baseline": [
+            "seeded-a/seeded-defaults: enforce restricted; enforce-version latest; rule set changes at the next minor: yes",
+        ],
+        "the-declared-line-says-the-version-is-latest": [
+            "seeded-a/seeded-defaults: enforce baseline; enforce-version v1.33; rule set changes at the next minor: yes",
+        ],
+        "the-declared-line-says-the-rule-set-moves": [
+            "seeded-a/seeded-defaults: enforce baseline; enforce-version latest; rule set changes at the next minor: no",
+        ],
+    },
+    "upgrades-stale-client-skew-named": {
+        "the-declared-line-names-the-stale-client": [
+            "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl v1.34.1; server v1.34.1-gke.1234000; within supported skew: no",
+        ],
+        "the-declared-line-says-the-client-is-outside-the-skew": [
+            "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl v1.29.0; server v1.34.1-gke.1234000; within supported skew: yes",
+        ],
+    },
+    "upgrades-cgroup-blind-runtime-named": {
+        "the-declared-line-names-the-pre-cgroup-v2-runtime": [
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u372-b07-jre; reads cgroup v2 limits: no; memory limit 192Mi",
+        ],
+        "the-declared-line-says-the-runtime-is-blind-to-cgroup-v2": [
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/library/eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: yes; memory limit 192Mi",
+        ],
+        "the-declared-line-names-the-memory-limit": [
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/library/eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit 256Mi",
+        ],
+    },
+    "upgrades-multi-process-oom-group-named": {
+        "the-declared-line-says-the-container-runs-several-processes": [
+            "seeded-a/seeded-shapes/multi-process-worker: processes per container one; memory limit 32Mi; oom kills the whole container: yes",
+        ],
+        "the-declared-line-names-the-shared-limit": [
+            "seeded-a/seeded-shapes/multi-process-worker: processes per container several; memory limit 64Mi; oom kills the whole container: yes",
+        ],
+        "the-declared-line-says-the-whole-container-dies": [
+            "seeded-a/seeded-shapes/multi-process-worker: processes per container several; memory limit 32Mi; oom kills the whole container: no",
+        ],
+    },
+    "upgrades-node-image-coupled-agent-named": {
+        "the-declared-line-says-the-agent-uses-the-host-network": [
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: no; host paths /etc/cni/net.d; coupled to the node image: yes",
+        ],
+        "the-declared-line-names-the-cni-directory": [
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths none; coupled to the node image: yes",
+        ],
+        "the-declared-line-says-the-agent-is-coupled": [
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /etc/cni/net.d; coupled to the node image: no",
+        ],
+    },
+    "upgrades-cuda-pinned-gpu-job-named": {
+        "the-declared-line-names-the-accelerator": [
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-tesla-t4; cuda 12.2; suspended: yes",
+        ],
+        "the-declared-line-names-the-cuda-pin": [
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.4; suspended: yes",
+        ],
+        "the-declared-line-says-the-job-is-suspended": [
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: no",
+        ],
+    },
+}
+
+
+def _forbidden_clauses(case: str) -> dict[str, list[str]]:
+    """The case's objectives that carry a forbidden clause, each with its patterns."""
+    spec = yaml.safe_load((TASKS / case / "task.yaml").read_text(encoding="utf-8"))
+    return {
+        entry["name"]: list(entry["check"]["forbidden_patterns"])
+        for entry in spec["verification_spec"]
+        if entry.get("check", {}).get("forbidden_patterns")
+    }
+
+
+def _objective_verdict(case: str, objective: str, text: str, forbidden: list[str]) -> str:
+    """One objective's verdict on a report, its forbidden clause replaced (`[]` drops it)."""
+    spec = yaml.safe_load((TASKS / case / "task.yaml").read_text(encoding="utf-8"))
+    entry = next(e for e in spec["verification_spec"] if e["name"] == objective)
+    check = {k: v for k, v in entry["check"].items() if k != "forbidden_patterns"}
+    if forbidden:
+        check["forbidden_patterns"] = forbidden
+    with tempfile.TemporaryDirectory(prefix="contradiction-fleet-") as root:
+        _write_fleet_dir(Path(root), list(spec["fixtures"]))
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            v = parse_node(check)
+            _stash(_group3_report(case, text) if case in _GROUP3 else _group5_report(text))
+            return v.verify(5.0).status
+
+
+@pytest.mark.parametrize(
+    "case,objective,index,line",
+    [
+        (case, objective, index, line)
+        for case, objectives in _CONTRADICTIONS.items()
+        for objective, lines in objectives.items()
+        for index, line in enumerate(lines)
+    ],
+)
+def test_a_contradicting_second_line_fails_the_objective(case, objective, index, line):
+    _skip_if_parked(case)
+    pair = _bare_line(case) + "\n" + line
+    assert _verdicts_for_line(case, pair)[objective] == "fail", "the case as shipped accepts the pair"
+    assert _objective_verdict(case, objective, pair, []) == "pass", "the pair is refused without the clause, so the row does not test it"
+    assert _objective_verdict(case, objective, pair, [_forbidden_clauses(case)[objective][index]]) == "fail", "the row's pattern does not refuse its line"
+
+
+@pytest.mark.parametrize("case", _TABLED_CASES)
+def test_every_forbidden_pattern_has_a_contradiction_row(case):
+    _skip_if_parked(case)
+    rows = {objective: len(lines) for objective, lines in _CONTRADICTIONS.get(case, {}).items()}
+    clauses = {objective: len(patterns) for objective, patterns in _forbidden_clauses(case).items()}
+    assert rows == clauses, (rows, clauses)
+
+
+# verified_claims_backed: the reply's evidence blocks against the workers' calls.
+_PODS_CMD = "kubectl get pod -n seeded-debug -l app=payments-api -o jsonpath='{.items[0].status.containerStatuses[0].lastState}'"
+# As the pod stores it: worker_trajectory.supplement re-serialises a JSON output with spaces.
+_PODS_OUT = json.dumps({"output": json.dumps({"terminated": {"exitCode": 137, "reason": "OOMKilled"}}), "exit_code": 0})
+# What the worker saw and copied: kubectl's compact JSON.
+_PODS_EXCERPT = '"exitCode":137,"reason":"OOMKilled"'
+
+
+def _block(command, excerpt):
+    return f"```\n$ {command}\n```\n```\n{excerpt}\n```"
+
+
+_EVIDENCE = (
+    "**payments-api is OOMKilled.**\n\n**Evidence for verified claims**\n\n"
+    "The last termination was OOMKilled (exit 0, 2026-10-20T12:00:00Z, on card t_2)\n\n" + _block(_PODS_CMD, _PODS_EXCERPT)
+)
+
+
+def _grade_claims(reply, calls, gaps=None, min_blocks=1):
+    transcript.set("ok", _TRAJECTORY + calls, final_message=reply, worker_capture_gaps=gaps)
+    return VerifiedClaimsBackedVerifier(type="verified_claims_backed", min_blocks=min_blocks).verify(5.0)
+
+
+def test_verified_claims_backed_passes_evidence_a_worker_produced():
+    res = _grade_claims(_EVIDENCE, [_terminal(_PODS_CMD, result=_PODS_OUT, agent="cluster-seeded-a", task="t_2")])
+    assert res.status == "pass", res
+    assert "not checked" not in res.reason
+
+
+def test_verified_claims_backed_fails_the_pilots_unbacked_label():
+    res = _grade_claims("Verification check: no mismatch exceeds 30%. **Verified.**", [_terminal(_PODS_CMD, result=_PODS_OUT)])
+    assert res.status == "fail"
+    assert "calls claims verified with 0 evidence block(s)" in res.reason
+
+
+def test_verified_claims_backed_fails_a_command_no_worker_ran():
+    res = _grade_claims(_EVIDENCE, [_terminal("kubectl get pods -A", result=_PODS_OUT)])
+    assert res.status == "fail" and "not a command any worker ran" in res.reason
+
+
+def test_verified_claims_backed_ignores_the_routers_own_call():
+    router = dict(_ROUTER_TERMINAL, args={"command": _PODS_CMD}, result=_PODS_OUT)
+    res = _grade_claims(_EVIDENCE, [router, _terminal("kubectl get nodes")])
+    assert res.status == "fail" and "not a command any worker ran" in res.reason
+
+
+def test_verified_claims_backed_no_worker_call_at_all_is_an_error():
+    res = _grade_claims(_EVIDENCE, [])
+    assert res.status == "error" and "no worker terminal call" in res.reason
+
+
+def test_verified_claims_backed_fails_an_invented_excerpt():
+    res = _grade_claims(_EVIDENCE.replace("137", "1"), [_terminal(_PODS_CMD, result=_PODS_OUT)])
+    assert res.status == "fail" and "is not in the output of" in res.reason
+
+
+def test_verified_claims_backed_reads_a_multi_line_command_from_its_own_fence():
+    command = "kubectl get pods -n seeded-debug \\\n  -o wide"
+    out = json.dumps({"output": "NAME  STATUS\npayments-api-1  OOMKilled", "exit_code": 0})
+    res = _grade_claims(_block(command, "payments-api-1  OOMKilled"), [_terminal(command, result=out)])
+    assert res.status == "pass", res
+
+
+def test_verified_claims_backed_a_lone_command_fence_is_not_evidence():
+    # A suggested fix after real evidence: a $ fence with no output fence after it.
+    fix = "\n\nTo fix it:\n\n```\n$ kubectl set resources deployment payments-api --limits=memory=256Mi\n```\n\nThen watch it."
+    res = _grade_claims(_EVIDENCE + fix, [_terminal(_PODS_CMD, result=_PODS_OUT)])
+    assert res.status == "pass", res
+
+
+def test_verified_claims_backed_a_clipped_output_checks_only_the_command():
+    clipped = _PODS_OUT[:20] + " ...[clipped 40 chars]"
+    res = _grade_claims(_EVIDENCE, [_terminal(_PODS_CMD, result=clipped)])
+    assert res.status == "pass" and "1 excerpt(s) not checked, output clipped" in res.reason
+
+
+def test_verified_claims_backed_finds_an_excerpt_in_a_clipped_head():
+    out = json.dumps({"output": "phase \u2026 node-b NotReady " + "x" * 3000, "exit_code": 0})
+    clipped = out[:200] + " ...[clipped 3000 chars]"
+    res = _grade_claims(_block("kubectl get nodes", "phase \u2026 node-b NotReady"), [_terminal("kubectl get nodes", result=clipped)])
+    assert res.status == "pass" and "not checked" not in res.reason, res
+
+
+def test_verified_claims_backed_masks_addresses_as_the_pod_does():
+    out = json.dumps({"output": "user:[REDACTED_EMAIL] roles/viewer", "exit_code": 0})
+    res = _grade_claims(_block("gcloud projects get-iam-policy p", "user:ana@example.com roles/viewer"),
+                        [_terminal("gcloud projects get-iam-policy p", result=out)])
+    assert res.status == "pass", res
+
+
+def test_verified_claims_backed_a_capture_gap_is_an_error():
+    res = _grade_claims(_EVIDENCE, [], gaps=["profile platform: state.db missing"])
+    assert res.status == "error" and "state.db missing" in res.reason
+
+
+def test_verified_claims_backed_withheld_arguments_are_an_error():
+    from kube_agents_bench import worker_trajectory
+
+    withheld = _terminal("", args={"raw": worker_trajectory.WITHHELD}, result=worker_trajectory.WITHHELD)
+    res = _grade_claims(_EVIDENCE, [withheld])
+    assert res.status == "error" and "withheld" in res.reason
+
+
+def test_verified_claims_backed_min_blocks_zero_passes_a_reply_with_no_evidence():
+    assert _grade_claims("All good.", [], min_blocks=0).status == "pass"
+
+
+def test_verified_claims_backed_reads_what_the_gate_renders():
+    # The gate's render_evidence, loaded from the image patch, through this verifier's parser.
+    import importlib.util
+    import pathlib
+
+    path = pathlib.Path(__file__).resolve().parents[2] / "deploy/docker/patches/kanban_verified_claims.py"
+    spec = importlib.util.spec_from_file_location("kanban_verified_claims", path)
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+    command = "kubectl get pods -n seeded-debug \\\n  -o wide"
+    out = json.dumps({"output": "NAME  STATUS\npayments-api-1  OOMKilled", "exit_code": 0})
+    claim = {"claim": "payments-api-1 is OOMKilled.", "command": command, "excerpt": "payments-api-1  OOMKilled",
+             "exit_code": 0, "ran_at": "2026-10-20T12:00:00Z", "card": "t_2"}
+    reply = "**payments-api is OOMKilled.**\n\n" + gate.render_evidence([claim])
+    res = _grade_claims(reply, [_terminal(command, result=out, task="t_2")])
+    assert res.status == "pass", res
+
+
+def test_verified_claims_backed_a_lone_command_fence_before_the_section_is_not_evidence():
+    # The gate appends the section at the end, so a suggested fix in the body comes first.
+    fix = "To fix it:\n\n```\n$ kubectl set resources deployment payments-api --limits=memory=256Mi\n```\n\nThen watch it.\n\n"
+    res = _grade_claims(fix + _EVIDENCE, [_terminal(_PODS_CMD, result=_PODS_OUT)])
+    assert res.status == "pass", res
+
+
+def test_verified_claims_backed_a_redacted_output_checks_only_the_command():
+    out = json.dumps({"output": "data:\n  JAVA_OPTS: [REDACTED_SECRET]", "exit_code": 0})
+    res = _grade_claims(_block("kubectl get cm api-config -o yaml", "JAVA_OPTS: -Xmx512m"),
+                        [_terminal("kubectl get cm api-config -o yaml", result=out)])
+    assert res.status == "pass" and "clipped or redacted" in res.reason, res
+
+
+def test_verified_claims_backed_a_redacted_span_of_a_command_matches():
+    out = json.dumps({"output": "NAME  READY\nweb-1  1/1", "exit_code": 0})
+    stored = _terminal("kubectl get pods --token=[REDACTED_SECRET] -n web", result=out)
+    res = _grade_claims(_block("kubectl get pods --token=abc123 -n web", "web-1  1/1"), [stored])
+    assert res.status == "pass", res
+    res = _grade_claims(_block("kubectl get pods --token=abc123 -n other", "web-1  1/1"), [stored])
+    assert res.status == "fail" and "not a command any worker ran" in res.reason
+
+
+def test_verified_claims_backed_reads_escaped_characters_as_the_worker_saw_them():
+    # The pod re-serialises JSON output with ensure_ascii; kubectl escapes & as &.
+    raw = {"message": "out of memory — killed", "command": "a && b"}
+    out = json.dumps({"output": json.dumps(raw), "exit_code": 0})
+    cmd = "kubectl get pod p -o json"
+    res = _grade_claims(_block(cmd, '"message":"out of memory — killed"'), [_terminal(cmd, result=out)])
+    assert res.status == "pass", res
+    res = _grade_claims(_block(cmd, '"command":"a \\u0026\\u0026 b"'), [_terminal(cmd, result=out)])
+    assert res.status == "pass", res
+
+
+def test_verified_claims_backed_a_fix_fence_then_a_manifest_fence_is_not_evidence():
+    # A remediation shown as a command fence and then a manifest fence, before the real section.
+    fix = "To fix it:\n\n```\n$ kubectl apply -f payments-api.yaml\n```\n\n```yaml\nresources:\n  limits:\n    memory: 256Mi\n```\n\n"
+    res = _grade_claims(fix + _EVIDENCE, [_terminal(_PODS_CMD, result=_PODS_OUT)])
+    assert res.status == "pass", res
+    adjacent = "```\n$ kubectl apply -f payments-api.yaml\n```\n```yaml\nmemory: 256Mi\n```\n\n"
+    res = _grade_claims(adjacent + _EVIDENCE, [_terminal(_PODS_CMD, result=_PODS_OUT)])
+    assert res.status == "pass", res
+
+
+def test_verified_claims_backed_a_redacted_span_cannot_hide_a_second_command():
+    # The pod masks one word; a span may not stand for a separator or a second command.
+    out = json.dumps({"output": "NAME  READY\nweb-1  1/1", "exit_code": 0})
+    stored = _terminal("kubectl get pods --token=[REDACTED_SECRET] -n web", result=out)
+    for forged in ("kubectl get pods --token=x; kubectl delete namespace prod -n web",
+                   "kubectl get pods --token=x\nkubectl delete ns prod -n web"):
+        res = _grade_claims(_block(forged, "web-1  1/1"), [stored])
+        assert res.status == "fail" and "not a command any worker ran" in res.reason, (forged, res)
+
+
+def test_verified_claims_backed_an_excerpt_inside_a_longer_word_fails():
+    out = json.dumps({"output": "node-a  NotReady  <none>", "exit_code": 0})
+    res = _grade_claims(_block("kubectl get nodes", "Ready  <none>"), [_terminal("kubectl get nodes", result=out)])
+    assert res.status == "fail" and "is not in the output of" in res.reason
+
+
+def test_verified_claims_backed_a_short_excerpt_fails():
+    out = json.dumps({"output": "healthy: 1", "exit_code": 0})
+    res = _grade_claims(_block("kubectl get pods", "1"), [_terminal("kubectl get pods", result=out)])
+    assert res.status == "fail" and "fewer than 8" in res.reason
+
+
+def test_verified_claims_backed_a_short_excerpt_that_is_the_whole_output_passes():
+    # A precise jsonpath query, as on a green run: its whole output is the exit code.
+    cmd = "kubectl get pod p -o jsonpath='{.exitCode}'"
+    out = json.dumps({"output": "137", "exit_code": 0, "error": None})
+    res = _grade_claims(_block(cmd, "137"), [_terminal(cmd, result=out)])
+    assert res.status == "pass", res
+
+
+def test_verified_claims_backed_a_stored_command_that_is_only_a_marker_matches_nothing():
+    out = json.dumps({"output": "NAME  READY\nweb-1  1/1", "exit_code": 0})
+    res = _grade_claims(_block("kubectl", "web-1  1/1"), [_terminal("[REDACTED_SECRET]", result=out)])
+    assert res.status == "fail" and "not a command any worker ran" in res.reason
+
+
+# The readiness-rule cases for catalogue entries 2, 13, 16 and 19 carry the same cell
+# slot: each quotes what its rule's `describe` (or, where the rule filed a note, the
+# rule's note line) prints on the seeded fleet, and each cell carries a `;`, so the
+# same wraps are held to the same fold through each case's shipped entry. The
+# fleet's own values (a node's name, the per-namespace counts, the disk) are left
+# open by the patterns and stand in here as the fleet would print them.
+_SURGE_CASE = "upgrades-readiness-surge-capacity"
+_DATAPLANE_CASE = "upgrades-readiness-legacy-dataplane"
+_CONTAINERD_CASE = "upgrades-readiness-containerd-socket"
+_INTREE_CASE = "upgrades-readiness-intree-volume"
+_DEFAULTS_CASE = "upgrades-readiness-changed-defaults"
+_DEPRECATED_CASE = "upgrades-readiness-deprecated-api-callers"
+_SLOT_NAMES = dict(zip(_SLOT_LETTERS, _SLOTS))
+_SURGE_CELL = (
+    "surge-capacity: pool no-surge-pool (maxSurge 0, maxUnavailable 1; 1 node(s), not autoscaled) removes a node before its replacement exists; "
+    "draining its node gke-seeded-b-no-surge-pool-1a2b3c4d-x9y8 leaves 250m CPU / 256Mi of pods with no node to take them "
+    "(0m / 0Mi free on the nodes they may schedule on): Deployment seeded-upgrade/pinned-batch-runner (250m / 256Mi, pinned to the pool)"
+)
+_DATAPLANE_RISK_CELL = (
+    "network-dataplane: legacy dataplane with policy enforcement off and NetworkPolicies in seeded-debug (1), seeded-upgrade (2): "
+    "the policies apply nowhere today and start to apply the moment enforcement turns on, at the node rebuild that follows enabling "
+    "the network policy add-on or on a Dataplane V2 cluster (in the listing: platform-agent-host, each enforcing its own policies); test what they deny before either"
+)
+_DATAPLANE_NOTE_LINE = "network-dataplane: legacy dataplane, policy enforcement off; network policies: none, nothing to enforce"
+_CONTAINERD_NOTE_LINE = (
+    "container-runtime: 1 workload(s) mount the container runtime socket (DaemonSet seeded-shapes/node-runtime-probe); "
+    "no pool's containerd major changes at the target"
+)
+# The rule's risk cell, the line the case admits on a fleet whose pool does change major.
+_CONTAINERD_RISK_CELL = (
+    "container-runtime: pool default-pool (COS_CONTAINERD) runs containerd 1 on its nodes (containerd://1.7.34) and the target's node image "
+    "ships containerd 2; mounting the runtime socket: DaemonSet seeded-shapes/node-runtime-probe (/run/containerd/containerd.sock)"
+)
+# The two lines cut at the rule's own `; `, as an agent that splits the note column on its
+# separator hands them back; the case's patterns stop before it.
+_CONTAINERD_NOTE_CUT = _CONTAINERD_NOTE_LINE.split("; ", 1)[0]
+_CONTAINERD_RISK_CUT = _CONTAINERD_RISK_CELL.split("; ", 1)[0]
+_INTREE_CELL = (
+    "in-tree-volumes: PersistentVolume intree-pd (in-tree gcePersistentDisk seeded-a-intree-pd, claim seeded-shapes/intree-pd, Bound) "
+    "attaches through CSI migration for Deployment seeded-shapes/intree-pd-reader; move it to pd.csi.storage.gke.io"
+)
+# The changed-defaults rule's three forms for the planted namespace: the note on the fleet as it
+# stands (no crossed minor changes a baseline check), the note for a crossed minor that only
+# widens the allowlist, and the risk for one that tightens it. The counts and minors are the
+# fleet's; the case's pattern stops before them.
+_DEFAULTS_NOTE_CELL = "changed-defaults: 1 namespace follows latest with no enforced check changing between 1.35 and 1.36 per the table"
+_DEFAULTS_LOOSENS_CELL = "changed-defaults: seeded-defaults follows latest; 1.37 only widens the baseline allowlist, which rejects nothing new"
+# The note the rule files first once the channel default passes the table's last minor; the prompt
+# asks for the first of the rule's entries, so the case admits it.
+_DEFAULTS_PAST_TABLE_CELL = "changed-defaults: the defaults table ends at 1.36 (read 2026-10-13); minors after it up to the target 1.37 are not graded, and a row per minor from its release notes refreshes the table"
+_DEFAULTS_RISK_CELL = (
+    "changed-defaults: namespace seeded-defaults: pod-security.kubernetes.io/enforce=baseline, pod-security.kubernetes.io/enforce-version=latest: "
+    "follows the running minor, so the enforced baseline rule set changes at 1.34; 1.34: the host field of probes and lifecycle hooks must be unset "
+    "(https://kubernetes.io/docs/concepts/security/pod-security-standards/)"
+)
+# The deprecated-api-callers rule's risk for the planted writer (the user agent, the count and
+# the last write are the fleet's; the case's pattern stops after the API), the same line cut at
+# the rule's first `; ` as an agent that splits the column there hands it back, and the note the
+# other clusters carry, where only the provider's endpoint-controller writes Endpoints.
+_DEPRECATED_CELL = (
+    "deprecated-api-callers: system:serviceaccount:seeded-deprecation:legacy-endpoints-writer via Python-urllib/3.12 writes core/v1 endpoints "
+    "(1008 writes in 7d, last 2026-10-20T19:50:03Z): deprecated and still served; the next removal is the outage, so plan the migration now; "
+    "successor discovery.k8s.io/v1 EndpointSlice (Endpoints deprecated in 1.33, KEP-4974)"
+)
+_DEPRECATED_CELL_CUT = _DEPRECATED_CELL.split("; ", 1)[0]
+_DEPRECATED_NOTE_LINE = "deprecated-api-callers: 1 provider caller of deprecated APIs not filed (system:serviceaccount:kube-system:endpoint-controller on core/v1 endpoints)"
+_CELL_WRAPS = ("{cell}", '"{cell}"', "'{cell}'", "\u201c{cell}\u201d", "<{cell}>", "`{cell}`")
+
+
+def _case_grades(case: str, objective: str, text: str) -> bool:
+    spec = yaml.safe_load((TASKS / case / "task.yaml").read_text(encoding="utf-8"))
+    check = next(entry["check"] for entry in spec["verification_spec"] if entry["name"] == objective)
+    v = parse_node(check)
+    _stash(text)
+    with tempfile.TemporaryDirectory(prefix="readiness-fleet-") as root:
+        _write_fleet_dir(Path(root), list(spec["fixtures"]), None)
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            return v.verify(5.0).status == "pass"
+
+
+def _bare(cell: str) -> str:
+    """The cell as `report.json` carries it: the rule's text without the `<rule>: ` prefix the table adds."""
+    return cell.split(": ", 1)[1]
+
+
+def _without_cell_slot(text: str) -> str:
+    return "\n".join(line.rsplit("; cell:", 1)[0] for line in text.splitlines())
+
+
+def _surge_report(cell: str = _SURGE_CELL, grade: str = "blocker", other_cell: str = "none", other_rule: str = "none") -> str:
+    lines = []
+    for letter, cluster in _SLOT_NAMES.items():
+        if letter == "b":
+            lines.append(f"{cluster}: pool that removes a node first: no-surge-pool; readiness rule: surge-capacity; graded as: {grade}; cell: {cell}")
+        else:
+            lines.append(f"{cluster}: pool that removes a node first: none; readiness rule: {other_rule}; graded as: none; cell: {other_cell}")
+    return "\n".join(lines)
+
+
+def _dataplane_report(risk_cell: str = _DATAPLANE_RISK_CELL, note_line: str = _DATAPLANE_NOTE_LINE, note_grade: str = "note") -> str:
+    lines = []
+    for letter, cluster in _SLOT_NAMES.items():
+        grade, cell = (note_grade, note_line) if letter == "c" else ("risk", risk_cell)
+        lines.append(f"{cluster}: kind Cluster; dataplane: legacy; network policies enforced: no; readiness rule: network-dataplane; graded as: {grade}; cell: {cell}")
+    return "\n".join(lines)
+
+
+def _containerd_report(cell: str = _CONTAINERD_NOTE_LINE, blocks: str = "no") -> str:
+    lines = [f"{_SLOT_NAMES['a']}/seeded-shapes/node-runtime-probe: kind DaemonSet; mounts the runtime socket: yes; blocks the upgrade: {blocks}; cell: {cell}"]
+    lines += [f"{cluster}: no runtime socket clients" for letter, cluster in _SLOT_NAMES.items() if letter != "a"]
+    return "\n".join(lines)
+
+
+def _defaults_report(cell: str = _DEFAULTS_NOTE_CELL, grade: str = "note", count: str = "1", rule: str = "changed-defaults") -> str:
+    lines = []
+    for letter, cluster in _SLOT_NAMES.items():
+        if letter == "a":
+            lines.append(f"{cluster}: kind Cluster; namespaces whose pod security version follows the running minor: {count}; readiness rule: {rule}; graded as: {grade}; cell: {cell}")
+        else:
+            lines.append(f"{cluster}: kind Cluster; namespaces whose pod security version follows the running minor: 0; readiness rule: none; graded as: none; cell: none")
+    return "\n".join(lines)
+
+
+def _intree_report(cell: str = _INTREE_CELL, addon: str = "on", blocks: str = "no") -> str:
+    lines = [f"{_SLOT_NAMES['a']}/intree-pd: kind PersistentVolume; pd csi driver add-on: {addon}; blocks the upgrade: {blocks}; cell: {cell}"]
+    lines += [f"{cluster}: no in-tree volumes" for letter, cluster in _SLOT_NAMES.items() if letter != "a"]
+    return "\n".join(lines)
+
+
+def _deprecated_report(cell: str = _DEPRECATED_CELL, grade: str = "risk", count: str = "1", rule: str = "deprecated-api-callers") -> str:
+    lines = []
+    for letter, cluster in _SLOT_NAMES.items():
+        if letter == "a":
+            lines.append(f"{cluster}: kind Cluster; deprecated-api callers the report names: {count}; readiness rule: {rule}; graded as: {grade}; cell: {cell}")
+        else:
+            lines.append(f"{cluster}: kind Cluster; deprecated-api callers the report names: 0; readiness rule: deprecated-api-callers; graded as: note; cell: {_DEPRECATED_NOTE_LINE}")
+    return "\n".join(lines)
+
+
+_GROUP_CASE_REPORTS = {
+    _SURGE_CASE: (
+        ("every-seeded-cluster-has-a-declared-line", "the-laggard-names-no-surge-pool-as-a-blocker", "the-laggards-line-quotes-the-reports-cell", "the-other-clusters-declare-no-such-pool"),
+        lambda wrap: _surge_report(wrap.format(cell=_SURGE_CELL)),
+    ),
+    _DATAPLANE_CASE: (
+        (
+            "every-seeded-cluster-has-a-declared-line",
+            "the-declared-lines-say-the-dataplane-is-legacy",
+            "the-declared-lines-say-policies-are-not-enforced",
+            "the-declared-lines-name-the-reports-rule",
+            "the-declared-lines-grade-the-finding-by-the-clusters-policies",
+            "the-declared-lines-quote-the-reports-cell",
+        ),
+        lambda wrap: _dataplane_report(wrap.format(cell=_DATAPLANE_RISK_CELL), wrap.format(cell=_DATAPLANE_NOTE_LINE)),
+    ),
+    _CONTAINERD_CASE: (
+        ("the-planted-agent-is-named-and-does-not-block", "the-planted-agents-line-quotes-the-reports-text"),
+        lambda wrap: _containerd_report(wrap.format(cell=_CONTAINERD_NOTE_LINE)),
+    ),
+    _INTREE_CASE: (
+        ("the-planted-volume-is-named-with-the-addon-on-and-does-not-block", "the-planted-volumes-line-quotes-the-reports-cell"),
+        lambda wrap: _intree_report(wrap.format(cell=_INTREE_CELL)),
+    ),
+    _DEFAULTS_CASE: (
+        (
+            "every-seeded-cluster-has-a-declared-line",
+            "the-planted-clusters-line-counts-the-namespace",
+            "the-planted-clusters-line-names-the-reports-rule",
+            "the-planted-clusters-line-does-not-block",
+            "the-planted-clusters-line-quotes-the-reports-cell",
+        ),
+        lambda wrap: _defaults_report(wrap.format(cell=_DEFAULTS_NOTE_CELL)),
+    ),
+    _DEPRECATED_CASE: (
+        (
+            "every-seeded-cluster-has-a-declared-line",
+            "the-planted-clusters-line-counts-the-writer",
+            "the-planted-clusters-line-names-the-reports-rule",
+            "the-planted-clusters-line-grades-it-a-risk",
+            "the-planted-clusters-line-quotes-the-reports-cell",
+        ),
+        lambda wrap: _deprecated_report(wrap.format(cell=_DEPRECATED_CELL)),
+    ),
+}
+
+
+@pytest.mark.parametrize("case,objective", [(case, objective) for case, (objectives, _) in _GROUP_CASE_REPORTS.items() for objective in objectives])
+@pytest.mark.parametrize("wrap", _CELL_WRAPS)
+def test_rule_cases_accept_the_cell_however_the_agent_wrapped_it(case, objective, wrap):
+    assert _case_grades(case, objective, _GROUP_CASE_REPORTS[case][1](wrap))
+
+
+@pytest.mark.parametrize("wrap", _CELL_WRAPS)
+def test_containerd_case_accepts_the_rules_risk_cell_on_a_fleet_whose_pool_changes_major(wrap):
+    assert _case_grades(_CONTAINERD_CASE, "the-planted-agents-line-quotes-the-reports-text", _containerd_report(wrap.format(cell=_CONTAINERD_RISK_CELL)))
+
+
+@pytest.mark.parametrize("cell", [_CONTAINERD_NOTE_CUT, _CONTAINERD_RISK_CUT, _bare(_CONTAINERD_NOTE_CUT), _bare(_CONTAINERD_RISK_CUT)])
+@pytest.mark.parametrize("wrap", _CELL_WRAPS)
+def test_containerd_case_accepts_the_rules_entry_cut_at_its_first_separator(cell, wrap):
+    assert _case_grades(_CONTAINERD_CASE, "the-planted-agents-line-quotes-the-reports-text", _containerd_report(wrap.format(cell=cell)))
+
+
+@pytest.mark.parametrize(
+    "case,objective,text",
+    [
+        # The cell as report.json carries it, with no rule prefix: the table adds the prefix when it
+        # renders, so an agent that reads the JSON copies the bare text, which the cases admit.
+        (_SURGE_CASE, "the-laggards-line-quotes-the-reports-cell", _surge_report(_bare(_SURGE_CELL))),
+        # A no-finding cluster may name the rule that cleared it, with no grade and no cell.
+        (_SURGE_CASE, "the-other-clusters-declare-no-such-pool", _surge_report(other_rule="surge-capacity")),
+        (_DATAPLANE_CASE, "the-declared-lines-quote-the-reports-cell", _dataplane_report(_bare(_DATAPLANE_RISK_CELL), _bare(_DATAPLANE_NOTE_LINE))),
+        (_CONTAINERD_CASE, "the-planted-agents-line-quotes-the-reports-text", _containerd_report(_bare(_CONTAINERD_NOTE_LINE))),
+        (_CONTAINERD_CASE, "the-planted-agents-line-quotes-the-reports-text", _containerd_report(_bare(_CONTAINERD_RISK_CELL))),
+        (_INTREE_CASE, "the-planted-volumes-line-quotes-the-reports-cell", _intree_report(_bare(_INTREE_CELL))),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _defaults_report(_bare(_DEFAULTS_NOTE_CELL))),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _defaults_report(_bare(_DEFAULTS_RISK_CELL), grade="risk")),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _deprecated_report(_bare(_DEPRECATED_CELL))),
+        # The entry cut at the rule's own first `; `, with and without the prefix: the pattern stops after the API.
+        (_DEPRECATED_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _deprecated_report(_DEPRECATED_CELL_CUT)),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _deprecated_report(_bare(_DEPRECATED_CELL_CUT))),
+    ],
+)
+def test_rule_cases_accept_the_bare_json_text_without_the_rule_prefix(case, objective, text):
+    assert _case_grades(case, objective, text)
+
+
+@pytest.mark.parametrize("cell,grade", [(_DEFAULTS_LOOSENS_CELL, "note"), (_DEFAULTS_RISK_CELL, "risk"), (_DEFAULTS_PAST_TABLE_CELL, "note")])
+@pytest.mark.parametrize("wrap", _CELL_WRAPS)
+def test_defaults_case_accepts_the_rules_other_forms_on_a_fleet_that_crosses_a_baseline_change(cell, grade, wrap):
+    report = _defaults_report(wrap.format(cell=cell), grade=grade)
+    assert _case_grades(_DEFAULTS_CASE, "the-planted-clusters-line-quotes-the-reports-cell", report)
+    assert _case_grades(_DEFAULTS_CASE, "the-planted-clusters-line-does-not-block", report)
+
+
+@pytest.mark.parametrize(
+    "case,objective,text",
+    [
+        # A report whose rule is missing prints no cell: `none`, or another text under the rule's id.
+        (_SURGE_CASE, "the-laggards-line-quotes-the-reports-cell", _surge_report("none")),
+        (_SURGE_CASE, "the-laggards-line-quotes-the-reports-cell", _surge_report('"surge-capacity: something else"')),
+        (_DATAPLANE_CASE, "the-declared-lines-quote-the-reports-cell", _dataplane_report(risk_cell="none")),
+        (_DATAPLANE_CASE, "the-declared-lines-quote-the-reports-cell", _dataplane_report(note_line='"network-dataplane: something else"')),
+        # Slot c carries no policy: its line quotes the note, not a risk cell it does not have.
+        (_DATAPLANE_CASE, "the-declared-lines-quote-the-reports-cell", _dataplane_report(note_line=_DATAPLANE_RISK_CELL)),
+        (_CONTAINERD_CASE, "the-planted-agents-line-quotes-the-reports-text", _containerd_report("none")),
+        (_CONTAINERD_CASE, "the-planted-agents-line-quotes-the-reports-text", _containerd_report('"container-runtime: something else"')),
+        (_INTREE_CASE, "the-planted-volumes-line-quotes-the-reports-cell", _intree_report("none")),
+        (_INTREE_CASE, "the-planted-volumes-line-quotes-the-reports-cell", _intree_report('"in-tree-volumes: something else"')),
+        # The grade slot names its subject; a wrapped cell does not change the grade.
+        (_SURGE_CASE, "the-laggard-names-no-surge-pool-as-a-blocker", _surge_report(f'"{_SURGE_CELL}"', grade="risk")),
+        (_DATAPLANE_CASE, "the-declared-lines-grade-the-finding-by-the-clusters-policies", _dataplane_report(note_grade="risk")),
+        (_CONTAINERD_CASE, "the-planted-agent-is-named-and-does-not-block", _containerd_report(f'"{_CONTAINERD_NOTE_LINE}"', blocks="yes")),
+        (_INTREE_CASE, "the-planted-volume-is-named-with-the-addon-on-and-does-not-block", _intree_report(f'"{_INTREE_CELL}"', blocks="yes")),
+        # A cluster with no such pool declares no cell either.
+        (_SURGE_CASE, "the-other-clusters-declare-no-such-pool", _surge_report(other_cell=_SURGE_CELL)),
+        # Another rule's id on a no-finding cluster is a reading of a finding the report did not make.
+        (_SURGE_CASE, "the-other-clusters-declare-no-such-pool", _surge_report(other_rule="drain-blocking-pdbs")),
+        (_SURGE_CASE, "the-other-clusters-declare-no-such-pool", _surge_report(other_rule="surge-capacity", other_cell=_SURGE_CELL)),
+        # A line without the cell slot is the earlier frame and fails the slots that need it.
+        (_SURGE_CASE, "the-laggard-names-no-surge-pool-as-a-blocker", _without_cell_slot(_surge_report())),
+        (_SURGE_CASE, "the-laggards-line-quotes-the-reports-cell", _without_cell_slot(_surge_report())),
+        (_DATAPLANE_CASE, "the-declared-lines-grade-the-finding-by-the-clusters-policies", _without_cell_slot(_dataplane_report())),
+        (_DATAPLANE_CASE, "the-declared-lines-quote-the-reports-cell", _without_cell_slot(_dataplane_report())),
+        (_CONTAINERD_CASE, "the-planted-agent-is-named-and-does-not-block", _without_cell_slot(_containerd_report())),
+        (_INTREE_CASE, "the-planted-volume-is-named-with-the-addon-on-and-does-not-block", _without_cell_slot(_intree_report())),
+        # The changed-defaults case: a missing or foreign cell, a blocker or `none` grade, a rule the
+        # report did not name, a count that denies the namespace, and the frame without the cell slot.
+        (_DEFAULTS_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _defaults_report("none")),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _defaults_report('"changed-defaults: something else"')),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _defaults_report(_DATAPLANE_NOTE_LINE)),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-does-not-block", _defaults_report(grade="blocker")),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-does-not-block", _defaults_report(grade="none")),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-names-the-reports-rule", _defaults_report(rule="none")),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-counts-the-namespace", _defaults_report(count="0")),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-counts-the-namespace", _defaults_report(count="none")),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-does-not-block", _without_cell_slot(_defaults_report())),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _without_cell_slot(_defaults_report())),
+        # The deprecated-api-callers case: a missing or foreign cell (the rule's own note for a cluster
+        # with no operator caller included), a blocker or note grade, a rule the report did not name,
+        # a count that denies the writer, and the frame without the cell slot.
+        (_DEPRECATED_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _deprecated_report("none")),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _deprecated_report('"deprecated-api-callers: something else"')),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _deprecated_report(_DEPRECATED_NOTE_LINE)),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-grades-it-a-risk", _deprecated_report(grade="blocker")),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-grades-it-a-risk", _deprecated_report(grade="note")),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-names-the-reports-rule", _deprecated_report(rule="none")),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-counts-the-writer", _deprecated_report(count="0")),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-grades-it-a-risk", _without_cell_slot(_deprecated_report())),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _without_cell_slot(_deprecated_report())),
+    ],
+)
+def test_rule_cases_refuse_a_missing_or_foreign_cell(case, objective, text):
+    assert not _case_grades(case, objective, text)
+
+
+
+
+_PER_CLUSTER_CELL_WRAPS = [
+    "{cell}",
+    '"{cell}"',
+    "'{cell}'",
+    "“{cell}”",
+    "<{cell}>",
+    "`{cell}`",
+    # The column's other entries ahead of the rule's.
+    "cluster read failed; PDBs not graded; {cell}",
+]
+
+
+def _per_cluster_case_spec(case: str) -> dict:
+    return yaml.safe_load((TASKS / case / "task.yaml").read_text(encoding="utf-8"))
+
+
+# The per-cluster readiness cases for the workload rules of catalogue entries
+# 4, 10, 12, 14, 15, 17, 18 and 20 grade one declared line per seeded cluster,
+# `<cluster>: <rule id>: <object kind namespace/name|none>; blocks the upgrade:
+# <yes|no|none>; cell: <the rule's text|none>`: slot a's line names the planted
+# object, reads `no` and quotes the rule's own text; the other slots read `none`
+# in every slot, since the fleet plants each shape on slot a alone (the
+# client-addon-skew case also admits a kubectl client the cluster's audit log
+# names there, in the rule's own wording: `_CLIENT_CASE` below). The cases
+# first graded one line per object, anchored on the object's name, and the
+# dev-install runs passed none of them: the agent read `<cluster>/<object name>`
+# as `<project>/<cluster>`, which put the object's name after `; blocks the
+# upgrade:` where the anchor could not find it, left a note-column object out
+# of a list it built from the risks, or wrote the lines for a dozen other
+# objects and left the planted one out;
+# `test_per_cluster_rule_case_fails_every_objective_on_the_object_line_frame`
+# keeps that rendering red. The cell texts are the rules' own, as their unit
+# tests assert them (agents/platform/skills/fleet-upgrade-verification/scripts/
+# test_readiness_rules_workloads.py, and test_audit_rules.py for entry 10); the
+# pools, the kubelet version, the skew gap and the target are the fleet's, so
+# the cases' patterns stop before them. A cell carries a `;`, so a wrap the
+# agent kept around it survives `_VALUE_WRAP`, and a note's entry may come with
+# the note column's other entries before it; the cases admit any prefix before
+# the rule's text.
+_PER_CLUSTER_RULE_CASES = {
+    "upgrades-fleet-readiness-node-local-state": (
+        "Deployment seeded-shapes/cache-on-emptydir",
+        "data-on-the-node",
+        "data-on-the-node: Deployment seeded-shapes/cache-on-emptydir keeps scratch on the node in queue (emptyDir; the name suggests state); "
+        "not a risk: a Deployment's emptyDir is emptied by every reschedule and a read-only or memory-backed mount holds nothing of the workload's",
+    ),
+    "upgrades-fleet-readiness-deprecated-node-label": (
+        "Deployment seeded-shapes/arch-pinned-worker",
+        "removed-node-label",
+        "removed-node-label: Deployment seeded-shapes/arch-pinned-worker: selects on beta.kubernetes.io/arch=amd64 (nodeSelector), deprecated since 1.14 "
+        "in favour of kubernetes.io/arch; the kubelet still sets it today, and a node image that stops setting it strands the pods",
+    ),
+    "upgrades-fleet-readiness-cgroup-blind-runtime": (
+        "Deployment seeded-shapes/cgroup-blind-jvm",
+        "cgroup-v2-runtime",
+        "cgroup-v2-runtime: Deployment seeded-shapes/cgroup-blind-jvm container jvm runs docker.io/library/eclipse-temurin:8u302-b08-jre "
+        "(JDK 8u302, below 8u372) on pool default-pool, already on cgroup v2; not an upgrade risk",
+    ),
+    "upgrades-fleet-readiness-multi-process-container": (
+        "Deployment seeded-shapes/multi-process-worker",
+        "group-oom-kill",
+        "group-oom-kill: Deployment seeded-shapes/multi-process-worker container supervisor runs a shell script that forks a background job "
+        "on pool default-pool, on cgroup v2 with a kubelet at 1.33.4-gke.1000, which already group-kills; not an upgrade risk",
+    ),
+    "upgrades-fleet-readiness-node-image-coupled-agent": (
+        "DaemonSet seeded-shapes/cni-shaped-agent",
+        "node-image-coupled-agent",
+        "node-image-coupled-agent: DaemonSet seeded-shapes/cni-shaped-agent: on the node's network and coupled to the node image: "
+        "mounts /etc/cni/net.d from the node; pool(s) default-pool, idle-batch-pool, pinned-inference-pool are below the target and get a new node image in this upgrade",
+    ),
+    "upgrades-fleet-readiness-cuda-pinned-gpu-job": (
+        "CronJob seeded-shapes/cuda-pinned-trainer",
+        "gpu-driver",
+        "gpu-driver: CronJob seeded-shapes/cuda-pinned-trainer: requests nvidia.com/gpu on accelerator nvidia-l4 and no pool in the cluster carries "
+        "that accelerator; the target driver cannot be read, and the pin image docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04 stays unchecked",
+    ),
+    "upgrades-fleet-readiness-retired-registry-image": (
+        "Deployment seeded-shapes/legacy-registry-pull",
+        "retired-registry",
+        "retired-registry: Deployment seeded-shapes/legacy-registry-pull: container pause pulls k8s.gcr.io/pause:3.9 from k8s.gcr.io "
+        "(frozen 2023-04-03, a redirect to registry.k8s.io since 2023-03-20); a rebuilt node pulls it again from a host that stopped publishing; "
+        "pool(s) default-pool, idle-batch-pool, pinned-inference-pool are below the target and are rebuilt in this upgrade",
+    ),
+    "upgrades-readiness-client-addon-skew": (
+        "CronJob seeded-shapes/stale-kubectl-client",
+        "client-addon-skew",
+        "client-addon-skew: kubectl v1.29 from CronJob seeded-shapes/stale-kubectl-client (image registry.k8s.io/kubectl:v1.29.0): "
+        "7 minors behind the target 1.36; kubectl is supported within 1 minor of kube-apiserver (https://kubernetes.io/releases/version-skew-policy/#kubectl)",
+    ),
+}
+_CLIENT_CASE = "upgrades-readiness-client-addon-skew"
+# The other-slots objective is named for what it admits; the client case admits
+# a finding the audit log names besides `none`.
+_OTHERS_OBJECTIVE_OF = {_CLIENT_CASE: "the-other-clusters-read-none-or-the-reports-own-finding"}
+_PLANTED_OBJECTIVE = "the-planted-object-is-named-and-does-not-block"
+_CELL_OBJECTIVE = "the-planted-objects-line-quotes-the-reports-cell"
+_EVERY_SLOT_OBJECTIVE = "every-seeded-cluster-has-a-declared-line"
+_OTHERS_OBJECTIVE = "the-other-clusters-read-none"
+
+
+def _others_objective(case: str) -> str:
+    return _OTHERS_OBJECTIVE_OF.get(case, _OTHERS_OBJECTIVE)
+
+
+def _per_cluster_objectives(case: str) -> tuple[str, ...]:
+    return (_EVERY_SLOT_OBJECTIVE, _PLANTED_OBJECTIVE, _CELL_OBJECTIVE, _others_objective(case))
+# The other grades the same rules print for the same objects on another fleet
+# (a cgroup v1 pool the target migrates, a GPU pool carrying the accelerator):
+# the patterns stop before the pool-dependent tail, so these pass the cell slot too.
+_PER_CLUSTER_OTHER_CELLS = {
+    "upgrades-fleet-readiness-cgroup-blind-runtime": (
+        "cgroup-v2-runtime: Deployment seeded-shapes/cgroup-blind-jvm: container jvm runs docker.io/library/eclipse-temurin:8u302-b08-jre "
+        "(JDK 8u302, below 8u372) on pool default-pool, which GKE migrates cgroup v1 pools to v2 from 1.33 at the target; "
+        "the heap is then sized from the node and the container is OOM-killed"
+    ),
+    "upgrades-fleet-readiness-multi-process-container": (
+        "group-oom-kill: Deployment seeded-shapes/multi-process-worker: container supervisor runs a shell script that forks a background job "
+        "(heuristic: the process count is not readable from the API) on pool default-pool, which GKE migrates cgroup v1 pools to v2 from 1.33 "
+        "at the target; a kubelet at 1.34 then sets memory.oom.group and an OOM kill takes every process in the container"
+    ),
+    "upgrades-fleet-readiness-cuda-pinned-gpu-job": (
+        "gpu-driver: CronJob seeded-shapes/cuda-pinned-trainer requests nvidia.com/gpu with image docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04 "
+        "on pool gpu-pool; the target 1.33 node image ships driver R535 (gpuDriverVersion DEFAULT), which serves CUDA 12.2; "
+        "forward-compatibility packages inside the image are not readable from the tag"
+    ),
+}
+# How the dev install's runs rendered a declared line: the project before the
+# cluster, the location after it, a bullet, emphasis, code, a stop.
+_PER_CLUSTER_RENDERINGS = (
+    "some-project/{line}",
+    "{cluster} (us-central1-a): {rest}",
+    "- {line}",
+    "**{cluster}**: {rest}",
+    "`{cluster}`: {rest}",
+    "{line}.",
+)
+
+
+def _one_role_per_slot() -> list[str]:
+    """One catalogue role per cluster slot. The runner records every seeded
+    cluster it reached whatever roles a case names, and `{cluster:<slot>}`
+    expands from that record, so the test directory reaches every slot as the
+    runner does; the cases themselves name the planted role alone."""
+    by_slot: dict[str, str] = {}
+    for role, spec in sorted(_catalog_roles().items()):
+        by_slot.setdefault(spec["cluster_slot"], role)
+    return [by_slot[slot] for slot in sorted(by_slot)]
+
+
+def _per_cluster_case_grades(case: str, objective: str, text: str) -> bool:
+    spec = _per_cluster_case_spec(case)
+    check = next(entry["check"] for entry in spec["verification_spec"] if entry["name"] == objective)
+    v = parse_node(check)
+    _stash(text)
+    with tempfile.TemporaryDirectory(prefix="per-cluster-fleet-") as root:
+        _write_fleet_dir(Path(root), list(spec["fixtures"]) + _one_role_per_slot(), None)
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            return v.verify(5.0).status == "pass"
+
+
+def _per_cluster_line(cluster: str, rule: str, obj: str = "none", verdict: str = "none", cell: str = "none") -> str:
+    return f"{cluster}: {rule}: {obj}; blocks the upgrade: {verdict}; cell: {cell}"
+
+
+def _per_cluster_report(case: str, cell: str | None = None, obj: str | None = None, verdict: str = "no", others: dict[str, str] | None = None, slots=_SLOT_LETTERS) -> str:
+    """The declared lines: slot a's names the planted object (or `obj`) with
+    `verdict` and the shipped cell (or `cell`); every other slot reads `none` in
+    every slot unless `others` gives its line."""
+    planted, rule, shipped = _PER_CLUSTER_RULE_CASES[case]
+    lines = []
+    for letter in slots:
+        cluster = _SLOT_NAMES[letter]
+        if letter == "a":
+            lines.append(_per_cluster_line(cluster, rule, planted if obj is None else obj, verdict, shipped if cell is None else cell))
+        else:
+            lines.append((others or {}).get(letter) or _per_cluster_line(cluster, rule))
+    return "\n".join(lines)
+
+
+def _rendered(text: str, rendering: str) -> str:
+    out = []
+    for line in text.splitlines():
+        cluster, rest = line.split(": ", 1)
+        out.append(rendering.format(line=line, cluster=cluster, rest=rest))
+    return "\n".join(out)
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+@pytest.mark.parametrize("wrap", _PER_CLUSTER_CELL_WRAPS)
+def test_per_cluster_rule_case_accepts_the_cell_however_the_agent_wrapped_it(case, wrap):
+    _planted, _rule, cell = _PER_CLUSTER_RULE_CASES[case]
+    text = _per_cluster_report(case, cell=wrap.format(cell=cell))
+    for objective in _per_cluster_objectives(case):
+        assert _per_cluster_case_grades(case, objective, text), objective
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+def test_per_cluster_rule_case_accepts_the_bare_json_text_without_the_rule_prefix(case):
+    _planted, _rule, cell = _PER_CLUSTER_RULE_CASES[case]
+    assert _per_cluster_case_grades(case, _CELL_OBJECTIVE, _per_cluster_report(case, cell=_bare(cell)))
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_OTHER_CELLS))
+def test_per_cluster_rule_case_accepts_the_rules_other_grade_on_another_fleet(case):
+    assert _per_cluster_case_grades(case, _CELL_OBJECTIVE, _per_cluster_report(case, cell=_PER_CLUSTER_OTHER_CELLS[case]))
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+@pytest.mark.parametrize("rendering", _PER_CLUSTER_RENDERINGS)
+def test_per_cluster_rule_case_accepts_the_lines_as_the_agent_renders_them(case, rendering):
+    text = _rendered(_per_cluster_report(case), rendering)
+    for objective in _per_cluster_objectives(case):
+        assert _per_cluster_case_grades(case, objective, text), objective
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+def test_per_cluster_rule_case_accepts_a_wrapped_object_and_a_pod_standing_in(case):
+    planted, _rule, _cell = _PER_CLUSTER_RULE_CASES[case]
+    for obj in (f'"{planted}"', f"<{planted}>", planted.lower(), f"{planted}-7d9f8c6b5-x2k9q", f"{planted}-x2k9q"):
+        assert _per_cluster_case_grades(case, _PLANTED_OBJECTIVE, _per_cluster_report(case, obj=obj)), obj
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+def test_per_cluster_rule_case_refuses_a_missing_or_foreign_cell_and_a_promoted_verdict(case):
+    planted, rule, _cell = _PER_CLUSTER_RULE_CASES[case]
+    # A report whose rule is missing prints no cell: `none`, or another text under the rule's id, wrapped or not.
+    for foreign in ("none", f"{rule}: something else", f'"{rule}: something else"'):
+        assert not _per_cluster_case_grades(case, _CELL_OBJECTIVE, _per_cluster_report(case, cell=foreign)), foreign
+    # A promoted verdict fails whatever the cell says, and so does a second slot-a line that contradicts the first.
+    assert not _per_cluster_case_grades(case, _PLANTED_OBJECTIVE, _per_cluster_report(case, verdict="yes"))
+    assert not _per_cluster_case_grades(case, _PLANTED_OBJECTIVE, "\n".join([_per_cluster_report(case), _per_cluster_report(case, verdict="yes", slots="a")]))
+    # Slot a reading `none` in every slot, naming another object, or naming the object without its
+    # kind and namespace, is outside the vocabulary whatever the cell says.
+    assert not _per_cluster_case_grades(case, _PLANTED_OBJECTIVE, _per_cluster_report(case, obj="none", verdict="none", cell="none"))
+    assert not _per_cluster_case_grades(case, _PLANTED_OBJECTIVE, _per_cluster_report(case, obj="Deployment seeded-shapes/other-workload"))
+    assert not _per_cluster_case_grades(case, _PLANTED_OBJECTIVE, _per_cluster_report(case, obj=planted.rsplit("/", 1)[1]))
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+def test_per_cluster_rule_case_needs_a_line_for_every_slot(case):
+    for missing in _SLOT_LETTERS:
+        text = _per_cluster_report(case, slots=tuple(s for s in _SLOT_LETTERS if s != missing))
+        assert not _per_cluster_case_grades(case, _EVERY_SLOT_OBJECTIVE, text), missing
+        if missing != "a":
+            assert not _per_cluster_case_grades(case, _others_objective(case), text), missing
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+def test_per_cluster_rule_case_refuses_a_finding_on_a_cluster_without_the_shape(case):
+    planted, rule, cell = _PER_CLUSTER_RULE_CASES[case]
+    for letter in _SLOT_LETTERS[1:]:
+        cluster = _SLOT_NAMES[letter]
+        for wrong in (
+            # The planted finding copied onto another cluster.
+            _per_cluster_line(cluster, rule, planted, "no", cell),
+            # A verdict, or a cell, where the rule printed nothing.
+            _per_cluster_line(cluster, rule, "none", "no", "none"),
+            _per_cluster_line(cluster, rule, "none", "none", cell),
+        ):
+            assert not _per_cluster_case_grades(case, _others_objective(case), _per_cluster_report(case, others={letter: wrong})), wrong
+
+
+def _object_line_report(case: str) -> str:
+    """The rendering the dev install's runs produced under the earlier per-object
+    prompt: the project and the cluster where the frame asked for the cluster and
+    the object, the kind as its own slot, the object's name inside the cell."""
+    planted, _rule, cell = _PER_CLUSTER_RULE_CASES[case]
+    kind = planted.split(" ", 1)[0].lower()
+    return "\n".join(
+        [
+            f"some-project/{_SLOT_NAMES['b']}: kind pdb; blocks the upgrade: yes; cell: seeded-upgrade/pinned-batch-runner (maxUnavailable: 0) over Deployment seeded-upgrade/pinned-batch-runner (1)",
+            f"some-project/{_SLOT_NAMES['a']}: kind {kind}; blocks the upgrade: no; cell: {_bare(cell)}",
+        ]
+    )
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+def test_per_cluster_rule_case_fails_every_objective_on_the_object_line_frame(case):
+    text = _object_line_report(case)
+    for objective in _per_cluster_objectives(case):
+        assert not _per_cluster_case_grades(case, objective, text), objective
+
+
+# What the client-addon-skew rule can add on a live fleet: a kubectl user agent
+# from a cluster's Admin Activity log (a human's or an agent's write in the last
+# seven days from a binary further than one minor from the target), filed on
+# any slot in the rule's own wording, and a note the rule prints for every
+# cluster, which is not a finding.
+_AUDIT_CLIENT_CELL = (
+    "client-addon-skew: kubectl v1.33 from principal operator@example.com (user agent kubectl/v1.33.2 (darwin/arm64) kubernetes/0b43ee2, "
+    "4 writes to apps/v1 deployments in 7d): 3 minors behind the target 1.36; kubectl is supported within 1 minor of kube-apiserver "
+    "(https://kubernetes.io/releases/version-skew-policy/#kubectl)"
+)
+_ADDON_CELL = (
+    "client-addon-skew: cert-manager v1.20 at Deployment cert-manager/cert-manager (image quay.io/jetstack/cert-manager-controller:v1.20.1): "
+    "cert-manager v1.20 supports Kubernetes 1.32 to 1.35 (https://cert-manager.io/docs/releases/, read 2026-10-09); the target 1.36 is outside it"
+)
+_GKE_ADDONS_NOTE = "client-addon-skew: GKE add-ons on: gcePersistentDiskCsiDriverConfig, httpLoadBalancing (GKE-managed; the cluster record carries no version, so not graded)"
+
+
+def test_client_addon_skew_case_keeps_one_line_per_cluster_with_the_planted_cronjob_first():
+    planted, rule, cell = _PER_CLUSTER_RULE_CASES[_CLIENT_CASE]
+    both = _per_cluster_report(_CLIENT_CASE, obj=f"{planted}, principal operator@example.com", cell=f"{cell}; {_AUDIT_CLIENT_CELL}")
+    for objective in _per_cluster_objectives(_CLIENT_CASE):
+        assert _per_cluster_case_grades(_CLIENT_CASE, objective, both), objective
+    # The principal before the CronJob is outside the vocabulary (a workload before a principal).
+    swapped = _per_cluster_report(_CLIENT_CASE, obj=f"principal operator@example.com, {planted}", cell=f"{_AUDIT_CLIENT_CELL}; {cell}")
+    assert not _per_cluster_case_grades(_CLIENT_CASE, _PLANTED_OBJECTIVE, swapped)
+    # Two lines for slot a, one per finding, contradict the one-line frame: the second names another object first.
+    two_lines = "\n".join([_per_cluster_report(_CLIENT_CASE), _per_cluster_line(_SLOT_NAMES["a"], rule, "principal operator@example.com", "no", _AUDIT_CLIENT_CELL)])
+    assert not _per_cluster_case_grades(_CLIENT_CASE, _PLANTED_OBJECTIVE, two_lines)
+
+
+@pytest.mark.parametrize("cell", [_AUDIT_CLIENT_CELL, _bare(_AUDIT_CLIENT_CELL), _ADDON_CELL])
+def test_client_addon_skew_case_admits_a_finding_the_report_files_on_another_cluster(cell):
+    _planted, rule, _cell = _PER_CLUSTER_RULE_CASES[_CLIENT_CASE]
+    obj = "principal operator@example.com" if "principal" in cell else "Deployment cert-manager/cert-manager"
+    report = _per_cluster_report(_CLIENT_CASE, others={"b": _per_cluster_line(_SLOT_NAMES["b"], rule, obj, "no", cell)})
+    for objective in _per_cluster_objectives(_CLIENT_CASE):
+        assert _per_cluster_case_grades(_CLIENT_CASE, objective, report), objective
+
+
+@pytest.mark.parametrize(
+    "obj,verdict,cell",
+    [
+        # The rule's note is not a finding: a cluster with the note alone reads none in every slot.
+        ("none", "none", _GKE_ADDONS_NOTE),
+        ("GKE add-ons", "no", _GKE_ADDONS_NOTE),
+        # A finding in the agent's words rather than the rule's, a hedged verdict, a blocker the rule never files.
+        ("principal operator@example.com", "no", "kubectl 1.33 is too old for this cluster"),
+        ("principal operator@example.com", "none", _AUDIT_CLIENT_CELL),
+        ("principal operator@example.com", "yes", _AUDIT_CLIENT_CELL),
+        ("none", "no", "none"),
+    ],
+)
+def test_client_addon_skew_case_refuses_what_is_not_a_finding_on_another_cluster(obj, verdict, cell):
+    _planted, rule, _cell = _PER_CLUSTER_RULE_CASES[_CLIENT_CASE]
+    report = _per_cluster_report(_CLIENT_CASE, others={"c": _per_cluster_line(_SLOT_NAMES["c"], rule, obj, verdict, cell)})
+    assert not _per_cluster_case_grades(_CLIENT_CASE, _others_objective(_CLIENT_CASE), report)
+

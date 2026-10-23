@@ -418,18 +418,15 @@ RECOVERY_GREEN_RUNS = 3
 #
 # The rule: the median wall clock of the newest SLOW_RUNS full runs -- a
 # concluded run of at least SLOW_MIN_TASKS cases (one fewer than the
-# presubmit file lists, read from hack/eval/presubmit-cases.txt: 11 for the
-# twelve the presubmit runs since 2026-10-17, eleven roster cases and the
-# held-out compliance canary (#2013), after two demotions (#3269 on 10-16,
-# #3120 on 10-17); fourteen from 2026-09-29: thirteen roster cases and the
-# canary from 2026-10-14, twelve and two seats before that (#2016); twelve
-# from 2026-09-22, when it became the
-# blocking roster only, #1023, having run 18-19 before); a run Prow cut short
-# at its ceiling recorded fewer and is not one; the floor was a literal 15
-# until the roster shrank under it, which would have made every run since a
-# partial one and the rule silent, so it follows the file and sits one
-# demotion below the roster on purpose, an admission or a demotion moving
-# it without an edit here) -- all of
+# presubmit runs: the cases hack/eval/presubmit-cases.txt lists, less those
+# hack/eval/inject-lane-exclusions.txt drops, since the presubmit grades
+# spec.mode next through the inject door and so runs that lane;
+# _slow_min_tasks below computes it from the two files; a run Prow
+# cut short at its ceiling recorded fewer and is not one; the floor was a
+# literal 15 until the roster shrank under it, which would have made every
+# run since a partial one and the rule silent, so it follows the files and
+# sits one demotion below the roster on purpose, an admission or a demotion
+# moving it without an edit here) -- all of
 # them finished inside SLOW_WINDOW, is at least SLOW_FACTOR times the median
 # of the full runs of the trailing SLOW_BASELINE before them, given at least
 # SLOW_BASELINE_MIN_RUNS of those. Medians rather than the p90 the issue
@@ -445,10 +442,12 @@ SLOW_WINDOW = timedelta(hours=6)
 
 
 def _slow_min_tasks(default: int = 11) -> int:
-    """One fewer than the presubmit file's case count; `default` when the
-    file cannot be read (a checkout without hack/eval/, an old era)."""
+    """One fewer than the cases the presubmit runs: its file's, less the
+    inject lane's exclusions, the lane it grades on; `default` when the files
+    cannot be read (a checkout without hack/eval/, an old era)."""
     try:
-        cases = eval_rosters.presubmit_cases()
+        excluded = eval_rosters.inject_lane_exclusions()
+        cases = [case for case in eval_rosters.presubmit_cases() if case not in excluded]
     except (OSError, ValueError):
         return default
     return max(1, len(cases) - 1) if cases else default
@@ -555,6 +554,24 @@ UNKNOWN_NODE = "(name unknown)"
 ADVICE_FIXTURE_DRIFT = (
     "A red on a case that depends on {roles} from a run that leased {projects} is the fixture, not your change;"
     " retest after the daily reconcile has re-applied bench/tf/fleet there (08:30 UTC) and the scan that follows reads it healthy."
+)
+# A role that reads seeded-a's default-pool capacity rather than a planted
+# object's shape: a re-apply changes nothing while the pool is full, so the
+# advice names the pool's size instead. post_health.py and gate_issue.py carry
+# the same split for the Chat message and the tracking issue.
+CAPACITY_ROLES = frozenset({"default-pool-headroom"})
+ADVICE_FIXTURE_CAPACITY = (
+    "A red on a case that needs a pod placed on seeded-a's default pool from a run that leased {projects} is the pool running out of room, not your change;"
+    " {roles} reads capacity: the pool is below the headroom margin the scan keeps for the next fixtures, a re-apply changes nothing,"
+    " and the pool's size in bench/tf/fleet/main.tf (seeded_a_default) is the fix: if a size change has just merged, the postsubmit reconcile"
+    " is rolling it project by project and the scans clear as it lands."
+)
+# Appended to the re-apply advice when a capacity role drifts beside planted
+# ones, the usual shape: a pool that fills strands a fixture whose own role
+# then drifts too.
+ADVICE_FIXTURE_CAPACITY_MIXED = (
+    " {roles} beside them reads capacity: seeded-a's default pool is below the headroom margin the scan keeps for the next fixtures,"
+    " a re-apply changes nothing for it, and the pool's size in bench/tf/fleet/main.tf (seeded_a_default) is its fix."
 )
 ADVICE_POOL_DRIFT = (
     "A 403 or a missing-resource red from a run that leased {projects} is the pool project's shape, not your change"
@@ -1963,10 +1980,16 @@ def advice_for(
         )
     if condition == FIXTURE_DRIFT:
         incident = incident or {}
-        return ADVICE_FIXTURE_DRIFT.format(
-            roles=", ".join(incident.get("roles") or []) or "the drifted fixture roles",
+        roles = list(incident.get("roles") or [])
+        capacity = [role for role in roles if role in CAPACITY_ROLES]
+        template = ADVICE_FIXTURE_CAPACITY if roles and len(capacity) == len(roles) else ADVICE_FIXTURE_DRIFT
+        advice = template.format(
+            roles=", ".join(roles) or "the drifted fixture roles",
             projects=_project_list(list(incident.get("projects") or [])) or "the drifted projects",
         )
+        if capacity and len(capacity) < len(roles):
+            advice += ADVICE_FIXTURE_CAPACITY_MIXED.format(roles=", ".join(capacity))
+        return advice
     if condition == POOL_DRIFT:
         return _pool_drift_advice(incident or {})
     return ADVICE_SETUP
@@ -2139,6 +2162,16 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
         }
     else:
         incident = None
+    last_lost_pod = max((run.finished for run in visible if run.lost_pod), default=None)
+    last_deadline_kill = max((run.finished for run in visible if run.deadline_kill), default=None)
+    # Lost pods and deadline kills fire on a two-hour window; the gate leaves
+    # them only once RECOVERY_GREEN_RUNS runs have landed after the last loss
+    # or kill (recovered), and the list below holds them to the same bar, or
+    # a quiet night would read as the nodes healed.
+    awaiting_runs = {
+        LOST_PODS: last_lost_pod is not None and not _runs_landed_after(full_runs, last_lost_pod, verdict_only=False),
+        DEADLINE_KILL: last_deadline_kill is not None and not _runs_landed_after(full_runs, last_deadline_kill, verdict_only=True),
+    }
     return {
         "state": state,
         "condition": condition,
@@ -2150,12 +2183,47 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
         "current": current,
         "full_runs": full_runs,
         "last_setup_death": max((run.finished for run in visible if run.setup_death), default=None),
-        "last_lost_pod": max((run.finished for run in visible if run.lost_pod), default=None),
-        "last_deadline_kill": max((run.finished for run in visible if run.deadline_kill), default=None),
+        "last_lost_pod": last_lost_pod,
+        "last_deadline_kill": last_deadline_kill,
         "roster": roster,
         "fixture": r3c,
         "pool_state": r3e,
+        # Every condition whose rule still fires, whose scan could not say, or
+        # whose run-based exit is not yet met, whatever condition won above:
+        # the poster closes a bot-filed tracking issue when its condition
+        # leaves this list (#3664).
+        "open_conditions": [
+            name
+            for name, rule in ((SHARED_BREAK, r1), (DEADLINE_KILL, r3d), (LOST_PODS, r3b), (STORM, r2), (DELEGATION_CEILING, r2b), (SETUP_DEATHS, r3), (FIXTURE_DRIFT, r3c), (POOL_DRIFT, r3e))
+            if _unresolved(rule) or awaiting_runs.get(name, False)
+        ],
     }
+
+
+def _runs_landed_after(full_runs, after: datetime, verdict_only: bool) -> bool:
+    """recovered()'s run bar for a loss or a kill: the newest
+    RECOVERY_GREEN_RUNS full runs -- green ones for lost pods, ones with a
+    verdict either way for deadline kills -- all finished after `after`, on
+    distinct pull requests."""
+    pool = [run for run in full_runs if run.has_verdict] if verdict_only else full_runs
+    recent = pool[-RECOVERY_GREEN_RUNS:]
+    if len(recent) < RECOVERY_GREEN_RUNS or any(run.finished <= after for run in recent):
+        return False
+    if not verdict_only and any(run.result != RUN_SUCCESS for run in recent):
+        return False
+    return len(_prs(recent)) >= RECOVERY_GREEN_RUNS
+
+
+def _unresolved(rule: dict) -> bool:
+    """A rule that fires, or a scan rule with no full reading to clear on: no
+    document, a stale one, one that could check no project or skipped some
+    (the incident's may be among them, as _scan_hold's `waiting` guards),
+    or a hand run over a few named projects."""
+    if rule["fires"] or rule.get("known") is False:
+        return True
+    if rule.get("known") and rule.get("checked", 0) < rule.get("total", 0):
+        return True
+    return any(bool(rule.get(key)) for key in ("stale", "unknown", "partial"))
 
 
 def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime | None, roster: Roster, last_lost_pod: datetime | None = None, last_deadline_kill: datetime | None = None) -> bool:
@@ -2436,7 +2504,12 @@ def adjudicate(
         # The poster keeps the current condition's issue in `issue` and
         # every issue of the episode in `issues`; the one for the decided
         # condition is cited, wherever it sits.
-        candidates = [(posted or {}).get("issue"), *((posted or {}).get("issues") or []), (prev or {}).get("issue")]
+        # The previous health.json stands in only while no poster state
+        # carries `issues`: once one does it is the authority, and an issue
+        # it dropped (closed by a human) must not come back through here.
+        candidates = [(posted or {}).get("issue"), *((posted or {}).get("issues") or [])]
+        if not isinstance(posted, dict) or "issues" not in posted:
+            candidates.append((prev or {}).get("issue"))
         issue = next((match for match in (issue_for(candidate, decided["condition"]) for candidate in candidates) if match), None)
     evidence = list(assessed["evidence"])
     if decided["recovering"]:
@@ -2568,6 +2641,7 @@ def adjudicate(
         "evidence": evidence,
         "advice": advice,
         "recovering": decided["recovering"],
+        "open_conditions": assessed["open_conditions"],
         "stale": stale,
         "fixture_state": fixture_state_block(assessed["fixture"]),
         "pool_state": scan_block(assessed["pool_state"]),
@@ -2622,6 +2696,7 @@ def scan_block(scan_result: dict) -> dict | None:
         "reds_runs_projects": scan_result.get("reds_runs_projects", []),
         "unknown": scan_result["unknown"],
         "stale": scan_result["stale"],
+        "partial": bool(scan_result.get("partial")),
         "reason": scan_result["reason"],
     }
 

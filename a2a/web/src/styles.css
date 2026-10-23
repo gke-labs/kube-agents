@@ -215,6 +215,14 @@ body {
   font-size: 11px;
 }
 
+/* An answer's footer: what the turn cost, as its executor reported it. */
+.chat-usage {
+  display: block;
+  margin-top: 2px;
+  color: var(--ghost);
+  font-size: 11px;
+}
+
 /* The progress glyph is the one full-colour emoji on the page; drain it. */
 .chat-progress > .chat-glyph {
   filter: grayscale(1);
@@ -258,6 +266,16 @@ body {
   letter-spacing: 0.16em;
   text-transform: uppercase;
   cursor: pointer;
+}
+
+.usage-summary-button {
+  margin-left: 8px;
+}
+
+.chat-copy {
+  margin-left: 8px;
+  padding: 2px 8px;
+  vertical-align: middle;
 }
 
 .probe-button:hover {

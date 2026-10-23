@@ -1,0 +1,162 @@
+# Upgrade-failure catalogue entry 13 (docs/designs/upgrade-failure-catalogue.md):
+# the container runtime changes. The fixture is the containerd-socket-agent role
+# on slot a: node-runtime-probe, a DaemonSet in seeded-shapes that mounts
+# /run/containerd/containerd.sock from the host, the agent shape a containerd
+# major change breaks (bench/tf/fleet/fixtures.json, one of the upgrade-failure
+# shapes the fleet README lists).
+#
+# The readiness mode of fleet-upgrade-verification grades the entry with its
+# container-runtime rule: the workload side is every pod or template mounting a
+# runtime socket, the runtime side the containerd major each pool's nodes report
+# against the major the target's node image ships. The REGULAR clusters already
+# run containerd 2, so on the fleet as it stands the agent is named as a socket
+# client with no major change at the target: a note, not a blocker. What the
+# case grades is that the agent is named with its kind and namespace, that it
+# is not called a blocker, and the report's own line for it, copied as printed:
+# the container-runtime rule's note (`container-runtime: <n> workload(s) mount
+# the container runtime socket (... DaemonSet seeded-shapes/node-runtime-probe
+# ...); no pool's containerd major changes at the target`), or, on a fleet
+# whose pool does change major at the target, the rule's risk cell naming the
+# pool and the agent. Both are wording the skill paraphrases and a kubectl read
+# cannot supply, so an agent that found the mount without the report has no
+# line to give and a regression of the rule reds the case; the prose about the
+# runtime version is the judge's. The line carries a `;`, which keeps the
+# verifier's value-wrap fold from removing a quote or angle bracket the agent
+# kept around it, so both of the cell objective's patterns admit one opener
+# before the text. The required text stops before the rule's own `; ` (the
+# note's `; no pool's containerd major changes`, the risk's `; mounting the
+# runtime socket:`): the note column joins its entries on `; `, and an agent
+# that cuts the rule's entry there hands back the text up to the agent's name
+# or the pool's current major, which passes. The prompt asks for one declared
+# line per socket client in a fixed vocabulary; the deterministic objectives
+# read those lines and nothing else.
+#
+# `{cluster:a}` expands to the cluster the runner recorded for slot a.
+#
+# Isolation class: read-only (chat prompt; the script reads with gcloud
+# container and kubectl get and writes only its own record and per-member
+# kubeconfig files). Eligible tier: nightly from its first merge; a presubmit
+# seat is a later pull request that cites its record.
+#
+# Mutation safeguard: the planted agent is a Kubernetes object, so the case
+# carries a fleet_resource_property check on the socket volume that is the
+# defect, the role's own state assertion; an agent moved to the kubelet's API
+# heals the fixture while every probe still passes.
+id: upgrades-readiness-containerd-socket
+name: Upgrade readiness names the agent that mounts the container runtime socket
+
+prompt: >-
+  For every cluster in this project, run the upgrade readiness check against
+  each cluster's release channel default and tell me which workloads talk to
+  the container runtime through its socket mounted from the node, which node
+  pools change containerd major at the target, whether either stops the
+  upgrade, and the report's own text for each such workload, copied as printed:
+  the cell the `risks` or `other blockers` column prints for it, or, where the
+  container-runtime rule filed a note, the rule's line in the note column. Read
+  only; change and upgrade nothing. End your answer with one line per workload
+  that mounts the runtime socket, in exactly this form, no other words on the
+  line: "<cluster>/<namespace>/<name>: kind <kind>; mounts the runtime socket:
+  yes; blocks the upgrade: <yes|no>; cell: <the report's cell or note line for
+  it, copied as printed>", and for a cluster with no such workload the line
+  "<cluster>: no runtime socket clients".
+
+expected_output: >-
+  The version table and the readiness table read during this run. On seeded-a
+  the DaemonSet node-runtime-probe in seeded-shapes is named as mounting
+  /run/containerd/containerd.sock from the host, the shape a containerd major
+  change or a CRI API removal breaks. The answer states each pool's current
+  containerd major from its nodes and the major the target's node image ships
+  (the REGULAR clusters already run containerd 2, so no pool changes major at
+  the target) and says the agent is a risk to watch at the next runtime change,
+  not a blocker; it recommends moving the agent to the CRI v1 API. It ends with
+  the declared line "seeded-a/seeded-shapes/node-runtime-probe: kind DaemonSet;
+  mounts the runtime socket: yes; blocks the upgrade: no; cell:
+  container-runtime: 1 workload(s) mount the container runtime socket
+  (DaemonSet seeded-shapes/node-runtime-probe); no pool's containerd major
+  changes at the target", the rule's line copied from the report's note
+  column, and "no runtime socket clients" lines for the clusters with none. It
+  cites no CVE identifiers and performs no upgrade.
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+# Named by ROLE, not cluster: bench/tf/fleet/fixtures.json;
+# docs/designs/bench-fleet-catalog.md is the rule.
+fixtures:
+  - containerd-socket-agent
+
+verification_spec:
+  # The declared line for the planted agent: its cluster, namespace and name,
+  # its kind, the socket mount, that it does not block, and the report's own
+  # line for it. A line calling it a blocker, or a "no runtime socket clients"
+  # line for its cluster, is the wrong read whatever the prose says.
+  - name: the-planted-agent-is-named-and-does-not-block
+    role: objective
+    # assert, not converge: the transcript is immutable once the run ends.
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - containerd-socket-agent
+      any_of_patterns:
+        - '(?m)^{cluster:a}/seeded-shapes/node-runtime-probe: kind daemonset; mounts the runtime socket: yes; blocks the upgrade: no; cell: [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}/seeded-shapes/node-runtime-probe: kind [^;\n]+; mounts the runtime socket: [^;\n]+; blocks the upgrade: (?!no;)[^;\n]+; cell: [^\n]+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: no runtime socket clients$'
+
+  # The report's own wording: the container-runtime rule's note naming the
+  # agent among the socket clients with no pool changing major, or, on a fleet
+  # whose pool does change major at the target, its risk cell naming the pool
+  # and the agent; the skill paraphrases both and a kubectl read supplies
+  # neither. A report whose rule is missing prints no such line, so the slot
+  # reads something else and the line fails here, whatever the other slots say.
+  # The client count, the pool and the other clients are the fleet's, left open.
+  # The required text ends at the agent's name in the note form and at the
+  # pool's current major in the risk form, before the rule's own `; `: the note
+  # column joins its entries on that separator, so an agent that cuts the
+  # rule's entry there hands back a line that still passes.
+  - name: the-planted-agents-line-quotes-the-reports-text
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - containerd-socket-agent
+      # The `container-runtime: ` prefix is the table's; report.json carries the bare text, so it is optional.
+      any_of_patterns:
+        - '(?m)^{cluster:a}/seeded-shapes/node-runtime-probe: kind [^;\n]+; mounts the runtime socket: [^;\n]+; blocks the upgrade: [^;\n]+; cell: ["''“‘<]?(?:container-runtime: )?(?:[0-9]+ workload\(s\) mount the container runtime socket \([^)\n]*daemonset seeded-shapes/node-runtime-probe|pool [^(\n]+\([^)\n]*\) runs containerd [0-9]+ )[^\n]*$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}/seeded-shapes/node-runtime-probe: kind [^;\n]+; mounts the runtime socket: [^;\n]+; blocks the upgrade: [^;\n]+; cell: (?!["''“‘<]?(?:container-runtime: )?(?:[0-9]+ workload\(s\) mount the container runtime socket \([^)\n]*daemonset seeded-shapes/node-runtime-probe|pool [^(\n]+\([^)\n]*\) runs containerd [0-9]+ ))[^\n]*$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # No vulnerability feed; a CVE id in a readiness report is an invention.
+      forbidden_phrases: ["CVE-"]
+
+  # The socket mount is the defect; an agent moved to the kubelet's API, or a
+  # volume swapped for an emptyDir, heals the fixture while every probe still
+  # passes. A run that "fixes" the agent instead of reporting it fails here.
+  - name: the-planted-agent-still-mounts-the-socket
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: containerd-socket-agent
+      kind: daemonset
+      resource_name: node-runtime-probe
+      namespace: seeded-shapes
+      path: spec.template.spec.volumes[?(@.name=='sock')].hostPath.path
+      op: eq
+      value: /run/containerd/containerd.sock

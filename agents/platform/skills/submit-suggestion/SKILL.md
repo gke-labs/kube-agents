@@ -1,18 +1,18 @@
 ---
 name: submit-suggestion
-description: Propose declarative configuration updates securely by committing file changes and submitting pull requests (merge requests on GitLab) for SRE review, including a request to delete a resource, which its "Deleting a resource" section answers with a stated stop, never a pull request. Not for fleet-audit finding fixes — the fleet-audit skill opens and tracks those PRs itself.
+description: Propose declarative configuration updates securely by committing file changes and submitting pull requests (merge requests on GitLab) for SRE review, including a request to delete a resource, which its "Deleting a resource" section answers with a pull request that removes the declaring manifest, or a stated stop when the repository does not declare it. Not for fleet-audit finding fixes — the fleet-audit skill opens and tracks those PRs itself.
 ---
 
 # submit-suggestion - Secure GitOps Pull Request Orchestrator
 
-This skill equips the Platform Agent to propose declarative file updates, GKE infrastructure adjustments, or configuration changes securely by committing local repository changes and submitting pull requests (PRs; merge requests on GitLab) for human review. The repository is named as `owner/name` on github.com, `<host>/owner/name` on a GitHub Enterprise Server, or `<host>/<path>` — `gitlab.com/acme/platform/infra` — for one on another forge, exactly as it appears in the managed repository list.
+This skill equips the Platform Agent to propose declarative file updates, GKE infrastructure adjustments, or configuration changes securely by committing local repository changes and submitting pull requests (PRs; merge requests on GitLab) for human review. The repository is named as `owner/name` on github.com, `<host>/owner/name` on a GitHub Enterprise Server, or `<host>/<path>` — `gitlab.com/<group>/<subgroup>/<project>` — for one on another forge, exactly as it appears in the managed repository list.
 
 ## When to Use
 
 - **Declarative File Provisioning:** Triggered when new GKE manifests or configs are requested.
 - **Configuration Upgrades:** Triggered when upgrading version configurations, security patches, or network policies.
 - **Governance Policy Syncs:** Triggered when compliance playbooks or settings require updates.
-- **Deletions:** Triggered when someone asks to delete a resource. See [Deleting a resource](#deleting-a-resource) before Step 1: every case there ends in a stated stop.
+- **Deletions:** Triggered when someone asks to delete a resource. See [Deleting a resource](#deleting-a-resource) before Step 1: a declared object is removed in a pull request, anything else is a stated stop.
 
 _Crucially, you are strictly forbidden from executing direct, manual mutations. All changes must flow through a secure PR path — this skill, or the **fleet-audit** skill for fixes of its findings (below)._
 
@@ -203,13 +203,11 @@ manifest you generated from a log you left behind. Stage the ones that belong
 
 ### Deleting a resource
 
-A request to delete something (a namespace, a Deployment, a ConfigMap) is
-answered with a stated stop, not a pull request, in every case below. The
-only delete a pull request can carry is the removal of a manifest the
-repository already has, and this skill does not yet propose that removal.
-Never add a file, an annotation or a label to say "delete": nothing reads one
-you invent, and a manifest you add declares its object, so merging it keeps
-the object.
+A request to delete something (a namespace, a Deployment, a ConfigMap) reaches
+review the same way as any other change, and the only delete a pull request
+can carry is the removal of a manifest the repository already has. Never add a
+file, an annotation or a label to say "delete": nothing reads one you invent,
+and a manifest you add declares its object, so merging it keeps the object.
 
 1. **The repository first.** Before Step 1:
 
@@ -230,19 +228,55 @@ the object.
    `namespaces/<name>/` directory (Config Sync's hierarchical layout), or an
    Argo CD `Application` with `CreateNamespace=true` deploying into it. Any of
    those counts as declared. The search matches the key anywhere on the line,
-   so JSON and flow-style manifests are found too:
+   so JSON and flow-style manifests are found too. Search only the target
+   cluster's directory (`clusters/<cluster>/`, or the path its reconciler
+   syncs): the same name under another cluster's directory is another
+   cluster's object. When the repository has no per-cluster layout and the
+   name is declared in more than one place, or you cannot tell which
+   directory is the target's, stop and name each file; never remove a
+   declaration you have not tied to the target cluster:
 
    ```bash
-   grep -rlE "[\"' {,]?(name|namespace|targetNamespace)[\"']?: *[\"']?<name>[\"']?([ ,}#]|$)" <workspace>
-   find <workspace> -type d -path "*/namespaces/<name>"
+   grep -rlE "[\"' {,]?(name|namespace|targetNamespace)[\"']?: *[\"']?<name>[\"']?([ ,}#]|$)" <workspace>/clusters/<cluster>
+   find <workspace>/clusters/<cluster> -type d -path "*/namespaces/<name>"
    ```
 
-3. **The repository declares it.** Stop with: "`<repo>` declares
-   `<kind>/<name>` in `<files>`. Deleting it means removing those files (and
-   anything else there that would recreate it) in a pull request, which I
-   don't propose yet. Someone with write access to `<repo>` can open that pull
-   request. I have changed nothing." Block with that line as the reason, and
-   list every file step 2 found.
+3. **The repository declares it.** A delete needs the user's confirmation
+   first (`SOUL.md`); with it in the request, go ahead. Remove only what
+   declares the object, read document by document, never by file name or by
+   a `grep` hit alone:
+   - A file whose every document is the object (for a namespace: the
+     Namespace or an object in it) is `git rm`'d, and its line comes out of
+     the directory's `kustomization.yaml` `resources:` list.
+   - A file that also holds other documents keeps them: delete only the
+     matching documents from it.
+   - For a namespace, everything step 2 found goes in the same pull request,
+     each named in its body, because any one left behind recreates it: the
+     objects in it, its directory, and the `kustomization.yaml` that lists
+     only them.
+   - **The listing above it is an edit.** A removed file or directory that a
+     parent `kustomization.yaml` names in its `resources:` (for example
+     `- gitops-owned-scratch/` in `clusters/<cluster>/namespaces/kustomization.yaml`)
+     loses that one line in the same pull request; left in, the parent no
+     longer renders and the whole synced path stops applying. Read the parent
+     directory's `kustomization.yaml` `resources:` list itself (an entry may
+     be `<name>/`, `./<name>`, `<name>/<file>.yaml` or part of a flow list),
+     remove only the entries that name what this pull request removes, and
+     name the edit in the body.
+   - **A shared declaration is a stop.** A `kustomization.yaml`, Argo CD
+     `Application`, Flux `Kustomization` or Flux `HelmRelease` that also
+     creates objects outside the request, or a `namespaces/<name>/` directory with namespaces under it
+     (Config Sync's hierarchical abstract namespace), would delete those too.
+     Stop with: "`<file>` also declares `<other objects>`; removing it would
+     delete them as well. I have changed nothing." Never remove an
+     `Application` or a `HelmRelease`: an Application's resources finalizer
+     deletes everything it deploys, and helm-controller uninstalls a removed
+     release, cluster-scoped objects included. A request that would need one
+     removed is a stop that names it.
+
+   Then continue with Step 3. A delete's pull request body ends with what
+   step 5 read about the reconciler, in place of the template's closing line
+   about triggering a rollout.
 
 4. **The repository does not declare it.** Stop with: "`<repo>` does not
    declare `<kind>/<name>`, so a pull request cannot delete it: removing a
@@ -250,10 +284,68 @@ the object.
    access to `<cluster>` has to run the delete. I have changed nothing."
    Block with that line as the reason. Do not write a manifest for it.
 
-5. **Words.** Never describe the request as an action under way or done
-   ("deleting", "deleted"), and never name a GitOps controller, or say what
-   one will do, unless you read it syncing that path: a stop changes nothing,
-   and says so.
+5. **Say what merging will do, from what you read.** Removing the file deletes
+   the object only if a reconciler syncs that directory and prunes. Read the
+   reconciler objects on the target cluster, and on the hub that deploys to it
+   when your kubeconfig reaches one (Argo CD usually runs on a hub). Your
+   default context is the cluster this agent runs on, not the target: pass
+   the target's own kubeconfig, `$HERMES_HOME/.kubeconfigs/kubeconfig_<project>_<cluster>_<location>.yaml`,
+   with `--kubeconfig` on every read. When that file is not there yet,
+   fetch the target's credentials into it first (**gke-basics**, "Cluster
+   Credentials"). An answer of
+   `the server doesn't have a resource type` means that reconciler is not
+   installed on the context you read, and on this agent's own cluster it
+   says nothing about the target. Match each object's source against
+   `<repo>` and the file's directory:
+
+   ```bash
+   kubectl get applications.argoproj.io -A -o yaml --kubeconfig "<target kubeconfig>"
+   kubectl get kustomizations.kustomize.toolkit.fluxcd.io -A -o yaml --kubeconfig "<target kubeconfig>"
+   kubectl get rootsyncs.configsync.gke.io -A -o yaml --kubeconfig "<target kubeconfig>"
+   kubectl get reposyncs.configsync.gke.io -A -o yaml --kubeconfig "<target kubeconfig>"
+   ```
+
+   - Argo CD prunes only with `spec.syncPolicy.automated.prune: true`; without
+     it the Application goes OutOfSync and someone syncs with prune. A
+     namespace Argo CD created through `CreateNamespace=true` is never pruned,
+     even with the Application deleted: for that shape, say merging leaves the
+     namespace in place.
+   - A Flux `Kustomization` prunes only with `spec.prune: true`.
+   - Config Sync deletes the objects it applied when their file goes.
+   - Pruning skips an object that opts out, so read the live object's
+     annotations (`kubectl get <kind> <name> -o yaml --kubeconfig "<target kubeconfig>"`) before saying it will
+     be deleted: `argocd.argoproj.io/sync-options: Prune=false`,
+     `kustomize.toolkit.fluxcd.io/prune: disabled`,
+     `configmanagement.gke.io/managed: disabled` or
+     `client.lifecycle.config.k8s.io/deletion: detach` (which Config Sync sets
+     on a namespace it created only because objects sat in it) each mean
+     merging leaves it in place. An object with no reconciler's labels or
+     annotations was put there some other way, and no prune touches it.
+   - **A reconciler that syncs the path but is failing still counts as
+     present.** A `RootSync` or `RepoSync` with entries under
+     `status.source.errors`, `status.rendering.errors` or `status.sync.errors`,
+     an Application whose sync status is `Unknown` or health `Degraded`, or a
+     Kustomization with `Ready=False`: name it, quote its error, and say
+     merging deletes nothing until it syncs again.
+
+   A `Forbidden` is not an absence: say you could not read the reconcilers,
+   and fall back to their CRDs, which this agent's role can read:
+
+   ```bash
+   kubectl get crd applications.argoproj.io kustomizations.kustomize.toolkit.fluxcd.io rootsyncs.configsync.gke.io reposyncs.configsync.gke.io --kubeconfig "<target kubeconfig>"
+   ```
+
+   Name a reconciler in the reply or the pull request body only if you found
+   it syncing that directory. When one prunes, syncs, and the object does
+   not opt out, say it will delete the object after merge. Never write that
+   merging "triggers" a delete you have not read a healthy reconciler for. Otherwise say: "Merging removes the declaration only. I found
+   nothing on `<cluster>` that deletes what is removed from `<repo>`, so
+   `<kind>/<name>` stays until someone deletes it."
+
+6. **Words.** After the confirmation, say "I'll propose this as a pull request",
+   and report the pull request you opened and the files it removes. Never
+   describe the request as an action under way or done ("deleting",
+   "deleted"): the pull request only proposes it.
 
 ### Step 3: Call the Secure Submit Suggestion Script
 

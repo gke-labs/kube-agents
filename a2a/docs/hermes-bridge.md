@@ -131,7 +131,9 @@ opt-out is tracked in [#2623](https://github.com/gke-labs/kube-agents/issues/262
 ordinary `corev1.Container` entries, so a declared bridge's shape is CR-authored and
 reconcile leaves it alone: it has to carry its own `NATS_URL` and creds, and, for the `api`
 executor, `API_SERVER_KEY`, `A2A_ACTIVITY_SECRET` and `SESSION_KV_API_KEY` (without the last,
-every chat turn ends saying a card's answer cannot be posted back). The operator reads `BRIDGE_CONCURRENCY`
+every chat turn ends saying a card's answer cannot be posted back). The one thing the operator adds is the
+bus CA: `NATS_CA_FILE` and the bundle mount at `/etc/a2a-nats-ca`, overriding any value of the entry's own,
+since the bus requires TLS and a bridge that cannot verify it never connects. The operator reads `BRIDGE_CONCURRENCY`
 back out of the entry, to size the TASKS consumer reserve, and `BRIDGE_EXECUTOR`,
 `API_SERVER_KEY` and `BRIDGE_ACTIVITY_LISTEN`, to decide whether the `api` executor's
 pod-wide hook is rendered; it writes none of those.
@@ -171,7 +173,9 @@ bridge, unset `spec.deployment.sidecars` _before_ flipping to `today`. In any fl
 for such an install that step is a blocker, not tidiness. `hack/rollback-roundtrip.sh`
 follows it: a CR with declared sidecars has the whole list unset, not only the sidecars
 that look like bus clients, flipped, and the saved list declared again once `next` is back;
-a CR with none, the lane's own, is only flipped.
+a CR with none, the lane's own, is only flipped. Asked to end under `today`
+(`ROLLBACK_END_MODE=today`, the today lane's run), it refuses a CR with declared sidecars before
+changing anything, since the last flip would leave them unset.
 
 **The webhook does not screen sidecar env, on purpose.** The `SensitiveEnvVars`
 refusal applies to `spec.deployment.env` only; a sidecar's own `env` is unscreened (the
@@ -384,14 +388,17 @@ no key is refused at start.
 A kanban card the persona creates completes after the turn has answered, and the API server
 has no channel to push that completion back. So before a task's first turn the bridge records the
 conversation its session answers (the platform, the gateway's conversation key from the task's
-`authority.audience.conversation`, the `contextId`, and the kind of the prompt's ask, which the
-cards' posts keep marked while they run) in the pod's session-kv, with
+`authority.audience.conversation`, the `contextId`, the kind of the prompt's ask, which the
+cards' posts keep marked while they run, and `user_id` from `authority.requester.principal` plus
+`chat_type` from `authority.audience.kind` so the memory provider can isolate personal memory per
+user and disable personal memory in group conversations) in the pod's session-kv, with
 `PUT /v1/sessions/{id}/route` on `BRIDGE_ROUTE_URL` (default `http://127.0.0.1:8699`) and the
 `SESSION_KV_API_KEY` (inherited from the agent container on a rendered bridge). The card's report then goes back to that conversation through the
 gateway's chat.notify route (`docs/designs/spec-chatops-gateway.md`). The PUT is best effort: the
 turn runs either way, and when it fails the answer ends with a line saying a card's answer cannot
 be posted back. A Google Chat or Slack conversation is posted back. A
-conversation on a door with no notify route (inject, the A2A door, Discord) records nothing. The `cli` executor records no route, so its cards still do not report back.
+conversation on a door with no notify route (the Google-token A2A door or Discord) records an identity-only
+entry (`platform: ""`) when `authority.requester.principal` is set, while shared-credential doors (console, inject, and static-token A2A) record nothing. The `cli` executor records no route, so its cards still do not report back.
 
 Hermes can also run a wake turn in the session that filed a card: a synthetic message saying how the card ended, with the worker's result. On a conversation with no notify route, Slack included, a finished card (or one sent for review) wakes the session. On Google Chat only a card that failed, timed out or blocked does, because #2734 posts the finished card's report itself. The wake turn's reply isn't delivered anywhere, since the bridge only reads answers to its own task turns, but it stays in the session's history for the next turn. The wake turn can't file a card: in an `a2a-ctx-*` session, or one descended from it such as its compressed continuation, `kanban_create` refuses on a wake turn and says to wait for the person to ask (#2610, `deploy/docker/patches/kanban_wake_guard.py`). So does `kanban_unblock`: a blocked card's question is for the person, and their reply, a turn of its own, can unblock it.
 
@@ -658,7 +665,7 @@ count: a task past it is accepted and `submitted` and then queued with no subpro
 worker frees, and the harness classifies a repetition that reaches its budget still
 `submitted` as infrastructure rather than a graded case - it cancels the task and the bridge
 answers `canceled-before-start`. The presubmit fans units out at `EVAL_TASK_PARALLELISM`,
-default 4, the nightly at 8, so the install gives the bridge a `BRIDGE_CONCURRENCY` at or above
+default 4, the next-mode nightlies at 6, so the install gives the bridge a `BRIDGE_CONCURRENCY` at or above
 that value; at the defaults two of every four concurrent units wait for as long as the two ahead
 of them run. The queue behind the workers is fixed at `taskQueueCapacity`, 1024 in `bridge.go`,
 and a submission past it is finalized `failed` with `reason: bridge-queue-overflow`, also
@@ -673,12 +680,12 @@ read, the render in [Where it runs](#where-it-runs), the two env names it writes
 sidecar and the `api` executor's hook entry are the operator code the bridge has, and they
 retire with the bridge.
 
-## Activity: the persona's tool calls, and a heartbeat
+## Activity: the persona's tool calls, its plan steps, and a heartbeat
 
 Under `-Q` hermes writes nothing to stdout until the final response, so the pipe the
 bridge holds says nothing about tool calls while the run is on. What hermes does offer is
 its outbound webhooks: a `hooks.outbound` entry in the profile's config POSTs every
-`pre_tool_call` and `post_tool_call` to a URL, fire-and-forget through a bounded queue,
+`pre_tool_call`, `post_tool_call` and `post_api_request` to a URL, fire-and-forget through a bounded queue,
 HMAC-SHA256 signed when the variable its `secret_env` names is set. The bridge listens
 for those on a loopback address in the pod (`BRIDGE_ACTIVITY_LISTEN`, default
 `127.0.0.1:8651`, clear of hermes's API server on 8642 and the agent-api-auth
@@ -751,7 +758,9 @@ large file write is a few MiB); a larger one is refused and logged, and since th
 be verified nothing counts it, the one loss the `activity-budget` marker does not see. The
 over-size delivery is normally the call's `post_tool_call`, the one carrying the result, whose
 small `pre_tool_call` arrived and opened the call: that call then ends `interrupted` at the
-terminal although the tool finished. An over-size `pre_tool_call` leaves the call absent. `input` is capped (2 KiB): over the cap it becomes
+terminal although the tool finished. An over-size `pre_tool_call` leaves the call absent, and its
+plan step without it. An over-size `post_api_request` (it carries the model's response) loses that
+request's boundary and its synthesis step, uncounted. `input` is capped (2 KiB): over the cap it becomes
 `{"truncated": true, "bytes": N, "head": "..."}`, except for hermes's `tool_call` wrapper,
 where each nested call's `arguments` is capped on its own so the nested tool names stay
 readable. Tool results are not published: no check
@@ -765,6 +774,30 @@ heartbeat and never the trace. Past the trace's share, calls are counted and one
 `truncated` and `dropped` saying how many, goes out at the terminal ahead of the result. The stream keeps every activity
 part; the relay drops the artifact on purpose (debug and audit views never render to
 chat), and the inject door's probe is where a reader sees it.
+
+The turn's steps go on a `steps` artifact as `kube-agents.step/v1` records
+([`a2a/lib/stepmsg`](../lib/stepmsg/stepmsg.go)). A `plan` step is made from the trace itself: each
+`pre_tool_call` opens or extends one, titled with the call's tool name and carrying its call id, the
+same name and id its activity entry carries, so a renderer places each entry under its step.
+Consecutive calls of one tool within one model request share a step; a call of another tool, the
+next model request, or the task's finalize closes it and publishes it. The model request
+(`post_api_request`) is read only for where one request ends and the next begins, and for the
+`synthesis` step: a request of the turn's own session that stopped with no call planned, after work
+(a later request in the turn, or one after a call that turn completed; a follow-up turn of an `api` task counts its own calls only), titled `Writing the answer`. It is
+never the source of a title or an id, since it fires before hermes validates and repairs the calls'
+names and de-duplicates their ids: a name read off it could be one the model invented, or one
+handed to it, and an id one the trace never carries. The turn's own session is the task's session
+under `api`; under `cli` it is the session of the turn's first delivery, which comes before any
+delegated child can run. A delegated child runs in the same process and posts its own requests under
+its own session, so its last request makes no synthesis step, and nor does a request with no
+session id; its calls are plan steps when the trace takes them, which under `cli` it does (under
+`api` a child's deliveries are not attributed to the task at all). A step is structure only, like
+the trace: a tool's name, call ids, a kind and a fixed title, never the model's text, a call's
+arguments, or a tool's result or error text, and `thinking` is not published from the hook. A failed
+call's class stays on its activity entry as `errorType`; its error text is not published anywhere. A
+step the record refuses to encode is skipped, with one log line per task. One task publishes at most
+256 steps, counted against the trace's share as well, and past either they are dropped uncounted
+(the `activity-budget` marker counts calls). The relay ignores `steps`, as it ignores `activity`.
 
 Each of these also carries a `kube-agents.chat/v1` chat message where the payload spec's
 "Chat messages" section puts one (`chat.go`): a completed `result`'s last chunk holds the
@@ -795,7 +828,7 @@ that entry empty and `API_SERVER_KEY` non-blank or taken from a reference. The d
 when `BRIDGE_ACTIVITY_LISTEN` is unset or names the hook's port on `127.0.0.1` or a wildcard
 host. With several bridge sidecars, every one must qualify; a value the operator cannot read
 (`BRIDGE_EXECUTOR` or `BRIDGE_ACTIVITY_LISTEN` through `valueFrom`) disqualifies. Then
-`hooks.outbound` gains `a2a-bridge-activity`, posting `pre_tool_call` and `post_tool_call` to
+`hooks.outbound` gains `a2a-bridge-activity`, posting `pre_tool_call`, `post_tool_call` and `post_api_request` to
 `http://127.0.0.1:8651/hermes/tool-events`, signed with `A2A_ACTIVITY_SECRET`, read from the
 `bridge-activity-key` entry of the a2a creds Secret. The operator puts it in the agent
 container's env; the sidecar needs it in its own. A `cli` bridge, including one that fell back

@@ -237,6 +237,9 @@ needs — a request's own `max_tokens` still wins. `litellm.reasoningEffort`
 (`low`/`medium`/`high`, default empty, meaning none) puts a `reasoning_effort`
 under every alias the same way; LiteLLM maps it to `thinkingLevel` on Gemini 3.x
 ([details](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-reasoning-effort)).
+On a Gemini 2.5 or 3.x model the gateway asks for the model's thoughts with a
+`thinking` key under every alias, which a `reasoningEffort` value replaces
+([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#geminis-thoughts)).
 On a Claude model the gateway
 drops `temperature`, `top_p` and `top_k` from every request
 ([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-default-model)),
@@ -263,7 +266,10 @@ before it reaches the provider: the ConfigMap gains the shared redactor module,
 the redaction pre-call hook and a `redaction.yaml` rule file, all mounted beside
 `/app/config.yaml`, and the gateway container gets `KUBE_AGENTS_REDACTION_CONFIG`
 plus an optional `SESSION_KV_SALT` from the credentials Secret to salt the
-pseudonyms. `litellm.redaction.ip.action` (`pseudonym`, `mask`, `"off"` — quoted,
+pseudonyms. The PlatformAgent CR gains a read-only projection of `redaction.yaml` from
+that ConfigMap at `/etc/kube-agents-redaction/redaction.yaml`, the fixed path
+the agent image looks for, so the image applies the rules to what it writes to
+its volume as well. `litellm.redaction.ip.action` (`pseudonym`, `mask`, `"off"` — quoted,
 because YAML reads the bare word as a boolean and the render refuses it) and
 `litellm.redaction.ip.allowCidrs` govern IP literals; `litellm.redaction.rules`
 adds named `literal` or `pattern` rules with a `mask` or `pseudonym` action, and
@@ -277,6 +283,34 @@ owns what is redacted, what is not (responses, chat egress) and why a
 pseudonymised identifier is one the agent cannot act on; the site's
 [security and IAM page](../../docs/site/src/content/docs/reference/security-and-iam.md)
 owns what the image redacts in the files on the agent's volume.
+
+`litellm.traceLogEnabled=true` turns on pass-through trajectory logging across
+the gateway: the ConfigMap gains `llm_trace_logger.py` and the shared
+`redactor.py` module, mounted at `/app/llm_trace_logger.py` and
+`/app/redactor.py` beside `config.yaml`, registers
+`llm_trace_logger.proxy_handler_instance` under `litellm_settings.callbacks`, and sets
+`LITELLM_TRACE_LOG_PATH` (`litellm.traceLogPath`, default
+`"/tmp/litellm_traces.jsonl"`, which must be a normalised file path under `/tmp/`,
+with no `.` or `..` component, because the gateway runs with
+`readOnlyRootFilesystem: true`) plus an optional `SESSION_KV_SALT`
+from the credentials Secret. Every model request and response (model alias, custom
+LLM provider, messages, tool definitions, assistant responses, reasoning content,
+token usage, and latency) is redacted through `AuditRedactor` (credentials, Secret
+data blocks, sensitive keys, emails, and IP literals, plus operator rules when
+`litellm.redaction.enabled` is also set) before being appended as one JSONL line to
+the path. IP literals are pseudonymised by default; with `litellm.redaction.enabled`
+set, they follow `litellm.redaction.ip` instead: `"off"` writes them verbatim,
+`mask` masks them, and addresses in `allowCidrs` pass through. The trace file
+rotates at `5 MiB` across `3` backups (`.1`–`.3`) under an `flock` on `<path>.lock`;
+a record over `1 MiB` keeps its metadata and drops `messages`, `tools` and
+`response` behind a `truncated` marker, every caller-chosen string is clipped, and a
+line that would still carry a file past its cap is refused with the once-per-path
+warning, so the trail on the pod's `/tmp` `emptyDir` holds at most `20 MiB`. Each record is serialised, redacted and written on one
+writer thread, off the proxy's event loop and in order.
+Pass-through only: the logger never mutates live request or response payloads, and
+I/O failures log a once-per-path warning to stderr so inference never fails. Off by
+default, and the rendered default ConfigMap and rollout checksum are unchanged while
+it is off.
 
 #### Vertex AI (`litellm.modelProvider=vertex_ai`)
 
@@ -333,6 +367,7 @@ including `/v1`) are required, and the render fails without them. Set
   endpoint and no other.
 - **Egress.** The gateway's `litellm-policy` gets one rule derived from
   `apiBase`:
+
   - An in-cluster Service (`<svc>`, `<svc>.<ns>.svc`, or
     `<svc>.<ns>.svc.cluster.local`; a bare `<svc>` is the release namespace,
     and a two-label host such as `openrouter.ai` is a hostname, not
@@ -520,7 +555,7 @@ ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/ku
 
 `platformAgent.podMonitoring` renders a `PodMonitoring` for each of the agent's
 pods that serves metrics: the gateway pod, so GKE Managed Prometheus scrapes the
-event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's port 9095 on every replica, and, under a second `PodMonitoring` that selects the leader label alone, the chat plugin's `kubeagents_chat_messages_inbound_total` from the `platform-agent` container's port 9097 on the one pod that runs Hermes, and the credential-proxy pod, so it scrapes the broker's `kubeagents_*`
+event watcher's `k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's port 9095 on every replica, and, under a second `PodMonitoring` that selects the leader label alone, the chat plugin's `kubeagents_chat_*` series (`kubeagents_chat_messages_inbound_total` among them) from the `platform-agent` container's port 9097 on the one pod that runs Hermes, and the credential-proxy pod, so it scrapes the broker's `kubeagents_*`
 tool-invocation, request and version-control metrics from its metrics-only port 8766, and the A2A
 gateway pod a `spec.mode: next` install runs, so it scrapes the gateway's inbound-message,
 task terminal and Google Chat pull counters from its metrics-only port 9096 (elsewhere
@@ -677,8 +712,9 @@ canonical walkthroughs.
 
 ### Component stack (`platformAgent.mode`)
 
-`platformAgent.mode` is the CR's `spec.mode`: `today`, or `next`, which also
-renders the NATS bus and the A2A gateway, a development stack
+`platformAgent.mode` is the CR's `spec.mode`: `next`, which puts the NATS bus
+and the A2A gateway in front of the agent and is what a first `install.sh`
+install records, or `today`, the previous stack, kept as a rollback
 ([`docs/designs/spec-mode-switch.md`](../../docs/designs/spec-mode-switch.md)).
 It defaults to `null`, which renders no field, and the operator reads an absent
 mode as `today`. Because Helm patches the CR from the difference between its
@@ -687,6 +723,23 @@ value set and later cleared removes the field again. Changing it on a running
 release is a mode switch rather than a setting: the operator rolls the agent
 and renders or retires the A2A stack. `platformAgent.harness.tuning.maxSessions`
 caps the A2A session pods a `next` install runs at once and renders only when set.
+
+### Data volume size (`platformAgent.storage.size`)
+
+`platformAgent.storage.size` is the CR's `spec.storage.size`: the request of the agent's
+`<name>-data` claim and of the shell sandbox's data claim. The operator requests the same size
+for both.
+It defaults to `null`, which renders no field, and the operator default (50Gi) applies.
+Raising it expands both existing claims online where their StorageClass sets
+`allowVolumeExpansion`; where it does not, the claims keep their size and the CR carries the
+`DataVolumeNotExpanded` condition. A claim cannot shrink, so the admission webhook refuses a
+lower value when `operator.webhooks.enabled` is `true` (off by default). Without the webhook, a
+lower value is admitted and the operator keeps the claims at their size. Setting the value back
+to `null` leaves claims above the default at their size, and grows claims below it to the
+default. The render fails on a size of zero or above `64Ti`, and on a live install whose CRD
+predates `spec.storage`. The
+[PlatformAgent CRD page](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specstorage)
+is canonical for the behaviour.
 
 ### Agent runtime knobs
 
@@ -779,7 +832,7 @@ node's cache. The chart and the Terraform composition agree on `Always` for the
 mutable-tag case they were both written for; an install at a pinned release
 tag is the case that wants the override.
 
-Five knobs need context beyond the chart:
+These knobs need context beyond the chart:
 
 - `deployment.availability.runtimeClassName` defaults to `gvisor`, because the
   agent executes model-authored commands and an unsandboxed pod shares the node
@@ -825,6 +878,14 @@ Five knobs need context beyond the chart:
   the detector: enabled without a subscription to read, it comes up and retries
   a pull that cannot succeed for the life of the pod, never exits, and leaves
   the pod Ready. That is why it defaults to off.
+- `harness.stallWatch` tunes the controller stall watch with
+  `excludeNamespaces`, `minStallAgeMinutes` and `kinds`. The default `{}`
+  renders no block, and the watch keeps its own defaults. The operator delivers
+  the values in the agent's managed `.env`, so a change rolls the agent pod. The
+  [`spec.harness.stallWatch` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specharnessstallwatch)
+  is canonical for each field and for the opt-out annotation. If a field is
+  set, the chart fails the render against an installed CRD that predates
+  `spec.harness.stallWatch`.
 
 ### Plugins & Runtime Tuning
 
@@ -832,8 +893,9 @@ Five knobs need context beyond the chart:
 
 - `plugins.pubsubPlatform.enabled` (default `false`): Deploys the Cloud Pub/Sub platform adapter (`AgentPlugin/pubsubplatform`), providing Pub/Sub message ingress and kanban task dispatching.
 - `plugins.stockoutInvestigator.enabled` (default `false`): Deploys the GKE Stockout Investigator (`AgentPlugin/gkestockoutinvestigator`) targeting the `platform` profile, which investigates autoscaler scale-up failures. Requires `plugins.pubsubPlatform.enabled=true`.
+- `plugins.stockoutInvestigator.applyTuning` (default `true`): merges the plugin's execution limits into `platformAgent.harness.tuning`. `false` keeps the install's own tuning, for an install that runs the plugin only to prove its ingress.
 
-When `plugins.stockoutInvestigator.enabled=true`, the chart automatically seeds `platformAgent.harness.tuning` execution limits (`maxInProgress: 3`, `platform: {apiMaxRetries: 8, maxTurns: 200}`, `cluster: {apiMaxRetries: 8, maxTurns: 150}`). Stockout remediation is long-running and quota-intensive; these limits ensure the platform agent and delegated cluster workers have sufficient turns and retry budgets to diagnose and remediate capacity incidents across the fleet. Explicit settings in `platformAgent.harness.tuning.*` take precedence over these defaults.
+When `plugins.stockoutInvestigator.enabled=true` and `plugins.stockoutInvestigator.applyTuning` is not `false`, the chart automatically seeds `platformAgent.harness.tuning` execution limits (`maxInProgress: 3`, `platform: {apiMaxRetries: 8, maxTurns: 200}`, `cluster: {apiMaxRetries: 8, maxTurns: 150}`). Stockout remediation is long-running and quota-intensive; these limits ensure the platform agent and delegated cluster workers have sufficient turns and retry budgets to diagnose and remediate capacity incidents across the fleet. Explicit settings in `platformAgent.harness.tuning.*` take precedence over these defaults.
 
 ### Scoped service accounts
 
@@ -936,6 +998,9 @@ outside what the chart can see. A replica count of `0` costs nothing, and a `res
 though note that if a namespace ResourceQuota restricts that compute resource (such as
 `limits.cpu` or `limits.memory`), Kubernetes quota admission requires every container to
 declare it (or a `LimitRange` to default it), and will reject the pod if omitted.
+The two data claims are counted at `platformAgent.storage.size` when it is set: footprint.yaml
+records how many claims follow it (`dataClaims`) and their default size, and each one moves by
+the difference, so a raise of 30Gi adds 60Gi to `requests.storage`.
 The one value it will not guess is `hindsight.postgresql.storage`: the schema permits
 `null`, a claim sized from it would be counted as zero, so an empty one fails the check
 by name.
@@ -1006,18 +1071,30 @@ identity without that permission gets `error calling lookup: resourcequotas is
 forbidden` and no install rather than a quiet pass. Grant the permission, or install with
 `--set quotaPreflight.enabled=false`.
 
+### Optional AgentProfiles (`profiles.tse`)
+
+`profiles.tse.enabled` (default `false`) renders the optional `AgentProfile/tse`
+(GKE Support Agent — Customer-Side Technical Solutions Engineer) under `mode: next`
+(`templates/profiles.yaml`, gated on both `platformAgent.enabled` and
+`profiles.tse.enabled`), with `profiles.tse.{description,persona.image,harness,bus,lifecycle,concurrency,resources}`
+controlling its `AgentProfile` spec. When bound, the operator passes
+`KUBE_AGENTS_ENABLED_PROFILES=tse` to the gateway Deployment so the entrypoint
+scaffolds `/opt/data/profiles/tse` from `/opt/tse-template` on startup.
+
 ## Uninstalling
 
 ```bash
 helm uninstall kube-agents -n kubeagents-system
 ```
 
-The `PlatformAgent` resource carries a finalizer that only the operator can
-clear, and Helm deletes the CR and the operator in the same pass — so nothing
-would be left to clear it, the CR would strand, and the namespace would hang in
-`Terminating`. `platformAgent.cleanupHook` (on by default) prevents that with a
-`pre-delete` hook that deletes the CR and waits for the finalizer while the
-operator is still running.
+The `PlatformAgent` and `AgentProfile` resources carry finalizers that only the
+operator can clear, and Helm deletes the CRs and the operator in the same pass —
+so nothing would be left to clear them, the CRs would strand, and the namespace
+would hang in `Terminating`. `platformAgent.cleanupHook` (on by default)
+prevents that with a `pre-delete` hook that deletes all `AgentProfile` CRs first
+(while the `PlatformAgent` and NATS bus are still running so tombstone cards are
+published), then deletes the `PlatformAgent` CR and waits for the finalizers
+while the operator is still running.
 
 The hook runs `kubectl` from `alpine/k8s`, because the operator image is
 distroless and carries no client — and because the hook needs a shell: it is
@@ -1059,6 +1136,7 @@ entirely — any image with `kubectl` and `/bin/sh` works.
 With `platformAgent.cleanupHook.enabled=false`, the ordering is yours to keep:
 
 ```bash
+kubectl delete agentprofile --all -n kubeagents-system --ignore-not-found --wait
 kubectl delete platformagent platform-agent -n kubeagents-system --wait
 helm uninstall kube-agents -n kubeagents-system
 ```
@@ -1084,6 +1162,7 @@ helm uninstall kube-agents -n kubeagents-system
   `terraform/examples/full-install` does both in one apply.
 
   Two behaviours worth knowing before you enable them:
+
   - **`failurePolicy` defaults to `Ignore`, where the kustomize path uses
     `Fail`.** Helm applies the webhook configurations before both the
     `Certificate` and the `PlatformAgent` CR, so under `Fail` the API server

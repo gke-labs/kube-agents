@@ -83,6 +83,29 @@ const (
 	// chatInboundSeries is the chat_metrics plugin's counter of messages the
 	// gateway accepted, by platform; summed over every platform.
 	chatInboundSeries = "kubeagents_chat_messages_inbound_total"
+	// brokerFailuresSeries is the broker's failure counter, summed over its
+	// kind label into brokerFailuresTotal; the kinds stay in Prometheus.
+	brokerFailuresSeries = "kubeagents_broker_execution_failures_total"
+	// chatTurnsErroredSeries is the chat plugin's count of synchronous turns
+	// the Hermes gateway failed to complete, summed over its platform label
+	// into chatTurnsErroredTotal; on a next-mode install the A2A gateway's
+	// task terminals under a2aErroredTerminalStates join it, as the
+	// counter's sibling on that pod.
+	chatTurnsErroredSeries = "kubeagents_chat_turns_errored_total"
+	a2aTaskTerminalsSeries = "kubeagents_a2a_gateway_task_terminals_total"
+	a2aTerminalStateLabel  = "state"
+	// kanbanGaveUpSeries is the chat plugin's count of board cards that gave
+	// up since its process started, summed whole into backgroundTasksGaveUpTotal.
+	kanbanGaveUpSeries = "kubeagents_kanban_tasks_gave_up_total"
+	// chatFeedbackNegativeSeries is the chat plugin's count of thumbs-down
+	// reactions a person put on the bot's messages, summed over its platform
+	// label into negativeFeedbackTotal; the chat_feedback_reactions hook feeds
+	// it, and no A2A family joins it.
+	chatFeedbackNegativeSeries = "kubeagents_chat_feedback_negative_total"
+	// vcsClosedUnmergedSeries is the broker's count of this install's proposals
+	// the forge reported closed without a merge, summed whole into
+	// remediationsClosedUnmergedTotal; it carries no label.
+	vcsClosedUnmergedSeries = "kubeagents_vcs_proposals_closed_unmerged_total"
 	// a2aMessagesInboundSeries is the A2A gateway's counter of the chat
 	// messages it accepted as turns, by platform: the same counter on a
 	// next-mode install, where Chat ingress is the A2A gateway's rather than
@@ -119,8 +142,10 @@ const (
 	// toolInvocationsStatusLabel is the broker's outcome label. The outcomes
 	// toolInvocationsCountedStatuses sums are the broker's success and error:
 	// the commands it ran and the requests it rejected or failed on before
-	// running. blocked and busy are refusals, and abandoned cannot say
-	// whether the command had started.
+	// running. toolInvocationsRefusedStatuses are the rest, the requests the
+	// broker turned away: blocked and busy are refusals, and abandoned cannot
+	// say whether the command had started. The two sets partition the
+	// broker's vocabulary, so the two counters together are every request.
 	toolInvocationsStatusLabel = "status"
 
 	// The kinds a failed scrape is logged as: a closed vocabulary, never a
@@ -143,16 +168,38 @@ const (
 	usageScrapeKindOther = "error"
 )
 
-var toolInvocationsCountedStatuses = map[string]bool{"success": true, "error": true}
+var (
+	toolInvocationsCountedStatuses = map[string]bool{"success": true, "error": true}
+	toolInvocationsRefusedStatuses = map[string]bool{"blocked": true, "busy": true, "abandoned": true}
+)
+
+// a2aErroredTerminalStates are the A2A task terminals that are a failed turn:
+// failed, and rejected, which is a task the executor refused; not completed
+// and not canceled.
+var a2aErroredTerminalStates = map[string]bool{"failed": true, "rejected": true}
+
+// usageSibling is another family a counter is read from on a pod whose body
+// carries it in place of the counter's own, with the filter that family takes.
+type usageSibling struct {
+	family string
+	filter usageLabelFilter
+}
+
+// usageRead is one counter a family feeds and the filter it is read through.
+type usageRead struct {
+	counter string
+	filter  usageLabelFilter
+}
 
 // usageLabelFilter is, per label name, the values a metric must carry to be
 // summed into a counter; a nil filter sums every label set.
 type usageLabelFilter map[string]map[string]bool
 
 // usageSeriesFor is the family each counter is read from and the label values
-// summed: the broker's tool counter over its counted statuses, the proposals
-// counter over the one verb and status that is a proposal opened, the
-// watcher's injected counter over every label set.
+// summed: the broker's tool counter over its counted statuses, the same
+// counter over its refused statuses, the proposals counter over the one verb
+// and status that is a proposal opened, the watcher's injected counter over
+// every label set.
 func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 	switch counter {
 	case usageCounterEventsIngested:
@@ -170,21 +217,37 @@ func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 		return triageSessionsSeries, nil
 	case usageCounterSessionsChat:
 		return chatSessionsSeries, nil
+	case usageCounterToolExecutionsBlocked:
+		return toolInvocationsSeries, usageLabelFilter{toolInvocationsStatusLabel: toolInvocationsRefusedStatuses}
+	case usageCounterBrokerFailures:
+		return brokerFailuresSeries, nil
+	case usageCounterChatTurnsErrored:
+		return chatTurnsErroredSeries, nil
+	case usageCounterBackgroundTasksGaveUp:
+		return kanbanGaveUpSeries, nil
+	case usageCounterNegativeFeedback:
+		return chatFeedbackNegativeSeries, nil
+	case usageCounterRemediationsClosedUnmerged:
+		return vcsClosedUnmergedSeries, nil
 	default:
 		return toolInvocationsSeries, usageLabelFilter{toolInvocationsStatusLabel: toolInvocationsCountedStatuses}
 	}
 }
 
-// usageSiblingFamiliesFor is the other families a counter is read from, on
-// pods whose body carries one of them in place of the family usageSeriesFor
-// names: the chat counter comes from the chat_metrics plugin on a gateway pod
-// and from the A2A gateway on its own pod, under the same label set.
-func usageSiblingFamiliesFor(counter string) []string {
+// usageSiblingsFor is the other families a counter is read from, on pods
+// whose body carries one of them in place of the family usageSeriesFor names,
+// each with its own filter: the chat counter and the chat sessions come from
+// the chat_metrics plugin on a gateway pod and from the A2A gateway on its own
+// pod, under the same label set; the errored counter comes from the plugin
+// whole and from the A2A gateway's task terminals under the errored states.
+func usageSiblingsFor(counter string) []usageSibling {
 	switch counter {
 	case usageCounterChatMessagesInbound:
-		return []string{a2aMessagesInboundSeries}
+		return []usageSibling{{family: a2aMessagesInboundSeries}}
 	case usageCounterSessionsChat:
-		return []string{a2aSessionsSeries}
+		return []usageSibling{{family: a2aSessionsSeries}}
+	case usageCounterChatTurnsErrored:
+		return []usageSibling{{family: a2aTaskTerminalsSeries, filter: usageLabelFilter{a2aTerminalStateLabel: a2aErroredTerminalStates}}}
 	}
 	return nil
 }
@@ -334,20 +397,26 @@ func foldUsageBody(body io.Reader, counters []string) (usageReading, error) {
 	var start *float64
 	// wanted is every family the parser is asked to name in this body: each
 	// counter's, the start-time gauge, and the watcher's cluster gauge when
-	// the body is the watcher's.
+	// the body is the watcher's. A family feeds every counter that names it,
+	// each through its own filter: the broker's tool counter is read into
+	// two, over disjoint statuses.
 	var clusters *usageClusterGauges
-	counterOf := make(map[string]string, len(counters))
-	filters := make(map[string]usageLabelFilter, len(counters))
+	// readsOf is every (counter, filter) pair a family feeds, so a sibling
+	// family takes its own filter, not the one its counter's own family takes.
+	readsOf := make(map[string][]usageRead, len(counters))
 	wanted := []string{processStartTimeSeries}
+	want := func(family, counter string, filter usageLabelFilter) {
+		readsOf[family] = append(readsOf[family], usageRead{counter: counter, filter: filter})
+		if !slices.Contains(wanted, family) {
+			wanted = append(wanted, family)
+		}
+	}
 	for _, counter := range counters {
 		family, filter := usageSeriesFor(counter)
-		counterOf[family] = counter
-		filters[counter] = filter
 		sums[counter] = 0
-		wanted = append(wanted, family)
-		for _, sibling := range usageSiblingFamiliesFor(counter) {
-			counterOf[sibling] = counter
-			wanted = append(wanted, sibling)
+		want(family, counter, filter)
+		for _, sibling := range usageSiblingsFor(counter) {
+			want(sibling.family, counter, sibling.filter)
 		}
 		if family == eventsInjectedSeries {
 			clusters = &usageClusterGauges{}
@@ -418,11 +487,11 @@ func foldUsageBody(body io.Reader, counters []string) (usageReading, error) {
 						}
 						continue
 					}
-					counter := counterOf[name]
-					if !usageLabelsMatch(metric, filters[counter]) {
-						continue
+					for _, read := range readsOf[name] {
+						if usageLabelsMatch(metric, read.filter) {
+							sums[read.counter] += value
+						}
 					}
-					sums[counter] += value
 				}
 			}
 		}

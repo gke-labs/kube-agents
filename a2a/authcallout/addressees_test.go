@@ -74,7 +74,7 @@ func TestANarrowedPodNamedAfterAnAddresseeIsRefusedAtConnect(t *testing.T) {
 	names := renderedFixtureAddressees(t)
 	h := startHarness(t, sessionMap, addresseePodTokens(names))
 
-	nc, err := nats.Connect(h.url, nats.Token(tokenPodA), nats.CustomInboxPrefix("_INBOX."+podA))
+	nc, err := nats.Connect(h.url, h.tls, nats.Token(tokenPodA), nats.CustomInboxPrefix("_INBOX."+podA))
 	if err != nil {
 		t.Fatalf("a narrowed pod with an ordinary name was refused: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestANarrowedPodNamedAfterAnAddresseeIsRefusedAtConnect(t *testing.T) {
 
 	for _, name := range names {
 		t.Run(name, func(t *testing.T) {
-			nc, err := nats.Connect(h.url, nats.Token(addresseePodToken(name)), nats.CustomInboxPrefix("_INBOX."+name))
+			nc, err := nats.Connect(h.url, h.tls, nats.Token(addresseePodToken(name)), nats.CustomInboxPrefix("_INBOX."+name))
 			if err == nil {
 				nc.Close()
 				t.Fatalf("a narrowed pod named %q connected; it would hold addressee %s's task subjects", name, name)

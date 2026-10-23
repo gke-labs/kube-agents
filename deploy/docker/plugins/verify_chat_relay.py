@@ -159,7 +159,10 @@ def main() -> None:
     #    report's selection; a scrubbed one would silently fall back to its
     #    default. Onboarding's delivery under next runs `a2a notify` from the
     #    `oobe` child, which needs the bus and the conversation route's
-    #    platform; scrubbed, the report would wait for good.
+    #    platform; scrubbed, the report would wait for good. The stall watch's
+    #    knobs, which the operator pins in the managed .env from
+    #    spec.harness.stallWatch, take it to `stall_watch.py`; scrubbed, the
+    #    watch would read every namespace the CR excludes.
     for name in (
         "SESSION_KV_API_KEY",
         "CRON_REPORT_RELAY_URL",
@@ -172,7 +175,11 @@ def main() -> None:
         "A2A_NOTIFY_CONVERSATIONS",
         "A2A_NOTIFY_PLATFORM",
         "NATS_URL",
+        "NATS_CA_FILE",
         "A2A_BUS_USER",
+        "STALL_WATCH_EXCLUDE_NAMESPACES",
+        "STALL_WATCH_MIN_AGE_MINUTES",
+        "STALL_WATCH_KINDS",
     ):
         child_env = build_subprocess_env(base={**os.environ, name: "sentinel"})
         check(
@@ -347,8 +354,9 @@ def main() -> None:
     )
 
     # 11. The adapter flags the scheduler's failure line by its exact opening
-    # (adapter.SCHEDULER_FAILURE_PREFIXES), and the relay then posts it as
-    # written in place of a fleet-audit record. Each branch of the
+    # (adapter.SCHEDULER_FAILURE_PREFIXES), and the relay then posts it in
+    # plain words (session_kv_server.scheduler_failure_line), in place of a
+    # fleet-audit record for an audit job. Each branch of the
     # summarizer is its own f-string, so drive every one, and the
     # blocked-config line, which _compose_run_delivery builds without it.
     import inspect
@@ -394,6 +402,10 @@ def main() -> None:
     check(re.search(r"^\s*job_id TEXT", columns, re.M) is not None, "the run ledger still has job_id")
     check(re.search(r"^\s*started_at TEXT", columns, re.M) is not None, "the run ledger still has started_at")
     check("'running'" in columns, "the run ledger's status set still has 'running'")
+    # The relay also reads a `completed` row after a posted failure, which says
+    # the job recovered and its next failure is news; renamed, every repeat is
+    # withheld until a different failure.
+    check("'completed'" in columns, "the run ledger's status set still has 'completed'")
 
     print("\nverify_chat_relay: all checks passed")
 

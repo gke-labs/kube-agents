@@ -568,6 +568,216 @@ class EnsureProfileTest(unittest.TestCase):
         self.assertTrue(ps.is_scaffolded(self.home))
 
 
+class NpmCacheTest(unittest.TestCase):
+    """Every profile's npm uses one cache under $HERMES_HOME (gke-labs#3376).
+
+    A profile's processes run with HOME at <profile>/home, so without a ~/.npm link
+    npm keeps a separate ~100 MiB cache per profile.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.real_run = ps.subprocess.run
+        self.addCleanup(setattr, ps.subprocess, "run", self.real_run)
+        ps.subprocess.run = self.fake_run
+
+    def fake_run(self, cmd, **kwargs):
+        """Stand in for `hermes profile create`, which also makes the profile's home/."""
+        home = Path(kwargs["env"]["HERMES_HOME"]) / "profiles" / cmd[3]
+        (home / "home").mkdir(parents=True, exist_ok=True)
+        (home / "profile.yaml").write_text(f"name: {cmd[3]}\n")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    def scaffold(self, hermes_home, name="cluster-a"):
+        with redirect_stderr(io.StringIO()):
+            return ps.ensure_profile(name, "desc", hermes_home) / "home"
+
+    def share(self, process_home, hermes_home, reclaim=False):
+        with redirect_stderr(io.StringIO()) as err:
+            ps.share_npm_cache(process_home, hermes_home, reclaim=reclaim)
+        return err.getvalue()
+
+    def npm_cache(self, process_home):
+        """`npm config get cache` as a process with HOME=process_home sees it."""
+        cwd = self.tmp / "cwd"
+        cwd.mkdir(exist_ok=True)
+        proc = self.real_run(
+            ["npm", "config", "get", "cache"],
+            capture_output=True, text=True, timeout=60, cwd=cwd,
+            env={"PATH": ps.os.environ["PATH"], "HOME": str(process_home)},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.strip()
+
+    def old_cache(self, process_home):
+        """A per-profile cache as npm left it before this change."""
+        old = process_home / ".npm" / "_cacache"
+        old.mkdir(parents=True)
+        (old / "index").write_bytes(b"x" * 10)
+        return process_home / ".npm"
+
+    def test_a_scaffolded_profile_uses_the_shared_cache(self):
+        """Hermes looks for npx packages at ~/.npm/_npx, so that path leads to the shared cache too."""
+        for hermes_home in (self.tmp / "opt" / "data", self.tmp / "srv" / "agent-home"):
+            with self.subTest(hermes_home=hermes_home):
+                process_home = self.scaffold(hermes_home)
+                shared = hermes_home / ".cache" / "npm"
+                self.assertTrue((process_home / ".npm").is_symlink())
+                self.assertEqual((process_home / ".npm").resolve(), shared)
+                if shutil.which("npm"):
+                    self.assertEqual(Path(self.npm_cache(process_home)).resolve(), shared)
+
+    @unittest.skipUnless(shutil.which("npm"), "npm is not installed")
+    def test_without_the_link_npm_uses_a_cache_per_home(self):
+        """The control for the test above: the cache follows HOME when nothing points it elsewhere."""
+        process_home = self.tmp / "profiles" / "cluster-a" / "home"
+        process_home.mkdir(parents=True)
+        self.assertEqual(self.npm_cache(process_home), f"{process_home}/.npm")
+
+    @unittest.skipUnless(shutil.which("npm"), "npm is not installed")
+    def test_a_cache_line_a_user_wrote_still_wins(self):
+        process_home = self.scaffold(self.tmp)
+        (process_home / ".npmrc").write_text("cache=/elsewhere/npm\n", encoding="utf-8")
+        self.assertEqual(self.npm_cache(process_home), "/elsewhere/npm")
+
+    def test_an_existing_symlink_stays(self):
+        process_home = self.tmp / "home"
+        process_home.mkdir()
+        (process_home / ".npm").symlink_to("/elsewhere/npm")
+
+        self.share(process_home, self.tmp, reclaim=True)
+
+        self.assertEqual(ps.os.readlink(process_home / ".npm"), "/elsewhere/npm")
+
+    def test_the_scaffolder_leaves_an_old_cache_in_place(self):
+        """A process of the profile can be using it; only the start-up sweep removes it."""
+        process_home = self.tmp / "profiles" / "cluster-a" / "home"
+        process_home.mkdir(parents=True)
+        old = self.old_cache(process_home)
+
+        self.scaffold(self.tmp)
+
+        self.assertFalse(old.is_symlink())
+        self.assertTrue((old / "_cacache" / "index").is_file())
+
+    def test_the_sweep_replaces_an_old_cache(self):
+        process_home = self.tmp / "home"
+        process_home.mkdir()
+        old = self.old_cache(process_home)
+
+        err = self.share(process_home, self.tmp, reclaim=True)
+
+        self.assertEqual(old.resolve(), self.tmp / ".cache" / "npm")
+        self.assertIn(f"reclaimed the per-profile npm cache {process_home / ps.NPM_RECLAIM_NAME} (10 bytes)", err)
+
+    def test_a_failed_delete_still_leaves_the_link(self):
+        # The old cache is moved aside before the link goes in, so a delete that
+        # fails (another replica writing into it) leaves an orphan directory,
+        # never a home with no link until the next start.
+        process_home = self.tmp / "home"
+        process_home.mkdir()
+        old = self.old_cache(process_home)
+        real_rmtree = ps.shutil.rmtree
+        self.addCleanup(setattr, ps.shutil, "rmtree", real_rmtree)
+
+        def fail(path, *args, **kwargs):
+            raise OSError(39, "Directory not empty", str(path))
+
+        ps.shutil.rmtree = fail
+        err = self.share(process_home, self.tmp, reclaim=True)
+
+        self.assertTrue(old.is_symlink())
+        self.assertEqual(old.resolve(), self.tmp / ".cache" / "npm")
+        self.assertTrue((process_home / ps.NPM_RECLAIM_NAME).is_dir())
+        self.assertIn(f"could not delete the old per-profile npm cache {process_home / ps.NPM_RECLAIM_NAME}", err)
+        self.assertNotIn("could not point npm", err)
+
+        # The next start-up sweep deletes the orphan.
+        ps.shutil.rmtree = real_rmtree
+        err = self.share(process_home, self.tmp, reclaim=True)
+
+        self.assertFalse((process_home / ps.NPM_RECLAIM_NAME).exists())
+        self.assertIn("reclaimed the per-profile npm cache", err)
+        self.assertTrue(old.is_symlink())
+
+    def test_an_orphan_does_not_block_the_next_reclaim(self):
+        # A start-up stopped between the move and the link: an orphan and no
+        # link. A process then made a new real cache. The sweep removes both.
+        process_home = self.tmp / "home"
+        process_home.mkdir()
+        old = self.old_cache(process_home)
+        orphan = process_home / ps.NPM_RECLAIM_NAME
+        (orphan / "_cacache").mkdir(parents=True)
+        (orphan / "_cacache" / "index").write_text("x" * 7, encoding="utf-8")
+
+        err = self.share(process_home, self.tmp, reclaim=True)
+
+        self.assertEqual(old.resolve(), self.tmp / ".cache" / "npm")
+        self.assertFalse(orphan.exists())
+        self.assertNotIn("WARN", err)
+
+    def test_the_scaffolder_leaves_an_orphan_alone(self):
+        """Only the start-up sweep deletes, because a process can be using the directory."""
+        process_home = self.tmp / "home"
+        process_home.mkdir()
+        orphan = process_home / ps.NPM_RECLAIM_NAME
+        orphan.mkdir()
+
+        self.share(process_home, self.tmp)
+
+        self.assertTrue(orphan.is_dir())
+
+    def test_a_second_run_changes_nothing(self):
+        process_home = self.scaffold(self.tmp)
+        before = ps.os.readlink(process_home / ".npm")
+
+        self.assertEqual(self.share(process_home, self.tmp, reclaim=True), "")
+        self.assertEqual(ps.os.readlink(process_home / ".npm"), before)
+
+    def test_the_link_follows_a_moved_agent_home(self):
+        """An absolute link would point npm at the old mount path."""
+        old_home, new_home = self.tmp / "opt" / "data", self.tmp / "srv" / "agent-home"
+        self.scaffold(old_home)
+        new_home.parent.mkdir(parents=True)
+        old_home.rename(new_home)
+
+        link = new_home / "profiles" / "cluster-a" / "home" / ".npm"
+        self.assertEqual(link.resolve(), new_home / ".cache" / "npm")
+
+    def test_a_removed_shared_cache_is_made_again(self):
+        """npm fails on every command when its cache is a dangling link."""
+        process_home = self.scaffold(self.tmp)
+        (self.tmp / ".cache" / "npm").rmdir()
+
+        self.scaffold(self.tmp)
+
+        self.assertTrue((process_home / ".npm").resolve().is_dir())
+
+    def test_a_missing_home_is_not_created(self):
+        """Hermes uses <profile>/home as HOME only when it exists; creating it would move HOME."""
+        process_home = self.tmp / "profiles" / "cluster-a" / "home"
+        self.share(process_home, self.tmp)
+        self.assertFalse(process_home.exists())
+
+    def test_the_sweep_reaches_the_default_home_and_every_profile(self):
+        homes = [self.tmp / "home", self.tmp / "profiles" / "a" / "home", self.tmp / "profiles" / "b" / "home"]
+        for home in homes:
+            home.mkdir(parents=True)
+        self.old_cache(homes[1])
+        bare = self.tmp / "profiles" / "c"
+        bare.mkdir()
+
+        with unittest.mock.patch.object(sys, "argv", ["profile_scaffold.py", "--share-npm-cache"]), \
+                unittest.mock.patch.dict(ps.os.environ, {"HERMES_HOME": str(self.tmp)}), \
+                redirect_stderr(io.StringIO()):
+            ps.main()
+
+        for home in homes:
+            self.assertEqual((home / ".npm").resolve(), self.tmp / ".cache" / "npm")
+        self.assertFalse((bare / "home").exists())
+
+
 class BackfillCronStoreTest(unittest.TestCase):
     """Tests for standalone cron store backfill helpers (for cluster profiles and runtime stores)."""
 

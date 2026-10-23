@@ -1,65 +1,64 @@
-# GKE Environment Discovery Report
+# GKE Environment Discovery Report — raw findings
 
-This is the first-time environment scan for project `onboarding-criticals-prod`: one cluster, six
-workloads, seven findings.
+First-time environment scan, compiled at 2026-10-20 12:00 UTC from the per-cluster audit cards of sweep `t_sweep_criticals`. It carries every entry the audits filed under `findings`, and the delivered report is ranked from those alone; a condition an audit recorded only in a structured field (startup probe, read-only root filesystem, namespace governance, node autoscaling) is not carried forward. This scan ran 9 configuration checks; security and RBAC, reliability, capacity and cost come from the first-run audits. The 9 checks: startup probes, ResourceQuota and LimitRange, read-only root filesystems, Shielded Nodes, Dataplane V2, Managed Service for Prometheus, node auto-upgrade, static Google Cloud keys in pods and added capabilities.
+
+## Coverage
+
+| Cluster | Project | Location | Card | Workloads audited | Scanned in full |
+| :------ | :------ | :------- | :--- | ----------------: | :-------------- |
+| prod-central | onboarding-criticals-prod | us-central1 | t_prod_central | 6 | yes |
 
 ## GKE Fleet Discovery
 
-| Cluster Name | GCP Region / Zone | Status | K8s Version | Node Pools / Machine Types | Workload Identity | Observability Stack | Deployment Toolchain |
-| :----------- | :---------------- | :----- | :---------- | :------------------------- | :---------------- | :------------------ | :------------------- |
-| prod-central | us-central1 | RUNNING | 1.33.4-gke.1245000 | default-pool / e2-standard-4 (4 nodes) | disabled | Cloud Logging only | kubectl apply from CI |
+| Cluster Name | GCP Region / Zone | K8s Version | Node Pools / Machine Types | Workload Identity | Dataplane V2 | Observability Stack | Deployment Toolchain |
+| :----------- | :---------------- | :---------- | :------------------------- | :---------------- | :----------- | :------------------ | :------------------- |
+| prod-central | us-central1 | 1.33.4-gke.1245000 | default-pool (e2-standard-4) | disabled | enabled | Cloud Logging only | kubectl apply from CI |
 
 ## Workloads Inventory
 
-| Cluster | Namespace | Workload Name | Kind | Replicas (`Ready/Total`) | Probes (`Live/Ready`) | Resource QoS (`Req/Lim`) | OTel / Telemetry | Security Context (`NonRoot`) |
-| :------ | :-------- | :------------ | :--- | :----------------------- | :-------------------- | :----------------------- | :--------------- | :--------------------------- |
-| prod-central | billing | invoice-worker | Deployment | 2/2 | yes/yes | Burstable | none | yes |
-| prod-central | ci | release-bot | Deployment | 1/1 | yes/yes | Burstable | none | yes |
-| prod-central | shop | quote-api | Deployment | 0/1 | yes/yes | Guaranteed | none | yes |
-| prod-central | shop | pricing-engine | Deployment | 0/2 | yes/yes | Burstable | none | yes |
-| prod-central | shop | gift-cards | Deployment | 3/3 | yes/no | Burstable | none | yes |
-| prod-central | data | orders-db | StatefulSet | 1/1 | yes/yes | requests only, no memory limit | none | yes |
+| Cluster | Namespace | Workload Name | Kind | Replicas | Startup Probe | Telemetry | ReadOnlyFS |
+| :------ | :-------- | :------------ | :--- | :------- | :------------ | :-------- | :--------- |
+| prod-central | billing | invoice-worker | Deployment | 2/2 | yes | none | yes |
+| prod-central | logging | log-shipper | DaemonSet | 0/4 | yes | none | yes |
+| prod-central | shop | quote-api | Deployment | 0/1 | yes | none | yes |
+| prod-central | shop | pricing-engine | Deployment | 0/2 | yes | none | yes |
+| prod-central | shop | gift-cards | Deployment | 3/3 | yes | none | no |
+| prod-central | ledger | orders-db | StatefulSet | 1/1 | yes | none | yes |
 
 ## Prioritized SRE Remediation Plan
 
 ### Priority 1 — Security & Identity Hardening
 
-- `billing/invoice-worker` mounts a static service account key for a project-editor service account
-  from the Secret `invoice-gcp-key`. Anyone who can read that Secret holds editor on the project. Move
-  the workload to Workload Identity and delete the key. (severity: high)
-- The ClusterRoleBinding `ci-cluster-admin` grants `cluster-admin` to the ServiceAccount
-  `ci/release-bot`, whose token is mounted into the running `release-bot` pod. Anything that runs
-  code in that pod controls the whole cluster. Bind a namespaced Role with only the verbs the
-  release job uses. (severity: high)
+- **[HIGH]** `prod-central/billing/invoice-worker`: invoice-worker mounts a static project-editor service account key from the Secret invoice-gcp-key. Recommended: Move invoice-worker to Workload Identity and delete the key: anyone who can read the Secret holds editor on the project
+- **[MEDIUM]** `prod-central/shop/gift-cards`: gift-cards runs with a writable root filesystem. Recommended: Set readOnlyRootFilesystem: true and mount an emptyDir for the paths it writes
 
 ### Priority 2 — Workload Reliability & Probes
 
-- `shop/quote-api`, the only replica of a serving Deployment, is in CrashLoopBackOff: its container
-  is OOMKilled at its 256Mi limit and has restarted 47 times, so the service has no ready endpoint.
-  Raise the memory limit or fix the leak. (severity: high)
-- `shop/pricing-engine` has 0 of 2 replicas running: both pods are stuck in
-  CreateContainerConfigError because the ConfigMap `pricing-rules` they read does not exist, so the
-  service has no ready endpoint. Restore the ConfigMap. (severity: high)
-- `shop/gift-cards` has no readinessProbe, so a replica still warming up receives traffic. Add one.
-  (severity: medium)
-- `data/orders-db` sets memory requests but no memory limit, so it can take memory from its
-  neighbours until the node evicts them. Set a limit. (severity: medium)
+- **[HIGH]** `prod-central/logging/log-shipper`: log-shipper DaemonSet has 0 of 4 pods running: every pod is in ImagePullBackOff on a tag that no longer exists. Recommended: Point log-shipper at a published image tag; until then no node ships its logs
+- **[HIGH]** `prod-central/shop/quote-api`: quote-api, the only replica of a serving Deployment, is in CrashLoopBackOff, OOMKilled at its 256Mi limit after 47 restarts. Recommended: Raise the memory limit or fix the leak; the Service has no ready endpoint
+- **[HIGH]** `prod-central/shop/pricing-engine`: pricing-engine has 0 of 2 replicas running: both pods are stuck in CreateContainerConfigError on the missing ConfigMap pricing-rules. Recommended: Restore the ConfigMap pricing-rules; the Service has no ready endpoint
+- **[MEDIUM]** `prod-central/ledger/ledger`: Namespace ledger has no ResourceQuota or LimitRange. Recommended: Add a ResourceQuota and a LimitRange to ledger so one workload cannot take the namespace's share
 
 ### Priority 3 — Observability & Telemetry
 
-- Managed Service for Prometheus is not enabled on `prod-central`; nothing collects workload metrics.
-  Enable it. (severity: low)
+- **[LOW]** `prod-central/prod-central`: Managed Service for Prometheus is not enabled on prod-central. Recommended: Enable Managed Service for Prometheus so workload metrics are collected
+
+### Other
+
+- None reported.
+
+## Gaps
+
+- None.
 
 ## Machine-Readable Findings
 
 ```findings
-{"check": "sa-key-in-secret", "project": "onboarding-criticals-prod", "cluster": "prod-central", "namespace": "billing", "object": "invoice-worker", "title": "invoice-worker mounts a static project-editor service account key from a Secret", "detail": "Secret invoice-gcp-key holds a JSON key for a service account with roles/editor, mounted at /var/secrets/google; Workload Identity is disabled on the cluster", "severity_hint": "high"}
-{"check": "rbac-cluster-admin", "project": "onboarding-criticals-prod", "cluster": "prod-central", "namespace": "ci", "object": "release-bot", "title": "ServiceAccount release-bot is bound to cluster-admin", "detail": "ClusterRoleBinding ci-cluster-admin binds ClusterRole cluster-admin to ServiceAccount ci/release-bot; its token is automounted into the running release-bot pod", "severity_hint": "high"}
-{"check": "crashloop-backoff", "project": "onboarding-criticals-prod", "cluster": "prod-central", "namespace": "shop", "object": "quote-api", "title": "quote-api Deployment is in CrashLoopBackOff, OOMKilled", "detail": "1 replica, 0 ready; the container is OOMKilled at its 256Mi memory limit and has restarted 47 times; the Service has no ready endpoint", "severity_hint": "high"}
-{"check": "create-container-config-error", "project": "onboarding-criticals-prod", "cluster": "prod-central", "namespace": "shop", "object": "pricing-engine", "title": "pricing-engine pods are stuck in CreateContainerConfigError", "detail": "2 replicas, 0 running; configmap \"pricing-rules\" not found; the Service has no ready endpoint", "severity_hint": "high"}
-{"check": "probes-readiness", "project": "onboarding-criticals-prod", "cluster": "prod-central", "namespace": "shop", "object": "gift-cards", "title": "gift-cards Deployment has no readinessProbe", "detail": "3 replicas, no readinessProbe on any container", "severity_hint": "medium"}
-{"check": "no-memory-limit", "project": "onboarding-criticals-prod", "cluster": "prod-central", "namespace": "data", "object": "orders-db", "title": "orders-db StatefulSet has no memory limit", "detail": "resources.requests.memory is 2Gi, resources.limits.memory is unset", "severity_hint": "medium"}
-{"check": "managed-prometheus", "project": "onboarding-criticals-prod", "cluster": "prod-central", "object": "prod-central", "title": "Managed Service for Prometheus is not enabled", "detail": "monitoringConfig.managedPrometheusConfig.enabled is false", "severity_hint": "low"}
+{"check": "static-sa-key", "project": "onboarding-criticals-prod", "cluster": "prod-central", "object": "invoice-worker", "title": "invoice-worker mounts a static project-editor service account key from the Secret invoice-gcp-key", "namespace": "billing", "detail": "Move invoice-worker to Workload Identity and delete the key: anyone who can read the Secret holds editor on the project", "severity_hint": "high"}
+{"check": "image-pull-backoff", "project": "onboarding-criticals-prod", "cluster": "prod-central", "object": "log-shipper", "title": "log-shipper DaemonSet has 0 of 4 pods running: every pod is in ImagePullBackOff on a tag that no longer exists", "namespace": "logging", "detail": "Point log-shipper at a published image tag; until then no node ships its logs", "severity_hint": "high"}
+{"check": "crashloop-backoff", "project": "onboarding-criticals-prod", "cluster": "prod-central", "object": "quote-api", "title": "quote-api, the only replica of a serving Deployment, is in CrashLoopBackOff, OOMKilled at its 256Mi limit after 47 restarts", "namespace": "shop", "detail": "Raise the memory limit or fix the leak; the Service has no ready endpoint", "severity_hint": "high"}
+{"check": "create-container-config-error", "project": "onboarding-criticals-prod", "cluster": "prod-central", "object": "pricing-engine", "title": "pricing-engine has 0 of 2 replicas running: both pods are stuck in CreateContainerConfigError on the missing ConfigMap pricing-rules", "namespace": "shop", "detail": "Restore the ConfigMap pricing-rules; the Service has no ready endpoint", "severity_hint": "high"}
+{"check": "readonly-root-fs", "project": "onboarding-criticals-prod", "cluster": "prod-central", "object": "gift-cards", "title": "gift-cards runs with a writable root filesystem", "namespace": "shop", "detail": "Set readOnlyRootFilesystem: true and mount an emptyDir for the paths it writes", "severity_hint": "medium"}
+{"check": "no-resourcequota", "project": "onboarding-criticals-prod", "cluster": "prod-central", "object": "ledger", "title": "Namespace ledger has no ResourceQuota or LimitRange", "namespace": "ledger", "detail": "Add a ResourceQuota and a LimitRange to ledger so one workload cannot take the namespace's share", "severity_hint": "medium"}
+{"check": "managed-prometheus", "project": "onboarding-criticals-prod", "cluster": "prod-central", "object": "prod-central", "title": "Managed Service for Prometheus is not enabled on prod-central", "detail": "Enable Managed Service for Prometheus so workload metrics are collected", "severity_hint": "low"}
 ```
-
-scanned=1 clusters, 6 workloads findings=7 elapsed=438s

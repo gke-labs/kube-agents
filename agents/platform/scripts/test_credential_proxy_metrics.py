@@ -14,6 +14,7 @@ Run: python3 -m unittest test_credential_proxy_metrics -v
 import contextlib
 import io
 import json
+import subprocess
 import os
 import re
 import socket
@@ -703,6 +704,159 @@ class BusyRouteCountingTest(_BrokerFixture):
         self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="busy"))
 
 
+class BrokerFailureCountingTest(_BrokerFixture):
+    """The broker's own failures count by kind: a timeout, a broker fault on
+    the exec route, a git failure on the version-control route; a refusal, a
+    busy and a missing route count nothing here."""
+
+    FAMILY = "kubeagents_broker_execution_failures_total"
+
+    def assert_failure_count(self, kind, expected=1):
+        # Recorded as the response is written, so poll briefly, as the vcs
+        # test does, before reading the value.
+        deadline = time.monotonic() + 2.0
+        while True:
+            count = _series(self.families(), self.FAMILY, kind=kind)
+            if count == expected or time.monotonic() > deadline:
+                break
+            time.sleep(0.02)
+        self.assertEqual(expected, count)
+
+    def test_a_timed_out_command_counts_as_exec_timeout_beside_its_error(self):
+        slow = Path(self.temp_dir.name) / "bin" / "slow-kubectl"
+        slow.write_text("#!/bin/bash\nsleep 3\n", encoding="utf-8")
+        slow.chmod(0o755)
+        CredentialProxyHandler.executor.executables["kubectl"] = str(slow)
+        CredentialProxyHandler.executor.timeout_seconds = 1
+        status, body = self.post(["kubectl", "get", "pods"])
+        self.assertEqual((200, "completed", 124, True), (status, body["status"], body["exitCode"], body["timedOut"]))
+        self.assert_failure_count("exec_timeout")
+        self.assertEqual(
+            1, _series(self.families(), "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="error")
+        )
+
+    def test_a_broker_fault_on_the_exec_route_counts_as_exec_failed(self):
+        with mock.patch.object(CredentialProxyHandler.executor, "execute", side_effect=RuntimeError("boom")):
+            status, _ = self.post(["kubectl", "get", "pods"])
+        self.assertEqual(500, status)
+        self.assert_failure_count("exec_failed")
+        self.assertIsNone(_series(self.families(), self.FAMILY, kind="exec_timeout"))
+
+    def test_a_git_failure_on_the_vcs_route_counts_as_vcs_failed(self):
+        def failing(payload):
+            raise subprocess.CalledProcessError(128, ["git", "push"], stderr="fatal: remote error")
+        with VcsRequestCountingTest.vcs_route(self, "proposal-create", failing):
+            status, body = VcsRequestCountingTest.post_vcs(self, "proposal-create", {"repository": "github:example.com/o/r"})
+        self.assertEqual((502, "GIT_FAILED"), (status, body["code"]))
+        self.assert_failure_count("vcs_failed")
+
+    def test_a_refusal_a_busy_and_a_missing_route_count_no_failure(self):
+        self.assertEqual(403, self.post(["kubectl", "delete", "pod", "x"])[0])
+        self.assertEqual(404, self.get("/v1/vcs/no-such-verb"))
+        with mock.patch.object(
+            CredentialProxyHandler.executor, "execute",
+            side_effect=credential_proxy.CommandSlotUnavailable("full"),
+        ):
+            self.assertEqual(503, self.post(["kubectl", "get", "pods"])[0])
+        exposition = CredentialProxyHandler.metrics.render()
+        self.assertIn(f"# TYPE {self.FAMILY} counter", exposition, "the family renders with no series on a broker that has not failed")
+        self.assertEqual({}, _parse(exposition).get(self.FAMILY, {}))
+
+    def test_the_kind_follows_the_route_family_and_the_status(self):
+        """The decision as a table over real paths, through the same label
+        derivation the request counter uses: the broker's own routes count
+        500, 502 and 504 and not their busy 503; the relays, whose upstream
+        status passes through, count the whole 5xx class; the legacy
+        /v1/github refresh name is the forge mint; the chat relays count
+        nothing, since their 502 is the caller's channel or scope; an unlisted
+        family is other_failed; nothing outside 5xx counts anywhere."""
+        kind = credential_proxy._broker_failure_kind
+        label = credential_proxy._endpoint_label
+        cases = [
+            ("/v1/exec", "500", "exec_failed"),
+            ("/v1/exec", "503", None),
+            ("/v1/exec", "403", None),
+            ("/v1/vcs/proposal-create", "502", "vcs_failed"),
+            ("/v1/vcs/proposal-create", "500", "vcs_failed"),
+            ("/v1/vcs/proposal-create", "503", None),
+            ("/v1/forge/github/token", "502", "forge_refresh_failed"),
+            ("/v1/forge/github/token", "503", None),
+            ("/v1/github/refresh", "502", "forge_refresh_failed"),
+            (credential_proxy.API_RELAY_PREFIX + "container/v1/projects/p", "504", "api_relay_failed"),
+            (credential_proxy.API_RELAY_PREFIX + "container/v1/projects/p", "503", "api_relay_failed"),
+            (credential_proxy.API_RELAY_PREFIX + "container/v1/projects/p", "500", "api_relay_failed"),
+            (credential_proxy.API_RELAY_PREFIX + "container/v1/projects/p", "501", "api_relay_failed"),
+            (credential_proxy.API_RELAY_PREFIX + "container/v1/projects/p", "507", "api_relay_failed"),
+            (credential_proxy.API_RELAY_PREFIX + "container/v1/projects/p", "499", None),
+            (credential_proxy.API_RELAY_PREFIX + "container/v1/projects/p", "600", None),
+            (credential_proxy.mcp_policy.MCP_RELAY_PREFIX + "x", "502", "api_relay_failed"),
+            (credential_proxy.watcher_policy.WATCHER_K8S_PREFIX + "c/api/v1/events", "502", "api_relay_failed"),
+            (credential_proxy.watcher_policy.WATCHER_GCP_PREFIX + "x", "503", "api_relay_failed"),
+            ("/v1/chat/post", "502", None),
+            ("/v1/chat/api/x", "500", None),
+            ("/v1/chat/a2a/events", "502", None),
+            ("/v1/workspace/lease", "500", "other_failed"),
+            ("/v1/feedback/report", "502", "other_failed"),
+            ("/no/such/route", "500", "other_failed"),
+            ("/v1/workspace/lease", "404", None),
+        ]
+        for path, status, want in cases:
+            with self.subTest(path=path, status=status):
+                self.assertEqual(want, kind(label(path), status))
+
+    def test_an_unreadable_managed_list_counts_as_vcs_failed_despite_its_503(self):
+        broker = mock.Mock()
+        broker.registry.resolve.return_value = ("github", "example.com/o/r")
+        with (
+            mock.patch.object(CredentialProxyHandler, "vcs", broker, create=True),
+            mock.patch.object(credential_proxy.vcs_broker, "route_table", return_value={"proposal-list": lambda payload: {"items": []}}),
+            mock.patch.object(credential_proxy, "repository_is_managed", side_effect=OSError("mount gone")),
+        ):
+            status, body = VcsRequestCountingTest.post_vcs(self, "proposal-list", {"repository": "o/r"})
+        self.assertEqual((503, "MANAGED_REPOSITORIES_UNAVAILABLE"), (status, body["code"]))
+        self.assert_failure_count("vcs_failed")
+
+    def test_an_unreadable_managed_list_on_a_forge_refresh_counts_as_forge_refresh_failed(self):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.path = "/v1/forge/refresh"
+        handler.metrics = CredentialProxyHandler.metrics
+        handler.executor = None
+        handler._json = lambda status, payload: None
+        with mock.patch.object(credential_proxy, "repository_is_managed", side_effect=OSError("mount gone")):
+            self.assertFalse(handler._repository_is_permitted("o/r", "github"))
+        families = self.families()
+        self.assertEqual(1, _series(families, self.FAMILY, kind="forge_refresh_failed"))
+        self.assertIsNone(_series(families, self.FAMILY, kind="vcs_failed"))
+
+    def test_an_unsupported_method_on_a_relay_path_counts_nothing(self):
+        request = urllib.request.Request(self.endpoint + credential_proxy.API_RELAY_PREFIX + "x", method="PUT")
+        try:
+            with urllib.request.urlopen(request) as response:
+                status = response.status
+        except urllib.error.HTTPError as error:
+            status = error.code
+        self.assertEqual(501, status)
+        time.sleep(0.1)
+        self.assertEqual({}, self.families().get(self.FAMILY, {}))
+
+    def test_a_failed_chat_event_pull_counts_as_chat_pull_failed(self):
+        relay = mock.Mock()
+        relay.pull.side_effect = RuntimeError("subscription gone")
+        with mock.patch.object(CredentialProxyHandler, "chat_relay", relay, create=True):
+            self.assertEqual(503, self.get("/v1/chat/events"))
+        self.assert_failure_count("chat_pull_failed")
+
+    def test_the_kinds_are_a_closed_vocabulary_the_operator_can_pin(self):
+        self.assertEqual(
+            frozenset({"exec_timeout", "exec_failed", "vcs_failed", "forge_refresh_failed", "api_relay_failed", "chat_pull_failed", "other_failed"}),
+            credential_proxy.BROKER_FAILURE_KINDS,
+        )
+        self.assertEqual(
+            frozenset({"success", "error", "blocked", "busy", "abandoned"}),
+            credential_proxy.TOOL_STATUSES,
+        )
+
+
 class VcsRequestCountingTest(_BrokerFixture):
     """The version-control route counts by verb and outcome, the way the exec route counts tools."""
 
@@ -871,6 +1025,19 @@ class MergedProposalMetricTest(_BrokerFixture):
         broker.merge_observer(2)
         self.assertEqual(2, _series(self.families(), "kubeagents_vcs_proposals_merged_total"))
         self.assertEqual(credential_proxy.PROCESS_START_TIME_SECONDS, broker.started_at)
+
+    def test_proposals_closed_unmerged_render_as_one_unlabelled_counter(self):
+        CredentialProxyHandler.metrics.record_closed_unmerged(1)
+        CredentialProxyHandler.metrics.record_closed_unmerged(2)
+        families = self.families()
+        self.assertEqual(3, _series(families, "kubeagents_vcs_proposals_closed_unmerged_total"))
+        self.assertEqual(0, _series(families, "kubeagents_vcs_proposals_merged_total"), "a close moved the merged series")
+        self.assertIn("# TYPE kubeagents_vcs_proposals_closed_unmerged_total counter", CredentialProxyHandler.metrics.render())
+
+    def test_the_broker_built_for_the_handler_reports_closes_into_its_metrics(self):
+        broker = credential_proxy.build_vcs_broker(CredentialProxyHandler.executor)
+        broker.close_observer(3)
+        self.assertEqual(3, _series(self.families(), "kubeagents_vcs_proposals_closed_unmerged_total"))
 
 
 class MetricsListenerTest(unittest.TestCase):
@@ -1179,6 +1346,8 @@ class LabelDerivationTest(unittest.TestCase):
             "/v1/chat/a2a/events": "/v1/chat/a2a",
             "/v1/chat/api": "/v1/chat/api",
             "/v1/gcp/monitoring.googleapis.com/v3/x?y=z": "/v1/gcp",
+            "/v1/watcher/gcp/pubsub.googleapis.com/v1/projects/p/subscriptions/s:pull": "/v1/watcher/gcp",
+            "/v1/pubsub/gcp/pubsub.googleapis.com/v1/projects/p/subscriptions/s:pull": "/v1/pubsub/gcp",
             "/v1/vcs/push": "/v1/vcs",
             "/v1/workspace/acquire": "/v1/workspace",
             "/v1/forge/refresh": "/v1/forge",

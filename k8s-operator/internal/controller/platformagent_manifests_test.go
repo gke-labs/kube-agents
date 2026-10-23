@@ -305,8 +305,8 @@ func TestBuildPVC(t *testing.T) {
 		t.Errorf("expected PVC name test-agent-data, got %s", pvc.Name)
 	}
 	storageReq := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
-	if storageReq.String() != "10Gi" {
-		t.Errorf("expected storage request 10Gi, got %s", storageReq.String())
+	if storageReq.String() != "50Gi" {
+		t.Errorf("expected storage request 50Gi, got %s", storageReq.String())
 	}
 }
 
@@ -1466,6 +1466,15 @@ func TestSafeSandboxEnvOverridesPassesFindingsPacingLimits(t *testing.T) {
 	// A neighbour sharing the prefix is not on the list.
 	if _, ok := values["FINDINGS_QUEUE_DB_PATH"]; ok {
 		t.Errorf("FINDINGS_QUEUE_DB_PATH must not pass, got %#v", got)
+	}
+}
+
+func TestSafeSandboxEnvOverridesPassesWorkloadDedupWindow(t *testing.T) {
+	// session_kv_server.py reads the window from its own environment; off the
+	// allowlist, the documented spec.deployment.env entry never reaches it.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{{Name: "INCIDENT_WORKLOAD_DEDUP_SECONDS", Value: "900"}})
+	if len(got) != 1 || got[0].Name != "INCIDENT_WORKLOAD_DEDUP_SECONDS" || got[0].Value != "900" {
+		t.Errorf("expected INCIDENT_WORKLOAD_DEDUP_SECONDS=900 to pass, got %#v", got)
 	}
 }
 
@@ -3782,15 +3791,21 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 	// A deployment with no chat integration pins no PLATFORM key — an agent with no chat
 	// integration has no platform credential worth freezing, and a pin invented for one
 	// would only be a key the agent is refused permission to set. What survives is the
-	// five unconditional pins, none of which is about chat: the loopback bearer (see
-	// the next test), the PVC's directory mode, the mode switch, the scope path, and
-	// the empty management-project override.
+	// ten unconditional pins, none of which is about chat: the loopback bearer (see
+	// the next test), the PVC's directory mode, the mode switch, the scope path, the
+	// empty management-project override, the stall watch's three knobs, empty, the
+	// Pub/Sub platform relay URL, empty, and the project that qualifies its routes.
 	bare := renderManagedEnv(newTestPlatformAgent())
 	want := "API_SERVER_KEY=" + loopbackAgentAPIKey + "\n" +
 		"HERMES_HOME_MODE=" + hermesHomeMode + "\n" +
 		kubeagentsModeEnvKey + "=today\n" +
 		scopeFileEnvKey + "=" + scopeDir + "/" + scopeFileName + "\n" +
-		reconcileProjectEnvKey + "=\n"
+		reconcileProjectEnvKey + "=\n" +
+		stallWatchExcludeNamespacesEnvKey + "=\n" +
+		stallWatchMinAgeEnvKey + "=\n" +
+		stallWatchKindsEnvKey + "=\n" +
+		pubsubRelayURLEnvVar + "=\n" +
+		pubsubRelayProjectEnvVar + "=" + pubsubRelayProject(newTestPlatformAgent()) + "\n"
 	if bare != want {
 		t.Errorf("renderManagedEnv with no integration = %q, want %q", bare, want)
 	}
@@ -3857,11 +3872,15 @@ func assertManagedEnvAgrees(t *testing.T, agent *agentv1alpha1.PlatformAgent) {
 	// container env is not a disagreement — only a different answer is.
 	// The mode key is pinned-only by design: the managed .env is the one path the
 	// mode takes into the runtime (spec-mode-switch.md), so a container-env copy
-	// would be a second answer to a question that must have exactly one.
+	// would be a second answer to a question that must have exactly one. The stall
+	// watch's knobs take the same single path to stall_watch.py.
 	pinnedOnly := map[string]bool{
-		"GATEWAY_ALLOWED_USERS":   true,
-		"GATEWAY_ALLOW_ALL_USERS": true,
-		kubeagentsModeEnvKey:      true,
+		"GATEWAY_ALLOWED_USERS":           true,
+		"GATEWAY_ALLOW_ALL_USERS":         true,
+		kubeagentsModeEnvKey:              true,
+		stallWatchExcludeNamespacesEnvKey: true,
+		stallWatchMinAgeEnvKey:            true,
+		stallWatchKindsEnvKey:             true,
 	}
 
 	for _, line := range strings.Split(strings.TrimSpace(renderManagedEnv(agent)), "\n") {

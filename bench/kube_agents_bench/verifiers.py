@@ -68,7 +68,7 @@ import urllib.parse
 import urllib.request
 from collections import Counter
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import Any, Literal
 
 import yaml
@@ -95,6 +95,7 @@ from kube_agents_bench import (
     transcript,
     worker_trajectory,
 )
+from kube_agents_bench.parsing import DELEGATION_TOOL
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
@@ -131,6 +132,17 @@ _NO_TRANSCRIPT_REASON = (
     "no transcript stashed for this run: the harness did not complete an "
     "agent execution (kube_agents_bench.transcript is empty), so this check "
     "could not be evaluated"
+)
+_NO_TIME_WINDOW_REASON = (
+    "the run's transcript carries no start time (TranscriptSnapshot.started_at "
+    "is unset), so this check has no window to read the report's times against "
+    "and refuses to grade it"
+)
+# report_times_in_window, when a stated time matches no output it could read.
+_NO_WORKER_CAPTURE_GAP = "the delegated workers' tool calls were not captured"
+_UNSOURCED_WITH_GAPS_REASON = (
+    "observation time(s) {times} match no tool output this check could read, but the read "
+    "was not whole ({gaps}), so the output that shows them may be in the part it missed"
 )
 # A fence line read by ``report_manifest``, after any blockquote prefix: an
 # optional indent (a block inside a list item), a run of three or more
@@ -736,6 +748,402 @@ class ReportContainsVerifier(BaseVerifier):
             success=True,
             elapsed_time=time.monotonic() - start,
             reason="report contains " + ", ".join(satisfied),
+        )
+
+
+# report_times_in_window: a time the report says it observed something at.
+# A clock time: hours and minutes, seconds and a fraction of any length
+# optional (kubectl prints nanoseconds), then an optional AM or PM.
+_CLOCK = (
+    r"(?P<hour>\d{1,2}):(?P<minute>\d{2})(?::(?P<second>\d{2})(?:\.(?P<fraction>\d+))?)?"
+    r"(?:\s*(?P<meridiem>[AaPp]\.?[Mm]\.?)(?![A-Za-z]))?"
+)
+# A date and a clock time, `T` or a space between, then an optional UTC or
+# numeric zone: 2026-10-15 21:38:00 UTC, 2026-10-15T21:38:00Z,
+# 2026-10-15 21:38 +00:00. There is no named-zone alternative: an all-caps
+# word after a time ("GKE", "INFO") is not a zone, and a dated time with no
+# zone is read as UTC, which the agent's pods and persona both use. A colon
+# may follow ("Observed at 2026-10-15 21:38:00: 2 pods running").
+_STATED_DATETIME = re.compile(
+    r"(?<![\d-])(?P<date>\d{4}-\d{2}-\d{2})[T ]" + _CLOCK
+    + r"(?:\s*(?P<zone>Z|UTC|GMT|[+-]\d{2}:?\d{2})\b)?(?!\d)"
+)
+# A clock time with no date counts only with an explicit UTC zone ("as of
+# 21:38 UTC"); a bare "21:38" is as likely a duration or a log offset.
+_STATED_CLOCK = re.compile(r"(?<![\d:.-])" + _CLOCK + r"\s*(?P<zone>Z|UTC|GMT)\b(?!\d)")
+# The zones read as UTC.
+_UTC_ZONES = frozenset({"", "Z", "UTC", "GMT"})
+_NUMERIC_ZONE = re.compile(r"(?P<sign>[+-])(?P<hours>\d{2}):?(?P<minutes>\d{2})")
+_DATE_FORMAT = "%Y-%m-%d"
+# datetime keeps microseconds: a longer fraction is cut to six digits.
+_MICROSECOND_DIGITS = 6
+_HOURS_PER_HALF_DAY = 12
+_PM_PREFIX = "p"
+
+
+def _zone_offset(zone: str) -> timedelta | None:
+    """The zone's offset from UTC, or ``None`` for one this check does not read."""
+    if zone in _UTC_ZONES:
+        return timedelta(0)
+    numeric = _NUMERIC_ZONE.fullmatch(zone)
+    if numeric is None:
+        return None
+    offset = timedelta(hours=int(numeric["hours"]), minutes=int(numeric["minutes"]))
+    return -offset if numeric["sign"] == "-" else offset
+
+
+def _clock_of(match: re.Match) -> dt_time | None:
+    """The match's clock time, or ``None`` when it is not a valid one."""
+    hour = int(match["hour"])
+    meridiem = match["meridiem"]
+    if meridiem:
+        if not 1 <= hour <= _HOURS_PER_HALF_DAY:
+            return None
+        hour %= _HOURS_PER_HALF_DAY
+        if meridiem[0].lower() == _PM_PREFIX:
+            hour += _HOURS_PER_HALF_DAY
+    fraction = (match["fraction"] or "")[:_MICROSECOND_DIGITS].ljust(_MICROSECOND_DIGITS, "0")
+    try:
+        return dt_time(hour, int(match["minute"]), int(match["second"] or 0), int(fraction))
+    except ValueError:
+        return None
+
+
+def _stated_times(line: str, dates: list[str]) -> tuple[list[tuple[str, list[datetime]]], list[str]]:
+    """Every time ``line`` states, each with the UTC instants it can mean, and
+    the ones it could not read.
+
+    A dated time means one instant. A clock time with no date means one per
+    entry of ``dates`` (the run's start and end days), so a run that crosses
+    midnight can be read either way. A dated time with no zone is read as
+    UTC. Not read: a date or clock time that does not exist (2026-02-30,
+    25:00).
+    """
+    found: list[tuple[str, list[datetime]]] = []
+    unreadable: list[str] = []
+    dated_spans = []
+    for match in _STATED_DATETIME.finditer(line):
+        dated_spans.append(match.span())
+        text = match.group(0).strip()
+        offset = _zone_offset(match["zone"] or "")
+        clock = _clock_of(match)
+        try:
+            day = datetime.strptime(match["date"], _DATE_FORMAT)
+        except ValueError:
+            day = None
+        if offset is None or clock is None or day is None:
+            unreadable.append(text)
+            continue
+        local = datetime.combine(day.date(), clock)
+        found.append((text, [(local - offset).replace(tzinfo=timezone.utc)]))
+    for match in _STATED_CLOCK.finditer(line):
+        if any(start <= match.start() < end for start, end in dated_spans):
+            continue
+        clock = _clock_of(match)
+        if clock is None:
+            unreadable.append(match.group(0).strip())
+            continue
+        instants = [
+            datetime.combine(datetime.strptime(d, _DATE_FORMAT).date(), clock).replace(tzinfo=timezone.utc)
+            for d in dates
+        ]
+        found.append((match.group(0).strip(), instants))
+    return found, unreadable
+
+
+# The times a tool output in the run shows, for report_times_in_window's
+# provenance half. Beside the ISO forms _STATED_DATETIME reads: `date` and
+# `date -u` with no format ("Thu Oct 15 21:26:03 UTC 2026"), `date -R`
+# ("Thu, 15 Oct 2026 21:26:03 +0000"), and epoch seconds or milliseconds
+# (`date +%s`, a card's created_at). A ten-digit run is any instant from 2001
+# to 2286, so an id that happens to be ten digits can only widen what counts
+# as read, never narrow it.
+_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+_DATE_DEFAULT_OUTPUT = re.compile(
+    r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(?P<month>[A-Z][a-z]{2})\s+(?P<day>\d{1,2})\s+"
+    r"(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})\s+(?P<zone>UTC|GMT|Z)\s+(?P<year>\d{4})\b"
+)
+_DATE_RFC_2822 = re.compile(
+    r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s+(?P<day>\d{1,2})\s+(?P<month>[A-Z][a-z]{2})\s+(?P<year>\d{4})\s+"
+    r"(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})\s+(?P<zone>[+-]\d{4}|UTC|GMT)\b"
+)
+_EPOCH_SECONDS = re.compile(r"(?<![\d.])(?P<seconds>\d{10})(?:\.\d+)?(?![\d])")
+_EPOCH_MILLISECONDS = re.compile(r"(?<![\d.])(?P<millis>\d{13})(?![\d.])")
+_MILLIS_PER_SECOND = 1000
+# A bare clock time in an output (`date -u +%T`, a log line), with seconds,
+# so a ratio or a port pair ("8080:80") is not read as one.
+_BARE_CLOCK = re.compile(
+    r"(?<![\d:.-])(?P<hour>\d{1,2}):(?P<minute>\d{2}):(?P<second>\d{2})(?:\.(?P<fraction>\d+))?"
+    r"(?:\s*(?P<meridiem>[AaPp]\.?[Mm]\.?)(?![A-Za-z]))?(?![\d:])"
+)
+_HALF_MINUTE = timedelta(seconds=30)
+# Kanban tools return cards, and a card's result is a worker's own words.
+_KANBAN_TOOL_PREFIX = "kanban_"
+# What worker_trajectory's in-pod script puts in place of a result when the
+# pod's redactor will not load (its WITHHELD), and the marker its clip ends a
+# cut result with. Both live inside that script's source, so they are
+# spelled again here; test_report_times_in_window.py pins them to it.
+_WITHHELD_RESULT = "[WITHHELD: redactor unavailable in the pod]"
+_CLIPPED_RESULT = re.compile(r" \.\.\.\[clipped \d+ chars\]$")
+
+
+def _minute(instant: datetime) -> datetime:
+    return instant.replace(second=0, microsecond=0)
+
+
+def _minutes_of(instant: datetime) -> set[datetime]:
+    """The minutes a report may write a read instant as: its own, or the next
+    when the seconds round up (21:25:59 reported as 21:26)."""
+    return {_minute(instant), _minute(instant + _HALF_MINUTE)}
+
+
+def _named_month_instant(match: re.Match) -> datetime | None:
+    month = match["month"].lower()
+    if month not in _MONTHS:
+        return None
+    offset = _zone_offset(match["zone"])
+    if offset is None:
+        return None
+    try:
+        local = datetime(
+            int(match["year"]), _MONTHS.index(month) + 1, int(match["day"]),
+            int(match["hour"]), int(match["minute"]), int(match["second"]),
+        )
+    except ValueError:
+        return None
+    return (local - offset).replace(tzinfo=timezone.utc)
+
+
+def _output_minutes(text: str, dates: list[str]) -> set[datetime]:
+    """Every UTC minute a tool output's text shows a time in. A clock time
+    with no date (`date -u +%T`, a log line's time) is read on each of
+    ``dates``, the run's start and end days, as a stated one is."""
+    found, _ = _stated_times(text, dates)
+    instants = [instant for _, candidates in found for instant in candidates]
+    dated = [span for m in _STATED_DATETIME.finditer(text) for span in [m.span()]]
+    for match in _BARE_CLOCK.finditer(text):
+        if any(start <= match.start() < end for start, end in dated):
+            continue
+        clock = _clock_of(match)
+        if clock is not None:
+            instants.extend(
+                datetime.combine(datetime.strptime(d, _DATE_FORMAT).date(), clock).replace(tzinfo=timezone.utc)
+                for d in dates
+            )
+    for pattern in (_DATE_DEFAULT_OUTPUT, _DATE_RFC_2822):
+        for match in pattern.finditer(text):
+            instant = _named_month_instant(match)
+            if instant is not None:
+                instants.append(instant)
+    instants.extend(datetime.fromtimestamp(int(m["seconds"]), tz=timezone.utc) for m in _EPOCH_SECONDS.finditer(text))
+    instants.extend(
+        datetime.fromtimestamp(int(m["millis"]) // _MILLIS_PER_SECOND, tz=timezone.utc)
+        for m in _EPOCH_MILLISECONDS.finditer(text)
+    )
+    return {minute for instant in instants for minute in _minutes_of(instant)}
+
+
+def _compiled_labels(patterns: list[str]) -> list[re.Pattern]:
+    return [re.compile(p, re.IGNORECASE) for p in patterns if p.strip()]
+
+
+def _read_minutes(trajectory: list[dict[str, Any]], dates: list[str]) -> tuple[set[datetime], list[str], int]:
+    """The UTC minutes the run's tool outputs show, what kept the read from
+    being whole (a result the pod withheld), and how many results it clipped.
+
+    Every entry's ``result`` counts, the front door's and each delegated
+    worker's (``worker_trajectory`` adds those, a worker-filed card's
+    included), since any of them is a time the agent read, except a kanban
+    tool's: a card's result is what a worker wrote, so a guessed time a worker
+    put on its card would otherwise come back as read. A clipped result
+    still counts for what it kept; the cut is noted, not treated as a gap,
+    because nearly every long `kubectl` output is clipped while a `date -u`
+    never is.
+    """
+    minutes: set[datetime] = set()
+    withheld: list[str] = []
+    clipped = 0
+    for entry in trajectory:
+        if not isinstance(entry, dict):
+            continue
+        result = entry.get("result")
+        name = str(entry.get("name") or "")
+        if not isinstance(result, str) or name.startswith(_KANBAN_TOOL_PREFIX):
+            continue
+        if result == _WITHHELD_RESULT:
+            withheld.append(f"a {name or 'tool'} result was withheld")
+            continue
+        if _CLIPPED_RESULT.search(result):
+            clipped += 1
+        minutes |= _output_minutes(result, dates)
+    return minutes, withheld, clipped
+
+
+def _delegated_without_capture(snap: transcript.TranscriptSnapshot) -> bool:
+    """Whether the run delegated but its workers were not read: the front
+    door called ``kanban_create`` and the capture did not run. A run that
+    delegated nothing also has no capture, and is graded on what it has."""
+    if snap.worker_capture_gaps is not None:
+        return False
+    return any(
+        isinstance(e, dict) and e.get("name") == DELEGATION_TOOL and not e.get("agent") for e in snap.trajectory
+    )
+
+
+@VERIFIERS.register("report_times_in_window")
+class ReportTimesInWindowVerifier(BaseVerifier):
+    """Every observation time the report states falls inside the run and was read.
+
+    A report that says when it looked ("Timestamp of Observation: 2026-10-15
+    21:38:00 UTC") can only have looked while the run was going, so the time
+    must fall between the run's start (``TranscriptSnapshot.started_at``) and
+    the moment this check runs, which is after the report was delivered, each
+    widened by ``max_clock_skew_sec``. A report that states no such time
+    passes: leaving the time out is the right answer when nothing produced
+    one. Written for #3256, where a Cluster Agent's audit trail stated an
+    observation time five minutes after its own post.
+
+    Which times are observation times is the case's to say, in
+    ``label_patterns``: regexes searched, case-insensitively, in each line of
+    the report. A time on a matching line is checked. A time on any other
+    line is not, including one on the line after a label, so an event timestamp quoted from command output, which may be
+    days old, or a certificate's expiry, which is in the future, does not
+    fail a report. The window's end is the moment the check runs, not the
+    moment the report was delivered, which this check cannot see; the gap
+    between the two is part of the slack.
+
+    Every checked time must also have been read: its minute (UTC, seconds
+    dropped, so a time read as 21:26:03 may be reported as 21:26) must be a
+    minute some tool output in the run's trajectory shows. The outputs are
+    every entry's ``result``, the front door's and each delegated worker's,
+    a worker-filed card's included, but not a kanban tool's, whose card
+    result is a worker's own words. A worker's own words echoed back through
+    another tool (an ``echo``, a drafted file it cats) do count as read; an
+    exclusion by label was tried and removed, because a captured worker
+    result arrives as one JSON line, so a label word anywhere in it dropped
+    the whole result. The forms read are ISO 8601, the output
+    of ``date``, ``date -u`` and ``date -R``, a bare clock time with seconds
+    (on the run's days), and epoch seconds or milliseconds, so a
+    ``date +%s`` matches its UTC rendering; a read time also matches the
+    next minute when its seconds round up. A time no output shows fails,
+    even inside the window: that is the guess #3256 found. When the unread
+    time could sit in a part of the run that was not read (the run delegated
+    and its workers were not captured, the capture has gaps, or a result
+    was withheld), the check is ``status: error`` naming what was missing,
+    not a fail. A clipped result is read as far as it goes and noted.
+
+    Only a time on a label's own line is graded, with a date or an explicit
+    UTC zone; a value on the line after a label is not read, and a dated
+    time with no zone is read as UTC (#3266 cut the next-line and named-zone
+    rules after they kept growing).
+
+    What it cannot catch: a time on the line after its label; a time stated
+    in another zone, which is read as UTC; a date or clock time that does
+    not exist, which is named in the reason and not graded; and a guess
+    whose minute happens to match some other time the run read, which on a
+    run of a few minutes that printed event or creation times inside it is
+    not rare.
+    """
+
+    type: Literal["report_times_in_window"]
+    label_patterns: list[str]
+    max_clock_skew_sec: float = Field(default=120.0, ge=0)
+    scope: Literal["final", "full"] = "final"
+
+    @field_validator("label_patterns")
+    @classmethod
+    def _label_patterns_compile(cls, patterns: list[str]) -> list[str]:
+        if not [p for p in patterns if p.strip()]:
+            raise ValueError("label_patterns needs at least one non-blank pattern, or the check can only pass")
+        for pattern in patterns:
+            try:
+                re.compile(pattern)
+            except re.error as err:
+                raise ValueError(f"label pattern {pattern!r} does not compile: {err}") from err
+        return patterns
+
+    def _labelled_lines(self, raw: str) -> list[str]:
+        """The lines whose times are observation times: a label's own line,
+        and nothing else. A value on the line after a label is not read; the
+        rules for lending a line were the part of this check that kept
+        growing (#3266's review rounds), and a nightly guard can give it up.
+        The labels are searched on the line with its Markdown emphasis
+        stripped, as ``report_contains`` searches, since `\\b` finds no
+        boundary between `_` and a word ("_Observed at_")."""
+        labels = _compiled_labels(self.label_patterns)
+        return [line for line in raw.splitlines() if any(label.search(_normalize(line)) for label in labels)]
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+        snap = transcript.get()
+        if snap is None:
+            return VerificationResult(
+                success=False, status="error", elapsed_time=time.monotonic() - start, reason=_NO_TRANSCRIPT_REASON
+            )
+        if not snap.started_at:
+            return VerificationResult(
+                success=False, status="error", elapsed_time=time.monotonic() - start, reason=_NO_TIME_WINDOW_REASON
+            )
+        skew = timedelta(seconds=self.max_clock_skew_sec)
+        run_start = datetime.fromtimestamp(snap.started_at, tz=timezone.utc)
+        run_end = datetime.now(tz=timezone.utc)
+        earliest, latest = run_start - skew, run_end + skew
+        dates = sorted({run_start.strftime(_DATE_FORMAT), run_end.strftime(_DATE_FORMAT)})
+        raw = snap.final_message if self.scope == "final" else snap.output
+        checked, outside, unreadable = [], [], []
+        stated: list[tuple[str, list[datetime]]] = []
+        for line in self._labelled_lines(raw):
+            found, skipped = _stated_times(line, dates)
+            unreadable.extend(skipped)
+            for text, instants in found:
+                checked.append(text)
+                stated.append((text, instants))
+                if not any(earliest <= instant <= latest for instant in instants):
+                    outside.append(text)
+        window = f"{earliest.isoformat(timespec='seconds')} to {latest.isoformat(timespec='seconds')}"
+        not_read = (
+            f"; not read (not a real date and time): {unreadable}" if unreadable else ""
+        )
+        if outside:
+            return VerificationResult(
+                success=False,
+                elapsed_time=time.monotonic() - start,
+                reason=f"observation time(s) outside the run's window ({window}): {outside}{not_read}",
+            )
+        if not checked:
+            return VerificationResult(
+                success=True,
+                elapsed_time=time.monotonic() - start,
+                reason=f"the report states no observation time this check reads{not_read}",
+            )
+        read, withheld, clipped = _read_minutes(snap.trajectory, dates)
+        unsourced = [
+            text for text, instants in stated if not any(_minute(i) in read for i in instants)
+        ]
+        if unsourced:
+            gaps = withheld + list(snap.worker_capture_gaps or [])
+            if _delegated_without_capture(snap):
+                gaps.append(_NO_WORKER_CAPTURE_GAP)
+            if gaps:
+                return VerificationResult(
+                    success=False,
+                    status="error",
+                    elapsed_time=time.monotonic() - start,
+                    reason=_UNSOURCED_WITH_GAPS_REASON.format(times=unsourced, gaps="; ".join(gaps)),
+                )
+            return VerificationResult(
+                success=False,
+                elapsed_time=time.monotonic() - start,
+                reason=(
+                    f"observation time(s) no tool output in the run shows, to the minute: {unsourced}"
+                    + (f" ({clipped} result(s) were clipped and read as far as they went)" if clipped else "")
+                    + not_read
+                ),
+            )
+        return VerificationResult(
+            success=True,
+            elapsed_time=time.monotonic() - start,
+            reason=f"{len(checked)} observation time(s) inside the run's window ({window}) and read from a tool output{not_read}",
         )
 
 
@@ -1638,6 +2046,18 @@ _DELTA_RE = re.compile(
 _ALL_FINDINGS_RE = re.compile(
     r"^[ \t]*<!--[ \t]*audit-findings-all:[ \t]*(\[[^\n]*?\])[ \t]*-->[ \t]*$", re.M
 )
+
+# What `every_finding_named` counts as a name: audit_report's finding heading
+# (`FINDING_MARKER_RE`'s shape) and inline code outside HTML comments.
+_HEADING_ID_RE = re.compile(r"^####[ \t].*?<!--[ \t]*finding:[ \t]*(\S+?)[ \t]*-->[ \t]*$", re.M)
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+# The notice audit_report's `_render_findings` writes when it omits findings.
+_OMITTED_NOTICE_RE = re.compile(r"(\d+) further finding\(s\) are omitted from this description")
+# Mirrors audit_report's `HELD_IDS_RE`: the held ids its held span records.
+_HELD_IDS_RE = re.compile(r"<!--[ \t]*audit-held-ids:[ \t]*(\[.*?\])[ \t]*-->", re.S)
+_CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
+# Ids quoted in an `every_finding_named` failure; the count is always exact.
+_MAX_UNNAMED_IN_REASON = 5
 
 # Bound on issue URLs fetched from one report. An audit reply names its ledger
 # once; anything past a handful is a report to look at by hand, not a set of
@@ -2969,6 +3389,224 @@ class ReplyIsSilentVerifier(BaseVerifier):
         return VerificationResult(success=False, elapsed_time=time.monotonic() - start, reason=reason)
 
 
+# ``verified_claims_backed``: one evidence block as ``kanban_complete`` renders
+# it (``deploy/docker/patches/kanban_verified_claims.py``): a fence holding
+# ``$ <command>``, which may span lines, then a fence holding the output
+# excerpt, with the output fence opening on the line right after the command
+# fence closes and carrying no info string, as the gate renders it. The gate
+# refuses a fence inside either, so neither group may cross one. A lone ``$``
+# fence, such as a suggested fix, or one followed by a manifest fence, is not
+# a block and cannot swallow the block after it.
+_EVIDENCE_BLOCK_RE = re.compile(
+    r"```[^\n]*\n\$ ((?:(?!```).)*?)\n```\n```\n((?:(?!```).)*?)\n?```", re.S
+)
+# The gate's own section heading, which says "verified" itself; taken out
+# before the reply is searched for the label.
+_EVIDENCE_HEADING = "**Evidence for verified claims**"
+_VERIFIED_LABEL_RE = re.compile(r"\bverified\b", re.I)
+# ``worker_trajectory.clip``'s marker on a result cut in the pod.
+_CLIPPED_RESULT_RE = re.compile(r" \.\.\.\[clipped \d+ chars\]$")
+# The head of a terminal result as the pod stores it: ``{"output": "``.
+_OUTPUT_HEAD_RE = re.compile(r'^\{\s*"output":\s*"')
+# The longest escape a cut can split (``\uXXXX``), trimmed one character at a
+# time until the head decodes.
+_MAX_SPLIT_ESCAPE = 6
+# ``AuditRedactor.EMAIL_PATTERN`` and its marker
+# (``agents/chat/defaults/plugins/common/redactor.py``): the pod masks an
+# address in the trajectory, and the gate's own redaction does not, so the
+# reply's copy is masked the same way before it is compared.
+_EMAIL_RE = re.compile(
+    r"[a-zA-Z0-9._%+\-]+@(?!(?:[a-zA-Z0-9\-]+\.)*gserviceaccount\.com(?!\.?[\w\-]))[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}"
+)
+_EMAIL_MARKER = "[REDACTED_EMAIL]"
+# What every marker the pod writes starts with (``[REDACTED_SECRET]``,
+# ``[REDACTED_EMAIL]``, ...): a span of the worker's text the stored copy no
+# longer holds.
+_REDACTED_PREFIX = "[REDACTED"
+_REDACTED_SPAN_RE = re.compile(r"\\\[REDACTED_[A-Z_]*\\\]")
+# What a redacted span of a command may stand for: one word, with no shell
+# separator that would start a second command.
+_REDACTED_WORD = r"[^\s;&|<>()$`]*"
+# Spaces around JSON and YAML punctuation, which the pod's re-serialisation
+# adds or drops.
+_JSON_SPACING_RE = re.compile(r"\s*([,:{}\[\]])\s*")
+_WORD_CHAR_RE = re.compile(r"\w")
+# ``kanban_verified_claims.MIN_EXCERPT_CHARS``: the fewest characters besides
+# whitespace an excerpt may hold, unless it is the command's whole output.
+_MIN_EXCERPT_CHARS = 8
+# A ``\uXXXX`` escape. The pod re-serialises a JSON output with
+# ``json.dumps``, which escapes every non-ASCII character, and kubectl escapes
+# ``&``, ``<`` and ``>`` the same way, so both copies are compared unescaped.
+_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+
+def _squeezed(text: str) -> str:
+    """``text`` with ``\\uXXXX`` escapes undone, addresses masked, whitespace collapsed, and none around ``,:{}[]``.
+
+    The pod re-serialises a JSON output with ``", "`` and ``": "`` separators
+    (``worker_trajectory.supplement``), so compact JSON the worker saw and
+    copied differs from the stored text in those spaces and in escapes. Other
+    whitespace is kept as one space, so a word edge still reads as one.
+    """
+    return _JSON_SPACING_RE.sub(r"\1", " ".join(_normalized(text).split()))
+
+
+def _excerpt_in(needle: str, haystack: str) -> bool:
+    """Whether ``needle`` is in ``haystack`` starting and ending on a word edge, as the gate requires.
+
+    A side whose own end character is not a word character is an edge already.
+    """
+    start = haystack.find(needle)
+    while start != -1:
+        end = start + len(needle)
+        left = start == 0 or not (_WORD_CHAR_RE.match(needle[0]) and _WORD_CHAR_RE.match(haystack[start - 1]))
+        right = end == len(haystack) or not (_WORD_CHAR_RE.match(needle[-1]) and _WORD_CHAR_RE.match(haystack[end]))
+        if left and right:
+            return True
+        start = haystack.find(needle, start + 1)
+    return False
+
+
+def _normalized(text: str) -> str:
+    """``text`` with ``\\uXXXX`` escapes undone and addresses masked, whitespace kept."""
+    text = _UNICODE_ESCAPE_RE.sub(lambda m: chr(int(m.group(1), 16)), text)
+    text = text.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+    return _EMAIL_RE.sub(_EMAIL_MARKER, text)
+
+
+def _same_command(stored: str, cited: str) -> bool:
+    """Whether the reply's ``cited`` command is the stored one, a redacted span standing for one word.
+
+    The pod's redactor masks a token, password or ``key=value`` value, each of
+    which stops at whitespace, so a span matches only text with no whitespace
+    and no shell separator. It is matched on the whitespace-collapsed text,
+    since squeezing first would let a span swallow a second command.
+    """
+    if _squeezed(stored) == _squeezed(cited):
+        return True
+    if _REDACTED_PREFIX not in stored or not re.search(r"\w", _REDACTED_SPAN_RE.sub("", re.escape(stored))):
+        # A stored command that is only a marker would match any one word.
+        return False
+    stored, cited = " ".join(_normalized(stored).split()), " ".join(_normalized(cited).split())
+    pattern = _REDACTED_SPAN_RE.sub(lambda _: _REDACTED_WORD, re.escape(stored))
+    return re.fullmatch(pattern, cited) is not None
+
+
+def _terminal_output(result: str) -> tuple[str, bool]:
+    """The ``output`` of a terminal result as the trajectory stores it, and whether the pod clipped it.
+
+    The result is the JSON text of ``{"output": ..., "exit_code": ...}``. A
+    clipped one no longer parses; its surviving head is decoded as a JSON
+    string, less any escape the cut split.
+    """
+    clipped = _CLIPPED_RESULT_RE.search(result)
+    if not clipped:
+        try:
+            parsed = json.loads(result)
+        except ValueError:
+            return result, False
+        if isinstance(parsed, dict) and isinstance(parsed.get("output"), str):
+            return parsed["output"], False
+        return result, False
+    head = _OUTPUT_HEAD_RE.sub("", result[: clipped.start()])
+    for cut in range(_MAX_SPLIT_ESCAPE + 1):
+        try:
+            return json.loads('"' + head[: len(head) - cut] + '"'), True
+        except ValueError:
+            continue
+    return head, True
+
+
+@VERIFIERS.register("verified_claims_backed")
+class VerifiedClaimsBackedVerifier(BaseVerifier):
+    """Every piece of evidence in the reply is a command a worker ran, with its real output.
+
+    Reads the ``final_message`` for evidence blocks: a fence holding
+    ``$ <command>``, then a fence holding an excerpt of its output, the shape
+    ``kanban_complete`` renders for ``verified_claims``. Each block's command
+    must equal (whitespace removed) a worker's tagged ``terminal`` or
+    ``execute_code`` call
+    (:func:`_worker_terminal_calls`), on any card, and its excerpt must appear
+    in that call's output. A reply with fewer than ``min_blocks`` blocks fails,
+    and the reason says when it calls something verified with nothing behind
+    it.
+
+    Text is compared with ``\\uXXXX`` escapes undone, addresses masked and
+    whitespace collapsed, with none around JSON punctuation (:func:`_squeezed`).
+    An excerpt must start and end on a word edge and hold at least
+    :data:`_MIN_EXCERPT_CHARS` characters unless it is the command's whole
+    output, as the gate requires. A redacted
+    span of a stored command matches one word (:func:`_same_command`). An excerpt missing
+    from an output the pod clipped (``worker_trajectory.MAX_RESULT_CHARS``) or
+    redacted is not held against the reply: the command is checked and the
+    pass says the excerpt was not, since the gate checked it against the
+    output the worker saw. A block whose command is missing is an
+    error, not a fail, while ``worker_capture_gaps`` reports a gap or the pod
+    withheld the workers' arguments; so is any block when the trajectory holds
+    no worker terminal call at all.
+    """
+
+    type: Literal["verified_claims_backed"]
+    min_blocks: int = Field(default=1, ge=0)
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+
+        def done(status: str, reason: str) -> VerificationResult:
+            return VerificationResult(
+                success=status == "pass", status=status, elapsed_time=time.monotonic() - start, reason=reason
+            )
+
+        snap = transcript.get()
+        if snap is None:
+            return done("error", _NO_TRANSCRIPT_REASON)
+        reply = snap.final_message
+        blocks = _EVIDENCE_BLOCK_RE.findall(reply)
+        if len(blocks) < self.min_blocks:
+            labelled = _VERIFIED_LABEL_RE.search(reply.replace(_EVIDENCE_HEADING, ""))
+            what = "calls claims verified with" if labelled else "has"
+            return done("fail", f"the reply {what} {len(blocks)} evidence block(s) (a $ command fence, then an "
+                        f"output fence); at least {self.min_blocks} required")
+        calls = [(command, result) for _, _, command, result, _ in _worker_terminal_calls(snap.trajectory)]
+        withheld = any(
+            entry.get("agent") and entry.get("name") in _CODE_TOOLS and _args_withheld(entry)
+            for entry in snap.trajectory if isinstance(entry, dict)
+        )
+        if blocks and not calls and not (snap.worker_capture_gaps or withheld):
+            return done("error", f"the reply has {len(blocks)} evidence block(s), but the trajectory holds no "
+                        "worker terminal call to check them against")
+        unknown: list[str] = []
+        unchecked: list[str] = []
+        for command, excerpt in blocks:
+            runs = [_terminal_output(result) for ran, result in calls if _same_command(ran, command)]
+            needle = _squeezed(excerpt)
+            if not runs:
+                if snap.worker_capture_gaps or withheld:
+                    why = "; ".join(snap.worker_capture_gaps or ["the pod withheld the workers' arguments"])
+                    unknown.append(f"{command!r} is not in a trajectory that is incomplete: {why}")
+                    continue
+                return done("fail", f"evidence command {command!r} is not a command any worker ran")
+            short = len("".join(excerpt.split())) < _MIN_EXCERPT_CHARS
+            if short and any(needle == _squeezed(output) for output, clipped in runs if not clipped):
+                continue
+            if short:
+                return done("fail", f"evidence for {command!r} holds fewer than {_MIN_EXCERPT_CHARS} characters "
+                            "and is not the command's whole output")
+            if any(_excerpt_in(needle, _squeezed(output)) for output, _ in runs):
+                continue
+            if any(clipped or _REDACTED_PREFIX in output for output, clipped in runs):
+                unchecked.append(command)
+                continue
+            return done("fail", f"evidence excerpt {excerpt[:_REPLY_QUOTE_CHARS]!r} is not in the output of {command!r}")
+        if unknown:
+            return done("error", "; ".join(unknown))
+        if unchecked:
+            return done("pass", f"{len(blocks)} evidence block(s), each a command a worker ran; "
+                        f"{len(unchecked)} excerpt(s) not checked, output clipped or redacted in the pod: "
+                        f"{', '.join(repr(c) for c in unchecked)}")
+        return done("pass", f"{len(blocks)} evidence block(s), each a worker's command with its real output")
+
+
 def _agent_shell(script: str, timeout: float) -> str:
     # Lazy: the harness pulls in the agent transport, which a spec load does not need.
     from kube_agents_bench.harness import _agent_shell as shell
@@ -3203,6 +3841,15 @@ def _finding_ids(body: str) -> tuple[list[str], str] | None:
     return [i for i in ids if isinstance(i, str)], source
 
 
+def _json_str_list(payload: str) -> list[str]:
+    """The strings of a JSON list, or [] when it does not parse as one."""
+    try:
+        value = json.loads(payload)
+    except (ValueError, TypeError):
+        return []
+    return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
+
+
 @VERIFIERS.register("ledger_issue_contains")
 class LedgerIssueContainsVerifier(BaseVerifier):
     """Phrase checks against the GitHub ledger issue this run published.
@@ -3317,6 +3964,10 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     forbidden_phrases: list[str] = Field(default_factory=list)
     any_of_phrases: list[str] = Field(default_factory=list)
     scope: Literal["body", "finding_ids"] = "body"
+    # Every id the ledger files must be readable in its body, outside the two
+    # hidden id blocks: a finding cut for space and named only in
+    # `audit-findings-all` is filed but invisible to the person reading it.
+    every_finding_named: bool = False
     # Tolerance on the ledger stamp vs. the harness's run-start clock, which
     # are two different machines (the Prow runner and the agent pod). Small on
     # purpose: every second of it is a second of a previous run's ledger that
@@ -3621,6 +4272,33 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             text = ledger["body"].lower()
             surface = f"the body of {ledger['slug']}"
 
+        unnamed: list[str] = []
+        omitted_unlisted: re.Match | None = None
+        if self.every_finding_named:
+            filed = _finding_ids(ledger["body"])
+            if filed is None:
+                return done(
+                    False,
+                    f"{ledger['slug']} carries no readable "
+                    "<!-- audit-findings: [...] --> delta block, so whether it "
+                    "names every finding it filed cannot be read off it",
+                )
+            # Named means a heading a reader sees, or the id whole in a code
+            # span outside any HTML comment: a bare substring would let `x.orders`
+            # pass on a visible `x.orders-api`.
+            body = ledger["body"]
+            named = set(_HEADING_ID_RE.findall(body))
+            named |= set(_CODE_SPAN_RE.findall(_HTML_COMMENT_RE.sub("", body)))
+            # Collector-held ids are the collector's, rendered in what the
+            # findings leave; this check grades the findings the run filed.
+            held = {fid for match in _HELD_IDS_RE.findall(body) for fid in _json_str_list(match)}
+            unnamed = [fid for fid in filed[0] if fid not in named and fid not in held]
+            # Past its cap the complete-id block is left out and `filed` is the
+            # delta block, which lacks the omitted ids; the renderer's omission
+            # notice still says they exist.
+            if filed[1] == "audit-findings":
+                omitted_unlisted = _OMITTED_NOTICE_RE.search(_HTML_COMMENT_RE.sub("", body))
+
         missing = [p for p in self.required_phrases if p.lower() not in text]
         present = [p for p in self.forbidden_phrases if p.lower() in text]
         any_of_miss = bool(self.any_of_phrases) and not any(
@@ -3631,8 +4309,20 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             "generated_at": generated_at.isoformat(),
             "scope": self.scope,
         }
-        if missing or present or any_of_miss:
+        if missing or present or any_of_miss or unnamed or omitted_unlisted:
             parts = []
+            if omitted_unlisted:
+                parts.append(
+                    f"{ledger['slug']} says {omitted_unlisted.group(1)} further finding(s) are "
+                    "omitted from its description and carries no audit-findings-all block "
+                    "to name them, so they are filed but named nowhere"
+                )
+            if unnamed:
+                parts.append(
+                    f"{len(unnamed)} filed finding id(s) appear only in the hidden id "
+                    f"blocks of {ledger['slug']}, not in its visible body: "
+                    f"{unnamed[:_MAX_UNNAMED_IN_REASON]}"
+                )
             if missing:
                 parts.append(f"required phrases absent from {surface}: {missing}")
             if present:
@@ -3654,6 +4344,8 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             satisfied.append(
                 f"at least one of {len(self.any_of_phrases)} alternative phrasing(s)"
             )
+        if self.every_finding_named:
+            satisfied.append("a visible name for every filed finding")
         return done(
             True,
             f"{surface}, generated at {generated_at.isoformat()} by this run, "
@@ -4127,6 +4819,13 @@ class PullRequestOpenedVerifier(BaseVerifier):
     # meant to protect. Listed from `/pulls/{n}/files`, so the credential needs
     # `pull_requests: read`.
     unchanged_paths: list[str] = Field(default_factory=list)
+    # Repository paths, as `fnmatch` globs, the pull request must delete: each
+    # glob is matched by at least one file the pull request lists as
+    # `removed`. A delete reaches review as the removal of the manifest that
+    # declares the object; a pull request that adds a marker or edits the
+    # manifest in place leaves the declaration, and merging it keeps the
+    # object. Listed from `/pulls/{n}/files`, as `unchanged_paths` is.
+    removed_paths: list[str] = Field(default_factory=list)
     # Assertions over what the pull request writes (see PullRequestContentCheck):
     # the object a provisioning case expects, with the fields it must carry,
     # rather than only that some file changed. Read from `/pulls/{n}/files`,
@@ -4187,16 +4886,12 @@ class PullRequestOpenedVerifier(BaseVerifier):
             )
         return texts, None
 
-    def _changed_paths(
+    def _file_entries(
         self, owner: str, repo: str, number: int, token: str, budget: float
-    ) -> tuple[list[str], str | None]:
-        """``(paths the pull request changes, unevaluable reason)``.
-
-        A rename counts under both names: moving the declaration away is as
-        much a change to it as rewriting it.
-        """
+    ) -> tuple[list[dict], str | None]:
+        """``(the entries of /pulls/{n}/files, unevaluable reason)``."""
         base = f"{forges.github_api_root()}/repos/{owner}/{repo}/pulls/{number}/files"
-        paths: list[str] = []
+        entries: list[dict] = []
         for page in range(1, _PR_FILES_MAX_PAGES + 1):
             status, files = _http_get_json(
                 f"{base}?per_page={_PR_FILES_PAGE_SIZE}&page={page}", token, budget
@@ -4207,12 +4902,43 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     "the token needs `pull_requests: read` to check which paths the "
                     "fix changes, so this check could not be evaluated"
                 )
-            for entry in files:
-                if isinstance(entry, dict):
-                    paths += [str(entry[key]) for key in ("filename", "previous_filename") if entry.get(key)]
+            entries += [entry for entry in files if isinstance(entry, dict)]
             if len(files) < _PR_FILES_PAGE_SIZE:
                 break
-        return paths, None
+        return entries, None
+
+    def _changed_paths(
+        self, owner: str, repo: str, number: int, token: str, budget: float
+    ) -> tuple[list[str], str | None]:
+        """``(paths the pull request changes, unevaluable reason)``.
+
+        A rename counts under both names: moving the declaration away is as
+        much a change to it as rewriting it.
+        """
+        entries, unevaluable = self._file_entries(owner, repo, number, token, budget)
+        paths = [
+            str(entry[key])
+            for entry in entries
+            for key in ("filename", "previous_filename")
+            if entry.get(key)
+        ]
+        return paths, unevaluable
+
+    def _removed_paths(
+        self, owner: str, repo: str, number: int, token: str, budget: float
+    ) -> tuple[list[str], str | None]:
+        """``(paths the pull request deletes, unevaluable reason)``.
+
+        Only status `removed` counts. A rename moves the declaration rather
+        than deleting it, so a renamed file's old name is not a removal.
+        """
+        entries, unevaluable = self._file_entries(owner, repo, number, token, budget)
+        removed = [
+            str(entry["filename"])
+            for entry in entries
+            if entry.get("status") == "removed" and entry.get("filename")
+        ]
+        return removed, unevaluable
 
     def _spent_before(
         self,
@@ -4890,6 +5616,15 @@ class PullRequestOpenedVerifier(BaseVerifier):
                         "files and are not implemented for GitLab, so this check could not be evaluated"
                     )
                     continue
+                if verdict == "pass" and self.removed_paths:
+                    # removed_paths reads GitHub's file listing too; a merge request
+                    # that adds a marker passes every other clause, so ungraded on
+                    # what it removes it is not a pass either.
+                    unresolved.append(
+                        f"{full}!{number}: `removed_paths` reads GitHub's pull request "
+                        "files and is not implemented for GitLab, so this check could not be evaluated"
+                    )
+                    continue
                 if verdict == "pass":
                     return done(True, reason, raw=raw)
                 (rejected if verdict == "reject" else unresolved).append(reason)
@@ -5011,6 +5746,26 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     continue
                 if rejection:
                     rejected.append(rejection)
+                    continue
+            if self.removed_paths:
+                try:
+                    removed, unevaluable = self._removed_paths(owner, repo, number, token, budget)
+                except OSError as exc:
+                    unresolved.append(f"could not reach the GitHub API for {slug}: {exc}")
+                    continue
+                if unevaluable:
+                    unresolved.append(unevaluable)
+                    continue
+                kept = [
+                    pattern for pattern in self.removed_paths
+                    if not any(fnmatch.fnmatchcase(path, pattern) for path in removed)
+                ]
+                if kept:
+                    rejected.append(
+                        f"{slug}: does not remove {', '.join(kept)}, which this case "
+                        "requires the pull request to delete (`removed_paths`) -- a "
+                        "delete that leaves the declaration keeps the object"
+                    )
                     continue
             if self.unchanged_paths:
                 try:
@@ -6010,6 +6765,80 @@ class BootstrapReportCriticalsVerifier(_OnboardingPollVerifier):
         if padded:
             return "fail", f"the report's {len(items)} numbered item(s) {counts}{padding}", raw
         return "pass", f"the report's {len(items)} numbered item(s) {counts}, the limit of {self.limit}: {named}", raw
+
+
+# The report's one title line: a heading, or a bold line with no sentence end, as the Slack
+# presenter's title rule reads it. Only the first line can be the title.
+_TITLE_RE = re.compile(r"^\s*(?:#{1,6}\s.*|\*\*[^*\n]*[^*\n.!?\s]\s*\*\*)\s*$")
+
+
+def _report_body(text: str) -> str:
+    """The report with its first line dropped when that line is its title, every run of whitespace one space.
+
+    Any other heading or bold line stays in the text, so a verdict written as a second heading
+    or as a bold sentence before the counts fails the opening check.
+    """
+    lines = text.splitlines()
+    first = next((i for i, line in enumerate(lines) if line.strip()), None)
+    if first is not None and _TITLE_RE.match(lines[first]):
+        del lines[first]
+    return " ".join(" ".join(lines).split())
+
+
+@VERIFIERS.register("bootstrap_report_posture")
+class BootstrapReportPostureVerifier(_OnboardingPollVerifier):
+    """Checks that the onboarding report opens with the posture the SOP fixes.
+
+    The prioritization SOP (Step 6) has the worker open the report with what
+    was scanned and then the posture line ``inventory_findings.py select``
+    prints, which counts the scan's own checks and leaves the rest to the
+    first-run audits. A verdict on the fleet ("healthy", "no critical
+    vulnerabilities") there contradicts those audits minutes later. This reads,
+    off the shell sandbox (:mod:`kube_agents_bench.onboarding`), the report the
+    worker wrote, delivered copy first.
+
+    ``posture``: the paragraphs the report opens with, after its heading, in
+    order. Passes when the report's text, its title line dropped and whitespace
+    collapsed, starts with them, so a sentence added before or between them is
+    a fail, and when none of ``forbidden_patterns`` (case-insensitive) matches
+    anywhere in the report, headings included. No report, or one that cannot be read, is a fail; an
+    unreadable sandbox is ``status="error"``.
+    """
+
+    type: Literal["bootstrap_report_posture"]
+    posture: list[str] = Field(min_length=1)
+    forbidden_patterns: list[str] = Field(default_factory=list)
+
+    @field_validator("forbidden_patterns")
+    @classmethod
+    def _compiles(cls, patterns: list[str]) -> list[str]:
+        for pattern in patterns:
+            re.compile(pattern)
+        return patterns
+
+    def _check(self, read_timeout: float) -> tuple[VerificationStatus, str, dict[str, Any] | None]:
+        read = onboarding.read_scored_report(onboarding.sandbox_shell, read_timeout)
+        pod = onboarding.sandbox_pod()
+        if read is None:
+            return "error", f"{pod} could not be read (kubectl exec failed or the command did not run)", None
+        report, text = read.get("report"), read.get("text") or ""
+        raw: dict[str, Any] = {"report": report, "text": text}
+        if report == "absent":
+            return "fail", f"there is no INVENTORY.md or INVENTORY.delivered.md on {pod}: the worker wrote no report", raw
+        if report == "unreadable":
+            return "fail", f"the report on {pod} cannot be read: {text}", raw
+        body = _report_body(text)
+        expected = " ".join(" ".join(paragraph.split()) for paragraph in self.posture)
+        # Headings included: a verdict in a heading reaches the user as written.
+        full = " ".join(text.split())
+        verdicts = sorted({m.group(0) for p in self.forbidden_patterns for m in re.finditer(p, full, re.IGNORECASE)})
+        raw.update({"opening": body[: len(expected) + 200], "verdicts": verdicts})
+        if not body.startswith(expected):
+            return "fail", f"the report does not open with the posture the SOP fixes; it opens: {body[: len(expected) + 80]!r}", raw
+        if verdicts:
+            return "fail", f"the report judges the fleet, which its posture line leaves to the first-run audits: {verdicts}", raw
+        judged = " and has none of the forbidden verdicts" if self.forbidden_patterns else ""
+        return "pass", f"the report opens with the scan counts and the posture line{judged}", raw
 
 
 # The check rosters of the four audits the oobe stage runs after the scan

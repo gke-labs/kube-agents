@@ -62,6 +62,8 @@ KEY = {
     "fleet": 1,
     "verifiers": 1,
 }
+# The same software graded under spec.mode next (the inject lane).
+NEXT_KEY = {**KEY, "mode": "next"}
 
 
 @pytest.fixture(autouse=True)
@@ -87,6 +89,8 @@ def _clean_env(monkeypatch):
         "EVAL_BASELINE_CAT_WORKERS",
         "BUILD_ID",
         "PROW_JOB_ID",
+        "AGENT_TRANSPORT",
+        "EVAL_ROLLBACK_LANE",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -797,8 +801,8 @@ def store_with(tmp_path: Path, *lines: dict) -> Path:
     return root
 
 
-def baseline_line(case: str, *, runs: int, passes: int, judged=None, at="2026-08-01T00:00:00Z"):
-    doc = {"case": case, "recorded_at": at, "key": KEY, "runs": runs, "passes": passes}
+def baseline_line(case: str, *, runs: int, passes: int, judged=None, at="2026-08-01T00:00:00Z", key=None):
+    doc = {"case": case, "recorded_at": at, "key": key or KEY, "runs": runs, "passes": passes}
     if judged:
         doc["judged"] = judged
     return doc
@@ -914,23 +918,81 @@ def test_record_skips_a_case_the_inject_lane_set_aside_whole(tmp_path, capsys):
     assert run_record(store, doc) == 0
     printed = capsys.readouterr().out
     assert "3 of 3 repetition(s) not applicable on this transport" in printed
-    assert "not recorded, the store holds api-lane evidence only" in printed
+    assert "not recorded at a today key, whose window is the api lane's" in printed
     assert "blocked or hit infrastructure" not in printed
     assert list(store.glob("*.jsonl")) == []
 
 
 def test_record_skips_a_case_graded_with_a_check_set_aside(tmp_path, capsys):
     """The captured inject shape: three passes, each with the tool_called
-    check set aside. Recording it would file a 3/3 line, graded on half the
-    case's objectives, beside the api lane's record at the same version key
-    -- evidence the api lane would not have produced, and admission reads it."""
+    check set aside. At a today key, recording it would file a 3/3 line,
+    graded on half the case's objectives, beside the api lane's record --
+    evidence the api lane would not have produced, and admission reads it."""
     store = store_with(tmp_path)
     doc = case_file(
         tmp_path, "a", version_key=KEY,
         reps=[{"outcome": "pass", "not_applicable_checks": ["the-kanban-card-was-actually-filed"]}] * 3,
     )
     assert run_record(store, doc) == 0
-    assert "not recorded, the store holds api-lane evidence only" in capsys.readouterr().out
+    assert "not recorded at a today key" in capsys.readouterr().out
+    assert list(store.glob("*.jsonl")) == []
+
+
+def test_record_files_a_set_aside_check_under_the_next_key(tmp_path):
+    """At a next key the set-aside check is the window's own shape: every
+    next-mode run goes through the same door, so the graded repetitions are
+    recorded, under the mode, and only there."""
+    store = store_with(tmp_path)
+    doc = case_file(
+        tmp_path, "a", version_key=NEXT_KEY,
+        reps=[{"outcome": "pass", "not_applicable_checks": ["the-kanban-card-was-actually-filed"]}] * 3,
+    )
+    assert run_record(store, doc) == 0
+    line = json.loads((store / "a.jsonl").read_text().strip())
+    assert line["key"] == NEXT_KEY and line["key"]["mode"] == "next"
+    assert (line["runs"], line["passes"]) == (3, 3)
+
+
+def test_record_counts_a_whole_set_aside_repetition_as_neither_at_the_next_key(tmp_path, capsys):
+    """A repetition set aside whole has no pass or fail to count, whatever the
+    key; with nothing else graded there is nothing to file."""
+    store = store_with(tmp_path)
+    doc = case_file(
+        tmp_path, "a", version_key=NEXT_KEY, scored=0, passes=0,
+        reps=[{"outcome": "not_applicable", "not_applicable_checks": ["card"]}] * 3,
+    )
+    assert run_record(store, doc) == 0
+    printed = capsys.readouterr().out
+    assert "no repetition produced a pass or a fail (3 not applicable on this transport)" in printed
+    assert "blocked or hit infrastructure" not in printed
+    assert list(store.glob("*.jsonl")) == []
+
+    mixed = case_file(
+        tmp_path, "b", version_key=NEXT_KEY,
+        reps=[{"outcome": "not_applicable", "not_applicable_checks": ["card"]}, {"outcome": "fail"}, {"outcome": "pass"}],
+    )
+    assert run_record(store, mixed) == 0
+    line = json.loads((store / "b.jsonl").read_text().strip())
+    assert (line["runs"], line["passes"]) == (2, 1)
+
+
+def test_record_writes_a_today_key_without_a_mode(tmp_path):
+    """Today's key serialises as the five fields every existing line carries,
+    so a today record written now is byte-compatible with the history."""
+    store = store_with(tmp_path)
+    doc = case_file(tmp_path, "a", version_key=KEY, reps=[{"outcome": "pass"}])
+    assert run_record(store, doc) == 0
+    assert "mode" not in json.loads((store / "a.jsonl").read_text().strip())["key"]
+
+
+def test_record_refuses_to_run_on_the_today_lane(tmp_path, monkeypatch, capsys):
+    """The today lane's periodic grades an install rolled back from next over
+    the api transport: its key reads today, but today's window measures a
+    fresh today install. The shell keeps it out; this is the second guard."""
+    monkeypatch.setenv("EVAL_ROLLBACK_LANE", "1")
+    store = store_with(tmp_path)
+    assert run_record(store, case_file(tmp_path, "a", version_key=KEY, reps=[{"outcome": "pass"}])) == 2
+    assert "EVAL_ROLLBACK_LANE=1" in capsys.readouterr().err
     assert list(store.glob("*.jsonl")) == []
 
 
@@ -1287,6 +1349,54 @@ def test_an_explicit_baseline_rate_still_overrides_the_store(tmp_path):
     ]) == 0
 
 
+def test_the_aggregate_falls_back_to_today_for_a_next_case_with_no_next_window(tmp_path, capsys):
+    """Rung 6 reads same-mode history only, but the admitted-case aggregate
+    is one advisory number for the whole run: a next-mode case with nothing
+    at its next key keeps main's today lines on main's side, as it had before
+    the mode was on the key, and the verdict says so."""
+    store = store_with(tmp_path, baseline_line("a", runs=20, passes=20))
+    doc = case_file(tmp_path, "a", version_key=NEXT_KEY, passes=3, scored=3)
+    out = tmp_path / "suite.json"
+    assert main([
+        "suite", "--case-result", str(doc), "--baseline-dir", str(store),
+        "--json-out", str(out),
+    ]) == 0
+    assert json.loads(out.read_text(encoding="utf-8"))["baseline_rate"] == 1.0
+    printed = capsys.readouterr().out
+    assert "aggregate compared with today-mode history" in printed
+    assert "`a`" in printed
+
+
+def test_the_aggregate_prefers_same_mode_history(tmp_path, capsys):
+    """Where a next window exists the aggregate reads it, not today's, and
+    no fallback is reported."""
+    store = store_with(
+        tmp_path,
+        baseline_line("a", runs=20, passes=20),
+        baseline_line("a", runs=4, passes=1, key=NEXT_KEY, at="2026-08-02T00:00:00Z"),
+    )
+    doc = case_file(tmp_path, "a", version_key=NEXT_KEY, passes=3, scored=3)
+    out = tmp_path / "suite.json"
+    assert main([
+        "suite", "--case-result", str(doc), "--baseline-dir", str(store),
+        "--json-out", str(out),
+    ]) == 0
+    assert json.loads(out.read_text(encoding="utf-8"))["baseline_rate"] == 0.25
+    assert "today-mode history" not in capsys.readouterr().out
+
+
+def test_the_mode_is_read_off_the_run_without_the_environment(kanban_task, tmp_path, monkeypatch, make_run):
+    """A next run regraded by hand with no AGENT_TRANSPORT exported still
+    files under next: its record carries the inject transport's task marker."""
+    monkeypatch.setenv("JUDGE_MODEL", JUDGE)
+
+    def injected(rec):
+        rec.setdefault("trajectory", []).append({"name": "inject.task"})
+
+    doc = graded_case(kanban_task, [make_run(mutate=injected)], tmp_path / "case.json", store_with(tmp_path / "empty"))
+    assert doc["version_key"] == NEXT_KEY
+
+
 def test_an_unadmitted_case_contributes_nothing_to_either_side(tmp_path):
     """It failed everything and main passed everything, and the suite is still
     green: an unscreened case's rate is not yet a number worth comparing, and
@@ -1346,6 +1456,110 @@ def test_rung_6_arms_itself_once_the_store_has_judged_evidence(
     doc = graded_case(kanban_task, runs, out, seeded)
     assert doc["rung"] == 6 and doc["blocking"] is True
     assert doc["baseline_judged"]["OutcomeValidity"] == 1.0
+
+
+def _sour(rec):
+    rec["scores"]["OutcomeValidity"]["score"] = 0.1
+
+
+def _judged_history(tmp_path, key=None, nights=7):
+    """Main's record of agent-kanban-smoke judged at 1.0, at ``key``."""
+    return store_with(
+        tmp_path,
+        *[
+            baseline_line(
+                "agent-kanban-smoke", runs=3, passes=3,
+                judged={"OutcomeValidity": {"mean": 1.0, "n": 3}},
+                at=f"2026-08-0{i + 1}T00:00:00Z", key=key,
+            )
+            for i in range(nights)
+        ],
+    )
+
+
+def test_an_inject_run_is_not_compared_with_todays_history(kanban_task, tmp_path, monkeypatch, make_run):
+    """The 2026-10-17 shape: main's judged record is today's, and the inject
+    run grades next. The run's key carries mode next, the today window does
+    not match it, and the same sour runs that red on rung 6 against their
+    own mode's history do not red here: an empty window is the quiet one."""
+    monkeypatch.setenv("JUDGE_MODEL", JUDGE)
+    monkeypatch.setenv("BOOTSTRAP_ADMITTED", "agent-kanban-smoke")
+    monkeypatch.setenv(gate.AGENT_TRANSPORT_ENV, gate.TRANSPORT_INJECT)
+    runs = [make_run(mutate=_sour) for _ in range(3)]
+    doc = graded_case(kanban_task, runs, tmp_path / "case.json", _judged_history(tmp_path / "today"))
+    assert doc["version_key"] == NEXT_KEY
+    assert doc["rung"] != 6 and doc["blocking"] is False
+    assert doc["baseline_judged"] is None and doc["baseline_runs"] == 0
+    assert doc["record_verdict"] == "stale"
+
+
+def test_rung_6_compares_an_inject_run_with_next_history(kanban_task, tmp_path, monkeypatch, make_run):
+    """Back on for the inject lane once a same-mode window exists: the same
+    sour runs red on rung 6 against main's next-mode record, and only that
+    record is read (a better today record beside it changes nothing)."""
+    monkeypatch.setenv("JUDGE_MODEL", JUDGE)
+    monkeypatch.setenv("BOOTSTRAP_ADMITTED", "agent-kanban-smoke")
+    monkeypatch.setenv(gate.AGENT_TRANSPORT_ENV, gate.TRANSPORT_INJECT)
+    runs = [make_run(mutate=_sour) for _ in range(3)]
+    store = _judged_history(tmp_path / "next", key=NEXT_KEY)
+    with (store / "agent-kanban-smoke.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(baseline_line(
+            "agent-kanban-smoke", runs=3, passes=3,
+            judged={"OutcomeValidity": {"mean": 0.05, "n": 3}}, at="2026-08-09T00:00:00Z",
+        )) + "\n")
+    doc = graded_case(kanban_task, runs, tmp_path / "case.json", store)
+    assert doc["rung"] == 6 and doc["blocking"] is True
+    assert doc["baseline_judged"]["OutcomeValidity"] == 1.0
+    assert doc["baseline_runs"] == 21
+
+
+def test_rung_6_compares_an_inject_run_with_a_thin_next_window(kanban_task, tmp_path, monkeypatch, make_run):
+    """The thin-window rule is the one today's key has always had: a partial
+    window (one night, three runs) is measured on main and is compared."""
+    monkeypatch.setenv("JUDGE_MODEL", JUDGE)
+    monkeypatch.setenv("BOOTSTRAP_ADMITTED", "agent-kanban-smoke")
+    monkeypatch.setenv(gate.AGENT_TRANSPORT_ENV, gate.TRANSPORT_INJECT)
+    runs = [make_run(mutate=_sour) for _ in range(3)]
+    doc = graded_case(kanban_task, runs, tmp_path / "case.json", _judged_history(tmp_path / "thin", key=NEXT_KEY, nights=1))
+    assert doc["record_verdict"] == "collecting"
+    assert doc["rung"] == 6 and doc["baseline_runs"] == 3
+
+
+def test_a_today_run_is_not_compared_with_next_history(kanban_task, tmp_path, monkeypatch, make_run):
+    """The other direction: the today lane (api transport) reads today's
+    window only, so next's record cannot red it."""
+    monkeypatch.setenv("JUDGE_MODEL", JUDGE)
+    monkeypatch.setenv("BOOTSTRAP_ADMITTED", "agent-kanban-smoke")
+    runs = [make_run(mutate=_sour) for _ in range(3)]
+    doc = graded_case(kanban_task, runs, tmp_path / "case.json", _judged_history(tmp_path / "next", key=NEXT_KEY))
+    assert doc["version_key"] == KEY
+    assert doc["rung"] != 6 and doc["baseline_judged"] is None
+
+
+def test_an_inject_record_is_next_whatever_the_environment():
+    assert gate.graded_mode({}, inject_run=True) == "next"
+    assert gate.graded_mode({"AGENT_TRANSPORT": "api"}, inject_run=True) == "next"
+
+
+@pytest.mark.parametrize(
+    "env, mode",
+    [
+        ({}, "today"),
+        ({"AGENT_TRANSPORT": "api"}, "today"),
+        ({"AGENT_TRANSPORT": "inject"}, "next"),
+        # The today lane: the flag set for its deploy, the matrix over the api.
+        ({"EVAL_MODE_NEXT": "1", "EVAL_ROLLBACK_LANE": "1"}, "today"),
+        ({"EVAL_MODE_NEXT": "1", "AGENT_TRANSPORT": "inject"}, "next"),
+    ],
+)
+def test_the_graded_mode_is_read_off_the_transport(env, mode):
+    assert gate.graded_mode(env) == mode
+
+
+def test_the_transport_constants_match_the_harness():
+    from kube_agents_bench import harness
+
+    assert gate.TRANSPORT_INJECT == harness.TRANSPORT_INJECT
 
 
 def test_a_corrupt_store_is_never_read_as_an_empty_one(kanban_task, tmp_path, capsys):
