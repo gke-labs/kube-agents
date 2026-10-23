@@ -33,10 +33,11 @@ gcloud services enable \
   gkehub.googleapis.com \
   iam.googleapis.com \
   cloudkms.googleapis.com \
+  dns.googleapis.com \
   --project="${PROJECT_ID}"
 ```
 
-`cloudkms.googleapis.com` is for the GitHub token minter's signing key (section 5); the `ci-pool-minter` composition enables it too, so it is listed here only so a project provisioned by hand does not miss it. `cloudtrace.googleapis.com` is for the observability nightly case, which reads the install's own traces through the credential broker; the full-install composition enables it too. `gkehub.googleapis.com` is for the readiness report's rollout-sequence precheck, which lists the fleet host project's RolloutSequences on `roles/gkehub.viewer`; the full-install composition enables it too, and the role joined the platform GSA's set with it, so a project registered before that needs the binding by hand, in the same idempotent form as the `roles/cloudtrace.user` repair in section 3, plus `gcloud services enable gkehub.googleapis.com`. `compute.googleapis.com` is for the seeded fleet (section 6), which declares the orphan `google_compute_disk` the cost audit looks for and so depends on Compute directly rather than only transitively through GKE.
+`dns.googleapis.com` is for the private zone that resolves the self-managed forges' hosts (section 5.8). `cloudkms.googleapis.com` is for the GitHub token minter's signing key (section 5); the `ci-pool-minter` composition enables it too, so it is listed here only so a project provisioned by hand does not miss it. `cloudtrace.googleapis.com` is for the observability nightly case, which reads the install's own traces through the credential broker; the full-install composition enables it too. `gkehub.googleapis.com` is for the readiness report's rollout-sequence precheck, which lists the fleet host project's RolloutSequences on `roles/gkehub.viewer`; the full-install composition enables it too, and the role joined the platform GSA's set with it, so a project registered before that needs the binding by hand, in the same idempotent form as the `roles/cloudtrace.user` repair in section 3, plus `gcloud services enable gkehub.googleapis.com`. `compute.googleapis.com` is for the seeded fleet (section 6), which declares the orphan `google_compute_disk` the cost audit looks for and so depends on Compute directly rather than only transitively through GKE.
 
 This list and `REQUIRED_APIS` in `scripts/verify_ci_pool_project.py` must agree — the verifier fails a project for an API this block does not mention, and passes one that is missing an API only this block names.
 
@@ -114,11 +115,12 @@ Every registered project was provisioned before the script ran this step. Measur
 
   ```bash
   # The members scripts/provision_ci_pool_project.sh grants. The nightly needs
-  # the same thirteen, not a subset: it runs the same script end to end, so a
+  # the same fourteen, not a subset: it runs the same script end to end, so a
   # partial grant fails at a later step on a later night instead of here.
   PROW_RUNNER_SA="$(sed -n 's/^PROW_RUNNER_SA="\(.*\)"$/\1/p' scripts/provision_ci_pool_project.sh)"
   NIGHTLY_RUNNER_SA="$(sed -n 's/^NIGHTLY_RUNNER_SA="\(.*\)"$/\1/p' scripts/provision_ci_pool_project.sh)"
   for role in roles/cloudbuild.builds.editor roles/cloudbuild.builds.viewer \
+              roles/compute.instanceAdmin.v1 \
               roles/container.admin roles/container.developer \
               roles/iam.serviceAccountAdmin roles/iam.serviceAccountUser \
               roles/logging.logWriter roles/logging.viewer \
@@ -415,7 +417,7 @@ Done when the first call reports `private` with a `default_branch`, the second r
 
 The Prow job and the sweep's GitLab pass in `oss-test-infra` are the rest of #2394.
 
-The self-managed forges ([#3682](https://github.com/gke-labs/kube-agents/issues/3682); the forge table above, the lanes with #3683 and #3684) need no seed of their own: a GitHub Enterprise Server run fronts github.com, so its repository is the pool project's GitHub one above; a self-managed GitLab run stands a GitLab up on a VM in the leased project and creates its project per run, so that lane is to seed the same file at start-up through `seed_repository_file` in `hack/ci_gitlab_forge.py`, and nothing outlives the run for a backfill or the verifier to read.
+The self-managed forges ([#3682](https://github.com/gke-labs/kube-agents/issues/3682); the forge table above, the GHES lane in 5.8, the GitLab CE lane with #3683) need no seed of their own: a GitHub Enterprise Server run fronts github.com, so its repository is the pool project's GitHub one above; a self-managed GitLab run stands a GitLab up on a VM in the leased project and creates its project per run, so that lane is to seed the same file at start-up through `seed_repository_file` in `hack/ci_gitlab_forge.py`, and nothing outlives the run for a backfill or the verifier to read.
 
 ### 5.7 The Compute plant sweep
 
@@ -437,6 +439,34 @@ gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
 ```
 
 If the role exists, `create` fails with `ALREADY_EXISTS`. Then run `gcloud iam roles update` with the same flags, and then the binding. A role created before the alert-policy permissions were added needs the same `update` on every registered project; until then the sweep there finishes its Compute deletes and fails at the policy list. `scripts/verify_ci_pool_project.py` fails a project without the binding and prints these commands. It does not read the role's permissions. Until the binding exists, every sweep of that project fails at its first list, and the periodic exits 1 and names the project. The presubmit is not affected.
+
+### 5.8 The self-managed forge VM (`EVAL_FORGE=ghes`)
+
+The GHES lane runs the forge table's `ghes` row (5.6): a GitHub Enterprise Server at `ghes.eval.internal`, which is the forwarding proxy in `hack/ghes-proxy` in front of the pool project's github.com repository, on a VM the job creates per run and deletes after. `hack/ci-forge.sh up` runs before `hack/ci-deploy.sh` and `hack/ci-forge.sh down` after `hack/ci-eval-pr.sh`, from the job's cleanup trap whatever the eval's exit code. `up` makes the certificates with `hack/ghes-proxy/make-certs.sh` (one day, the CA key deleted at once), builds the proxy image with Cloud Build into the project's registry under the run's `pr-` tag, deletes any forge VM an earlier run left (by the label `kube-agents-forge`), creates `forge-ghes` at the project's reserved address with no external address and the `forge-vm` identity, waits for the proxy's own readiness check on the VM's serial console, proves one pod in the host cluster reaches `https://ghes.eval.internal/api/v3/meta` with the CA, and writes `ca.crt` into the state directory the deploy and the eval refuse to run without. The job pod runs in the Prow build cluster, not in the leased project's VPC, so nothing in the job reaches the host itself; the agent and the minter do, from the cluster, and the grader reads api.github.com (the data is there) with `BENCH_GITHUB_HOST` set to the host, which is what makes a github.com link a miss. The lane runs `hack/eval/ghes-cases.txt`, the GitLab lane's three cases, under the GitLab lane's rules ([`eval-gate-roster.md`](eval-gate-roster.md), "The GHES lane"), as `pull-kube-agents-smoke-test-ghes` on demand, `ci-kube-agents-eval-nightly-ghes` nightly and `ci-kube-agents-eval-nightly-ghes-next` nightly under `spec.mode: next` (the last named in `EVAL_MODE_NEXT_JOB_NAMES`); none appends to the evidence store, and none is a blocking presubmit, for the reasons the GitLab lane gives.
+
+What onboarding owes it, once per project, is what `up` reads and never writes: the private zone `eval-internal` (`eval.internal.`) on the `default` network with one A record per self-managed row, one reserved internal address per row (`forge-ghes`, `forge-gitlab-ce`; the record points at it and the VM takes it), the firewall rule `allow-forge-443` (TCP 443 from the VPC to the tag `forge`), the VM identity `forge-vm` with `roles/artifactregistry.reader` and nothing else, and `roles/compute.instanceAdmin.v1` for the two runner identities (section 3), which is the create, the delete and the serial-console read. `scripts/provision_ci_pool_project.sh` makes them (step 1.5) and `scripts/verify_ci_pool_project.py` reads them back (`forge_pieces`, in the hourly scan; its findings pass every leased run on the public lanes, since those read none of this). On a project already registered, run the commands rather than the script (section 8); each is skipped when its resource exists:
+
+```bash
+gcloud services enable dns.googleapis.com --project="${PROJECT_ID}"
+gcloud dns managed-zones create eval-internal --dns-name=eval.internal. --visibility=private \
+  --networks=default --description="Self-managed eval forges (hack/ci-forge.sh)" --project="${PROJECT_ID}"
+for row in ghes gitlab-ce; do
+  host="$(sed -n "s/^EVAL_FORGE_DEFAULT_$(printf '%s' "$row" | tr '[:lower:]-' '[:upper:]_')_HOST=\"\(.*\)\"$/\1/p" hack/ci-deploy.sh)"
+  gcloud compute addresses create "forge-${row}" --region=us-central1 --subnet=default --purpose=GCE_ENDPOINT --project="${PROJECT_ID}"
+  ip="$(gcloud compute addresses describe "forge-${row}" --region=us-central1 --project="${PROJECT_ID}" --format='value(address)')"
+  gcloud dns record-sets create "${host}." --zone=eval-internal --type=A --ttl=60 --rrdatas="${ip}" --project="${PROJECT_ID}"
+done
+gcloud compute firewall-rules create allow-forge-443 --network=default --direction=INGRESS --allow=tcp:443 \
+  --source-ranges=10.0.0.0/8 --target-tags=forge --project="${PROJECT_ID}"
+gcloud iam service-accounts create forge-vm --display-name="kube-agents forge VM" --project="${PROJECT_ID}"
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+  --member="serviceAccount:forge-vm@${PROJECT_ID}.iam.gserviceaccount.com" --role=roles/artifactregistry.reader
+for member in "${PROW_RUNNER_SA}" "${NIGHTLY_RUNNER_SA}"; do
+  gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="${member}" --role=roles/compute.instanceAdmin.v1 --quiet >/dev/null
+done
+```
+
+The VM has egress through the project's Cloud NAT (the proxy forwards to github.com) and no external address; the firewall rule admits the VPC, which is where the host cluster's pods are. A run that dies between `up` and `down` leaves one small VM behind until the next run's `up` on that project deletes it; `hack/ci-teardown.sh` stays Kubernetes-only. The GitLab CE row (`EVAL_FORGE=gitlab-ce`) takes the same pieces (`forge-gitlab-ce`, `gitlab.eval.internal`) and a larger VM that `up` does not build yet ([#3683](https://github.com/gke-labs/kube-agents/issues/3683)).
 
 ## 6. The seeded dirty fleet
 
