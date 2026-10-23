@@ -261,6 +261,7 @@ type swarmTaskView struct {
 	id, addr, addrLabel string // id is validated; addr raw; addrLabel sanitised
 	token               string // console token, "" when not a console task
 	viaTaskID           string
+	viaAddr             string // the delegating parent's addressee, raw; "" unless viaTaskID is set
 	submitted           time.Time
 	state               lib.TaskState
 	terminal            bool
@@ -497,6 +498,18 @@ func BuildSwarmState(in SwarmInput, prev BoardLedger) (SwarmSnapshot, BoardLedge
 		}
 		return swarmMemberPlatform
 	}
+	// The owner of a delegating parent that is not in the input (past the
+	// task cap or TASKS retention), from the child's ViaAddressee: the
+	// addressee mapping resolveTaskMember applies, or "" when it names no
+	// member, so the caller keeps its own fallback.
+	resolveViaMember := func(t *swarmTaskView) string {
+		if cand := sanitizeMemberName(t.viaAddr); cand != "" && cand != swarmMemberCoordinator && cand != swarmMemberNarrator {
+			if _, ok := members[cand]; ok {
+				return cand
+			}
+		}
+		return ""
+	}
 	taskByID := make(map[string]*swarmTaskView, len(tasks))
 	for _, t := range tasks {
 		taskByID[t.id] = t
@@ -545,11 +558,14 @@ func BuildSwarmState(in SwarmInput, prev BoardLedger) (SwarmSnapshot, BoardLedge
 		prompt := t.prompt
 
 		if t.viaTaskID != "" {
-			// Adam's delegation: posted by the parent task's owner, or the
-			// conversation's member when the parent is not in the input.
+			// Adam's delegation: posted by the parent task's owner; when the
+			// parent is not in the input, the owner its ViaAddressee names,
+			// else the conversation's member.
 			from := swarmMemberCoordinator
 			if parent, ok := taskByID[t.viaTaskID]; ok {
 				from = resolveTaskMember(parent)
+			} else if m := resolveViaMember(t); m != "" {
+				from = m
 			} else if c := byToken[t.token]; c != nil && c.member != "" {
 				from = c.member
 			}
@@ -607,6 +623,8 @@ func BuildSwarmState(in SwarmInput, prev BoardLedger) (SwarmSnapshot, BoardLedge
 			recipient := swarmMemberCoordinator
 			if parent, ok := taskByID[t.viaTaskID]; ok && t.viaTaskID != "" {
 				recipient = resolveTaskMember(parent)
+			} else if t.viaTaskID != "" {
+				recipient = firstNonEmptyString(resolveViaMember(t), recipient)
 			}
 			state := string(t.state)
 			summary := firstNonEmptyString(t.result, t.reason, t.progress, prompt, state)
@@ -1239,12 +1257,15 @@ func normalizeTasks(in []SwarmTask, now time.Time) []*swarmTaskView {
 			token = strings.TrimPrefix(conv, swarmConsolePrefix)
 		}
 		via := strings.TrimSpace(st.ViaTaskID)
+		viaAddr := ""
 		if !validTaskID(via) || via == id {
 			via = ""
+		} else if va := strings.TrimSpace(st.ViaAddressee); len(va) <= maxSwarmHandleBytes {
+			viaAddr = va
 		}
 		tv := &swarmTaskView{
 			id: id, addr: addr, addrLabel: firstNonEmptyString(swarmText(addr, 64), swarmMemberPlatform),
-			token: token, viaTaskID: via, submitted: sub, state: lib.StateSubmitted,
+			token: token, viaTaskID: via, viaAddr: viaAddr, submitted: sub, state: lib.StateSubmitted,
 			prompt: swarmLine(st.Prompt, maxBoardEventTextChars),
 		}
 		if t := st.Task; t != nil {
@@ -1333,7 +1354,7 @@ func taskLess(a, b *swarmTaskView) bool {
 		return a.submitted.Before(b.submitted)
 	}
 	for _, p := range [][2]string{
-		{a.id, b.id}, {a.addr, b.addr}, {a.token, b.token}, {a.viaTaskID, b.viaTaskID},
+		{a.id, b.id}, {a.addr, b.addr}, {a.token, b.token}, {a.viaTaskID, b.viaTaskID}, {a.viaAddr, b.viaAddr},
 		{string(a.state), string(b.state)}, {a.prompt, b.prompt}, {a.result, b.result},
 		{a.reason, b.reason}, {a.progress, b.progress}, {a.step, b.step}, {a.question, b.question},
 	} {
