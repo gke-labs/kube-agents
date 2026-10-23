@@ -23,7 +23,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, NamedTuple, Optional, Sequence
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, wait as futures_wait
-from contextlib import closing
+from contextlib import closing, nullcontext
 from pathlib import Path
 
 import logging
@@ -119,6 +119,10 @@ FEED_STATUS_INJECTED = "injected"
 FEED_STATUS_FILTERED = "filtered"
 FEED_STATUS_SUPPRESSED = "suppressed"
 FEED_STATUS_UNDELIVERED = "undelivered"
+# A row folded into an earlier admitted event for the same workload
+# (INCIDENT_WORKLOAD_DEDUP_SECONDS), which is also what the inject route answers
+# for it. Checked before `undelivered`/`suppressed`: its `notified` is 0.
+FEED_STATUS_FOLDED = "folded"
 # A drift backlog row that is digested or owed a digest. Checked before the
 # others, because its `notified` is 0 and would otherwise read as suppressed. A
 # carded backlog row (DRIFT_BACKLOG_CARDED) reads as a live drift row does.
@@ -532,6 +536,58 @@ ALERT_DAILY_LIMITS = {
     DRIFT_QUOTA_KEY: _alert_daily_limit("ALERT_DAILY_LIMIT_DRIFT", DEFAULT_ALERT_DAILY_LIMIT_DRIFT),
 }
 
+# How long an admitted event holds its workload's incident open: within this
+# many seconds of it, a later Warning-or-worse event for the same (cluster,
+# namespace, object kind, fold key) is recorded as a duplicate of it and starts
+# no triage, posts nothing and spends no alert budget; a Critical is folded only
+# into a Critical (_workload_incident_anchor). The watcher deduplicates
+# on (object UID, reason), so without this every replica of a broken Deployment,
+# every replacement pod and every reason in a cascade opens a triage of its own.
+# The window runs from the anchor, not from the latest duplicate, so a new pod
+# or reason from a workload that keeps failing is announced again once the
+# window has passed. 0, the default, turns
+# folding off; a negative or unparseable value reads as the default, the same
+# parse the daily ceilings use. Capped at a day, the watcher's own dedup window.
+INCIDENT_WORKLOAD_DEDUP_MAX_SECONDS = 86400
+INCIDENT_WORKLOAD_DEDUP_SECONDS = min(
+    _alert_daily_limit("INCIDENT_WORKLOAD_DEDUP_SECONDS", 0), INCIDENT_WORKLOAD_DEDUP_MAX_SECONDS
+)
+# A pod named like a Deployment's for display: 8-10 hex characters, then the
+# pod's own suffix (`checkout-6cfdb6b98b-zwv24` -> `checkout`). clean_workload_name
+# strips it, and so a CronJob run's pod (`report-29812345-abcde`) and a
+# date-stamped Job's (`db-migrate-20261021-abcde`) display under their owner's
+# prefix too, which is a display choice and not an identity.
+DEPLOYMENT_POD_NAME_RE = re.compile(r"^(.*?)-[a-f0-9]{8,10}-[a-z0-9]{5}$")
+# What a fold key is read from: a ReplicaSet's pod-template hash is
+# rand.SafeEncodeString of a decimal number, which maps the ten digits to
+# exactly `4-9bcdf`, so this matches every Deployment pod the display pattern
+# does and refuses a segment holding any of `0-3`, `a` or `e` (every Unix-minute
+# CronJob run until the 2040s, every date stamp, `deadbeef`). Folding those
+# would put a Job's failure under a same-named Deployment's incident and
+# silence it. The lower bound stays at 8: the hash is shorter for about 0.2% of
+# templates, which then do not fold, and a lower bound would also match short
+# name segments (`log-bd`) and fold different owners together; a missed fold
+# only announces an event, a wrong one silences it.
+POD_TEMPLATE_HASH_POD_RE = re.compile(r"^(.*?)-[4-9bcdf]{8,10}-[a-z0-9]{5}$")
+# The severity get_severity_details grades a blocker, which folds only into an
+# anchor of its own grade (_workload_incident_anchor).
+CRITICAL_SEVERITY = "Critical"
+# A 5xx other than 503 can come after the turn already filed its card, so it
+# reads as a started turn; a 503 and anything below 500 come before any turn
+# (_start_agent_turn).
+HTTP_SERVER_ERROR_MIN = 500
+HTTP_SERVICE_UNAVAILABLE = 503
+# How long _start_agent_turn waits on the gateway's synchronous chat route,
+# which answers only when the turn has finished.
+GATEWAY_TURN_TIMEOUT_S = 300.0
+# Bounds the anchor lookup's wait on a locked database, as the other ledger
+# writers here do; a lookup that gives up announces the event.
+INCIDENT_FOLD_DB_TIMEOUT_S = 5.0
+# Held from the anchor lookup to the ledger insert, so two replicas' events
+# arriving together cannot both find no anchor and both open a triage. The
+# route is a sync def served on a threadpool, so they can.
+_WORKLOAD_FOLD_LOCK = threading.Lock()
+
 # The `kind` a drift record carries, set by the drift detector
 # (`injectKindDrift` in k8s-operator/cmd/drift-detector/inject.go). It is the
 # only field `inject_message` routes on, and the two constants are one decision
@@ -900,6 +956,13 @@ def init_db() -> None:
                 ("backlog", f"backlog INTEGER NOT NULL DEFAULT {DRIFT_BACKLOG_NONE}"),
                 ("principal", "principal TEXT NOT NULL DEFAULT ''"),
                 ("payload", "payload TEXT NOT NULL DEFAULT ''"),
+                # The ledger id of the admitted event this one was folded
+                # into (INCIDENT_WORKLOAD_DEDUP_SECONDS); NULL on every other row.
+                ("duplicate_of", "duplicate_of INTEGER"),
+                # What a row folds on (_fold_key): the workload of a
+                # Deployment's pod, or a non-Pod object's own name. Empty on
+                # every row that can neither fold nor anchor.
+                ("fold_key", "fold_key TEXT NOT NULL DEFAULT ''"),
             ):
                 if column in ledger_columns:
                     continue
@@ -993,6 +1056,15 @@ def init_db() -> None:
                 )
                 """
             )
+            # A fold anchor is written as an intent, before its background task
+            # runs, so a process that died in between (OOM, SIGKILL, a crash)
+            # leaves a row anchoring its workload with no triage behind it and
+            # nothing left to release it. Every start therefore releases them
+            # all: a workload whose triage did start loses its window, which
+            # costs one more triage (per severity: a Critical folds only into a
+            # Critical) for a sibling that arrives after
+            # the restart, and is noise rather than silence.
+            conn.execute("UPDATE intercepted_events SET fold_key = '' WHERE fold_key != ''")
             findings_queue.init_findings_schema(conn)
             _purge_plaintext_identities(conn)
 
@@ -1059,6 +1131,8 @@ def record_intercepted_event(
     occurrences: int,
     notified: bool,
     session_id: str = "",
+    duplicate_of: Optional[int] = None,
+    fold_key: str = "",
 ) -> Optional[int]:
     """Append one forwarded event to the ledger the daily recap reads.
 
@@ -1104,8 +1178,8 @@ def record_intercepted_event(
                 cursor = conn.execute(
                     "INSERT INTO intercepted_events "
                     "(cluster, namespace, workload, object_uid, object_kind, reason, message, severity, "
-                    "occurrences, notified, session_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "occurrences, notified, session_id, duplicate_of, fold_key) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         cluster,
                         namespace,
@@ -1118,6 +1192,8 @@ def record_intercepted_event(
                         int(occurrences),
                         1 if notified else 0,
                         session_id,
+                        duplicate_of,
+                        fold_key,
                     ),
                 )
                 return cursor.lastrowid
@@ -1173,6 +1249,96 @@ def mark_delivery_headless(event_row_id: Optional[int]) -> None:
         logger.error(f"Failed to record headless delivery for ledger row {event_row_id}: {exc}")
 
 
+def mark_triage_not_started(event_row_id: Optional[int]) -> None:
+    """Stop a ledger row anchoring its workload's window, because its triage never started.
+
+    Clears `fold_key` and nothing else. `notified` and `delivery_error` still
+    say what reached chat: an alert that posted and whose gateway session then
+    failed was delivered, and reading it as undelivered would send someone to
+    check chat credentials that work. With no fold key the next sibling is
+    admitted and starts the triage this one could not.
+
+    Best-effort for the same reason as the other ledger corrections.
+    """
+    if not event_row_id:
+        return
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=INCIDENT_FOLD_DB_TIMEOUT_S)) as conn:
+            with conn:
+                conn.execute("UPDATE intercepted_events SET fold_key = '' WHERE id = ?", (int(event_row_id),))
+    except Exception as exc:
+        logger.error(f"Failed to release the fold anchor on ledger row {event_row_id}: {exc}")
+
+
+def _fold_key(object_kind: str, object_name: str) -> str:
+    """What an event folds on, or "" for an event that neither folds nor anchors.
+
+    A Deployment's pod (POD_TEMPLATE_HASH_POD_RE) folds on its workload. Any
+    other Pod name does not fold: a StatefulSet's `web-0` and `web-1` keep their
+    ordinals, a CronJob run's or a date-stamped Job's pod is not the same
+    workload as a same-named Deployment, and a DaemonSet's, a Job's or a bare
+    pod's last segment is not one workload's replica suffix. A non-Pod object
+    folds on its own name, which is exact.
+    """
+    if object_kind.lower() != "pod":
+        return object_name
+    m = POD_TEMPLATE_HASH_POD_RE.match(object_name)
+    return m.group(1) if m else ""
+
+
+def _workload_incident_anchor(
+    cluster: str, namespace: str, object_kind: str, fold_key: str, severity: str
+) -> Optional[int]:
+    """The ledger id of the workload's open incident, or None (INCIDENT_WORKLOAD_DEDUP_SECONDS).
+
+    An anchor is a row the route admitted: `notified` non-zero, or a
+    `delivery_error`. The second matters because a failed chat post resets
+    `notified` to 0 within seconds (`mark_delivery_failed`) while the triage it
+    started keeps running, and on an install with no working chat route every
+    admitted row ends that way; anchoring on `notified` alone would let each
+    sibling open a triage of its own. A row whose triage never started has
+    its `fold_key` cleared (mark_triage_not_started): nobody is working on it. A
+    refused row never anchors: one the Info gate filtered or the ceiling
+    dropped has `notified = 0` and no error, and so does a duplicate, so a
+    refused event cannot silence a later warning. Only a row with a `fold_key`
+    anchors, which leaves out the drift and stall rows that share the table.
+
+    A Critical event folds only into a Critical anchor. A workload that gets
+    worse after its Warning was announced (a `BackOff`, then `OOMKilled`) is a
+    second announcement chat should see; folded, the Critical would reach no
+    one, and the Warning's triage was opened on the lesser symptom.
+
+    Best-effort: a failed read returns None, so the event is announced rather
+    than lost.
+    """
+    if INCIDENT_WORKLOAD_DEDUP_SECONDS <= 0 or not fold_key:
+        return None
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=INCIDENT_FOLD_DB_TIMEOUT_S)) as conn:
+            row = conn.execute(
+                "SELECT id FROM intercepted_events "
+                "WHERE cluster = ? AND namespace = ? AND object_kind = ? AND fold_key = ? "
+                "AND (? != ? OR severity = ?) "
+                "AND (notified != 0 OR delivery_error != '') "
+                "AND created_at >= datetime('now', ?) "
+                "ORDER BY id DESC LIMIT 1",
+                (
+                    cluster,
+                    namespace,
+                    object_kind,
+                    fold_key,
+                    severity,
+                    CRITICAL_SEVERITY,
+                    CRITICAL_SEVERITY,
+                    f"-{INCIDENT_WORKLOAD_DEDUP_SECONDS} seconds",
+                ),
+            ).fetchone()
+    except Exception as exc:
+        logger.error(f"Failed to look up an open incident for {namespace}/{fold_key}: {exc}")
+        return None
+    return row[0] if row else None
+
+
 @app.get("/healthz")
 def healthz() -> Dict[str, Any]:
     """Unauthenticated on purpose: it returns no data and gates the others.
@@ -1207,7 +1373,7 @@ def create_session() -> Dict[str, str]:
 def clean_workload_name(kind: str, name: str) -> str:
     if kind.lower() == "pod":
         # Match pattern of deployment replica (e.g. -6cfdb6b98b-zwv24)
-        m = re.match(r"^(.*?)-[a-f0-9]{8,10}-[a-z0-9]{5}$", name)
+        m = DEPLOYMENT_POD_NAME_RE.match(name)
         if m:
             return m.group(1)
         # Match pattern of statefulset/job/pod replica (e.g. -0 or -abcde)
@@ -2719,8 +2885,23 @@ def _stall_agent_query(payload: Dict[str, Any]) -> str:
     )
 
 
-def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[str, str]) -> None:
-    """Post the agent query request to execute the diagnostic reasoning loop."""
+def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[str, str]) -> bool:
+    """Post the agent query request to execute the diagnostic reasoning loop.
+
+    True when the turn may have started: a 5xx other than 503, or an error
+    while waiting for the response, which may be a turn that outlived the
+    timeout. An error while connecting or sending (URLError) is False. Reading either as
+    refused would let a sibling open a second triage beside it
+    (mark_triage_not_started). Anything else is False. In the Hermes route
+    (`_handle_session_chat`) a 4xx is a failed check before the turn, a 503 is
+    `gateway_draining` (the admission wrapper, which `POST /api/sessions` does
+    not have, so a draining gateway creates the session and refuses the turn)
+    or `session_db_unavailable`, and no turn ran for either. The route sends
+    no redirect; a 307 or 308 from anything in front of it is one urlopen does
+    not follow for a POST, so no turn ran for that either. A 5xx out of
+    `_run_agent` comes after the turn started, possibly after the front door
+    filed its card.
+    """
     try:
         req = urllib.request.Request(
             f"{api_url}/api/sessions/{session_id}/chat",
@@ -2728,11 +2909,24 @@ def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[s
             headers=headers,
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=300.0) as resp:
-            if resp.status != 200:
-                logger.error(f"Gateway API chat execution failed (status {resp.status})")
+        # urlopen raises HTTPError for every non-2xx it does not follow, so a
+        # returned response is an accepted turn (a followed 301/302/303 would
+        # land elsewhere as a GET; the Hermes route sends none).
+        with urllib.request.urlopen(req, timeout=GATEWAY_TURN_TIMEOUT_S):
+            pass
+    except urllib.error.HTTPError as exc:
+        logger.error(f"Gateway API chat execution failed (status {exc.code})")
+        return exc.code >= HTTP_SERVER_ERROR_MIN and exc.code != HTTP_SERVICE_UNAVAILABLE
+    except urllib.error.URLError as exc:
+        # urlopen wraps an error raised while connecting or sending the request
+        # (a refused connection, a connect timeout) in URLError; an error while
+        # waiting for the response, such as a read timeout, comes out unwrapped.
+        # So this one is a request the gateway never had in full: no turn.
+        logger.error(f"Gateway API chat request was not delivered: {exc.reason}")
+        return False
     except Exception as exc:
         logger.error(f"Failed to call gateway API chat execution: {exc}")
+    return True
 
 
 def trigger_agent_troubleshooter(
@@ -2747,7 +2941,31 @@ def trigger_agent_troubleshooter(
 
     ``slack_alert_msg`` replaces ``alert_msg`` when the alert goes to Slack, and
     ``alert_title`` is recorded only for a Slack thread.
+
+    An exception releases the row's fold anchor before it propagates: the
+    ledger row was written as admitted before this task was queued, and a task
+    that died before the turn would otherwise leave every sibling folding into
+    a triage that never started (mark_triage_not_started). _start_agent_turn
+    catches its own errors, so nothing raised here comes after a turn began.
     """
+    try:
+        _trigger_agent_troubleshooter(
+            session_id, alert_msg, payload, event_row_id, slack_alert_msg=slack_alert_msg, alert_title=alert_title
+        )
+    except Exception:
+        mark_triage_not_started(event_row_id)
+        raise
+
+
+def _trigger_agent_troubleshooter(
+    session_id: str,
+    alert_msg: str,
+    payload: Dict[str, Any],
+    event_row_id: Optional[int] = None,
+    slack_alert_msg: Optional[str] = None,
+    alert_title: Optional[str] = None,
+) -> None:
+    """trigger_agent_troubleshooter's work, without the release on an exception."""
     # 1. Post initial warning notification to Google Chat or Slack.
     #
     #    One destination, but the first one is not the only one tried. This path
@@ -2843,11 +3061,13 @@ def trigger_agent_troubleshooter(
     session_created = _create_gateway_session(api_url, session_id, headers)
     if not session_created:
         logger.error(f"Aborting troubleshooting trigger: session creation failed for {session_id}")
+        mark_triage_not_started(event_row_id)
         return
 
     # 5. Formulate instructions query and execute the agent turn
     agent_query = _build_agent_query(payload)
-    _start_agent_turn(api_url, session_id, agent_query, headers)
+    if not _start_agent_turn(api_url, session_id, agent_query, headers):
+        mark_triage_not_started(event_row_id)
 
 
 # --------------------------------------------------------------------------
@@ -4738,30 +4958,55 @@ def inject_message(
     # Info event before this line, neither reaches the claim and the bucket is
     # never drawn down at all. Move the claim above the gate and five suppressed
     # `BackOff`s can exhaust it and cap-drop the node event behind them.
+    #
+    # The workload fold comes between the two for the same reason: a duplicate
+    # is never going to post, so it must not spend a budget either.
     quota_denied = False
     suppressed_today = 0
-    if not suppressed:
-        allowed, suppressed_today = _claim_alert_quota(severity_label)
-        quota_denied = not allowed
+    anchor_id = None
+    with _WORKLOAD_FOLD_LOCK if INCIDENT_WORKLOAD_DEDUP_SECONDS > 0 else nullcontext():
+        fold_key = _fold_key(object_kind, object_name)
+        if not suppressed:
+            anchor_id = _workload_incident_anchor(event_cluster, namespace, object_kind, fold_key, severity_label)
+        if not suppressed and anchor_id is None:
+            allowed, suppressed_today = _claim_alert_quota(severity_label)
+            quota_denied = not allowed
 
-    # One ledger row per forwarded event, whatever became of it, with
-    # `notified` carrying the outcome — that invariant is what lets the daily
-    # recap report a suppressed event as a number rather than lose it. A
-    # cap-dropped alert is written here too: it is the case the recap most
-    # needs to show, since nothing about it reaches chat at all.
-    event_row_id = record_intercepted_event(
-        cluster=event_cluster,
-        namespace=namespace,
-        workload=clean_name,
-        object_uid=object_uid,
-        object_kind=object_kind,
-        reason=event_reason,
-        message=clean_msg,
-        severity=severity_label,
-        occurrences=count,
-        notified=not (suppressed or quota_denied),
-        session_id=session_id,
-    )
+        # One ledger row per forwarded event, whatever became of it, with
+        # `notified` carrying the outcome — that invariant is what lets the daily
+        # recap report a suppressed event as a number rather than lose it. A
+        # cap-dropped alert is written here too: it is the case the recap most
+        # needs to show, since nothing about it reaches chat at all.
+        event_row_id = record_intercepted_event(
+            cluster=event_cluster,
+            namespace=namespace,
+            workload=clean_name,
+            object_uid=object_uid,
+            object_kind=object_kind,
+            reason=event_reason,
+            message=clean_msg,
+            severity=severity_label,
+            occurrences=count,
+            notified=not (suppressed or quota_denied or anchor_id is not None),
+            session_id=session_id,
+            duplicate_of=anchor_id,
+            fold_key=fold_key,
+        )
+
+    if anchor_id is not None:
+        # Neither "filtered" nor "suppressed", both of which reopen. The watcher
+        # rolls back its entry on "suppressed", and flags it on "filtered" so
+        # the next Warning sighting of the same key reopens it; either way this
+        # pod's (UID, reason) comes back at kubelet's repeat cadence while the
+        # anchor's triage runs. The watcher keeps its entry for "folded" and
+        # counts it in k8s_event_watcher_events_folded_total. One that predates
+        # the status reads it as delivered, which keeps the entry the same way
+        # and counts it as injected, so no feature negotiation is needed.
+        logger.info(
+            f"Folded {severity_label} event {event_reason} for {namespace}/{object_kind}/{object_name} "
+            f"into ledger row {anchor_id} (no chat alert, no triage session)"
+        )
+        return {"status": FEED_STATUS_FOLDED, "duplicate_of": str(anchor_id)}
 
     if suppressed:
         # "filtered", deliberately not the "suppressed" the ceiling answers
@@ -5143,7 +5388,13 @@ def _validate_non_negative_int64(value: int, name: str) -> int:
     return value
 
 
-def _feed_status(notified: int, severity: str, delivery_error: str, backlog: int = DRIFT_BACKLOG_NONE) -> str:
+def _feed_status(
+    notified: int,
+    severity: str,
+    delivery_error: str,
+    backlog: int = DRIFT_BACKLOG_NONE,
+    duplicate_of: Optional[int] = None,
+) -> str:
     """What became of a ledger row, in the inject route's own words.
 
     Derived rather than stored, from the three columns that already decide it:
@@ -5152,10 +5403,13 @@ def _feed_status(notified: int, severity: str, delivery_error: str, backlog: int
     skips chat delivery) only for an alert admitted past the severity gate and
     daily quota, an Info row is the one the severity gate filters, and
     `delivery_error` is written only when a chat post was attempted and failed.
-    A backlog row that is not carded is `backlog` whatever the other three say.
+    A backlog row that is not carded is `backlog` whatever the other three say,
+    and a row with `duplicate_of` is `folded`.
     """
     if backlog and backlog != DRIFT_BACKLOG_CARDED:
         return FEED_STATUS_BACKLOG
+    if duplicate_of is not None:
+        return FEED_STATUS_FOLDED
     if notified:
         return FEED_STATUS_INJECTED
     if delivery_error:
@@ -5183,7 +5437,7 @@ def list_intercepted_events(
     limit = _clamp_limit(limit, FEED_EVENTS_MAX_LIMIT)
     columns = (
         "id, session_id, created_at, cluster, namespace, object_kind, workload, "
-        "reason, severity, notified, delivery_error, message, backlog"
+        "reason, severity, notified, delivery_error, message, backlog, duplicate_of"
     )
     with closing(_read_only(SESSION_KV_DB_PATH)) as conn:
         if since_id is not None:
@@ -5207,8 +5461,11 @@ def list_intercepted_events(
             "name": row["workload"],
             "reason": row["reason"],
             "severity": row["severity"],
-            "status": _feed_status(row["notified"], row["severity"], row["delivery_error"], row["backlog"]),
+            "status": _feed_status(
+                row["notified"], row["severity"], row["delivery_error"], row["backlog"], row["duplicate_of"]
+            ),
             "message": row["message"],
+            "duplicate_of": row["duplicate_of"],
         }
         for row in rows[:limit]
     ]

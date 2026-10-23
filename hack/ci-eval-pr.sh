@@ -2933,6 +2933,9 @@ unit_cost_hint() {
     # measured 7-11 minutes a repetition on a dev install.
     gitops-drift-deleted-policy-triage) echo 900 ;;
     gitops-drift-load-bearing-change-triage) echo 900 ;;
+    # The autoops-incident stack at three replicas, on the infra lock, and a
+    # board read. Unmeasured; priced with autoops-warning-event-triage.
+    incident-triage-workload-fold) echo 900 ;;
     # Tofu too, and the same shape, plus a plant that waits out
     # stall_report.py's ten-minute Deployment threshold before it posts the
     # record and then waits for the card. 1040-1080s a repetition on a dev

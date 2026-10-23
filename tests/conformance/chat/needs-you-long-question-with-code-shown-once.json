@@ -1,0 +1,19 @@
+{
+  "name": "needs-you-long-question-with-code-shown-once",
+  "source": "agents/platform/scripts/test_slack_moments.py::NeedsYouTest.test_a_long_question_with_a_code_span_is_cut_outside_it_and_shown_once",
+  "notes": "A question too long for the headline, with code spans, is cut at a word outside them; the headline ends in an ellipsis the detail resumes after, so the question is drawn once and never reads as a statement.",
+  "input": {
+    "reason": "Should I scale `checkout-gateway` in `seeded-reliability` down to zero replicas while I read the OOMKill events and the `resources.limits.memory` set on each of its containers? It restarts every few minutes."
+  },
+  "expected": [
+    {
+      "carrier": "notify",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Should I scale checkout-gateway in seeded-reliability down to zero replicas while I read the OOMKill events and the resources.limits.memory set on…",
+        "detail": "…each of its containers? It restarts every few minutes.",
+        "tone": "attention"
+      }
+    }
+  ]
+}
