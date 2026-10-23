@@ -443,6 +443,13 @@ FIXTURE_NOT_READY = {
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "
         "verification sweep"
     ),
+    "autoops-warning-event-triage-open-pr": (
+        "#2513: needs an install with INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true in spec.deployment.env, "
+        "each pool project's *-infra GitOps repository to carry both a manifest for "
+        "eval-open-pr-workload and a terraform/ directory, and per-repetition session KV "
+        "ledger reset or workload suffixing so consecutive units do not fold into unit 1's "
+        "pull request"
+    ),
     "upgrades-removed-api-caller-named": (
         "#2655: needs a removed-api-caller role, a writer that calls an API "
         "version the cluster's next minor stops serving, which no standing fleet "
