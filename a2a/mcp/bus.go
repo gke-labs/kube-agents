@@ -292,45 +292,41 @@ func (b *NATSBus) agentCards(ctx context.Context) (map[string]AgentCard, error) 
 	if pending == 0 {
 		return cards, nil
 	}
+	// Read through the shared byte-bounded reader, as every read here is:
+	// a DIRECTORY that grew past readMaxBytes is reported, with the cards
+	// read before it, rather than read whole into the pod.
+	r, err := b.newBudgetReader(cons, int(min(pending, directoryFetchBatch)), readMaxBytes)
+	if err != nil {
+		return cards, err
+	}
+	defer r.stop()
 	seen := 0
 	for {
-		wait := directoryFetchWait
-		if dl, ok := ctx.Deadline(); ok {
-			wait = min(wait, time.Until(dl))
-		}
+		wait := fetchWait(ctx, directoryFetchWait)
 		if wait < minFetchWait {
 			return cards, fmt.Errorf("read %d of the directory before the deadline", seen)
 		}
-		// Sized to what is pending, so the fetch returns as soon as it has
-		// it rather than waiting out FetchMaxWait for a batch that cannot fill.
-		batch, err := cons.Fetch(int(min(pending, directoryFetchBatch)), jetstream.FetchMaxWait(wait))
-		if err != nil {
-			return cards, err
-		}
-		n := 0
-		for msg := range batch.Messages() {
-			n++
-			seen++
-			if seen > maxAgentCards {
-				return cards, fmt.Errorf("DIRECTORY holds more than %d cards; showing the first %d", maxAgentCards, maxAgentCards)
+		msg, err := r.next(wait)
+		if errors.Is(err, nats.ErrTimeout) {
+			if ctx.Err() != nil {
+				return cards, ctx.Err()
 			}
-			addCard(cards, msg.Subject(), msg.Data())
-			if md, err := msg.Metadata(); err == nil {
-				if pending = md.NumPending; pending == 0 {
-					return cards, nil
-				}
-			}
-		}
-		if err := batch.Error(); err != nil && !errors.Is(err, nats.ErrTimeout) {
-			return cards, err
-		}
-		if n == 0 {
-			// Messages were pending and the fetch brought none: it did not
+			// Messages were pending and none came: the read did not
 			// complete, which is not an empty directory.
 			return cards, fmt.Errorf("read %d of the directory; a fetch came back empty with cards still pending", seen)
 		}
-		if ctx.Err() != nil {
-			return cards, ctx.Err()
+		if err != nil {
+			return cards, fmt.Errorf("DIRECTORY: %w", err)
+		}
+		seen++
+		if seen > maxAgentCards {
+			return cards, fmt.Errorf("DIRECTORY holds more than %d cards; showing the first %d", maxAgentCards, maxAgentCards)
+		}
+		addCard(cards, msg.Subject(), msg.Data())
+		if md, err := msg.Metadata(); err == nil {
+			if pending = md.NumPending; pending == 0 {
+				return cards, nil
+			}
 		}
 	}
 }

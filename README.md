@@ -115,6 +115,7 @@ The Platform Agent runs these audits on a schedule and posts each report to chat
 | Upgrade & Patch Readiness Audit | Weekly, Monday 07:20 | [`security_patch_orchestrator_sop.md`](agents/platform/governance/security_patch_orchestrator_sop.md) |
 | Fleet Waste Audit | Weekly, Monday 07:50 | [`fleet_wide_cost_analysis_sop.md`](agents/platform/governance/fleet_wide_cost_analysis_sop.md) |
 | Fleet Consistency Drift Audit | Weekly, Monday 08:20 | [`fleet_consistency_drift_sop.md`](agents/platform/governance/fleet_consistency_drift_sop.md) |
+| Upgrade Retrospective | Weekly, Sunday 18:00 | [`upgrade_retrospective_sop.md`](agents/platform/governance/upgrade_retrospective_sop.md) |
 
 ### Skills by area
 

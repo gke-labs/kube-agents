@@ -7,8 +7,8 @@
 > `collect.py` one each for `obtainability-audit`, `compliance-audit` and `ai-security-audit`,
 > `fleet_waste.py` one for `fleet-wide-cost-analysis`, `fleet_stockout.py` one for
 > `stockout-prevention`, `gce-compute-fleet-audit/scripts/compute_fleet_audit.py` one for
-> `gce-compute-fleet-audit`, and `gcp-networking-fabric-audit/scripts/networking_audit.py` one for
-> `gcp-networking-fabric-audit`;
+> `gce-compute-fleet-audit`, `gcp-networking-fabric-audit/scripts/networking_audit.py` one for
+> `gcp-networking-fabric-audit`, and `upgrade_retrospective.py` one for `upgrade-retrospective`;
 > each of those streams' SOPs runs its collector and passes the flag, and every other stream
 > publishes on the document's own attestation, exactly as it did before the flag existed.
 > `fleet_health.py` emits the same shape for `fleet-health`, a chat-only sweep that no stream and
