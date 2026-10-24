@@ -1,19 +1,39 @@
-"""Plotly visualizations for normalized activity."""
+"""Plotly visualizations for normalized activity and harness measurements."""
 
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from collections.abc import Mapping
 from html import escape
 
 import plotly.graph_objects as go
 
 from admin_console.causal_flow import CausalSource
 from admin_console.domain import ActivityEvent
+from admin_console.harness_limits import (
+    LEAST_SQUARES_LABEL,
+    LIMIT_LABEL,
+    PREDICTED_LABEL,
+    TWO_POINT_LABEL,
+    MetricChart,
+)
 from admin_console.ui import ATTRIBUTION_COLORS, PALETTE, STATUS_COLORS, TRIGGER_COLORS
 
 PLOT_BG = "rgba(0,0,0,0)"
 GRID = PALETTE.border
 TEXT = PALETTE.chart_text
+HARNESS_CHART_HEIGHT = 360
+HARNESS_MARKER_SIZE = 9
+HARNESS_LINE_WIDTH = 2
+THRESHOLD_LINE_WIDTH = 1
+PREDICTION_DASH = "dash"
+THRESHOLD_DASH = "dot"
+FLEET_DASH = "dashdot"
+MEASURED_SYMBOL = "circle"
+EXCLUDED_SYMBOL = "circle-open"
+EXCLUDED_LABEL = "excluded from fit"
+FLEET_LABEL = "this fleet"
+CONTAINER_LIMIT_KEY = "container limit"
 
 
 def _base_layout(figure: go.Figure, *, height: int) -> go.Figure:
@@ -264,3 +284,126 @@ def interaction_timeline(events: list[ActivityEvent]) -> go.Figure:
         categoryarray=list(reversed(ordered_agents)),
     )
     return _base_layout(figure, height=max(260, 80 + len(ordered_agents) * 48))
+
+
+def _style_key(figure: go.Figure, name: str, *, dash: str = "", symbol: str = "") -> None:
+    """A legend entry that explains a line or marker style, with no data."""
+    figure.add_trace(
+        go.Scatter(
+            x=[None],
+            y=[None],
+            name=name,
+            mode="markers" if symbol else "lines",
+            line={"color": PALETTE.neutral, "width": HARNESS_LINE_WIDTH, "dash": dash or None},
+            marker={"color": PALETTE.neutral, "size": HARNESS_MARKER_SIZE, "symbol": symbol or None},
+            hoverinfo="skip",
+        )
+    )
+
+
+def harness_limit_chart(chart: MetricChart, colors: Mapping[str | None, str]) -> go.Figure:
+    """One metric against one factor: the runs, the fitted lines, and the thresholds."""
+    figure = go.Figure()
+    scale = chart.scale
+    unit = f" {chart.unit}" if chart.unit else ""
+    for series in chart.series:
+        color = colors.get(series.container, PALETTE.accent)
+        name = escape(series.name)
+        for excluded in (False, True):
+            points = [point for point in series.points if point.excluded is excluded]
+            if not points:
+                continue
+            figure.add_trace(
+                go.Scatter(
+                    x=[point.x for point in points],
+                    y=[point.y / scale for point in points],
+                    mode="markers",
+                    name=f"{series.name} ({EXCLUDED_LABEL})" if excluded else series.name,
+                    legendgroup=series.name,
+                    showlegend=not excluded,
+                    marker={
+                        "color": color,
+                        "size": HARNESS_MARKER_SIZE,
+                        "symbol": EXCLUDED_SYMBOL if excluded else MEASURED_SYMBOL,
+                    },
+                    customdata=[[point.key, point.run] for point in points],
+                    hovertemplate=(
+                        f"<b>{name}</b><br>%{{x:,.1f}} · %{{y:,.2f}}{unit}"
+                        "<br>run %{customdata[1]} · %{customdata[0]}<extra></extra>"
+                    ),
+                )
+            )
+        fit = series.fit
+        if fit is not None:
+            segments = [((fit.x_min, fit.x_max), fit.label, None)]
+            if chart.x_end > fit.x_max:
+                segments.append(((fit.x_max, chart.x_end), PREDICTED_LABEL, PREDICTION_DASH))
+            for (start, end), label, dash in segments:
+                figure.add_trace(
+                    go.Scatter(
+                        x=[start, end],
+                        y=[fit.at(start) / scale, fit.at(end) / scale],
+                        mode="lines",
+                        name=f"{series.name} · {label}",
+                        legendgroup=series.name,
+                        showlegend=False,
+                        line={"color": color, "width": HARNESS_LINE_WIDTH, "dash": dash},
+                        hovertemplate=(
+                            f"<b>{name}</b> · {label}<br>%{{x:,.1f}} · %{{y:,.2f}}{unit}"
+                            "<extra></extra>"
+                        ),
+                    )
+                )
+        if series.limit is not None:
+            # A trace, not a labelled shape: it toggles with its container and
+            # names itself on hover instead of covering the base runs with text.
+            limit_name = LIMIT_LABEL.format(container=series.name)
+            figure.add_trace(
+                go.Scatter(
+                    x=[0, chart.x_end],
+                    y=[series.limit / scale] * 2,
+                    mode="lines",
+                    name=limit_name,
+                    legendgroup=series.name,
+                    showlegend=False,
+                    line={"color": color, "width": THRESHOLD_LINE_WIDTH, "dash": THRESHOLD_DASH},
+                    hovertemplate=(
+                        f"<b>{escape(limit_name)}</b><br>%{{y:,.2f}}{unit}<extra></extra>"
+                    ),
+                )
+            )
+    for line in chart.lines:
+        figure.add_hline(
+            y=line.value / scale,
+            line={
+                "color": PALETTE.danger if line.critical else PALETTE.warning,
+                "width": THRESHOLD_LINE_WIDTH,
+                "dash": THRESHOLD_DASH,
+            },
+            annotation_text=escape(line.label),
+            annotation_position="top right",
+            annotation_font_color=TEXT,
+        )
+    if chart.fleet_x is not None:
+        figure.add_vline(
+            x=chart.fleet_x,
+            line={"color": PALETTE.neutral, "width": THRESHOLD_LINE_WIDTH, "dash": FLEET_DASH},
+        )
+        _style_key(figure, FLEET_LABEL, dash=FLEET_DASH)
+    if any(series.limit is not None for series in chart.series):
+        _style_key(figure, CONTAINER_LIMIT_KEY, dash=THRESHOLD_DASH)
+    fits = [series.fit for series in chart.series if series.fit is not None]
+    if fits:
+        two_point = all(fit.two_point for fit in fits)
+        _style_key(figure, TWO_POINT_LABEL if two_point else LEAST_SQUARES_LABEL)
+        if any(chart.x_end > fit.x_max for fit in fits):
+            _style_key(figure, PREDICTED_LABEL, dash=PREDICTION_DASH)
+    if any(point.excluded for series in chart.series for point in series.points):
+        _style_key(figure, EXCLUDED_LABEL, symbol=EXCLUDED_SYMBOL)
+    figure.update_xaxes(
+        title=chart.x_title, showgrid=True, gridcolor=GRID, rangemode="tozero", zeroline=False
+    )
+    figure.update_yaxes(
+        title=chart.y_title, showgrid=True, gridcolor=GRID, rangemode="tozero", zeroline=False
+    )
+    return _base_layout(figure, height=HARNESS_CHART_HEIGHT)
