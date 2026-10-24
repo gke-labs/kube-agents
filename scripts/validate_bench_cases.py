@@ -167,16 +167,6 @@ KNOWN_UNREGISTERED = {
     # nightly is a tier decision nobody has made; this entry is the record
     # that the omission is known rather than accidental.
     "cluster-provision-kanban": "cluster-scoped provisioning task, tier decision pending",
-    # Has its fixture (its own stack) and its eval record (#3467: red on main,
-    # three greens on the fix, on a dev install), and belongs in the nightly.
-    # The pool runners hold no role that creates a Cloud Monitoring alert
-    # policy, so every apply of its stack would fail with 403; #3632 grants
-    # roles/monitoring.alertPolicyEditor. The entry goes when the case joins
-    # hack/eval/nightly-cases.txt.
-    "monitoring-alert-policy-read": (
-        "#3632: stack case held out of the nightly until the pool runners can "
-        "create a Cloud Monitoring alert policy"
-    ),
     # Has its fixture (its own stack) and its eval record (#2468: red on main,
     # three greens on the fix), and belongs in the nightly. #2755 lists what it
     # still needs first: Compute network permission for the CI runners,
@@ -312,6 +302,9 @@ FIXTURE_NOT_READY = {
     "terraform-node-pool-autoscaling-pr": (
         "#3576: needs a Terraform provisioning/ path in the pool GitOps repositories"
     ),
+    "terraform-new-cluster-pr": (
+        "#3576: needs a Terraform provisioning/ path in the pool GitOps repositories"
+    ),
     "fanout-bound-ten-cards": (
         "#3560: needs an eval install with more than ten clusters in scope, so a "
         "fleet question reaches the ten-card fan-out bound; the seeded fleet and "
@@ -442,6 +435,11 @@ FIXTURE_NOT_READY = {
         "#1873: needs the stalled-controller role applied to every pool "
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "
         "verification sweep"
+    ),
+    "autoops-warning-event-triage-open-pr": (
+        "#2513: needs an install with INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true in spec.deployment.env "
+        "and a manifest for eval-open-pr-workload in each pool project's *-infra repository "
+        "so the follow-up Platform Agent card can open the recommended remediation Pull Request"
     ),
     "upgrades-removed-api-caller-named": (
         "#2655: needs a removed-api-caller role, a writer that calls an API "

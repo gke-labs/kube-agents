@@ -250,13 +250,6 @@ func (c *Conversations) resolve(alias, token string) (string, bool, bool, string
 		c.touchLocked(e)
 		return e.token, true, false, "", nil
 	}
-	// So is a known conversation's bare token in any other shape (one a
-	// caller resumed by), as the original client took a name or a token in
-	// the same argument.
-	if a, ok := c.aliasOfTokenLocked(alias); ok {
-		c.touchLocked(c.byAlias[a])
-		return alias, true, true, "", nil
-	}
 	t, evicted, err := c.addLocked(alias, "")
 	return t, err == nil, false, evicted, err
 }
@@ -347,7 +340,8 @@ func (c *Conversations) lookup(alias, token string) (string, bool, error) {
 	return "", false, fmt.Errorf("no conversation named %s; send a turn first or pass conversation_token", cell(alias))
 }
 
-// Forget drops alias, and reports whether it was there. The conversation
+// Forget drops the name holding token, or else alias (a name, or a token in
+// a name's place), and returns the name it dropped, if any. The conversation
 // itself is untouched: it stays reachable by its token.
 func (c *Conversations) Forget(alias, token string) (string, bool) {
 	c.mu.Lock()

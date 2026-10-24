@@ -482,3 +482,12 @@ func TestDeleteTakesATokenAsEveryActionDoes(t *testing.T) {
 	out = mustSucceed(t, callTool(t, s, ToolManageSession, map[string]any{"action": actionDelete, "conversation": consoleConversationPrefix + devToken}))
 	mustContain(t, out, "Forgot the name `dev`")
 }
+
+// A name of spaces alone is no name: delete says it needs one.
+func TestDeleteOfSpacesAloneNeedsAName(t *testing.T) {
+	s, _ := busless(t)
+	res := callTool(t, s, ToolManageSession, map[string]any{"action": actionDelete, "conversation": "   "})
+	if !res.IsError || !strings.Contains(res.Content[0].Text, "needs the conversation's name") {
+		t.Errorf("delete of spaces = %+v", res)
+	}
+}

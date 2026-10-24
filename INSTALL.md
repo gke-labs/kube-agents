@@ -183,7 +183,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
   --github-pem-path="/path/to/app-private-key.pem"
 ```
 
-_(If the Cloud KMS key was already imported Ahead-Of-Time, `--github-pem-path` can be omitted; see [Token Minter Guide](docs/site/src/content/docs/deploy/token-minter.md).)_
+_(If the Cloud KMS key was already imported Ahead-Of-Time, `--github-pem-path` can be omitted; see [Token Minter Guide](docs/site/src/content/docs/deploy/token-minter.md). For GitLab or self-managed Gitea GitOps repositories, see [GitLab as the GitOps forge](docs/site/src/content/docs/install/gitlab.md) and [Gitea as the GitOps forge](docs/site/src/content/docs/install/gitea.md).)_
 
 `--github-app-id` is the App's number (its settings page, **General**, "App ID"), not its name or slug; the installer refuses anything else, `--dry-run` included. An applying run, or a `--generate-only` handoff, records `GITOPS_ORG`, `GITOPS_REPO` and `GITHUB_APP_ID` in `install.env`, adding the ones the file lacks and replacing any it records with a different value, so `upgrade.sh`, which renders from the file alone, keeps GitOps on. The PEM path is never recorded: once imported, the key lives in Cloud KMS.
 
@@ -1346,7 +1346,7 @@ kubectl exec deploy/platform-agent-gateway -n kubeagents-system -c platform-agen
 Each audit's report is a ledger issue in the GitOps repository, and its fixes are pull requests
 there, so those two need a GitOps repository, on GitHub or on GitLab. With no GitOps repository
 registered, the audits still run: each keeps its findings in the report store on the agent's
-volume, and a run that changed something posts a summary to chat that says no forge is configured.
+volume, and a run that changed something posts a summary to chat that says no GitOps repository is connected.
 A run whose repository the broker cannot reach, or a run on an install with several managed
 repositories and none with `role: gitops`, does the same, but it posts its summary on every run,
 with the reason and the fix. See

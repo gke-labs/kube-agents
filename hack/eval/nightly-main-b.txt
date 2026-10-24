@@ -54,3 +54,8 @@ gitops-drift-load-bearing-change-triage
 # (main-b) with gpu-stress-test-diagnosis kept above; moved to main-a they
 # are 1950s apart, over the one-case tolerance.
 triage-start-burst
+# monitoring-alert-policy-read joined the nightly on 2026-10-23 as a stack
+# case at the script's default hint. In main-a it put the halves 1850s apart
+# (11450s against 9600s), over the one-case tolerance; here they are 1450s
+# apart. Placed on the arithmetic alone, like the line above.
+monitoring-alert-policy-read
