@@ -442,6 +442,28 @@ func TestTheWebCredentialCannotReachTheVerifyPlane(t *testing.T) {
 	}
 }
 
+// The console credential, the same hole and the same deny. consoleIdentity
+// copied web's `a2a.>` read surface and shipped without web's subtraction, and
+// its password is handed to a browser too (the PoC console server's
+// /config.json). It holds no publish under `a2a.cap.reply.>` either, so the
+// hazard is the same swallowed request, not a forged answer.
+func TestTheConsoleCredentialCannotReachTheVerifyPlane(t *testing.T) {
+	h, _ := startHarnessWithServerLogMap(t, capMap(t), capTokens())
+	nc, violations := connectStatic(t, h, "console", "pw-console")
+
+	if !queueSubscribeRefused(t, nc, violations, capability.VerifySubscribe, capability.VerifyQueue) {
+		t.Errorf("console joined queue group %q on %s; it can swallow verify requests and every swallowed one is a task rejected",
+			capability.VerifyQueue, capability.VerifySubscribe)
+	}
+	if !subscribeRefused(t, nc, violations, capability.ReplyPrefix+">") {
+		t.Errorf("console may subscribe to %s>", capability.ReplyPrefix)
+	}
+	// The control: the console still reads the task plane its page renders.
+	if subscribeRefused(t, nc, violations, "a2a.tasks.>") {
+		t.Error("console can no longer subscribe to the task plane; the deny is too wide")
+	}
+}
+
 // The bridge -- the executor a stock install actually runs -- can verify, and
 // cannot ask in anybody else's name.
 //
