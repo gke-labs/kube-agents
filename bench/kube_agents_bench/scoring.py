@@ -1135,21 +1135,11 @@ def classify_rep(
             Rung.CHECK_DID_NOT_RUN,
         )
 
-    # Before the has_scores test, because a transport-failed record carries
-    # both: the harness marks the error AND the judge still scores the empty
-    # output. No noop carve-out either, unlike the missing-record branch above.
-    # That branch INFERS infrastructure from an absent record, which a task
-    # provisioning nothing cannot honestly claim; this one is the harness
-    # stating what happened, and an unreachable agent endpoint is
-    # infrastructure whatever the task's deployer builds.
-    #
-    # The launcher writes the same marker on a record with no scores at all
+    # For unscored launcher or transport failures carrying the infra marker.
+    # The launcher writes the marker on a record with no scores at all
     # when it could not start the repetition (record_unit_not_run in
     # hack/ci-eval-pr.sh: GitHub's token endpoint failing before launch).
-    # Same class, but "the record is scored" and "the harness exhausted its
-    # retries" would both be false of it, so its reason is the record's own
-    # words after the marker, led by the marker as every infra reason the
-    # dashboard counts is. Gated on ``not record.has_scores``: a record that
+    # Gated on ``not record.has_scores``: a record that
     # has scores ran, and sits below rung 1 so any tripped catastrophic safeguard
     # continues to block.
     if record.error is not None and INFRA_FAILURE_MARKER in str(record.error) and not record.has_scores:

@@ -651,7 +651,9 @@ _LITELLM_TRAFFIC_PATTERN = re.compile(
 _LOG_TIMESTAMP_PATTERN = re.compile(
     r"\b(?P<ts>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\b"
 )
-_LOG_TIME_ONLY_PATTERN = re.compile(r"(?<!\d)(?P<time>\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)\b")
+_LOG_TIME_ONLY_PATTERN = re.compile(
+    r"^\s*(?:\[[^\]]+\]\s*)?(?:[A-Za-z]+:\s+)?(?P<time>\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)(?![:\w])"
+)
 _POD_PREFIX_PATTERN = re.compile(r"^\[(?P<pod>pod/[^\]]+)\]")
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 _LITELLM_NAMESPACE_DEFAULT = "kubeagents-system"
@@ -659,6 +661,7 @@ _LITELLM_LABEL_SELECTOR = "app=litellm"
 _LITELLM_CONTAINER_NAME = "litellm-container"
 _LITELLM_LOG_TAIL_LINES = 20000
 _LITELLM_LOG_FETCH_TIMEOUT = 15.0
+_TELEMETRY_UNSET = object()
 
 
 def _find_log_until(content: str, since: float | None) -> float | None:
@@ -845,17 +848,19 @@ def _scan_log_content_for_429(
         next_ts: list[float | None] = [None] * n
         next_t: float | None = None
         for i in range(n - 1, -1, -1):
+            next_ts[i] = next_t
             if parsed_ts[i] is not None:
                 next_t = parsed_ts[i]
-            next_ts[i] = next_t
 
-        for i in range(n):
+        for i in range(n - 1, -1, -1):
             p_t = parsed_ts[i]
             n_t = next_ts[i]
             if p_t is not None and n_t is not None and p_t > n_t + 5.0:
                 re_ts = _parse_log_line_timestamp(lines[i], since=since, until=n_t)
                 if re_ts is not None:
                     parsed_ts[i] = re_ts
+                    if i > 0:
+                        next_ts[i - 1] = re_ts
 
         for i, line in enumerate(lines):
             if not _LITELLM_429_PATTERN.search(line):
@@ -950,6 +955,7 @@ def _fetch_live_litellm_log_impl(timeout: float = _LITELLM_LOG_FETCH_TIMEOUT) ->
         "-n",
         ns,
         "--prefix",
+        "--timestamps",
         "--ignore-errors",
         f"--tail={tail_lines}",
     ]
@@ -3082,6 +3088,7 @@ class KubeAgentsHarness(AgentHarness):
             return board_messages
 
         bblock_kinds = final_bstate[3] if len(final_bstate) > 3 else {}
+        telemetry_fetched = False
         telemetry_corroborated: bool | None = None
         for t in failure_cards:
             live_status = final_bstate[0].get(t)
@@ -3093,10 +3100,11 @@ class KubeAgentsHarness(AgentHarness):
             if live_status is not None and live_status not in _TERMINAL_STATUSES:
                 if bblock_kinds.get(t) == "transient":
                     if has_rate_limit:
-                        if telemetry_corroborated is None:
+                        if not telemetry_fetched:
                             telemetry_corroborated = _corroborate_platform_rate_limit(
                                 since=since, session_id=session_id
                             )
+                            telemetry_fetched = True
                         corroborated = telemetry_corroborated
                     else:
                         corroborated = None
@@ -3114,7 +3122,8 @@ class KubeAgentsHarness(AgentHarness):
             if card_msgs:
                 board_messages.extend(card_msgs)
         if telemetry_state is not None:
-            telemetry_state.append(telemetry_corroborated)
+            if telemetry_fetched:
+                telemetry_state.append(telemetry_corroborated)
         return board_messages
 
     def _await_delegated_cards(
@@ -3307,6 +3316,7 @@ class KubeAgentsHarness(AgentHarness):
             )
         unsettled = []
         discrepancies = []
+        telemetry_fetched = False
         telemetry_corroborated: bool | None = None
         for t in poll_failure_statuses:
             if _status(t) not in _TERMINAL_STATUSES and t not in outstanding:
@@ -3322,11 +3332,12 @@ class KubeAgentsHarness(AgentHarness):
                         )
                     )
                     if has_rate_limit:
-                        if telemetry_corroborated is None:
+                        if not telemetry_fetched:
                             telemetry_corroborated = _corroborate_platform_rate_limit(
                                 since=getattr(self, "_run_started_at", None),
                                 session_id=session_id,
                             )
+                            telemetry_fetched = True
                         corroborated = telemetry_corroborated
                     else:
                         corroborated = None
@@ -3396,6 +3407,7 @@ class KubeAgentsHarness(AgentHarness):
             captured=captured,
             since=getattr(self, "_run_started_at", None),
             session_id=session_id,
+            telemetry_corroborated=telemetry_corroborated if telemetry_fetched else _TELEMETRY_UNSET,
         )
         if not shown and len(result.trajectory) > before:
             withheld = result.trajectory[before:]
@@ -3529,6 +3541,7 @@ class KubeAgentsHarness(AgentHarness):
                 opening_turn=opening_turn,
                 since=getattr(self, "_run_started_at", None),
                 session_id="",
+                telemetry_corroborated=telemetry_corroborated if telemetry_state else _TELEMETRY_UNSET,
             )
             return ""
 
@@ -3814,6 +3827,7 @@ class KubeAgentsHarness(AgentHarness):
             captured=captured,
             since=getattr(self, "_run_started_at", None),
             session_id=session_id,
+            telemetry_corroborated=telemetry_corroborated if telemetry_state else _TELEMETRY_UNSET,
         )
         return session_id
 
@@ -3829,6 +3843,7 @@ class KubeAgentsHarness(AgentHarness):
         captured: worker_trajectory.WorkerCapture | None = None,
         since: float | None = None,
         session_id: str | None = None,
+        telemetry_corroborated: bool | None | object = _TELEMETRY_UNSET,
     ) -> None:
         """Collect everything the delegated cards produced, then clear them out.
 
@@ -3881,15 +3896,18 @@ class KubeAgentsHarness(AgentHarness):
 
         infra_reason: str | None = None
         infra_detail: str = ""
-        telemetry_corroborated: bool | None = None
+        telemetry_fetched = (telemetry_corroborated is not _TELEMETRY_UNSET)
+        if not telemetry_fetched:
+            telemetry_corroborated = None
         if board_messages:
             for text in board_messages:
                 reason = _extract_infra_failure_reason(text)
                 if reason:
-                    if telemetry_corroborated is None:
+                    if not telemetry_fetched:
                         telemetry_corroborated = _corroborate_platform_rate_limit(
                             since=since, session_id=session_id
                         )
+                        telemetry_fetched = True
                     corroborated = telemetry_corroborated
                     if corroborated is False:
                         result.errors.append(

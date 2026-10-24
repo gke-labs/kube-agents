@@ -2709,14 +2709,15 @@ def test_a_delegated_worker_status_turn_board_read_fallback_when_final_read_fail
         ),
     ]
 
+    reads: list[str] = []
+
     def _shell(script: str, timeout: float) -> str:
         if board.BOARD_PRESENT in script:
-            import inspect
-
-            stack_names = {f.function for f in inspect.stack()}
-            if "_final_board_failures" in stack_names:
-                return ""
-            if len(stub_agent.requests) == 2:
+            idx = len(reads)
+            reads.append(script)
+            # Read 0 is the poll before the status turn, read 1 the status
+            # turn's clamped re-read, read 2 the settle-time read that fails.
+            if idx == 1:
                 payload = {
                     "statuses": {_TASK_ID: "blocked"},
                     "summaries": {},
@@ -7224,9 +7225,10 @@ def test_corroborate_platform_rate_limit_with_live_content_does_not_persist_to_a
     assert not (tmp_path / "litellm.log").exists()
 
 
-def test_time_only_log_line_across_midnight_corroborates_true() -> None:
+def test_time_only_log_line_across_midnight_corroborates_true(monkeypatch: pytest.MonkeyPatch) -> None:
     """A time-only 429 log line 2.5 hours after start across midnight UTC dates to tomorrow and corroborates True."""
     since = datetime(2026, 10, 19, 23, 0, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(harness.time, "time", lambda: since + 3 * 3600)
     log = (
         "23:00:00 INFO: 200 OK GET /health\n"
         "01:30:00 - RateLimitError: 429 RESOURCE_EXHAUSTED\n"
@@ -7234,9 +7236,10 @@ def test_time_only_log_line_across_midnight_corroborates_true() -> None:
     assert harness._scan_log_content_for_429(log, since=since) is True
 
 
-def test_time_only_log_line_four_hours_after_since_on_same_day_corroborates_true() -> None:
+def test_time_only_log_line_four_hours_after_since_on_same_day_corroborates_true(monkeypatch: pytest.MonkeyPatch) -> None:
     """A time-only 429 log line 4.5 hours after start on the same calendar day dates to today and corroborates True."""
     since = datetime(2026, 10, 19, 10, 0, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(harness.time, "time", lambda: since + 5 * 3600)
     log = (
         "10:00:00 INFO: 200 OK GET /health\n"
         "14:30:00 - RateLimitError: 429 RESOURCE_EXHAUSTED\n"
@@ -7253,9 +7256,10 @@ def test_time_only_log_line_before_since_on_same_day_does_not_roll_into_tomorrow
     assert parsed_dt == datetime(2026, 10, 19, 10, 0, 0, tzinfo=timezone.utc)
 
 
-def test_multi_replica_time_only_log_line_out_of_order_tails_corroborates_true() -> None:
+def test_multi_replica_time_only_log_line_out_of_order_tails_corroborates_true(monkeypatch: pytest.MonkeyPatch) -> None:
     """When kubectl logs prints a quiet replica last whose tail timestamp is earlier than another replica's 429, the 429 is not misdated to yesterday."""
     since = datetime(2026, 10, 19, 10, 0, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(harness.time, "time", lambda: since + 3600)
     log = (
         "[pod/litellm-replica-a] 10:00:00 INFO: 200 OK GET /health\n"
         "[pod/litellm-replica-a] 10:05:00 - RateLimitError: 429 RESOURCE_EXHAUSTED\n"
@@ -7293,6 +7297,7 @@ def test_fetch_live_litellm_log_command_and_options(monkeypatch: pytest.MonkeyPa
         "-n",
         "custom-ns",
         "--prefix",
+        "--timestamps",
         "--ignore-errors",
         "--tail=12345",
         "--context",
@@ -7300,9 +7305,10 @@ def test_fetch_live_litellm_log_command_and_options(monkeypatch: pytest.MonkeyPa
     ]
 
 
-def test_undated_429_following_pre_window_stamp_in_same_pod_returns_none() -> None:
+def test_undated_429_following_pre_window_stamp_in_same_pod_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
     """An undated 429 line bracketed by pre-window and in-window timestamps in the same pod returns None."""
     since = datetime(2026, 10, 19, 9, 30, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(harness.time, "time", lambda: since + 3600)
     log = (
         "[pod/litellm-0] 09:00:00 - LiteLLM Proxy:INFO starting\n"
         '[pod/litellm-0] INFO: 10.0.0.1:50000 - "POST /chat/completions HTTP/1.1" 429 Too Many Requests\n'
@@ -7311,9 +7317,22 @@ def test_undated_429_following_pre_window_stamp_in_same_pod_returns_none() -> No
     assert harness._scan_log_content_for_429(log, since=since) is None
 
 
-def test_telemetry_window_evaluated_per_pod_clipped_pod_returns_none() -> None:
+def test_undated_429_with_ipv6_client_in_same_pod_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An undated 429 access line with IPv6 client address is not misdated by client address octets."""
+    since = datetime(2026, 10, 19, 9, 30, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(harness.time, "time", lambda: since + 3600)
+    log = (
+        "[pod/litellm-0] 09:00:00 - LiteLLM Proxy:INFO starting\n"
+        '[pod/litellm-0] INFO:     fd00::10:20:30:54706 - "POST /chat/completions HTTP/1.1" 429 Too Many Requests\n'
+        "[pod/litellm-0] 09:40:00 - LiteLLM Proxy:INFO traffic\n"
+    )
+    assert harness._scan_log_content_for_429(log, since=since) is None
+
+
+def test_telemetry_window_evaluated_per_pod_clipped_pod_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
     """When one replica's tail is clipped (starts after since), scan returns None even if a quiet replica reaches pre-since."""
     since = datetime(2026, 10, 19, 10, 0, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(harness.time, "time", lambda: since + 3600)
     log = (
         "[pod/litellm-replica-a] 09:00:00 INFO: 200 OK GET /health\n"
         "[pod/litellm-replica-b] 10:30:00 INFO: 200 OK POST /v1/chat/completions\n"
@@ -7322,14 +7341,81 @@ def test_telemetry_window_evaluated_per_pod_clipped_pod_returns_none() -> None:
     assert harness._scan_log_content_for_429(log, since=since) is None
 
 
-def test_quiet_replica_pre_since_tail_does_not_inflate_wall_clock_or_accept_prior_day_429() -> None:
+def test_quiet_replica_pre_since_tail_does_not_inflate_wall_clock_or_accept_prior_day_429(monkeypatch: pytest.MonkeyPatch) -> None:
     """A quiet replica whose tail is before since does not inflate log_until to tomorrow and admit yesterday's 429."""
     since = datetime(2026, 10, 19, 10, 0, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(harness.time, "time", lambda: since + 3600)
     log = (
         "[pod/litellm-replica-a] 15:00:00 - RateLimitError: 429 RESOURCE_EXHAUSTED\n"
         "[pod/litellm-replica-a] 10:20:00 INFO: 200 OK GET /health\n"
         "[pod/litellm-replica-b] 09:50:00 INFO: 200 OK GET /health\n"
     )
     assert harness._scan_log_content_for_429(log, since=since) is False
+
+
+def test_intra_pod_ordering_guard_reparses_prior_day_line_exceeding_following_stamp(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When a pod's log line has a timestamp exceeding the following line's timestamp by >5s, it is re-parsed as prior day."""
+    since = datetime(2026, 10, 19, 10, 0, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(harness.time, "time", lambda: since + 2 * 3600)
+    # Line 0 is yesterday 11:00 (which wall clock at 12:00 would otherwise admit as today 11:00)
+    # Line 1 is today 10:20. Line 0 jumps forward past line 1, violating monotonicity.
+    # The intra-pod ordering guard re-parses line 0 with until=10:20, dating it to yesterday.
+    log = (
+        "[pod/litellm-0] 11:00:00 - RateLimitError: 429 RESOURCE_EXHAUSTED\n"
+        "[pod/litellm-0] 10:20:00 INFO: 200 OK GET /health\n"
+    )
+    # Since line 0 is dated to yesterday (before since), it does not corroborate True.
+    assert harness._scan_log_content_for_429(log, since=since) is not True
+
+
+def test_telemetry_corroboration_cached_when_result_is_none_and_not_refetched_in_settle(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When _corroborate_platform_rate_limit returns None, it is fetched once across candidates and passed to _settle."""
+    fetch_calls: list[float | None] = []
+
+    def _mock_corroborate(since=None, session_id=None, until=None):
+        fetch_calls.append(since)
+        return None
+
+    monkeypatch.setattr(harness, "_corroborate_platform_rate_limit", _mock_corroborate)
+
+    _TASK_A = "task-a"
+    _TASK_B = "task-b"
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            payload = {
+                "statuses": {_TASK_A: "blocked", _TASK_B: "blocked"},
+                "summaries": {},
+                "errors": {
+                    _TASK_A: "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429",
+                    _TASK_B: "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429",
+                },
+                "block_kinds": {_TASK_A: "transient", _TASK_B: "transient"},
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    stub_agent.turns = [
+        _turn(
+            *_call("kanban_create", {"title": "Task A"}, {"ok": True, "task_id": _TASK_A, "status": "ready"}, "call_c1"),
+            *_call("kanban_create", {"title": "Task B"}, {"ok": True, "task_id": _TASK_B, "status": "ready"}, "call_c2"),
+            _text("Filed both tasks."),
+        ),
+        _show_turn("blocked", task_id=_TASK_A, call_id="call_s1"),
+        _show_turn("blocked", task_id=_TASK_B, call_id="call_s2"),
+    ]
+
+    result = KubeAgentsHarness().run("Do both tasks.")
+    assert result.has_errors()
+    # Exactly one telemetry fetch should have occurred across both cards and settle
+    assert len(fetch_calls) == 1
 
 
