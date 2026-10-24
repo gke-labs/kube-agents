@@ -1730,7 +1730,9 @@ adds that if the agent filed a card, that card keeps working until it finishes, 
 `stop` cannot reach a card (gke-labs#3263). With `A2A_CARD_STOP=true` the second case
 stops the conversation's cards instead (Stop, above). A top-level status question matches the exact
 status phrases only; one shaped like a question ("how is the deploy doing") is an ask.
-A bare `/session` asks for the next message in its thread.
+A bare `/session` asks for the next message in its thread. Slack's native Stop button,
+which also ends the kanban cards a thread's task filed, is designed in
+[`slack-stop.md`](slack-stop.md).
 
 The thread-less `slack:dm/{channel}` parses and posts top-level, and no inbound message
 is keyed that way. It is the form a DM record from before DMs threaded carries, so such
