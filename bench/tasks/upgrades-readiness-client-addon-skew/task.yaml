@@ -122,7 +122,9 @@ prompt: >-
   readiness report prints it: in the readiness table, the text behind
   `client-addon-skew: ` in the risks column (or the other blockers column); in
   the report's JSON, the member's `readiness.risks[]` or
-  `readiness.rule_blocking[]` object whose `rule` is `client-addon-skew`. The
+  `readiness.rule_blocking[]` object whose `rule` is `client-addon-skew`
+  (those lists, like `readiness.unknown[]`, hold objects with `rule` and
+  `text`; `readiness.notes[]` holds strings prefixed with the rule's id). The
   rule's notes (the GKE add-ons that are on, clients within one minor of the
   target, client-go callers) are not findings and stay off the line: a cluster
   the rule files no risk or blocker for reads none. Copy the text, not a
