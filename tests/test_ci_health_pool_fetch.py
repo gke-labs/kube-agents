@@ -54,7 +54,7 @@ def step_script() -> str:
 
 class PoolFetchStepTest(unittest.TestCase):
     def run_step(self, pointer=BUILD, artifact=READING, raw=None, finished=True, builds=(EARLIER, BUILD), aborted=(), pointer_error=NOT_FOUND):
-        """The step against a stub gsutil. `pointer` None means latest-build.txt
+        """The step against a stub gcloud storage. `pointer` None means latest-build.txt
         is unreadable and `pointer_error` is what gsutil says about it,
         `artifact` None means the copy fails, `raw` is bytes copied verbatim --
         what a crashed periodic leaves behind, `finished` False is a build
@@ -73,7 +73,7 @@ class PoolFetchStepTest(unittest.TestCase):
             payload = tmp / "payload.json"
             payload.write_text(json.dumps(artifact) if raw is None else raw)
             copy = f'cat "{payload}" > "${{@: -1}}"'
-        # `gsutil ls` on the prefix, the way the fallback reads it: the build
+        # `gcloud storage ls` on the prefix, the way the fallback reads it: the build
         # directories plus the pointer object, which the step has to skip.
         listing = "".join(f"{LOGS}/{b}/\\n" for b in builds)
         # One stat and one cp per prior build, so the walk past an aborted one
@@ -173,7 +173,7 @@ class PoolFetchStepTest(unittest.TestCase):
 
     def test_an_artifact_that_copies_but_does_not_parse_gets_the_same_treatment(self):
         """The periodic redirects into the file before it runs, so a crash
-        publishes a 0-byte object and `gsutil cp` copies it happily. Left
+        publishes a 0-byte object and `gcloud storage cp` copies it happily. Left
         alone, health.py reads a bare `{}` as no artifact at all -- the one
         reading that means "not wired up"."""
         for name, content in (("empty", ""), ("truncated", '{"verdict": "OK", "trend": {'), ("html", "<html>nope")):

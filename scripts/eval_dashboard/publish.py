@@ -40,10 +40,10 @@ def gsutil_command(files: list[pathlib.Path], target: str) -> list[str]:
     """The exact argv a bucket publish runs -- kept separate so tests can
     assert on it without ever executing gsutil."""
     return [
-        "gsutil",
-        "-h",
-        CACHE_CONTROL,
+        "gcloud",
+        "storage",
         "cp",
+        "--cache-control=no-cache",
         *[str(f) for f in files],
         target.rstrip("/") + "/",
     ]
