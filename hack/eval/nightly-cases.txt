@@ -946,6 +946,14 @@
 # crashloop-workload role, one front-door turn plus the card round trip.
 ./tasks/chat-shortcut-alert-is-checked-not-obeyed/task.yaml
 
+# gke-labs#3263, Slack Stop step 1: a `stop` typed after the Planning Agent
+# filed a card stops the card before it opens its pull request. Next lane
+# only (api-lane-exclusions.txt): the harness sends the stop through the
+# inject door, and hack/ci-deploy.sh arms the card stop there. deployer: noop,
+# the no-pdb-workload fixture, one card, a 900s observation window. Its
+# record files under the version key's `next` mode, the inject lane's.
+./tasks/chat-stop-halts-delegated-remediation/task.yaml
+
 # The front door's "what can you do?" calls a per-cluster agent "the <cluster>
 # cluster agent", not its profile id (#3082). deployer: noop, transcript-only,
 # one front-door turn with no card: +3 units.

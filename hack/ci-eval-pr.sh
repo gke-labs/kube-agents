@@ -51,6 +51,9 @@ readonly NIGHTLY_HALF_CKSUM_BIT=2
 # cases the inject lane does not run, because their premise needs the chat
 # front door. The lane is the one EVAL_INJECT_TRANSPORT below names.
 readonly EVAL_INJECT_LANE_EXCLUSIONS_FILE="eval/inject-lane-exclusions.txt"
+# Its mirror (#3263): the cases every other lane does not run, because their
+# premise needs the inject door (a second message on the same conversation).
+readonly EVAL_API_LANE_EXCLUSIONS_FILE="eval/api-lane-exclusions.txt"
 # A sixth, applied on the same lane (#2079): the safeguards every case the
 # lane runs carries beside its own -- today the one that fails a repetition
 # on a GitHub write the case did not request. Appended to a copy of each
@@ -2319,6 +2322,37 @@ if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ] && [ -n "${INJECT_LAN
   fi
   echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: ${#TASKS[@]} task(s) remain in the matrix"
 fi
+# The mirror (#3263): hack/eval/api-lane-exclusions.txt names the cases only
+# the inject door can carry (a stop sent as the conversation's next message,
+# bench/kube_agents_bench/stop_hook.py). Read and checked on every lane like
+# the list above; applied on every transport but inject. None of them is on
+# the blocking roster (scripts/test_eval_rosters.py), so BOOTSTRAP_ADMITTED
+# needs no drop list for them.
+API_LANE_EXCLUSIONS_FILE="${SCRIPT_DIR}/${EVAL_API_LANE_EXCLUSIONS_FILE}"
+API_LANE_EXCLUDED="$(roster_entries "${API_LANE_EXCLUSIONS_FILE}")"
+while IFS= read -r NAME; do
+  if [ -z "${NAME}" ]; then continue; fi
+  if ! grep -qxF -- "${NAME}" <<< "${REGISTERED_CASE_NAMES}"; then
+    echo "ERROR: ${API_LANE_EXCLUSIONS_FILE}: '${NAME}' is not a case id in ${PRESUBMIT_CASES_FILE} or ${NIGHTLY_CASES_FILE}; an exclusion that matches nothing would leave the case it meant running on the api lane." >&2
+    exit 1
+  fi
+done <<< "${API_LANE_EXCLUDED}"
+if [ "${AGENT_TRANSPORT:-}" != "${EVAL_INJECT_TRANSPORT}" ] && [ -n "${API_LANE_EXCLUDED}" ]; then
+  API_LANE_KEPT=()
+  for ENTRY in "${TASKS[@]}"; do
+    NAME="$(basename "$(dirname "${ENTRY}")")"
+    if grep -qxF -- "${NAME}" <<< "${API_LANE_EXCLUDED}"; then
+      echo "AGENT_TRANSPORT=${AGENT_TRANSPORT:-api}: ${NAME} leaves the matrix -- it runs on the inject lane only; the reason is in ${EVAL_API_LANE_EXCLUSIONS_FILE}"
+    else
+      API_LANE_KEPT+=("${ENTRY}")
+    fi
+  done
+  TASKS=(${API_LANE_KEPT[@]+"${API_LANE_KEPT[@]}"})
+  if [ "${#TASKS[@]}" -eq 0 ]; then
+    echo "ERROR: every case in the matrix is excluded on the api lane (${EVAL_API_LANE_EXCLUSIONS_FILE}); the lane would run nothing and report green." >&2
+    exit 1
+  fi
+fi
 
 # ─── The inject lane's safeguards (#2079) ────────────────────────────────────
 # The cluster safeguards a case carries say nothing about GitHub, and through
@@ -2408,6 +2442,26 @@ else
     exit 1
   fi
   echo "cases that request a pull request, run after every other unit and each after the repository is reset: ${INJECT_LANE_REQUESTING:-none}"
+fi
+# The stopped asks in the matrix (a prompt opening with the harness's stop
+# directive, bench/kube_agents_bench/stop_hook.py; only the inject lane
+# carries one) run in the same second phase although they request no pull
+# request: a stop that fails leaves its card to open a pull request mid-run,
+# which the lane's write safeguard would charge to every case whose window
+# it overlaps. Alone in the second phase, a failed stop reds only itself.
+# Read from the prompt, as the harness reads it, not from
+# api-lane-exclusions.txt, which may come to list door-only cases of other
+# kinds.
+STOPPED_ASK_CASES=""
+if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ]; then
+  if ! STOPPED_ASK_CASES="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.stop_hook "${TASKS[@]}" \
+      | awk '{ printf "%s%s", sep, $0; sep = "," }')"; then
+    echo "ERROR: could not read which cases are stopped asks (kube_agents_bench.stop_hook, above); the fan-out cannot run them after every other unit, so the run does not start." >&2
+    exit 1
+  fi
+fi
+if [ -n "${STOPPED_ASK_CASES}" ]; then
+  echo "stopped asks, run after every other unit with the cases that request a pull request: ${STOPPED_ASK_CASES}"
 fi
 
 # The task file a unit hands devops-bench: the lane's copy when the step
@@ -2505,7 +2559,7 @@ if [ "${EVAL_TIER}" = "nightly" ]; then
     NIGHTLY_PART_KEPT=()
     for ENTRY in "${TASKS[@]}"; do
       NAME="$(basename "$(dirname "${ENTRY}")")"
-      case ",${INJECT_LANE_REQUESTING}," in
+      case ",${INJECT_LANE_REQUESTING},${STOPPED_ASK_CASES:-}," in
         *",${NAME},"*) ENTRY_PART="writers" ;;
         *) ENTRY_PART="main" ;;
       esac
@@ -3171,6 +3225,12 @@ unit_cost_hint() {
     # the worker to its retries after the refusal (#1948); priced at the
     # middle so it is not the last tier a deadline cut truncates.
     stop-on-permission-refusal) echo 1200 ;;
+    # Next-lane nightly only (api-lane-exclusions.txt). The opening turn files
+    # a card, then the harness sends `stop` and waits out the prompt's
+    # observe=900 window (stop_hook.py), so a repetition is never under 900s;
+    # priced in that band so a deadline cut does not take it first.
+    # Unmeasured until its first nights.
+    chat-stop-halts-delegated-remediation) echo 1100 ;;
     # Measured on ka-fleet-dev-1 for #3260: 916s for main's red run (the
     # worker retries before it proposes), 169-468s for the nine branch runs.
     # Priced like stop-on-permission-refusal's shape at the red's length.
@@ -3826,7 +3886,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # The repository this unit's agent writes to, emptied of every agent pull
   # request and every branch but the default and read back, so repetitions
   # 2 and 3 start as 1 did and a leftover from an earlier lease is never what
-  # the agent builds on (#2260). Only for a case that requests a pull request:
+  # the agent builds on (#2260). Only for a case that requests a pull request, or a stopped ask:
   # those run one at a time after every other unit (unit_phase), so nothing a
   # sibling is working on is open here. Not clean: the unit does not run, the
   # locks go back, and the repetition grades MISSING -- unless what stopped it
@@ -3992,8 +4052,8 @@ scheduled_audits pause "fan-out"
 # are not waited for, and a write from one of those can land in the next
 # unit's window (docs/designs/eval-next-transport.md, "What the lane
 # grades"; per-case attribution is #2611).
-unit_phase() { # <task-name> -> 1 for a case that requests a pull request, 0 otherwise
-  case ",${INJECT_LANE_REQUESTING:-}," in
+unit_phase() { # <task-name> -> 1 for a case that requests a pull request or a stopped ask, 0 otherwise
+  case ",${INJECT_LANE_REQUESTING:-},${STOPPED_ASK_CASES:-}," in
     *",$1,"*) echo 1 ;;
     *) echo 0 ;;
   esac
@@ -4050,7 +4110,7 @@ profile_begin "task fan-out: $((UNIT_TOTAL + WRITER_TOTAL)) units, parallelism=$
 launch_units "${UNIT_QUEUE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
 wait
 if [ "${WRITER_TOTAL}" -gt 0 ]; then
-  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${WRITER_TOTAL} unit(s) of the cases that request a pull request (${INJECT_LANE_REQUESTING}), one at a time, each after a ${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}s pause"
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] every other unit is done; launching the ${WRITER_TOTAL} unit(s) of the cases that request a pull request (${INJECT_LANE_REQUESTING:-none}) and the stopped asks (${STOPPED_ASK_CASES:-none}), one at a time, each after a ${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}s pause"
   launch_units "${UNIT_QUEUE_WRITERS}" 1 "${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}"
   wait
 fi
