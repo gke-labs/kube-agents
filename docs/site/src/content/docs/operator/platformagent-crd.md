@@ -411,10 +411,11 @@ differently: when the retries were spent on provider rate limits (429s), the wor
 card instead, kind `transient`, with the provider's error text as the reason; `kanban_unblock` it
 once the quota window has passed. A second rate-limit block after an unblock sends the card to
 `triage`. A turn that fails outright, because the provider refused the call (an HTTP 401, a billing
-wall, a safety block) or the last retry ended on an error, is recorded by the worker itself: the
-error Hermes reported goes on the card as a comment, the run is charged as `crashed` and counted,
-and the card goes back to `ready` until it reaches its retry limit. The chat thread shows the
-generic "worker crashed" line for it, so read the card's comment for the cause. The charge's own
+wall, a safety block) or the last retry ended on an error, or a worker whose `chat()` returns before
+any turn runs (agent init or runtime credentials unresolved), is recorded by the worker itself: the
+error Hermes reported (or the no-turn notice) goes on the card as a comment, the run is charged as
+`crashed` and counted, and the card goes back to `ready` until it reaches its retry limit. The chat
+thread shows the generic "worker crashed" line for it, so read the card's comment for the cause. The charge's own
 error text names no provider error, so the dispatcher retries the card rather than parking it as
 an auth or quota failure. Goal-mode cards, which the dispatcher runs as a loop of turns judged
 against the card's goal, get none of this: their failures exit through the dispatcher's reaper as
