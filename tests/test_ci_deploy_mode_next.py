@@ -96,12 +96,13 @@ _PLATFORM_URI = f"{_AR_REPO}/platform-agent:{_TAG}"
 _FLAG_UNSET_SPELLINGS = (None, "", "0", "true", "yes")
 # The Prow jobs (oss-test-infra) section 2b admits the flag on without a pull
 # request: the merge-blocking presubmit (in a Tide batch), the today lane's
-# periodic, the main nightly's two parts and the GitLab next nightly; the
+# periodic, the main nightly's three parts and the GitLab next nightly; the
 # today-mode nightly and a made-up job stand for every other Prow run.
 _NEXT_LANE_JOB_NAMES = (
     "pull-kube-agents-smoke-test",
     "ci-kube-agents-eval-today",
     "ci-kube-agents-eval-nightly",
+    "ci-kube-agents-eval-nightly-main-b",
     "ci-kube-agents-eval-nightly-writers",
     "ci-kube-agents-eval-nightly-gitlab-next",
     # The release-candidate eval: a postsubmit, so no PULL_NUMBER.

@@ -2237,7 +2237,7 @@ esac
 # one project that phase and the infra lock's stretch did not fit the then-480m
 # deadline together. "all", the default, is the whole matrix; "main" leaves
 # those cases out and "writers" runs them alone. "main-a" and "main-b" split
-# "main" again, so it can run as two periodics on two more leased projects:
+# "main" again, so it can run as two periodics on two leased projects:
 # its length is set by the stack-bearing units, which run one at a time under
 # lock-infra, and each project has a lock of its own (#3384). The split is
 # applied after the lane step, which is what names the writers. A part
@@ -4161,8 +4161,8 @@ profile_begin "record + final gate"
 # install today's window measures. `bench-gate record` refuses it too.
 #
 # A next-mode run on main does record. The main nightly
-# (ci-kube-agents-eval-nightly and its -writers part, EVAL_MODE_NEXT=1) is a
-# periodic with no PULL_NUMBER, and its matrix runs over the inject transport,
+# (ci-kube-agents-eval-nightly, its -main-b half and its -writers part,
+# EVAL_MODE_NEXT=1) is a periodic with no PULL_NUMBER, and its matrix runs over the inject transport,
 # which `bench-gate` reads as the version key's `next` mode: its lines file
 # under a key of their own, never today's, and are the window an inject-lane
 # run at the same agent model (setupId) is compared with. Today's window is
