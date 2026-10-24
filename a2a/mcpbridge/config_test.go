@@ -1,0 +1,277 @@
+package mcpbridge
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// ConfigStore: persistence, deployment disambiguation, release enrichment, and cross-process coherence.
+
+func TestConfigStorePersistenceAndConversations(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "mcp-config.json")
+	store, err := NewConfigStore(cfgFile)
+	if err != nil {
+		t.Fatalf("NewConfigStore: %v", err)
+	}
+
+	err = store.UpsertDeployments([]DeploymentProfile{
+		{
+			Name:              testClusterName,
+			KubeContext:       testKubeContext,
+			Namespace:         testNamespace,
+			PlatformAgentName: testPAName,
+			ClusterName:       testClusterName,
+			GitHubRepo:        testGitHubRepo,
+			MCPToken:          "in-memory-secret-never-persisted",
+			Ready:             true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("UpsertDeployments: %v", err)
+	}
+
+	rawDisk, err := os.ReadFile(cfgFile)
+	if err != nil {
+		t.Fatalf("ReadFile config: %v", err)
+	}
+	if strings.Contains(string(rawDisk), "in-memory-secret-never-persisted") {
+		t.Fatalf("MCPToken must never be persisted to disk, got:\n%s", rawDisk)
+	}
+
+	active, ok := store.ActiveDeployment()
+	if !ok || active.Name != testClusterName {
+		t.Fatalf("ActiveDeployment = %+v, ok=%v; want %s", active, ok, testClusterName)
+	}
+
+	conv, err := store.EnsureConversation("incident-42", true, "Investigating node upgrade")
+	if err != nil {
+		t.Fatalf("EnsureConversation: %v", err)
+	}
+	if conv.Alias != "incident-42" || !strings.HasPrefix(conv.Token, defaultConvTokenPrefix) {
+		t.Fatalf("unexpected conversation entry: %+v", conv)
+	}
+	if _, err := store.SetConversationSessionMode("incident-42", true); err != nil {
+		t.Fatalf("SetConversationSessionMode: %v", err)
+	}
+
+	reloaded, err := NewConfigStore(cfgFile)
+	if err != nil {
+		t.Fatalf("reloading ConfigStore: %v", err)
+	}
+	if reloaded.ActiveConversation().Alias != "incident-42" || !reloaded.ActiveConversation().SessionMode {
+		t.Fatalf("reloaded conversation state mismatch: %+v", reloaded.ActiveConversation())
+	}
+}
+
+func TestConfigStoreCrossProcessCoherence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mcp-config.json")
+	storeA, err := NewConfigStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storeB, err := NewConfigStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := storeA.SetDebugMode(true); err != nil {
+		t.Fatal(err)
+	}
+	if err := storeB.UpsertDeployments([]DeploymentProfile{{Name: "host", KubeContext: "ctx-host", Namespace: testNamespace, PlatformAgentName: testPAName, Ready: true}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := storeA.Snapshot(); !got.DebugMode || got.Deployments["host"].KubeContext != "ctx-host" {
+		t.Fatalf("storeA sees debug=%v deployments=%v; want both writes", got.DebugMode, got.Deployments)
+	}
+	if got := storeB.Snapshot(); !got.DebugMode {
+		t.Fatalf("storeB lost storeA's DebugMode write")
+	}
+
+	const writers, perWriter = 6, 10
+	var wg sync.WaitGroup
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			st, err := NewConfigStore(path)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			for i := 0; i < perWriter; i++ {
+				if _, err := st.EnsureConversation(fmt.Sprintf("conv-%d-%d", w, i), true, ""); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	snap := storeA.Snapshot()
+	// 1 default + writers*perWriter conversations
+	if len(snap.Conversations) < writers*perWriter {
+		t.Fatalf("Conversations len = %d, want at least %d", len(snap.Conversations), writers*perWriter)
+	}
+}
+
+func TestUpsertAndSyncCrossContextNameDisambiguation(t *testing.T) {
+	store, err := NewConfigStore(filepath.Join(t.TempDir(), "mcp-config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const (
+		ctxA = "gke_proj_us-central1_a"
+		ctxB = "gke_proj_us-east1_b"
+	)
+	// Full scan with two contexts sharing the same cluster alias "shared-cluster".
+	fullScan := []DeploymentProfile{
+		{Name: "shared-cluster", KubeContext: ctxA, Namespace: testNamespace, PlatformAgentName: testPAName, Ready: true},
+		{Name: "shared-cluster", KubeContext: ctxB, Namespace: testNamespace, PlatformAgentName: testPAName, Ready: true},
+	}
+	if err := store.SyncDiscoveredDeployments(fullScan); err != nil {
+		t.Fatalf("SyncDiscoveredDeployments: %v", err)
+	}
+	snap := store.Snapshot()
+	if _, ok := snap.Deployments[ctxA+"/shared-cluster"]; !ok {
+		t.Fatalf("missing disambiguated key %q in %v", ctxA+"/shared-cluster", snap.Deployments)
+	}
+	if _, ok := snap.Deployments[ctxB+"/shared-cluster"]; !ok {
+		t.Fatalf("missing disambiguated key %q in %v", ctxB+"/shared-cluster", snap.Deployments)
+	}
+
+	// Subsequent single-context scan (where discovery returns bare "shared-cluster" for ctxB)
+	// must update ctxB+"/shared-cluster" in-place rather than creating a bare "shared-cluster"
+	// entry or clobbering ctxA.
+	filteredScan := []DeploymentProfile{
+		{Name: "shared-cluster", KubeContext: ctxB, Namespace: testNamespace, PlatformAgentName: testPAName, Version: "0.16.0", Ready: true},
+	}
+	if err := store.UpsertDeployments(filteredScan); err != nil {
+		t.Fatalf("UpsertDeployments(filteredScan): %v", err)
+	}
+	snap = store.Snapshot()
+	if len(snap.Deployments) != 2 {
+		t.Fatalf("expected 2 deployments after filtered scan, got %d: %v", len(snap.Deployments), snap.Deployments)
+	}
+	if got := snap.Deployments[ctxB+"/shared-cluster"].Version; got != "0.16.0" {
+		t.Fatalf("expected %s/shared-cluster version updated to 0.16.0, got %q", ctxB, got)
+	}
+}
+
+func TestSyncDiscoveredDeploymentsKeepsProfilesOfUnscannedContexts(t *testing.T) {
+	store, err := NewConfigStore(filepath.Join(t.TempDir(), "mcp-config.json"))
+	if err != nil {
+		t.Fatalf("NewConfigStore: %v", err)
+	}
+	const (
+		ctxA, ctxB, ctxC = "gke_example_us-central1_a", "gke_example_us-central1_b", "gke_example_us-central1_c"
+		depA, depB, depC = "cluster-a", "cluster-b", "cluster-c"
+	)
+	saved := []DeploymentProfile{
+		{Name: depA, KubeContext: ctxA, Namespace: testNamespace, PlatformAgentName: testPAName, Ready: true},
+		{Name: depB, KubeContext: ctxB, Namespace: testNamespace, PlatformAgentName: testPAName, Ready: true},
+		{Name: depC, KubeContext: ctxC, Namespace: testNamespace, PlatformAgentName: testPAName, Ready: true},
+		{Name: "manual", DirectMCPURL: "http://127.0.0.1:8089", Namespace: testNamespace, PlatformAgentName: testPAName, Ready: true},
+	}
+	if err := store.UpsertDeployments(saved); err != nil {
+		t.Fatalf("UpsertDeployments: %v", err)
+	}
+	if _, err := store.SetActiveDeployment(depA); err != nil {
+		t.Fatalf("SetActiveDeployment: %v", err)
+	}
+
+	scan := []DeploymentProfile{
+		{Name: depB, KubeContext: ctxB, Namespace: testNamespace, PlatformAgentName: testPAName, Ready: true, LastDiscoveredAt: time.Now().UTC()},
+		ContextProbeFailure(ctxA, fmt.Errorf("Unauthorized")),
+	}
+	if err := store.SyncDiscoveredDeployments(scan); err != nil {
+		t.Fatalf("SyncDiscoveredDeployments: %v", err)
+	}
+	snap := store.Snapshot()
+	if snap.ActiveDeployment != depA {
+		t.Fatalf("active deployment re-targeted to %q after a failed probe of %q; want it kept", snap.ActiveDeployment, depA)
+	}
+	keptA, ok := snap.Deployments[depA]
+	if !ok {
+		t.Fatalf("profile %q was pruned although its context only failed to answer", depA)
+	}
+	if keptA.Ready || !strings.Contains(keptA.StatusMessage, "Unauthorized") {
+		t.Fatalf("kept profile should be marked Not Ready with the probe failure, got %+v", keptA)
+	}
+	if _, ok := snap.Deployments[depC]; ok {
+		t.Fatalf("profile %q should have been pruned: its context was not in the scan and did not fail", depC)
+	}
+	if _, ok := snap.Deployments["manual"]; !ok {
+		t.Fatalf("manually configured direct-URL profile must survive a kubeconfig sync")
+	}
+
+	// Next scan that reaches A restores it.
+	recovered := []DeploymentProfile{
+		{Name: depA, KubeContext: ctxA, Namespace: testNamespace, PlatformAgentName: testPAName, Ready: true, StatusMessage: "Reconciled", LastDiscoveredAt: time.Now().UTC()},
+		{Name: depB, KubeContext: ctxB, Namespace: testNamespace, PlatformAgentName: testPAName, Ready: true, LastDiscoveredAt: time.Now().UTC()},
+	}
+	if err := store.SyncDiscoveredDeployments(recovered); err != nil {
+		t.Fatalf("SyncDiscoveredDeployments (recovered): %v", err)
+	}
+	snap = store.Snapshot()
+	if got := snap.Deployments[depA]; !got.Ready || got.StatusMessage != "Reconciled" || snap.ActiveDeployment != depA {
+		t.Fatalf("recovered profile mismatch: %+v (active=%q)", got, snap.ActiveDeployment)
+	}
+}
+
+func TestEnrichDeploymentVersionStatusSemverAndTargetCommitish(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case githubLatestReleasePath:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"tag_name":         "0.16.0",
+				"target_commitish": "main",
+				"html_url":         "https://github.com/gke-labs/kube-agents/releases/tag/0.16.0",
+			})
+		case "/repos/gke-labs/kube-agents/compare/0.15.0...0.16.0":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":   "ahead",
+				"ahead_by": 4,
+			})
+		case "/repos/gke-labs/kube-agents/compare/main...0.16.0":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":   "behind",
+				"ahead_by": 0,
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	ResetReleaseCacheForTest(srv.URL, srv.Client())
+
+	// 1. Newer semver installed than latest release -> UpgradeAvailable must be false.
+	newer := DeploymentProfile{Name: "newer", Version: "0.17.0"}
+	EnrichDeploymentVersionStatus(context.Background(), &newer)
+	if newer.UpgradeAvailable || newer.CommitsBehind != 0 {
+		t.Fatalf("newer semver 0.17.0 vs 0.16.0 marked UpgradeAvailable=%v CommitsBehind=%d", newer.UpgradeAvailable, newer.CommitsBehind)
+	}
+
+	// 2. Older semver installed -> UpgradeAvailable true, CommitsBehind=4.
+	older := DeploymentProfile{Name: "older", Version: "0.15.0"}
+	EnrichDeploymentVersionStatus(context.Background(), &older)
+	if !older.UpgradeAvailable || older.CommitsBehind != 4 {
+		t.Fatalf("older semver 0.15.0 vs 0.16.0: UpgradeAvailable=%v CommitsBehind=%d, want true / 4", older.UpgradeAvailable, older.CommitsBehind)
+	}
+
+	// 3. Branch name "main" when target_commitish is "main" and compare says ahead_by=0 -> UpgradeAvailable false.
+	branchProf := DeploymentProfile{Name: "branch", Version: "main"}
+	EnrichDeploymentVersionStatus(context.Background(), &branchProf)
+	if branchProf.UpgradeAvailable {
+		t.Fatalf("branch 'main' with ahead_by=0 should not report UpgradeAvailable=true")
+	}
+}

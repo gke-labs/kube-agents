@@ -1,0 +1,696 @@
+package mcpbridge
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+)
+
+const (
+	githubHost               = "github.com"
+	githubAPIBaseURL         = "https://api.github.com"
+	prStateMerged            = "MERGED"
+	githubPRURLPrefix        = "https://github.com/"
+	githubPRURLFormat        = "https://github.com/%s/pull/%d"
+	githubAPIPRFormat        = "%s/repos/%s/pulls/%d"
+	githubAPIPRFilesFormat   = "%s/repos/%s/pulls/%d/files?per_page=%d"
+	githubAPIPRFilesPerPage  = 100
+	maxPRFilesPages          = 30 // GitHub lists at most 3000 files per pull request
+	linkHeader               = "Link"
+	linkRelNext              = "next"
+	acceptHeader             = "Accept"
+	authHeader               = "Authorization"
+	userAgentHeader          = "User-Agent"
+	userAgentValue           = "kube-agents-mcp/1.0"
+	acceptGitHubJSON         = "application/vnd.github.v3+json"
+	acceptGitHubDiff         = "application/vnd.github.v3.diff"
+	bearerPrefix             = "Bearer "
+	gitCredentialsRelPath    = ".git-credentials"
+	envGHToken               = "GH_TOKEN"
+	envGitHubToken           = "GITHUB_TOKEN"
+	ghBinary                 = "gh"
+	ghCmdPR                  = "pr"
+	ghSubcmdView             = "view"
+	ghSubcmdDiff             = "diff"
+	ghFlagRepo               = "--repo"
+	ghFlagJSON               = "--json"
+	ghJSONFields             = "number,title,state,url,headRefName,baseRefName,additions,deletions,changedFiles,body,author,files"
+	prFetchTimeout           = 15 * time.Second
+	maxInlineDiffBytes       = 3200
+	maxPRDiffReadBytes       = 10 << 20
+	prURLRegexPattern        = `https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/(\d+)`
+	prShortRefRegexPattern   = `\b([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(\d+)\b`
+	prNumberOnlyRegexPattern = `^#?(\d+)$`
+	summaryFileName          = "PR_SUMMARY.md"
+	diffFileNameFormat       = "pr-%d.diff"
+	filesSubdirName          = "files"
+	patchExt                 = ".patch"
+	pathSeparatorReplacement = "__"
+	diffHeaderPrefix         = "diff --git "
+	bSidePrefix              = " b/"
+	quotedBSidePrefix        = ` "b/`
+	fileSchemePrefix         = "file://"
+	maxDiffErrorBodyBytes    = 512
+	ghPRDiffHintFormat       = "gh pr diff %d --repo %s"
+)
+
+var (
+	prURLRegex        = regexp.MustCompile(prURLRegexPattern)
+	prShortRefRegex   = regexp.MustCompile(prShortRefRegexPattern)
+	prNumberOnlyRegex = regexp.MustCompile(prNumberOnlyRegexPattern)
+	errInvalidPRRef   = errors.New("invalid pull request reference; provide a GitHub PR URL, owner/repo#number, or PR number")
+)
+
+// PRFileChange describes a single file modified in a pull request.
+type PRFileChange struct {
+	Path      string `json:"path"`
+	Additions int    `json:"additions"`
+	Deletions int    `json:"deletions"`
+	Status    string `json:"status,omitempty"`
+	PatchPath string `json:"patchPath,omitempty"`
+}
+
+// PRInspection holds the metadata, changed files, unified diff, and local file paths
+// for opening a pull request in a local code and diff viewer.
+type PRInspection struct {
+	Repo            string         `json:"repo"`
+	Number          int            `json:"number"`
+	Title           string         `json:"title"`
+	State           string         `json:"state"`
+	Author          string         `json:"author,omitempty"`
+	URL             string         `json:"url"`
+	HeadRef         string         `json:"headRef"`
+	BaseRef         string         `json:"baseRef"`
+	Additions       int            `json:"additions"`
+	Deletions       int            `json:"deletions"`
+	ChangedFiles    int            `json:"changedFiles"`
+	Body            string         `json:"body,omitempty"`
+	Files           []PRFileChange `json:"files,omitempty"`
+	UnifiedDiff     string         `json:"unifiedDiff,omitempty"`
+	DiffFilePath    string         `json:"diffFilePath"`
+	SummaryFilePath string         `json:"summaryFilePath"`
+	// DiffError explains why UnifiedDiff is empty (HTTP status such as GitHub's 406 for diffs
+	// over 20k lines / 300 files, a transport error, or a failed gh pr diff) so an empty
+	// result is never presented as a complete native diff file.
+	DiffError string `json:"diffError,omitempty"`
+}
+
+// ExtractPRReferences scans text for GitHub PR URLs and owner/repo#number references
+// and returns normalized https://github.com/<owner>/<repo>/pull/<number> URLs.
+func ExtractPRReferences(text string) []string {
+	var out []string
+	seen := make(map[string]bool)
+	for _, m := range prURLRegex.FindAllStringSubmatch(text, -1) {
+		if len(m) == 3 {
+			num, err := strconv.Atoi(m[2])
+			if err == nil && num > 0 {
+				u := fmt.Sprintf(githubPRURLFormat, m[1], num)
+				if !seen[u] {
+					seen[u] = true
+					out = append(out, u)
+				}
+			}
+		}
+	}
+	for _, m := range prShortRefRegex.FindAllStringSubmatch(text, -1) {
+		if len(m) == 3 {
+			num, err := strconv.Atoi(m[2])
+			if err == nil && num > 0 {
+				u := fmt.Sprintf(githubPRURLFormat, m[1], num)
+				if !seen[u] {
+					seen[u] = true
+					out = append(out, u)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// ParsePRReference resolves a PR URL, owner/repo#123, or #123 into (owner/repo, number).
+func ParsePRReference(ref string, defaultRepo string) (string, int, error) {
+	trimmed := strings.TrimSpace(ref)
+	if trimmed == "" {
+		return "", 0, errInvalidPRRef
+	}
+	if m := prURLRegex.FindStringSubmatch(trimmed); len(m) == 3 {
+		num, err := strconv.Atoi(m[2])
+		if err == nil && num > 0 {
+			return m[1], num, nil
+		}
+	}
+	if m := prShortRefRegex.FindStringSubmatch(trimmed); len(m) == 3 {
+		num, err := strconv.Atoi(m[2])
+		if err == nil && num > 0 {
+			return m[1], num, nil
+		}
+	}
+	if m := prNumberOnlyRegex.FindStringSubmatch(trimmed); len(m) == 2 {
+		if strings.TrimSpace(defaultRepo) == "" {
+			return "", 0, fmt.Errorf("%w: bare PR number %q requires a repo or connected deployment with githubRepo", errInvalidPRRef, trimmed)
+		}
+		num, err := strconv.Atoi(m[1])
+		if err == nil && num > 0 {
+			return strings.TrimSpace(defaultRepo), num, nil
+		}
+	}
+	return "", 0, fmt.Errorf("%w: %q", errInvalidPRRef, trimmed)
+}
+
+// InspectPullRequest fetches PR metadata and unified diff, writes local diff/patch files
+// for the native viewer, and returns the PRInspection.
+func InspectPullRequest(
+	ctx context.Context,
+	runner CommandRunner,
+	apiBaseURL string,
+	prRef string,
+	defaultRepo string,
+	outputDir string,
+) (*PRInspection, error) {
+	repo, num, err := ParsePRReference(prRef, defaultRepo)
+	if err != nil {
+		return nil, err
+	}
+	if apiBaseURL == "" {
+		apiBaseURL = githubAPIBaseURL
+	}
+
+	fetchCtx, cancel := context.WithTimeout(ctx, prFetchTimeout)
+	defer cancel()
+
+	token := resolveGitHubToken()
+	insp, err := fetchPRViaHTTP(fetchCtx, apiBaseURL, repo, num, token)
+	if err != nil {
+		httpErr := err
+		// The model often hears "PR #220 on example-infra" and guesses an owner. If the guessed
+		// repo is not the deployment's but shares its name, retry against the deployment's repo
+		// before falling back to the gh CLI (which may not be installed on this host).
+		if alt := sameNameRepo(repo, defaultRepo); alt != "" {
+			if insp2, err2 := fetchPRViaHTTP(fetchCtx, apiBaseURL, alt, num, token); err2 == nil {
+				insp, err, repo = insp2, nil, alt
+			}
+		}
+		if err != nil {
+			insp, err = fetchPRViaGHCLI(fetchCtx, runner, repo, num)
+			if err != nil {
+				var ghErr *githubHTTPError
+				if errors.As(httpErr, &ghErr) && ghErr.StatusCode == http.StatusNotFound {
+					return nil, fmt.Errorf("pull request %s#%d not found on GitHub (HTTP 404)", repo, num)
+				}
+				if errors.Is(err, exec.ErrNotFound) {
+					return nil, httpErr
+				}
+				return nil, fmt.Errorf("%w (GitHub API: %v)", err, httpErr)
+			}
+		}
+	}
+
+	if outputDir == "" {
+		home, hErr := os.UserHomeDir()
+		if hErr != nil {
+			outputDir = os.TempDir()
+		} else {
+			safeRepo := strings.ReplaceAll(repo, "/", "-")
+			outputDir = filepath.Join(home, prCacheDirRelPath, fmt.Sprintf("%s-pr-%d", safeRepo, num))
+		}
+	}
+	if err := os.MkdirAll(outputDir, DirPermMode); err != nil {
+		return nil, fmt.Errorf("creating PR cache dir %s: %w", outputDir, err)
+	}
+
+	diffPath := filepath.Join(outputDir, fmt.Sprintf(diffFileNameFormat, num))
+	if strings.TrimSpace(insp.UnifiedDiff) == "" {
+		// A refused or failed diff download (GitHub answers 406 past 20k lines / 300 files) must
+		// not be advertised as a complete native diff file: leave DiffFilePath unset, drop any
+		// stale pr-N.diff from an earlier inspection, and surface the reason in the summary.
+		_ = os.Remove(diffPath)
+		if insp.DiffError == "" {
+			insp.DiffError = "GitHub returned an empty unified diff"
+		}
+	} else {
+		if err := WriteFileAtomic(diffPath, []byte(insp.UnifiedDiff)); err != nil {
+			return nil, fmt.Errorf("writing unified diff %s: %w", diffPath, err)
+		}
+		insp.DiffFilePath = diffPath
+	}
+
+	perFilePatches := splitUnifiedDiffByFile(insp.UnifiedDiff)
+	filesDir := filepath.Join(outputDir, filesSubdirName)
+	_ = os.MkdirAll(filesDir, DirPermMode)
+	// Write every chunk the diff produced, not only the paths the files listing returned, so a
+	// partial listing never leaves per-file patches unwritten.
+	patchFiles := make(map[string]string, len(perFilePatches))
+	for fPath, patch := range perFilePatches {
+		patchFile := filepath.Join(filesDir, sanitizePatchFilename(fPath))
+		if WriteFileAtomic(patchFile, []byte(patch)) == nil {
+			patchFiles[fPath] = patchFile
+		}
+	}
+	for i := range insp.Files {
+		if patchFile, ok := patchFiles[insp.Files[i].Path]; ok {
+			insp.Files[i].PatchPath = patchFile
+		}
+	}
+
+	summaryPath := filepath.Join(outputDir, summaryFileName)
+	insp.SummaryFilePath = summaryPath
+	summaryMD := FormatPRInspectionMarkdown(insp)
+	_ = WriteFileAtomic(summaryPath, []byte(summaryMD))
+
+	return insp, nil
+}
+
+func sanitizePatchFilename(fPath string) string {
+	cleaned := strings.TrimLeft(strings.ReplaceAll(fPath, "\\", "/"), "/")
+	var safeParts []string
+	for _, seg := range strings.Split(cleaned, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			continue
+		}
+		safeParts = append(safeParts, seg)
+	}
+	if len(safeParts) == 0 {
+		safeParts = []string{"file"}
+	}
+	joined := strings.Join(safeParts, pathSeparatorReplacement)
+	const maxBaseLen = 190
+	if len(joined) > maxBaseLen {
+		sum := sha256.Sum256([]byte(fPath))
+		hashPrefix := hex.EncodeToString(sum[:6])
+		lastSeg := safeParts[len(safeParts)-1]
+		if len(lastSeg) > 120 {
+			lastSeg = lastSeg[len(lastSeg)-120:]
+		}
+		joined = hashPrefix + pathSeparatorReplacement + lastSeg
+	}
+	return joined + patchExt
+}
+
+// githubHTTPError is a non-2xx GitHub REST response, kept structured so callers can branch on
+// the status code instead of on message text.
+type githubHTTPError struct {
+	Endpoint   string
+	StatusCode int
+	Body       string
+}
+
+func (e *githubHTTPError) Error() string {
+	return fmt.Sprintf("GitHub API %s returned HTTP %d: %s", e.Endpoint, e.StatusCode, e.Body)
+}
+
+func fetchPRViaHTTP(ctx context.Context, apiBaseURL string, repo string, num int, token string) (*PRInspection, error) {
+	prEndpoint := fmt.Sprintf(githubAPIPRFormat, strings.TrimRight(apiBaseURL, "/"), repo, num)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, prEndpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set(acceptHeader, acceptGitHubJSON)
+	req.Header.Set(userAgentHeader, userAgentValue)
+	if token != "" {
+		req.Header.Set(authHeader, bearerPrefix+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, &githubHTTPError{Endpoint: prEndpoint, StatusCode: resp.StatusCode, Body: strings.TrimSpace(string(body))}
+	}
+	var payload struct {
+		Number       int    `json:"number"`
+		Title        string `json:"title"`
+		State        string `json:"state"`
+		Merged       bool   `json:"merged"`
+		MergedAt     string `json:"merged_at"`
+		HTMLURL      string `json:"html_url"`
+		Body         string `json:"body"`
+		Additions    int    `json:"additions"`
+		Deletions    int    `json:"deletions"`
+		ChangedFiles int    `json:"changed_files"`
+		User         struct {
+			Login string `json:"login"`
+		} `json:"user"`
+		Head struct {
+			Ref string `json:"ref"`
+		} `json:"head"`
+		Base struct {
+			Ref string `json:"ref"`
+		} `json:"base"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+
+	// GitHub reports merged PRs as state "closed" with merged=true; a user reading "CLOSED" assumes
+	// the change was rejected (soak round 13), so surface MERGED explicitly.
+	state := strings.ToUpper(payload.State)
+	if payload.Merged || strings.TrimSpace(payload.MergedAt) != "" {
+		state = prStateMerged
+	}
+	insp := &PRInspection{
+		Repo:         repo,
+		Number:       num,
+		Title:        payload.Title,
+		State:        state,
+		Author:       payload.User.Login,
+		URL:          FirstNonEmptyStr(payload.HTMLURL, fmt.Sprintf(githubPRURLFormat, repo, num)),
+		HeadRef:      payload.Head.Ref,
+		BaseRef:      payload.Base.Ref,
+		Additions:    payload.Additions,
+		Deletions:    payload.Deletions,
+		ChangedFiles: payload.ChangedFiles,
+		Body:         payload.Body,
+	}
+
+	// The files endpoint is paginated: follow rel="next" until exhausted (bounded by
+	// maxPRFilesPages) so a PR with more than one page of changed files lists every file.
+	filesEndpoint := fmt.Sprintf(githubAPIPRFilesFormat, strings.TrimRight(apiBaseURL, "/"), repo, num, githubAPIPRFilesPerPage)
+	for page := 0; filesEndpoint != "" && page < maxPRFilesPages; page++ {
+		fReq, fErr := http.NewRequestWithContext(ctx, http.MethodGet, filesEndpoint, nil)
+		if fErr != nil {
+			break
+		}
+		fReq.Header.Set(acceptHeader, acceptGitHubJSON)
+		fReq.Header.Set(userAgentHeader, userAgentValue)
+		if token != "" {
+			fReq.Header.Set(authHeader, bearerPrefix+token)
+		}
+		fResp, dErr := http.DefaultClient.Do(fReq)
+		if dErr != nil {
+			break
+		}
+		var fileList []struct {
+			Filename  string `json:"filename"`
+			Additions int    `json:"additions"`
+			Deletions int    `json:"deletions"`
+			Status    string `json:"status"`
+		}
+		pageOK := fResp.StatusCode == http.StatusOK && json.NewDecoder(fResp.Body).Decode(&fileList) == nil
+		nextEndpoint := nextPageURL(fResp.Header.Get(linkHeader), filesEndpoint)
+		_ = fResp.Body.Close()
+		if !pageOK {
+			break
+		}
+		for _, f := range fileList {
+			insp.Files = append(insp.Files, PRFileChange{
+				Path:      f.Filename,
+				Additions: f.Additions,
+				Deletions: f.Deletions,
+				Status:    f.Status,
+			})
+		}
+		filesEndpoint = nextEndpoint
+	}
+
+	diffReq, err := http.NewRequestWithContext(ctx, http.MethodGet, prEndpoint, nil)
+	if err == nil {
+		diffReq.Header.Set(acceptHeader, acceptGitHubDiff)
+		diffReq.Header.Set(userAgentHeader, userAgentValue)
+		if token != "" {
+			diffReq.Header.Set(authHeader, bearerPrefix+token)
+		}
+		diffResp, dErr := http.DefaultClient.Do(diffReq)
+		switch {
+		case dErr != nil:
+			insp.DiffError = fmt.Sprintf("unified diff download failed: %v", dErr)
+		case diffResp.StatusCode != http.StatusOK:
+			body, _ := io.ReadAll(io.LimitReader(diffResp.Body, maxDiffErrorBodyBytes))
+			_ = diffResp.Body.Close()
+			insp.DiffError = (&githubHTTPError{Endpoint: prEndpoint + " (" + acceptGitHubDiff + ")", StatusCode: diffResp.StatusCode, Body: strings.TrimSpace(string(body))}).Error()
+		default:
+			rawDiff, _ := io.ReadAll(io.LimitReader(diffResp.Body, maxPRDiffReadBytes))
+			_ = diffResp.Body.Close()
+			insp.UnifiedDiff = string(rawDiff)
+		}
+	}
+	return insp, nil
+}
+
+// nextPageURL returns the rel="next" target of a GitHub Link header, or "" when there is no
+// further page. Only a target on the same scheme and host as the current request is followed,
+// so the bearer token is never replayed to another origin.
+func nextPageURL(link string, current string) string {
+	cur, err := url.Parse(current)
+	if err != nil {
+		return ""
+	}
+	for _, part := range strings.Split(link, ",") {
+		segs := strings.Split(part, ";")
+		target := strings.TrimSpace(segs[0])
+		if len(segs) < 2 || !strings.HasPrefix(target, "<") || !strings.HasSuffix(target, ">") {
+			continue
+		}
+		isNext := false
+		for _, param := range segs[1:] {
+			param = strings.TrimSpace(param)
+			if strings.HasPrefix(param, "rel=") && strings.Trim(strings.TrimPrefix(param, "rel="), `"`) == linkRelNext {
+				isNext = true
+				break
+			}
+		}
+		if !isNext {
+			continue
+		}
+		next, pErr := url.Parse(strings.TrimSuffix(strings.TrimPrefix(target, "<"), ">"))
+		if pErr != nil || next.Scheme != cur.Scheme || next.Host != cur.Host {
+			return ""
+		}
+		return next.String()
+	}
+	return ""
+}
+
+func fetchPRViaGHCLI(ctx context.Context, runner CommandRunner, repo string, num int) (*PRInspection, error) {
+	if runner == nil {
+		runner = DefaultCommandRunner
+	}
+	numStr := strconv.Itoa(num)
+	out, err := runner(ctx, ghBinary, ghCmdPR, ghSubcmdView, numStr, ghFlagRepo, repo, ghFlagJSON, ghJSONFields)
+	if err != nil {
+		return nil, fmt.Errorf("fetching PR %s#%d via gh: %w", repo, num, err)
+	}
+	var ghData struct {
+		Number       int    `json:"number"`
+		Title        string `json:"title"`
+		State        string `json:"state"`
+		URL          string `json:"url"`
+		HeadRefName  string `json:"headRefName"`
+		BaseRefName  string `json:"baseRefName"`
+		Additions    int    `json:"additions"`
+		Deletions    int    `json:"deletions"`
+		ChangedFiles int    `json:"changedFiles"`
+		Body         string `json:"body"`
+		Author       struct {
+			Login string `json:"login"`
+		} `json:"author"`
+		Files []struct {
+			Path      string `json:"path"`
+			Additions int    `json:"additions"`
+			Deletions int    `json:"deletions"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(out, &ghData); err != nil {
+		return nil, fmt.Errorf("parsing gh pr view output: %w", err)
+	}
+	diffOut, dErr := runner(ctx, ghBinary, ghCmdPR, ghSubcmdDiff, numStr, ghFlagRepo, repo)
+	insp := &PRInspection{
+		Repo:         repo,
+		Number:       num,
+		Title:        ghData.Title,
+		State:        ghData.State,
+		Author:       ghData.Author.Login,
+		URL:          FirstNonEmptyStr(ghData.URL, fmt.Sprintf(githubPRURLFormat, repo, num)),
+		HeadRef:      ghData.HeadRefName,
+		BaseRef:      ghData.BaseRefName,
+		Additions:    ghData.Additions,
+		Deletions:    ghData.Deletions,
+		ChangedFiles: ghData.ChangedFiles,
+		Body:         ghData.Body,
+		UnifiedDiff:  string(diffOut),
+	}
+	if dErr != nil {
+		insp.DiffError = fmt.Sprintf(ghPRDiffHintFormat+" failed: %v", num, repo, dErr)
+	}
+	for _, f := range ghData.Files {
+		insp.Files = append(insp.Files, PRFileChange{
+			Path:      f.Path,
+			Additions: f.Additions,
+			Deletions: f.Deletions,
+		})
+	}
+	return insp, nil
+}
+
+func resolveGitHubToken() string {
+	if t := strings.TrimSpace(os.Getenv(envGHToken)); t != "" {
+		return t
+	}
+	if t := strings.TrimSpace(os.Getenv(envGitHubToken)); t != "" {
+		return t
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	root, err := os.OpenRoot(home)
+	if err != nil {
+		return ""
+	}
+	defer root.Close()
+	raw, err := root.ReadFile(gitCredentialsRelPath)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		u, uErr := url.Parse(line)
+		if uErr == nil && strings.EqualFold(u.Host, githubHost) && u.User != nil {
+			if tok, ok := u.User.Password(); ok && tok != "" {
+				return tok
+			}
+		}
+	}
+	return ""
+}
+
+func splitUnifiedDiffByFile(diff string) map[string]string {
+	out := make(map[string]string)
+	if strings.TrimSpace(diff) == "" {
+		return out
+	}
+	// Anchor the split to line starts: hunk body lines always begin with '+', '-', ' ' or '\',
+	// so a literal "diff --git " inside a patch body (a committed .patch file, a test fixture
+	// embedding a sample diff) must not start a new chunk or truncate the enclosing one.
+	chunks := strings.Split("\n"+diff, "\n"+diffHeaderPrefix)
+	for i := 1; i < len(chunks); i++ {
+		chunk := chunks[i]
+		if i < len(chunks)-1 {
+			chunk += "\n" // re-attach the line terminator consumed by the separator
+		}
+		if strings.TrimSpace(chunk) == "" {
+			continue
+		}
+		fullChunk := diffHeaderPrefix + chunk
+		firstLineEnd := strings.IndexByte(chunk, '\n')
+		firstLine := chunk
+		if firstLineEnd >= 0 {
+			firstLine = chunk[:firstLineEnd]
+		}
+		if filePath := diffHeaderBSidePath(firstLine); filePath != "" {
+			out[filePath] = fullChunk
+		}
+	}
+	return out
+}
+
+// diffHeaderBSidePath extracts the post-image path from the remainder of a
+// `diff --git a/<path> b/<path>` header line, tolerating git's C-style quoting
+// (`diff --git "a/p q" "b/p q"`) used for paths with spaces or special characters.
+func diffHeaderBSidePath(firstLine string) string {
+	line := strings.TrimSpace(firstLine)
+	if idx := strings.LastIndex(line, quotedBSidePrefix); idx >= 0 {
+		if unquoted, err := strconv.Unquote(line[idx+1:]); err == nil {
+			return strings.TrimPrefix(unquoted, "b/")
+		}
+	}
+	if idx := strings.LastIndex(line, bSidePrefix); idx >= 0 {
+		return strings.TrimSpace(line[idx+len(bSidePrefix):])
+	}
+	return ""
+}
+
+// sameNameRepo returns defaultRepo when guessed is a different owner/repo with the same repository
+// name (e.g. guessed "someone/example-infra", default "example-org/example-infra"), else "".
+func sameNameRepo(guessed, defaultRepo string) string {
+	g := strings.TrimSpace(guessed)
+	d := strings.TrimSpace(defaultRepo)
+	if g == "" || d == "" || strings.EqualFold(g, d) {
+		return ""
+	}
+	gi := strings.LastIndex(g, "/")
+	di := strings.LastIndex(d, "/")
+	if gi < 0 || di < 0 {
+		return ""
+	}
+	if strings.EqualFold(g[gi+1:], d[di+1:]) {
+		return d
+	}
+	return ""
+}
+
+// FormatPRInspectionMarkdown renders a GitHub PR with clickable file:// diff links.
+func FormatPRInspectionMarkdown(insp *PRInspection) string {
+	if insp == nil {
+		return ""
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "## 🔀 Pull Request [%s#%d](%s): %s\n\n", insp.Repo, insp.Number, insp.URL, insp.Title)
+	fmt.Fprintf(&sb, "- **State**: `%s` | **Author**: `%s` | **Branch**: `%s` → `%s`\n",
+		insp.State, FirstNonEmptyStr(insp.Author, "—"), insp.HeadRef, insp.BaseRef)
+	fmt.Fprintf(&sb, "- **Changes**: `+ %d` / `- %d` across `%d` file(s)\n",
+		insp.Additions, insp.Deletions, insp.ChangedFiles)
+	if insp.DiffFilePath != "" {
+		fmt.Fprintf(&sb, "- **Unified Diff File**: [%s](%s%s)\n",
+			filepath.Base(insp.DiffFilePath), fileSchemePrefix, insp.DiffFilePath)
+	} else if insp.DiffError != "" {
+		fmt.Fprintf(&sb, "- **Unified Diff**: ⚠️ not available — %s. Fetch it locally with `"+ghPRDiffHintFormat+"`.\n",
+			insp.DiffError, insp.Number, insp.Repo)
+	}
+	if insp.SummaryFilePath != "" {
+		fmt.Fprintf(&sb, "- **Local PR Summary Markdown**: [%s](%s%s)\n",
+			filepath.Base(insp.SummaryFilePath), fileSchemePrefix, insp.SummaryFilePath)
+	}
+	sb.WriteString("\n")
+
+	if strings.TrimSpace(insp.Body) != "" {
+		sb.WriteString("### 📝 PR Description\n\n")
+		sb.WriteString(strings.TrimSpace(insp.Body) + "\n\n")
+	}
+
+	if len(insp.Files) > 0 {
+		sb.WriteString("### 📂 Changed Files (Click Patch Link to Open in Viewer)\n\n")
+		sb.WriteString("| File | Status | Additions | Deletions | Native Patch Link |\n")
+		sb.WriteString("| :--- | :--- | ---: | ---: | :--- |\n")
+		for _, f := range insp.Files {
+			patchLink := "—"
+			if f.PatchPath != "" {
+				patchLink = fmt.Sprintf("[%s](%s%s)", filepath.Base(f.PatchPath), fileSchemePrefix, f.PatchPath)
+			}
+			fmt.Fprintf(&sb, "| `%s` | `%s` | `+%d` | `-%d` | %s |\n",
+				f.Path, FirstNonEmptyStr(f.Status, "modified"), f.Additions, f.Deletions, patchLink)
+		}
+		sb.WriteString("\n")
+	}
+
+	if strings.TrimSpace(insp.UnifiedDiff) != "" {
+		sb.WriteString("### 🔍 Unified Diff\n\n```diff\n")
+		diffText := insp.UnifiedDiff
+		if len(diffText) > maxInlineDiffBytes {
+			diffText = diffText[:maxInlineDiffBytes] + "\n... (diff truncated inline; open full diff at " + fileSchemePrefix + insp.DiffFilePath + ")\n"
+		}
+		sb.WriteString(diffText)
+		if !strings.HasSuffix(diffText, "\n") {
+			sb.WriteString("\n")
+		}
+		sb.WriteString("```\n")
+	}
+	return sb.String()
+}
