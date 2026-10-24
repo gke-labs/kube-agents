@@ -4656,7 +4656,7 @@ NON_INSPECTING_COMMAND_RE = re.compile(
 # fleet_upgrade_report.py is the fleet-upgrade-verification skill's read-only
 # reporter; the upgrade audit's 3.11 records its invocation as the command that
 # ran, and that invocation names none of the six binaries.
-INSPECTION_BINARIES = ("kubectl", "gcloud", "gsutil", "bq", "helm", "curl", "fleet_upgrade_report.py")
+INSPECTION_BINARIES = ("kubectl", "gcloud", "bq", "helm", "curl", "fleet_upgrade_report.py")
 
 MIN_CHECK_COMMAND_CHARS = 8
 
