@@ -306,7 +306,7 @@ class PerCaseGradingTest(unittest.TestCase):
     UNIT_STUBS = """
 _now_ms() { date +%s000; }
 lock_acquire() { mkdir "$1" 2>/dev/null; }
-lock_release() { rmdir "$1" 2>/dev/null || true; }
+""" + lifted("lock_release") + """
 mint_ledger_token() { return 0; }
 unit_delegation_timeout() { echo 1800; }
 ledger_audit_id_for_task() { echo ""; }
