@@ -469,6 +469,12 @@ func (b *NATSBus) awaitRunningTurn(ctx context.Context, convs *Conversations, to
 	case errors.Is(err, ErrTaskNotFound), err == nil && t != nil && t.Final:
 		convs.clearRunning(token, ref)
 		return nil
+	case tooLargeToRead(err):
+		// The task can't be read here, now or later, so it can't be waited
+		// on either. Holding the conversation for it would refuse every
+		// later message, so let this one go.
+		convs.clearRunning(token, ref)
+		return nil
 	case ctx.Err() != nil:
 		return convs.busy(token, ctx.Err())
 	case errors.Is(err, context.DeadlineExceeded):

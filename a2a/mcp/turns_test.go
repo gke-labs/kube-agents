@@ -289,6 +289,31 @@ func TestAFollowedTaskTooLargeToReadIsReadOnce(t *testing.T) {
 	if n := reads.Load(); n != 1 {
 		t.Errorf("read the over-budget task %d times in a 3s wait; want once", n)
 	}
+	// The turn leaves that task as the conversation's running one, and the
+	// next message can't wait on a task it can't read: it goes, rather than
+	// the conversation refusing every message from now on.
+	res = callTool(t, s, ToolSendMessage, map[string]any{"text": "delegate check it again", "wait_seconds": 3})
+	if res.IsError || strings.Contains(res.Content[0].Text, "running task") {
+		t.Fatalf("a second message after a too-large task: %s", res.Content[0].Text)
+	}
+}
+
+// oneMsgSource is a read whose every wait brings one message.
+type oneMsgSource struct{}
+
+func (oneMsgSource) Fetch(int, ...nats.PullOpt) ([]*nats.Msg, error) {
+	return []*nats.Msg{{Subject: "a2a.tasks.x", Data: []byte("{}")}}, nil
+}
+func (oneMsgSource) Unsubscribe() error { return nil }
+
+// A task read past maxTaskEvents fails as too large to read, which a turn
+// takes as final for that task rather than reading it again.
+func TestATaskPastItsEventCapIsTooLargeToRead(t *testing.T) {
+	w := &taskWatch{ref: TaskRef{Addressee: fakeAddressee, TaskID: "task-chatty"}, r: &budgetReader{sub: oneMsgSource{}, batch: 1, budget: readMaxBytes}, seen: maxTaskEvents, pending: 1, release: func(bool) {}}
+	err := w.next(context.Background())
+	if !tooLargeToRead(err) {
+		t.Fatalf("a read past %d events returned %v; want it too large to read", maxTaskEvents, err)
+	}
 }
 
 // A turn that hands its work to kanban cards completes with its
