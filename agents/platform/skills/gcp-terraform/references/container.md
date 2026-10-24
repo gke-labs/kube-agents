@@ -83,7 +83,8 @@ decides.
   module call. With none, the kube-agents `gke-cluster` module pinned to a
   release tag is the reference layout's example; ask before introducing a
   module the repository does not already use. Its `deletion_protection` is
-  the existing clusters' value, or `true` with none (Step 3).
+  `true`, written as the existing clusters write it; a sibling's `false` is
+  not copied (Step 3).
 
 ## Shared resources beside a cluster
 

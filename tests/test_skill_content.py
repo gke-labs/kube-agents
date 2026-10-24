@@ -73,6 +73,10 @@ class TerraformNewClusterDefaultsTest(unittest.TestCase):
     def test_the_reference_lists_the_shared_resources(self):
         reference = (TERRAFORM_SKILL.parent / "references" / "container.md").read_text(encoding="utf-8")
         self.assertIn("## Shared resources beside a cluster", reference)
+        # The reference agrees with Step 3: a sibling's false is never copied.
+        flat = " ".join(reference.split())
+        self.assertNotIn("the existing clusters' value", flat)
+        self.assertIn("a sibling's `false` is not copied", flat)
         for resource in ("google_gke_hub_feature", "google_gke_hub_fleet", "google_project_service"):
             self.assertIn(f"`{resource}`", reference)
 
