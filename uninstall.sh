@@ -949,6 +949,9 @@ main() {
     { declare -F is_table_model_provider >/dev/null && ! is_table_model_provider "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}"; }; then
     export MODEL_PROVIDER="$DEFAULT_MODEL_PROVIDER" MODEL_DEFAULT_NAME=""
   fi
+  # Also force WEB_CONSOLE_ENABLED=false so write_tfvars_from_state never refuses
+  # the destroy when ACCEPT_NO_NETWORK_POLICY=true was also set in install.env.
+  export WEB_CONSOLE_ENABLED="false"
   write_tfvars_from_state "${compose_dir}/terraform.tfvars"
   (
     cd "$compose_dir"

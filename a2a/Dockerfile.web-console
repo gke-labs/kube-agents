@@ -1,0 +1,35 @@
+# The web console image: a browser chat page for the Platform Agent, served
+# from inside the cluster for installs with no chat platform configured.
+#
+# It reaches the Hermes gateway on the agent Service and nothing else, and it
+# is reachable only through `kubectl port-forward` — the chart renders it
+# behind a ClusterIP Service and a deny-all ingress NetworkPolicy. See
+# docs/site/src/content/docs/deploy/web-console.md.
+#
+# Build from the a2a/ module root:
+#   docker build -f Dockerfile.web-console -t <registry>/web-console:<tag> .
+
+# Bases come from images.json, spelled the way Dockerfile.verifier spells them
+# so `make mirror-images` and the pinning there cover this build too.
+ARG GOLANG_IMAGE=golang
+ARG GOLANG_VERSION=1.27-alpine
+ARG DISTROLESS_IMAGE=gcr.io/distroless/static
+ARG DISTROLESS_VERSION=nonroot
+
+FROM ${GOLANG_IMAGE}:${GOLANG_VERSION} AS build
+# Refuse to download a toolchain the pin above does not name (#1138).
+ENV GOTOOLCHAIN=local
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -o /out/web-console ./cmd/web-console
+
+# The page is embedded in the binary and nothing is written to disk, so the
+# Deployment mounts the root filesystem read-only. `USER nonroot` (uid 65532)
+# matches the chart's runAsUser.
+FROM ${DISTROLESS_IMAGE}:${DISTROLESS_VERSION}
+COPY --from=build /out/web-console /web-console
+USER nonroot
+EXPOSE 8080
+ENTRYPOINT ["/web-console"]
