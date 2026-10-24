@@ -694,8 +694,8 @@ func TestAResumedConversationIsNamedByItsToken(t *testing.T) {
 // read's would, on a consumer that cannot be asked for its info.
 type emptySource struct{}
 
-func (emptySource) NextMsg(time.Duration) (*nats.Msg, error) { return nil, nats.ErrTimeout }
-func (emptySource) Unsubscribe() error                       { return nil }
+func (emptySource) Fetch(int, ...nats.PullOpt) ([]*nats.Msg, error) { return nil, nats.ErrTimeout }
+func (emptySource) Unsubscribe() error                              { return nil }
 
 type noInfoConsumer struct{ jetstream.Consumer }
 
@@ -706,7 +706,7 @@ func (noInfoConsumer) Info(context.Context) (*jetstream.ConsumerInfo, error) {
 // A task read whose fetch comes back empty while events are still pending
 // is an error, not the task's end folded from what was read so far.
 func TestAStalledTaskReadIsAnError(t *testing.T) {
-	w := &taskWatch{ref: TaskRef{Addressee: fakeAddressee, TaskID: "task-stall"}, r: &budgetReader{cons: noInfoConsumer{}, sub: emptySource{}, budget: readMaxBytes, pulling: true, pullEnds: time.Now().Add(time.Hour)}, pending: 5, release: func(bool) {}}
+	w := &taskWatch{ref: TaskRef{Addressee: fakeAddressee, TaskID: "task-stall"}, r: &budgetReader{cons: noInfoConsumer{}, sub: emptySource{}, budget: readMaxBytes}, pending: 5, release: func(bool) {}}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := w.next(ctx); err == nil || !strings.Contains(err.Error(), "still pending") {

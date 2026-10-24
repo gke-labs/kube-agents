@@ -2,7 +2,6 @@ package mcp
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -27,7 +26,7 @@ const (
 	// of headers and payload, a subject of up to max_control_line's 64 KiB,
 	// and 8 KiB for the ack reply and slack. A larger message (a bus whose
 	// max_payload was raised past it) the server does not send at all; the
-	// read stops at it (budgetReader.status) rather than take it into the
+	// read stops at it (budgetReader.next) rather than take it into the
 	// pod.
 	pullMaxBytes = 1<<20 + 72<<10
 
@@ -36,12 +35,14 @@ const (
 	// drain, a task watch (over its whole life, since the watch keeps what
 	// it folds) and a DIRECTORY read each stop at it. The pod has 128 MiB
 	// (a2aMCPMemoryLimit in the operator), with GOMEMLIMIT at 85% of it,
-	// about 108 MiB. One read holds at worst two pulls in flight (one
-	// taken as over after pullGap may still be arriving), 2.2 MiB, plus what it passed on, 4 MiB, plus a task watch's
-	// parsed copy of that, 4 MiB more: about 10.2 MiB. The eight reader
-	// slots (maxTaskReaders) and the one DIRECTORY read the status cache
-	// keeps in flight, all at their worst at once, come to about 92 MiB,
-	// leaving some 16 MiB of the GOMEMLIMIT for the server itself.
+	// about 108 MiB. A reader has one Fetch in flight at a time and hands
+	// its messages out before it sends the next, so it holds at worst one
+	// pull's pullMaxBytes, 1.1 MiB, plus what it passed on, 4 MiB, plus a
+	// task watch's parsed copy of that, 4 MiB more: about 9.1 MiB. The
+	// eight reader slots (maxTaskReaders) and the one DIRECTORY read the
+	// status cache keeps in flight, all at their worst at once, come to
+	// about 82 MiB, leaving some 26 MiB of the GOMEMLIMIT for the server
+	// itself.
 	readMaxBytes = 4 << 20
 )
 
@@ -51,173 +52,89 @@ const (
 var ErrReadByteBudget = errors.New("read byte budget reached")
 
 // budgetReader is the one way this server reads a consumer: one pull at a
-// time, each capped by the server at pullMaxBytes, and a running total of
-// what it has passed on, which stops the read at its budget. It sends its
-// own pull requests rather than use the client's Fetch or Messages: Fetch
-// has no byte cap short of FetchBytes's million-message buffers, and
-// Messages treats the server's "409 Message Size Exceeds MaxBytes" as
-// routine and pulls again at once, so a message over the cap had it send
-// some 37,000 pulls in a two-second wait. Here that 409 on a pull that
-// brought nothing ends the read. One per read; stop it when done.
+// time, each capped by the server at pullMaxBytes, handed out a message at
+// a time, and a running total of what it has passed on, which stops the
+// read at its budget. Its pulls are the legacy client's one-shot Fetch on a
+// subscription bound to the consumer, the one client call that takes a
+// byte cap alongside a batch and reports the server refusing a message
+// over it ("409 Message Size Exceeds MaxBytes") as an error. The jetstream
+// package's FetchBytes hides that refusal and allocates for a million
+// messages a call; its Messages iterator treats it as routine and pulls
+// again at once, some 37,000 pulls in a two-second wait. One per read;
+// stop it when done.
 type budgetReader struct {
-	cons jetstream.Consumer
-	nc   *nats.Conn
-	sub  msgSource
-	// api is the consumer's next-message subject; inbox is the prefix of
-	// each pull's reply subject, which tells one pull's status from an
-	// earlier pull's.
-	api, inbox string
-	batch      int
-	budget     int
-	total      int
-	read       int
-
-	// The pull in flight: its reply subject, when it expires, how many
-	// messages it has brought, and whether the last of them said more were
-	// pending.
-	pulling     bool
-	reply       string
-	pulls       int
-	pullEnds    time.Time
-	got         int
-	morePending bool
+	cons  jetstream.Consumer
+	sub   msgFetcher
+	buf   []*nats.Msg
+	batch int
+	// pending is what the consumer last said it still held (its info at
+	// the start, then each message's metadata): each Fetch asks for that
+	// many, at least one and at most batch, as the reads did before.
+	pending uint64
+	budget  int
+	total   int
+	read    int
 }
 
-// msgSource is the reader's subscription (a *nats.Subscription).
-type msgSource interface {
-	NextMsg(time.Duration) (*nats.Msg, error)
+// msgFetcher is the reader's bound pull subscription (a *nats.Subscription).
+type msgFetcher interface {
+	Fetch(batch int, opts ...nats.PullOpt) ([]*nats.Msg, error)
 	Unsubscribe() error
 }
 
-const (
-	// jsAPINext is the JetStream API subject a pull is sent to, under the
-	// default API prefix, as the bus's jetstream client uses.
-	jsAPINext = "$JS.API.CONSUMER.MSG.NEXT.%s.%s"
-	// pullGap is how long a pull that brought messages, the last of which
-	// said more were pending, may go quiet before it is taken as over: the
-	// server ends a pull that fills its byte cap exactly without a word.
-	pullGap = 50 * time.Millisecond
-)
-
 // newBudgetReader reads cons in pulls of at most batch messages (at least
-// one) and pullMaxBytes, passing at most budget bytes in all.
+// one) and pullMaxBytes, passing at most budget bytes in all. The
+// subscription binds to cons without looking it up (the read has its info
+// already), so it needs no grant but the consumer's MSG.NEXT; and since the
+// client did not create the consumer, unsubscribing never deletes it, a
+// delete the console grant refuses.
 func (b *NATSBus) newBudgetReader(cons jetstream.Consumer, batch, budget int) (*budgetReader, error) {
-	nc := b.client.Conn()
-	inbox := nc.NewInbox()
-	sub, err := nc.SubscribeSync(inbox + ".*")
+	js, err := b.client.Conn().JetStream()
 	if err != nil {
 		return nil, err
 	}
 	info := cons.CachedInfo()
-	return &budgetReader{
-		cons: cons, nc: nc, sub: sub,
-		api: fmt.Sprintf(jsAPINext, info.Stream, info.Name), inbox: inbox,
-		batch: max(1, batch), budget: budget,
-	}, nil
-}
-
-// pull asks for the next batch, expiring after expires.
-func (r *budgetReader) pull(expires time.Duration) error {
-	req, err := json.Marshal(struct {
-		Batch    int           `json:"batch"`
-		MaxBytes int           `json:"max_bytes"`
-		Expires  time.Duration `json:"expires"`
-	}{r.batch, pullMaxBytes, expires})
+	sub, err := js.PullSubscribe("", "", nats.Bind(info.Stream, info.Name), nats.SkipConsumerLookup())
 	if err != nil {
-		return err
+		return nil, err
 	}
-	r.pulls++
-	r.reply = fmt.Sprintf("%s.%d", r.inbox, r.pulls)
-	if err := r.nc.PublishRequest(r.api, r.reply, req); err != nil {
-		return err
-	}
-	r.pulling, r.got, r.morePending = true, 0, false
-	// A pull whose end was never seen (its status lost) is given up a
-	// second after it expired.
-	r.pullEnds = time.Now().Add(expires + time.Second)
-	return nil
+	return &budgetReader{cons: cons, sub: sub, batch: max(1, batch), budget: budget, pending: info.NumPending}, nil
 }
 
 // next returns the next message, waiting at most wait for it. No message in
 // that time is nats.ErrTimeout. A message that would take the read past its
 // budget is not passed: next reports how many were read before it, wrapping
 // ErrReadByteBudget, as the deadline stop does. So is a message the server
-// will not send under pullMaxBytes, on the first pull it refuses.
+// will not send under pullMaxBytes: one refused pull ends the read.
 func (r *budgetReader) next(wait time.Duration) (jetstream.Msg, error) {
-	deadline := time.Now().Add(wait)
-	for {
-		left := time.Until(deadline)
-		if left <= 0 {
+	if len(r.buf) == 0 {
+		ask := int(max(1, min(r.pending, uint64(r.batch))))
+		msgs, err := r.sub.Fetch(ask, nats.PullMaxBytes(pullMaxBytes), nats.MaxWait(wait))
+		switch {
+		case err != nil && strings.Contains(err.Error(), "Exceeds MaxBytes"):
+			// Not a sentinel in the client: the server's description.
+			return nil, fmt.Errorf("read %d messages before one over the %d-byte pull cap, which the server will not send: %w", r.read, pullMaxBytes, ErrReadByteBudget)
+		case errors.Is(err, nats.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) || (err == nil && len(msgs) == 0):
 			return nil, nats.ErrTimeout
-		}
-		if r.pulling && time.Now().After(r.pullEnds) {
-			r.pulling = false
-		}
-		if !r.pulling {
-			if err := r.pull(max(left, minFetchWait)); err != nil {
-				return nil, err
-			}
-		}
-		timeout := left
-		if r.got > 0 && r.morePending {
-			timeout = min(left, pullGap)
-		}
-		m, err := r.sub.NextMsg(timeout)
-		if errors.Is(err, nats.ErrTimeout) {
-			if timeout < left {
-				r.pulling = false
-				continue
-			}
-			return nil, nats.ErrTimeout
-		}
-		if err != nil {
+		case err != nil:
 			return nil, err
 		}
-		if status := m.Header.Get("Status"); status != "" && len(m.Data) == 0 {
-			if done, err := r.status(m, status); err != nil || done {
-				return nil, err
-			}
-			continue
-		}
-		r.got++
-		if r.got >= r.batch {
-			r.pulling = false
-		}
-		msg := pulledMsg{m}
-		if md, err := m.Metadata(); err == nil {
-			r.morePending = md.NumPending > 0
-		}
-		size := msgBytes(msg)
-		if r.total+size > r.budget {
-			return nil, fmt.Errorf("read %d messages before the byte budget (%d bytes): %w", r.read, r.budget, ErrReadByteBudget)
-		}
-		r.total += size
-		r.read++
-		return msg, nil
+		r.buf = msgs
 	}
-}
-
-// status handles a status message: the end of the pull in flight (a 408 or
-// 404, or a 409 for a filled byte cap or batch), the end of the read (a 409
-// for a byte cap on a pull that brought nothing, which is a message over
-// pullMaxBytes), or an error. A status for an earlier pull is ignored.
-func (r *budgetReader) status(m *nats.Msg, status string) (bool, error) {
-	if m.Subject != r.reply || status == "100" {
-		return false, nil
+	m := r.buf[0]
+	r.buf[0] = nil
+	r.buf = r.buf[1:]
+	if md, err := m.Metadata(); err == nil {
+		r.pending = md.NumPending
 	}
-	desc := m.Header.Get("Description")
-	switch {
-	case status == "404" || status == "408":
-	case status == "409" && strings.Contains(desc, "Exceeds MaxBytes"):
-		if r.got == 0 {
-			return true, fmt.Errorf("read %d messages before one over the %d-byte pull cap, which the server will not send: %w", r.read, pullMaxBytes, ErrReadByteBudget)
-		}
-	case status == "409" && strings.Contains(desc, "Batch Completed"):
-	default:
-		return true, fmt.Errorf("pull: %s %s", status, desc)
+	msg := pulledMsg{m}
+	size := msgBytes(msg)
+	if r.total+size > r.budget {
+		return nil, fmt.Errorf("read %d messages before the byte budget (%d bytes): %w", r.read, r.budget, ErrReadByteBudget)
 	}
-	r.pulling = false
-	return false, nil
+	r.total += size
+	r.read++
+	return msg, nil
 }
 
 // stalled explains a read that got nothing in its wait with messages still
@@ -233,6 +150,10 @@ func (r *budgetReader) stalled(ctx context.Context, base error) error {
 	}
 	return fmt.Errorf("%w; the server holds %d more and sent none, which is a message over the %d-byte pull cap: %w", base, info.NumPending, pullMaxBytes, ErrReadByteBudget)
 }
+
+// setBatch sizes the reader's next pull: at most n messages, at least one.
+// It takes effect once the last pull's messages are handed out.
+func (r *budgetReader) setBatch(n int) { r.batch = max(1, n) }
 
 func (r *budgetReader) stop() { _ = r.sub.Unsubscribe() }
 

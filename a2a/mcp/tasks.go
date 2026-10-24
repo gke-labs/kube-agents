@@ -209,7 +209,7 @@ func (b *NATSBus) watchTask(ctx context.Context, ref TaskRef) (*taskWatch, error
 	pending := cons.CachedInfo().NumPending
 	// The watch keeps every event it folds, so its byte budget runs over
 	// its whole life, as maxTaskEvents does.
-	r, err := b.newBudgetReader(cons, int(max(1, min(pending, taskFetchBatch))), readMaxBytes)
+	r, err := b.newBudgetReader(cons, taskFetchBatch, readMaxBytes)
 	if err != nil {
 		release(true)
 		return nil, err
@@ -234,6 +234,10 @@ func (w *taskWatch) next(ctx context.Context) error {
 	wait = max(wait, minFetchWait)
 	got := 0
 	for got < taskFetchBatch {
+		// Size each pull from what is pending now, not when the watch began:
+		// a watch that starts on an empty task would otherwise pull one
+		// event at a time for its whole life.
+		w.r.setBatch(int(min(w.pending, uint64(taskFetchBatch-got))))
 		msg, err := w.r.next(wait)
 		if errors.Is(err, nats.ErrTimeout) {
 			break

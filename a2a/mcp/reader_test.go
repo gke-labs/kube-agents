@@ -275,3 +275,37 @@ func TestADrainStopsAtAMessageOverThePullCap(t *testing.T) {
 		t.Errorf("took %s to stop; want it at the first refused pull", took)
 	}
 }
+
+// A task watch sizes each pull from what is pending then, not when the watch
+// began: a watch opened on a task with no events yet reads a burst of later
+// ones in a few pulls, not one pull per event.
+func TestATaskWatchSizesEachPullFromWhatIsPending(t *testing.T) {
+	url, js := bigBus(t)
+	var pulls atomic.Int64
+	sub, err := js.Conn().Subscribe("$JS.API.CONSUMER.MSG.NEXT."+lib.TasksStream+".>", func(*nats.Msg) { pulls.Add(1) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+	ref := TaskRef{Addressee: fakeAddressee, TaskID: "task-later"}
+	w, err := dial(t, url).watchTask(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.close()
+	const n = 50
+	publishN(t, js, lib.TaskEventsSubject(ref.Addressee, ref.TaskID), []byte("{}"), n)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for w.seen < n && ctx.Err() == nil {
+		if err := w.next(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if w.seen != n {
+		t.Fatalf("read %d of %d events", w.seen, n)
+	}
+	if got := pulls.Load(); got > 5 {
+		t.Errorf("sent %d pulls for %d events; want each pull sized from what is pending", got, n)
+	}
+}
