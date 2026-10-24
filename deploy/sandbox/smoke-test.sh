@@ -423,6 +423,8 @@ check "python3 exists (execute_code probes for it)" "python3" \
   "$("${SSH[@]}" 'command -v python3' 2>&1)"
 check "tar exists (file sync is tar over ssh, not sftp)" "tar" \
   "$("${SSH[@]}" 'command -v tar' 2>&1)"
+check "leeway exists (topology drift CLI)" "v0.1.3" \
+  "$("${SSH[@]}" 'leeway version' 2>&1)"
 # Not SSH_OPTS: sftp spells the port -P, and -p means something else entirely.
 check "no sftp subsystem is advertised" "subsystem request failed" \
   "$(sftp -i "$WORK/id" -P "$PORT" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
