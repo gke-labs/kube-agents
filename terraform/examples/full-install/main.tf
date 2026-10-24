@@ -12,6 +12,10 @@ locals {
     # credential broker's relay on the Trace role granted below; the API has
     # to be on for the grant to buy anything.
     "cloudtrace.googleapis.com",
+    # The readiness report's rollout-sequence precheck lists the fleet host
+    # project's RolloutSequences on the GKE Hub role granted below; the API has
+    # to be on for the grant to buy anything.
+    "gkehub.googleapis.com",
     # Unconditional: the cluster is created with the Backup for GKE agent
     # enabled whether or not a BackupPlan follows, and the addon cannot be
     # enabled without the API.
@@ -158,6 +162,7 @@ locals {
     "roles/compute.viewer",
     "roles/monitoring.viewer",
     "roles/logging.viewer",
+    "roles/gkehub.viewer",
     "roles/cloudtrace.user",
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",

@@ -478,6 +478,27 @@ AUDITS: dict[str, AuditSpec] = {
             ),
         ),
     ),
+    "upgrade-retrospective": AuditSpec(
+        "Upgrade Retrospective",
+        "upgrade_retrospective_sop.md",
+        # The seven ids the collector (`upgrade_retrospective.py`, `CHECK_READS`)
+        # emits; a failure still present from an earlier review is re-emitted
+        # under its original id with its persistence, never under one of its
+        # own. The collector grades an Error at `major` and a Warning at
+        # `minor`, never `critical`, and none of these slugs is on
+        # `MAJOR_SWEEP_CHECKS`, so `finish` opens no pull request on its own
+        # for this stream -- the design's guard against a retrospective that
+        # proposes manifest changes nobody asked for.
+        (
+            "upgrade-operation-failed",
+            "upgrade-broke-workload",
+            "node-broken-after-upgrade",
+            "upgrade-symptom-tentative",
+            "upgrade-symptom-unclassified",
+            "symptom-predates-upgrade",
+            "upgrade-log-volume-rose",
+        ),
+    ),
 }
 
 # The streams whose SOP runs a collector, and so the streams whose `finish`
@@ -500,6 +521,7 @@ COLLECTOR_AUDITS = frozenset(
         "obtainability-audit",
         "security-patch-orchestrator",
         "stockout-prevention",
+        "upgrade-retrospective",
     }
 )
 
@@ -1217,6 +1239,14 @@ CHECK_PHRASES = {
     "mig-convergence-stalled": "{object} instance group isn't converging",
     "sole-tenant-headroom": "sole-tenant nodes are nearly full",
     "orphaned-snapshots": "{object} is a snapshot of a deleted disk",
+    # Upgrade Retrospective
+    "upgrade-operation-failed": "an upgrade operation failed",
+    "upgrade-broke-workload": "{object} broke after the upgrade",
+    "node-broken-after-upgrade": "{object} node stayed broken after its pool's rebuild",
+    "upgrade-symptom-tentative": "{object} may have been broken by the upgrade",
+    "upgrade-symptom-unclassified": "{object} shows a symptom after the upgrade that matches no known pattern",
+    "symptom-predates-upgrade": "{object} was already broken before the upgrade",
+    "upgrade-log-volume-rose": "{object} writes far more logs since the upgrade",
 }
 
 # Applied to a pull request the harness itself closed as stale. It is the
@@ -2251,6 +2281,32 @@ CLUSTERS_LISTED_KEY = "clusters_listed"
 MANIFEST_FINISHED_KEY = "finished_at"
 # The collector's wall-clock start. Read only for the `collect_s` timer.
 MANIFEST_STARTED_KEY = "started_at"
+# Two keys the upgrade retrospective's collector writes that say the manifest
+# is not one the SOP files from, so `load_manifest` refuses it for `draft`
+# and `finish` alike. `scoped`: the run was narrowed (no `--full`, or
+# `--cluster`, `--since`, `--after-upgrade`); a scoped run files no ledger
+# and the SOP hands it no `--manifest-file`, since a manifest that read a few
+# clusters would have `finish` announce every other cluster's finding
+# resolved. `after_reset`: the store was reset (`--reset-ledger`) and the run
+# is the baseline the SOP files nothing from, or a run before it; the ledger
+# keeps its findings until the next full run reads the fleet again.
+MANIFEST_SCOPED_KEY = "scoped"
+MANIFEST_AFTER_RESET_KEY = "after_reset"
+MANIFEST_SCOPED_REFUSAL = (
+    "--manifest-file: {path} carries {key}: true; the collector ran a scoped run (no "
+    "--full, or --cluster, --since or --after-upgrade), and the SOP hands a scoped run "
+    "no --manifest-file: it files no ledger. This manifest vouches for the clusters it "
+    "read and for no other, so a finish from it would announce every other cluster's "
+    "finding resolved. Run neither draft nor finish on it; only a full run's manifest "
+    "reaches finish."
+)
+MANIFEST_AFTER_RESET_REFUSAL = (
+    "--manifest-file: {path} carries {key}: true; the collector wrote it after "
+    "--reset-ledger archived its store, and no full run has written the new baseline "
+    "yet. The SOP files nothing from such a run: report from the collector's report "
+    "alone, and run neither draft nor finish on this manifest. The ledger keeps its "
+    "findings until the next full run reads the fleet again."
+)
 MANIFEST_OUTCOME_COLLECTED = "collected"
 MANIFEST_OUTCOME_OUT_OF_SCOPE = "out-of-scope"
 # How much of a collector's `error` a refusal quotes back.
@@ -6469,6 +6525,12 @@ def load_manifest(path: str, audit_id: str | None = None, command: str | None = 
             f"not {audit_id!r}; a manifest cross-checks the document against its own "
             "stream's roster and corroborates nothing about another's."
         )
+    # The two runs whose manifest the SOP never files from (the constants say
+    # why); a scoped run is the worker's error to pass at all, so it is named
+    # first when a manifest carries both.
+    for key, refusal in ((MANIFEST_SCOPED_KEY, MANIFEST_SCOPED_REFUSAL), (MANIFEST_AFTER_RESET_KEY, MANIFEST_AFTER_RESET_REFUSAL)):
+        if manifest.get(key):
+            raise ValidationError(refusal.format(path=path, key=key))
     if audit_id:
         stale = manifest_predates_run(manifest, audit_id)
         if stale:

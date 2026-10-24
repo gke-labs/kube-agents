@@ -52,7 +52,8 @@ kube-agents/
 │   │   │                                          console links) + design docs
 │   │   ├── governance/                            cron-run SOP playbooks + the
 │   │   │                                          first-run inventory-scan and
-│   │   │                                          report-prioritization SOPs
+│   │   │                                          report-prioritization SOPs,
+│   │   │                                          and the on-request rollout SOP
 │   │   ├── skill-overlays/                        patches + append.md behind the mirrored
 │   │   │                                          gke-* skills (scripts/skill_overlay.py)
 │   │   └── skills/                                SKILL.md bundles + each
@@ -259,6 +260,7 @@ identifier appears, add its source here.
 | fleet-audit report store: root, `FLEET_AUDIT_REPORTS_DIR`, ring size, stamp format, and the in-flight TTL | `agents/platform/skills/fleet-audit/scripts/audit_report.py` (`report_status.py` beside it copies the root and the TTL) |
 | fleet-audit route-note caps: the longest path or reconciler a route note shows | `ROUTE_PATH_MAX_CHARS` and `ROUTE_RECONCILER_MAX_CHARS` in `agents/platform/skills/fleet-audit/scripts/audit_report.py` |
 | fleet-audit content-mode mirror caps: the most files, directory links and bytes the collector copies from the GitOps repository | `MIRROR_MAX_FILES` and `MIRROR_MAX_BYTES` in `agents/platform/skills/fleet-audit/scripts/collect.py` |
+| upgrade-retrospective store: root, `UPGRADE_RETROSPECTIVE_HOME`, latest-report link, ring size, scoped suffix, lock | `agents/platform/skills/fleet-audit/scripts/upgrade_retrospective.py` |
 | fleet-upgrade-verification record path, file name per target, record format version, readiness flags and exit codes, kubeconfig directory and file name, the readiness cell strings, the per-entry rule ids, grades and finding texts, the read kinds and context keys, the audit-log filters and page limits, and the shape tables | `agents/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py`, `upgrade_readiness.py`, `readiness_rules/` and `upgrade_shape_tables.py` beside it |
 | Chat-delivery watch: the `ALERT chat_delivery_watch` log prefix and file, the ledger issue's label and marker, the streak state path, and the `CHAT_DELIVERY_*` environment variables | `agents/platform/scripts/chat_delivery_watch.py` |
 | Controller stall watch: the `STALL_WATCH_*` environment variables, the opt-out annotation, the default kind list, the per-tick alert ceiling, the ledger path, the tick budget and the credential refresh interval | `agents/platform/scripts/stall_watch.py` (`TICK_BUDGET_SECONDS`, `CREDENTIALS_REFRESH_SECONDS`, `EXEMPT_ANNOTATION`); the three set from the CR's `spec.harness.stallWatch` are pinned in the managed `.env` by `renderManagedEnv` in `k8s-operator/internal/controller/platformagent_manifests.go` |

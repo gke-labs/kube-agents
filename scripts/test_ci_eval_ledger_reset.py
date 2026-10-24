@@ -713,7 +713,7 @@ class CallSiteTest(unittest.TestCase):
         self.assertEqual(result.stderr, "")
 
     def test_a_case_holds_the_streams_it_declares(self):
-        # oobe-first-run-audits grades no ledger, but its stack starts four real
+        # oobe-first-run-audits grades no ledger, but its stack starts five real
         # audit runs; it holds their streams, sorted, and is counted on each, so
         # an audit case waiting behind it on one of them waits long enough.
         tasks = (
@@ -743,7 +743,7 @@ class CallSiteTest(unittest.TestCase):
         self.assertEqual(
             got,
             {
-                "oobe": "compliance-audit fleet-wide-cost-analysis obtainability-audit stockout-prevention",
+                "oobe": "compliance-audit fleet-wide-cost-analysis obtainability-audit stockout-prevention upgrade-retrospective",
                 "compliance_case": "compliance-audit",
                 "probe": "",
                 "compliance_count": "2",

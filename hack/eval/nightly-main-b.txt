@@ -59,3 +59,11 @@ triage-start-burst
 # (11450s against 9600s), over the one-case tolerance; here they are 1450s
 # apart. Placed on the arithmetic alone, like the line above.
 monitoring-alert-policy-read
+
+# The two recorded-weeks cases of #3535 (upgrades-retrospective-log-volume-gate
+# and upgrades-rollout-family-held-by-canary-gate) share one stack that seeds
+# the retrospective's report store, priced at 600s each; each run applies and
+# tears it down, so the halves may split them. One here, the family case in
+# main-a: the halves read 13300s (main-a) against 12800s; both here they would
+# read 12700s against 13400s, also inside the 1800s the balance test allows.
+upgrades-retrospective-log-volume-gate

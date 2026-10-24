@@ -49,6 +49,7 @@
 reliability-pdb-probe
 capacity-pinned-pool-probe
 security-overgrant-probe
+upgrades-lagging-master-probe
 cost-idle-pool-probe
 obtainability-remediation-proposal
 cluster-agent-crashloop-debug
