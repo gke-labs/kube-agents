@@ -226,7 +226,7 @@ func (w *taskWatch) close() {
 // waits up to taskFetchWait for the next event when nothing is.
 func (w *taskWatch) next(ctx context.Context) error {
 	wait := fetchWait(ctx, taskFetchWait)
-	// Never below the fetch's floor, even with less than that left: what is
+	// Never below minFetchWait, even with less than that left: what is
 	// pending still arrives at once, and an empty fetch ends just past the
 	// deadline, which the caller then sees as ctx done and keeps what it has
 	// folded. Refusing the fetch instead would end the read on an error

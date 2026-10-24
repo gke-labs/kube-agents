@@ -42,7 +42,10 @@ const (
 	// eight reader slots (maxTaskReaders) and the one DIRECTORY read the
 	// status cache keeps in flight, all at their worst at once, come to
 	// about 82 MiB, leaving some 26 MiB of the GOMEMLIMIT for the server
-	// itself.
+	// itself. That leaves out per-message overhead (msgBytes counts
+	// content only), the cached status the next refresh replaces, and each
+	// response's encoding; a read's raw messages can be collected once
+	// parsed, which offsets some of it. It's an estimate, not a bound.
 	readMaxBytes = 4 << 20
 )
 
