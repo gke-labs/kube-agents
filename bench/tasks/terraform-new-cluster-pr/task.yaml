@@ -34,12 +34,12 @@ expected_output: >-
 infrastructure:
   deployer: noop
 validated: false
-# Red until #3727: on main and on this case's first runs the pull request set
-# the new cluster's deletion_protection = false (4 of 5) and re-declared the
-# project-wide google_gke_hub_feature "configmanagement" (3 of 4), both of
-# which gcp-terraform forbids. The two not_matches checks below fail those.
-# Flip this when #3727 lands.
-expected_fail: true
+# Was expected_fail until #3727 (#3917): on main and on this case's first runs
+# the pull request set the new cluster's deletion_protection = false (4 of 5)
+# and re-declared the project-wide google_gke_hub_feature "configmanagement"
+# (3 of 4). With gcp-terraform's new-cluster rules it went 3/3 on the GitOps
+# lane (2026-10-24; run_20261024_000245_153691, run_20261024_001013_860471,
+# run_20261024_001451_717451).
 
 # Slug per docs/designs/domains.yaml.
 domain: remediation
