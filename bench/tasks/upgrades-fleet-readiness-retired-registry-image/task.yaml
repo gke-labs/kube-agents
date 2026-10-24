@@ -163,7 +163,7 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: retired-registry: [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: retired-registry: [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: retired-registry: [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: retired-registry: [^\n]+$)'
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: (?:retired-registry: )?[^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: (?:retired-registry: )?[^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: (?:retired-registry: )?[^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: (?:retired-registry: )?[^\n]+$)'
 
   # The entry this case exists for: slot a's line is the rule's risk for
   # legacy-registry-pull in the rule's words, whole, with the pool list open
@@ -186,9 +186,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: retired-registry: ["''“‘<]?(?:retired-registry: )?deployment seeded-shapes/legacy-registry-pull: container pause pulls k8s\.gcr\.io/pause:3\.9 from k8s\.gcr\.io \(frozen 2023-04-03, a redirect to registry\.k8s\.io since 2023-03-20\); a rebuilt node pulls it again from a host that stopped publishing; (?:pool\(s\) [a-z0-9-]+(?:, [a-z0-9-]+)* are below the target and are rebuilt in this upgrade|no pool is below the target; the next node upgrade pulls it again|which pools are rebuilt needs a target)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: (?:retired-registry: )?["''“‘<]?(?:retired-registry: )?deployment seeded-shapes/legacy-registry-pull: container pause pulls k8s\.gcr\.io/pause:3\.9 from k8s\.gcr\.io \(frozen 2023-04-03, a redirect to registry\.k8s\.io since 2023-03-20\); a rebuilt node pulls it again from a host that stopped publishing; (?:pool\(s\) [a-z0-9-]+(?:, [a-z0-9-]+)* are below the target and are rebuilt in this upgrade|no pool is below the target; the next node upgrade pulls it again|which pools are rebuilt needs a target)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: retired-registry: (?!["''“‘<]?(?:retired-registry: )?deployment seeded-shapes/legacy-registry-pull: container pause pulls k8s\.gcr\.io/pause:3\.9 from k8s\.gcr\.io \(frozen 2023-04-03, a redirect to registry\.k8s\.io since 2023-03-20\); a rebuilt node pulls it again from a host that stopped publishing; (?:pool\(s\) [a-z0-9-]+(?:, [a-z0-9-]+)* are below the target and are rebuilt in this upgrade|no pool is below the target; the next node upgrade pulls it again|which pools are rebuilt needs a target)$)[^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: (?!(?:retired-registry: )?["''“‘<]?(?:retired-registry: )?deployment seeded-shapes/legacy-registry-pull: container pause pulls k8s\.gcr\.io/pause:3\.9 from k8s\.gcr\.io \(frozen 2023-04-03, a redirect to registry\.k8s\.io since 2023-03-20\); a rebuilt node pulls it again from a host that stopped publishing; (?:pool\(s\) [a-z0-9-]+(?:, [a-z0-9-]+)* are below the target and are rebuilt in this upgrade|no pool is below the target; the next node upgrade pulls it again|which pools are rebuilt needs a target)$)[^\n]*$'
 
   # The fleet's only image on a retired host is legacy-registry-pull's; every
   # other image is on registry.k8s.io, docker.io or Docker Hub's busybox, so
@@ -208,9 +208,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?ms)\A(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: retired-registry: none$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: retired-registry: none$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: retired-registry: none$)'
+        - '(?ms)\A(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: (?:retired-registry: )?none$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: (?:retired-registry: )?none$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: (?:retired-registry: )?none$)'
       forbidden_patterns:
-        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: retired-registry: (?!none$)[^\n]*$'
+        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: (?!(?:retired-registry: )?none$)[^\n]*$'
 
   # The prompt's "read only", grounded: the planted object is as the fixture
   # declares it after the run.

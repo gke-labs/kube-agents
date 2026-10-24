@@ -161,7 +161,7 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: node-image-coupled-agent: [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: node-image-coupled-agent: [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: node-image-coupled-agent: [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: node-image-coupled-agent: [^\n]+$)'
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: (?:node-image-coupled-agent: )?[^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: (?:node-image-coupled-agent: )?[^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: (?:node-image-coupled-agent: )?[^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: (?:node-image-coupled-agent: )?[^\n]+$)'
 
   # The entry this case exists for: slot a's line is the rule's risk for
   # cni-shaped-agent in the rule's words, whole, with the pool list open and
@@ -184,9 +184,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: node-image-coupled-agent: ["''“‘<]?(?:node-image-coupled-agent: )?daemonset seeded-shapes/cni-shaped-agent: on the node''s network and coupled to the node image: mounts /etc/cni/net\.d from the node; (?:pool\(s\) [a-z0-9-]+(?:, [a-z0-9-]+)* are below the target and get a new node image in this upgrade|no pool is below the target; the next node upgrade changes the image under it|which pools change image needs a target)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: (?:node-image-coupled-agent: )?["''“‘<]?(?:node-image-coupled-agent: )?daemonset seeded-shapes/cni-shaped-agent: on the node''s network and coupled to the node image: mounts /etc/cni/net\.d from the node; (?:pool\(s\) [a-z0-9-]+(?:, [a-z0-9-]+)* are below the target and get a new node image in this upgrade|no pool is below the target; the next node upgrade changes the image under it|which pools change image needs a target)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: node-image-coupled-agent: (?!["''“‘<]?(?:node-image-coupled-agent: )?daemonset seeded-shapes/cni-shaped-agent: on the node''s network and coupled to the node image: mounts /etc/cni/net\.d from the node; (?:pool\(s\) [a-z0-9-]+(?:, [a-z0-9-]+)* are below the target and get a new node image in this upgrade|no pool is below the target; the next node upgrade changes the image under it|which pools change image needs a target)$)[^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: (?!(?:node-image-coupled-agent: )?["''“‘<]?(?:node-image-coupled-agent: )?daemonset seeded-shapes/cni-shaped-agent: on the node''s network and coupled to the node image: mounts /etc/cni/net\.d from the node; (?:pool\(s\) [a-z0-9-]+(?:, [a-z0-9-]+)* are below the target and get a new node image in this upgrade|no pool is below the target; the next node upgrade changes the image under it|which pools change image needs a target)$)[^\n]*$'
 
   # The fleet's only host-network DaemonSet is cni-shaped-agent, so the rule
   # prints nothing for slots b, c and d and each reads none; any entry there
@@ -204,9 +204,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?ms)\A(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: node-image-coupled-agent: none$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: node-image-coupled-agent: none$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: node-image-coupled-agent: none$)'
+        - '(?ms)\A(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: (?:node-image-coupled-agent: )?none$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: (?:node-image-coupled-agent: )?none$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: (?:node-image-coupled-agent: )?none$)'
       forbidden_patterns:
-        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: node-image-coupled-agent: (?!none$)[^\n]*$'
+        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: (?!(?:node-image-coupled-agent: )?none$)[^\n]*$'
 
   # The prompt's "read only", grounded: the planted object is as the fixture
   # declares it after the run.

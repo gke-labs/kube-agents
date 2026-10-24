@@ -160,7 +160,7 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: gpu-driver: [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: gpu-driver: [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: gpu-driver: [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: gpu-driver: [^\n]+$)'
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: (?:gpu-driver: )?[^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: (?:gpu-driver: )?[^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: (?:gpu-driver: )?[^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: (?:gpu-driver: )?[^\n]+$)'
 
   # The entry this case exists for: slot a's line is the rule's risk for
   # cuda-pinned-trainer in the rule's words, whole. A report whose rule is
@@ -183,9 +183,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: gpu-driver: ["''“‘<]?(?:gpu-driver: )?cronjob seeded-shapes/cuda-pinned-trainer: requests nvidia\.com/gpu on accelerator nvidia-l4 and no pool in the cluster carries that accelerator; the target driver cannot be read, and the pin image docker\.io/nvidia/cuda:12\.2\.0-base-ubuntu22\.04 stays unchecked$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: (?:gpu-driver: )?["''“‘<]?(?:gpu-driver: )?cronjob seeded-shapes/cuda-pinned-trainer: requests nvidia\.com/gpu on accelerator nvidia-l4 and no pool in the cluster carries that accelerator; the target driver cannot be read, and the pin image docker\.io/nvidia/cuda:12\.2\.0-base-ubuntu22\.04 stays unchecked$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: gpu-driver: (?!["''“‘<]?(?:gpu-driver: )?cronjob seeded-shapes/cuda-pinned-trainer: requests nvidia\.com/gpu on accelerator nvidia-l4 and no pool in the cluster carries that accelerator; the target driver cannot be read, and the pin image docker\.io/nvidia/cuda:12\.2\.0-base-ubuntu22\.04 stays unchecked$)[^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: (?!(?:gpu-driver: )?["''“‘<]?(?:gpu-driver: )?cronjob seeded-shapes/cuda-pinned-trainer: requests nvidia\.com/gpu on accelerator nvidia-l4 and no pool in the cluster carries that accelerator; the target driver cannot be read, and the pin image docker\.io/nvidia/cuda:12\.2\.0-base-ubuntu22\.04 stays unchecked$)[^\n]*$'
 
   # The fleet's only nvidia.com/gpu request is cuda-pinned-trainer's, so the
   # rule prints nothing for slots b, c and d and each reads none; any entry
@@ -204,9 +204,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?ms)\A(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: gpu-driver: none$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: gpu-driver: none$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: gpu-driver: none$)'
+        - '(?ms)\A(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: (?:gpu-driver: )?none$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: (?:gpu-driver: )?none$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: (?:gpu-driver: )?none$)'
       forbidden_patterns:
-        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: gpu-driver: (?!none$)[^\n]*$'
+        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: (?!(?:gpu-driver: )?none$)[^\n]*$'
 
   # The prompt's "read only", grounded: the planted object is as the fixture
   # declares it after the run.

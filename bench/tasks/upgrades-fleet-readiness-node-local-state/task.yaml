@@ -158,7 +158,7 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: data-on-the-node: [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: data-on-the-node: [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: data-on-the-node: [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: data-on-the-node: [^\n]+$)'
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: (?:data-on-the-node: )?[^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: (?:data-on-the-node: )?[^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: (?:data-on-the-node: )?[^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: (?:data-on-the-node: )?[^\n]+$)'
 
   # The entry this case exists for: slot a's line is the rule's note for
   # cache-on-emptydir in the rule's words, whole. A report whose rule is
@@ -180,9 +180,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: data-on-the-node: ["''“‘<]?(?:data-on-the-node: )?deployment seeded-shapes/cache-on-emptydir keeps scratch on the node in queue \(emptydir; the name suggests state\); not a risk: a deployment''s emptydir is emptied by every reschedule and a read-only or memory-backed mount holds nothing of the workload''s$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: (?:data-on-the-node: )?["''“‘<]?(?:data-on-the-node: )?deployment seeded-shapes/cache-on-emptydir keeps scratch on the node in queue \(emptydir; the name suggests state\); not a risk: a deployment''s emptydir is emptied by every reschedule and a read-only or memory-backed mount holds nothing of the workload''s$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: data-on-the-node: (?!["''“‘<]?(?:data-on-the-node: )?deployment seeded-shapes/cache-on-emptydir keeps scratch on the node in queue \(emptydir; the name suggests state\); not a risk: a deployment''s emptydir is emptied by every reschedule and a read-only or memory-backed mount holds nothing of the workload''s$)[^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: (?!(?:data-on-the-node: )?["''“‘<]?(?:data-on-the-node: )?deployment seeded-shapes/cache-on-emptydir keeps scratch on the node in queue \(emptydir; the name suggests state\); not a risk: a deployment''s emptydir is emptied by every reschedule and a read-only or memory-backed mount holds nothing of the workload''s$)[^\n]*$'
 
   # The fleet's only emptyDir is cache-on-emptydir's, its hostPaths are on
   # DaemonSets the rule does not read, and its claims are on no local
@@ -202,9 +202,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?ms)\A(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: data-on-the-node: none$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: data-on-the-node: none$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: data-on-the-node: none$)'
+        - '(?ms)\A(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: (?:data-on-the-node: )?none$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: (?:data-on-the-node: )?none$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: (?:data-on-the-node: )?none$)'
       forbidden_patterns:
-        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: data-on-the-node: (?!none$)[^\n]*$'
+        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: (?!(?:data-on-the-node: )?none$)[^\n]*$'
 
   # The prompt's "read only", grounded: the planted object is as the fixture
   # declares it after the run.

@@ -10840,7 +10840,9 @@ def _per_cluster_case_spec(case: str) -> dict:
 # pools, the kubelet version, the skew gap and the target are the fleet's, and
 # the cases' patterns leave those open. An entry carries a `;`, so a wrap the
 # agent kept around it survives `_VALUE_WRAP`; the cases admit one opener and
-# the table's `<rule id>: ` prefix before the rule's text, nothing else.
+# the table's `<rule id>: ` prefix before the rule's text, nothing else; the
+# line's own `<rule id>: ` may be missing, as a worker that puts the rule in a
+# heading leaves it.
 _PER_CLUSTER_RULE_CASES = {
     "upgrades-fleet-readiness-node-local-state": (
         "Deployment seeded-shapes/cache-on-emptydir",
@@ -10957,6 +10959,8 @@ _NOTE_COLUMN_AHEAD = "cluster read failed; PDBs not graded; {cell}"
 # cluster, the location after it, a bullet, emphasis, code, a stop.
 _PER_CLUSTER_RENDERINGS = (
     "some-project/{line}",
+    # The rule id carried in a heading and left off the line.
+    "{cluster}: {entry}",
     "{cluster} (us-central1-a): {rest}",
     "- {line}",
     "**{cluster}**: {rest}",
@@ -11030,7 +11034,8 @@ def _rendered(text: str, rendering: str) -> str:
     out = []
     for line in text.splitlines():
         cluster, rest = line.split(": ", 1)
-        out.append(rendering.format(line=line, cluster=cluster, rest=rest))
+        _rule, entry = rest.split(": ", 1)
+        out.append(rendering.format(line=line, cluster=cluster, rest=rest, entry=entry))
     return "\n".join(out)
 
 
