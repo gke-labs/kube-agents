@@ -138,6 +138,52 @@ func TestTheAgentProfileCRDBoundsAllowedTiers(t *testing.T) {
 	}
 }
 
+// Each tier's bus identity, profile-<name>-<tier>, must fit one 63-character
+// label, so the name bound depends on the tiers: 50, or 44 with unattended.
+// And a named ServiceAccount is one identity, so it can serve one tier only.
+func TestTheAgentProfileCRDBoundsTheNameAndNamedServiceAccountByTier(t *testing.T) {
+	cfg, scheme := startEnvtestConfig(t)
+	c, err := client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	const ns = "agentprofile-tier-bounds"
+	if err := c.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}); err != nil {
+		t.Fatal(err)
+	}
+	both := []string{"read", "unattended"}
+	for _, tc := range []struct {
+		name  string
+		tiers []string
+		sa    string
+		want  string // "" admits; otherwise a substring of the refusal
+	}{
+		{strings.Repeat("a", 50), nil, "", ""},
+		{strings.Repeat("b", 51), nil, "", "too long for its tiers"},
+		{strings.Repeat("c", 50), []string{"read"}, "", ""},
+		{strings.Repeat("d", 44), both, "", ""},
+		{strings.Repeat("e", 45), both, "", "too long for its tiers"},
+		{strings.Repeat("f", 45), []string{"unattended"}, "", "too long for its tiers"},
+		{"named-one", []string{"unattended"}, "mine", ""},
+		{"named-default", nil, "mine", ""},
+		{"named-two", both, "mine", "can serve only one tier"},
+	} {
+		p := testAgentProfile(ns, tc.name, func(p *agentv1alpha1.AgentProfile) {
+			p.Spec.AllowedTiers = tc.tiers
+			p.Spec.Identity.ServiceAccountName = tc.sa
+		})
+		p.ResourceVersion, p.Generation, p.UID = "", 0, ""
+		err := c.Create(ctx, &p)
+		switch {
+		case tc.want == "" && err != nil:
+			t.Errorf("%s (%d chars, tiers %v, serviceAccountName %q) refused: %v", tc.name, len(tc.name), tc.tiers, tc.sa, err)
+		case tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)):
+			t.Errorf("%s (%d chars, tiers %v, serviceAccountName %q) = %v, want a refusal saying %q", tc.name, len(tc.name), tc.tiers, tc.sa, err, tc.want)
+		}
+	}
+}
+
 // LiteLLM admits the profile namespace only once that namespace's fence is
 // in place, at its own apply site.
 func TestLiteLLMAdmitsProfilePodsOnlyWhenTheyAreFenced(t *testing.T) {
@@ -531,5 +577,83 @@ func TestLiteLLMWithholdsThePeerOnAProfileReadError(t *testing.T) {
 				t.Error("LiteLLM admits the profile namespace though its fence couldn't be read")
 			}
 		}
+	}
+}
+
+// The identity map renders a profile's entries only once the profile
+// namespace, marked as the chart's, exists: its ServiceAccounts live there,
+// and whoever made a namespace of that name must not get them.
+func TestTheIdentityMapRendersProfilesOnlyWithTheProfileNamespace(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	cfg, scheme := startEnvtestConfig(t)
+	c, err := client.NewWithWatch(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{
+		ProjectID: envtestHarnessProject, Location: envtestHarnessLocation, ClusterName: envtestHarnessCluster,
+	}
+	if err := c.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: agent.Namespace}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Create(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	p := testAgentProfile(agent.Namespace, "auditor")
+	p.ResourceVersion, p.Generation, p.UID = "", 0, ""
+	if err := c.Create(ctx, &p); err != nil {
+		t.Fatal(err)
+	}
+	r := &PlatformAgentReconciler{Client: c, APIReader: c, Scheme: scheme}
+	mapHas := func() bool {
+		t.Helper()
+		_, _ = r.reconcileA2A(ctx, agent)
+		var cm corev1.ConfigMap
+		if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aAuthMapName(agent)}, &cm); err != nil {
+			t.Fatalf("the identity map was not rendered: %v", err)
+		}
+		for _, v := range cm.Data {
+			if strings.Contains(v, `"profile-auditor-read"`) {
+				return true
+			}
+		}
+		return false
+	}
+	if mapHas() {
+		t.Error("the map renders the profile with no profile namespace")
+	}
+	if err := c.Create(ctx, chartProfileNamespace(agent)); err != nil {
+		t.Fatal(err)
+	}
+	if !mapHas() {
+		t.Error("the map leaves the profile out with the profile namespace in place")
+	}
+
+	// A failed read of the namespace returns and leaves the applied map
+	// alone: dropping the entries would revoke the profile on a blip.
+	failing := interceptor.NewClient(c, interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*corev1.Namespace); ok && key.Name == profileNamespaceName(agent) {
+				return fmt.Errorf("the API server timed out")
+			}
+			return cl.Get(ctx, key, obj, opts...)
+		},
+	})
+	r.APIReader = failing
+	if _, err := r.reconcileA2A(ctx, agent); err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Errorf("reconcileA2A = %v, want the namespace read's error", err)
+	}
+	var cm corev1.ConfigMap
+	if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aAuthMapName(agent)}, &cm); err != nil {
+		t.Fatal(err)
+	}
+	kept := false
+	for _, v := range cm.Data {
+		kept = kept || strings.Contains(v, `"profile-auditor-read"`)
+	}
+	if !kept {
+		t.Error("a failed namespace read rewrote the map without the profile")
 	}
 }

@@ -1,5 +1,5 @@
 {
-  "version": "16958eff5fe00a0e",
+  "version": "f682d20b87895ba3",
   "identities": [
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-provision",
@@ -103,8 +103,8 @@
       }
     },
     {
-      "serviceAccount": "system:serviceaccount:kubeagents-system:agentprofile-auditor",
-      "user": "profile-auditor",
+      "serviceAccount": "system:serviceaccount:kubeagents-system-profiles:agentprofile-auditor-read",
+      "user": "profile-auditor-read",
       "account": "APP",
       "grants": {
         "publish": null,
@@ -119,18 +119,20 @@
         "subscribe": [
           "shared.blueprint"
         ]
-      }
+      },
+      "tier": "read"
     },
     {
-      "serviceAccount": "system:serviceaccount:kubeagents-system:agentprofile-cluster-a",
-      "user": "profile-cluster-a",
+      "serviceAccount": "system:serviceaccount:kubeagents-system-profiles:agentprofile-cluster-a-read",
+      "user": "profile-cluster-a-read",
       "account": "APP",
       "grants": {
         "publish": null,
         "subscribe": null
       },
       "narrowing": "profile",
-      "profile": "cluster-a"
+      "profile": "cluster-a",
+      "tier": "read"
     }
   ]
 }
