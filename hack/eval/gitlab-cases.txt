@@ -3,7 +3,8 @@
 # (kube-agents#2394, #2832), and ci-kube-agents-eval-nightly-gitlab-next runs
 # once a night under spec.mode next (EVAL_MODE_NEXT=1, through the inject
 # door). hack/ci-eval-pr.sh reads this file in place of the catalogue
-# whenever EVAL_FORGE=gitlab, on either tier: nothing else grades the forge,
+# whenever EVAL_FORGE is gitlab or gitlab-ce (a self-managed instance,
+# kube-agents#3682), on either tier: nothing else grades the forge,
 # so the presubmit cases and the other nightly-only cases run on GitHub
 # only. Neither nightly appends to the evidence store.
 #
