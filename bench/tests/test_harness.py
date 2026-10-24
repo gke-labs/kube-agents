@@ -7357,12 +7357,15 @@ def test_intra_pod_ordering_guard_reparses_prior_day_line_exceeding_following_st
     """When a pod's log line has a timestamp exceeding the following line's timestamp by >5s, it is re-parsed as prior day."""
     since = datetime(2026, 10, 19, 10, 0, 0, tzinfo=timezone.utc).timestamp()
     monkeypatch.setattr(harness.time, "time", lambda: since + 2 * 3600)
-    # Line 0 is yesterday 11:00 (which wall clock at 12:00 would otherwise admit as today 11:00)
-    # Line 1 is today 10:20. Line 0 jumps forward past line 1, violating monotonicity.
+    # Replica litellm-1 has a later tail (11:30) and a pre-since line (09:50), lifting until to 11:30.
+    # Without the guard, line 0 of litellm-0 (11:00) parses as today 11:00 (within until), corroborating True.
+    # Line 1 of litellm-0 is today 10:20. Line 0 jumps forward past line 1, violating intra-pod monotonicity.
     # The intra-pod ordering guard re-parses line 0 with until=10:20, dating it to yesterday.
     log = (
         "[pod/litellm-0] 11:00:00 - RateLimitError: 429 RESOURCE_EXHAUSTED\n"
         "[pod/litellm-0] 10:20:00 INFO: 200 OK GET /health\n"
+        "[pod/litellm-1] 09:50:00 INFO: 200 OK GET /health\n"
+        "[pod/litellm-1] 11:30:00 INFO: 200 OK GET /health\n"
     )
     # Since line 0 is dated to yesterday (before since), it does not corroborate True.
     assert harness._scan_log_content_for_429(log, since=since) is not True
@@ -7388,16 +7391,28 @@ def test_telemetry_corroboration_cached_when_result_is_none_and_not_refetched_in
         if board.BOARD_PRESENT in script:
             idx = len(reads)
             reads.append(script)
-            payload = {
-                "statuses": {_TASK_A: "blocked", _TASK_B: "blocked"},
-                "summaries": {},
-                "errors": {
-                    _TASK_A: "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429",
-                    _TASK_B: "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429",
-                },
-                "block_kinds": {_TASK_A: "transient", _TASK_B: "transient"},
-                "error": None,
-            }
+            if idx < 2:
+                payload = {
+                    "statuses": {_TASK_A: "blocked", _TASK_B: "blocked"},
+                    "summaries": {},
+                    "errors": {
+                        _TASK_A: "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429",
+                        _TASK_B: "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429",
+                    },
+                    "block_kinds": {_TASK_A: "transient", _TASK_B: "transient"},
+                    "error": None,
+                }
+            else:
+                # Settle read: Task A was unblocked to running, while Task B remains blocked.
+                payload = {
+                    "statuses": {_TASK_A: "running", _TASK_B: "blocked"},
+                    "summaries": {},
+                    "errors": {
+                        _TASK_B: "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429",
+                    },
+                    "block_kinds": {_TASK_A: "transient", _TASK_B: "transient"},
+                    "error": None,
+                }
             return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
         return ""
 
