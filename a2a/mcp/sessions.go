@@ -108,9 +108,9 @@ func ManageSessionTool(bus TurnBus, convs *Conversations) Tool {
 						actionList, actionNew, actionDelete, actionSessionOn, actionSessionOff, actionStatus, actionHelp,
 					}},
 					"conversation": map[string]any{"type": "string", "description": "The conversation's name. new: the name to create " +
-						"(default session-<unix time>); delete: the name to forget; the control actions: the conversation to send on " +
+						"(default session-<unix time>); delete: the name to forget (or its conversation's token); the control actions: the conversation to send on " +
 						"(default: " + DefaultConversation + ")."},
-					"conversation_token": map[string]any{"type": "string", "description": "The control actions only: the conversation, by token, instead of by name."},
+					"conversation_token": map[string]any{"type": "string", "description": "The control actions and delete: the conversation, by token, instead of by name."},
 					"description":        map[string]any{"type": "string", "description": fmt.Sprintf("new only: what the conversation is for, %d characters at most.", maxDescriptionRunes)},
 				},
 			},
@@ -188,11 +188,11 @@ func newConversation(convs *Conversations, a manageSessionArgs) (string, error) 
 }
 
 func deleteConversation(convs *Conversations, a manageSessionArgs) (string, error) {
+	// Trimmed as new trims it, so the name new made is the name forgotten.
+	a.Conversation = strings.TrimSpace(a.Conversation)
 	if a.Conversation == "" && a.ConversationToken == "" {
 		return "", errors.New("delete needs the conversation's name, or its token")
 	}
-	// Trimmed as new trims it, so the name new made is the name forgotten.
-	a.Conversation = strings.TrimSpace(a.Conversation)
 	name, ok := convs.Forget(a.Conversation, a.ConversationToken)
 	if !ok {
 		if a.ConversationToken != "" {

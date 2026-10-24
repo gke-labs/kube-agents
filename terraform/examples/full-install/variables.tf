@@ -615,6 +615,16 @@ variable "slack_home_channel_name" {
   default     = ""
 }
 
+variable "slack_home_channel_policy" {
+  description = "\"auto\" (also empty) or \"manual\". Accepted and recorded in this release but with no effect yet: the A2A gateway does not learn a home channel, so slack_home_channel alone decides. Only used when enable_slack is true."
+  type        = string
+  default     = ""
+  validation {
+    condition     = contains(["", "auto", "manual"], var.slack_home_channel_policy)
+    error_message = "slack_home_channel_policy must be \"\", \"auto\" or \"manual\"."
+  }
+}
+
 variable "chat_topic_name" {
   description = "Pub/Sub topic for Google Chat events. The default matches the chat-pubsub module and the chart."
   type        = string

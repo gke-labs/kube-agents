@@ -108,7 +108,9 @@ and the link, unless the relayed line counts a finding. When the issue cannot be
 the leg posts the relayed line in bold with the link. Not parsing includes a title
 of 0 findings, a body listing no finding, a "<n> new" above the
 title's count, a title whose count disagrees with the finding total the relayed
-line states, and a relayed line with no total that counts no non-zero new,
+line states, an issue that disagrees with the count the line leads with (fleet-audit's own
+line states no total and leads with the count of its most severe findings, "2 critical
+findings", which must be the issue's count at that severity, with none more severe), and a relayed line with no total that counts no non-zero new,
 resolved or severity count or calls the run clean, held, carried or nothing
 reproduced (a zero-finding partial or held run leaves the ledger open over its old
 title, or over a refreshed coverage title when a gap opened the ledger). A run that speaks only
@@ -170,6 +172,14 @@ same card goes to the gateway as a `kube-agents.chat/v1` message instead
 gateway lays it out, buttons included, as it lays out a card's post in a conversation.
 The text headline rides beside it as the fallback the gateway posts when the message
 breaks a rule or Slack refuses it; the leg's own fallbacks above are unchanged.
+
+A fleet-audit report with no ledger link that is fleet-audit's own summary of a run with
+no GitOps repository (`slack_audit_report.summary_card`) gets the same card, built from
+the summary instead of an issue. `_post_summary_card` posts `blocks_from_summary` through
+the relay, or `chat_from_summary` through the gateway under `spec.mode: next`: the
+summary's headline, its finding rows, its other lines under them, and "Look at the first
+one" with no link button. Where the card does not post, `headline_from_summary` goes out
+as text, and the fallbacks are those of the ledger card.
 
 ## Why no agent turn runs over the report
 

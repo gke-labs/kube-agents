@@ -121,7 +121,10 @@ set -euo pipefail
 # pdb-remediation-pr (#2016; held out until its roster line on 2026-10-14)
 # added three more on its own task lock, a ~62 minute chain at its 1250 s hint
 # and ~96 minutes at its measured maximum, until its demotion to the nightly
-# on 2026-10-17 (#3120) took it out of this lane's matrix. A graded miss on the
+# on 2026-10-17 (#3120) took it out of this lane's matrix. vcs-spent-branch-reuse
+# (roster since 2026-10-23) adds three serial units in the fan-out's second
+# phase, after every other unit and each after the reset and a 120 s settle:
+# ~15 minutes at its 173 s median, ~56 at its 1000 s hint. A graded miss on the
 # canary leaves the verdict alone, since it is not admitted; an erroring check
 # (rungs 1-3) turns the verdict RED like any case's.
 #
