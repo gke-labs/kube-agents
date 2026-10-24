@@ -2237,7 +2237,7 @@ esac
 # one project that phase and the infra lock's stretch did not fit the then-480m
 # deadline together. "all", the default, is the whole matrix; "main" leaves
 # those cases out and "writers" runs them alone. "main-a" and "main-b" split
-# "main" again, so it can run as two periodics on two more leased projects:
+# "main" again, so it can run as two periodics on two leased projects:
 # its length is set by the stack-bearing units, which run one at a time under
 # lock-infra, and each project has a lock of its own (#3384). The split is
 # applied after the lane step, which is what names the writers. A part
