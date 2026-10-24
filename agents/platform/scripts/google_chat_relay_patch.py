@@ -8,6 +8,7 @@ import base64
 import json
 import logging
 import os
+import sys
 import urllib.request
 from typing import Any, NamedTuple
 
@@ -78,6 +79,10 @@ BYTES_PER_KIB = 1024
 #: blob or a log line; a markdown report, by contrast, is *meant* to be
 #: rendered and reads worse fenced.
 INLINE_FENCED_SUFFIXES = frozenset({".json", ".yaml", ".yml", ".csv", ".log"})
+
+#: Threaded-reply option passed to the Chat API: fall back to a new thread when
+#: the referenced thread cannot accept replies, rather than failing the post.
+GCHAT_REPLY_FALLBACK_OPTION = "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
 
 
 def _payload_budget(*, fenced: bool) -> int:
@@ -523,3 +528,144 @@ def install() -> None:
 
         PlatformRegistry.create_adapter = create_adapter
         PlatformRegistry._credential_proxy_relay_patched = True
+
+    def has_local_gchat_credential(pconfig: Any) -> bool:
+        """True when a direct Google Chat credential is present on this process.
+
+        On a credential-proxy install, neither service_account_json nor
+        GOOGLE_CHAT_SERVICE_ACCOUNT_JSON is set by design. GKE Workload
+        Identity supplies ADC, but routing through it bypasses the proxy and
+        authenticates as the node identity — the isolation hole this sender
+        closes by routing through the relay instead. ADC is therefore not
+        a signal to use the original path here.
+        """
+        if getattr(pconfig, "extra", {}).get("service_account_json"):
+            return True
+        return bool(os.getenv("GOOGLE_CHAT_SERVICE_ACCOUNT_JSON", ""))
+
+    def build_standalone_sender(original_sender: Any) -> Any:
+        async def relay_standalone_send(
+            pconfig: Any,
+            chat_id: Any,
+            message: Any,
+            *,
+            thread_id: Any = None,
+            **_kwargs: Any,
+        ) -> dict[str, Any]:
+            if original_sender is not None and has_local_gchat_credential(pconfig):
+                return await original_sender(
+                    pconfig, chat_id, message, thread_id=thread_id, **_kwargs
+                )
+            if not str(message or "").strip():
+                LOGGER.info(
+                    "google chat relay: dropped a %d-character message as a "
+                    "silent tick",
+                    len(str(message or "")),
+                )
+                return {
+                    "success": True,
+                    "platform": "google_chat",
+                    "skipped": "empty_text",
+                }
+            body: dict[str, Any] = {"text": str(message)}
+            call_args: dict[str, Any] = {
+                "parent": str(chat_id or ""),
+                "body": body,
+            }
+            if thread_id:
+                body["thread"] = {"name": str(thread_id)}
+                call_args["messageReplyOption"] = GCHAT_REPLY_FALLBACK_OPTION
+            try:
+                response = await asyncio.to_thread(
+                    request,
+                    "/v1/chat/api",
+                    {
+                        "resource": ["spaces", "messages"],
+                        "method": "create",
+                        "arguments": call_args,
+                    },
+                )
+                # The relay envelope mirrors RemoteRequest.execute(): the Chat
+                # API's own response is nested under the "response" key.
+                api_response = response.get("response") or {}
+                thread_name = (api_response.get("thread") or {}).get("name")
+                return {
+                    "success": True,
+                    "platform": "google_chat",
+                    "message_id": api_response.get("name", ""),
+                    "thread_id": thread_name,
+                }
+            except Exception as exc:
+                LOGGER.warning(
+                    "Google Chat relay standalone send failed: %s",
+                    exc,
+                    exc_info=True,
+                )
+                return {"success": False, "platform": "google_chat", "error": str(exc)}
+
+        relay_standalone_send._credential_proxy_relay_patched = True
+        return relay_standalone_send
+
+    def patch_gchat_entry(entry: Any) -> None:
+        original_sender = getattr(entry, "standalone_sender_fn", None)
+        if not getattr(original_sender, "_credential_proxy_relay_patched", False):
+            entry.standalone_sender_fn = build_standalone_sender(original_sender)
+
+    original_registry_register = getattr(PlatformRegistry, "register", None)
+    if original_registry_register is not None and not getattr(
+        PlatformRegistry, "_gchat_standalone_relay_patched", False
+    ):
+
+        # Forward blind past ``entry``: this wrapper adds a side effect and
+        # delegates, so upstream owns the signature. Restating it is how the
+        # Slack shim took every platform down when the base image gained a
+        # keyword-only ``scope`` argument (see slack_relay_patch).
+        def register(self: Any, entry: Any, *args: Any, **kwargs: Any) -> Any:
+            if getattr(entry, "name", None) == "google_chat":
+                try:
+                    patch_gchat_entry(entry)
+                except Exception:
+                    LOGGER.warning(
+                        "Google Chat relay entry patch failed", exc_info=True
+                    )
+            return original_registry_register(self, entry, *args, **kwargs)
+
+        PlatformRegistry.register = register
+        PlatformRegistry._gchat_standalone_relay_patched = True
+
+        # Registration order is not a contract. If the plugin got there first
+        # the entry is already in place, and no future register() call will
+        # reach it. Read the live entries directly rather than through get(),
+        # which resolves deferred loaders and would pay the plugin import cost
+        # this patch is deliberately deferring.
+        try:
+            registry_module = sys.modules.get("gateway.platform_registry")
+            singleton = getattr(registry_module, "platform_registry", None)
+            entries = getattr(singleton, "_entries", None)
+            scoped = getattr(singleton, "_scoped_entries", None)
+            readable = [entries] if isinstance(entries, dict) else []
+            if isinstance(scoped, dict):
+                readable.extend(
+                    scope_entries
+                    for scope_entries in scoped.values()
+                    if isinstance(scope_entries, dict)
+                )
+            for scope_entries in readable:
+                gchat_entry = scope_entries.get("google_chat")
+                if gchat_entry is not None:
+                    patch_gchat_entry(gchat_entry)
+            if singleton is not None and not (
+                isinstance(entries, dict) and isinstance(scoped, dict)
+            ):
+                LOGGER.warning(
+                    "Google Chat relay: platform registry is loaded but its "
+                    "entries are not introspectable (_entries is %s, "
+                    "_scoped_entries is %s); a Google Chat entry registered "
+                    "before this patch installed may not be patched",
+                    type(entries).__name__,
+                    type(scoped).__name__,
+                )
+        except Exception:
+            LOGGER.debug(
+                "No pre-registered Google Chat entry to patch", exc_info=True
+            )
