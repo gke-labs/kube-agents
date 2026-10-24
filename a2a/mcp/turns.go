@@ -208,13 +208,6 @@ func (c *Conversations) ResolveCall(alias, token string) (string, bool, error) {
 		c.touchLocked(e)
 		return e.token, false, nil
 	}
-	// So is a known conversation's bare token in any other shape (one a
-	// caller resumed by), as the original client took a name or a token in
-	// the same argument.
-	if a, ok := c.aliasOfTokenLocked(alias); ok {
-		c.touchLocked(c.byAlias[a])
-		return alias, true, nil
-	}
 	t, err := c.addLocked(alias, "")
 	return t, false, err
 }
@@ -257,7 +250,8 @@ func (c *Conversations) Create(alias, description string) (string, error) {
 	return c.addLocked(alias, description)
 }
 
-// Forget drops alias, and reports whether it was there. The conversation
+// Forget drops the name holding token, or else alias (a name, or a token in
+// a name's place), and returns the name it dropped, if any. The conversation
 // itself is untouched: it stays reachable by its token.
 func (c *Conversations) Forget(alias, token string) (string, bool) {
 	c.mu.Lock()
