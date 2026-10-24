@@ -4161,8 +4161,8 @@ profile_begin "record + final gate"
 # install today's window measures. `bench-gate record` refuses it too.
 #
 # A next-mode run on main does record. The main nightly
-# (ci-kube-agents-eval-nightly and its -writers part, EVAL_MODE_NEXT=1) is a
-# periodic with no PULL_NUMBER, and its matrix runs over the inject transport,
+# (ci-kube-agents-eval-nightly, its -main-b half and its -writers part,
+# EVAL_MODE_NEXT=1) is a periodic with no PULL_NUMBER, and its matrix runs over the inject transport,
 # which `bench-gate` reads as the version key's `next` mode: its lines file
 # under a key of their own, never today's, and are the window an inject-lane
 # run at the same agent model (setupId) is compared with. Today's window is
