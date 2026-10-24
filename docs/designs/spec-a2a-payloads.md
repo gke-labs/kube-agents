@@ -882,7 +882,9 @@ counts are what it could not promise: `failed` cards it could not archive, `pend
 archives still running when it ran out of time, and `unresolved` cards claimed just before
 the stop, for which a worker may still start. `truncated` says more cards were open than one
 stop takes, `deadline` that the stop ran out of time, and `listsCut` only that a list was
-cut to fit the part. A stop that failed carries no part and ends `failed` with
+cut to fit the part. An optional list rides beside them for the Slack Stop button's reply
+(spec-chatops-gateway, the Slack adapter): `notStopped`, the cards the three counts count, by id
+and title. An executor that sends none leaves it out, which reads as none named. A stop that failed carries no part and ends `failed` with
 `reason: card-stop-unavailable` (`card-stop-unsupported` from the `cli` executor). If the
 bus refuses the result with the part, the text goes alone, so a `completed` control can
 arrive with no part. The bridge side is in `a2a/docs/hermes-bridge.md`.
