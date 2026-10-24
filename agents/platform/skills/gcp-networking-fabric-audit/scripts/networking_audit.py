@@ -154,6 +154,14 @@ UNENUMERATED_SUBNETS = "UNENUMERATED_SUBNETS"
 # The skipped-target leaf for a project whose subnet-usage reads failed and
 # which owns no subnet entry its failure could be named on.
 UNREAD_SUBNET_USAGE = "UNREAD_SUBNET_USAGE"
+# The mark on a `project/<id>` entry whose subnet listing completed, held no
+# subnet this sweep counts, and whose VM, address, forwarding-rule and cluster
+# reads all passed and name no subnet that this sweep did not measure. `audit_report` reads
+# it as "no subnet to audit here", so a fleet with no countable subnet does
+# not report a gap for the subnet check. A failed, unreadable or partial
+# listing gets no mark, and so does a Shared VPC service project that uses a
+# subnet of a host project outside the scope.
+SUBNETS_LISTED_KEY = "subnets_listed"
 COMMAND_JOINER = " && "
 LIMITATION_JOINER = "; "
 SUBNETS_FORMAT = "--format=json(name,region,ipCidrRange,secondaryIpRanges,purpose,selfLink)"
@@ -161,8 +169,9 @@ CLUSTERS_FORMAT = "--format=json(name,location,subnetwork,networkConfig,ipAlloca
 ADDRESSES_FILTER = "--filter=addressType=INTERNAL"
 ADDRESSES_FORMAT = "--format=json(address,subnetwork)"
 FORWARDING_RULES_FORMAT = "--format=json(IPAddress,subnetwork)"
-# `gcloud container clusters list` exits 0 when some zones time out and names
-# them on stderr, so the listing is partial. Same markers as stall_watch.py's
+# A gcloud list (clusters, subnets, instances, addresses, forwarding rules)
+# exits 0 when some zones or regions time out and names them on stderr, so the
+# listing is partial. Same markers as stall_watch.py's
 # INCOMPLETE_LISTING_MARKERS.
 INCOMPLETE_LISTING_MARKERS = ("did not respond", "may be incomplete")
 # Decimals a free share is rounded to before it is floored to a percentage, so
@@ -613,6 +622,41 @@ def _prefix(value: object) -> int | None:
     return prefix if prefix is not None and 0 <= prefix <= IPV4_BITS else None
 
 
+def cluster_default_subnet(cluster: dict, pools: list, project_id: str) -> tuple[str, str, str] | None:
+    """The (project, region, subnet) key of a cluster's default subnet, or None if it names none.
+
+    `networkConfig.subnetwork` is the full link; without it, a node pool link
+    with the same name as the bare `subnetwork` field gives the owner, and the
+    bare name alone falls back to `project_id`.
+    """
+    bare_subnet = cluster.get("subnetwork", "")
+    default_subnet = subnet_key((cluster.get("networkConfig") or {}).get("subnetwork", ""), project_id)
+    if default_subnet is None:
+        for pool in pools:
+            pool_subnet = subnet_key((pool.get("networkConfig") or {}).get("subnetwork", ""), project_id)
+            if pool_subnet and pool_subnet[2] == bare_subnet:
+                return pool_subnet
+    if default_subnet is None and bare_subnet:
+        default_subnet = (project_id, region_of_location(cluster.get("location", "")), bare_subnet)
+    return default_subnet
+
+
+def cluster_subnets(cluster: dict, project_id: str) -> set[tuple[str, str, str]]:
+    """Every (project, region, subnet) key a cluster's listing names: its default subnet and each node pool's.
+
+    The listing names the subnet whether or not GKE reported a Pod-range
+    utilization on it.
+    """
+    pools = [p for p in cluster.get("nodePools") or [] if isinstance(p, dict)]
+    default_subnet = cluster_default_subnet(cluster, pools, project_id)
+    keys = {default_subnet} if default_subnet else set()
+    for pool in pools:
+        pool_subnet = subnet_key((pool.get("networkConfig") or {}).get("subnetwork", ""), project_id)
+        if pool_subnet:
+            keys.add(pool_subnet)
+    return keys
+
+
 def pod_range_utilization(
     clusters: list, project_id: str, ranges: dict | None = None
 ) -> dict[tuple[str, str, str, str], dict]:
@@ -659,16 +703,7 @@ def pod_range_utilization(
         name = cluster.get("name", "")
         policy = cluster.get("ipAllocationPolicy") or {}
         pools = [p for p in cluster.get("nodePools") or [] if isinstance(p, dict)]
-        bare_subnet = cluster.get("subnetwork", "")
-        default_subnet = subnet_key((cluster.get("networkConfig") or {}).get("subnetwork", ""), project_id)
-        if default_subnet is None:
-            for pool in pools:
-                pool_subnet = subnet_key((pool.get("networkConfig") or {}).get("subnetwork", ""), project_id)
-                if pool_subnet and pool_subnet[2] == bare_subnet:
-                    default_subnet = pool_subnet
-                    break
-        if default_subnet is None and bare_subnet:
-            default_subnet = (project_id, region_of_location(cluster.get("location", "")), bare_subnet)
+        default_subnet = cluster_default_subnet(cluster, pools, project_id)
 
         def keyed(subnet, range_name):
             return (*subnet, range_name) if subnet and range_name else None
@@ -746,6 +781,16 @@ def percent_available(fraction: float) -> int:
     return max(math.floor(round(fraction * 100, PERCENT_ROUNDING_DIGITS)), 0)
 
 
+def incomplete_listing(warnings: list[str]) -> str | None:
+    """The first warning in which gcloud says that a listing may be
+    incomplete, or None."""
+    return next((w for w in warnings if any(m in w for m in INCOMPLETE_LISTING_MARKERS)), None)
+
+
+def _partial_limitation(read: str, cmd: list[str], warning: str) -> str:
+    return f"{read} partially read: `{shlex.join(cmd)}` warned: {warning[:ERROR_EXCERPT_CHARS]}"
+
+
 def _limitation(read: str, cmd: list[str], error: str | None) -> str:
     excerpt = (error or "no output").strip()[:ERROR_EXCERPT_CHARS]
     return f"{read} not read: `{shlex.join(cmd)}` failed: {excerpt}"
@@ -758,7 +803,8 @@ def read_subnet_usage(projects: list[str], instance_cache: dict | None = None) -
     project and keyed by the subnet's owning project, so a Shared VPC host
     subnet counts the nodes, Pods and load balancers of its service projects.
     Returns the merged Pod-range reports, the unique primary-range addresses
-    per subnet, the projects whose reads named an address in each subnet, and
+    per subnet, the projects whose reads named an address in each subnet, the
+    projects whose clusters read named each subnet, and
     the limitations of each project's failed or partial reads, keyed by project,
     and the projects whose clusters read failed or was partial. A caller that
     passes `instance_cache` gets each project's `instances list` result in it,
@@ -767,6 +813,7 @@ def read_subnet_usage(projects: list[str], instance_cache: dict | None = None) -
     pod_ranges: dict[tuple[str, str, str, str], dict] = {}
     used_ips: dict[tuple[str, str, str], set[str]] = {}
     readers: dict[tuple[str, str, str], set[str]] = {}
+    cluster_users: dict[tuple[str, str, str], set[str]] = {}
     limitations: dict[str, list[str]] = {}
     autopilot_networks: dict[str, set[str]] = {}
     clusters_unread: set[str] = set()
@@ -783,16 +830,17 @@ def read_subnet_usage(projects: list[str], instance_cache: dict | None = None) -
             )
             clusters = []
             clusters_unread.add(project_id)
-        partial = next((w for w in warnings if any(m in w for m in INCOMPLETE_LISTING_MARKERS)), None)
+        partial = incomplete_listing(warnings)
         if partial:
             clusters_unread.add(project_id)
-            own.append(
-                f"Pod ranges partially read: `{shlex.join(cmds['clusters'])}` warned: "
-                f"{partial[:ERROR_EXCERPT_CHARS]}"
-            )
+            own.append(_partial_limitation("Pod ranges", cmds["clusters"], partial))
         pod_range_utilization(clusters, project_id, pod_ranges)
         for cluster in clusters:
-            if isinstance(cluster, dict) and (cluster.get("autopilot") or {}).get("enabled"):
+            if not isinstance(cluster, dict):
+                continue
+            for key in cluster_subnets(cluster, project_id):
+                cluster_users.setdefault(key, set()).add(project_id)
+            if (cluster.get("autopilot") or {}).get("enabled"):
                 network = (cluster.get("networkConfig") or {}).get("network") or cluster.get("network", "")
                 autopilot_networks.setdefault(_network_key(network, project_id), set()).add(
                     f"{project_id}/{cluster.get('location', '')}/{cluster.get('name', '')}"
@@ -801,7 +849,8 @@ def read_subnet_usage(projects: list[str], instance_cache: dict | None = None) -
         primary_reads = {}
         for role, read in (("instances", "VM NICs"), ("addresses", "internal addresses"),
                            ("forwarding_rules", "forwarding rules")):
-            items, error = run_gcloud_json(cmds[role])
+            warnings = []
+            items, error = run_gcloud_json(cmds[role], warnings=warnings)
             if role == "instances" and instance_cache is not None:
                 instance_cache[project_id] = (items, error)
             if items == API_DISABLED:
@@ -811,6 +860,13 @@ def read_subnet_usage(projects: list[str], instance_cache: dict | None = None) -
                     _limitation(read, cmds[role], error) + "; primary-range use is counted without them"
                 )
                 items = []
+            partial = incomplete_listing(warnings)
+            if partial:
+                # A VM on a host subnet outside the scope can be in the part
+                # that was not read.
+                own.append(
+                    _partial_limitation(read, cmds[role], partial) + "; primary-range use can be undercounted"
+                )
             primary_reads[role] = items
         for key, ips in primary_ips_by_subnet(project_id, primary_reads["instances"], primary_reads["addresses"],
                                               primary_reads["forwarding_rules"]).items():
@@ -820,6 +876,9 @@ def read_subnet_usage(projects: list[str], instance_cache: dict | None = None) -
         "pod_ranges": pod_ranges,
         "used_ips": used_ips,
         "readers": readers,
+        # The projects whose clusters read named each subnet, with or
+        # without a Pod-range utilization on it.
+        "cluster_users": cluster_users,
         "limitations": limitations,
         # Network key to the Autopilot clusters on it, from the clusters reads
         # that passed. The firewall check marks an untargeted rule on such a
@@ -850,16 +909,19 @@ def subnet_entry(target: str, region: str, project_id: str, command: str, limita
 
 
 def audit_subnet_capacity(projects: list[str], usage: dict, skipped_targets: list,
-                          active_targets: list) -> list[dict]:
+                          active_targets: list, listed_empty: set[str] | None = None) -> list[dict]:
     """Second subnet-ip-exhaustion pass: each listed subnet against `read_subnet_usage`'s maps.
 
     One `<project>/<region>/<subnet>` scope entry per countable subnet. Pod
     ranges are measured from GKE's own utilization fields; the primary range
     as a lower bound from VM NICs, internal addresses and forwarding rules,
     plus the four addresses GCP reserves. A failed subnet listing skips that
-    project. A Pod range on a subnet no listing named -- a Shared VPC host
-    project outside the scope, or one whose listing failed -- still gets an
-    entry under its owner's name, measured on the Pod range alone.
+    project, and so does a listing that warns it may be incomplete and
+    returned no countable subnet; the subnets that such a listing did return
+    name the warning in their `limitations`. A Pod range on a subnet no
+    listing named -- a Shared VPC host project outside the scope, or one whose
+    listing failed -- still gets an entry under its owner's name, measured on
+    the Pod range alone.
 
     A failed or partial read of the first pass is named in the `limitations`
     of the reading project's own subnet entries. A project whose reads failed
@@ -868,6 +930,14 @@ def audit_subnet_capacity(projects: list[str], usage: dict, skipped_targets: lis
     reads as partial: what it draws from a host subnet cannot be known
     without the read, but one unreadable project does not mark every subnet
     in the fleet.
+
+    A caller that gives `listed_empty` gets in it each project whose subnet
+    listing completed with no countable subnet and whose usage reads all passed
+    and name no subnet that this sweep did not evaluate. A failed listing, a
+    listing that warns it may be incomplete, a listing with an item that is not
+    an object or a countable subnet with a range that does not parse, a project
+    with a failed usage read or one that warns it may be incomplete,
+    and a project that uses a subnet nobody measured do not go in.
     """
     limitations = usage["limitations"]
     pods_by_subnet: dict[tuple[str, str, str], dict[str, dict]] = {}
@@ -900,9 +970,12 @@ def audit_subnet_capacity(projects: list[str], usage: dict, skipped_targets: lis
     # Why a project in scope named none of its subnets, for the entries of Pod
     # ranges on them.
     unlisted: dict[str, str] = {}
+    # The projects whose subnet listing completed with no countable subnet.
+    empty_listings: set[str] = set()
     for project_id in projects:
         cmds = subnet_commands(project_id)
-        subnets, error = run_gcloud_json(cmds["subnets"])
+        warnings: list[str] = []
+        subnets, error = run_gcloud_json(cmds["subnets"], warnings=warnings)
         if subnets == API_DISABLED:
             unlisted[project_id] = f"the Compute Engine API is disabled in {project_id}"
             continue
@@ -917,14 +990,24 @@ def audit_subnet_capacity(projects: list[str], usage: dict, skipped_targets: lis
             })
             unlisted[project_id] = f"the subnet listing of {project_id} failed (see {target})"
             continue
+        # A subnet the listing did not return can be in a region that did not
+        # respond. The subnets it returned name the warning, and a listing
+        # that returned none is skipped as a failed one is.
+        partial = incomplete_listing(warnings)
+        listing_notes = [_partial_limitation("subnets", cmds["subnets"], partial)] if partial else []
 
         # The same reads run in every project in scope; the entry names its
         # own project's, which keeps it under audit_report's MAX_COMMAND_CHARS
         # however many service projects draw on the subnet.
         scope_command = command_text(*cmds.values())
         uncounted = []
+        counted = 0
+        # An item the sweep could not read means the listing did not say
+        # that the project holds no subnet to measure.
+        unreadable = False
         for subnet in subnets:
             if not isinstance(subnet, dict):
+                unreadable = True
                 continue
             name = subnet.get("name", "")
             purpose = subnet.get("purpose") or ""
@@ -938,12 +1021,15 @@ def audit_subnet_capacity(projects: list[str], usage: dict, skipped_targets: lis
                 network = ipaddress.ip_network(cidr, strict=False)
             except ValueError:
                 uncounted.append(f"{name} (unparsable range {cidr!r})")
+                unreadable = True
                 continue
             _, region, name = key
             target = f"{project_id}/{region}/{name}"
             evaluated.add(key)
+            counted += 1
             active_targets.append(subnet_entry(target, region, project_id, scope_command,
-                                               [*limitations.get(project_id, []), *unreadable_notes(key)]))
+                                               [*listing_notes, *limitations.get(project_id, []),
+                                                *unreadable_notes(key)]))
 
             capacity = network.num_addresses
             used = (addresses_in_range(usage["used_ips"].get(key, set()), network)
@@ -964,6 +1050,18 @@ def audit_subnet_capacity(projects: list[str], usage: dict, skipped_targets: lis
                 for secondary in subnet.get("secondaryIpRanges") or [] if isinstance(secondary, dict)
             }
             findings.extend(pod_findings(target, name, region, key, cidrs))
+        if partial and not counted:
+            target = f"{project_id}/{UNENUMERATED_SUBNETS}"
+            skipped_targets.append({
+                "cluster": target,
+                "name": target,
+                "location": GLOBAL_LOCATION,
+                "project": project_id,
+                "reason": listing_notes[0],
+            })
+            unlisted[project_id] = f"the subnet listing of {project_id} was partial (see {target})"
+        elif not counted and not unreadable:
+            empty_listings.add(project_id)
         if uncounted:
             sys.stderr.write(
                 f"{project_id}: subnet-ip-exhaustion skipped subnets no read can count: {', '.join(uncounted)}\n"
@@ -987,6 +1085,23 @@ def audit_subnet_capacity(projects: list[str], usage: dict, skipped_targets: lis
         active_targets.append(subnet_entry(target, region, owner, clusters_command(fullest),
                                            [note, *limitations.get(owner, []), *unreadable_notes(key)]))
         findings.extend(pod_findings(target, name, region, key, {}))
+
+    if listed_empty is not None:
+        # A project whose reads name a subnet that this sweep did not
+        # evaluate uses address space that nothing measured, for example a
+        # Shared VPC service project on a host subnet outside the scope.
+        unmeasured = {
+            reader
+            for users in (usage["readers"], usage["cluster_users"])
+            for key, reader_set in users.items() if key not in evaluated
+            for reader in reader_set
+        } | {
+            pod["project"] for (owner, region, subnet_name, _), pod in usage["pod_ranges"].items()
+            if (owner, region, subnet_name) not in evaluated
+        }
+        # A failed or partial usage read could name such a subnet too.
+        unread = {project_id for project_id, notes in limitations.items() if notes}
+        listed_empty.update(empty_listings - unmeasured - unread)
 
     entry_projects = {entry["project"] for entry in active_targets[first_entry:]}
     unlisted_rows = {row["project"]: row for row in skipped_targets
@@ -2009,14 +2124,16 @@ def candidate_from_finding(finding: dict) -> dict:
     }
 
 
-def subnet_targets(projects: list[str], usage: dict | None = None) -> list[dict]:
+def subnet_targets(projects: list[str], usage: dict | None = None,
+                   listed_empty: set[str] | None = None) -> list[dict]:
     """The subnet sweep's entries, skipped rows and findings as manifest
     targets: each evaluated subnet `collected` with its findings as candidates,
-    each skipped row `gate-failed` with its reason as the error."""
+    each skipped row `gate-failed` with its reason as the error.
+    `listed_empty` is as for `audit_subnet_capacity`."""
     skipped: list[dict] = []
     active: list[dict] = []
     usage = usage if usage is not None else read_subnet_usage(projects)
-    findings = audit_subnet_capacity(projects, usage, skipped, active)
+    findings = audit_subnet_capacity(projects, usage, skipped, active, listed_empty)
     by_target: dict[str, list[dict]] = {}
     for finding in findings:
         by_target.setdefault(finding["cluster"], []).append(candidate_from_finding(finding))
@@ -2087,7 +2204,16 @@ def collect_fleet(project_id: str | None = None, check: str = CHECK_ALL) -> dict
             entries, projects, api_off, (usage or {}).get("autopilot_networks"), (usage or {}).get("clusters_unread")
         )
     if check in (CHECK_ALL, SUBNET_CHECK_SLUG):
-        entries.extend(subnet_targets(projects, usage))
+        listed_empty: set[str] = set()
+        entries.extend(subnet_targets(projects, usage, listed_empty))
+        # The mark goes on the project entries that the subnet sweep found
+        # empty. A project entry that is not collected goes to `scope.skipped`,
+        # which is a gap with or without the mark.
+        for entry in entries:
+            if (entry.get("outcome") == OUTCOME_COLLECTED
+                    and entry.get("name") == f"{PROJECT_TARGET_PREFIX}{entry.get('project')}"
+                    and entry.get("project") in listed_empty):
+                entry[SUBNETS_LISTED_KEY] = 0
     if notes:
         entries.append(unenumerated_entry(notes, declared_scope.sweep_is_declared((project_id or "").strip())))
     # Under a declared scope the reason is in `notes` (nothing readable, the

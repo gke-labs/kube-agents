@@ -19361,6 +19361,122 @@ class TestClustersListedMarker(unittest.TestCase):
         audit_report.cross_check_manifest(doc, self._manifest(audit_id, **{self.KEY: 0}))
 
 
+class TestSubnetsListedMarker(unittest.TestCase):
+    """`subnets_listed: 0` on a project entry: a fleet with no subnet to
+    measure is not a run that lost its subnets.
+
+    Without it, a networking run over projects with no countable subnet
+    reported "no subnet targets were audited" and stayed partial on every
+    run. The networking collector writes the mark, the worker copies it onto
+    `scope.clusters`, and it lifts the subnet kind's gap only when every
+    project target carries it. It follows the same rules as `clusters_listed`.
+    """
+
+    AUDIT = "gcp-networking-fabric-audit"
+    # The literal, so that a module without the constant fails on behaviour.
+    KEY = "subnets_listed"
+
+    def test_the_key_is_the_module_constant(self):
+        self.assertEqual(audit_report.SUBNETS_LISTED_KEY, self.KEY)
+
+    def _project(self, project, **extra):
+        entry = {
+            "name": f"project/{project}",
+            "location": "-",
+            "project": project,
+            "checks_run": list(audit_report.audit_target_checks(self.AUDIT, f"project/{project}")),
+        }
+        entry.update(extra)
+        return entry
+
+    def _gaps(self, clusters):
+        return audit_report.coverage_gaps(make_doc(findings=[], audit=self.AUDIT, clusters=clusters))
+
+    def test_every_project_marked_empty_lifts_the_subnet_gap(self):
+        clusters = [self._project("acme", **{self.KEY: 0}), self._project("beta", **{self.KEY: 0})]
+        self.assertEqual(self._gaps(clusters), [])
+
+    def test_one_unmarked_project_keeps_the_subnet_gap(self):
+        # beta's subnet list failed: its subnets may exist unaudited.
+        gaps = self._gaps([self._project("acme", **{self.KEY: 0}), self._project("beta")])
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("no subnet targets were audited", gaps[0])
+
+    def test_no_marked_project_keeps_the_subnet_gap(self):
+        gaps = self._gaps([self._project("acme")])
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("no subnet targets were audited", gaps[0])
+
+    def test_the_cluster_mark_does_not_lift_the_subnet_gap(self):
+        gaps = self._gaps([self._project("acme", **{audit_report.CLUSTERS_LISTED_KEY: 0})])
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("no subnet targets were audited", gaps[0])
+
+    def test_the_subnet_mark_does_not_lift_the_cluster_gap(self):
+        audit_id = "fleet-wide-cost-analysis"
+        project = {
+            "name": "project/acme",
+            "location": "-",
+            "project": "acme",
+            "checks_run": list(audit_report.audit_target_checks(audit_id, "project/acme")),
+            self.KEY: 0,
+        }
+        gaps = audit_report.coverage_gaps(make_doc(findings=[], audit=audit_id, clusters=[project]))
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("no cluster targets were audited", gaps[0])
+
+    def test_the_marker_never_lifts_the_project_gap(self):
+        subnet = {"name": "acme/us-central1/s1", "location": "us-central1", "project": "acme"}
+        gaps = audit_report._unenumerated_kind_gaps(self.AUDIT, [subnet])
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("no project targets were audited", gaps[0])
+
+    def test_validation_accepts_the_collectors_zero_on_a_project_entry(self):
+        doc = make_doc(findings=[], audit=self.AUDIT, clusters=[self._project("acme", **{self.KEY: 0})])
+        audit_report.validate_findings(doc, self.AUDIT)
+
+    def test_validation_rejects_anything_the_collector_would_not_write(self):
+        subnet = {"name": "acme/us-central1/s1", "location": "us-central1", "project": "acme", self.KEY: 0}
+        cases = {
+            "a subnet entry": subnet,
+            "a non-zero count": self._project("acme", **{self.KEY: 3}),
+            "a bool": self._project("acme", **{self.KEY: False}),
+            "a string": self._project("acme", **{self.KEY: "0"}),
+        }
+        for label, entry in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(audit_report.ValidationError) as caught:
+                    audit_report.validate_findings(make_doc(findings=[], audit=self.AUDIT, clusters=[entry]), self.AUDIT)
+                self.assertIn(self.KEY, str(caught.exception))
+                self.assertIn("subnet list", str(caught.exception))
+
+    def _manifest(self, **extra):
+        entry = {
+            "name": "project/acme",
+            "outcome": "collected",
+            "commands": [{"check": c, "rc": 0} for c in audit_report.audit_target_checks(self.AUDIT, "project/acme")],
+        }
+        entry.update(extra)
+        return {"clusters": [entry]}
+
+    def test_the_manifest_must_carry_the_marker_the_document_claims(self):
+        doc = make_doc(findings=[], audit=self.AUDIT, clusters=[self._project("acme", **{self.KEY: 0})])
+        with self.assertRaises(audit_report.ValidationError) as caught:
+            audit_report.cross_check_manifest(doc, self._manifest())
+        self.assertIn(self.KEY, str(caught.exception))
+
+    def test_a_marker_copied_from_the_manifest_passes(self):
+        doc = make_doc(findings=[], audit=self.AUDIT, clusters=[self._project("acme", **{self.KEY: 0})])
+        audit_report.cross_check_manifest(doc, self._manifest(**{self.KEY: 0}))
+
+    def test_draft_copies_the_marker(self):
+        manifest = self._manifest(**{self.KEY: 0})
+        manifest["audit"] = self.AUDIT
+        doc = audit_report.draft_findings(manifest, self.AUDIT)
+        self.assertEqual(doc["scope"]["clusters"][0][self.KEY], 0)
+        self.assertEqual(audit_report.coverage_gaps(doc), [])
+
+
 class TestCrossCheckManifest(unittest.TestCase):
     """Manifest-scoped attestation: see `audit_report.cross_check_manifest`."""
 
@@ -22844,6 +22960,24 @@ class TestFinishManifestFlag(HarnessTestCase):
             "project": "acme",
             "checks_run": list(audit_report.audit_target_checks(audit_id, "project/acme")),
             audit_report.CLUSTERS_LISTED_KEY: 0,
+        }
+        doc = make_doc(findings=[], audit=audit_id, clusters=[project])
+        for label, extra in {"no flag": [], "waived": ["--no-collector-manifest", "collector crashed"]}.items():
+            with self.subTest(case=label):
+                self.harness.replies = {"issue-list": issues_view([])}
+                rc = self.run_finish(doc, ["--dry-run", *extra], audit=audit_id)
+                self.assertEqual(rc, 2)
+                self.assertIn("only the collector manifest can back", self.err)
+
+    def test_the_subnets_listed_marker_needs_a_manifest(self):
+        # Hand-written, the marker would lift the no-subnet gap on the worker's word alone.
+        audit_id = "gcp-networking-fabric-audit"
+        project = {
+            "name": "project/acme",
+            "location": "-",
+            "project": "acme",
+            "checks_run": list(audit_report.audit_target_checks(audit_id, "project/acme")),
+            "subnets_listed": 0,
         }
         doc = make_doc(findings=[], audit=audit_id, clusters=[project])
         for label, extra in {"no flag": [], "waived": ["--no-collector-manifest", "collector crashed"]}.items():

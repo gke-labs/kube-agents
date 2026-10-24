@@ -103,6 +103,7 @@ is `started_at`: `finish` reads it only to give the `collect_s` timer, and no de
 | `clusters[].checks_not_applicable[]`       | **read**         | Checks the collector itself dispositioned as having nothing to run against on this target. The collector is the authority on applicability; §3.1 holds the document to it in both directions.                                                                                                                                                                                                                                                                                              |
 | `clusters[].checks_unevaluated[]`          | **read**         | `{check, reason}` for a check whose own read failed or whose inputs could not decide it on this target, so it neither ran nor was found inapplicable. The document may list it in neither `checks_run` nor `checks_not_applicable`, and must carry `limitations` on that target, which makes the run partial.                                                                                                                                                                              |
 | `clusters[].clusters_listed`               | **read**         | `0` on a `project/<id>` entry whose `clusters list` completed and came back empty, or was refused by that project's own disabled Kubernetes Engine API. Copied verbatim onto that `scope.clusters` entry, it lifts the gap for enumerating no cluster (§5); absent on a failed, zone-incomplete or unreached list.                                                                                                                                                                         |
+| `clusters[].subnets_listed`                | **read**         | `0` on a `project/<id>` entry whose `subnets list` completed with no subnet that `subnet-ip-exhaustion` counts, and whose VM, address, forwarding-rule and cluster reads passed and name no unmeasured subnet. Copied like `clusters_listed`, it lifts the gap for enumerating no subnet (§5); absent on a failed, unreadable or incomplete list, or a failed or incomplete usage read.                                                                                                    |
 | `clusters[].candidates[]`                  | **read**         | What the collector would flag: `(check, namespace, object)` plus `excerpt` and `impact`. `cluster` is optional and defaults to the enclosing entry's `name`. `command`, `impact_authoritative` and `needs_triage` are optional and read in §3. `severity` is read only by the `major` sweep (§3.4); the stream's SOP says if the model copies it or re-judges it from fleet context.                                                                                                       |
 | `clusters[].candidates[]` route fields     | **read**         | `declaration`, `release_declaration`, `namespace_directory` and `reconciler`, each optional. `finish` reads them for the route notes on a `manual` remediation (the issue-ledger design, §6). An absent field is no claim.                                                                                                                                                                                                                                                                 |
 | `audit`                                    | **read**         | The stream the manifest was written for. When present it must equal `--audit`, the way `load_findings` holds the document to it; a mismatch is a validation error naming both. Absent, the manifest is accepted.                                                                                                                                                                                                                                                                           |
@@ -162,10 +163,11 @@ before any `gh` call:
   inapplicable there, or the document's `checks_not_applicable` names a check the manifest ran to
   `rc == 0` without itself declaring inapplicable. Applicability is corroborated, never prohibited:
   a check the collector never reached still takes the model's judgement.
-- A target carries `clusters_listed` and its manifest entry does not carry the same value. The
-  marker takes the cluster kind out of the coverage count (§5), so a hand-written one would turn a
-  run that lost its clusters clean. `validate_findings` accepts it only on a `project/<id>` entry and
-  only as the literal `0` (a bool is rejected), and `finish` rejects it without `--manifest-file`.
+- A target carries `clusters_listed` or `subnets_listed` and its manifest entry does not carry the
+  same value. The marker takes the cluster or subnet kind out of the coverage count (§5), so a
+  hand-written one would turn a run that lost its clusters or subnets clean. `validate_findings`
+  accepts it only on a `project/<id>` entry and only as the literal `0` (a bool is rejected), and
+  `finish` rejects it without `--manifest-file`.
 - A target's `checks_run` or `checks_not_applicable` names a check the manifest lists in that
   target's `checks_unevaluated`, or the manifest lists any there and the target carries no
   `limitations`. The check's own read failed, so it neither ran nor was found inapplicable; naming it
@@ -493,7 +495,14 @@ a run that lost them, so their collectors write `clusters_listed: 0` on a `proje
 `clusters list` completed empty or was refused by that project's own disabled Kubernetes Engine
 API, never on a failed, zone-incomplete or unreached one, nor one another project's API refused, and the SOPs
 carry it onto `scope.clusters`. The `cluster` kind's gap is lifted only when every `project/<id>`
-target carries it; §3.1 holds each copy to the manifest.
+target carries it; §3.1 holds each copy to the manifest. The networking collector writes
+`subnets_listed: 0` by a similar rule on a `project/<id>` entry whose `subnets list` completed with
+no subnet that `subnet-ip-exhaustion` counts. It never writes it on a failed or unreadable list, on
+a list that exits 0 but warns that it may be incomplete, nor on a project whose VM, address,
+forwarding-rule or cluster reads failed, warned that they may be incomplete, or name a subnet the
+run did not measure (a Shared VPC service project on a host subnet outside the scope). A project
+whose Compute Engine API is disabled has no subnet listing, and so has no mark. The `subnet` kind's
+gap is lifted only when every `project/<id>` target carries it.
 
 ## 6. Testing
 

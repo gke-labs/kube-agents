@@ -2272,6 +2272,25 @@ UNNAMED_EVIDENCE_TARGET = "(unnamed)"
 # what tells a fleet with no clusters apart from a run that lost them
 # (`_unenumerated_kind_gaps`).
 CLUSTERS_LISTED_KEY = "clusters_listed"
+# The same mark for subnets. The networking collector sets it on a
+# `project/<id>` entry whose `gcloud compute networks subnets list` completed
+# and held no subnet that the IPAM check counts, and whose VM, address,
+# forwarding-rule and cluster reads all passed and name no subnet that the run
+# did not measure. It is never set on a failed or unreadable list.
+SUBNETS_LISTED_KEY = "subnets_listed"
+# Each target kind that has a "listed empty" mark, and the mark. A kind with
+# no target in the run is not a coverage gap when every project target
+# carries its mark (`_unenumerated_kind_gaps`).
+LISTED_EMPTY_KEYS = {TARGET_KIND_CLUSTER: CLUSTERS_LISTED_KEY, TARGET_KIND_SUBNET: SUBNETS_LISTED_KEY}
+# What each mark says about its project, for the error messages.
+LISTED_EMPTY_LISTS = {
+    CLUSTERS_LISTED_KEY: "cluster list completed empty",
+    SUBNETS_LISTED_KEY: (
+        "subnet list completed with no subnet that subnet-ip-exhaustion counts, "
+        "and whose VM, address, forwarding-rule and cluster reads all passed and "
+        "name no subnet that the run did not measure"
+    ),
+}
 # The one manifest `outcome` under which the collector vouches for a cluster's
 # `checks_run`; every other outcome leaves the cluster to the manual fallback —
 # except `out-of-scope`, the collector saying the target is not this audit's,
@@ -5131,14 +5150,16 @@ def _validate_findings_document(data: object, audit_id: str) -> dict:
             f"scope.clusters[{i}].limitations",
             allow_empty=False,
         )
-        if CLUSTERS_LISTED_KEY in cluster:
-            listed = cluster[CLUSTERS_LISTED_KEY]
+        for listed_key in LISTED_EMPTY_KEYS.values():
+            if listed_key not in cluster:
+                continue
+            listed = cluster[listed_key]
             if not name.startswith(PROJECT_TARGET_PREFIX) or isinstance(listed, bool) or listed != 0:
                 raise ValidationError(
-                    f"scope.clusters[{i}].{CLUSTERS_LISTED_KEY}: only a "
+                    f"scope.clusters[{i}].{listed_key}: only a "
                     f"`{PROJECT_TARGET_PREFIX}<id>` entry carries it, and only as "
-                    "the 0 the collector wrote for a project whose cluster list "
-                    f"completed empty; copy it from the manifest or leave it out. "
+                    f"the 0 the collector wrote for a project whose {LISTED_EMPTY_LISTS[listed_key]}; "
+                    "copy it from the manifest or leave it out. "
                     f"{_sop_pointer(audit_id)}"
                 )
 
@@ -6378,7 +6399,8 @@ def _unenumerated_kind_gaps(audit_id: str, targets: list) -> list[str]:
     `CLUSTERS_LISTED_KEY`: each project's cluster list completed and came back
     empty, so the cluster checks had nothing to run against rather than lost
     what they should have read. One project without it -- or no project
-    target at all -- and the gap stands.
+    target at all -- and the gap stands. The subnet kind and
+    `SUBNETS_LISTED_KEY` follow the same rule (`LISTED_EMPTY_KEYS`).
     """
     return [
         f"no {kind} targets were audited — {len(checks)} check(s) ran "
@@ -6402,9 +6424,11 @@ def _stranded_kinds(audit_id: str, targets: list) -> list[tuple[str, tuple[str, 
     ]
     seen = {kind for kind, _ in kinds}
     projects = [t for kind, t in kinds if kind == TARGET_KIND_PROJECT]
-    listed_empty = bool(projects) and all(
-        t.get(CLUSTERS_LISTED_KEY) == 0 and not isinstance(t.get(CLUSTERS_LISTED_KEY), bool) for t in projects
-    )
+    listed_empty = {
+        kind
+        for kind, key in LISTED_EMPTY_KEYS.items()
+        if projects and all(t.get(key) == 0 and not isinstance(t.get(key), bool) for t in projects)
+    }
     # A check owed by more than one kind ran wherever a present kind carried
     # it: stockout's `reservation-mismatch-risk` has a cluster arm beside its
     # project one, and a run with clusters and no project did not run it
@@ -6412,7 +6436,7 @@ def _stranded_kinds(audit_id: str, targets: list) -> list[tuple[str, tuple[str, 
     covered = {check for kind, checks in spec.scopes if kind in seen for check in checks}
     stranded: list[tuple[str, tuple[str, ...]]] = []
     for kind, checks in spec.scopes:
-        if kind in seen or (kind == TARGET_KIND_CLUSTER and listed_empty):
+        if kind in seen or kind in listed_empty:
             continue
         checks = tuple(c for c in checks if c not in covered)
         if not checks:
@@ -6714,13 +6738,14 @@ def cross_check_manifest(data: dict, manifest: dict) -> None:
         # The marker takes the cluster kind out of the coverage count, so it
         # has to be the collector's word, never the document's: a project
         # the manifest does not mark empty cannot be claimed as one.
-        if CLUSTERS_LISTED_KEY in cluster and (manifest_cluster or {}).get(CLUSTERS_LISTED_KEY) != cluster[CLUSTERS_LISTED_KEY]:
-            raise ValidationError(
-                f"scope.clusters: {name!r} carries {CLUSTERS_LISTED_KEY}="
-                f"{cluster[CLUSTERS_LISTED_KEY]!r}, but the collector manifest for "
-                f"{audit_id} does not. Carry the marker only where the manifest "
-                "entry has it, verbatim."
-            )
+        for listed_key in LISTED_EMPTY_KEYS.values():
+            if listed_key in cluster and (manifest_cluster or {}).get(listed_key) != cluster[listed_key]:
+                raise ValidationError(
+                    f"scope.clusters: {name!r} carries {listed_key}="
+                    f"{cluster[listed_key]!r}, but the collector manifest for "
+                    f"{audit_id} does not. Carry the marker only where the manifest "
+                    "entry has it, verbatim."
+                )
         if not manifest_cluster:
             # A target the collector never named: nothing corroborates a claim
             # that every check is inapplicable there, which `validate_findings`
@@ -19056,8 +19081,9 @@ def draft_findings(manifest: dict, audit_id: str) -> dict:
             "project": project or name,
             "checks_run": [{"check": check, "command": command} for check, command in sorted(commands.items())],
         }
-        if CLUSTERS_LISTED_KEY in entry:
-            cluster[CLUSTERS_LISTED_KEY] = entry[CLUSTERS_LISTED_KEY]
+        for listed_key in LISTED_EMPTY_KEYS.values():
+            if listed_key in entry:
+                cluster[listed_key] = entry[listed_key]
         # What the collector found cannot apply leaves the denominator, as it
         # does in `finish`'s own reading; left out, every Autopilot or empty
         # cluster would publish as partially audited.
@@ -21248,17 +21274,18 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # The marker lifts a coverage gap only as the collector's word, which only
     # `cross_check_manifest` can hold the document to; without a manifest it
     # would be the worker's own claim that the fleet holds no clusters.
-    unbacked = [
-        str(c.get("name"))
-        for c in (data.get("scope") or {}).get("clusters") or []
-        if isinstance(c, dict) and CLUSTERS_LISTED_KEY in c
-    ]
-    if manifest is None and unbacked:
-        raise ValidationError(
-            f"scope.clusters: {', '.join(unbacked)} carries {CLUSTERS_LISTED_KEY}, "
-            "which only the collector manifest can back; pass --manifest-file, or "
-            f"leave {CLUSTERS_LISTED_KEY} out and take the coverage gap."
-        )
+    for listed_key in LISTED_EMPTY_KEYS.values():
+        unbacked = [
+            str(c.get("name"))
+            for c in (data.get("scope") or {}).get("clusters") or []
+            if isinstance(c, dict) and listed_key in c
+        ]
+        if manifest is None and unbacked:
+            raise ValidationError(
+                f"scope.clusters: {', '.join(unbacked)} carries {listed_key}, "
+                "which only the collector manifest can back; pass --manifest-file, or "
+                f"leave {listed_key} out and take the coverage gap."
+            )
     waiver_given = getattr(args, "no_collector_manifest", None)
     waiver = str(waiver_given or "").strip()
     if waiver_given is not None and not waiver:
