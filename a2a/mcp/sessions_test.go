@@ -389,7 +389,11 @@ func TestAnUnknownBareTokenIsThatConversation(t *testing.T) {
 	if rows := convs.List(); len(rows) != 0 {
 		t.Errorf("an unknown token given as a name minted %+v", rows)
 	}
-	mustFail(t, callTool(t, s, ToolManageSession, map[string]any{"action": actionNew, "conversation": token}))
+	res := callTool(t, s, ToolManageSession, map[string]any{"action": actionNew, "conversation": token})
+	if !res.IsError || !strings.Contains(res.Content[0].Text, "is a conversation's token, not a name") ||
+		strings.Contains(res.Content[0].Text, "conversation_token") {
+		t.Errorf("new with a token = %+v; want a refusal that says it is a token, with no advice new refuses", res)
+	}
 }
 
 // A call naming a conversation by its token, in either form, counts as a

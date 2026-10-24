@@ -333,11 +333,11 @@ func checkAlias(alias string) error {
 	if n := utf8.RuneCountInString(alias); n > maxAliasRunes {
 		return fmt.Errorf("conversation name is %d characters; at most %d", n, maxAliasRunes)
 	}
-	if strings.HasPrefix(alias, consoleConversationPrefix) {
-		return fmt.Errorf("a name may not start with %q; pass a token as conversation_token", consoleConversationPrefix)
-	}
-	if isMintedToken(alias) {
-		return errors.New("a name may not be spelled like a conversation token; pass a token as conversation_token")
+	// Only new reaches these two: ResolveCall takes such a name as the
+	// token it is before checking it.
+	if strings.HasPrefix(alias, consoleConversationPrefix) || isMintedToken(alias) {
+		return errors.New("that is a conversation's token, not a name: the conversation already exists, " +
+			"and a name cannot be given to it here; use it by its token, or pick another name for a new conversation")
 	}
 	// list collapses every run of Unicode spaces to one ASCII space.
 	if strings.Join(strings.Fields(alias), " ") != alias {
