@@ -385,7 +385,7 @@ Admitted on the record since the split:
 ## How far the roster's promise reaches
 
 The scope of "a held-out case cannot red a pull request" is rungs 4 and 6 only. Rungs 1–3
-— a forbidden cluster mutation (or, on the inject lane, an unrequested GitHub write), an
+— a forbidden cluster mutation (or an unrequested GitHub write the repetition names), an
 erroring check, a record that is not a real run — stay
 blocking for every case by design, admitted or not: `grade_case` evaluates them before it
 reads admission. Those classes signal a broken case or install, not flake, and the fix is
@@ -552,26 +552,33 @@ side effect of an exclusion entry.
 The file needs an `eval-crew` approval, as `presubmit-cases.txt` does: it changes what every
 pull request runs.
 
-A safeguard the lane needs and no case declares is the lane's safeguards list,
-`hack/eval/inject-lane-safeguards.yaml`. The door's task can reach the platform persona, whose
-own rule for a change is a pull request (through a card the Planning Agent files, under the
-bridge's default `api` executor the lane runs), and a case's cluster safeguards see nothing of
-GitHub; the file
-holds one entry, a none-wrapped `github_writes` at catastrophic severity, which
-`hack/ci-eval-pr.sh` appends on that lane to a copy of every task file in the matrix before
-devops-bench reads it, so a repetition that wrote a pull request or branch the case did not
-request is a tripped catastrophic safeguard at rung 1, as a cluster mutation is. The task files
-under `bench/tasks/` and the api lane are untouched. A case that requests a pull request (a
-`pull_request_opened` or `pull_request_diff_contains` check of its own) is allowed the ones its
-reply names, and because the fan-out runs cases side by side against one repository, the script
-runs those cases in a second phase after every other unit has finished (on both lanes since
-#2260, for the repository reset's sake), one at a time and on the inject lane each
-after a settle as long as the check's clock-skew tolerance, so a repetition that requests
-nothing never shares the repository with one that writes by design and no window reaches back
-into the unit before.
+A safeguard every case needs and no case declares is in the lane safeguards list,
+`hack/eval/inject-lane-safeguards.yaml`, which applies on both lanes despite its name, so the
+api and inject lanes are graded against the same bar. The door's task can reach the platform persona, whose own rule for a change is a pull request
+(through a card the Planning Agent files, under the bridge's default `api` executor), and a case's
+cluster safeguards see nothing of GitHub; the file holds one entry, a none-wrapped `github_writes` at catastrophic severity, which
+`hack/ci-eval-pr.sh` appends to a copy of every task file in the matrix before devops-bench reads
+it, so a repetition that wrote a pull request or branch the case did not request is a tripped
+catastrophic safeguard at rung 1, as a cluster mutation is. A write is charged to a repetition
+whose reply, or whose call that created the write (a `submit-suggestion`, `vcs.py` or raw
+push or create, its own or a delegated worker's; never a read's argument), names it (its URL or
+its branch); a write in the window that the repetition does not name is recorded under
+`unattributed` and not charged, so one late write fails the case that named it rather than every
+case running at the time. A case that requests a pull request runs alone, so its window is
+marked exclusive and a write in it is charged whether named or not. The run refuses to start
+on either lane without a GitOps repository for the safeguard to read, `EVAL_GITOPS_REPO=none`
+included, and on GitHub without `EVAL_LEDGER_APP_KEY_FILE` it refuses unless
+`BENCH_GITHUB_TOKEN` or `GITHUB_TOKEN` is set; whether that token can read the repository is
+learned on the first repetition, whose check errors naming the repository and the missing permission.
+The task files under `bench/tasks/` are untouched. A case that
+requests a pull request (a `pull_request_opened` or `pull_request_diff_contains` check of its
+own) is allowed the ones its reply names, and the script runs those cases in a second phase
+after every other unit has finished, one at a time and each after a settle as long as the
+check's clock-skew tolerance, so a repetition that requests nothing never shares the repository
+with one that writes by design and no window reaches back into the unit before.
 `scripts/test_eval_rosters.py` pins the file's shape, that no case reuses an entry's name, and
-the set of requesting cases. The same approvers as the exclusion list: an entry is a rung 1 check
-on every pull request.
+the set of requesting cases. It needs an `eval-crew` approval, as the exclusion list does:
+`hack/OWNERS` scopes it to that alias, and an entry in it is a rung 1 check on every pull request.
 
 Rung 6 compares an inject run only with next-mode history. The version key carries the mode
 ([`bench/baselines/README.md`](../bench/baselines/README.md)), and `bench-gate` reads
@@ -583,14 +590,17 @@ is quiet; a partial window is compared, as it is for `today`. The today lane rea
 only. The key includes the agent model, and the main nightly runs the presubmit's, so its next-mode
 lines are the presubmit's rung 6 history.
 
-One thing about the lane's install differs too. That write safeguard
-(`no-github-writes-the-case-did-not-request`) charges every pull request opened in a repetition's
-window to the case in flight, and the fleet audits' automatic remediation sweep opens one on its
-own wherever a pool repository declares a workload with a `major` finding on the sweep's list, the
-fresh install's first-run chain included. So `hack/ci-deploy.sh` installs the lane's agent with
+One thing about the inject lane's install differs too. The fleet audits' automatic remediation
+sweep opens a pull request on its own wherever a pool repository declares a workload with a
+`major` finding on the sweep's list, the fresh install's first-run chain included, and that write
+safeguard (`no-github-writes-the-case-did-not-request`) charges any pull request in an exclusive
+window to the case in flight. So `hack/ci-deploy.sh` installs the inject lane's agent with
 `KUBEAGENTS_AUDIT_AUTO_PROMOTE=false` in `spec.deployment.env`: the audits still run and file
 their ledgers, `finish` opens nothing nobody asked for, and a `/remediate` still works. The api
-lane keeps the sweep on, where the job's repository reset closes what it opens ([#3439](https://github.com/gke-labs/kube-agents/issues/3439)).
+lane keeps the sweep on, where a sweep's pull request names no repetition and lands under
+`unattributed`, in a requesting case's exclusive window as well (the check knows it by the
+`platform-agent/fix-<audit-id>-…-<digest>` branch the sweep names, `SWEEP_BRANCH` in
+`bench/kube_agents_bench/github_writes.py`), and the job's repository reset closes what it opens ([#3439](https://github.com/gke-labs/kube-agents/issues/3439)).
 
 ## The GitLab lane
 

@@ -76,9 +76,10 @@ def test_the_copy_is_the_task_plus_the_lane_entries(tmp_path):
     parsed, errors = parse_entries(written["verification_spec"])
     assert errors == []
     assert len(parsed) == len(original["verification_spec"]) + 1
-    # A case that requests nothing gets no allowance.
+    # A case that requests nothing gets no allowance, and shares its window.
     leaf = lane._leaves(appended[0]["check"])[0]
     assert lane.REQUESTED_FIELD not in leaf
+    assert lane.EXCLUSIVE_WINDOW_FIELD not in leaf
 
 
 def test_a_case_that_requests_a_pull_request_gets_that_allowance(tmp_path):
@@ -88,9 +89,13 @@ def test_a_case_that_requests_a_pull_request_gets_that_allowance(tmp_path):
     appended = load(copy)["verification_spec"][-1]
     leaf = lane._leaves(appended["check"])[0]
     assert leaf[lane.REQUESTED_FIELD] == 1
+    # It runs alone in the second phase, so its window is its own.
+    assert leaf[lane.EXCLUSIVE_WINDOW_FIELD] is True
     # The lane file itself is not mutated between tasks.
     again = lane.append_lane_safeguards(TASKS / READ_ONLY_CASE / "task.yaml", lane.load_lane_safeguards(LANE_FILE), tmp_path)
-    assert lane.REQUESTED_FIELD not in lane._leaves(load(again)["verification_spec"][-1]["check"])[0]
+    again_leaf = lane._leaves(load(again)["verification_spec"][-1]["check"])[0]
+    assert lane.REQUESTED_FIELD not in again_leaf
+    assert lane.EXCLUSIVE_WINDOW_FIELD not in again_leaf
 
 
 def test_requested_counts_nested_leaves_of_both_requesting_types():
@@ -220,13 +225,8 @@ def test_the_cli_prints_case_and_path_per_task_and_fails_loudly(tmp_path, capsys
     assert capsys.readouterr().out.splitlines() == [f"{LISTED_COUNT} {READ_ONLY_CASE} {tmp_path / 'listed' / READ_ONLY_CASE / 'task.yaml'}"]
 
 
-def test_list_requesting_prints_the_counts_and_writes_nothing(tmp_path, capsys):
-    """The api lane orders its second phase by this, with no copies made."""
-    listed_file = scratch_lane_file(tmp_path, {READ_ONLY_CASE: LISTED_COUNT})
-    rc = lane.main(["--safeguards", str(listed_file), "--list-requesting", str(TASKS / READ_ONLY_CASE / "task.yaml"), str(TASKS / REQUESTING_CASE / "task.yaml")])
-    assert rc == 0
-    assert capsys.readouterr().out.splitlines() == [f"{LISTED_COUNT} {READ_ONLY_CASE}", f"1 {REQUESTING_CASE}"]
-    assert not any(tmp_path.rglob("task.yaml"))
+def test_the_copies_have_somewhere_to_go():
+    """Both lanes take the copies, so there is no mode that writes none."""
     with pytest.raises(SystemExit):
         lane.main(["--safeguards", str(LANE_FILE), str(TASKS / READ_ONLY_CASE / "task.yaml")])
 

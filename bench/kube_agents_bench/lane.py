@@ -12,20 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Lane-level safeguards: ``verification_spec`` entries every case on one
+"""Lane-level safeguards: ``verification_spec`` entries every case on a
 lane carries, appended to a copy of each task file before devops-bench reads it.
 
-A safeguard that belongs to a lane rather than to a case -- the inject lane's
-"the agent wrote nothing to GitHub the case did not ask for" (#2079) -- has
-no home in fifty task files, and a per-case edit would change what the api
-lane grades too. devops-bench reads a task's checks from its ``task.yaml``
+A safeguard that belongs to the lanes rather than to a case -- "the agent
+wrote nothing to GitHub the case did not ask for" (#2079), applied on the
+api and inject lanes alike (#2611) -- has no home in fifty task files.
+devops-bench reads a task's checks from its ``task.yaml``
 and nothing else, and it records the case id as the directory the file sits
 in, so the lane materialises ``<out>/<case>/task.yaml``: the case's own
 document with the lane's entries appended to its ``verification_spec``, and
 hands devops-bench that path. The task file under ``bench/tasks/`` is not
-touched, the scorer still reads it (the appended entries reach the record
-through the report, which is what rung 1 grades), and on any other lane
-nothing here runs.
+touched, and the scorer still reads it (the appended entries reach the
+record through the report, which is what rung 1 grades).
 
 The file is ``hack/eval/inject-lane-safeguards.yaml``, read by
 ``hack/ci-eval-pr.sh`` beside the lane's exclusions; its shape is two keys:
@@ -43,7 +42,8 @@ request (a leaf of a type in :data:`REQUESTING_CHECK_TYPES` in its own spec)
 has that many requested writes: every ``github_writes`` leaf appended to it
 gets ``requested_pull_requests`` set to that count, so the lane's safeguard
 leaves the case's own pull request out and fails the repetition on anything
-beyond it. The command line also reports that count per case, which the
+beyond it, and ``exclusive_window``, since such a case runs alone and a
+write in its window is its own whether or not it names it. The command line also reports that count per case, which the
 script uses to run the requesting cases in a second phase after every other
 unit has finished, so a repetition that requests nothing never shares the
 repository with a case that writes by design.
@@ -87,6 +87,7 @@ CHECK_CHILD_KEYS = ("checks", "check")
 REQUESTING_CHECK_TYPES = frozenset({"pull_request_opened", "pull_request_diff_contains"})
 WRITES_CHECK_TYPE = "github_writes"
 REQUESTED_FIELD = "requested_pull_requests"
+EXCLUSIVE_WINDOW_FIELD = "exclusive_window"
 #: What a task file names its checks under, and the file the copy is written as.
 SPEC_KEY = "verification_spec"
 TASK_FILE = "task.yaml"
@@ -295,6 +296,9 @@ def copy_task(
         for leaf in _leaves(clone.get("check")):
             if leaf.get("type") == WRITES_CHECK_TYPE and requested:
                 leaf[REQUESTED_FIELD] = requested
+                # A requesting case runs alone in the second phase, so a
+                # write in its window that it does not name is still its own.
+                leaf[EXCLUSIVE_WINDOW_FIELD] = True
         appended.append(clone)
     doc[SPEC_KEY] = existing + appended
     target_dir = Path(out_dir) / source.parent.name
@@ -312,18 +316,11 @@ def main(argv: list[str] | None = None) -> int:
     in the fan-out's second phase, then the copy's path, last because it may
     hold spaces; exits
     non-zero, naming the file and the fault, when the lane file or a task
-    refuses the append. ``--list-requesting`` prints ``<requested> <case>``
-    and writes nothing: the api lane runs the same second phase for the
-    repository reset's sake and needs the list without the copies.
+    refuses the append.
     """
     parser = argparse.ArgumentParser(description=main.__doc__.splitlines()[0])
     parser.add_argument("--safeguards", required=True, help="the lane safeguards YAML file")
-    parser.add_argument("--out-dir", default="", help="where <case>/task.yaml copies go")
-    parser.add_argument(
-        "--list-requesting",
-        action="store_true",
-        help="print `<requested> <case>` per task and write no copies; the api lane orders its fan-out by it",
-    )
+    parser.add_argument("--out-dir", required=True, help="where <case>/task.yaml copies go")
     parser.add_argument(
         "--gitops-repo",
         default="",
@@ -332,8 +329,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("tasks", nargs="+", help="task.yaml paths to copy")
     args = parser.parse_args(argv)
-    if not args.out_dir and not args.list_requesting:
-        parser.error("--out-dir is required unless --list-requesting")
     try:
         safeguards = load_lane_safeguards(args.safeguards)
         if args.gitops_repo:
@@ -341,9 +336,6 @@ def main(argv: list[str] | None = None) -> int:
         listed = load_lane_requesting(args.safeguards)
         for task in args.tasks:
             case = Path(task).parent.name
-            if args.list_requesting:
-                print(f"{requested_for(_load_task(Path(task)).get(SPEC_KEY), listed.get(case, 0))} {case}")
-                continue
             written, requested = copy_task(task, safeguards, args.out_dir, listed.get(case, 0))
             # The count first and the path last: the path may hold spaces
             # (a TMPDIR with one), and the consumer splits on whitespace.
