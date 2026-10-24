@@ -234,10 +234,6 @@ func (w *taskWatch) next(ctx context.Context) error {
 	wait = max(wait, minFetchWait)
 	got := 0
 	for got < taskFetchBatch {
-		// Size each pull from what is pending now, not when the watch began:
-		// a watch that starts on an empty task would otherwise pull one
-		// event at a time for its whole life.
-		w.r.setBatch(int(min(w.pending, uint64(taskFetchBatch-got))))
 		msg, err := w.r.next(wait)
 		if errors.Is(err, nats.ErrTimeout) {
 			break

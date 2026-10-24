@@ -108,7 +108,8 @@ func (b *NATSBus) newBudgetReader(cons jetstream.Consumer, batch, budget int) (*
 // will not send under pullMaxBytes: one refused pull ends the read.
 func (r *budgetReader) next(wait time.Duration) (jetstream.Msg, error) {
 	if len(r.buf) == 0 {
-		ask := int(max(1, min(r.pending, uint64(r.batch))))
+		// drainFetchBatch bounds the conversion; no read asks for more.
+		ask := max(1, min(int(min(r.pending, drainFetchBatch)), r.batch))
 		msgs, err := r.sub.Fetch(ask, nats.PullMaxBytes(pullMaxBytes), nats.MaxWait(wait))
 		switch {
 		case err != nil && strings.Contains(err.Error(), "Exceeds MaxBytes"):
@@ -150,10 +151,6 @@ func (r *budgetReader) stalled(ctx context.Context, base error) error {
 	}
 	return fmt.Errorf("%w; the server holds %d more and sent none, which is a message over the %d-byte pull cap: %w", base, info.NumPending, pullMaxBytes, ErrReadByteBudget)
 }
-
-// setBatch sizes the reader's next pull: at most n messages, at least one.
-// It takes effect once the last pull's messages are handed out.
-func (r *budgetReader) setBatch(n int) { r.batch = max(1, n) }
 
 func (r *budgetReader) stop() { _ = r.sub.Unsubscribe() }
 
