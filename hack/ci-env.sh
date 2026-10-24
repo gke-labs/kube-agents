@@ -107,8 +107,8 @@ readonly CREDENTIAL_PROXY_METRICS_SCRAPE='import os, sys, urllib.request; port =
 # pods one after another, so a file over the cap loses the first pod's oldest
 # lines first. Two full line tails fit under it at up to ~400 bytes a line,
 # so the cap is the belt for a log with long lines.
-export LITELLM_LOG_TAIL_LINES=20000
-readonly LITELLM_LOG_TAIL_LINES
+readonly LITELLM_LOG_TAIL_LINES=20000
+export LITELLM_LOG_TAIL_LINES
 readonly LITELLM_LOG_MAX_BYTES=$((16 * 1024 * 1024))
 readonly LITELLM_LOG_ARTIFACT="litellm.log"
 # The existence check gives up after this, so an unreachable cluster costs
@@ -119,12 +119,10 @@ readonly LITELLM_LOG_REQUEST_TIMEOUT="30s"
 # The Deployment that says LiteLLM is installed at all, and the pod label and
 # container its pods carry; the chart and the kustomize base render the same
 # three (charts/kube-agents/templates/litellm.yaml).
-export LITELLM_LOG_DEPLOYMENT="deployment/litellm"
-export LITELLM_LOG_POD_SELECTOR="app=litellm"
-export LITELLM_LOG_CONTAINER="litellm-container"
-readonly LITELLM_LOG_DEPLOYMENT
-readonly LITELLM_LOG_POD_SELECTOR
-readonly LITELLM_LOG_CONTAINER
+readonly LITELLM_LOG_DEPLOYMENT="deployment/litellm"
+readonly LITELLM_LOG_POD_SELECTOR="app=litellm"
+readonly LITELLM_LOG_CONTAINER="litellm-container"
+export LITELLM_LOG_DEPLOYMENT LITELLM_LOG_POD_SELECTOR LITELLM_LOG_CONTAINER
 
 # ─── Agent pod diagnostics ───────────────────────────────────────────────────
 # collect_agent_pod_diagnostics keeps, on every eval run, what says why a pod

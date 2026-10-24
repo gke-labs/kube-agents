@@ -1234,7 +1234,7 @@ def classify_rep(
     errors = record.error if isinstance(record.error, list) else [record.error]
     infra_marker_entry = next((str(e) for e in errors if INFRA_FAILURE_MARKER in str(e)), None)
     if infra_marker_entry is not None:
-        detail = infra_marker_entry.partition(INFRA_FAILURE_MARKER)[2].lstrip(": ").strip()
+        detail = " ".join(infra_marker_entry.partition(INFRA_FAILURE_MARKER)[2].lstrip(": ").split())
         if "delegated" in detail:
             return rep(
                 "infra",

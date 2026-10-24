@@ -793,7 +793,10 @@ def _scan_log_content_for_429(
     if until is None and since is not None:
         log_until = _find_log_until(content, since)
         if abs(time.time() - since) < 24 * 3600:
-            until = time.time() + 5.0
+            if log_until is not None:
+                until = min(time.time() + 5.0, log_until)
+            else:
+                until = time.time() + 5.0
         else:
             until = log_until
 
@@ -845,6 +848,14 @@ def _scan_log_content_for_429(
             if parsed_ts[i] is not None:
                 next_t = parsed_ts[i]
             next_ts[i] = next_t
+
+        for i in range(n):
+            p_t = parsed_ts[i]
+            n_t = next_ts[i]
+            if p_t is not None and n_t is not None and p_t > n_t + 5.0:
+                re_ts = _parse_log_line_timestamp(lines[i], since=since, until=n_t)
+                if re_ts is not None:
+                    parsed_ts[i] = re_ts
 
         for i, line in enumerate(lines):
             if not _LITELLM_429_PATTERN.search(line):
@@ -1701,6 +1712,7 @@ def _record_unsettled(
     *,
     has_delivery: bool = False,
     opening_turn: bool = True,
+    telemetry_corroborated: bool | None = None,
 ) -> None:
     """Record that failure cards unblocked to non-terminal at settle delivered no result."""
     marked: list[str] = []
@@ -1712,11 +1724,14 @@ def _record_unsettled(
             f"delegated task {t} was reported {last} during wait but {live} at settle; nothing delivered"
         )
         if not has_delivery and opening_turn:
+            if telemetry_corroborated is None:
+                report += " (platform proxy log unavailable at settle; not corroborated)"
             marked.append(report)
         else:
             plain.append(report)
     if marked:
         _mark_result_infra_failure(result, "; ".join(marked))
+        result.metadata["platform_rate_limit_corroborated"] = (telemetry_corroborated is True)
     if plain:
         result.errors.extend(plain)
 
@@ -3046,6 +3061,7 @@ class KubeAgentsHarness(AgentHarness):
         rate_limited_cards: set[str] | None = None,
         since: float | None = None,
         session_id: str | None = None,
+        telemetry_state: list[bool | None] | None = None,
     ) -> list[str]:
         """Read summary and error from the board for any awaited cards in failure statuses.
 
@@ -3097,6 +3113,8 @@ class KubeAgentsHarness(AgentHarness):
             card_msgs = KubeAgentsHarness._extract_board_card_messages(final_bstate, t)
             if card_msgs:
                 board_messages.extend(card_msgs)
+        if telemetry_state is not None:
+            telemetry_state.append(telemetry_corroborated)
         return board_messages
 
     def _await_delegated_cards(
@@ -3327,6 +3345,7 @@ class KubeAgentsHarness(AgentHarness):
                 poll_failure_statuses,
                 {t: _status(t) for t in unsettled},
                 has_delivery=has_delivery,
+                telemetry_corroborated=telemetry_corroborated,
             )
         if discrepancies:
             _record_unsettled(
@@ -3467,6 +3486,7 @@ class KubeAgentsHarness(AgentHarness):
             discrepancies: list[str] = []
             live_statuses: dict[str, str] = {}
             prior_statuses = dict(statuses)
+            telemetry_state: list[bool | None] = []
             board_messages = self._final_board_failures(
                 awaited,
                 statuses,
@@ -3477,7 +3497,9 @@ class KubeAgentsHarness(AgentHarness):
                 rate_limited_cards=rate_limited_cards,
                 since=getattr(self, "_run_started_at", None),
                 session_id="",
+                telemetry_state=telemetry_state,
             )
+            telemetry_corroborated = telemetry_state[0] if telemetry_state else None
             if unsettled:
                 has_delivery = _has_successful_delivery(
                     observed, [t for t in awaited if t not in unsettled]
@@ -3489,6 +3511,7 @@ class KubeAgentsHarness(AgentHarness):
                     live_statuses,
                     has_delivery=has_delivery,
                     opening_turn=opening_turn,
+                    telemetry_corroborated=telemetry_corroborated,
                 )
             if discrepancies:
                 _record_unsettled(
@@ -3739,6 +3762,7 @@ class KubeAgentsHarness(AgentHarness):
         discrepancies: list[str] = []
         live_statuses: dict[str, str] = {}
         prior_statuses = dict(latest)
+        telemetry_state: list[bool | None] = []
         board_messages = self._final_board_failures(
             awaited,
             latest,
@@ -3749,7 +3773,9 @@ class KubeAgentsHarness(AgentHarness):
             rate_limited_cards=rate_limited_cards,
             since=getattr(self, "_run_started_at", None),
             session_id=session_id,
+            telemetry_state=telemetry_state,
         )
+        telemetry_corroborated = telemetry_state[0] if telemetry_state else None
         if outstanding:
             unsettled = [t for t in unsettled if t not in outstanding]
             discrepancies = [t for t in discrepancies if t not in outstanding]
@@ -3765,6 +3791,7 @@ class KubeAgentsHarness(AgentHarness):
                 live_statuses,
                 has_delivery=has_delivery,
                 opening_turn=opening_turn,
+                telemetry_corroborated=telemetry_corroborated,
             )
         if discrepancies:
             _record_unsettled(

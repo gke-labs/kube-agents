@@ -5077,7 +5077,7 @@ def test_litellm_log_whose_every_stamp_predates_rep_returns_none_and_admits_with
     assert result.metadata.get("platform_rate_limit_corroborated") is False
 
 
-def test_scan_log_for_429_returns_none_on_os_error_or_placeholder(tmp_path: Path) -> None:
+def test_scan_log_for_429_returns_none_on_os_error_or_placeholder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """_scan_log_for_429 returns None when log cannot be read or contains placeholder."""
     # Nonexistent file -> None
     assert harness._scan_log_for_429(tmp_path / "does_not_exist.log") is None
@@ -5145,6 +5145,10 @@ def test_scan_log_for_429_returns_none_on_os_error_or_placeholder(tmp_path: Path
     )
     morning_since = datetime(2026, 10, 20, 10, 0, 0, tzinfo=timezone.utc).timestamp()
     assert harness._scan_log_for_429(prior_time_log, since=morning_since) is False
+    # On the live branch when wall clock is past 15:00 (e.g. 16:00 on same day),
+    # prior-day 15:00 is not inflated into today or accepted as in-window
+    monkeypatch.setattr(time, "time", lambda: morning_since + 6 * 3600)
+    assert harness._scan_log_for_429(prior_time_log, since=morning_since) is False
 
     # Undated log with traffic and no 429 when since is set returns None (cannot place in window)
     undated_ok = tmp_path / "undated_traffic_no_429.log"
@@ -5177,6 +5181,7 @@ def test_record_unsettled_prepends_marked_infra_error_preserving_existing_errors
         {"t1": "blocked"},
         {"t1": "running"},
         has_delivery=False,
+        telemetry_corroborated=True,
     )
     assert len(result.errors) == 2
     assert result.errors[0] == (
@@ -5187,6 +5192,27 @@ def test_record_unsettled_prepends_marked_infra_error_preserving_existing_errors
     assert result.metadata.get("infra_failure") == (
         "delegated task t1 was reported blocked during wait but running at settle; nothing delivered"
     )
+    assert result.metadata.get("platform_rate_limit_corroborated") is True
+    rep = _classify(results_json(result), "helm")
+    assert rep.outcome == "infra"
+
+
+def test_record_unsettled_with_absent_telemetry_records_notice_and_false_metadata(results_json: Any) -> None:
+    """When telemetry_corroborated is None, _record_unsettled includes notice and sets metadata False."""
+    result = AgentResult(output="acknowledged", trajectory=[], errors=[])
+    harness._record_unsettled(
+        result,
+        ["t1"],
+        {"t1": "blocked"},
+        {"t1": "running"},
+        has_delivery=False,
+        telemetry_corroborated=None,
+    )
+    assert len(result.errors) == 1
+    assert result.errors[0] == (
+        f"{harness.INFRA_FAILURE_MARKER}: delegated task t1 was reported blocked during wait but running at settle; nothing delivered (platform proxy log unavailable at settle; not corroborated)"
+    )
+    assert result.metadata.get("platform_rate_limit_corroborated") is False
     rep = _classify(results_json(result), "helm")
     assert rep.outcome == "infra"
 
