@@ -9949,7 +9949,7 @@ def test_worker_commands_after_result_pattern_withheld_call_beside_readable_pass
     import kube_agents_bench.worker_trajectory as worker_trajectory
 
     # When no required run specifies succeeded: true, a withheld call beside a readable call is skipped per docstring.
-    v = WorkerCommandsVerifier(type="worker_commands", after_result_pattern=r"OPEN", required_patterns=[r"^echo OPEN$"])
+    v = WorkerCommandsVerifier(type="worker_commands", after_result_pattern=r"OPEN", forbidden_patterns=[r"never_matches"], required_patterns=[r"^echo OPEN$"])
     traj = [
         {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo OPEN"}, "result": "OPEN", "status": "completed", "at": 1.0},
         {"agent": "worker", "name": "terminal", "task": "t_1", "args": worker_trajectory.WITHHELD, "status": "completed", "at": 2.0},
@@ -9965,7 +9965,7 @@ def test_worker_commands_after_result_pattern_withheld_call_beside_credited_succ
     import kube_agents_bench.worker_trajectory as worker_trajectory
 
     run = WorkerRun(script="collect.py", word_patterns=[r"^compliance-audit$"], succeeded=True)
-    v = WorkerCommandsVerifier(type="worker_commands", after_result_pattern=r"OPEN", required_runs=[run])
+    v = WorkerCommandsVerifier(type="worker_commands", after_result_pattern=r"OPEN", forbidden_patterns=[r"never_matches"], required_runs=[run])
     traj = [
         {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo OPEN"}, "result": "OPEN", "status": "completed", "at": 1.0},
         {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "python3 /opt/data/skills/collect.py compliance-audit"}, "result": '{"exit_code": 0}', "exit_code": 0, "status": "completed", "at": 2.0},
