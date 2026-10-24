@@ -4,8 +4,8 @@
 Run: cd scripts && python3 -m unittest test_merge_gate
 
 The two wrong answers cost differently. A gate that passes when Tide would
-not merges a pull request that is unapproved or unsmoked; a gate
-that holds when Tide would merge leaves a ready pull request out of the queue
+not have merged lets in a pull request that is unapproved or unsmoked; a gate
+that holds when Tide would have merged leaves a ready pull request out of the queue
 with nothing on it saying why. So each verdict gets both sides, the smoke
 skip list is checked against the paths Prow skips, and the queue branch is
 parsed from the shape GitHub names it.
@@ -112,15 +112,15 @@ class LabelsTest(unittest.TestCase):
         self.assertEqual(state, gate.PENDING)
         self.assertIn("lgtm", description)
 
-    def test_each_label_tide_excludes_holds(self):
+    def test_each_label_tide_excluded_holds(self):
         for hold in ("do-not-merge", "do-not-merge/hold", "do-not-merge/invalid-owners-file", "do-not-merge/work-in-progress"):
             with self.subTest(label=hold):
                 state, description = gate.labels_verdict(APPROVED | {hold})
                 self.assertEqual(state, gate.PENDING)
                 self.assertIn(hold, description)
 
-    def test_a_do_not_merge_label_tide_does_not_exclude_does_not_hold(self):
-        """Holding on it would keep a pull request out of the queue that Tide merges today."""
+    def test_a_do_not_merge_label_tide_did_not_exclude_does_not_hold(self):
+        """Holding on it would keep a pull request out of the queue that Tide would have merged."""
         for label in ("do-not-merge/release-note", "do-not-merge-ish"):
             with self.subTest(label=label):
                 self.assertEqual(gate.labels_verdict(APPROVED | {label})[0], gate.SUCCESS)
@@ -146,13 +146,13 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(results[gate.SMOKE_GATE][0], gate.PENDING)
 
     def test_no_smoke_on_skipped_paths_passes(self):
-        """Prow posts no smoke status on these, and Tide does not wait for one."""
+        """Prow posts no smoke status on these, and Tide did not wait for one."""
         files = ["docs/a.md", ".github/workflows/x.yml", "README.md", "scripts/test_x.py", "OWNERS", "install.sh"]
         results = gate.verdicts(pull(), lambda: files)
         self.assertEqual(results[gate.SMOKE_GATE][0], gate.SUCCESS)
 
     def test_a_red_or_running_smoke_on_skipped_paths_still_decides(self):
-        """A hand-run `/test` posts a smoke status on a skip-only change; Tide holds on its red."""
+        """A hand-run `/test` posts a smoke status on a skip-only change; Tide held on its red."""
         for state, expected in (("failure", gate.FAILURE), ("pending", gate.PENDING)):
             with self.subTest(state=state):
                 statuses = {gate.SMOKE_CONTEXT: (state, "")}
@@ -321,7 +321,7 @@ class PostTest(unittest.TestCase):
         self.assertTrue(all(path == f"/repos/{REPO}/statuses/{SHA}" for path, _ in api.posts))
 
     def test_a_non_green_verdict_is_not_posted_over_nothing(self):
-        """Tide holds on any non-green context, so a first pending would hold a Tide merge."""
+        """Tide held on any non-green context, so a first pending would have held a Tide merge."""
         api = FakeAPI()
         gate.gate_pull(api, pull({"lgtm"}, statuses=green(gate.SMOKE_CONTEXT)))
         self.assertEqual([payload["context"] for _, payload in api.posts], [gate.SMOKE_GATE])

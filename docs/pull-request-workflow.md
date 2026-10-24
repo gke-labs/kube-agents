@@ -723,6 +723,13 @@ ordinary `Job succeeded.`; the `/override` comment, the build log's `REVALIDATED
 run leaves in its `finished.json` metadata are the record that it was one, and step 0 reads the key
 so that such a run is never itself taken for a green.
 
+Do not post `/test pull-kube-agents-smoke-test` on an approved pull request whose `Smoke gate` is
+green, above all one in the merge queue. The run posts a pending smoke status, and if the queue's
+`Smoke gate` reads it before the run reports, the queue fails the group and removes the pull
+request. The sweep puts it back once after the first such removal since the last push, but a second
+one keeps it out until a push. If `Smoke gate` is pending, a `/test` or a push is how you get a
+fresh green. `/retest` is fine: it reruns only failed contexts.
+
 No verdict carries across a change to what the job grades. When the blocking job's `spec.mode`
 changes in `oss-test-infra` (the swap to `next`, or a rollback to `today`), set the repository
 variable `SMOKE_PIN_NOT_BEFORE` right after it merges, to that merge time plus the job's 360-minute
