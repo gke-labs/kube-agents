@@ -215,6 +215,7 @@ func toolsFor(bus toolBus, convs *mcp.Conversations, broker *mcp.BrokerClient) [
 		mcp.ConnectionStatusTool(bus),
 		mcp.SendMessageTool(bus, convs),
 		mcp.TaskControlTool(bus, convs),
+		mcp.ManageSessionTool(bus, convs),
 	}
 	if broker != nil {
 		tools = append(tools, mcp.InspectPRTool(broker))
