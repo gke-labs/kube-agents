@@ -114,6 +114,7 @@ type gatewayScenario struct {
 	finish   bool // the root task completes with answerText
 	delegate bool // the root delegates; a child runs and a wake task carries the answer
 	handoff  bool // the root acknowledges and hands its work to kanban cards (no wake task ever)
+	bigChild bool // with delegate: the child's events total more than readMaxBytes, and no wake task comes
 	decoys   bool // before the root: another conversation's turn, a delegated child here, an earlier turn's late submission, and a cancel here
 	// lateStart delays the root's first event after its submission, as an
 	// executor's cold start does.
@@ -175,6 +176,13 @@ func runFakeGateway(t *testing.T, url string, js jetstream.JetStream, sc gateway
 			publishStatus(t, js, fakeAddressee, root, lib.StateCompleted, true)
 			child := fmt.Sprintf("task-deleg%d", i)
 			publishSubmission(t, js, "cluster-a", child, conv, "look at checkout", root)
+			if sc.bigChild {
+				publishRun(t, js, "cluster-a", child, "", false)
+				for range readMaxBytes/(800<<10) + 1 {
+					publishArtifact(t, js, "cluster-a", child, lib.ArtifactResult, strings.Repeat("x", 800<<10))
+				}
+				return
+			}
 			publishRun(t, js, "cluster-a", child, "child notes", true)
 			wake := fmt.Sprintf("task-wake%d", i)
 			publishSubmission(t, js, fakeAddressee, wake, conv, "child finished", child)
@@ -254,6 +262,33 @@ func TestADelegationsAnswerComesFromTheWakeTask(t *testing.T) {
 		t.Fatalf("send_message failed: %s", res.Content[0].Text)
 	}
 	mustContain(t, res.Content[0].Text, "answer came from a delegated task", fakeAddressee+"/task-wake1", wakeAnswer, "cluster-a/task-deleg1")
+}
+
+// A delegated task too large to read is read once, not again every 200 ms
+// for the rest of the wait, each read holding a reader slot until every
+// other caller is refused.
+func TestAFollowedTaskTooLargeToReadIsReadOnce(t *testing.T) {
+	url, js := bigBus(t)
+	runFakeGateway(t, url, js, gatewayScenario{delegate: true, bigChild: true})
+	var reads atomic.Int32
+	sub, err := js.Conn().Subscribe("$JS.API.CONSUMER.CREATE.>", func(m *nats.Msg) {
+		if strings.Contains(string(m.Data), "task-deleg1") {
+			reads.Add(1)
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+	b := dial(t, url)
+	s := mustServer(t, SendMessageTool(b, NewConversations()))
+	res := callTool(t, s, ToolSendMessage, map[string]any{"text": "delegate check the rollout", "wait_seconds": 3})
+	if res.IsError {
+		t.Fatalf("send_message failed: %s", res.Content[0].Text)
+	}
+	if n := reads.Load(); n != 1 {
+		t.Errorf("read the over-budget task %d times in a 3s wait; want once", n)
+	}
 }
 
 // A turn that hands its work to kanban cards completes with its
@@ -691,22 +726,16 @@ func TestAResumedConversationIsNamedByItsToken(t *testing.T) {
 }
 
 // emptySource is a read whose every wait comes back empty, as a stalled
-// read's would, on a consumer that cannot be asked for its info.
+// read's would.
 type emptySource struct{}
 
 func (emptySource) Fetch(int, ...nats.PullOpt) ([]*nats.Msg, error) { return nil, nats.ErrTimeout }
 func (emptySource) Unsubscribe() error                              { return nil }
 
-type noInfoConsumer struct{ jetstream.Consumer }
-
-func (noInfoConsumer) Info(context.Context) (*jetstream.ConsumerInfo, error) {
-	return nil, errors.New("no info")
-}
-
 // A task read whose fetch comes back empty while events are still pending
 // is an error, not the task's end folded from what was read so far.
 func TestAStalledTaskReadIsAnError(t *testing.T) {
-	w := &taskWatch{ref: TaskRef{Addressee: fakeAddressee, TaskID: "task-stall"}, r: &budgetReader{cons: noInfoConsumer{}, sub: emptySource{}, budget: readMaxBytes}, pending: 5, release: func(bool) {}}
+	w := &taskWatch{ref: TaskRef{Addressee: fakeAddressee, TaskID: "task-stall"}, r: &budgetReader{sub: emptySource{}, budget: readMaxBytes}, pending: 5, release: func(bool) {}}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := w.next(ctx); err == nil || !strings.Contains(err.Error(), "still pending") {

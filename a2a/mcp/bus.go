@@ -313,7 +313,7 @@ func (b *NATSBus) agentCards(ctx context.Context) (map[string]AgentCard, error) 
 			}
 			// Messages were pending and none came: the read did not
 			// complete, which is not an empty directory.
-			return cards, r.stalled(ctx, fmt.Errorf("read %d of the directory; a fetch came back empty with cards still pending", seen))
+			return cards, fmt.Errorf("read %d of the directory; a fetch came back empty with cards still pending", seen)
 		}
 		if err != nil {
 			return cards, fmt.Errorf("DIRECTORY: %w", err)

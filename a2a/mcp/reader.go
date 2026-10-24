@@ -66,7 +66,6 @@ var ErrReadByteBudget = errors.New("read byte budget reached")
 // again at once, some 37,000 pulls in a two-second wait. One per read;
 // stop it when done.
 type budgetReader struct {
-	cons  jetstream.Consumer
 	sub   msgFetcher
 	buf   []*nats.Msg
 	batch int
@@ -101,7 +100,7 @@ func (b *NATSBus) newBudgetReader(cons jetstream.Consumer, batch, budget int) (*
 	if err != nil {
 		return nil, err
 	}
-	return &budgetReader{cons: cons, sub: sub, batch: max(1, batch), budget: budget, pending: info.NumPending}, nil
+	return &budgetReader{sub: sub, batch: max(1, batch), budget: budget, pending: info.NumPending}, nil
 }
 
 // next returns the next message, waiting at most wait for it. No message in
@@ -139,20 +138,6 @@ func (r *budgetReader) next(wait time.Duration) (jetstream.Msg, error) {
 	r.total += size
 	r.read++
 	return msg, nil
-}
-
-// stalled explains a read that got nothing in its wait with messages still
-// to read, as base when the consumer has nothing left to send (they went
-// away under it) or cannot be asked. When the server still holds messages
-// for it, a live server that sends none of them is refusing the next one
-// under pullMaxBytes: it ends each pull on it (a 409) rather than deliver
-// it, so the read could never get past it, and saying so beats a bare stall.
-func (r *budgetReader) stalled(ctx context.Context, base error) error {
-	info, err := r.cons.Info(ctx)
-	if err != nil || info.NumPending == 0 {
-		return base
-	}
-	return fmt.Errorf("%w; the server holds %d more and sent none, which is a message over the %d-byte pull cap: %w", base, info.NumPending, pullMaxBytes, ErrReadByteBudget)
 }
 
 func (r *budgetReader) stop() { _ = r.sub.Unsubscribe() }
@@ -212,7 +197,7 @@ func (b *NATSBus) drainConsumer(ctx context.Context, s jetstream.Stream, cfg jet
 				// Nothing came with messages still to read: a read that
 				// stalled, not an empty stream. Say so rather than report
 				// what was read as all there is.
-				return int(seen), r.stalled(ctx, fmt.Errorf("read %d of %d pending messages before a fetch came back empty", seen, want))
+				return int(seen), fmt.Errorf("read %d of %d pending messages before a fetch came back empty", seen, want)
 			}
 			if err != nil {
 				return int(seen), err

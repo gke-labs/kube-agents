@@ -217,6 +217,15 @@ func (b *NATSBus) watchTask(ctx context.Context, ref TaskRef) (*taskWatch, error
 	return &taskWatch{ref: ref, r: r, pending: pending, release: release}, nil
 }
 
+// errTooManyEvents is a task with more than maxTaskEvents events.
+var errTooManyEvents = errors.New("too many to read here")
+
+// tooLargeToRead is a read that will fail the same way every time: the task
+// has more events, or more bytes of them, than a read here takes.
+func tooLargeToRead(err error) bool {
+	return errors.Is(err, ErrReadByteBudget) || errors.Is(err, errTooManyEvents)
+}
+
 func (w *taskWatch) close() {
 	w.r.stop()
 	w.release(true)
@@ -244,7 +253,7 @@ func (w *taskWatch) next(ctx context.Context) error {
 		got++
 		w.seen++
 		if w.seen > maxTaskEvents {
-			return fmt.Errorf("task %s has more than %d events, too many to read here", w.ref, maxTaskEvents)
+			return fmt.Errorf("task %s has more than %d events: %w", w.ref, maxTaskEvents, errTooManyEvents)
 		}
 		if env := agreedEnvelope(msg.Subject(), msg.Data()); env != nil {
 			w.events = append(w.events, env)
@@ -264,7 +273,7 @@ func (w *taskWatch) next(ctx context.Context) error {
 		// which is not the end of the task. Saying so beats folding what was
 		// read as the task's state.
 		if w.pending > 0 {
-			return w.r.stalled(ctx, fmt.Errorf("task %s: a fetch came back empty with %d events still pending", w.ref, w.pending))
+			return fmt.Errorf("task %s: a fetch came back empty with %d events still pending", w.ref, w.pending)
 		}
 	}
 	return nil

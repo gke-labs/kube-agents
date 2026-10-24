@@ -705,7 +705,9 @@ func (b *NATSBus) WaitForTurn(ctx context.Context, w *turnWatch, root TaskRef, w
 	for ctx.Err() == nil {
 		progressed := false
 		for _, ref := range w.followedTasks() {
-			if f, ok := read[ref.TaskID]; ok && f.Task != nil && f.Task.Final {
+			if f, ok := read[ref.TaskID]; ok && (f.Task != nil && f.Task.Final || tooLargeToRead(f.Err)) {
+				// Done, or a read that would fail the same way again and
+				// take a reader slot each time.
 				continue
 			}
 			if _, ok := read[ref.TaskID]; !ok {
