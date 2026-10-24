@@ -16,6 +16,7 @@ import threading
 import time
 import urllib.error
 from collections.abc import Generator
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.metadata import entry_points
 from pathlib import Path
@@ -1728,6 +1729,7 @@ def results_json(tmp_path: Path) -> Any:
                     {
                         "name": "gpu-stress-test-diagnosis",
                         "output": dumped["output"],
+                        "trajectory": dumped.get("trajectory", []),
                         "errors": dumped["errors"],
                         "error": (dumped["errors"] or [None])[0],
                         "scores": scores if scores is not None else {"OutcomeValidity": 0.0},
@@ -1753,6 +1755,29 @@ def test_the_marker_classifies_the_run_as_infra(results_json: Any) -> None:
     # No noop carve-out: an unreachable agent endpoint is infrastructure
     # whatever the task provisions.
     assert _classify(path, "noop").outcome == "infra"
+
+
+def test_a_scored_record_with_worker_rate_limit_infra_marker_is_infra(results_json: Any) -> None:
+    path = results_json(
+        AgentResult(
+            output="blocked",
+            trajectory=[],
+            errors=[f"{harness.INFRA_FAILURE_MARKER}: delegated worker hit infrastructure failure (rate_limit)"],
+        ),
+        scores={"OutcomeValidity": 0.0},
+    )
+    assert _classify(path, "opentofu").outcome == "infra"
+
+
+def test_a_scored_record_with_429_in_output_is_still_graded(results_json: Any) -> None:
+    path = results_json(
+        AgentResult(
+            output="The platform agent diagnosed: upstream returned HTTP 429: TPM quota exhausted",
+            trajectory=[],
+        ),
+        scores={"OutcomeValidity": 0.9},
+    )
+    assert _classify(path, "opentofu").outcome != "infra"
 
 
 def test_an_ordinary_scored_record_is_still_graded(results_json: Any) -> None:
@@ -1854,12 +1879,16 @@ def _show_turn(
     body: str = "",
     result: str | None = None,
     call_id: str = "call_show",
+    block_kind: str | None = None,
 ) -> bytes:
+    task_payload: dict[str, Any] = {"id": task_id, "status": status, "result": result}
+    if block_kind is not None:
+        task_payload["block_kind"] = block_kind
     return _turn(
         *_call(
             "kanban_show",
             {"task_id": task_id},
-            {"task": {"id": task_id, "status": status, "result": result}, "runs": []},
+            {"task": task_payload, "runs": []},
             call_id,
         ),
         _text(body or f"Task {task_id} is {status}."),
@@ -2606,6 +2635,3105 @@ def test_a_status_turn_429_clears_to_the_delegated_answer(
 
     assert not result.has_errors()
     assert result.output.endswith(_RCA_RESULT)
+
+
+def _corroborate_429(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    log_file = tmp_path / "litellm.log"
+    now_iso = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+    log_file.write_text(
+        f'{now_iso} ERROR: VertexAIException - {{"error": {{"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}}}\n'
+    )
+    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+
+
+def test_a_delegated_worker_status_turn_reported_blocked_is_infrastructure(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """When a status turn reports a card blocked with rate limit, it is classified as infra even if final exec fails."""
+    _corroborate_429(tmp_path, monkeypatch)
+    stub_agent.turns = [
+        _create_turn(),
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": _TASK_ID},
+                {
+                    "task": {"id": _TASK_ID, "status": "blocked", "block_kind": "transient"},
+                    "runs": [
+                        {
+                            "summary": (
+                                "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                                'HTTP 429 ... "TPM quota exhausted"'
+                            )
+                        }
+                    ],
+                },
+                "call_show",
+            ),
+            _text(f"Task {_TASK_ID} is blocked."),
+        ),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "rate_limit" in result.errors[0]
+    assert result.output == ""
+    assert len(result.trajectory) >= 1
+
+
+def test_a_delegated_worker_status_turn_board_read_fallback_when_final_read_fails(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """When a status turn reports a card blocked and single-card board read records failure error, final exec fallback marks infra."""
+    _corroborate_429(tmp_path, monkeypatch)
+    stub_agent.turns = [
+        _create_turn(),
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": _TASK_ID},
+                {
+                    "task": {"id": _TASK_ID, "status": "blocked"},
+                    "runs": [],
+                },
+                "call_show",
+            ),
+            _text(f"Task {_TASK_ID} is blocked."),
+        ),
+    ]
+
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            # Read 0 is the poll before the status turn, read 1 the status
+            # turn's clamped re-read, read 2 the settle-time read that fails.
+            if idx == 1:
+                payload = {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {},
+                    "errors": {
+                        _TASK_ID: (
+                            "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"
+                        )
+                    },
+                    "block_kinds": {_TASK_ID: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "rate_limit" in result.errors[0]
+    assert result.output == ""
+
+
+def test_status_turn_non_object_json_tool_result_does_not_crash(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """A status turn with scalar or array JSON tool results does not raise AttributeError."""
+    _corroborate_429(tmp_path, monkeypatch)
+    stub_agent.turns = [
+        _create_turn(),
+        _turn(
+            {
+                "type": "function_call",
+                "name": "bash",
+                "arguments": json.dumps({"command": "wc -l"}),
+                "call_id": "c_scalar",
+            },
+            {"type": "function_call_output", "call_id": "c_scalar", "output": "12"},
+            {
+                "type": "function_call",
+                "name": "jq",
+                "arguments": json.dumps({"expr": ".items"}),
+                "call_id": "c_array",
+            },
+            {"type": "function_call_output", "call_id": "c_array", "output": "[1, 2, 3]"},
+            *_call(
+                "kanban_show",
+                {"task_id": _TASK_ID},
+                {
+                    "task": {"id": _TASK_ID, "status": "blocked", "block_kind": "transient"},
+                    "runs": [
+                        {
+                            "summary": (
+                                "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                                'HTTP 429 ... "TPM quota exhausted"'
+                            )
+                        }
+                    ],
+                },
+                "call_show",
+            ),
+            _text(f"Task {_TASK_ID} is blocked."),
+        ),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert result.output == ""
+
+
+def test_a_delegated_worker_rate_limit_on_board_is_infrastructure(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """When a card on the kanban board reports rate_limit failure, mark the rep as infrastructure."""
+    _corroborate_429(tmp_path, monkeypatch)
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("failed", body="Worker failed.", result="Worker failed."),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {},
+                "errors": {
+                    _TASK_ID: (
+                        "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                        'HTTP 429 ... "TPM quota exhausted"'
+                    )
+                },
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "rate_limit" in result.errors[0]
+    assert result.output == ""
+    assert len(result.trajectory) >= 1
+
+
+def test_an_agent_output_reporting_429_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When the agent diagnoses an upstream 429 in its answer, it remains graded and not infra."""
+    answer = "The upstream service returned HTTP 429 Too Many Requests: rate limit exceeded."
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("done", body=answer, result=answer),
+    ]
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "")
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert not result.has_errors()
+    assert result.output.endswith(answer)
+
+
+def test_delegated_worker_infra_failure_preserves_trajectory(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """An infra failure preserves result.trajectory so Rung 1 catastrophic safeguards can inspect worker calls."""
+    _corroborate_429(tmp_path, monkeypatch)
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("failed", body="Worker failed.", result="Worker failed."),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {},
+                "errors": {
+                    _TASK_ID: (
+                        "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                        'HTTP 429 ... "TPM quota exhausted"'
+                    )
+                },
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert len(result.trajectory) >= 1
+    assert result.trajectory[0]["name"] == "kanban_create"
+
+
+def test_mark_result_infra_failure_prepends_errors_and_clears_final_message() -> None:
+    res = AgentResult(
+        output="answer text",
+        trajectory=[{"name": "step"}],
+        errors=["pre-existing error"],
+        metadata={"final_message": "answer text", "key": "value"},
+    )
+    harness._mark_result_infra_failure(res, "rate limit reached")
+    assert res.output == ""
+    assert res.trajectory == [{"name": "step"}]
+    assert res.errors == [
+        f"{harness.INFRA_FAILURE_MARKER}: rate limit reached",
+        "pre-existing error",
+    ]
+    assert "final_message" not in res.metadata
+    assert res.metadata["infra_failure"] == "rate limit reached"
+
+
+def test_final_board_failures_fallback_branches(monkeypatch: pytest.MonkeyPatch) -> None:
+    t = "task-1"
+    fallback = {t: ["provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"]}
+
+    # Branch 1: final read fails, falls back immediately to fallback store
+    read_attempts: list[str] = []
+
+    def _shell_failed(script: str, timeout: float) -> str:
+        read_attempts.append(script)
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell_failed)
+    msgs = KubeAgentsHarness._final_board_failures([t], {t: "blocked"}, fallback)
+    assert len(read_attempts) == 1
+    assert msgs == fallback[t]
+
+    # Branch 2: final read succeeds but card was unblocked (status is running) -> cleared, empty msgs
+    def _shell_running(script: str, timeout: float) -> str:
+        payload = {"statuses": {t: "running"}, "summaries": {}, "errors": {}}
+        return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}"
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell_running)
+    msgs = KubeAgentsHarness._final_board_failures([t], {t: "blocked"}, fallback)
+    assert msgs == []
+
+    # Branch 3: final read succeeds, card is still blocked but has empty summaries and errors
+    def _shell_empty_failures(script: str, timeout: float) -> str:
+        payload = {"statuses": {t: "blocked"}, "summaries": {}, "errors": {}, "block_kinds": {t: "transient"}}
+        return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}"
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell_empty_failures)
+    msgs = KubeAgentsHarness._final_board_failures([t], {t: "blocked"}, fallback)
+    assert msgs == []
+
+    # Branch 4: final read succeeds and has summaries/errors, does not use fallback
+    def _shell_with_summary(script: str, timeout: float) -> str:
+        payload = {
+            "statuses": {t: "blocked"},
+            "summaries": {t: "new summary"},
+            "errors": {},
+            "block_kinds": {t: "transient"},
+        }
+        return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}"
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell_with_summary)
+    msgs = KubeAgentsHarness._final_board_failures([t], {t: "blocked"}, fallback)
+    assert msgs == ["new summary"]
+
+
+def test_board_card_messages_refuses_non_transient_triage() -> None:
+    t = "t-triage"
+    summ = f"{harness._RATE_LIMIT_REASON_PREFIX}: 429 quota exhausted"
+    bstate_nontransient = (
+        {t: "triage"},
+        {t: summ},
+        {},
+        {t: "needs_input"},
+    )
+    assert KubeAgentsHarness._extract_board_card_messages(bstate_nontransient, t) == []
+
+    bstate_transient = (
+        {t: "triage"},
+        {t: summ},
+        {},
+        {t: "transient"},
+    )
+    assert KubeAgentsHarness._extract_board_card_messages(bstate_transient, t) == [summ]
+
+
+def test_extract_trajectory_failure_summaries_branches() -> None:
+    t = "t-1"
+    # Exit 1: task blocked+transient with cleared newest run -> evicts stale store
+    traj_cleared = [
+        {
+            "name": "kanban_show",
+            "result": json.dumps({
+                "task": {"id": t, "status": "blocked", "block_kind": "transient"},
+                "runs": [
+                    {"summary": f"{harness._RATE_LIMIT_REASON_PREFIX}: quota exhausted"},
+                    {"summary": None},
+                ],
+            }),
+        }
+    ]
+    store = {t: ["stale"]}
+    res = KubeAgentsHarness._extract_trajectory_failure_summaries(traj_cleared, [t], store=store)
+    assert res is store
+    assert t not in store
+    assert res == {}
+
+    # Exit 2: task status failed with cleared newest run -> evicts stale store
+    traj_failed_cleared = [
+        {
+            "name": "kanban_show",
+            "result": json.dumps({
+                "task": {"id": t, "status": "failed"},
+                "runs": [
+                    {"summary": f"{harness._RATE_LIMIT_REASON_PREFIX}: quota exhausted"},
+                    {"summary": None},
+                ],
+            }),
+        }
+    ]
+    store = {t: ["stale"]}
+    res = KubeAgentsHarness._extract_trajectory_failure_summaries(traj_failed_cleared, [t], store=store)
+    assert res is store
+    assert t not in store
+    assert res == {}
+
+    # Exit 2b: tasks item blocked+transient with cleared newest run -> evicts stale store
+    traj_tasks_cleared = [
+        {
+            "name": "kanban_list",
+            "result": json.dumps({
+                "tasks": [
+                    {
+                        "id": t,
+                        "status": "blocked",
+                        "block_kind": "transient",
+                        "runs": [
+                            {"summary": f"{harness._RATE_LIMIT_REASON_PREFIX}: quota exhausted"},
+                            {"summary": None},
+                        ],
+                    },
+                ],
+            }),
+        }
+    ]
+    store = {t: ["stale"]}
+    res = KubeAgentsHarness._extract_trajectory_failure_summaries(traj_tasks_cleared, [t], store=store)
+    assert res is store
+    assert t not in store
+    assert res == {}
+
+    # Exit 3: tasks list item status failed with rate limit summary -> {t: [summary]}
+    expected_sum = f"{harness._RATE_LIMIT_REASON_PREFIX}: 429 quota exhausted"
+    traj_tasks_failed = [
+        {
+            "name": "kanban_list",
+            "result": json.dumps({
+                "tasks": [
+                    {"id": t, "status": "failed", "runs": [{"summary": expected_sum}]},
+                ],
+            }),
+        }
+    ]
+    assert KubeAgentsHarness._extract_trajectory_failure_summaries(traj_tasks_failed, [t]) == {t: [expected_sum]}
+
+    # Exit 4: tasks item blocked without transient -> evicts stale store
+    traj_tasks_blocked_nontransient = [
+        {
+            "name": "kanban_list",
+            "result": json.dumps({
+                "tasks": [
+                    {
+                        "id": t,
+                        "status": "blocked",
+                        "block_kind": "needs_input",
+                        "runs": [{"summary": expected_sum}],
+                    },
+                ],
+            }),
+        }
+    ]
+    store = {t: ["stale"]}
+    res = KubeAgentsHarness._extract_trajectory_failure_summaries(traj_tasks_blocked_nontransient, [t], store=store)
+    assert res is store
+    assert t not in store
+    assert res == {}
+
+    # Exit 4b: task item blocked with absent block_kind key -> evicts stale store
+    traj_task_blocked_nokind = [
+        {
+            "name": "kanban_show",
+            "result": json.dumps({
+                "task": {"id": t, "status": "blocked"},
+                "runs": [{"summary": expected_sum}],
+            }),
+        }
+    ]
+    store = {t: ["stale"]}
+    res = KubeAgentsHarness._extract_trajectory_failure_summaries(traj_task_blocked_nokind, [t], store=store)
+    assert res is store
+    assert t not in store
+    assert res == {}
+
+    # Exit 4c: tasks item blocked with absent block_kind key -> evicts stale store
+    traj_tasks_blocked_nokind = [
+        {
+            "name": "kanban_list",
+            "result": json.dumps({
+                "tasks": [
+                    {"id": t, "status": "blocked", "runs": [{"summary": expected_sum}]},
+                ],
+            }),
+        }
+    ]
+    store = {t: ["stale"]}
+    res = KubeAgentsHarness._extract_trajectory_failure_summaries(traj_tasks_blocked_nokind, [t], store=store)
+    assert res is store
+    assert t not in store
+    assert res == {}
+
+    # Exit 5: task triage without transient -> evicts stale store
+    traj_task_triage = [
+        {
+            "name": "kanban_show",
+            "result": json.dumps({
+                "task": {"id": t, "status": "triage", "block_kind": "needs_input"},
+                "runs": [{"summary": expected_sum}],
+            }),
+        }
+    ]
+    store = {t: ["stale"]}
+    res = KubeAgentsHarness._extract_trajectory_failure_summaries(traj_task_triage, [t], store=store)
+    assert res is store
+    assert t not in store
+    assert res == {}
+
+    # Exit 6: task item with empty runs list -> evicts stale store
+    traj_task_empty_runs = [
+        {
+            "name": "kanban_show",
+            "result": json.dumps({
+                "task": {"id": t, "status": "failed"},
+                "runs": [],
+            }),
+        }
+    ]
+    store = {t: ["stale"]}
+    res = KubeAgentsHarness._extract_trajectory_failure_summaries(traj_task_empty_runs, [t], store=store)
+    assert res is store
+    assert t not in store
+    assert res == {}
+
+    # Exit 7: tasks list item with absent runs -> evicts stale store
+    traj_tasks_no_runs = [
+        {
+            "name": "kanban_list",
+            "result": json.dumps({
+                "tasks": [{"id": t, "status": "failed"}],
+            }),
+        }
+    ]
+    store = {t: ["stale"]}
+    res = KubeAgentsHarness._extract_trajectory_failure_summaries(traj_tasks_no_runs, [t], store=store)
+    assert res is store
+    assert t not in store
+    assert res == {}
+
+    # Exit 8: tasks list item with status blocked, transient kind, but absent runs -> preserves live store
+    traj_tasks_blocked_transient_no_runs = [
+        {
+            "name": "kanban_list",
+            "result": json.dumps({
+                "tasks": [{"id": t, "status": "blocked", "block_kind": "transient"}],
+            }),
+        }
+    ]
+    store = {t: ["live_entry"]}
+    res = KubeAgentsHarness._extract_trajectory_failure_summaries(
+        traj_tasks_blocked_transient_no_runs, [t], store=store
+    )
+    assert res is store
+    assert t in store
+    assert store[t] == ["live_entry"]
+
+    # Exit 8b: task item with status blocked, transient kind, but absent/empty runs -> preserves live store
+    traj_task_blocked_transient_no_runs = [
+        {
+            "name": "kanban_show",
+            "result": json.dumps({
+                "task": {"id": t, "status": "blocked", "block_kind": "transient"},
+                "runs": [],
+            }),
+        }
+    ]
+    store_task = {t: ["live_entry"]}
+    res_task = KubeAgentsHarness._extract_trajectory_failure_summaries(
+        traj_task_blocked_transient_no_runs, [t], store=store_task
+    )
+    assert res_task is store_task
+    assert t in store_task
+    assert store_task[t] == ["live_entry"]
+
+
+def test_gitops_fix_cycle_skipped_on_infra_failure(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """When a run is marked as infrastructure failure, gitops.await_fix_cycle is not called."""
+    _corroborate_429(tmp_path, monkeypatch)
+    called: list[bool] = []
+    import kube_agents_bench.gitops as gitops
+
+    monkeypatch.setattr(gitops, "await_fix_cycle", lambda *args, **kwargs: called.append(True))
+
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("failed"),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {},
+                "errors": {
+                    _TASK_ID: (
+                        "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                        'HTTP 429 ... "TPM quota exhausted"'
+                    )
+                },
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    result = KubeAgentsHarness().run("Investigate incident.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert not called
+    assert result.metadata.get("session_id") == _SESSION_ID
+    assert stub_agent.session_lookups == [f"/api/sessions/{_SESSION_ID}"]
+
+
+def test_infra_failure_preserves_token_canonicalisation_and_worker_fold(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """When a run is marked as infra failure, session tokens and worker tokens are preserved and folded."""
+    _corroborate_429(tmp_path, monkeypatch)
+    from kube_agents_bench.worker_trajectory import WorkerCapture
+
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("failed"),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {},
+                "errors": {
+                    _TASK_ID: (
+                        "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                        'HTTP 429 ... "TPM quota exhausted"'
+                    )
+                },
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    monkeypatch.setattr(
+        worker_trajectory,
+        "capture",
+        lambda *args, **kwargs: WorkerCapture(
+            entries=[],
+            summary={"tasks": {_TASK_ID: "worker-session"}},
+            tokens={"cluster": {"input_tokens": 50, "output_tokens": 25}},
+            unbilled=[],
+        ),
+    )
+
+    result = KubeAgentsHarness().run("Investigate incident.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert result.metadata.get("session_id") == _SESSION_ID
+    assert "front_door" in result.tokens
+    assert result.tokens["workers"]["input"] == 50
+    assert result.tokens["workers"]["output"] == 25
+    assert result.tokens["workers"]["total"] == 75
+    assert result.tokens["total"] == _SESSION_ROW["session"]["input_tokens"] + _SESSION_ROW["session"]["output_tokens"] + _SESSION_ROW["session"]["cache_read_tokens"] + _SESSION_ROW["session"]["cache_write_tokens"] + 75
+
+
+def test_a_delegated_worker_cleared_rate_limit_in_trajectory_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When a card re-runs after a rate-limit and the newest run summary is cleared in trajectory, it remains graded."""
+    stub_agent.turns = [
+        _create_turn(),
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": _TASK_ID},
+                {
+                    "task": {"id": _TASK_ID, "status": "blocked", "block_kind": "transient"},
+                    "runs": [
+                        {
+                            "summary": (
+                                "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                                'HTTP 429 ... "TPM quota exhausted"'
+                            )
+                        },
+                        {
+                            "summary": None,
+                        },
+                    ],
+                },
+                "call_show",
+            ),
+            _text(f"Task {_TASK_ID} is blocked."),
+        ),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert not result.has_errors()
+    assert f"Task {_TASK_ID} is blocked." in result.output
+
+
+def test_status_turn_unawaited_card_not_read_via_exec(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When a status turn reports an unawaited card as blocked, board read exec is not attempted for it."""
+    stub_agent.turns = [
+        _create_turn(),
+        _turn(
+            *_call(
+                "kanban_list",
+                {},
+                {
+                    "tasks": [
+                        {"id": _TASK_ID, "status": "in_progress"},
+                        {"id": "unawaited-999", "status": "blocked"},
+                    ]
+                },
+                "call_list",
+            ),
+            _text(f"Task {_TASK_ID} is in progress."),
+        ),
+        _show_turn("done"),
+    ]
+
+    exec_scripts: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        exec_scripts.append(script)
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Investigate incident.")
+
+    assert not any("unawaited-999" in s for s in exec_scripts)
+
+
+def test_status_turn_batches_and_clamps_board_read_timeout(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When a status turn reports multiple awaited cards in failure statuses, board read is batched and clamped."""
+    task_1 = "task-alpha"
+    task_2 = "task-beta"
+    stub_agent.turns = [
+        _turn(
+            *_call("kanban_create", {"title": "alpha"}, {"task_id": task_1}, "call_create_1"),
+            *_call("kanban_create", {"title": "beta"}, {"task_id": task_2}, "call_create_2"),
+            _text("Created two tasks."),
+        ),
+        _turn(
+            *_call(
+                "kanban_list",
+                {},
+                {
+                    "tasks": [
+                        {"id": task_1, "status": "blocked", "block_kind": "transient"},
+                        {"id": task_2, "status": "blocked", "block_kind": "transient"},
+                    ]
+                },
+                "call_list",
+            ),
+            _text("Both tasks are blocked."),
+        ),
+    ]
+
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "10")
+    board_calls: list[tuple[str, float]] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            board_calls.append((script, timeout))
+            # First poll before status turn returns empty; status turn read returns state
+            if len(board_calls) > 1:
+                payload = {
+                    "statuses": {task_1: "blocked", task_2: "blocked"},
+                    "summaries": {
+                        task_1: (
+                            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                            "HTTP 429 quota exhausted"
+                        )
+                    },
+                    "errors": {},
+                    "block_kinds": {task_1: "transient", task_2: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Investigate incident.")
+
+    # Call 0 is the poll before the status turn (timeout 60s).
+    # Call 1 is the batched status turn read (clamped timeout <= 10s).
+    # Call 2 is the settle-time read.
+    assert len(board_calls) == 3, f"Expected 3 board reads total (1 poll, 1 batched status turn, 1 settle), got {len(board_calls)}"
+    script, recorded_timeout = board_calls[1]
+    assert task_1 in script and task_2 in script
+    assert recorded_timeout <= 10.0
+
+
+def test_a_delegated_worker_cleared_rate_limit_rerun_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When a worker hit rate limit in an earlier poll but the re-run finishes done, it remains graded."""
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("running"),
+        _show_turn("done", body="All pods recovered.", result="All pods recovered."),
+    ]
+    reads = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {
+                        _TASK_ID: (
+                            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                            "HTTP 429 quota exhausted"
+                        )
+                    },
+                    "errors": {},
+                    "block_kinds": {_TASK_ID: "transient"},
+                    "error": None,
+                }
+            else:
+                payload = {
+                    "statuses": {_TASK_ID: "done"},
+                    "summaries": {},
+                    "errors": {},
+                    "error": None,
+                }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert not result.has_errors()
+    assert result.output.endswith("All pods recovered.")
+
+
+def test_a_cleared_rate_limit_card_evicted_from_poll_fallback_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When a poll-captured rate-limit card is later reported running by a poll, it is evicted from poll_failure_messages.
+
+    If the subsequent re-run fails for its own fault with no summary/error and final board read fails,
+    the stale rate-limit message is not handed to _settle and the run remains graded.
+    """
+    worker_failure = "Worker failed: syntax error in script."
+    stub_agent.turns = [
+        _create_turn(),
+        _turn(_text("still looking")),
+        _show_turn("blocked", block_kind="transient", body=worker_failure, result=worker_failure, call_id="call_show_2"),
+    ]
+    reads = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {
+                        _TASK_ID: (
+                            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                            "HTTP 429 quota exhausted"
+                        )
+                    },
+                    "errors": {},
+                    "block_kinds": {_TASK_ID: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 1:
+                payload = {
+                    "statuses": {_TASK_ID: "running"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert not result.has_errors()
+    assert worker_failure in result.output
+
+
+def test_a_cleared_rate_limit_card_evicted_by_status_turn_running_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When a status turn reports a card running, it is evicted from poll_failure_messages even if poll exec fails."""
+    worker_failure = "Worker failed: syntax error in script."
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("running", call_id="call_show_1"),
+        _show_turn("blocked", block_kind="transient", body=worker_failure, result=worker_failure, call_id="call_show_2"),
+    ]
+    reads = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {
+                        _TASK_ID: (
+                            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                            "HTTP 429 quota exhausted"
+                        )
+                    },
+                    "errors": {},
+                    "block_kinds": {_TASK_ID: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            # Intermediate poll, status turn clamped read, and final read fail
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert not result.has_errors()
+    assert worker_failure in result.output
+
+
+def test_status_turn_re_read_retired_card_refreshes_or_evicts_poll_fallback_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """When a status turn re-reads a card already retired from outstanding, it refreshes or evicts the stored prefix."""
+    _corroborate_429(tmp_path, monkeypatch)
+    prefix = (
+        "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+        'HTTP 429 ... "TPM quota exhausted"'
+    )
+    task_1 = "task-t1"
+    task_2 = "task-t2"
+    stub_agent.turns = [
+        _turn(
+            *_call("kanban_create", {"title": "alpha"}, {"task_id": task_1}, "call_create_1"),
+            *_call("kanban_create", {"title": "beta"}, {"task_id": task_2}, "call_create_2"),
+            _text("Created two tasks."),
+        ),
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": task_1},
+                {
+                    "task": {"id": task_1, "status": "blocked", "block_kind": "transient"},
+                    "runs": [{"summary": prefix}],
+                },
+                "call_show_1",
+            ),
+            _text(f"Task {task_1} is blocked."),
+        ),
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": task_1},
+                {
+                    "task": {"id": task_1, "status": "blocked", "block_kind": "transient"},
+                    "runs": [
+                        {"summary": prefix},
+                        {"summary": None},
+                    ],
+                },
+                "call_show_2a",
+            ),
+            *_call(
+                "kanban_show",
+                {"task_id": task_2},
+                {
+                    "task": {"id": task_2, "status": "done"},
+                    "runs": [],
+                },
+                "call_show_2b",
+            ),
+            _text("Task 1 failed worker re-run, Task 2 is done."),
+        ),
+    ]
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {task_1: "blocked", task_2: "running"},
+                    "summaries": {task_1: prefix},
+                    "errors": {},
+                    "block_kinds": {task_1: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert not result.has_errors()
+
+
+def test_a_failure_status_card_with_empty_messages_evicted_from_poll_fallback_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """When a poll-captured rate-limit card later polls in a failure status with empty messages,
+
+    it is evicted from poll_failure_messages. If final board read fails, the stale rate-limit
+    message is not handed to _settle and the run remains graded with the worker's failure.
+    """
+    _corroborate_429(tmp_path, monkeypatch)
+    stub_agent.turns = [
+        _create_turn(),
+        _turn(_text("still investigating 1")),
+        _turn(_text("still investigating 2")),
+        _turn(_text("still investigating 3")),
+    ]
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {
+                        _TASK_ID: (
+                            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                            "HTTP 429 quota exhausted"
+                        )
+                    },
+                    "errors": {},
+                    "block_kinds": {_TASK_ID: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 1:
+                payload = {
+                    "statuses": {_TASK_ID: "failed"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in err for err in result.errors)
+    assert not any("delegated worker failed" in err for err in result.errors)
+    assert any("agent reported no status for 3 turns running" in err for err in result.errors)
+
+
+def test_a_non_transient_failure_card_on_status_turn_evicts_poll_fallback_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When a poll-captured rate-limit card is reported on a status turn with non-transient block_kind,
+
+    it is evicted from poll_failure_messages even if the intermediate poll failed. If the final board
+    read fails, the stale rate-limit message does not reach _settle and the run remains graded.
+    """
+    worker_failure = "Worker blocked: missing authorization token."
+    stub_agent.turns = [
+        _create_turn(),
+        _turn(_text("checking card")),
+        _show_turn(
+            "blocked",
+            body=worker_failure,
+            result=worker_failure,
+            call_id="call_show_blocked",
+            block_kind="needs_input",
+        ),
+    ]
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {
+                        _TASK_ID: (
+                            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                            "HTTP 429 quota exhausted"
+                        )
+                    },
+                    "errors": {},
+                    "block_kinds": {_TASK_ID: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            # Intermediate poll and subsequent reads fail.
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert not result.has_errors()
+    assert worker_failure in result.output
+
+
+def test_a_status_turn_with_transient_re_failed_card_evicts_poll_fallback_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When a poll-captured rate-limit card re-fails under a transient kind and status turn reports
+
+    a newest run with no rate-limit summary, it evicts the stored prefix even if the status-turn
+    and final board reads fail.
+    """
+    worker_failure = "Worker failed without rate limit."
+    stub_agent.turns = [
+        _create_turn(),
+        _turn(_text("checking card")),
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": _TASK_ID},
+                {
+                    "task": {"id": _TASK_ID, "status": "blocked", "block_kind": "transient"},
+                    "runs": [
+                        {
+                            "summary": (
+                                "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                                "HTTP 429 quota exhausted"
+                            )
+                        },
+                        {
+                            "summary": None,
+                        },
+                    ],
+                },
+                "call_show_refailed",
+            ),
+            _text(worker_failure),
+            usage={"input_tokens": 200, "output_tokens": 20, "total_tokens": 220},
+        ),
+    ]
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {
+                        _TASK_ID: (
+                            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                            "HTTP 429 quota exhausted"
+                        )
+                    },
+                    "errors": {},
+                    "block_kinds": {_TASK_ID: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            # Intermediate poll, status turn clamped read, and final read fail.
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert not result.has_errors()
+    assert not any(harness.INFRA_FAILURE_MARKER in err for err in result.errors)
+    assert worker_failure in result.output
+
+
+def test_status_turn_refresh_and_evict_against_successful_board_read_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When a poll-captured rate-limit card is reported on a status turn and the status-turn board read
+
+    succeeds with a non-transient block kind, it is evicted from poll_failure_messages. If the final
+    board read fails, the stale rate-limit message does not reach _settle and the run remains graded.
+    """
+    worker_failure = "Worker blocked: waiting for user input."
+    stub_agent.turns = [
+        _create_turn(),
+        _turn(_text("checking card")),
+        _show_turn(
+            "blocked",
+            body=worker_failure,
+            result=worker_failure,
+            call_id="call_show_blocked_not_transient",
+        ),
+    ]
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                # Initial poll captures transient rate limit
+                payload = {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {
+                        _TASK_ID: (
+                            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                            "HTTP 429 quota exhausted"
+                        )
+                    },
+                    "errors": {},
+                    "block_kinds": {_TASK_ID: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 1:
+                # Intermediate poll fails
+                return ""
+            elif idx == 2:
+                # Status turn clamped read succeeds with non-transient block_kind
+                payload = {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {_TASK_ID: "needs_input"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            # Final settle read fails
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert not result.has_errors()
+    assert not any(harness.INFRA_FAILURE_MARKER in err for err in result.errors)
+    assert worker_failure in result.output
+
+
+def test_worker_authored_kanban_block_with_non_transient_kind_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """A worker-authored kanban_block with block_kind != transient is not treated as infra failure."""
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("blocked", body="Worker blocked on input.", result="Worker blocked on input."),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "blocked"},
+                "summaries": {
+                    _TASK_ID: (
+                        "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                        "sibling is blocked, waiting for input"
+                    )
+                },
+                "errors": {},
+                "block_kinds": {_TASK_ID: "needs_input"},
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert not result.has_errors()
+    assert "Worker blocked on input." in result.output
+
+
+def test_failed_card_with_worker_failure_text_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """A failed card whose error is ordinary worker failure text (even mentioning 429) is graded."""
+    worker_failure = "Traceback (most recent call last): HTTP 429 from the GKE API: rateLimitExceeded"
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("failed", body=worker_failure, result=worker_failure),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {},
+                "errors": {_TASK_ID: worker_failure},
+                "block_kinds": {},
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert not result.has_errors()
+    assert not any(harness.INFRA_FAILURE_MARKER in err for err in result.errors)
+    assert worker_failure in result.output
+
+
+def test_extract_infra_failure_reason_classifier() -> None:
+    """_extract_infra_failure_reason matches exact hermes failure prefix and rate_limit reasons."""
+    assert harness._extract_infra_failure_reason(None) is None
+    assert harness._extract_infra_failure_reason("") is None
+    assert harness._extract_infra_failure_reason("   ") is None
+    assert harness._extract_infra_failure_reason("upstream returned HTTP 429 rate limit") is None
+    assert harness._extract_infra_failure_reason("Traceback: 429 RESOURCE_EXHAUSTED") is None
+
+    # Exact prefix -> rate_limit
+    assert (
+        harness._extract_infra_failure_reason(
+            f"{harness._RATE_LIMIT_REASON_PREFIX}: API retries exhausted"
+        )
+        == "rate_limit"
+    )
+    # failure_reason=rate_limit -> rate_limit
+    assert (
+        harness._extract_infra_failure_reason(
+            f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=rate_limit): 429"
+        )
+        == "rate_limit"
+    )
+    # failure_reason=billing (unwritten by hermes under rate limit prefix) -> None
+    assert (
+        harness._extract_infra_failure_reason(
+            f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=billing): credit exhausted"
+        )
+        is None
+    )
+    # failure_reason=context_length (non-infra reason under prefix) -> None
+    assert (
+        harness._extract_infra_failure_reason(
+            f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=context_length): max context"
+        )
+        is None
+    )
+
+
+def test_a_429_blocked_card_unblocked_and_running_at_settle_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """A card 429-blocked and retired, then unblocked and still running at settle, is cleared and remains graded."""
+    _corroborate_429(tmp_path, monkeypatch)
+    t1 = _TASK_ID
+    t2 = _TASK_ID + "-2"
+    stub_agent.turns = [
+        # Turn 0: delegate t1 and t2
+        _turn(
+            *_call("kanban_create", {"title": "task 1"}, {"ok": True, "task_id": t1, "status": "ready"}, "c1"),
+            *_call("kanban_create", {"title": "task 2"}, {"ok": True, "task_id": t2, "status": "ready"}, "c2"),
+            _text("Delegated both."),
+        ),
+        # Turn 1: front agent shows t1 blocked -> t1 retires from outstanding
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t1},
+                {
+                    "task": {"id": t1, "status": "blocked", "block_kind": "transient"},
+                    "runs": [{"summary": f"{harness._RATE_LIMIT_REASON_PREFIX}: 429 quota exhausted"}],
+                },
+                "s1",
+            ),
+            _text("t1 is blocked, waiting on t2."),
+        ),
+        # Turn 2: front agent shows t2 done
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t2},
+                {"task": {"id": t2, "status": "done", "result": "t2 finished"}, "runs": []},
+                "s2",
+            ),
+            _text("Finished."),
+        ),
+    ]
+
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                # Poll 0: t1 is blocked/transient with prefix, t2 is running
+                payload = {
+                    "statuses": {t1: "blocked", t2: "running"},
+                    "summaries": {t1: f"{harness._RATE_LIMIT_REASON_PREFIX}: 429 quota exhausted"},
+                    "errors": {},
+                    "block_kinds": {t1: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 1:
+                # Status turn 1's clamped read fails, so the turn's own
+                # kanban_show (newest run carries the prefix, kind transient)
+                # keeps t1 in poll_failure_messages as it retires.
+                return ""
+            elif idx == 2:
+                # Poll 1: poll reads outstanding [t2] only; t1 is retired so poll
+                # mirror stays off it, preserving latest[t1]=blocked and stored prefix.
+                payload = {
+                    "statuses": {t2: "running"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 3:
+                # Poll 2: t2 has finished. A terminal reading is what ends the
+                # poll-and-continue loop and spends status turn 2.
+                payload = {
+                    "statuses": {t2: "done"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 4:
+                # Settle read: failure_cards is [t1]. Board shows t1 was unblocked and is running.
+                payload = {
+                    "statuses": {t1: "running"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {t1: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Check cards.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+    assert result.errors == [
+        f"delegated task {t1} was reported blocked during wait but running at settle; nothing delivered"
+    ]
+    assert "Finished." in result.output
+
+
+def test_a_429_blocked_card_unblocked_and_ready_at_settle_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """A card 429-blocked and retired, then unblocked to ready at settle, records the status discrepancy and remains graded."""
+    _corroborate_429(tmp_path, monkeypatch)
+    t1 = _TASK_ID
+    t2 = _TASK_ID + "-2"
+    stub_agent.turns = [
+        # Turn 0: delegate t1 and t2
+        _turn(
+            *_call("kanban_create", {"title": "task 1"}, {"ok": True, "task_id": t1, "status": "ready"}, "c1"),
+            *_call("kanban_create", {"title": "task 2"}, {"ok": True, "task_id": t2, "status": "ready"}, "c2"),
+            _text("Delegated both."),
+        ),
+        # Turn 1: front agent shows t1 blocked -> t1 retires from outstanding
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t1},
+                {
+                    "task": {"id": t1, "status": "blocked", "block_kind": "transient"},
+                    "runs": [{"summary": f"{harness._RATE_LIMIT_REASON_PREFIX}: 429 quota exhausted"}],
+                },
+                "s1",
+            ),
+            _text("t1 is blocked, waiting on t2."),
+        ),
+        # Turn 2: front agent shows t2 done
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t2},
+                {"task": {"id": t2, "status": "done", "result": "t2 finished"}, "runs": []},
+                "s2",
+            ),
+            _text("Finished."),
+        ),
+    ]
+
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {t1: "blocked", t2: "running"},
+                    "summaries": {t1: f"{harness._RATE_LIMIT_REASON_PREFIX}: 429 quota exhausted"},
+                    "errors": {},
+                    "block_kinds": {t1: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 1:
+                return ""
+            elif idx == 2:
+                payload = {
+                    "statuses": {t2: "running"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 3:
+                payload = {
+                    "statuses": {t2: "done"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 4:
+                # Settle read: failure_cards is [t1]. Board shows t1 was unblocked and is ready.
+                payload = {
+                    "statuses": {t1: "ready"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {t1: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Check cards.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+    assert result.errors == [
+        f"delegated task {t1} was reported blocked during wait but ready at settle; nothing delivered"
+    ]
+    assert "Finished." in result.output
+
+
+def test_a_429_blocked_card_unblocked_at_settle_with_nothing_delivered_records_ceiling(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, results_json: Any, tmp_path: Path
+) -> None:
+    """A run where all cards were blocked and one is unblocked at settle with nothing delivered records ceiling infra."""
+    _corroborate_429(tmp_path, monkeypatch)
+    called: list[bool] = []
+    import kube_agents_bench.gitops as gitops
+
+    monkeypatch.setattr(gitops, "await_fix_cycle", lambda *args, **kwargs: called.append(True))
+
+    t1 = _TASK_ID
+    t2 = _TASK_ID + "-2"
+    stub_agent.turns = [
+        # Turn 0: delegate t1 and t2
+        _turn(
+            *_call("kanban_create", {"title": "task 1"}, {"ok": True, "task_id": t1, "status": "ready"}, "c1"),
+            *_call("kanban_create", {"title": "task 2"}, {"ok": True, "task_id": t2, "status": "ready"}, "c2"),
+            _text("Delegated both."),
+        ),
+        # Turn 1: front agent shows t1 blocked -> t1 retires from outstanding
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t1},
+                {
+                    "task": {"id": t1, "status": "blocked", "block_kind": "transient"},
+                    "runs": [{"summary": f"{harness._RATE_LIMIT_REASON_PREFIX}: 429 quota exhausted"}],
+                },
+                "s1",
+            ),
+            _text("t1 is blocked, waiting on t2."),
+        ),
+        # Turn 2: front agent shows t2 blocked (non-transient) -> t2 retires from outstanding
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t2},
+                {
+                    "task": {"id": t2, "status": "blocked", "block_kind": "needs_input"},
+                    "runs": [{"summary": "worker failed"}],
+                },
+                "s2",
+            ),
+            _text("Both blocked."),
+        ),
+    ]
+
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {t1: "blocked", t2: "running"},
+                    "summaries": {t1: f"{harness._RATE_LIMIT_REASON_PREFIX}: 429 quota exhausted"},
+                    "errors": {},
+                    "block_kinds": {t1: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 1:
+                # Clamped read for t1: card unblocked to ready; poll_failure_messages.pop fires but rate_limited_cards preserves it
+                payload = {
+                    "statuses": {t1: "ready"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {t1: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 2:
+                payload = {
+                    "statuses": {t2: "blocked"},
+                    "summaries": {t2: "worker failed"},
+                    "errors": {},
+                    "block_kinds": {t2: "needs_input"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 3:
+                # Turn 2 needed_read for t2
+                payload = {
+                    "statuses": {t2: "blocked"},
+                    "summaries": {t2: "worker failed"},
+                    "errors": {},
+                    "block_kinds": {t2: "needs_input"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 4:
+                # Settle read: failure_cards are [t1, t2].
+                # Board shows t1 was unblocked to running; t2 remains blocked.
+                payload = {
+                    "statuses": {t1: "running", t2: "blocked"},
+                    "summaries": {t2: "worker failed"},
+                    "errors": {},
+                    "block_kinds": {t1: "transient", t2: "needs_input"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Check cards.")
+
+    assert any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+    assert result.errors == [
+        f"{harness.INFRA_FAILURE_MARKER}: delegated task {t1} was reported blocked during wait but running at settle; nothing delivered"
+    ]
+    assert result.metadata.get("infra_failure")
+    assert result.output == ""
+    assert not called
+    rep = _classify(results_json(result), "helm")
+    assert rep.outcome == "infra"
+
+
+def test_a_worker_authored_transient_block_with_need_a_moment_unblocked_at_settle_does_not_record_ceiling(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, results_json: Any, tmp_path: Path
+) -> None:
+    """A worker-authored transient block with arbitrary reason (no rate-limit prefix) unblocked at settle records plain discrepancy and stays graded."""
+    _corroborate_429(tmp_path, monkeypatch)
+    t1 = _TASK_ID
+    t2 = _TASK_ID + "-2"
+    stub_agent.turns = [
+        # Turn 0: delegate t1 and t2
+        _turn(
+            *_call("kanban_create", {"title": "task 1"}, {"ok": True, "task_id": t1, "status": "ready"}, "c1"),
+            *_call("kanban_create", {"title": "task 2"}, {"ok": True, "task_id": t2, "status": "ready"}, "c2"),
+            _text("Delegated both."),
+        ),
+        # Turn 1: front agent shows t1 blocked with "need a moment" -> t1 retires from outstanding
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t1},
+                {
+                    "task": {"id": t1, "status": "blocked", "block_kind": "transient"},
+                    "runs": [{"summary": "need a moment"}],
+                },
+                "s1",
+            ),
+            _text("t1 is blocked, waiting on t2."),
+        ),
+        # Turn 2: front agent shows t2 blocked (non-transient) -> t2 retires from outstanding
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t2},
+                {
+                    "task": {"id": t2, "status": "blocked", "block_kind": "needs_input"},
+                    "runs": [{"summary": "worker failed"}],
+                },
+                "s2",
+            ),
+            _text("Both blocked."),
+        ),
+    ]
+
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {t1: "blocked", t2: "running"},
+                    "summaries": {t1: "need a moment"},
+                    "errors": {},
+                    "block_kinds": {t1: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 1:
+                return ""
+            elif idx == 2:
+                payload = {
+                    "statuses": {t2: "blocked"},
+                    "summaries": {t2: "worker failed"},
+                    "errors": {},
+                    "block_kinds": {t2: "needs_input"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 3:
+                payload = {
+                    "statuses": {t2: "blocked"},
+                    "summaries": {t2: "worker failed"},
+                    "errors": {},
+                    "block_kinds": {t2: "needs_input"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 4:
+                # Settle read: board shows t1 was unblocked to running; t2 remains blocked.
+                payload = {
+                    "statuses": {t1: "running", t2: "blocked"},
+                    "summaries": {t2: "worker failed"},
+                    "errors": {},
+                    "block_kinds": {t1: "transient", t2: "needs_input"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Check cards.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+    assert result.errors == [
+        f"delegated task {t1} was reported blocked during wait but running at settle; nothing delivered"
+    ]
+    rep = _classify(results_json(result), "helm")
+    assert rep.outcome != "infra"
+
+
+def test_a_429_blocked_card_unblocked_at_settle_refused_by_platform_telemetry_does_not_record_ceiling(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, results_json: Any, tmp_path: Path
+) -> None:
+    """When platform telemetry is present and shows no 429, an unblocked transient card is refused and routed to discrepancies."""
+    ok_log = tmp_path / "litellm.log"
+    start_iso = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    end_iso = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+    ok_log.write_text(
+        f"{start_iso} INFO: 200 OK GET /health\n"
+        f"{end_iso} INFO: 200 OK POST /v1/chat/completions\n"
+    )
+    monkeypatch.setenv("LITELLM_LOG_PATH", str(ok_log))
+
+    t1 = _TASK_ID
+    t2 = _TASK_ID + "-2"
+    stub_agent.turns = [
+        _turn(
+            *_call("kanban_create", {"title": "task 1"}, {"ok": True, "task_id": t1, "status": "ready"}, "c1"),
+            *_call("kanban_create", {"title": "task 2"}, {"ok": True, "task_id": t2, "status": "ready"}, "c2"),
+        ),
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t1},
+                {
+                    "task": {"id": t1, "status": "blocked", "block_kind": "transient"},
+                    "runs": [{"summary": f"{harness._RATE_LIMIT_REASON_PREFIX}: 429 quota exhausted"}],
+                },
+                "s1",
+            ),
+            _text("t1 is blocked, waiting on t2."),
+        ),
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t2},
+                {
+                    "task": {"id": t2, "status": "blocked", "block_kind": "needs_input"},
+                    "runs": [{"summary": "worker failed"}],
+                },
+                "s2",
+            ),
+            _text("Both blocked."),
+        ),
+    ]
+
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {t1: "blocked", t2: "running"},
+                    "summaries": {t1: f"{harness._RATE_LIMIT_REASON_PREFIX}: 429 quota exhausted"},
+                    "errors": {},
+                    "block_kinds": {t1: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 1:
+                payload = {
+                    "statuses": {t1: "ready"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {t1: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 2:
+                payload = {
+                    "statuses": {t2: "blocked"},
+                    "summaries": {t2: "worker failed"},
+                    "errors": {},
+                    "block_kinds": {t2: "needs_input"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 3:
+                payload = {
+                    "statuses": {t2: "blocked"},
+                    "summaries": {t2: "worker failed"},
+                    "errors": {},
+                    "block_kinds": {t2: "needs_input"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 4:
+                payload = {
+                    "statuses": {t1: "running", t2: "blocked"},
+                    "summaries": {t2: "worker failed"},
+                    "errors": {},
+                    "block_kinds": {t1: "transient", t2: "needs_input"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Check cards.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+    assert result.errors == [
+        f"delegated task {t1} was reported blocked during wait but running at settle; nothing delivered"
+    ]
+    rep = _classify(results_json(result), "helm")
+    assert rep.outcome != "infra"
+
+
+def test_a_429_blocked_card_unblocked_and_done_without_delivered_result_records_ceiling(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, results_json: Any, tmp_path: Path
+) -> None:
+    """When a sibling card is reported done but delivered no result, an unblocked card records ceiling infra."""
+    _corroborate_429(tmp_path, monkeypatch)
+    t1 = _TASK_ID
+    t2 = _TASK_ID + "-2"
+    stub_agent.turns = [
+        # Turn 0: delegate t1 and t2
+        _turn(
+            *_call("kanban_create", {"title": "task 1"}, {"ok": True, "task_id": t1, "status": "ready"}, "c1"),
+            *_call("kanban_create", {"title": "task 2"}, {"ok": True, "task_id": t2, "status": "ready"}, "c2"),
+            _text("Delegated both."),
+        ),
+        # Turn 1: front agent shows t1 blocked -> t1 retires from outstanding
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t1},
+                {
+                    "task": {"id": t1, "status": "blocked", "block_kind": "transient"},
+                    "runs": [{"summary": f"{harness._RATE_LIMIT_REASON_PREFIX}: 429 quota exhausted"}],
+                },
+                "s1",
+            ),
+            _text("t1 is blocked, waiting on t2."),
+        ),
+        # Turn 2: front agent shows t2 done but with null result and no run summary -> t2 retires
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t2},
+                {"task": {"id": t2, "status": "done", "result": None}, "runs": []},
+                "s2",
+            ),
+            _text("t2 done."),
+        ),
+    ]
+
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {t1: "blocked", t2: "running"},
+                    "summaries": {t1: f"{harness._RATE_LIMIT_REASON_PREFIX}: 429 quota exhausted"},
+                    "errors": {},
+                    "block_kinds": {t1: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 1:
+                return ""
+            elif idx == 2:
+                payload = {
+                    "statuses": {t2: "done"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 3:
+                # Settle read: failure_cards is [t1].
+                # Board shows t1 was unblocked to running.
+                payload = {
+                    "statuses": {t1: "running"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {t1: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Check cards.")
+
+    assert any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+    assert result.errors == [
+        f"{harness.INFRA_FAILURE_MARKER}: delegated task {t1} was reported blocked during wait but running at settle; nothing delivered"
+    ]
+    rep = _classify(results_json(result), "helm")
+    assert rep.outcome == "infra"
+
+
+def test_a_needs_input_card_unblocked_and_running_at_settle_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, results_json: Any
+) -> None:
+    """A card blocked with needs_input and unblocked to running at settle does not record ceiling infra."""
+    t1 = _TASK_ID
+    stub_agent.turns = [
+        # Turn 0: delegate t1
+        _turn(
+            *_call("kanban_create", {"title": "task 1"}, {"ok": True, "task_id": t1, "status": "ready"}, "c1"),
+            _text("Delegated."),
+        ),
+        # Turn 1: front agent shows t1 blocked on needs_input
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t1},
+                {
+                    "task": {"id": t1, "status": "blocked", "block_kind": "needs_input"},
+                    "runs": [{"summary": "Clarification needed from user."}],
+                },
+                "s1",
+            ),
+            _text("t1 needs input."),
+        ),
+    ]
+
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {t1: "blocked"},
+                    "summaries": {t1: "Clarification needed."},
+                    "errors": {},
+                    "block_kinds": {t1: "needs_input"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 1:
+                # Status turn 1's needed_read for t1 (reported blocked) fails,
+                # so the settle read below is the one that sees the board.
+                return ""
+            elif idx == 2:
+                # Settle read: failure_cards is [t1]. Board shows t1 was unblocked and is running with needs_input
+                payload = {
+                    "statuses": {t1: "running"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {t1: "needs_input"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Check cards.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+    assert not result.has_errors()
+
+
+def test_a_card_blocked_during_wait_and_done_at_settle_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """A card reported blocked during polling that shows done on settle read remains graded."""
+    t1 = _TASK_ID
+    stub_agent.turns = [
+        _create_turn(),
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t1},
+                {"task": {"id": t1, "status": "blocked", "block_kind": "transient"}, "runs": []},
+                "s1",
+            ),
+            _text("Waiting for t1."),
+        ),
+    ]
+
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {t1: "blocked"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {t1: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 1:
+                # Status turn 1's needed_read for t1 (reported blocked) fails,
+                # so the settle read below is the one that sees the board.
+                return ""
+            elif idx == 2:
+                # Settle read: card finished and is done
+                payload = {
+                    "statuses": {t1: "done"},
+                    "summaries": {t1: "Completed successfully."},
+                    "errors": {},
+                    "block_kinds": {},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Run task.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+    assert not result.has_errors()
+    assert "Waiting for t1." in result.output
+
+
+def test_worker_acted_and_delivered_before_sibling_429_rate_limit_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """When a worker acted and delivered a result before a sibling card hits 429, the run stays graded."""
+    _corroborate_429(tmp_path, monkeypatch)
+    t1 = _TASK_ID
+    t2 = _TASK_ID + "-2"
+    stub_agent.turns = [
+        # Turn 0: delegate t1 and t2
+        _turn(
+            *_call("kanban_create", {"title": "task 1"}, {"ok": True, "task_id": t1, "status": "ready"}, "c1"),
+            *_call("kanban_create", {"title": "task 2"}, {"ok": True, "task_id": t2, "status": "ready"}, "c2"),
+            _text("Delegated both."),
+        ),
+        # Turn 1: front agent shows t1 done with deliverable, and t2 blocked on 429
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t1},
+                {"task": {"id": t1, "status": "done", "result": "Card 1 solution delivered."}, "runs": []},
+                "s1",
+            ),
+            *_call(
+                "kanban_show",
+                {"task_id": t2},
+                {
+                    "task": {"id": t2, "status": "blocked", "block_kind": "transient"},
+                    "runs": [{"summary": f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=rate_limit): 429 quota exhausted"}],
+                },
+                "s2",
+            ),
+            _text("Card 1 done, but card 2 blocked on quota."),
+        ),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {t1: "done", t2: "blocked"},
+                "summaries": {t2: f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=rate_limit): 429 quota exhausted"},
+                "errors": {},
+                "block_kinds": {t2: "transient"},
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Investigate incident.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any("delegated worker failed (rate_limit)" in e for e in result.errors)
+    assert "Card 1 solution delivered." in result.output
+    assert not result.metadata.get("infra_failure")
+
+
+def test_worker_with_tool_calls_before_429_rate_limit_is_infrastructure(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """When a worker executed tool actions before hitting 429 quota exhaustion without delivery, the rep is marked infra."""
+    _corroborate_429(tmp_path, monkeypatch)
+
+    t1 = _TASK_ID
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn(
+            "failed",
+            block_kind="transient",
+            body=f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=rate_limit): 429 quota exhausted",
+        ),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {t1: "failed"},
+                "summaries": {t1: f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=rate_limit): 429 quota exhausted"},
+                "errors": {},
+                "block_kinds": {t1: "transient"},
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    # Mock worker trajectory capture returning tool calls executed by the worker
+    mock_capture = worker_trajectory.WorkerCapture(
+        entries=[
+            {"role": "assistant", "tool_calls": [{"function": {"name": "kubectl_get"}}], "profile": "cluster"}
+        ],
+        summary={t1: "executed kubectl_get"},
+        tokens={},
+        unbilled=[],
+    )
+    monkeypatch.setattr(worker_trajectory, "capture", lambda *a, **kw: mock_capture)
+
+    result = KubeAgentsHarness().run("Investigate incident.")
+
+    assert any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any("delegated worker hit infrastructure failure (rate_limit)" in e for e in result.errors)
+    assert result.output == ""
+    assert result.metadata.get("infra_failure")
+
+
+def test_litellm_log_with_429_in_token_count_or_latency_does_not_corroborate(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """A log with 429 appearing as a bare numeric field for tokens/latencies does not match HTTP status code pattern."""
+    log_file = tmp_path / "litellm.log"
+    start_iso = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    end_iso = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+    log_file.write_text(
+        f"{start_iso} INFO: 200 OK GET /health\n"
+        f'{end_iso} INFO: 200 OK POST /v1/chat/completions {{"prompt_tokens": 429, "latency_ms": 429, "request_id": "req-429-x"}}\n'
+    )
+    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("failed", block_kind="transient"),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {
+                    _TASK_ID: f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=rate_limit): 429 quota exhausted"
+                },
+                "errors": {},
+                "block_kinds": {_TASK_ID: "transient"},
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Investigate.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any("platform proxy log showed no 429" in e for e in result.errors)
+
+
+def test_worker_fabricated_transient_block_without_platform_429_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """A worker-authored transient block with 429 prefix without platform LiteLLM 429 logs is refused from infra classification."""
+    log_file = tmp_path / "litellm.log"
+    start_iso = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    end_iso = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+    log_file.write_text(
+        f"{start_iso} INFO: 200 OK GET /health/liveliness\n"
+        f"{end_iso} INFO: 200 OK POST /v1/chat/completions\n"
+    )
+    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("failed", block_kind="transient"),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {
+                    _TASK_ID: f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=rate_limit): 429 quota exhausted"
+                },
+                "errors": {},
+                "block_kinds": {_TASK_ID: "transient"},
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Investigate.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any("platform proxy log showed no 429" in e for e in result.errors)
+
+
+def test_platform_429_corroboration_from_litellm_log_marks_infra(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """When platform LiteLLM log confirms Vertex 429 RESOURCE_EXHAUSTED, the transient block is corroborated and marks infra."""
+    _corroborate_429(tmp_path, monkeypatch)
+
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("failed", block_kind="transient"),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {
+                    _TASK_ID: f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=rate_limit): 429 quota exhausted"
+                },
+                "errors": {},
+                "block_kinds": {_TASK_ID: "transient"},
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Investigate.")
+
+    assert any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert result.output == ""
+    assert result.metadata.get("platform_rate_limit_corroborated") is True
+
+
+def test_platform_429_corroboration_when_log_absent_records_metadata_and_marks_infra(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """When ARTIFACTS is set but litellm.log is absent at settle time, transient block marks infra with metadata recorded."""
+    monkeypatch.setenv("ARTIFACTS", str(tmp_path))
+
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("failed", block_kind="transient"),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {
+                    _TASK_ID: f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=rate_limit): 429 quota exhausted"
+                },
+                "errors": {},
+                "block_kinds": {_TASK_ID: "transient"},
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Investigate.")
+
+    assert any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any("(platform proxy log unavailable at settle; not corroborated)" in e for e in result.errors)
+    assert result.output == ""
+    assert result.metadata.get("platform_rate_limit_corroborated") is False
+
+
+def test_litellm_log_with_429_from_prior_rep_does_not_corroborate(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """A LiteLLM log containing a 429 from an earlier repetition when current rep traffic is present is refused."""
+    log_file = tmp_path / "litellm.log"
+    now_str = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+    log_file.write_text(f"{now_str} INFO: 200 OK GET /health\n2026-10-18 10:00:00 - RateLimitError: 429 RESOURCE_EXHAUSTED\n")
+    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("failed", block_kind="transient"),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {
+                    _TASK_ID: f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=rate_limit): 429 quota exhausted"
+                },
+                "errors": {},
+                "block_kinds": {_TASK_ID: "transient"},
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Investigate.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any("platform proxy log showed no 429" in e for e in result.errors)
+
+
+def test_litellm_log_whose_every_stamp_predates_rep_returns_none_and_admits_with_notice(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """A LiteLLM log whose every timestamp predates the repetition returns None and admits infra with notice."""
+    log_file = tmp_path / "litellm.log"
+    log_file.write_text("2026-10-18 10:00:00 - INFO: 200 OK GET /health\n2026-10-18 10:00:05 - RateLimitError: 429 RESOURCE_EXHAUSTED\n")
+    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("failed", block_kind="transient"),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {
+                    _TASK_ID: f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=rate_limit): 429 quota exhausted"
+                },
+                "errors": {},
+                "block_kinds": {_TASK_ID: "transient"},
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Investigate.")
+
+    assert any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any("(platform proxy log unavailable at settle; not corroborated)" in e for e in result.errors)
+    assert result.metadata.get("platform_rate_limit_corroborated") is False
+
+
+def test_scan_log_for_429_returns_none_on_os_error_or_placeholder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """_scan_log_for_429 returns None when log cannot be read or contains placeholder."""
+    # Nonexistent file -> None
+    assert harness._scan_log_for_429(tmp_path / "does_not_exist.log") is None
+
+    # Directory -> None (OSError)
+    assert harness._scan_log_for_429(tmp_path) is None
+
+    # Placeholder file written by hack/ci-env.sh -> None
+    placeholder = tmp_path / "placeholder.log"
+    placeholder.write_text("note: no LiteLLM log for this run: litellm in default could not be read\n")
+    assert harness._scan_log_for_429(placeholder) is None
+
+    # Normal log without 429 -> False
+    ok_log = tmp_path / "ok.log"
+    ok_log.write_text("INFO: 200 OK POST /v1/chat/completions\n")
+    assert harness._scan_log_for_429(ok_log) is False
+
+    # Log with 429 -> True
+    err_log = tmp_path / "429.log"
+    err_log.write_text('ERROR: 429 Too Many Requests: {"code": 429, "message": "RateLimitError: RESOURCE_EXHAUSTED"}\n')
+    assert harness._scan_log_for_429(err_log) is True
+
+    # Empty log -> None
+    empty_log = tmp_path / "empty.log"
+    empty_log.write_text("")
+    assert harness._scan_log_for_429(empty_log) is None
+
+    # Stderr-only log without traffic lines -> None
+    stderr_log = tmp_path / "stderr.log"
+    stderr_log.write_text("No resources found in default namespace.\n")
+    assert harness._scan_log_for_429(stderr_log) is None
+
+    # Kubectl container stderr naming litellm selector without traffic -> None
+    k8s_stderr = tmp_path / "k8s_stderr.log"
+    k8s_stderr.write_text('Error from server (BadRequest): container "litellm-container" in pod "litellm-0" is waiting to start: ContainerCreating\n')
+    assert harness._scan_log_for_429(k8s_stderr) is None
+
+    # Log with string-coded "code": "429" -> True
+    str_code_log = tmp_path / "str_code_429.log"
+    str_code_log.write_text('{"error": {"message": "Rate limit reached", "type": null, "param": null, "code": "429"}}\n')
+    assert harness._scan_log_for_429(str_code_log) is True
+
+    # Undated 429 when since is set returns None (cannot be placed in time)
+    undated_log = tmp_path / "undated_429.log"
+    undated_log.write_text('INFO: 10.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 429 Too Many Requests\n')
+    since_ts = datetime(2026, 10, 20, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+    assert harness._scan_log_for_429(undated_log, since=since_ts, session_id="test-session") is None
+
+    # Time-only stamp just after since (and with ANSI color codes) corroborates True
+    time_log = tmp_path / "time_only_429.log"
+    time_log.write_text('\x1b[32m12:02:00\x1b[0m - RateLimitError: 429 RESOURCE_EXHAUSTED\n')
+    assert harness._scan_log_for_429(time_log, since=since_ts) is True
+
+    # Time-only stamp across midnight (since at 23:58:00, 429 at 00:03:00) corroborates True
+    midnight_since = datetime(2026, 10, 19, 23, 58, 0, tzinfo=timezone.utc).timestamp()
+    midnight_log = tmp_path / "midnight_429.log"
+    midnight_log.write_text('[pod/litellm-0/litellm-container] 00:03:00 - RateLimitError: 429 RESOURCE_EXHAUSTED\n')
+    assert harness._scan_log_for_429(midnight_log, since=midnight_since) is True
+
+    # Time-only stamp from prior day (e.g. 15:00:00 with since at 10:00:00) with current traffic refuses False
+    prior_time_log = tmp_path / "prior_time_429.log"
+    prior_time_log.write_text(
+        '[pod/litellm-0/litellm-container] 15:00:00 - RateLimitError: 429 RESOURCE_EXHAUSTED\n'
+        '[pod/litellm-0/litellm-container] 10:01:00 - INFO: 200 OK POST /v1/chat/completions\n'
+    )
+    morning_since = datetime(2026, 10, 20, 10, 0, 0, tzinfo=timezone.utc).timestamp()
+    assert harness._scan_log_for_429(prior_time_log, since=morning_since) is False
+    # On the live branch when wall clock is past 15:00 (e.g. 16:00 on same day),
+    # prior-day 15:00 is not inflated into today or accepted as in-window
+    monkeypatch.setattr(time, "time", lambda: morning_since + 6 * 3600)
+    assert harness._scan_log_for_429(prior_time_log, since=morning_since) is False
+
+    # Undated log with traffic and no 429 when since is set returns None (cannot place in window)
+    undated_ok = tmp_path / "undated_traffic_no_429.log"
+    undated_ok.write_text('INFO: 10.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 200 OK\n')
+    assert harness._scan_log_for_429(undated_ok, since=since_ts) is None
+
+    # Tail-clipped log starting after since returns None
+    clipped_log = tmp_path / "tail_clipped.log"
+    clipped_log.write_text(
+        '2026-10-20 12:05:00 INFO: 200 OK GET /health\n'
+        '2026-10-20 12:06:00 INFO: 200 OK POST /v1/chat/completions\n'
+    )
+    assert harness._scan_log_for_429(clipped_log, since=since_ts) is None
+
+    # Multi-pod log where pod 0 ends at in-window timestamp and pod 1 starts with undated 429 returns None
+    multi_pod_log = tmp_path / "multi_pod.log"
+    multi_pod_log.write_text(
+        '[pod/litellm-0/litellm-container] 2026-10-20 12:05:00 INFO: 200 OK POST /v1/chat/completions\n'
+        '[pod/litellm-1/litellm-container] INFO: 10.0.0.1 - "POST /v1/chat/completions HTTP/1.1" 429 Too Many Requests\n'
+    )
+    assert harness._scan_log_for_429(multi_pod_log, since=since_ts) is None
+
+
+def test_record_unsettled_prepends_marked_infra_error_preserving_existing_errors(results_json: Any) -> None:
+    """When has_delivery is False, _record_unsettled prepends marked infra errors so scoring reads it at errors[0]."""
+    result = AgentResult(output="acknowledged", trajectory=[], errors=["agent reported no status for 3 turns running; still waiting on: t2"])
+    harness._record_unsettled(
+        result,
+        ["t1"],
+        {"t1": "blocked"},
+        {"t1": "running"},
+        has_delivery=False,
+        telemetry_corroborated=True,
+    )
+    assert len(result.errors) == 2
+    assert result.errors[0] == (
+        f"{harness.INFRA_FAILURE_MARKER}: delegated task t1 was reported blocked during wait but running at settle; nothing delivered"
+    )
+    assert result.errors[1] == "agent reported no status for 3 turns running; still waiting on: t2"
+    assert result.output == ""
+    assert result.metadata.get("infra_failure") == (
+        "delegated task t1 was reported blocked during wait but running at settle; nothing delivered"
+    )
+    assert result.metadata.get("platform_rate_limit_corroborated") is True
+    rep = _classify(results_json(result), "helm")
+    assert rep.outcome == "infra"
+
+
+def test_record_unsettled_with_absent_telemetry_records_notice_and_false_metadata(results_json: Any) -> None:
+    """When telemetry_corroborated is None, _record_unsettled includes notice and sets metadata False."""
+    result = AgentResult(output="acknowledged", trajectory=[], errors=[])
+    harness._record_unsettled(
+        result,
+        ["t1"],
+        {"t1": "blocked"},
+        {"t1": "running"},
+        has_delivery=False,
+        telemetry_corroborated=None,
+    )
+    assert len(result.errors) == 1
+    assert result.errors[0] == (
+        f"{harness.INFRA_FAILURE_MARKER}: delegated task t1 was reported blocked during wait but running at settle; nothing delivered (platform proxy log unavailable at settle; not corroborated)"
+    )
+    assert result.metadata.get("platform_rate_limit_corroborated") is False
+    rep = _classify(results_json(result), "helm")
+    assert rep.outcome == "infra"
+
+
+def test_record_unsettled_appends_unmarked_report_when_has_delivery() -> None:
+    """When has_delivery is True, _record_unsettled appends plain reports without marker."""
+    result = AgentResult(output="done", trajectory=[], errors=["prior warning line"])
+    harness._record_unsettled(
+        result,
+        ["t1"],
+        {"t1": "blocked"},
+        {"t1": "running"},
+        has_delivery=True,
+    )
+    assert result.errors == [
+        "prior warning line",
+        "delegated task t1 was reported blocked during wait but running at settle; nothing delivered",
+    ]
+
+
+def test_a_delegated_worker_status_turn_kanban_list_reported_blocked_is_infrastructure(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """When kanban_list reports a card blocked with rate limit, it is classified as infra even if final exec fails."""
+    _corroborate_429(tmp_path, monkeypatch)
+    stub_agent.turns = [
+        _create_turn(),
+        _turn(
+            *_call(
+                "kanban_list",
+                {},
+                {
+                    "tasks": [{"id": _TASK_ID, "status": "blocked", "block_kind": "transient"}],
+                },
+                "call_list",
+            ),
+            _text(f"Task {_TASK_ID} is blocked."),
+        ),
+    ]
+
+    reads = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {
+                        _TASK_ID: (
+                            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                            "HTTP 429 quota exhausted"
+                        )
+                    },
+                    "errors": {},
+                    "block_kinds": {_TASK_ID: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "rate_limit" in result.errors[0]
+    assert result.output == ""
+    assert len(result.trajectory) >= 1
+
+
+def test_a_triage_card_at_deadline_on_api_lane_records_ceiling_once(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """A card in triage reaching deadline timeout records the ceiling error exactly once."""
+    t1 = _TASK_ID
+    stub_agent.turns = [
+        # Turn 0: delegate t1 and show t1 in triage
+        _turn(
+            *_call("kanban_create", {"title": "task 1"}, {"ok": True, "task_id": t1, "status": "ready"}, "c1"),
+            *_call("kanban_show", {"task_id": t1}, {"task": {"id": t1, "status": "triage"}, "runs": []}, "s1"),
+            _text("Delegated, currently in triage."),
+        ),
+    ]
+
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            payload = {
+                "statuses": {t1: "triage"},
+                "summaries": {},
+                "errors": {},
+                "block_kinds": {t1: "transient"},
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0.01")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.01")
+
+    result = KubeAgentsHarness().run("Check cards.")
+
+    assert result.errors == [
+        f"{harness.DELEGATION_CEILING_MARKER}: delegated tasks did not finish within 0s: {t1} (triage)"
+    ]
+
+
+def test_a_triage_card_on_mute_agent_exit_does_not_record_unsettled_status_discrepancy(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """A card still in triage on a mute agent exit does not record a spurious unsettled status discrepancy."""
+    t1 = _TASK_ID
+    stub_agent.turns = [
+        # Turn 0: delegate t1 and show t1 in triage
+        _turn(
+            *_call("kanban_create", {"title": "task 1"}, {"ok": True, "task_id": t1, "status": "ready"}, "c1"),
+            *_call("kanban_show", {"task_id": t1}, {"task": {"id": t1, "status": "triage"}, "runs": []}, "s1"),
+            _text("Delegated, currently in triage."),
+        ),
+        _turn(_text("still investigating")),
+    ]
+
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx < 3:
+                return ""
+            payload = {
+                "statuses": {t1: "triage"},
+                "summaries": {},
+                "errors": {},
+                "block_kinds": {t1: "transient"},
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Check cards.")
+
+    assert any("reported no status for 3 turns running" in e for e in result.errors)
+    assert not any("but triage at settle" in e for e in result.errors)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+
+
+def test_a_429_blocked_card_unblocked_and_re_failed_for_own_fault_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """A card 429-blocked and retired, then unblocked and re-failed for its own fault, remains graded."""
+    _corroborate_429(tmp_path, monkeypatch)
+    t1 = _TASK_ID
+    t2 = _TASK_ID + "-2"
+    stub_agent.turns = [
+        # Turn 0: delegate t1 and t2
+        _turn(
+            *_call("kanban_create", {"title": "task 1"}, {"ok": True, "task_id": t1, "status": "ready"}, "c1"),
+            *_call("kanban_create", {"title": "task 2"}, {"ok": True, "task_id": t2, "status": "ready"}, "c2"),
+            _text("Delegated both."),
+        ),
+        # Turn 1: front agent shows t1 blocked on 429 -> t1 retires
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t1},
+                {
+                    "task": {"id": t1, "status": "blocked", "block_kind": "transient"},
+                    "runs": [{"summary": f"{harness._RATE_LIMIT_REASON_PREFIX}: 429 quota exhausted"}],
+                },
+                "s1",
+            ),
+            _text("t1 is blocked, waiting on t2."),
+        ),
+        # Turn 2: front agent shows t2 done
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t2},
+                {"task": {"id": t2, "status": "done", "result": "t2 finished"}, "runs": []},
+                "s2",
+            ),
+            _text("Finished."),
+        ),
+    ]
+
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {t1: "blocked", t2: "running"},
+                    "summaries": {t1: f"{harness._RATE_LIMIT_REASON_PREFIX}: 429 quota exhausted"},
+                    "errors": {},
+                    "block_kinds": {t1: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 1:
+                return ""
+            elif idx == 2:
+                payload = {
+                    "statuses": {t2: "running"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 3:
+                payload = {
+                    "statuses": {t2: "done"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx >= 4:
+                # Settle read: t1 re-failed for its own worker fault (not transient, not 429)
+                payload = {
+                    "statuses": {t1: "failed"},
+                    "summaries": {},
+                    "errors": {t1: "worker exit code 1: internal assertion error"},
+                    "block_kinds": {},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Check cards.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert "Finished." in result.output
+
+
+def test_status_turn_filed_and_blocked_card_seeds_fallback_store_and_marks_infra(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """A card filed and shown blocked in the same status turn joins awaited and seeds fallback store."""
+    _corroborate_429(tmp_path, monkeypatch)
+
+    t1 = _TASK_ID
+    t_new = _TASK_ID + "-new"
+    stub_agent.turns = [
+        # Turn 0: delegate t1
+        _turn(
+            *_call("kanban_create", {"title": "task 1"}, {"ok": True, "task_id": t1, "status": "ready"}, "c1"),
+            _text("Delegated initial task."),
+        ),
+        # Turn 1: status turn shows t1 running, but files t_new and shows t_new blocked on 429
+        _turn(
+            *_call("kanban_show", {"task_id": t1}, {"task": {"id": t1, "status": "running"}, "runs": []}, "s1"),
+            *_call("kanban_create", {"title": "followup task"}, {"ok": True, "task_id": t_new, "status": "ready"}, "c2"),
+            *_call(
+                "kanban_show",
+                {"task_id": t_new},
+                {
+                    "task": {"id": t_new, "status": "blocked", "block_kind": "transient"},
+                    "runs": [{"summary": f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=rate_limit): 429 quota exhausted"}],
+                },
+                "s2",
+            ),
+            _text("t1 running, but followup t_new blocked."),
+        ),
+    ]
+
+    # Every BOARD_PRESENT read fails (returns empty string), forcing settle to rely on fallback store
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "")
+
+    result = KubeAgentsHarness().run("Run pipeline.")
+
+    assert any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert "rate_limit" in result.errors[0]
+    assert result.output == ""
+
+
+def test_a_delegated_worker_rate_limit_on_board_early_settle_is_infrastructure(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """A worker rate limit on the board when the opening turn already reports failure marks infra without status turns."""
+    log_file = tmp_path / "litellm.log"
+    now_iso = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+    log_file.write_text(f'{now_iso} ERROR: VertexAIException - {{"error": {{"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}}}\n')
+    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+
+    stub_agent.turns = [
+        _turn(
+            *_call(
+                "kanban_create",
+                {"title": "subtask"},
+                {"ok": True, "task_id": _TASK_ID, "status": "ready"},
+                "c1",
+            ),
+            *_call(
+                "kanban_show",
+                {"task_id": _TASK_ID},
+                {"task": {"id": _TASK_ID, "status": "failed", "result": None}, "runs": []},
+                "c2",
+            ),
+            _text("Investigating."),
+        )
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {},
+                "errors": {
+                    _TASK_ID: (
+                        "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                        "HTTP 429 quota exhausted"
+                    )
+                },
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert len(stub_agent.requests) == 1
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert result.output == ""
+
+
+def test_a_delegated_worker_rate_limit_on_board_early_settle_refuses_when_telemetry_shows_only_prior_rep_429(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """When the opening turn early-settles a failed card, a LiteLLM log from a prior repetition is refused and stays graded."""
+    log_file = tmp_path / "litellm.log"
+    start_iso = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    end_iso = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+    log_file.write_text(
+        f"{start_iso} INFO: 200 OK GET /health\n"
+        f"{end_iso} INFO: 200 OK POST /v1/chat/completions\n"
+        '2026-10-18 10:00:00 ERROR: VertexAIException - {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}\n'
+    )
+    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+
+    stub_agent.turns = [
+        _turn(
+            *_call(
+                "kanban_create",
+                {"title": "subtask"},
+                {"ok": True, "task_id": _TASK_ID, "status": "ready"},
+                "c1",
+            ),
+            *_call(
+                "kanban_show",
+                {"task_id": _TASK_ID},
+                {"task": {"id": _TASK_ID, "status": "failed", "result": None}, "runs": []},
+                "c2",
+            ),
+            _text("Investigating."),
+        )
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {},
+                "errors": {
+                    _TASK_ID: (
+                        "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                        "HTTP 429 quota exhausted"
+                    )
+                },
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert len(stub_agent.requests) == 1
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any("platform proxy log showed no 429" in e for e in result.errors)
+
+
+def test_a_delegated_worker_rate_limit_on_board_early_settle_fallback_when_final_read_fails(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """When the opening turn reports a card failed with rate limit in runs and the final exec fails, it marks infra."""
+    log_file = tmp_path / "litellm.log"
+    now_iso = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+    log_file.write_text(f'{now_iso} ERROR: VertexAIException - {{"error": {{"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}}}\n')
+    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+
+    stub_agent.turns = [
+        _turn(
+            *_call(
+                "kanban_create",
+                {"title": "subtask"},
+                {"ok": True, "task_id": _TASK_ID, "status": "ready"},
+                "c1",
+            ),
+            *_call(
+                "kanban_show",
+                {"task_id": _TASK_ID},
+                {
+                    "task": {"id": _TASK_ID, "status": "failed", "result": None},
+                    "runs": [
+                        {
+                            "summary": (
+                                "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                                'HTTP 429 ... "TPM quota exhausted"'
+                            )
+                        }
+                    ],
+                },
+                "c2",
+            ),
+            _text("Investigating."),
+        )
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert len(stub_agent.requests) == 1
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert result.output == ""
+
+
+def test_a_delegated_worker_rate_limit_on_board_fallback_when_final_read_fails(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """When the final board read fails, fallback to poll failure summary marks infra."""
+    log_file = tmp_path / "litellm.log"
+    now_iso = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+    log_file.write_text(f'{now_iso} ERROR: VertexAIException - {{"error": {{"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}}}\n')
+    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("blocked", block_kind="transient"),
+    ]
+    reads = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {
+                        _TASK_ID: (
+                            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                            "HTTP 429 quota exhausted"
+                        )
+                    },
+                    "errors": {},
+                    "block_kinds": {_TASK_ID: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert result.output == ""
+
+
+def test_settle_on_answer_turn_records_worker_failure_without_infra_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _corroborate_429(tmp_path, monkeypatch)
+    res = AgentResult(
+        output="graded answer",
+        trajectory=[],
+        errors=[],
+        metadata={"final_message": "graded answer"},
+    )
+    harness.KubeAgentsHarness._settle(
+        res,
+        [],
+        ["t_1"],
+        board_messages=["provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"],
+        opening_turn=False,
+    )
+    assert res.output == "graded answer"
+    assert res.metadata.get("final_message") == "graded answer"
+    assert len(res.errors) == 1
+    assert harness.INFRA_FAILURE_MARKER not in res.errors[0]
+    assert "delegated worker failed (rate_limit)" in res.errors[0]
 
 
 def test_a_status_turn_502_recovers_through_a_fresh_tunnel(
@@ -3682,6 +6810,137 @@ def test_a_card_wake_answer_turn_502_with_rate_limit_is_an_agent_error_not_infra
     assert _archived(scripts)
 
 
+def test_a_card_wake_answer_turn_with_worker_rate_limit_preserves_wake_reply(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """A worker rate limit on an answer turn records the failure on errors while preserving the wake reply."""
+    _corroborate_429(tmp_path, monkeypatch)
+    scripts: list[str] = []
+    base_shell = _replay_shell(scripts)
+
+    def shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {},
+                "errors": {
+                    _TASK_ID: (
+                        "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429 quota exhausted"
+                    )
+                },
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}"
+        return base_shell(script, timeout)
+
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    stub_agent.turns = [
+        _turn(_text(_FINAL_TEXT)),
+        _create_turn(),
+        _show_turn("failed"),
+    ]
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert any("delegated worker failed (rate_limit)" in err for err in result.errors)
+    assert result.output == _FINAL_TEXT
+    assert _archived(scripts)
+
+
+def test_card_wake_answer_turn_with_unsettled_card_preserves_wake_reply_without_ceiling_marker(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, tmp_path: Path
+) -> None:
+    """An unsettled card on a card-wake answer turn (opening_turn=False) does not record delegation ceiling marker."""
+    _corroborate_429(tmp_path, monkeypatch)
+    scripts: list[str] = []
+    base_shell = _replay_shell(scripts)
+
+    reads: list[str] = []
+
+    def shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx < 2:
+                payload = {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {
+                        _TASK_ID: f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=rate_limit): 429 quota exhausted"
+                    },
+                    "errors": {},
+                    "block_kinds": {_TASK_ID: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}"
+            else:
+                # Settle read: card was unblocked to running with nothing delivered
+                payload = {
+                    "statuses": {_TASK_ID: "running"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {_TASK_ID: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}"
+            return ""
+        return base_shell(script, timeout)
+
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    stub_agent.turns = [
+        _turn(_text(_FINAL_TEXT)),
+        _create_turn(),
+        _show_turn("blocked", block_kind="transient"),
+    ]
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert result.has_errors()
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any(f"delegated task {_TASK_ID} was reported blocked during wait but running at settle; nothing delivered" in e for e in result.errors)
+    assert result.output == _FINAL_TEXT
+    assert _archived(scripts)
+
+
+def test_card_wake_answer_turn_timing_out_preserves_wake_reply_without_ceiling_marker(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    """A card-wake answer turn (opening_turn=False) timing out does not record delegation ceiling marker."""
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0.05")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.03")
+    scripts: list[str] = []
+    base_shell = _replay_shell(scripts)
+
+    def shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "running"},
+                "summaries": {},
+                "errors": {},
+                "block_kinds": {},
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}"
+        return base_shell(script, timeout)
+
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    stub_agent.turns = [
+        _turn(_text(_FINAL_TEXT)),
+        _create_turn(),
+        _show_turn("running"),
+    ]
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert result.has_errors()
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any("did not finish within" in e for e in result.errors)
+    assert result.output == _FINAL_TEXT
+    assert _archived(scripts)
+
+
 def test_a_fresh_session_replay_answer_turn_500_is_an_agent_error_not_infra(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
 ) -> None:
@@ -3946,3 +7205,232 @@ def test_a_fresh_session_replay_whose_context_failed_in_the_image_sends_no_answe
     assert not result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
     assert len(stub_agent.requests) == 1
     assert _archived(scripts)
+
+
+def test_corroborate_platform_rate_limit_with_live_content_does_not_persist_to_artifacts_litellm_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live proxy log fetched at settle is scanned in-memory and not persisted to $ARTIFACTS/litellm.log."""
+    monkeypatch.setenv("ARTIFACTS", str(tmp_path))
+    since = datetime(2026, 10, 19, 23, 0, 0, tzinfo=timezone.utc).timestamp()
+    live_log = (
+        "2026-10-19 23:00:00 INFO: GET /health 200\n"
+        "2026-10-19 23:05:00 - RateLimitError: 429 RESOURCE_EXHAUSTED\n"
+    )
+    monkeypatch.setattr(harness, "_fetch_live_litellm_log", lambda *args, **kwargs: live_log)
+
+    result = harness._corroborate_platform_rate_limit(since=since)
+    assert result is True
+    # Crucially, the live log must NOT be written to $ARTIFACTS/litellm.log to avoid shadowing parallel units.
+    assert not (tmp_path / "litellm.log").exists()
+
+
+def test_time_only_log_line_across_midnight_corroborates_true(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A time-only 429 log line 2.5 hours after start across midnight UTC dates to tomorrow and corroborates True."""
+    since = datetime(2026, 10, 19, 23, 0, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(harness.time, "time", lambda: since + 3 * 3600)
+    log = (
+        "23:00:00 INFO: 200 OK GET /health\n"
+        "01:30:00 - RateLimitError: 429 RESOURCE_EXHAUSTED\n"
+    )
+    assert harness._scan_log_content_for_429(log, since=since) is True
+
+
+def test_time_only_log_line_four_hours_after_since_on_same_day_corroborates_true(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A time-only 429 log line 4.5 hours after start on the same calendar day dates to today and corroborates True."""
+    since = datetime(2026, 10, 19, 10, 0, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(harness.time, "time", lambda: since + 5 * 3600)
+    log = (
+        "10:00:00 INFO: 200 OK GET /health\n"
+        "14:30:00 - RateLimitError: 429 RESOURCE_EXHAUSTED\n"
+    )
+    assert harness._scan_log_content_for_429(log, since=since) is True
+
+
+def test_time_only_log_line_before_since_on_same_day_does_not_roll_into_tomorrow() -> None:
+    """A time-only line from 10:00 AM when repetition starts at 23:00 PM dates to same day, not next morning."""
+    since = datetime(2026, 10, 19, 23, 0, 0, tzinfo=timezone.utc).timestamp()
+    ts = harness._parse_log_line_timestamp("10:00:00 INFO: GET /health", since=since)
+    assert ts is not None
+    parsed_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    assert parsed_dt == datetime(2026, 10, 19, 10, 0, 0, tzinfo=timezone.utc)
+
+
+def test_multi_replica_time_only_log_line_out_of_order_tails_corroborates_true(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When kubectl logs prints a quiet replica last whose tail timestamp is earlier than another replica's 429, the 429 is not misdated to yesterday."""
+    since = datetime(2026, 10, 19, 10, 0, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(harness.time, "time", lambda: since + 3600)
+    log = (
+        "[pod/litellm-replica-a] 10:00:00 INFO: 200 OK GET /health\n"
+        "[pod/litellm-replica-a] 10:05:00 - RateLimitError: 429 RESOURCE_EXHAUSTED\n"
+        "[pod/litellm-replica-b] 10:00:00 INFO: 200 OK GET /health\n"
+        "[pod/litellm-replica-b] 10:04:00 INFO: 200 OK GET /health\n"
+    )
+    assert harness._scan_log_content_for_429(log, since=since) is True
+
+
+def test_fetch_live_litellm_log_command_and_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_fetch_live_litellm_log issues kubectl logs with named constants, ignore-errors, env overrides, and context."""
+    executed_cmd = []
+
+    def _mock_run(cmd, capture_output, text, errors, timeout, check):
+        executed_cmd.extend(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="test-log-output\n")
+
+    monkeypatch.setattr(subprocess, "run", _mock_run)
+    monkeypatch.setattr(harness, "_fetch_live_litellm_log", harness._fetch_live_litellm_log_impl)
+    monkeypatch.setenv("AGENT_NAMESPACE", "custom-ns")
+    monkeypatch.setenv("AGENT_CLUSTER_CONTEXT", "custom-ctx")
+    monkeypatch.setenv("LITELLM_LOG_POD_SELECTOR", "custom-selector")
+    monkeypatch.setenv("LITELLM_LOG_CONTAINER", "custom-container")
+    monkeypatch.setenv("LITELLM_LOG_TAIL_LINES", "12345")
+
+    output = harness._fetch_live_litellm_log()
+    assert output == "test-log-output\n"
+    assert executed_cmd == [
+        "kubectl",
+        "logs",
+        "-l",
+        "custom-selector",
+        "-c",
+        "custom-container",
+        "-n",
+        "custom-ns",
+        "--prefix",
+        "--timestamps",
+        "--ignore-errors",
+        "--tail=12345",
+        "--context",
+        "custom-ctx",
+    ]
+
+
+def test_undated_429_following_pre_window_stamp_in_same_pod_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An undated 429 line bracketed by pre-window and in-window timestamps in the same pod returns None."""
+    since = datetime(2026, 10, 19, 9, 30, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(harness.time, "time", lambda: since + 3600)
+    log = (
+        "[pod/litellm-0] 09:00:00 - LiteLLM Proxy:INFO starting\n"
+        '[pod/litellm-0] INFO: 10.0.0.1:50000 - "POST /chat/completions HTTP/1.1" 429 Too Many Requests\n'
+        "[pod/litellm-0] 09:40:00 - LiteLLM Proxy:INFO traffic\n"
+    )
+    assert harness._scan_log_content_for_429(log, since=since) is None
+
+
+def test_undated_429_with_ipv6_client_in_same_pod_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An undated 429 access line with IPv6 client address is not misdated by client address octets."""
+    since = datetime(2026, 10, 19, 9, 30, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(harness.time, "time", lambda: since + 3600)
+    log = (
+        "[pod/litellm-0] 09:00:00 - LiteLLM Proxy:INFO starting\n"
+        '[pod/litellm-0] INFO:     fd00::10:20:30:54706 - "POST /chat/completions HTTP/1.1" 429 Too Many Requests\n'
+        "[pod/litellm-0] 09:40:00 - LiteLLM Proxy:INFO traffic\n"
+    )
+    assert harness._scan_log_content_for_429(log, since=since) is None
+
+
+def test_telemetry_window_evaluated_per_pod_clipped_pod_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When one replica's tail is clipped (starts after since), scan returns None even if a quiet replica reaches pre-since."""
+    since = datetime(2026, 10, 19, 10, 0, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(harness.time, "time", lambda: since + 3600)
+    log = (
+        "[pod/litellm-replica-a] 09:00:00 INFO: 200 OK GET /health\n"
+        "[pod/litellm-replica-b] 10:30:00 INFO: 200 OK POST /v1/chat/completions\n"
+        "[pod/litellm-replica-b] 10:45:00 INFO: 200 OK POST /v1/chat/completions\n"
+    )
+    assert harness._scan_log_content_for_429(log, since=since) is None
+
+
+def test_quiet_replica_pre_since_tail_does_not_inflate_wall_clock_or_accept_prior_day_429(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A quiet replica whose tail is before since does not inflate log_until to tomorrow and admit yesterday's 429."""
+    since = datetime(2026, 10, 19, 10, 0, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(harness.time, "time", lambda: since + 3600)
+    log = (
+        "[pod/litellm-replica-a] 15:00:00 - RateLimitError: 429 RESOURCE_EXHAUSTED\n"
+        "[pod/litellm-replica-a] 10:20:00 INFO: 200 OK GET /health\n"
+        "[pod/litellm-replica-b] 09:50:00 INFO: 200 OK GET /health\n"
+    )
+    assert harness._scan_log_content_for_429(log, since=since) is False
+
+
+def test_intra_pod_ordering_guard_reparses_prior_day_line_exceeding_following_stamp(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When a pod's log line has a timestamp exceeding the following line's timestamp by >5s, it is re-parsed as prior day."""
+    since = datetime(2026, 10, 19, 10, 0, 0, tzinfo=timezone.utc).timestamp()
+    monkeypatch.setattr(harness.time, "time", lambda: since + 2 * 3600)
+    # Replica litellm-1 has a later tail (11:30) and a pre-since line (09:50), lifting until to 11:30.
+    # Without the guard, line 0 of litellm-0 (11:00) parses as today 11:00 (within until), corroborating True.
+    # Line 1 of litellm-0 is today 10:20. Line 0 jumps forward past line 1, violating intra-pod monotonicity.
+    # The intra-pod ordering guard re-parses line 0 with until=10:20, dating it to yesterday.
+    log = (
+        "[pod/litellm-0] 11:00:00 - RateLimitError: 429 RESOURCE_EXHAUSTED\n"
+        "[pod/litellm-0] 10:20:00 INFO: 200 OK GET /health\n"
+        "[pod/litellm-1] 09:50:00 INFO: 200 OK GET /health\n"
+        "[pod/litellm-1] 11:30:00 INFO: 200 OK GET /health\n"
+    )
+    # Since line 0 is dated to yesterday (before since), it does not corroborate True.
+    assert harness._scan_log_content_for_429(log, since=since) is not True
+
+
+def test_telemetry_corroboration_cached_when_result_is_none_and_not_refetched_in_settle(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When _corroborate_platform_rate_limit returns None, it is fetched once across candidates and passed to _settle."""
+    fetch_calls: list[float | None] = []
+
+    def _mock_corroborate(since=None, session_id=None, until=None):
+        fetch_calls.append(since)
+        return None
+
+    monkeypatch.setattr(harness, "_corroborate_platform_rate_limit", _mock_corroborate)
+
+    _TASK_A = "task-a"
+    _TASK_B = "task-b"
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx < 2:
+                payload = {
+                    "statuses": {_TASK_A: "blocked", _TASK_B: "blocked"},
+                    "summaries": {},
+                    "errors": {
+                        _TASK_A: "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429",
+                        _TASK_B: "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429",
+                    },
+                    "block_kinds": {_TASK_A: "transient", _TASK_B: "transient"},
+                    "error": None,
+                }
+            else:
+                # Settle read: Task A was unblocked to running, while Task B remains blocked.
+                payload = {
+                    "statuses": {_TASK_A: "running", _TASK_B: "blocked"},
+                    "summaries": {},
+                    "errors": {
+                        _TASK_B: "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429",
+                    },
+                    "block_kinds": {_TASK_A: "transient", _TASK_B: "transient"},
+                    "error": None,
+                }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    stub_agent.turns = [
+        _turn(
+            *_call("kanban_create", {"title": "Task A"}, {"ok": True, "task_id": _TASK_A, "status": "ready"}, "call_c1"),
+            *_call("kanban_create", {"title": "Task B"}, {"ok": True, "task_id": _TASK_B, "status": "ready"}, "call_c2"),
+            _text("Filed both tasks."),
+        ),
+        _show_turn("blocked", task_id=_TASK_A, call_id="call_s1"),
+        _show_turn("blocked", task_id=_TASK_B, call_id="call_s2"),
+    ]
+
+    result = KubeAgentsHarness().run("Do both tasks.")
+    assert result.has_errors()
+    # Exactly one telemetry fetch should have occurred across both cards and settle
+    assert len(fetch_calls) == 1
+
+

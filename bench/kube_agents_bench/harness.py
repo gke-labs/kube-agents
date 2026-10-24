@@ -145,9 +145,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -159,6 +160,7 @@ from kube_agents_bench import board, card_wake, gitops, transcript, worker_traje
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     STATUS_TOOL,
+    _json_object,
     delegated_task_ids,
     delivered_results,
     merge_new,
@@ -635,6 +637,388 @@ _OPENER = urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({
 _SESSION_ID_HEADER = "X-Hermes-Session-Id"
 _FAILURE_REASON_HEADER = "X-Hermes-Failure-Reason"
 _INFRA_FAILURE_REASONS = frozenset({"rate_limit", "billing"})
+_FAILURE_STATUSES = frozenset({"blocked", "triage", "failed"})
+_RATE_LIMIT_REASON_PREFIX = "provider rate limit: API retries exhausted"
+_FAILURE_REASON_PATTERN = re.compile(r"\bfailure_reason=([a-zA-Z0-9_]+)\b")
+_LITELLM_429_PATTERN = re.compile(
+    r'(?:"(?:code|status)":\s*"?429"?\b|status_code=429\b|HTTP/\d\.\d"\s+429\b|\bRESOURCE_EXHAUSTED\b|\bRateLimitError\b)',
+    re.IGNORECASE,
+)
+_LITELLM_TRAFFIC_PATTERN = re.compile(
+    r'(?:HTTP/\d\.\d|\b(?:POST|GET|PUT|DELETE)\s+/\S*|status_code=\d{3}\b|"(?:code|status)":\s*"?\d{3}"?|\bRESOURCE_EXHAUSTED\b|\bRateLimitError\b)',
+    re.IGNORECASE,
+)
+_LOG_TIMESTAMP_PATTERN = re.compile(
+    r"\b(?P<ts>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\b"
+)
+_LOG_TIME_ONLY_PATTERN = re.compile(
+    r"^\s*(?:\[[^\]]+\]\s*)?(?:[A-Za-z]+:\s+)?(?P<time>\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)(?![:\w])"
+)
+_POD_PREFIX_PATTERN = re.compile(r"^\[(?P<pod>pod/[^\]]+)\]")
+_ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+_LITELLM_NAMESPACE_DEFAULT = "kubeagents-system"
+_LITELLM_LABEL_SELECTOR = "app=litellm"
+_LITELLM_CONTAINER_NAME = "litellm-container"
+_LITELLM_LOG_TAIL_LINES = 20000
+_LITELLM_LOG_FETCH_TIMEOUT = 15.0
+_TELEMETRY_UNSET = object()
+
+
+def _find_log_until(content: str, since: float | None) -> float | None:
+    """Determine the effective upper bound of time observed in the log content."""
+    if since is None:
+        return None
+    since_dt = datetime.fromtimestamp(since, tz=timezone.utc)
+    pod_tails: dict[str | None, float] = {}
+    for line in reversed(content.splitlines()):
+        clean = _ANSI_ESCAPE_PATTERN.sub("", line)
+        m_pod = _POD_PREFIX_PATTERN.match(clean)
+        pod_key = m_pod.group("pod") if m_pod else None
+        if pod_key in pod_tails:
+            continue
+        dt_match = _LOG_TIMESTAMP_PATTERN.search(clean)
+        if dt_match:
+            try:
+                iso_str = dt_match.group("ts").replace(" ", "T").replace(",", ".")
+                if not iso_str.endswith("Z") and "+" not in iso_str and "-" not in iso_str[10:]:
+                    iso_str += "Z"
+                pod_tails[pod_key] = datetime.fromisoformat(iso_str.replace("Z", "+00:00")).timestamp() + 5.0
+                continue
+            except ValueError:
+                pass
+        t_match = _LOG_TIME_ONLY_PATTERN.search(clean)
+        if t_match:
+            try:
+                time_str = t_match.group("time").replace(",", ".")
+                parts = time_str.split(":")
+                hour, minute = int(parts[0]), int(parts[1])
+                sec = float(parts[2])
+                cand_same = since_dt.replace(
+                    hour=hour,
+                    minute=minute,
+                    second=int(sec),
+                    microsecond=int((sec % 1) * 1e6),
+                )
+                if cand_same.timestamp() < since - 5.0:
+                    cand_next = cand_same + timedelta(days=1)
+                    if abs(time.time() - since) < 24 * 3600:
+                        if cand_next.timestamp() <= time.time() + 5.0:
+                            pod_tails[pod_key] = cand_next.timestamp() + 5.0
+                        else:
+                            pod_tails[pod_key] = cand_same.timestamp() + 5.0
+                    else:
+                        if cand_next.timestamp() - since <= 6 * 3600:
+                            pod_tails[pod_key] = cand_next.timestamp() + 5.0
+                        else:
+                            pod_tails[pod_key] = cand_same.timestamp() + 5.0
+                else:
+                    pod_tails[pod_key] = cand_same.timestamp() + 5.0
+                continue
+            except ValueError:
+                pass
+    if pod_tails:
+        return max(pod_tails.values())
+    return None
+
+
+def _parse_log_line_timestamp(
+    line: str,
+    since: float | None = None,
+    until: float | None = None,
+) -> float | None:
+    """Extract and parse timestamp from a log line into unix epoch seconds."""
+    clean = _ANSI_ESCAPE_PATTERN.sub("", line)
+    match = _LOG_TIMESTAMP_PATTERN.search(clean)
+    if match:
+        try:
+            iso_str = match.group("ts").replace(" ", "T").replace(",", ".")
+            dt = datetime.fromisoformat(iso_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except ValueError:
+            pass
+    if since is not None:
+        t_match = _LOG_TIME_ONLY_PATTERN.search(clean)
+        if t_match:
+            try:
+                since_dt = datetime.fromtimestamp(since, tz=timezone.utc)
+                time_str = t_match.group("time").replace(",", ".")
+                parts = time_str.split(":")
+                hour, minute = int(parts[0]), int(parts[1])
+                sec = float(parts[2])
+                cand_same = since_dt.replace(
+                    hour=hour,
+                    minute=minute,
+                    second=int(sec),
+                    microsecond=int((sec % 1) * 1e6),
+                )
+                cand_prev = cand_same - timedelta(days=1)
+                cand_next = cand_same + timedelta(days=1)
+
+                candidates = [cand_prev, cand_same, cand_next]
+                wall_limit = (until if until is not None else time.time()) + 5.0
+
+                valid: list[tuple[float, float]] = []
+                for c in candidates:
+                    ts = c.timestamp()
+                    if ts > wall_limit:
+                        continue
+                    if ts - since > 6 * 3600:
+                        continue
+                    valid.append((abs(ts - since), ts))
+
+                if valid:
+                    valid.sort(key=lambda item: item[0])
+                    return valid[0][1]
+                return cand_same.timestamp()
+            except ValueError:
+                pass
+    return None
+
+
+def _scan_log_content_for_429(
+    content: str,
+    since: float | None = None,
+    session_id: str | None = None,
+    until: float | None = None,
+) -> bool | None:
+    if (
+        not content.strip()
+        or content.startswith("note: no LiteLLM log for this run")
+        or not _LITELLM_TRAFFIC_PATTERN.search(content)
+    ):
+        return None
+
+    if since is None and not session_id:
+        return bool(_LITELLM_429_PATTERN.search(content))
+
+    if until is None and since is not None:
+        log_until = _find_log_until(content, since)
+        if abs(time.time() - since) < 24 * 3600:
+            if log_until is not None:
+                until = min(time.time() + 5.0, log_until)
+            else:
+                until = time.time() + 5.0
+        else:
+            until = log_until
+
+    # Group lines by pod stream to maintain replica isolation
+    lines_by_pod: dict[str | None, list[str]] = {}
+    current_pod: str | None = None
+    for raw_line in content.splitlines():
+        line = _ANSI_ESCAPE_PATTERN.sub("", raw_line)
+        m_pod = _POD_PREFIX_PATTERN.match(line)
+        if m_pod:
+            current_pod = m_pod.group("pod")
+        lines_by_pod.setdefault(current_pod, []).append(line)
+
+    has_undated_429 = False
+    traffic_pods: list[str | None] = []
+    pod_min_ts: dict[str | None, float | None] = {}
+    pod_max_ts: dict[str | None, float | None] = {}
+
+    for pod, lines in lines_by_pod.items():
+        pod_has_traffic = any(_LITELLM_TRAFFIC_PATTERN.search(l) for l in lines)
+        if pod_has_traffic:
+            traffic_pods.append(pod)
+
+        # Parse explicit timestamps for all lines in this pod
+        parsed_ts: list[float | None] = [
+            _parse_log_line_timestamp(l, since=since, until=until) for l in lines
+        ]
+
+        valid_ts = [t for t in parsed_ts if t is not None]
+        if valid_ts:
+            pod_min_ts[pod] = min(valid_ts)
+            pod_max_ts[pod] = max(valid_ts)
+        else:
+            pod_min_ts[pod] = None
+            pod_max_ts[pod] = None
+
+        # Build prefix and suffix timestamp lookups for bracket bounding
+        n = len(lines)
+        prev_ts: list[float | None] = [None] * n
+        last_t: float | None = None
+        for i in range(n):
+            if parsed_ts[i] is not None:
+                last_t = parsed_ts[i]
+            prev_ts[i] = last_t
+
+        next_ts: list[float | None] = [None] * n
+        next_t: float | None = None
+        for i in range(n - 1, -1, -1):
+            next_ts[i] = next_t
+            if parsed_ts[i] is not None:
+                next_t = parsed_ts[i]
+
+        for i in range(n - 1, -1, -1):
+            p_t = parsed_ts[i]
+            n_t = next_ts[i]
+            if p_t is not None and n_t is not None and p_t > n_t + 5.0:
+                re_ts = _parse_log_line_timestamp(lines[i], since=since, until=n_t)
+                if re_ts is not None:
+                    parsed_ts[i] = re_ts
+                    if i > 0:
+                        next_ts[i - 1] = re_ts
+
+        for i, line in enumerate(lines):
+            if not _LITELLM_429_PATTERN.search(line):
+                continue
+
+            if session_id and session_id in line:
+                return True
+
+            line_ts = parsed_ts[i]
+            if line_ts is not None:
+                if since is not None:
+                    if line_ts >= (since - 5.0):
+                        return True
+                else:
+                    return True
+            else:
+                # Undated 429 line
+                if since is not None:
+                    p_ts = prev_ts[i]
+                    n_ts = next_ts[i]
+                    if p_ts is not None and p_ts >= (since - 5.0):
+                        return True
+                    elif n_ts is not None and n_ts < (since - 5.0):
+                        pass
+                    else:
+                        has_undated_429 = True
+                else:
+                    has_undated_429 = True
+
+    if since is not None:
+        if has_undated_429:
+            return None
+        if not traffic_pods:
+            return None
+        for p in traffic_pods:
+            p_min = pod_min_ts.get(p)
+            if p_min is None or p_min > since:
+                return None
+        if not any((p_max := pod_max_ts.get(p)) is not None and p_max >= (since - 5.0) for p in traffic_pods):
+            return None
+        return False
+
+    if has_undated_429:
+        return None
+    if not _LITELLM_429_PATTERN.search(content):
+        return False
+    return None
+
+
+def _scan_log_for_429(
+    path: Path,
+    since: float | None = None,
+    session_id: str | None = None,
+    until: float | None = None,
+) -> bool | None:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+            return _scan_log_content_for_429(content, since=since, session_id=session_id, until=until)
+    except OSError:
+        return None
+
+
+def _extract_infra_failure_reason(text: str | None) -> str | None:
+    """Extract an infrastructure failure reason if text opens with the hermes failure prefix."""
+    if not text:
+        return None
+    text = text.strip()
+    if text.startswith(_RATE_LIMIT_REASON_PREFIX):
+        match = _FAILURE_REASON_PATTERN.search(text)
+        if match:
+            return match.group(1) if match.group(1) == "rate_limit" else None
+        return "rate_limit"
+    return None
+
+
+def _fetch_live_litellm_log_impl(timeout: float = _LITELLM_LOG_FETCH_TIMEOUT) -> str | None:
+    ns = os.environ.get("AGENT_NAMESPACE", _LITELLM_NAMESPACE_DEFAULT)
+    label_selector = os.environ.get("LITELLM_LOG_POD_SELECTOR", _LITELLM_LABEL_SELECTOR)
+    container = os.environ.get("LITELLM_LOG_CONTAINER", _LITELLM_CONTAINER_NAME)
+    try:
+        tail_lines = int(os.environ.get("LITELLM_LOG_TAIL_LINES", str(_LITELLM_LOG_TAIL_LINES)))
+    except ValueError:
+        tail_lines = _LITELLM_LOG_TAIL_LINES
+    cmd = [
+        "kubectl",
+        "logs",
+        "-l",
+        label_selector,
+        "-c",
+        container,
+        "-n",
+        ns,
+        "--prefix",
+        "--timestamps",
+        "--ignore-errors",
+        f"--tail={tail_lines}",
+    ]
+    context = os.environ.get("AGENT_CLUSTER_CONTEXT")
+    if context:
+        cmd.extend(["--context", context])
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+_fetch_live_litellm_log = _fetch_live_litellm_log_impl
+
+
+def _corroborate_platform_rate_limit(
+    since: float | None = None,
+    session_id: str | None = None,
+    until: float | None = None,
+) -> bool | None:
+    """Verify provider quota exhaustion against platform inference gateway (LiteLLM) log if available.
+
+    Returns:
+        True: Telemetry log was read and confirmed a 429 status code or RESOURCE_EXHAUSTED event tied to this rep.
+        False: Telemetry log was read and showed no 429 event for this rep (refusing infra classification).
+        None: Telemetry log was unreadable, placeholder, or unavailable at settle time (telemetry not pre-collected).
+    """
+    path = os.environ.get("LITELLM_LOG_PATH")
+    if path:
+        p = Path(path)
+        if not p.is_file():
+            return None
+        return _scan_log_for_429(p, since=since, session_id=session_id, until=until)
+
+    live_content = _fetch_live_litellm_log()
+    if live_content:
+        return _scan_log_content_for_429(live_content, since=since, session_id=session_id, until=until)
+
+    artifacts = os.environ.get(_ARTIFACTS_ENV)
+    if artifacts:
+        art_path = Path(artifacts) / "litellm.log"
+        if art_path.is_file():
+            return _scan_log_for_429(art_path, since=since, session_id=session_id, until=until)
+
+    return None
+
+
+def _mark_result_infra_failure(result: AgentResult, detail: str) -> None:
+    """Convert an AgentResult in-place into an infrastructure failure."""
+    result.output = ""
+    result.errors = [f"{INFRA_FAILURE_MARKER}: {detail}", *result.errors]
+    result.metadata.pop("final_message", None)
+    result.metadata["infra_failure"] = detail
 
 # The session lookup only refines accounting, so it never inherits the agent's
 # (minutes-long) budget: a hung route would be billed as the agent's latency.
@@ -1279,6 +1663,21 @@ def _pending_first(task_ids: list[str], statuses: dict[str, str]) -> list[str]:
     return pending + [t for t in task_ids if t not in set(pending)]
 
 
+def _has_successful_delivery(
+    observed: list[dict[str, Any]],
+    task_ids: Sequence[str],
+) -> bool:
+    """Return whether any of the task_ids has a successful delivery in observed.
+
+    Filters out cards reported in _FAILURE_STATUSES or carrying an infra failure reason.
+    """
+    reported = reported_statuses(observed)
+    return any(
+        reported.get(tid) not in _FAILURE_STATUSES and not _extract_infra_failure_reason(text)
+        for tid, text in delivered_results(observed, list(task_ids)).items()
+    )
+
+
 def _record_ceiling(
     result: AgentResult,
     observed: list[dict[str, Any]],
@@ -1286,6 +1685,8 @@ def _record_ceiling(
     outstanding: list[str],
     statuses: dict[str, str],
     delegation_timeout: float,
+    *,
+    opening_turn: bool = True,
 ) -> None:
     """Record that ``outstanding`` cards outran the delegation budget.
 
@@ -1293,7 +1694,9 @@ def _record_ceiling(
     marker routes it to its own class in the scorer rather than a graded
     failure of the agent under test. A partial delivery keeps the plain report
     and grades on what arrived. Both delegation waits end their deadline path
-    here, so the two transports cannot drift on what the scorer reads.
+    here, so the two transports cannot drift on what the scorer reads. (A failure
+    card unblocked to non-terminal at settle is recorded by ``_record_unsettled``
+    under ``INFRA_FAILURE_MARKER`` instead, not under this marker.)
     """
     if not outstanding:
         return
@@ -1302,9 +1705,41 @@ def _record_ceiling(
         f"{delegation_timeout:.0f}s: "
         + ", ".join(f"{t} ({statuses.get(t, 'unknown')})" for t in outstanding)
     )
-    if not delivered_results(observed, awaited):
+    if not delivered_results(observed, awaited) and opening_turn:
         report = f"{DELEGATION_CEILING_MARKER}: {report}"
     result.errors.append(report)
+
+
+def _record_unsettled(
+    result: AgentResult,
+    unsettled: Sequence[str],
+    last_statuses: Mapping[str, str],
+    live_statuses: Mapping[str, str],
+    *,
+    has_delivery: bool = False,
+    opening_turn: bool = True,
+    telemetry_corroborated: bool | None = None,
+) -> None:
+    """Record that failure cards unblocked to non-terminal at settle delivered no result."""
+    marked: list[str] = []
+    plain: list[str] = []
+    for t in unsettled:
+        last = last_statuses.get(t, "unknown")
+        live = live_statuses.get(t, "unknown")
+        report = (
+            f"delegated task {t} was reported {last} during wait but {live} at settle; nothing delivered"
+        )
+        if not has_delivery and opening_turn:
+            if telemetry_corroborated is None:
+                report += " (platform proxy log unavailable at settle; not corroborated)"
+            marked.append(report)
+        else:
+            plain.append(report)
+    if marked:
+        _mark_result_infra_failure(result, "; ".join(marked))
+        result.metadata["platform_rate_limit_corroborated"] = (telemetry_corroborated is True)
+    if plain:
+        result.errors.extend(plain)
 
 
 def _fold_status_turn(base: AgentResult, turn: AgentResult, *, settled: bool) -> None:
@@ -1879,11 +2314,12 @@ class KubeAgentsHarness(AgentHarness):
         # for the evidence it will not happen; the outcome is recorded in
         # metadata["gitops"] and, in the pilot, not scored. Never fatal: a poll
         # failure must not turn a finished agent run into a crashed one.
-        try:
-            gitops.await_fix_cycle(result, since=getattr(self, "_run_started_at", None))
-        except Exception as exc:  # noqa: BLE001 - recorded, never raised past here
-            _log.error("gitops wait failed: %s", exc)
-            result.metadata.setdefault("gitops", {})["error"] = str(exc)
+        if not result.metadata.get("infra_failure"):
+            try:
+                gitops.await_fix_cycle(result, since=getattr(self, "_run_started_at", None))
+            except Exception as exc:  # noqa: BLE001 - recorded, never raised past here
+                _log.error("gitops wait failed: %s", exc)
+                result.metadata.setdefault("gitops", {})["error"] = str(exc)
 
         # One lookup, after the last turn: the session row is cumulative over
         # the conversation, so it supersedes the summed envelopes outright.
@@ -2524,6 +2960,172 @@ class KubeAgentsHarness(AgentHarness):
                 return _infra_failure(str(exc))
         return result
 
+    @staticmethod
+    def _extract_board_card_messages(
+        bstate: tuple[dict[str, str], dict[str, str], dict[str, str], dict[str, str]]
+        | tuple[dict[str, str], dict[str, str], dict[str, str]],
+        task_id: str,
+    ) -> list[str]:
+        """Summary and error strings for ``task_id`` if the board shows it in a failure status."""
+        bstatuses, bsummaries, berrors = bstate[:3]
+        bblock_kinds = bstate[3] if len(bstate) > 3 else {}
+        msgs: list[str] = []
+        status = bstatuses.get(task_id)
+        if status in _FAILURE_STATUSES:
+            # A card a block landed in ``blocked`` (or, on the loop breaker's second
+            # block, ``triage``) must carry block_kind == "transient" to be recognized
+            # as an infra candidate. Note that while Hermes's patched 429 exit stamps
+            # RATE_LIMIT_BLOCK_KIND ("transient"), upstream's kanban_block tool also
+            # accepts "transient" outside goal mode (hermes_cli/kanban_db.py:93).
+            # Non-transient blocks (e.g. worker-authored needs_input or capability per
+            # SOUL.md §0) are excluded here, and transient board messages are checked
+            # against platform inference gateway telemetry in _settle when available.
+            if status in ("blocked", "triage") and bblock_kinds.get(task_id) != "transient":
+                return []
+            if task_id in bsummaries:
+                msgs.append(bsummaries[task_id])
+            if task_id in berrors:
+                msgs.append(berrors[task_id])
+        return msgs
+
+    @staticmethod
+    def _extract_trajectory_failure_summaries(
+        trajectory: Iterable[dict[str, Any]],
+        task_ids: Iterable[str],
+        store: dict[str, list[str]] | None = None,
+    ) -> dict[str, list[str]]:
+        """Scan tool calls in a trajectory for rate-limit summaries of failure cards.
+
+        When store is provided, updates or evicts matching task entries in-place.
+        """
+        wanted = set(str(t) for t in task_ids)
+        if not wanted:
+            return store if store is not None else {}
+        found: dict[str, list[str]] = store if store is not None else {}
+        for entry in trajectory:
+            payload = _json_object(entry.get("result"))
+            if not payload:
+                continue
+            shown = payload.get("task")
+            if isinstance(shown, dict):
+                tid = str(shown.get("id"))
+                if tid in wanted:
+                    status = shown.get("status")
+                    if (
+                        status in ("blocked", "triage")
+                        and shown.get("block_kind") != "transient"
+                    ):
+                        found.pop(tid, None)
+                        continue
+                    runs = payload.get("runs")
+                    if isinstance(runs, list) and runs:
+                        if isinstance(runs[-1], dict):
+                            summ = runs[-1].get("summary")
+                            if isinstance(summ, str) and summ.strip().startswith(_RATE_LIMIT_REASON_PREFIX):
+                                found[tid] = [summ]
+                            else:
+                                found.pop(tid, None)
+                        else:
+                            found.pop(tid, None)
+                    elif status == "failed":
+                        found.pop(tid, None)
+            listed = payload.get("tasks")
+            if isinstance(listed, list):
+                for item in listed:
+                    if isinstance(item, dict):
+                        tid = str(item.get("id"))
+                        if tid in wanted:
+                            status = item.get("status")
+                            if (
+                                status in ("blocked", "triage")
+                                and item.get("block_kind") != "transient"
+                            ):
+                                found.pop(tid, None)
+                                continue
+                            runs = item.get("runs")
+                            if isinstance(runs, list) and runs:
+                                if isinstance(runs[-1], dict):
+                                    summ = runs[-1].get("summary")
+                                    if isinstance(summ, str) and summ.strip().startswith(_RATE_LIMIT_REASON_PREFIX):
+                                        found[tid] = [summ]
+                                    else:
+                                        found.pop(tid, None)
+                                else:
+                                    found.pop(tid, None)
+                            elif status == "failed":
+                                found.pop(tid, None)
+        return found
+
+    @staticmethod
+    def _final_board_failures(
+        awaited: Sequence[str],
+        statuses: Mapping[str, str],
+        fallback_messages: Mapping[str, Sequence[str]] | None = None,
+        unsettled: list[str] | None = None,
+        discrepancies: list[str] | None = None,
+        live_statuses: dict[str, str] | None = None,
+        rate_limited_cards: set[str] | None = None,
+        since: float | None = None,
+        session_id: str | None = None,
+        telemetry_state: list[bool | None] | None = None,
+    ) -> list[str]:
+        """Read summary and error from the board for any awaited cards in failure statuses.
+
+        When the board read fails, falls back immediately to the most recent failure
+        summary/error seen during polling without retrying.
+        """
+        failure_cards = [t for t in awaited if statuses.get(t) in _FAILURE_STATUSES]
+        if not failure_cards:
+            return []
+        board_messages: list[str] = []
+        final_bstate = board.read_board_state(_agent_shell, failure_cards, _EXEC_TIMEOUT)
+        if final_bstate is None:
+            _log.warning("kanban board could not be read for failure cards: %s", ", ".join(failure_cards))
+            if fallback_messages:
+                for t in failure_cards:
+                    if t in fallback_messages:
+                        board_messages.extend(fallback_messages[t])
+            return board_messages
+
+        bblock_kinds = final_bstate[3] if len(final_bstate) > 3 else {}
+        telemetry_fetched = False
+        telemetry_corroborated: bool | None = None
+        for t in failure_cards:
+            live_status = final_bstate[0].get(t)
+            card_fallback = (fallback_messages.get(t) or []) if fallback_messages else []
+            has_rate_limit = (
+                (rate_limited_cards is not None and t in rate_limited_cards)
+                or any(_extract_infra_failure_reason(m) for m in card_fallback)
+            )
+            if live_status is not None and live_status not in _TERMINAL_STATUSES:
+                if bblock_kinds.get(t) == "transient":
+                    if has_rate_limit:
+                        if not telemetry_fetched:
+                            telemetry_corroborated = _corroborate_platform_rate_limit(
+                                since=since, session_id=session_id
+                            )
+                            telemetry_fetched = True
+                        corroborated = telemetry_corroborated
+                    else:
+                        corroborated = None
+                    if has_rate_limit and corroborated is not False:
+                        if unsettled is not None:
+                            unsettled.append(t)
+                    else:
+                        if discrepancies is not None:
+                            discrepancies.append(t)
+                if live_statuses is not None:
+                    live_statuses[t] = live_status
+                if isinstance(statuses, dict):
+                    statuses[t] = live_status
+            card_msgs = KubeAgentsHarness._extract_board_card_messages(final_bstate, t)
+            if card_msgs:
+                board_messages.extend(card_msgs)
+        if telemetry_state is not None:
+            if telemetry_fetched:
+                telemetry_state.append(telemetry_corroborated)
+        return board_messages
+
     def _await_delegated_cards(
         self,
         result: AgentResult,
@@ -2645,6 +3247,20 @@ class KubeAgentsHarness(AgentHarness):
             awaited = [t for t in awaited if t not in gone]
             return [t for t in awaited if _status(t) not in _TERMINAL_STATUSES]
 
+        rate_limited_cards: set[str] = set()
+
+        def _track_rate_limits(cards_map: Mapping[str, Mapping[str, Any]]) -> None:
+            for tid, c in cards_map.items():
+                if str(c.get("status")) in _FAILURE_STATUSES and c.get("block_kind") == "transient":
+                    sum_text = str(c.get("summary") or "")
+                    err_text = str(c.get("error") or "")
+                    if _extract_infra_failure_reason(sum_text) or _extract_infra_failure_reason(err_text):
+                        rate_limited_cards.add(tid)
+                    else:
+                        rate_limited_cards.discard(tid)
+
+        _track_rate_limits(read.cards)
+
         outstanding = _merge()
         deadline = time.monotonic() + delegation_timeout
         timed_out = False
@@ -2659,6 +3275,7 @@ class KubeAgentsHarness(AgentHarness):
             if fresh is None:
                 raise _exhausted(outstanding)
             read = fresh
+            _track_rate_limits(read.cards)
             outstanding = _merge()
 
         # Only a card the board shows terminal is read back, as the status-turn
@@ -2669,12 +3286,15 @@ class KubeAgentsHarness(AgentHarness):
         # before a refused completion -- and delivering it would both grade
         # that text and hide the ceiling from the scorer.
         settled = [t for t in awaited if _status(t) in _TERMINAL_STATUSES]
-        if settled:
-            final = _read(settled)
+        want_cards = list(dict.fromkeys(settled + [t for t in awaited if _status(t) in _FAILURE_STATUSES]))
+        poll_failure_statuses = {t: _status(t) for t in awaited if _status(t) in _FAILURE_STATUSES}
+        if want_cards:
+            final = _read(want_cards)
             if final is None:
                 raise _exhausted(outstanding)
-            final.cards = {**read.cards, **{t: c for t, c in final.cards.items() if t in settled}}
+            final.cards = {**read.cards, **{t: c for t, c in final.cards.items() if t in want_cards}}
             read = final
+            _track_rate_limits(final.cards)
         observed: list[dict[str, Any]] = list(result.trajectory)
         observed.extend(
             e
@@ -2684,6 +3304,7 @@ class KubeAgentsHarness(AgentHarness):
         result.metadata["delegated_cards"] = {t: _status(t) for t in awaited}
         if missing:
             result.metadata["delegated_cards_missing"] = list(missing)
+        captured: worker_trajectory.WorkerCapture | None = None
         if timed_out:
             _record_ceiling(
                 result,
@@ -2692,6 +3313,58 @@ class KubeAgentsHarness(AgentHarness):
                 outstanding,
                 {t: _status(t) for t in outstanding},
                 delegation_timeout,
+            )
+        unsettled = []
+        discrepancies = []
+        telemetry_fetched = False
+        telemetry_corroborated: bool | None = None
+        for t in poll_failure_statuses:
+            if _status(t) not in _TERMINAL_STATUSES and t not in outstanding:
+                card_data = read.cards.get(t, {})
+                if card_data.get("block_kind") == "transient":
+                    summary_text = str(card_data.get("summary") or "")
+                    error_text = str(card_data.get("error") or "")
+                    has_rate_limit = (
+                        t in rate_limited_cards
+                        or bool(
+                            _extract_infra_failure_reason(summary_text)
+                            or _extract_infra_failure_reason(error_text)
+                        )
+                    )
+                    if has_rate_limit:
+                        if not telemetry_fetched:
+                            telemetry_corroborated = _corroborate_platform_rate_limit(
+                                since=getattr(self, "_run_started_at", None),
+                                session_id=session_id,
+                            )
+                            telemetry_fetched = True
+                        corroborated = telemetry_corroborated
+                    else:
+                        corroborated = None
+                    if has_rate_limit and corroborated is not False:
+                        unsettled.append(t)
+                    else:
+                        discrepancies.append(t)
+        if unsettled:
+            has_delivery = _has_successful_delivery(
+                observed,
+                [t for t in awaited if t not in unsettled],
+            )
+            _record_unsettled(
+                result,
+                unsettled,
+                poll_failure_statuses,
+                {t: _status(t) for t in unsettled},
+                has_delivery=has_delivery,
+                telemetry_corroborated=telemetry_corroborated,
+            )
+        if discrepancies:
+            _record_unsettled(
+                result,
+                discrepancies,
+                poll_failure_statuses,
+                {t: _status(t) for t in discrepancies},
+                has_delivery=True,
             )
         # The scorer reads an inject record with no activity marker and
         # nothing outside the envelope as one whose door showed no trace, and
@@ -2702,7 +3375,40 @@ class KubeAgentsHarness(AgentHarness):
         # checks that could read them are set aside on inject records anyway.
         shown = any(e.get("name") == inject.EVENT_ENTRY_ACTIVITY for e in result.trajectory)
         before = len(result.trajectory)
-        self._settle(result, observed, awaited, stalled=outstanding if timed_out else [])
+        bstatuses = {t: _status(t) for t in awaited}
+        bsummaries = {
+            t: str(read.cards[t]["summary"])
+            for t in awaited
+            if read.cards.get(t, {}).get("summary")
+        }
+        berrors = {
+            t: str(read.cards[t]["error"])
+            for t in awaited
+            if read.cards.get(t, {}).get("error")
+        }
+        bblock_kinds = {
+            t: str(read.cards[t]["block_kind"])
+            for t in awaited
+            if read.cards.get(t, {}).get("block_kind")
+        }
+        bstate = (bstatuses, bsummaries, berrors, bblock_kinds)
+        board_messages: list[str] = []
+        for t in awaited:
+            msgs = self._extract_board_card_messages(bstate, t)
+            if msgs:
+                board_messages.extend(msgs)
+        self._settle(
+            result,
+            observed,
+            awaited,
+            stalled=outstanding if timed_out else [],
+            board_messages=board_messages,
+            opening_turn=True,
+            captured=captured,
+            since=getattr(self, "_run_started_at", None),
+            session_id=session_id,
+            telemetry_corroborated=telemetry_corroborated if telemetry_fetched else _TELEMETRY_UNSET,
+        )
         if not shown and len(result.trajectory) > before:
             withheld = result.trajectory[before:]
             del result.trajectory[before:]
@@ -2777,8 +3483,66 @@ class KubeAgentsHarness(AgentHarness):
         # The status turns' trajectories, which carry the settled cards'
         # results. Kept beside the graded trajectory rather than in it.
         observed: list[dict[str, Any]] = list(result.trajectory)
+        poll_failure_messages: dict[str, list[str]] = {}
+        failure_awaited = [t for t in awaited if statuses.get(t) in _FAILURE_STATUSES]
+        if failure_awaited:
+            poll_failure_messages.update(
+                self._extract_trajectory_failure_summaries(result.trajectory, failure_awaited)
+            )
+        rate_limited_cards: set[str] = {
+            t for t, msgs in poll_failure_messages.items()
+            if any(_extract_infra_failure_reason(m) for m in msgs)
+        }
         if not outstanding:
-            self._settle(result, observed, awaited)
+            unsettled: list[str] = []
+            discrepancies: list[str] = []
+            live_statuses: dict[str, str] = {}
+            prior_statuses = dict(statuses)
+            telemetry_state: list[bool | None] = []
+            board_messages = self._final_board_failures(
+                awaited,
+                statuses,
+                poll_failure_messages,
+                unsettled=unsettled,
+                discrepancies=discrepancies,
+                live_statuses=live_statuses,
+                rate_limited_cards=rate_limited_cards,
+                since=getattr(self, "_run_started_at", None),
+                session_id="",
+                telemetry_state=telemetry_state,
+            )
+            telemetry_corroborated = telemetry_state[0] if telemetry_state else None
+            if unsettled:
+                has_delivery = _has_successful_delivery(
+                    observed, [t for t in awaited if t not in unsettled]
+                )
+                _record_unsettled(
+                    result,
+                    unsettled,
+                    prior_statuses,
+                    live_statuses,
+                    has_delivery=has_delivery,
+                    opening_turn=opening_turn,
+                    telemetry_corroborated=telemetry_corroborated,
+                )
+            if discrepancies:
+                _record_unsettled(
+                    result,
+                    discrepancies,
+                    prior_statuses,
+                    live_statuses,
+                    has_delivery=True,
+                )
+            self._settle(
+                result,
+                observed,
+                awaited,
+                board_messages=board_messages,
+                opening_turn=opening_turn,
+                since=getattr(self, "_run_started_at", None),
+                session_id="",
+                telemetry_corroborated=telemetry_corroborated if telemetry_state else _TELEMETRY_UNSET,
+            )
             return ""
 
         deadline = time.monotonic() + delegation_timeout
@@ -2819,9 +3583,24 @@ class KubeAgentsHarness(AgentHarness):
             # that fails, or does not know every outstanding card, decides
             # nothing: the turn is made exactly as before, so the silent-turn
             # ceiling still ends a wait on a card the agent cannot see.
-            on_board = board.read_statuses(_agent_shell, outstanding, _EXEC_TIMEOUT)
-            if on_board is not None:
+            bstate = board.read_board_state(_agent_shell, outstanding, _EXEC_TIMEOUT)
+            if bstate is not None:
+                on_board = bstate[0]
                 latest.update(on_board)
+                for t in outstanding:
+                    if on_board.get(t) not in _FAILURE_STATUSES:
+                        poll_failure_messages.pop(t, None)
+                    else:
+                        msgs = self._extract_board_card_messages(bstate, t)
+                        if msgs:
+                            poll_failure_messages[t] = msgs
+                            if any(_extract_infra_failure_reason(m) for m in msgs):
+                                rate_limited_cards.add(t)
+                            else:
+                                rate_limited_cards.discard(t)
+                        else:
+                            poll_failure_messages.pop(t, None)
+                            rate_limited_cards.discard(t)
                 if all(t in on_board for t in outstanding) and not any(
                     on_board[t] in _TERMINAL_STATUSES for t in outstanding
                 ):
@@ -2908,8 +3687,53 @@ class KubeAgentsHarness(AgentHarness):
             # poll, so the cumulative view would let an agent that has stopped
             # reading the board pass as one still answering, and would mark
             # every turn after the first terminal card as settled.
-            fresh_reported = reported_statuses(new_calls(status_turn, seen_calls))
+            turn_new_calls = new_calls(status_turn, seen_calls)
+            fresh_reported = reported_statuses(turn_new_calls)
+            statuses.update(reported_statuses(status_turn.trajectory))
+            # dict.fromkeys: order-preserving dedupe, so a card the agent
+            # re-filed under the same id is awaited once. The overflow is
+            # reported only the first time, since the replayed trajectory
+            # re-offers the dropped ids on every poll.
+            merged = list(dict.fromkeys(awaited + delegated_task_ids(status_turn.trajectory)))
+            awaited = self._capped(_pending_first(merged, statuses), None if capped else result)
+            capped = capped or len(merged) > _MAX_AWAITED_TASKS
             latest.update(fresh_reported)
+            for t, s in fresh_reported.items():
+                if s not in _FAILURE_STATUSES:
+                    poll_failure_messages.pop(t, None)
+            needed_read = [
+                t for t, s in fresh_reported.items()
+                if t in awaited and s in _FAILURE_STATUSES
+            ]
+            if needed_read:
+                remaining_turn = max(0.0, deadline - time.monotonic())
+                cstate = board.read_board_state(
+                    _agent_shell, needed_read, min(_EXEC_TIMEOUT, remaining_turn)
+                )
+                if cstate is not None:
+                    for t in needed_read:
+                        msgs = self._extract_board_card_messages(cstate, t)
+                        if msgs:
+                            poll_failure_messages[t] = msgs
+                            if any(_extract_infra_failure_reason(m) for m in msgs):
+                                rate_limited_cards.add(t)
+                            else:
+                                rate_limited_cards.discard(t)
+                        else:
+                            poll_failure_messages.pop(t, None)
+                            if cstate[0].get(t) in _FAILURE_STATUSES:
+                                rate_limited_cards.discard(t)
+                else:
+                    # If board read exec failed, evaluate trajectory failure summaries
+                    # across all needed cards, allowing newer runs to both set and evict.
+                    self._extract_trajectory_failure_summaries(
+                        turn_new_calls, needed_read, store=poll_failure_messages
+                    )
+                    for t in needed_read:
+                        if any(_extract_infra_failure_reason(m) for m in poll_failure_messages.get(t, [])):
+                            rate_limited_cards.add(t)
+                        else:
+                            rate_limited_cards.discard(t)
             _fold_status_turn(
                 result,
                 status_turn,
@@ -2931,25 +3755,80 @@ class KubeAgentsHarness(AgentHarness):
                     )
                     timed_out = False
                     break
-            statuses.update(reported_statuses(status_turn.trajectory))
-            # dict.fromkeys: order-preserving dedupe, so a card the agent
-            # re-filed under the same id is awaited once. The overflow is
-            # reported only the first time, since the replayed trajectory
-            # re-offers the dropped ids on every poll.
-            merged = list(dict.fromkeys(awaited + delegated_task_ids(status_turn.trajectory)))
-            awaited = self._capped(_pending_first(merged, statuses), None if capped else result)
-            capped = capped or len(merged) > _MAX_AWAITED_TASKS
             outstanding = [t for t in awaited if statuses.get(t) not in _TERMINAL_STATUSES]
 
         # Only on the deadline path: after a transport failure or a mute agent
         # the budget is untouched, and claiming it ran out would misreport why
         # the run stopped.
+        captured: worker_trajectory.WorkerCapture | None = None
         if outstanding and timed_out:
-            _record_ceiling(result, observed, awaited, outstanding, latest, delegation_timeout)
+            _record_ceiling(
+                result,
+                observed,
+                awaited,
+                outstanding,
+                latest,
+                delegation_timeout,
+                opening_turn=opening_turn,
+            )
+        unsettled: list[str] = []
+        discrepancies: list[str] = []
+        live_statuses: dict[str, str] = {}
+        prior_statuses = dict(latest)
+        telemetry_state: list[bool | None] = []
+        board_messages = self._final_board_failures(
+            awaited,
+            latest,
+            poll_failure_messages,
+            unsettled=unsettled,
+            discrepancies=discrepancies,
+            live_statuses=live_statuses,
+            rate_limited_cards=rate_limited_cards,
+            since=getattr(self, "_run_started_at", None),
+            session_id=session_id,
+            telemetry_state=telemetry_state,
+        )
+        telemetry_corroborated = telemetry_state[0] if telemetry_state else None
+        if outstanding:
+            unsettled = [t for t in unsettled if t not in outstanding]
+            discrepancies = [t for t in discrepancies if t not in outstanding]
+        if unsettled:
+            has_delivery = _has_successful_delivery(
+                observed,
+                [t for t in awaited if t not in unsettled],
+            )
+            _record_unsettled(
+                result,
+                unsettled,
+                prior_statuses,
+                live_statuses,
+                has_delivery=has_delivery,
+                opening_turn=opening_turn,
+                telemetry_corroborated=telemetry_corroborated,
+            )
+        if discrepancies:
+            _record_unsettled(
+                result,
+                discrepancies,
+                prior_statuses,
+                live_statuses,
+                has_delivery=True,
+            )
         # Only the deadline path leaves transcripts behind: a card still
         # outstanding after a transport failure or a mute agent did not stall,
         # and the run stopped for a reason the record already names.
-        self._settle(result, observed, awaited, stalled=outstanding if timed_out else [])
+        self._settle(
+            result,
+            observed,
+            awaited,
+            stalled=outstanding if timed_out else [],
+            board_messages=board_messages,
+            opening_turn=opening_turn,
+            captured=captured,
+            since=getattr(self, "_run_started_at", None),
+            session_id=session_id,
+            telemetry_corroborated=telemetry_corroborated if telemetry_state else _TELEMETRY_UNSET,
+        )
         return session_id
 
     @staticmethod
@@ -2959,6 +3838,12 @@ class KubeAgentsHarness(AgentHarness):
         awaited: list[str],
         *,
         stalled: Sequence[str] = (),
+        board_messages: Sequence[str] = (),
+        opening_turn: bool = True,
+        captured: worker_trajectory.WorkerCapture | None = None,
+        since: float | None = None,
+        session_id: str | None = None,
+        telemetry_corroborated: bool | None | object = _TELEMETRY_UNSET,
     ) -> None:
         """Collect everything the delegated cards produced, then clear them out.
 
@@ -2995,7 +3880,8 @@ class KubeAgentsHarness(AgentHarness):
         result.metadata["worker_commands"] = _worker_commands(logs)
         _dump_worker_logs(logs, stalled)
         _archive_stalled_cards(stalled, _EXEC_TIMEOUT)
-        captured = worker_trajectory.capture(_agent_shell, awaited, _EXEC_TIMEOUT)
+        if captured is None:
+            captured = worker_trajectory.capture(_agent_shell, awaited, _EXEC_TIMEOUT)
         if captured is None:
             result.metadata["worker_trajectory"] = None
             # A run that filed no card settles too (nothing to wait for), and
@@ -3007,7 +3893,58 @@ class KubeAgentsHarness(AgentHarness):
             result.trajectory.extend(captured.entries)
             result.metadata["worker_trajectory"] = captured.summary
             result.tokens["workers"] = _worker_token_buckets(captured.tokens, captured.unbilled)
+
+        infra_reason: str | None = None
+        infra_detail: str = ""
+        telemetry_fetched = (telemetry_corroborated is not _TELEMETRY_UNSET)
+        if not telemetry_fetched:
+            telemetry_corroborated = None
+        if board_messages:
+            for text in board_messages:
+                reason = _extract_infra_failure_reason(text)
+                if reason:
+                    if not telemetry_fetched:
+                        telemetry_corroborated = _corroborate_platform_rate_limit(
+                            since=since, session_id=session_id
+                        )
+                        telemetry_fetched = True
+                    corroborated = telemetry_corroborated
+                    if corroborated is False:
+                        result.errors.append(
+                            f"delegated worker failed ({reason}): card on board recorded {reason} ({text[:200]}) but platform proxy log showed no 429"
+                        )
+                        result.metadata["platform_rate_limit_corroborated"] = False
+                        break
+                    else:
+                        infra_reason = reason
+                        infra_detail = f"card on board recorded {reason}: {text[:200]}"
+                        if corroborated is None:
+                            infra_detail += " (platform proxy log unavailable at settle; not corroborated)"
+                        result.metadata["platform_rate_limit_corroborated"] = (corroborated is True)
+                        break
+
         _purge_card_state(awaited, _EXEC_TIMEOUT)
+
+        reported = reported_statuses(observed)
+        successful_deliveries = {
+            tid: text
+            for tid, text in delivered_results(observed, awaited).items()
+            if reported.get(tid) not in _FAILURE_STATUSES and not _extract_infra_failure_reason(text)
+        }
+        worker_acted = bool(successful_deliveries)
+        if infra_reason:
+            if opening_turn and not worker_acted:
+                _mark_result_infra_failure(
+                    result,
+                    f"delegated worker hit infrastructure failure ({infra_reason}): {infra_detail}",
+                )
+            else:
+                result.errors.append(
+                    f"delegated worker failed ({infra_reason}): {infra_detail}"
+                )
+        elif result.metadata.get("infra_failure"):
+            result.output = ""
+            result.metadata.pop("final_message", None)
 
     @staticmethod
     def _capped(task_ids: list[str], result: AgentResult | None) -> list[str]:

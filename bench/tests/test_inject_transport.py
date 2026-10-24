@@ -39,6 +39,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Generator
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -2670,6 +2671,431 @@ def test_a_running_card_at_the_ceiling_delivers_nothing_from_an_earlier_run(
     ]
     assert result.metadata["final_message"] == ACK
     assert "RESOURCE_EXHAUSTED" not in result.output
+
+
+def _corroborate_429(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    log_file = tmp_path / "litellm.log"
+    now_iso = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+    log_file.write_text(f'{now_iso} ERROR: VertexAIException - {{"error": {{"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}}}\n')
+    monkeypatch.setenv("LITELLM_LOG_PATH", str(log_file))
+
+
+def test_a_blocked_card_with_rate_limit_summary_on_inject_is_infrastructure(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card on the board blocked with a rate limit summary marks the repetition as infra."""
+    _corroborate_429(tmp_path, monkeypatch)
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(
+        tmp_path,
+        CARD_A,
+        "blocked",
+        summary=(
+            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+            'HTTP 429 ... "TPM quota exhausted"'
+        ),
+        block_kind="transient",
+    )
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert infra(result)
+    assert result.output == ""
+    assert "rate_limit" in result.errors[0]
+
+
+def test_a_card_unblocked_between_poll_and_final_read_on_inject_records_infra(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card unblocked between the poll that ended the loop and the final read with nothing delivered records infra."""
+    _corroborate_429(tmp_path, monkeypatch)
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(
+        tmp_path,
+        CARD_A,
+        "blocked",
+        summary=(
+            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+            'HTTP 429 ... "TPM quota exhausted"'
+        ),
+        block_kind="transient",
+    )
+
+    def _on_read(n: int) -> None:
+        if n == 2:
+            # On the deliverable read (want_cards) the card has been unblocked
+            # (``unblock_task`` -> ready) and not yet claimed, so the blocked
+            # run's row is still the newest ``task_runs`` row.
+            set_card(tmp_path, CARD_A, "ready", block_kind="transient")
+
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch, on_read=_on_read))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert infra(result)
+    assert any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+    assert result.errors == [
+        f"{harness.INFRA_FAILURE_MARKER}: delegated task {CARD_A} was reported blocked during wait but ready at settle; nothing delivered"
+    ]
+
+
+def test_a_card_unblocked_and_claimed_running_on_inject_records_infra(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card unblocked and re-claimed running on the deliverable read with nothing delivered records infra."""
+    _corroborate_429(tmp_path, monkeypatch)
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(
+        tmp_path,
+        CARD_A,
+        "blocked",
+        summary=(
+            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+            'HTTP 429 ... "TPM quota exhausted"'
+        ),
+        error=(
+            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+            'HTTP 429 ... "TPM quota exhausted"'
+        ),
+        block_kind="transient",
+    )
+
+    def _on_read(n: int) -> None:
+        if n == 2:
+            # On deliverable read (want_cards), card was unblocked and re-claimed running with fresh run row
+            set_card(
+                tmp_path,
+                CARD_A,
+                "running",
+                block_kind="transient",
+            )
+            conn = sqlite3.connect(tmp_path / board.BOARD_FILE)
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status) VALUES (?, 'platform', 'running')",
+                (CARD_A,),
+            )
+            conn.commit()
+            conn.close()
+
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch, on_read=_on_read))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert infra(result)
+    assert any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+    assert result.errors == [
+        f"{harness.INFRA_FAILURE_MARKER}: delegated task {CARD_A} was reported blocked during wait but running at settle; nothing delivered"
+    ]
+    assert "final_message" not in result.metadata
+    assert result.metadata.get("infra_failure")
+
+
+def test_a_needs_input_card_unblocked_and_running_on_inject_does_not_record_ceiling(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card blocked with needs_input unblocked to running on deliverable read does not record ceiling."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(
+        tmp_path,
+        CARD_A,
+        "blocked",
+        summary="User input needed.",
+        block_kind="needs_input",
+    )
+
+    def _on_read(n: int) -> None:
+        if n == 2:
+            set_card(tmp_path, CARD_A, "running", block_kind="needs_input")
+
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch, on_read=_on_read))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert not infra(result)
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+    assert not result.has_errors()
+
+
+def test_a_transient_card_with_non_rate_limit_reason_unblocked_and_running_on_inject_does_not_record_ceiling(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card blocked with transient kind and non-rate-limit reason unblocked to running records plain discrepancy without ceiling."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(
+        tmp_path,
+        CARD_A,
+        "blocked",
+        summary="need a moment",
+        block_kind="transient",
+    )
+
+    def _on_read(n: int) -> None:
+        if n == 2:
+            set_card(tmp_path, CARD_A, "running", block_kind="transient")
+
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch, on_read=_on_read))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert not infra(result)
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+    assert result.errors == [
+        f"delegated task {CARD_A} was reported blocked during wait but running at settle; nothing delivered"
+    ]
+
+
+def test_a_card_unblocked_on_inject_refused_by_platform_telemetry_does_not_record_ceiling(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When platform telemetry log is present and shows no 429, an unblocked transient card on inject is refused and routed to discrepancies."""
+    ok_log = tmp_path / "litellm.log"
+    start_iso = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    end_iso = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+    ok_log.write_text(
+        f"{start_iso} INFO: 200 OK GET /health\n"
+        f"{end_iso} INFO: 200 OK POST /v1/chat/completions\n"
+    )
+    monkeypatch.setenv("LITELLM_LOG_PATH", str(ok_log))
+
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(
+        tmp_path,
+        CARD_A,
+        "blocked",
+        summary=(
+            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+            'HTTP 429 ... "TPM quota exhausted"'
+        ),
+        block_kind="transient",
+    )
+
+    def _on_read(n: int) -> None:
+        if n == 2:
+            set_card(tmp_path, CARD_A, "running", block_kind="transient")
+
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch, on_read=_on_read))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert not infra(result)
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+    assert result.errors == [
+        f"delegated task {CARD_A} was reported blocked during wait but running at settle; nothing delivered"
+    ]
+
+
+def test_a_failed_card_with_rate_limit_error_on_inject_is_infrastructure(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card on the board failed with a rate limit error marks the repetition as infra."""
+    _corroborate_429(tmp_path, monkeypatch)
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(
+        tmp_path,
+        CARD_A,
+        "failed",
+        error=(
+            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+            'HTTP 429 ... "TPM quota exhausted"'
+        ),
+    )
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert infra(result)
+    assert result.output == ""
+    assert "rate_limit" in result.errors[0]
+
+
+def test_a_failed_card_with_worker_429_error_on_inject_remains_graded(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card failed with ordinary worker error (even mentioning 429) is graded, not marked infra."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(
+        tmp_path,
+        CARD_A,
+        "failed",
+        error="upstream returned HTTP 429: rateLimitExceeded",
+    )
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert not infra(result)
+
+
+def test_transient_blocked_card_with_infra_prefix_on_inject_is_infrastructure(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card blocked transient with hermes rate limit prefix on inject lane is classified as infra."""
+    _corroborate_429(tmp_path, monkeypatch)
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(
+        tmp_path,
+        CARD_A,
+        "blocked",
+        summary=(
+            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+            'HTTP 429 ... "TPM quota exhausted"'
+        ),
+        block_kind="transient",
+    )
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert infra(result)
+    assert not result.output
+
+
+def test_worker_authored_kanban_block_with_non_transient_kind_on_inject_remains_graded(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker-authored kanban_block with non-transient block_kind remains graded on inject lane."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(
+        tmp_path,
+        CARD_A,
+        "blocked",
+        summary=(
+            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+            'HTTP 429 ... "TPM quota exhausted"'
+        ),
+        block_kind="needs_input",
+    )
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert not infra(result)
+    assert ACK in result.metadata["final_message"]
+    assert "TPM quota exhausted" in result.metadata["final_message"]
+
+
+def test_a_triage_card_with_transient_rate_limit_summary_on_inject_is_infrastructure(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card in triage at the ceiling with a transient rate limit summary marks rep as infra."""
+    _corroborate_429(tmp_path, monkeypatch)
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(
+        tmp_path,
+        CARD_A,
+        "triage",
+        summary=(
+            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+            'HTTP 429 ... "TPM quota exhausted"'
+        ),
+        block_kind="transient",
+    )
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "1")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.1")
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert infra(result)
+    assert result.output == ""
+    assert result.errors == [
+        f"{harness.INFRA_FAILURE_MARKER}: delegated worker hit infrastructure failure (rate_limit): "
+        'card on board recorded rate_limit: provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429 ... "TPM quota exhausted"',
+        f"{harness.DELEGATION_CEILING_MARKER}: delegated tasks did not finish within 1s: {CARD_A} (triage)",
+    ]
+
+
+def test_a_triage_card_with_non_transient_block_kind_on_inject_records_ceiling_not_rate_limit(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A triage card at the ceiling with a non-transient block_kind is not marked by the rate-limit classifier; the ceiling marker alone files it (scorer: infra via DELEGATION_CEILING_MARKER)."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(
+        tmp_path,
+        CARD_A,
+        "triage",
+        summary=(
+            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+            'HTTP 429 ... "TPM quota exhausted"'
+        ),
+        block_kind="needs_input",
+    )
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "1")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.1")
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert not infra(result)
+    assert result.metadata["final_message"] == ACK
+    assert result.errors == [
+        f"{harness.DELEGATION_CEILING_MARKER}: delegated tasks did not finish within 1s: {CARD_A} (triage)"
+    ]
+
+
+def test_a_blocked_card_with_rate_limit_summary_on_inject_does_not_issue_board_present_exec(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Inject lane resolves failure summaries directly from read_session_cards without issuing BOARD_PRESENT exec."""
+    _corroborate_429(tmp_path, monkeypatch)
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(
+        tmp_path,
+        CARD_A,
+        "blocked",
+        summary=(
+            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+            'HTTP 429 ... "TPM quota exhausted"'
+        ),
+        block_kind="transient",
+    )
+    real = local_shell(tmp_path, monkeypatch)
+    scripts: list[str] = []
+
+    def recording_shell(script: str, timeout: float) -> str:
+        scripts.append(script)
+        return real(script, timeout)
+
+    monkeypatch.setattr(harness, "_agent_shell", recording_shell)
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert infra(result)
+    assert result.output == ""
+    assert "rate_limit" in result.errors[0]
+    assert not any(board.BOARD_PRESENT in s for s in scripts)
+
+
+def test_a_cleared_rate_limit_rerun_on_inject_remains_graded(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_session_store(tmp_path, created=[CARD_A])
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("UPDATE tasks SET status = 'failed', result = 'worker fault' WHERE id = ?", (CARD_A,))
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, summary) VALUES (?, 'platform', 'blocked', ?)",
+            (
+                CARD_A,
+                "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, summary) VALUES (?, 'platform', 'failed', NULL)",
+            (CARD_A,),
+        )
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert not infra(result)
+    assert not result.has_errors()
+    assert "worker fault" in result.output
 
 
 def test_a_board_that_stops_answering_is_infrastructure(

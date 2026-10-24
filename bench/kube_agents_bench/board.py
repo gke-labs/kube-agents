@@ -13,10 +13,11 @@ The board itself is a SQLite file on the agent's data volume, the same one
 they settle. This module has two reads, each one ``kubectl exec`` of the kind
 the harness already relies on for artifacts and session stores:
 
-- :func:`read_statuses`, the ``status`` column of the awaited cards. The api
-  transport's wait asks the board each poll and spends a front-door turn only
-  when the board says a card has stopped moving, which is the one turn that
-  can carry the card's result back into the conversation.
+- :func:`read_board_state` (and :func:`read_statuses`), the ``status``, ``summary``,
+  and ``error`` columns of the awaited cards. The api transport's wait asks the
+  board each poll and spends a front-door turn only when the board says a card has
+  stopped moving, which is the one turn that can carry the card's result back into
+  the conversation.
 - :func:`read_session_cards`, for the inject transport under the bridge's
   ``api`` executor, where no turn can carry a result back. It finds the cards
   one Hermes session filed, from that session's ``kanban_create`` results in
@@ -48,7 +49,13 @@ from typing import Any
 from kube_agents_bench.parsing import _TASK_ID_RE, DELEGATION_TOOL, delegated_task_ids
 from kube_agents_bench.worker_trajectory import DATA_ROOT, FALLBACK_PYTHON, HERMES_PYTHON
 
-__all__ = ["SessionCards", "api_session_id", "read_session_cards", "read_statuses"]
+__all__ = [
+    "SessionCards",
+    "api_session_id",
+    "read_board_state",
+    "read_session_cards",
+    "read_statuses",
+]
 
 _log = logging.getLogger("kube_agents_bench.board")
 
@@ -78,14 +85,81 @@ ids = [a for a in sys.argv[4:] if a]
 # Seconds a read waits on a locked store before giving up. A hermes writer
 # holds a WAL lock for milliseconds; anything longer is stuck.
 SQLITE_BUSY_TIMEOUT = 10
-out = {"statuses": {}, "error": None}
+out = {"statuses": {}, "summaries": {}, "errors": {}, "block_kinds": {}, "error": None}
+
+
+def has_table(conn, name):
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+    ).fetchone() is not None
+
+
+def columns(conn, table):
+    return {r[1] for r in conn.execute("PRAGMA table_info(%s)" % table)}
+
+
 try:
     conn = sqlite3.connect("file:%s/%s?mode=ro" % (ROOT, BOARD), uri=True, timeout=SQLITE_BUSY_TIMEOUT)
     marks = ",".join("?" for _ in ids)
-    rows = conn.execute("SELECT id, status FROM tasks WHERE id IN (%s)" % marks, ids).fetchall()
-    conn.close()
-    for tid, status in rows:
+    cols = columns(conn, "tasks")
+    has_lfe = "last_failure_error" in cols
+    has_bk = "block_kind" in cols
+    query = "SELECT id, status%s%s FROM tasks WHERE id IN (%s)" % (
+        ", last_failure_error" if has_lfe else "",
+        ", block_kind" if has_bk else "",
+        marks,
+    )
+    rows = conn.execute(query, ids).fetchall()
+    for row in rows:
+        tid, status = row[0], row[1]
         out["statuses"][str(tid)] = str(status)
+        idx = 2
+        if has_lfe:
+            if len(row) > idx and row[idx] and str(status) in ("blocked", "triage", "failed"):
+                out["errors"][str(tid)] = str(row[idx])
+            idx += 1
+        if has_bk:
+            if len(row) > idx and row[idx]:
+                out["block_kinds"][str(tid)] = str(row[idx])
+    if has_table(conn, "task_runs"):
+        run_cols = columns(conn, "task_runs")
+        has_sum = "summary" in run_cols
+        has_err = "error" in run_cols
+        failure_ids = [
+            tid for tid in ids
+            if out["statuses"].get(str(tid)) in ("blocked", "triage", "failed")
+        ]
+        if has_sum and has_err:
+            for tid in failure_ids:
+                r = conn.execute(
+                    "SELECT summary, error FROM task_runs WHERE task_id = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (tid,),
+                ).fetchone()
+                if r:
+                    if r[0]:
+                        out["summaries"][str(tid)] = str(r[0])
+                    if r[1] and str(tid) not in out["errors"]:
+                        out["errors"][str(tid)] = str(r[1])
+        elif has_sum:
+            for tid in failure_ids:
+                r = conn.execute(
+                    "SELECT summary FROM task_runs WHERE task_id = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (tid,),
+                ).fetchone()
+                if r and r[0]:
+                    out["summaries"][str(tid)] = str(r[0])
+        elif has_err:
+            for tid in failure_ids:
+                r = conn.execute(
+                    "SELECT error FROM task_runs WHERE task_id = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (tid,),
+                ).fetchone()
+                if r and r[0] and str(tid) not in out["errors"]:
+                    out["errors"][str(tid)] = str(r[0])
+    conn.close()
 except sqlite3.Error as exc:
     out["error"] = "kanban board: %s" % exc
 print(SENTINEL)
@@ -280,26 +354,88 @@ if out["error"] is None:
         for tid in out["created"]:
             if isinstance(tid, str) and tid and tid not in ids:
                 ids.append(tid)
-        # Every scanned card's status; a deliverable only for the ids wanted.
+        task_cols = columns(board, "tasks")
+        has_lfe = "last_failure_error" in task_cols
+        has_bk = "block_kind" in task_cols
+        has_res = "result" in task_cols
+        query = "SELECT id, status FROM tasks WHERE id IN (%s)"
         for part in chunks(ids):
-            for tid, status in board.execute(
-                "SELECT id, status FROM tasks WHERE id IN (%s)" % marks(part), part
-            ):
-                out["cards"][str(tid)] = {"status": str(status), "result": None, "summary": None}
+            for row in board.execute(query % marks(part), part):
+                tid, status = row[0], row[1]
+                out["cards"][str(tid)] = {
+                    "status": str(status),
+                    "result": None,
+                    "summary": None,
+                    "block_kind": None,
+                    "error": None,
+                }
         wanted = [t for t in WANT if t in out["cards"]]
         if wanted:
-            if "result" in columns(board, "tasks"):
-                for tid, result in board.execute(
-                    "SELECT id, result FROM tasks WHERE id IN (%s)" % marks(wanted), wanted
+            cols = []
+            if has_res:
+                cols.append("result")
+            if has_lfe:
+                cols.append("last_failure_error")
+            if has_bk:
+                cols.append("block_kind")
+            if cols:
+                for row in board.execute(
+                    ("SELECT id, " + ", ".join(cols) + " FROM tasks WHERE id IN (%s)") % marks(wanted),
+                    wanted,
                 ):
-                    out["cards"][str(tid)]["result"] = result
-            if has_table(board, "task_runs") and "summary" in columns(board, "task_runs"):
-                for tid in wanted:
-                    row = board.execute(
-                        "SELECT summary FROM task_runs WHERE task_id = ? AND summary IS NOT NULL "
-                        "AND summary != '' ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
-                    if row:
-                        out["cards"][tid]["summary"] = row[0]
+                    tid = str(row[0])
+                    for i, col in enumerate(cols, 1):
+                        val = row[i]
+                        if val is not None:
+                            if col == "result":
+                                out["cards"][tid]["result"] = val
+                            elif col == "last_failure_error":
+                                out["cards"][tid]["error"] = str(val)
+                            elif col == "block_kind":
+                                out["cards"][tid]["block_kind"] = str(val)
+            if has_table(board, "task_runs"):
+                run_cols = columns(board, "task_runs")
+                has_sum = "summary" in run_cols
+                has_err = "error" in run_cols
+                if has_sum and has_err:
+                    for tid in wanted:
+                        row = board.execute(
+                            "SELECT summary, error FROM task_runs WHERE task_id = ? "
+                            "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+                        if not row or (not row[0] and not row[1]):
+                            row = board.execute(
+                                "SELECT summary, error FROM task_runs WHERE task_id = ? "
+                                "AND status IN ('blocked', 'triage', 'failed') "
+                                "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+                        if row:
+                            if row[0]:
+                                out["cards"][tid]["summary"] = str(row[0])
+                            if row[1] and not out["cards"][tid]["error"]:
+                                out["cards"][tid]["error"] = str(row[1])
+                elif has_sum:
+                    for tid in wanted:
+                        row = board.execute(
+                            "SELECT summary FROM task_runs WHERE task_id = ? "
+                            "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+                        if not row or not row[0]:
+                            row = board.execute(
+                                "SELECT summary FROM task_runs WHERE task_id = ? "
+                                "AND status IN ('blocked', 'triage', 'failed') "
+                                "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+                        if row and row[0]:
+                            out["cards"][tid]["summary"] = str(row[0])
+                elif has_err:
+                    for tid in wanted:
+                        row = board.execute(
+                            "SELECT error FROM task_runs WHERE task_id = ? "
+                            "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+                        if not row or not row[0]:
+                            row = board.execute(
+                                "SELECT error FROM task_runs WHERE task_id = ? "
+                                "AND status IN ('blocked', 'triage', 'failed') "
+                                "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+                        if row and row[0] and not out["cards"][tid]["error"]:
+                            out["cards"][tid]["error"] = str(row[0])
         board.close()
     except sqlite3.Error as exc:
         out["error"] = "kanban board: %s" % exc
@@ -319,19 +455,12 @@ def command(task_ids: list[str]) -> str:
     )
 
 
-def read_statuses(
+def read_board_state(
     shell: Callable[[str, float], str], task_ids: list[str], timeout: float
-) -> dict[str, str] | None:
-    """The board's current status for each of ``task_ids``, or ``None``.
+) -> tuple[dict[str, str], dict[str, str], dict[str, str], dict[str, str]] | None:
+    """The board's current status, latest summary, errors, and block kinds for each of ``task_ids``, or ``None``.
 
-    ``shell`` is :func:`harness._agent_shell`, taken as a parameter so this
-    module stays importable without the harness and testable with a canned
-    reply.
-
-    ``None`` means the read cannot be trusted: no card was asked for, the
-    script did not run to completion, its reply was not JSON, or the board
-    could not be opened. A card the board does not know is simply absent from
-    the returned map; the caller decides what an unknown card means.
+    Returns a tuple of ``(statuses, summaries, errors, block_kinds)``.
     """
     if not task_ids:
         return None
@@ -354,7 +483,45 @@ def read_statuses(
     statuses = payload.get("statuses")
     if not isinstance(statuses, dict):
         return None
-    return {str(k): str(v) for k, v in statuses.items() if k in task_ids}
+    raw_summaries = payload.get("summaries")
+    summaries = (
+        {str(k): str(v) for k, v in raw_summaries.items() if k in task_ids}
+        if isinstance(raw_summaries, dict)
+        else {}
+    )
+    raw_errors = payload.get("errors")
+    errors = (
+        {str(k): str(v) for k, v in raw_errors.items() if k in task_ids}
+        if isinstance(raw_errors, dict)
+        else {}
+    )
+    raw_block_kinds = payload.get("block_kinds")
+    block_kinds = (
+        {str(k): str(v) for k, v in raw_block_kinds.items() if k in task_ids}
+        if isinstance(raw_block_kinds, dict)
+        else {}
+    )
+    return {str(k): str(v) for k, v in statuses.items() if k in task_ids}, summaries, errors, block_kinds
+
+
+def read_statuses(
+    shell: Callable[[str, float], str], task_ids: list[str], timeout: float
+) -> dict[str, str] | None:
+    """The board's current status for each of ``task_ids``, or ``None``.
+
+    ``shell`` is :func:`harness._agent_shell`, taken as a parameter so this
+    module stays importable without the harness and testable with a canned
+    reply.
+
+    ``None`` means the read cannot be trusted: no card was asked for, the
+    script did not run to completion, its reply was not JSON, or the board
+    could not be opened. A card the board does not know is simply absent from
+    the returned map; the caller decides what an unknown card means.
+    """
+    got = read_board_state(shell, task_ids, timeout)
+    if got is None:
+        return None
+    return got[0]
 
 
 def api_session_id(context_id: str) -> str:
@@ -384,7 +551,7 @@ class SessionCards:
     the board's subscriptions addressed to it (``"kanban_notify_subs"``).
     ``cards`` maps each id the board knows to its ``status``, and, for the
     ids the read was asked for (``want``), its ``result`` (``tasks.result``)
-    and ``summary`` (the newest non-empty ``task_runs.summary``); ``None``
+    and ``summary`` (the newest ``task_runs.summary``); ``None``
     for the rest. An id in ``card_ids`` and not in ``cards`` is one the board
     has no row for.
     """
@@ -411,9 +578,15 @@ class SessionCards:
         if card is None:
             return None
         payload: dict[str, Any] = {
-            "task": {"id": task_id, "status": card.get("status"), "result": card.get("result")},
+            "task": {
+                "id": task_id,
+                "status": card.get("status"),
+                "result": card.get("result"),
+            },
             "runs": [{"summary": card["summary"]}] if card.get("summary") else [],
         }
+        if card.get("block_kind"):
+            payload["task"]["block_kind"] = card["block_kind"]
         return {
             "name": "kanban_show",
             "args": {"task_id": task_id},
@@ -451,7 +624,7 @@ def read_session_cards(
     timeout: float,
     *,
     want: Sequence[str] = (),
-    max_want: int = 0,
+    max_want: int | None = None,
 ) -> SessionCards | None:
     """The cards ``session_id`` filed and their board state, or ``None``.
 
@@ -466,7 +639,8 @@ def read_session_cards(
     """
     if not session_id:
         return None
-    reply = shell(session_cards_command(session_id, want, max_want), timeout)
+    effective_max_want = len(want) if max_want is None and want else (max_want or 0)
+    reply = shell(session_cards_command(session_id, want, effective_max_want), timeout)
     marker = reply.find(SESSION_CARDS_PRESENT)
     if marker < 0:
         _log.debug("the session store could not be read for %s", session_id)
@@ -508,6 +682,12 @@ def read_session_cards(
                     "result": card.get("result") if isinstance(card.get("result"), str) else None,
                     "summary": card.get("summary")
                     if isinstance(card.get("summary"), str)
+                    else None,
+                    "block_kind": card.get("block_kind")
+                    if isinstance(card.get("block_kind"), str)
+                    else None,
+                    "error": card.get("error")
+                    if isinstance(card.get("error"), str)
                     else None,
                 }
     return SessionCards(

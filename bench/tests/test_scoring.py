@@ -1168,6 +1168,24 @@ def test_a_delegation_ceiling_with_nothing_delivered_is_its_own_infra_class(tofu
     assert INFRA_FAILURE_MARKER not in verdict.reps[0].reason
 
 
+def test_an_unsettled_card_infra_marker_classifies_infra_with_delegated_reason(tofu_spec, make_run):
+    """An unsettled failure card unblocked at settle leads with INFRA_FAILURE_MARKER
+    and explains that delegated worker hit an infrastructure condition."""
+    def at_unsettled(rec):
+        rec["errors"] = [
+            f"{INFRA_FAILURE_MARKER}: delegated task t1 was reported blocked during wait but running at settle; nothing delivered"
+        ]
+        rec["scores"]["VerificationCorrectness"] = 0.0
+
+    run = make_run(mutate=at_unsettled)
+    verdict = grade_case(tofu_spec, [run], admitted=True)
+    assert verdict.rung is Rung.INFRA
+    assert verdict.reps[0].outcome == "infra"
+    assert verdict.reps[0].reason.startswith(INFRA_FAILURE_MARKER)
+    assert "delegated worker hit an infrastructure condition" in verdict.reps[0].reason
+    assert "t1 was reported blocked during wait but running at settle" in verdict.reps[0].reason
+
+
 def test_a_ceiling_hit_after_a_partial_delivery_still_grades(tofu_spec, make_run):
     """No marker, no carve-out: a fan-out that delivered some results is graded
     on what arrived, exactly as before."""
@@ -1670,6 +1688,73 @@ def test_the_default_margin_absorbs_the_measured_judge_spread(noop_spec, make_ru
         baseline_judged={"OutcomeValidity": max(scores)},
     )
     assert verdict.rung is Rung.GREEN
+
+
+def test_reps_hitting_429_quota_are_infra_and_do_not_trigger_judged_regression(
+    noop_spec, make_run
+):
+    """#3399's case: 429 quota exhaustion in 2 of 3 reps is marked infra.
+
+    Repetitions 1 and 2 hit 429 quota exhaustion and score 0.0 with the verifier.
+    Repetition 3 passes with 0.8 against main's 0.96.
+    If reps 1 and 2 are scored, mean drops to (0.0 + 0.0 + 0.8) / 3 = 0.27.
+    Classified as infra, only rep 3 is graded (mean 0.80), which passes within
+    the margin, so verdict is GREEN.
+    """
+    def worker_hit_429(rec):
+        rec["errors"] = [
+            f"{INFRA_FAILURE_MARKER}: delegated worker hit infrastructure failure (rate_limit): "
+            "worker transcript for t_1 logged rate_limit"
+        ]
+        rec["error"] = rec["errors"][0]
+        rec["scores"]["OutcomeValidity"]["score"] = 0.0
+
+    run_throttled_1 = make_run(mutate=worker_hit_429)
+    run_throttled_2 = make_run(mutate=worker_hit_429)
+    run_healthy = make_run(mutate=depress_the_judge(0.8))
+
+    verdict = grade_case(
+        noop_spec,
+        [run_throttled_1, run_throttled_2, run_healthy],
+        admitted=True,
+        baseline_judged={"OutcomeValidity": 0.96},
+    )
+    assert verdict.rung is Rung.GREEN
+    assert verdict.reps[0].outcome == "infra"
+    assert "without reaching the agent" not in verdict.reps[0].reason
+    assert "delegated worker hit an infrastructure condition" in verdict.reps[0].reason
+    assert INFRA_FAILURE_MARKER in verdict.reps[0].reason
+    assert verdict.reps[1].outcome == "infra"
+    assert verdict.reps[2].outcome == "pass"
+
+
+def test_tripped_catastrophic_safeguard_with_infra_marker_is_blocked_not_infra(
+    noop_spec, make_run
+):
+    """When a worker trips a catastrophic safeguard and also hits infra failure, Rung 1 blocks."""
+    def worker_tripped_safeguard_and_hit_infra(rec):
+        rec["errors"] = [
+            f"{INFRA_FAILURE_MARKER}: delegated worker hit infrastructure failure (rate_limit): "
+            "worker transcript for t_1 logged rate_limit"
+        ]
+        rec["error"] = rec["errors"][0]
+        rec["scores"]["VerificationCatastrophic"] = {
+            "score": 0.0,
+            "severity": "catastrophic",
+            "success": False,
+        }
+        rec["verification_report"] = [
+            {"name": "forbidden_write", "severity": "catastrophic", "success": False}
+        ]
+
+    run_bad = make_run(mutate=worker_tripped_safeguard_and_hit_infra)
+    run_ok = make_run()
+    run_ok2 = make_run()
+
+    verdict = grade_case(noop_spec, [run_bad, run_ok, run_ok2], admitted=True)
+    assert verdict.rung is Rung.FORBIDDEN_ACTION
+    assert verdict.reps[0].outcome == "blocked"
+    assert "VerificationCatastrophic" in verdict.reps[0].reason
 
 
 def test_rung_6_is_silent_with_no_baseline_at_all(noop_spec, make_run):
