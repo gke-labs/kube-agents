@@ -14,7 +14,7 @@ override plugin's, one pull of a batch without a verdict, the escape hatch
 -- must fall through to a full run.
 
 The script is copied into a fixture checkout (with the mint module beside
-it) and sourced, then executed with `gsutil` stubbed, GitHub faked by a
+it) and sourced, then executed with `gcloud storage` stubbed, GitHub faked by a
 `sitecustomize` that replaces urlopen for every python the script runs, and
 the fixture git repository standing in for the decorated checkout, so these
 assertions are against the code that ships.
@@ -60,7 +60,7 @@ _JOB_NAME_SET = "JOB_NAME: set"
 _JOB_NAME_ABSENT = "JOB_NAME: absent"
 
 _GSUTIL_STUB = """#!/usr/bin/env bash
-# gsutil stub: `ls` prints the fixture listing for the PR named in the glob
+# gcloud storage stub: `ls` prints the fixture listing for the PR named in the glob
 # (GSUTIL_LS_DIR/<pr>.txt, else it fails like a no-match glob), `cat` serves
 # "<build>.<file>" out of GSUTIL_OBJECT_DIR.
 # Every call is appended to GSUTIL_CALL_LOG so a test can pin WHICH history
@@ -492,7 +492,7 @@ class RevalidationTest(unittest.TestCase):
     def test_the_history_read_is_scoped_to_this_prs_own_job(self):
         """A wrong PR number, job name or bucket in the history path would
         reuse a FOREIGN verdict while every content assertion still passed;
-        the URLs the script hands gsutil are the load-bearing part."""
+        the URLs the script hands gcloud storage are the load-bearing part."""
         self._plant_history([("200", True, self.c1, self.c3)])
         self._run(cur_head=self.c4, cur_base=self.c2)
         calls = self.call_log.read_text().splitlines()

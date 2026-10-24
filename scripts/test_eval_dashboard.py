@@ -13,8 +13,8 @@ result.
 What the pages *show* from brief.json is `test_eval_dashboard_pages.py`'s
 job, in headless Chrome; this file pins what render.py *computes*.
 
-The publish tests never touch a bucket. The gsutil argv is asserted as a
-value (``gsutil_command``), and ``publish`` is only ever *executed* against a
+The publish tests never touch a bucket. The gcloud storage argv is asserted as a
+value (``gcloud storage_command``), and ``publish`` is only ever *executed* against a
 local directory -- a gs:// target in these tests gets a recording fake for a
 runner, and the local-path test uses a runner that fails the test if called.
 """
