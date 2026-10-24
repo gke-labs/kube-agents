@@ -10912,15 +10912,17 @@ _PER_CLUSTER_OTHER_POOL_NOTES = {
 }
 # The two pool-naming rules (entries 17 and 20) end their risk with the pools
 # below the target, or say no pool is below it on a fleet already at the
-# target; the cases admit either tail.
+# target, or that it needs a target when none resolved; the cases admit all three.
 _PER_CLUSTER_OTHER_TAILS = {
     "upgrades-fleet-readiness-node-image-coupled-agent": (
         "pool(s) default-pool, idle-batch-pool, pinned-inference-pool are below the target and get a new node image in this upgrade",
         "no pool is below the target; the next node upgrade changes the image under it",
+        "which pools change image needs a target",
     ),
     "upgrades-fleet-readiness-retired-registry-image": (
         "pool(s) default-pool, idle-batch-pool, pinned-inference-pool are below the target and are rebuilt in this upgrade",
         "no pool is below the target; the next node upgrade pulls it again",
+        "which pools are rebuilt needs a target",
     ),
 }
 # The grades the same rules print for the same objects on another fleet (a
@@ -11075,12 +11077,16 @@ def test_per_pool_rule_case_accepts_the_note_for_every_pool_on_one_line(case):
 
 
 @pytest.mark.parametrize("case", sorted(_PER_CLUSTER_OTHER_TAILS))
-def test_pool_naming_rule_case_accepts_either_pools_tail(case):
+def test_pool_naming_rule_case_accepts_every_pools_tail(case):
+    # The rule prints one of three tails: the pools below the target, no pool below it, or, with no
+    # target resolved (no release channel, or get-server-config failed), that it needs one.
     _planted, _rule, cell = _PER_CLUSTER_RULE_CASES[case]
-    below, none_below = _PER_CLUSTER_OTHER_TAILS[case]
+    below, *other_tails = _PER_CLUSTER_OTHER_TAILS[case]
     assert cell.endswith(below)
-    swapped = cell[: -len(below)] + none_below
-    assert _per_cluster_case_grades(case, _planted_objective(case), _per_cluster_report(case, cell=swapped))
+    for tail in other_tails:
+        swapped = cell[: -len(below)] + tail
+        assert _per_cluster_case_grades(case, _planted_objective(case), _per_cluster_report(case, cell=swapped)), tail
+    assert not _per_cluster_case_grades(case, _planted_objective(case), _per_cluster_report(case, cell=cell[: -len(below)] + "the pools are fine"))
 
 
 @pytest.mark.parametrize("case", sorted(_PER_CLUSTER_OTHER_FLEET_CELLS))
@@ -11195,6 +11201,8 @@ def test_client_addon_skew_case_keeps_one_line_per_cluster_in_the_reports_order(
     assert not _per_cluster_case_grades(_CLIENT_CASE, _planted_objective(_CLIENT_CASE), _per_cluster_report(_CLIENT_CASE, cell=f"{_GKE_ADDONS_NOTE}; {cell}"))
     # What follows the planted finding after `; ` is another finding in the rule's wording, or nothing:
     # a gloss, a verdict or the note is not.
+    # A gloss ahead of the finding, opened with the rule's own principal phrase, is not a finding either.
+    assert not _per_cluster_case_grades(_CLIENT_CASE, _planted_objective(_CLIENT_CASE), _per_cluster_report(_CLIENT_CASE, cell=f"kubectl v1.33 from principal me: not a blocker; {cell}"))
     for tail in ("fine", "not a blocker", _GKE_ADDONS_NOTE, "client-addon-skew: none"):
         assert not _per_cluster_case_grades(_CLIENT_CASE, _planted_objective(_CLIENT_CASE), _per_cluster_report(_CLIENT_CASE, cell=f"{cell}; {tail}")), tail
     assert _per_cluster_case_grades(_CLIENT_CASE, _planted_objective(_CLIENT_CASE), _per_cluster_report(_CLIENT_CASE, cell=f"{cell}; {_ADDON_CELL}"))
@@ -11218,6 +11226,8 @@ def test_client_addon_skew_case_admits_a_finding_the_report_files_on_another_clu
         # `none` with a gloss, and the planted CronJob's finding on another cluster.
         f"none; {_GKE_ADDONS_NOTE}",
         _PER_CLUSTER_RULE_CASES[_CLIENT_CASE][2],
+        # A real finding with a verdict of the agent's after it.
+        f"{_AUDIT_CLIENT_CELL}; this blocks the upgrade, do not proceed",
     ],
 )
 def test_client_addon_skew_case_refuses_what_is_not_a_finding_on_another_cluster(entry):

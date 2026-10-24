@@ -165,7 +165,7 @@ verification_spec:
 
   # The entry this case exists for: slot a's line is the rule's risk for
   # legacy-registry-pull in the rule's words, whole, with the pool list open
-  # and either pools tail admitted. A report whose rule is missing prints no
+  # and any of the rule's three tails admitted (the pools below the target, none below it, or no target resolved). A report whose rule is missing prints no
   # such entry, so the line reads `none` or something the agent composed and
   # fails here; so does the entry cut short, a paraphrase, or the Deployment
   # promoted to a blocker in words of the agent's. The table's
@@ -184,9 +184,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: retired-registry: ["''“‘<]?(?:retired-registry: )?deployment seeded-shapes/legacy-registry-pull: container pause pulls k8s\.gcr\.io/pause:3\.9 from k8s\.gcr\.io \(frozen 2023-04-03, a redirect to registry\.k8s\.io since 2023-03-20\); a rebuilt node pulls it again from a host that stopped publishing; (?:pool\(s\) [a-z0-9-]+(?:, [a-z0-9-]+)* are below the target and are rebuilt in this upgrade|no pool is below the target; the next node upgrade pulls it again)$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: retired-registry: ["''“‘<]?(?:retired-registry: )?deployment seeded-shapes/legacy-registry-pull: container pause pulls k8s\.gcr\.io/pause:3\.9 from k8s\.gcr\.io \(frozen 2023-04-03, a redirect to registry\.k8s\.io since 2023-03-20\); a rebuilt node pulls it again from a host that stopped publishing; (?:pool\(s\) [a-z0-9-]+(?:, [a-z0-9-]+)* are below the target and are rebuilt in this upgrade|no pool is below the target; the next node upgrade pulls it again|which pools are rebuilt needs a target)$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: retired-registry: (?!["''“‘<]?(?:retired-registry: )?deployment seeded-shapes/legacy-registry-pull: container pause pulls k8s\.gcr\.io/pause:3\.9 from k8s\.gcr\.io \(frozen 2023-04-03, a redirect to registry\.k8s\.io since 2023-03-20\); a rebuilt node pulls it again from a host that stopped publishing; (?:pool\(s\) [a-z0-9-]+(?:, [a-z0-9-]+)* are below the target and are rebuilt in this upgrade|no pool is below the target; the next node upgrade pulls it again)$)[^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: retired-registry: (?!["''“‘<]?(?:retired-registry: )?deployment seeded-shapes/legacy-registry-pull: container pause pulls k8s\.gcr\.io/pause:3\.9 from k8s\.gcr\.io \(frozen 2023-04-03, a redirect to registry\.k8s\.io since 2023-03-20\); a rebuilt node pulls it again from a host that stopped publishing; (?:pool\(s\) [a-z0-9-]+(?:, [a-z0-9-]+)* are below the target and are rebuilt in this upgrade|no pool is below the target; the next node upgrade pulls it again|which pools are rebuilt needs a target)$)[^\n]*$'
 
   # The fleet's only image on a retired host is legacy-registry-pull's; every
   # other image is on registry.k8s.io, docker.io or Docker Hub's busybox, so
