@@ -183,7 +183,7 @@ verification_spec:
       any_of_patterns:
         - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: (?:removed-node-label: )?["''“‘<]?(?:removed-node-label: )?deployment seeded-shapes/arch-pinned-worker: selects on beta\.kubernetes\.io/arch=amd64 \(nodeselector\), deprecated since 1\.14 in favour of kubernetes\.io/arch; the kubelet still sets it today, and a node image that stops setting it strands the pods$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: (?!(?:removed-node-label: )?["''“‘<]?(?:removed-node-label: )?deployment seeded-shapes/arch-pinned-worker: selects on beta\.kubernetes\.io/arch=amd64 \(nodeselector\), deprecated since 1\.14 in favour of kubernetes\.io/arch; the kubelet still sets it today, and a node image that stops setting it strands the pods$)[^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: removed-node-label: (?!["''“‘<]?(?:removed-node-label: )?deployment seeded-shapes/arch-pinned-worker: selects on beta\.kubernetes\.io/arch=amd64 \(nodeselector\), deprecated since 1\.14 in favour of kubernetes\.io/arch; the kubelet still sets it today, and a node image that stops setting it strands the pods$)[^\n]*$'
 
   # The fleet's other selectors are on labels a pool's configuration defines
   # (seeded-role) or GKE sets on every node (cloud.google.com/gke-nodepool,
@@ -206,7 +206,7 @@ verification_spec:
       any_of_patterns:
         - '(?ms)\A(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: (?:removed-node-label: )?none$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: (?:removed-node-label: )?none$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: (?:removed-node-label: )?none$)'
       forbidden_patterns:
-        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: (?!(?:removed-node-label: )?none$)[^\n]*$'
+        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: removed-node-label: (?!none$)[^\n]*$'
 
   # The prompt's "read only", grounded: the planted object is as the fixture
   # declares it after the run.

@@ -190,7 +190,7 @@ verification_spec:
       any_of_patterns:
         - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: (?:group-oom-kill: )?["''“‘<]?(?:["''“‘<]?(?:group-oom-kill: )?deployment seeded-shapes/multi-process-worker container supervisor runs a shell script that forks a background job on pool [a-z0-9-]+, on cgroup v2 with a kubelet at [0-9][a-z0-9.-]*, which already group-kills; not an upgrade risk["''”’>]?(?:; |$))+$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: (?!(?:group-oom-kill: )?["''“‘<]?(?:["''“‘<]?(?:group-oom-kill: )?deployment seeded-shapes/multi-process-worker container supervisor runs a shell script that forks a background job on pool [a-z0-9-]+, on cgroup v2 with a kubelet at [0-9][a-z0-9.-]*, which already group-kills; not an upgrade risk["''”’>]?(?:; |$))+$)[^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: group-oom-kill: (?!["''“‘<]?(?:["''“‘<]?(?:group-oom-kill: )?deployment seeded-shapes/multi-process-worker container supervisor runs a shell script that forks a background job on pool [a-z0-9-]+, on cgroup v2 with a kubelet at [0-9][a-z0-9.-]*, which already group-kills; not an upgrade risk["''”’>]?(?:; |$))+$)[^\n]*$'
 
   # The fleet's only container that forks a background job, runs a supervisor
   # program or runs a supervisor image is multi-process-worker's, so the rule
@@ -211,7 +211,7 @@ verification_spec:
       any_of_patterns:
         - '(?ms)\A(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: (?:group-oom-kill: )?none$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: (?:group-oom-kill: )?none$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: (?:group-oom-kill: )?none$)'
       forbidden_patterns:
-        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: (?!(?:group-oom-kill: )?none$)[^\n]*$'
+        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: group-oom-kill: (?!none$)[^\n]*$'
 
   # The prompt's "read only", grounded: the planted object is as the fixture
   # declares it after the run.

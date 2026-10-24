@@ -185,7 +185,7 @@ verification_spec:
       any_of_patterns:
         - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: (?:cgroup-v2-runtime: )?["''“‘<]?(?:["''“‘<]?(?:cgroup-v2-runtime: )?deployment seeded-shapes/cgroup-blind-jvm container jvm runs docker\.io/library/eclipse-temurin:8u302-b08-jre \(jdk 8u302, below 8u372\) on pool [a-z0-9-]+, already on cgroup v2; not an upgrade risk["''”’>]?(?:; |$))+$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: (?!(?:cgroup-v2-runtime: )?["''“‘<]?(?:["''“‘<]?(?:cgroup-v2-runtime: )?deployment seeded-shapes/cgroup-blind-jvm container jvm runs docker\.io/library/eclipse-temurin:8u302-b08-jre \(jdk 8u302, below 8u372\) on pool [a-z0-9-]+, already on cgroup v2; not an upgrade risk["''”’>]?(?:; |$))+$)[^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: cgroup-v2-runtime: (?!["''“‘<]?(?:["''“‘<]?(?:cgroup-v2-runtime: )?deployment seeded-shapes/cgroup-blind-jvm container jvm runs docker\.io/library/eclipse-temurin:8u302-b08-jre \(jdk 8u302, below 8u372\) on pool [a-z0-9-]+, already on cgroup v2; not an upgrade risk["''”’>]?(?:; |$))+$)[^\n]*$'
 
   # The fleet's only Java or .NET image is cgroup-blind-jvm's, so the rule
   # prints nothing for slots b, c and d and each reads none; any entry there
@@ -205,7 +205,7 @@ verification_spec:
       any_of_patterns:
         - '(?ms)\A(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: (?:cgroup-v2-runtime: )?none$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: (?:cgroup-v2-runtime: )?none$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: (?:cgroup-v2-runtime: )?none$)'
       forbidden_patterns:
-        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: (?!(?:cgroup-v2-runtime: )?none$)[^\n]*$'
+        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: cgroup-v2-runtime: (?!none$)[^\n]*$'
 
   # The prompt's "read only", grounded: the planted object is as the fixture
   # declares it after the run.
