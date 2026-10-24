@@ -136,6 +136,21 @@
       "deliver": "chat"
     },
     {
+      "id": "upgrade-retrospective",
+      "name": "Upgrade Retrospective",
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 18 * * 0",
+        "display": "0 18 * * 0"
+      },
+      "prompt": "Run the weekly upgrade retrospective. Read the SOP at '/opt/data/profiles/platform/governance/upgrade_retrospective_sop.md' — all 256 lines of it, before you run anything. Its seven checks are section 3, lines 104-189, so a read that stops early skips the grading and reports a clean fleet it never looked at. Section 1 resolves the scope with the platform_control fleet_scope tool; section 0 probes the collector's lock (`--probe-lock`), then opens the audit run with the fleet-audit skill where a repository is linked, and says when a run has none and reports in chat alone. Section 2 runs the collector (`/opt/data/profiles/platform/skills/fleet-audit/scripts/upgrade_retrospective.py --full`) with the tool's collector_args verbatim and --manifest-file /opt/data/scratch/manifest_upgrade-retrospective.json, in the foreground with the terminal tool's timeout: 600 and never in the background: run it before grading anything by hand, draft the findings document from the manifest the way section 2 says, copy every candidate's grade by section 3, and pass the same manifest to finish as --manifest-file; a collector exit without a manifest after start takes section 0's recovery finish. Then execute the SOP exactly. This review is read-only: never upgrade, roll back, cordon, delete or patch anything.",
+      "skills": ["fleet-audit"],
+      "max_turns": 250,
+      "risk": "low",
+      "enabled": true,
+      "deliver": "chat"
+    },
+    {
       "id": "findings-morning-nudge",
       "name": "Findings Queue Nudge",
       "schedule": {

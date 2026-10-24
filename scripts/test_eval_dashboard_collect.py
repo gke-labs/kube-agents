@@ -1515,7 +1515,8 @@ class TestRepoDerivedFacts(unittest.TestCase):
         # only a roster line counts. pdb-remediation-pr took its roster line on
         # 2026-10-14 (#2016), which covered remediation again.
         # upgrades-lagging-master-probe, upgrades' only roster case, was
-        # demoted to the nightly on 2026-10-16 (#3269), uncovering upgrades.
+        # demoted to the nightly on 2026-10-16 (#3269), uncovering upgrades,
+        # and took its line back on 2026-10-23 after #3338, covering it again.
         # pdb-remediation-pr, remediation's only roster case, was demoted to
         # the nightly on 2026-10-17 (#3120), uncovering remediation again.
         # consistency-authorized-networks-probe, consistency's only roster
@@ -1526,7 +1527,7 @@ class TestRepoDerivedFacts(unittest.TestCase):
         # off on 2026-10-23, when vcs-spent-branch-reuse took a roster seat.
         self.assertEqual(
             cov["uncovered"],
-            ["fleet-audits", "upgrades", "remediation", "consistency", "observability"],
+            ["fleet-audits", "remediation", "consistency", "observability"],
         )
         self.assertEqual(cov["domains_covered"], cov["domains_total"] - len(cov["uncovered"]))
 

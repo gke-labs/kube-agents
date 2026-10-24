@@ -1956,6 +1956,7 @@ LEDGER_AUDIT_IDS = frozenset(
         "obtainability-audit",
         "security-patch-orchestrator",
         "stockout-prevention",
+        "upgrade-retrospective",
     }
 )
 
@@ -1971,6 +1972,7 @@ AuditId = Literal[
     "obtainability-audit",
     "security-patch-orchestrator",
     "stockout-prevention",
+    "upgrade-retrospective",
 ]
 
 # Every `status` a fleet-audit `finish` stores, for `audit_report_stored`:
@@ -7055,10 +7057,16 @@ class BootstrapReportPostureVerifier(_OnboardingPollVerifier):
         return "pass", f"the report opens with the scan counts and the posture line{judged}", raw
 
 
-# The check rosters of the four audits the oobe stage runs after the scan
+# The check rosters of the five audits the oobe stage runs after the scan
 # (agents/chat/scripts/oobe.py FIRST_RUN_AUDITS; each roster is `AUDITS[<id>].checks` in
 # agents/platform/skills/fleet-audit/scripts/audit_report.py). The cluster inventory SOP
 # leaves these checks to those audits; tests/test_bootstrap_handoff.py re-derives this
+
+# The check rosters of the audits the oobe stage runs after the scan
+# (agents/chat/scripts/oobe.py FIRST_RUN_AUDITS, in its order; each roster is `AUDITS[<id>].checks`
+# in agents/platform/skills/fleet-audit/scripts/audit_report.py). The cluster inventory SOP
+# leaves the four fleet audits' checks to those audits; the upgrade retrospective's are the
+# collector's six, which no scan reports. tests/test_bootstrap_handoff.py re-derives this
 # copy from both files.
 FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
     "fleet-wide-cost-analysis": (
@@ -7085,6 +7093,11 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "ccc-mixed-disk-generations", "ccc-hyperdisk-incompatible", "quota-exhaustion-risk",
         "spot-scarcity-risk", "single-zone-nodepool", "reservation-mismatch-risk",
         "autoscaler-out-of-resources", "dangling-compute-class",
+    ),
+    "upgrade-retrospective": (
+        "upgrade-operation-failed", "upgrade-broke-workload", "node-broken-after-upgrade",
+        "upgrade-symptom-tentative", "upgrade-symptom-unclassified", "symptom-predates-upgrade",
+        "upgrade-log-volume-rose",
     ),
 }
 

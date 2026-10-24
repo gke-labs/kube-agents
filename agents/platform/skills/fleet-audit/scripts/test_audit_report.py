@@ -99,6 +99,7 @@ SOP_FILENAMES = {
     "stockout-prevention": "stockout_prevention_sop.md",
     "gcp-networking-fabric-audit": "gcp_networking_fabric_sop.md",
     "gce-compute-fleet-audit": "gce_compute_fleet_sop.md",
+    "upgrade-retrospective": "upgrade_retrospective_sop.md",
 }
 
 # Rules that hold on every stream — because the harness enforces them, or
@@ -19119,6 +19120,55 @@ class TestLoadManifest(BaseTestCase):
     def test_an_empty_envelope_loads(self):
         self.assertEqual(audit_report.load_manifest(self.write("{}")), {})
 
+    def test_a_manifest_written_after_a_reset_is_refused(self):
+        """`--reset-ledger` marks the store, and every manifest until a full run
+        has written the new baseline carries `after_reset: true`. The SOP files
+        nothing from such a run: a `finish` from it would resolve every finding
+        the archived guards held, and a `draft` is the step before one.
+        """
+        path = self.write(json.dumps({"audit": AUDIT, audit_report.MANIFEST_AFTER_RESET_KEY: True}))
+        for audit_id in (AUDIT, None):
+            with self.subTest(audit_id=audit_id):
+                with self.assertRaises(audit_report.ValidationError) as ctx:
+                    audit_report.load_manifest(path, audit_id)
+                message = str(ctx.exception)
+                self.assertIn(f"{audit_report.MANIFEST_AFTER_RESET_KEY}: true", message)
+                self.assertIn("--reset-ledger", message)
+                self.assertIn("neither draft nor finish", message)
+
+    def test_a_manifest_after_the_baseline_loads(self):
+        """The marker is removed once the baseline is written, and the collector
+        then writes the key as `false`; a sibling collector writes no key."""
+        path = self.write(json.dumps({"audit": AUDIT, audit_report.MANIFEST_AFTER_RESET_KEY: False}))
+        self.assertEqual(audit_report.load_manifest(path, AUDIT)["audit"], AUDIT)
+
+    def test_a_scoped_runs_manifest_is_refused(self):
+        """A scoped run (no `--full`, or `--cluster`, `--since`, `--after-upgrade`)
+        files no ledger, and the SOP hands it no `--manifest-file`. Passed
+        anyway, its manifest vouches for the clusters it read and for no other,
+        and `finish` would announce every other cluster's finding resolved."""
+        path = self.write(json.dumps({"audit": AUDIT, audit_report.MANIFEST_SCOPED_KEY: True}))
+        for audit_id in (AUDIT, None):
+            with self.subTest(audit_id=audit_id):
+                with self.assertRaises(audit_report.ValidationError) as ctx:
+                    audit_report.load_manifest(path, audit_id)
+                message = str(ctx.exception)
+                self.assertIn(f"{audit_report.MANIFEST_SCOPED_KEY}: true", message)
+                self.assertIn("no --manifest-file", message)
+                self.assertIn("neither draft nor finish", message)
+
+    def test_a_scoped_run_is_named_before_a_pending_reset(self):
+        path = self.write(json.dumps({"audit": AUDIT, audit_report.MANIFEST_SCOPED_KEY: True, audit_report.MANIFEST_AFTER_RESET_KEY: True}))
+        with self.assertRaises(audit_report.ValidationError) as ctx:
+            audit_report.load_manifest(path, AUDIT)
+        self.assertIn(f"{audit_report.MANIFEST_SCOPED_KEY}: true", str(ctx.exception))
+
+    def test_a_full_runs_manifest_loads(self):
+        """The collector writes `scoped: false` on a full run; a sibling
+        collector writes no key."""
+        path = self.write(json.dumps({"audit": AUDIT, audit_report.MANIFEST_SCOPED_KEY: False}))
+        self.assertEqual(audit_report.load_manifest(path, AUDIT)["audit"], AUDIT)
+
     def test_last_weeks_manifest_at_the_same_path_is_refused(self):
         """The failure the guard exists for: the worker skipped the collector.
 
@@ -22127,6 +22177,44 @@ class TestTriageMarkedFindings(BaseTestCase):
             set(),
         )
 
+    def test_the_retrospective_stays_off_the_major_sweep(self):
+        """The retrospective files an Error at `major` and a Warning at `minor`
+        and never at `critical`, so the one way `finish` could still open a
+        pull request on its own is a slug on `MAJOR_SWEEP_CHECKS`. The design
+        keeps every one of them off it; the SOP states both halves as rules.
+        """
+        import upgrade_retrospective
+
+        checks = set(audit_report.AUDITS["upgrade-retrospective"].checks)
+        self.assertFalse(checks & audit_report.MAJOR_SWEEP_CHECKS)
+        # The collector's roster is the SOP's, in the SOP's order: `commands`
+        # it emits per cluster are copied straight into `checks_run`.
+        self.assertEqual(
+            [check for check, _ in upgrade_retrospective.CHECK_READS],
+            list(audit_report.AUDITS["upgrade-retrospective"].checks),
+        )
+
+    def test_the_reader_refuses_on_the_keys_the_collector_writes(self):
+        """`load_manifest` refuses a manifest on the two keys the collector
+        writes for a run the SOP files nothing from; the names are pinned to
+        what `build_manifest` emits, not to a copy of the collector's literals."""
+        import upgrade_retrospective
+
+        self.assertEqual(audit_report.MANIFEST_AFTER_RESET_KEY, upgrade_retrospective.AFTER_RESET_KEY)
+        result = {
+            "generated_at": "2026-10-11T18:00:00Z",
+            "sections": {"errors": [], "warnings": []},
+            "reviews": [],
+            "unchanged": [],
+            "upgrading": [],
+            "failed_reads": [],
+            "scoped": True,
+            upgrade_retrospective.AFTER_RESET_KEY: True,
+        }
+        manifest = upgrade_retrospective.build_manifest(result, {}, started_at="2026-10-11T18:00:00Z", finished_at="2026-10-11T18:05:00Z")
+        self.assertEqual((manifest[audit_report.MANIFEST_SCOPED_KEY], manifest[audit_report.MANIFEST_AFTER_RESET_KEY]), (True, True))
+        self.assertEqual(manifest["audit"], "upgrade-retrospective")
+
     def test_the_sweep_passes_over_it(self):
         plan = audit_report.promotion_candidates(
             [manifest_finding("free", "a.yaml"), manifest_finding("fronted", "b.yaml")],
@@ -22518,6 +22606,7 @@ class TestCollectorStreamsRequireAManifest(HarnessTestCase):
         import fleet_stockout
         import fleet_waste
         import patch_readiness
+        import upgrade_retrospective
 
         # The GCE compute and networking collectors ship in their own skills,
         # beside their SOPs.
@@ -22534,7 +22623,7 @@ class TestCollectorStreamsRequireAManifest(HarnessTestCase):
 
         expected = set(collect.CHECK_TABLES) | {
             fleet_drift.AUDIT_ID, patch_readiness.AUDIT_ID, fleet_waste.AUDIT_NAME, fleet_stockout.AUDIT_ID,
-            compute_fleet_audit.AUDIT_ID, networking_audit.AUDIT_SLUG,
+            compute_fleet_audit.AUDIT_ID, networking_audit.AUDIT_SLUG, upgrade_retrospective.AUDIT_ID,
         }
         self.assertEqual(set(REAL_COLLECTOR_AUDITS), expected)
         self.assertLessEqual(set(REAL_COLLECTOR_AUDITS), set(audit_report.AUDITS))
@@ -22602,6 +22691,24 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.harness.replies = {"issue-list": {"issues": []}}
         rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(_full_manifest())])
         self.assertEqual(rc, 0, self.err)
+
+    def test_a_manifest_written_after_a_reset_publishes_nothing(self):
+        """The refusal is `load_manifest`'s, so it reaches `finish` before the
+        cross-check and before any ledger call: exit 2, the ledger untouched."""
+        self.harness.replies = {"issue-list": {"issues": []}}
+        manifest = _full_manifest() | {audit_report.MANIFEST_AFTER_RESET_KEY: True}
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 2, self.err)
+        self.assertIn(f"{audit_report.MANIFEST_AFTER_RESET_KEY}: true", self.err)
+        self.assertEqual(self.harness.calls, [])
+
+    def test_a_scoped_runs_manifest_publishes_nothing(self):
+        self.harness.replies = {"issue-list": {"issues": []}}
+        manifest = _full_manifest() | {audit_report.MANIFEST_SCOPED_KEY: True}
+        rc = self.run_finish(make_doc(findings=[]), ["--manifest-file", self.manifest_file(manifest)])
+        self.assertEqual(rc, 2, self.err)
+        self.assertIn(f"{audit_report.MANIFEST_SCOPED_KEY}: true", self.err)
+        self.assertEqual(self.harness.calls, [])
 
     def test_without_either_flag_the_payload_carries_no_collector_keys(self):
         self.harness.replies = {"issue-list": {"issues": []}}

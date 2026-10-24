@@ -284,8 +284,9 @@ HELD_OUT_IN_PRESUBMIT = [
 # when its line went in the nightly file's sorted section (#3495), which is
 # where a demotion lands from now on.
 DEMOTED_AFTER_THE_SPLIT = [
-    ("upgrades-lagging-master-probe", "fleet-cost-idle-pool"),  # 2026-10-16, #3269 (agent reads upgradeTargetVersion)
-    ("pdb-remediation-pr", "upgrades-lagging-master-probe"),  # 2026-10-17, #3120 (worker declines a pull request into an -infra repo with no manifest; #3145)
+    # upgrades-lagging-master-probe sat here 2026-10-16 to 2026-10-23 (#3269; its line followed
+    # fleet-cost-idle-pool) and took its roster line back on three clean nightlies after #3338.
+    ("pdb-remediation-pr", "fleet-cost-idle-pool"),  # 2026-10-17, #3120 (worker declines a pull request into an -infra repo with no manifest; #3145)
     ("consistency-authorized-networks-probe", None),  # 2026-10-21, #3598 (Gemini reads seeded-c's leftover authorized-networks block as configured; #3448 for the 429s)
 ]
 DEMOTED = {case for case, _ in DEMOTED_AFTER_THE_SPLIT}
@@ -293,8 +294,7 @@ DEMOTED = {case for case, _ in DEMOTED_AFTER_THE_SPLIT}
 # frozen part after a named predecessor. Written out and not to grow: every
 # later demotion goes in the sorted section, recorded with None.
 DEMOTED_INTO_THE_FROZEN_PART = frozenset({
-    ("upgrades-lagging-master-probe", "fleet-cost-idle-pool"),
-    ("pdb-remediation-pr", "upgrades-lagging-master-probe"),
+    ("pdb-remediation-pr", "fleet-cost-idle-pool"),  # followed upgrades-lagging-master-probe until that line left, 2026-10-23
 })
 # Held-out seats withdrawn since #3495: a withdrawal moves the line to the
 # nightly file's sorted section and records the case here, in the same edit

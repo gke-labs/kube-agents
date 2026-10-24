@@ -268,6 +268,8 @@ OTHER_FLEET_AUDITS = (
 # A request that needs no chat history, so it works in any conversation; the nightly request-path case
 # sends it verbatim. A test holds every audit the note checks to the store's audits (audit_report.AUDITS).
 AUDITS_REQUEST_FORMAT = "Show me the latest report of each of these fleet audits from the report store: {ids}."
+# The first-run chain's fifth job is not a posture family: named in the note by what it is.
+AUDIT_AREA_EXTRA = {"upgrade-retrospective": "upgrade retrospective"}
 # Said of every failed delivery, whatever refused it: usually no home channel yet, which an audit
 # that ends before anyone opens the chat always meets, and the scheduler does not post it again
 # (_lost_audits).
@@ -988,7 +990,7 @@ def _stage_sentences(data_dir: Path, state: dict, no_coverage: bool) -> tuple[st
 
 def _area(audit: str) -> str:
     """What ``audit`` reports on, or its job id for an audit with no area."""
-    return inventory_findings.AUDIT_FAMILIES.get(audit) or _audit_label(audit)
+    return inventory_findings.AUDIT_FAMILIES.get(audit) or AUDIT_AREA_EXTRA.get(audit) or _audit_label(audit)
 
 
 def _in_area_order(audits: list[str]) -> list[str]:

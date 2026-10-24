@@ -2253,7 +2253,11 @@ class FirstRunAuditsTest(unittest.TestCase):
         self.assertEqual({slug for slug, _ in inventory_findings.SCAN_CHECKS}, self._slug_table())
 
     def test_every_first_run_audit_has_an_area(self):
-        self.assertEqual(set(inventory_findings.AUDIT_FAMILIES), set(oobe.FIRST_RUN_AUDITS))
+        # The four posture audits are the families; the retrospective, the chain's fifth job, is
+        # named by what it is, so no first-run audit falls back to its backticked id.
+        self.assertTrue(set(inventory_findings.AUDIT_FAMILIES) <= set(oobe.FIRST_RUN_AUDITS))
+        for audit in oobe.FIRST_RUN_AUDITS:
+            self.assertNotIn("`", bootstrap_delivery._area(audit), audit)
 
     def test_a_no_coverage_report_after_another_skip_points_at_the_schedules(self):
         self._skipped(oobe.SKIP_NOT_NEW)
@@ -2283,7 +2287,7 @@ class FirstRunAuditsTest(unittest.TestCase):
 
     def test_a_finished_chain_says_which_audits_the_stage_started(self):
         note = self._note({oobe.STATE_FIRED: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_DONE: True})
-        self.assertIn("The security and RBAC, reliability, capacity and cost audits started as part of onboarding.", note)
+        self.assertIn("The security and RBAC, reliability, capacity, cost and upgrade retrospective audits started as part of onboarding.", note)
         # The onboarding sentence names the audits by area; ids appear only where a request names one.
         self.assertNotIn("`", note)
         self.assertTrue(note.endswith(bootstrap_delivery.AUDITS_HOME_SENTENCE))
@@ -2382,7 +2386,7 @@ class FirstRunAuditsTest(unittest.TestCase):
         return note.partition("not posted to the chat:")[2].partition(". To see them")[0]
 
     def _finished_chain(self, outcome: str | None) -> dict:
-        """All four audits marked and completed after their marks, each run's delivery ending ``outcome``."""
+        """Every audit in the chain marked and completed after its mark, each run's delivery ending ``outcome``."""
         now = time.time()
         marks = {a: now - 3600 + i * 600 for i, a in enumerate(oobe.FIRST_RUN_AUDITS)}
         for audit in oobe.FIRST_RUN_AUDITS:
@@ -2391,14 +2395,14 @@ class FirstRunAuditsTest(unittest.TestCase):
 
     def test_audits_that_finished_before_a_home_channel_are_listed_with_a_request(self):
         note = self._note(self._finished_chain(bootstrap_delivery.DELIVERY_FAILED))
-        self.assertIn("The security and RBAC, reliability, capacity and cost audits started as part of onboarding.", note)
+        self.assertIn("The security and RBAC, reliability, capacity, cost and upgrade retrospective audits started as part of onboarding.", note)
         # No home-channel promise beside summaries that were not posted.
         self.assertNotIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, note)
         self.assertIn(
             "These ran, but their summaries were not posted to the chat: "
-            "`fleet-wide-cost-analysis`, `compliance-audit`, `obtainability-audit`, `stockout-prevention`. "
+            "`fleet-wide-cost-analysis`, `compliance-audit`, `obtainability-audit`, `stockout-prevention`, `upgrade-retrospective`. "
             "To see them, send me: `Show me the latest report of each of these fleet audits from the report store: "
-            "fleet-wide-cost-analysis, compliance-audit, obtainability-audit, stockout-prevention.`", note)
+            "fleet-wide-cost-analysis, compliance-audit, obtainability-audit, stockout-prevention, upgrade-retrospective.`", note)
         self.assertNotIn("Ask me", note)
 
     def test_a_skip_names_the_scheduled_runs_that_lost_their_summaries(self):
@@ -2648,10 +2652,10 @@ class FirstRunAuditsTest(unittest.TestCase):
         cron.mkdir(parents=True)
         (cron / oobe.EXECUTIONS_DB).write_text("not a database", encoding="utf-8")
         note = self._note({oobe.STATE_FIRED: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_DONE: True})
-        self.assertIn("The security and RBAC, reliability, capacity and cost audits started as part of onboarding.", note)
+        self.assertIn("The security and RBAC, reliability, capacity, cost and upgrade retrospective audits started as part of onboarding.", note)
         self.assertIn("I could not read the audit run records", note)
         self.assertIn("report store: fleet-wide-cost-analysis, compliance-audit, obtainability-audit, "
-                      "stockout-prevention, security-patch-orchestrator, fleet-consistency-drift, ai-security-audit, "
+                      "stockout-prevention, upgrade-retrospective, security-patch-orchestrator, fleet-consistency-drift, ai-security-audit, "
                       "gcp-networking-fabric-audit, gce-compute-fleet-audit.`", note)
         self.assertIn("cannot read", (self.d / oobe.STAGE_LOG).read_text())
 
@@ -2699,7 +2703,7 @@ class FirstRunAuditsTest(unittest.TestCase):
     def test_the_text_delivery_carries_the_lost_summaries(self):
         oobe.write_state(self.d, self._finished_chain(bootstrap_delivery.DELIVERY_FAILED))
         self._filed(1)
-        self.assertIn("stockout-prevention.`\n", self._deliver())
+        self.assertIn("stockout-prevention, upgrade-retrospective.`\n", self._deliver())
 
     def test_the_text_delivery_closes_with_the_skip(self):
         self._filed(1)

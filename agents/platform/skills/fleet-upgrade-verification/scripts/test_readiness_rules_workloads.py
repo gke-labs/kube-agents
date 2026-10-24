@@ -79,7 +79,7 @@ class RegistrationTest(unittest.TestCase):
             self.assertIn(module, r.EXTRA_RULES, module.RULE_ID)
             self.assertEqual(module.ENTRY, entry)
             self.assertEqual(module.CAN_BLOCK, module in CAN_BLOCK, module.RULE_ID)
-        entries = [m.ENTRY for m in r.EXTRA_RULES]
+        entries = [m.ENTRY for m in r.EXTRA_RULES if m.ENTRY is not None]  # the plan-level rules, with no entry, come after the numbered ones
         self.assertEqual(entries, sorted(entries))
 
     def test_the_fold_names_the_object_in_a_per_object_unknown_and_prefixes_notes(self):
