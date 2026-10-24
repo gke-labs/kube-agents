@@ -152,33 +152,93 @@ func TestBuildA2AMCPDeployment(t *testing.T) {
 
 // The creds Secret holds every static user's password. The MCP pod gets the
 // console's and nothing else, and its only other Secret is its own token.
+// With broker access on (A2A_MCP_DOOR=true on a next install) it also holds
+// exactly one projected token, for the broker's mcp audience and nothing else;
+// with it off, none.
 func TestTheMCPPodHoldsTheConsolePasswordAndItsOwnTokenOnly(t *testing.T) {
-	agent := a2aTestAgent()
-	pod := buildA2AMCPDeployment(agent).Spec.Template.Spec
-	secrets := map[string]*corev1.SecretVolumeSource{}
-	for _, v := range pod.Volumes {
-		if v.Projected != nil {
-			t.Errorf("projected volume %s: the MCP pod holds no projected token", v.Name)
-		}
-		if v.Secret != nil {
-			secrets[v.Secret.SecretName] = v.Secret
-		}
-	}
-	if len(secrets) != 2 {
-		t.Fatalf("secret volumes = %v, want the creds Secret and the token Secret", secrets)
-	}
-	for name, key := range map[string]string{a2aCredsSecretName(agent): a2aConsolePasswordKey, a2aMCPAccessName(agent): a2aMCPAccessKey} {
-		src := secrets[name]
-		if src == nil {
-			t.Errorf("no volume from Secret %s", name)
-			continue
-		}
-		if len(src.Items) != 1 || src.Items[0].Key != key {
-			t.Errorf("Secret %s projects %+v, want exactly %s", name, src.Items, key)
-		}
-		if src.Optional != nil && *src.Optional {
-			t.Errorf("Secret %s is optional; the server must not start without it", name)
-		}
+	for _, brokerOn := range []bool{false, true} {
+		t.Run(map[bool]string{false: "broker access off", true: "broker access on"}[brokerOn], func(t *testing.T) {
+			t.Setenv(a2aMCPDoorEnvVar, map[bool]string{false: "", true: "true"}[brokerOn])
+			agent := a2aTestAgent()
+			pod := buildA2AMCPDeployment(agent).Spec.Template.Spec
+			secrets := map[string]*corev1.SecretVolumeSource{}
+			var projected []corev1.Volume
+			for _, v := range pod.Volumes {
+				if v.Projected != nil {
+					projected = append(projected, v)
+				}
+				if v.Secret != nil {
+					secrets[v.Secret.SecretName] = v.Secret
+				}
+			}
+			if len(secrets) != 2 {
+				t.Fatalf("secret volumes = %v, want the creds Secret and the token Secret", secrets)
+			}
+			for name, key := range map[string]string{a2aCredsSecretName(agent): a2aConsolePasswordKey, a2aMCPAccessName(agent): a2aMCPAccessKey} {
+				src := secrets[name]
+				if src == nil {
+					t.Errorf("no volume from Secret %s", name)
+					continue
+				}
+				if len(src.Items) != 1 || src.Items[0].Key != key {
+					t.Errorf("Secret %s projects %+v, want exactly %s", name, src.Items, key)
+				}
+				if src.Optional != nil && *src.Optional {
+					t.Errorf("Secret %s is optional; the server must not start without it", name)
+				}
+			}
+
+			if !brokerOn {
+				if len(projected) != 0 {
+					t.Errorf("projected volumes %v: the MCP pod holds no projected token without broker access", projected)
+				}
+				return
+			}
+			if len(projected) != 1 {
+				t.Fatalf("projected volumes = %d, want exactly the broker token", len(projected))
+			}
+			vol := projected[0]
+			sources := vol.Projected.Sources
+			if len(sources) != 1 {
+				t.Fatalf("projected volume %s has %d sources, want only the broker token", vol.Name, len(sources))
+			}
+			src := sources[0]
+			if src.ServiceAccountToken == nil || src.Secret != nil || src.ConfigMap != nil || src.DownwardAPI != nil || src.ClusterTrustBundle != nil {
+				t.Fatalf("projected source %+v, want a ServiceAccount token and nothing else", src)
+			}
+			if src.ServiceAccountToken.Audience != credentialProxyMCPAudience {
+				t.Errorf("token audience = %q, want the broker's mcp audience %q", src.ServiceAccountToken.Audience, credentialProxyMCPAudience)
+			}
+
+			// Mounted read-only, in the one container, at exactly the path
+			// the MCP binary is told to read.
+			c := pod.Containers[0]
+			tokenFile := ""
+			for _, e := range c.Env {
+				if e.Name == a2aMCPBrokerTokenFileEnvVar {
+					tokenFile = e.Value
+				}
+			}
+			if tokenFile == "" {
+				t.Fatalf("%s is not set on the MCP container", a2aMCPBrokerTokenFileEnvVar)
+			}
+			var mounts []corev1.VolumeMount
+			for _, m := range c.VolumeMounts {
+				if m.Name == vol.Name {
+					mounts = append(mounts, m)
+				}
+			}
+			if len(mounts) != 1 {
+				t.Fatalf("volume %s mounted %d times, want once", vol.Name, len(mounts))
+			}
+			m := mounts[0]
+			if !m.ReadOnly || m.SubPath != "" {
+				t.Errorf("token mount %+v, want a read-only directory mount", m)
+			}
+			if want := path.Join(m.MountPath, src.ServiceAccountToken.Path); tokenFile != want {
+				t.Errorf("%s = %q, but the token is mounted at %q", a2aMCPBrokerTokenFileEnvVar, tokenFile, want)
+			}
+		})
 	}
 }
 
@@ -473,19 +533,37 @@ func TestTheMCPRemovalReadsEachObjectOnce(t *testing.T) {
 }
 
 // Nothing else carries a credential into the pod: no env from a Secret, no
-// second container, no init container, no ServiceAccount of its own.
+// second container, no init container. Without broker access it runs as the
+// namespace default with no token mounted; with it, as its own ServiceAccount,
+// whose only token is the projected broker one the test above pins.
 func TestTheMCPPodCarriesNoOtherCredential(t *testing.T) {
-	pod := buildA2AMCPDeployment(a2aTestAgent()).Spec.Template.Spec
-	if len(pod.Containers) != 1 || len(pod.InitContainers) != 0 || len(pod.EphemeralContainers) != 0 {
-		t.Errorf("containers %d, init %d, ephemeral %d; want one container", len(pod.Containers), len(pod.InitContainers), len(pod.EphemeralContainers))
-	}
-	if pod.ServiceAccountName != "" {
-		t.Errorf("serviceAccountName = %q, want the namespace default with no token mounted", pod.ServiceAccountName)
-	}
-	for _, c := range pod.Containers {
-		if len(c.EnvFrom) != 0 {
-			t.Errorf("container %s has envFrom %v; every credential here is one mounted file", c.Name, c.EnvFrom)
-		}
+	for _, brokerOn := range []bool{false, true} {
+		t.Run(map[bool]string{false: "broker access off", true: "broker access on"}[brokerOn], func(t *testing.T) {
+			t.Setenv(a2aMCPDoorEnvVar, map[bool]string{false: "", true: "true"}[brokerOn])
+			agent := a2aTestAgent()
+			pod := buildA2AMCPDeployment(agent).Spec.Template.Spec
+			if len(pod.Containers) != 1 || len(pod.InitContainers) != 0 || len(pod.EphemeralContainers) != 0 {
+				t.Errorf("containers %d, init %d, ephemeral %d; want one container", len(pod.Containers), len(pod.InitContainers), len(pod.EphemeralContainers))
+			}
+			if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken {
+				t.Error("the default-audience ServiceAccount token is mounted; the pod never talks to the API server")
+			}
+			wantSA := ""
+			if brokerOn {
+				wantSA = a2aMCPName(agent)
+			}
+			if pod.ServiceAccountName != wantSA {
+				t.Errorf("serviceAccountName = %q, want %q", pod.ServiceAccountName, wantSA)
+			}
+			if pod.DeprecatedServiceAccount != "" {
+				t.Errorf("serviceAccount = %q, want none", pod.DeprecatedServiceAccount)
+			}
+			for _, c := range pod.Containers {
+				if len(c.EnvFrom) != 0 {
+					t.Errorf("container %s has envFrom %v; every credential here is one mounted file", c.Name, c.EnvFrom)
+				}
+			}
+		})
 	}
 }
 

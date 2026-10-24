@@ -36,4 +36,6 @@ To rotate the token, write a new value into the Secret. The server reads it on e
 
 ## What it reads
 
+`inspect_pr` reads one pull or merge request, with its comments and diff, from a repository the install manages. It asks the credential broker's `proposal-view` with the pod's own projected token, so it works on GitHub and GitLab and the pod holds no forge credential; the broker refuses any repository outside the install's managed list, and the token's role reaches that one read and nothing else. The tool is offered only when the operator has wired the broker in (`A2A_MCP_BROKER_URL`). Everything the pull request's authors wrote, its title, description, comments and diff, is shown as data: fenced, capped on line boundaries with a count of what was cut, control and bidi characters shown as `<U+XXXX>`, and introduced by a line saying it is the authors' content.
+
 `connection_status` reports the bus endpoint and identity, whether the connection is TLS, the size of the four message streams, whether the gateway and the platform agent are consuming, and the agents registered on `DIRECTORY`. It reads all of it through the console's grants, at most once every five seconds whatever the call rate. Agent names and descriptions are shown as code, as published, shortened.
