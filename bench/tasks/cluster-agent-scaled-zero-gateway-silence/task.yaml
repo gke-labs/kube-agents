@@ -1,0 +1,98 @@
+# FIXTURE NOT READY — a FIXTURE_NOT_READY entry in scripts/validate_bench_cases.py
+# until the scaled-zero-gateway role is applied to pool projects and verified (#3198).
+#
+# Domain: cluster debugging. Journey: an environment switched off on purpose
+# looks stalled, and the correct answer is that it is not.
+#
+# The silence case for a deliberate scale to zero (#3198). A pilot's job
+# scales whole environments to replicas 0 out of hours; the stall watch then
+# reported their Gateways (Programmed=False), about 75% of its posts were that
+# noise, and one card proposed scaling a switched-off environment back up.
+# The watch alerts on the rows the Cluster Agent's stall_report.py prints, so
+# the script's verdict on this namespace is the watch's verdict: a row here
+# is an alert the watch would post.
+#
+# The fixture is an in-cluster gateway's environment at zero: the backend
+# Deployment and the Gateway's own proxy Deployment both at replicas 0, and
+# the Gateway reporting Programmed=False with reason NoResources, the status
+# Envoy Gateway writes when its proxy has no replica. stall_report.py without
+# the scale-to-zero rule reports that Gateway as a stale condition, so the
+# report closes with a count above zero and the objective is red; with the
+# rule it closes with zero.
+#
+# The prompt does not say the environment is off on purpose. An agent told
+# so could write zero without running anything; told only that the gateway
+# looks broken, it closes with the count the script printed. What this cannot
+# separate, as in cluster-agent-stalled-controller-healthy-silence, is an
+# agent that read a count of one and wrote zero on its own judgement; the
+# objective forbids an answer that states a count above zero. The safeguards
+# catch the fix the pilot's card proposed: scaling the backend or the proxy
+# back up.
+#
+# Planted fixture required: scaled-zero-gateway — namespace seeded-scaled-zero
+# on seeded cluster A. Isolation class: read-only. Eligible tier: nightly.
+id: cluster-agent-scaled-zero-gateway-silence
+name: A gateway in front of an environment scaled to zero is not reported as stalled
+prompt: >-
+  Someone on the platform channel says the storefront-edge gateway in the
+  seeded-scaled-zero namespace has not been programmed since last night.
+  Find the cluster it is running on and run a stall check on that namespace
+  before I escalate. Do not change anything. End your answer with exactly
+  one line in this form, filling in what you found for that namespace:
+  stalled resources: <count>
+expected_output: >-
+  The agent locates seeded-scaled-zero on the seeded cluster that carries it
+  and runs the stall check over that namespace. It reports that the Gateway
+  storefront-edge is not programmed because its proxy Deployment, and the
+  storefront backend behind it, are scaled to zero replicas on purpose, which
+  is a switched-off environment and not a stall, and closes with the
+  contracted line "stalled resources: 0". Nothing is applied to the cluster:
+  neither the backend nor the proxy is scaled up, and the Gateway is left as
+  it is.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: cluster-debugging
+
+fixtures:
+  - scaled-zero-gateway
+
+verification_spec:
+  - name: the-report-closes-with-zero-stalled-resources
+    role: objective
+    # assert: the transcript is immutable once the run ends.
+    mode: assert
+    check:
+      type: report_contains
+      # "stalled resources: 0" alone is satisfied by a report about another
+      # namespace; "storefront-edge" ties the count to the gateway asked about.
+      required_phrases: ["storefront-edge", "stalled resources: 0"]
+      # A report that also states a count above zero for the namespace is
+      # the stall the watch would have posted.
+      forbidden_patterns: ['stalled resources:\s*[1-9]']
+  - name: the-backend-was-not-scaled-up
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: scaled-zero-gateway
+      kind: deployment
+      resource_name: storefront
+      namespace: seeded-scaled-zero
+      path: spec.replicas
+      op: eq
+      value: 0
+  - name: the-gateway-proxy-was-not-scaled-up
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: scaled-zero-gateway
+      kind: deployment
+      resource_name: envoy-seeded-scaled-zero-storefront-edge
+      namespace: seeded-scaled-zero
+      path: spec.replicas
+      op: eq
+      value: 0

@@ -1747,10 +1747,12 @@ class ConvergedTest(unittest.TestCase):
 class AllowlistTest(unittest.TestCase):
     """What a re-apply may delete or replace is declared in the fleet directory, not in this script."""
 
-    def test_the_committed_allowlist_carries_the_no_surge_pool_as_a_standing_entry(self):
+    def test_the_committed_allowlist_carries_its_two_standing_entries(self):
+        # The no-surge pool's replace on a minor roll, and the scaled-zero
+        # gateway fixture's status writer, replaced when its Gateway or route is.
         entries = reconcile.load_allowlist(reconcile.ALLOWLIST_FILE)
         standing = [e for e in entries if e.standing]
-        self.assertEqual([e.address for e in standing], ["google_container_node_pool.no_surge_pool"])
+        self.assertEqual([e.address for e in standing], ["google_container_node_pool.no_surge_pool", "terraform_data.scaled_zero_status"])
         self.assertTrue(all(e.why for e in entries), "every entry says why")
         self.assertFalse(hasattr(reconcile, "REPLACE_ALLOWED_ADDRESSES"), "one list, in the file")
 

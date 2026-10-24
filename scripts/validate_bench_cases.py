@@ -281,6 +281,11 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    "cluster-agent-scaled-zero-gateway-silence": (
+        "#3198: needs bench/tf/fleet's scaled-zero-gateway role applied to every pool "
+        "project (the postsubmit reconcile); no pool project has the seeded-scaled-zero "
+        "namespace or its Gateway"
+    ),
     # Needs a GitOps repository that declares the namespace under a path a
     # reconciler syncs; no pool project's repository has one. Run by hand on
     # the GitOps-wired dev lane (gitops-target-1, sackheads/kage-fleet-dev).
