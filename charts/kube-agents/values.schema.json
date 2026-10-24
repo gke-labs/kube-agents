@@ -1368,6 +1368,37 @@
         }
       }
     },
+    "webConsole": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "repository": {
+              "type": "string"
+            },
+            "tag": {
+              "type": ["string", "integer"]
+            },
+            "pullPolicy": {
+              "type": "string",
+              "enum": ["", "Always", "IfNotPresent", "Never"]
+            }
+          }
+        },
+        "resources": {
+          "type": "object"
+        },
+        "securityContext": {
+          "type": "object"
+        }
+      }
+    },
     "profiles": {
       "type": "object",
       "additionalProperties": false,

@@ -949,6 +949,9 @@ main() {
     { declare -F is_table_model_provider >/dev/null && ! is_table_model_provider "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}"; }; then
     export MODEL_PROVIDER="$DEFAULT_MODEL_PROVIDER" MODEL_DEFAULT_NAME=""
   fi
+  # The web console requires NetworkPolicy enforcement in write_tfvars_from_state;
+  # forcing it off avoids a preflight refusal during destroy on clusters without it.
+  export WEB_CONSOLE_ENABLED="false"
   write_tfvars_from_state "${compose_dir}/terraform.tfvars"
   (
     cd "$compose_dir"

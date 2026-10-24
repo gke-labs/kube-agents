@@ -520,6 +520,17 @@ sets, and the restart a new or rotated CA Secret needs, are in
 [GitHub Enterprise Server](https://gke-labs.github.io/kube-agents/deploy/token-minter/#github-enterprise-server)
 in the token minter guide.
 
+### Web console
+
+`webConsole.*` renders the web console's Deployment, a ClusterIP Service and a
+deny-all ingress NetworkPolicy. `enabled` defaults to `false`;
+`install.sh --enable-web-console` turns it on, and the render fails if it is set
+without `platformAgent.enabled`. The Service type is not configurable,
+because the console holds the agent's API key and has no login of its own:
+`kubectl port-forward` is the only way in. The
+[Web console page](https://gke-labs.github.io/kube-agents/deploy/web-console/)
+is canonical for what it does and how it is reached.
+
 ### Telemetry
 
 `telemetry.otlpEndpoint` (default `""`) is the OTLP/HTTP collector base URL.
@@ -1014,7 +1025,8 @@ creation. `--set quotaPreflight.enabled=false` skips it.
 What it sums: the chart's own workloads from `values.yaml` — the operator, LiteLLM and
 the GitHub minter, each multiplied by its `replicaCount`, Hindsight's two pods, which
 have no replica count to multiply, and the pre-delete cleanup hook Job (one pod, when
-`platformAgent.cleanupHook.enabled` is true) — plus the pods the operator renders, whose
+`platformAgent.cleanupHook.enabled` is true) and the web console (one pod, when
+`webConsole.enabled` is true) — plus the pods the operator renders, whose
 sizes come from `files/footprint.yaml` because the chart cannot render them itself. The agent
 pod is multiplied by `platformAgent.deployment.availability.replicas` (an over-count above one,
 since the operator runs the gateway as a single replica whatever the value); the shell sandbox, the
