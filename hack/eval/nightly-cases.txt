@@ -1150,55 +1150,58 @@
 # cgroup-blind-jvm on slot a (role cgroup-blind-runtime) runs a JDK 8u302
 # image, below the cgroup v2 floor, on a pool already on cgroup v2, so the
 # report carries it in its note, never as a blocker. Read-only chat prompt
-# graded on the planted object's declared line: its verdict and the rule's
-# cell. Nightly from its first merge.
+# graded on one declared line per seeded cluster carrying the rule's own
+# entry as printed, none where it prints nothing. Nightly from its first
+# merge.
 ./tasks/upgrades-fleet-readiness-cgroup-blind-runtime/task.yaml
 
 # Catalogue entry 18 through the readiness report's gpu-driver rule: cuda-
 # pinned-trainer on slot a (role cuda-pinned-gpu-job) requests a GPU with a
 # CUDA 12.2 image on a cluster with no accelerator pool, so the report names
 # the unchecked pin as a risk, never a blocker. Read-only chat prompt graded
-# on the planted object's declared line: its verdict and the rule's cell.
-# Nightly from its first merge.
+# on one declared line per seeded cluster carrying the rule's own entry as
+# printed, none where it prints nothing. Nightly from its first merge.
 ./tasks/upgrades-fleet-readiness-cuda-pinned-gpu-job/task.yaml
 
 # Catalogue entry 12 through the readiness report's removed-node-label rule:
 # arch-pinned-worker on slot a (role deprecated-label-selector) selects on
 # beta.kubernetes.io/arch, deprecated in favour of kubernetes.io/arch, so the
 # report names it as a risk with the GA replacement, never a blocker. Read-
-# only chat prompt graded on the planted object's declared line: its verdict
-# and the rule's cell. Nightly from its first merge.
+# only chat prompt graded on one declared line per seeded cluster carrying
+# the rule's own entry as printed, none where it prints nothing. Nightly from
+# its first merge.
 ./tasks/upgrades-fleet-readiness-deprecated-node-label/task.yaml
 
 # Catalogue entry 15 through the readiness report's group-oom-kill rule:
 # multi-process-worker on slot a (role multi-process-container) forks two
 # workers under one shell on a pool that already group-kills, so the report
 # carries it in its note, never as a blocker. Read-only chat prompt graded on
-# the planted object's declared line: its verdict and the rule's cell. Nightly
-# from its first merge.
+# one declared line per seeded cluster carrying the rule's own entry as
+# printed, none where it prints nothing. Nightly from its first merge.
 ./tasks/upgrades-fleet-readiness-multi-process-container/task.yaml
 
 # Catalogue entry 17 through the readiness report's node-image-coupled-agent
 # rule: cni-shaped-agent on slot a (role node-image-coupled-agent), a host-
 # network DaemonSet mounting /etc/cni/net.d, is a risk naming the pools the
-# upgrade re-images, never a blocker. Read-only chat prompt graded on the
-# planted object's declared line: its verdict and the rule's cell. Nightly
-# from its first merge.
+# upgrade re-images, never a blocker. Read-only chat prompt graded on one
+# declared line per seeded cluster carrying the rule's own entry as printed,
+# none where it prints nothing. Nightly from its first merge.
 ./tasks/upgrades-fleet-readiness-node-image-coupled-agent/task.yaml
 
 # Catalogue entry 4 through the readiness report's data-on-the-node rule:
 # cache-on-emptydir on slot a (role node-local-state), a Deployment keeping
 # its queue on an emptyDir, is carried in the report's note as scratch, never
-# as a blocker. Read-only chat prompt graded on the planted object's declared
-# line: its verdict and the rule's cell. Nightly from its first merge.
+# as a blocker. Read-only chat prompt graded on one declared line per seeded
+# cluster carrying the rule's own entry as printed, none where it prints
+# nothing. Nightly from its first merge.
 ./tasks/upgrades-fleet-readiness-node-local-state/task.yaml
 
 # Catalogue entry 20 through the readiness report's retired-registry rule:
 # legacy-registry-pull on slot a (role retired-registry-image) pulls
 # k8s.gcr.io/pause:3.9 from a retired host, so the report names it as a risk,
-# never a blocker. Read-only chat prompt graded on the planted object's
-# declared line: its verdict and the rule's cell. Nightly from its first
-# merge.
+# never a blocker. Read-only chat prompt graded on one declared line per
+# seeded cluster carrying the rule's own entry as printed, none where it
+# prints nothing. Nightly from its first merge.
 ./tasks/upgrades-fleet-readiness-retired-registry-image/task.yaml
 
 # Upgrade-failure catalogue entry 8 through the readiness report's
@@ -1214,8 +1217,9 @@
 # Catalogue entry 10 through the readiness report's client-addon-skew rule:
 # stale-kubectl-client on slot a (role stale-client-skew) runs kubectl v1.29.0
 # against a control plane several minors ahead, so the report names it as a
-# risk, never a blocker. Read-only chat prompt graded on the planted object's
-# declared line: its verdict and the rule's cell. Nightly from its first merge.
+# risk, never a blocker. Read-only chat prompt graded on one declared line per
+# seeded cluster carrying the rule's risk as printed, none where it files no
+# finding. Nightly from its first merge.
 ./tasks/upgrades-readiness-client-addon-skew/task.yaml
 
 # Catalogue entry 24 through the readiness report's cluster-status-age rule: the
