@@ -279,6 +279,30 @@ the reds that once argued for un-arming it belonged to the old vocabulary check.
 
 Admitted on the record since the split:
 
+- **vcs-spent-branch-reuse**, 2026-10-23, the source-control domain's first roster seat, moved
+  from `hack/eval/nightly-cases.txt` into the presubmit file and onto the roster in one edit, on
+  the record the writers nightly built: 42 of 42 graded repetitions over the fourteen nights
+  2026-10-09 to 10-22, every night 3/3, no infra repetition, median repetition 173 s (113–656 s).
+  The agent model changed from `gemini-3-1-pro-preview-kubeagents-mcp` to
+  `claude-opus-5-5-kubeagents-mcp` on 2026-10-19, which reset the version key: the store reads
+  `collecting: 12/12 runs recorded at this key across 4 recorded run(s), 8 more needed`, and the
+  last Gemini key read `would-admit` (21/21 over the newest seven nights) on every night from
+  2026-10-09 to 10-18. So the citation is the
+  nightly record, 12/12 of it on the four Claude nights, and the eval crew's approval of this
+  line is the call that it suffices before the window fills (expected with the 2026-10-25
+  writers nightly). The same case under `spec.mode next`, the presubmit's lane, passed 18 of 18
+  on `ci-kube-agents-eval-nightly-next-claude` 2026-10-16 to 10-21, with
+  `the-forge-was-reached-without-a-cli` (a `worker_commands` check) set aside as blind on that
+  transport, as it will be on the presubmit; and 15 of 15 on the five GitLab nightlies that
+  graded, 2026-10-17 to 10-22. `deployer: noop`, and it seeds its own spent branch inside the
+  run, so it reads no seeded cluster and no fixture: none of the fleet-drift exposure that
+  demoted the upgrades and consistency probes. What it costs: it is the presubmit's one case
+  that requests a pull request, so its three repetitions run in the fan-out's second phase, one
+  at a time after every other unit, each after the repository reset and on the inject lane the
+  120-second GitHub-write settle ([The inject lane](#the-inject-lane)): about 15 minutes of
+  serial tail at the measured median (3 × (120 s + 173 s)), plus the resets and the drain at the
+  phase boundary. Its seat took `source-control` off the
+  `docs/designs/domains.yaml` allowlist.
 - **pdb-remediation-pr**, 2026-10-14
   ([#2016](https://github.com/gke-labs/kube-agents/issues/2016) step 4), from the held-out
   seat it took on 2026-09-28. The three clean days the bar asks for are the writers nightlies
@@ -358,13 +382,16 @@ erroring verifier or an empty record is a rung-1–3 red for every case, admitte
 graded miss on the canary's seat (no ledger URL or the planted binding skipped) is reported as
 UNSTABLE and "(held out)" and blocks nothing; pdb-remediation-pr's (no pull request URL in the
 final answer) armed rung 4 like any roster case from 2026-10-14 until its demotion to the nightly
-on 2026-10-17 (#3120), and since then the submit-suggestion path is not in the presubmit at all.
-`rca-remediation-pr` and `pdb-remediation-pr` are nightly-only, so what they alone grade, a
-pull request opened through submit-suggestion, is first seen by the next nightly that finishes
-grading. The eval crew took that trade with the policy; what makes a break on a GitHub-write
-path block is a roster line for the seat (#2013 step 4; #2016's landed 2026-10-14 and was
-withdrawn 2026-10-17), and until one holds a pull request that touches that path should still
-say what it ran by hand.
+on 2026-10-17 (#3120). From then until 2026-10-23 the submit-suggestion path was not in the
+presubmit at all; since then `vcs-spent-branch-reuse`, on the roster, opens two pull requests a
+repetition through it on the leased `*-infra` repository, so a change that breaks that path is a
+rung-4 red on the pull request that introduces it, or a rung-1–3 red when the verifier errors.
+What it does not grade is a remediation: `rca-remediation-pr` and `pdb-remediation-pr` are
+nightly-only, so a fix that never becomes a pull request is first seen by the next nightly that
+finishes grading. The eval crew took that trade with the policy; what makes a break on the ledger
+path block is the canary's roster line (#2013 step 4), and until it holds a pull request that
+touches that path should still say what it ran by hand. The submit-suggestion path has blocked
+since 2026-10-23 (above); #2016's line for it landed 2026-10-14 and was withdrawn 2026-10-17.
 
 ## The whole-suite rate
 
@@ -575,9 +602,10 @@ lane arms rung 4 there, and a held-out seat runs and reports without arming it, 
 the GitHub presubmit. pdb-remediation-pr was on the roster from 2026-10-14
 ([#2016](https://github.com/gke-labs/kube-agents/issues/2016)) until its demotion to the nightly
 on 2026-10-17 ([#3120](https://github.com/gke-labs/kube-agents/issues/3120)), and while it was,
-its collapse redded the lane's verdict. Today no lane case is on the roster: all three are held
-out, rung 4 is disarmed on the lane (the script says so in the log), and rungs 1 to 3 red it
-like every case. The demotion leaves the case's line in `gitlab-cases.txt`: the file needs only
+its collapse redded the lane's verdict. From then until 2026-10-23 no lane case was on the
+roster and rung 4 was disarmed on the lane; since `vcs-spent-branch-reuse` took its roster line
+that day it arms rung 4 there, the other two are held out, and rungs 1 to 3 red the lane like
+every case. pdb-remediation-pr's demotion leaves its line in `gitlab-cases.txt`: the file needs only
 a registered case, which the nightly line still makes it, and the lane is not a blocking gate, so
 it keeps grading the GitLab merge-request path, held out, until the roster line returns. GitLab runs on demand
 (`/test pull-kube-agents-smoke-test-gitlab`) and nightly, not as a blocking presubmit: the agent

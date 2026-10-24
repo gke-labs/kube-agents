@@ -117,12 +117,14 @@ locals {
       }
     } : {},
     var.enable_slack ? {
-      slack = {
+      slack = merge({
         enabled         = true
         allowedUsers    = var.slack_allowed_users
         homeChannel     = var.slack_home_channel
         homeChannelName = var.slack_home_channel_name
-      }
+        }, var.slack_home_channel_policy != "" ? {
+        homeChannelPolicy = var.slack_home_channel_policy
+      } : {})
     } : {},
     local.gitops_is_gitlab ? { forges = local.gitlab_forges } : {},
     local.gitops_is_gitlab ? { repositories = local.gitlab_repositories } : {},

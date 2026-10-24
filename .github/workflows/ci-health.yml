@@ -15,9 +15,9 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # (#1607), the watched periodics' latest builds and the rest -- are optional;
 # an absence just drops its note.
 # The order is adjudicate ->
-# upload health.json -> append history -> render -> publish -> post ->
-# comment, so the Brief a reader opens from a message already shows the
-# verdict the message names.
+# upload health.json -> append history -> render -> publish -> file nightly
+# bugs -> post -> comment, so the Brief a reader opens from a message
+# already shows the verdict the message names.
 #
 # Two identities, each least-privilege for its half, which is why the
 # refresh script is not invoked as one unit here: it couples collect and
@@ -115,7 +115,11 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # every tick in dry run -- it reads the open issues and prints what it would
 # file, comment and assign -- and writes only when the repository variable
 # NIGHTLY_BUGS_LIVE is `true` (a maintainer arms it after reading a few dry
-# runs) and CI_HEALTH_MUTE is not.
+# runs) and CI_HEALTH_MUTE is not. It runs before the post, so the 9 AM
+# digest's nightly section (scripts/eval_dashboard/nightly_digest.py) reads
+# the issues it filed that tick. The section turns owners' GitHub logins
+# into Chat mentions through the CI_HEALTH_CHAT_MENTIONS secret (a JSON
+# object, login -> Chat user id); without it the logins print as text.
 #
 # A second job, on its own hourly cron: the seeded-fleet scan (#1550). It
 # runs hack/fleet-kubeconfigs.sh and hack/fleet-fixture-state.py against
@@ -229,10 +233,10 @@ env:
   COLLECT_TIMEOUT_S: "1500"
   # The refresh job's timeout-minutes in seconds (move the two together),
   # and what the store read must leave on that clock for the adjudicator,
-  # the render and the post after it (recent ticks spend 80-150 s on the
-  # whole job).
+  # the render, the nightly bug filer and the post after it (recent ticks
+  # spend 80-150 s on the whole job; the filer step is capped at 3 minutes).
   JOB_TIMEOUT_S: "1800"
-  JOB_TAIL_S: "240"
+  JOB_TAIL_S: "420"
   WEBHOOK_SECRET: ci-health-chat-webhook
   WEBHOOK_SECRET_PROJECT: kube-agents-prow
   # The seeded-fleet scan's knobs (scripts/eval_dashboard/fixture_state.py):
@@ -661,6 +665,23 @@ jobs:
           fi
           rm -f gcloud.err
 
+      # Dry run unless armed (header). Reads data.json as the digest does, so
+      # after a failed collect it judges the bucket's copy, which holds the
+      # same nights. Before the post, so the digest's nightly section sees
+      # the issues this tick filed. Best-effort like the comment step: never
+      # reds the run.
+      - name: File bugs for persistent nightly failures (dry run unless armed)
+        continue-on-error: true
+        # Bounded, so a slow GitHub cannot run the job into its timeout and
+        # cancel the post after it (JOB_TAIL_S budgets this step too).
+        timeout-minutes: 3
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mode=--dry-run
+          if [ "$NIGHTLY_BUGS_LIVE" = "true" ] && [ "$CI_HEALTH_MUTE" != "true" ]; then mode=--live; fi
+          python3 scripts/eval_dashboard/nightly_bugs.py --data work/data.json "$mode"
+
       # The token goes to the poster step alone, as a masked step output
       # rather than through GITHUB_ENV, so no later step sees it.
       - name: Mint a Chat token
@@ -676,12 +697,17 @@ jobs:
         continue-on-error: true
         env:
           CI_HEALTH_CHAT_TOKEN: ${{ steps.chat_token.outputs.token }}
-          # For the tracking issue a new OUTAGE or lost_pods condition files (header).
+          # For the tracking issue a new OUTAGE or lost_pods condition files
+          # (header), and the digest's read of the nightly-red issues.
           GH_TOKEN: ${{ github.token }}
+          # GitHub login -> Chat user id (JSON object) for the digest's
+          # nightly section mentions; the ids are internal, so a secret. Empty
+          # without one: every login is then printed as plain text.
+          CI_HEALTH_CHAT_MENTIONS: ${{ secrets.CI_HEALTH_CHAT_MENTIONS || '' }}
         run: |
           # --digest-hour is a Toronto hour (the poster's default zone).
           # --data is the data.json this tick collected (or, after a failed
-          # collect, the bucket's): the digest's nightly line reads last
+          # collect, the bucket's): the digest's nightly section reads last
           # night's run from it.
           python3 scripts/eval_dashboard/post_health.py \
             --health work/health.json \
@@ -704,18 +730,6 @@ jobs:
             --data work/data.json \
             --health work/health.json \
             --state "$DASHBOARD_BUCKET/gate-comment-state.json"
-
-      # Dry run unless armed (header). Reads data.json as the digest does, so
-      # after a failed collect it judges the bucket's copy, which holds the
-      # same nights. Best-effort like the comment step: never reds the run.
-      - name: File bugs for persistent nightly failures (dry run unless armed)
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          mode=--dry-run
-          if [ "$NIGHTLY_BUGS_LIVE" = "true" ] && [ "$CI_HEALTH_MUTE" != "true" ]; then mode=--live; fi
-          python3 scripts/eval_dashboard/nightly_bugs.py --data work/data.json "$mode"
 
       - name: Fail the run if the collect or the post failed
         if: steps.collect.outcome == 'failure' || steps.post.outcome == 'failure'
