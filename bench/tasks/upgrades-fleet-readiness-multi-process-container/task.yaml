@@ -92,18 +92,16 @@ prompt: >-
   anything. End your answer with one line per seeded cluster in exactly this
   form, no other words on the line: "<cluster>: group-oom-kill: <the
   group-oom-kill rule's entry for that cluster, copied as printed|none>". The
-  entry is the rule's own text for that cluster as the readiness report
-  prints it: in the readiness table, the text behind `group-oom-kill: ` in
-  the note column (or, for a risk or a blocker, in the risks or other
-  blockers column); in the report's JSON, the member's `readiness.notes[]`
-  entry that starts with `group-oom-kill: ` (the notes are strings, each
-  already prefixed with its rule's id), or the `readiness.risks[]` or
-  `readiness.rule_blocking[]` object whose `rule` is `group-oom-kill` (those
-  lists, like `readiness.unknown[]`, hold objects with `rule` and `text`).
-  Copy the text, not a paraphrase and not values you composed from kubectl;
-  when the rule prints several entries for one cluster, keep one line and
-  copy them in the order printed, separated by "; "; a cluster the rule
-  prints nothing for reads none.
+  entry is the rule's own text for that cluster as the readiness report prints
+  it: in the readiness table, the text behind `group-oom-kill: ` in the note
+  column (or, for a risk or a blocker, in the risks or other blockers column);
+  in the report's JSON, the member's `readiness.notes[]` entry that starts
+  with `group-oom-kill: `, or the `readiness.risks[]` or
+  `readiness.rule_blocking[]` object whose `rule` is `group-oom-kill`. Copy
+  the text, not a paraphrase and not values you composed from kubectl; when
+  the rule prints several entries for one cluster, keep one line and copy them
+  in the order printed, separated by "; "; a cluster the rule prints nothing
+  for reads none.
 expected_output: >-
   A per-cluster readiness report read during this run. For seeded-a it names
   the Deployment multi-process-worker in seeded-shapes: its container runs a
@@ -188,9 +186,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: group-oom-kill: ["''“‘<]?(?:(?:group-oom-kill: )?deployment seeded-shapes/multi-process-worker container supervisor runs a shell script that forks a background job on pool [a-z0-9-]+, on cgroup v2 with a kubelet at [0-9][a-z0-9.-]*, which already group-kills; not an upgrade risk(?:; |$))+$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: group-oom-kill: ["''“‘<]?(?:["''“‘<]?(?:group-oom-kill: )?deployment seeded-shapes/multi-process-worker container supervisor runs a shell script that forks a background job on pool [a-z0-9-]+, on cgroup v2 with a kubelet at [0-9][a-z0-9.-]*, which already group-kills; not an upgrade risk["''”’>]?(?:; |$))+$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: group-oom-kill: (?!["''“‘<]?(?:(?:group-oom-kill: )?deployment seeded-shapes/multi-process-worker container supervisor runs a shell script that forks a background job on pool [a-z0-9-]+, on cgroup v2 with a kubelet at [0-9][a-z0-9.-]*, which already group-kills; not an upgrade risk(?:; |$))+$)[^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: group-oom-kill: (?!["''“‘<]?(?:["''“‘<]?(?:group-oom-kill: )?deployment seeded-shapes/multi-process-worker container supervisor runs a shell script that forks a background job on pool [a-z0-9-]+, on cgroup v2 with a kubelet at [0-9][a-z0-9.-]*, which already group-kills; not an upgrade risk["''”’>]?(?:; |$))+$)[^\n]*$'
 
   # The fleet's only container that forks a background job, runs a supervisor
   # program or runs a supervisor image is multi-process-worker's, so the rule

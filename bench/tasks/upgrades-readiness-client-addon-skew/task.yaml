@@ -120,17 +120,15 @@ prompt: >-
   client-addon-skew rule's risk or blocker for that cluster, copied as
   printed|none>". The entry is the rule's own text for that finding as the
   readiness report prints it: in the readiness table, the text behind
-  `client-addon-skew: ` in the risks column (or the other blockers column);
-  in the report's JSON, the member's `readiness.risks[]` or
-  `readiness.rule_blocking[]` object whose `rule` is `client-addon-skew`
-  (those lists, like `readiness.unknown[]`, hold objects with `rule` and
-  `text`, while `readiness.notes[]` holds strings, each already prefixed with
-  its rule's id). The rule's notes (the GKE add-ons that are on, clients
-  within one minor of the target, client-go callers) are not findings and
-  stay off the line: a cluster the rule files no risk or blocker for reads
-  none. Copy the text, not a paraphrase and not values you composed from
-  kubectl; when the rule files several findings for one cluster, keep one
-  line and copy them in the order printed, separated by "; ".
+  `client-addon-skew: ` in the risks column (or the other blockers column); in
+  the report's JSON, the member's `readiness.risks[]` or
+  `readiness.rule_blocking[]` object whose `rule` is `client-addon-skew`. The
+  rule's notes (the GKE add-ons that are on, clients within one minor of the
+  target, client-go callers) are not findings and stay off the line: a cluster
+  the rule files no risk or blocker for reads none. Copy the text, not a
+  paraphrase and not values you composed from kubectl; when the rule files
+  several findings for one cluster, keep one line and copy them in the order
+  printed, separated by "; ".
 expected_output: >-
   A per-cluster readiness report read during this run. For seeded-a it names
   the CronJob stale-kubectl-client in seeded-shapes: it runs kubectl v1.29.0
@@ -220,9 +218,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: client-addon-skew: ["''“‘<]?(?:(?:client-addon-skew: )?kubectl v\d+\.\d+ from principal [^\n]*?; )*(?:client-addon-skew: )?kubectl v1\.29 from cronjob seeded-shapes/stale-kubectl-client \(image registry\.k8s\.io/kubectl:\s?v1\.29\.0\): \d+ minors? behind the target \d+\.\d+; kubectl is supported within 1 minor of kube-apiserver \(<?https://kubernetes\.io/releases/version-skew-policy/#kubectl>?\)?(?:; [^\n]*)?$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: client-addon-skew: ["''“‘<]?(?:(?:client-addon-skew: )?kubectl v\d+\.\d+ from principal [^\n]*?; )*(?:client-addon-skew: )?kubectl v1\.29 from cronjob seeded-shapes/stale-kubectl-client \(image registry\.k8s\.io/kubectl:\s?v1\.29\.0\): \d+ minors? behind the target \d+\.\d+; kubectl is supported within 1 minor of kube-apiserver \(<?https://kubernetes\.io/releases/version-skew-policy/#kubectl>?\)?(?:; (?:client-addon-skew: )?(?:kubectl v\d+\.\d+ from [^;\n]*?: (?:\d+ minors? (?:behind|ahead of) the target \d+\.\d+; kubectl is supported within 1 minor of kube-apiserver \([^)\n]*\)?|major version differs from the target \d+\.\d+)|[a-z0-9-]+ v\d+\.\d+ at [^;\n]*?: [a-z0-9-]+ v\d+\.\d+ supports kubernetes \d+\.\d+ to \d+\.\d+ \([^)\n]*\)?(?:; the target \d+\.\d+ is outside it)?))*[\"''”’>]?$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: client-addon-skew: (?!["''“‘<]?(?:(?:client-addon-skew: )?kubectl v\d+\.\d+ from principal [^\n]*?; )*(?:client-addon-skew: )?kubectl v1\.29 from cronjob seeded-shapes/stale-kubectl-client \(image registry\.k8s\.io/kubectl:\s?v1\.29\.0\): \d+ minors? behind the target \d+\.\d+; kubectl is supported within 1 minor of kube-apiserver \(<?https://kubernetes\.io/releases/version-skew-policy/#kubectl>?\)?(?:; [^\n]*)?$)[^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: client-addon-skew: (?!["''“‘<]?(?:(?:client-addon-skew: )?kubectl v\d+\.\d+ from principal [^\n]*?; )*(?:client-addon-skew: )?kubectl v1\.29 from cronjob seeded-shapes/stale-kubectl-client \(image registry\.k8s\.io/kubectl:\s?v1\.29\.0\): \d+ minors? behind the target \d+\.\d+; kubectl is supported within 1 minor of kube-apiserver \(<?https://kubernetes\.io/releases/version-skew-policy/#kubectl>?\)?(?:; (?:client-addon-skew: )?(?:kubectl v\d+\.\d+ from [^;\n]*?: (?:\d+ minors? (?:behind|ahead of) the target \d+\.\d+; kubectl is supported within 1 minor of kube-apiserver \([^)\n]*\)?|major version differs from the target \d+\.\d+)|[a-z0-9-]+ v\d+\.\d+ at [^;\n]*?: [a-z0-9-]+ v\d+\.\d+ supports kubernetes \d+\.\d+ to \d+\.\d+ \([^)\n]*\)?(?:; the target \d+\.\d+ is outside it)?))*[\"''”’>]?$)[^\n]*$'
 
   # The fleet plants no kubectl image and no add-on on slots b, c and d, so
   # each reads none unless the rule files a kubectl client from that cluster's

@@ -10552,6 +10552,8 @@ def test_per_pool_rule_case_accepts_the_note_for_every_pool_on_one_line(case):
         "; ".join(_bare(note) for note in (cell,) + others),
         others[0],
         '"' + "; ".join((cell,) + others) + '"',
+        # The JSON strings copied with their quotes, one pair per note.
+        "; ".join(f'"{note}"' for note in (cell,) + others),
     ):
         for objective in _per_cluster_objectives(case):
             assert _per_cluster_case_grades(case, objective, _per_cluster_report(case, cell=line)), (line, objective)
@@ -10679,6 +10681,11 @@ def test_client_addon_skew_case_keeps_one_line_per_cluster_in_the_reports_order(
     assert not _per_cluster_case_grades(_CLIENT_CASE, _planted_objective(_CLIENT_CASE), two_lines)
     # The rule's note ahead of the finding is not a finding.
     assert not _per_cluster_case_grades(_CLIENT_CASE, _planted_objective(_CLIENT_CASE), _per_cluster_report(_CLIENT_CASE, cell=f"{_GKE_ADDONS_NOTE}; {cell}"))
+    # What follows the planted finding after `; ` is another finding in the rule's wording, or nothing:
+    # a gloss, a verdict or the note is not.
+    for tail in ("fine", "not a blocker", _GKE_ADDONS_NOTE, "client-addon-skew: none"):
+        assert not _per_cluster_case_grades(_CLIENT_CASE, _planted_objective(_CLIENT_CASE), _per_cluster_report(_CLIENT_CASE, cell=f"{cell}; {tail}")), tail
+    assert _per_cluster_case_grades(_CLIENT_CASE, _planted_objective(_CLIENT_CASE), _per_cluster_report(_CLIENT_CASE, cell=f"{cell}; {_ADDON_CELL}"))
 
 
 @pytest.mark.parametrize("cell", [_AUDIT_CLIENT_CELL, _bare(_AUDIT_CLIENT_CELL), _ADDON_CELL])
