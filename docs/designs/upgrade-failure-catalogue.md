@@ -90,7 +90,7 @@ afterwards, how to prevent or repair it, and whether Google's own advisor for GK
 One row per entry. The first three tables group the entries by the reader that covers the entry's
 own failure on `main` today: a scheduled audit, one of the `fleet-upgrade-verification` skill's two
 scripts, or the assistant answering a question; the fourth lists every entry against the two
-scheduled readers, the daily readiness watch on `main` and the upgrade retrospective, whose collector is on `main` and whose weekly job is in review, with the Saturday `upgrade-readiness-weekly-review` running the readiness rules over every cluster in scope and registering what they find on the findings queue. Every entry but 1 and 3, and entries 21 to 26, sit in the second group through a readiness rule,
+scheduled readers, the daily readiness watch on `main` and the upgrade retrospective, whose collector and weekly job are on `main`, with the Saturday `upgrade-readiness-weekly-review` running the readiness rules over every cluster in scope and registering what they find on the findings queue. Every entry but 1 and 3, and entries 21 to 26, sit in the second group through a readiness rule,
 entry 10 for both its halves; the third group is empty. Scenario links to the entry's
 section below. Reason says in plain words why the upgrade breaks it. Detection says which reader
 finds it and what a stock install ships for it: the cron jobs in `agents/platform/cron/jobs.json`
@@ -163,7 +163,7 @@ Saturday job `upgrade-readiness-weekly-review` runs the readiness report over ev
 and registers each blocker and risk on the findings queue, which reminds until the user dismisses,
 snoozes or accepts it. The daily
 job `upgrade-readiness-watch` (`agents/platform/cron/jobs.json`, 10:10 UTC) runs the readiness report's rules before an
-upgrade, for a cluster below a version its release channel offers. The weekly job `upgrade-retrospective` (its [design](upgrade-retrospective.md) and its collector, `upgrade_retrospective.py` under the `fleet-audit` skill, on `main`; the job and its SOP in #3196, in review) runs
+upgrade, for a cluster below a version its release channel offers. The weekly job `upgrade-retrospective` (its [design](upgrade-retrospective.md)) runs
 after one; its collector matches symptoms to this list, and it also reads a set of risk shapes on
 every cluster it reviews and writes them as guards for the readiness watch to print. "Rule" means a
 rule in the readiness report, run daily with the target version known and every Saturday against each cluster's channel default; the entry's own section says

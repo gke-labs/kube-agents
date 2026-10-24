@@ -68,8 +68,10 @@ locals {
   own_wait = 3600
   # arm.py prints this when the image ships no oobe job.
   no_job = "ships no oobe job"
-  # The chain runs the four audits one after another (1-15 minutes each), and the stage is
-  # done once the last has started.
+  # The chain runs the four fleet audits and then the upgrade retrospective one after
+  # another (1-15 minutes each), and the stage is done once the last, the fifth, has
+  # started: four full runs plus the marks between them, under the hour by the design's
+  # one-to-eight-minute measurement (docs/designs/oobe.md, chain length).
   chain_wait = 3600
   poll       = 30
   # How long an exec into the agent Deployment waits for a pod when it has none.
@@ -163,8 +165,8 @@ resource "null_resource" "oobe" {
       printf '%s\n' "$armed"
 
       # ---- 4. Wait for the chain --------------------------------------------
-      # The stage marks the four audits one after another and is done once the last
-      # has started. Whether or not it gets there in time, the verifier decides; this
+      # The stage marks the five audits one after another and is done once the last,
+      # the retrospective, has started. Whether or not it gets there in time, the verifier decides; this
       # only keeps its two-minute window from opening before the chain has run.
       if [[ "$armed" != *"${local.no_job}"* ]]; then
         elapsed=0

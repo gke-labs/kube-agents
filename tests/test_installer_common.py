@@ -5580,7 +5580,7 @@ class SlackHomeChannelRuleMatchesTheGatewayTest(unittest.TestCase):
         self.assertIsNotNone(regex, "SLACK_HOME_CHANNEL_ID_RE not found")
         gateway = self._rule("a2a/gateway/slack.go", "slackIsHomeChannelID", "id", "slackMinChannelIDLen")
         operator = self._rule("k8s-operator/internal/controller/platformagent_a2a_manifests.go",
-                              "a2aSlackHomeChannel", "home", "a2aSlackMinChannelIDLen")
+                              "slackChannelID", "home", "a2aSlackMinChannelIDLen")
         self.assertEqual(gateway, operator, "the gateway's and the operator's rules differ")
         letters, min_len = gateway
         self.assertEqual(regex.group(1), f"^[{letters}][A-Z0-9]{{{min_len - 1},}}$")

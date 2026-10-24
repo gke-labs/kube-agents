@@ -669,6 +669,12 @@ and nothing that needs to be co-resident.
 the same sandbox, and a route that demanded nothing would be the one gap in a
 table whose point is that every route names what it requires.
 
+It admits one other caller: the A2A MCP server's pod, under the `mcp` role,
+which `ROLE_VCS_VERBS` holds to `proposal-view`, a read, with that verb's
+managed-repository check still applying. `CREDENTIAL_PROXY_MCP_CALLERS` binds
+the role to the MCP pod's own ServiceAccount.
+[`agent-shell-sandboxing.md`](agent-shell-sandboxing.md) owns that caller.
+
 ### No shallow clones
 
 There is no `depth`. This is a property of the transport rather than an
@@ -2101,6 +2107,15 @@ shared table, living in the forge package. GitLab is the first to populate it,
 for its own readings of 401 and 400, so by the time Bitbucket arrives the
 mechanism has a user and a test rather than being a speculative hook.
 
+Self-managed Gitea checks a second axis of the same contract: a forge with no
+canonical SaaS host, an optional non-default `port`, and an optional
+`scheme: http` restricted to in-cluster `.svc` / `.svc.cluster.local` Services.
+Its differences — `WIP:` draft title prefixes, label name-to-numeric-ID
+resolution, issue endpoints that return pull requests alongside issues, and
+`Authorization: token <t>` on `StaticFileCredential` — stay inside its own
+package, while `Forge.scheme` and `BrokerForge.{Scheme,Port}` carry the origin
+metadata across `VCS_FORGES_CONFIG`.
+
 ### Not every provider is a forge
 
 The Bitbucket row above says "no issue tracker" is absorbed by `verbs`
@@ -2163,10 +2178,12 @@ the first three forges and not a property of the domain.**
 ## 6. The declarative surface
 
 `IntegrationSpec` declares two lists. `forges` names each forge the install talks to: a `name`
-the rest of the spec refers to it by, a `provider`, an optional `host`, an optional default
-`namespace`, and an optional `credentialsRef`. `repositories` names each repository the operator
-registers: the `forge` it lives on, the `repository` itself, an optional `namespace` of its own
-for a repository given as a bare name, a `role`, and an optional `baseBranch`.
+the rest of the spec refers to it by, a `provider`, an optional `host`, an optional `port`
+(`1`–`65535`) and `scheme` (`https` default, or `http` for an in-cluster self-managed service),
+an optional default `namespace`, and an optional `credentialsRef`. `repositories` names each
+repository the operator registers: the `forge` it lives on, the `repository` itself, an optional
+`namespace` of its own for a repository given as a bare name, a `role`, and an optional
+`baseBranch`.
 (`PlatformAgentIntegrationSpec` embeds it alongside `GoogleChat` and `Slack`, so version control
 is one integration among several.)
 
@@ -2931,6 +2948,10 @@ summary to chat. A repository on a forge with no issue verbs uses the same
 path. The signal is `capabilities`: when its `verbs` do not include the issue
 verbs, the ledger goes to the store. An answer that cannot be read keeps the
 forge path, so a transient fault on GitHub or GitLab does not move a ledger.
+The read that then checks that the repository can be reached is the listing
+that the chosen path needs: one open issue for a ledger on the forge, and one
+open proposal for a ledger in the store. An issue listing proves nothing on a
+forge that has no issues.
 
 One difference makes the decision carry two facts, not one. The path with no
 GitOps repository opens no remediation proposal, because there is no forge to
@@ -2952,15 +2973,29 @@ class LedgerDecision(NamedTuple):
     ledger: Literal["forge", "store"]
     remediation: bool
     reason: str | None
+    probe: str = "issue-list"
 ```
 
 `start` makes the decision and writes it into the run record, `ledger` and
 `remediation` included, and `finish` follows the record. If `finish` decided
 again, a forge that changed between the two steps would split one run across
-two ledgers. The "store, remediation on" row is new behaviour for the store
-path: it opens, finds and closes remediation proposals as the forge path does
+two ledgers. `probe` is the listing that found a repository unreachable: the
+note gives its advice from the record, with no broker call, so a broker that
+is lost at `finish` cannot stop the run after its store write. In the "store,
+remediation on" row the store path opens, finds and closes remediation
+proposals as the forge path does
 (`open_remediation_pr`, `list_remediation_prs`, `close_stale_remediation_prs`),
-and it puts their links in the chat summary and in the stored report. An
+and it puts their links in the chat summary and in the stored report. The
+stored report is the ledger: it holds the body that the forge path would post,
+with the status `STORE_LEDGER`, and nothing posts it. The next run of the
+repository reads it as its memory, so the delta, the findings that `start`
+names, and the guard that stops a clean run from closing a fix over a finding
+that it did not account for read it as the forge path reads the stored body of
+the issue. One input differs: the forge path seeds a lost memory from the
+issue, and this ledger has no other copy, so a store with no ledger in it is a
+lost memory while a remediation proposal of the stream is open. The
+envelope is not marked as a diverted run's is, and the no-forge path and the
+forge path do not read it. An
 install can use a forge with no issues only where `start` makes this decision:
 on a path that does not, the ledger lookup refuses, and the run stops at
 `start`.
@@ -2972,7 +3007,10 @@ ledger in the store. Its ledger lookup refuses, not answers "none", because
 
 What a store ledger does not give: a ledger that a person can open, link and
 comment on. A `/remediate` request then comes through chat, not a ledger
-comment, and the history is on the volume of the report store.
+comment, and the history is on the volume of the report store. A request in
+chat is not tied to a forge identity, so it cannot overrule a person's close of
+a remediation proposal, as a write-gated ledger comment can. Only the person at
+the terminal can, with `--override-human-close`.
 
 The chat-delivery watch keeps its own ledger issue beside a log channel that
 does not depend on chat. On a forge with no issue tracker, or no labels, the
@@ -3288,6 +3326,11 @@ ask for. It is not that the caller is known to be the model, and it is not a
 claim about what else the sandbox can reach —
 [`../credential-isolation-design.md`](../credential-isolation-design.md) owns
 that question.
+
+The MCP pod is the second caller, and its requests come from outside the
+cluster, through the pod. What bounds it is narrower than the `shell` role:
+`ROLE_VCS_VERBS` holds the `mcp` role to `proposal-view`, which writes nothing,
+and only on a repository the install manages.
 
 `clone` pulls a whole branch's history, which is the wrong shape for a one-off
 read of a large upstream repository, and there is no shallow option to make it

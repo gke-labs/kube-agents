@@ -117,9 +117,9 @@ REFUSED_RESOURCES = frozenset({"secrets"})
 # k8s-operator/internal/controller/platformagent_manifests.go). Drift on a
 # GitOps-managed object is what the drift detector exists for, and the join
 # reading only kinds the agent itself can read keeps the two grants in step. A
-# change to either list has to change both. Today
-# test_the_reconciler_kinds_are_the_six_the_agent_can_read pins a copy of the
-# six; a check that reads the rendered role is owed once #2987 has merged.
+# change to either list has to change both: conformance
+# test_C1_the_watcher_reads_by_name_only_the_reconciler_kinds_the_agent_can_read
+# compares this table with the rendered role on every golden fixture.
 RECONCILER_NAMED_READS = frozenset(
     {
         ("argoproj.io", "applications"),

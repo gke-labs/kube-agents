@@ -54,6 +54,22 @@ spec:
             spec:
               description: AgentProfileSpec defines the desired state of AgentProfile.
               properties:
+                allowedTiers:
+                  description: |-
+                    AllowedTiers are the tiers this profile may run at (#3660, "Tiers and
+                    identity"). A task runs at its requester's tier, and the dispatcher
+                    refuses one whose tier is not listed here; a pinned production profile
+                    might allow only read. Tier is authority, so it lives on the CR, never
+                    in the persona. Absent means read alone (AllowedTierList).
+                  items:
+                    enum:
+                      - read
+                      - unattended
+                    type: string
+                  maxItems: 2
+                  minItems: 1
+                  type: array
+                  x-kubernetes-list-type: set
                 bus:
                   description: |-
                     Bus holds topic grants beyond the task subjects every executor gets.

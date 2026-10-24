@@ -22,7 +22,7 @@ that store which runs `hermes cron tick` against every named profile with work d
 [`autonomous-watchdogs.md`](../../../docs/site/src/content/docs/concepts/autonomous-watchdogs.md)).
 
 An enabled entry here therefore fires in its own process, with this profile's
-persona, toolsets (unless the entry's `enabled_toolsets` replaces them), `skills`, `model` and `max_turns` — which is the whole reason
+persona and toolsets (unless the entry's `enabled_toolsets` replaces them) and the entry's own `skills`, `model` and `max_turns` — which is the whole reason
 the watchdogs live here rather than as kanban cards filed from the Chat Agent's
 roster. A card is not a cron run, and that indirection is what stopped `skills`,
 `model` and `deliver` reaching the thing that ran.
@@ -327,8 +327,8 @@ cannot hold the run past the hour before it writes its record. The queue's ident
 its rubric sets the severity (a budget over a single replica, a pool past the skew ceiling and a
 webhook in the upgrade's path are critical; a budget over several replicas, a pool at the ceiling
 and a webhook refusing only what it matches today are major; a covering exclusion is minor; a
-readiness rule's blocker is critical, and its risk is minor for catalogue entries 9, 10, 11, 13, 16 and 25 and major for every other entry, as the rubric's
-entry table sets it); a row
+readiness rule's blocker is critical, and its risk is minor for catalogue entries 9, 10, 11, 13, 16 and 25 and major for every other entry, and minor for the plan-level `rollout-sequence-precheck`, as the rubric's
+tables set it); a row
 the user dismissed stays dismissed; and the hourly nudge paces what is named and reminds daily of
 undecided criticals. A cluster read in full sends its batch with a `scope` naming the job's check
 family (`upgrade-`) and its own source, an empty batch when nothing was found, so a finding the week
@@ -580,6 +580,66 @@ publish. `enabled: false` on the entry stays the fleet-wide switch, and
 retiring it follows the two-step path below like any other id; deleting the
 entry outright would leave the volume's copy firing against a script the next
 image no longer ships.
+
+## `upgrade-retrospective` looks back after the weekend's upgrades
+
+The other audits say what an upgrade _would_ break. Nothing on the roster said
+what one _did_ break, so the same surprise waited for the next cluster. This
+entry is the fleet-audit stream that fills that gap: at 18:00 UTC on Sunday,
+after the maintenance windows most fleets set at night or at the weekend and
+before Monday's audits, the Platform Agent follows
+`governance/upgrade_retrospective_sop.md`. The SOP resolves the fleet with the
+platform_control `fleet_scope` tool first, as every fleet-audit stream does,
+probes the collector's lock (`--probe-lock`) before it opens the audit run, and
+runs the deterministic collector,
+`skills/fleet-audit/scripts/upgrade_retrospective.py`, with `--full`, the
+tool's `collector_args` verbatim (`--scope-projects`, `--scope-unread`; nothing
+on an install that declares no scope) and `--manifest-file`, so `finish` holds
+the findings document to what the collector read, in the foreground under the
+terminal tool's `timeout: 600`. The collector keeps a ledger of versions per cluster,
+reviews every cluster that is new or was upgraded since the last run, reads
+pods, nodes, events and budgets, classifies what it finds against the upgrade
+failure catalogue, and writes the three-section report (Errors, Warnings, Info)
+to `/opt/data/upgrade-retrospective/` on the shell sandbox's volume, with
+`upgrade-retro-report.md` pointing at the newest full run. The SOP's half is
+the judgement: it confirms every candidate against the seven checks in its
+section 3 and copies the collector's grade (the gate per reviewed cluster included: `clear`, `risk` or `pending` from the pod and node diff plus Cloud Logging ingestion bytes by container, seven days after against seven days before), tailors the catalogue's mitigation
+text to the cluster's own objects, files the stream's one ledger issue where a repository is configured, and reaches `finish`, whose record is what chat receives (the relay posts what `finish` rendered, not the run's final message): the headline and the most severe findings, each with its cluster and object; the counts per cluster and the Errors and Warnings entries are the report's. A quiet weekend, with no cluster new or upgraded, posts nothing.
+
+Two things set it apart from the streams beside it. With no GitHub repository in `managed_repos` it takes the skill's no-forge path as they do (`start` and `finish` with no ledger issue, the findings kept in the report store), and keeps its own store on the volume beside it: the ledger, the guards and the dated reports the on-demand route reads. The Chat Agent's
+first-run stage (`agents/chat/scripts/oobe.py`) marks this job due after the four
+fleet audits it starts once the first inventory scan settles, so a fresh
+install's first report is a baseline of every cluster it manages. And it never
+opens a pull request on its own: an Error files at
+`major`, a Warning at `minor`, nothing at `critical`, every remediation is
+`manual` naming the manifest and the change, and none of its check slugs is on
+`MAJOR_SWEEP_CHECKS`, so `finish` has nothing to promote. A fix stays a user's
+"apply" in chat, through `submit-suggestion`.
+
+The same report answers a question. `agents/platform/CAPABILITIES.md` and the
+persona's delegation list route "how did the upgrades go", "did anything break",
+"what broke last upgrade" to the SOP's on-demand section (a forward-looking question,
+"anything to worry about before we upgrade", is the readiness report's), which answers
+from the saved report when it is newer than the last upgrade operation on the
+clusters the question covers and runs the collector first when it is not: a
+fleet-wide question as a full run, a question about named clusters as a scoped
+one (`--cluster`, beside the tool's `collector_args`; the collector refuses a
+cluster outside the declared scope), which writes a `-scoped` report, moves no
+link and touches no ledger. A second run while one holds the store's lock prints
+one line and writes nothing; a question that meets it is answered from the saved
+report, naming the run that holds the lock. A collector exit without a manifest
+after `start` (the lock lost, a crash record) takes the SOP's recovery `finish`,
+which releases the in-flight note at once instead of leaving it to its TTL.
+
+`risk: low`, as every audit: the run's only writes are the collector's files on
+the volume, the ledger issue through `audit_report.py`, and the chat message,
+and the `high` tier's command allowlist would refuse the collector itself, a
+Python script. `deliver: chat`, so the Chat Agent owns the thread a reply lands
+in. The collector also keeps a guard per classified failure and per risk shape
+in `guards.json` beside its ledger, for the readiness watch to read once its
+reader ships ([the readiness design](../../../docs/designs/upgrade-readiness-checks.md));
+nothing scheduled reads the file today, and the SOP's on-demand section reads its
+risk entries for a cluster the latest report lists as unchanged.
 
 ## Never put an id on both rosters
 
@@ -860,3 +920,17 @@ tier default fail-closed to `"high"` under `cron_run_scope.py` and `cron_risk_ga
   no agent loop and therefore no tool-approval surface to gate; `"high"` is a threat classification of
   the untrusted input the subprocess ingests (runtime isolation is tracked in #913; today the tier is
   metadata only for those jobs).
+
+## `max_turns` contract
+
+Every model-run entry (one without `no_agent`) declares `"max_turns"`, a positive integer, and
+no `no_agent` entry carries one; `scripts/check_prompt_assets.py` (`check_cron_max_turns`)
+enforces both. The image's scheduler reads it ahead of the profile's `agent.max_turns`
+(`deploy/docker/patches/apply_cron_job_max_turns.py`, the same change upstream Hermes has
+open, so the patch drops out on the tag bump that carries it). The audits carry the budget
+their by-hand per-cluster fallback needs; the profile's own value bounds the kanban workers,
+which never need that much. Required rather than optional because an absent key silently
+runs the job under the worker budget. Hermes reads 0, a negative number, a bool or a
+non-numeric string as unlimited; the patch ignores such a roster value and the profile's stands,
+so an entry the image does not ship cannot lift a cron run past every budget. `merge_cron_store` carries it to existing installs like any
+image-owned key. Raise an entry's number when its SOP outgrows it; do not raise the profile's.

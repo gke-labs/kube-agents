@@ -2,7 +2,7 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one `spec.mode: next` install, so an external coding agent or IDE host can talk to it. It is a console client of the install's A2A bus: it holds the `console` bus credential and nothing else, and it can do on the bus exactly what the console page can.
 
-This is the core. It answers one tool, `connection_status`; the tools that send turns, steer tasks and read topics come in later changes.
+It answers `connection_status`, and the turn tools `send_message` and `task_control`. Further tools come in later changes.
 
 ## Turn it on
 
@@ -32,8 +32,10 @@ Point an MCP client at `http://localhost:8089/mcp` with the header `Authorizatio
 
 A request that names an MCP revision this server doesn't speak (the `MCP-Protocol-Version` header) is refused with 400; a request without the header is served.
 
-To rotate the token, write a new value into the Secret. The server reads it on every request, so the new one is accepted, and the old one refused, as soon as the kubelet updates the mounted file, usually within a minute.
+To rotate the token, write a new value into the Secret. The server reads it on every request, so the new one is accepted, and the old one refused, as soon as the kubelet updates the mounted file, usually within a minute. A value that is blank, or holds a byte no request header could carry (a line break or another control character other than a tab), is replaced: the operator mints a new token over it.
 
 ## What it reads
+
+`inspect_pr` reads one pull or merge request, with its comments and diff, from a repository the install manages. It asks the credential broker's `proposal-view` with the pod's own projected token, so it works on GitHub and GitLab and the pod holds no forge credential; the broker refuses any repository outside the install's managed list, and the token's role reaches that one read and nothing else. The tool is offered only when the operator has wired the broker in (`A2A_MCP_BROKER_URL`). Everything the pull request's authors wrote, its title, description, comments and diff, is shown as data: fenced, capped on line boundaries with a count of what was cut, control and bidi characters shown as `<U+XXXX>`, and introduced by a line saying it is the authors' content.
 
 `connection_status` reports the bus endpoint and identity, whether the connection is TLS, the size of the four message streams, whether the gateway and the platform agent are consuming, and the agents registered on `DIRECTORY`. It reads all of it through the console's grants, at most once every five seconds whatever the call rate. Agent names and descriptions are shown as code, as published, shortened.

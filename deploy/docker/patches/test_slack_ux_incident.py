@@ -700,6 +700,91 @@ class RuntimeTest(unittest.TestCase):
         self.assertIn("apply Option B: Restore the secret", text)
         self.assertNotIn("(recommended)", text)
 
+    def test_open_pull_request_omits_the_recommended_choice_button(self):
+        open_pr_report = REPORT.replace(
+            "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix, "
+            "or name one directly with **'apply Option A'** / **'apply Option B'**.",
+            "- **To authorize:** a GitOps Pull Request for the recommended fix is being opened automatically, "
+            "or reply **'apply Option A'** / **'apply Option B'** to open a Pull Request for a different option.",
+        )
+        triage = runtime.parse_triage(open_pr_report)
+        self.assertEqual(
+            triage["choices"],
+            [("Roll back to 14:02", "apply Option A: Roll back to 14:02", False)],
+        )
+        self.assertEqual(triage["fold_title"], runtime.FOLD_TITLE_OPTIONS)
+        adapter = _Adapter()
+        self.deliver(adapter, result=open_pr_report)
+        update = adapter.log[0][1]
+        action_texts = [
+            btn["text"]["text"]
+            for block in update["blocks"]
+            if block.get("type") == "actions"
+            for btn in block.get("elements", [])
+        ]
+        self.assertEqual(action_texts, ["Roll back to 14:02", "GKE Workloads ↗", "Cloud Logs ↗"])
+
+        open_pr_single = SINGLE.replace(
+            "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with this fix.",
+            "- **To authorize:** a GitOps Pull Request for this fix is being opened automatically.",
+        )
+        single = runtime.parse_triage(open_pr_single)
+        self.assertEqual(single["choices"], [])
+        self.assertEqual(single["fold_title"], runtime.FOLD_TITLE_SINGLE)
+        runtime._edited.clear()
+        adapter_single = _Adapter()
+        self.deliver(adapter_single, result=open_pr_single)
+        single_blocks = adapter_single.log[0][1]["blocks"]
+        self.assertEqual([b["type"] for b in single_blocks], ["rich_text", "container"])
+
+        # Under spec.mode: next (kube-agents.chat/v1), chat_triage carries the same filtered choices.
+        chat_multi, _ = runtime.chat_triage(open_pr_report)
+        self.assertEqual([c["text"] for c in chat_multi["choices"]], ["Roll back to 14:02"])
+        chat_single, _ = runtime.chat_triage(open_pr_single)
+        self.assertEqual(chat_single.get("choices", []), [])
+
+        # A wrapped open-PR `To authorize:` bullet still omits the recommended button.
+        wrapped_report = REPORT.replace(
+            "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix, "
+            "or name one directly with **'apply Option A'** / **'apply Option B'**.",
+            "- **To authorize:** a GitOps Pull Request for the recommended fix is being\n"
+            "  opened automatically, or reply **'apply Option A'** to open another option.",
+        )
+        self.assertEqual(len(runtime.parse_triage(wrapped_report)["choices"]), 1)
+        # Only the marker words count. A restatement of the reply-wanted clause, in the passive or on a
+        # continuation line, keeps every button: stripping one would leave a report that asks for
+        # `apply` with no button for it, on an install that is not opening anything.
+        for clause in (
+            "- **To authorize:** reply **'apply'** and a GitOps Pull Request will be opened with this fix.",
+            "- **To authorize:** reply **'apply'** and a GitOps Pull Request is being opened for review.",
+            "- **To authorize:** reply **'apply'** to choose a fix.\n  Once you reply, a Pull Request will be opened for review.",
+            "- **To authorize:** a GitOps Pull Request for the recommended fix will be opened automatically.",
+        ):
+            with self.subTest(clause=clause):
+                off_report = REPORT.replace(
+                    "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix, "
+                    "or name one directly with **'apply Option A'** / **'apply Option B'**.",
+                    clause,
+                )
+                self.assertEqual(len(runtime.parse_triage(off_report)["choices"]), 2)
+
+        # A drift or controller-stall report on an install with INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true
+        # still invites `reply **'apply'**`, and keeps its recommended/single choice button on deliver().
+        with mock.patch.dict(os.environ, {"INCIDENT_TRIAGE_OPEN_PULL_REQUEST": "true"}):
+            drift_triage = runtime.parse_triage(REPORT)
+            self.assertEqual(len(drift_triage["choices"]), 2)
+            self.assertEqual(len(runtime.parse_triage(SINGLE)["choices"]), 1)
+            runtime._edited.clear()
+            adapter_drift = _Adapter()
+            self.deliver(adapter_drift, result=REPORT)
+            drift_action_texts = [
+                btn["text"]["text"]
+                for block in adapter_drift.log[0][1]["blocks"]
+                if block.get("type") == "actions"
+                for btn in block.get("elements", [])
+            ]
+            self.assertIn("Restore the secret (recommended)", drift_action_texts)
+
     def test_the_alert_title_is_read_from_the_alerts_routing_row(self):
         self.assertEqual(runtime.alert_title(CHANNEL, ALERT_TS, self.db), "")
         meta = {"platform": "slack", "chat_id": CHANNEL, "thread_id": ALERT_TS,

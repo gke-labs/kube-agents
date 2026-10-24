@@ -583,6 +583,20 @@ On clusters enforcing NetworkPolicy, scrapes are dropped unless admitted: set `p
 
 When deploying via GitOps tools like ArgoCD, `helm template` passes the destination cluster's discovered API versions by default when connected to the target cluster. If default detection does not pick up your CRDs or if running disconnected templates, explicitly set `platformAgent.serviceMonitor: true` or `platformAgent.vmPodScrape: true` in your Helm values.
 
+`operator.metrics` is the operator's own listener: the manager serves controller-runtime's
+series and every `PlatformAgent`'s `status.usage` and `status.phase` as gauges
+(`kubeagents_platformagent_usage`, `kubeagents_platformagent_usage_time_seconds`,
+`kubeagents_platformagent_phase`; [Observability](https://gke-labs.github.io/kube-agents/concepts/observability/#prometheus-metrics))
+on port `8080` (container port `metrics`), plain HTTP on the pod network.
+`operator.metrics.podMonitoring` renders `<release>-operator-monitoring` over the operator's
+pods, the same tri-state as `platformAgent.podMonitoring`. `operator.metrics.enabled: false`
+binds no listener and renders neither the port, the `PodMonitoring` nor the policy.
+`<release>-operator-netpol` bounds the plain listener as the broker's and gateway's
+policies bound theirs: ingress to the metrics port from `gke-gmp-system`, and from
+`platformAgent.monitoringScraperNamespace` when set, and nothing else; the health port, and
+the webhook port when the webhooks render, stay open. A `helm upgrade --reuse-values` from
+a release that predates `operator.metrics` renders with the listener off until the value is set.
+
 ### Turning telemetry off
 
 A cluster with no collector needs nothing done: when discovery completes and
@@ -638,20 +652,31 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
 - **Slack** — `platformAgent.integration.slack.enabled=true`; the bot/app
   tokens are read from the credentials Secret's `SLACK_BOT_TOKEN` /
   `SLACK_APP_TOKEN` keys (the CRD requires both refs when Slack is enabled).
+  Custom Secret references can be configured via `botTokenSecretRef` and
+  `appTokenSecretRef` (`name` and `key`) if tokens are kept in a separate Secret.
+  On an installer-managed install (`upgrade.sh` full mode), custom refs can
+  be preserved across upgrades by specifying them via `TF_VAR_extra_helm_values`
+  in `install.env` (e.g.
+  `TF_VAR_extra_helm_values='{platformAgent={integration={slack={botTokenSecretRef={name="custom-slack-secret"},appTokenSecretRef={name="custom-slack-secret"}}}}}'`).
+  Note: installer recovery heuristics and front-door flag validation for split
+  Secrets are decoupled and deferred to follow-up work; the installer expects
+  the tokens in `install.env` or the shared Secret until that lands.
 - **Microsoft Teams** — `platformAgent.integration.teams.enabled=true`; the bot
   credentials are read from the credentials Secret's `TEAMS_APP_ID` and
-  `TEAMS_APP_PASSWORD` keys. Optional single-tenant lock-down is set via
-  `tenantId`, and user authorization is configured via `allowedUsers` (or
-  `allowAllUsers: true`). Supports Microsoft Adaptive Cards v1.5 with markdown
-  fallback.
+  `TEAMS_APP_PASSWORD` keys. Custom Secret references can be configured via
+  `appIdSecretRef` and `appPasswordSecretRef` (`name` and `key`). Optional
+  single-tenant lock-down is set via `tenantId`, and user authorization is
+  configured via `allowedUsers` (or `allowAllUsers: true`). Supports Microsoft
+  Adaptive Cards v1.5 with markdown fallback. Custom refs can likewise be
+  preserved across `upgrade.sh` upgrades via `TF_VAR_extra_helm_values`.
 - **Git forges and repositories** — `platformAgent.integration.forges` lists
   the forges the agent talks to (`name`, `provider`, optional `host`,
-  `namespace` and `credentialsRef`), and
+  `scheme`, `port`, `namespace` and `credentialsRef`), and
   `platformAgent.integration.repositories` the repositories on them (`forge`,
   `repository`, optional `namespace`, and `role`: `gitops` for the one the
   agent publishes to, `managed` for others it may change, `context` for
-  read-only reference). `provider` is `github` or `gitlab`. If you omit it, it is `github`. A forge at a host other than github.com must name it. `credentialsRef` is
-  ignored for `github` and required for `gitlab`: a Secret holding the access
+  read-only reference). `provider` is `github`, `gitlab` or `gitea`. If you omit it, it is `github`. A forge at a host other than github.com must name it. `credentialsRef` is
+  ignored for `github` and required for `gitlab` and `gitea`: a Secret holding the access
   token under the key `token`, mounted into the credential broker only. A
   `gitlab` forge's `host` is gitlab.com by default or a self-managed instance,
   never a GitHub name, and one `gitlab` forge per host. A `github` forge's
@@ -660,21 +685,27 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   `api.github.com` or `<name>.ghe.com`). An install serves one GitHub host:
   a second `github` forge at another host, or one host for two providers,
   fails the render. A self-managed
-  instance whose certificate a private CA signed also sets `caBundleRef`
+  instance whose certificate a private CA signed (`gitlab` at a self-managed
+  host, `github` at a GitHub Enterprise Server host, or `gitea` over `https`)
+  also sets `caBundleRef`
   (`name`, and an optional `key` that defaults to `ca.crt`): a Secret that
   holds the CA, which the broker trusts for that host only. On a GitHub
   Enterprise Server forge, the token minter also gets the CA, and it trusts
   the CA for all of its outbound calls (see the token minter guide). A Secret, so
   changing the CA needs the same rights as changing the token. It is for a
-  forge at a self-managed host, GitLab or GitHub Enterprise Server, never
-  gitlab.com or github.com. With a `gitlab` forge
+  forge at a self-managed host, GitLab, GitHub Enterprise Server, or `https`
+  Gitea, never gitlab.com or github.com. With a `gitlab` or `gitea` forge
   declared beside GitHub, a bare `owner/name` still works for a GitHub
-  repository that the install registered by URL. Name a GitLab repository, or
+  repository that the install registered by URL. Name a GitLab or Gitea repository, or
   a GitHub repository that the install did not register, by its URL. Apply `crds/` before upgrading
   to a release that adds a provider, since `helm upgrade` does not update CRDs. A GitHub forge's
   `host` is a spelling of github.com (`github.com`, `www.github.com`,
-  `ssh.github.com`) or a GitHub Enterprise Server hostname, as above, and a
-  repository must name a declared forge.
+  `ssh.github.com`) or a GitHub Enterprise Server hostname, as above, and it
+  takes neither `port` nor `scheme: http`. A Gitea forge is self-managed:
+  `host` is required, `scheme` may be `http` only for an in-cluster Service
+  (`*.svc` or `*.svc.cluster.local`), `port` is set when the forge is not on
+  the scheme's default port, and `credentialsRef` names the Secret holding its
+  API token under the key `token`. A repository must name a declared forge.
   `platformAgent.integration.github.org` / `.gitRepo` remain as a deprecated
   alias for one GitHub forge and its gitops repository — set the lists or the
   alias, not both. For a github.com GitOps repository, the alias is still what
@@ -1163,7 +1194,6 @@ helm uninstall kube-agents -n kubeagents-system
   `terraform/examples/full-install` does both in one apply.
 
   Two behaviours worth knowing before you enable them:
-
   - **`failurePolicy` defaults to `Ignore`, where the kustomize path uses
     `Fail`.** Helm applies the webhook configurations before both the
     `Certificate` and the `PlatformAgent` CR, so under `Fail` the API server

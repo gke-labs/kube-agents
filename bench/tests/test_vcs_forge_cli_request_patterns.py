@@ -14,6 +14,8 @@ import re
 from pathlib import Path
 
 import yaml
+from kube_agents_bench import transcript
+from kube_agents_bench.verifiers import WorkerCommandsVerifier
 
 TASK = (
     Path(__file__).resolve().parent.parent
@@ -22,6 +24,7 @@ TASK = (
     / "task.yaml"
 )
 CHECK = "no-credentialed-git-and-no-writes"
+LIST_CHECK = "the-proposals-were-listed-through-the-verbs"
 VCS = "/opt/data/skills/version-control/scripts/vcs.py"
 
 # Every forge-changing verb `vcs.py` serves, aliases included.
@@ -158,3 +161,53 @@ def test_the_reads_a_passing_worker_issues_are_not_flagged():
         'git commit -m "gh pr create was not used"',
     ):
         assert not _flagged(command), command
+
+
+# The second terminal call of the nightly run that failed the list check
+# (ci-kube-agents-eval-nightly 2113057845506215936, rep 3, card t_e6e25baf),
+# as typed, and the one line Hermes v2026.9.14 wrote to the card log for it
+# (``summarize_shell_command``: the assignment segment is kept as the first
+# command, the rest collapses to a count), which carries no list verb.
+LISTED_AS_TYPED = (
+    "V=/opt/data/profiles/platform/skills/version-control/scripts/vcs.py; "
+    "python3 $V proposal list --repo gke-agentic/kube-agents-evals-10-infra --state all -n 100"
+    " > /opt/data/scratch/prs_t_e6e25baf.json; echo exit=$?; python3 -c \"\nimport json;"
+    "d=json.load(open('/opt/data/scratch/prs_t_e6e25baf.json'));"
+    "print({k:v for k,v in d.items() if not isinstance(v,list)})\n\""
+)
+LISTED_ROW = "V=/opt/data/profiles/platform/skills/version-control/scripts/vcs.py + 2 commands"
+
+
+def _list_check() -> dict:
+    doc = yaml.safe_load(TASK.read_text())
+    (check,) = [c for c in doc["verification_spec"] if c.get("name") == LIST_CHECK]
+    return check["check"]
+
+
+def _listed(check: dict) -> bool:
+    call = {
+        "name": "terminal",
+        "args": {"command": LISTED_AS_TYPED},
+        "result": "",
+        "status": "error",
+        "agent": "platform",
+        "task": "t_e6e25baf",
+        "session": "s_1",
+        "at": 1792657983.68,
+    }
+    transcript.set("", [call], worker_commands=[{"task": "t_e6e25baf", "command": LISTED_ROW}])
+    try:
+        result = WorkerCommandsVerifier(**check).verify(5.0)
+    finally:
+        transcript.clear()
+    assert result.status in ("pass", "fail"), result.reason
+    return result.success
+
+
+def test_the_list_check_reads_the_recorded_command_as_typed():
+    check = _list_check()
+    assert check["after_result_pattern"] == "(?!)"
+    assert _listed(check)
+    # Without the switch the check reads the card-log row, where the list
+    # verb is behind `+ 2 commands`: the recorded false fail (#3128).
+    assert not _listed({k: v for k, v in check.items() if k != "after_result_pattern"})

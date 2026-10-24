@@ -1956,6 +1956,7 @@ LEDGER_AUDIT_IDS = frozenset(
         "obtainability-audit",
         "security-patch-orchestrator",
         "stockout-prevention",
+        "upgrade-retrospective",
     }
 )
 
@@ -1971,18 +1972,21 @@ AuditId = Literal[
     "obtainability-audit",
     "security-patch-orchestrator",
     "stockout-prevention",
+    "upgrade-retrospective",
 ]
 
 # Every `status` a fleet-audit `finish` stores, for `audit_report_stored`:
 # a typo fails at spec-load time, as `AuditId` does for the stream.
-AuditStatus = Literal["OPENED", "UPDATED", "CLEAN", "HELD", "NO_FORGE"]
+AuditStatus = Literal["OPENED", "UPDATED", "CLEAN", "HELD", "NO_FORGE", "STORE_LEDGER"]
 
 # Environment names carrying the read credential, in precedence order. See
 # LedgerIssueContainsVerifier's docstring for what it has to be. A literal
 # rather than `forges.GITHUB_TOKEN_ENV_VARS`, which it must equal (pinned in
 # tests/test_gitlab_checks.py): `scripts/verify_ci_pool_project.py` parses
 # this tuple out of the file, without importing bench, to check that CI mints
-# into the name bench reads first.
+# into the name bench reads first. A non-empty file named by
+# forges.GITHUB_TOKEN_FILE_ENV_VAR outranks both: CI seeds it from the same
+# mint and renews it while the unit runs (forges.read_token).
 LEDGER_TOKEN_ENV_VARS = ("BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
 
 # When the first unit on the case's audit stream began, in epoch seconds, and
@@ -2055,6 +2059,10 @@ _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
 _OMITTED_NOTICE_RE = re.compile(r"(\d+) further finding\(s\) are omitted from this description")
 # Mirrors audit_report's `HELD_IDS_RE`: the held ids its held span records.
 _HELD_IDS_RE = re.compile(r"<!--[ \t]*audit-held-ids:[ \t]*(\[.*?\])[ \t]*-->", re.S)
+# Mirrors audit_report's `NOT_RECHECKED_IDS_COMMENT`: the ids its held span
+# keeps under "Not re-checked this run", previous findings on a target the run
+# did not check.
+_NOT_RECHECKED_IDS_RE = re.compile(r"<!--[ \t]*audit-not-rechecked-ids:[ \t]*(\[.*?\])[ \t]*-->", re.S)
 _CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
 # Ids quoted in an `every_finding_named` failure; the count is always exact.
 _MAX_UNNAMED_IN_REASON = 5
@@ -2142,20 +2150,17 @@ def _no_pr_url_reason(host: str) -> str:
         f"({forges.GITHUB_HOST_ENV_VAR})"
     )
 
-_NO_TOKEN_REASON = (
-    "no GitHub read credential in the environment: set one of "
-    f"{', '.join(LEDGER_TOKEN_ENV_VARS)} to a token that can read issues on "
-    "the eval GitOps repository, or this check cannot be evaluated"
-)
-
-
 def _no_token_reason(forge: str) -> str:
-    """The reason for an absent grading credential, naming the forge's variables."""
+    """The reason for an absent grading credential, naming what was read."""
     if forge == forges.FORGE_GITHUB:
-        return _NO_TOKEN_REASON
+        return (
+            "no GitHub read credential in the environment: "
+            f"{forges.missing_token_hint(forge)} to a token that can read issues on "
+            "the eval GitOps repository, or this check cannot be evaluated"
+        )
     return (
-        f"no {forge} read credential in the environment: set one of "
-        f"{', '.join(forges.token_env_vars(forge))} to a token that can read the eval "
+        f"no {forge} read credential in the environment: "
+        f"{forges.missing_token_hint(forge)} to a token that can read the eval "
         "GitOps repository, or this check cannot be evaluated"
     )
 
@@ -2272,9 +2277,9 @@ _NO_WORKER_COMMANDS_REASON = (
 _NO_WORKER_TERMINAL_CALLS_REASON = (
     "no delegated worker's terminal or execute_code calls are readable in the trajectory: no "
     "card was delegated, the worker-trajectory capture did not run, the card log could not be "
-    "read, or the pod withheld a call's arguments, so the ordered read cannot observe its "
-    "subject (a worker whose tagged calls are all MCP or board calls, with an empty card log, "
-    "grades as zero commands)"
+    "read, or the pod withheld a call's arguments, so the read of the calls as typed cannot "
+    "observe its subject (a worker whose tagged calls are all MCP or board calls, with an empty "
+    "card log, grades as zero commands)"
 )
 _UNTIMED_WORKER_CALLS_REASON = (
     "{count} worker terminal call(s) carry no numeric time ({shown}), so the ordered read "
@@ -2283,6 +2288,12 @@ _UNTIMED_WORKER_CALLS_REASON = (
 _PARTIAL_WORKER_CAPTURE_REASON = (
     "the worker-trajectory capture was partial ({gaps}), so the commands it did read "
     "cannot clear the forbidden pattern(s): a retry may sit in the part it did not read"
+)
+# The same gap on a check with no forbidden set: nothing is ordered, so the
+# only open question is the required command(s) it did not see.
+_PARTIAL_REQUIRED_CAPTURE_REASON = (
+    "the worker-trajectory capture was partial ({gaps}), so the required command(s) it did "
+    "not see may sit in the part it did not read: {unseen}"
 )
 _MAX_NAMED_COMMANDS = 5
 # How much of a named command the reason quotes.
@@ -2832,8 +2843,9 @@ class WorkerCommandsVerifier(BaseVerifier):
     the rendering can miss a worker-filed card's command behind a ``cd ... &&``
     or on a second line, and a capture gap on such a card does not change the
     result (#3406).
-    ``after_result_pattern`` (below) reads the tagged calls alone, as typed,
-    for every card.
+    ``after_result_pattern`` (below) reads the tagged calls as typed for
+    every card: alone for the ordered check it was built for, and beside the
+    card log's rows for a check with no forbidden set.
 
     ``required_patterns``: each must match at least one command.
     ``forbidden_patterns``: none may match any command.
@@ -2931,7 +2943,11 @@ class WorkerCommandsVerifier(BaseVerifier):
     withheld), is ``status="error"``, a withheld argument beside a readable call
     is skipped, a worker whose tagged calls are all MCP calls grades as zero
     commands, and a capture with gaps that found no forbidden command is
-    ``status="error"``. Fails closed like its siblings -- a run with no captured
+    ``status="error"``; a check with no forbidden set is not ordered, so an
+    untimed call and a gap beside a satisfied required set do not error it,
+    and the card log's rows join its typed set, so a command the trajectory
+    missed still counts (a case sets ``after_result_pattern: "(?!)"`` to
+    read the required commands as typed and nothing else). Fails closed like its siblings -- a run with no captured
     worker commands is ``status="error"``, not a pass.
     """
 
@@ -2982,6 +2998,7 @@ class WorkerCommandsVerifier(BaseVerifier):
         window = ""
         sources = ""
         result_hits: list[tuple[str, str]] = []
+        forbidding = bool(self.forbidden_patterns or self.forbidden_runs or self.forbidden_result_patterns)
         if self.after_result_pattern is None:
             # ``None`` stays an error even when the trajectory carries tagged calls: it
             # means a filed card's log could not be read (or nothing was filed), and
@@ -3044,8 +3061,21 @@ class WorkerCommandsVerifier(BaseVerifier):
                         reason=_NO_WORKER_TERMINAL_CALLS_REASON,
                     )
             typed = [command for _, _, command, _, _ in calls]
+            # The ordered check reads the calls alone: a log row has no time.
+            # A check with no forbidden set keeps the card log as a source for
+            # its required checks: the trajectory can be the narrower read (two
+            # #2959 runs had a command on the log and no tagged call), so a row
+            # the calls do not carry joins the typed set rather than becoming a miss.
+            if not forbidding:
+                seen = set(typed)
+                joined = [row for row in (str(r.get("command") or "") for r in snap.worker_commands or []) if row and row not in seen]
+                typed += joined
+                if joined:
+                    sources = f" ({len(calls)} tagged calls as typed and {len(joined)} from the card log)"
             untimed = [command for _, at, command, _, _ in calls if at is None]
-            if untimed:
+            # Only the window orders calls; a check with no forbidden set
+            # grades nothing by time, so an untimed call cannot mislead it.
+            if untimed and forbidding:
                 shown = "; ".join(repr(c[:_SHOWN_COMMAND_CHARS]) for c in untimed[:_MAX_NAMED_COMMANDS])
                 return VerificationResult(
                     success=False,
@@ -3056,7 +3086,9 @@ class WorkerCommandsVerifier(BaseVerifier):
             lineage = _card_lineages(snap.worker_card_parents or {}, [c for c, _, _, _, _ in calls])
             windowed = []
             opened: list[str] = []
-            for root in dict.fromkeys(lineage[c] for c, _, _, _, _ in calls):
+            # A check with no forbidden set has nothing to grade after the
+            # opener; its reasons say nothing about a window it never used.
+            for root in dict.fromkeys(lineage[c] for c, _, _, _, _ in calls) if forbidding else ():
                 mine = [call for call in calls if lineage[call[0]] == root]
                 opener = next((i for i, (_, _, _, result, _) in enumerate(mine) if re.search(self.after_result_pattern, result)), None)
                 if opener is None:
@@ -3067,7 +3099,9 @@ class WorkerCommandsVerifier(BaseVerifier):
                 for _, _, command, result, _ in later:
                     result_hits.extend((p, command) for p in self.forbidden_result_patterns if re.search(p, result))
                 opened.append(f"{len(later)} in the lineage of card {root} after {mine[opener][2][:_SHOWN_COMMAND_CHARS]!r}")
-            if not opened:
+            if not forbidding:
+                window = ""
+            elif not opened:
                 window = (
                     f"; no worker command opened the window ({self.after_result_pattern!r} in the result"
                     " of any command, failed or not), so no command is after it and the forbidden pattern(s) graded nothing"
@@ -3125,13 +3159,20 @@ class WorkerCommandsVerifier(BaseVerifier):
                 elapsed_time=time.monotonic() - start,
                 reason="; ".join(parts) + window,
             )
-        if partial:
+        # A required command that was read is conclusive the same way: a gap
+        # beside a satisfied required set errors only a check that also has a
+        # forbidden set to clear.
+        if partial and (forbidding or missing or unrun):
             unseen = f"; required pattern(s) {missing} not seen in what was read" if missing else ""
+            reason = _PARTIAL_WORKER_CAPTURE_REASON.format(gaps="; ".join(snap.worker_capture_gaps)) + unseen + window
+            if not forbidding:
+                not_seen = [f"pattern {p!r}" for p in missing] + [" ".join(["run", run.script, *run.flags]) for run in unrun]
+                reason = _PARTIAL_REQUIRED_CAPTURE_REASON.format(gaps="; ".join(snap.worker_capture_gaps), unseen=", ".join(not_seen))
             return VerificationResult(
                 success=False,
                 status="error",
                 elapsed_time=time.monotonic() - start,
-                reason=_PARTIAL_WORKER_CAPTURE_REASON.format(gaps="; ".join(snap.worker_capture_gaps)) + unseen + window,
+                reason=reason,
             )
         return VerificationResult(
             success=True,
@@ -3227,6 +3268,174 @@ class WorkerAgentsVerifier(BaseVerifier):
             reason=f"all {len(self.required_agents)} required profile pattern(s) matched; workers ran as {agents}",
         )
 
+
+
+# The dispatcher's record of a worker that ran out of its turn budget: the
+# run closes ``timed_out`` with this at the head of ``error`` (hermes
+# ``agent/turn_finalizer.py``, ``_record_kanban_budget_exhausted``). The two
+# numbers are the calls made and the cap in force.
+_BUDGET_EXHAUSTED_RE = re.compile(r"Iteration budget exhausted \((?P<used>\d+)/(?P<cap>\d+)\)")
+
+# Hermes' one-shot checkpoint notice, appended to the newest tool result once a
+# dispatcher-owned kanban worker has used 90% of a finite cap
+# (``agent/turn_iteration_prep.py``, ``ITERATION_BUDGET_WARNING_TEMPLATE``). It
+# names the cap in force whether the worker then stops or runs into the wall,
+# which is why it is the primary read; the worker capture carries it inside
+# the tagged call's ``result``. Matched with its prefix at a paragraph seam,
+# so a notice another session's transcript quotes inside a search result (a
+# JSON string, whose newlines are escaped) is not read as this worker's cap.
+_BUDGET_NOTICE_RE = re.compile(
+    r"(?:^|\n\n)\[SYSTEM NOTICE — iteration budget checkpoint\] "
+    r"You have used (?P<used>\d+) of (?P<cap>\d+) iterations"
+)
+
+# The run outcome the dispatcher records when a worker finished its card
+# (``kanban_db._end_run(outcome="completed")``); the one outcome that says the
+# worker stayed inside its cap. The harness's ceiling archive closes a running
+# card ``reclaimed`` instead, which says nothing about the cap.
+_RUN_COMPLETED = "completed"
+
+_NO_WORKER_RUNS_REASON = (
+    "no delegated card's run rows were captured for this run: either no card was "
+    "delegated, the run ended before the cards settled, or the board could not be "
+    "read -- so this check could not be evaluated"
+)
+
+
+@VERIFIERS.register("worker_budget")
+class WorkerBudgetVerifier(BaseVerifier):
+    """Checks the turn budget a delegated worker actually ran under.
+
+    Two records name the cap in force, and the check reads both. Once a
+    dispatcher-owned worker has used 90% of a finite cap, Hermes appends a
+    one-shot notice to its newest tool result, ``You have used N of M
+    iterations``, which the worker capture carries in the tagged call's
+    ``result``; a worker that goes on to exhaust the cap closes its kanban run
+    ``timed_out`` with ``Iteration budget exhausted (N/M)`` in the run's
+    ``error`` (:func:`kube_agents_bench.worker_trajectory.runs`). The notice is
+    the primary read: whether the worker then stops at the checkpoint or runs
+    into the wall is the model's choice, and the cap is on the record either
+    way. A run that finishes inside 90% of its cap records neither.
+
+    ``budget``: the cap every notice and every exhausted run must name.
+
+    Passes when at least one delegated worker reached its checkpoint or ran
+    out, and every cap named is ``budget``. Fails when a cap named is another
+    number, or when nothing was named and a worker finished its card
+    (``outcome`` ``completed``), which for a card written to outrun the cap
+    means the cap in force was larger than the one declared; the reason names
+    each card's captured call count so the read is on the record. Fails closed
+    like its siblings: an empty stash, a run with no card rows, nothing named
+    on a capture that recorded gaps (``worker_capture_gaps``), or nothing named
+    and no completed attempt either (the harness archived the card at its
+    delegation ceiling, which closes the run ``reclaimed``; a crash; an attempt
+    still open) is ``status="error"``: none of those says what cap was in force.
+    A notice past the capture's per-result clip is not read, which a card of
+    short tool outputs never reaches; a capture in which every result was
+    withheld or never recorded is unreadable, and with nothing named it is
+    ``status="error"`` too, while a single missing result among readable ones
+    does not turn a plain failure into one.
+    """
+
+    type: Literal["worker_budget"]
+    budget: int = Field(ge=1)
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+        snap = transcript.get()
+        if snap is None:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_TRANSCRIPT_REASON,
+            )
+        if snap.worker_runs is None:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_WORKER_RUNS_REASON,
+            )
+        # (task, used, cap, how) for every record that names a cap.
+        named: list[tuple[str, int, int, str]] = []
+        for row in snap.worker_runs:
+            match = _BUDGET_EXHAUSTED_RE.search(str(row.get("error") or ""))
+            if match:
+                named.append((str(row.get("task") or ""), int(match["used"]), int(match["cap"]), "exhausted"))
+        calls: dict[str, int] = {}
+        # A pod whose redactor failed to load withholds every result, and the
+        # notice with them: with nothing named, that is an unreadable cap, not
+        # evidence of a larger one. One call with no result row (a worker
+        # killed mid-call, an orphaned result) among readable ones is not: the
+        # notice would have landed on one of the others.
+        unreadable = tagged = 0
+        for entry in snap.trajectory:
+            if not entry.get("agent"):
+                continue
+            task = str(entry.get("task") or "")
+            calls[task] = calls.get(task, 0) + 1
+            tagged += 1
+            result = entry.get("result")
+            if result is None or result == worker_trajectory.WITHHELD:
+                unreadable += 1
+                continue
+            match = _BUDGET_NOTICE_RE.search(str(result))
+            if match:
+                named.append((task, int(match["used"]), int(match["cap"]), "checkpoint"))
+        seen = ", ".join(f"{task}: {n} call(s)" for task, n in sorted(calls.items())) or "no worker calls captured"
+        if not named:
+            outcomes = sorted({f"{r.get('task')}={r.get('outcome')}" for r in snap.worker_runs})
+            if not any(r.get("outcome") == _RUN_COMPLETED for r in snap.worker_runs):
+                # No worker finished inside its cap and none ran out of it: the
+                # card was archived at the delegation ceiling (``reclaimed``),
+                # crashed, or is still open. Nothing here says what cap was in force.
+                return VerificationResult(
+                    success=False,
+                    status="error",
+                    elapsed_time=time.monotonic() - start,
+                    reason=(
+                        "no delegated worker reached its turn-budget checkpoint or ran out, and none finished its "
+                        f"card, so the cap in force cannot be read (runs: {outcomes or ['no run rows']}; {seen})"
+                    ),
+                )
+            all_unreadable = tagged > 0 and unreadable == tagged
+            if snap.worker_capture_gaps or all_unreadable:
+                why = (
+                    "; ".join(snap.worker_capture_gaps)
+                    if snap.worker_capture_gaps
+                    else f"all {unreadable} worker result(s) have no readable text (none recorded, or withheld in the pod)"
+                )
+                return VerificationResult(
+                    success=False,
+                    status="error",
+                    elapsed_time=time.monotonic() - start,
+                    reason=(
+                        f"no delegated worker reached its turn-budget checkpoint or ran out (runs: {outcomes}; {seen}), "
+                        f"but the capture was incomplete, so this check could not be evaluated: {why}"
+                    ),
+                )
+            return VerificationResult(
+                success=False,
+                elapsed_time=time.monotonic() - start,
+                reason=(
+                    f"no delegated worker reached its turn-budget checkpoint or ran out, so the cap in force "
+                    f"was larger than {self.budget} or the card did not outrun it (runs: {outcomes}; {seen})"
+                ),
+            )
+        record = "; ".join(f"{task} {how} {used}/{cap}" for task, used, cap, how in named)
+        wrong = [cap for _, _, cap, _ in named if cap != self.budget]
+        if wrong:
+            return VerificationResult(
+                success=False,
+                elapsed_time=time.monotonic() - start,
+                reason=f"a delegated worker ran under a {wrong[0]}-turn budget, not {self.budget}: {record}",
+            )
+        return VerificationResult(
+            success=True,
+            elapsed_time=time.monotonic() - start,
+            reason=f"delegated worker(s) ran under the {self.budget}-turn budget: {record}",
+        )
 
 _NO_REPLAY_CARD_REASON = (
     f"no {card_wake.SETTLED_ENTRY} entry in the trajectory: the prompt was not a "
@@ -3896,8 +4105,9 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     the noun does not pass. Exactly one of the reported URLs may satisfy them;
     two would mean the report named two ledgers for a stream that owns one.
 
-    AUTHENTICATION. A GitHub token from ``BENCH_GITHUB_TOKEN`` (preferred) or
-    ``GITHUB_TOKEN``, read by the verifier process — the Prow runner, not the
+    AUTHENTICATION. A GitHub token from the file ``BENCH_GITHUB_TOKEN_FILE``
+    names when it holds one, else ``BENCH_GITHUB_TOKEN`` (preferred) or
+    ``GITHUB_TOKEN`` (:func:`forges.read_token`), read by the verifier process — the Prow runner, not the
     agent. It needs one permission, ``issues: read``, on the eval GitOps
     repositories, which are private and ours (``gke-agentic/
     kube-agents-evals-infra`` and ``…-evals-2-infra``); that they are
@@ -4289,9 +4499,16 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             body = ledger["body"]
             named = set(_HEADING_ID_RE.findall(body))
             named |= set(_CODE_SPAN_RE.findall(_HTML_COMMENT_RE.sub("", body)))
-            # Collector-held ids are the collector's, rendered in what the
-            # findings leave; this check grades the findings the run filed.
-            held = {fid for match in _HELD_IDS_RE.findall(body) for fid in _json_str_list(match)}
+            # Collector-held ids are the collector's, and not-re-checked ids
+            # are previous findings this run did not check. Both are rendered
+            # in what the findings leave; this check grades the findings the
+            # run filed.
+            held = {
+                fid
+                for pattern in (_HELD_IDS_RE, _NOT_RECHECKED_IDS_RE)
+                for match in pattern.findall(body)
+                for fid in _json_str_list(match)
+            }
             unnamed = [fid for fid in filed[0] if fid not in named and fid not in held]
             # Past its cap the complete-id block is left out and `filed` is the
             # delta block, which lacks the omitted ids; the renderer's omission
@@ -5096,8 +5313,8 @@ class PullRequestOpenedVerifier(BaseVerifier):
             # token lasts an hour, and telling the reader to widen a permission
             # sends them to the App's settings for a fault that is in the mint.
             return None, (
-                f"GitHub answered 401 for {owner}/{repo}#{number}: the token in "
-                f"{LEDGER_TOKEN_ENV_VARS[0]} is not valid — an installation token "
+                f"GitHub answered 401 for {owner}/{repo}#{number}: "
+                f"{forges.token_source(forges.FORGE_GITHUB)} is not valid — an installation token "
                 "expires an hour after it is minted — so this check could not be "
                 "evaluated"
             )
@@ -5105,8 +5322,8 @@ class PullRequestOpenedVerifier(BaseVerifier):
             return payload, None
         if first == 403 and status_code == 403:
             return None, (
-                f"GitHub denied {owner}/{repo}#{number} on both endpoints: the token "
-                f"behind {LEDGER_TOKEN_ENV_VARS[0]} can reach that repository but "
+                f"GitHub denied {owner}/{repo}#{number} on both endpoints: "
+                f"{forges.token_source(forges.FORGE_GITHUB)} can reach that repository but "
                 "read neither its issues nor its pull requests — add "
                 "`pull_requests: read` to the installation — so this check could "
                 "not be evaluated"
@@ -5167,7 +5384,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     {},
                     None,
                     f"GitHub answered 401 for {owner}/{repo}#{number} on the pulls "
-                    f"endpoint: the token in {LEDGER_TOKEN_ENV_VARS[0]} is not valid — "
+                    f"endpoint: {forges.token_source(forges.FORGE_GITHUB)} is not valid — "
                     "an installation token expires an hour after it is minted — so "
                     "this check could not be evaluated",
                 )
@@ -5178,7 +5395,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     {},
                     None,
                     f"GitHub denied {owner}/{repo}#{number} on the pulls endpoint; "
-                    f"the token behind {LEDGER_TOKEN_ENV_VARS[0]} needs "
+                    f"{forges.token_source(forges.FORGE_GITHUB)} needs "
                     "`pull_requests: read` to grade what a run pushed, so this "
                     "check could not be evaluated",
                 )
@@ -5214,7 +5431,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 {},
                 None,
                 f"GitHub answered 401 for {owner}/{repo}#{number} on the commits "
-                f"page: the token in {LEDGER_TOKEN_ENV_VARS[0]} is not valid — "
+                f"page: {forges.token_source(forges.FORGE_GITHUB)} is not valid — "
                 "an installation token expires an hour after it is minted — so "
                 "this check could not be evaluated",
             )
@@ -5225,7 +5442,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 {},
                 None,
                 f"GitHub denied {owner}/{repo}#{number} on the commits page; "
-                f"the token behind {LEDGER_TOKEN_ENV_VARS[0]} needs "
+                f"{forges.token_source(forges.FORGE_GITHUB)} needs "
                 "`pull_requests: read` to grade what a run pushed, so this "
                 "check could not be evaluated",
             )
@@ -5973,13 +6190,12 @@ class GitHubWritesVerifier(BaseVerifier):
             forge = github_writes.forge_name()
         except github_writes.UnknownForge as exc:
             return done(False, str(exc), status="error")
-        token_vars = github_writes.token_env_vars(forge)
-        token = next((v for v in (os.environ.get(n) for n in token_vars) if v), None)
+        token = forges.read_token(forge)
         if not token:
             return done(
                 False,
-                f"no {forge} read credential in the environment: set one of "
-                f"{', '.join(token_vars)} to a token that can read the GitOps repository, "
+                f"no {forge} read credential in the environment: "
+                f"{forges.missing_token_hint(forge)} to a token that can read the GitOps repository, "
                 "or this check cannot be evaluated",
                 status="error",
             )
@@ -6841,10 +7057,16 @@ class BootstrapReportPostureVerifier(_OnboardingPollVerifier):
         return "pass", f"the report opens with the scan counts and the posture line{judged}", raw
 
 
-# The check rosters of the four audits the oobe stage runs after the scan
+# The check rosters of the five audits the oobe stage runs after the scan
 # (agents/chat/scripts/oobe.py FIRST_RUN_AUDITS; each roster is `AUDITS[<id>].checks` in
 # agents/platform/skills/fleet-audit/scripts/audit_report.py). The cluster inventory SOP
 # leaves these checks to those audits; tests/test_bootstrap_handoff.py re-derives this
+
+# The check rosters of the audits the oobe stage runs after the scan
+# (agents/chat/scripts/oobe.py FIRST_RUN_AUDITS, in its order; each roster is `AUDITS[<id>].checks`
+# in agents/platform/skills/fleet-audit/scripts/audit_report.py). The cluster inventory SOP
+# leaves the four fleet audits' checks to those audits; the upgrade retrospective's are the
+# collector's six, which no scan reports. tests/test_bootstrap_handoff.py re-derives this
 # copy from both files.
 FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
     "fleet-wide-cost-analysis": (
@@ -6871,6 +7093,11 @@ FIRST_RUN_AUDIT_CHECKS: dict[str, tuple[str, ...]] = {
         "ccc-mixed-disk-generations", "ccc-hyperdisk-incompatible", "quota-exhaustion-risk",
         "spot-scarcity-risk", "single-zone-nodepool", "reservation-mismatch-risk",
         "autoscaler-out-of-resources", "dangling-compute-class",
+    ),
+    "upgrade-retrospective": (
+        "upgrade-operation-failed", "upgrade-broke-workload", "node-broken-after-upgrade",
+        "upgrade-symptom-tentative", "upgrade-symptom-unclassified", "symptom-predates-upgrade",
+        "upgrade-log-volume-rose",
     ),
 }
 

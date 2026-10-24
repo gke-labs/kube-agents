@@ -47,6 +47,7 @@ spec:
     activeDeadlineSeconds: 1800
     ttlSecondsAfterFinished: 600
   concurrency: 2
+  allowedTiers: [read] # optional; absent means read alone
   resources:
     requests: { cpu: 250m, memory: 512Mi }
     limits: { cpu: "1", memory: 2Gi }
@@ -78,7 +79,11 @@ The operator looks for AgentProfiles once, at startup. If the CRD isn't installe
 
 Writing an `AgentProfile` grants a bus identity, so treat create and update on `agentprofiles` like create on RoleBindings in that namespace. A profile's name is its addressee on the task subjects, the same space the gateway's session pods use. A profile named exactly like a live session pod could write that session's task events, so nobody who can't already act as that session should be able to create profiles.
 
-Nothing runs a pod from a profile yet. The dispatcher that turns a task into a Job for its profile comes later.
+`allowedTiers` lists the tiers the profile may run at, `read` and `unattended`. A task runs at its requester's tier, and the dispatcher will refuse one whose tier the profile doesn't list. Absent means `read` alone.
+
+Profile workers run in their own namespace, `<agent-namespace>-profiles`, which the chart creates on a `mode: next` install. The operator never creates it, and treats a namespace of that name as the profile namespace only when it carries the chart's `app.kubernetes.io/component: profiles` label and its `meta.helm.sh/release-namespace` annotation naming the agent's namespace. Into it the operator renders a pod quota and a NetworkPolicy that lets its pods reach DNS, the bus and LiteLLM and nothing else, and only then admits that namespace on the bus's and LiteLLM's own policies. LiteLLM is reached without a key, so anyone who can create a pod in that namespace can use the install's model credentials. Treat pod create there like pod create in the agent's own namespace.
+
+Nothing runs a pod from a profile yet. The dispatcher and the warm workers come later.
 
 ## Status
 

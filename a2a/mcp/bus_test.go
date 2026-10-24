@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -387,6 +388,77 @@ func TestStatusHonoursTheCallersDeadline(t *testing.T) {
 	}
 }
 
+// A read whose caller gave up still completes and is cached: the next
+// caller inside the cache's lifetime opens no DIRECTORY consumer of its own.
+func TestAReadACallerGaveUpOnIsStillCached(t *testing.T) {
+	url, js := testBus(t)
+	publishCard(t, js, "platform", map[string]any{"name": "Platform agent"})
+	b := dial(t, url)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if st := b.Status(ctx); !strings.Contains(strings.Join(st.Problems, "\n"), context.Canceled.Error()) {
+		t.Errorf("the caller who gave up got %v, want its cancellation named", st.Problems)
+	}
+	deadline := time.Now().Add(statusTimeout)
+	for directoryConsumers(t, js) != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("the read the cancelled caller started never reached DIRECTORY")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	next := b.Status(context.Background())
+	if len(next.AgentCards) != 1 || strings.Contains(strings.Join(next.Problems, "\n"), context.Canceled.Error()) {
+		t.Errorf("the next caller got problems %v, cards %v", next.Problems, next.AgentCards)
+	}
+	if got := directoryConsumers(t, js); got != 1 {
+		t.Errorf("the next caller left %d DIRECTORY consumers, want 1: the abandoned read answers it", got)
+	}
+}
+
+// A caller is answered by its own context, whatever the read does: one that
+// gives up during a stalled read returns at once, the read runs on, and its
+// answer is every later caller's, from one read.
+func TestACallerDoesNotWaitOutAStalledRead(t *testing.T) {
+	release := make(chan struct{})
+	var mu sync.Mutex
+	reads := 0
+	b := &NATSBus{now: time.Now, readBus: func(context.Context) BusStatus {
+		mu.Lock()
+		reads++
+		mu.Unlock()
+		<-release
+		return BusStatus{Connected: true, URL: "the-read"}
+	}}
+	// Two callers give up in turn while the read stalls: each returns at
+	// once, and the second shares the first's read rather than starting one.
+	for i := range 2 {
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		start := time.Now()
+		st := b.Status(ctx)
+		cancel()
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Errorf("caller %d: a caller whose context ended waited %s on a stalled read", i, elapsed)
+		}
+		if !strings.Contains(strings.Join(st.Problems, "\n"), context.DeadlineExceeded.Error()) {
+			t.Errorf("caller %d: the caller who gave up got %v, want its deadline named", i, st.Problems)
+		}
+	}
+	waiting := make(chan BusStatus)
+	go func() { waiting <- b.Status(context.Background()) }()
+	close(release)
+	if got := <-waiting; got.URL != "the-read" {
+		t.Errorf("a caller waiting on the read got %+v", got)
+	}
+	if got := b.Status(context.Background()); got.URL != "the-read" {
+		t.Errorf("the next caller got %+v, want the cached read", got)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if reads != 1 {
+		t.Errorf("%d reads, want 1: the abandoned read answers every later caller", reads)
+	}
+}
+
 // A card read that fails is not an empty directory.
 func TestAFailedCardReadIsNotNoCards(t *testing.T) {
 	md := FormatBusStatusMarkdown(BusStatus{Connected: true, Problems: []string{"agent cards: context canceled"}})
@@ -478,5 +550,39 @@ func TestThePasswordFilePathHoldsTheConsoleGrants(t *testing.T) {
 	st := b.Status(context.Background())
 	if len(st.AgentCards) != 1 {
 		t.Errorf("status over the password-file path: cards %v, problems %v", st.AgentCards, st.Problems)
+	}
+}
+
+// A connection_status call whose request ends before the read does (a stop,
+// or the caller's deadline) is an error, never a status reading as a
+// disconnected bus.
+func TestAStatusCallThatEndsEarlyIsAnErrorNotDisconnected(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	b := &NATSBus{now: time.Now, readBus: func(context.Context) BusStatus {
+		<-release
+		return BusStatus{URL: "the-read", Connected: true}
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	text, err := ConnectionStatusTool(b).Call(ctx, nil)
+	if err == nil || strings.Contains(text, "disconnected") {
+		t.Errorf("an early-ended call returned %q, err %v; want an error and no status", text, err)
+	}
+}
+
+// A read that panics is turned into a problem, stored, and its waiters are
+// released: a later call gets an answer instead of waiting forever.
+func TestAPanickingStatusReadIsReportedAndReleased(t *testing.T) {
+	b := &NATSBus{now: time.Now, readBus: func(context.Context) BusStatus { panic("boom") }}
+	done := make(chan BusStatus, 1)
+	go func() { done <- b.Status(context.Background()) }()
+	select {
+	case st := <-done:
+		if len(st.Problems) == 0 || !strings.Contains(st.Problems[0], "boom") {
+			t.Errorf("problems = %v, want the panic reported", st.Problems)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a panicking read left its caller waiting")
 	}
 }

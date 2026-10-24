@@ -2668,7 +2668,14 @@ within that route `ROLE_EXECUTABLES` holds the session to `kubectl` and `gcloud`
 Pod picks the audience it projects, the role is also bound to the caller:
 `CREDENTIAL_PROXY_SESSION_CALLERS` names the session ServiceAccount, which may present only
 the session audience, and no other caller may present that audience
-([spec-mode-switch.md](spec-mode-switch.md#switches-inside-next) owns the flag). A `NetworkPolicy` would have expressed the same thing and is not the mechanism
+([spec-mode-switch.md](spec-mode-switch.md#switches-inside-next) owns the flag). With the
+A2A MCP server on, a fifth, `mcp`, is the MCP pod's: its token is minted for
+`kubeagents-credential-proxy-mcp`, it reaches `/v1/vcs/` alone, and within it `ROLE_VCS_VERBS`
+admits `proposal-view` only, checked on the normalised verb before the body is read, with that
+verb's managed-repository check still applying. It is bound the same way:
+`CREDENTIAL_PROXY_MCP_CALLERS` names the MCP pod's own ServiceAccount, which may present only
+the mcp audience, and no other caller may present it; with the list empty, nobody holds the
+role. A `NetworkPolicy` would have expressed the same thing and is not the mechanism
 chosen, because it does nothing at all on a CNI that does not implement `NetworkPolicy` and
 `TokenReview` is answered by the API server on every cluster.
 
