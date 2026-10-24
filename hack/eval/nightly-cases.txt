@@ -66,8 +66,9 @@
 # are frozen in the order they landed.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
-# Spec-ready, each domain covered in the presubmit by its probe (upgrades'
-# probe nightly since 2026-10-16, #3269; consistency's since 2026-10-21, #3598):
+# Spec-ready, each domain covered in the presubmit by its probe (consistency's
+# probe nightly since 2026-10-21, #3598; upgrades' was nightly-only 2026-10-16
+# to 2026-10-23, #3269):
 #   -- obtainability-planted-pdb: measured PASSED at 962s on 2026-08-26
 #      (build 2092638061140643840); too slow for a presubmit seat.
 #   -- stockout-pinned-pool: same full-audit shape and cost band; its
@@ -332,14 +333,6 @@
 # INSTANTANEOUS question, so the cost domain is covered meanwhile. Audit
 # shape, unmeasured: priced with the 900s band in unit_cost_hint.
 ./tasks/fleet-cost-idle-pool/task.yaml
-
-# #3269: upgrades-lagging-master-probe demoted 2026-10-16. The fixture is
-# healthy (seeded-b one minor behind REGULAR's defaultVersion on every pool),
-# but the agent compares seeded-b against the channel's upgradeTargetVersion,
-# the newest patch of its own minor, and reports no lag, so it fails 0/3 on
-# unrelated pull requests. Back on the roster once an agent-side fix has the
-# comparison use the channel default and the case shows greens (#3269).
-./tasks/upgrades-lagging-master-probe/task.yaml
 
 # #3120: pdb-remediation-pr demoted 2026-10-17. It collapsed 0/3 on unrelated
 # pull requests after its roster line of 2026-10-14 (#2971, #3017, #3329):
@@ -1300,6 +1293,89 @@
 # first merge; a presubmit seat is a later pull request that cites its
 # record.
 ./tasks/upgrades-retired-registry-image-named/task.yaml
+
+# The retrospective's verdict on catalogue entry 14 in the shape the seeded fleet
+# plants it: seeded-a's cgroup-blind-jvm Deployment (role cgroup-blind-runtime), a
+# pre-cgroup-v2 JDK image the collector's risk shape names, graded on one declared
+# line, `<cluster>/<namespace>/<kind>/<name>: entry <n>`, plus the route check.
+# deployer: noop; holds the `upgrade-retrospective` stream as the sibling
+# retrospective cases do. A coverage case for #2717's list: the shape exists.
+./tasks/upgrades-retrospective-cgroup-blind-runtime/task.yaml
+
+# The retrospective's verdict on catalogue entry 18 in the shape the seeded fleet
+# plants it: seeded-a's suspended cuda-pinned-trainer CronJob (role
+# cuda-pinned-gpu-job), a CUDA pin on a GPU request the collector's risk shape
+# names from the job template, graded on one declared line plus the route check.
+# deployer: noop; holds the `upgrade-retrospective` stream. A coverage case for
+# #2717's list: the shape exists.
+./tasks/upgrades-retrospective-cuda-pinned-gpu-job/task.yaml
+
+# The retrospective's verdict on the fleet's planted upgrade failure: seeded-b's
+# drain-blocking budget (role readiness-drain-blocked) reported under catalogue
+# entry 1, graded on one declared line, `<cluster>/<namespace>/<kind>/<name>: entry
+# <n>`, plus the route check. deployer: noop; holds the `upgrade-retrospective`
+# stream for the same reason as the case below.
+./tasks/upgrades-retrospective-drained-budget/task.yaml
+
+# The retrospective's verdict on catalogue entry 7 in the shape the seeded fleet
+# plants it: seeded-b's seeded-fail-closed-gate (role readiness-failclosed-webhook),
+# graded on one declared line plus the route check. `expected_fail: true`: the
+# collector's webhook shape skips a hook whose rules do not reach pod creation,
+# and the gate's one rule is on ConfigMaps, so no reading names it today (#2717);
+# the nightly records EXPECTED_FAIL until the shape or the fixture changes.
+# deployer: noop; holds the `upgrade-retrospective` stream.
+./tasks/upgrades-retrospective-failclosed-webhook/task.yaml
+
+# The retrospective's gate (#3535): the seeded report's first-upgraded cluster
+# carries `gate risk` with one container past the log-volume thresholds, and
+# the answer's declared line per reviewed cluster is read against it. The stack
+# prebuilt/upgrade-retro-recorded-weeks seeds the report store on the sandbox
+# (a stack, so it takes lock-infra); priced at 600s beside the retrospective's
+# other cases until the nightly record measures it. Nightly from its first merge.
+./tasks/upgrades-retrospective-log-volume-gate/task.yaml
+
+
+# The retrospective's verdict on catalogue entry 15 in the shape the seeded fleet
+# plants it: seeded-a's multi-process-worker Deployment (role
+# multi-process-container), graded on one declared line plus the route check.
+# `expected_fail: true`: the collector has no entry-15 shape ("not visible from
+# the spec") and the fixture never OOM-kills (#2717); the nightly records
+# EXPECTED_FAIL until the shape lands. deployer: noop; holds the
+# `upgrade-retrospective` stream.
+./tasks/upgrades-retrospective-multi-process-container/task.yaml
+
+# The retrospective's verdict on catalogue entry 16 in the shape the seeded fleet
+# holds it: seeded-a's legacy dataplane with enforcement off and default-deny
+# policies nothing enforces, the cluster itself as the object (role
+# no-pdb-workload standing for the slot), graded on one declared line plus the
+# route check. `expected_fail: true`: the collector reads no NetworkPolicies and
+# has no entry-16 shape (#2717); the nightly records EXPECTED_FAIL until the
+# shape lands. deployer: noop; holds the `upgrade-retrospective` stream.
+./tasks/upgrades-retrospective-network-policy-enforcement/task.yaml
+
+# The upgrade retrospective's on-demand route (governance/upgrade_retrospective_sop.md,
+# section 7): a generic question about the last upgrades, answered from the
+# retrospective's saved report or a run made for it, graded on the route (the worker's
+# terminal reached the store or the collector), the report file named, and one declared
+# line per seeded cluster. deployer: noop; a fleet-wide question with a stale report is
+# a full run, so the case holds the `upgrade-retrospective` stream for the unit.
+./tasks/upgrades-retrospective-on-demand/task.yaml
+
+# The retrospective's verdict on catalogue entry 10 in the shape the seeded fleet
+# plants it: seeded-a's stale-kubectl-client CronJob (role stale-client-skew),
+# graded on one declared line plus the route check. `expected_fail: true`: the
+# collector has no entry-10 shape or signature and the Job never fails (#2717);
+# the nightly records EXPECTED_FAIL until the shape lands. deployer: noop; holds
+# the `upgrade-retrospective` stream.
+./tasks/upgrades-retrospective-stale-client-skew/task.yaml
+
+# The rollout orchestration SOP's family line (#3535): the seeded-regular
+# family's first cluster shows a `risk` gate in the seeded report, so the line
+# reads `rollout hold`. The same recorded-weeks stack as the gate case (a stack,
+# so it takes lock-infra); priced at 600s until the nightly record measures it.
+# Nightly from its first merge.
+./tasks/upgrades-rollout-family-held-by-canary-gate/task.yaml
+
 
 # The weekly upgrade readiness brief's on-request route: a brief in the SOP's shape
 # whose Decide-now lines name slot b's singleton budget and keep the webhook outage

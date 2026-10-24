@@ -1192,6 +1192,10 @@
                 },
                 "homeChannelName": {
                   "type": "string"
+                },
+                "homeChannelPolicy": {
+                  "type": "string",
+                  "enum": ["", "auto", "manual"]
                 }
               }
             },

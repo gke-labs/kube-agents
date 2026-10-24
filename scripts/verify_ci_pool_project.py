@@ -336,6 +336,10 @@ REQUIRED_APIS = {
     # The observability nightly case reads the install's traces through the
     # broker's relay; the composition enables this for the same reason.
     "cloudtrace.googleapis.com",
+    # The readiness report's rollout-sequence precheck lists the fleet host
+    # project's RolloutSequences through the GKE Hub API; the composition
+    # enables it for the same reason.
+    "gkehub.googleapis.com",
     "iam.googleapis.com",
     "cloudkms.googleapis.com",
 }
@@ -901,6 +905,7 @@ PLATFORM_GSA_ROLES = {
     "roles/compute.viewer",
     "roles/monitoring.viewer",
     "roles/logging.viewer",
+    "roles/gkehub.viewer",
     "roles/cloudtrace.user",
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",

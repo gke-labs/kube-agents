@@ -1389,6 +1389,10 @@ platformAgent:
       allowedUsers: []
       homeChannel: ""
       homeChannelName: ""
+      # "auto" (also empty) or "manual". Accepted and recorded in this release
+      # but with no effect yet: the A2A gateway does not learn a home channel,
+      # so homeChannel alone decides.
+      homeChannelPolicy: ""
     teams:
       # Microsoft Teams ChatOps integration via Microsoft Bot Framework / Entra ID.
       # App ID and App Password are read from credentials.secretName under
