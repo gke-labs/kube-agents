@@ -8,7 +8,8 @@ three things have to agree for the scrape to work: the port the operator
 declares on the container, the number in the PodMonitoring, and the labels the
 operator puts on the pod. The chart cannot read the operator, so the structural
 tests hold the template to the operator's golden manifest instead. No golden
-renders mode next, so the A2A gateway's row is held to the rendered A2A
+renders mode next with both doors armed (the next-mode golden is the example
+CR, which arms neither), so the A2A gateway's row is held to the rendered A2A
 ingress fixture (k8s-operator/internal/controller/testdata/a2a-gateway-ingress.yaml).
 Whether they render at all follows the cluster by
 default: helm template has no cluster, so the render tests hand it the

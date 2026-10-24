@@ -55,6 +55,22 @@ metadata:
   {{- $_ := set $annotations $upstreamEgressKey $upstreamEgress }}
   {{- end }}
   {{- end }}
+  {{- /*
+    The chart's standing pods in this namespace, which share the next-mode
+    namespace pod quota with the session pods; the operator sizes that quota's
+    headroom from it (#3848). Stamped on the CR rather than the operator, because
+    the CR is in the namespace those pods run in and the chart renders it even
+    when an operator installed elsewhere reconciles it. Chart-derived like the
+    keys above, so an entry in platformAgent.annotations that disagrees fails.
+  */}}
+  {{- $chartPodsKey := "kubeagents.x-k8s.io/a2a-quota-chart-pods" }}
+  {{- $chartPods := include "kube-agents.chartStandingPods" $ }}
+  {{- with get $annotations $chartPodsKey }}
+  {{- if ne (toString . | trim) $chartPods }}
+  {{- fail (printf "platformAgent.annotations[%q]=%q contradicts the chart's own pods, %s. Drop the annotation; the chart stamps it." $chartPodsKey (toString .) $chartPods) }}
+  {{- end }}
+  {{- end }}
+  {{- $_ := set $annotations $chartPodsKey $chartPods }}
   {{- with $annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}

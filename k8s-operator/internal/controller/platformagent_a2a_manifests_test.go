@@ -24,7 +24,9 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	"maps"
 	"net"
+	"os"
 	"path"
+	"path/filepath"
 	"reflect"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -33,6 +35,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	sigsyaml "sigs.k8s.io/yaml"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -1535,17 +1539,112 @@ func TestBuildA2ASessionQuota(t *testing.T) {
 	if !ok {
 		t.Fatalf("quota does not bound pods: %v", hard)
 	}
-	// Default gateway cap 10 + the fixed headroom for the rest of the
-	// namespace (base stack, rollout surge, race overshoot).
-	if pods.Value() != 26 {
-		t.Fatalf("default quota = %d, want 26 (cap 10 + headroom 16)", pods.Value())
+	// The gateway's cap plus the derived headroom (#3848): what the operator
+	// renders for the agent, the chart's pods (the default for a CR the chart
+	// did not stamp), and the transient margin.
+	standing := a2aStandingPods(agent)
+	want := 10 + standing + a2aDefaultChartPods + a2aQuotaTransientMargin
+	if pods.Value() != want {
+		t.Fatalf("default quota = %d, want %d (cap 10 + standing %d + chart default %d + margin %d)",
+			pods.Value(), want, standing, a2aDefaultChartPods, a2aQuotaTransientMargin)
 	}
 
 	two := 2
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &two}}
 	pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]
-	if pods.Value() != 18 {
-		t.Fatalf("tuned quota = %d, want 18 (cap 2 + headroom 16)", pods.Value())
+	if want := 2 + standing + a2aDefaultChartPods + a2aQuotaTransientMargin; pods.Value() != want {
+		t.Fatalf("tuned quota = %d, want %d", pods.Value(), want)
+	}
+}
+
+// The chart's standing pods come from the annotation the chart stamps on the
+// CR; a CR without one, or with an unreadable one, gets the chart's default.
+func TestA2AQuotaCountsTheChartsPods(t *testing.T) {
+	base := a2aTestAgent()
+	quotaBase := int64(resolveA2AMaxSessions(base)) + a2aStandingPods(base) + a2aQuotaTransientMargin
+	for _, tc := range []struct {
+		name       string
+		annotation *string
+		want       int64
+	}{
+		{"the chart's count", ptr.To("7"), quotaBase + 7},
+		{"zero, for a chart that renders none here", ptr.To("0"), quotaBase},
+		{"trimmed", ptr.To(" 4 "), quotaBase + 4},
+		{"the default without the annotation", nil, quotaBase + a2aDefaultChartPods},
+		{"the default for an unreadable count", ptr.To("seven"), quotaBase + a2aDefaultChartPods},
+		{"the default for a negative count", ptr.To("-3"), quotaBase + a2aDefaultChartPods},
+		{"the cap itself", ptr.To(strconv.Itoa(a2aMaxChartPods)), quotaBase + a2aMaxChartPods},
+		{"the default past the cap", ptr.To(strconv.Itoa(a2aMaxChartPods + 1)), quotaBase + a2aDefaultChartPods},
+		{"the default for a figure that would wrap the quota", ptr.To("9223372036854775807"), quotaBase + a2aDefaultChartPods},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			if tc.annotation != nil {
+				agent.Annotations = map[string]string{a2aChartPodsAnnotation: *tc.annotation}
+			}
+			pods := buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]
+			if pods.Value() != tc.want {
+				t.Fatalf("quota = %d, want %d", pods.Value(), tc.want)
+			}
+		})
+	}
+}
+
+// An agent scaled to zero runs no agent pod, so it holds no slot of the
+// headroom; the rest of the stack still stands.
+func TestA2AStandingPodsDropTheAgentPodAtScaleToZero(t *testing.T) {
+	agent := a2aTestAgent()
+	running := a2aStandingPods(agent)
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{ScaleToZero: ptr.To(true)}
+	if got := a2aStandingPods(agent); got != running-1 {
+		t.Fatalf("a2aStandingPods at scaleToZero = %d, want %d", got, running-1)
+	}
+}
+
+// a2aStandingPods has to name every standing workload the operator renders in
+// next mode. The next-mode golden is the operator's own steady-state render of
+// the example CR, so a Deployment or StatefulSet added there and not here fails
+// this rather than quietly eating the session headroom (#3848).
+func TestA2AStandingPodsMatchTheNextModeGolden(t *testing.T) {
+	dir := filepath.Join("..", "testing", "testdata", "platform")
+	input, err := os.ReadFile(filepath.Join(dir, "platformagent-next.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent := &agentv1alpha1.PlatformAgent{}
+	if err := sigsyaml.Unmarshal(input, agent); err != nil {
+		t.Fatal(err)
+	}
+	golden, err := os.ReadFile(filepath.Join(dir, "expected", "platformagent-next.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rendered int64
+	var names []string
+	for _, doc := range strings.Split(string(golden), "\n---\n") {
+		var w struct {
+			Kind     string `json:"kind"`
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+			Spec struct {
+				Replicas *int32 `json:"replicas"`
+			} `json:"spec"`
+		}
+		if err := sigsyaml.Unmarshal([]byte(doc), &w); err != nil {
+			t.Fatal(err)
+		}
+		if w.Kind != "Deployment" && w.Kind != "StatefulSet" {
+			continue
+		}
+		rendered += int64(ptr.Deref(w.Spec.Replicas, 1))
+		names = append(names, w.Kind+"/"+w.Metadata.Name)
+	}
+	if len(names) == 0 {
+		t.Fatal("no Deployment or StatefulSet found in the next-mode golden")
+	}
+	if got := a2aStandingPods(agent); got != rendered {
+		t.Fatalf("a2aStandingPods = %d, the next-mode golden runs %d pods across %v", got, rendered, names)
 	}
 }
 
