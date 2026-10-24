@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"strconv"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -84,6 +85,12 @@ const (
 	a2aMCPEnvAgent        = "MCP_AGENT_NAME"
 	a2aMCPEnvNamespace    = "MCP_NAMESPACE"
 	a2aMCPEnvListen       = "MCP_LISTEN"
+	// GOMEMLIMIT, the Go runtime's soft heap limit, set to
+	// a2aMCPGoMemLimitPercent of a2aMCPMemoryLimit (a2aMCPGoMemLimit), so
+	// the collector works harder as the heap nears the container's limit
+	// instead of letting garbage push the pod into an OOM kill.
+	a2aMCPEnvGoMemLimit     = "GOMEMLIMIT"
+	a2aMCPGoMemLimitPercent = 85
 
 	a2aMCPReadinessPeriod  = 5
 	a2aMCPReadinessFailure = 3
@@ -100,6 +107,15 @@ const (
 	a2aMCPMemoryRequest = "64Mi"
 	a2aMCPMemoryLimit   = "128Mi"
 )
+
+// a2aMCPGoMemLimit is the MCP container's GOMEMLIMIT: a2aMCPGoMemLimitPercent
+// of its memory limit, in bytes (114085068 for 128Mi), derived from
+// a2aMCPMemoryLimit so a change to the limit carries over. The MCP server's
+// reads are sized against it (readMaxBytes in a2a/mcp/reader.go).
+func a2aMCPGoMemLimit() string {
+	limit := resource.MustParse(a2aMCPMemoryLimit)
+	return strconv.FormatInt(limit.Value()*a2aMCPGoMemLimitPercent/100, 10)
+}
 
 // a2aMCPFenceIndex is the fence's place in a2aMCPObjects.
 const a2aMCPFenceIndex = 2
@@ -210,6 +226,7 @@ func buildA2AMCPDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploymen
 							{Name: a2aMCPEnvListen, Value: fmt.Sprintf(":%d", a2aMCPPort)},
 							{Name: a2aMCPEnvAgent, Value: agent.Name},
 							{Name: a2aMCPEnvNamespace, Value: agent.Namespace},
+							{Name: a2aMCPEnvGoMemLimit, Value: a2aMCPGoMemLimit()},
 						},
 						Ports: []corev1.ContainerPort{{Name: a2aMCPPortName, ContainerPort: a2aMCPPort}},
 						VolumeMounts: []corev1.VolumeMount{

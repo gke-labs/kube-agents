@@ -690,27 +690,23 @@ func TestAResumedConversationIsNamedByItsToken(t *testing.T) {
 	mustNotContain(t, res.Content[0].Text, "Conversation `default`")
 }
 
-// emptyFetchConsumer is a consumer whose every fetch comes back empty, as a
-// stalled read's would.
-type emptyFetchConsumer struct{ jetstream.Consumer }
+// emptySource is a read whose every wait comes back empty, as a stalled
+// read's would, on a consumer that cannot be asked for its info.
+type emptySource struct{}
 
-func (emptyFetchConsumer) Fetch(int, ...jetstream.FetchOpt) (jetstream.MessageBatch, error) {
-	return emptyBatch{}, nil
+func (emptySource) NextMsg(time.Duration) (*nats.Msg, error) { return nil, nats.ErrTimeout }
+func (emptySource) Unsubscribe() error                       { return nil }
+
+type noInfoConsumer struct{ jetstream.Consumer }
+
+func (noInfoConsumer) Info(context.Context) (*jetstream.ConsumerInfo, error) {
+	return nil, errors.New("no info")
 }
-
-type emptyBatch struct{}
-
-func (emptyBatch) Messages() <-chan jetstream.Msg {
-	c := make(chan jetstream.Msg)
-	close(c)
-	return c
-}
-func (emptyBatch) Error() error { return nil }
 
 // A task read whose fetch comes back empty while events are still pending
 // is an error, not the task's end folded from what was read so far.
 func TestAStalledTaskReadIsAnError(t *testing.T) {
-	w := &taskWatch{ref: TaskRef{Addressee: fakeAddressee, TaskID: "task-stall"}, cons: emptyFetchConsumer{}, pending: 5, release: func(bool) {}}
+	w := &taskWatch{ref: TaskRef{Addressee: fakeAddressee, TaskID: "task-stall"}, r: &budgetReader{cons: noInfoConsumer{}, sub: emptySource{}, budget: readMaxBytes, pulling: true, pullEnds: time.Now().Add(time.Hour)}, pending: 5, release: func(bool) {}}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := w.next(ctx); err == nil || !strings.Contains(err.Error(), "still pending") {

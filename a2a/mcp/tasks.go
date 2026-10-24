@@ -178,7 +178,7 @@ func (b *NATSBus) waitForTask(ctx context.Context, ref TaskRef, wait time.Durati
 // deletes its consumer, a delete the console grant refuses.
 type taskWatch struct {
 	ref     TaskRef
-	cons    jetstream.Consumer
+	r       *budgetReader
 	events  []*lib.Envelope
 	seen    int
 	pending uint64
@@ -206,31 +206,42 @@ func (b *NATSBus) watchTask(ctx context.Context, ref TaskRef) (*taskWatch, error
 		release(consumerMayExist(err))
 		return nil, err
 	}
-	return &taskWatch{ref: ref, cons: cons, pending: cons.CachedInfo().NumPending, release: release}, nil
+	pending := cons.CachedInfo().NumPending
+	// The watch keeps every event it folds, so its byte budget runs over
+	// its whole life, as maxTaskEvents does.
+	r, err := b.newBudgetReader(cons, int(max(1, min(pending, taskFetchBatch))), readMaxBytes)
+	if err != nil {
+		release(true)
+		return nil, err
+	}
+	return &taskWatch{ref: ref, r: r, pending: pending, release: release}, nil
 }
 
-func (w *taskWatch) close() { w.release(true) }
+func (w *taskWatch) close() {
+	w.r.stop()
+	w.release(true)
+}
 
-// next fetches what is pending, or waits up to taskFetchWait for the next
-// event when nothing is.
+// next reads what is pending, up to taskFetchBatch events at a time, or
+// waits up to taskFetchWait for the next event when nothing is.
 func (w *taskWatch) next(ctx context.Context) error {
-	wait := taskFetchWait
-	if dl, ok := ctx.Deadline(); ok {
-		wait = min(wait, time.Until(dl))
-	}
+	wait := fetchWait(ctx, taskFetchWait)
 	// Never below the fetch's floor, even with less than that left: what is
 	// pending still arrives at once, and an empty fetch ends just past the
 	// deadline, which the caller then sees as ctx done and keeps what it has
 	// folded. Refusing the fetch instead would end the read on an error
 	// with ctx not yet done, and drop the fold.
 	wait = max(wait, minFetchWait)
-	batch, err := w.cons.Fetch(int(max(1, min(w.pending, taskFetchBatch))), jetstream.FetchMaxWait(wait))
-	if err != nil {
-		return err
-	}
-	got := false
-	for msg := range batch.Messages() {
-		got = true
+	got := 0
+	for got < taskFetchBatch {
+		msg, err := w.r.next(wait)
+		if errors.Is(err, nats.ErrTimeout) {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("task %s: %w", w.ref, err)
+		}
+		got++
 		w.seen++
 		if w.seen > maxTaskEvents {
 			return fmt.Errorf("task %s has more than %d events, too many to read here", w.ref, maxTaskEvents)
@@ -241,11 +252,11 @@ func (w *taskWatch) next(ctx context.Context) error {
 		if md, err := msg.Metadata(); err == nil {
 			w.pending = md.NumPending
 		}
+		if w.pending == 0 {
+			break
+		}
 	}
-	if err := batch.Error(); err != nil && !errors.Is(err, nats.ErrTimeout) {
-		return err
-	}
-	if !got {
+	if got == 0 {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -253,7 +264,7 @@ func (w *taskWatch) next(ctx context.Context) error {
 		// which is not the end of the task. Saying so beats folding what was
 		// read as the task's state.
 		if w.pending > 0 {
-			return fmt.Errorf("task %s: a fetch came back empty with %d events still pending", w.ref, w.pending)
+			return w.r.stalled(ctx, fmt.Errorf("task %s: a fetch came back empty with %d events still pending", w.ref, w.pending))
 		}
 	}
 	return nil
