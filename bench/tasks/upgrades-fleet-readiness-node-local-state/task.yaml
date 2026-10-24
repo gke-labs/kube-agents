@@ -142,7 +142,7 @@ verification_spec:
   # start of the line; every pattern matches the whole declared frame,
   # anchored at both ends, with the line's decoration folded first
   # (`fold_decoration: true`); a parenthetical after the cluster's name is
-  # allowed. The frame every cluster must satisfy: the rule id and an entry.
+  # allowed. The frame every cluster must satisfy: the rule id, which may be left off the line, and an entry.
   - name: every-seeded-cluster-has-a-declared-line
     role: objective
     # assert, not the converge default: the transcript is immutable once the
@@ -205,6 +205,7 @@ verification_spec:
         - '(?ms)\A(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: (?:data-on-the-node: )?none$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: (?:data-on-the-node: )?none$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: (?:data-on-the-node: )?none$)'
       forbidden_patterns:
         - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: data-on-the-node: (?!none$)[^\n]*$'
+        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: (?:data-on-the-node: )?["''“‘<]?(?:data-on-the-node: )?deployment seeded-shapes/cache-on-emptydir keeps scratch on the node in queue \(emptydir; the name suggests state\); not a risk: a deployment''s emptydir is emptied by every reschedule and a read-only or memory-backed mount holds nothing of the workload''s$'
 
   # The prompt's "read only", grounded: the planted object is as the fixture
   # declares it after the run.

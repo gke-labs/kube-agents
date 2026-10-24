@@ -11115,6 +11115,28 @@ def test_per_cluster_rule_case_refuses_a_missing_foreign_or_cut_entry(case):
 
 
 @pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+def test_per_cluster_rule_case_accepts_the_planted_line_with_neither_prefix(case):
+    # The rule id carried in a heading and the entry copied bare: `seeded-a: <text>`, with a prose
+    # line about the same cluster elsewhere in the answer, which no forbid may take for the line.
+    _planted, rule, cell = _PER_CLUSTER_RULE_CASES[case]
+    bare_line = f"{_SLOT_NAMES['a']}: {_bare(cell)}"
+    report = "\n".join([bare_line] + [_per_cluster_line(_SLOT_NAMES[s], rule) for s in _SLOT_LETTERS if s != "a"])
+    for objective in _per_cluster_objectives(case):
+        assert _per_cluster_case_grades(case, objective, report), objective
+    with_prose = f"{_SLOT_NAMES['a']}: Ready.\n{_SLOT_NAMES['b']}: none\n" + report
+    for objective in _per_cluster_objectives(case):
+        assert _per_cluster_case_grades(case, objective, with_prose), objective
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+def test_per_cluster_rule_case_refuses_the_planted_entry_on_another_slot_without_the_rule_id(case):
+    _planted, rule, cell = _PER_CLUSTER_RULE_CASES[case]
+    for wrong in (f"{_SLOT_NAMES['b']}: {_bare(cell)}", f"{_SLOT_NAMES['b']}: {cell}"):
+        report = _per_cluster_report(case, others={"b": wrong})
+        assert not _per_cluster_case_grades(case, _others_objective(case), report), wrong
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
 def test_per_cluster_rule_case_needs_a_line_for_every_slot(case):
     for missing in _SLOT_LETTERS:
         text = _per_cluster_report(case, slots=tuple(s for s in _SLOT_LETTERS if s != missing))
@@ -11211,6 +11233,12 @@ def test_client_addon_skew_case_keeps_one_line_per_cluster_in_the_reports_order(
     for tail in ("fine", "not a blocker", _GKE_ADDONS_NOTE, "client-addon-skew: none"):
         assert not _per_cluster_case_grades(_CLIENT_CASE, _planted_objective(_CLIENT_CASE), _per_cluster_report(_CLIENT_CASE, cell=f"{cell}; {tail}")), tail
     assert _per_cluster_case_grades(_CLIENT_CASE, _planted_objective(_CLIENT_CASE), _per_cluster_report(_CLIENT_CASE, cell=f"{cell}; {_ADDON_CELL}"))
+    # A principal's user agent is the caller's own string and may carry a `;`; the where is bounded
+    # by the detail that follows it, not by that character.
+    wrapped_agent = _AUDIT_CLIENT_CELL.replace("(darwin/arm64)", "(linux/amd64; acme-wrapper)")
+    for line in (f"{wrapped_agent}; {cell}", f"{cell}; {wrapped_agent}"):
+        assert _per_cluster_case_grades(_CLIENT_CASE, _planted_objective(_CLIENT_CASE), _per_cluster_report(_CLIENT_CASE, cell=line)), line
+    assert _per_cluster_case_grades(_CLIENT_CASE, _others_objective(_CLIENT_CASE), _per_cluster_report(_CLIENT_CASE, others={"b": _per_cluster_line(_SLOT_NAMES["b"], "client-addon-skew", wrapped_agent)}))
 
 
 @pytest.mark.parametrize("cell", [_AUDIT_CLIENT_CELL, _bare(_AUDIT_CLIENT_CELL), _ADDON_CELL])

@@ -45,7 +45,7 @@
 # the `;` inside the entry keeps the verifier's value-wrap fold from removing
 # it; the whole line is lower-cased. Every pattern is read after the harness's
 # trail fold (`fold_decoration`) and matches the whole line, anchored at both
-# ends; each forbid is the same frame with any other value, so a second line
+# ends; each forbid is the same frame, with the rule id on the line, with any other value, so a second line
 # about a slot that contradicts the first fails whatever the right line says.
 # The patterns name the slots through `{cluster:<slot>}`, which the verifier
 # expands to the cluster the runner recorded for the slot, so a fleet applied
@@ -144,7 +144,7 @@ verification_spec:
   # start of the line; every pattern matches the whole declared frame,
   # anchored at both ends, with the line's decoration folded first
   # (`fold_decoration: true`); a parenthetical after the cluster's name is
-  # allowed. The frame every cluster must satisfy: the rule id and an entry.
+  # allowed. The frame every cluster must satisfy: the rule id, which may be left off the line, and an entry.
   - name: every-seeded-cluster-has-a-declared-line
     role: objective
     # assert, not the converge default: the transcript is immutable once the
@@ -207,6 +207,7 @@ verification_spec:
         - '(?ms)\A(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: (?:gpu-driver: )?none$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: (?:gpu-driver: )?none$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: (?:gpu-driver: )?none$)'
       forbidden_patterns:
         - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: gpu-driver: (?!none$)[^\n]*$'
+        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: (?:gpu-driver: )?["''“‘<]?(?:gpu-driver: )?cronjob seeded-shapes/cuda-pinned-trainer: requests nvidia\.com/gpu on accelerator nvidia-l4 and no pool in the cluster carries that accelerator; the target driver cannot be read, and the pin image docker\.io/nvidia/cuda:12\.2\.0-base-ubuntu22\.04 stays unchecked$'
 
   # The prompt's "read only", grounded: the planted object is as the fixture
   # declares it after the run.

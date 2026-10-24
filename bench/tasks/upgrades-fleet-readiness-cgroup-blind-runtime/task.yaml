@@ -44,7 +44,7 @@
 # admitted, since the `;` inside the note keeps the verifier's value-wrap fold
 # from removing it; the whole line is lower-cased. Every pattern is read after
 # the harness's trail fold (`fold_decoration`) and matches the whole line,
-# anchored at both ends; each forbid is the same frame with any other value,
+# anchored at both ends; each forbid is the same frame, with the rule id on the line, with any other value,
 # so a second line about a slot that contradicts the first fails whatever the
 # right line says. The patterns name the slots through `{cluster:<slot>}`,
 # which the verifier expands to the cluster the runner recorded for the slot,
@@ -143,7 +143,7 @@ verification_spec:
   # start of the line; every pattern matches the whole declared frame,
   # anchored at both ends, with the line's decoration folded first
   # (`fold_decoration: true`); a parenthetical after the cluster's name is
-  # allowed. The frame every cluster must satisfy: the rule id and an entry.
+  # allowed. The frame every cluster must satisfy: the rule id, which may be left off the line, and an entry.
   - name: every-seeded-cluster-has-a-declared-line
     role: objective
     # assert, not the converge default: the transcript is immutable once the
@@ -206,6 +206,7 @@ verification_spec:
         - '(?ms)\A(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: (?:cgroup-v2-runtime: )?none$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: (?:cgroup-v2-runtime: )?none$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: (?:cgroup-v2-runtime: )?none$)'
       forbidden_patterns:
         - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: cgroup-v2-runtime: (?!none$)[^\n]*$'
+        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: (?:cgroup-v2-runtime: )?["''“‘<]?(?:["''“‘<]?(?:cgroup-v2-runtime: )?deployment seeded-shapes/cgroup-blind-jvm container jvm runs docker\.io/library/eclipse-temurin:8u302-b08-jre \(jdk 8u302, below 8u372\) on pool [a-z0-9-]+, already on cgroup v2; not an upgrade risk["''”’>]?(?:; |$))+$'
 
   # The prompt's "read only", grounded: the planted object is as the fixture
   # declares it after the run.

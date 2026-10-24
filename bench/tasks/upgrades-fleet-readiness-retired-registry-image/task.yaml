@@ -147,7 +147,7 @@ verification_spec:
   # start of the line; every pattern matches the whole declared frame,
   # anchored at both ends, with the line's decoration folded first
   # (`fold_decoration: true`); a parenthetical after the cluster's name is
-  # allowed. The frame every cluster must satisfy: the rule id and an entry.
+  # allowed. The frame every cluster must satisfy: the rule id, which may be left off the line, and an entry.
   - name: every-seeded-cluster-has-a-declared-line
     role: objective
     # assert, not the converge default: the transcript is immutable once the
@@ -172,7 +172,7 @@ verification_spec:
   # fails here; so does the entry cut short, a paraphrase, or the Deployment
   # promoted to a blocker in words of the agent's. The table's
   # `retired-registry: ` prefix is optional; one opener before the text is
-  # admitted; the forbid is the same frame with any other value.
+  # admitted; the forbid is the same frame, with the rule id on the line, with any other value.
   - name: the-planted-clusters-line-quotes-the-rules-risk
     role: objective
     mode: assert
@@ -211,6 +211,7 @@ verification_spec:
         - '(?ms)\A(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: (?:retired-registry: )?none$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: (?:retired-registry: )?none$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: (?:retired-registry: )?none$)'
       forbidden_patterns:
         - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: retired-registry: (?!none$)[^\n]*$'
+        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: (?:retired-registry: )?["''“‘<]?(?:retired-registry: )?deployment seeded-shapes/legacy-registry-pull: container pause pulls k8s\.gcr\.io/pause:3\.9 from k8s\.gcr\.io \(frozen 2023-04-03, a redirect to registry\.k8s\.io since 2023-03-20\); a rebuilt node pulls it again from a host that stopped publishing; (?:pool\(s\) [a-z0-9-]+(?:, [a-z0-9-]+)* are below the target and are rebuilt in this upgrade|no pool is below the target; the next node upgrade pulls it again|which pools are rebuilt needs a target)$'
 
   # The prompt's "read only", grounded: the planted object is as the fixture
   # declares it after the run.

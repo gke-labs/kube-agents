@@ -148,7 +148,7 @@ verification_spec:
   # start of the line; every pattern matches the whole declared frame,
   # anchored at both ends, with the line's decoration folded first
   # (`fold_decoration: true`); a parenthetical after the cluster's name is
-  # allowed. The frame every cluster must satisfy: the rule id and an entry.
+  # allowed. The frame every cluster must satisfy: the rule id, which may be left off the line, and an entry.
   - name: every-seeded-cluster-has-a-declared-line
     role: objective
     # assert, not the converge default: the transcript is immutable once the
@@ -174,7 +174,7 @@ verification_spec:
   # short, a paraphrase, the pools merged into one note, or the Deployment
   # promoted to a risk in words of the agent's. The table's `group-oom-kill: `
   # prefix is optional on each note; one opener before the text is admitted;
-  # the forbid is the same frame with any other value.
+  # the forbid is the same frame, with the rule id on the line, with any other value.
   - name: the-planted-clusters-line-quotes-the-rules-note
     role: objective
     mode: assert
@@ -212,6 +212,7 @@ verification_spec:
         - '(?ms)\A(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: (?:group-oom-kill: )?none$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: (?:group-oom-kill: )?none$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: (?:group-oom-kill: )?none$)'
       forbidden_patterns:
         - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: group-oom-kill: (?!none$)[^\n]*$'
+        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: (?:group-oom-kill: )?["''“‘<]?(?:["''“‘<]?(?:group-oom-kill: )?deployment seeded-shapes/multi-process-worker container supervisor runs a shell script that forks a background job on pool [a-z0-9-]+, on cgroup v2 with a kubelet at [0-9][a-z0-9.-]*, which already group-kills; not an upgrade risk["''”’>]?(?:; |$))+$'
 
   # The prompt's "read only", grounded: the planted object is as the fixture
   # declares it after the run.
