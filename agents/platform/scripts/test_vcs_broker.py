@@ -70,13 +70,14 @@ def git(cwd: Path | str, *args: str, check: bool = True):
     )
 
 
-def git_runner(argv, cwd, check=True, config=()):
+def git_runner(argv, cwd, check=True, config=(), *, allow_http=False):
     """The shape the broker's git runner presents.
 
     `config` is what the forge's credential asked for on this invocation. The
     executor turns it into a `GIT_CONFIG_COUNT` layer; here it becomes `-c`
     flags, which is the same precedence and is visible to an assertion.
     """
+    del allow_http
     flags = [flag for key, value in config for flag in ("-c", f"{key}={value}")]
     return subprocess.run(
         [argv[0], *flags, *argv[1:]],

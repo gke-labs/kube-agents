@@ -225,6 +225,15 @@ class GitLabForge(Forge):
         for entry in config.get("forges") or ():
             if entry.get("provider") != cls.name:
                 continue
+            if entry.get("port") not in (None, "", 0):
+                raise ValueError(
+                    f"port is not supported for {cls.name}: the broker reaches "
+                    f"{entry.get('host')} on its standard HTTPS port only"
+                )
+            if entry.get("scheme") not in (None, "", "https"):
+                raise ValueError(
+                    f"scheme {entry.get('scheme')!r} is not supported for {cls.name}"
+                )
             token_path = str(entry.get("token_path") or "")
             if not token_path:
                 raise ValueError(f"the {cls.name} forge at {entry.get('host')} names no tokenPath")

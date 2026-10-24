@@ -192,6 +192,7 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # slack_allowed_users     = ["U01234567"]
 # slack_home_channel      = "C01234567"
 # slack_home_channel_name = "#kube-agents"
+# slack_home_channel_policy = "auto"   # or "manual"; accepted but with no effect yet
 
 # Optional AgentPlugins.
 # enable_pubsub_platform       = true

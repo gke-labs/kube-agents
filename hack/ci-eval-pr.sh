@@ -1379,7 +1379,7 @@ ledger_audit_id_for_task() { # <task.yaml, relative to BENCH_DIR or absolute>
 
 # Every stream lock a case's unit holds: the stream it grades and the ones its
 # task.yaml declares in `audit_streams:` (a case whose stack starts real audit
-# runs; oobe-first-run-audits starts four), read with the YAML parser by
+# runs; oobe-first-run-audits starts five), read with the YAML parser by
 # kube_agents_bench.audit_streams once before the fan-out. Sorted and each
 # once, so a unit holding several always takes them in the same order and two
 # such units cannot each hold what the other waits on.
@@ -2879,8 +2879,9 @@ if [ -z "${BLOCKING_ROSTER_ON_LANE}" ] && [ -n "${INJECT_LANE_DROPPED_ROSTER}" ]
   exit 1
 fi
 
-# The GitLab lane's list may hold no roster case (all three of its seats are
-# held out since pdb-remediation-pr's demotion of 2026-10-17, #3120), which empties the export by design, like a nightly part: said
+# The GitLab lane's list may hold no roster case (it held none from
+# pdb-remediation-pr's demotion of 2026-10-17, #3120, until
+# vcs-spent-branch-reuse's roster line of 2026-10-23), which empties the export by design, like a nightly part: said
 # in the log, not stopped. After the inject guard, so a lane the guard stops
 # does not also hear this.
 if [ -n "${GITLAB_LANE_DROPPED:-}" ] && [ -z "${BLOCKING_ROSTER_DEFAULT}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
@@ -3125,7 +3126,7 @@ unit_cost_hint() {
     # Nightly-only. The audit measured 1415-1488s a repetition with its ledger
     # write (build 2099607409826729984); the crashloop triage takes the
     # incumbent autoops hint (same watcher and card waits) until it passes.
-    ai-security-planted-model-audit) echo 1450 ;;
+    ai-security-planted-model-audit | ai-security-manual-names-reconciler) echo 1450 ;;
     # Not measured yet: the same stream and stack shape as the case above, so
     # it takes that case's hint until its nightly record says otherwise.
     fleet-audit-clean-close-reads-clean) echo 1450 ;;
@@ -3221,6 +3222,12 @@ unit_cost_hint() {
     upgrades-removed-api-callers-distinguished | upgrades-network-policy-enforcement-stated) echo 900 ;;
     upgrades-stale-client-skew-named | upgrades-multi-process-oom-group-named) echo 900 ;;
     upgrades-cuda-pinned-gpu-job-named) echo 900 ;;
+    # The upgrade retrospective's cases: each holds the stream, and a
+    # fleet-wide question with a stale report is a full collector run over the
+    # seeded fleet. 540s and 360s a red repetition on a dev install
+    # (2026-10-15); priced at the audit band's floor. The six after-upgrade
+    # cases ask the same fleet-wide question and take the same price.
+    upgrades-retrospective-on-demand | upgrades-retrospective-drained-budget) echo 600 ;;
     # Nightly-only since #3524. One of the five readiness-line cases of that
     # change, each the same read-only run (three project list reads, the
     # server config per location, the per-member kubectl reads); unmeasured.
@@ -3229,6 +3236,10 @@ unit_cost_hint() {
     # the default is cut from this tier rather than from all five; the four
     # siblings pack at the default until the nightly record prices them.
     upgrades-audit-control-plane-capacity) echo 600 ;;
+    upgrades-retrospective-cgroup-blind-runtime | upgrades-retrospective-cuda-pinned-gpu-job) echo 600 ;;
+    upgrades-retrospective-failclosed-webhook | upgrades-retrospective-multi-process-container) echo 600 ;;
+    upgrades-retrospective-network-policy-enforcement | upgrades-retrospective-stale-client-skew) echo 600 ;;
+    upgrades-retrospective-log-volume-gate | upgrades-rollout-family-held-by-canary-gate) echo 600 ;;
     *) echo 200 ;;
   esac
 }
@@ -3376,7 +3387,7 @@ STATE_DIR="$(mktemp -d)"
 #                 finish lands in this lane's fresh one. Taken after the task
 #                 lock, keyed on the audit id, by units that write one and by
 #                 units that declare the streams their stack starts audits on
-#                 (audit_streams; oobe-first-run-audits holds four).
+#                 (audit_streams; oobe-first-run-audits holds five).
 #                 A task-lock holder on a shared stream waits its turn on
 #                 the stream before its own run, so both deadlines scale by
 #                 the cases on the stream (stream_case_count), as the infra

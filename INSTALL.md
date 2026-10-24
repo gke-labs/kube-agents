@@ -183,7 +183,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
   --github-pem-path="/path/to/app-private-key.pem"
 ```
 
-_(If the Cloud KMS key was already imported Ahead-Of-Time, `--github-pem-path` can be omitted; see [Token Minter Guide](docs/site/src/content/docs/deploy/token-minter.md).)_
+_(If the Cloud KMS key was already imported Ahead-Of-Time, `--github-pem-path` can be omitted; see [Token Minter Guide](docs/site/src/content/docs/deploy/token-minter.md). For GitLab or self-managed Gitea GitOps repositories, see [GitLab as the GitOps forge](docs/site/src/content/docs/install/gitlab.md) and [Gitea as the GitOps forge](docs/site/src/content/docs/install/gitea.md).)_
 
 `--github-app-id` is the App's number (its settings page, **General**, "App ID"), not its name or slug; the installer refuses anything else, `--dry-run` included. An applying run, or a `--generate-only` handoff, records `GITOPS_ORG`, `GITOPS_REPO` and `GITHUB_APP_ID` in `install.env`, adding the ones the file lacks and replacing any it records with a different value, so `upgrade.sh`, which renders from the file alone, keeps GitOps on. The PEM path is never recorded: once imported, the key lives in Cloud KMS.
 
@@ -1333,10 +1333,11 @@ section describes each stage.
 
 ### Each morning: the scheduled audits
 
-The Platform Agent runs its fleet audits on a cron schedule in UTC, some daily and some on
-Mondays only. On a new install, four of them (security, reliability, cost
+The Platform Agent runs its fleet audits on a cron schedule in UTC, some daily, some on
+Mondays, and the upgrade retrospective on Sunday evening. On a new install, four of them (security, reliability, cost
 and capacity) also run once as soon as the first inventory scan finishes, or at a fallback of 90 minutes or more
-after it started if it has not, so their first results do not wait for the schedule. To list every job with its next and last run:
+after it started if it has not, so their first results do not wait for the schedule; the upgrade
+retrospective runs once after them. To list every job with its next and last run:
 
 ```bash
 kubectl exec deploy/platform-agent-gateway -n kubeagents-system -c platform-agent -- \

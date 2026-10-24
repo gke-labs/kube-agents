@@ -14,7 +14,9 @@ column does.
 
 One entry per rule, in catalogue-entry order: its id and name, the catalogue entry, the highest
 grade it files, what it reads and how it grades, and what the cell tells the operator to do. A
-new rule adds its entry in that order.
+new rule adds its entry in that order. A plan-level rule, one with no catalogue entry (its
+`ENTRY` is None), grades the upgrade plan rather than a scenario, is registered after every
+numbered rule, and is listed last here.
 
 - `surge-capacity` (Surge capacity), entry 2, blocker. Reads: A pool whose upgrade settings take a
   node away before its replacement exists (`maxUnavailable` above 0 on the surge strategy, or a
@@ -240,6 +242,20 @@ new rule adds its entry in that order.
 - `cluster-status-age` (Cluster status age), entry 24, blocker. Reads: the cluster's `status` and, from the same operations list, the operations on the member or on one of its node pools (a pool upgrade, resize or repair names the pool); a status other than `RUNNING` with an operation `RUNNING` for more than four hours blocks, naming it, a younger one is noted; no `RUNNING` operation in the project's list is read again for the member, a `clusters describe` and then an `operations list` for the cluster (the project's lists may predate the operation's end, or its start): `RUNNING` now is a note, a `RUNNING` operation in the fresh list is graded against the threshold, a failed read is unknown, and nothing running with a status still not `RUNNING` blocks, quoting the cluster's `statusMessage`. Action: freeze changes; past a few hours open a support case quoting the operation id, or the status and its message when nothing is `RUNNING` (the `gke-upgrades` skill's "Stuck operation" section).
 - `target-patch-valid` (Target patch valid), entry 25, blocker. Reads: `gcloud container get-server-config` once per location: the member's target against its channel's `validVersions`, and against `validNodeVersions` too only when the control plane is already at or above it (a pool move; a blocker otherwise; a target given without its `-gke.` build is valid when a list carries a build of it), and its running control-plane version against the channel's `validVersions` (a risk). Action: target the newest active patch of the minor on the channel at or above the version, else the next active version the channel lists.
 - `known-issues-matrix` (Known-issues matrix), entry 26, risk. Reads: the DaemonSets and Deployments in `kube-system` and `gmp-system` (the reads the report makes; `addons` in the JSON) against `scripts/known_issues.json` (the page's rows naming a minor from 1.32 up; a row naming no add-on matches by version alone; a match through a version set with no upper bound, `All versions` or a build or minor and later with no fixed build above it, is a note on the member, not a risk; a target given without its build is graded against the builds of the patch `target-patch-valid` holds valid, the channel's list, `validNodeVersions` too when the pools alone move: a risk when the issue affects every one and a note naming the affected builds otherwise), and the table's age, a risk past thirty days. Action: target the patch the issue names as fixed, or hold; regenerate a stale table before trusting a clean matrix.
+- `rollout-sequence-precheck` (Rollout-sequence precheck), plan-level (no catalogue entry), risk.
+  Reads: A member's `fleet` block in the cluster record names its fleet host project
+  (`fleet.project`; absent for a cluster that is not a fleet member, which is a note: no
+  RolloutSequence can carry it, so an upgrade of it is the manual path). The host project's
+  RolloutSequences are listed once per run, with
+  `gcloud container fleet rolloutsequences list --project <host> --format=json` on
+  `roles/gkehub.viewer` with `gkehub.googleapis.com` enabled there, filed on the host's first
+  member in the listing (by project, location and name); the host's other members carry a note
+  saying where. One existing sequence is one `risk` naming its stages, each with its
+  fleet projects, cluster selector and soak, because the platform allows one sequence per host
+  project and refuses a plan that creates a second (FAILED_PRECONDITION); no sequence is a note. A
+  refused, failed, cut or unparsable read is unknown and, since the rule can never block, goes in
+  the note and leaves the verdict to the other rules. Action: Add the train as stages of the existing
+  sequence, or plan it in a separate host project.
 
 A blocking rule declares what its mechanism holds (`HOLDS`): a control-plane move, a node-pool move, or both. The fold stamps it on each `rule_blocking` row as `holds`, and the Monday audit's `upgrade-blocked` check counts the block for the move the cluster's lag makes due: `lb-connection-draining` and `orphan-node-objects` hold a node's removal and do not count where the control plane alone is due, as a budget does not; `cluster-status-age` and `target-patch-valid` hold both moves. A blocking rule's `unknown` (a read it needed failed) carries `holds` too, and the check records the member unevaluated for it on the move due, never clean; a block on the row still wins.
 

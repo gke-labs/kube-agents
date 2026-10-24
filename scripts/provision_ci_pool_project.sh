@@ -361,6 +361,7 @@ gcloud services enable \
   logging.googleapis.com \
   monitoring.googleapis.com \
   cloudtrace.googleapis.com \
+  gkehub.googleapis.com \
   iam.googleapis.com \
   cloudkms.googleapis.com \
   --project="${PROJECT_ID}"

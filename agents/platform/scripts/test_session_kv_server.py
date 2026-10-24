@@ -2412,7 +2412,7 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             ("_chat_platforms_disabled", lambda: False),
             ("_register_session_routing", MagicMock()),
             ("_post_initial_alert", MagicMock(return_value="spaces/A/threads/B")),
-            ("_build_agent_query", lambda payload: "q"),
+            ("_build_agent_query", lambda payload, session_id="": "q"),
             ("_triage_sleep", MagicMock()),
         ):
             p = patch.object(session_kv_server, name, value)
@@ -2962,6 +2962,261 @@ class TestFrontDoorDelegation(unittest.TestCase):
         self.assertIn("`goal_mode`: leave it unset", query)
         self.assertIn("**Leave `goal_mode` off.**", query)
         self.assertLess(query.index("Leave `goal_mode` off"), query.index("--- BEGIN TASK BODY"))
+
+
+class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
+    """INCIDENT_TRIAGE_OPEN_PULL_REQUEST, the opt-in set through spec.deployment.env.
+
+    Off is the shipped behaviour and must not move: one card, the footer that
+    leaves the pull request to a human's reply. On, the front door files a
+    second card for the Platform Agent, parented on the triage card, that opens
+    the pull request on a branch keyed to the incident.
+    """
+
+    PAYLOAD = {
+        "reason": "OOMKilled",
+        "namespace": "test-ns",
+        "kind_of_object": "Pod",
+        "name": "test-pod",
+        "message": "some message",
+        "cluster": "prod-us-central1",
+    }
+    SESSION = "evt-Prod_us/OOM:42"
+    ENV = "INCIDENT_TRIAGE_OPEN_PULL_REQUEST"
+    OFF_FOOTER = "A human reads your options and the agent that holds the GitOps write path opens the Pull Request"
+
+    def query(self, value):
+        env = {self.ENV: value} if value is not None else {}
+        with patch.dict(os.environ, env, clear=False):
+            if value is None:
+                os.environ.pop(self.ENV, None)
+            return session_kv_server._build_agent_query(self.PAYLOAD, self.SESSION)
+
+    def test_unset_and_false_leave_the_default_query_alone(self):
+        default = self.query(None)
+        self.assertEqual(default, self.query("false"))
+        self.assertEqual(default, self.query(""))
+        self.assertIn("Make exactly one `kanban_create` call", default)
+        self.assertIn(self.OFF_FOOTER, default)
+        self.assertNotIn("parents", default)
+        self.assertNotIn("platform-agent/incident-", default)
+
+    def _load_dotenv(self, content: bytes, keys):
+        with tempfile.NamedTemporaryFile("wb", suffix=".env", delete=False) as f:
+            f.write(content)
+            dotenv_path = f.name
+        try:
+            with patch.dict(os.environ, {"PREEXISTING_VAR": "from_env"}, clear=False):
+                for key in (self.ENV, *keys):
+                    os.environ.pop(key, None)
+                session_kv_server._load_dotenv_ignoring_operator_switches(dotenv_path)
+                return {key: os.environ.get(key) for key in (self.ENV, "PREEXISTING_VAR", *keys)}
+        finally:
+            os.remove(dotenv_path)
+
+    def test_the_pvc_dotenv_cannot_turn_the_switch_on(self):
+        loaded = self._load_dotenv(
+            b"INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true\n"
+            b"export SAFE_KEY='loaded_ok'\n"
+            b"COMMENTED=value # an inline comment\n"
+            b"PREEXISTING_VAR=from_dotenv\n",
+            ("SAFE_KEY", "COMMENTED"),
+        )
+        self.assertIsNone(loaded[self.ENV])
+        self.assertEqual(loaded["SAFE_KEY"], "loaded_ok")
+        self.assertEqual(loaded["COMMENTED"], "value")
+        self.assertEqual(loaded["PREEXISTING_VAR"], "from_env")
+
+    def test_an_undecodable_pvc_dotenv_does_not_stop_the_import(self):
+        loaded = self._load_dotenv(b"# caf\xe9\nSAFE_KEY=1\n", ("SAFE_KEY",))
+        self.assertIsNone(loaded["SAFE_KEY"])
+        self.assertEqual(loaded["PREEXISTING_VAR"], "from_env")
+
+    def test_the_default_body_is_the_one_the_old_signature_built(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(self.ENV, None)
+            body = session_kv_server._triage_task_body(self.PAYLOAD)
+            self.assertEqual(
+                body,
+                session_kv_server._triage_task_body(self.PAYLOAD, open_pull_request=False),
+            )
+            self.assertIn(
+                "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with this fix.\n"
+                "No Recommended line, and nothing after **'apply'** in the call to action — a bare 'apply' is unambiguous when there is one fix.",
+                body,
+            )
+            self.assertIn(
+                "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix, "
+                "or name one directly with **'apply Option A'** / **'apply Option B'**.",
+                body,
+            )
+            self.assertIn(
+                "**Who acts on this:**\n"
+                "A human reads your options and the agent that holds the GitOps write path opens the Pull Request — not you, and not from this card. "
+                "Your job is to make that possible: name the manifest change each option needs precisely enough that someone can open the Pull Request from your report alone. "
+                "Two things are true whoever acts on it — the fix ships as a Pull Request against the GitOps repository, and nothing is written to the live cluster directly "
+                "(no `kubectl scale`, `patch`, or `apply`).",
+                body,
+            )
+
+    def test_on_asks_for_two_cards_the_second_parented_on_the_first(self):
+        query = self.query("true")
+        self.assertIn("Make exactly two `kanban_create` calls", query)
+        self.assertIn("`assignee`: `platform`", query)
+        self.assertIn("`parents`: a list holding the one card id call 1 returned", query)
+        self.assertIn("`title`: `Open GitOps PR for test-ns/Pod/test-pod (OOMKilled) on prod-us-central1`", query)
+        self.assertIn("`title`: `Triage test-ns/Pod/test-pod (OOMKilled) on prod-us-central1`", query)
+        self.assertIn("do not file a third card", query)
+        self.assertIn("**Leave `goal_mode` off.**", query)
+
+    def test_on_carries_both_bodies_whole_between_their_markers(self):
+        query = self.query("TRUE ")
+        triage = query.split("--- BEGIN TASK BODY (copy verbatim) ---\n", 1)[1].split("\n--- END TASK BODY ---", 1)[0]
+        self.assertEqual(triage, session_kv_server._triage_task_body(self.PAYLOAD, open_pull_request=True))
+        pr = query.split("--- BEGIN PULL REQUEST TASK BODY (copy verbatim) ---\n", 1)[1]
+        pr = pr.split("\n--- END PULL REQUEST TASK BODY ---", 1)[0]
+        self.assertEqual(pr, session_kv_server._triage_pr_task_body(self.PAYLOAD, self.SESSION))
+
+    def test_on_keeps_the_report_template_the_notifier_gates_on(self):
+        body = session_kv_server._triage_task_body(self.PAYLOAD, open_pull_request=True)
+        self.assertNotIn(self.OFF_FOOTER, body)
+        self.assertIn("To authorize", body)
+        self.assertNotIn("reply **'apply'** to open a GitOps Pull Request", body)
+        self.assertIn("a GitOps Pull Request for the recommended fix is being opened automatically", body)
+        self.assertIn("a GitOps Pull Request for this fix is being opened automatically", body)
+        self.assertIn("Keep the words `is being opened automatically` exactly as written", body)
+        self.assertIn("do not tell the reader to reply **'apply'** to open the recommended Pull Request", body)
+        self.assertIn("## What to do", body)
+        headings = [line for line in body.splitlines() if line.startswith("## ")]
+        self.assertEqual(len(headings), 3, headings)
+
+    def test_every_reader_keys_on_the_same_marker_words(self):
+        import kanban_board_health
+        self.assertEqual(session_kv_server.TRIAGE_OPEN_PR_MARKER, "is being opened automatically")
+        self.assertEqual(kanban_board_health.TRIAGE_OPEN_PR_MARKER, session_kv_server.TRIAGE_OPEN_PR_MARKER)
+        self.assertIn(f"'%{session_kv_server.TRIAGE_OPEN_PR_MARKER}%'", kanban_board_health.MISSING_PR_CHILD_SQL)
+        slack = (Path(__file__).resolve().parents[3] / "deploy/docker/patches/slack_ux_incident.py").read_text()
+        self.assertIn(r"\bis\s+being\s+opened\s+automatically\b", slack)
+        task = (Path(__file__).resolve().parents[3] / "bench/tasks/autoops-warning-event-triage-open-pr/task.yaml").read_text()
+        self.assertIn(session_kv_server.TRIAGE_OPEN_PR_MARKER, task)
+        off = session_kv_server._triage_task_body(self.PAYLOAD, open_pull_request=False)
+        self.assertNotIn(session_kv_server.TRIAGE_OPEN_PR_MARKER, off)
+
+    def test_the_pull_request_card_names_the_branch_and_forbids_cluster_writes(self):
+        body = session_kv_server._triage_pr_task_body(self.PAYLOAD, self.SESSION)
+        expected_branch = session_kv_server._incident_branch(self.SESSION, self.PAYLOAD)
+        self.assertIn(f"`{expected_branch}`", body)
+        self.assertRegex(
+            expected_branch,
+            r"^platform-agent/incident-prod-us-central1-test-ns-pod-test-pod-oomkilled-[0-9a-f]{8}$",
+        )
+        self.assertIn("**submit-suggestion**", body)
+        self.assertIn("Never pass `--force` to `prepare` while another `Open GitOps PR` card is `running`", body)
+        # The refusal is quoted the way vcs_client._refuse_to_discard words it.
+        self.assertIn("`there is already a copy at <path> with ...`", body)
+        self.assertIn("`Publish it, or re-run with --force to replace it.`", body)
+        self.assertNotIn("with uncommitted work on branch", body)
+        import vcs_client
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp)
+            (dest / "stray").write_text("x")
+            with patch.object(vcs_client, "all_sessions", return_value=[]), patch.object(
+                vcs_client, "local_git",
+                return_value=MagicMock(returncode=0, stdout=" M stray\n"),
+            ):
+                with self.assertRaises(vcs_client.VcsError) as refused:
+                    vcs_client._refuse_to_discard(dest, force=False)
+        self.assertTrue(str(refused.exception).startswith(f"there is already a copy at {dest} with "))
+        self.assertTrue(str(refused.exception).endswith("Publish it, or re-run with --force to replace it."))
+        self.assertIn("`kanban_show` this card's parent", body)
+        self.assertIn("If the parent card has no report (`result` is empty or its `status` is not `done`)", body)
+        self.assertIn("Never change the live cluster directly", body)
+        self.assertIn("open nothing", body)
+
+    def test_the_branch_is_stable_and_one_safe_segment(self):
+        first = session_kv_server._incident_branch(self.SESSION, self.PAYLOAD)
+        self.assertEqual(first, session_kv_server._incident_branch("k8s-evt-retried9", self.PAYLOAD))
+        self.assertRegex(
+            first,
+            r"^platform-agent/incident-prod-us-central1-test-ns-pod-test-pod-oomkilled-[0-9a-f]{8}$",
+        )
+        fallback = session_kv_server._incident_branch("", self.PAYLOAD)
+        self.assertEqual(fallback, first)
+        # Sibling or replaced Deployment pods share their Deployment's name on the branch,
+        # the same identity the incident fold uses (_fold_key).
+        replica_a = {**self.PAYLOAD, "name": "test-pod-6cfdb6b98b-zwv24"}
+        replica_b = {**self.PAYLOAD, "name": "test-pod-6cfdb6b98b-k8m12"}
+        self.assertEqual(
+            session_kv_server._incident_branch(self.SESSION, replica_a),
+            session_kv_server._incident_branch("k8s-evt-other", replica_b),
+        )
+        self.assertEqual(session_kv_server._incident_branch(self.SESSION, replica_a), first)
+        # Any other pod keeps its own name: StatefulSet ordinals, numerically suffixed bare
+        # pods, a bare pod beside a same-prefix StatefulSet, DaemonSet, Job and CronJob pods.
+        # The name cannot prove they are one workload, and a wrong merge would land one
+        # object's fix on another's pull request.
+        for name_a, name_b in (
+            ("cache-0", "cache-1"),
+            ("worker-1", "worker-2"),
+            ("cache-7", "cache"),
+            ("fluentd-k2x9p", "fluentd-m7q4z"),
+            ("backup-29312345-abcde", "backup-29312346-fghij"),
+        ):
+            with self.subTest(pair=(name_a, name_b)):
+                self.assertNotEqual(
+                    session_kv_server._incident_branch(self.SESSION, {**self.PAYLOAD, "name": name_a}),
+                    session_kv_server._incident_branch(self.SESSION, {**self.PAYLOAD, "name": name_b}),
+                )
+        for name in ("cache-0", "worker-1", "fluentd-k2x9p", "backup-29312345-abcde"):
+            with self.subTest(name=name):
+                self.assertEqual(session_kv_server._incident_branch_workload("Pod", name), name)
+        self.assertEqual(session_kv_server._incident_branch_workload("Pod", "test-pod-6cfdb6b98b-zwv24"), "test-pod")
+        self.assertEqual(session_kv_server._incident_branch_workload("Deployment", "api-6cfdb6b98b-zwv24"), "api-6cfdb6b98b-zwv24")
+        # Distinct bare pods ending in 5-character words stay on distinct branches.
+        bare_a = {**self.PAYLOAD, "name": "redis-cache"}
+        bare_b = {**self.PAYLOAD, "name": "redis-proxy"}
+        self.assertNotEqual(
+            session_kv_server._incident_branch(self.SESSION, bare_a),
+            session_kv_server._incident_branch(self.SESSION, bare_b),
+        )
+        other = session_kv_server._incident_branch(self.SESSION, {**self.PAYLOAD, "name": "other-pod"})
+        self.assertNotEqual(first, other)
+        hostile = session_kv_server._incident_branch("../`x` y\n", {})
+        self.assertRegex(hostile.removeprefix("platform-agent/incident-"), r"^[a-z0-9-]+$")
+
+    def test_the_branch_does_not_collide_across_boundary_shifts_or_punctuation(self):
+        shift_a = dict(self.PAYLOAD, namespace="test", name="ns-pod")
+        shift_b = dict(self.PAYLOAD, namespace="test-ns", name="pod")
+        self.assertNotEqual(
+            session_kv_server._incident_branch("s1", shift_a),
+            session_kv_server._incident_branch("s1", shift_b),
+        )
+        dot_name = dict(self.PAYLOAD, name="api.v2", kind_of_object="CronJob")
+        dash_name = dict(self.PAYLOAD, name="api-v2", kind_of_object="CronJob")
+        self.assertNotEqual(
+            session_kv_server._incident_branch("s1", dot_name),
+            session_kv_server._incident_branch("s1", dash_name),
+        )
+
+    def test_a_long_key_is_cut_with_a_digest(self):
+        from providers import validate as provider_validate
+
+        long_a = dict(self.PAYLOAD, name="w" * 200 + "a", kind_of_object="Deployment")
+        long_b = dict(self.PAYLOAD, name="w" * 200 + "b", kind_of_object="Deployment")
+        full_a = session_kv_server._incident_branch("", long_a)
+        full_b = session_kv_server._incident_branch("", long_b)
+        self.assertNotEqual(full_a, full_b)
+        self.assertLessEqual(len(full_a), session_kv_server.INCIDENT_BRANCH_MAX_LEN)
+        self.assertLessEqual(len(full_b), session_kv_server.INCIDENT_BRANCH_MAX_LEN)
+        self.assertEqual(provider_validate.validate_branch(full_a), full_a)
+        self.assertEqual(provider_validate.validate_branch(full_b), full_b)
+
+    def test_drift_records_ignore_the_setting(self):
+        drift = {"kind": session_kv_server.INJECT_KIND_DRIFT, "summary": "s"}
+        with patch.object(session_kv_server, "_drift_agent_query", return_value="drift") as drift_query:
+            with patch.dict(os.environ, {self.ENV: "true"}):
+                self.assertEqual(session_kv_server._build_agent_query(drift, self.SESSION), "drift")
+        drift_query.assert_called_once_with(drift)
 
 
 class TestGatewaySessionBody(unittest.TestCase):
@@ -10686,7 +10941,7 @@ class TestTriageStartRetry(unittest.TestCase):
         for target, value in (
             ("time", MagicMock(monotonic=self.clock.monotonic, time=time.time)),
             ("_triage_sleep", self.clock.sleep),
-            ("_build_agent_query", lambda payload: "q"),
+            ("_build_agent_query", lambda payload, session_id="": "q"),
             ("_gateway_api_token", lambda: "tok"),
         ):
             p = patch.object(session_kv_server, target, value)
@@ -11076,7 +11331,7 @@ class TestTriageStartBurst(unittest.TestCase):
             patch.dict(os.environ, {"PLATFORM_API_URL": f"http://127.0.0.1:{self.server.server_port}"}),
             patch.object(session_kv_server, "enabled_chat_platforms", lambda: [session_kv_server.DEFAULT_CHAT_PLATFORM]),
             patch.object(session_kv_server, "_chat_platforms_disabled", lambda: True),
-            patch.object(session_kv_server, "_build_agent_query", lambda payload: "q"),
+            patch.object(session_kv_server, "_build_agent_query", lambda payload, session_id="": "q"),
             patch.object(session_kv_server, "_gateway_api_token", lambda: "tok"),
             # A real pool, not the parked stand-in, and retry waits on the same scale.
             patch.object(session_kv_server, "_TRIAGE_START_POOL", None),

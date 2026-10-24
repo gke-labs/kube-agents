@@ -196,6 +196,15 @@ class GitHubForge(Forge):
             if not host:
                 raise ValueError(f"a {cls.name} forge entry names no host")
             for entry in mine:
+                if entry.get("port") not in (None, "", 0):
+                    raise ValueError(
+                        f"port is not supported for {cls.name}: the broker reaches "
+                        f"{host} on its standard HTTPS port only"
+                    )
+                if entry.get("scheme") not in (None, "", "https"):
+                    raise ValueError(
+                        f"scheme {entry.get('scheme')!r} is not supported for {cls.name}"
+                    )
                 # Refused rather than ignored: the same key narrows a forge
                 # whose credential reaches a whole host, and accepted here it
                 # would read as narrowing this one. The App installation's
