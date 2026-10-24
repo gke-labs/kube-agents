@@ -406,6 +406,9 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		// name different buckets is an authorization failure at runtime with
 		// a green suite.
 		"$KV.session-state.>",
+		// The kept 👍 and 👎 ratings (a2a/gateway/feedback.go), the bucket's
+		// data plane; its JetStream grants are a2aGatewayJetStreamGrants'.
+		"$KV.feedback.>",
 		// The console adapter's notices (spec-chatops-gateway.md, "The
 		// console adapter"): core NATS, one subject per conversation.
 		"chat.console.*.out",
@@ -454,7 +457,8 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			"Its $JS.API grant is scoped to what it emits, by name and by verb\n" +
 			"(#1666): INFO, CONSUMER.CREATE, CONSUMER.MSG.NEXT and DIRECT.GET on\n" +
 			"TASKS, and INFO, DIRECT.GET and consumer create/delete on\n" +
-			"KV_session-state, its own registry. So no STREAM.DELETE, PURGE,\n" +
+			"KV_session-state, its own registry, and on KV_feedback, the kept\n" +
+			"answer ratings. So no STREAM.DELETE, PURGE,\n" +
 			"UPDATE or MSG.DELETE on any stream - one STREAM.DELETE.TASKS here\n" +
 			"used to destroy every task's history and the five consumers on it -\n" +
 			"no CONSUMER.DELETE on TASKS, and nothing at all on DIRECTORY, the\n" +
@@ -482,6 +486,7 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			"a2a.agents.>",
 			"agents.hb.>",
 			"$KV.session-state.>",
+			"$KV.feedback.>",
 			"chat.console.*.in",
 			// Proactive posts from the agent to the home channel, and a
 			// card's report back to its conversation, one subject per backend.
@@ -550,7 +555,7 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 		// principal create a
 		// consumer that delivers TASKS into its own inbox, and delete any
 		// stream on the bus. It provisions - it creates the four streams
-		// and three buckets, idempotently, with an info-then-add - so it
+		// and four buckets, idempotently, with an info-then-add - so it
 		// needs CREATE and INFO on exactly those and nothing else. A KV
 		// bucket is a stream named KV_<bucket>, which is why those appear
 		// in stream form.
@@ -581,6 +586,7 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 			"$JS.API.STREAM.CREATE.KV_runtime-state",
 			"$JS.API.STREAM.CREATE.KV_session-state",
 			"$JS.API.STREAM.CREATE.KV_cap",
+			"$JS.API.STREAM.CREATE.KV_feedback",
 			"$JS.API.STREAM.INFO.TASKS",
 			"$JS.API.STREAM.INFO.DIRECTORY",
 			"$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -588,6 +594,7 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 			"$JS.API.STREAM.INFO.KV_runtime-state",
 			"$JS.API.STREAM.INFO.KV_session-state",
 			"$JS.API.STREAM.INFO.KV_cap",
+			"$JS.API.STREAM.INFO.KV_feedback",
 			"_INBOX.provision.>",
 		},
 		subscribe: []string{

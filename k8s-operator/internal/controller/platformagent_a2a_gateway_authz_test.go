@@ -230,6 +230,26 @@ func TestGatewayJetStreamGrantOnARealServer(t *testing.T) {
 	t.Logf("%-72s allowed", "CONSUMER.DELETE KV_session-state, watcher Stop (Registry.Sessions)")
 	allowed("$KV.session-state delete (Registry.DropTask)", kv.Delete(ctx, taskIndexKey))
 
+	// The kept answer ratings (a2a/gateway/feedback.go): bound and its max
+	// age read at start, a 👎 put and read back for its note, the export's
+	// key list, and a 👍's delete.
+	fb, err := js.KeyValue(ctx, a2aFeedbackBucket)
+	allowed("STREAM.INFO KV_feedback (startFeedback js.KeyValue)", err)
+	if status, err := fb.Status(ctx); err != nil || status.TTL() <= 0 {
+		t.Errorf("the feedback bucket's max age read as %v (err %v); the gateway keeps nothing without one", status, err)
+	}
+	_, err = fb.Put(ctx, "t1.U1", []byte(`{"rating":"down"}`))
+	allowed("$KV.feedback put (feedbackDesk.Rate)", err)
+	_, err = fb.Get(ctx, "t1.U1")
+	allowed("DIRECT.GET KV_feedback (feedbackDesk.Note)", err)
+	fbKeys, err := fb.ListKeys(ctx)
+	allowed("CONSUMER.CREATE KV_feedback, watcher (ExportFeedback)", err)
+	if err == nil {
+		for range fbKeys.Keys() {
+		}
+	}
+	allowed("$KV.feedback delete (feedbackDesk.Rate, a 👍)", fb.Delete(ctx, "t1.U1"))
+
 	if v := log.publishViolations("gateway"); len(v) != 0 {
 		t.Errorf("the gateway's own operations tripped %d publish violations; each is a grant a2aGatewayJetStreamGrants is missing:\n%s",
 			len(v), strings.Join(v, "\n"))

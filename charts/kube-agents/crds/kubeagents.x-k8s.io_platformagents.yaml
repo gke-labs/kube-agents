@@ -10324,6 +10324,14 @@ spec:
                             type: string
                           type: array
                           x-kubernetes-list-type: set
+                        answerFeedback:
+                          default: true
+                          description: |-
+                            AnswerFeedback draws Slack's thumbs-up and thumbs-down buttons under
+                            each final answer under spec.mode next, and keeps each rating with
+                            its question and answer (a thumbs-down with its note) on the install for the feedback bucket's max age (30 days as provisioned).
+                            False hides the buttons and keeps nothing.
+                          type: boolean
                         appTokenSecretRef:
                           description:
                             AppTokenSecretRef securely references a Secret

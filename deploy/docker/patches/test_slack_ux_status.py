@@ -375,6 +375,58 @@ class _RuntimeCase(unittest.TestCase):
         self.addCleanup(env.stop)
 
 
+class AnswerKeyTest(_RuntimeCase):
+    """Which card's settle finished its ask's plan: that card's report is the ask's answer."""
+
+    def _plan(self, *statuses, pending=()):
+        plan = runtime._Plan(TEAM)
+        plan.ts = "plan-t_0-1"
+        for i, status in enumerate(statuses):
+            row = runtime._Row(f"t_{i}", "card")
+            row.status = status
+            plan.rows[row.task_id] = row
+        for card in pending:
+            plan.pending[card] = True
+        runtime._plans[(CHANNEL, THREAD)] = plan
+        return plan
+
+    def _sub(self, card):
+        return {"chat_id": CHANNEL, "thread_id": THREAD, "task_id": card}
+
+    def test_the_card_that_settles_the_plan_answers_it_once(self):
+        plan = self._plan(slack_status.TASK_COMPLETE, slack_status.TASK_COMPLETE)
+        _run(runtime._retire(_Adapter(), (CHANNEL, THREAD), plan, "t_1"))
+        self.assertEqual(runtime.answer_key(self._sub("t_0")), "", "only the card whose settle it was")
+        self.assertEqual(runtime.answer_key(self._sub("t_1")), "plan-t_0-1")
+        self.assertEqual(runtime.answer_key(self._sub("t_1")), "", "a replayed event is not the answer again")
+
+    def test_a_plan_with_a_card_left_answers_nothing(self):
+        for statuses, pending in (
+            ((slack_status.TASK_COMPLETE, slack_status.TASK_RUNNING), ()),
+            ((slack_status.TASK_COMPLETE, slack_status.TASK_PENDING), ()),
+            ((slack_status.TASK_COMPLETE,), ("t_next",)),
+        ):
+            plan = self._plan(*statuses, pending=pending)
+            _run(runtime._retire(_Adapter(), (CHANNEL, THREAD), plan, "t_0"))
+            self.assertEqual(runtime.answer_key(self._sub("t_0")), "")
+
+    def test_a_set_aside_plan_its_last_card_finishes_answers_it(self):
+        # A plan quiet past the hold is set aside; its last card's settle still answers its ask.
+        plan = runtime._Plan(TEAM)
+        plan.ts = "plan-t_0-2"
+        row = runtime._Row("t_0", "card")
+        row.status = slack_status.TASK_RUNNING
+        plan.rows["t_0"] = row
+        runtime._lapsed[(CHANNEL, THREAD)] = [plan]
+        status = slack_status.task_status("completed")
+        _run(runtime._settle_lapsed(_Adapter(), (CHANNEL, THREAD), "t_0", "completed", status, True))
+        self.assertEqual(runtime.answer_key(self._sub("t_0")), "plan-t_0-2")
+
+    def test_no_plan_answers_nothing(self):
+        # After a restart the plan is gone, and no report is taken for the answer.
+        self.assertEqual(runtime.answer_key(self._sub("t_0")), "")
+
+
 class SessionTest(_RuntimeCase):
     def _status(self, adapter, status, thread=THREAD):
         _run(adapter._set_thread_status(CHANNEL, TEAM, thread, status, "failed"))
@@ -971,6 +1023,27 @@ class PlanTest(_RuntimeCase):
         self.assertEqual(len(runtime._lapsed[(CHANNEL, THREAD)]), 1)
         _run(runtime.settle_row(adapter, _sub(), "unblocked"))
         self.assertEqual(self._tasks(adapter)[0]["status"], "in_progress")
+
+    def test_a_card_with_no_note_that_settles_the_plan_answers_it(self):
+        adapter = _Adapter()
+        _run(runtime.expect_cards(adapter, CHANNEL, TEAM, THREAD, {"t_a": True}))
+        _run(runtime.settle_row(adapter, _sub(), "completed", "1.33.4 = default", "seeded-a"))
+        self.assertNotEqual(runtime.answer_key(_sub()), "", "its report is the ask's answer")
+
+    def test_a_card_that_starts_its_own_plan_answers_nothing(self):
+        # After a restart no plan holds the ask; a new plan's key would bind to the latest ask.
+        adapter = _Adapter()
+        _run(runtime.settle_row(adapter, _sub(), "completed", "1.33.4 = default", "seeded-a"))
+        self.assertEqual(runtime.answer_key(_sub()), "")
+
+    def test_a_card_that_gives_up_and_is_unblocked_answers_its_ask_once(self):
+        adapter = _Adapter()
+        self._note(adapter, 1, "reading logs")
+        _run(runtime.settle_row(adapter, _sub(), "gave_up", ""))
+        self.assertNotEqual(runtime.answer_key(_sub()), "", "the give-up settles the plan")
+        _run(runtime.settle_row(adapter, _sub(), "unblocked"))
+        _run(runtime.settle_row(adapter, _sub(), "completed", "both pods are up"))
+        self.assertEqual(runtime.answer_key(_sub()), "", "the ask already has its answer")
 
     def test_a_replayed_terminal_event_opens_no_second_row(self):
         adapter = _Adapter()

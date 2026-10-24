@@ -837,8 +837,12 @@ matches a key that adds a `-` suffix to it. The alert is a
 home-channel post and its triage a reply in its thread, so the edit asks the gateway to
 keep `update` keys for a home-channel thread as it does for a conversation. The plan
 carries the `mark` when it changes: `ask` while a card runs, `ask` with `settle: blocked`
-while one waits on the user, and `settle: done` or `failed` once all have settled. The
-notifier has not seen the ask, so the bridge records its kind on the conversation route
+while one waits on the user, and `settle: done` or `failed` once all have settled. A
+completed card's report, or a hard-wall block's reason, whose settle finished the ask's plan goes
+out with `--answer-to <plan key>` (`answer_to` on the request): it is that ask's answer, the one
+post the gateway draws rating controls on, under the ask the plan's key is bound to
+(spec-chatops-gateway.md, "Answer feedback"). A fan-out's children fold into their rows and post
+nothing, so a fan-out flags its creator's completion alone. The notifier has not seen the ask, so the bridge records its kind on the conversation route
 (`PUT /v1/sessions/{id}/route`, `ask`) for the notifier to read back. Not yet ported: a
 typed answer read back onto the question it answers, which needs the backend's own
 history. Until the gateway reads `chat` and `update` (`lib.NotifyRequest` says where it
