@@ -60,10 +60,11 @@ Every delivery closes with a short note on the first-run audits, read off the ``
 marker by ``_audits_note``: the report's scan leaves security and RBAC, reliability, capacity and
 cost to those audits (``inventory_findings.AUDIT_FAMILIES``; an install whose kept marker records
 an older stage's no-repository skip ran the workload checks in the scan), and a short report would
-otherwise read as a healthy fleet. An audit the stage started or
-adopted whose summary failed to deliver, as every one that finished before anyone opened the chat
-does for want of a home channel, is named (``_undelivered_audits``). The text path appends it to
-the report; the
+otherwise read as a healthy fleet. It also names every shipped fleet audit that ran since the sweep
+was filed and whose summary was not posted, however its run started, with a request for those
+reports (``_lost_audits``): an audit that finished before anyone opened the chat had no home channel
+to post to, and nothing posts it later. The note is built before the claim. The text path appends it
+to the report; the
 card paths print it on their own, since the card leaves closing lines out.
 
 Just before the claim, the run registers the sweep's findings in the
@@ -125,6 +126,11 @@ OOBE_JOB_ID = "oobe"
 # is easy to lose; keeping it means a re-send is a `cat`, not a re-scan.
 DELIVERED_REPORT_NAME = "INVENTORY.delivered.md"
 REPORT_NAME = "INVENTORY.md"
+# Touched once the sweep's findings are in the findings queue (or the sweep found
+# none), before the claim: the record that the fleet was checked, which the
+# Slack Home tab's board reads (agents/platform/scripts/board_snapshot.py) so a
+# clean cluster is not drawn as unchecked after a delivery that never posts.
+FINDINGS_REGISTERED_MARKER = ".bootstrap_findings_registered"
 
 # The items the report lists, written by ``inventory_findings.py select``
 # (its DEFAULT_SHOWN_PATH and the keys below; test_bootstrap_onboarding_scripts.py
@@ -207,8 +213,10 @@ REMOTE_MV = "/bin/mv"
 # The only surface the reshaped report is written for; every other one gets it as written.
 PRESENTED_PLATFORM = "slack"
 
-# The note on the first-run audits (_audits_note). The scan leaves their workload checks to them.
-AUDITS_SKIPPED_NOTE = "The first-run audits did not run: {reason}."
+# The note on the fleet audits (_audits_note). The scan leaves their workload checks to the first-run
+# audits. Its stage sentences say only what oobe's marker records the stage did; whether an audit ran is
+# said by AUDITS_LOST_NOTE alone, from the cron store, so no sentence about the stage can contradict it.
+AUDITS_SKIPPED_NOTE = "The audits did not run as part of onboarding: {reason}."
 AUDITS_NO_REASON = "no reason was recorded"
 # The reason an older oobe stage recorded when it skipped for no repository. A marker an install
 # kept through the upgrade still carries it, and on such an install the scan ran those checks,
@@ -225,42 +233,61 @@ AUDITS_NOT_COVERED_NOTE = (
 )
 # A skip with the hand-off's no-coverage report (bootstrap_handoff.NO_RANKING).
 AUDITS_UNCHECKED_SCHEDULED_NOTE = (
-    "No cluster was audited either, so this report covers no cluster; those audits check "
+    "No cluster was audited, so this report covers no cluster; those audits check "
     f"{inventory_findings.AUDIT_FAMILY_WORDS} on their schedules."
 )
-# The audits by what each reports on, in the posture line's order. The job ids stay out of
+# The first-run audits by what each reports on, in the posture line's order. The job ids stay out of
 # these sentences; the list of unposted summaries keeps them, since a request for one names it.
 AUDITS_AREAS = "The {areas} {audits}"
 AUDITS_WORD = ("audit", "audits")
 # Also the note before the marker exists: the stage writes it on its first tick after the ranking
 # card finishes, which a user already in the chat can beat to this run.
 AUDITS_RUNNING_NOTE = (
-    f"{AUDITS_AREAS.format(areas=inventory_findings.AUDIT_FAMILY_WORDS, audits=AUDITS_WORD[1])} run one after another once this "
-    "scan is done. Each posts a summary to the home channel when it finds something new."
+    f"{AUDITS_AREAS.format(areas=inventory_findings.AUDIT_FAMILY_WORDS, audits=AUDITS_WORD[1])} run one after another "
+    "once this scan is done."
 )
-AUDITS_RAN_NOTE = (
-    "{audits} {have} started. Each posts a summary to the home channel when it finds something new."
+AUDITS_STARTED_NOTE = "{audits} started as part of onboarding."
+AUDITS_NONE_STARTED_NOTE = (
+    "None of the first-run audits ran as part of onboarding. This report does not cover "
+    f"{inventory_findings.AUDIT_FAMILY_WORDS}."
 )
-AUDITS_NONE_RAN_NOTE = (
-    f"None of the first-run audits ran. This report does not cover {inventory_findings.AUDIT_FAMILY_WORDS}."
-)
-AUDITS_NOT_RUN_NOTE = "Not run: {audits}."
-AUDITS_NOT_RUN_ITEM = "the {area} audit ({reason})"
+AUDITS_NOT_STARTED_NOTE = "Did not run as part of onboarding: {audits}."
+AUDITS_NOT_STARTED_ITEM = "the {area} audit ({reason})"
 # oobe gives up on an audit it could not start; the audit still runs on its own schedule.
 AUDITS_GAVE_UP_REASON = "it did not start, and runs on its own schedule"
-# Every audit the chain started has completed its run, so "have started" would be stale.
-AUDITS_FINISHED_NOTE = "{audits} {have} run."
-AUDITS_HAVE = ("has", "have")
+
+# The shipped fleet audits beyond the first-run ones (agents/platform/cron/jobs.json, each `deliver: chat`),
+# in roster order. One that ends before anyone opens the chat loses its summary the same way.
+OTHER_FLEET_AUDITS = (
+    "security-patch-orchestrator",
+    "fleet-consistency-drift",
+    "ai-security-audit",
+    "gcp-networking-fabric-audit",
+    "gce-compute-fleet-audit",
+)
+# A request that needs no chat history, so it works in any conversation; the nightly request-path case
+# sends it verbatim. A test holds every audit the note checks to the store's audits (audit_report.AUDITS).
+AUDITS_REQUEST_FORMAT = "Show me the latest report of each of these fleet audits from the report store: {ids}."
+# The first-run chain's fifth job is not a posture family: named in the note by what it is.
+AUDIT_AREA_EXTRA = {"upgrade-retrospective": "upgrade retrospective"}
 # Said of every failed delivery, whatever refused it: usually no home channel yet, which an audit
 # that ends before anyone opens the chat always meets, and the scheduler does not post it again
-# (_undelivered_audits).
-AUDITS_UNDELIVERED_NOTE = (
-    "These finished, but their summaries were not posted to the chat: {audits}. "
-    "Ask me for any of these reports."
+# (_lost_audits).
+AUDITS_LOST_NOTE = (
+    "These ran, but their summaries were not posted to the chat: {labels}. To see them, send me: `{request}`"
+)
+# An audit whose run failed wrote no report, so the request above cannot fetch what was lost: the
+# scheduler's failure notice. Said, like AUDITS_LOST_NOTE, of every failed delivery, whatever refused it.
+AUDITS_FAILED_RUNS_NOTE = "These failed, and their failure notices were not posted to the chat: {labels}."
+AUDITS_UNREAD_NOTE = (
+    "I could not read the audit run records, so this note cannot say which summaries reached the chat. "
+    "To see any of them, send me: `{request}`"
 )
 
-# The scheduler's record of where a run's final message went (Hermes cron/executions.db).
+# The scheduler's record of where a run's final message went (Hermes cron/executions.db), and the run
+# statuses that can carry one: a completed run's summary, or a failed run's failure notice.
 DELIVERY_OUTCOME_COLUMN = "delivery_outcome"
+RUN_FAILED_STATUS = "failed"
 OUTCOME_LOST = "lost"
 OUTCOME_SILENT = "silent"
 OUTCOME_TRIED = "tried"
@@ -279,8 +306,20 @@ DELIVERY_OUTCOME_CLASS: dict[str | None, str] = {
     "not_configured": OUTCOME_TRIED,
 }
 
-# The sentence of the two notes above that names the home channel, and what replaces it where the
-# gateway has none to post to (no A2A_NOTIFY_PLATFORM on the conversation path).
+# What the chat relay posted, per audit job: session_kv_server.py's audit_report_runs, written when it posts
+# a fleet-audit job's report. `delivered` alone is not proof, because the relay plugin answers success for a
+# run whose last message is a silence marker the scheduler let through, and `failed` alone is not either,
+# because the plugin answers an error for a post that reached one platform and missed another.
+SESSION_KV_DB_ENV = "SESSION_KV_DB_PATH"
+DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
+# SQLite's CURRENT_TIMESTAMP, which is UTC.
+RELAY_POSTED_AT_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+# One ended run: (claimed_at, finished_at, delivery_outcome, status).
+AuditRun = tuple[float, float | None, str | None, str]
+
+# The sentence that names the home channel, and what replaces it where the gateway has none to post
+# to (no A2A_NOTIFY_PLATFORM on the conversation path).
 AUDITS_HOME_SENTENCE = "Each posts a summary to the home channel when it finds something new."
 AUDITS_NO_HOME_SENTENCE = (
     "Each one's summary goes to the home channel, and this install has none yet, so those summaries "
@@ -648,6 +687,7 @@ def _register_findings(data_dir: Path, in_sandbox: bool, no_ranking: bool | None
             return suppressed
         items = extracted[ITEMS_KEY]
         if not items:
+            _mark_registered(data_dir)
             return suppressed  # a clean fleet: nothing to register, and no scores file
         raw_scores = _read_json_beside(data_dir, in_sandbox, SCORES_NAME)
         if raw_scores is None:
@@ -660,12 +700,14 @@ def _register_findings(data_dir: Path, in_sandbox: bool, no_ranking: bool | None
         sys.stderr.write(f"bootstrap_delivery: could not read the sweep's findings; registering nothing: {detail}\n")
         return suppressed
     endpoint = _findings_endpoint()
+    refused = 0
     for where, batch, scope in batches:
         try:
             result = inventory_findings.post_batch(endpoint, batch, scope)
         except urllib.error.HTTPError as e:
             # This cluster only.
             sys.stderr.write(f"bootstrap_delivery: the findings queue refused {where}'s findings: {e.code}\n")
+            refused += 1
             continue
         except Exception as e:
             sys.stderr.write(
@@ -677,7 +719,18 @@ def _register_findings(data_dir: Path, in_sandbox: bool, no_ranking: bool | None
         for entry in outcomes if isinstance(outcomes, list) else []:
             if isinstance(entry, dict) and entry.get("outcome") == SUPPRESSED:
                 suppressed.add(str(entry.get("id")))
+    # A refused batch is a cluster the queue does not hold, so the fleet is not checked yet.
+    if not refused:
+        _mark_registered(data_dir)
     return suppressed
+
+
+def _mark_registered(data_dir: Path) -> None:
+    """Record that the sweep's findings reached the queue; best effort, never raises."""
+    try:
+        (data_dir / FINDINGS_REGISTERED_MARKER).touch(exist_ok=True)
+    except OSError as e:
+        sys.stderr.write(f"bootstrap_delivery: could not touch {FINDINGS_REGISTERED_MARKER}: {e}\n")
 
 
 def _post_surfaced(endpoint: str, finding_id: str, body: dict) -> None:
@@ -841,30 +894,103 @@ def _skip_follows_this_sweep(data_dir: Path, state: dict) -> bool:
     A sweep filed after the skip (onboarding repeated with the stage's marker kept) ran on a later
     build, whose scan leaves the workload checks to the audits whatever the old skip said.
     """
-    filed = bootstrap_handoff.read_scan_marker(data_dir / oobe.SCAN_FILED_MARKER)
     try:
+        filed = oobe.scan_filed(data_dir)
         skipped_at = float(state.get(oobe.STATE_AT))
-    except (TypeError, ValueError):
+    except (OSError, TypeError, ValueError):
+        # Also a marker whose bytes do not decode: the not-covered caveat is the safe one.
         return False
     return filed is not None and skipped_at >= filed[1]
 
 
 def _audits_note(data_dir: Path, no_coverage: bool, home: bool = True) -> str:
-    """The note on the first-run audits, saying where their summaries go only when ``home``.
+    """The note on the fleet audits the delivery closes with.
 
-    With no home channel and a list of unposted summaries already in the note,
-    the home sentence is dropped rather than replaced, so "not posted" is said once.
+    In order: what the stage did (``_stage_sentences``); the audits whose summaries ran but were not
+    posted, each fleet audit whatever path its run took, or why that cannot be told; then where later
+    summaries go. ``home`` false is a gateway with no home channel to post to, which every path says.
+    With one, the home sentence is left out beside a list of unposted summaries, which it would contradict.
+    ``no_coverage`` is a report no cluster's audit reached (``_no_ranking``), which covers nothing.
     """
-    note = _audits_state_note(data_dir, no_coverage)
-    if home:
-        return note
-    replacement = "" if AUDITS_UNDELIVERED_NOTE.split("{audits}")[0] in note else " " + AUDITS_NO_HOME_SENTENCE
-    return note.replace(" " + AUDITS_HOME_SENTENCE, replacement)
+    state = oobe.read_state(data_dir)
+    stage, later_posts = _stage_sentences(data_dir, state, no_coverage)
+    sentences = [stage]
+    try:
+        lost = _lost_sentences(data_dir, state)
+    except Exception as e:  # noqa: BLE001 - the stage sentence, and its coverage caveat, still go out
+        _stage_note(data_dir, f"the audits note could not tell which summaries were posted: {e!r}")
+        lost = [AUDITS_UNREAD_NOTE.format(request=_request(_checked_audits()))]
+    sentences += lost
+    later_posts = later_posts and not lost
+    if not home:
+        sentences.append(AUDITS_NO_HOME_SENTENCE)
+    elif later_posts:
+        sentences.append(AUDITS_HOME_SENTENCE)
+    return " ".join(sentences)
+
+
+def _lost_sentences(data_dir: Path, state: dict) -> list[str]:
+    """The sentences on runs whose summaries or failure notices were not posted, or that this cannot be told."""
+    audits = _checked_audits()
+    runs = _audit_runs(data_dir, audits)
+    if runs is None:
+        return [AUDITS_UNREAD_NOTE.format(request=_request(audits))]
+    lost = _lost_audits(audits, runs, _windows(data_dir, state, audits), _relay_posts(data_dir))
+    summaries = [a for a, crashed in lost if not crashed]
+    failed = [a for a, crashed in lost if crashed]
+    sentences = []
+    if summaries:
+        labels = ", ".join(_audit_label(a) for a in summaries)
+        sentences.append(AUDITS_LOST_NOTE.format(labels=labels, request=_request(summaries)))
+    if failed:
+        sentences.append(AUDITS_FAILED_RUNS_NOTE.format(labels=", ".join(_audit_label(a) for a in failed)))
+    return sentences
+
+
+def _safe_audits_note(data_dir: Path, no_coverage: bool, home: bool) -> str:
+    """``_audits_note``, or on any error the unreadable-records note: delivery calls no stage under oobe's guard."""
+    try:
+        return _audits_note(data_dir, no_coverage, home)
+    except Exception as e:  # noqa: BLE001 - a raise here would hold the report back on every tick
+        _stage_note(data_dir, f"the audits note failed, so it says the run records could not be read: {e!r}")
+        note = AUDITS_UNREAD_NOTE.format(request=_request(_checked_audits()))
+        return note if home else f"{note} {AUDITS_NO_HOME_SENTENCE}"
+
+
+def _stage_sentences(data_dir: Path, state: dict, no_coverage: bool) -> tuple[str, bool]:
+    """What oobe's marker says the stage did, and whether audits it started or will start are still to report.
+
+    Before the marker exists the stage has not decided, and the sentence is the chain's.
+    """
+    if state.get(oobe.STATE_SKIPPED):
+        reason = str(state.get(oobe.STATE_REASON) or AUDITS_NO_REASON)
+        if no_coverage:
+            coverage = AUDITS_UNCHECKED_SCHEDULED_NOTE
+        elif reason == LEGACY_NO_REPOSITORY_REASON and _skip_follows_this_sweep(data_dir, state):
+            coverage = AUDITS_COVERED_NOTE
+        else:
+            coverage = AUDITS_NOT_COVERED_NOTE
+        return f"{AUDITS_SKIPPED_NOTE.format(reason=reason)} {coverage}", False
+    fired = [a for a in oobe.FIRST_RUN_AUDITS if a in _list(state.get(oobe.STATE_FIRED))]
+    held = state.get(oobe.STATE_HELD) if isinstance(state.get(oobe.STATE_HELD), dict) else {}
+    gave_up = _list(state.get(oobe.STATE_GAVE_UP))
+    reasons = {a: held[a] for a in oobe.FIRST_RUN_AUDITS if a in held}
+    reasons.update({a: AUDITS_GAVE_UP_REASON for a in oobe.FIRST_RUN_AUDITS if a in gave_up and a not in reasons})
+    not_started = [AUDITS_NOT_STARTED_ITEM.format(area=_area(a), reason=reasons[a]) for a in _in_area_order(list(reasons))]
+    if not state.get(oobe.STATE_DONE):
+        note, later_posts = AUDITS_RUNNING_NOTE, True
+    elif fired:
+        note, later_posts = AUDITS_STARTED_NOTE.format(audits=_areas(fired)), True
+    else:
+        note, later_posts = AUDITS_NONE_STARTED_NOTE, False
+    if not_started:
+        note = f"{note} {AUDITS_NOT_STARTED_NOTE.format(audits=', '.join(not_started))}"
+    return note, later_posts
 
 
 def _area(audit: str) -> str:
     """What ``audit`` reports on, or its job id for an audit with no area."""
-    return inventory_findings.AUDIT_FAMILIES.get(audit) or f"`{audit}`"
+    return inventory_findings.AUDIT_FAMILIES.get(audit) or AUDIT_AREA_EXTRA.get(audit) or _audit_label(audit)
 
 
 def _in_area_order(audits: list[str]) -> list[str]:
@@ -880,66 +1006,58 @@ def _areas(audits: list[str]) -> str:
     return AUDITS_AREAS.format(areas=joined, audits=AUDITS_WORD[len(words) != 1])
 
 
-def _audits_state_note(data_dir: Path, no_coverage: bool) -> str:
-    """The note on the first-run audits the delivery closes with, from oobe's marker.
+def _checked_audits() -> tuple[str, ...]:
+    """Every fleet audit whose lost summary the note names: the first-run audits in chain order, then the rest.
 
-    Before the marker exists the stage has not decided, and the note is the chain's. ``no_coverage``
-    is a report no cluster's audit reached (``_no_ranking``), which covers nothing.
+    Built when called, not at import: ``oobe`` imports this module, so its tuples are not defined yet
+    when ``oobe`` is imported first.
     """
-    state = oobe.read_state(data_dir)
-    if state.get(oobe.STATE_SKIPPED):
-        reason = str(state.get(oobe.STATE_REASON) or AUDITS_NO_REASON)
-        if no_coverage:
-            coverage = AUDITS_UNCHECKED_SCHEDULED_NOTE
-        elif reason == LEGACY_NO_REPOSITORY_REASON and _skip_follows_this_sweep(data_dir, state):
-            coverage = AUDITS_COVERED_NOTE
-        else:
-            coverage = AUDITS_NOT_COVERED_NOTE
-        return f"{AUDITS_SKIPPED_NOTE.format(reason=reason)} {coverage}"
-    fired = [a for a in oobe.FIRST_RUN_AUDITS if a in _list(state.get(oobe.STATE_FIRED))]
-    held = state.get(oobe.STATE_HELD) if isinstance(state.get(oobe.STATE_HELD), dict) else {}
-    gave_up = _list(state.get(oobe.STATE_GAVE_UP))
-    reasons = {a: held[a] for a in oobe.FIRST_RUN_AUDITS if a in held}
-    reasons.update({a: AUDITS_GAVE_UP_REASON for a in oobe.FIRST_RUN_AUDITS if a in gave_up and a not in reasons})
-    not_run = [AUDITS_NOT_RUN_ITEM.format(area=_area(a), reason=reasons[a]) for a in _in_area_order(list(reasons))]
-    runs = _completed_runs(data_dir, fired)
+    first = tuple(oobe.FIRST_RUN_AUDITS)
+    return first + tuple(a for a in OTHER_FLEET_AUDITS if a not in first)
+
+
+def _audit_label(audit: str) -> str:
+    return f"`{audit}`"
+
+
+def _request(audits: list[str] | tuple[str, ...]) -> str:
+    """The message that fetches ``audits``' latest reports, in their order."""
+    return AUDITS_REQUEST_FORMAT.format(ids=", ".join(audits))
+
+
+def _windows(data_dir: Path, state: dict, audits: tuple[str, ...]) -> dict[str, float]:
+    """``audit -> time``: a run that ended before it is not one this onboarding owes the user.
+
+    The sweep's filing, or for an audit the stage marked its mark, whichever is later. A mark that is
+    not a number reads as no mark, and a sweep marker that cannot be read as none: this runs before
+    the claim, and a raise here would hold the report back on every tick.
+    """
+    try:
+        filed = oobe.scan_filed(data_dir)
+    except (OSError, ValueError) as e:
+        _stage_note(data_dir, f"cannot read the sweep marker, so the audits note reads every run: {e}")
+        filed = None
+    since = filed[1] if filed is not None else 0
     marks = state.get(oobe.STATE_MARKS) if isinstance(state.get(oobe.STATE_MARKS), dict) else {}
-    # A mark that is not a number reads as no mark: this runs after the claim, and a raise here
-    # would lose the report.
-    since = {a: m if isinstance(m, (int, float)) else 0 for a, m in marks.items()}
-    # Judged by when the run ended: a scheduled run already going when the stage marked the audit
-    # is the stage's answer, though it was claimed before the mark.
-    finished = [
-        a for a in fired if any((ended or claimed) >= since.get(a, 0) for claimed, ended, _ in runs.get(a, ()))
-    ]
-    if not state.get(oobe.STATE_DONE):
-        note = AUDITS_RUNNING_NOTE
-    elif fired and finished == fired:
-        note = AUDITS_FINISHED_NOTE.format(audits=_areas(fired), have=AUDITS_HAVE[len(fired) != 1])
-    elif fired:
-        note = AUDITS_RAN_NOTE.format(audits=_areas(fired), have=AUDITS_HAVE[len(fired) != 1])
-    else:
-        note = AUDITS_NONE_RAN_NOTE
-    if not_run:
-        note = f"{note} {AUDITS_NOT_RUN_NOTE.format(audits=', '.join(not_run))}"
-    undelivered = _undelivered_audits(finished, runs)
-    return f"{note} {AUDITS_UNDELIVERED_NOTE.format(audits=', '.join(undelivered))}" if undelivered else note
+    fired = _list(state.get(oobe.STATE_FIRED))
+    windows = {}
+    for audit in audits:
+        mark = marks.get(audit) if audit in fired else None
+        windows[audit] = max(since, mark) if isinstance(mark, (int, float)) else since
+    return windows
 
 
-def _completed_runs(data_dir: Path, jobs: list[str]) -> dict[str, list[tuple[float, float | None, str | None]]]:
-    """``job -> [(claimed_at, finished_at, delivery_outcome), ...]`` for the completed runs of ``jobs``, oldest first.
+def _audit_runs(data_dir: Path, jobs: tuple[str, ...]) -> dict[str, list[AuditRun]] | None:
+    """``job -> [(claimed_at, finished_at, delivery_outcome, status), ...]``: the ended runs of ``jobs``, oldest first.
 
-    Empty when the Platform Agent's cron store cannot be read: the note then says what it said
-    before, rather than holding the report back, and the stage log says why (Hermes drops this
-    run's stderr when it exits 0).
+    Completed runs carry a summary, failed ones the scheduler's failure notice. Empty before the
+    Platform Agent's cron store exists; None when it cannot be read, and the stage log says why
+    (Hermes drops this run's stderr when it exits 0).
     """
     ledger = data_dir / oobe.PROFILES_DIR / oobe.PLATFORM_PROFILE / oobe.CRON_DIR / oobe.EXECUTIONS_DB
-    if not jobs:
-        return {}
     if not ledger.is_file():
-        _stage_note(data_dir, f"no {ledger}, so the audits note names no unposted summary")
         return {}
-    placeholders = ",".join("?" * len(jobs))
+    statuses = (oobe.COMPLETED_STATUS, RUN_FAILED_STATUS)
     try:
         conn = sqlite3.connect(
             f"file:{ledger}?mode=ro", uri=True, timeout=bootstrap_handoff.SQLITE_BUSY_TIMEOUT_SECONDS
@@ -954,17 +1072,18 @@ def _completed_runs(data_dir: Path, jobs: list[str]) -> dict[str, list[tuple[flo
             outcome = DELIVERY_OUTCOME_COLUMN if DELIVERY_OUTCOME_COLUMN in columns else "NULL"
             finished = oobe.FINISHED_AT_COLUMN if oobe.FINISHED_AT_COLUMN in columns else "NULL"
             rows = conn.execute(
-                f"SELECT job_id, claimed_at, {finished}, {outcome} FROM executions "
-                f"WHERE job_id IN ({placeholders}) AND status = ? ORDER BY claimed_at",
-                (*jobs, oobe.COMPLETED_STATUS),
+                f"SELECT job_id, claimed_at, {finished}, {outcome}, status FROM executions "
+                f"WHERE job_id IN ({','.join('?' * len(jobs))}) AND status IN ({','.join('?' * len(statuses))}) "
+                "ORDER BY claimed_at",
+                (*jobs, *statuses),
             ).fetchall()
         finally:
             conn.close()
     except sqlite3.Error as e:
-        _stage_note(data_dir, f"cannot read {ledger}, so the audits note names no unposted summary: {e}")
-        return {}
-    runs: dict[str, list[tuple[float, float | None, str | None]]] = {}
-    for job_id, claimed, finished_at, delivery in rows:
+        _stage_note(data_dir, f"cannot read {ledger}, so the audits note cannot say which summaries were posted: {e}")
+        return None
+    runs: dict[str, list[AuditRun]] = {}
+    for job_id, claimed, finished_at, delivery, status in rows:
         try:
             claimed_at = datetime.fromisoformat(claimed).timestamp()
         except (TypeError, ValueError):
@@ -973,26 +1092,86 @@ def _completed_runs(data_dir: Path, jobs: list[str]) -> dict[str, list[tuple[flo
             ended = datetime.fromisoformat(finished_at).timestamp()
         except (TypeError, ValueError):
             ended = None
-        runs.setdefault(job_id, []).append((claimed_at, ended, delivery))
+        runs.setdefault(job_id, []).append((claimed_at, ended, delivery, status))
     return runs
 
 
-def _undelivered_audits(audits: list[str], runs: dict[str, list[tuple[float, float | None, str | None]]]) -> list[str]:
-    """The audits whose latest run that tried to post its summary failed, or recorded an unknown outcome.
+def _relay_posts(data_dir: Path) -> dict[str, float] | None:
+    """``job -> when the chat relay last posted for it``.
+
+    From session-kv's database; None when unreadable, which leaves each run's delivery outcome to
+    decide alone, and the stage log says why.
+    """
+    db = Path(os.environ.get(SESSION_KV_DB_ENV) or DEFAULT_SESSION_KV_DB_PATH)
+    if not db.is_file():
+        _stage_note(data_dir, f"no {db}, so the audits note takes each run's delivery outcome as it is")
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=bootstrap_handoff.SQLITE_BUSY_TIMEOUT_SECONDS)
+        try:
+            rows = conn.execute(
+                "SELECT job_id, posted_at FROM audit_report_runs WHERE profile = ?", (oobe.PLATFORM_PROFILE,)
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        _stage_note(data_dir, f"cannot read {db}, so the audits note takes each run's delivery outcome as it is: {e}")
+        return None
+    posts = {}
+    for job_id, posted_at in rows:
+        try:
+            posted = datetime.strptime(posted_at, RELAY_POSTED_AT_FORMAT).replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            continue
+        posts[job_id] = posted.timestamp()
+    return posts
+
+
+def _lost_audits(audits: tuple[str, ...], runs: dict[str, list[AuditRun]], windows: dict[str, float],
+                 posts: dict[str, float] | None) -> list[tuple[str, bool]]:
+    """``(audit, its run failed)`` for each audit whose newest run in its window with something to post did not post it.
 
     A run that ends before anyone has opened the chat finds no home channel, the relay refuses
-    it, and nothing posts it later; this delivery is the first message that user reads. Any other
-    failed delivery is listed too, since its summary is just as missing. A later run that posted
-    nothing on purpose (a silent run: suppressed, or no outcome recorded) does not stand in for
-    the lost one.
+    it, and nothing posts it later; this delivery is the first message that user reads. Runs are
+    judged newest first. A silent one is passed over, so it does not stand in for a lost one. A relay
+    post at or after a run's claim settles it as posted, whatever its outcome says. Lost otherwise
+    means a ``failed`` outcome or one the table does not know. A run the scheduler counts as delivered
+    that the relay has no post for posted nothing, and is passed over too; with no relay record to ask,
+    its outcome stands. A run that crashed wrote no report, so it does not stand in for an earlier run
+    whose report is in the store: the audit is named for both. Its posted failure notice replaces the
+    relay's one row per job, so the post is read as the crashed run's, and nothing left in the row says
+    whether an earlier run posted: the walk goes on, and each earlier run is judged by its outcome.
+    Where that names a summary that did post, the user asks one question instead of missing a report.
     """
-    out = []
+    lost = []
     for audit in audits:
-        classes = [DELIVERY_OUTCOME_CLASS.get(run[2], OUTCOME_LOST) for run in runs.get(audit, ())]
-        tried = [c for c in classes if c != OUTCOME_SILENT]
-        if tried and tried[-1] == OUTCOME_LOST:
-            out.append(f"`{audit}`")
-    return out
+        since = windows.get(audit, 0)
+        posted = posts.get(audit) if posts is not None else None
+        crashed = False
+        for claimed, ended, outcome, status in reversed(runs.get(audit, ())):
+            if (ended if ended is not None else claimed) < since:
+                break
+            kind = DELIVERY_OUTCOME_CLASS.get(outcome, OUTCOME_LOST)
+            if kind == OUTCOME_SILENT:
+                continue
+            if posted is not None and posted >= claimed:
+                # The relay keeps one row per job, so the post is this run's; a posted failure notice is
+                # not an earlier run's report.
+                if status != RUN_FAILED_STATUS:
+                    break
+                posted = None
+                continue
+            if kind == OUTCOME_LOST and status == RUN_FAILED_STATUS:
+                if not crashed:
+                    lost.append((audit, True))
+                crashed = True
+                continue
+            if kind == OUTCOME_LOST:
+                lost.append((audit, False))
+                break
+            if posts is None and status != RUN_FAILED_STATUS:
+                break
+    return lost
 
 
 def _stage_note(data_dir: Path, message: str) -> None:
@@ -1208,14 +1387,13 @@ def _record_outcome(data_dir: Path, outcome: str) -> None:
 
 
 def _deliver_to_conversation(data_dir: Path, in_sandbox: bool, conversation: dict, content: str,
-                             no_ranking: bool | None, suppressed: set[str]) -> None:
+                             note: str, suppressed: set[str]) -> None:
     """After the claim: post into the conversation, and release the claim unless the report is out.
 
     The findings are marked shown only once the claim is kept (posted, or on
     the text path most likely posted), so a released claim leaves none counted
     against the day's limit.
     """
-    note = _audits_note(data_dir, no_ranking is True, home=bool(chat_notify.routed_platform()))
     outcome, reason, shown = _post_to_conversation(
         data_dir, conversation, content, note, lambda: _mark_shown(data_dir, in_sandbox, suppressed)
     )
@@ -1289,6 +1467,9 @@ def main(data_dir: Path | None = None) -> int:
     # the marks below are sent.
     no_ranking = _no_ranking(data_dir)
     suppressed = _register_findings(data_dir, in_sandbox, no_ranking)
+    # Also before the claim, so its reads cannot cost the report once the claim is taken.
+    home = bool(chat_notify.routed_platform()) if conversation is not None else True
+    note = _safe_audits_note(data_dir, no_ranking is True, home)
 
     # The cheap check above is advisory; this is the decision. Nothing may be
     # written to stdout before it succeeds.
@@ -1296,14 +1477,13 @@ def main(data_dir: Path | None = None) -> int:
         return 0  # another run is delivering this report — stay silent
 
     if conversation is not None:
-        _deliver_to_conversation(data_dir, in_sandbox, conversation, content, no_ranking, suppressed)
+        _deliver_to_conversation(data_dir, in_sandbox, conversation, content, note, suppressed)
         return 0
 
     # Right after the claim, which ends the nudge's hold, so a nudge run has
     # the shortest window in which to announce these findings as new.
     shown = _mark_shown(data_dir, in_sandbox, suppressed)
 
-    note = _audits_note(data_dir, no_ranking is True)
     if _posted_as_blocks(content):
         sys.stdout.write(note + "\n")
     else:

@@ -37,7 +37,7 @@ turns them into behaviour.
 
 The routes are stateless to their callers. There is no handle, no answer depends
 on an earlier request, and two concurrent requests share nothing but the lock the
-HTTP layer holds and the merged-proposal count's own, which guards a metric and
+HTTP layer holds and the proposal-outcome counts' own, which guards two metrics and
 never an answer.
 
 This file names no forge, and a test enforces that. Everything a forge decides
@@ -86,6 +86,7 @@ from providers import (
     short_branch,
     tls_refusal as tls_refusal_default,
     validate_branch,
+    validate_number,
     validate_revision,
 )
 from workspace_paths import WorkspaceError
@@ -137,6 +138,14 @@ AGENT_BRANCH_PREFIX = "platform-agent/"
 # (`providers/*/translate.py` maps every forge's spelling to it), and the
 # spelling of UTC `datetime.fromisoformat` did not accept before Python 3.11.
 MERGED_PROPOSAL_STATE = "merged"
+# The neutral state for a proposal closed without a merge, the same adapters'
+# spelling; the broker counts it apart from a merge.
+CLOSED_PROPOSAL_STATE = "closed"
+# A forge answer below this status is the forge's own refusal (401, 403, 404,
+# 409, 422, 429: providers/errors.py keeps those as they are), so the write was
+# not applied; at or above it the answer was lost or unreadable and the write
+# may have been (502, 503 there), which is what the own-close mark is for.
+FORGE_REFUSAL_STATUS_CEILING = 500
 ISO_UTC_SUFFIX = "Z"
 ISO_UTC_OFFSET = "+00:00"
 
@@ -353,8 +362,8 @@ class VcsBroker:
     request, which is what makes these routes stateless to their callers: there
     is no handle to leak, no tree to collide with another caller's, and no
     cleanup an interrupted client can skip. What the process keeps across
-    requests is the merged-proposal count's seen set and the identity cache
-    beside it (`_count_merges`), which no answer depends on.
+    requests is the proposal-outcome counts' seen sets and the identity cache
+    beside it (`_count_outcomes`), which no answer depends on.
     """
 
     def __init__(
@@ -371,6 +380,7 @@ class VcsBroker:
         pinned_bases: Mapping[tuple[str, str], str] | None = None,
         tls_refusal: Callable[[str], WorkspaceError | None] | None = None,
         merge_observer: Callable[[int], None] | None = None,
+        close_observer: Callable[[int], None] | None = None,
         started_at: float | None = None,
         mint_write: Callable[[str, str], str] | None = None,
         drop_write: Callable[[str], None] | None = None,
@@ -381,14 +391,17 @@ class VcsBroker:
         # raising it. The broker hands its own, which names a forge's CA
         # Secret; without one, the shared reading names the cause alone.
         self._tls_refusal = tls_refusal or tls_refusal_default
-        # The merged-proposal count (`_count_merges`): called with how many
-        # proposals of this install's own a read just showed merged for the
+        # The proposal-outcome counts (`_count_outcomes`): each observer is
+        # called with how many proposals of this install's own a read just
+        # showed in its outcome, merged or closed without a merge, for the
         # first time in this process. None counts nothing. `started_at` is the
-        # process start the count is bounded by, so a restart counts no merge
-        # the previous process could have counted.
+        # process start the counts are bounded by, so a restart counts no
+        # outcome the previous process could have counted.
         self.merge_observer = merge_observer
+        self.close_observer = close_observer
         self.started_at = time.time() if started_at is None else started_at
         self._merged_seen: set[tuple[str, str, Any]] = set()
+        self._closed_seen: set[tuple[str, str, Any]] = set()
         self._merged_lock = threading.Lock()
         # The credential's login per (forge, repository), asked once per process
         # and only when a merge could count: the lookup is a forge call. A
@@ -470,6 +483,7 @@ class VcsBroker:
                 outer_deadline=self._request_deadline,
                 ca_file=forge.ca_file,
                 ca_source=forge.ca_source,
+                allow_http=(forge.scheme == "http"),
             )
         raise ForgeUnsupported(
             f"{forge.name} declares the {forge.transport!r} transport, which "
@@ -495,8 +509,12 @@ class VcsBroker:
         # Read per invocation, not at bind time: a minted credential holds no
         # token until the verb's `ensure` has run, and a token minted later
         # than the bind is the one git must present.
+        allow_http = forge.scheme == "http"
+
         def run(cwd: Path, *args: str, check: bool = True):
             config = tuple(forge.credential.git_config(repo))
+            if allow_http:
+                return self._git_runner(["git", *args], cwd, check, config, allow_http=True)
             return self._git_runner(["git", *args], cwd, check, config)
 
         return run
@@ -1539,68 +1557,92 @@ class VcsBroker:
         return self._forge_verb("proposal-create", payload, pinned_target=True)
 
     def proposal_list(self, payload):
-        return self._forge_verb("proposal-list", payload, observe=self._observe_merged_list)
+        return self._forge_verb("proposal-list", payload, observe=self._observe_outcomes_list)
 
     def proposal_view(self, payload):
-        return self._forge_verb("proposal-view", payload, observe=self._observe_merged_view)
+        return self._forge_verb("proposal-view", payload, observe=self._observe_outcomes_view)
 
-    # -- the merged-proposal count -----------------------------------------
+    # -- the proposal-outcome counts ---------------------------------------
     #
-    # The agent never merges: a merge is a person's act on the forge, and the
-    # broker learns of it only when a later read shows the proposal in the
-    # merged state. The count therefore rides on the reads the agent already
-    # makes of its proposals, under three rules that keep it from counting a
-    # merge twice without a store: the proposal is this install's own (its
-    # author is the credential's login), it merged no earlier than this process
-    # started (a merge before that was the previous process's to count, or is
-    # lost with it), and each proposal is counted once per process. A merge
-    # this process never reads is not counted: the count under-counts rather
-    # than over-counts, like the operator's totals it feeds.
+    # The agent never merges, and closes only through `proposal-close` here,
+    # which is marked seen; any other merge or close is a person's, a forge
+    # rule's or a bot's act on the forge, and the broker learns of it only
+    # when a later read shows the proposal in that state. The counts therefore ride on the reads the agent
+    # already makes of its proposals, under three rules that keep them from
+    # counting an outcome twice without a store: the proposal is this
+    # install's own (its author is the credential's login), it reached the
+    # outcome no earlier than this process started (one before that was the
+    # previous process's to count, or is lost with it), and each proposal is
+    # counted once per outcome per process. An outcome this process never
+    # reads is not counted: the counts under-count rather than over-count,
+    # like the operator's totals they feed. A proposal closed, reopened and
+    # merged counts once in each.
 
-    def _observe_merged_list(self, bound: Binding, result: dict[str, Any]) -> None:
+    def _observe_outcomes_list(self, bound: Binding, result: dict[str, Any]) -> None:
         proposals = result.get("proposals")
-        self._count_merges(bound, proposals if isinstance(proposals, list) else [])
+        self._count_outcomes(bound, proposals if isinstance(proposals, list) else [])
 
-    def _observe_merged_view(self, bound: Binding, result: dict[str, Any]) -> None:
+    def _observe_outcomes_view(self, bound: Binding, result: dict[str, Any]) -> None:
         proposal = result.get("proposal")
-        self._count_merges(bound, [proposal] if isinstance(proposal, dict) else [])
+        self._count_outcomes(bound, [proposal] if isinstance(proposal, dict) else [])
 
-    def _count_merges(self, bound: Binding, proposals: list) -> None:
-        if self.merge_observer is None:
+    def _note_own_close(self, bound: Binding, result: dict[str, Any], number: Any) -> None:
+        """Mark a proposal as closed by this broker, so no read counts it."""
+        proposal = result.get("proposal") if isinstance(result, dict) else None
+        if isinstance(proposal, dict) and proposal.get("number") is not None:
+            number = proposal.get("number")
+        if number is None:
             return
+        with self._merged_lock:
+            self._closed_seen.add(self._merged_key(bound, number))
+
+    def _count_outcomes(self, bound: Binding, proposals: list) -> None:
         try:
-            # The free rules first -- merged, not before this process started,
-            # not already counted -- so the identity lookup, a forge call, runs
-            # only when something could count, and never for a history of old
-            # merges a `state=all` listing carries on every read.
-            with self._merged_lock:
-                candidates = [
-                    p for p in proposals
-                    if isinstance(p, dict)
-                    and p.get("state") == MERGED_PROPOSAL_STATE
-                    and (closed := _iso_timestamp(p.get("closed"))) is not None
-                    and closed >= self.started_at
-                    and self._merged_key(bound, p.get("number")) not in self._merged_seen
-                ]
-            if not candidates:
-                return
-            viewer = self._merged_viewer_for(bound)
-            if not viewer:
-                return
-            count = 0
-            with self._merged_lock:
-                for proposal in candidates:
-                    if _login_key(str(proposal.get("author") or "")) != _login_key(viewer):
-                        continue
-                    key = self._merged_key(bound, proposal.get("number"))
-                    if key in self._merged_seen:
-                        continue
-                    self._merged_seen.add(key)
-                    count += 1
-            if count:
-                self.merge_observer(count)
+            self._count_outcome(bound, proposals, MERGED_PROPOSAL_STATE, self.merge_observer, self._merged_seen)
+            self._count_outcome(bound, proposals, CLOSED_PROPOSAL_STATE, self.close_observer, self._closed_seen)
         except Exception as exc:  # noqa: BLE001 -- the count never fails the read
-            LOGGER.debug("merged-proposal count skipped type=%s", type(exc).__name__)
+            LOGGER.debug("proposal-outcome count skipped type=%s", type(exc).__name__)
+
+    def _count_outcome(
+        self,
+        bound: Binding,
+        proposals: list,
+        state: str,
+        observer: Callable[[int], None] | None,
+        seen: set[tuple[str, str, Any]],
+    ) -> None:
+        if observer is None:
+            return
+        # The free rules first -- in the state, not before this process
+        # started, not already counted -- so the identity lookup, a forge call,
+        # runs only when something could count, and never for a history of old
+        # outcomes a `state=all` listing carries on every read.
+        with self._merged_lock:
+            candidates = [
+                p for p in proposals
+                if isinstance(p, dict)
+                and p.get("state") == state
+                and (closed := _iso_timestamp(p.get("closed"))) is not None
+                and closed >= self.started_at
+                and self._merged_key(bound, p.get("number")) not in seen
+            ]
+        if not candidates:
+            return
+        viewer = self._merged_viewer_for(bound)
+        if not viewer:
+            return
+        count = 0
+        with self._merged_lock:
+            for proposal in candidates:
+                if _login_key(str(proposal.get("author") or "")) != _login_key(viewer):
+                    continue
+                key = self._merged_key(bound, proposal.get("number"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                count += 1
+        if count:
+            observer(count)
 
     @staticmethod
     def _merged_scope(forge: Forge) -> str:
@@ -1621,13 +1663,14 @@ class VcsBroker:
         return (cls._merged_scope(bound.forge), bound.repo.casefold(), number)
 
     def _merged_viewer_for(self, bound: Binding) -> str:
-        """The credential's login for the count, remembered per repository,
+        """The credential's login for the outcome counts, remembered per repository,
         keyed the way the seen set is: the login is the credential's, not the
         spelling's.
 
         "" is a real answer, a credential that cannot name itself, and is
         remembered too, with one INFO line per process so that a flat
-        `remediationsMergedTotal` on such an install is explained in the log;
+        `remediationsMergedTotal` and `remediationsClosedUnmergedTotal` on such
+        an install are explained in the log;
         a lookup that raises is left to the caller's guard and asked again next
         time.
         """
@@ -1643,7 +1686,7 @@ class VcsBroker:
                 self._merged_nameless_logged = True
         if announce:
             LOGGER.info(
-                "merged-proposal count is off for %s: the credential cannot name itself, "
+                "proposal-outcome counts are off for %s: the credential cannot name itself, "
                 "so no proposal can be told to be this install's own",
                 self._merged_scope(bound.forge),
             )
@@ -1675,7 +1718,31 @@ class VcsBroker:
         )
 
     def proposal_close(self, payload):
-        return self._forge_verb("proposal-close", payload)
+        # A close this route makes is the harness tidying up (the fleet audit
+        # closes its own stale remediation proposals here), not a person
+        # rejecting: it is marked seen before the forge call, because the
+        # forge applies the close before it answers, and an answer lost to a
+        # timeout or a reset would otherwise leave a close of the broker's own
+        # for a later read to count as a person's. A close the forge refused
+        # leaves the proposal open; if a person closes it later, that close is
+        # not counted, the under-counting direction every counter here takes.
+        # The number is validated here first, as the adapter would, so a number
+        # the forge never issued, or a bool that hashes like 1, leaves no mark.
+        number = validate_number(payload.get("number")) if isinstance(payload, dict) else None
+        bound = self._bind(payload) if number is not None else None
+        if bound is not None:
+            self._note_own_close(bound, {}, number)
+        try:
+            return self._forge_verb("proposal-close", payload)
+        except WorkspaceError as exc:
+            # The forge refused and applied nothing: the mark comes off, so a
+            # person's later close of this proposal counts. A lost answer (502,
+            # 503) keeps it: the forge may have applied the close.
+            status = getattr(exc, "status", None)
+            if bound is not None and isinstance(status, int) and status < FORGE_REFUSAL_STATUS_CEILING:
+                with self._merged_lock:
+                    self._closed_seen.discard(self._merged_key(bound, number))
+            raise
 
     def proposal_commits(self, payload):
         return self._forge_verb("proposal-commits", payload)

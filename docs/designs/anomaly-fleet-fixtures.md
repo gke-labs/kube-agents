@@ -4,8 +4,8 @@
 three zonal-skew fixtures — are in `bench/tf/fleet/` (catalogued in
 [`bench-fleet-catalog.md`](bench-fleet-catalog.md)); step 3's
 [`topology-zonal-skew-probe`](../../bench/tasks/topology-zonal-skew-probe/task.yaml) eval case is
-defined in `bench/tasks/` (`validated: false` pending live fleet red/green runs; see
-[`bench/tf/fleet/README.md`](../../bench/tf/fleet/README.md)); the rest is plan. It says what the seeded fleet
+defined in `bench/tasks/` and still `validated: false` (its red/green loop has not been run; see
+step 3 below); the rest is plan. It says what the seeded fleet
 must grow for the fleet anomaly-detection checks to be developed test-first, and which of those
 checks the fleet cannot serve at all.
 
@@ -155,10 +155,13 @@ gate is a case that fails for the environment rather than the agent.
    [`fleet-fixtures.yaml`](fleet-fixtures.yaml), and the fixture counts in
    [`bench-fleet-catalog.md`](bench-fleet-catalog.md).
 2. Done: the three zonal-skew fixtures on `seeded-d`, their roles, probes and catalogue entries.
-3. Case defined (`validated: false` pending live fleet red/green validation):
+3. Case defined, not yet run (`validated: false` until one red against `main` and three greens
+   on a dev install with the fleet applied, which the eval rule requires and which needs the
+   sandbox image that ships `leeway`):
    [`topology-zonal-skew-probe`](../../bench/tasks/topology-zonal-skew-probe/task.yaml),
-   asserting the agent names the zone, the cause (`scheduling`, `volume`, `capacity`) and the blast
-   radius for all three planted workloads on `seeded-d`.
+   asserting the agent names the zone, the cause (`scheduling`, `volume`, `capacity`, or
+   `node-pool` for the sponge pinned to a single-zone pool) and the running share for each of
+   the four single-zone workloads on slot `d`, and that it ran `leeway report` to get there.
 4. Tier 1 fixtures and their cases, one at a time, in the same red-then-green order.
 5. Tier 3 project fixtures last: they are the slowest to become assertable and the least
    informative about the checks' hard part, which is attribution.

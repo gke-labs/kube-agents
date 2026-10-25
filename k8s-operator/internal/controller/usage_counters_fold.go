@@ -60,15 +60,16 @@ const (
 
 	// The counters the document keeps, named for the status fields they
 	// project to, so the JSON reads beside the status.
-	usageCounterToolExecutions        = "toolExecutionsTotal"
-	usageCounterEventsIngested        = "eventsIngestedTotal"
-	usageCounterRemediationsProposed  = "remediationsProposedTotal"
-	usageCounterRemediationsMerged    = "remediationsMergedTotal"
-	usageCounterChatMessagesInbound   = "chatMessagesInboundTotal"
-	usageCounterBrokerFailures        = "brokerFailuresTotal"
-	usageCounterChatTurnsErrored      = "chatTurnsErroredTotal"
-	usageCounterBackgroundTasksGaveUp = "backgroundTasksGaveUpTotal"
-	usageCounterNegativeFeedback      = "negativeFeedbackTotal"
+	usageCounterToolExecutions             = "toolExecutionsTotal"
+	usageCounterEventsIngested             = "eventsIngestedTotal"
+	usageCounterRemediationsProposed       = "remediationsProposedTotal"
+	usageCounterRemediationsMerged         = "remediationsMergedTotal"
+	usageCounterChatMessagesInbound        = "chatMessagesInboundTotal"
+	usageCounterBrokerFailures             = "brokerFailuresTotal"
+	usageCounterChatTurnsErrored           = "chatTurnsErroredTotal"
+	usageCounterBackgroundTasksGaveUp      = "backgroundTasksGaveUpTotal"
+	usageCounterNegativeFeedback           = "negativeFeedbackTotal"
+	usageCounterRemediationsClosedUnmerged = "remediationsClosedUnmergedTotal"
 	// sessionsTotal is two document counters, because its halves aggregate
 	// differently (usageAggregationFor): the sessions the watcher opens for
 	// triage, read on every gateway replica over the same event stream, and
@@ -101,17 +102,18 @@ var (
 	// reaction hook alone counts; asking would seed an idle entry per A2A pod
 	// and name the field in that pod's Warning.
 	usageA2AChatCounters = []string{usageCounterChatMessagesInbound, usageCounterSessionsChat, usageCounterChatTurnsErrored}
-	usageBrokerCounters  = []string{usageCounterToolExecutions, usageCounterRemediationsProposed, usageCounterRemediationsMerged, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures}
+	usageBrokerCounters  = []string{usageCounterToolExecutions, usageCounterRemediationsProposed, usageCounterRemediationsMerged, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures, usageCounterRemediationsClosedUnmerged}
 	// usageCounters is every counter the document keeps and the status seeds.
-	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterRemediationsMerged, usageCounterChatMessagesInbound, usageCounterSessionsTriage, usageCounterSessionsChat, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures, usageCounterChatTurnsErrored, usageCounterBackgroundTasksGaveUp, usageCounterNegativeFeedback}
+	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterRemediationsMerged, usageCounterChatMessagesInbound, usageCounterSessionsTriage, usageCounterSessionsChat, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures, usageCounterChatTurnsErrored, usageCounterBackgroundTasksGaveUp, usageCounterNegativeFeedback, usageCounterRemediationsClosedUnmerged}
 	// usageQuietCounters are the counters whose advance is not activity and
 	// leaves LastMoved alone: the broker's failures, which a watcher retrying
 	// an unreachable fleet cluster through the relay produces every poll on
 	// an install nobody is using; the failed turns, each a failure whose
 	// message already moved the time; and a background card giving up, a
-	// failure, not the agent at work; and a thumbs-down, a person's verdict on a
-	// message that already moved it.
-	usageQuietCounters = map[string]bool{usageCounterBrokerFailures: true, usageCounterChatTurnsErrored: true, usageCounterBackgroundTasksGaveUp: true, usageCounterNegativeFeedback: true}
+	// failure, not the agent at work; a thumbs-down, a person's verdict on a
+	// message that already moved it; and the proposals closed without a merge,
+	// a person's, a rule's or a bot's act, not the agent's.
+	usageQuietCounters = map[string]bool{usageCounterBrokerFailures: true, usageCounterChatTurnsErrored: true, usageCounterBackgroundTasksGaveUp: true, usageCounterNegativeFeedback: true, usageCounterRemediationsClosedUnmerged: true}
 	// usageSessionsCounters is the pair that projects to usageStatusFieldSessions.
 	usageSessionsCounters = []string{usageCounterSessionsTriage, usageCounterSessionsChat}
 	// usageHumanCounters is the counter only a person moves: a chat message.

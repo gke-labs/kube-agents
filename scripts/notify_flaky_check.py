@@ -285,6 +285,7 @@ WORKFLOW_FILE = ".github/workflows/flaky-check-notify.yml"
 WATCHED_WORKFLOWS = (
     "A2A Module Tests",
     "Actionlint",
+    "CodeQL",
     "Conformance",
     "Docker Build",
     "Docs Build",

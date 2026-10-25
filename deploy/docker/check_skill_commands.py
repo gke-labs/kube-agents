@@ -158,18 +158,6 @@ KNOWN_FINDINGS: dict[tuple[str, str], tuple[frozenset[str], str]] = {
         "all of them change together",
     ),
     (
-        "agents/platform/skills/topology-drift/SKILL.md",
-        'PROJECT="$GKE_PROJECT_ID"   # CLUSTER and LOCATION come from the request\n'
-        'export KUBECONFIG="${HERMES_HOME:-/opt/data}/.kubeconfigs/'
-        'kubeconfig_${PROJECT}_${CLUSTER}_${LOCATION}.yaml"\n'
-        'gcloud container clusters get-credentials "$CLUSTER" --location="$LOCATION"'
-        ' --project="$PROJECT" --quiet',
-    ): (
-        frozenset({"sensitive_env_export"}),
-        "per-target kubeconfig export required by agents/platform/AGENTS.md before running "
-        "leeway report or kubectl against a target cluster",
-    ),
-    (
         "agents/platform/skills/gke-app-onboarding/SKILL.md",
         "# Configure Docker for Artifact Registry\n"
         "gcloud auth configure-docker <REGION>-docker.pkg.dev --quiet\n"

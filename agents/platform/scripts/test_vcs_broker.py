@@ -70,13 +70,14 @@ def git(cwd: Path | str, *args: str, check: bool = True):
     )
 
 
-def git_runner(argv, cwd, check=True, config=()):
+def git_runner(argv, cwd, check=True, config=(), *, allow_http=False):
     """The shape the broker's git runner presents.
 
     `config` is what the forge's credential asked for on this invocation. The
     executor turns it into a `GIT_CONFIG_COUNT` layer; here it becomes `-c`
     flags, which is the same precedence and is visible to an assertion.
     """
+    del allow_http
     flags = [flag for key, value in config for flag in ("-c", f"{key}={value}")]
     return subprocess.run(
         [argv[0], *flags, *argv[1:]],
@@ -537,11 +538,19 @@ class HostResolutionTest(unittest.TestCase):
 class MergedListingForge(LocalForge):
     """A forge that answers `proposal-list` and `proposal-view` out of a set the test holds."""
 
-    verbs = ("proposal-list", "proposal-view")
+    verbs = ("proposal-list", "proposal-view", "proposal-close")
 
     def __init__(self, root, proposals):
         super().__init__(root, [])
         self.proposals = list(proposals)
+
+    def proposal_close(self, api, repo, payload):
+        for p in self.proposals:
+            if p["number"] == payload.get("number"):
+                p["state"] = "closed"
+                p["closed"] = p.get("closed") or "2027-01-15T09:30:00Z"
+                return {"proposal": dict(p)}
+        raise WorkspaceError("no such proposal", status=404)
 
     def proposal_list(self, api, repo, payload):
         return {"proposals": [dict(p) for p in self.proposals], "truncated": False}
@@ -582,10 +591,12 @@ class MergedProposalCountingTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.counts: list[int] = []
+        self.closes: list[int] = []
         self.broker = VcsBroker(
             Path(self.tmp.name) / "scratch",
             git_runner=git_runner,
             merge_observer=self.counts.append,
+            close_observer=self.closes.append,
             started_at=self.STARTED,
         )
         self.broker._transport = lambda _forge, _repo: SelfAware("kube-agents[bot]")
@@ -700,6 +711,101 @@ class MergedProposalCountingTest(unittest.TestCase):
         self.forge_with(self.merged(16))
         answer = self.broker.proposal_list({"repository": "local.test/acme/infra"})
         self.assertEqual(1, len(answer["proposals"]))
+
+    # -- closed without a merge: the same reads, the same three rules ------
+
+    def test_a_proposal_closed_unmerged_of_the_installs_own_is_counted_once(self):
+        self.forge_with(self.merged(30, state="closed"), self.merged(31, state="closed"))
+        self.broker.proposal_list({"repository": "local.test/acme/infra"})
+        self.assertEqual([2], self.closes)
+        self.assertEqual([], self.counts, "a close was counted as a merge")
+        self.broker.proposal_list({"repository": "local.test/acme/infra"})
+        self.broker.proposal_view({"repository": "local.test/acme/infra", "number": 30})
+        self.assertEqual([2], self.closes, "a proposal already counted was counted again")
+
+    def test_a_view_counts_a_close_a_list_has_not_seen(self):
+        self.forge_with(self.merged(32, state="closed"))
+        self.broker.proposal_view({"repository": "local.test/acme/infra", "number": 32})
+        self.assertEqual([1], self.closes)
+
+    def test_a_merge_and_an_open_proposal_are_not_closes(self):
+        self.forge_with(self.merged(33), self.merged(34, state="open", closed=""))
+        self.broker.proposal_list({"repository": "local.test/acme/infra"})
+        self.assertEqual([], self.closes)
+        self.assertEqual([1], self.counts)
+
+    def test_somebody_elses_close_is_not_counted(self):
+        self.forge_with(self.merged(35, state="closed", author="a-colleague"))
+        self.broker.proposal_list({"repository": "local.test/acme/infra"})
+        self.assertEqual([], self.closes)
+
+    def test_a_close_from_before_this_process_started_is_not_counted(self):
+        self.forge_with(self.merged(36, state="closed", closed="2027-01-15T07:59:59Z"))
+        self.broker.proposal_list({"repository": "local.test/acme/infra"})
+        self.assertEqual([], self.closes)
+
+    def test_a_close_observer_that_raises_does_not_fail_the_read(self):
+        def boom(_count):
+            raise RuntimeError("metrics are down")
+
+        self.broker.close_observer = boom
+        self.forge_with(self.merged(37, state="closed"))
+        answer = self.broker.proposal_list({"repository": "local.test/acme/infra"})
+        self.assertEqual(1, len(answer["proposals"]))
+
+    def test_a_close_the_broker_made_itself_is_not_counted(self):
+        # The fleet audit closes its own stale remediation proposals through
+        # this route; that is the harness tidying up, not a person rejecting.
+        self.forge_with(self.merged(40, state="open", closed=""), self.merged(41, state="closed"))
+        self.broker.proposal_close({"repository": "local.test/acme/infra", "number": 40})
+        self.broker.proposal_list({"repository": "local.test/acme/infra"})
+        self.broker.proposal_view({"repository": "local.test/acme/infra", "number": 40})
+        self.assertEqual([1], self.closes, "the broker's own close was counted as a person's")
+
+    def test_a_close_whose_answer_was_lost_after_the_forge_applied_it_is_not_counted(self):
+        # The forge applied the PATCH and the answer never arrived: the close
+        # is the broker's own all the same, so it is marked before the call.
+        forge = self.forge_with(self.merged(42, state="open", closed=""))
+        applied = forge.proposal_close
+
+        def close_then_drop(api, repo, payload):
+            applied(api, repo, payload)
+            raise WorkspaceError("upstream timed out", status=504)
+
+        forge.proposal_close = close_then_drop
+        with self.assertRaises(WorkspaceError):
+            self.broker.proposal_close({"repository": "local.test/acme/infra", "number": 42})
+        self.broker.proposal_list({"repository": "local.test/acme/infra"})
+        self.assertEqual([], self.closes, "a close the broker made, answer lost, was counted as a person's")
+
+    def test_a_close_the_forge_refused_leaves_a_persons_later_close_countable(self):
+        # A 404 (or any status under 500) is the forge saying it applied nothing,
+        # so the mark comes off and a person's later close of that proposal counts.
+        forge = self.forge_with(self.merged(43, state="open", closed=""))
+
+        def refuse(api, repo, payload):
+            raise WorkspaceError("no such proposal", status=404)
+
+        forge.proposal_close = refuse
+        with self.assertRaises(WorkspaceError):
+            self.broker.proposal_close({"repository": "local.test/acme/infra", "number": 43})
+        forge.proposals[0]["state"] = "closed"
+        forge.proposals[0]["closed"] = "2027-01-15T09:45:00Z"
+        self.broker.proposal_list({"repository": "local.test/acme/infra"})
+        self.assertEqual([1], self.closes, "a close the forge refused kept its mark")
+
+    def test_a_number_the_adapter_would_refuse_is_refused_before_any_mark(self):
+        self.forge_with(self.merged(1, state="closed"))
+        for bad in (True, 0, -1, "1", None):
+            with self.subTest(number=bad), self.assertRaises(WorkspaceError):
+                self.broker.proposal_close({"repository": "local.test/acme/infra", "number": bad})
+        self.broker.proposal_list({"repository": "local.test/acme/infra"})
+        self.assertEqual([1], self.closes, "a refused number left a mark that hid proposal 1's close")
+
+    def test_a_close_and_a_merge_in_one_read_count_in_their_own_series(self):
+        self.forge_with(self.merged(38), self.merged(39, state="closed"))
+        self.broker.proposal_list({"repository": "local.test/acme/infra"})
+        self.assertEqual(([1], [1]), (self.counts, self.closes))
 
 
 class RepositoryVerbTest(unittest.TestCase):
@@ -2914,6 +3020,35 @@ class CollaborationTest(unittest.TestCase):
         broker, recorder = self.broker({"name": "x"}, {"name": "x", "color": "000000"})
         broker.label_ensure({"repository": "acme/infra", "name": "x", "color": "000000"})
         self.assertEqual([c[3] for c in recorder.calls], ["GET", "PATCH"])
+
+    def test_label_ensure_writes_nothing_when_the_label_is_unchanged(self):
+        # GitHub answers the colour in lower case and an empty description as
+        # null; neither is a change, so no PATCH follows the read.
+        held = {"name": "audit:x", "color": "1d76db", "description": None}
+        broker, recorder = self.broker(held)
+        answer = broker.label_ensure(
+            {"repository": "acme/infra", "name": "audit:x", "color": "#1D76DB", "description": ""}
+        )
+        self.assertEqual([c[3] for c in recorder.calls], ["GET"])
+        self.assertEqual(answer["label"], {"name": "audit:x", "color": "1d76db", "description": ""})
+        held = {"name": "audit:x", "color": "1d76db", "description": "Findings"}
+        broker, recorder = self.broker(held)
+        broker.label_ensure(
+            {"repository": "acme/infra", "name": "audit:x", "color": "1d76db", "description": "Findings"}
+        )
+        self.assertEqual([c[3] for c in recorder.calls], ["GET"])
+
+    def test_label_ensure_patches_a_changed_description_or_name(self):
+        for held in (
+            {"name": "audit:x", "color": "1d76db", "description": "Old"},
+            {"name": "Audit:X", "color": "1d76db", "description": "Findings"},
+        ):
+            with self.subTest(held=held):
+                broker, recorder = self.broker(held, held)
+                broker.label_ensure(
+                    {"repository": "acme/infra", "name": "audit:x", "color": "1d76db", "description": "Findings"}
+                )
+                self.assertEqual([c[3] for c in recorder.calls], ["GET", "PATCH"])
 
     def test_identity_reads_the_login_from_the_cli_and_the_permission_from_the_api(self):
         status = subprocess.CompletedProcess(

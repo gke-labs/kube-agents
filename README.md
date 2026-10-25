@@ -20,15 +20,7 @@ _An SRE asks for a fleet self-health check; the agent answers in the thread. An 
 
 ## 💬 Five things to ask it
 
-Each of these is a single chat message. The agent answers in the thread from read-only reads of the fleet, the GCP projects it monitors, and the linked GitOps repositories, and it recommends changes without applying them.
-
-1. **"Which clusters are behind their release channel, and what would block upgrading them?"** — Every cluster's control-plane and node-pool versions against the channel default, with what would stop the upgrade named: drain-blocking PodDisruptionBudgets, fail-closed admission webhooks with an unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap RBAC writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and kube-public), maintenance exclusions, node-pool version skew, and the blockers the per-entry rules of the upgrade-failure catalogue file, with the risks that do not block listed beside them. Name a target version and it also scans the GitOps manifests for the `apiVersions` that version removes. ([`fleet-upgrade-verification`](agents/platform/skills/fleet-upgrade-verification/SKILL.md))
-2. **"Which workloads request far more CPU and memory than they use?"** — One run of the fleet waste audit's collector compares a week of Cloud Monitoring peaks with each workload's requests, so the answer names the over-requested controllers in resource units, beside idle pools and orphaned disks; a stock install has no billing export to price them. ([`fleet_wide_cost_analysis_sop.md`](agents/platform/governance/fleet_wide_cost_analysis_sop.md))
-3. **"Design a Standard cluster for 32 A100s in us-central1. Check quota and live obtainability, and give me a ComputeClass fallback. Design only."** — Quota and capacity are checked separately, each against live `gcloud` evidence, and the design names the fallback tiers that change the workload's GPU class or interconnect characteristics. ([`capacity-obtainability`](agents/platform/skills/capacity-obtainability/SKILL.md), [`gke-compute-classes`](agents/platform/skills/gke-compute-classes/SKILL.md))
-4. **"Something in the `payments` namespace on `prod-east` stopped making progress without erroring. Find it."** — The work is delegated to the Cluster Agent for that cluster, which looks for controllers whose `observedGeneration` lags, progress conditions that stopped advancing, repeating warning events, and references to objects that do not exist. ([`gke-stall-detection`](agents/cluster/skills/gke-stall-detection/SKILL.md))
-5. **"`checkout` on `prod-east` has been crash-looping since this morning. What happened?"** — The Cluster Agent for that cluster fixes the time window, reads the container's exit codes and the events around them, tells an OOM kill from an application crash, and proposes the manifest correction without applying it. ([`gke-workload-troubleshooting`](agents/cluster/skills/gke-workload-troubleshooting/SKILL.md))
-
-On an install running `spec.mode: next`, the agent still answers these in the thread, with a few differences in how the answer is delivered; [how a chat question is answered under `next`](https://gke-labs.github.io/kube-agents/concepts/chatops/#how-a-chat-question-is-answered-under-next) walks through each step.
+The list lives on the documentation site: [First prompts](https://gke-labs.github.io/kube-agents/install/first-prompts/) gives the first message to send a new install, what a healthy answer looks like, and five things to ask it next.
 
 ---
 
@@ -123,6 +115,7 @@ The Platform Agent runs these audits on a schedule and posts each report to chat
 | Upgrade & Patch Readiness Audit | Weekly, Monday 07:20 | [`security_patch_orchestrator_sop.md`](agents/platform/governance/security_patch_orchestrator_sop.md) |
 | Fleet Waste Audit | Weekly, Monday 07:50 | [`fleet_wide_cost_analysis_sop.md`](agents/platform/governance/fleet_wide_cost_analysis_sop.md) |
 | Fleet Consistency Drift Audit | Weekly, Monday 08:20 | [`fleet_consistency_drift_sop.md`](agents/platform/governance/fleet_consistency_drift_sop.md) |
+| Upgrade Retrospective | Weekly, Sunday 18:00 | [`upgrade_retrospective_sop.md`](agents/platform/governance/upgrade_retrospective_sop.md) |
 
 ### Skills by area
 

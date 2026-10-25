@@ -100,7 +100,7 @@ class ContractTest(unittest.TestCase):
         for module in RULES_C:
             self.assertIn(module, readiness.EXTRA_RULES, module.RULE_ID)
             self.assertTrue(callable(module.evaluate) and callable(module.describe))
-        entries = [m.ENTRY for m in readiness.EXTRA_RULES]
+        entries = [m.ENTRY for m in readiness.EXTRA_RULES if m.ENTRY is not None]  # the plan-level rules, with no entry, come after the numbered ones
         self.assertEqual(entries, sorted(entries))
 
     def test_every_rule_runs_over_two_shared_reads_through_the_fold(self):
@@ -462,6 +462,10 @@ class ReportTest(unittest.TestCase):
         subject = cluster("seeded-a", "us-central1-a", "1.33.5-gke.100", [("default-pool", "1.33.5-gke.100")])
         behind = cluster("seeded-c", "us-central1-a", "1.33.5-gke.100", [("default-pool", "1.33.5-gke.100")])
         self.clusters = {"p1": [subject, behind]}
+        # The target sits above the fleet: the location's server config lists it as valid beside the
+        # running version, as GKE lists a version it serves, so `target-patch-valid` has nothing to say.
+        versions = ["1.33.5-gke.100", self.TARGET]
+        self.config = {"us-central1-a": {"channels": [{"channel": "REGULAR", "defaultVersion": "1.33.5-gke.100", "validVersions": versions}], "validMasterVersions": versions, "validNodeVersions": versions}}
         self.objects = {
             "seeded-a": [k8s_workload("Deployment", "shop", "web", 3, {"app": "web"}), k8s_pdb("shop", "web-pdb", {"maxUnavailable": 1, "selector": {"matchLabels": {"app": "web"}}}, 3)],
             "seeded-c": [k8s_workload("Deployment", "shop", "web", 3, {"app": "web"})],
@@ -487,19 +491,19 @@ class ReportTest(unittest.TestCase):
         return rc, stdout.getvalue(), data
 
     def test_a_recent_removed_api_caller_blocks_and_the_rest_are_risks_in_the_two_columns(self):
-        fake = FakeReadinessCommands(self.clusters, {}, self.objects, namespaced_objects_by_cluster=self.namespaced, audit_by_cluster={"seeded-a": self.served()})
+        fake = FakeReadinessCommands(self.clusters, self.config, self.objects, namespaced_objects_by_cluster=self.namespaced, audit_by_cluster={"seeded-a": self.served()})
         rc, text, data = self._run(fake)
         self.assertEqual(rc, report.EXIT_OK)
         by_name = {m["cluster"]: m["readiness"] for m in data["members"]}
         a = by_name["seeded-a"]
         self.assertEqual(a["status"], "blocked")
         self.assertEqual([(f["rule"], f["principal"]) for f in a["rule_blocking"]], [("removed-api-callers", TUNER)])
-        self.assertEqual({f["rule"] for f in a["risks"]}, {"deprecated-api-callers", "client-addon-skew", "zonal-control-plane"})
+        self.assertEqual({f["rule"] for f in a["risks"]}, {"deprecated-api-callers", "client-addon-skew", "zonal-control-plane", "known-issues-matrix"})
         self.assertEqual((a["audit_log"]["removed"]["entries"], a["audit_log"]["deprecated"]["entries"]), (2, 6))
         self.assertEqual(a["rules"]["removed-api-callers"]["blocking"], 1)
         c = by_name["seeded-c"]
         self.assertEqual(c["status"], "ready")
-        self.assertEqual({(f["rule"], f.get("namespace") or f.get("version")) for f in c["risks"] if f["rule"] != "zonal-control-plane"}, {("changed-defaults", "seeded-defaults"), ("client-addon-skew", "v1.29")})
+        self.assertEqual({(f["rule"], f.get("namespace") or f.get("version")) for f in c["risks"] if f["rule"] not in ("zonal-control-plane", "known-issues-matrix")}, {("changed-defaults", "seeded-defaults"), ("client-addon-skew", "v1.29")})
         self.assertEqual(data["readiness"]["summary"], {"blocked": 1, "ready": 1, "unknown": 0})
         self.assertEqual(data["readiness"]["members_with_risks"], 2)
         row = next(l for l in text.splitlines() if l.startswith("| p1 | seeded-a |") and "| blocked |" in l)
@@ -512,7 +516,7 @@ class ReportTest(unittest.TestCase):
         self.assertIn("kubectl v1.29 from CronJob seeded-shapes/stale-kubectl-client", c_row)
 
     def test_a_removed_api_caller_silent_for_six_days_is_a_risk_and_the_member_ready(self):
-        fake = FakeReadinessCommands(self.clusters, {}, self.objects, audit_by_cluster={"seeded-a": self.served()})
+        fake = FakeReadinessCommands(self.clusters, self.config, self.objects, audit_by_cluster={"seeded-a": self.served()})
         rc, text, data = self._run(fake, "--at", "2026-10-05T16:00:00Z")
         a = next(m for m in data["members"] if m["cluster"] == "seeded-a")["readiness"]
         self.assertEqual(a["status"], "ready")
@@ -520,14 +524,14 @@ class ReportTest(unittest.TestCase):
         stale = next(f for f in a["risks"] if f["rule"] == "removed-api-callers")
         self.assertIn("more than 48h before 2026-10-05T16:00:00Z", stale["detail"])
         # The sample's own 1.32 removal on this 1.33 control plane is a crossing: a note, and the member ready.
-        fake = FakeReadinessCommands(self.clusters, {}, self.objects, audit_by_cluster={"seeded-a": sample_entries()})
+        fake = FakeReadinessCommands(self.clusters, self.config, self.objects, audit_by_cluster={"seeded-a": sample_entries()})
         rc, text, data = self._run(fake)
         a = next(m for m in data["members"] if m["cluster"] == "seeded-a")["readiness"]
         self.assertEqual((a["status"], a["rule_blocking"], [f["rule"] for f in a["risks"] if f["rule"] == "removed-api-callers"]), ("ready", [], []))
         self.assertIn("removed in 1.32, which the control plane's 1.33 has crossed", a["note"])
 
     def test_a_failed_audit_read_is_unknown_for_the_member_through_the_blocking_rule(self):
-        fake = FakeReadinessCommands(self.clusters, {}, self.objects, failing_logging=["seeded-a"])
+        fake = FakeReadinessCommands(self.clusters, self.config, self.objects, failing_logging=["seeded-a"])
         rc, text, data = self._run(fake)
         self.assertEqual(rc, report.EXIT_PARTIAL)
         a = next(m for m in data["members"] if m["cluster"] == "seeded-a")["readiness"]

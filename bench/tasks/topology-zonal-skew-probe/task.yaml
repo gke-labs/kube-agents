@@ -1,58 +1,86 @@
 # NIGHTLY-ACTIVE — registered in hack/eval/nightly-cases.txt.
 #
 # Domain: reliability (topology-drift skill).
-# Journey: proactive zonal skew and topology distribution anomaly detection
-# against the three planted causes on slot d (`seeded-d`, namespace
-# `seeded-topology`):
-#   - `zonal-skew-scheduling` (`deployment/zone-pinned-api`): 2 Running
-#     replicas in zone 1, 0 in zone 2 (`100%` single-zone blast radius) because
-#     `topologySpreadConstraints` uses `whenUnsatisfiable: ScheduleAnyway`
-#     alongside a required single-zone `nodeAffinity`. Fix is a manifest edit.
-#   - `zonal-skew-volume` (`statefulset/zone-bound-store`): 2 Running replicas
-#     in zone 1, 0 in zone 2 (`100%` single-zone blast radius) because its PVCs
-#     bind to StorageClass `seeded-zonal-pd` (`allowedTopologies` pinned to
-#     zone 1). Fix is a storage migration / regional StorageClass, not a pod
-#     template spread edit.
-#   - `zonal-skew-capacity` (`deployment/capacity-starved-worker`): 4 desired
-#     replicas at 500m CPU; running replicas sit in zone 2 while the remaining
-#     replicas stay `Pending` with `Insufficient cpu` because `first-zone-sponge`
-#     consumes zone 1's `e2-small` CPU headroom. Fix is node capacity or
-#     resource sizing, not a spread constraint edit.
+# Journey: zonal skew attribution on slot d (namespace `seeded-topology`),
+# where four multi-replica workloads each have every running replica in one
+# zone, for four different reasons:
+#   - `zonal-skew-scheduling` (`deployment/zone-pinned-api`): a `ScheduleAnyway`
+#     zonal spread beside a required single-zone `nodeAffinity`, so the
+#     constraint asks and the affinity decides. leeway: `constraint_ignored`
+#     with the conflicting-affinity evidence line, `manifest_patch`. Fix is the
+#     affinity, a manifest edit.
+#   - `zonal-skew-volume` (`statefulset/zone-bound-store`): PVCs on StorageClass
+#     `seeded-zonal-pd`, whose `allowedTopologies` pins volumes to one zone.
+#     leeway: `volume_pinning`, `storage_topology`. Fix is storage, not a
+#     spread edit.
+#   - `zonal-skew-capacity` (`deployment/capacity-starved-worker`): four 500m
+#     replicas under a `DoNotSchedule` spread; the running ones sit in the
+#     second zone and the rest are Pending for CPU because `first-zone-sponge`
+#     fills the first zone's e2-small. leeway: `domain_capacity_shortfall`,
+#     `cluster_capacity`. Fix is capacity or sizing, not a spread edit.
+#   - the same role's `deployment/first-zone-sponge`: six replicas pinned by
+#     `nodeSelector` to `default-pool`, which has nodes in the first zone only.
+#     leeway prints NO finding for it (a selector is intent), and the design's
+#     "single-zone node pool" cause is the one an agent must find by hand.
+#     Fix is the node pool; widening the affinity or adding a spread
+#     constraint leaves pods Pending.
+#
+# What the case grades, and why it is shaped this way (review rounds 1-4 on
+# #3419): the prompt names the namespace and the output grammar and nothing
+# else -- not the cluster (fixtures.json is the only thing allowed to address
+# a seeded cluster), not the workloads, not which cause belongs to which --
+# so a green shows attribution rather than recall. Each declared line carries
+# the cause word, the evidence, the zone and the running share
+# (`running there: <n>/<m>`), so the blast-radius check reads the line the
+# agent declared and not a pasted `kubectl get` row. The fourth line is the
+# node-pool case, the one leeway is silent on and the one a manifest-happy
+# agent gets wrong in the direction that pages someone. And the run has to
+# have executed `leeway report`, at the front door or on a delegated card.
+#
+# What the first live run must settle: that `leeway-report-ran` sees the
+# route the install takes. The `any` has a child per route (the front door's
+# own `terminal` call; a worker's command), because `tool_called` under
+# `scope: workers` and `worker_commands` both read as status=error when no
+# card was filed, and the platform agent files one only when slot d has a
+# Cluster Agent profile on the install.
 #
 # Isolation class: read-only (analysis only; nothing created, patched, or
 # published).
 # Eligible tier: nightly.
 id: topology-zonal-skew-probe
-name: Topology drift analysis attributes scheduling, volume, and capacity causes on seeded-topology
+name: Topology drift analysis attributes four single-zone concentrations to four causes on seeded-topology
 prompt: >-
-  Analyze the topology distribution and zonal skew of multi-replica workloads
-  in the `seeded-topology` namespace on our multi-zonal cluster (`seeded-d`).
-  For `zone-pinned-api`, `zone-bound-store`, and `capacity-starved-worker`,
-  report the per-zone running pod distribution and the share of running pods
-  that would be lost if a single zone failed, attribute the specific root cause
-  of the skew (`scheduling` vs. `volume` vs. `capacity`), and state the
-  appropriate remediation category for each. Conclude with one summary line per
-  workload in the exact form:
-  `<workload>: cause is <scheduling|capacity|volume>; primary evidence: <evidence>; blast-radius zone: <zone>`.
-  Read-only analysis only: do not modify any cluster resources or open any pull
-  requests.
+  One of our clusters is multi-zonal: its nodes span two zones. Analyze the
+  topology distribution of the multi-replica workloads in its
+  `seeded-topology` namespace. For every workload whose running replicas all
+  sit in one zone, report the per-zone running pod distribution, attribute
+  the root cause of the concentration, and state the appropriate remediation
+  category. Conclude with one summary line per such workload in the exact
+  form:
+  `<workload>: cause is <scheduling|capacity|volume|node-pool>; primary evidence: <evidence>; blast-radius zone: <zone>; running there: <n>/<m>`
+  where <n> is the workload's running replicas in that zone and <m> its
+  running replicas in total; Pending replicas count in neither, so name them
+  after the line when there are any. Read-only analysis only: do not modify
+  any cluster resources or open any pull requests.
 expected_output: >-
-  The agent loads the `topology-drift` skill, runs `leeway report` (or
-  confirming read-only `kubectl` checks) against the `seeded-topology`
-  namespace on `seeded-d`, and reports all three workloads with their `100%`
-  single-zone concentration and distinct root causes:
-  (1) `zone-pinned-api` has both running replicas in one zone because its
-  `topologySpreadConstraints` sets `whenUnsatisfiable: ScheduleAnyway` while a
-  required `nodeAffinity` pins `topology.kubernetes.io/zone` to a single zone
-  (remediation: manifest edit);
-  (2) `zone-bound-store` has both running replicas in one zone because its
-  `PersistentVolumeClaim` templates use the zonal `seeded-zonal-pd`
-  `StorageClass` whose `allowedTopologies` pins volumes to one zone
-  (remediation: storage migration / regional StorageClass, not a spread edit);
-  (3) `capacity-starved-worker` has running replicas in one zone while its
-  remaining replicas are `Pending` due to `Insufficient cpu` in the starved
-  zone (remediation: cluster capacity or CPU request right-sizing, not a
-  spread constraint edit).
+  The agent finds the two-zone cluster, loads the `topology-drift` skill, runs
+  `leeway report` against the `seeded-topology` namespace there (delegating to
+  the cluster's Cluster Agent when one exists), confirms each finding with a
+  read-only `kubectl` read, and declares four workloads, each 100% in one zone:
+  (1) `zone-pinned-api`, cause scheduling -- a required `nodeAffinity` pins
+  both replicas to one zone while its spread constraint is `ScheduleAnyway`
+  (remediation: edit the affinity, a manifest change);
+  (2) `zone-bound-store`, cause volume -- its PersistentVolumeClaims bind to
+  the zonal `seeded-zonal-pd` StorageClass whose `allowedTopologies` names one
+  zone (remediation: regional StorageClass or volume migration, not a spread
+  edit);
+  (3) `capacity-starved-worker`, cause capacity -- its running replica(s) sit
+  in the other zone and the rest are Pending with `Insufficient cpu`
+  (remediation: node capacity or request sizing, not a spread edit);
+  (4) `first-zone-sponge`, cause node-pool -- its `nodeSelector` targets
+  `default-pool`, which has nodes in one zone only, so leeway reports no
+  finding and the exposure is real (remediation: a node-pool change, never a
+  wider affinity or a spread constraint). Nothing is applied to the cluster.
 infrastructure:
   deployer: noop
 validated: false
@@ -66,6 +94,11 @@ fixtures:
   - zonal-skew-capacity
 
 verification_spec:
+  # The declared lines. Each pattern reads one line: an optional kind prefix
+  # and parenthetical on the name, the cause word, an evidence field that has
+  # to name the mechanism, a GCP zone, and a running share whose numerator
+  # and denominator agree (every running replica is in that zone). Trailing
+  # text after the share is allowed, which is where the Pending count goes.
   - name: report-attributes-scheduling-skew
     role: objective
     mode: assert
@@ -76,11 +109,10 @@ verification_spec:
         - zonal-skew-scheduling
       required_phrases:
         - "zone-pinned-api"
-        - "ScheduleAnyway"
       any_of_patterns:
-        - '(?m)^(?:[a-z0-9.-]+/)*zone-pinned-api(?:\s*\([^)\n]*\))?: cause is scheduling(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:scheduleanyway|node[ -]?affinity|nodeselector|node selector)[^\n]*; blast-radius zone: [a-z0-9-]+[^\n]*$'
+        - '(?im)^(?:[a-z0-9.-]+/)*zone-pinned-api(?:\s*\([^)\n]*\))?: cause is scheduling(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:node[ -]?affinity|node ?selector)[^\n]*; blast-radius zone: [a-z]+-[a-z]+[0-9]-[a-z]\b[^\n;]*; running there: (\d+)/\1\b'
       forbidden_patterns:
-        - '(?m)^(?:[a-z0-9.-]+/)*zone-pinned-api(?:\s*\([^)\n]*\))?: cause is (?:capacity|volume)\b'
+        - '(?im)^(?:[a-z0-9.-]+/)*zone-pinned-api(?:\s*\([^)\n]*\))?: cause is (?:capacity|volume|node-pool)\b'
   - name: report-attributes-volume-skew
     role: objective
     mode: assert
@@ -93,9 +125,9 @@ verification_spec:
         - "zone-bound-store"
         - "seeded-zonal-pd"
       any_of_patterns:
-        - '(?m)^(?:[a-z0-9.-]+/)*zone-bound-store(?:\s*\([^)\n]*\))?: cause is volume(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:seeded-zonal-pd|allowedtopologies|persistentvolumeclaim|pvc|storage[ -]?class)[^\n]*; blast-radius zone: [a-z0-9-]+[^\n]*$'
+        - '(?im)^(?:[a-z0-9.-]+/)*zone-bound-store(?:\s*\([^)\n]*\))?: cause is volume(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:seeded-zonal-pd|allowed ?topolog|persistent ?volume|pvc|storage ?class|zonal (?:pd|disk|volume)|volume[_ ]pinning)[^\n]*; blast-radius zone: [a-z]+-[a-z]+[0-9]-[a-z]\b[^\n;]*; running there: (\d+)/\1\b'
       forbidden_patterns:
-        - '(?m)^(?:[a-z0-9.-]+/)*zone-bound-store(?:\s*\([^)\n]*\))?: cause is (?:scheduling|capacity)\b'
+        - '(?im)^(?:[a-z0-9.-]+/)*zone-bound-store(?:\s*\([^)\n]*\))?: cause is (?:scheduling|capacity|node-pool)\b'
   - name: report-attributes-capacity-skew
     role: objective
     mode: assert
@@ -108,20 +140,44 @@ verification_spec:
         - "capacity-starved-worker"
         - "Pending"
       any_of_patterns:
-        - '(?m)^(?:[a-z0-9.-]+/)*capacity-starved-worker(?:\s*\([^)\n]*\))?: cause is capacity(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:insufficient cpu|pending|cpu)[^\n]*; blast-radius zone: [a-z0-9-]+[^\n]*$'
+        - '(?im)^(?:[a-z0-9.-]+/)*capacity-starved-worker(?:\s*\([^)\n]*\))?: cause is capacity(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:insufficient cpu|pending|failedscheduling|capacity[_ ]shortfall)[^\n]*; blast-radius zone: [a-z]+-[a-z]+[0-9]-[a-z]\b[^\n;]*; running there: (\d+)/\1\b'
       forbidden_patterns:
-        - '(?m)^(?:[a-z0-9.-]+/)*capacity-starved-worker(?:\s*\([^)\n]*\))?: cause is (?:scheduling|volume)\b'
-  - name: report-quantifies-blast-radius
+        - '(?im)^(?:[a-z0-9.-]+/)*capacity-starved-worker(?:\s*\([^)\n]*\))?: cause is (?:scheduling|volume|node-pool)\b'
+  # The line leeway does not write for the agent. `first-zone-sponge` has no
+  # finding, so this line exists only if the agent looked at the pools. Its
+  # forbidden half is the harm: a scheduling attribution here recommends
+  # widening an affinity onto a zone where the pool has no nodes.
+  - name: report-attributes-node-pool-skew
     role: objective
     mode: assert
     check:
       type: report_contains
       fold_decoration: true
       fixture_roles:
-        - zonal-skew-scheduling
+        - zonal-skew-capacity
+      required_phrases:
+        - "first-zone-sponge"
       any_of_patterns:
-        - '(?i)zone-pinned-api[^\n]*(?:100%|2/2\s+(?:(?:replicas|pods)\s+)?running|all\s+(?:2\s+)?running|max(?:domain|zone)share:\s*1(?:\.0+)?)'
-        - '(?i)(?:100%|2/2\s+(?:(?:replicas|pods)\s+)?running|all\s+(?:2\s+)?running|max(?:domain|zone)share:\s*1(?:\.0+)?)[^\n]*zone-pinned-api'
+        - '(?im)^(?:[a-z0-9.-]+/)*first-zone-sponge(?:\s*\([^)\n]*\))?: cause is node-pool(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:node ?pool|default-pool|node ?selector|one zone|single[- ]zone)[^\n]*; blast-radius zone: [a-z]+-[a-z]+[0-9]-[a-z]\b[^\n;]*; running there: (\d+)/\1\b'
+      forbidden_patterns:
+        - '(?im)^(?:[a-z0-9.-]+/)*first-zone-sponge(?:\s*\([^)\n]*\))?: cause is (?:scheduling|capacity|volume)\b'
+  # The tool ran. One child per route the install can take; see the header.
+  - name: leeway-report-ran
+    role: objective
+    mode: assert
+    check:
+      type: any
+      checks:
+        - type: tool_called
+          scope: router
+          tool_names: ["terminal"]
+          arguments:
+            command: '(?s).*\bleeway\s+report\b.*'
+        - type: worker_commands
+          required_runs:
+            - script: leeway
+              word_patterns: ["^report$"]
+  # Cluster-state safeguards: each fixture came out the way it went in.
   - name: scheduling-fixture-preserved
     role: safeguard
     severity: catastrophic

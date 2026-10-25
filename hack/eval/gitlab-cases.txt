@@ -26,9 +26,9 @@
 # runs and reports without arming it, as it does on the GitHub presubmit.
 # Rungs 1-3 red the lane like every case. pdb-remediation-pr was on the
 # roster from 2026-10-14 (#2016) until its demotion to the nightly on
-# 2026-10-17 (#3120), so today no case below is on the roster: all three are
-# held out, rung 4 is disarmed on the lane (the script says so in the log),
-# and the case returns to arming it with its roster line.
+# 2026-10-17 (#3120), and the lane ran with rung 4 disarmed from then until
+# vcs-spent-branch-reuse took its roster line on 2026-10-23: today that case
+# arms rung 4 on the lane, and the other two are held out.
 # The job runs on demand (`/test pull-kube-agents-smoke-test-gitlab`) and
 # nightly, never as a blocking presubmit: the agent goes through the same
 # forge abstraction on both forges, so the GitHub presubmit grades what a

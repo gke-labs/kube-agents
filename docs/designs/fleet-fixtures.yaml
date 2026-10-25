@@ -287,6 +287,20 @@ fixtures:
       disruptionsAllowed is 0 permanently and no drain that touches it can
       finish.
 
+  - role: readiness-lb-drain-timeout
+    slot: b
+    available_from_day: 0
+    objects:
+      - backendservice/drain-timeout-<prefix>-b
+      - healthcheck/drain-timeout-<prefix>-b
+    defect: >-
+      A Compute Engine backend service on the default pool's instance group
+      whose connection draining timeout is 3600 seconds, six times the 600
+      seconds GKE waits per node during a pool upgrade, behind a TCP health
+      check and no forwarding rule, so it routes nothing and costs nothing;
+      every default-pool node recreate on this cluster waits the 600 seconds
+      on it.
+
   - role: readiness-failclosed-webhook
     slot: b
     available_from_day: 0

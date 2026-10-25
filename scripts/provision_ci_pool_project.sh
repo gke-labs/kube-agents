@@ -50,7 +50,7 @@ readonly COMPUTE_SWEEP_SA="serviceAccount:eval-compute-sweeper@kube-agents-prow.
 readonly COMPUTE_SWEEP_ROLE_ID="kubeAgentsComputePlantSweeper"
 readonly COMPUTE_SWEEP_ROLE_TITLE="kube-agents Compute plant sweeper"
 readonly COMPUTE_SWEEP_ROLE_STAGE="GA"
-readonly COMPUTE_SWEEP_PERMISSIONS="compute.addresses.delete,compute.addresses.deleteInternal,compute.addresses.list,compute.globalAddresses.delete,compute.globalAddresses.deleteInternal,compute.globalAddresses.list,compute.globalOperations.get,compute.networks.delete,compute.networks.list,compute.regionOperations.get,compute.subnetworks.delete,compute.subnetworks.list"
+readonly COMPUTE_SWEEP_PERMISSIONS="compute.addresses.delete,compute.addresses.deleteInternal,compute.addresses.list,compute.globalAddresses.delete,compute.globalAddresses.deleteInternal,compute.globalAddresses.list,compute.globalOperations.get,compute.networks.delete,compute.networks.list,compute.regionOperations.get,compute.subnetworks.delete,compute.subnetworks.list,monitoring.alertPolicies.delete,monitoring.alertPolicies.list"
 # The identity the seeded-fleet reconcile runs as (hack/fleet_reconcile.py, a
 # postsubmit and a daily on main). The IAM step before 1.3 grants it what re-applying
 # bench/tf/fleet needs on the project; step 2 grants it the state bucket.
@@ -361,6 +361,7 @@ gcloud services enable \
   logging.googleapis.com \
   monitoring.googleapis.com \
   cloudtrace.googleapis.com \
+  gkehub.googleapis.com \
   iam.googleapis.com \
   cloudkms.googleapis.com \
   --project="${PROJECT_ID}"
@@ -463,9 +464,14 @@ done
 
 # compute.viewer: the GKE provider lists each node pool's instance group
 # managers on refresh, which no other role here carries (seen live 2026-09-28).
+# compute.loadBalancerAdmin: the stack plants a backend service and a health
+# check on the default pool's instance group (readiness-lb-drain-timeout,
+# defects-b.tf), and the create needs compute.backendServices.*,
+# compute.healthChecks.* and compute.instanceGroups.use.
 echo "Granting the seeded-fleet reconciler access to ${PROJECT_ID}..."
 for role in \
   roles/compute.instanceAdmin.v1 \
+  roles/compute.loadBalancerAdmin \
   roles/compute.securityAdmin \
   roles/compute.storageAdmin \
   roles/compute.viewer \
@@ -481,8 +487,8 @@ for role in \
 done
 
 # A custom role, not roles/compute.networkAdmin: that role holds almost a
-# thousand permissions, and the sweep needs twelve. `update` on a re-run keeps the
-# role's permissions equal to the list above. On a project already registered,
+# thousand permissions, and the sweep needs only COMPUTE_SWEEP_PERMISSIONS.
+# `update` on a re-run keeps the role's permissions equal to the list above. On a project already registered,
 # run the commands in docs/ci-pool-projects.md section 5.7 by hand rather than
 # the script (section 8).
 echo "Granting the Compute plant sweeper its custom role on ${PROJECT_ID}..."
