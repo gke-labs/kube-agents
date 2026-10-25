@@ -545,7 +545,7 @@ spec's "Coexistence is by mode").
 The operator render kept the three conditions the A2A owner set on it: it cites the gateway
 spec's sections; the Google Chat adapter's `verifiedBy: chat-event-topic-iam` and its
 allowed-users gate are exactly as "The Google Chat adapter" section has them, the gate carried
-as `A2A_GCHAT_ALLOWED_USERS` and `A2A_GCHAT_ALLOW_ALL_USERS` from the CR's list; Google Chat enabled on the CR is a backend the operator's own check (`a2aGatewayBackend`) recognises, so a Chat install's
+as `A2A_GCHAT_ALLOWED_USERS` and `A2A_GCHAT_ALLOW_ALL_USERS` from the CR's list; Google Chat enabled on the CR is a backend the operator's own check (`a2aGatewayBackend`; removed 2026-10-22, when every next install began running a console-only gateway) recognises, so a Chat install's
 gateway renders and starts without a Discord Secret; and the one-backend guard is settled by
 precedence rather than by a guard change: the render omits the Discord reference when Chat is
 armed, the relay URL beside a Slack credential stays the gateway's refusal, and the inject door
@@ -716,11 +716,14 @@ today-mode nightly on the same agent model, the GitLab lane's nightly under next
 release-candidate eval's postsubmit, which grades a candidate in the mode a new install gets), and
 refuses it on any other Prow run, so the flag
 mis-set on the today nightly or another postsubmit still stops the deploy before anything is built. A
-record of `next`'s own does not exist yet: the baseline key has no mode field, so a next-mode
-sample appended to the store would be today's once written, and the dashboard has no next lane to
-file a run under. Until both exist, `hack/ci-eval-pr.sh` keeps every flagged run out of the
-baseline recorder and the dashboard publisher on the flag alone, whatever its job type; a flagged
-run reads the store, when one is armed, and writes nothing shared.
+next-mode run has a record of its own: the baseline version key carries the mode, which
+`bench-gate` reads off the inject transport ([`bench/baselines/README.md`](../../bench/baselines/README.md)),
+so the next-mode nightly on `main` appends under a `next` key that today's window never reads, and
+rung 6 on the inject lane compares only with next-mode history at its own key (agent model
+included, so the presubmit, on another model than that nightly, has none yet). The today lane stays out of the
+recorder and the dashboard publisher (`EVAL_ROLLBACK_LANE=1`): its key reads `today`, but it grades
+a rolled-back install. The dashboard's Trend page keeps a series per mode, drawing today's; the
+next-mode nightly's Prow runs are not collected onto the dashboard's run pages yet.
 
 ## Open questions
 

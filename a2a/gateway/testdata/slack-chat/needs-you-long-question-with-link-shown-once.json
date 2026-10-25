@@ -1,0 +1,56 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "Should I merge PR #412, which raises the memory limit of checkout-gateway in seeded-reliability to 512Mi, or close it and open one that rolls back…",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      }
+    ],
+    "attachments": [
+      {
+        "blocks": [
+          {
+            "elements": [
+              {
+                "elements": [
+                  {
+                    "text": "PR #412",
+                    "type": "link",
+                    "url": "https://github.com/acme/gitops/pull/412"
+                  },
+                  {
+                    "text": "\n",
+                    "type": "text"
+                  },
+                  {
+                    "text": "…the image instead?",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              }
+            ],
+            "type": "rich_text"
+          }
+        ],
+        "color": "#ECB22E",
+        "fallback": "(the text fallback)"
+      }
+    ]
+  }
+]

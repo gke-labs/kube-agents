@@ -25,6 +25,7 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 	"github.com/go-logr/logr/funcr"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -57,13 +58,29 @@ func existingClaim(agent *agentv1alpha1.PlatformAgent, name, size string) *corev
 	return pvc
 }
 
+// testStorageClassName is the class every test claim names. growDataClaim
+// reads it before a patch, so a test that expects a patch seeds
+// storageClass(testStorageClassName, true).
+const testStorageClassName = "test-class"
+
+// storageClass is a StorageClass named name whose allowVolumeExpansion is
+// expandable.
+func storageClass(name string, expandable bool) *storagev1.StorageClass {
+	return &storagev1.StorageClass{
+		ObjectMeta:           metav1.ObjectMeta{Name: name},
+		Provisioner:          "test.csi.example.com",
+		AllowVolumeExpansion: ptr.To(expandable),
+	}
+}
+
 // unownedClaim is a claim nobody's controller reference points at: one an
 // administrator made by hand, or one a StatefulSet template created.
 func unownedClaim(name, namespace, size string) *corev1.PersistentVolumeClaim {
 	return &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 		Spec: corev1.PersistentVolumeClaimSpec{
-			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			StorageClassName: ptr.To(testStorageClassName),
+			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse(size)},
 			},
@@ -104,6 +121,7 @@ func TestReconcilePVCGrowsAnExistingDataClaim(t *testing.T) {
 			cl := fake.NewClientBuilder().
 				WithScheme(scheme).
 				WithObjects(agent,
+					storageClass(testStorageClassName, true),
 					existingClaim(agent, dataClaim.Name, tc.have),
 					existingClaim(agent, systemClaim.Name, "1Gi")).
 				Build()
@@ -139,10 +157,11 @@ func TestReconcilePVCCreatesTheDataClaimAtTheConstant(t *testing.T) {
 	}
 }
 
-// TestReconcilePVCSurvivesARefusedExpansion pins the best-effort contract: a
-// StorageClass without allowVolumeExpansion refuses the patch, the claim keeps
-// its size, and the reconcile still succeeds rather than taking the agent down
-// over a volume that is merely smaller than wanted.
+// TestReconcilePVCSurvivesARefusedExpansion pins the best-effort contract: the
+// class allows expansion, but the API server refuses the patch anyway (a
+// namespace storage quota, say). The claim keeps its size, and the reconcile
+// still succeeds rather than taking the agent down over a volume that is
+// merely smaller than wanted.
 func TestReconcilePVCSurvivesARefusedExpansion(t *testing.T) {
 	agent := brokerPodAgent()
 	dataClaim := buildPVC(agent)
@@ -155,13 +174,13 @@ func TestReconcilePVCSurvivesARefusedExpansion(t *testing.T) {
 			refusals++
 			return errors.NewForbidden(
 				schema.GroupResource{Resource: "persistentvolumeclaims"}, obj.GetName(),
-				fmt.Errorf("only dynamically provisioned pvc can be resized and the storageclass that provisions the pvc must support resize"))
+				fmt.Errorf("exceeded quota: storage, requested: requests.storage=40Gi"))
 		},
 	}
 	scheme := setupScheme()
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent, existingClaim(agent, dataClaim.Name, "10Gi")).
+		WithObjects(agent, storageClass(testStorageClassName, true), existingClaim(agent, dataClaim.Name, "10Gi")).
 		WithInterceptorFuncs(refuse).
 		Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
@@ -182,6 +201,9 @@ func TestReconcilePVCSurvivesARefusedExpansion(t *testing.T) {
 	}
 	if strings.Contains(joined, "could not grow the data claim") {
 		t.Errorf("an admission refusal that repeats identically every reconcile was logged as an error:\n%s", joined)
+	}
+	if msg, _ := r.dataVolumeExpansionMessage(agent); msg != "" {
+		t.Errorf("a refusal from a class that allows expansion must not set %s; message: %s", dataVolumeExpansionConditionType, msg)
 	}
 }
 
@@ -258,7 +280,7 @@ func TestReconcilePVCReportsAnAcceptedPatchAsARequest(t *testing.T) {
 	scheme := setupScheme()
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent, existingClaim(agent, dataClaim.Name, "10Gi")).
+		WithObjects(agent, storageClass(testStorageClassName, true), existingClaim(agent, dataClaim.Name, "10Gi")).
 		Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 

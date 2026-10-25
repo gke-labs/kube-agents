@@ -15,13 +15,16 @@
 """The triage delivery contract, held together across the files that own it.
 
 ``_triage_task_body`` (agents/platform/scripts/session_kv_server.py) writes the
-report template a Cluster Agent fills in. It permits two shapes, and the
-difference between them is the whole subject of this module: with two or more
-remediations the options are lettered ``Option A``, ``Option B``, ...; with
-exactly one the template forbids the letter outright and labels that bullet
-``Proposed fix`` instead. The call to action follows either way — the
+report template a Cluster Agent fills in. It permits two shapes that propose a
+fix, and the difference between them is the whole subject of this module: with
+two or more remediations the options are lettered ``Option A``, ``Option B``,
+...; with exactly one the template forbids the letter outright and labels that
+bullet ``Proposed fix`` instead. The call to action follows either way — the
 single-option shape is those two bullets and nothing else — which is why
-``To authorize:`` is the line both shapes carry.
+``To authorize:`` is the line both shapes carry. The event template also has a
+shape for a report that proposes no fix: one ``No action needed`` bullet, with
+neither an ``Option`` letter nor the call to action. Both gates must refuse it,
+because a reply has nothing to apply.
 
 ``_drift_task_body``, in the same module, writes the card for an out-of-band
 change to a live object and reaches the same contract by its own route: same
@@ -65,8 +68,9 @@ template emits, not as first coverage of a join that had none.
 Living in bench/tests/ rather than scripts/test_integration_contracts.py is
 forced by ``verifiers``, which imports devops_bench — the bench environment is
 the only one that has it. (pydantic, the other heavy import, is in the root test
-environment already; Makefile PYTHON_TEST_IMPORTS names it.) Only the two tests
-that instantiate ``ReportContainsVerifier`` actually need that; the phrase-join
+environment already; Makefile PYTHON_TEST_IMPORTS names it.) Only the tests that
+instantiate ``ReportContainsVerifier`` (through ``_eval_check_accepts`` and
+``_named_check_accepts``) actually need that; the phrase-join
 test needs nothing beyond ``ast`` and ``yaml``, and is here to sit with them.
 
 What is NOT asserted here is that the two gates are equivalent. They are not:
@@ -125,6 +129,7 @@ CONTRACTS = [
     (TASKS / "autoops-warning-event-triage" / "task.yaml", TRIAGE_TEMPLATE),
     (TASKS / "incident-triage-oom-event-probe" / "task.yaml", TRIAGE_TEMPLATE),
     (TASKS / "autoops-crashloop-config-triage" / "task.yaml", TRIAGE_TEMPLATE),
+    (TASKS / "autoops-warning-event-triage-state-stamp" / "task.yaml", TRIAGE_TEMPLATE),
     (TASKS / "gitops-drift-out-of-band-triage" / "task.yaml", DRIFT_TEMPLATE),
     (TASKS / "gitops-drift-noise-filtered-triage" / "task.yaml", DRIFT_TEMPLATE),
     (TASKS / "gitops-drift-deleted-policy-triage" / "task.yaml", DRIFT_TEMPLATE),
@@ -132,6 +137,17 @@ CONTRACTS = [
     (TASKS / "autoops-controller-stall-triage" / "task.yaml", STALL_TEMPLATE),
 ]
 CHECK_NAME = "triage-delivers-an-actionable-report"
+
+#: The cases whose card comes from the event template, the one template that
+#: writes the no-action shape in NO_ACTION_ANCHOR's words.
+NO_ACTION_CONTRACTS = [c for c in CONTRACTS if c[1] == TRIAGE_TEMPLATE]
+
+#: The case that grades the no-action shape itself, and its two objectives on
+#: the report. It is not in CONTRACTS: it has no actionable-report objective,
+#: because its correct report is the one both gates refuse.
+NO_ACTION_CASE = TASKS / "autoops-warning-event-no-action-triage" / "task.yaml"
+NO_ACTION_NOTHING_TO_APPLY = "triage-offers-nothing-to-apply"
+NO_ACTION_SAYS_SO = "triage-says-no-action-needed"
 
 #: The distinct templates the cases above reach, for the assertions that are
 #: about a template rather than about a case. Sorted so the parametrize ids are
@@ -151,6 +167,9 @@ NOTIFIER_PATH = NOTIFIER_DIR / "kanban_notifier.py"
 #: reworded — which is a red worth having rather than a lenient fallback.
 SINGLE_OPTION_ANCHOR = "- **Proposed fix ("
 SINGLE_OPTION_BULLETS = 2
+NO_ACTION_ANCHOR = "- **No action needed:**"
+NO_ACTION_BULLETS = 1
+NO_ACTION_END = "\n\n"
 WHAT_TO_DO_PHRASE = "What to do"
 WHAT_TO_DO_HEADING = f"## {WHAT_TO_DO_PHRASE}"
 
@@ -374,6 +393,63 @@ def test_both_gates_reject_a_report_with_nothing_to_act_on(report, contract):
     case_path, _template = contract
     assert not _eval_check_accepts(report, case_path)
     assert not actionable_report(report)
+
+
+@pytest.mark.parametrize("contract", NO_ACTION_CONTRACTS, ids=lambda c: c[0].parent.name)
+def test_both_gates_reject_the_no_action_shape(contract):
+    """The event template's report for "no manifest change is warranted".
+
+    Its 'What to do' is one ``No action needed`` bullet, with no ``Option``
+    letter and no ``To authorize:`` call to action. Every bullet in that block
+    is cut from the template's own text and tried as a report. If a reword puts
+    either literal into the bullet, or adds a bullet to the block, the count or
+    a gate reds: such a report would earn an ``incidents`` row and pass delivery
+    while it offers nothing to apply. If a reword drops the anchor, the slice
+    reds.
+    """
+    case_path, template = contract
+    block = _slice_unique(_template_text(template), NO_ACTION_ANCHOR, NO_ACTION_END)
+    bullets = [line for line in block.splitlines() if line.startswith("- **")]
+    assert len(bullets) == NO_ACTION_BULLETS, bullets
+    for bullet in bullets:
+        report = f"{WHAT_TO_DO_HEADING}\n\n{bullet}\n"
+        assert not actionable_report(report), bullet
+        assert not _eval_check_accepts(report, case_path), bullet
+
+
+def _named_check_accepts(report: str, case_path: Path, name: str) -> bool:
+    """The objective ``name`` of ``case_path``, run through the real verifier."""
+    document = yaml.safe_load(case_path.read_text())
+    entry = next((e for e in document["verification_spec"] if e.get("name") == name), None)
+    assert entry is not None, f"{case_path.parent.name} has no {name!r} objective"
+    transcript.set(report, [])
+    return ReportContainsVerifier(**entry["check"]).verify(5.0).success
+
+
+def test_the_no_action_case_passes_the_template_no_action_shape_only():
+    """autoops-warning-event-no-action-triage, pinned to the event template.
+
+    The template's no-action bullet, cut from its own text, passes both of the
+    case's report objectives. The two shapes that propose a fix fail the
+    nothing-to-apply objective, and so does the no-action bullet followed by an
+    invented ``Proposed fix`` bullet with no call to action. If
+    a reword drops the bullet's label, the slice reds here rather than on the
+    nightly; if task.yaml asks for a phrase the bullet does not carry, the
+    says-no-action objective reds.
+    """
+    text = _template_text(TRIAGE_TEMPLATE)
+    block = _slice_unique(text, NO_ACTION_ANCHOR, NO_ACTION_END)
+    bullets = [line for line in block.splitlines() if line.startswith("- **")]
+    assert len(bullets) == NO_ACTION_BULLETS, bullets
+    report = f"{WHAT_TO_DO_HEADING}\n\n{bullets[0]}\n"
+    assert _named_check_accepts(report, NO_ACTION_CASE, NO_ACTION_NOTHING_TO_APPLY)
+    assert _named_check_accepts(report, NO_ACTION_CASE, NO_ACTION_SAYS_SO)
+    for shape, fix_report in _report_shapes(TRIAGE_TEMPLATE).items():
+        assert not _named_check_accepts(fix_report, NO_ACTION_CASE, NO_ACTION_NOTHING_TO_APPLY), shape
+    hybrid = report + "- **Proposed fix (Restart the pod):** restart the pod to clear the warning.\n"
+    assert not _named_check_accepts(hybrid, NO_ACTION_CASE, NO_ACTION_NOTHING_TO_APPLY)
+    prose = f"{WHAT_TO_DO_HEADING}\n\n{bullets[0]} No proposed fix is needed.\n"
+    assert _named_check_accepts(prose, NO_ACTION_CASE, NO_ACTION_NOTHING_TO_APPLY)
 
 
 def test_every_phrase_the_case_requires_is_still_in_the_template(contract):

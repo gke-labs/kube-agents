@@ -37,6 +37,11 @@ A first install runs `next` unless you pass `--mode=today` (`./install.sh --mode
        always_online: true
      assistant_view:
        assistant_description: Ask kube-agents about your clusters.
+     shortcuts:
+       - name: Ask about this
+         type: message
+         callback_id: ask_about_message
+         description: kube-agents looks into this message and answers in its thread
    oauth_config:
      scopes:
        bot:
@@ -44,6 +49,7 @@ A first install runs `next` unless you pass `--mode=today` (`./install.sh --mode
          - channels:history
          - channels:read
          - chat:write
+         - commands
          - groups:history
          - groups:read
          - im:history
@@ -72,10 +78,11 @@ A first install runs `next` unless you pass `--mode=today` (`./install.sh --mode
 What the manifest covers, so you can check an existing app instead:
 
 - **Events.** The gateway reads messages only: `message.im` for DMs, and `message.channels`, `message.groups` and `message.mpim` for public, private and group channels. Each event needs its history scope (`im:history`, `channels:history`, `groups:history`, `mpim:history`); without it the app connects normally and is never sent the message. In a channel the gateway answers only a message that mentions the app, or a reply in a thread it is already answering; it finds mentions in the message text, so `app_mention` is not needed.
-- **Scopes.** `chat:write` covers every post and edit the gateway makes. `channels:read`, `groups:read`, `im:read` and `mpim:read` read who is in a conversation. A reply goes into the conversation or thread the message came from, so no other scope is needed for it, in a DM either. `reactions:write` puts the reactions on your message, `users:read` names who answered a question, and `assistant:write` shows Working… on a thread, titles it and sets the suggested prompts; without them the answers still arrive and only those go missing ([ChatOps](/kube-agents/concepts/chatops/#slack)).
-- **Interactivity, the assistant view and `assistant_thread_started`.** The gateway answers a click on a question's buttons, so interactivity is on, and it offers suggested prompts when a member opens a new assistant thread. On an app using agent view the gateway also answers `app_home_opened` on the Messages tab with the prompts.
+- **Scopes.** `chat:write` covers every post and edit the gateway makes. `channels:read`, `groups:read`, `im:read` and `mpim:read` read who is in a conversation. A reply goes into the conversation or thread the message came from, so no other scope is needed for it, in a DM either. `reactions:write` puts the reactions on your message, `users:read` names who answered a question, who used the message shortcut and who wrote the message it quotes (without it they read as Someone), and `assistant:write` shows Working… on a thread, titles it and sets the suggested prompts; without them the answers still arrive and only those go missing ([ChatOps](/kube-agents/concepts/chatops/#slack)).
+- **Interactivity, the assistant view and `assistant_thread_started`.** The gateway answers a click on a question's buttons and the message shortcut, which both arrive as interactions, so interactivity is on, and it offers suggested prompts when a member opens a new assistant thread. On an app using agent view the gateway also answers `app_home_opened` on the Messages tab with the prompts.
 - **Messages tab.** Without it, members cannot DM the app.
 - **Home tab and `app_home_opened`.** The gateway draws the fleet dashboard ([the Slack Home tab](/kube-agents/concepts/chatops/#the-slack-home-tab)) when a member opens the tab. Without either, the tab is absent or blank and nothing else changes; neither needs a scope. With `allowedUsers` left empty, the gateway checks each member's workspace with `users.info`, so the tab also needs `users:read`; without it the tab stays blank.
+- **The message shortcut and `commands`.** The `shortcuts` entry puts **Ask about this** in every message's **⋯** menu, with the app's name beside it, and Slack offers shortcuts only to an app with the `commands` scope. The gateway knows the shortcut by its `callback_id`, so keep `ask_about_message` and rename only `name` and `description`; Slack refuses a `name` of 25 characters or more. The shortcut also needs interactivity on. Without the entry or the scope, everything else works and the menu entry is missing ([ChatOps](/kube-agents/concepts/chatops/#which-messages-it-answers)).
 - **No slash commands.** The gateway does not acknowledge them, so a member who used one would see Slack's timeout error.
 
 ### Moving an existing app to `next`
@@ -88,6 +95,8 @@ An app made for `today` from the `hermes slack manifest` output already has ever
 4. Save. The edit changes no scopes; if Slack still asks you to reinstall, do so.
 
 Do it after the switch rather than before, because the `today` listener answers slash commands until then. Until you do, a slash command under `next` shows the member Slack's timeout error. Switching back to `today` means putting the block back, which the full manifest from `hermes slack manifest` does.
+
+For the message shortcut, add the `features.shortcuts` entry from the manifest above in the same edit. The app already has the `commands` scope, since its slash commands need it; if Slack still asks you to reinstall, do so. The `today` listener has no handler for the shortcut, so remove the entry before switching back.
 
 ### For `spec.mode: today` (the Hermes listener)
 
@@ -122,7 +131,7 @@ The allowlist decides who may talk to the agent. It takes **Slack member IDs**, 
 
 What a member who is not on the list sees:
 
-- **`next`:** the gateway answers once per member with a notice that it cannot verify them, naming their member ID, so an admin can add them. A member of another workspace in a Slack Connect channel is not served, even with an empty list. The first time they mention the bot, send it a direct message, or click one of its buttons, the bot replies once, in that thread, that it answers only its own workspace, and names their member ID. The reply is a public post in the thread, so in a Slack Connect channel members of both organizations can read it.
+- **`next`:** the gateway answers once per member with a notice that it cannot verify them, naming their member ID, so an admin can add them. A member of another workspace in a Slack Connect channel is not served, even with an empty list. The first time they mention the bot, send it a direct message, or click one of its buttons, the bot replies once, in that thread, that it answers only its own workspace, and names their member ID. The reply is a public post in the thread, so in a Slack Connect channel members of both organizations can read it. A member who uses the message shortcut gets the notice that it cannot verify them every time, visible only to them; a member of another workspace who uses it gets no reply.
 - **`today`:** the message is ignored, with no reply.
 
 The pairing step in `INSTALL.md` applies only if you set the Hermes Slack DM policy to `pairing` yourself. A kube-agents install configures the allowlist instead, and the A2A gateway has no pairing.
