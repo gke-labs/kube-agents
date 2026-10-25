@@ -833,6 +833,8 @@ check "CREDENTIAL_PROXY_TOKEN_FILE crosses too" "/var/run/secrets/kubeagents/cre
   "$("${SSH[@]}" 'echo "$CREDENTIAL_PROXY_TOKEN_FILE"' 2>&1)"
 check "the wrapper dispatches rather than refusing to start" "credential proxy" \
   "$("${SSH[@]}" 'kubectl version 2>&1' 2>&1)"
+check "leeway report dispatches cluster reads through the kubectl wrapper" "credential proxy" \
+  "$("${SSH[@]}" 'leeway report --clusters p/l/c' 2>&1)"
 check "the wrappers are on PATH" "/opt/credential-proxy/bin:" \
   "$("${SSH[@]}" 'echo "$PATH"' 2>&1)"
 # A login shell runs /etc/profile, which overwrites PATH wholesale; profile.d is

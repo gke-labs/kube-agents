@@ -81,9 +81,12 @@ RUN apt-get update && \
 # spot, and zonal topology-skew diagnostics. This is their only home —
 # deploy/docker's step 2 says so and its guard enforces it — so a version bump
 # has one place to happen. leeway holds no credentials of its own; inside the
-# sandbox it runs via `--clusters <project>/<location>/<cluster>` or
-# `--kubeconfig $HERMES_HOME/.kubeconfigs/<cluster>.yaml`, delegating cluster
-# reads to the sandbox's `kubectl` credential-proxy shim (`KUBECTL_READ_VERBS`).
+# sandbox session `CREDENTIAL_PROXY_URL` is set (`pkg/clusters/broker.go`:
+# `BrokerFromEnv` sets `ShellMode: true`), so `leeway report` (`v0.1.3+`) leaves
+# `Cluster.Config = nil` and `fetchViaKubectl` (`pkg/report/collector.go`)
+# shells out to the sandbox's `kubectl` credential-proxy shim on `PATH`
+# (`/opt/credential-proxy/bin/kubectl`, governed by `KUBECTL_READ_VERBS`) rather
+# than dialing the Kubernetes API server directly through `client-go`.
 # k9s did not come across: it is a full-screen terminal UI, and every command
 # here arrives over a non-interactive `ssh host -- cmd` with no tty, so it
 # could not run even if a skill asked for it. Nothing in agents/ does.
