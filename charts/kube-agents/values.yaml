@@ -45,14 +45,15 @@ global:
   # name only, which is the layout `make mirror-images` writes:
   #   ghcr.io/gke-labs/kube-agents/platform-agent
   #     -> registry.example.com/kube-agents/platform-agent
-  # It also reaches the images the chart does not render itself — the agent
-  # and logging-sidecar references the operator resolves at runtime — so a
+  # It also reaches the first-party images the chart does not render itself —
+  # the agent and shell sandbox references the operator resolves at runtime — so a
   # PlatformAgent created without an explicit spec.deployment.image still
-  # pulls from the mirror.
+  # pulls from the mirror. (The fluent-bit logging sidecar follows
+  # thirdPartyImageRegistry below).
   imageRegistry: ""
   # Registry prefix for images this project does not build (LiteLLM,
-  # fluent-bit). Defaults to imageRegistry; set it only when the mirror keeps
-  # third-party images under a different path.
+  # fluent-bit, GitHub token minter, Hindsight). Empty leaves them on their
+  # upstream registries; set it only when the mirror keeps third-party images.
   thirdPartyImageRegistry: ""
   # Secrets holding credentials for a mirror that has to be authenticated to
   # (Harbor, Artifactory). Leave empty when the nodes can read it themselves —
@@ -90,9 +91,9 @@ global:
 operator:
   enabled: true
   # Extra environment variables for the controller manager. The image
-  # overrides the operator reads (PLATFORM_AGENT_IMAGE, AGENT_SANDBOX_IMAGE,
-  # FLUENT_BIT_IMAGE) are
-  # rendered from global.imageRegistry and the image values below, so a
+  # overrides the operator reads (PLATFORM_AGENT_IMAGE, AGENT_SANDBOX_IMAGE)
+  # are rendered from global.imageRegistry (and FLUENT_BIT_IMAGE from
+  # global.thirdPartyImageRegistry) and the image values below, so a
   # mirrored install does not need to hand-write them; anything set here is
   # appended afterwards and therefore still wins.
   extraEnv: []
@@ -142,6 +143,16 @@ operator:
   # chart cannot see and the hint would fight it.
   topologySpread:
     enabled: true
+  # The manager's own metrics listener, port 8080, plain HTTP on the pod
+  # network: controller-runtime's series plus the operator's view of every
+  # PlatformAgent, status.usage and status.phase as three gauge families
+  # (kubeagents_platformagent_usage, kubeagents_platformagent_usage_time_seconds,
+  # kubeagents_platformagent_phase), so Managed Prometheus reads the numbers
+  # the poller wrote. podMonitoring is the same tri-state as
+  # platformAgent.podMonitoring: null follows the cluster.
+  metrics:
+    enabled: true
+    podMonitoring: null
   # Admission webhooks for the PlatformAgent CR — defaulting, validation, and
   # delete protection, mirroring k8s-operator/config/webhook. Without them the
   # CRD's CEL rules and OpenAPI defaults still apply; everything the webhook
@@ -193,13 +204,32 @@ operator:
     # not also create the CR (platformAgent.enabled=false), and after the first
     # install once the operator is serving.
     failurePolicy: Ignore
+  # Memory here is the manager's cache, and the cache holds one entry per
+  # object in the cluster, not per install: every informer it starts is
+  # cluster-wide, Owns() included (it filters events by owner, it does not
+  # scope the watch). Pods are read live instead, because they outnumber
+  # every other kind, as Secrets and the A2A bookkeeping objects already
+  # were. What stays: Deployments, StatefulSets,
+  # Services, ServiceAccounts, ConfigMaps, PersistentVolumeClaims,
+  # NetworkPolicies and PodDisruptionBudgets; ClusterRoles,
+  # ClusterRoleBindings, Roles and RoleBindings; and the three custom
+  # resources themselves (PlatformAgent always, AgentPlugin and AgentProfile
+  # where their CRDs are installed). Deployments, StatefulSets, Services and
+  # PersistentVolumeClaims grow with the cluster's workloads, a Deployment
+  # carrying a whole pod template, so a cluster with thousands of them is the
+  # case to raise this for; the rest grow with its namespaces, and the
+  # operator is one pod per install.
+  #
+  # Sized from a measurement rather than the Kubebuilder scaffold it replaces:
+  # on a 3-node install the store holds 675 objects in 3.7 MiB of live heap,
+  # in a process of 22 MiB RSS. Kept in step with k8s-operator/config/manager.
   resources:
     limits:
       cpu: 500m
-      memory: 128Mi
+      memory: 512Mi
     requests:
       cpu: 10m
-      memory: 64Mi
+      memory: 128Mi
 
 telemetry:
   # Where OpenTelemetry signals go. One setting, three consumers: the PlatformAgent CR,
@@ -241,14 +271,31 @@ litellm:
   # the otel callback's DNS failure aborts every LLM request. Enable it once
   # the managed collector exists; the NetworkPolicy already allows the egress.
   otel: false
-  # model-default routes to <modelProvider>/<modelDefaultName>. Providers:
-  # gemini, anthropic, openai, vertex_ai, openai_compatible. The provider's API
-  # key must exist in the credentials Secret — except vertex_ai, which
-  # authenticates with Workload Identity instead, and openai_compatible, whose
-  # key (OPENAI_COMPATIBLE_API_KEY) is optional; see openaiCompatible below.
+  # model-default routes to <modelProvider>/<modelDefaultName>. Providers with
+  # a default model: gemini, anthropic, openai, vertex_ai, sap (SAP AI Core).
+  # The provider's API key must exist in the credentials Secret — except
+  # vertex_ai, which authenticates with Workload Identity instead;
+  # openai_compatible, whose key (OPENAI_COMPATIBLE_API_KEY) is optional (see
+  # openaiCompatible below); and sap, whose credentials arrive through
+  # envFromSecret. Any other LiteLLM provider slug (azure, bedrock, ...) is
+  # accepted when modelDefaultName names the model; its credentials arrive
+  # through envFromSecret too.
   modelProvider: gemini
+  # A Secret in the release namespace mounted whole into the gateway container
+  # as environment variables (envFrom, optional: a missing Secret does not stop
+  # the pod). Create it yourself; the chart only names it. It carries whatever
+  # the LiteLLM provider reads from the environment: AICORE_SERVICE_KEY and
+  # AICORE_RESOURCE_GROUP for sap, AZURE_API_KEY and AZURE_API_BASE for azure,
+  # and for openai_compatible the OAuth2 client-credentials trio
+  # OPENAI_COMPATIBLE_OAUTH_TOKEN_URL / _CLIENT_ID / _CLIENT_SECRET, which turns
+  # on the gateway's token-exchange hook. A key the chart also sets from the
+  # credentials Secret (GEMINI_API_KEY, HOSTED_VLLM_API_KEY, ...) wins over the
+  # same name here. envFrom does not roll the pods on a Secret change:
+  # `kubectl rollout restart deployment/litellm` after rotating it.
+  envFromSecret: ""
   # Empty selects the per-provider default (mirrors common.sh).
-  # A Claude model (anthropic, or vertex_ai with a claude-* name) gets
+  # A Claude model (anthropic, vertex_ai with a claude-* name, or sap with an
+  # anthropic--* name) gets
   # additional_drop_params: temperature, top_p and top_k under every alias,
   # because Claude Opus 5 refuses them and a caller may send them anyway.
   # Chart-only; the kustomize dev base carries no such key.
@@ -269,8 +316,10 @@ litellm:
   # checksum are what they were and the model uses its own default. LiteLLM
   # translates it per provider; on Gemini 3.x it becomes thinkingLevel. What
   # it maps to, and when a request's own value wins, is on the site's
-  # inference-gateway page, "Setting the reasoning effort". Chart-only; the
-  # kustomize dev base carries no such key.
+  # inference-gateway page, "Setting the reasoning effort". On a Gemini 2.5 or
+  # 3.x model a value also replaces the thinking key the chart renders there
+  # to get Gemini's thoughts back ("Gemini's thoughts" on the same page); both
+  # ask for them. Chart-only; the kustomize dev base carries no such key.
   reasoningEffort: ""
   # modelProvider: vertex_ai only. The gateway calls
   # projects/<projectId>/locations/<location> as a GSA reached through Workload
@@ -331,7 +380,7 @@ litellm:
     # copies: a chart pinned to a version the mirror was never populated with
     # is an ImagePullBackOff. This pin sat a release behind the kustomize base
     # for exactly that reason.
-    tag: v1.104.0
+    tag: v1.106.0
     pullPolicy: IfNotPresent
   replicaCount: 2
   # Rollout strategy — the canonical home for this argument. The chart template
@@ -403,13 +452,21 @@ litellm:
   # smaller request to meet it, so there this 2Gi request is billed at roughly
   # 315m of CPU per replica whatever this line says; that is accepted rather
   # than fought with a request Standard does not need.
+  # Ephemeral storage is the tmp emptyDir's 1Gi sizeLimit (templates/litellm.yaml)
+  # plus 256Mi for the container's logs, twice the 86 MiB peak measured over seven
+  # days on the dev installs (2026-10-22). Stated, because a namespace quota on
+  # requests.ephemeral-storage refuses a pod without one and Autopilot bills it;
+  # the limit equals it, because a LimitRange defaulting a smaller limit would
+  # refuse a request with none.
   resources:
     requests:
       cpu: 100m
       memory: 2Gi
+      ephemeral-storage: 1280Mi
     limits:
       cpu: 500m
       memory: 3Gi
+      ephemeral-storage: 1280Mi
   # NetworkPolicy and GKE managed-Prometheus PodMonitoring for the gateway;
   # when platformAgent.enabled and operator.enabled are true (the default), litellm-policy is managed
   # dynamically by the operator with cluster-discovered DNS VIPs. When either
@@ -428,10 +485,12 @@ litellm:
   # the built-in credential patterns plus the rules below over messages,
   # tool-call arguments, embeddings input and completion prompts before the
   # provider sees them.
-  # Request bodies only: responses, tool results on disk and chat egress are
-  # not covered. The concepts/inference-gateway page on the site owns the
-  # model, including why a pseudonymised identifier is one the agent can no
-  # longer act on.
+  # The same switch mounts this rule file into the agent pod, where the image
+  # applies the rules to what the agent writes to its volume: agent.log, the
+  # terminal-output cache, the worker transcript, state.db and the kanban
+  # board. Responses and chat egress are not covered. The
+  # concepts/inference-gateway page on the site owns the model, including why
+  # a pseudonymised identifier is one the agent can no longer act on.
   redaction:
     enabled: false
     # IPv4 and IPv6 literals. action: pseudonym replaces each with a stable
@@ -456,6 +515,29 @@ litellm:
     #     literal: prod-eu-1
     #     action: pseudonym
     rules: []
+  # Pass-through JSONL trajectory logger callback. When enabled, registers
+  # llm_trace_logger.proxy_handler_instance in LiteLLM's callbacks and mounts
+  # llm_trace_logger.py plus the shared redactor.py module beside config.yaml.
+  # Every upstream model invocation (messages, tools, responses, reasoning
+  # content, token usage, latency) is redacted through AuditRedactor (built-in
+  # credential patterns, Secret data blocks, sensitive keys, emails, and IP
+  # literals, plus any operator rules when redaction.enabled is also true) and
+  # appended as one JSONL record to traceLogPath. IP literals are pseudonymised
+  # by default; with redaction.enabled they follow redaction.ip instead ("off"
+  # writes them verbatim, mask masks them, allowCidrs addresses pass through).
+  # The file rotates at 5 MiB across 3 backups (.1-.3) under an flock on
+  # <path>.lock; a record over 1 MiB keeps its metadata and drops messages,
+  # tools and response behind a truncated marker, caller-chosen strings are
+  # clipped, and a line that would still pass the file cap is refused, so the
+  # trail holds at most 20 MiB. Each record is written on one writer thread, off the proxy's
+  # event loop. Pass-through only: does not alter live requests or responses, and
+  # logs a once-per-path warning to stderr on I/O failure rather than breaking
+  # inference.
+  traceLogEnabled: false
+  # Normalised file path under /tmp/ where the trajectory log is written: no
+  # . or .. component, no doubled or trailing slash (the gateway container runs
+  # with readOnlyRootFilesystem: true and only /tmp is writable).
+  traceLogPath: "/tmp/litellm_traces.jsonl"
 
 # The Hindsight memory store: the API the agents call for long-term memory,
 # the Postgres/pgvector StatefulSet behind it, a NetworkPolicy standing in for
@@ -516,13 +598,18 @@ hindsight:
       repository: docker.io/pgvector/pgvector
       tag: "0.8.6-pg15@sha256:a947c45cdc5906a1bc951f20a8709e321256343ee0f251e4ae00b5e7def4e6da"
       pullPolicy: IfNotPresent
+    # Ephemeral storage is the run and tmp emptyDirs' sizeLimits (64Mi and 1Gi,
+    # templates/hindsight.yaml) plus 64Mi for the container's logs; the limit
+    # equals the request, as LiteLLM's does.
     resources:
       requests:
         cpu: 250m
         memory: 256Mi
+        ephemeral-storage: 1152Mi
       limits:
         cpu: "1"
         memory: 1Gi
+        ephemeral-storage: 1152Mi
     # volumeClaimTemplate size. Immutable once the StatefulSet exists.
     storage: 8Gi
   # Disable podMonitoring off-GKE, same caveat as litellm.podMonitoring.
@@ -628,8 +715,9 @@ platformAgent:
   enabled: true
   name: platform-agent
   # The PlatformAgent's spec.mode: which component stack the operator renders.
-  # "today" is the current architecture; "next" also renders the NATS bus and
-  # the A2A gateway, a development stack (docs/designs/spec-mode-switch.md).
+  # "next" puts the NATS bus and the A2A gateway in front of the agent, and is
+  # what a first install.sh install records; "today" is the previous stack,
+  # kept as a rollback (docs/designs/spec-mode-switch.md).
   # null, the default, leaves the field out of the CR, which the operator reads
   # as "today", so an install that never sets it renders the CR it always did.
   # Changing it on a running install is a mode switch, not a setting: the
@@ -637,6 +725,22 @@ platformAgent:
   # the CR by hand with kubectl is left alone while this stays null, because
   # Helm patches only the fields its renders differ in.
   mode: null
+  storage:
+    # The PlatformAgent's spec.storage.size: the request of the agent's
+    # <name>-data claim and of the shell sandbox's data claim. The operator
+    # requests the same size for both. null, the default, leaves the field out
+    # of the CR, and the operator default applies (50Gi). Raising it expands both
+    # existing claims online where their StorageClass sets allowVolumeExpansion.
+    # Where it does not, the claims keep their size and the CR's
+    # DataVolumeNotExpanded condition says so. A claim cannot shrink, so the
+    # admission webhook refuses a lower value when operator.webhooks.enabled is
+    # true (off by default). Without the webhook a lower value is admitted, and
+    # the operator keeps the claims at their size. Setting this back to null
+    # never shrinks a claim. Each GiB added counts twice against a namespace
+    # requests.storage quota, once for each claim, and the quota preflight
+    # counts it so. A Kubernetes quantity above zero and at most 64Ti, the
+    # largest persistent disk, for example 80Gi.
+    size: null
   # Annotations to add to the PlatformAgent custom resource metadata. The
   # operator reads its kubeagents.x-k8s.io/* keys from here (chart README,
   # "PlatformAgent annotations"). Three of them the chart also derives from
@@ -740,6 +844,18 @@ platformAgent:
       # but never marks a change as one a controller may already have
       # reverted.
       gitopsManagers: ""
+    # The controller stall watch, the stall-watch cron job that alerts on
+    # controllers that stopped making progress. Empty omits the block and
+    # keeps the watch's defaults. A change rolls the agent pod. The
+    # annotation kubeagents.x-k8s.io/stall-watch: exempt on a namespace or an
+    # object works without any value here.
+    stallWatch: {}
+      # Namespaces never read, on every cluster, as exact names.
+      # excludeNamespaces: ["load-test", "payments-canary"]
+      # Hold a new alert until a stall has lasted this many minutes (0-1440).
+      # minStallAgeMinutes: 30
+      # Replaces the default kind list; ["all"] scans every namespaced kind.
+      # kinds: ["deployments", "statefulsets", "gateways.gateway.networking.k8s.io"]
     # Unsupported switches. Nothing under here carries a compatibility promise:
     # a field may change meaning, change default, or be removed between
     # releases, and an install that sets one is expected to re-check it at every
@@ -779,12 +895,21 @@ platformAgent:
     # Execution limits per agent persona. Empty omits the field so CRD/Hermes
     # defaults apply. When plugins.stockoutInvestigator.enabled=true, the chart
     # automatically applies tuning (maxInProgress: 3, platform.maxTurns: 200,
-    # cluster.maxTurns: 150) unless overridden here.
+    # cluster.maxTurns: 150) unless overridden here, or unless
+    # plugins.stockoutInvestigator.applyTuning is false.
     tuning: {}
       # maxInProgress: 3
       # maxSessions caps the A2A session pods a "next" install runs at once;
       # the operator's default applies when it is unset, and "today" ignores it.
       # maxSessions: 10
+      # profiles sizes AgentProfile work on a "next" install: ceiling is the most
+      # profile tasks running at once across every profile (default 8), and
+      # warmReplicas the warm workers kept per interactive (profile, tier)
+      # (default 1). The <release namespace>-profiles namespace's pod quota is
+      # the warm workers, a surge pod per warm pool, and the ceiling.
+      # profiles:
+      #   ceiling: 8
+      #   warmReplicas: 1
       # platform:
       #   apiMaxRetries: 8
       #   maxTurns: 200
@@ -806,6 +931,12 @@ platformAgent:
       pullPolicy: Always
     availability:
       # Number of agent pods. `null` omits the field; the operator defaults to 1.
+      # The operator runs the gateway as a single replica: a value above 1 is
+      # rendered as 1 and the PlatformAgent's ReplicasLimited condition says so.
+      # High availability is not supported yet: a second replica's leader
+      # election has no in-cluster token, and the data volumes are
+      # ReadWriteOnce. The chart's quota preflight still multiplies by this
+      # value, so above 1 it over-counts the agent pod.
       replicas: null
       # RuntimeClass for the agent pod. "gvisor" asks for GKE Sandbox kernel
       # isolation, and is the default because the agent executes model-authored
@@ -846,6 +977,11 @@ platformAgent:
     #
     # Prefer telemetry.otlpEndpoint when you do have a collector; this is the
     # off switch, not the way to point at one.
+    #
+    # KUBEAGENTS_AUDIT_AUTO_PROMOTE: "false" stops the fleet audits from
+    # opening remediation pull requests on their own; a `/remediate` on a
+    # ledger still opens one. The operator forwards it to the shell sandbox,
+    # where the audits run.
     env: []
     # The daily alert ceilings, one per bucket: critical, warning, info and
     # drift. Each key that you set becomes ALERT_DAILY_LIMIT_<KEY> in
@@ -951,9 +1087,13 @@ platformAgent:
     image:
       repository: docker.io/alpine/k8s
       tag: "1.36.5"
-    # How long to wait for the finalizer to clear.
+    # How long to wait for AgentProfile finalizers to clear before deleting
+    # the PlatformAgent CR.
+    agentProfileTimeout: 30s
+    # How long to wait for the PlatformAgent finalizer to clear.
     timeout: 120s
-    # Bounds the Job itself (image pull, scheduling) above that wait.
+    # Bounds the Job itself (image pull, scheduling) above the combined
+    # agentProfileTimeout + timeout waits.
     activeDeadlineSeconds: 300
   security:
     # Kubernetes ServiceAccount the credential broker pod runs as; the agent
@@ -1165,8 +1305,12 @@ platformAgent:
     #
     # forges:
     #   - name: github            # what repositories[].forge refers to
-    #     provider: github        # github or gitlab; required when host is not github.com
-    #     host: ""                # empty is github.com; or a GitHub Enterprise Server hostname
+    #     provider: github        # github (default), gitlab, or gitea; required when host is not github.com
+    #     host: ""                # empty is the provider's default (github.com), or a GitHub Enterprise
+    #                             # Server hostname; required for gitea, which has none
+    #     scheme: https           # https (default); http only for gitea on an
+    #                             # in-cluster Service (*.svc or *.svc.cluster.local)
+    #     port: 3000              # gitea only, when not the scheme's default port
     #     namespace: my-org       # default owner for this forge's repositories
     #     credentialsRef:         # Secret for providers that need one; ignored
     #       name: ""              # for github, which uses the GitHub App
@@ -1174,12 +1318,13 @@ platformAgent:
     #     provider: gitlab
     #     host: ""                # gitlab.com, or a self-managed instance's hostname
     #     namespace: my-group     # group path; bounds which projects the agent may reach
-    #     credentialsRef:         # required for gitlab: a Secret holding an access
-    #       name: gitlab-token    # token under the key `token`, created out of band
-    #     caBundleRef:            # optional, self-managed GitLab or GitHub Enterprise Server only: a Secret holding
-    #       name: gitlab-forge-ca # the PEM CA that signed the instance's certificate, created out of band;
-    #       key: ca.crt           # the broker trusts it for this host only. On a GitHub Enterprise Server
-    #                             # forge, the token minter also gets it and trusts it for all of its calls
+    #     credentialsRef:         # required for gitlab and gitea: a Secret holding an
+    #       name: gitlab-token    # access token under the key `token`, created out of band
+    #     caBundleRef:            # optional, self-managed GitLab, GitHub Enterprise Server, or https gitea:
+    #       name: gitlab-forge-ca # a Secret holding the PEM CA that signed the instance's certificate,
+    #       key: ca.crt           # created out of band; the broker trusts it for this host only. On a
+    #                             # GitHub Enterprise Server forge, the token minter also gets it and trusts
+    #                             # it for all of its calls
     forges: []
     # repositories:
     #   - forge: github
@@ -1231,16 +1376,34 @@ platformAgent:
       mode: default
     slack:
       # Bot/app tokens are read from credentials.secretName under the
-      # SLACK_BOT_TOKEN / SLACK_APP_TOKEN keys.
+      # SLACK_BOT_TOKEN / SLACK_APP_TOKEN keys by default.
+      # Custom Secret references can be specified if tokens live in separate Secrets:
+      # botTokenSecretRef:
+      #   name: ""    # defaults to credentials.secretName
+      #   key: ""     # defaults to SLACK_BOT_TOKEN
+      # appTokenSecretRef:
+      #   name: ""    # defaults to credentials.secretName
+      #   key: ""     # defaults to SLACK_APP_TOKEN
       enabled: false
       # Slack member IDs (U0123ABCD), not emails. Empty list = all users allowed.
       allowedUsers: []
       homeChannel: ""
       homeChannelName: ""
+      # "auto" (also empty) or "manual". Accepted and recorded in this release
+      # but with no effect yet: the A2A gateway does not learn a home channel,
+      # so homeChannel alone decides.
+      homeChannelPolicy: ""
     teams:
       # Microsoft Teams ChatOps integration via Microsoft Bot Framework / Entra ID.
       # App ID and App Password are read from credentials.secretName under
-      # TEAMS_APP_ID and TEAMS_APP_PASSWORD.
+      # TEAMS_APP_ID and TEAMS_APP_PASSWORD by default.
+      # Custom Secret references can be specified if credentials live in separate Secrets:
+      # appIdSecretRef:
+      #   name: ""    # defaults to credentials.secretName
+      #   key: ""     # defaults to TEAMS_APP_ID
+      # appPasswordSecretRef:
+      #   name: ""    # defaults to credentials.secretName
+      #   key: ""     # defaults to TEAMS_APP_PASSWORD
       enabled: false
       # Microsoft Entra ID Tenant ID for single-tenant enterprise lock-down.
       tenantId: ""
@@ -1281,9 +1444,62 @@ plugins:
       repository: ghcr.io/gke-labs/kube-agents/gke-stockout-investigator
       tag: "" # defaults to Chart.appVersion
       pullPolicy: IfNotPresent
+    # The plugin's execution limits (maxInProgress: 3, platform.maxTurns: 200,
+    # platform.apiMaxRetries: 8, cluster.maxTurns: 150, cluster.apiMaxRetries: 8)
+    # are merged into platformAgent.harness.tuning when the plugin is enabled.
+    # false keeps the agent at the tuning the install set, for an install that
+    # runs the plugin only to prove its ingress, such as the presubmit's.
+    applyTuning: true
     pubsub:
       topic: gke-stockout-alerts-topic
       subscription: gke-stockout-alerts-sub
       sink: gke-stockout-alerts-sink
       thresholdCount: 1
       thresholdWindowSeconds: 300
+
+# Optional built-in specialist AgentProfiles deployed into the cluster (`spec.mode: next`).
+# When `profiles.tse.enabled` is true, the operator reconciles the `tse` AgentProfile's
+# ServiceAccount, NATS auth-callout identity, and agent card (`a2a.agents.tse`), and
+# passes `tse` to the gateway pod via KUBE_AGENTS_ENABLED_PROFILES so its Hermes
+# profile home (`/opt/data/profiles/tse`) is scaffolded from `/opt/tse-template` at startup.
+profiles:
+  # GKE Support Agent (TSE): customer-side L1 GKE support case deflection and
+  # structured incident triage specialist (`agents/tse/`, `/opt/tse-template`).
+  tse:
+    enabled: false
+    description: >-
+      Customer-side GKE Technical Solutions Engineer (TSE) for L1 support case
+      deflection and cross-layer incident triage. Performs read-only diagnostics
+      across Kubernetes (kubectl) and GCP control-plane telemetry (Cloud Logging,
+      Cloud Monitoring, GKE operations) using sanitized Google Cloud support
+      skills, returning either a grounded Root Cause Analysis with a proposed
+      GitOps fix or a redacted Google Cloud Support Escalation Bundle.
+    persona:
+      # Placeholder image reference required by the AgentProfile CRD schema;
+      # today the gateway scaffolds `tse` from `/opt/tse-template` in the
+      # platform-agent image until the per-profile Job dispatcher lands.
+      image:
+        repository: ghcr.io/gke-labs/kube-agents/platform-agent
+        tag: "" # defaults to platformAgent.deployment.image.tag or Chart.appVersion
+    harness:
+      image:
+        repository: ghcr.io/gke-labs/kube-agents/a2a-worker
+        tag: "" # defaults to platformAgent.deployment.image.tag or Chart.appVersion
+      model: model-default
+      maxTurns: 90
+    bus:
+      publishTopics: []
+      subscribeTopics:
+        - shared.blueprint
+        - agent.platform.upgrade-readiness
+    lifecycle:
+      activeDeadlineSeconds: 1800
+      ttlSecondsAfterFinished: 600
+    concurrency: 2
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 2Gi

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -130,6 +131,36 @@ func TestSlackClickIsATurnFromTheClicker(t *testing.T) {
 	}
 }
 
+// TestSlackRefusedClickKeysOnThePayloadTeamWhenTheUserHasNone: a click whose
+// user names no workspace is keyed by the payload's team, so the same member id
+// clicking from two other workspaces is two senders, each told once.
+func TestSlackRefusedClickKeysOnThePayloadTeamWhenTheUserHasNone(t *testing.T) {
+	api := &fakeSlackAPI{}
+	a, _ := newUXSlackAdapter(api)
+	click := func(team, actionTS string) json.RawMessage {
+		raw, err := json.Marshal(map[string]any{
+			"type":      "block_actions",
+			"user":      map[string]any{"id": "U9"},
+			"team":      map[string]any{"id": team},
+			"channel":   map[string]any{"id": "C1"},
+			"message":   map[string]any{"ts": "50.0", "text": "Which one?", "blocks": json.RawMessage(uxQuestionBlocks)},
+			"actions":   []any{map[string]any{"action_id": "kage.choice.0", "value": "x", "text": map[string]any{"text": "Option A"}}},
+			"action_ts": actionTS,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	if _, ok := a.interactive(click("T2", "70.0")); ok {
+		t.Fatal("a click from another workspace was delivered")
+	}
+	a.interactive(click("T3", "71.0"))
+	if len(api.posted) != 2 {
+		t.Errorf("posts = %+v, want one notice per payload workspace for a user that names none", api.posted)
+	}
+}
+
 func TestSlackClickWithoutReplySendsItsLabelAndDMKeys(t *testing.T) {
 	a, _ := newUXSlackAdapter(&fakeSlackAPI{})
 	msg, ok := a.interactive(clickPayload(t, "U1", "T1", "D9", "", "kage.choice.1", "Option B", "", "61.0"))
@@ -139,15 +170,74 @@ func TestSlackClickWithoutReplySendsItsLabelAndDMKeys(t *testing.T) {
 }
 
 func TestSlackClickThatIsNotOursIsNoTurn(t *testing.T) {
-	a, _ := newUXSlackAdapter(&fakeSlackAPI{})
+	api := &fakeSlackAPI{}
+	a, _ := newUXSlackAdapter(api)
 	if _, ok := a.interactive(clickPayload(t, "U1", "T1", "C1", "40.0", "kage.link.0", "Docs", "", "62.0")); ok {
 		t.Error("a link button is acked and nothing else")
 	}
+	logs := &recordingHandler{}
+	a.log = slog.New(logs)
 	if _, ok := a.interactive(clickPayload(t, "U1", "T2", "C1", "40.0", "kage.choice.0", "Option A", "x", "63.0")); ok {
 		t.Error("another workspace's member's click must drop")
 	}
+	if !logs.has("user", "U1") {
+		t.Error("the click refusal's log line does not name the refused member")
+	}
+	a.log = slog.Default()
+	// The refused clicker is told once, in the question's thread, as a refused
+	// message's sender is; a second click gets nothing more.
+	if len(api.posted) != 1 || api.posted[0].channel != "C1" || api.posted[0].thread != "40.0" ||
+		!strings.Contains(api.posted[0].text, "Your member id is U1") {
+		t.Errorf("posts = %+v, want one notice in the question's thread naming the member", api.posted)
+	}
+	a.interactive(clickPayload(t, "U1", "T2", "C1", "40.0", "kage.choice.1", "Option B", "y", "64.0"))
+	if len(api.posted) != 1 {
+		t.Errorf("posts = %+v, want no second notice for the same clicker", api.posted)
+	}
 	if _, ok := a.interactive(json.RawMessage(`{"type":"view_submission"}`)); ok {
 		t.Error("a view submission is not a click")
+	}
+}
+
+func TestSlackClickFromAListedGuestIsATurn(t *testing.T) {
+	api := &fakeSlackAPI{}
+	a, _ := newUXSlackAdapter(api)
+	a.SetAllowedGuests([]string{"T2:U9"})
+	msg, ok := a.interactive(clickPayload(t, "U9", "T2", "C1", "40.0", "kage.choice.0", "Option A", "x", "65.0"))
+	if !ok || msg.AuthorID != "T2:U9" {
+		t.Fatalf("a listed guest's click = (%+v, %v), want a turn authored T2:U9", msg, ok)
+	}
+	if _, ok := a.interactive(clickPayload(t, "U8", "T2", "C1", "41.0", "kage.choice.0", "Option A", "x", "66.0")); ok {
+		t.Error("an unlisted member of the same workspace clicked through")
+	}
+	if len(api.posted) != 1 || !strings.Contains(api.posted[0].text, "`T2:U8`") {
+		t.Errorf("posts = %+v, want one notice naming the entry T2:U8", api.posted)
+	}
+}
+
+func TestSlackClickGuestWorkspaceFields(t *testing.T) {
+	api := &fakeSlackAPI{}
+	a, _ := newUXSlackAdapter(api)
+	a.SetAllowedGuests([]string{"T2:U9"})
+	withTeams := func(raw json.RawMessage, userTeam, team string) json.RawMessage {
+		var p map[string]any
+		if err := json.Unmarshal(raw, &p); err != nil {
+			t.Fatal(err)
+		}
+		p["user"].(map[string]any)["team_id"] = userTeam
+		p["team"].(map[string]any)["id"] = team
+		out, _ := json.Marshal(p)
+		return out
+	}
+	// Only the click's team names the workspace: matched by it.
+	teamOnly := withTeams(clickPayload(t, "U9", "T2", "C1", "40.0", "kage.choice.0", "Option A", "x", "67.0"), "", "T2")
+	if msg, ok := a.interactive(teamOnly); !ok || msg.AuthorID != "T2:U9" {
+		t.Errorf("a listed guest named only by team.id = (%+v, %v), want T2:U9", msg, ok)
+	}
+	// The two fields disagree: no entry matches.
+	disagree := withTeams(clickPayload(t, "U9", "T2", "C1", "41.0", "kage.choice.0", "Option A", "x", "68.0"), "T2", "T3")
+	if _, ok := a.interactive(disagree); ok {
+		t.Error("a click whose two workspace fields disagree was admitted")
 	}
 }
 

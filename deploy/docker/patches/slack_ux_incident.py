@@ -18,7 +18,9 @@ edited into the report's "What's wrong" sentence, one button per option, the
 links on the report's 🔗 line as link buttons, and the report, up to its
 first divider, in a collapsed fold, rendered by the Slack plugin's own ``block_kit.render_blocks``,
 the renderer the threaded reply goes through when the adapter sends rich
-blocks. The message's ``text`` is the headline, the choices and then the
+blocks. A declared next step (the report's last ``[next: ...]`` line,
+``slack_moments.visible_text``) is left out of all of it: the options are the
+alert's buttons. The message's ``text`` is the headline, the choices and then the
 whole report, because the adapter reads a thread back from ``text`` and
 top-level blocks, never a fold's. That holds on a cold read of the thread
 only: a session already open on it fetches at most the newer replies, which
@@ -29,7 +31,11 @@ A button's text is the option's title, with `` (recommended)`` after the
 recommended one's (the single-fix shape has none); its value is the reply the
 report's call to action asks for, ``apply Option B: <title>`` (``apply:
 <title>`` for the single-fix shape), and that is what ``slack_ux_clicks``
-sends as the clicker's message in the thread. Typing ``apply`` still works:
+sends as the clicker's message in the thread. When the report's ``To
+authorize:`` bullet states that the recommended or single fix's Pull Request is
+already being opened automatically (``INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true``), :func:`parse_triage` strips that recommended or single choice from
+``choices`` so Slack renders buttons only for non-recommended alternatives (or
+no choice buttons when there is only one proposed fix). Typing ``apply`` still works:
 the ``incidents`` row the notifier stores after the send is keyed to the same
 thread, and the report text is untouched, only laid out.
 
@@ -87,6 +93,10 @@ try:
     import slack_presenter as _presenter
 except ImportError:  # the scripts directory is not on PYTHONPATH
     _presenter = None
+try:
+    import slack_moments as _moments
+except ImportError:  # the scripts directory is not on PYTHONPATH
+    _moments = None
 try:
     import chat_message as _chat
 except ImportError:  # the scripts directory is not on PYTHONPATH, or predates it
@@ -160,6 +170,19 @@ RECOMMENDED = re.compile(r"^[^\w\n]*Recommended[*_]*:?[*_\s]*Option ([A-Z])\b", 
 MD_LINK = re.compile(r"\[([^\]\n]+)\]\((https?://[^()\s]+(?:\([^()\s]*\)[^()\s]*)*)\)")
 #: How many edited alerts this process remembers.
 EDITED_MAX = 512
+#: The open-PR ``To authorize`` clause from ``session_kv_server._triage_authorize_clauses(True)``,
+#: matched on its fixed marker words ``is being opened automatically``
+#: (``session_kv_server.TRIAGE_OPEN_PR_MARKER``; ``kanban_board_health`` and the bench case read the
+#: same words). Keyed on the report text rather than ``os.environ`` so drift and controller-stall
+#: reports on the same install keep their ``apply`` buttons, and a report delivered after the env
+#: changes is read against the call to action it actually carries. Only the marker counts: a
+#: restatement of the reply-wanted clause (``a Pull Request will be opened``, ``is being opened for
+#: review``) keeps its buttons, because stripping them would leave a report that asks for ``apply``
+#: with no button for it. The words may wrap onto continuation lines of the bullet.
+OPENING_PULL_REQUEST = re.compile(
+    r"^[^\w\n]*To authorize[*_]*:?(?:[^\n]|\n(?![ \t]*[-*#]|\s*$))*?\bis\s+being\s+opened\s+automatically\b",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 #: ``(chat_id, thread_id)`` of the alerts this process has edited, oldest first.
 _edited: OrderedDict[tuple[str, str], None] = OrderedDict()
@@ -267,6 +290,9 @@ def parse_triage(report: str) -> dict | None:
     headline, _body = _presenter.split_answer(_section(sections, WHATS_WRONG))
     if not headline:
         return None
+    fold_title = FOLD_TITLE_OPTIONS if len(choices) > 1 else FOLD_TITLE_SINGLE
+    if OPENING_PULL_REQUEST.search(what_to_do):
+        choices = [choice for choice in choices if not choice[2]]
     return {
         "headline": headline,
         "choices": choices,
@@ -278,7 +304,7 @@ def parse_triage(report: str) -> dict | None:
             for url in (raw.translate(_presenter.MRKDWN_URL_ESCAPES),)
             if _presenter._safe_link_url(url)
         ],
-        "fold_title": FOLD_TITLE_OPTIONS if len(choices) > 1 else FOLD_TITLE_SINGLE,
+        "fold_title": fold_title,
     }
 
 
@@ -571,7 +597,12 @@ def adapter_for(adapter: Any, platform: str, event: Any, task: Any, sub: Any) ->
         result = getattr(task, "result", None)
         if not actionable_report(result):
             return adapter
-        report = clip_handoff(str(result).strip(), RESULT_LIMIT)
+        report = str(result).strip()
+        if _moments is not None:
+            # A declared next step is never shown; the alert's options are its buttons. Taken off
+            # before the clip, which could otherwise leave a cut fragment of the line.
+            report = _moments.visible_text(report) or report
+        report = clip_handoff(report, RESULT_LIMIT)
         if len(report) > FOLD_TEXT_MAX:
             return adapter
         chat_id = str(sub.get("chat_id") or "").strip()

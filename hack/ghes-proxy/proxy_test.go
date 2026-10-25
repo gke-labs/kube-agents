@@ -240,7 +240,8 @@ func TestAuthorizationIsPassedThroughUnchanged(t *testing.T) {
 	f := newFixture(t)
 	bearer := "Bearer test-installation-token"
 	jwt := "Bearer test-app-jwt"
-	basic := "Basic eC1hY2Nlc3MtdG9rZW46dGVzdC1naXQtdG9rZW4="
+	// Not a credential: the proxy passes any value through, so a plain string proves it.
+	basic := "Basic not-a-real-credential"
 	f.do(t, "GET", "/api/v3/repos/acme/infra", nil, http.Header{"Authorization": {bearer}})
 	f.do(t, "POST", "/api/v3/app/installations/1/access_tokens", nil, http.Header{"Authorization": {jwt}})
 	f.do(t, "POST", "/api/graphql", strings.NewReader(`{"query":"{viewer{login}}"}`), http.Header{"Authorization": {bearer}})

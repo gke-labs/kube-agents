@@ -10,9 +10,9 @@ import datetime
 import json
 import pathlib
 import re
+import shlex
 import shutil
 import stat
-import shlex
 import subprocess
 import tempfile
 import unittest
@@ -47,6 +47,22 @@ _SKIP_UNLESS_TRAP_FIRES = (
     "handles, so the guard cannot be seen missing here; "
     "ToleratedProbesClearErrTrapTest pins it by shape"
 )
+
+# The front doors (install.sh's source_provisioning_helpers and Day-2 menu,
+# upgrade.sh's and uninstall.sh's main) source installer_common.sh from inside
+# a function. SourcedFromAFunctionTest runs that shape under every bash a
+# developer here may run the front doors with: the one on PATH, and macOS's
+# /bin/bash 3.2 when it is a different binary.
+_MACOS_SYSTEM_BASH = pathlib.Path("/bin/bash")
+
+
+def _bashes_here():
+    bashes = ["bash"]
+    on_path = shutil.which("bash")
+    if _MACOS_SYSTEM_BASH.exists() and (on_path is None or not _MACOS_SYSTEM_BASH.samefile(on_path)):
+        bashes.append(str(_MACOS_SYSTEM_BASH))
+    return bashes
+
 
 # installer_common.sh's contract: the caller defines the print helpers.
 _PRINT_STUBS = """
@@ -240,6 +256,8 @@ class InstallerCommonTest(unittest.TestCase):
                     "SCOPED_SA_POOL_MAX_ACCOUNTS": "",
                     # And the mode, refused on a value outside the CRD's enum.
                     "PLATFORM_AGENT_MODE": "",
+                    # And the data volume size, refused when malformed.
+                    "PLATFORM_AGENT_STORAGE_SIZE": "",
                     **(env or {}),
                 },
                 bin_dir=str(bin_dir),
@@ -1420,6 +1438,89 @@ class InstallerCommonTest(unittest.TestCase):
                     self.assertIn("rc=0", proc.stdout, proc.stderr)
                     self.assertIn(expected, dest.read_text())
 
+    # ── PLATFORM_AGENT_STORAGE_SIZE: the PlatformAgent's spec.storage.size ──
+
+    def test_tfvars_carry_the_platform_agent_storage_size(self):
+        # Written on every run, the default included; the composition renders
+        # nothing into the chart for the default.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for env, expected in (
+                ({}, 'platform_agent_storage_size = "50Gi"\n'),
+                ({"PLATFORM_AGENT_STORAGE_SIZE": ""}, 'platform_agent_storage_size = "50Gi"\n'),
+                ({"PLATFORM_AGENT_STORAGE_SIZE": "80Gi"}, 'platform_agent_storage_size = "80Gi"\n'),
+                ({"PLATFORM_AGENT_STORAGE_SIZE": "1Ti"}, 'platform_agent_storage_size = "1Ti"\n'),
+                ({"PLATFORM_AGENT_STORAGE_SIZE": "64Ti"}, 'platform_agent_storage_size = "64Ti"\n'),
+                ({"PLATFORM_AGENT_STORAGE_SIZE": "67108864Mi"}, 'platform_agent_storage_size = "67108864Mi"\n'),
+            ):
+                with self.subTest(env=env):
+                    proc = self._run(
+                        f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", **env},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    self.assertIn(expected, dest.read_text())
+
+    def test_tfvars_refuse_a_malformed_platform_agent_storage_size(self):
+        # The generator is the installer's only check on the value: it names
+        # the key and writes nothing, rather than leave the variable's
+        # validation to refuse it at plan.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for value in ("0Gi", "80", "80G", "1.5Ti", "-10Gi", "080Gi", "80Gi ", "65Ti", "65537Gi", "99999999999Ti"):
+                with self.subTest(value=value):
+                    proc = self._run(
+                        f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                        env={"API_SERVER_KEY": "k", "PLATFORM_AGENT_STORAGE_SIZE": value},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=1", proc.stdout, proc.stderr)
+                    self.assertIn(
+                        f"PLATFORM_AGENT_STORAGE_SIZE='{value}' is not a whole number of Mi, Gi or Ti above zero",
+                        proc.stderr,
+                    )
+                    self.assertIn("Fix it in install.env, or on a first install, in the value this shell exports.", proc.stderr)
+                    self.assertFalse(dest.exists(), "no tfvars is written for a value Terraform would refuse")
+
+    def test_load_install_env_reads_the_storage_size_from_the_file_alone(self):
+        # An inherited size would grow the claims for one run, and the next run
+        # from a clean shell would drop the field again; the file's own key
+        # still loads.
+        with tempfile.TemporaryDirectory() as tmp:
+            silent = pathlib.Path(tmp) / "silent.env"
+            silent.write_text("PROJECT_ID=p\n")
+            recorded = pathlib.Path(tmp) / "recorded.env"
+            recorded.write_text("PLATFORM_AGENT_STORAGE_SIZE=80Gi\n")
+            for file, expected in ((silent, "SIZE=[]"), (recorded, "SIZE=[80Gi]")):
+                with self.subTest(file=file.name):
+                    proc = self._run(
+                        f'load_install_env "{file}"; echo "SIZE=[${{PLATFORM_AGENT_STORAGE_SIZE:-}}]"',
+                        env={"PLATFORM_AGENT_STORAGE_SIZE": "120Gi"},
+                    )
+                    self.assertIn(expected, proc.stdout, proc.stderr)
+
+    def test_a_recorded_storage_size_is_carried_into_the_regenerated_tfvars(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = pathlib.Path(tmp) / "terraform.tfvars"
+            recorded = pathlib.Path(tmp) / "recorded.env"
+            recorded.write_text("PLATFORM_AGENT_STORAGE_SIZE=80Gi\n")
+            silent = pathlib.Path(tmp) / "silent.env"
+            silent.write_text("PROJECT_ID=test-project\n")
+            for file, exported, expected in (
+                (recorded, "", 'platform_agent_storage_size = "80Gi"\n'),
+                (recorded, "120Gi", 'platform_agent_storage_size = "80Gi"\n'),
+                (silent, "120Gi", 'platform_agent_storage_size = "50Gi"\n'),
+            ):
+                with self.subTest(file=file.name, exported=exported):
+                    proc = self._run(
+                        f'load_install_env "{file}"; write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", "PLATFORM_AGENT_STORAGE_SIZE": exported},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    self.assertIn(expected, dest.read_text())
+
     _CONTEXT_KUBECTL = '#!/usr/bin/env bash\ncase "$*" in *"config get-contexts"*) exit 0 ;; esac\nexit 1\n'
 
     # A CR list as `kubectl get platformagents -o json` prints it: no CR, a CR
@@ -1675,7 +1776,7 @@ class InstallerCommonTest(unittest.TestCase):
         for args, expect in (
             # Installed today through the installer; the key now asks for next.
             ("unset unset next", ("WARN: This apply switches the install from spec.mode today to next",
-                                  "renders the NATS bus and the A2A gateway", "Google Chat moves")),
+                                  "renders the NATS bus and the A2A gateway", "chat moves from the agent to the A2A gateway: Google Chat, or Slack")),
             # Installed next through the installer; the key now asks for today,
             # which renders nothing and so removes the recorded field.
             ("next next today", ("WARN: This apply switches the install from spec.mode next to today",
@@ -1732,6 +1833,26 @@ class InstallerCommonTest(unittest.TestCase):
                     f"WARN: install.env sets PLATFORM_AGENT_MODE={key}, but the PlatformAgent carries spec.mode {running}, set outside this installer",
                     proc.stdout,
                 )
+
+    def test_the_mode_after_the_apply_is_kept_for_the_chat_checklists(self):
+        # The chat checklists follow the mode the CR is left on: the key,
+        # unless the CR carries a mode set by hand that the apply leaves there.
+        # Every early return, a first install's included, leaves the key.
+        echo = '; echo "AFTER=$PLATFORM_AGENT_MODE_AFTER_APPLY"'
+        for listing, latest, key, after in (
+            (self._cr_list("next"), "{}", "today", "next"),
+            (self._cr_list(), '{"platformAgent":{"mode":"next"}}', "next", "today"),
+            (self._cr_list(), "{}", "next", "next"),
+            (self._cr_list("next"), '{"platformAgent":{"mode":"next"}}', "next", "next"),
+            (self._cr_list(), "norelease", "next", "next"),
+        ):
+            with self.subTest(listing=listing, latest=latest, key=key):
+                proc = self._announce(self._cr_kubectl(listing), self._helm(self._HEALTHY, {}, latest=latest),
+                                      call=f"announce_platform_agent_mode_for_apply kubeagents-system {key}{echo}")
+                self.assertIn(f"AFTER={after}\n", proc.stdout, proc.stderr)
+        first = self._run(f"{self._LOUD_PRINTS}PLATFORM_AGENT_MODE_AFTER_APPLY=stale; TFVARS_CLUSTER_EXISTS=false "
+                          f"announce_platform_agent_mode_for_apply kubeagents-system today{echo}", kubectl_script=None)
+        self.assertIn("AFTER=today\n", first.stdout, first.stderr)
 
     def test_a_retag_says_what_a_full_upgrade_would_do(self):
         proc = self._run(f"{self._LOUD_PRINTS}note_platform_agent_mode_not_applied unset unset next harness")
@@ -2457,6 +2578,54 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn('openai_compatible_api_key = "oc-key"', content)
             self.assertIn("tfvar=oc-key", proc.stdout)
 
+    # ── the gateway's env Secret, and provider slugs ─────────────────────────
+
+    def test_tfvars_names_the_litellm_env_secret_only_when_set(self):
+        for env, expected in (
+            ({"API_SERVER_KEY": "k", "MODEL_PROVIDER": "sap", "LITELLM_ENV_SECRET_NAME": "sap-aicore"}, True),
+            ({"API_SERVER_KEY": "k", "MODEL_PROVIDER": "sap"}, False),
+            ({"API_SERVER_KEY": "k", "MODEL_PROVIDER": "gemini", "LITELLM_ENV_SECRET_NAME": ""}, False),
+        ):
+            with self.subTest(env=env), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env)
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                content = dest.read_text()
+                self.assertEqual('litellm_env_secret_name = "sap-aicore"' in content, expected, content)
+                self.assertIn(f'model_provider     = "{env["MODEL_PROVIDER"]}"', content)
+
+    def test_a_provider_slug_is_accepted_and_needs_a_model(self):
+        proc = self._run(
+            'for p in sap azure bedrock databricks2 a_b; do is_valid_model_provider "$p" && echo "ok $p"; done; '
+            'for p in Azure v-llm 1azure "sap/" "" "azure bedrock" chatgpt; do is_valid_model_provider "$p" || echo "no $p"; done; '
+            'is_table_model_provider sap && echo table-sap; is_table_model_provider azure || echo slug-azure; '
+            'validate_model_provider_inputs azure "" ; echo "slug-no-model=$?"; '
+            'validate_model_provider_inputs azure gpt-5.4; echo "slug-model=$?"; '
+            'validate_model_provider_inputs sap ""; echo "sap-no-model=$?"; '
+            'echo "sap-default=$(default_model_for_provider sap) azure-default=[$(default_model_for_provider azure)]"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        for line in ("ok sap", "ok azure", "ok bedrock", "ok databricks2", "ok a_b",
+                     "no Azure", "no v-llm", "no 1azure", "no sap/", "no ", "no azure bedrock", "no chatgpt",
+                     "table-sap", "slug-azure", "slug-no-model=1", "slug-model=0", "sap-no-model=0",
+                     "sap-default=anthropic--claude-4.5-sonnet azure-default=[]"):
+            self.assertIn(line, proc.stdout)
+        self.assertIn("MODEL_PROVIDER='azure' is a LiteLLM provider slug", proc.stderr + proc.stdout)
+
+    def test_the_generator_refuses_a_slug_without_a_model_and_a_bad_secret_name(self):
+        for env, message in (
+            ({"API_SERVER_KEY": "k", "MODEL_PROVIDER": "azure", "LITELLM_ENV_SECRET_NAME": "azure-openai"},
+             "set --model-default-name"),
+            ({"API_SERVER_KEY": "k", "MODEL_PROVIDER": "gemini", "LITELLM_ENV_SECRET_NAME": "Not_A_Secret"},
+             "is not a valid Kubernetes Secret name"),
+        ):
+            with self.subTest(env=env), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env)
+                self.assertIn("rc=1", proc.stdout, proc.stderr)
+                self.assertIn(message, proc.stderr + proc.stdout)
+                self.assertFalse(dest.exists(), "the file must be left untouched")
+
     def test_tfvars_writes_a_service_target_port_as_a_number(self):
         env = dict(self._OPENAI_COMPATIBLE_ENV,
                    OPENAI_COMPATIBLE_API_BASE="http://llm.models.svc.cluster.local/v1",
@@ -2951,7 +3120,7 @@ class InstallDefaultsFileTest(unittest.TestCase):
         proc = subprocess.run(
             ["bash", "-c",
              f'set -u; source "{self._INSTALLER_COMMON}"; '
-             'for p in gemini openai anthropic vertex_ai; do '
+             'for p in gemini openai anthropic vertex_ai sap; do '
              'echo "$p=$(default_model_for_provider "$p")"; done'],
             capture_output=True, text=True, cwd=str(_REPO_ROOT),
         )
@@ -5260,6 +5429,14 @@ class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
                 )
                 self.assertIn(f"[C0lower] [] LC_ALL={locale}", proc.stdout, proc.stderr)
 
+    def test_a_channel_id_padded_with_unicode_space_is_not_refused(self):
+        # The operator trims with strings.TrimSpace before it checks the id.
+        for home in ("\u00a0C0HOME", "C0HOME\u202f"):
+            with self.subTest(home=home):
+                proc = self._run(home=home)
+                self.assertIn("rc=0", proc.stdout, proc.stdout + proc.stderr)
+                self.assertNotIn("SLACK_HOME_CHANNEL is", proc.stdout + proc.stderr)
+
     def test_a_home_channel_that_is_not_a_channel_id_is_refused_and_named(self):
         for home in ("D0123ABCD", "U0123ABCD", "#ops", "general", "c0lower", "C0lower", "Gcore", "C", "C0HOME/1.2"):
             with self.subTest(home=home):
@@ -5303,6 +5480,18 @@ class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
                     out,
                 )
                 self.assertNotIn("secretpart", out)
+
+    def test_a_list_of_bot_tokens_through_flags_names_the_mode_flag(self):
+        # A first install is next by default, so the way to keep the list is --mode=today.
+        proc = self._run(token="xoxb-1-secretpart,xoxb-2-secretpart", flags=True)
+        out = proc.stdout + proc.stderr
+        self.assertIn("rc=1", proc.stdout, out)
+        self.assertIn(
+            "INFO: Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in install.env or "
+            "--slack-bot-token and run again, or keep this install on PLATFORM_AGENT_MODE=today "
+            "(--mode=today on a first install with no install.env).",
+            out,
+        )
 
     def test_one_bot_token_or_none_passes(self):
         for token in (self._TOKEN, f" {self._TOKEN} ", ""):
@@ -5391,10 +5580,44 @@ class SlackHomeChannelRuleMatchesTheGatewayTest(unittest.TestCase):
         self.assertIsNotNone(regex, "SLACK_HOME_CHANNEL_ID_RE not found")
         gateway = self._rule("a2a/gateway/slack.go", "slackIsHomeChannelID", "id", "slackMinChannelIDLen")
         operator = self._rule("k8s-operator/internal/controller/platformagent_a2a_manifests.go",
-                              "a2aSlackHomeChannel", "home", "a2aSlackMinChannelIDLen")
+                              "slackChannelID", "home", "a2aSlackMinChannelIDLen")
         self.assertEqual(gateway, operator, "the gateway's and the operator's rules differ")
         letters, min_len = gateway
         self.assertEqual(regex.group(1), f"^[{letters}][A-Z0-9]{{{min_len - 1},}}$")
+
+
+class GchatHomeChannelRuleMatchesTheGatewayTest(unittest.TestCase):
+    """The Google Chat checklist names a GOOGLE_CHAT_HOME_CHANNEL the A2A
+    gateway would not arm its notify route on. The installer's check copies
+    the gateway's gchatIsSpaceName and the operator's a2aGchatHomeSpace; this
+    keeps the copy from drifting (docs/README.md lists the rule's three
+    homes)."""
+
+    def test_the_rule_is_the_gateways_and_the_operators(self):
+        gateway = (_REPO_ROOT / "a2a/gateway/gchat.go").read_text()
+        self.assertRegex(gateway, r'\n\tgchatSpacesToken\s*=\s*"spaces/"\n')
+        self.assertIn("func gchatIsSpaceName(s string) bool {\n"
+                      "\tid, found := strings.CutPrefix(s, gchatSpacesToken)\n"
+                      "\treturn found && id != \"\" && !strings.Contains(id, \"/\")\n}\n", gateway)
+        operator = (_REPO_ROOT / "k8s-operator/internal/controller/platformagent_a2a_manifests.go").read_text()
+        self.assertRegex(operator, r'\n\ta2aGchatSpacePrefix\s*=\s*"spaces/"\n')
+        self.assertIn("\thome := strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel)\n"
+                      "\tid, ok := strings.CutPrefix(home, a2aGchatSpacePrefix)\n"
+                      "\tif !ok || id == \"\" || strings.Contains(id, \"/\") {\n", operator)
+        shell = (_REPO_ROOT / "scripts/installer/installer_common.sh").read_text()
+        self.assertRegex(shell, r'(?m)^readonly GCHAT_SPACE_PREFIX="spaces/"$')
+        cases = {"spaces/AAA": "", "  spaces/AAA ": "", "": "", "AAA": "AAA", "spaces/": "spaces/",
+                 "spaces/AAA/threads/B": "spaces/AAA/threads/B", " Spaces/AAA": "Spaces/AAA",
+                 # strings.TrimSpace strips Unicode spaces too, so the operator
+                 # and the gateway take these as spaces/AAA.
+                 "\u00a0spaces/AAA\u3000": "", "\u0085spaces/AAA\u2009\t": "",
+                 "spaces/A\u00a0A": ""}
+        script = "".join(f'printf "[%s]\\n" "$(gchat_home_channel_not_a_space_name {shlex.quote(v)})"\n'
+                         for v in cases)
+        proc = subprocess.run(["bash", "-c", f'source "{_INSTALLER_COMMON}"\n{script}'],
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.splitlines(), [f"[{v}]" for v in cases.values()])
 
 
 class NextHomeChannelUnsetWarningTest(unittest.TestCase):
@@ -5450,12 +5673,68 @@ class NextHomeChannelUnsetWarningTest(unittest.TestCase):
     def test_a_blank_home_channel_counts_as_unset(self):
         self.assertIn("key=SLACK_HOME_CHANNEL", self._run(slack_home="   ").stdout)
 
+    def test_a_home_channel_of_unicode_space_counts_as_unset(self):
+        # The operator trims with strings.TrimSpace, which strips these too,
+        # and sets HomeChannelUnset; the checklist trims the same way. In the
+        # C locale [[:space:]] matches none of them, and glibc's UTF-8 locales
+        # leave U+00A0 out, so the result must not depend on the locale.
+        for locale in ("C", "en_US.UTF-8"):
+            for args, key in (('next false true "" "\u00a0"', "GOOGLE_CHAT_HOME_CHANNEL"),
+                              ('next true false "\u3000\u202f" ""', "SLACK_HOME_CHANNEL")):
+                with self.subTest(locale=locale, key=key):
+                    proc = subprocess.run(
+                        ["bash", "-c", f'source "{_INSTALLER_COMMON}"; export LC_ALL={locale}; '
+                         f'echo "key=$(next_home_channel_unset_key {args})"'],
+                        capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+                    )
+                    self.assertIn(f"key={key}", proc.stdout, proc.stderr)
+
     def test_the_summary_repeats_it_last(self):
         proc = self._run(summary=True)
         lines = [l for l in proc.stdout.splitlines() if l]
         self.assertTrue(lines[-2].startswith("WARN: No home channel: proactive posts are dropped."), proc.stdout)
         self.assertTrue(lines[-1].startswith("INFO: Set SLACK_HOME_CHANNEL"), proc.stdout)
         self.assertEqual(self._run(slack_home="C0123ABCD", summary=True).stdout, "rc=0 key=\n")
+
+
+class SourcedFromAFunctionTest(unittest.TestCase):
+    """The library is sourced from inside a function by every front door, so
+    its top level runs in that function's scope. On bash 3.2 (macOS's
+    /bin/bash) a `readonly -a` there is local to the function, as a `declare`
+    is on every bash, and the array is gone by the time trim_go_space reads
+    it: install.sh stopped on `GO_TRIMSPACE_CHARS[@]: unbound variable`
+    (#3837). bash 4.4 and 5.x keep a `readonly -a` global there, so the
+    behavioural test sees the defect only on a bash 3.2 host; the shape test
+    is the guard on every bash."""
+
+    _SOURCED_FILES = sorted((_REPO_ROOT / "scripts" / "installer").glob("*.sh"))
+    # A top-level `declare`/`typeset`, or a `readonly` with an array flag, in a
+    # file sourced from a function. `local` is never legal at top level, and
+    # the function bodies are indented, so the anchor at column 0 is the
+    # top level.
+    _FUNCTION_SCOPED_DECLARATION = re.compile(
+        r"^(?:(?:declare|typeset)\b.*|readonly\s+(?:-\w+\s+)*-\w*[aA]\w*\b.*)$", re.MULTILINE)
+
+    def test_no_sourced_file_declares_at_top_level(self):
+        self.assertIn(_INSTALLER_COMMON, self._SOURCED_FILES)
+        for path in self._SOURCED_FILES:
+            with self.subTest(file=path.name):
+                hits = self._FUNCTION_SCOPED_DECLARATION.findall(path.read_text())
+                self.assertEqual(hits, [], f"{path.name}: assign the value, then `readonly NAME` on its own line")
+
+    def test_trim_go_space_runs_after_a_function_sourced_the_library(self):
+        body = (
+            _PRINT_STUBS
+            + f'load() {{ source "{_INSTALLER_COMMON}"; }}\nload\nset -u\n'
+            + 'printf "n=%s [%s] [%s]\\n" "${#GO_TRIMSPACE_CHARS[@]}" "$(trim_go_space $\'\\xc2\\xa0C0HOME \')" '
+            '"$(slack_home_channel_not_an_id $\' D0DM\\xe3\\x80\\x80\')"\n'
+        )
+        for bash in _bashes_here():
+            with self.subTest(bash=bash):
+                proc = subprocess.run([bash, "-c", body], capture_output=True, text=True,
+                                      env=get_isolated_test_env(), cwd=str(_REPO_ROOT))
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("n=25 [C0HOME] [D0DM]", proc.stdout, proc.stderr)
 
 if __name__ == "__main__":
     unittest.main()

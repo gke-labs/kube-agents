@@ -285,6 +285,7 @@ WORKFLOW_FILE = ".github/workflows/flaky-check-notify.yml"
 WATCHED_WORKFLOWS = (
     "A2A Module Tests",
     "Actionlint",
+    "CodeQL",
     "Conformance",
     "Docker Build",
     "Docs Build",
@@ -504,7 +505,9 @@ def occurrence(current, previous, pull_request, test_ids=()):
     issue can list every test the flake has surfaced through.
     `triggering_actor` on the green attempt is whoever clicked re-run, which
     on a re-run is a person -- unlike `actor`, which is who opened the pull
-    request or, on `main`, Tide.
+    request or, on `main`, Tide. A re-run made by `/retest`
+    (`rerun_failed_checks.py`) carries the Actions bot here; the comment on
+    the pull request names the person.
     """
     return {
         "failed": [_plain(test_id) for test_id in list(test_ids)[:MAX_OCCURRENCE_IDS]],

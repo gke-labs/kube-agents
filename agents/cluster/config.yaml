@@ -27,19 +27,26 @@ model:
 # (hermes_cli/timeouts.py). stale_timeout_seconds is the base of both stale
 # detectors: a stream with no first chunk, or no chunk for that long, and a
 # non-streamed call with no answer; then Hermes drops the stream and retries.
-# It is 600s because Gemini thinks in silence on this path: with the request
-# shape Hermes sends, no reasoning deltas stream, and a hard prompt measured
-# 140-210s before its first chunk, so a shorter bound would cut off healthy
-# long thinks, and every retry would repeat the same think.
 # request_timeout_seconds is the per-read socket timeout (and the stream read
 # timeout), not a cap on a whole call; the chart's LiteLLM sets no timeout of
 # its own. A call that stalls is retried inside each of Hermes' 3 attempts
-# (agent.api_max_retries) until five stale kills in a row trip its breaker, so
-# a persistent stall costs five or six 600s windows before the turn fails; a
-# one-off stall recovers at the first 600s kill.
+# (agent.api_max_retries) until five stale kills in a row trip its breaker.
+#
+# A Cluster Agent is a kanban worker, so it uses 120s, not the front door's
+# 600s. The front door needs 600s because Gemini thinks in silence on this path
+# and a hard front-door prompt took 140-210s before its first chunk. A worker
+# hardly thinks: in the five-run latency benchmark (gke-labs/kube-agents#3140)
+# worker calls used about 100 reasoning tokens each, and 99% of 6,059 worker
+# calls sent their first chunk within 60s. The slow ones were stalls, not
+# thinks: most returned fewer than 120 tokens, three in four missed the prompt
+# cache, and each 600s stale kill matched a Vertex 504. A 120s bound retries
+# such a call up to 480s sooner. Hermes raises the bound for a large prompt
+# (to at least 240s above 50k context tokens and 300s above 100k), so the gain
+# is smaller there. The cluster loop in deploy/shared/docker-entrypoint.sh moves
+# a profile that still holds the old 600s to this value.
 providers:
   custom:
-    stale_timeout_seconds: 600
+    stale_timeout_seconds: 120
     request_timeout_seconds: 900
 
 # MCP Servers configuration. Read-only diagnostics surface only.
@@ -140,9 +147,15 @@ memory:
 web:
   backend: "ddgs"
 
+# tool_call_audit writes each tool call, with its task, to the profile's
+# logs/audit.jsonl. The fluent-bit sidecar ships that file to Cloud Logging.
+# The credential proxy records a terminal command by tool and verb, and a gke
+# MCP call by server and method. Neither record has the arguments or the task,
+# so this record is the only one that shows what the Cluster Agent ran.
 plugins:
   enabled:
     - hermes_otel
+    - tool_call_audit
 
 # This template is copied verbatim into /opt/cluster-template rather than merged
 # with deploy/shared/defaults/config.yaml, so the probe has to be turned off

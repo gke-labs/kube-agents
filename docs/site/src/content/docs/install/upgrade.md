@@ -31,8 +31,12 @@ kubectl get deployment platform-agent-gateway -n kubeagents-system \
   -o jsonpath='{.spec.template.spec.containers[?(@.name=="platform-agent")].image}{"\n"}'
 kubectl get deployment kube-agents-controller-manager -n kubeagents-system \
   -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}'
+kubectl get platformagent platform-agent -n kubeagents-system \
+  -o jsonpath='{.spec.mode}{"\n"}'
 helm history kube-agents -n kubeagents-system
 ```
+
+The third command prints the install's `spec.mode`; an empty line means `today`.
 
 Read the release notes for every release between the one you run and the one you are moving to.
 
@@ -99,8 +103,9 @@ and do not save either one to a shared disk.
    ```
 
    Exit code 0 means the file renders the install as it is. If the exit code is 2, find the key
-   that differs and plan again. The plan masks the Helm values, so compare `values.json` with the
-   file.
+   that differs and plan again (one exception: `THIRD_PARTY_REGISTRY_PREFIX` added per the table's
+   note below is expected to differ on older releases; keep it). The plan masks the Helm values,
+   so compare `values.json` with the file.
 
 Then upgrade to the new release with the same file.
 
@@ -108,42 +113,43 @@ Then upgrade to the new release with the same file.
 
 Each path is a `jq` path on `values.json`.
 
-| Key                                              | Path                                                                                  | Notes                                                                                                                                                                                                                                                                         |
-| ------------------------------------------------ | ------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PROJECT_ID`                                     | `.platformAgent.harness.projectId`                                                    |                                                                                                                                                                                                                                                                               |
-| `CLUSTER_NAME`                                   | `.platformAgent.harness.clusterName`                                                  |                                                                                                                                                                                                                                                                               |
-| `REGION`                                         | `.platformAgent.harness.location`                                                     | Copy it exactly. It can be a zone.                                                                                                                                                                                                                                            |
-| `NAMESPACE`                                      | the release namespace                                                                 |                                                                                                                                                                                                                                                                               |
-| `PLATFORM_AGENT_MODE`                            | `.platformAgent.mode`                                                                 | Empty means `today`.                                                                                                                                                                                                                                                          |
-| `MODEL_PROVIDER`                                 | `.litellm.modelProvider`                                                              |                                                                                                                                                                                                                                                                               |
-| `MODEL_DEFAULT_NAME`                             | `.litellm.modelDefaultName`                                                           |                                                                                                                                                                                                                                                                               |
-| `MODEL_MAX_TOKENS`                               | `.litellm.maxTokens`                                                                  |                                                                                                                                                                                                                                                                               |
-| `VERTEX_PROJECT_ID`, `VERTEX_LOCATION`           | `.litellm.vertex.projectId`, `.litellm.vertex.location`                               | `vertex_ai` only.                                                                                                                                                                                                                                                             |
-| `LITELLM_REDACTION_ENABLED`                      | `.litellm.redaction.enabled`                                                          | If it is `true`, also copy `.litellm.redaction.ip.action` to `LITELLM_REDACTION_IP_ACTION`, `.litellm.redaction.ip.allowCidrs` to `LITELLM_REDACTION_IP_ALLOW_CIDRS` and `.litellm.redaction.rules` to `LITELLM_REDACTION_RULES` (as JSON in single quotes).                  |
-| `GOOGLE_CHAT_ENABLED`                            | `.platformAgent.integration.googleChat.enabled`                                       | If it is `true`, also copy these fields of `.platformAgent.integration.googleChat`: `topicName` to `CHAT_TOPIC_NAME`, `subscriptionName` to `CHAT_SUB_NAME`, `mode` to `GOOGLE_CHAT_MODE`, `allowedUsers` to `ALLOWED_USERS` and `homeChannel` to `GOOGLE_CHAT_HOME_CHANNEL`. |
-| `SLACK_ENABLED`                                  | `.platformAgent.integration.slack.enabled`                                            | If it is `true`, also copy these fields of `.platformAgent.integration.slack`: `allowedUsers` to `SLACK_ALLOWED_USERS`, `homeChannel` to `SLACK_HOME_CHANNEL` and `homeChannelName` to `SLACK_HOME_CHANNEL_NAME`.                                                             |
-| `GITOPS_ORG`                                     | `.platformAgent.integration.github.org`                                               |                                                                                                                                                                                                                                                                               |
-| `GITOPS_REPO`                                    | `.platformAgent.integration.github.gitRepo`                                           | The value is `<org>/<repo>`. Write only the part after the `/`.                                                                                                                                                                                                               |
-| `GITHUB_APP_ID`                                  | `.githubMinter.appId`                                                                 |                                                                                                                                                                                                                                                                               |
-| `KMS_KEYRING`, `KMS_KEY`                         | `.githubMinter.kms.keyring`, `.githubMinter.kms.key`                                  |                                                                                                                                                                                                                                                                               |
-| GitLab keys                                      | `.platformAgent.integration.forges[0]`, `.platformAgent.integration.repositories[0]`  | If the forge's `provider` is `gitlab`, set `GITOPS_FORGE=gitlab`. Copy the forge's `host` to `GITOPS_HOST`, `credentialsRef.name` to `GITLAB_TOKEN_SECRET` and `caBundleRef.name` to `GITOPS_CA_SECRET`, and the repository's `repository` to `GITOPS_REPO`.                  |
-| GitHub Enterprise Server keys                    | `.platformAgent.integration.forges[0]`, `.platformAgent.integration.repositories[0]`  | If the forge's `provider` is `github` and it has a `host`, set `GITOPS_FORGE=github`. Copy the forge's `host` to `GITOPS_HOST`, `caBundleRef.name` to `GITOPS_CA_SECRET` and `namespace` to `GITOPS_ORG`, and the repository's `repository` to `GITOPS_REPO`.                 |
-| `ENABLE_GVISOR`                                  | `.platformAgent.deployment.availability.runtimeClassName`                             | `gvisor` means `true`. Always write the key: the upgrade's default is `false`, not the installer's `true`.                                                                                                                                                                    |
-| `MEMORY`                                         | `.platformAgent.harness.memory.provider`                                              | `kube_agents_memory` is `hindsight`, `multiuser_memory` is `file` and `none` is `off`.                                                                                                                                                                                        |
-| `USER_PROFILE_ENABLED`                           | `.platformAgent.harness.memory.userProfileEnabled`                                    |                                                                                                                                                                                                                                                                               |
-| `HERMES_DASHBOARD_ENABLED`                       | `.platformAgent.harness.hermes.dashboardEnabled`                                      | The upgrade does not read the old `ENABLE_WEBUI` name.                                                                                                                                                                                                                        |
-| `ENABLE_DRIFT_DETECTOR`                          | `.platformAgent.harness.driftDetector`                                                | If `enabled` is `true`, write `true`. If the path is absent (`null`), write `false`. If it has a `subscription` but no `enabled`, write `false` and `TF_VAR_enable_drift_pubsub=true`.                                                                                        |
-| `ENABLE_PUBSUB_PLATFORM`                         | `.plugins.pubsubPlatform.enabled`                                                     | When `.plugins.stockoutInvestigator.enabled` is `true`, this value is always `true` and does not show the key. Write the key only if you know its old value.                                                                                                                  |
-| `ENABLE_STOCKOUT_INVESTIGATOR`                   | `.plugins.stockoutInvestigator.enabled`                                               | If it is `true`, also copy these fields of `.plugins.stockoutInvestigator.pubsub`: `topic` to `TF_VAR_stockout_pubsub_topic`, `subscription` to `TF_VAR_stockout_pubsub_subscription` and `sink` to `TF_VAR_stockout_pubsub_sink`.                                            |
-| `SCOPE_*`                                        | `.platformAgent.scope`                                                                | Copy `projects`, `folders`, `organizations`, `sharedVpcHosts`, `metricsScopes`, `maxProjects`, `exclude.projects` and `exclude.clusters` (each as `project/location/cluster`).                                                                                                |
-| `SCOPED_SA_POOL_ENABLED`                         | `.platformAgent.security.scopedServiceAccountPool.enabled`                            |                                                                                                                                                                                                                                                                               |
-| `ACCEPT_NO_NETWORK_POLICY`                       | `.platformAgent.annotations["kubeagents.x-k8s.io/network-policy-enforcement"]`        | `absent-accepted` means `true`.                                                                                                                                                                                                                                               |
-| `REGISTRY_PREFIX`, `THIRD_PARTY_REGISTRY_PREFIX` | `.global.imageRegistry`, `.global.thirdPartyImageRegistry`                            |                                                                                                                                                                                                                                                                               |
-| `PLATFORM_AGENT_GSA_NAME`                        | `.platformAgent.security.serviceAccountAnnotations["iam.gke.io/gcp-service-account"]` | Write the part before the `@`.                                                                                                                                                                                                                                                |
-| `GITHUB_MINTER_GSA_NAME`                         | `.githubMinter.gsaName`                                                               |                                                                                                                                                                                                                                                                               |
-| `LITELLM_GSA_NAME`                               | `.litellm.vertex.serviceAccountAnnotations["iam.gke.io/gcp-service-account"]`         | `vertex_ai` only. Write the part before the `@`.                                                                                                                                                                                                                              |
-| `TF_VAR_agent_ksa_name`                          | `.platformAgent.security.serviceAccountName`                                          |                                                                                                                                                                                                                                                                               |
-| `TF_VAR_image_pull_secrets`                      | `.global.imagePullSecrets`                                                            | Write it as a JSON list in single quotes.                                                                                                                                                                                                                                     |
+| Key                                              | Path                                                                                  | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `PROJECT_ID`                                     | `.platformAgent.harness.projectId`                                                    |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `CLUSTER_NAME`                                   | `.platformAgent.harness.clusterName`                                                  |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `REGION`                                         | `.platformAgent.harness.location`                                                     | Copy it exactly. It can be a zone.                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `NAMESPACE`                                      | the release namespace                                                                 |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `PLATFORM_AGENT_MODE`                            | `.platformAgent.mode`                                                                 | Empty means `today`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `PLATFORM_AGENT_STORAGE_SIZE`                    | `.platformAgent.storage.size`                                                         | Empty means the operator default.                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `MODEL_PROVIDER`                                 | `.litellm.modelProvider`                                                              |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `MODEL_DEFAULT_NAME`                             | `.litellm.modelDefaultName`                                                           |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `MODEL_MAX_TOKENS`                               | `.litellm.maxTokens`                                                                  |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `VERTEX_PROJECT_ID`, `VERTEX_LOCATION`           | `.litellm.vertex.projectId`, `.litellm.vertex.location`                               | `vertex_ai` only.                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `LITELLM_REDACTION_ENABLED`                      | `.litellm.redaction.enabled`                                                          | If it is `true`, also copy `.litellm.redaction.ip.action` to `LITELLM_REDACTION_IP_ACTION`, `.litellm.redaction.ip.allowCidrs` to `LITELLM_REDACTION_IP_ALLOW_CIDRS` and `.litellm.redaction.rules` to `LITELLM_REDACTION_RULES` (as JSON in single quotes).                                                                                                                                                                                                                         |
+| `GOOGLE_CHAT_ENABLED`                            | `.platformAgent.integration.googleChat.enabled`                                       | If it is `true`, also copy these fields of `.platformAgent.integration.googleChat`: `topicName` to `CHAT_TOPIC_NAME`, `subscriptionName` to `CHAT_SUB_NAME`, `mode` to `GOOGLE_CHAT_MODE`, `allowedUsers` to `ALLOWED_USERS` and `homeChannel` to `GOOGLE_CHAT_HOME_CHANNEL`.                                                                                                                                                                                                        |
+| `SLACK_ENABLED`                                  | `.platformAgent.integration.slack.enabled`                                            | If it is `true`, also copy these fields of `.platformAgent.integration.slack`: `allowedUsers` to `SLACK_ALLOWED_USERS`, `homeChannel` to `SLACK_HOME_CHANNEL` and `homeChannelName` to `SLACK_HOME_CHANNEL_NAME`.                                                                                                                                                                                                                                                                    |
+| `GITOPS_ORG`                                     | `.platformAgent.integration.github.org`                                               |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `GITOPS_REPO`                                    | `.platformAgent.integration.github.gitRepo`                                           | The value is `<org>/<repo>`. Write only the part after the `/`.                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `GITHUB_APP_ID`                                  | `.githubMinter.appId`                                                                 |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `KMS_KEYRING`, `KMS_KEY`                         | `.githubMinter.kms.keyring`, `.githubMinter.kms.key`                                  |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| GitLab keys                                      | `.platformAgent.integration.forges[0]`, `.platformAgent.integration.repositories[0]`  | If the forge's `provider` is `gitlab`, set `GITOPS_FORGE=gitlab`. Copy the forge's `host` to `GITOPS_HOST`, `credentialsRef.name` to `GITLAB_TOKEN_SECRET` and `caBundleRef.name` to `GITOPS_CA_SECRET`, and the repository's `repository` to `GITOPS_REPO`.                                                                                                                                                                                                                         |
+| GitHub Enterprise Server keys                    | `.platformAgent.integration.forges[0]`, `.platformAgent.integration.repositories[0]`  | If the forge's `provider` is `github` and it has a `host`, set `GITOPS_FORGE=github`. Copy the forge's `host` to `GITOPS_HOST`, `caBundleRef.name` to `GITOPS_CA_SECRET` and `namespace` to `GITOPS_ORG`, and the repository's `repository` to `GITOPS_REPO`.                                                                                                                                                                                                                        |
+| `ENABLE_GVISOR`                                  | `.platformAgent.deployment.availability.runtimeClassName`                             | `gvisor` means `true`. Always write the key: the upgrade's default is `false`, not the installer's `true`.                                                                                                                                                                                                                                                                                                                                                                           |
+| `MEMORY`                                         | `.platformAgent.harness.memory.provider`                                              | `kube_agents_memory` is `hindsight`, `multiuser_memory` is `file` and `none` is `off`.                                                                                                                                                                                                                                                                                                                                                                                               |
+| `USER_PROFILE_ENABLED`                           | `.platformAgent.harness.memory.userProfileEnabled`                                    |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `HERMES_DASHBOARD_ENABLED`                       | `.platformAgent.harness.hermes.dashboardEnabled`                                      | The upgrade does not read the old `ENABLE_WEBUI` name.                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `ENABLE_DRIFT_DETECTOR`                          | `.platformAgent.harness.driftDetector`                                                | If `enabled` is `true`, write `true`. If the path is absent (`null`), write `false`. If it has a `subscription` but no `enabled`, write `false` and `TF_VAR_enable_drift_pubsub=true`.                                                                                                                                                                                                                                                                                               |
+| `ENABLE_PUBSUB_PLATFORM`                         | `.plugins.pubsubPlatform.enabled`                                                     | When `.plugins.stockoutInvestigator.enabled` is `true`, this value is always `true` and does not show the key. Write the key only if you know its old value.                                                                                                                                                                                                                                                                                                                         |
+| `ENABLE_STOCKOUT_INVESTIGATOR`                   | `.plugins.stockoutInvestigator.enabled`                                               | If it is `true`, also copy these fields of `.plugins.stockoutInvestigator.pubsub`: `topic` to `TF_VAR_stockout_pubsub_topic`, `subscription` to `TF_VAR_stockout_pubsub_subscription` and `sink` to `TF_VAR_stockout_pubsub_sink`.                                                                                                                                                                                                                                                   |
+| `SCOPE_*`                                        | `.platformAgent.scope`                                                                | Copy `projects`, `folders`, `organizations`, `sharedVpcHosts`, `metricsScopes`, `maxProjects`, `exclude.projects` and `exclude.clusters` (each as `project/location/cluster`).                                                                                                                                                                                                                                                                                                       |
+| `SCOPED_SA_POOL_ENABLED`                         | `.platformAgent.security.scopedServiceAccountPool.enabled`                            |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `ACCEPT_NO_NETWORK_POLICY`                       | `.platformAgent.annotations["kubeagents.x-k8s.io/network-policy-enforcement"]`        | `absent-accepted` means `true`.                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `REGISTRY_PREFIX`, `THIRD_PARTY_REGISTRY_PREFIX` | `.global.imageRegistry`, `.global.thirdPartyImageRegistry`                            | If `.global.imageRegistry` was set but `.global.thirdPartyImageRegistry` was empty: for an install created before the third-party fallback was removed whose mirror holds third-party images (the `make mirror-images MIRROR_PREFIX=` default), copy `.global.imageRegistry` to `THIRD_PARTY_REGISTRY_PREFIX` to keep third-party images on the mirror; step 5 exits 2 on this key, keep it. If the mirror holds only first-party images, leave `THIRD_PARTY_REGISTRY_PREFIX` unset. |
+| `PLATFORM_AGENT_GSA_NAME`                        | `.platformAgent.security.serviceAccountAnnotations["iam.gke.io/gcp-service-account"]` | Write the part before the `@`.                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `GITHUB_MINTER_GSA_NAME`                         | `.githubMinter.gsaName`                                                               |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `LITELLM_GSA_NAME`                               | `.litellm.vertex.serviceAccountAnnotations["iam.gke.io/gcp-service-account"]`         | `vertex_ai` only. Write the part before the `@`.                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `TF_VAR_agent_ksa_name`                          | `.platformAgent.security.serviceAccountName`                                          |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `TF_VAR_image_pull_secrets`                      | `.global.imagePullSecrets`                                                            | Write it as a JSON list in single quotes.                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 
 ### Keys outside the values record
 
@@ -244,17 +250,19 @@ Before a move across several releases:
 The release notes list pull request titles only. A `!` before the colon marks a breaking change.
 0.10.0 and 0.11.0 have no `!` changes. The table also lists changes with no `!` that turn on something new for an existing install.
 
-| Release | Change                                                      | What an existing install meets                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| ------- | ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 0.12.0  | #2891: the credential proxy requests 1Gi of memory          | The operator refuses a `credentialProxy.resources` that sets `limits.memory` under 1Gi without `requests.memory`. Set the request with the limit, or raise the limit. See [`spec.deployment`](/kube-agents/operator/platformagent-crd/#specdeployment).                                                                                                                                                                                                                                                                                                                                                                                                           |
-| 0.12.0  | #2862: the drift export covers the scope's other projects   | The drift export also creates sinks in other projects of the scope. See [Multi-project](/kube-agents/deploy/multi-project/) for which projects, the permission the apply needs, and how to leave a project out.                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| 0.9.0   | #2264: the drift detector is on by default                  | If `install.env` does not set `ENABLE_DRIFT_DETECTOR`, a full upgrade creates a Log Router sink, a Pub/Sub topic and a subscription, and starts the detector. The sink exports the GKE admin-activity audit records of every cluster in the project. The subscription keeps unacknowledged records for up to 31 days. To keep it off, write `ENABLE_DRIFT_DETECTOR=false`. In a project where another install has the drift resources, the upgrade stops until you write that line or set the `TF_VAR_drift_pubsub_*` names.                                                                                                                                      |
-| 0.9.0   | #2350: the scoped service account pool is keyed per project | The upgrade turns off a pool armed under the old per-cluster field. See [the scoped service account pool](/kube-agents/reference/security-and-iam/#the-scoped-service-account-pool).                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| 0.9.0   | #2706: the Slack UX is on by default                        | Slack users see new reactions, buttons and cards. See [Reactions](/kube-agents/concepts/chatops/#reactions) and [Buttons](/kube-agents/concepts/chatops/#buttons). The buttons use the Slack app's Interactivity setting. An app made from `hermes slack manifest` has it on. On an app made by hand, turn on Interactivity: Socket Mode needs no request URL. If a button does not work, a typed reply still works. To keep the old behaviour, see below. Under `spec.mode: next`, 0.9.0 also moves Slack to the A2A gateway, and `KAGE_SLACK_UX` does not turn off the gateway's reactions and buttons. See [Slack app setup](/kube-agents/install/slack-app/). |
-| 0.8.0   | #2065: the `litellm` Service is renamed `inference-gateway` | Model calls can fail for a short time during the upgrade. See the chart README's [upgrade note](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/README.md#upgrade-notes-inference-gateway-service-rename).                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| 0.8.0   | #2070: forges and repositories in `spec.integration`        | The operator refuses some repository spellings that worked before. See the upgrade notes under [`spec.integration`](/kube-agents/operator/platformagent-crd/#specintegration).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| 0.8.0   | #2010, #2042: the A2A bus reserves more consumers           | `spec.mode: next` only. If 0.7.0 or earlier created the TASKS stream, the provision Job can stop the upgrade. Do what its message says.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| 0.8.0   | #1756: the upgrade follows the release-pinned contract      | The upgrade refuses an install with only `k8s-operator/scripts/vars.sh`. See [When an upgrade is refused](#when-an-upgrade-is-refused).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Release | Change                                                      | What an existing install meets                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ------- | ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| pending | #3675: the A2A bus requires TLS                             | `spec.mode: next` only. The upgrade restarts the bus once with TLS required, and every client the operator renders rolls onto `tls://` and the bus CA in the same pass. A session task running at that moment fails, as on any bus restart. Anything you run by hand against the bus, such as a `nats` CLI session, needs `tls://` and the CA from the `<name>-a2a-nats-ca-bundle` ConfigMap afterwards. If you roll back to an earlier release, delete the session pods (`kubectl delete pod -l app.kubernetes.io/component=a2a-session`): the earlier gateway would otherwise reuse them against a plaintext bus.                                                                                                                                                                                                                                                                                                              |
+| 0.14.0  | #3362: the agent's data volume is 50Gi                      | The operator grows the agent's `<name>-data` claim and the shell sandbox's data claim to 50Gi, online, where the StorageClass has `allowVolumeExpansion: true` (GKE's `standard-rwo` does). Where the class cannot expand a claim, the claims keep their size and the CR carries the `DataVolumeNotExpanded` condition (reason `StorageClassCannotExpand`); see [`status`](/kube-agents/operator/platformagent-crd/#status). [`spec.storage.size`](/kube-agents/operator/platformagent-crd/#specstorage) raises the size above 50Gi. The upgrade adds 80 GiB of disk: a namespace `ResourceQuota` on `requests.storage` and the project's regional SSD quota both need room for it. A quota failure after the operator's patch leaves the claim `Bound` at its old `status.capacity`; the operator log says the resize has not landed, and the claim's events say why; see [Prerequisites](/kube-agents/install/prerequisites/). |
+| 0.12.0  | #2891: the credential proxy requests 1Gi of memory          | The operator refuses a `credentialProxy.resources` that sets `limits.memory` under 1Gi without `requests.memory`. Set the request with the limit, or raise the limit. See [`spec.deployment`](/kube-agents/operator/platformagent-crd/#specdeployment).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| 0.12.0  | #2862: the drift export covers the scope's other projects   | The drift export also creates sinks in other projects of the scope. See [Multi-project](/kube-agents/deploy/multi-project/) for which projects, the permission the apply needs, and how to leave a project out.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| 0.9.0   | #2264: the drift detector is on by default                  | If `install.env` does not set `ENABLE_DRIFT_DETECTOR`, a full upgrade creates a Log Router sink, a Pub/Sub topic and a subscription, and starts the detector. The sink exports the GKE admin-activity audit records of every cluster in the project. The subscription keeps unacknowledged records for up to 31 days. To keep it off, write `ENABLE_DRIFT_DETECTOR=false`. In a project where another install has the drift resources, the upgrade stops until you write that line or set the `TF_VAR_drift_pubsub_*` names.                                                                                                                                                                                                                                                                                                                                                                                                     |
+| 0.9.0   | #2350: the scoped service account pool is keyed per project | The upgrade turns off a pool armed under the old per-cluster field. See [the scoped service account pool](/kube-agents/reference/security-and-iam/#the-scoped-service-account-pool).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| 0.9.0   | #2706: the Slack UX is on by default                        | Slack users see new reactions, buttons and cards. See [Reactions](/kube-agents/concepts/chatops/#reactions) and [Buttons](/kube-agents/concepts/chatops/#buttons). The buttons use the Slack app's Interactivity setting. An app made from `hermes slack manifest` has it on. On an app made by hand, turn on Interactivity: Socket Mode needs no request URL. If a button does not work, a typed reply still works. To keep the old behaviour, see below. Under `spec.mode: next`, 0.9.0 also moves Slack to the A2A gateway, and `KAGE_SLACK_UX` does not turn off the gateway's reactions and buttons. See [Slack app setup](/kube-agents/install/slack-app/).                                                                                                                                                                                                                                                                |
+| 0.8.0   | #2065: the `litellm` Service is renamed `inference-gateway` | Model calls can fail for a short time during the upgrade. See the chart README's [upgrade note](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/README.md#upgrade-notes-inference-gateway-service-rename).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| 0.8.0   | #2070: forges and repositories in `spec.integration`        | The operator refuses some repository spellings that worked before. See the upgrade notes under [`spec.integration`](/kube-agents/operator/platformagent-crd/#specintegration).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| 0.8.0   | #2010, #2042: the A2A bus reserves more consumers           | `spec.mode: next` only. If 0.7.0 or earlier created the TASKS stream, the provision Job can stop the upgrade. Do what its message says.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| 0.8.0   | #1756: the upgrade follows the release-pinned contract      | The upgrade refuses an install with only `k8s-operator/scripts/vars.sh`. See [When an upgrade is refused](#when-an-upgrade-is-refused).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 
 To keep the Slack UX off across upgrades, add `KAGE_SLACK_UX=false` to the chart's
 `platformAgent.deployment.env` list. `install.env` has no key for it. On an install made with
@@ -270,35 +278,6 @@ TF_VAR_extra_helm_values='{platformAgent={deployment={env=[{name="KAGE_SLACK_UX"
 replaces the first one, with no error. If the line already has a `platformAgent.deployment.env`
 list, add the entry to that list, because Helm replaces a list as a whole. See
 [Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) for how the line works.
-
-## Switching `spec.mode`
-
-`next` is an unsupported development stack. To move a running install between `today` and
-`next`, set `PLATFORM_AGENT_MODE` in `install.env` and run a full upgrade (the default mode) or
-`install.sh`. The operator and harness modes re-apply the values the release recorded, so they do
-not switch. Preview a full upgrade with `upgrade.sh --plan` first; a run that switches says so
-before it applies.
-
-- **Slack.** With Slack on and Google Chat off, `next` hands Slack to the A2A gateway. Before the
-  switch, check the three Slack settings the run refuses (see
-  [When an upgrade is refused](#when-an-upgrade-is-refused)). After it, edit the Slack app as
-  [Moving an existing app to `next`](/kube-agents/install/slack-app/#moving-an-existing-app-to-next)
-  describes.
-- **A home channel.** Under `next` the A2A gateway posts alerts, drift reports and scheduled reports
-  only to a home channel: set `SLACK_HOME_CHANNEL`, or `GOOGLE_CHAT_HOME_CHANNEL` when Google Chat is
-  on, before the switch ([Home channel](/kube-agents/install/slack-app/#home-channel)). Without one
-  those posts are dropped while conversations keep working; the run warns, and the PlatformAgent
-  carries the `HomeChannelUnset` condition.
-- **Switching back** to `today` is the same `install.env` edit the other way. Put the Slack app's
-  slash commands back too, as that section says.
-- **A mode set on the PlatformAgent by hand** (`kubectl patch`, as 0.9.0 needed) survives upgrades,
-  because Helm sees no change in a value the release already renders. When `install.env` names a
-  mode and the CR carries the other one, the run says so and leaves the CR as it is. To bring them
-  together, patch `spec.mode` on the CR to the mode you want, or apply once with
-  `PLATFORM_AGENT_MODE` set to the mode the CR carries and then again with the one you want.
-
-What a switch changes inside the install is in the design document,
-[`docs/designs/spec-mode-switch.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/spec-mode-switch.md).
 
 ## Upgrade modes
 
@@ -316,7 +295,8 @@ What a switch changes inside the install is in the design document,
   `crds/` on an upgrade — then re-tags the operator image the same way.
 - `--upgrade-mode=full`, the default, applies the CRDs and then runs a full `terraform apply`
   through the install engine: every image tag moves, and every setting in `install.env` is
-  re-rendered.
+  re-rendered. It is the only mode that applies `PLATFORM_AGENT_MODE`, so it is the one that
+  [switches `spec.mode`](#switching-specmode).
 
 The operator moves before the harness because the operator owns the resources the harness runs as.
 Every mode needs the `kube-agents` Helm release to exist in the target namespace; an install
@@ -418,6 +398,277 @@ chart's default `platformAgent.name` value.
 
 The run also writes a machine-readable report to `/tmp/kube-agents-upgrade-report.json`.
 
+### Slack
+
+On an install with Slack enabled, check that Slack still answers. Which process holds the Slack
+connection depends on `spec.mode` (the third command under [Before you start](#before-you-start)):
+
+- **Empty or `today`**, or `next` with Google Chat also enabled: the credential broker.
+
+  ```bash
+  kubectl logs deploy/platform-agent-credential-proxy -n kubeagents-system \
+    | grep -E 'Slack relay enabled|Slack relay initialization failed|Slack bot token authentication failed'
+  ```
+
+  The pattern matches exactly three kinds of line. `Slack relay enabled workspaces=1` as the last line is
+  the healthy reading: the number counts the bot tokens Slack accepted, one per workspace.
+  `Slack bot token authentication failed` means Slack refused one of the bot tokens; it gives the
+  error type and Slack's error, not which token. `Slack relay initialization failed; retrying`
+  means no bot token was accepted or the Socket Mode connection failed, and the broker tries again
+  every 30 seconds. No output has no reading of its own (on a broker that has run for a while the
+  startup lines may have rotated out of the log): go by the DM test below.
+
+- **`next`**: the A2A gateway.
+
+  ```bash
+  kubectl logs deploy/platform-agent-a2a-gateway -c gateway -n kubeagents-system \
+    | grep -E 'slack connected|chat backend stopped'
+  ```
+
+  The last line contains `"msg":"slack connected"` and names the bot user and the workspace
+  (`team`). The gateway logs it once it has joined the bus and Slack has accepted the bot token,
+  and then opens the Socket Mode connection. A `chat backend stopped` line after it means that
+  connection failed. One with no `slack connected` before it means the gateway's first call to
+  Slack failed: its `err` reads `invalid_auth` when Slack refused the bot token, and anything else
+  (a DNS error or a timeout, say) is the gateway not reaching Slack. The gateway retries either
+  way. No output means the gateway has not tried Slack yet: it first joins the bus, retrying for up
+  to 45 seconds, and exits if that fails. Wait a minute and run the command again. If the pod's
+  restart count is climbing, `kubectl logs ... --previous` shows why the last run exited.
+
+Either way, DM the app a question such as `what clusters can you see?` and wait for the answer (an
+AI agent asks a person to do this): the log line does not prove that messages reach the agent. If
+nothing comes back, [Slack app setup → Verify](/kube-agents/install/slack-app/#verify) has the next
+checks.
+
+## Switching `spec.mode`
+
+`PLATFORM_AGENT_MODE` in `install.env` sets the install's `spec.mode`: `next`, which a first install
+gets, or `today`, the previous stack, kept as a rollback. A file with no such line means `today` in
+`upgrade.sh`, so upgrading an install made before `next` became the default leaves it on `today`;
+`install.sh` keeps the mode the cluster runs and records it there, and a full `upgrade.sh` over such
+a file is refused when the install may run `next`. Of `upgrade.sh`'s modes only
+full applies the key; a re-run of `install.sh` applies it too. Only the `install.sh` and
+`upgrade.sh` of releases after 0.9.0 read it, so upgrade to such a release first.
+[`scripts/installer/README.md`](https://github.com/gke-labs/kube-agents/blob/main/scripts/installer/README.md)
+has the rules for the key, and
+[`docs/designs/spec-mode-switch.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/spec-mode-switch.md)
+what a switch changes inside the install. This section covers what a switch does to chat: Google Chat first, then
+Slack, in order.
+
+### Google Chat
+
+With Google Chat enabled, Google Chat takes the A2A gateway under `next`. The thing that changes for
+it is the home channel, where alerts and scheduled reports land. Under `next` the gateway posts them
+only to `GOOGLE_CHAT_HOME_CHANNEL` in `install.env` (the `PlatformAgent`'s
+`spec.integration.googleChat.homeChannel`), and it must be a space name, `spaces/<id>`. A home
+channel set from chat with `/sethome`, or by the install's first chat message, is kept in the
+Planning Agent's profile and does not count. With the key unset or not a space name, the agent posts
+nothing to Google Chat unprompted. So before switching to `next`, set `GOOGLE_CHAT_HOME_CHANNEL` in
+the same `install.env` as `PLATFORM_AGENT_MODE`, so the one full run applies both
+([ChatOps → Home channel](/kube-agents/concepts/chatops/#home-channel)). After the switch, check
+that a scheduled report or an alert reaches that space.
+
+With Slack enabled too, Slack stays on the credential broker under `next`, as under `today`. Then
+none of the Slack steps below apply: switch, check Slack as in [Checking the result](#slack), and
+leave the Slack app as it is. The rest of this section is for an install whose Slack takes the
+gateway.
+
+### Before the switch
+
+1. Check that Slack answers now, as in [Checking the result](#slack).
+2. Check the Slack settings `next` depends on. A full upgrade refuses a switch to `next` that
+   would hand the gateway a setting it cannot use, and names it
+   ([When an upgrade is refused](#when-an-upgrade-is-refused)); `--plan` warns of the same
+   ones. Checking first saves a refused run:
+   - The bot token is one `xoxb-` token, not a comma-separated list: the A2A gateway takes a
+     single workspace's token
+     ([Get the tokens](/kube-agents/install/slack-app/#get-the-tokens)). This counts the
+     `xoxb-` tokens in the installer's Secret without printing them, and should print `1`:
+
+     ```bash
+     kubectl get secret platform-agent-secrets -n kubeagents-system \
+       -o jsonpath='{.data.SLACK_BOT_TOKEN}' | base64 -d | tr ',' '\n' | grep -c '^xoxb-'
+     ```
+
+     `0` means nothing was read: check that the `PlatformAgent`'s
+     `spec.integration.slack.botTokenSecretRef`, if set, names this Secret and key.
+
+   - `SLACK_ALLOWED_USERS` in `install.env` holds member IDs such as `U0123ABCD`, not emails
+     ([Allowed users](/kube-agents/install/slack-app/#allowed-users)).
+   - `SLACK_HOME_CHANNEL` in `install.env` is the ID of the channel for alerts and scheduled
+     reports: `C…`, or `G…` for some private channels. In Slack, the ID is at the bottom of the
+     channel's details. Under `next` the gateway posts the agent's proactive messages to this
+     channel only. A home channel set from Slack with `/sethome` is kept in the Planning Agent's
+     profile, not in `install.env`, so it does not carry over. A DM ID (`D…`) or a channel name
+     turns off the gateway's notify route, and with it the reports of board cards
+     ([Slack app setup → Home channel](/kube-agents/install/slack-app/#home-channel)). With no home
+     channel those posts are dropped while conversations keep working: the run warns, and the
+     `PlatformAgent` carries the `HomeChannelUnset` condition.
+
+3. Check the board for cards in flight:
+
+   ```bash
+   kubectl exec deploy/platform-agent-gateway -c platform-agent -n kubeagents-system -- \
+     hermes kanban ls --status running
+   kubectl exec deploy/platform-agent-gateway -c platform-agent -n kubeagents-system -- \
+     hermes kanban ls --status blocked
+   ```
+
+   Wait until neither command lists a card: answer each blocked card in its Slack thread, and let
+   running ones finish ([What carries over](#what-carries-over) says why). If scheduled jobs keep
+   filing cards, switch between their runs.
+
+4. Switch when nobody is using the agent, and tell its users that Slack will not answer for a
+   while.
+
+### The switch
+
+Edit the `install.env` the upgrade reads ([Before you start](#before-you-start) says where it
+looks). Set the key, adding the line if the file has none:
+
+```bash
+PLATFORM_AGENT_MODE=next
+```
+
+[Run the upgrade](#run-the-upgrade) again at the release the install runs, in the default full
+mode: pass no `--upgrade-mode`. Before it applies anything, the run warns:
+
+```text
+This apply switches the install from spec.mode today to next (PLATFORM_AGENT_MODE in install.env): a mode switch, not a settings change.
+```
+
+It does not stop to ask. To stay on `today`, press Ctrl-C at that warning and set the key back.
+
+`--upgrade-mode=harness` and `--upgrade-mode=operator` leave the mode as it is and say that a full
+upgrade would switch it. If the run says instead that the `PlatformAgent` carries a `spec.mode` set
+outside the installer, the resource was patched by hand (`kubectl patch`, as 0.9.0 needed). That
+mode survives upgrades, because Helm sees no change in a value the release already renders, so the
+run leaves the resource as it is. To bring the two together, patch `spec.mode` on the resource to
+the mode you want, or apply once with `PLATFORM_AGENT_MODE` set to the mode the resource carries and
+then again with the one you want.
+
+### During the switch
+
+The operator moves Slack in three steps:
+
+1. It restarts the credential broker without the Slack tokens, stopping the old broker pod before
+   it starts the new one, and restarts the agent's pod without its Slack listener. From here, no
+   process holds the app's Socket Mode connection.
+   - Messages the broker had taken from Slack but not yet handed to the agent are lost: the
+     broker acknowledges each event to Slack when it arrives and holds it in memory.
+   - A question the agent was answering stops with its pod and gets no answer.
+   - A board card that was running is put back in the queue once the board reclaims its stale
+     claim, which can take up to 30 minutes (`kanban.dispatch_stale_timeout_seconds`), and runs
+     again from the start.
+2. It creates the NATS bus and the auth callout. It creates the A2A gateway once a callout
+   replica is ready, which needs the bus to be running. The provisioning Job, started at the same
+   point, creates the bus's streams.
+3. The gateway joins the bus, retrying for up to 45 seconds while the streams do not exist and
+   restarting after that. It then checks the bot token with Slack, logs `slack connected`, and
+   opens the Socket Mode connection.
+
+The broker's connection stops when the switch starts, and the gateway exists only once the bus is
+up, so in practice the two never take the same message. How long Slack goes unanswered depends on
+how fast the cluster schedules and pulls the new pods. Slack has no connection to deliver a message
+sent in that gap to, and nothing in kube-agents fetches it later: treat it as lost, and ask its
+sender to send it again. Wait for the gateway, for up to 15 minutes:
+
+```bash
+for i in $(seq 90); do
+  kubectl logs deploy/platform-agent-a2a-gateway -c gateway -n kubeagents-system 2>/dev/null \
+    | grep -q 'slack connected' && { echo connected; break; }
+  sleep 10
+done
+```
+
+It prints `connected` once the gateway has logged `slack connected`. The operator then restarts
+the agent's pod once more, to add the bridge that runs the gateway's tasks, and that can take a few
+minutes if the cluster has to add a node for it. Wait for the `PlatformAgent` to report `Ready`,
+then check Slack as in [Checking the result](#slack):
+
+```bash
+kubectl wait platformagent/platform-agent -n kubeagents-system --for=condition=Ready --timeout=15m
+```
+
+If the loop prints nothing, the `Ready` condition's message names what the
+operator is waiting on, and
+[Troubleshooting](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#6-tracing-where-a-chat-message-stops)
+has the checks for the bus and the gateway. Slack stays unanswered until the gateway connects or
+you [switch back](#switching-back-to-today).
+
+```bash
+kubectl get platformagent platform-agent -n kubeagents-system \
+  -o jsonpath='{.status.conditions[?(@.type=="Ready")].message}{"\n"}'
+```
+
+### What carries over
+
+- **The same app, tokens and allowlist.** The gateway reads the tokens from the same Secret.
+- **The board and the agent's data volume.** The new pod mounts the same volume.
+- **Not the conversations.** Under `next` the agent starts every Slack conversation with no
+  history from `today`. In a channel, a reply without a mention in a thread started before the
+  switch gets no answer: mention the app.
+- **Not the cards in flight, outside the home channel.** A card filed before the switch from a
+  DM or from any channel other than the home channel posts nothing after it: the gateway refuses
+  the post and, with a home channel set, logs `thread "<channel>/<ts>" is not a thread of the home channel`. A card filed
+  in a home-channel thread still posts its progress and report there. Either way its buttons stop
+  working: the gateway answers only the buttons it drew itself.
+- **The home channel only from `install.env`**, as in step 2 above.
+
+Slash commands, buttons, cards and the other Slack features that do not carry over are listed in
+[ChatOps → What carries over from default mode](/kube-agents/concepts/chatops/#what-carries-over-from-default-mode).
+
+### After the switch: the Slack app
+
+Once a DM gets an answer as in [Checking the result](#slack), edit the app as
+[Slack app setup → Moving an existing app to `next`](/kube-agents/install/slack-app/#moving-an-existing-app-to-next)
+describes: delete the slash commands from its manifest and leave interactivity on, since the gateway
+answers the buttons it draws. Edit the app rather than pasting the `next` manifest over it: a
+manifest replaces the app's whole configuration, including its name. Do it after the switch rather
+than before, because the `today` listener answers slash commands until then. Until you do, a slash
+command gets Slack's timeout error.
+
+### Switching back to `today`
+
+1. Set `PLATFORM_AGENT_MODE=today` in `install.env`, or delete the line, and run the upgrade again
+   in full mode. The run warns
+   `This apply switches the install from spec.mode next to today (PLATFORM_AGENT_MODE in install.env): a mode switch, not a settings change.`
+2. The operator restarts the credential broker with the Slack tokens and deletes the A2A stack,
+   the gateway with it. For the seconds the gateway pod takes to stop, both can hold a
+   connection, and a message the stopping gateway takes gets no answer. The bus volume and its
+   credentials Secret stay; [Uninstall](/kube-agents/install/uninstall/#what-specmode-next-leaves-behind)
+   says how to remove them. Wait for the broker, for up to 5 minutes:
+
+   ```bash
+   for i in $(seq 30); do
+     kubectl logs deploy/platform-agent-credential-proxy -n kubeagents-system 2>/dev/null \
+       | grep -q 'Slack relay enabled' && { echo connected; break; }
+     sleep 10
+   done
+   ```
+
+   It prints `connected` once the broker has connected to Slack. If it prints nothing, read the
+   broker's log as in [Checking the result](#slack).
+
+3. Put the slash commands back. Print the `today` manifest:
+
+   ```bash
+   kubectl exec deploy/platform-agent-gateway -c platform-agent -n kubeagents-system -- \
+     hermes slack manifest
+   ```
+
+   Before you paste it into the app's **App Manifest** page, change its `name`, `description` and
+   `display_name` to the app's current values: the manifest replaces the app's whole
+   configuration. [Slack app setup](/kube-agents/install/slack-app/#create-the-app) covers its
+   options; read its warning about agent view first. Reinstall the app if Slack asks.
+
+4. Check Slack as in [Checking the result](#slack).
+
+Conversations and cards started under `next` do not carry back, for the same reasons as above.
+
+To roll back to an older release, switch to `today` first:
+[Rolling back a release](/kube-agents/deploy/rollback/#before-you-start) says why.
+
 ## The gateway's own ServiceAccount
 
 From the release in which the gateway Pod runs as its own ServiceAccount, an upgrade moves the
@@ -510,11 +761,28 @@ change of the new release.
   ring and service account. This is what an install whose GitOps came from `install.sh`'s flags looks like when it
   was set up by a release that did not record them in `install.env`. The run prints the lines to
   set, with the live values filled in where it can read them; set them and re-run the same command. To remove GitOps on purpose, re-run with `KUBE_AGENTS_REMOVE_GITOPS=true` in the
-  environment. `--plan` warns instead.
+  environment. `--plan` warns instead. A minter that this install did not make (one made by hand,
+  by `make deploy-github`, or by another Helm release) is not removed by the apply, so the run does
+  not ask for `GITHUB_APP_ID`. It refuses when `GITOPS_ORG`, `GITOPS_REPO` and `GITOPS_HOST` do not
+  name the PlatformAgent's GitOps repository, or when it cannot read the PlatformAgent or the
+  repository it names. The run decides that the minter is not this install's only when the
+  `kube-agents` release record has `githubMinter.enabled` false, the minter's Deployment carries no
+  Helm annotations for that release, and the install's Terraform state holds no minter module (its
+  service account and Cloud KMS key); with no release (a first install), or a state it cannot
+  read, it applies the check above.
+
+- **The chart's minter would land on another minter.** This run renders the chart's own token
+  minter, but a minter that this install did not make runs under the same names, and Helm does not
+  take over objects it does not own. Remove all of the other minter's objects first: run
+  `make -C k8s-operator undeploy-github` with the same `GITHUB_MINTER_KSA_NAME` for the kustomize
+  path, or turn the minter off in the Helm release that made it, and delete a
+  `github-app-credentials` Secret that you made by hand. Or keep the other minter: set
+  `GITHUB_APP_ID` empty in `install.env` (and, with `install.sh`, give no `--github-app-id`).
+  `--plan` warns instead.
 
 ## What stops during an upgrade
 
-This section describes `spec.mode: today`, the default.
+This section describes `spec.mode: today`, which an install made before `next` became the first-install default keeps.
 
 At the default of one replica, the agent gateway and the credential broker each run one pod with
 the `Recreate` strategy. Kubernetes stops the old pod before it starts the new one, so chat stops

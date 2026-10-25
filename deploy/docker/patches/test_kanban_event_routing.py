@@ -189,6 +189,24 @@ class CompressedSessionTest(unittest.TestCase):
         self.assertEqual(got, ("api_server", "a2a-ctx-1", None))
         self.assertTrue(any("no notifier serves" in line for line in logs.output), logs.output)
 
+    def test_a_console_card_reports_to_its_conversation_naming_the_turn(self):
+        # The console's route is served whatever A2A_NOTIFY_CONVERSATIONS names
+        # (here slack), and the card snapshots the turn's task after '#'.
+        routing_db(self.tmp / "console.db", {"a2a-ctx-5": {"conversation_route": {
+            "platform": "console", "conversation": "console:tab-5", "context_id": "ctx-5", "task_id": "task-9"}}})
+        self.assertEqual(
+            resolve_chat_route("api_server", "a2a-ctx-5", None, db_path=str(self.tmp / "console.db")),
+            ("console", "a2a-ctx-5", "console:tab-5#task-9"),
+        )
+
+    def test_a_console_route_without_a_task_addresses_the_conversation_alone(self):
+        routing_db(self.tmp / "console-old.db", {"a2a-ctx-6": {"conversation_route": {
+            "platform": "console", "conversation": "console:tab-6", "context_id": "ctx-6"}}})
+        self.assertEqual(
+            resolve_chat_route("api_server", "a2a-ctx-6", None, db_path=str(self.tmp / "console-old.db")),
+            ("console", "a2a-ctx-6", "console:tab-6"),
+        )
+
     def test_a_route_without_its_context_is_not_used(self):
         routing_db(self.tmp / "partial.db", {"a2a-ctx-9": {"conversation_route": {"platform": "slack", "conversation": "slack:dm/D9"}}})
         self.assertEqual(

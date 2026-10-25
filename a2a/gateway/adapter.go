@@ -84,6 +84,13 @@ type InboundMessage struct {
 	// sender's such message is dropped without the public refusal notice,
 	// since they asked the bot nothing. False on every other path.
 	Unaddressed bool
+	// Shortcut marks a message a member sent by using the "ask about this"
+	// message shortcut on someone's message: the conversation is the thread
+	// under that message, MessageID names it, and Text quotes it. A sender
+	// the gateway cannot verify gets no refusal in that thread, which the
+	// channel reads; the adapter tells them privately. False on every other
+	// path, and on every backend but Slack.
+	Shortcut bool
 }
 
 // IntentCancel is the only Intent today: stop the conversation's running
@@ -305,7 +312,9 @@ type TaskObserver interface {
 	// CancelPublished says a kind:cancel envelope for taskID is on the
 	// task's `in` subject. Called after the publish returns, on both cancel
 	// routes (the active task's and a named task the conversation no longer
-	// holds).
+	// holds), and for the card-stop control a stop sends (cardstop.go), with
+	// the control's id: that stop reached the bus too, whether or not a task
+	// was running to cancel.
 	//
 	// Signalled on success only, like TaskAccepted, and read against the end
 	// of the turn: the gateway's answer to a cancel it did not publish is a

@@ -72,8 +72,10 @@ SANDBOX_PRINCIPAL = "hermes"
 # line rather than a second credential, and the separation the module docstring
 # describes is the only thing keeping them apart.
 #
-# Four writers pass it, all for the same reason: they have to write inside a
-# tree that is `agent:agent` to the leaves, which uid 1001 cannot do.
+# Five writers pass it, all for the same reason: they have to write inside a
+# tree that is `agent:agent` to the leaves, which uid 1001 cannot do
+# (`upgrade_readiness_review.py` places the weekly report's copy under the
+# sandbox's agent-owned /opt/data, where the agent reads it on request).
 # `kanban_workspace_gc.py` unlinks scratch workspaces; `cluster_agent_profile.py`
 # writes one profile's kubeconfig; `bootstrap_delivery.py` renames the delivered
 # onboarding report; `bootstrap_handoff.py` writes the raw onboarding report. The alternative in any case — loosening the modes so a
@@ -494,6 +496,12 @@ def read_bytes(path: str, *, max_bytes: int, principal: str = TERMINAL_PRINCIPAL
     the cap is applied by `head` on the far side, so a caller asking for 32 KiB
     of a 2 GB core dump moves 32 KiB. Pass one byte more than the real ceiling
     to tell "at the limit" from "over it", the way a local capped read does.
+
+    `path` is rendered into the script through `shlex.quote`, which is the
+    right escaping for the remote shell and not a sanitizer CodeQL's
+    `py/command-line-injection` query recognises. A caller whose path derives
+    from a request body passes an allowlisted copy of the value instead, as
+    `session_kv_server._shipped_audit_job` does.
 
     `principal` defaults to `TERMINAL_PRINCIPAL`, which is NOT this module's
     default and is deliberate. The other callers that name it pass it to

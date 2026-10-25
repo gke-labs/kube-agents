@@ -6,8 +6,8 @@ run the agent, score, read the log. Most of the mistakes are static. A domain
 slug that matches no row in `docs/designs/domains.yaml` counts as coverage of
 nothing; a fixture role the seeded fleet does not define is a case addressing
 a defect that was never planted; a check with no assertion is a check that
-cannot fail; a case no roster file under `hack/eval/` names never runs; a case with no
-`owner:` has nobody to answer when it flakes; a fixture carrying a real
+cannot fail; a case no roster file under `hack/eval/` names never runs; an
+`owner: maintainers` sends a case's bugs to nobody; a fixture carrying a real
 address or a credential is a leak the moment it merges. None of those needs a
 cluster to find.
 
@@ -47,6 +47,7 @@ import yaml
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
+import case_owner  # noqa: E402
 import eval_rosters  # noqa: E402
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -77,15 +78,12 @@ FIXTURES_FILE = REPO_ROOT / "docs" / "designs" / "fleet-fixtures.yaml"
 # to name a role differently, which fixture_catalog_disagreements() enforces.
 ROLE_CATALOG = REPO_ROOT / "bench" / "tf" / "fleet" / "fixtures.json"
 
-# The `owner:` field, from bench/CONTRIBUTING.md. A GitHub login, bare, or
-# this literal for a case the OWNERS approvers answer for. Bare because the
-# field is a name to look up, not a mention: a task.yaml is quoted into
-# issues and pull-request comments, where a leading at sign pages someone.
-OWNER_MAINTAINERS = "maintainers"
-# GitHub's own login rule: alphanumerics and single interior hyphens, at most
-# 39 characters, so a stray e-mail address or a display name is rejected
-# before a reviewer has to spot it.
-GITHUB_LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}")
+# The optional `owner:` field, from bench/CONTRIBUTING.md: a GitHub login,
+# written bare because the field is a name to look up, not a mention -- a
+# task.yaml is quoted into issues and pull-request comments, where a leading
+# at sign pages someone. Absent, the case's bugs go to its domain's owner
+# (scripts/case_owner.py, which owns the login rule).
+GITHUB_LOGIN = case_owner.GITHUB_LOGIN
 
 # The fixture sanitization scan, from bench/CONTRIBUTING.md. Everything a
 # contributed case brings with it lives in one of these trees -- the case
@@ -156,19 +154,14 @@ CREDENTIAL_SHAPES: dict[str, str] = {
 # review. Delete an entry once its case is registered -- staleness is only
 # enforced for cases that no longer exist, because an in-flight branch
 # registering a case must not red main the day it merges.
+# Why the twelve upgrade-failure scenario cases below wait, in one sentence
+# their KNOWN_UNREGISTERED reasons share.
+SCENARIO_BATCH_WAIT = (
+    "enters hack/eval/nightly-cases.txt in a later batch of five as the main "
+    "part's nights allow, the next after the first batch's nights are measured"
+)
+
 KNOWN_UNREGISTERED = {
-    # The two CUJ 1 cases (#2889), held out for the same infra-lock budget
-    # as the stack cases below: a `stack:` case runs alone on lock-infra
-    # whatever EVAL_TASK_PARALLELISM is, and the main nightly part's serial
-    # chain is already at or past the 480m deadline on cost hints alone.
-    "gitops-drift-deleted-policy-triage": (
-        "#2889: stack case held out of the nightly until the infra-lock "
-        "chain has room"
-    ),
-    "gitops-drift-load-bearing-change-triage": (
-        "#2889: stack case held out of the nightly until the infra-lock "
-        "chain has room"
-    ),
     # Provisions its own cluster, so registering it costs every pull request
     # a second multi-minute provision. Whether it belongs in presubmit or
     # nightly is a tier decision nobody has made; this entry is the record
@@ -206,6 +199,12 @@ KNOWN_UNREGISTERED = {
     "fleet-audit-chat-report-is-the-report": (
         "needs a chat platform, which no CI install has; run by hand on a chat install"
     ),
+    # Same constraint, one step further in: it grades a report falling back to the
+    # home channel after its thread refused it, so an install with no chat platform
+    # has neither the thread nor the channel and the case can only fail.
+    "notification-dead-thread-falls-back": (
+        "needs a chat platform, which no CI install has; run by hand on a chat install"
+    ),
     # It grades a GitHub forge declared at a GitHub Enterprise Server host,
     # which needs the GHES proxy (hack/ghes-proxy) and an install pointed at
     # it. No eval lane deploys either, so it runs by hand with the recipe in
@@ -213,6 +212,59 @@ KNOWN_UNREGISTERED = {
     "ghes-pdb-remediation-pr": (
         "needs the GHES proxy and a GHES-forge install, which no eval lane has; "
         "run by hand with the recipe in the case header"
+    ),
+    # The upgrade-failure catalogue's scenario cases enter
+    # hack/eval/nightly-cases.txt in batches of five (decided 2026-10-15 on
+    # the registration's review). The nightly's main part ran 370-401 minutes
+    # on its clear nights of 10-15 October against the 480m deadline, the
+    # seventeen measure 770-1,145 serial minutes a night, and the cost-ordered
+    # queue would charge a deadline kill to the existing cases' last
+    # repetition; each entry below carries its measured cost, and
+    # hack/ci-eval-pr.sh's unit_cost_hint prices the seventeen from the same
+    # record. The first batch, entries 1, 3, 5, 12 and 20, is in the roster's
+    # sorted section. These twelve have a fixture the fleet plants and a
+    # task file, and wait for a later batch: the next after the first batch's
+    # first measured week of nights, in the order of measured cost, the five
+    # with no clean pass last. An entry goes when its batch's pull request
+    # moves the case to the roster's sorted section.
+    "upgrades-no-surge-pool-recreate-warned": (
+        f"catalogue entry 2: {SCENARIO_BATCH_WAIT}; median 1065s on three clean "
+        "passes, the record's heaviest run at 3163s"
+    ),
+    "upgrades-node-local-state-named": (
+        f"catalogue entry 4: {SCENARIO_BATCH_WAIT}; median 1226s on two clean passes"
+    ),
+    "upgrades-removed-api-callers-distinguished": (
+        f"catalogue entry 6: {SCENARIO_BATCH_WAIT}; no clean pass on record, an "
+        "agent gap on its complete runs"
+    ),
+    "upgrades-pod-security-latest-pinned-named": (
+        f"catalogue entry 8: {SCENARIO_BATCH_WAIT}; one clean pass, 750s"
+    ),
+    "upgrades-stale-client-skew-named": (
+        f"catalogue entry 10: {SCENARIO_BATCH_WAIT}; no clean pass on record"
+    ),
+    "upgrades-containerd-socket-agent-named": (
+        f"catalogue entry 13: {SCENARIO_BATCH_WAIT}; one clean pass, 540s"
+    ),
+    "upgrades-cgroup-blind-runtime-named": (
+        f"catalogue entry 14: {SCENARIO_BATCH_WAIT}; one clean pass, 360s"
+    ),
+    "upgrades-multi-process-oom-group-named": (
+        f"catalogue entry 15: {SCENARIO_BATCH_WAIT}; no clean pass on record, an "
+        "agent gap on its complete run"
+    ),
+    "upgrades-network-policy-enforcement-stated": (
+        f"catalogue entry 16: {SCENARIO_BATCH_WAIT}; no clean pass on record"
+    ),
+    "upgrades-node-image-coupled-agent-named": (
+        f"catalogue entry 17: {SCENARIO_BATCH_WAIT}; one clean pass, 2180s wall"
+    ),
+    "upgrades-cuda-pinned-gpu-job-named": (
+        f"catalogue entry 18: {SCENARIO_BATCH_WAIT}; no clean pass on record"
+    ),
+    "upgrades-intree-volume-named": (
+        f"catalogue entry 19: {SCENARIO_BATCH_WAIT}; median 1167s on two clean passes"
     ),
 }
 
@@ -229,6 +281,41 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    # Needs a GitOps repository that declares the namespace under a path a
+    # reconciler syncs; no pool project's repository has one. Run by hand on
+    # the GitOps-wired dev lane (gitops-target-1, sackheads/kage-fleet-dev).
+    "delete-namespace-declared-pr": (
+        "#3576: needs a declared, reconciler-synced namespace in the pool GitOps repositories"
+    ),
+    # Needs a GitOps repository with a Config Connector + Config Sync sibling
+    # cluster; no pool project has one. Run by hand on the GitOps-wired dev
+    # lane (ka-fleet-dev-1, sackheads/kage-fleet-dev).
+    "substrate-cluster-gitops-pr": (
+        "#3576: needs a Config Connector + Config Sync sibling cluster in the pool GitOps repositories"
+    ),
+    # Needs a GitOps repository whose provisioning/ path holds Terraform; no
+    # pool project's repository has one. Run by hand on a dev install whose
+    # repository does (ka-fleet-dev-1, sackheads/kage-fleet-dev at branch hcl).
+    "terraform-spot-replacement-pr": (
+        "#3576: needs a Terraform provisioning/ path in the pool GitOps repositories"
+    ),
+    "terraform-node-pool-autoscaling-pr": (
+        "#3576: needs a Terraform provisioning/ path in the pool GitOps repositories"
+    ),
+    "terraform-new-cluster-pr": (
+        "#3576: needs a Terraform provisioning/ path in the pool GitOps repositories"
+    ),
+    "fanout-bound-ten-cards": (
+        "#3560: needs an eval install with more than ten clusters in scope, so a "
+        "fleet question reaches the ten-card fan-out bound; the seeded fleet and "
+        "every dev install have five or fewer"
+    ),
+    "upgrades-readiness-lb-drain-timeout": (
+        "#3524: needs bench/tf/fleet's drain-timeout backend service on seeded-b's default "
+        "pool (the readiness-lb-drain-timeout role) applied to every pool project (fleet "
+        "re-apply); no pool project has a backend service draining longer than the 600 s "
+        "GKE waits per node"
+    ),
     "scope-excluded-cluster-not-listed": (
         "#3213: needs an eval install whose PlatformAgent spec.scope.exclude.clusters "
         "names seeded-b (seeded-a and seeded-c in scope); no pool install declares a "
@@ -279,6 +366,20 @@ FIXTURE_NOT_READY = {
         "spec.integration); every CI eval install has a GitHub forge, so no CI tier "
         "can run it; run it by hand against such an install"
     ),
+    "fleet-audit-forge-without-issues-keeps-the-ledger-in-the-store": (
+        "#1154: needs an install whose forge's capabilities declare no issue verbs "
+        "and labels: false (an install whose forge declares no issue tracker, as a "
+        "Bitbucket provider does), and the no-pdb-workload declaration of #2228; "
+        "every CI eval install has a GitHub forge, so no CI tier can run it; run it "
+        "by hand against such an install"
+    ),
+    "fleet-audit-ledger-goes-to-the-gitops-repository": (
+        "#3536: needs an install whose PlatformAgent declares a second managed "
+        "repository beside the gitops one; every CI eval install declares one, and "
+        "a case cannot add one to a shared install, since the operator never removes "
+        "it from managed_repos and every other fleet-audit case on main would then "
+        "refuse; run it by hand against such an install"
+    ),
     "gitops-drift-no-repository-triage": (
         "#3313: needs an install with no usable GitOps repository (a PlatformAgent "
         "whose spec.integration.repositories is empty); every CI eval install "
@@ -317,6 +418,14 @@ FIXTURE_NOT_READY = {
         "each pool project's *-infra repository, so 3.3's fix is a manifest "
         "rather than manual"
     ),
+    "obtainability-pdb-kustomize-overlay": (
+        "#2686: needs checkout-gateway declared in a Kustomize root under "
+        "clusters/seeded-a/seeded-reliability/ in each pool project's *-infra "
+        "repository (the two files are in the case's header), so a new "
+        "PodDisruptionBudget there renders only if the kustomization lists it; "
+        "the fixture cannot share a repository with "
+        "obtainability-major-pdb-auto-pr's (#2228)"
+    ),
     "obtainability-untargeted-compute-class-manifest": (
         "#2540: needs a ComputeClass cluster without default ComputeClass and with "
         "an untargeted workload (untargeted-worker) in each pool project, so 3.24's "
@@ -326,6 +435,41 @@ FIXTURE_NOT_READY = {
         "#1873: needs the stalled-controller role applied to every pool "
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "
         "verification sweep"
+    ),
+    "autoops-warning-event-triage-open-pr": (
+        "#2513: needs an install with INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true in spec.deployment.env "
+        "and a manifest for eval-open-pr-workload in each pool project's *-infra repository "
+        "so the follow-up Platform Agent card can open the recommended remediation Pull Request"
+    ),
+    "upgrades-removed-api-caller-named": (
+        "#2655: needs a removed-api-caller role, a writer that calls an API "
+        "version the cluster's next minor stops serving, which no standing fleet "
+        "role can carry (the catalogue's entry 6 Fixture line says why), so the "
+        "seeded fleet's upgrade-failure shapes merged without it; the "
+        "deprecated-api-caller role is stamped deprecated, not removed, and stands "
+        "in for entry 9, and the readiness report's removed-api-callers rule is "
+        "covered by unit tests on a captured log sample. The case waits for the "
+        "role on a purpose-built cluster, or for the next minor that removes a "
+        "served API; #2275 is the umbrella that tracks the scenario cases to merge"
+    ),
+    "upgrades-readiness-surge-headroom": (
+        "#3569: needs a cluster whose Pod secondary range leaves fewer free "
+        "per-node blocks than the maxSurge sum of its surging pools, or a node "
+        "pool with an accelerator on the surge strategy with no reservation "
+        "affinity; the seeded fleet plants neither (a secondary range is fixed "
+        "at cluster creation, so the short range is a new small cluster slot, "
+        "and an accelerator pool costs by the hour on every pool project), so "
+        "the surge-capacity rule's two surge halves are covered by unit tests on "
+        "a recorded cluster record and node list until the fixture lands"
+    ),
+    "upgrades-readiness-rollout-sequence-precheck": (
+        "#3798: needs gkehub.googleapis.com enabled, roles/gkehub.viewer bound for "
+        "the agent's service account, a fleet, and the standing RolloutSequence "
+        "`seeded-train` on every pool project, so a worker's `gcloud container fleet "
+        "rolloutsequences list` on the eval project answers `existing 1; plan "
+        "blocked`, the line the case pins; no pool project has them today, so the "
+        "read fails for a reason that is not the case's, and the blocked path is "
+        "graded by the rule's unit tests on a recorded list"
     ),
 }
 
@@ -370,16 +514,25 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
         "forbidden_patterns",
         "required_patterns",
     ),
+    # The lines whose times are observation times; with none it can only pass.
+    "report_times_in_window": ("label_patterns",),
     # The parsed manifest's fields and selector are the assertion; `kind` alone
     # only names what to look for.
     "report_manifest": ("fields", "selects", "excludes"),
-    "ledger_issue_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
+    "ledger_issue_contains": (
+        "required_phrases",
+        "forbidden_phrases",
+        "any_of_phrases",
+        "every_finding_named",
+    ),
     # No field: a bold one-sentence lead, no heading and the length caps are
     # the assertion, and every field narrows it.
     "answer_first": (),
     # No field: "this run's report is in the store" is the assertion, and
     # `status` and `required_finding_phrases` only narrow it.
     "audit_report_stored": (),
+    # The audits whose part of the reply is graded against the store.
+    "report_store_reply": ("audits",),
     # No field, deliberately: the freshness binding is the assertion and every
     # field only narrows it. See the empty-tuple rule in _check_assertions.
     "pull_request_opened": (),
@@ -391,10 +544,14 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     "tool_called": ("tool_names",),
     "worker_commands": ("required_patterns", "forbidden_patterns", "required_runs", "forbidden_runs", "forbidden_result_patterns"),
     "worker_agents": ("required_agents",),
+    "worker_budget": ("budget",),
     "replay_card": ("status_in", "status_not_in", "comment_phrases", "decoy_status_in"),
     # No assertion field: "the gateway would post nothing" is the assertion; `reply` only picks
     # which reply is graded.
     "reply_is_silent": (),
+    # No field: "every evidence block in the reply is a worker's command with its real output"
+    # is the assertion; `min_blocks` only sets how many blocks a reply needs.
+    "verified_claims_backed": (),
     # This repository, agent-disk-reading: the discovery sweep a cron job filed.
     "bootstrap_fanout": ("require",),
     # This repository, sandbox-reading: the findings the onboarding
@@ -412,6 +569,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # This repository, sandbox-reading: how many of the batch's critical
     # findings the onboarding report lists, against `limit`.
     "bootstrap_report_criticals": ("limit",),
+    # This repository, sandbox-reading: the paragraphs the onboarding report
+    # opens with, and the verdicts it must not write.
+    "bootstrap_report_posture": ("posture",),
     # This repository, sandbox-reading. No field, like pull_request_opened:
     # the diff against the image is the assertion. It reads the agent's own
     # shell sandbox pod, not a seeded-fleet fixture, so it is not in
@@ -424,13 +584,24 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # case planted. The rows it names are the assertion; with none it could
     # only pass.
     "findings_item_state": ("finding_ids",),
+    # This repository, agent-pod-reading: how many of a workload's events the
+    # session daemon folded into its newest incident. The count is the
+    # assertion; min_folded is at least 1, so it cannot pass on nothing folded.
+    "workload_incident_folded": ("min_folded",),
     # This repository, agent-pod-reading. No field: whether every post a planted
     # report produced is that report, exactly, is the whole assertion.
     "relay_posted_as_written": (),
+    # This repository, agent-pod-reading. No field: whether a report its thread
+    # refused still reached the home channel is the whole assertion, and the
+    # probe's planted thread is what makes the refusal certain.
+    "notification_fell_back_to_home": (),
     # This repository, agent-pod- and sandbox-reading. No field: whether every
     # post a fired audit run produced is the report its `finish` rendered is the
     # whole assertion.
     "audit_chat_report_posted": (),
+    # This repository, agent-pod- and cluster-reading: the namespace names the
+    # burst whose admitted alerts must each have started a triage turn.
+    "triage_starts": ("namespace",),
 }
 
 # Check types that read live cluster state. A case using one is asserting on
@@ -556,7 +727,20 @@ def platform_job_ids() -> set[str]:
 def known_domains() -> set[str]:
     """Slugs defined in docs/designs/domains.yaml."""
     data = _load_yaml(DOMAINS_FILE) or {}
-    return {d["slug"] for d in data.get("domains") or []}
+    rows = data.get("domains") or []
+    # The filer resolves a case with no owner through case_owner's line scan
+    # of this file, so a row the scan reads differently (slug not first, a
+    # quoted slug, a nested owner:) would route to someone else, or nobody.
+    parsed = {d.get("slug"): d.get("owner") for d in rows if isinstance(d, dict)}
+    scanned = case_owner.parse_domain_owners(DOMAINS_FILE.read_text(encoding="utf-8"))
+    differ = sorted(str(slug) for slug in parsed.keys() | scanned.keys() if parsed.get(slug) != scanned.get(slug))
+    if differ:
+        raise CaseError(
+            f"{DOMAINS_FILE}: scripts/case_owner.py reads the owner of domain(s) "
+            f"{', '.join(differ)} differently from YAML. Start each row with "
+            "'- slug: <slug>' unquoted and give it one plain 'owner: <login>'"
+        )
+    return {d["slug"] for d in rows}
 
 
 # `{cluster:<slot>}` in a report_contains pattern, as bench/kube_agents_bench/
@@ -923,30 +1107,56 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
             "not define"
         )
 
-    # The owner. Demotion (docs/eval-gate-roster.md) files an issue against a
-    # flaking case, and this field is who that issue goes to. devops-bench
-    # discards the key, so like `domain` it is enforced here or nowhere.
+    # The owner, optional. A case's bugs go to it first, and to the domain's
+    # owner in docs/designs/domains.yaml when it is absent (scripts/case_owner.py).
+    # Offline: whether GitHub accepts the login as an assignee is checked when
+    # a bug is filed, not here. devops-bench discards the key, so like `domain`
+    # it is enforced here or nowhere. A bare `owner:` counts as absent.
+    owner_problems = len(problems)
     owner = spec.get("owner")
-    if owner is None:
-        problems.append(
-            "declares no 'owner:'. Name the GitHub login (without the at sign) "
-            f"that answers when this case flakes, or {OWNER_MAINTAINERS!r} for "
-            "a case the OWNERS approvers own -- see bench/CONTRIBUTING.md"
-        )
-    elif not isinstance(owner, str) or not owner:
-        problems.append(f"'owner:' {owner!r} is not a GitHub login string")
-    elif owner.startswith("@"):
-        problems.append(
-            f"owner {owner!r} carries a leading at sign; write the login bare, "
-            "so a task.yaml quoted into an issue names someone rather than "
-            "paging them"
-        )
-    elif owner != OWNER_MAINTAINERS and not GITHUB_LOGIN.fullmatch(owner):
-        problems.append(
-            f"owner {owner!r} is neither a GitHub login (letters, digits and "
-            "single hyphens, at most 39 characters) nor the literal "
-            f"{OWNER_MAINTAINERS!r}"
-        )
+    if owner is not None:
+        if not isinstance(owner, str) or not owner:
+            problems.append(f"'owner:' {owner!r} is not a GitHub login string")
+        elif owner.startswith("@"):
+            problems.append(
+                f"owner {owner!r} carries a leading at sign; write the login bare, "
+                "so a task.yaml quoted into an issue names someone rather than "
+                "paging them"
+            )
+        elif case_owner.is_retired_owner(owner):
+            problems.append(
+                f"'owner: {owner}' is no longer allowed: it names nobody. Delete "
+                "the line and the case's bugs go to its domain's owner in "
+                "docs/designs/domains.yaml, or name the person whose bugs this "
+                "case is -- see bench/CONTRIBUTING.md"
+            )
+        elif not GITHUB_LOGIN.fullmatch(owner):
+            problems.append(
+                f"owner {owner!r} is not a GitHub login (letters, digits and "
+                "single hyphens, at most 39 characters)"
+            )
+
+    # The filer routes a red with case_owner's line scan, not this YAML read.
+    # Where the two read `owner:` or `domain:` differently (`owner: null`, a
+    # block scalar, an anchor, a quoted key), the lint would show one person
+    # and the bug would go to another, so the case is rejected here.
+    if len(problems) == owner_problems:
+        text = path.read_text(encoding="utf-8")
+        for key in ("owner", "domain"):
+            parsed = spec.get(key)
+            if parsed is not None and not isinstance(parsed, str):
+                continue  # already reported above as not a string
+            scanned = case_owner.task_field(text, key)
+            if scanned != parsed:
+                problems.append(
+                    f"'{key}:' reads as {parsed!r} to YAML but as {scanned!r} to "
+                    "scripts/case_owner.py, which routes the case's bugs from the "
+                    f"first line that starts '{key}:' at column 0. Make that line a "
+                    f"plain '{key}: value' (no null, block scalar, anchor or quoted "
+                    "key), and check for such a line inside another field's text or "
+                    "an invisible character such as a byte-order mark before it"
+                    + (", or delete an empty 'owner:' line" if key == "owner" else "")
+                )
 
     # The audit streams a case drives without grading their ledger. The runner
     # holds each one's lock for the unit (hack/ci-eval-pr.sh, task_streams); an

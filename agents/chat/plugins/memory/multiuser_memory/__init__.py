@@ -1,7 +1,10 @@
+from contextlib import closing
 import hashlib
 import json
 import logging
+import os
 import re
+import sqlite3
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -14,6 +17,11 @@ logger = logging.getLogger(__name__)
 ENTRY_DELIMITER = "\n§\n"
 MAX_ENTRY_LENGTH = 2000
 MAX_ENTRIES_PER_TARGET = 500
+A2A_SESSION_PREFIX = "a2a-"
+DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
+MAX_PARENT_SESSION_HOPS = 256
+SQLITE_TIMEOUT_SECONDS = 2.0
+COMPRESSION_END_REASON = "compression"
 
 MEMORY_TOOL_SCHEMA = {
     "name": "multiuser_memory",
@@ -54,7 +62,16 @@ SHARED_SESSION_NOTICE = (
     "more than one person can post in, and the harness cannot attribute a message to "
     "its sender here, so nothing may be written to or read from a personal store. "
     "Use target='memory' only for facts that are genuinely shared; personal memory "
-    "works in a direct message."
+    "works in a direct message. If someone asks you to remember a personal fact or "
+    "preference here, tell them that personal memory is off in a shared thread and "
+    "nothing was saved — never imply it was noted."
+)
+NO_IDENTITY_NOTICE = (
+    "Personal memory is unavailable because this session carries no user identity, "
+    "so nothing may be written to or read from a personal store. Only shared memory "
+    "(target='memory') is reachable here. If the user asks you to remember a personal "
+    "fact or preference, tell them that personal memory is unavailable in this session "
+    "and nothing was saved — never imply it was noted."
 )
 
 
@@ -255,13 +272,80 @@ def _thread_sessions_are_per_user() -> bool:
     return False
 
 
+def _resolve_a2a_session_id(
+    session_id: str, hermes_home: Optional[Path]
+) -> str:
+    """Return the originating ``a2a-*`` session id, walking compression parents if needed."""
+    sid = str(session_id or "").strip()
+    if sid.startswith(A2A_SESSION_PREFIX):
+        return sid
+    if not sid or hermes_home is None:
+        return ""
+    state_db = hermes_home / "state.db"
+    if not state_db.is_file():
+        return ""
+    try:
+        with closing(sqlite3.connect(f"file:{state_db}?mode=ro", uri=True, timeout=SQLITE_TIMEOUT_SECONDS)) as conn:
+            cur = sid
+            seen = {cur}
+            for _ in range(MAX_PARENT_SESSION_HOPS):
+                row = conn.execute(
+                    "SELECT s.parent_session_id FROM sessions s "
+                    "JOIN sessions p ON p.id = s.parent_session_id "
+                    "WHERE s.id = ? AND p.end_reason = ? "
+                    "AND json_extract(COALESCE(s.model_config, '{}'), '$._branched_from') IS NULL "
+                    "AND json_extract(COALESCE(s.model_config, '{}'), '$._delegate_from') IS NULL",
+                    (cur, COMPRESSION_END_REASON),
+                ).fetchone()
+                parent = str(row[0] or "").strip() if row else ""
+                if not parent or parent in seen:
+                    break
+                if parent.startswith(A2A_SESSION_PREFIX):
+                    return parent
+                seen.add(parent)
+                cur = parent
+    except Exception as e:
+        logger.debug("Could not walk state.db parent_session_id for %s: %s", sid, e)
+    return ""
+
+
+def _resolve_a2a_session_route(
+    session_id: str, hermes_home: Optional[Path]
+) -> Tuple[bool, str, str]:
+    """Return ``(is_a2a, user_id, chat_type)`` from ``session_kv.db`` for ``a2a-*`` sessions."""
+    a2a_sid = _resolve_a2a_session_id(session_id, hermes_home)
+    if not a2a_sid:
+        return False, "", ""
+    db_path = os.environ.get("SESSION_KV_DB_PATH", DEFAULT_SESSION_KV_DB_PATH)
+    if not db_path or not os.path.isfile(db_path):
+        return True, "", ""
+    try:
+        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=SQLITE_TIMEOUT_SECONDS)) as conn:
+            row = conn.execute(
+                "SELECT metadata FROM session_metadata WHERE session_id = ?", (a2a_sid,)
+            ).fetchone()
+        if not row or not row[0]:
+            return True, "", ""
+        meta = json.loads(row[0])
+        route = meta.get("conversation_route") if isinstance(meta, dict) else None
+        if not isinstance(route, dict):
+            return True, "", ""
+        user_id = str(route.get("user_id") or "").strip()
+        chat_type = str(route.get("chat_type") or "").strip().lower()
+        return True, user_id, chat_type
+    except Exception as e:
+        logger.debug("Could not read conversation_route for %s: %s", a2a_sid, e)
+        return True, "", ""
+
+
 class MultiUserFileMemoryProvider(MemoryProvider):
     """Memory provider that isolates USER.md per user_id while keeping MEMORY.md global."""
 
     def __init__(self):
         self._hermes_home: Optional[Path] = None
-        self._user_id: str = "default"
+        self._user_id: str = ""
         self._session_is_shared: bool = False
+        self._personal_disabled_reason: str = NO_IDENTITY_NOTICE
 
     @property
     def name(self) -> str:
@@ -273,11 +357,19 @@ class MultiUserFileMemoryProvider(MemoryProvider):
     def initialize(self, session_id: str, **kwargs: Any) -> None:
         hermes_home_str = kwargs.get("hermes_home")
         self._hermes_home = Path(hermes_home_str) if hermes_home_str else Path("/opt/data")
-        raw_user = kwargs.get("user_id") or "default"
-        # Sanitize user_id for safe filesystem path and append a hash to prevent collisions
-        sanitized = "".join(c if c.isalnum() or c in "-_." else "_" for c in raw_user).strip("_")
-        user_hash = hashlib.sha256(raw_user.encode("utf-8")).hexdigest()[:12]
-        self._user_id = f"{sanitized}_{user_hash}" if sanitized else f"default_{user_hash}"
+        raw_user = str(kwargs.get("user_id") or "").strip()
+        if raw_user == "default":
+            raw_user = ""
+        chat_type = str(kwargs.get("chat_type") or "").strip().lower()
+
+        is_a2a, a2a_user, a2a_chat_type = _resolve_a2a_session_route(
+            session_id, self._hermes_home
+        )
+        if is_a2a:
+            if not raw_user and a2a_user:
+                raw_user = a2a_user
+            if not chat_type and a2a_chat_type:
+                chat_type = a2a_chat_type
 
         # Refuse the personal store when the session can carry more than one human.
         #
@@ -288,31 +380,54 @@ class MultiUserFileMemoryProvider(MemoryProvider):
         # frozen once at construction (agent/agent_init.py), and build_session_key()
         # (gateway/session.py) deliberately omits the participant id inside a thread
         # unless `thread_sessions_per_user` is on — "threads are shared across all
-        # participants". So in a shared thread the second speaker reuses the first
-        # speaker's cached Agent, and this provider would hydrate person A's private
-        # entries into person B's prompt and file B's writes under A's name.
+        # participants". On A2A (`is_a2a`), the gateway shares one `context_id` per
+        # group conversation without passing `thread_id`. So in a shared thread the
+        # second speaker reuses the first speaker's cached Agent, and this provider
+        # would hydrate person A's private entries into person B's prompt and file
+        # B's writes under A's name.
         #
         # The provider cannot tell who is speaking (system_prompt_block() takes no
         # arguments, and handle_tool_call() is passed no identity), so it fails
         # closed: no personal reads, no personal writes. The shared store, which is
         # visible to everyone by design, is unaffected.
-        chat_type = str(kwargs.get("chat_type") or "").strip().lower()
-        self._session_is_shared = bool(
-            chat_type
-            and chat_type != "dm"
-            and kwargs.get("thread_id")
-            and not _thread_sessions_are_per_user()
-        )
+        if is_a2a:
+            self._session_is_shared = bool(chat_type and chat_type != "dm")
+        else:
+            self._session_is_shared = bool(
+                chat_type
+                and chat_type != "dm"
+                and kwargs.get("thread_id")
+                and not _thread_sessions_are_per_user()
+            )
+
         if self._session_is_shared:
+            self._user_id = ""
+            self._personal_disabled_reason = SHARED_SESSION_NOTICE
             logger.info(
                 "multiuser_memory: personal store disabled for session %s "
                 "(shared %s thread — sender cannot be attributed)",
                 session_id, chat_type,
             )
+        elif not raw_user:
+            self._user_id = ""
+            self._personal_disabled_reason = NO_IDENTITY_NOTICE
+            logger.info(
+                "multiuser_memory: personal store disabled for session %s "
+                "(no user identity)",
+                session_id,
+            )
+        else:
+            # Sanitize user_id for safe filesystem path and append a hash to prevent collisions
+            sanitized = "".join(c if c.isalnum() or c in "-_." else "_" for c in raw_user).strip("_")
+            user_hash = hashlib.sha256(raw_user.encode("utf-8")).hexdigest()[:12]
+            self._user_id = f"{sanitized}_{user_hash}" if sanitized else user_hash
+            self._personal_disabled_reason = ""
 
     def _path_for(self, target: str) -> Path:
         mem_dir = self._hermes_home / "memories"
         if target == "user":
+            if not self._user_id:
+                raise RuntimeError("personal memory is disabled for this session")
             user_dir = mem_dir / "users"
             user_dir.mkdir(parents=True, exist_ok=True)
             return user_dir / f"{self._user_id}.md"
@@ -360,8 +475,8 @@ class MultiUserFileMemoryProvider(MemoryProvider):
             if content:
                 blocks.append(f"## System & Environment Memory (Shared SOPs)\n{content}")
 
-        if self._session_is_shared:
-            blocks.append(SHARED_SESSION_NOTICE)
+        if self._personal_disabled_reason or not self._user_id:
+            blocks.append(self._personal_disabled_reason or NO_IDENTITY_NOTICE)
             return "\n\n".join(blocks)
 
         user_entries = self._read_entries("user")
@@ -384,10 +499,10 @@ class MultiUserFileMemoryProvider(MemoryProvider):
         target = args.get("target", "memory")
         if target not in {"memory", "user"}:
             return tool_error("Target must be 'memory' or 'user'.")
-        # Fails closed on reads too: the entries in scope belong to whoever opened
-        # this shared thread, not necessarily to whoever is speaking now.
-        if target == "user" and self._session_is_shared:
-            return tool_error(SHARED_SESSION_NOTICE)
+        # Fails closed on reads and writes when the session is shared or carries
+        # no user identity, rather than falling back to a shared "default" file.
+        if target == "user" and (self._session_is_shared or not self._user_id):
+            return tool_error(self._personal_disabled_reason or NO_IDENTITY_NOTICE)
 
         entries = self._read_entries(target)
 

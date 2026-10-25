@@ -37,7 +37,7 @@ on:
         default: ""
         type: string
       mode:
-        description: "The PlatformAgent's spec.mode to install: today, or next (the unsupported A2A stack)"
+        description: "The PlatformAgent's spec.mode to install: today, or next (the A2A stack)"
         required: false
         default: "today"
         type: choice

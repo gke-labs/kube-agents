@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -106,14 +107,19 @@ type slackQuestion struct {
 }
 
 // slackPending is a message handed to the gateway and not yet verified: a
-// click, with the question it answered and the label it showed, or a typed
+// click, with the question it answered and the label it showed; a typed
 // message, which answers the conversation's open question and may title the
-// thread.
+// thread; or a shortcut, whose text is the message it quotes, which may title
+// the thread, and whose responseURL reaches its clicker alone.
 type slackPending struct {
 	conversation, author, text string
 	click                      bool
 	label                      string
 	question                   slackQuestion
+	shortcut                   bool
+	responseURL                string
+	// clicker is a shortcut clicker's Slack name, for the credit line.
+	clicker string
 }
 
 // slackUX is the adapter's click and question state, under s.mu.
@@ -133,13 +139,18 @@ type slackUX struct {
 	// questions is each conversation's open question, the latest posted.
 	questions      map[string]slackQuestion
 	questionsOrder []string
+	// credits is each conversation's verified shortcut credit line until the
+	// shortcut's own task starts there (slack_shortcut.go).
+	credits      map[string]string
+	creditsOrder []string
 }
 
 // uxLocked is s.ux, made on first use. Caller holds s.mu.
 func (s *SlackAdapter) uxLocked() *slackUX {
 	if s.ux == nil {
 		s.ux = &slackUX{pending: map[string]slackPending{}, claims: map[string]bool{},
-			answered: map[string]bool{}, lines: map[string]string{}, questions: map[string]slackQuestion{}}
+			answered: map[string]bool{}, lines: map[string]string{}, questions: map[string]slackQuestion{},
+			credits: map[string]string{}}
 	}
 	return s.ux
 }
@@ -316,25 +327,44 @@ func (s *SlackAdapter) notePending(msg InboundMessage) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.addPendingLocked(slackPendingKey(msg.Conversation, msg.MessageID),
-		slackPending{conversation: msg.Conversation, author: msg.AuthorID, text: msg.Text})
+		slackPending{conversation: msg.Conversation, author: slackMemberOf(msg.AuthorID), text: msg.Text})
 }
 
+// slackMemberOf is the Slack member id behind an author id: the id itself for
+// our own member, the part after the workspace for an admitted guest's
+// "T…:U…" (slackGuestEntry). A pending turn keeps this raw id, because what it
+// feeds, the answered line's display name and the Home tab's asker, are Slack
+// API calls that take a member id.
+func slackMemberOf(author string) string {
+	if _, member, found := strings.Cut(author, slackGuestSep); found {
+		return member
+	}
+	return author
+}
+
+// The first entry under a key stands until the gateway's verdict takes it: a
+// shortcut and the typed message it was used on share one key (the message's
+// ts), and a second writer would take the first's verdict. Nothing else
+// writes a key twice: a redelivered message is dropped by alreadySeen, and a
+// click is keyed by its own action_ts.
 func (s *SlackAdapter) addPendingLocked(key string, p slackPending) {
 	ux := s.uxLocked()
-	if _, ok := ux.pending[key]; !ok {
-		remember(&ux.pendingOrder, key, func(k string) {
-			if old, ok := ux.pending[k]; ok && old.click {
-				delete(ux.claims, old.question.channel+"/"+old.question.ts)
-			}
-			delete(ux.pending, k)
-		})
+	if _, ok := ux.pending[key]; ok {
+		return
 	}
+	remember(&ux.pendingOrder, key, func(k string) {
+		if old, ok := ux.pending[k]; ok && old.click {
+			delete(ux.claims, old.question.channel+"/"+old.question.ts)
+		}
+		delete(ux.pending, k)
+	})
 	ux.pending[key] = p
 }
 
 // interactive turns one interactive envelope's payload into a turn, or
 // reports it is not one: a click on a choice button, from a member of the
-// bot's own workspace, on a question not already answered.
+// bot's own workspace or a guest the allowlist names as "T…:U…" (admitGuest),
+// on a question not already answered.
 func (s *SlackAdapter) interactive(raw json.RawMessage) (InboundMessage, bool) {
 	var p slackClickPayload
 	if err := json.Unmarshal(raw, &p); err != nil {
@@ -352,20 +382,31 @@ func (s *SlackAdapter) interactive(raw json.RawMessage) (InboundMessage, bool) {
 	if p.User.ID == "" || p.Channel.ID == "" || p.Message.TS == "" || p.ActionTS == "" {
 		return InboundMessage{}, false
 	}
-	if s.otherWorkspace(p.User.TeamID) || s.otherWorkspace(p.Team.ID) {
-		s.log.Info("slack: ignoring a click from another workspace's member",
-			"userTeam", p.User.TeamID, "team", s.teamID, "channel", p.Channel.ID)
-		return InboundMessage{}, false
-	}
-	if s.alreadySeen("click:" + p.Channel.ID + "/" + p.ActionTS) {
-		return InboundMessage{}, false
-	}
 	thread := p.Message.ThreadTS
 	if thread == "" {
 		thread = p.Container.ThreadTS
 	}
 	if thread == "" {
 		thread = p.Message.TS
+	}
+	author := p.User.ID
+	if s.otherWorkspace(p.User.TeamID) || s.otherWorkspace(p.Team.ID) {
+		// The message path's rule (foreignSender): a member of another
+		// workspace is admitted only when the allowlist names them by
+		// workspace, and their click then carries the same "T…:U…" author.
+		guest, ok := s.admitGuest(p.User.TeamID, p.Team.ID, p.User.ID)
+		author = guest
+		if !ok {
+			s.log.Info("slack: ignoring a click from another workspace's member",
+				"user", p.User.ID, "userTeam", p.User.TeamID, "team", s.teamID, "channel", p.Channel.ID)
+			// The same once-per-sender notice a refused message gets, in the
+			// question's thread: a button that does nothing looks broken.
+			s.noticeForeignSender(p.Channel.ID, thread, p.User.TeamID, p.Team.ID, p.User.ID)
+			return InboundMessage{}, false
+		}
+	}
+	if s.alreadySeen("click:" + p.Channel.ID + "/" + p.ActionTS) {
+		return InboundMessage{}, false
 	}
 	kind, channelType := "group", "channel"
 	if strings.HasPrefix(p.Channel.ID, slackDMChannelPrefix) {
@@ -396,7 +437,7 @@ func (s *SlackAdapter) interactive(raw json.RawMessage) (InboundMessage, bool) {
 	return InboundMessage{
 		Conversation: conversation,
 		Kind:         kind,
-		AuthorID:     p.User.ID,
+		AuthorID:     author,
 		MessageID:    p.ActionTS,
 		Text:         text,
 		Click:        true,
@@ -419,6 +460,34 @@ func (s *SlackAdapter) InboundVerified(conversation, messageID string, verified 
 	forget(&ux.pendingOrder, key)
 	if !ok {
 		s.mu.Unlock()
+		return
+	}
+	if verified {
+		// Any verified turn in the conversation: a shortcut's credit line
+		// still waiting for its task is not about the task this turn may
+		// start. A shortcut arms its own below.
+		s.uncreditLocked(conversation)
+	}
+	if p.shortcut {
+		// A shortcut answers no question: it is an ask about a message, so
+		// it titles the thread after that message and credits the clicker
+		// when its task starts, and a clicker the gateway refused is told so
+		// where only they can see it.
+		if verified {
+			s.creditLocked(conversation, fmt.Sprintf(slackShortcutCredit, p.clicker))
+			s.mu.Unlock()
+			s.noteAsk(conversation, p.text)
+			// The clicker asked, so a question the task posts waits on them
+			// (the Home tab's "waiting on you"), as for a typed ask.
+			s.noteAsker(conversation, p.author)
+			return
+		}
+		s.mu.Unlock()
+		s.goSession(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), slackShortcutTimeout)
+			defer cancel()
+			s.respondPrivately(ctx, p.responseURL, unverifiedNotice(slackBackend, p.author))
+		})
 		return
 	}
 	var q slackQuestion
@@ -515,6 +584,17 @@ func slackTypedWords(text string) string {
 // then real name, then handle, never a mention or an id.
 func (s *SlackAdapter) slackUserName(userID string) string {
 	u, err := s.api.GetUserInfo(userID)
+	return s.slackNameOf(userID, u, err)
+}
+
+// slackUserNameContext is slackUserName under ctx.
+func (s *SlackAdapter) slackUserNameContext(ctx context.Context, userID string) string {
+	u, err := s.api.GetUserInfoContext(ctx, userID)
+	return s.slackNameOf(userID, u, err)
+}
+
+// slackNameOf is the name a users.info answer gives userID.
+func (s *SlackAdapter) slackNameOf(userID string, u *slack.User, err error) string {
 	if err != nil || u == nil {
 		if err != nil {
 			s.log.Debug("slack: users.info failed; naming the answer generically", "user", userID, "err", err)
