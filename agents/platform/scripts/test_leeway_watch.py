@@ -22,20 +22,22 @@ T0 = datetime(2026, 10, 19, 8, 30, 0, tzinfo=timezone.utc)
 
 
 def make_topology_finding(
-    name: str = "zone-pinned-api",
-    namespace: str = "seeded-topology",
+    name: str = "checkout-api",
+    namespace: str = "shop",
     kind: str = "Deployment",
     replicas: int = 2,
     topology_key: str = "topology.kubernetes.io/zone",
     tier: str = "B",
     severity: str = "warning",
-    cause: str = "affinity_conflict",
+    cause: str = "constraint_ignored",
     actual_a: int = 2,
     actual_b: int = 0,
 ) -> dict:
+    # The shape of a leeway.Finding as `leeway report` (v0.1.3) prints it:
+    # pkg/leeway/finding.go; `subject` carries kind/namespace/name only.
     return {
         "kind": "leeway.placement_drift",
-        "subject": {"kind": kind, "namespace": namespace, "name": name, "replicas": replicas},
+        "subject": {"kind": kind, "namespace": namespace, "name": name},
         "topologyKey": topology_key,
         "tier": tier,
         "severity": severity,
@@ -47,15 +49,31 @@ def make_topology_finding(
             "relocationDistance": 1,
             "maxDomainShare": actual_a / replicas if replicas else 1.0,
         },
+        "intent": {
+            "source": "topology-spread-constraint",
+            "confidence": "declared",
+            "weighting": "Equal",
+            "maxSkew": 1,
+            "evidence": [
+                f"topologySpreadConstraints[0]: topologyKey={topology_key} maxSkew=1 whenUnsatisfiable=ScheduleAnyway labelSelector=app={name}",
+                f"conflicting nodeAffinity/nodeSelector on {topology_key} restricts placement to 1 domain(s), contradicting the spread constraint on {topology_key}",
+            ],
+        },
         "domains": [
             {"domain": "us-central1-a", "actual": actual_a, "expected": 1, "delta": actual_a - 1, "readyNodes": 1},
             {"domain": "us-central1-b", "actual": actual_b, "expected": 1, "delta": actual_b - 1, "readyNodes": 1},
         ],
         "suspectedCause": cause,
-        "contributingFactors": ["pod template pins topology.kubernetes.io/zone=us-central1-a"],
+        "contributingFactors": [
+            "0 pods pinned by zonal volumes",
+            f"whenUnsatisfiable: ScheduleAnyway with maxSkew 1 and observed skew {abs(actual_a - actual_b)}",
+        ],
+        "untestedCauses": ["rollout_bias"],
+        "firstSeenAt": "2026-10-19T12:00:00Z",
         "remediation": {
             "kind": "manifest_patch",
-            "summary": "Remove hard zone nodeSelector and add topologySpreadConstraints.",
+            "summary": f"Remove the conflicting nodeAffinity/nodeSelector on {topology_key} from {kind}/{namespace}/{name} so its topologySpreadConstraint can spread replicas across eligible domains.",
+            "command": f"kubectl -n {namespace} rollout restart deployment/{name}",
             "yaml": "spec:\n  template:\n    spec:\n      topologySpreadConstraints:\n      - maxSkew: 1\n        topologyKey: topology.kubernetes.io/zone\n        whenUnsatisfiable: ScheduleAnyway",
         },
     }
@@ -64,22 +82,46 @@ def make_topology_finding(
 def make_rank_finding(
     compute_class: str = " balanced-spot",
     severity: str = "warning",
-    cause: str = "spot_preemption",
+    rule: str = "last-rank",
+    last_rank_share: float = 0.75,
 ) -> dict:
+    # The shape of a leeway.RankFinding as `leeway report` (v0.1.3) prints it:
+    # pkg/leeway/rankfinding.go. No suspectedCause, contributingFactors or
+    # remediation; the judging rule and the observed shares carry the finding.
     return {
-        "kind": "leeway.rank_cascade",
-        "computeClass": compute_class.strip(),
-        "tier": "A",
+        "kind": "leeway.rank_degraded",
+        "subject": {"kind": "PreferenceAxis", "name": compute_class.strip()},
+        "provider": "gke-computeclass",
+        "objectKind": "ComputeClass",
+        "specHash": "842f2f5b7a0deb21",
+        "tier": "B",
         "severity": severity,
-        "activeRank": 1,
-        "floorShare": 0.75,
-        "unreadyPods": 0,
-        "suspectedCause": cause,
-        "contributingFactors": ["rank 0 spot pool exhausted in us-central1-a"],
-        "remediation": {
-            "kind": "node_pool_scale",
-            "summary": "Check spot stockout in us-central1-a or widen machine family list.",
+        "rule": rule,
+        "observed": {
+            "windowSeconds": 3600,
+            "tierSeconds": 21600,
+            "rank0Share": round(1 - last_rank_share, 4),
+            "lastRank": 1,
+            "lastRankShare": last_rank_share,
+            "meanRank": last_rank_share,
+            "pendingPods": 1,
+            "pendingProvisioning": 0,
+            "pendingDeclined": 0,
+            "degradedPods": 6,
+            "improving": 0,
+            "worsening": 0,
+            "lateral": 0,
         },
+        "ranks": [
+            {"rank": 0, "rules": "machineFamily=n2", "podSeconds": 0, "share": round(1 - last_rank_share, 4), "pods": 0},
+            {"rank": 1, "rules": "machineFamily=e2", "podSeconds": 21600, "share": last_rank_share, "pods": 6},
+        ],
+        "ordering": "list-position",
+        "tiers": 2,
+        "scaleUp": "unset",
+        "optimizeRulePriority": False,
+        "reason": f"rank 1 share {last_rank_share:.2f} is above the ceiling 0.90: running on last-resort capacity, which on most classes is the spot or the cheapest rule",
+        "firstSeenAt": "2026-10-16T12:00:00Z",
     }
 
 
@@ -123,8 +165,17 @@ class GateAndReportingTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def run_tick(self, fake_run, *, now: datetime = T0, dry_run: bool = False) -> tuple[int, str]:
+        # The project under test has no Cluster Agent profiles (roster_patch), so
+        # the sweep enumerates it with gcloud first; this harness answers that
+        # listing with one cluster and hands every other sandbox command,
+        # i.e. the `leeway report --clusters ...` run, to the test's fake.
+        def sandbox(argv, **kw):
+            if argv[0] == "gcloud":
+                return subprocess.CompletedProcess(args=argv, returncode=0, stdout="seeded-d\tus-central1\n", stderr="")
+            return fake_run(argv, **kw)
+
         buf = io.StringIO()
-        with mock.patch.object(watch.sandbox_exec, "run", side_effect=fake_run), redirect_stdout(buf):
+        with mock.patch.object(watch.sandbox_exec, "run", side_effect=sandbox), redirect_stdout(buf):
             code = watch.tick(dry_run=dry_run, now=now)
         return code, buf.getvalue()
 
@@ -148,11 +199,16 @@ class GateAndReportingTests(unittest.TestCase):
         self.assertTrue(latest_md.is_symlink())
         self.assertTrue(latest_json.is_symlink())
         md_text = latest_md.read_text(encoding="utf-8")
-        self.assertIn("`seeded-topology/Deployment/zone-pinned-api`", md_text)
+        self.assertIn("`shop/Deployment/checkout-api`", md_text)
         self.assertIn("2/2 (100%)", md_text)
         self.assertIn("us-central1-a: 2, us-central1-b: 0", md_text)
-        self.assertIn("`affinity_conflict`", md_text)
+        self.assertIn("`constraint_ignored`", md_text)
         self.assertIn("topologySpreadConstraints:", md_text)
+        # The rank finding renders from the RankFinding shape: the rule stands
+        # in for the cause, the last-rank share for the blast radius.
+        self.assertIn("`ComputeClass/balanced-spot`", md_text)
+        self.assertIn("`last-rank`", md_text)
+        self.assertIn("lastRankShare 75%", md_text)
 
         # Next day (T0 + 1 day): unchanged findings are not due -> quiet tick.
         t1 = T0 + timedelta(days=1)
@@ -164,16 +220,16 @@ class GateAndReportingTests(unittest.TestCase):
         c1 = {
             "cluster": "p1/us-central1/seeded-d",
             "status": "ok",
-            "topology_findings": [make_topology_finding(cause="missing_constraint", severity="warning")],
+            "topology_findings": [make_topology_finding(cause="unknown", severity="warning")],
         }
         self.run_tick(lambda *a, **kw: completed_json(make_report([c1], T0)), now=T0)
 
-        # Next day, suspectedCause shifts to pvc_locality -> immediate report.
+        # Next day, suspectedCause shifts to volume_pinning -> immediate report.
         t1 = T0 + timedelta(days=1)
         c2 = {
             "cluster": "p1/us-central1/seeded-d",
             "status": "ok",
-            "topology_findings": [make_topology_finding(cause="pvc_locality", severity="warning")],
+            "topology_findings": [make_topology_finding(cause="volume_pinning", severity="warning")],
         }
         code, out = self.run_tick(lambda *a, **kw: completed_json(make_report([c2], t1)), now=t1)
         self.assertEqual(code, 0)
@@ -184,7 +240,7 @@ class GateAndReportingTests(unittest.TestCase):
         c3 = {
             "cluster": "p1/us-central1/seeded-d",
             "status": "ok",
-            "topology_findings": [make_topology_finding(cause="pvc_locality", severity="critical")],
+            "topology_findings": [make_topology_finding(cause="volume_pinning", severity="critical")],
         }
         code3, out3 = self.run_tick(lambda *a, **kw: completed_json(make_report([c3], t2)), now=t2)
         self.assertEqual(code3, 0)
@@ -250,7 +306,7 @@ class GateAndReportingTests(unittest.TestCase):
         code_ok, out_ok = self.run_tick(lambda *a, **kw: completed_json(make_report([c_clean], t3)), now=t3)
         self.assertEqual(code_ok, 0)
         self.assertIn("leeway watch: the fleet scan reads every target again", out_ok)
-        self.assertIn("leeway: 1 finding(s) resolved (seeded-d:seeded-topology/zone-pinned-api); retired from the watch", out_ok)
+        self.assertIn("leeway: 1 finding(s) resolved (seeded-d:shop/checkout-api); retired from the watch", out_ok)
         ledger_after = watch.load_ledger(self.home)
         self.assertEqual(ledger_after[watch.FINDINGS_KEY], {})
 
@@ -369,6 +425,111 @@ class GateAndReportingTests(unittest.TestCase):
         self.assertEqual(code2, 0)
         self.assertEqual(out2, "")
 
+    def test_normalizers_read_the_fields_leeway_prints(self) -> None:
+        # Verbatim `leeway report` (v0.1.3) output for one topology finding and
+        # one rank finding, from leeway's own report collector on its test
+        # fixtures (pkg/report/report_test.go). The field names here are the
+        # contract; a normalizer that reads a field this payload does not
+        # carry falls back to its defaults and this test catches it.
+        topology = {
+            "kind": "leeway.contract_violated",
+            "subject": {"kind": "Deployment", "namespace": "shop", "name": "batch-worker"},
+            "topologyKey": "topology.kubernetes.io/zone",
+            "tier": "A",
+            "severity": "critical",
+            "score": {
+                "drift": 0.5,
+                "observedSkew": 1,
+                "minAchievableSkew": 0,
+                "excessSkew": 3,
+                "relocationDistance": 1,
+                "maxDomainShare": 1,
+            },
+            "intent": {
+                "source": "topology-spread-constraint",
+                "confidence": "declared",
+                "weighting": "Equal",
+                "maxSkew": 1,
+                "evidence": [
+                    "topologySpreadConstraints[0]: topologyKey=topology.kubernetes.io/zone maxSkew=1 whenUnsatisfiable=DoNotSchedule labelSelector=app=batch-worker"
+                ],
+            },
+            "domains": [
+                {"domain": "us-central1-a", "actual": 0, "expected": 1, "delta": -1, "readyNodes": 1},
+                {"domain": "us-central1-b", "actual": 1, "expected": 1, "delta": 0, "readyNodes": 1},
+            ],
+            "suspectedCause": "domain_capacity_shortfall",
+            "contributingFactors": [
+                "3 pods Pending with FailedScheduling: 0/2 nodes are available: 1 Insufficient cpu, 1 node(s) didn't match pod topology spread constraints.",
+                "0 pods pinned by zonal volumes",
+            ],
+            "firstSeenAt": "2026-10-19T12:00:00Z",
+            "remediation": {
+                "kind": "cluster_capacity",
+                "summary": "Deficit domain(s) (us-central1-a) lack allocatable capacity to schedule replicas of Deployment/shop/batch-worker; scale node pools in us-central1-a or right-size pod resource requests rather than editing workload spread constraints.",
+            },
+        }
+        norm_t = watch.normalize_topology_finding("p1/us-central1/c1", topology)
+        self.assertEqual(
+            norm_t["key"],
+            "p1/us-central1/c1/shop/Deployment/batch-worker/topology.kubernetes.io/zone/leeway.contract_violated",
+        )
+        self.assertEqual(norm_t["suspected_cause"], "domain_capacity_shortfall")
+        self.assertEqual(norm_t["observed_skew"], 1)
+        self.assertEqual(norm_t["max_domain_share"], 1.0)
+        self.assertEqual(norm_t["blast_radius_display"], "1/1 (100%)")
+        self.assertEqual(norm_t["distribution_display"], "us-central1-a: 0, us-central1-b: 1")
+        self.assertEqual(norm_t["remediation"]["kind"], "cluster_capacity")
+        self.assertEqual(norm_t["remediation"]["yaml"], "")
+
+        rank = {
+            "kind": "leeway.rank_degraded",
+            "subject": {"kind": "PreferenceAxis", "name": "gold"},
+            "provider": "gke-computeclass",
+            "objectKind": "ComputeClass",
+            "specHash": "842f2f5b7a0deb21",
+            "tier": "B",
+            "severity": "warning",
+            "rule": "last-rank",
+            "observed": {
+                "windowSeconds": 3600,
+                "tierSeconds": 21600,
+                "rank0Share": 0,
+                "lastRank": 1,
+                "lastRankShare": 1,
+                "meanRank": 1,
+                "pendingPods": 1,
+                "pendingProvisioning": 0,
+                "pendingDeclined": 0,
+                "degradedPods": 6,
+                "improving": 0,
+                "worsening": 0,
+                "lateral": 0,
+            },
+            "ranks": [
+                {"rank": 0, "rules": "machineFamily=n2", "podSeconds": 0, "share": 0, "pods": 0},
+                {"rank": 1, "rules": "machineFamily=e2", "podSeconds": 21600, "share": 1, "pods": 6},
+            ],
+            "ordering": "list-position",
+            "tiers": 2,
+            "scaleUp": "unset",
+            "optimizeRulePriority": False,
+            "reason": "rank 1 share 1.00 is above the ceiling 0.90: running on last-resort capacity, which on most classes is the spot or the cheapest rule",
+            "firstSeenAt": "2026-10-16T12:00:00Z",
+        }
+        norm_r = watch.normalize_rank_finding("p1/us-central1/c1", rank)
+        self.assertEqual(norm_r["key"], "p1/us-central1/c1/_cluster/ComputeClass/gold/rule:last-rank/leeway.rank_degraded")
+        self.assertEqual(norm_r["subject_name"], "gold")
+        self.assertEqual(norm_r["suspected_cause"], "last-rank")
+        self.assertEqual(norm_r["observed_skew"], 1)
+        self.assertEqual(norm_r["max_domain_share"], 1.0)
+        self.assertEqual(norm_r["blast_radius_display"], "lastRankShare 100%, 1 pending")
+        self.assertEqual(
+            norm_r["distribution_display"],
+            "rank 0 (machineFamily=n2): 0%, rank 1 (machineFamily=e2): 100%",
+        )
+        self.assertEqual(norm_r["contributing_factors"], [rank["reason"]])
+
     def test_defensive_normalizers_handle_non_numeric_and_null_fields(self) -> None:
         weird_topo = {
             "kind": None,
@@ -385,15 +546,19 @@ class GateAndReportingTests(unittest.TestCase):
 
         weird_rank = {
             "kind": None,
-            "computeClass": None,
-            "activeRank": "bad",
-            "floorShare": "NaN",
-            "contributingFactors": [None, "factor-a"],
+            "subject": None,
+            "objectKind": None,
+            "rule": None,
+            "observed": {"lastRank": "bad", "lastRankShare": "NaN", "rank0Share": None},
+            "ranks": "not-a-list",
+            "reason": "  ",
         }
         norm_r = watch.normalize_rank_finding("p1/us-central1/c1", weird_rank)
+        self.assertEqual(norm_r["key"], "p1/us-central1/c1/_cluster/ComputeClass/unknown/compute-class/unknown")
         self.assertEqual(norm_r["observed_skew"], 0)
         self.assertEqual(norm_r["max_domain_share"], 0.0)
-        self.assertEqual(norm_r["contributing_factors"], ["factor-a"])
+        self.assertEqual(norm_r["contributing_factors"], [])
+        self.assertEqual(norm_r["suspected_cause"], "unknown")
         self.assertEqual(watch._float("Infinity", 0.0), 0.0)
         self.assertEqual(watch._float(1e308, 0.0), 0.0)
         self.assertEqual(watch._int(float("inf"), 0), 0)
@@ -401,10 +566,10 @@ class GateAndReportingTests(unittest.TestCase):
     def test_failing_project_at_full_timeout_is_stamped_so_tail_projects_rotate(self) -> None:
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}, clear=False):
             def fake_run(argv, **kw):
-                target = argv[-1]
-                if target == "p1":
+                # argv[-1] is the `--clusters` value: this project's triples.
+                if argv[-1].startswith("p1/"):
                     raise subprocess.TimeoutExpired(cmd=argv, timeout=watch.PROJECT_TIMEOUT_SECONDS)
-                return completed_json(make_report([{"cluster": "p2/us-central1/c2", "status": "ok"}], T0))
+                return completed_json(make_report([{"cluster": "p2/us-central1/seeded-d", "status": "ok"}], T0))
 
             code, out = self.run_tick(fake_run, now=T0)
             self.assertEqual(code, 0)
@@ -417,9 +582,9 @@ class GateAndReportingTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}, clear=False):
             # Day 0: p1 succeeds, p2 fails with scan_failed -> announces partial scan.
             def day0_run(argv, **kw):
-                if argv[-1] == "p2":
+                if argv[-1].startswith("p2/"):
                     return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="err")
-                return completed_json(make_report([{"cluster": "p1/us-central1/c1", "status": "ok"}], T0))
+                return completed_json(make_report([{"cluster": "p1/us-central1/seeded-d", "status": "ok"}], T0))
 
             _, out0 = self.run_tick(day0_run, now=T0)
             self.assertIn("leeway watch: the fleet scan was partial", out0)
@@ -428,9 +593,9 @@ class GateAndReportingTests(unittest.TestCase):
             t1 = T0 + timedelta(days=1)
 
             def day1_run(argv, **kw):
-                if argv[-1] == "p1":
+                if argv[-1].startswith("p1/"):
                     return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="err")
-                return completed_json(make_report([{"cluster": "p2/us-central1/c2", "status": "ok"}], t1))
+                return completed_json(make_report([{"cluster": "p2/us-central1/seeded-d", "status": "ok"}], t1))
 
             _, out1 = self.run_tick(day1_run, now=t1)
             self.assertEqual(out1, "")
@@ -526,6 +691,63 @@ class DiscoveryTests(unittest.TestCase):
             seen_argv,
             [["leeway", "report", "--topology-tier-c-signals", "--clusters", "p1/us-central1/c1,p1/us-east1/c2"]],
         )
+    def test_project_without_profiles_is_enumerated_with_gcloud_and_swept_by_triples(self) -> None:
+        # `--clusters-from <project>` is never used: in the sandbox it would go
+        # to the GKE API over a proxy route the api_policy does not relay. The
+        # project's clusters come from `gcloud container clusters list`, and
+        # the sweep is a `--clusters` run over the triples that returns.
+        seen_argv: list[list[str]] = []
+
+        def fake_run(argv, **kw):
+            seen_argv.append(list(argv))
+            if argv[0] == "gcloud":
+                return subprocess.CompletedProcess(
+                    args=argv, returncode=0, stdout="west\tus-west1\neast\tus-east1-b\n\n", stderr=""
+                )
+            return completed_json(make_report([{"cluster": "p1/us-west1/west", "status": "ok"}]))
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ,
+            {watch.WATCH_HOME_ENV: tmp, watch.CLUSTERS_ENV: "", watch.PROJECTS_ENV: "p1"},
+            clear=False,
+        ), mock.patch.object(watch, "roster_clusters_by_project", return_value={}), mock.patch.object(
+            watch.sandbox_exec, "run", side_effect=fake_run
+        ):
+            watch.tick(now=T0)
+
+        self.assertEqual(
+            seen_argv,
+            [
+                ["gcloud", "container", "clusters", "list", "--format=value(name,location)", "--project", "p1"],
+                ["leeway", "report", "--topology-tier-c-signals", "--clusters", "p1/us-east1-b/east,p1/us-west1/west"],
+            ],
+        )
+        self.assertNotIn("--clusters-from", " ".join(" ".join(a) for a in seen_argv))
+
+    def test_project_with_no_clusters_is_a_clean_read_not_an_error(self) -> None:
+        seen_argv: list[list[str]] = []
+
+        def fake_run(argv, **kw):
+            seen_argv.append(list(argv))
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ,
+            {watch.WATCH_HOME_ENV: tmp, watch.CLUSTERS_ENV: "", watch.PROJECTS_ENV: "p1"},
+            clear=False,
+        ), mock.patch.object(watch, "roster_clusters_by_project", return_value={}), mock.patch.object(
+            watch.sandbox_exec, "run", side_effect=fake_run
+        ):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = watch.tick(now=T0)
+            ledger = watch.load_ledger(Path(tmp))
+        self.assertEqual(code, 0)
+        self.assertEqual(buf.getvalue(), "")
+        self.assertEqual([a[0] for a in seen_argv], ["gcloud"])
+        # The project is stamped as swept even though leeway had nothing to read.
+        self.assertEqual(ledger[watch.PROJECT_RUNS_KEY].get("p1"), watch.iso(T0))
+
     def test_explicit_clusters_env_passes_clusters_flag(self) -> None:
         seen_argv: list[list[str]] = []
 

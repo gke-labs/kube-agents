@@ -46,11 +46,33 @@ func TaskSupervisorSubject(addressee, taskID string) string {
 	return fmt.Sprintf("a2a.tasks.%s.%s.%s", addressee, taskID, TaskClassSupervisor)
 }
 
+// TaskSubmitSubject is where a new task for a profile is submitted (added
+// 10/22, #3660): a2a.tasks.{profile}.{tier}.{kind}.{taskId}.submit. The tier
+// and kind tokens exist only to route a submission to the operator's durable
+// for that (profile, tier, kind), whose dispatcher holds the task for its
+// life. Follow-ups and cancels for the task stay on TaskInSubject, and its
+// events on TaskEventsSubject and TaskSupervisorSubject, so no five-token
+// pattern (a2a.tasks.*.*.in and the rest) matches a submission and no
+// follow-up reaches the durable. Chat sessions and the platform agent keep
+// taking new tasks on TaskInSubject.
+func TaskSubmitSubject(profile, tier, kind, taskID string) string {
+	return fmt.Sprintf("a2a.tasks.%s.%s.%s.%s.%s", profile, tier, kind, taskID, TaskClassSubmit)
+}
+
 // The task-subject classes: the last token of a2a.tasks.{addressee}.{taskId}.
+// TaskClassSubmit ends the longer submission subject instead.
 const (
 	TaskClassIn         = "in"
 	TaskClassEvents     = "events"
 	TaskClassSupervisor = "supervisor"
+	TaskClassSubmit     = "submit"
+)
+
+// The kind token of a submission subject: a task a client asked for, or one
+// another task started.
+const (
+	SubmitKindTop   = "top"
+	SubmitKindChild = "child"
 )
 
 // agentsPrefix is the directory plane: a2a.agents.{profile}.
@@ -80,6 +102,25 @@ func ParseTaskSubject(subject string) (addressee, taskID, class string, ok bool)
 		return parts[0], parts[1], parts[2], true
 	}
 	return "", "", "", false
+}
+
+// ParseSubmitSubject splits a submission subject into its profile, tier, kind
+// (SubmitKindTop or SubmitKindChild) and taskId. ok is false for any other
+// subject shape.
+func ParseSubmitSubject(subject string) (profile, tier, kind, taskID string, ok bool) {
+	rest, found := strings.CutPrefix(subject, "a2a.tasks.")
+	if !found {
+		return "", "", "", "", false
+	}
+	parts := strings.Split(rest, ".")
+	if len(parts) != 5 || parts[4] != TaskClassSubmit || parts[0] == "" || parts[1] == "" || parts[3] == "" {
+		return "", "", "", "", false
+	}
+	switch parts[2] {
+	case SubmitKindTop, SubmitKindChild:
+		return parts[0], parts[1], parts[2], parts[3], true
+	}
+	return "", "", "", "", false
 }
 
 // dialTimeout bounds one connection attempt's TCP and auth handshake;
@@ -224,6 +265,7 @@ func (c *Client) dial() (*nats.Conn, jetstream.JetStream, error) {
 		nats.MaxReconnects(-1),
 		nats.Timeout(dialTimeout),
 	}
+	opts = append(opts, TLSOptions()...)
 	opts = append(opts, c.opts.natsOpts...)
 	opts = append(opts,
 		// NR-6: jittered backoff on every reconnection attempt, library-owned
@@ -409,8 +451,13 @@ func (c *Client) PublishSeq(ctx context.Context, subject string, env *Envelope) 
 	// Task-subject tokens must be dot-free DNS-1123 labels - dots change the
 	// token count under every wildcard filter.
 	if strings.HasPrefix(subject, "a2a.tasks.") {
-		addressee, taskID, _, ok := ParseTaskSubject(subject)
-		if !ok || !validDNS1123Label(addressee) || !validDNS1123Label(taskID) {
+		if profile, tier, _, taskID, ok := ParseSubmitSubject(subject); ok {
+			if !validDNS1123Label(profile) || !validDNS1123Label(tier) || !validDNS1123Label(taskID) {
+				return 0, &ProtocolError{Msg: fmt.Sprintf("malformed submission subject %q: profile, tier and taskId must be dot-free DNS-1123 labels", subject)}
+			}
+		} else if strings.HasSuffix(subject, "."+TaskClassSubmit) {
+			return 0, &ProtocolError{Msg: fmt.Sprintf("malformed submission subject %q: want a2a.tasks.<profile>.<tier>.<top|child>.<taskId>.submit", subject)}
+		} else if addressee, taskID, _, ok := ParseTaskSubject(subject); !ok || !validDNS1123Label(addressee) || !validDNS1123Label(taskID) {
 			return 0, &ProtocolError{Msg: fmt.Sprintf("malformed task subject %q: addressee and taskId must be dot-free DNS-1123 labels", subject)}
 		}
 	}
@@ -519,6 +566,12 @@ func (c *Client) SubscribeDurable(ctx context.Context, cfg SubscribeConfig, hand
 // envelope off `…events` is the executor's (CheckSubjectAgreement has
 // already held the envelope to the subject by the time the handler sees it).
 func (c *Client) SubscribeDurableAttributed(ctx context.Context, cfg SubscribeConfig, handler func(subject string, env *Envelope)) (Subscription, error) {
+	return c.subscribe(ctx, cfg, func(s *durableSub) { s.handler = handler })
+}
+
+// subscribe validates cfg, registers a durableSub that set has finished
+// configuring (the auto-ack handler, or the held mode), and binds it.
+func (c *Client) subscribe(ctx context.Context, cfg SubscribeConfig, set func(*durableSub)) (Subscription, error) {
 	switch {
 	case cfg.Stream == "":
 		return nil, fmt.Errorf("SubscribeConfig.Stream is required")
@@ -533,7 +586,12 @@ func (c *Client) SubscribeDurableAttributed(ctx context.Context, cfg SubscribeCo
 		// silently delivering other sessions' envelopes is non-conforming.
 		return nil, fmt.Errorf("SubscribeConfig.Session is required")
 	}
-	s := &durableSub{c: c, cfg: cfg, handler: handler, seen: newDedupSet(dedupWindow)}
+	s := &durableSub{c: c, cfg: cfg}
+	set(s)
+	if s.held == nil {
+		// The held mode skips the envelopeId dedup (see deliver).
+		s.seen = newDedupSet(dedupWindow)
+	}
 	// Register before starting so a rebuild racing this call cannot snapshot
 	// c.subs without it and leave its consumer bound to a dead connection.
 	c.mu.Lock()
@@ -592,6 +650,8 @@ type durableSub struct {
 	handler func(subject string, env *Envelope)
 	seen    *dedupSet
 	stopped atomic.Bool
+	// held is the held-delivery mode (held.go); nil for auto-ack.
+	held *heldState
 
 	mu sync.Mutex
 	cc jetstream.ConsumeContext
@@ -601,6 +661,14 @@ type durableSub struct {
 // Called at subscribe time and again by rebuild with a fresh js; it holds no
 // reference to any prior connection's objects.
 func (s *durableSub) start(ctx context.Context, js jetstream.JetStream) error {
+	if s.held != nil {
+		// Held mode binds and never creates (held.go).
+		cons, err := s.held.bind(ctx, js, s.cfg)
+		if err != nil {
+			return err
+		}
+		return s.consume(cons)
+	}
 	consCfg := jetstream.ConsumerConfig{
 		Durable:   s.cfg.Durable,
 		AckPolicy: jetstream.AckExplicitPolicy,
@@ -614,6 +682,11 @@ func (s *durableSub) start(ctx context.Context, js jetstream.JetStream) error {
 	if err != nil {
 		return fmt.Errorf("consumer %s on %s: %w", s.cfg.Durable, s.cfg.Stream, err)
 	}
+	return s.consume(cons)
+}
+
+// consume starts delivery from cons, displacing any earlier consume context.
+func (s *durableSub) consume(cons jetstream.Consumer) error {
 	cc, err := cons.Consume(s.deliver)
 	if err != nil {
 		return fmt.Errorf("consume %s: %w", s.cfg.Durable, err)
@@ -621,7 +694,13 @@ func (s *durableSub) start(ctx context.Context, js jetstream.JetStream) error {
 	s.mu.Lock()
 	old := s.cc
 	s.cc = cc
+	stopped := s.stopped.Load()
 	s.mu.Unlock()
+	if stopped {
+		// A Stop landed while this (re)bind was in flight: it saw the old
+		// context, so this one is nobody's to stop but ours.
+		cc.Stop()
+	}
 	if old != nil {
 		// Usually already dead with its connection; stopping is a no-op then,
 		// and prevents double delivery if a start ever displaces a live one.
@@ -662,6 +741,12 @@ func (s *durableSub) deliver(msg jetstream.Msg) {
 		_ = msg.Ack()
 		return
 	}
+	if s.held != nil {
+		// Held mode: the handler disposes of the delivery itself, and a
+		// redelivery is expected, so the envelopeId dedup does not apply.
+		s.held.dispatch(msg, env)
+		return
+	}
 	// Assertion 5: at most once per envelopeId across redeliveries.
 	if !s.seen.add(env.EnvelopeID) {
 		_ = msg.Ack()
@@ -674,6 +759,10 @@ func (s *durableSub) deliver(msg jetstream.Msg) {
 // Stop ends the subscription and removes it from the rebuild registry.
 func (s *durableSub) Stop() {
 	s.stopLocal()
+	s.unregister()
+}
+
+func (s *durableSub) unregister() {
 	s.c.mu.Lock()
 	defer s.c.mu.Unlock()
 	for i, sub := range s.c.subs {
@@ -684,8 +773,22 @@ func (s *durableSub) Stop() {
 	}
 }
 
+// stopLocal stops intake and, in the held mode, cancels running handlers. It
+// never waits for a handler: Close calls it under the client lock, and a
+// handler may be the caller.
 func (s *durableSub) stopLocal() {
+	s.stopIntake()
+	if s.held != nil {
+		s.held.cancel()
+	}
+}
+
+// stopIntake stops taking deliveries.
+func (s *durableSub) stopIntake() {
 	s.stopped.Store(true)
+	if s.held != nil {
+		s.held.stopIntake()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.cc != nil {

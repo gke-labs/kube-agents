@@ -1,0 +1,9 @@
+servers:
+  gke:
+    broker: gke
+    include: [get_cluster, list_clusters]
+  docs:
+    broker: developer_knowledge
+    include: [search]
+  unused:
+    broker: observability

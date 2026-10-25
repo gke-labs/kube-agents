@@ -16,10 +16,10 @@
 /opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py start --audit gcp-networking-fabric-audit [--repo "<owner>/<repo>"]
 ```
 
-If multiple repositories are registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`), pass `--repo "<owner>/<repo>"` explicitly:
+The audit targets the repository with `role: gitops`. `start` and `finish` resolve it without `--repo`, also when more than one repository is registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`):
 
-- **Interactive session:** If no `--repo` was specified, prompt the user to choose which repository to target before proceeding.
-- **Scheduled / unattended cron:** Iterate over all repositories in `managed_repos` in sequence, executing the audit and running `audit_report.py start` and `audit_report.py finish` for each repository with `--repo "<owner>/<repo>"`.
+- **Do not loop over the managed repositories, and do not ask the user to choose one.** Run `start` and `finish` once, without `--repo`. If `start` cannot find the `role: gitops` repository, it says so in its `no_forge` note and the run goes on with no forge; never choose a repository yourself.
+- **Pass `--repo "<owner>/<repo>"` only when a person names a repository for this one run,** and pass the same `--repo` to `finish`.
 
 Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/gcp-networking-fabric-audit/org__repo", "findings_path":"/opt/data/scratch/findings_gcp-networking-fabric-audit.json", "pending_remediation_requests": [<finding_id>, ...]}`.
 
@@ -208,14 +208,15 @@ Every finding must conform to the full findings schema:
   --findings-file /opt/data/scratch/findings_gcp-networking-fabric-audit.json \
   --manifest-file /opt/data/scratch/manifest_gcp-networking-fabric-audit.json \
   [--repo "<owner>/<repo>"]
-# -> {"status":"CLEAN"|"HELD"|"OPENED"|"UPDATED"|"NO_FORGE","issue_url":...,"new":n,"resolved":m,
+# -> {"status":"CLEAN"|"HELD"|"OPENED"|"UPDATED"|"NO_FORGE"|"STORE_LEDGER","issue_url":...,"new":n,"resolved":m,
 #     "prs_opened":[...],"prs_closed":[...],"partial":false,"coverage_gaps":[],
 #     "silent_ok":true}
 ```
 
 - On a **scheduled** run, `silent_ok: true` -> your final response is exactly `[SILENT]`.
 - **An on-demand run is never silent.** If a person dispatched this job, report the outcome and the ledger URL whatever `silent_ok` says.
-- `status == "NO_FORGE"` → no forge is configured, so there is no ledger URL: unless the run is silent by the rule above, your report is `summary` verbatim (the skill's "No forge configured" section, `/opt/data/profiles/platform/skills/fleet-audit/references/finish.md`).
+- `status == "NO_FORGE"` → no forge is configured, or the broker cannot reach the repository, so nothing was published and there is no ledger URL: unless the run is silent by the rule above, your report is `summary` verbatim (the skill's "No forge configured" section, `/opt/data/profiles/platform/skills/fleet-audit/references/finish.md`).
+- `status == "STORE_LEDGER"` → the forge has no issue tracker, or no labels, so the ledger is in the report store and there is no ledger URL: unless the run is silent by the rule above, your report is `summary` verbatim, which names the remediation pull requests (the skill's "A forge with no issue tracker" section, `/opt/data/profiles/platform/skills/fleet-audit/references/finish.md`).
 - Repo writers can trigger remediation by commenting `/remediate <finding-id>` or `/remediate all` on the ledger issue.
 
 ---

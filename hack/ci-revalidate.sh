@@ -11,7 +11,9 @@
 # definition that has not yet hoisted it, where it saves the matrix alone.
 #
 # Three things count as a verdict this run could only repeat. The first is a
-# green build at THIS head (#1202): Tide credits a presubmit only against the
+# green build at THIS head (#1202), or at an earlier head with the same tree
+# (an empty commit, or a message-only rewrite: the matrix gets the same
+# files, so it is the same head in all but name): Tide credits a presubmit only against the
 # base SHA it ran on, so every merge to main retests, or batches, every other
 # green pull request whose head has not changed -- over the three weeks to
 # 2026-10-05 that was 150 Tide-started runs against 831 merges, 34 of them on
@@ -35,7 +37,9 @@
 # excuse it: it predates the first and answers a push, which is the
 # author's act, where the first answers a retest nobody asked for. Widening
 # it is a separate decision with its own record, not a consequence of this
-# one. The third is an admin /override of this job's context at THIS head:
+# one. The first rule's same-tree case answers a push too, and still skips
+# main's side: that push hands the matrix identical files, where an inert
+# push changes some. The third is an admin /override of this job's context at THIS head:
 # the override plugin posts a success status reading "Overridden by <user>"
 # (kubernetes-sigs/prow, pkg/plugins/override), which only a repository
 # admin can obtain, and it is the admin's decision that this head merges
@@ -103,10 +107,10 @@
 # and the check UI no longer says so. For an inert delta that is the same judgement a
 # passing /retest would render -- the delta cannot feed the eval differently,
 # so the red was flake or infrastructure by construction. For the same head
-# it is not: a full run that reached the matrix at a newer base (a step-0
+# (or the same tree) it is not: a full run that reached the matrix at a newer base (a step-0
 # fall-through, or the escape hatch) can red on the combination the reuse
 # does not test, and the rule still prefers the older green because the rule
-# is that the head passed once. Read a same-head red as either, not as
+# is that the head passed once. Read a same-head or same-tree red as either, not as
 # noise; reproducing one needs a non-inert push or EVAL_SKIP_REVALIDATION=1
 # in the job env.
 #
@@ -772,6 +776,23 @@ print("attested")
       fi
     fi
   done
+
+  # The same tree at a new head counts as the same head: an empty commit, or
+  # one that only rewrites the message, hands the matrix the same files, so
+  # it is the first kind of verdict and the base is not compared. A push to
+  # put a pull request back in the merge queue is this case. A tree that
+  # cannot be read falls through to the inert rule below.
+  local prev_tree cur_tree
+  if prev_tree="$(git -C "${repo_dir}" rev-parse --verify --quiet "${prev_head}^{tree}" 2>/dev/null)" \
+    && cur_tree="$(git -C "${repo_dir}" rev-parse --verify --quiet "${cur_head}^{tree}" 2>/dev/null)" \
+    && [ "${prev_tree}" = "${cur_tree}" ]; then
+    echo "PR #${pull_number} holds a reusable verdict: green build ${prev_green} -- this tree already passed"
+    echo "Reused verdict: ${REVALIDATION_SPYGLASS_PREFIX}/${pull_number}/${REVALIDATION_JOB_NAME}/${prev_green}"
+    echo "Attested by the Prow-posted ${REVALIDATION_JOB_NAME} success status on ${prev_head}"
+    echo "Same tree ${cur_tree} at head ${prev_head} then, ${cur_head} now; base ${prev_base} then, ${cur_base} now -- a tree that passed once passes"
+    REVALIDATION_REUSED+=("green build ${prev_green} (PR #${pull_number})")
+    return 0
+  fi
 
   # --no-renames is load-bearing: with rename detection (git's default) a
   # `git mv hack/tool.sh docs/tool.md` lists ONLY the inert destination, and

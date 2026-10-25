@@ -1805,9 +1805,6 @@ def compute_drift(clusters: list[dict], *, now: datetime) -> tuple[dict[tuple, l
     checks_run: dict[tuple, list[str]] = {ckey(c): [] for c in clusters}
     candidates: dict[tuple, list[dict]] = {ckey(c): [] for c in clusters}
     outlier_facet_count: dict[tuple, int] = {ckey(c): 0 for c in clusters}
-    # §3.6's guard rewrites a cluster's candidates from its `ckey` alone, so it
-    # needs the same name the per-facet emits used.
-    targets: dict[tuple, str] = {ckey(c): target_name(c) for c in clusters}
 
     layout = cohort_layout(clusters, now=now)
     env_of, strategy = layout.env_of, layout.strategy
@@ -1873,7 +1870,6 @@ def compute_drift(clusters: list[dict], *, now: datetime) -> tuple[dict[tuple, l
                         continue
                     if _shape_mismatch(facet, c, baseline_clusters):
                         continue
-                    name = target_name(c)
                     inferred = baseline_inferred or (env_matters and env_of[ckey(c)][1] == "inferred")
                     base_sev = facet.base_severity(observed) if callable(facet.base_severity) else facet.base_severity
                     sev, downgrades = apply_severity_ladder(base_sev, r, k, inferred)

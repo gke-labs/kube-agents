@@ -11,9 +11,12 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // consoleRig is a console adapter on an embedded server plus a raw client
@@ -218,6 +221,174 @@ func TestConsolePostAndEditArriveAsOutFrames(t *testing.T) {
 	}
 	if frames[1] != (ConsoleOutFrame{MessageID: id, Text: "step 1", Edit: true}) {
 		t.Errorf("edit frame = %+v", frames[1])
+	}
+}
+
+// A terminal goes out as one frame naming its task, under an id derived from
+// the task and its state, so the same terminal from a second adapter (a
+// restart, a redelivery) repeats it. The wire spelling is pinned, since the MCP server
+// and the page match on it. A notice carries none of the terminal fields.
+func TestConsoleTerminalArrivesAsAResultFrame(t *testing.T) {
+	r := startConsoleRig(t)
+	sub, err := r.browser.SubscribeSync("chat.console.tab-5.out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.browser.Flush()
+	term := ConsoleTerminal{TaskID: "task-1", Addressee: "platform", State: lib.StateCompleted, Text: "all green"}
+	if err := r.adapter.PostTerminal("console:tab-5", term); err != nil {
+		t.Fatal(err)
+	}
+	other, err := NewConsoleAdapter(r.browser.ConnectedUrl(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(other.Close)
+	if err := other.PostTerminal("console:tab-5", term); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.adapter.Post("console:tab-5", "a notice"); err != nil {
+		t.Fatal(err)
+	}
+	var raw []string
+	for len(raw) < 3 {
+		msg, err := sub.NextMsg(5 * time.Second)
+		if err != nil {
+			t.Fatalf("after %d frames: %v", len(raw), err)
+		}
+		raw = append(raw, string(msg.Data))
+	}
+	// Two connections publish, so the frames arrive in no fixed order.
+	const want = `{"messageId":"r-task-1-completed","text":"all green","kind":"result","state":"completed","addressee":"platform","taskId":"task-1"}`
+	var terminals, notices []string
+	for _, f := range raw {
+		if f == want {
+			terminals = append(terminals, f)
+		} else {
+			notices = append(notices, f)
+		}
+	}
+	if len(terminals) != 2 || len(notices) != 1 {
+		t.Fatalf("frames = %q, want two exactly %s and one notice", raw, want)
+	}
+	for _, field := range []string{`"kind"`, `"state"`, `"addressee"`, `"taskId"`} {
+		if strings.Contains(notices[0], field) {
+			t.Errorf("the notice frame carries %s: %s", field, notices[0])
+		}
+	}
+}
+
+// cardsPending is spelled on the wire only when set.
+func TestConsoleTerminalSpellsCardsPendingOnlyWhenSet(t *testing.T) {
+	r := startConsoleRig(t)
+	sub, err := r.browser.SubscribeSync("chat.console.tab-9.out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.browser.Flush()
+	if err := r.adapter.PostTerminal("console:tab-9", ConsoleTerminal{TaskID: "task-4", Addressee: "platform", State: lib.StateCompleted, Text: "ack", CardsPending: true}); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := sub.NextMsg(5 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `{"messageId":"r-task-4-completed","text":"ack","kind":"result","state":"completed","addressee":"platform","taskId":"task-4","cardsPending":true}`
+	if string(msg.Data) != want {
+		t.Errorf("frame = %s, want %s", msg.Data, want)
+	}
+}
+
+// A terminal past consoleResultTextCap is cut to fit under the server's
+// max_payload, says so, and stays valid UTF-8 where the cut lands inside a
+// multi-byte rune.
+func TestConsoleTerminalCutsAnOversizeAnswer(t *testing.T) {
+	r := startConsoleRig(t)
+	sub, err := r.browser.SubscribeSync("chat.console.tab-6.out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.browser.Flush()
+	long := strings.Repeat("é", consoleResultTextCap)
+	if err := r.adapter.PostTerminal("console:tab-6", ConsoleTerminal{TaskID: "task-2", State: lib.StateCompleted, Text: long}); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := sub.NextMsg(5 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f ConsoleOutFrame
+	if err := json.Unmarshal(msg.Data, &f); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Text) > consoleResultTextCap || !strings.HasSuffix(f.Text, consoleResultCutNote) || !utf8.ValidString(f.Text) {
+		t.Errorf("cut text: %d bytes, cut note %v, valid UTF-8 %v", len(f.Text), strings.HasSuffix(f.Text, consoleResultCutNote), utf8.ValidString(f.Text))
+	}
+}
+
+// Text that JSON escapes six bytes for one (`<` becomes \u003c) passes the
+// byte cap and would still overrun max_payload once encoded; the frame is cut
+// again until it fits, rather than failing to publish.
+func TestConsoleTerminalFitsUnderMaxPayloadAfterEscaping(t *testing.T) {
+	r := startConsoleRig(t)
+	sub, err := r.browser.SubscribeSync("chat.console.tab-7.out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.browser.Flush()
+	escapable := strings.Repeat("<", consoleResultTextCap)
+	if err := r.adapter.PostTerminal("console:tab-7", ConsoleTerminal{TaskID: "task-3", State: lib.StateCompleted, Text: escapable}); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := sub.NextMsg(5 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if max := r.browser.MaxPayload(); int64(len(msg.Data)) > max {
+		t.Fatalf("frame is %d bytes, over max_payload %d", len(msg.Data), max)
+	}
+	var f ConsoleOutFrame
+	if err := json.Unmarshal(msg.Data, &f); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(f.Text, consoleResultCutNote) {
+		t.Errorf("the escaped answer was not cut: %d bytes", len(f.Text))
+	}
+}
+
+// A notify frame's wire spelling is pinned (the MCP server and the page read
+// it): kind notify, the turn it answers, a minted n- id, and an edit that
+// repeats the id it names.
+func TestConsoleNotifyArrivesAsANotifyFrame(t *testing.T) {
+	r := startConsoleRig(t)
+	sub, err := r.browser.SubscribeSync("chat.console.tab-8.out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.browser.Flush()
+	id, err := r.adapter.PostNotifyFrame("console:tab-8", "", "the report", "task-7", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(id, consoleNotifyIDPrefix) {
+		t.Errorf("minted id %q lacks the %q prefix", id, consoleNotifyIDPrefix)
+	}
+	if _, err := r.adapter.PostNotifyFrame("console:tab-8", id, "the report, updated", "task-7", true); err != nil {
+		t.Fatal(err)
+	}
+	var raw []string
+	for len(raw) < 2 {
+		msg, err := sub.NextMsg(5 * time.Second)
+		if err != nil {
+			t.Fatalf("after %d frames: %v", len(raw), err)
+		}
+		raw = append(raw, string(msg.Data))
+	}
+	if want := `{"messageId":"` + id + `","text":"the report","kind":"notify","replyTo":"task-7"}`; raw[0] != want {
+		t.Errorf("notify frame = %s, want %s", raw[0], want)
+	}
+	if want := `{"messageId":"` + id + `","text":"the report, updated","edit":true,"kind":"notify","replyTo":"task-7"}`; raw[1] != want {
+		t.Errorf("edit frame = %s, want %s", raw[1], want)
 	}
 }
 
@@ -601,5 +772,30 @@ func TestConsoleRunReturnsWhenTheConnectionIsClosedForGood(t *testing.T) {
 	}
 	if got := logs.String(); !strings.Contains(got, "closed for good") {
 		t.Errorf("a terminal close was not logged as terminal:\n%s", got)
+	}
+}
+
+// A notify frame cut to fit says the report was cut, not that the full text
+// is a task's result on the bus: a card's report is not on TASKS.
+func TestAConsoleNotifyFrameCutSaysTheReportWasCut(t *testing.T) {
+	r := startConsoleRig(t)
+	sub, err := r.browser.SubscribeSync("chat.console.tab-11.out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = r.browser.Flush()
+	if _, err := r.adapter.PostNotifyFrame("console:tab-11", "", strings.Repeat("<", consoleResultTextCap), "task-1", false); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := sub.NextMsg(5 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f ConsoleOutFrame
+	if err := json.Unmarshal(msg.Data, &f); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(f.Text, consoleNotifyCutNote) || strings.HasSuffix(f.Text, consoleResultCutNote) {
+		t.Errorf("cut notify text ends %q, want the notify note", f.Text[len(f.Text)-80:])
 	}
 }

@@ -574,20 +574,17 @@ MOCK_MODE_CONTEXT = f"gke_{MOCK_GCP_PROJECT_ID}_{MOCK_GCP_REGION}_{MOCK_GKE_CLUS
 MOCK_CR_READY_AT_GENERATION_2 = "2 True 2"
 MOCK_CR_STALE_READY = "2 True 1"
 MOCK_CR_NOT_READY = "2 False 2"
-MOCK_GATEWAY_DARK_REASON = "NoChatBackend"
 
 
 def write_mode_kubectl_stub(bin_dir, calls_log, ready_reads=(MOCK_CR_READY_AT_GENERATION_2,),
-                            gateway_reason="", containers="", rollout_exit=0, condition_status="True",
-                            gateway_read_failures=0, installed_mode=""):
+                            containers="", rollout_exit=0, condition_status="True",
+                            installed_mode=""):
     """A `kubectl` on PATH that records every call and answers the mode gate's reads.
 
     `ready_reads` is what successive reads of the CR's generation and Ready
-    condition return, the last one repeating; `gateway_reason` is the
-    A2AGateway condition's reason; `condition_status` what a read of any other
-    condition's status returns; `containers` the pod template's container
-    names. The first `gateway_read_failures` reads of the A2AGateway condition
-    fail, as an API server that drops a request would. `installed_mode` is
+    condition return, the last one repeating; `condition_status` what a read
+    of any other condition's status returns; `containers` the pod template's
+    container names. `installed_mode` is
     the CR's spec.mode, empty for a CR that carries none. Every other call succeeds silently, `rollout status` with
     `rollout_exit`. Each call is one line of `calls_log`, prefixed `kubectl `.
     """
@@ -597,8 +594,6 @@ def write_mode_kubectl_stub(bin_dir, calls_log, ready_reads=(MOCK_CR_READY_AT_GE
     reads.write_text("\n".join(ready_reads) + "\n")
     counter = bin_dir / "kubectl-ready-count"
     counter.write_text("0")
-    gateway_counter = bin_dir / "kubectl-gateway-count"
-    gateway_counter.write_text("0")
     stub = bin_dir / "kubectl"
     stub.write_text(f"""#!/usr/bin/env bash
 echo "kubectl $*" >> "{calls_log}"
@@ -612,14 +607,6 @@ case "$*" in
     [ "$n" -lt "$total" ] || n=$((total - 1))
     sed -n "$((n + 1))p" "{reads}" | tr -d '\\n'
     exit 0 ;;
-  *A2AGateway*)
-    g="$(cat "{gateway_counter}")"
-    echo $((g + 1)) > "{gateway_counter}"
-    if [ "$g" -lt {gateway_read_failures} ]; then
-      echo "Error from server: the server is currently unable to handle the request" >&2
-      exit 1
-    fi
-    printf '%s' "{gateway_reason}"; exit 0 ;;
   *"status.conditions"*) printf '%s' "{condition_status}"; exit 0 ;;
   *"containers[*].name"*) printf '%s' "{containers}"; exit 0 ;;
   *"rollout status"*) exit {rollout_exit} ;;

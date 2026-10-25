@@ -11,11 +11,8 @@ import urllib.request
 import urllib.error
 import urllib.parse
 import subprocess
-import ipaddress
-import tempfile
 from typing import Any
 from pathlib import Path
-from datetime import datetime
 from mcp.server import MCPServer
 import sandbox_exec
 from agent_common_server import _run_env
@@ -433,7 +430,7 @@ def _cluster_agent_roster() -> list[dict]:
         return []
     roster = []
     for home in sorted(base.iterdir()):
-        if home.name in RESERVED_PROFILES or not is_ready_profile(home):
+        if home.name in RESERVED_PROFILES or home.name.startswith(".") or not is_ready_profile(home):
             continue
         entry = {"name": home.name}
         try:
@@ -802,8 +799,8 @@ def get_cc_pod_diagnostics(
         results.append(f"=== POD LOGS (PREVIOUS TAIL=100) ===\n{_sanitize_log_text(res.stdout)}\n")
     except subprocess.TimeoutExpired:
         results.append("=== POD LOGS (PREVIOUS TAIL=100) TIMEOUT ===\nCommand timed out after 30 seconds.\n")
-    except subprocess.CalledProcessError as e:
-        results.append(f"=== POD LOGS (PREVIOUS TAIL=100) ===\nNo previous container logs available (container has not restarted or previous logs expired).\n")
+    except subprocess.CalledProcessError:
+        results.append("=== POD LOGS (PREVIOUS TAIL=100) ===\nNo previous container logs available (container has not restarted or previous logs expired).\n")
     except sandbox_exec.SandboxUnavailable as e:
         # Not folded into the clause above: "no previous logs" is a statement
         # about the pod, and the sandbox being gone is not evidence for it.
@@ -1207,7 +1204,8 @@ def register_findings(findings: list, scope: dict | None = None) -> str:
     cluster name alone is ambiguous across projects. A finding the user
     dismissed stays dismissed and is reported back as 'suppressed'.
 
-    Each finding needs: source ('inventory' | 'event-watcher' | 'audit'), check
+    Each finding needs: source ('inventory' | 'event-watcher' | 'audit' |
+    'upgrade-readiness'), check
     (the audit stream's own slug), project, cluster, namespace (omit for
     cluster-scoped), object, title, rubric, recommendation {action, rationale,
     risk}, remediation {kind, path, note} and verification {kind, command,
@@ -1224,7 +1222,15 @@ def register_findings(findings: list, scope: dict | None = None) -> str:
         scope: Pass {'project': '<id>', 'cluster': '<name>', 'complete': true}
             only when this run covered that cluster in full. It lowers the
             confidence of queued rows the run did not re-report. Omit it for a
-            partial or failed run.
+            partial or failed run. The claim reaches the rows whose check
+            starts with 'check_prefix' when the scope names one (a run that
+            reads one family of checks, such as 'upgrade-'; a family ends with
+            '-', and a batch with findings must belong to it), whatever wrote
+            them, or, with 'source' beside it, that source's rows in the family;
+            else the rows of the batch's own sources, or of 'source',
+            which must be a known source and one the batch wrote. An empty
+            findings list with a complete scope is a complete run that found
+            nothing; it must name 'check_prefix' or 'source', or it is refused.
     """
     return _findings_call("POST", "/v1/findings", {"findings": findings, "scope": scope})
 

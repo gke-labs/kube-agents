@@ -2,11 +2,11 @@
 """leeway_watch.py - sweep fleet clusters daily with `leeway report` and
 surface new, worsened, or weekly-refreshed topology skew findings.
 
-The `topology-drift` skill diagnoses single-cluster and fleet-wide placement
-drift (`leeway.placement_drift`), unschedulable topology skew
-(`leeway.unschedulable_skew`), unavailable topology domains
-(`leeway.domain_unavailable`), and compute-class priority rank cascades
-(`leeway.rank_cascade`, `leeway.scaleup_stalled`) on demand. This job runs once
+The `topology-drift` skill diagnoses single-cluster and fleet-wide topology
+findings (`leeway.contract_violated`, `leeway.placement_drift`,
+`leeway.domain_unavailable`) and ComputeClass priority-rank findings
+(`leeway.rank_wedged`, `leeway.rank_degraded`, `leeway.rank_no_migration`,
+`leeway.rank_tier_unused`) on demand. This job runs once
 a day from the Platform Agent's cron roster (`no_agent: true`, `deliver:
 "chat"`) so the fleet learns about single-zone blast-radius concentration and
 broken spread constraints before a zone outage or node drain exposes them.
@@ -18,12 +18,15 @@ Which clusters. Target clusters are resolved on the agent pod:
    (`GCP_PROJECT_ID`) together with every project a Cluster Agent profile's
    `cluster_identity` names; with neither, the sandbox's `gcloud config
    get-value project`; and with nothing at all the tick fails closed rather
-   than enumerate every project the credential can list. When Cluster Agent
-   profiles on the gateway pod name a project's `<project>/<location>/<cluster>`
-   triples, those triples are passed via `leeway report --clusters` so the
-   sandbox run uses the `kubectl` credential-proxy shim directly; otherwise the
-   project is swept via `leeway report --topology-tier-c-signals --clusters-from
-   <project>`.
+   than enumerate every project the credential can list. A project whose
+   clusters the Cluster Agent profiles name is swept by those
+   `<project>/<location>/<cluster>` triples; any other project is enumerated
+   first with `gcloud container clusters list --project <project>` in the
+   sandbox and swept by the triples that returns. Every `leeway report` run
+   is a `--clusters` run: in the sandbox each triple becomes a
+   `kubectl --context=gke_<project>_<location>_<cluster>` read through the
+   credential-proxy shim, which is the one route the sandbox has to a
+   cluster.
 
 Where it runs. `leeway` is baked into `agent-sandbox` at `/usr/local/bin/leeway`
 and routes Kubernetes object reads through the sandbox's `kubectl`
@@ -113,12 +116,20 @@ NO_PROJECT_DETAIL = (
     "refusing to let the sweep enumerate every project the credential can list"
 )
 
-# How `leeway report` runs in the sandbox.
+# How `leeway report` runs in the sandbox. Every target is a
+# `<project>/<location>/<cluster>` triple passed with `--clusters`: inside the
+# sandbox leeway reads each one as `kubectl --context=gke_<project>_<location>_<cluster>`
+# through the credential-proxy shim. `--clusters-from <project>` is not used
+# there: it lists the project through the GKE API over the proxy's
+# `/v1/gcp/container.googleapis.com/` route, which the proxy's api_policy does
+# not relay. A project's clusters are enumerated with `gcloud container
+# clusters list` instead, which the sandbox's gcloud shim does relay.
 LEEWAY_EXECUTABLE = "leeway"
 LEEWAY_REPORT_SUBCOMMAND = "report"
 TIER_C_FLAG = "--topology-tier-c-signals"
 CLUSTERS_FLAG = "--clusters"
-CLUSTERS_FROM_FLAG = "--clusters-from"
+LIST_CLUSTERS_ARGV = ("gcloud", "container", "clusters", "list", "--format=value(name,location)", "--project")
+LIST_CLUSTERS_FAILED_DETAIL = "gcloud container clusters list --project {project} exited {code}: {error}"
 PROJECT_TIMEOUT_SECONDS = 900
 TICK_BUDGET_SECONDS = 2700
 MIN_PROJECT_RUN_SECONDS = 60
@@ -147,8 +158,15 @@ DEFAULT_SUBJECT_KIND_CLUSTER = "Cluster"
 DEFAULT_SUBJECT_KIND_COMPUTE_CLASS = "ComputeClass"
 DEFAULT_UNKNOWN = "unknown"
 DEFAULT_DOMAIN_UNKNOWN = "?"
-DEFAULT_FINDING_KIND_DRIFT = "leeway.placement_drift"
-DEFAULT_FINDING_KIND_RANK = "leeway.rank_cascade"
+# A finding without a `kind` is malformed; it is keyed under "unknown" rather
+# than under a real kind it never claimed. leeway's kinds are
+# leeway.contract_violated / placement_drift / baseline_breach /
+# domain_unavailable and leeway.rank_wedged / rank_degraded /
+# rank_no_migration / rank_tier_unused (pkg/leeway/finding.go).
+DEFAULT_FINDING_KIND_DRIFT = DEFAULT_UNKNOWN
+DEFAULT_FINDING_KIND_RANK = DEFAULT_UNKNOWN
+# A rank finding's axis for the ledger key: its judging `rule` (`last-rank`,
+# `rank0-floor`, ...), which is what distinguishes two findings on one class.
 DEFAULT_TOPOLOGY_KEY_COMPUTE_CLASS = "compute-class"
 DEFAULT_SEVERITY = "warning"
 DEFAULT_DISPLAY_NA = "n/a"
@@ -351,6 +369,38 @@ def run_leeway_report(flag: str, value: str, *, timeout: int = PROJECT_TIMEOUT_S
     return report
 
 
+def project_cluster_triples(project: str, *, timeout: int = PROJECT_LOOKUP_TIMEOUT_SECONDS) -> list[str]:
+    """`<project>/<location>/<cluster>` for every cluster `gcloud` lists in the project.
+
+    Read in the sandbox, where the gcloud shim relays `container clusters list`
+    and the GKE API route leeway's own `--clusters-from <project>` would take is
+    not relayed. `--format=value(name,location)` prints one tab-separated
+    `name location` pair per line; anything else on a line is skipped.
+    """
+    argv = [*LIST_CLUSTERS_ARGV, project]
+    try:
+        completed = sandbox_exec.run(argv, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        raise SandboxTimedOut(TIMED_OUT_DETAIL.format(seconds=timeout)) from None
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        raise RuntimeError(
+            LIST_CLUSTERS_FAILED_DETAIL.format(
+                project=project,
+                code=completed.returncode,
+                error=stderr[-STDERR_EXCERPT_CHARS:] if stderr else "no output",
+            )
+        )
+    triples: set[str] = set()
+    for line in (completed.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        name, location = parts
+        triples.add(CLUSTER_KEY_SEPARATOR.join([project, location, name]))
+    return sorted(triples)
+
+
 def canonical_cluster_name(cr: dict[str, Any]) -> str:
     """Return `<project>/<location>/<cluster>` from `cr['source']` when present, else `cr['cluster']`."""
     raw_source = str(cr.get("source") or "").strip()
@@ -503,37 +553,59 @@ def normalize_topology_finding(cluster: str, finding: dict[str, Any]) -> dict[st
 
 
 def normalize_rank_finding(cluster: str, finding: dict[str, Any]) -> dict[str, Any]:
-    """Normalize a single rank_findings entry with its canonical ledger key."""
-    cc_name = str(finding.get("computeClass") or DEFAULT_UNKNOWN)
+    """Normalize a single rank_findings entry with its canonical ledger key.
+
+    A `leeway.RankFinding` (pkg/leeway/rankfinding.go) carries `subject`
+    (`{kind: "PreferenceAxis", name: <class>}`), `objectKind` (`ComputeClass`),
+    `rule` (the judging rule, e.g. `last-rank`), `observed` (`rank0Share`,
+    `lastRank`, `lastRankShare`, `meanRank`, `pendingPods`, ...), `ranks[]`
+    (`rank`, `rules`, `share`, `pods`) and `reason`; it has no
+    `suspectedCause`, `contributingFactors` or `remediation`. The rule stands
+    in for the cause in the ledger's change detection, and the last-rank share
+    -- the fraction of the window the class spent on its last-resort rank --
+    stands in for the blast-radius share.
+    """
+    subject = finding.get("subject") if isinstance(finding.get("subject"), dict) else {}
+    cc_name = str(subject.get("name") or DEFAULT_UNKNOWN)
+    s_kind = str(finding.get("objectKind") or DEFAULT_SUBJECT_KIND_COMPUTE_CLASS)
     f_kind = str(finding.get("kind") or DEFAULT_FINDING_KIND_RANK)
-    active_rank = finding.get("activeRank")
-    topo_key = f"rank:{active_rank}" if active_rank is not None else DEFAULT_TOPOLOGY_KEY_COMPUTE_CLASS
-    key = CLUSTER_KEY_SEPARATOR.join(
-        [cluster, CLUSTER_WIDE_NAMESPACE, DEFAULT_SUBJECT_KIND_COMPUTE_CLASS, cc_name, topo_key, f_kind]
-    )
-    remediation = finding.get("remediation") if isinstance(finding.get("remediation"), dict) else {}
-    floor_share = _float(finding.get("floorShare"), 0.0)
+    rule = str(finding.get("rule") or "")
+    topo_key = f"rule:{rule}" if rule else DEFAULT_TOPOLOGY_KEY_COMPUTE_CLASS
+    key = CLUSTER_KEY_SEPARATOR.join([cluster, CLUSTER_WIDE_NAMESPACE, s_kind, cc_name, topo_key, f_kind])
+    observed = finding.get("observed") if isinstance(finding.get("observed"), dict) else {}
+    last_rank = _int(observed.get("lastRank"), 0)
+    last_rank_share = _float(observed.get("lastRankShare"), 0.0)
+    rank0_share = _float(observed.get("rank0Share"), 0.0)
+    mean_rank = _float(observed.get("meanRank"), 0.0)
+    pending = _int(observed.get("pendingPods"), 0)
+    ranks = finding.get("ranks") if isinstance(finding.get("ranks"), list) else []
+    rank_parts = [
+        f"rank {_int(r.get('rank'), 0)} ({r.get('rules') or 'no rules'}): {round(_float(r.get('share'), 0.0) * 100)}%"
+        for r in ranks
+        if isinstance(r, dict)
+    ]
+    reason = str(finding.get("reason") or "").strip()
     return {
         "key": key,
         "cluster": cluster,
         "kind": f_kind,
         "namespace": CLUSTER_WIDE_NAMESPACE,
-        "subject_kind": DEFAULT_SUBJECT_KIND_COMPUTE_CLASS,
+        "subject_kind": s_kind,
         "subject_name": cc_name,
         "topology_key": topo_key,
         "tier": str(finding.get("tier") or ""),
         "severity": str(finding.get("severity") or DEFAULT_SEVERITY),
-        "suspected_cause": str(finding.get("suspectedCause") or DEFAULT_UNKNOWN),
-        "contributing_factors": _str_list(finding.get("contributingFactors")),
-        "observed_skew": _int(active_rank, 0),
-        "max_domain_share": round(floor_share, 4),
-        "distribution_display": f"activeRank={active_rank}, floorShare={round(floor_share * 100)}%",
-        "blast_radius_display": f"floorShare {round(floor_share * 100)}%",
-        "remediation": {
-            "kind": str(remediation.get("kind") or ""),
-            "summary": str(remediation.get("summary") or ""),
-            "yaml": str(remediation.get("yaml") or ""),
-        },
+        "suspected_cause": rule or DEFAULT_UNKNOWN,
+        "contributing_factors": [reason] if reason else [],
+        "observed_skew": last_rank,
+        "max_domain_share": round(last_rank_share, 4),
+        "distribution_display": (
+            ", ".join(rank_parts)
+            if rank_parts
+            else f"rank0Share={round(rank0_share * 100)}%, lastRankShare={round(last_rank_share * 100)}%, meanRank={mean_rank:g}"
+        ),
+        "blast_radius_display": f"lastRankShare {round(last_rank_share * 100)}%" + (f", {pending} pending" if pending else ""),
+        "remediation": {"kind": "", "summary": "", "yaml": ""},
     }
 
 
@@ -883,12 +955,16 @@ def sweep_fleet(
             continue
         timeout = min(PROJECT_TIMEOUT_SECONDS, remaining)
         triples = known_triples_by_proj.get(proj) or []
-        if triples:
-            requested_clusters.update(triples)
-        flag = CLUSTERS_FLAG if triples else CLUSTERS_FROM_FLAG
-        value = ",".join(triples) if triples else proj
         try:
-            rep = run_leeway_report(flag, value, timeout=timeout)
+            if not triples:
+                triples = project_cluster_triples(proj)
+            if not triples:
+                # A project with no clusters is a clean, empty read.
+                scanned_projects.add(proj)
+                project_runs[proj] = iso(now)
+                continue
+            requested_clusters.update(triples)
+            rep = run_leeway_report(CLUSTERS_FLAG, ",".join(triples), timeout=timeout)
         except SandboxTimedOut:
             if timeout < PROJECT_TIMEOUT_SECONDS:
                 scan_errors[proj] = SCAN_CUT_SHORT_DETAIL.format(target=proj)

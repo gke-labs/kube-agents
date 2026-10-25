@@ -26,7 +26,7 @@ Hermes base-image bump brings its fixes along with no merge to redo.
 | [`config_schema.py`](config_schema.py) | Bank name, the two scope tags, retain strategies and missions, the profile-config reads | a data-migration question            |
 | [`prompts.py`](prompts.py)             | System prompt variants, tool schemas, the guidance strings a result carries             | an agent-behaviour question          |
 | [`client.py`](client.py)               | The only code that touches the stock provider or its generated client                   | where a Hermes base-image bump lands |
-| [`session.py`](session.py)             | The provider class: identity, the three session states, tool dispatch                   | the wrapper's own logic              |
+| [`session.py`](session.py)             | The provider class: identity, session states, tool dispatch                             | the wrapper's own logic              |
 
 Three things outside this package restate the constants in `config_schema.py` and must be kept in
 step: [`memory_file_import.py`](../../../scripts/memory_file_import.py),

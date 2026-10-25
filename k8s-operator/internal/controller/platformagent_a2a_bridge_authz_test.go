@@ -142,7 +142,7 @@ func a2aStartRenderedServer(t *testing.T, conf string) (*natsserver.Server, *a2a
 func a2aStartRenderedServerAt(t *testing.T, conf string, port int, store string) (*natsserver.Server, *a2aServerLog) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "nats.conf")
-	if err := os.WriteFile(path, []byte(conf), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(a2aWithTestTLS(t, conf)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	opts, err := natsserver.ProcessConfigFile(path)
@@ -150,6 +150,8 @@ func a2aStartRenderedServerAt(t *testing.T, conf string, port int, store string)
 		t.Fatalf("the rendered nats.conf does not parse: %v", err)
 	}
 	opts.Port = port
+	// The test pair names localhost, and clients dial the loopback address.
+	opts.Host = "127.0.0.1"
 	opts.HTTPPort = 0
 	opts.Websocket.Port = 0
 	opts.StoreDir = store
@@ -177,7 +179,7 @@ func a2aStartRenderedServerAt(t *testing.T, conf string, port int, store string)
 // reply.
 func a2aConnectAs(t *testing.T, url, user, password string) (*nats.Conn, jetstream.JetStream) {
 	t.Helper()
-	nc, err := nats.Connect(url,
+	nc, err := nats.Connect(url, a2aTestBusTLS(t),
 		nats.UserInfo(user, password),
 		nats.CustomInboxPrefix("_INBOX."+user),
 		nats.Name(user),
@@ -904,7 +906,7 @@ func TestBridgeConsumersSurviveABusRestart(t *testing.T) {
 	// The lib's reconnect posture (MaxReconnects -1), with a short wait so
 	// the test is not paced by backoff.
 	reconnected := make(chan struct{}, 4)
-	bridge, err := nats.Connect(url,
+	bridge, err := nats.Connect(url, a2aTestBusTLS(t),
 		nats.UserInfo("bridge", bridgePW), nats.CustomInboxPrefix("_INBOX.bridge"), nats.Name("bridge"),
 		nats.MaxReconnects(-1), nats.ReconnectWait(200*time.Millisecond),
 		nats.ReconnectHandler(func(*nats.Conn) { reconnected <- struct{}{} }),
@@ -957,7 +959,7 @@ func TestBridgeConsumersSurviveABusRestart(t *testing.T) {
 
 	submitAsGateway := func(body string) {
 		t.Helper()
-		nc, err := nats.Connect(url, nats.UserInfo("gateway", gatewayPW), nats.CustomInboxPrefix("_INBOX.gateway"))
+		nc, err := nats.Connect(url, a2aTestBusTLS(t), nats.UserInfo("gateway", gatewayPW), nats.CustomInboxPrefix("_INBOX.gateway"))
 		if err != nil {
 			t.Fatal(err)
 		}

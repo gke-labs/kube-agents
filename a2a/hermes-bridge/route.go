@@ -54,12 +54,18 @@ const (
 
 // routePlatforms maps a gateway conversation key's prefix to the platform name
 // the agent side spells it with (Hermes's, and lib's NotifyPlatform names).
-// A conversation on any other door (inject, the A2A door, Discord) has no
-// notify route, and no route is recorded for it.
+// A conversation on any other door (inject, console, the A2A door, Discord) has
+// no chat notify route; identityRouteFor records an identity-only route for
+// doors that still carry speaker or audience context.
 var routePlatforms = map[string]string{
-	"gchat:": lib.NotifyPlatformGchat,
-	"slack:": lib.NotifyPlatformSlack,
+	"gchat:":           lib.NotifyPlatformGchat,
+	"slack:":           lib.NotifyPlatformSlack,
+	consoleRoutePrefix: lib.NotifyPlatformConsole,
 }
+
+// consoleRoutePrefix is the console conversation's key prefix, the one route
+// that carries its task (conversationRoute.TaskID).
+const consoleRoutePrefix = "console:"
 
 // errNoChatConversation is an authority that names no chat conversation the
 // notify route serves; nothing is recorded and nothing is wrong.
@@ -70,34 +76,125 @@ var errRouteDisabled = errors.New("no route store configured")
 
 // conversationRoute is the PUT's body. Ask is the kind of the task's ask,
 // a mark.ask token (askKind in chat.go): the kanban notifier keeps it marked
-// on the chat messages its cards send while they run.
+// on the chat messages its cards send while they run. UserID and ChatType
+// carry the gateway's requester principal (hmac:<32-hex>) and audience kind
+// ("dm" or "group") so the memory provider can isolate personal memory per
+// user and fail closed in shared threads.
+//
+// TaskID, on a console conversation's route only, is the gateway task the
+// turn runs: a card the turn files snapshots it, and its report names it
+// (a2a notify --reply-to), so a console client can join the report to the
+// turn. A chat conversation's route leaves it out.
 type conversationRoute struct {
 	Platform     string `json:"platform"`
 	Conversation string `json:"conversation"`
 	ContextID    string `json:"context_id"`
 	Ask          string `json:"ask,omitempty"`
+	TaskID       string `json:"task_id,omitempty"`
+	UserID       string `json:"user_id,omitempty"`
+	ChatType     string `json:"chat_type,omitempty"`
+}
+
+type routeAuthority struct {
+	Audience struct {
+		Conversation string `json:"conversation"`
+		Kind         string `json:"kind"`
+	} `json:"audience"`
+	Requester struct {
+		Principal  string `json:"principal"`
+		Backend    string `json:"backend"`
+		VerifiedBy string `json:"verifiedBy"`
+	} `json:"requester"`
+}
+
+func parseRouteAuthority(env *lib.Envelope) (routeAuthority, error) {
+	var auth routeAuthority
+	if len(env.Authority) > 0 {
+		if err := json.Unmarshal(env.Authority, &auth); err != nil {
+			return routeAuthority{}, fmt.Errorf("authority unreadable: %w", err)
+		}
+	}
+	return auth, nil
 }
 
 // routeFor reads the conversation the gateway's authority block names
-// (audience.conversation, its session-record key) and the platform it is on.
+// (audience.conversation, its session-record key), the platform it is on, and
+// the speaker identity and audience kind for memory scoping.
 func routeFor(env *lib.Envelope) (conversationRoute, error) {
-	var auth struct {
-		Audience struct {
-			Conversation string `json:"conversation"`
-		} `json:"audience"`
-	}
-	if len(env.Authority) > 0 {
-		if err := json.Unmarshal(env.Authority, &auth); err != nil {
-			return conversationRoute{}, fmt.Errorf("authority unreadable: %w", err)
-		}
+	auth, err := parseRouteAuthority(env)
+	if err != nil {
+		return conversationRoute{}, err
 	}
 	key := strings.TrimSpace(auth.Audience.Conversation)
+	userID := strings.TrimSpace(auth.Requester.Principal)
+	// A console route is recorded so its cards post back, but the console
+	// door's credential is shared, so its principal is not a person.
+	if hasSharedPrincipal(key, auth) {
+		userID = ""
+	}
+	chatType := strings.TrimSpace(auth.Audience.Kind)
 	for prefix, platform := range routePlatforms {
 		if strings.HasPrefix(key, prefix) && len(key) > len(prefix) && env.ContextID != "" {
-			return conversationRoute{Platform: platform, Conversation: key, ContextID: env.ContextID}, nil
+			route := conversationRoute{
+				Platform:     platform,
+				Conversation: key,
+				ContextID:    env.ContextID,
+				UserID:       userID,
+				ChatType:     chatType,
+			}
+			if prefix == consoleRoutePrefix {
+				route.TaskID = env.TaskID
+			}
+			return route, nil
 		}
 	}
 	return conversationRoute{}, errNoChatConversation
+}
+
+// hasSharedPrincipal reports whether the gateway conversation or requester
+// uses a shared credential across multiple callers (the console door's
+// nats:console grant, or the inject and A2A static bearer-token doors where any
+// token holder can self-assert an author/caller name). Personal memory must
+// stay off for shared credentials so one caller's private memories never pool
+// with or become readable by another's.
+func hasSharedPrincipal(key string, auth routeAuthority) bool {
+	if strings.HasPrefix(key, "console:") || strings.HasPrefix(key, "inject:") {
+		return true
+	}
+	switch strings.TrimSpace(auth.Requester.Backend) {
+	case "console", "inject", "a2a":
+		return true
+	}
+	switch strings.TrimSpace(auth.Requester.VerifiedBy) {
+	case "nats-grant", "inject-bearer", "a2a-bearer":
+		return true
+	}
+	return false
+}
+
+// identityRouteFor extracts an identity-only record for doors without a chat
+// notify route (such as the Google-token A2A door or Discord) when the gateway
+// supplies a non-shared requester principal. Doors whose credential is shared
+// across callers (console, inject, and static-token A2A) clear userID and do
+// not record a user route, since any a2a-* session without a stored user_id
+// already fails closed as an unattributable interactive conversation.
+func identityRouteFor(env *lib.Envelope) (conversationRoute, bool) {
+	auth, err := parseRouteAuthority(env)
+	if err != nil {
+		return conversationRoute{}, false
+	}
+	key := strings.TrimSpace(auth.Audience.Conversation)
+	userID := strings.TrimSpace(auth.Requester.Principal)
+	chatType := strings.TrimSpace(auth.Audience.Kind)
+	if hasSharedPrincipal(key, auth) || key == "" || userID == "" || env.ContextID == "" {
+		return conversationRoute{}, false
+	}
+	return conversationRoute{
+		Conversation: key,
+		ContextID:    env.ContextID,
+		UserID:       userID,
+		ChatType:     chatType,
+	}, true
 }
 
 // recordRoute records env's conversation route against sessionID. It returns
@@ -111,6 +208,15 @@ func (b *Bridge) recordRoute(ctx context.Context, sessionID string, env *lib.Env
 	}
 	route, err := routeFor(env)
 	if err != nil {
+		if errors.Is(err, errNoChatConversation) {
+			if idRoute, ok := identityRouteFor(env); ok && b.recordedRoute(sessionID) != idRoute {
+				if putErr := b.putRoute(ctx, sessionID, idRoute); putErr != nil {
+					b.cfg.Logger.Warn("conversation identity PUT failed", "session", sessionID, "err", putErr)
+				} else {
+					b.rememberRoute(sessionID, idRoute)
+				}
+			}
+		}
 		return err
 	}
 	prompt, _ := promptFromMessage(env.Payload)
@@ -118,8 +224,18 @@ func (b *Bridge) recordRoute(ctx context.Context, sessionID string, env *lib.Env
 	if err := b.putRoute(ctx, sessionID, route); err != nil {
 		// The ask is a reaction's kind, not what a card needs to report
 		// back: an earlier record of the same conversation still routes it.
+		// In a group conversation, the requester principal varies by speaker
+		// while personal memory is disabled regardless, so an earlier group
+		// record of the same conversation still holds.
+		// A console route's task is not: a card filed now would report
+		// naming the earlier turn, which its client cannot join to this one,
+		// so a console route differing only in its task is lost, and the
+		// answer says the card's report may not arrive.
 		earlier := b.recordedRoute(sessionID)
 		earlier.Ask = route.Ask
+		if route.ChatType == "group" {
+			earlier.UserID = route.UserID
+		}
 		if earlier == route {
 			b.cfg.Logger.Warn("conversation route PUT failed; the session's earlier record of the same route stands",
 				"session", sessionID, "err", err)

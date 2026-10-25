@@ -17,6 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -51,14 +52,26 @@ type AgentProfileSpec struct {
 	// +required
 	Description string `json:"description"`
 
-	// Persona is the OCI artifact holding SOUL.md, AGENTS.md, skills and the
-	// persona config, mounted read-only via image volume.
+	// Persona is the OCI artifact holding the persona (persona.yaml,
+	// instructions.md, skills/, mcp.yaml) under its /files directory, mounted
+	// read-only at /persona.
 	// +required
 	Persona AgentProfilePersona `json:"persona"`
 
 	// Harness is the worker image and its model routing.
 	// +required
 	Harness AgentProfileHarness `json:"harness"`
+
+	// Tools are OCI images of command-line tools for the profile's pods. Each
+	// is mounted read-only at /opt/tools/<name> and its bin/ directory is put
+	// on PATH, in list order, so one tools image serves every harness. A tools
+	// image holds no credentials: a tool that needs them (kubectl or gcloud
+	// against the fleet, a forge CLI) gets them from the broker, per task.
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=16
+	// +optional
+	Tools []AgentProfileTool `json:"tools,omitempty"`
 
 	// Bus holds topic grants beyond the task subjects every executor gets.
 	// Absent or empty grants no topic at all.
@@ -93,6 +106,18 @@ type AgentProfileSpec struct {
 	// +required
 	Concurrency int32 `json:"concurrency"`
 
+	// AllowedTiers are the tiers this profile may run at (#3660, "Tiers and
+	// identity"). A task runs at its requester's tier, and the dispatcher
+	// refuses one whose tier is not listed here; a pinned production profile
+	// might allow only read. Tier is authority, so it lives on the CR, never
+	// in the persona. Absent means read alone (AllowedTierList).
+	// +listType=set
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=2
+	// +kubebuilder:validation:items:Enum=read;unattended
+	// +optional
+	AllowedTiers []string `json:"allowedTiers,omitempty"`
+
 	// Resources is the pod resource class.
 	// +required
 	Resources AgentProfileResources `json:"resources"`
@@ -104,6 +129,31 @@ type AgentProfilePersona struct {
 	// +kubebuilder:validation:MinLength=1
 	// +required
 	Image string `json:"image"`
+}
+
+// AgentProfileTool is one command-line tools image.
+type AgentProfileTool struct {
+	// Name is the tool's directory under /opt/tools: a DNS-1123 label unique
+	// in the list, at most 24 characters so the staging init container's name
+	// ("stage-tool-<name>") stays within the 35 GKE Autopilot allows.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=24
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]{0,22}[a-z0-9])?$`
+	// +required
+	Name string `json:"name"`
+
+	// Image is the OCI reference of the tools image. Its payload is the image's
+	// /files directory, mounted at /opt/tools/<name>; binaries go in
+	// /files/bin.
+	// +kubebuilder:validation:MinLength=1
+	// +required
+	Image string `json:"image"`
+
+	// ImagePullPolicy is the pull policy for the image. Absent means
+	// IfNotPresent.
+	// +kubebuilder:validation:Enum=Always;IfNotPresent;Never
+	// +optional
+	ImagePullPolicy *corev1.PullPolicy `json:"imagePullPolicy,omitempty"`
 }
 
 // AgentProfileHarness is the worker image and its model routing.
@@ -257,6 +307,22 @@ type AgentProfile struct {
 	// +required
 	Spec   AgentProfileSpec   `json:"spec"`
 	Status AgentProfileStatus `json:"status,omitempty"`
+}
+
+// The tiers a profile may run at. Lowercase DNS labels, because each is also
+// a token of the profile's submission subject.
+const (
+	AgentProfileTierRead       = "read"
+	AgentProfileTierUnattended = "unattended"
+)
+
+// AllowedTierList reports the tiers the profile may run at, applying the
+// default (read alone) when the field is absent.
+func (p *AgentProfile) AllowedTierList() []string {
+	if len(p.Spec.AllowedTiers) == 0 {
+		return []string{AgentProfileTierRead}
+	}
+	return p.Spec.AllowedTiers
 }
 
 // QueueTimeout reports the effective queue deadline, applying the spec's

@@ -1,0 +1,79 @@
+# A delegated worker runs under the Platform Agent's worker budget, 150 turns,
+# not the 250 the fleet audits carry (#1947).
+#
+# The 250 was raised for the scheduled audits and, with no per-job budget in
+# the scheduler, reached every kanban worker spawned under the platform
+# profile: a short chat request that went wrong had 250 steps before anything
+# stopped it. The fix gives the audits their own `max_turns` on the roster and
+# drops the profile default to 150. This case reads the second half of that:
+# the prompt is a card written to outrun 150 turns by design, one trivial
+# terminal call per number, so the worker runs out of whatever budget is in
+# force and Hermes records which one: at 90% of the cap the worker's newest
+# tool result carries `You have used N of M iterations`, and a worker that
+# pushes on to the wall also closes its run with `Iteration budget exhausted
+# (N/M)`. `worker_budget` reads M from either; whether the worker stops at the
+# checkpoint or runs into the wall is the model's choice and does not decide
+# the case. On a profile still at 250 the card finishes before 90% of the cap
+# and records neither, which the check reports with the worker's captured call
+# count: that is the red.
+#
+# The audits' own 250 is not read here: it is a cron run, not a card, and the
+# fleet-audit cases on the roster are what show an audit finishing.
+#
+# Limits: the worker has to follow "one call per number" for the count to
+# climb past 150; a worker that batches the numbers into one loop finishes
+# inside any cap and the check fails for the wrong reason. The prompt forbids
+# loops in as many words. The run spends 150 trivial model calls on
+# purpose, twice: the dispatcher retries a timed-out card once before blocking
+# it (`DEFAULT_FAILURE_LIMIT`), and both attempts record the same cap. That is
+# minutes, not an hour; a 250 cap on the red run spends about 200 calls once
+# before the card completes.
+#
+# Domain: chat-and-routing. Isolation class: read-only. Eligible tier: nightly.
+id: platform-worker-turn-budget
+name: A delegated worker runs under the 150-turn worker budget, not the audits' 250
+prompt: >-
+  I need a timing probe of the specialist's tool loop, nothing on the cluster
+  changes. Delegate this to the Platform Agent as one card and have the worker
+  count from 1 to 200 by running the shell command `echo turn-<n>` once for
+  each number, as its own separate terminal tool call, waiting for each
+  call's output before making the next. No loops, no `seq`, no `for`, no
+  batching several numbers into one command, no script file: exactly one
+  `echo` per tool call, 200 calls. When it finishes, or if it is stopped
+  before it finishes, report how many numbers were echoed.
+expected_output: >-
+  The agent delegates one card to the Platform Agent. The worker issues
+  separate `echo turn-<n>` terminal calls and does not reach 200: either it
+  runs into its 150-turn budget and the card ends with the dispatcher's note
+  that the iteration budget was exhausted at 150, or it stops at the budget
+  checkpoint notice it receives at 135 of 150 and completes the card saying
+  so. The reply to the user says the probe stopped short of 200 rather than
+  claiming it finished.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: lapis2002
+
+# No fixtures: the one check reads the delegated card's run rows, which the
+# harness captures from the agent's own board before purging the card.
+
+verification_spec:
+  - name: the-worker-ran-under-the-150-turn-worker-budget
+    role: objective
+    # assert, not converge: the card's run rows are immutable once the run ends.
+    mode: assert
+    check:
+      type: worker_budget
+      # agents/platform/config.yaml `agent.max_turns`, the budget every kanban
+      # worker spawned under the platform profile runs with. The audits' 250
+      # sits on their roster entries and must not reach a card. The image's
+      # value, not an install's: a CR that sets tuning.platform.maxTurns (the
+      # stockout plugin's chart overlay sets 200) raises every worker to that
+      # number, and this case then fails naming it. Run it where the knob is
+      # unset, as the CI pool is.
+      budget: 150

@@ -248,6 +248,7 @@ func buildA2AVerifierDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Depl
 						WorkingDir: "/",
 						Env: []corev1.EnvVar{
 							{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
+							a2aNATSCAFileEnvVar(),
 							// NATS_USER is deliberately ABSENT. The binary
 							// takes the static-password path only when it is
 							// set, and warns when it does; unset is the
@@ -257,7 +258,7 @@ func buildA2AVerifierDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Depl
 								FieldPath: "metadata.namespace",
 							}}},
 						},
-						VolumeMounts: []corev1.VolumeMount{a2aBusTokenVolumeMount()},
+						VolumeMounts: []corev1.VolumeMount{a2aBusTokenVolumeMount(), a2aNATSCABundleMount()},
 						Ports:        []corev1.ContainerPort{{Name: "status", ContainerPort: a2aVerifierStatusPort}},
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
@@ -286,7 +287,7 @@ func buildA2AVerifierDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Depl
 							a2aVerifierCPULimit, a2aVerifierMemoryLimit),
 						SecurityContext: hardenedSecurityContext(),
 					}},
-					Volumes: []corev1.Volume{a2aBusTokenVolumeSource()},
+					Volumes: []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent)},
 				},
 			},
 		},

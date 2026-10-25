@@ -582,7 +582,7 @@ while kb is not None and queue:
             cards[tid] = None
             continue
         runs = kb.execute(
-            "SELECT id, profile, status, started_at, ended_at, metadata "
+            "SELECT id, profile, status, started_at, ended_at, metadata, outcome, error "
             "FROM task_runs WHERE task_id = ? ORDER BY id",
             (tid,),
         ).fetchall()
@@ -617,6 +617,14 @@ while kb is not None and queue:
         "assignee": row["assignee"],
         "status": row["status"],
         "runs": len(runs),
+        # How each attempt ended, as the dispatcher recorded it: a worker out
+        # of its turn budget closes its run ``timed_out`` with the budget in
+        # ``error`` (``Iteration budget exhausted (N/M)``), which is the one
+        # place the cap a worker actually ran under can be read back.
+        "run_outcomes": [
+            {"profile": r["profile"], "status": r["status"], "outcome": r["outcome"], "error": r["error"]}
+            for r in runs
+        ],
         "children": list(dict.fromkeys(children)),
         "fanned_out": list(dict.fromkeys(fanned_out)),
         "sessions": [],
@@ -726,6 +734,26 @@ def parents(summary: dict[str, Any] | None) -> dict[str, str] | None:
         for child in card.get("fanned_out") or []:
             found.setdefault(str(child), str(card.get("task") or ""))
     return found
+
+
+def runs(summary: dict[str, Any] | None) -> list[dict[str, Any]] | None:
+    """Every attempt of every captured card, in board order, with its card id.
+
+    ``None`` when the read did not run. Each row is the card's ``run_outcomes``
+    entry (``profile``, ``status``, ``outcome``, ``error``) plus ``task``; a
+    summary without card records yields an empty list. ``worker_budget`` reads the rows for the
+    turn budget a worker ran out of.
+    """
+    if not isinstance(summary, dict):
+        return None
+    rows: list[dict[str, Any]] = []
+    for card in summary.get("cards") or []:
+        if not isinstance(card, dict):
+            continue
+        for run in card.get("run_outcomes") or []:
+            if isinstance(run, dict):
+                rows.append({"task": str(card.get("task") or ""), **run})
+    return rows
 
 
 

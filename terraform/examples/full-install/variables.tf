@@ -615,6 +615,16 @@ variable "slack_home_channel_name" {
   default     = ""
 }
 
+variable "slack_home_channel_policy" {
+  description = "\"auto\" (also empty) or \"manual\". Accepted and recorded in this release but with no effect yet: the A2A gateway does not learn a home channel, so slack_home_channel alone decides. Only used when enable_slack is true."
+  type        = string
+  default     = ""
+  validation {
+    condition     = contains(["", "auto", "manual"], var.slack_home_channel_policy)
+    error_message = "slack_home_channel_policy must be \"\", \"auto\" or \"manual\"."
+  }
+}
+
 variable "chat_topic_name" {
   description = "Pub/Sub topic for Google Chat events. The default matches the chat-pubsub module and the chart."
   type        = string
@@ -902,6 +912,26 @@ variable "platform_agent_mode" {
   validation {
     condition     = contains(["today", "next"], var.platform_agent_mode)
     error_message = "platform_agent_mode must be \"today\" or \"next\", the PlatformAgent CRD's spec.mode enum."
+  }
+}
+
+variable "platform_agent_storage_size" {
+  description = "The PlatformAgent's spec.storage.size: the request of the agent's <name>-data claim and of the shell sandbox's data claim, which the operator gives the same size. The default is the operator's own default, and passes the chart nothing, so the CR carries no storage field. Raising it expands both existing claims online where their StorageClass sets allowVolumeExpansion; elsewhere the claims keep their size and the CR's DataVolumeNotExpanded condition says so. A claim cannot shrink, so the operator's admission webhook refuses a lower value, and returning to the default never shrinks a claim. Each GiB added counts twice against the project's disk quota, once for each claim. At most 64Ti, the largest persistent disk. Mirrors PLATFORM_AGENT_STORAGE_SIZE in install.env, and its default is DEFAULT_PLATFORM_AGENT_STORAGE_SIZE in install.defaults.env."
+  type        = string
+  default     = "50Gi"
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[1-9][0-9]*(Mi|Gi|Ti)$", var.platform_agent_storage_size))
+    error_message = "platform_agent_storage_size must be a whole number of Mi, Gi or Ti above zero, for example \"80Gi\". It sets the PlatformAgent CRD's spec.storage.size."
+  }
+
+  # 67108864 Mi is 64Ti, the largest persistent disk, the limit the admission
+  # webhook, the chart and the installer also take. A value the grammar above
+  # refuses passes here, so it is refused once.
+  validation {
+    condition     = try(tonumber(regex("^[0-9]+", var.platform_agent_storage_size)) * lookup({ Mi = 1, Gi = 1024, Ti = 1048576 }, regex("[MGT]i$", var.platform_agent_storage_size)) <= 67108864, true)
+    error_message = "platform_agent_storage_size must be at most 64Ti, the largest persistent disk size."
   }
 }
 

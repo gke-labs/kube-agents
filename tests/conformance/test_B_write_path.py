@@ -75,6 +75,7 @@ def _profile_configs():
     return {
         "platform": merge(shared, platform),
         "cluster": yaml.safe_load(h.text("cluster_config")),
+        "tse": yaml.safe_load(h.text("tse_config")),
     }
 
 
@@ -259,7 +260,10 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
             for path in (h.path_of("shared_defaults_config"), *sorted((h.REPO_ROOT / "agents").glob("*/config.yaml")))
             if _servers_reaching(yaml.safe_load(path.read_text()) or {}, _GKE_MCP_TARGETS)
         }
-        modelled = {h.SOURCES[name].path for name in ("shared_defaults_config", "platform_config", "cluster_config")}
+        modelled = {
+            h.SOURCES[name].path
+            for name in ("shared_defaults_config", "platform_config", "cluster_config", "tse_config")
+        }
         self.assertEqual(
             set(),
             declaring - modelled,
@@ -540,7 +544,7 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
         """
         relay = "${KUBE_AGENTS_MCP_RELAY_URL}/"
         checked = 0
-        for source in ("shared_defaults_config", "platform_config", "cluster_config"):
+        for source in ("shared_defaults_config", "platform_config", "cluster_config", "tse_config"):
             servers = (yaml.safe_load(h.text(source)) or {}).get("mcp_servers") or {}
             for alias, spec in servers.items():
                 spec = spec or {}
@@ -624,8 +628,16 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
     def test_B2_no_workflow_grants_a_bot_the_ability_to_approve(self) -> None:
         """`pull-requests: write` is the permission an approval needs.
 
-        Seven workflows hold it, and none can give an approval:
+        Eight workflows hold it, and none can give an approval:
 
+        - auto-enqueue: `schedule`, `workflow_dispatch` and
+          `pull_request_target: labeled, unlabeled`, `permissions: {}` at the
+          top, job-gated on `github.repository`, the grant job-scoped, checkout
+          pinned to the default branch with `persist-credentials: false`. Its
+          `GITHUB_TOKEN` pull-request write is one comment on a pull request
+          removed from the merge queue, saying why and how to put it back. Its
+          auto-merge calls run on a GitHub App token, which the tests below
+          pin; the comment explains a removal and cannot approve or merge.
         - auto_request_review, which requests reviewers and does not give them.
         - auto-assign-milestone: triggers on `pull_request_target: closed`
           gated on `merged == true`, so it runs only after the merge decision
@@ -660,7 +672,7 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
 
         The list is an allowlist of holders, not of intents: the permission is
         a capability, and this asserts membership rather than absence so a
-        seventh holder is a red test and a conversation rather than a silent
+        ninth holder is a red test and a conversation rather than a silent
         addition. Adding a name here means someone read the workflow. A GitHub
         App token minted with Pull requests write is not a `permissions:`
         grant; `test_B2_app_token_write_grants_are_pinned` holds those.
@@ -679,6 +691,7 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
         self.assertEqual(
             [
                 "auto-assign-milestone.yml",
+                "auto-enqueue.yml",
                 "auto_request_review.yml",
                 "ci-health.yml",
                 "coverage-comment.yml",
@@ -703,9 +716,9 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
         `lgtm` and `approved` with no `do-not-merge` label, the predicate Tide
         merges on today, and Prow sets those two labels only for accounts the
         `OWNERS` files name. No model verdict is an input. The call runs on a
-        GitHub App token, not on a `pull-requests: write` grant, so the holder
-        list above does not show it; the App-token test below pins who mints
-        one. The next test pins the predicate; any other script under
+        GitHub App token, not on a `pull-requests: write` grant: the holder
+        list above shows `auto-enqueue.yml` only for its left-out comment, and
+        the App-token test below pins who mints one. The next test pins the predicate; any other script under
         `scripts/` making one of these calls is a red.
         """
         merging = (
@@ -741,7 +754,9 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
         Auto-merge goes on only for a pull request that is not a draft, carries
         both `lgtm` and `approved`, and carries none of the `do-not-merge`
         labels Tide's query excludes. Every other combination must leave it
-        off.
+        off. That holds on each removal path too: never removed, removed with
+        the one retry after a `failed_checks` removal due, and removed with it
+        spent, which stays out.
         """
         scripts = h.REPO_ROOT / "scripts"
         if str(scripts) not in sys.path:
@@ -761,13 +776,21 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
                         labels = {"size/S"} | ({"lgtm"} if lgtm else set()) | ({"approved"} if approved else set())
                         if hold:
                             labels.add(hold)
-                        pull = {"draft": draft, "labels": labels, "auto_merge": False, "queue_entry": None}
-                        expected = lgtm and approved and not hold and not draft
-                        with self.subTest(labels=sorted(labels), draft=draft):
-                            self.assertEqual(
-                                expected,
-                                merge_gate.enqueue_action(pull) == merge_gate.ENABLE,
-                            )
+                        for removed, retry in ((False, False), (True, True), (True, False)):
+                            pull = {
+                                "draft": draft,
+                                "labels": labels,
+                                "auto_merge": False,
+                                "queue_entry": None,
+                                "removed_since_push": removed,
+                                "retry": retry,
+                            }
+                            expected = lgtm and approved and not hold and not draft and (retry or not removed)
+                            with self.subTest(labels=sorted(labels), draft=draft, removed=removed, retry=retry):
+                                self.assertEqual(
+                                    expected,
+                                    merge_gate.enqueue_action(pull) == merge_gate.ENABLE,
+                                )
 
 
     def test_B2_app_token_write_grants_are_pinned(self) -> None:

@@ -22,7 +22,7 @@ that store which runs `hermes cron tick` against every named profile with work d
 [`autonomous-watchdogs.md`](../../../docs/site/src/content/docs/concepts/autonomous-watchdogs.md)).
 
 An enabled entry here therefore fires in its own process, with this profile's
-persona, toolsets, `skills`, `model` and `max_turns` — which is the whole reason
+persona and toolsets (unless the entry's `enabled_toolsets` replaces them) and the entry's own `skills`, `model` and `max_turns` — which is the whole reason
 the watchdogs live here rather than as kanban cards filed from the Chat Agent's
 roster. A card is not a cron run, and that indirection is what stopped `skills`,
 `model` and `deliver` reaching the thing that ran.
@@ -202,8 +202,10 @@ install's remedy, and the table carries each as that project's failure, and a ti
 refused fails, announced once. An install that declares none keeps the bare flag, and a scope
 render the pod cannot read fails the tick with the reason. The cluster read is `gcloud` cluster metadata
 for the version table and, on a report day, the readiness report's read set,
-the same as a run on request: one `get-credentials` and six `kubectl get`s
-per cluster (budgets, Deployments and StatefulSets; webhook configurations
+the same as a run on request: three `gcloud` list reads per project (backend
+services, instances and GKE operations, projected to the fields the rules read)
+beside the server config per location, then one `get-credentials` and six
+`kubectl get`s per cluster (budgets, Deployments and StatefulSets; webhook configurations
 with their Services, EndpointSlices and Namespaces; DaemonSets, CronJobs,
 claims, NetworkPolicies and Namespaces; every pod; the nodes through a
 jsonpath projection; StorageClasses and PersistentVolumes), plus
@@ -216,8 +218,14 @@ spelled by its number is keyed by the id `gcloud projects describe` resolves,
 learned on its first table run. A number the credential cannot resolve is
 never a key, so its clusters earn no report until it resolves: when nothing
 was read under a key (it is the only project, or every other is an unresolved
-number too), the tick fails with the reason and the remedy, posted once and
-kept in `last-failure.txt` until the next clean tick posts the recovery;
+number too), the tick fails, posted once as a plain line ("The upgrade readiness
+check didn't run today", why, and that an admin needs to fix it, since no retry
+resolves the number) with the reason and the remedy in
+`logs/upgrade_readiness_watch.log` under the agent home, which fluent-bit
+ships, and kept in `last-failure.txt` by the kind of failure until the next
+clean tick posts the recovery. A failure a retry may clear (a timeout, a
+sandbox that failed) says instead that it tries again tomorrow, or at its next
+scheduled run when its roster entry is not daily;
 beside projects that were keyed, the table is partial, posted once with the
 reason, and the ledger's `table_errors` keeps it. The remedy is
 `resourcemanager.projects.get` on the credential (every read role the install
@@ -286,7 +294,7 @@ the hops refused as outside the declared scope and the ids it learned for
 numbered spellings, kept at whichever step the tick failed unless the ledger
 itself cannot be written or re-read, so the next tick files them under the same cause)
 keeps its key in
-`last-failure.txt` beside it (its line, or, for a tick whose every run was refused, the
+`last-failure.txt` beside it (the plain reason, or, for a tick whose every run was refused, the
 refused projects and their causes), and the next line is the recovery. A version
 none of whose clusters can be read is retried
 three days running and then recorded, so an unreachable cluster costs its
@@ -298,6 +306,82 @@ at the gateway's home. The three
 environment knobs (`UPGRADE_READINESS_REFRESH_DAYS`, `_PROJECTS`,
 `_WATCH_HOME`) are for a run started by hand in the pod; the operator's
 `spec.deployment.env` allowlist does not carry them.
+
+## `upgrade-readiness-weekly-review` and `upgrade-readiness-weekly-brief` are one Saturday in two jobs
+
+The daily watch reads a cluster only while a release channel offers it a version it is below, and
+posts one line per report. The weekly pair reads every cluster of the roster's projects whatever its
+version (a declared scope refuses a project outside it), and ends in one message a person reads.
+
+`upgrade-readiness-weekly-review` (`0 6 * * 6`) is a `no_agent` script on this pod. It runs the
+`fleet-upgrade-verification` readiness report in the sandbox through the watch's own loader, one
+run per project inside the watch's 45-minute tick budget (Hermes kills a `no_agent` script at an
+hour), and turns every blocker and risk the report names (a drain-blocking budget, a fail-closed
+webhook, a pool past or at the skew ceiling, a covering exclusion, and each readiness rule's rows
+once the report carries rules) into a finding on the findings queue, through the Session KV
+server's `POST /v1/findings` route, reached at the endpoint and with the key `findings_nudge.py`
+uses. Each project is registered as soon as its run returns, so a run the hour cuts short keeps
+what it registered. The sends have ten minutes of their own past the reads, each waiting no longer
+than what is left, and a batch with no time left is booked as not sent, so a queue that hangs
+cannot hold the run past the hour before it writes its record. The queue's identity rule makes next Saturday's run an update of the same row;
+its rubric sets the severity (a budget over a single replica, a pool past the skew ceiling and a
+webhook in the upgrade's path are critical; a budget over several replicas, a pool at the ceiling
+and a webhook refusing only what it matches today are major; a covering exclusion is minor; a
+readiness rule's blocker is critical, and its risk is minor for catalogue entries 9, 10, 11, 13, 16 and 25 and major for every other entry, and minor for the plan-level `rollout-sequence-precheck`, as the rubric's
+tables set it); a row
+the user dismissed stays dismissed; and the hourly nudge paces what is named and reminds daily of
+undecided criticals. A cluster read in full sends its batch with a `scope` naming the job's check
+family (`upgrade-`) and its own source, an empty batch when nothing was found, so a finding the week
+no longer reports loses confidence and stops being reminded without touching another family's rows
+on that cluster, or the `upgrade-` rows another writer filed there. Three kinds of cluster claim nothing: one
+with more findings than one batch holds (500), sent in pieces; two of one name in one project, whose
+claims the queue could not tell apart; and one with a row the queue would refuse, since the claim
+would book that finding's row absent. A cluster with no upgrade target (no release channel, or a
+server config that did not answer) is never read in full, since the grader cannot judge its pools'
+skew, so it claims nothing either: a budget or webhook row there that is fixed stays on the queue
+until the user decides it. The same holds for a cluster on which a readiness rule failed or left an
+`unknown`, even a rule that cannot block: a claim would lower that rule's own rows, which the run
+could not read again. A cluster the listing no longer returns (deleted, renamed or out of scope) is
+not in the run at all, so nothing is sent for it, and its rows stay until the user decides them. On an install with no declared scope, a roster that names one
+project both by number and by id runs it twice until the daily watch has learned the number's id,
+and on a Saturday `gcloud projects describe` fails, the number's run is booked as a project not
+read; name the project by its id alone to avoid both. The script writes the technical report under `upgrade-readiness/weekly/` beside the
+watch's ledger, keeps the newest eight runs, and places a copy of `latest.md` and `latest.json` in
+the sandbox at `/opt/data/upgrade-readiness/weekly/` so the agent can read it when asked. It prints
+nothing on success: the brief speaks for the week and the queue for each finding. A project it could
+not read is one line naming it; a batch the findings queue refused, or a sandbox copy that failed,
+is one line each, since both leave the week's findings where the brief cannot act on them; a
+failure of the run is one line, once per distinct failure (numbers aside), with the recovery line
+on the next clean run. The entry declares `risk: high` as the watch does: the budget, pool, exclusion and webhook names it reads are tenant-written, and they reach the queue, the report, the sandbox copy and, by queue id and object name, the brief in chat.
+
+`upgrade-readiness-weekly-brief` (`0 7 * * 6`, an hour after the review starts and past its
+budget) is the model turn, and the reason the pair is not one job: the review can rank by rubric
+but cannot tell that two criticals on one cluster are one problem, or that a critical whose clock
+ends next week outranks one with no date. Its SOP (`governance/upgrade_readiness_brief_sop.md`) has it
+read the review's summary, the queue's open backlog (the rows whose `check` starts with `upgrade-`)
+and its snoozed and dismissed rows (read by state, since the backlog never carries them), and
+compose a brief of at most twenty-five lines: the week's headline, the
+undecided criticals that need a decision (one line per cluster, at most ten, with one clause of
+why and one action each), the rest of the week as counts, what was decided earlier, any project the review could not
+read, and where the full report is with the sentence that opens it in chat. It never registers,
+never decides, never runs the report, and is never `[SILENT]`: the brief is owed every week, a
+quiet one in three lines. If the review's summary is missing or older than two days (the review
+did not run, the hour cut it short, or its copy did not land), the brief says so in its headline and
+composes **Decide now** from the queue alone. The entry declares `risk: high`: a prompt job over
+tenant-written names, so its terminal is held to read-only inspection commands. For the same
+reason the turn holds no queue tool and no file-writing tool: the entry's `enabled_toolsets` gives
+it the terminal tool alone and no MCP server (`no_mcp`), so nothing a name says can make it
+register or decide a finding through `platform_control`, or write a file the command policy would
+refuse. The queue reads are made before the turn by the entry's
+pre-run `script`, `upgrade_readiness_brief_queue.py`, whose JSON the scheduler puts above the
+prompt. An open backlog it cannot read is said there and in the brief's headline; a page of
+decided rows it cannot read leaves out only the brief's **Decided earlier** line. The `deliver: "chat"` relay posts it as written and stores it against the
+thread, so a reply with an id and `dismiss`, `snooze until <date>` or `accept` reaches the agent
+with the brief attached.
+
+Why the queue and not a weekly chat line per finding: a line is read once; the queue keeps asking
+until a person answers, keeps the answer, and stops. That is the contract the review needs for a
+finding a user may have missed, and the one that lets a user say "ignore this" once.
 
 ## `sa-role-watch` says when the agent's account holds more than `read-only`
 
@@ -341,24 +425,31 @@ the organisation or a group is not in that answer, and reading those needs
 verbs the broker's allowlist does not carry. A `custom` set chosen on purpose
 is reported like any other grant, and repeated daily like one.
 
-## `leeway-watch` sweeps topology skew and priority rank cascades daily
+## `leeway-watch` sweeps topology skew and priority-rank findings daily
 
-The `topology-drift` skill diagnoses zonal placement drift, unschedulable
-spread constraints, unavailable topology domains, and compute-class priority
-rank cascades on request. `leeway_watch.py` (`no_agent: true`, `deliver:
-"chat"`, daily at 08:30 UTC) runs `leeway report --topology-tier-c-signals`
-in `agent-sandbox` across the fleet (`LEEWAY_WATCH_CLUSTERS` when set, else
-`LEEWAY_WATCH_PROJECTS` or the management project plus every project a Cluster
-Agent profile's identity names) and gates notifications through `<profile
-home>/leeway/ledger.json`. A finding earns a report under `<profile
-home>/leeway/reports/` (`<timestamp>.md` and `<timestamp>.json`, with
+The `topology-drift` skill reads a `leeway report` on request and attributes
+the zonal skew it finds. `leeway_watch.py` (`no_agent: true`, `deliver:
+"chat"`, daily at 08:30 UTC) runs `leeway report --topology-tier-c-signals
+--clusters <project>/<location>/<cluster>,…` in `agent-sandbox` across the fleet
+(`LEEWAY_WATCH_CLUSTERS` when set, else `LEEWAY_WATCH_PROJECTS` or the
+management project plus every project a Cluster Agent profile's identity names;
+a project with no Cluster Agent profiles is enumerated with `gcloud container
+clusters list` first, since the sandbox relays that and not the GKE API route
+leeway's own `--clusters-from <project>` would take) and gates notifications
+through `<profile home>/leeway/ledger.json`. The report's topology findings
+(`leeway.contract_violated`, `leeway.placement_drift`,
+`leeway.domain_unavailable`) are keyed by cluster, namespace, subject, topology
+key and kind; its ComputeClass rank findings (`leeway.rank_wedged`,
+`leeway.rank_degraded`, `leeway.rank_no_migration`, `leeway.rank_tier_unused`)
+by cluster, class, judging rule and kind. A finding earns a report under
+`<profile home>/leeway/reports/` (`<timestamp>.md` and `<timestamp>.json`, with
 `latest.md` and `latest.json` symlinks) and a chat summary line when it first
-appears, when its `suspectedCause` changes or its `severity` escalates, or when
-its 7-day refresh window (`LEEWAY_WATCH_REFRESH_DAYS`, with ten minutes of
-slack) comes round. Resolved findings on cleanly scanned (`status: "ok"`)
-clusters are retired with a single resolution line, while clusters whose scan
-failed retain their ledger entries so transient errors do not erase state and
-re-page tomorrow.
+appears, when its `suspectedCause` (a rank finding's `rule`) changes or its
+`severity` escalates, or when its 7-day refresh window
+(`LEEWAY_WATCH_REFRESH_DAYS`, with ten minutes of slack) comes round. Resolved
+findings on cleanly scanned (`status: "ok"`) clusters are retired with a single
+resolution line, while clusters whose scan failed retain their ledger entries so
+transient errors do not erase state and re-page tomorrow.
 
 ## `kanban-workspace-gc` is neither a watchdog nor a poller
 
@@ -500,8 +591,10 @@ operator's allowlist, are the whole configuration surface: `FEEDBACK_PROMPT_ENAB
 on later still gets exactly one) and `FEEDBACK_PROMPT_DELAY` (default `7d`;
 `<n>d`, `<n>h` or `<n>m`). A hand edit of the CR's `spec.deployment.env` can
 be lost at the next chart apply. A delay that does not parse is a failed run, exit 1
-with the reason on stderr, which the scheduler reports in chat like any other
-script failure until the value is fixed; it does not fall back, because the
+with the reason on stderr. The scheduler turns that into its failure line, which
+the relay posts once in plain words ("The Feedback Prompt didn't run. It hit an
+error."), and the run's output, which the scheduler saves under the profile's
+`cron/output/`, keeps the reason; it does not fall back, because the
 scheduler keeps a zero-exit script's stderr nowhere and a silent fallback
 would leave no trace but the message arriving a week early. The schedule is
 daily, so whatever the delay, the message lands on the first 13:00 UTC tick
@@ -513,6 +606,66 @@ publish. `enabled: false` on the entry stays the fleet-wide switch, and
 retiring it follows the two-step path below like any other id; deleting the
 entry outright would leave the volume's copy firing against a script the next
 image no longer ships.
+
+## `upgrade-retrospective` looks back after the weekend's upgrades
+
+The other audits say what an upgrade _would_ break. Nothing on the roster said
+what one _did_ break, so the same surprise waited for the next cluster. This
+entry is the fleet-audit stream that fills that gap: at 18:00 UTC on Sunday,
+after the maintenance windows most fleets set at night or at the weekend and
+before Monday's audits, the Platform Agent follows
+`governance/upgrade_retrospective_sop.md`. The SOP resolves the fleet with the
+platform_control `fleet_scope` tool first, as every fleet-audit stream does,
+probes the collector's lock (`--probe-lock`) before it opens the audit run, and
+runs the deterministic collector,
+`skills/fleet-audit/scripts/upgrade_retrospective.py`, with `--full`, the
+tool's `collector_args` verbatim (`--scope-projects`, `--scope-unread`; nothing
+on an install that declares no scope) and `--manifest-file`, so `finish` holds
+the findings document to what the collector read, in the foreground under the
+terminal tool's `timeout: 600`. The collector keeps a ledger of versions per cluster,
+reviews every cluster that is new or was upgraded since the last run, reads
+pods, nodes, events and budgets, classifies what it finds against the upgrade
+failure catalogue, and writes the three-section report (Errors, Warnings, Info)
+to `/opt/data/upgrade-retrospective/` on the shell sandbox's volume, with
+`upgrade-retro-report.md` pointing at the newest full run. The SOP's half is
+the judgement: it confirms every candidate against the seven checks in its
+section 3 and copies the collector's grade (the gate per reviewed cluster included: `clear`, `risk` or `pending` from the pod and node diff plus Cloud Logging ingestion bytes by container, seven days after against seven days before), tailors the catalogue's mitigation
+text to the cluster's own objects, files the stream's one ledger issue where a repository is configured, and reaches `finish`, whose record is what chat receives (the relay posts what `finish` rendered, not the run's final message): the headline and the most severe findings, each with its cluster and object; the counts per cluster and the Errors and Warnings entries are the report's. A quiet weekend, with no cluster new or upgraded, posts nothing.
+
+Two things set it apart from the streams beside it. With no GitHub repository in `managed_repos` it takes the skill's no-forge path as they do (`start` and `finish` with no ledger issue, the findings kept in the report store), and keeps its own store on the volume beside it: the ledger, the guards and the dated reports the on-demand route reads. The Chat Agent's
+first-run stage (`agents/chat/scripts/oobe.py`) marks this job due after the four
+fleet audits it starts once the first inventory scan settles, so a fresh
+install's first report is a baseline of every cluster it manages. And it never
+opens a pull request on its own: an Error files at
+`major`, a Warning at `minor`, nothing at `critical`, every remediation is
+`manual` naming the manifest and the change, and none of its check slugs is on
+`MAJOR_SWEEP_CHECKS`, so `finish` has nothing to promote. A fix stays a user's
+"apply" in chat, through `submit-suggestion`.
+
+The same report answers a question. `agents/platform/CAPABILITIES.md` and the
+persona's delegation list route "how did the upgrades go", "did anything break",
+"what broke last upgrade" to the SOP's on-demand section (a forward-looking question,
+"anything to worry about before we upgrade", is the readiness report's), which answers
+from the saved report when it is newer than the last upgrade operation on the
+clusters the question covers and runs the collector first when it is not: a
+fleet-wide question as a full run, a question about named clusters as a scoped
+one (`--cluster`, beside the tool's `collector_args`; the collector refuses a
+cluster outside the declared scope), which writes a `-scoped` report, moves no
+link and touches no ledger. A second run while one holds the store's lock prints
+one line and writes nothing; a question that meets it is answered from the saved
+report, naming the run that holds the lock. A collector exit without a manifest
+after `start` (the lock lost, a crash record) takes the SOP's recovery `finish`,
+which releases the in-flight note at once instead of leaving it to its TTL.
+
+`risk: low`, as every audit: the run's only writes are the collector's files on
+the volume, the ledger issue through `audit_report.py`, and the chat message,
+and the `high` tier's command allowlist would refuse the collector itself, a
+Python script. `deliver: chat`, so the Chat Agent owns the thread a reply lands
+in. The collector also keeps a guard per classified failure and per risk shape
+in `guards.json` beside its ledger, for the readiness watch to read once its
+reader ships ([the readiness design](../../../docs/designs/upgrade-readiness-checks.md));
+nothing scheduled reads the file today, and the SOP's on-demand section reads its
+risk entries for a cluster the latest report lists as unchanged.
 
 ## Never put an id on both rosters
 
@@ -529,8 +682,8 @@ returns an **empty target list** for `"local"` — the outcome is written to
 `last_output` and delivered nowhere. A watchdog whose run failed would then be
 indistinguishable from a quiet fleet. Both audible values carry a failure: the
 scheduler builds one with `_summarize_cron_failure_for_delivery` and delivers it
-on the same leg, and the relay posts that line as written for a fleet-audit job
-too.
+on the same leg, and the relay posts it in plain words, once until the job runs
+again, for any job.
 
 Silence is still cheap: a run with no findings returns `[SILENT]` and the
 scheduler skips delivery, so a steadily clean fleet generates no chat traffic.
@@ -569,9 +722,11 @@ written and stores the full report against its thread, so the user's reply there
 Chat Agent with the report attached. A fleet-audit job the image ships is the
 exception: its scheduled delivery posts the report the run's `finish` rendered,
 not the final message,
-which holds whatever else the model wrote in its last turn. A run over several
+which holds whatever else the model wrote in its last turn. A run publishes to
+one repository, the one with `role: gitops`; a run that a person ran for several
 repositories posts each finished repository's report, then a line naming any it
-did not finish. A failed run posts the scheduler's failure line, which says why,
+did not finish. A failed run posts the scheduler's failure line in plain words,
+once until the job runs again ([the relay design](../../../docs/designs/cron-report-relay.md)),
 and a run that finished no repository without failing posts a one-line notice
 that it did not finish. On Slack the report is then replaced by a headline linking its
 ledger issue when the run covered one repository; a message with that line, or
@@ -791,3 +946,17 @@ tier default fail-closed to `"high"` under `cron_run_scope.py` and `cron_risk_ga
   no agent loop and therefore no tool-approval surface to gate; `"high"` is a threat classification of
   the untrusted input the subprocess ingests (runtime isolation is tracked in #913; today the tier is
   metadata only for those jobs).
+
+## `max_turns` contract
+
+Every model-run entry (one without `no_agent`) declares `"max_turns"`, a positive integer, and
+no `no_agent` entry carries one; `scripts/check_prompt_assets.py` (`check_cron_max_turns`)
+enforces both. The image's scheduler reads it ahead of the profile's `agent.max_turns`
+(`deploy/docker/patches/apply_cron_job_max_turns.py`, the same change upstream Hermes has
+open, so the patch drops out on the tag bump that carries it). The audits carry the budget
+their by-hand per-cluster fallback needs; the profile's own value bounds the kanban workers,
+which never need that much. Required rather than optional because an absent key silently
+runs the job under the worker budget. Hermes reads 0, a negative number, a bool or a
+non-numeric string as unlimited; the patch ignores such a roster value and the profile's stands,
+so an entry the image does not ship cannot lift a cron run past every budget. `merge_cron_store` carries it to existing installs like any
+image-owned key. Raise an entry's number when its SOP outgrows it; do not raise the profile's.

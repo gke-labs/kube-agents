@@ -1382,17 +1382,22 @@ none of them: the profile list, the SSH key, and the files themselves. It runs f
 agent entrypoint (step 5.7, in the foreground, gated on the bootstrap primary so
 two replicas do not both push) and again from `cluster_agent_profile.py` when a profile is
 scaffolded later, so a cluster onboarded at 3am does not wait for a pod restart to get its
-directories. Nothing about it is ordered against the sandbox starting: the Deployment and
+directories. The scaffold passes `--profile <name>` and pushes that home plus the machine
+home and `profiles/platform`, the two roots the sandbox creates bare; the start pushes
+every home. Re-sending every home on every scaffold made onboarding N clusters
+cost O(N²) (#3701). Nothing about it is ordered against the sandbox starting: the Deployment and
 the StatefulSet come up independently, so the script waits for sshd and, failing that,
 leaves the agent pod's files untouched and lets the next start retry.
 
-**One of its failures holds the agent pod down and the rest do not**, which is a distinction
-the exit codes carry rather than a judgement the entrypoint makes. A copy that ran and
-failed can have moved the model's files off the agent pod's volume without landing them on
-the sandbox's, and coming up healthy in that state is the outcome the mirror exists to
-prevent — so it exits `EXIT_FATAL`, the container refuses to start, and
-`getDeploymentStatusDetails` surfaces a Degraded CR naming this container. Everything else
-exits `EXIT_RETRY`: the entrypoint warns and the agent starts.
+**Almost none of its failures hold the agent pod down**, which is a distinction the exit
+codes carry rather than a judgement the entrypoint makes. A copy that ran and failed exits
+`EXIT_RETRY` like everything else: the copy reads the agent pod's volume and never removes
+from it, so a transfer that dies halfway leaves every file where it was and the migration
+marker unwritten, and the next start copies again, keeping whatever already landed. The
+entrypoint warns and the agent starts. `EXIT_FATAL` is left for what running the script
+again cannot fix, no `tar` on `PATH` and an unhandled exception (the reasoning is at the
+exit codes in `deploy/shared/sandbox_mirror.py`): the container refuses to start, and
+`getDeploymentStatusDetails` surfaces a Degraded CR naming this container.
 
 The dividing line is who can provoke the failure, not how bad it looks. Everything under
 the sandbox's `/opt/data` except the image's trees is owned by uid 1000 and the volume
@@ -1454,9 +1459,9 @@ Sizing the two volumes together has an upgrade cost, because `volumeClaimTemplat
 immutable and the template sizes only the claims it creates. An install that predates it
 therefore needs both halves done to it: the operator widens the existing claim in place
 (online, with the volume still mounted) and recreates the StatefulSet with Orphan
-propagation so the pod and its disk survive the swap. Both are in `reconcileShellSandbox`;
-the widening is `growDataClaim`, which `reconcilePVC` also runs on the agent's own claim,
-and both are best-effort in the direction that matters — a StorageClass without
+propagation so the pod and its disk survive the swap. The recreate is in
+`reconcileShellSandbox`; the widening is `growShellSandboxDataClaim`, which `reconcilePVC` runs
+through `growDataClaim` before it grows the agent's own claim, and both are best-effort in the direction that matters — a StorageClass without
 `allowVolumeExpansion` leaves a smaller volume and a bounded migration rather than a failed
 reconcile that would take the agent down with it.
 
@@ -1991,8 +1996,8 @@ build fails if anything under it is not owned by root or is writable by group or
 
 #### Cron scripts stay in the agent pod and reach into the sandbox from there
 
-A `no_agent` cron job — one carrying a `script` rather than a `prompt` — is unaffected
-by the terminal backend. The scheduler's `_run_job_script` resolves the script against
+A cron job's `script` — the whole of a `no_agent` job, or a prompt job's pre-run step — is
+unaffected by the terminal backend. The scheduler's `_run_job_script` resolves the script against
 `HERMES_HOME/scripts`, rejects anything resolving outside it, picks `/bin/bash` or
 `sys.executable` by extension, and calls `subprocess.run` with an environment from
 `build_subprocess_env` — imported from `tools.environments.local`, hardcoded. There is
@@ -2663,7 +2668,14 @@ within that route `ROLE_EXECUTABLES` holds the session to `kubectl` and `gcloud`
 Pod picks the audience it projects, the role is also bound to the caller:
 `CREDENTIAL_PROXY_SESSION_CALLERS` names the session ServiceAccount, which may present only
 the session audience, and no other caller may present that audience
-([spec-mode-switch.md](spec-mode-switch.md#switches-inside-next) owns the flag). A `NetworkPolicy` would have expressed the same thing and is not the mechanism
+([spec-mode-switch.md](spec-mode-switch.md#switches-inside-next) owns the flag). With the
+A2A MCP server on, a fifth, `mcp`, is the MCP pod's: its token is minted for
+`kubeagents-credential-proxy-mcp`, it reaches `/v1/vcs/` alone, and within it `ROLE_VCS_VERBS`
+admits `proposal-view` only, checked on the normalised verb before the body is read, with that
+verb's managed-repository check still applying. It is bound the same way:
+`CREDENTIAL_PROXY_MCP_CALLERS` names the MCP pod's own ServiceAccount, which may present only
+the mcp audience, and no other caller may present it; with the list empty, nobody holds the
+role. A `NetworkPolicy` would have expressed the same thing and is not the mechanism
 chosen, because it does nothing at all on a CNI that does not implement `NetworkPolicy` and
 `TokenReview` is answered by the API server on every cluster.
 
@@ -2841,6 +2853,8 @@ The Slack relay holds a socket-mode WebSocket. Two replicas means two connection
 duplicate event delivery, so the broker Deployment pins `replicas: 1`. The credential
 broker cannot be made highly available while it is fused with an inbound event pump, and
 splitting the two is the obvious follow-up.
+[`credential-proxy-single-pod.md`](credential-proxy-single-pod.md) owns the replica decision
+and the other state that keeps the broker at one pod.
 
 ### The proxy image is not the agent image
 
