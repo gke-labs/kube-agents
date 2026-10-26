@@ -458,6 +458,8 @@ ANCHORED_LINES = (
     "",
     '<a id="explicit"></a>',
     '<a name="named"></a>',
+    '<a href="/x" data-name="not-an-anchor">x</a>',
+    '<span data-id="not-an-anchor-either"></span>',
     "",
     "```",
     "## Fenced heading",
@@ -490,12 +492,25 @@ SITE_ANCHORED_LINES = (
     "",
     "## On the site",
     "## What next ?",
+    "",
+    "[same page, on the site](#what-next)",
+    "[same page, the title](#_top)",
+)
+RULED = "docs/ruled.md"
+RULED_LINES = (
+    "---",
+    "",
+    "# Ruled",
+    "",
+    "## Section",
 )
 ANCHORS_SAME_GONE = "[same, gone](#gone)"
 ANCHORS_FENCED = f"[fenced]({ANCHORED}#fenced-heading)"
 ANCHORS_COMMENTED = f"[commented]({ANCHORED}#commented-heading)"
 ANCHORS_QUOTED = f"[quoted]({ANCHORED}#quoted)"
 ANCHORS_SITE_GONE = f"[site, gone]({cdl.SITE_ROUTE_PREFIX}concepts/anchored/#gone)"
+ANCHORS_SITE_TITLE_ON_GITHUB = f"[site title, read on GitHub]({SITE_ANCHORED}#_top)"
+ANCHORS_SITE_TRIMMED_ON_GITHUB = f"[site slug trimmed, read on GitHub]({SITE_ANCHORED}#what-next)"
 ANCHORS_MISSING_FILE = f"[missing file]({MISSING_PLAIN}#gone)"
 ANCHORS_LINES = (
     "# Anchors",
@@ -519,12 +534,24 @@ ANCHORS_LINES = (
     f"[empty fragment]({ANCHORED}#)",
     f"[site title]({cdl.SITE_ROUTE_PREFIX}concepts/anchored/#_top)",
     f"[site section]({cdl.SITE_ROUTE_PREFIX}concepts/anchored/#on-the-site)",
+    f"[site slug trimmed]({cdl.SITE_ROUTE_PREFIX}concepts/anchored/#what-next)",
+    f"[site slug, read on GitHub]({SITE_ANCHORED}#what-next-)",
     ANCHORS_SITE_GONE,
+    ANCHORS_SITE_TITLE_ON_GITHUB,
+    ANCHORS_SITE_TRIMMED_ON_GITHUB,
     "[directory](docs#gone)",
     f"[blob]({cdl.REPO_BLOB_URL_PREFIXES[0]}{ANCHORED}#gone)",
     ANCHORS_MISSING_FILE,
 )
-ANCHORS_BROKEN = (ANCHORS_SAME_GONE, ANCHORS_FENCED, ANCHORS_COMMENTED, ANCHORS_QUOTED, ANCHORS_SITE_GONE)
+ANCHORS_BROKEN = (
+    ANCHORS_SAME_GONE,
+    ANCHORS_FENCED,
+    ANCHORS_COMMENTED,
+    ANCHORS_QUOTED,
+    ANCHORS_SITE_GONE,
+    ANCHORS_SITE_TITLE_ON_GITHUB,
+    ANCHORS_SITE_TRIMMED_ON_GITHUB,
+)
 
 # Files the scan has to keep reaching: the two #992 was filed against, and one
 # of each other kind CODE_GLOBS names, each of which cites a design document.
@@ -861,7 +888,19 @@ class SyntheticRepoTest(unittest.TestCase):
     def test_a_page_yields_each_heading_shape_and_explicit_anchor_and_hides_the_rest(self) -> None:
         self._track_anchor_fixtures()
         self.assertEqual(cdl.page_anchors(self.root / ANCHORED), ANCHORED_ANCHORS)
-        self.assertEqual(cdl.page_anchors(self.root / SITE_ANCHORED), {cdl.SITE_TITLE_ANCHOR, "on-the-site", "what-next"})
+        self.assertEqual(cdl.page_anchors(self.root / ANCHORED, site=True), ANCHORED_ANCHORS | {cdl.SITE_TITLE_ANCHOR})
+
+    def test_a_site_page_has_astros_anchors_on_the_site_and_githubs_on_github(self) -> None:
+        self._track_anchor_fixtures()
+        on_github = cdl.page_anchors(self.root / SITE_ANCHORED)
+        on_site = cdl.page_anchors(self.root / SITE_ANCHORED, site=True)
+        self.assertEqual(on_github, {"on-the-site", "what-next-"})
+        self.assertEqual(on_site, {cdl.SITE_TITLE_ANCHOR, "on-the-site", "what-next"})
+        self.assertEqual(cdl.check_file(self.root / SITE_ANCHORED, cdl.tracked_paths()), [])
+
+    def test_a_leading_rule_with_no_closing_fence_is_a_thematic_break_not_frontmatter(self) -> None:
+        ruled = _write(self.root, RULED, "\n".join(RULED_LINES) + "\n")
+        self.assertEqual(cdl.page_anchors(ruled), {"ruled", "section"})
 
     def test_a_fragment_its_page_lacks_is_reported_with_its_line(self) -> None:
         anchors = self._track_anchor_fixtures()
@@ -973,6 +1012,10 @@ class HeadingSlugTest(unittest.TestCase):
             ("Audit (`cluster-<profile>`)", "audit-cluster-profile"),
             ("When a card _is_ the right shape", "when-a-card-is-the-right-shape"),
             ("`snake_case` and __init__", "snake_case-and-init"),
+            ("Set FOO_ to bar", "set-foo_-to-bar"),
+            ("__dirname and friends", "__dirname-and-friends"),
+            ("\\_private and \\_not\\_ emphasis", "_private-and-_not_-emphasis"),
+            ("_see [a link](docs/x.md)_ now", "see-a-link-now"),
             ("A <code>tag</code> and [a link](docs/x.md) and [a ref][r]", "a-tag-and-a-link-and-a-ref"),
             ("Step 1: `kubectl get` -- then", "step-1-kubectl-get----then"),
             ("What next ?", "what-next-"),
@@ -1068,7 +1111,9 @@ class RealRepoTest(unittest.TestCase):
             "measure-how-far-a-branch-has-drifted-from-main",
             cdl.page_anchors(REPO / "docs/pull-request-workflow.md"),
         )
-        self.assertIn(cdl.SITE_TITLE_ANCHOR, cdl.page_anchors(REPO / SITE / "concepts/chatops.md"))
+        chatops = REPO / SITE / "concepts/chatops.md"
+        self.assertIn(cdl.SITE_TITLE_ANCHOR, cdl.page_anchors(chatops, site=True))
+        self.assertIn("what-carries-over-from-today", cdl.page_anchors(chatops))
 
     def test_this_module_contains_no_literal_citation(self) -> None:
         """The guard behind the module docstring: a literal here would fail docs-check."""
