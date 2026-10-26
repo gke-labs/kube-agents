@@ -69,9 +69,10 @@ const (
 	toolInvocationsSeries  = "kubeagents_tool_invocations_total"
 	eventsInjectedSeries   = "k8s_event_watcher_events_injected_total"
 	processStartTimeSeries = "process_start_time_seconds"
-	// vcsRequestsSeries is the broker's version-control counter, by verb and
-	// status; remediationsProposedTotal sums it under vcsProposalCreateVerb
-	// and vcsStatusSuccess alone: a proposal the forge accepted is a proposal.
+	// vcsRequestsSeries is the broker's version-control counter, by verb,
+	// status and provider; remediationsProposedTotal sums it under
+	// vcsProposalCreateVerb and vcsStatusSuccess alone, over every provider:
+	// a proposal the forge accepted is a proposal.
 	vcsRequestsSeries     = "kubeagents_vcs_requests_total"
 	vcsVerbLabel          = "verb"
 	vcsProposalCreateVerb = "proposal-create"
