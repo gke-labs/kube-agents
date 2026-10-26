@@ -158,13 +158,13 @@ CI enforcement: `make docs-check` runs the same checks as
   release-pipeline tag and workflow names), name a project ID `hack/ci-env.sh`
   exports (the evaluation pool), name a service-account email in a
   non-placeholder project, or cite a pull request or issue in prose (a bare
-  `#NNN`, this repository's `pull/` or `issues/` URL, or the link form; fenced
-  code and HTML comments are not read; `contributing.md` is exempt). The pages
-  that carried findings when a shape arrived are pinned per page and shape in
-  `scripts/docs_audience_allowlist.txt`, which only shrinks: a count that rises
-  fails, and so does one left higher than the page. It also fails when it finds
-  no site page or derives no project ID. The rule is
-  `.agents/rules/documentation.md`.
+  `#NNN`, this repository's `pull/` or `issues/` URL, or a link carrying both;
+  fenced code, inline code and comments are not read; `contributing.md` is
+  exempt). The pages that carried findings when a shape arrived are pinned per
+  page and shape in `scripts/docs_audience_allowlist.txt`, which only shrinks
+  and pins only those shapes: a count that rises fails, and so does one left
+  higher than the page. It also fails when it finds no site page or derives no
+  project ID. The rule is `.agents/rules/documentation.md`.
 - `docs-check-context-budget` — `scripts/check_context_budget.py`; `AGENTS.md`
   plus `CLAUDE.md` are loaded into every agent session before the first prompt,
   and their combined size must stay inside the `BUDGET` that file sets.

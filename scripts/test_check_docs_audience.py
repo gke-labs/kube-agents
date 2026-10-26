@@ -60,10 +60,13 @@ class SiteFixture(unittest.TestCase):
         self.allowlist = root / "allowlist.txt"
         self.allowlist.write_text("# empty\n", encoding="utf-8")
 
-    def findings_for(self, body: str, name: str = "page.md") -> list[check_docs_audience.Finding]:
+    def write_page(self, body: str, name: str = "page.md") -> None:
         page = self.site / name
         page.parent.mkdir(parents=True, exist_ok=True)
         page.write_text(body, encoding="utf-8")
+
+    def findings_for(self, body: str, name: str = "page.md") -> list[check_docs_audience.Finding]:
+        self.write_page(body, name)
         return check_docs_audience.scan(self.site, self.denylist, self.ci_env)
 
     def shapes_for(self, body: str, name: str = "page.md") -> list[str]:
@@ -269,23 +272,29 @@ class CommittedSiteTest(unittest.TestCase):
         """Every entry names a page the site has and a shape the check reports; none is a free pass."""
         entries, _ = check_docs_audience.load_allowlist()
         pages = {p.relative_to(check_docs_audience.SITE_ROOT).as_posix() for p in check_docs_audience.site_pages()}
-        shapes = {CITATION} | {
-            check_docs_audience.DENYLIST_SHAPE.format(pattern=p.pattern) for p in check_docs_audience.load_denylist()
-        }
         self.assertTrue(entries)
         for entry in entries:
             with self.subTest(entry=repr(entry)):
                 self.assertIn(entry.page, pages)
-                self.assertIn(entry.shape, shapes)
+                self.assertIn(entry.shape, check_docs_audience.PINNABLE_SHAPES)
+
+    def test_pinnable_shapes_are_the_citation_shape_and_one_denylist_line(self):
+        """Widening this tuple is how a maintainer identifier would first pass the gate; pin it."""
+        denylist_shapes = {
+            check_docs_audience.DENYLIST_SHAPE.format(pattern=p.pattern) for p in check_docs_audience.load_denylist()
+        }
+        self.assertEqual(check_docs_audience.PINNABLE_SHAPES, (CITATION, "denylist: evalcand_"))
+        self.assertIn("denylist: evalcand_", denylist_shapes)
 
     def test_main_reports_success(self):
         self.assertEqual(check_docs_audience.main(), 0)
 
     def test_main_runs_inside_the_budget(self):
-        started = time.monotonic()
+        """CPU time, not wall clock, so a loaded runner does not fail an unrelated pull request."""
+        started = time.process_time()
         with contextlib.redirect_stdout(io.StringIO()):
             check_docs_audience.main()
-        self.assertLess(time.monotonic() - started, RUN_BUDGET_SECONDS)
+        self.assertLess(time.process_time() - started, RUN_BUDGET_SECONDS)
 
 
 class CitationShapeTest(SiteFixture):
@@ -302,6 +311,18 @@ class CitationShapeTest(SiteFixture):
         """`[#N](url)` carries the number and the URL; it is one citation."""
         self.assertEqual(self.citations_for(f"a release with [#2801]({PULL_URL}) in it\n"), [(1, f"[#2801]({PULL_URL})")])
 
+    def test_link_text_wording_and_url_fragment_do_not_change_the_count(self):
+        for body in (
+            f"[PR #2801]({PULL_URL})",
+            f"[#2801]({PULL_URL}#issuecomment-5)",
+            f"[pull request #2801, merged]({PULL_URL}#event-1)",
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(self.citations_for(body + "\n"), [(1, body)])
+
+    def test_link_text_number_to_another_target_is_one_bare_citation(self):
+        self.assertEqual(self.citations_for("[PR #2801](/kube-agents/install/)\n"), [(1, "#2801")])
+
     def test_short_link_text_is_caught_through_its_url(self):
         self.assertEqual(self.citations_for(f"([#12]({ISSUE_URL}))\n"), [(1, ISSUE_URL)])
 
@@ -311,6 +332,14 @@ class CitationShapeTest(SiteFixture):
     def test_heading_anchors_pass(self):
         body = "See [refused](#when-an-upgrade-is-refused) and [status](/crd/#status) and [step 2](#2-install).\n"
         self.assertEqual(self.citations_for(body), [])
+
+    def test_anchors_and_entities_starting_with_digits_pass(self):
+        body = "[404 errors](#404-errors), [2026](#2026-roadmap), a space&#160;here, #2801v2\n"
+        self.assertEqual(self.citations_for(body), [])
+
+    def test_punctuation_after_a_number_still_counts(self):
+        body = "#2801. #2802, #2803: (#2804) #2805\n"
+        self.assertEqual([t for _, t in self.citations_for(body)], ["#2801", "#2802", "#2803", "#2804", "#2805"])
 
     def test_fewer_than_three_digits_pass(self):
         self.assertEqual(self.citations_for("item #12 and #99\n"), [])
@@ -330,6 +359,11 @@ class CitationShapeTest(SiteFixture):
         body = "~~~\n#1234\n~~~\n   ```\n   #5678\n   ```\n#2801\n"
         self.assertEqual(self.citations_for(body), [(7, "#2801")])
 
+    def test_fence_inside_a_list_item_passes(self):
+        """A fence at the item's content column, five spaces in on the upgrade page, is still a fence."""
+        body = "1. Step one.\n\n     ```bash\n     echo hi # #1234\n     ```\n\n     then #2801\n"
+        self.assertEqual(self.citations_for(body), [(7, "#2801")])
+
     def test_longer_closing_fence_closes_shorter_opening_but_not_the_reverse(self):
         body = "````md\n```\n#1234\n```\n#5678\n````\n#2801\n"
         self.assertEqual(self.citations_for(body), [(7, "#2801")])
@@ -341,6 +375,17 @@ class CitationShapeTest(SiteFixture):
     def test_blanked_comment_does_not_fuse_its_neighbours(self):
         self.assertEqual(self.citations_for("word<!-- c -->#2801\n"), [(1, "#2801")])
 
+    def test_mdx_comment_passes(self):
+        body = "{/* BEGIN GENERATED: #1234 */}\n{/*\n#5678\n*/}\n#2801\n"
+        self.assertEqual(self.citations_for(body, name="page.mdx"), [(5, "#2801")])
+
+    def test_inline_code_passes_and_a_quoted_opener_opens_nothing(self):
+        body = "the `<!--` marker opens a comment, as does `{/*`; port `#8080` and ``a `#1234` b``\nlater prose #2801\n"
+        self.assertEqual(self.citations_for(body), [(2, "#2801")])
+
+    def test_unbalanced_backtick_does_not_hide_the_line(self):
+        self.assertEqual(self.citations_for("a stray ` here and #2801\n"), [(1, "#2801")])
+
     def test_contributing_page_is_exempt_from_citations_only(self):
         self.assertEqual(self.citations_for("thanks to #2801\n", name="contributing.md"), [])
         self.assertEqual(self.shapes_for("app_id = 1 and #2801\n", name="contributing.md"), ["denylist: \\bapp_id\\b"])
@@ -351,6 +396,11 @@ class CitationShapeTest(SiteFixture):
     def test_denylist_lines_still_read_fenced_code(self):
         """Only the citation shape masks prose; a denylist shape inside a fence still fails."""
         self.assertEqual(self.shapes_for("```\nuses secrets.API_TOKEN\n```\n"), ["denylist: secrets\\.[A-Z_]+"])
+
+    def test_denylist_lines_count_every_occurrence(self):
+        """Two hits on one line are two findings, so an allowlist count is occurrences for every shape."""
+        texts = [f.text for f in self.findings_for("secrets.A and secrets.B\n")]
+        self.assertEqual(texts, ["secrets.A", "secrets.B"])
 
 
 class ReleaseMarkerTest(unittest.TestCase):
@@ -394,26 +444,22 @@ class AllowlistTest(SiteFixture):
         uncovered, problems = check_docs_audience.reconcile(findings, entries, self.site, self.allowlist)
         return uncovered, problems, errors
 
-    def _page(self, body: str, name: str = "page.md") -> None:
-        page = self.site / name
-        page.parent.mkdir(parents=True, exist_ok=True)
-        page.write_text(body, encoding="utf-8")
-
     def test_an_equal_count_passes(self):
-        self._page("#2801 and #2802\n")
+        self.write_page("#2801 and #2802\n")
         uncovered, problems, errors = self._reconcile(f"page.md 2 {CITATION}\n")
         self.assertEqual((uncovered, problems, errors), ([], [], []))
 
     def test_a_rise_fails_and_reports_the_page_findings(self):
-        self._page("#2801 and #2802\n#2803\n")
+        self.write_page("#2801 and #2802\n#2803\n")
         uncovered, problems, errors = self._reconcile(f"page.md 2 {CITATION}\n")
         self.assertEqual(errors, [])
         self.assertEqual(len(problems), 1)
         self.assertIn(f"page.md: 3 finding(s) of shape {CITATION!r}, the allowlist entry at {self.allowlist}:1 allows 2", problems[0])
+        self.assertIn("remove enough of the 3 listed below to return to 2", problems[0])
         self.assertEqual([f.text for f in uncovered], ["#2801", "#2802", "#2803"])
 
     def test_a_drop_fails_naming_the_entry_to_lower(self):
-        self._page("#2801\n")
+        self.write_page("#2801\n")
         uncovered, problems, errors = self._reconcile(f"# header\n\npage.md 2 {CITATION}\n")
         self.assertEqual((uncovered, errors), ([], []))
         self.assertEqual(
@@ -422,7 +468,7 @@ class AllowlistTest(SiteFixture):
         )
 
     def test_a_clean_page_fails_naming_the_entry_to_remove(self):
-        self._page("clean\n")
+        self.write_page("clean\n")
         _, problems, _ = self._reconcile(f"page.md 1 {CITATION}\n")
         self.assertEqual(
             problems,
@@ -430,37 +476,62 @@ class AllowlistTest(SiteFixture):
         )
 
     def test_a_missing_page_fails(self):
-        self._page("clean\n")
+        self.write_page("clean\n")
         _, problems, _ = self._reconcile(f"gone.md 1 {CITATION}\n")
         self.assertEqual(problems, [f"{self.allowlist}:1: gone.md is not a site page; remove the entry"])
 
     def test_a_malformed_or_zero_line_is_an_error(self):
-        self._page("clean\n")
+        self.write_page("clean\n")
         _, _, errors = self._reconcile(f"page.md 0 {CITATION}\npage.md\npage.md two {CITATION}\n")
         self.assertEqual(len(errors), 3)
         for number, error in enumerate(errors, start=1):
             self.assertIn(f"{self.allowlist}:{number}: expected `<page> <count> <shape>` with a count above zero", error)
 
+    def test_only_the_backlog_shapes_can_be_pinned(self):
+        """An entry for a workflow secret or an App ID is refused: those shapes have always held at zero."""
+        self.write_page("secrets.API_TOKEN and app_id = 1\n")
+        _, _, errors = self._reconcile("page.md 1 denylist: secrets\\.[A-Z_]+\npage.md 1 denylist: \\bapp_id\\b\n")
+        self.assertEqual(len(errors), 2)
+        self.assertIn(f"{self.allowlist}:1: shape 'denylist: secrets\\\\.[A-Z_]+' cannot be pinned", errors[0])
+        self.assertIn(f"{self.allowlist}:2: shape 'denylist: \\\\bapp_id\\\\b' cannot be pinned", errors[1])
+
+    def test_an_unpinnable_entry_fails_main_even_when_the_page_matches_it(self):
+        self.write_page("uses secrets.API_TOKEN\n")
+        self.allowlist.write_text("page.md 1 denylist: secrets\\.[A-Z_]+\n", encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(check_docs_audience.main(self.site, self.denylist, self.ci_env, self.allowlist), 1)
+
+    def test_a_repeated_page_and_shape_is_an_error(self):
+        self.write_page("#2801\n")
+        _, _, errors = self._reconcile(f"page.md 1 {CITATION}\npage.md 1 {CITATION}\n")
+        self.assertEqual(errors, [f"{self.allowlist}:2: page.md already has an entry of shape {CITATION!r} at line 1"])
+
+    def test_the_evalcand_line_is_pinnable_by_occurrence(self):
+        self.denylist.write_text("evalcand_\n", encoding="utf-8")
+        self.write_page("push evalcand_a then evalcand_b\n")
+        uncovered, problems, errors = self._reconcile("page.md 2 denylist: evalcand_\n")
+        self.assertEqual((uncovered, problems, errors), ([], [], []))
+
     def test_an_entry_covers_its_shape_only(self):
-        self._page("#2801 and secrets.API_TOKEN\n")
+        self.write_page("#2801 and secrets.API_TOKEN\n")
         uncovered, problems, _ = self._reconcile(f"page.md 1 {CITATION}\n")
         self.assertEqual(problems, [])
         self.assertEqual([f.shape for f in uncovered], ["denylist: secrets\\.[A-Z_]+"])
 
     def test_an_entry_covers_its_page_only(self):
-        self._page("#2801\n")
-        self._page("#2802\n", name="other.md")
+        self.write_page("#2801\n")
+        self.write_page("#2802\n", name="other.md")
         uncovered, problems, _ = self._reconcile(f"page.md 1 {CITATION}\n")
         self.assertEqual(problems, [])
         self.assertEqual([(f.path.name, f.text) for f in uncovered], [("other.md", "#2802")])
 
     def test_a_nested_page_is_keyed_by_its_site_relative_path(self):
-        self._page("#2801\n", name="install/upgrade.md")
+        self.write_page("#2801\n", name="install/upgrade.md")
         uncovered, problems, _ = self._reconcile(f"install/upgrade.md 1 {CITATION}\n")
         self.assertEqual((uncovered, problems), ([], []))
 
     def test_no_entry_means_zero(self):
-        self._page("#2801\n")
+        self.write_page("#2801\n")
         uncovered, problems, _ = self._reconcile("# nothing pinned\n")
         self.assertEqual(problems, [])
         self.assertEqual([f.text for f in uncovered], ["#2801"])

@@ -22,22 +22,28 @@ review-time hope. Four sources feed it:
   (``<project>``, ``${PROJECT_ID}``, ``your-project``) or a Google service
   agent domain (``gcp-sa-*``, ``*-robot``, ``*-system``, ``cloudservices``).
 * **Pull-request and issue citations** -- a bare ``#NNN`` of three or more
-  digits, a ``github.com/gke-labs/kube-agents/pull|issues/N`` URL, or the
-  ``[#N](url)`` link form, counted once each. This shape reads prose only:
-  fenced code blocks and HTML comments are blanked first, line by line so the
-  reported line numbers stay true, which is what keeps a ``#heading`` anchor
-  or a shell comment inside a fence from matching. A ``#NNN`` glued to a
-  word or a ``/`` (``kubernetes/kubernetes#68078``) is a cross-repository
-  reference and is excused. ``contributing.md`` is exempt from this shape
-  alone: it is the one site page written for contributors.
+  digits, a ``github.com/gke-labs/kube-agents/pull|issues/N`` URL, or a link
+  whose text carries the number and whose target is that URL, counted once
+  each. This shape reads prose only: fenced code blocks, inline code spans
+  and HTML or MDX comments are blanked first, line by line so the reported
+  line numbers stay true, which is what keeps a shell comment inside a fence
+  from matching. A ``#NNN`` glued to a word or a ``/``
+  (``kubernetes/kubernetes#68078``) is a cross-repository reference, one
+  followed by a word character, ``-`` or ``;`` (``#404-errors``, ``&#160;``)
+  is an anchor or an entity, and both are excused. ``contributing.md`` is
+  exempt from this shape alone: it is the one site page written for
+  contributors.
 
 The pages that carried findings when a shape arrived are pinned in
 ``scripts/docs_audience_allowlist.txt``: one line per page and shape, with
-the count the page has today. The list only shrinks. A page with more
-findings than its entry fails as a rise; a page with fewer fails until the
-entry is lowered or removed; an entry naming a page that is gone, a zero
-count, or a malformed line fails the run. A page with no entry is held at
-zero.
+the count the page has today. Only the shapes that arrived with a backlog
+can be pinned; a denylist shape that has always held at zero stays
+unpinnable, so the list cannot be used to ship a workflow secret or a
+project ID. The list only shrinks. A page with more findings than its entry
+fails as a rise; a page with fewer fails until the entry is lowered or
+removed; an entry naming a page that is gone, another shape, a zero count,
+a repeated page and shape, or a malformed line fails the run. A page with
+no entry is held at zero.
 
 The check also fails when it finds no site page at all, or derives no project
 ID from ``hack/ci-env.sh``: either would otherwise turn the gate green with
@@ -58,7 +64,7 @@ from __future__ import annotations
 
 import re
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -67,9 +73,10 @@ REPO = Path(__file__).resolve().parent.parent
 SITE_ROOT = REPO / "docs" / "site" / "src" / "content" / "docs"
 SITE_SUFFIXES = (".md", ".mdx")
 
-# One regular expression per line; `#` lines and blank lines are ignored.
+# One regular expression per line; `#` lines and blank lines are ignored, as
+# in every list file this check reads.
 DENYLIST = REPO / "scripts" / "docs_audience_denylist.txt"
-DENYLIST_COMMENT_PREFIX = "#"
+LIST_FILE_COMMENT_PREFIX = "#"
 
 # The script CI sources before every eval run; its `export` lines carry the
 # maintainers' project IDs as literal defaults. Only variables named *PROJECT_ID
@@ -102,38 +109,49 @@ GOOGLE_AGENT_PROJECT_RE = re.compile(
 SERVICE_ACCOUNT_SHAPE = "service-account email in a non-placeholder project"
 
 # A pull-request or issue citation in prose. The three forms are one
-# alternation so `finditer` counts the link form once: the `[#N](url)` branch
-# is tried first and consumes the URL it wraps, the bare `#NNN` branch asks for
-# three or more digits so a `#2` list marker or a short heading anchor does not
-# match, and its lookbehind excuses a number glued to a word or a `/`, which is
-# how a cross-repository reference (`kubernetes/kubernetes#68078`) is written.
+# alternation so `finditer` counts a linked citation once: the link branch is
+# tried first and consumes the number in its text, the URL it points at and any
+# fragment after it; the bare `#NNN` branch asks for three or more digits so a
+# `#2` list marker does not match, its lookbehind excuses a number glued to a
+# word or a `/` (a cross-repository reference, `kubernetes/kubernetes#68078`),
+# and its lookahead excuses a number that runs on into a word, a `-` or a `;`
+# (a heading anchor such as `#404-errors`, a numeric entity such as `&#160;`).
 REPO_ISSUE_URL_RE = r"(?:https?://)?github\.com/gke-labs/kube-agents/(?:pull|issues)/[0-9]+"
 CITATION_RE = re.compile(
-    rf"\[#[0-9]{{3,}}\]\({REPO_ISSUE_URL_RE}\)" rf"|(?<![\w/])#[0-9]{{3,}}" rf"|{REPO_ISSUE_URL_RE}"
+    rf"\[[^\]]*#[0-9]{{3,}}[^\]]*\]\({REPO_ISSUE_URL_RE}(?:#[^)\s]*)?\)"
+    rf"|(?<![\w/])#[0-9]{{3,}}(?![-;\w])"
+    rf"|{REPO_ISSUE_URL_RE}"
 )
 CITATION_SHAPE = "pull-request or issue citation"
 # The one site page written for contributors (.agents/rules/documentation.md,
 # "Who the site is for"); relative to the site root.
 CITATION_EXEMPT_PAGES = (Path("contributing.md"),)
 
-# What the citation shape does not read: a fenced code block (backtick or tilde
-# fence, up to three spaces of indentation, closed by a fence of the same
-# character at least as long with nothing after it) and an HTML comment, which
-# may span lines. Both are blanked in place so line numbers stay true.
-FENCE_RE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
-HTML_COMMENT_OPEN = "<!--"
-HTML_COMMENT_CLOSE = "-->"
-# A blanked comment leaves one space, so the text either side of it does not
-# fuse into a token neither side wrote.
+# What the citation shape does not read. A fenced code block: a backtick or
+# tilde fence at any indentation (a fence inside a list item sits at the item's
+# content column), closed by a fence of the same character at least as long
+# with nothing after it. An inline code span: a backtick run closed by a run of
+# the same length on the same line. A comment, HTML or MDX, which may span
+# lines. All are blanked in place so line numbers stay true, and code spans go
+# first so a comment opener quoted in one does not open a comment.
+FENCE_RE = re.compile(r"^\s*(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
+CODE_SPAN_RE = re.compile(r"(?P<ticks>`+)(?!`).+?(?<!`)(?P=ticks)(?!`)")
+COMMENT_DELIMITERS = (("<!--", "-->"), ("{/*", "*/}"))
+# A blanked span or comment leaves one space, so the text either side of it
+# does not fuse into a token neither side wrote.
 BLANK = " "
 
 # The shrinking allowlist: `<page> <count> <shape>` per line, the page relative
 # to the site root, the shape exactly as this check reports it. `#` lines and
 # blank lines are ignored. An entry pins the findings a page carried when its
-# shape arrived; the count may only go down.
+# shape arrived; the count may only go down. Only the shapes that arrived with
+# a backlog can be pinned: the citation shape and the `evalcand_` denylist
+# line. Every other shape has held at zero since it arrived and has nothing to
+# pin, so an entry naming one is refused rather than becoming the first way a
+# maintainer identifier passes the gate.
 ALLOWLIST = REPO / "scripts" / "docs_audience_allowlist.txt"
-ALLOWLIST_COMMENT_PREFIX = "#"
 ALLOWLIST_FIELDS = 3
+PINNABLE_SHAPES = (CITATION_SHAPE, "denylist: evalcand_")
 
 # How a denylist line or a derived project ID is named in the report.
 DENYLIST_SHAPE = "denylist: {pattern}"
@@ -141,10 +159,12 @@ CI_ENV_SHAPE = "project ID exported by hack/ci-env.sh"
 
 # How an allowlist entry that no longer matches the site is reported.
 ALLOWLIST_MALFORMED_ERROR = "{allowlist}:{line}: expected `<page> <count> <shape>` with a count above zero, got {text!r}"
+ALLOWLIST_UNPINNABLE_ERROR = "{allowlist}:{line}: shape {shape!r} cannot be pinned; only {pinnable} arrived with a backlog"
+ALLOWLIST_DUPLICATE_ERROR = "{allowlist}:{line}: {page} already has an entry of shape {shape!r} at line {first}"
 ALLOWLIST_MISSING_PAGE_ERROR = "{allowlist}:{line}: {page} is not a site page; remove the entry"
 ALLOWLIST_RISE_ERROR = (
     "{page}: {found} finding(s) of shape {shape!r}, the allowlist entry at {allowlist}:{line} allows {allowed}; "
-    "the list only shrinks, so remove the new occurrence(s) listed below"
+    "the list only shrinks, so remove enough of the {found} listed below to return to {allowed}"
 )
 ALLOWLIST_DROP_ERROR = (
     "{page}: {found} finding(s) of shape {shape!r}, the allowlist entry at {allowlist}:{line} allows {allowed}; "
@@ -190,15 +210,17 @@ class AllowlistEntry:
         return f"AllowlistEntry({self.page} {self.count} {self.shape!r} @{self.line})"
 
 
+def list_file_lines(path: Path) -> Iterator[tuple[int, str]]:
+    """(line number, stripped line) for every line of a list file that is not blank or a comment."""
+    for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = raw.strip()
+        if line and not line.startswith(LIST_FILE_COMMENT_PREFIX):
+            yield number, line
+
+
 def load_denylist(path: Path = DENYLIST) -> list[re.Pattern[str]]:
     """Compile every non-comment, non-blank line of the denylist."""
-    patterns = []
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith(DENYLIST_COMMENT_PREFIX):
-            continue
-        patterns.append(re.compile(line))
-    return patterns
+    return [re.compile(line) for _, line in list_file_lines(path)]
 
 
 def ci_env_project_ids(path: Path = CI_ENV) -> list[str]:
@@ -227,24 +249,48 @@ def service_account_findings(path: Path, text: str) -> list[Finding]:
 
 
 def pattern_findings(path: Path, text: str, shapes: Iterable[tuple[str, re.Pattern[str]]]) -> list[Finding]:
-    """Every (shape name, pattern) hit in the text, one Finding per line per shape."""
+    """Every (shape name, pattern) hit in the text, one Finding per occurrence, as the citation shape counts."""
     findings = []
     for number, line in enumerate(text.splitlines(), start=1):
         for shape, pattern in shapes:
-            match = pattern.search(line)
-            if match:
+            for match in pattern.finditer(line):
                 findings.append(Finding(path, number, shape, match.group(0)))
     return findings
 
 
+def blank_comments(line: str, open_delimiter: str | None) -> tuple[str, str | None]:
+    """The line with every comment segment blanked, and the delimiter of a comment left open at its end."""
+    kept: list[str] = []
+    pos = 0
+    while pos < len(line):
+        if open_delimiter is not None:
+            close = dict(COMMENT_DELIMITERS)[open_delimiter]
+            end = line.find(close, pos)
+            if end == -1:
+                return "".join(kept), open_delimiter
+            open_delimiter = None
+            pos = end + len(close)
+            continue
+        starts = [(line.find(opener, pos), opener) for opener, _ in COMMENT_DELIMITERS]
+        starts = [(at, opener) for at, opener in starts if at != -1]
+        if not starts:
+            kept.append(line[pos:])
+            break
+        at, open_delimiter = min(starts)
+        kept.append(line[pos:at])
+        kept.append(BLANK)
+        pos = at + len(open_delimiter)
+    return "".join(kept), open_delimiter
+
+
 def prose_lines(text: str) -> list[str]:
-    """The page's lines with fenced code blocks and HTML comments blanked, one entry per source line."""
+    """The page's lines with fenced code, inline code spans and comments blanked, one entry per source line."""
     lines: list[str] = []
     fence: str | None = None
-    in_comment = False
+    open_delimiter: str | None = None
     for raw in text.splitlines():
         match = FENCE_RE.match(raw)
-        if fence is None and match:
+        if fence is None and match and open_delimiter is None:
             fence = match.group("fence")
             lines.append("")
             continue
@@ -253,25 +299,9 @@ def prose_lines(text: str) -> list[str]:
                 fence = None
             lines.append("")
             continue
-        kept: list[str] = []
-        pos = 0
-        while pos < len(raw):
-            if in_comment:
-                end = raw.find(HTML_COMMENT_CLOSE, pos)
-                if end == -1:
-                    break
-                in_comment = False
-                pos = end + len(HTML_COMMENT_CLOSE)
-                continue
-            start = raw.find(HTML_COMMENT_OPEN, pos)
-            if start == -1:
-                kept.append(raw[pos:])
-                break
-            kept.append(raw[pos:start])
-            kept.append(BLANK)
-            in_comment = True
-            pos = start + len(HTML_COMMENT_OPEN)
-        lines.append("".join(kept))
+        line = raw if open_delimiter is not None else CODE_SPAN_RE.sub(BLANK, raw)
+        line, open_delimiter = blank_comments(line, open_delimiter)
+        lines.append(line)
     return lines
 
 
@@ -288,16 +318,25 @@ def load_allowlist(path: Path = ALLOWLIST) -> tuple[list[AllowlistEntry], list[s
     """Every entry of the allowlist, and the lines that are not one."""
     entries: list[AllowlistEntry] = []
     errors: list[str] = []
-    for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        line = raw.strip()
-        if not line or line.startswith(ALLOWLIST_COMMENT_PREFIX):
-            continue
+    seen: dict[tuple[str, str], int] = {}
+    shown = display_path(path)
+    for number, line in list_file_lines(path):
         fields = line.split(None, ALLOWLIST_FIELDS - 1)
         count = int(fields[1]) if len(fields) == ALLOWLIST_FIELDS and fields[1].isdigit() else 0
         if count < 1:
-            errors.append(ALLOWLIST_MALFORMED_ERROR.format(allowlist=display_path(path), line=number, text=line))
+            errors.append(ALLOWLIST_MALFORMED_ERROR.format(allowlist=shown, line=number, text=line))
             continue
-        entries.append(AllowlistEntry(fields[0], count, fields[2], number))
+        page, shape = fields[0], fields[2]
+        if shape not in PINNABLE_SHAPES:
+            pinnable = ", ".join(repr(s) for s in PINNABLE_SHAPES)
+            errors.append(ALLOWLIST_UNPINNABLE_ERROR.format(allowlist=shown, line=number, shape=shape, pinnable=pinnable))
+            continue
+        if (page, shape) in seen:
+            first = seen[(page, shape)]
+            errors.append(ALLOWLIST_DUPLICATE_ERROR.format(allowlist=shown, line=number, page=page, shape=shape, first=first))
+            continue
+        seen[(page, shape)] = number
+        entries.append(AllowlistEntry(page, count, shape, number))
     return entries, errors
 
 
