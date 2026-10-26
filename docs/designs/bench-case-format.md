@@ -58,7 +58,13 @@ A first line of `[bench:card-failure-wake]` or `[bench:slack-question-wake]` mak
 replay of a card's wake rather than an ask
 ([`bench/kube_agents_bench/card_wake.py`](../../bench/kube_agents_bench/card_wake.py)); a replay
 runs only over the api transport and errors under any other `AGENT_TRANSPORT`, so the case also
-needs an entry in `hack/eval/inject-lane-exclusions.txt`.
+needs an entry in `hack/eval/inject-lane-exclusions.txt`. A first line of
+`[bench:stop-after-first-card]`, optionally with `observe=<seconds>`, makes the rest of the
+prompt an ask the harness stops once it has filed a card
+([`bench/kube_agents_bench/stop_hook.py`](../../bench/kube_agents_bench/stop_hook.py)); it runs
+only over the inject transport, so the case needs an entry in
+`hack/eval/api-lane-exclusions.txt`. The harness writes two entries for such a case,
+`harness_stop_sent` and `harness_cards_stopped`, and the case's `tool_called` objectives name them.
 
 `expected_output` is the judge's reference. It feeds `OutcomeValidity` and, where the
 case declares `documentation.constraints`, `ChecklistScore`. It never gates a case that
@@ -491,7 +497,9 @@ test checks both, so two case pull requests don't edit the same lines). It lands
 decision (2026-09-15,
 [#1546](https://github.com/gke-labs/kube-agents/issues/1546),
 [#1564](https://github.com/gke-labs/kube-agents/issues/1564)). It runs every night from
-the night it merges, its record accrues in the evidence store, and a presubmit seat is a
+the night it merges, its record accrues in the evidence store (for a case in
+`hack/eval/api-lane-exclusions.txt`, which runs only over the inject transport, under the
+version key's `next` mode), and a presubmit seat is a
 later pull request that moves its line to the presubmit file, adds its name to
 `hack/eval/blocking-roster.txt` in the same edit (since 2026-09-22 the presubmit runs the
 blocking roster and nothing else, and `scripts/test_eval_rosters.py` pins the two files as
