@@ -25,6 +25,8 @@ import yaml
 from admin_console import harness_limits as hl
 
 TABLE_SEPARATOR = " | "
+LIMIT = "limit"
+REQUEST = "request"
 # Fleets the sizing table answers question 2 for: this many clusters, each shaped like the base.
 REFERENCE_CLUSTERS = (8, 16, 32, 64, 128)
 CELL_SEPARATOR = " · "
@@ -50,20 +52,22 @@ def _point(item: hl.ProxyDemand) -> str:
     return hl.BASE_LEVEL if item.factor == hl.BASE_FACTOR else f"{hl.factor_label(item.factor)} {_count(item.level)}"
 
 
-def _threshold(check: hl.Check) -> str:
+def _threshold(check: hl.Check, resource: str = LIMIT) -> str:
+    """The lowest critical line; a container's memory or CPU line is named for the resource checked."""
     critical = [line for line in check.lines if line.critical]
     if not critical:
         return hl.NO_VALUE
     line = min(critical, key=lambda item: item.value)
-    return f"{hl.format_value(check.metric, line.value)} ({line.label})"
+    label = f"{check.container} {resource}" if check.metric in hl.CONTAINER_LIMIT_KEYS else line.label
+    return f"{hl.format_value(check.metric, line.value)} ({label})"
 
 
-def capacity_table(items: Sequence[hl.Capacity], unit: str, ceiling: float) -> str:
+def capacity_table(items: Sequence[hl.Capacity], unit: str, ceiling: float, resource: str = LIMIT) -> str:
     """The checks that pass at the base and fail below the ceiling, first failure first."""
     rows = [
         (
             item.check.label,
-            _threshold(item.check),
+            _threshold(item.check, resource),
             hl.format_value(item.check.metric, item.check.prediction.base if item.check.prediction else None),
             f"{hl._number_text(item.value)} {unit}",
             hl.basis(item.check.prediction),
@@ -161,6 +165,7 @@ def report(
     records: Sequence[hl.Record],
     limits: Mapping[str, Mapping[str, float]],
     title: str,
+    resource: str = LIMIT,
 ) -> str:
     containers = hl.containers(records)
     base = hl.base_fleet(records)
@@ -175,7 +180,7 @@ def report(
             "Past the threshold at the base point already: "
             + "; ".join(
                 f"{item.check.label}, {hl.format_value(item.check.metric, item.check.prediction.base)} "
-                f"against {_threshold(item.check)}"
+                f"against {_threshold(item.check, resource)}"
                 for item in past
             )
             + "."
@@ -183,7 +188,7 @@ def report(
     sections.append(
         "## Clusters shaped like the base\n\n"
         "Pod churn and Pods failing at once grow with the clusters; every other input stays.\n\n"
-        + capacity_table(shaped, "clusters", cluster_ceiling)
+        + capacity_table(shaped, "clusters", cluster_ceiling, resource)
     )
     for factor in hl.factors(records):
         if factor not in hl.FACTORS:
@@ -192,7 +197,7 @@ def report(
         sections.append(
             f"## {hl.FACTORS[factor].input_label}, the other inputs at the base\n\n"
             + capacity_table(hl.factor_capacities(records, containers, limits, factor, base),
-                             hl.FACTORS[factor].input_label.lower(), ceiling)
+                             hl.FACTORS[factor].input_label.lower(), ceiling, resource)
         )
     sections.append(sizing_section(records, base))
     onsets = [onset for factor in hl.factors(records) if factor in hl.FACTORS
@@ -248,10 +253,11 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
     records = hl.select(dataset.records, commit, mode)
+    resource = LIMIT
     if args.limits:
         limits, against = read_limits(args.limits), f"limits from {args.limits}"
     elif args.against == "requests":
-        limits, against = hl.latest_requests(records), "the latest run's requests"
+        limits, against, resource = hl.latest_requests(records), "the latest run's requests", REQUEST
         if not limits:
             print("No record of this commit and mode holds requests.", file=sys.stderr)
             return 1
@@ -260,7 +266,7 @@ def main(argv: list[str] | None = None) -> int:
     title = f"{hl.commit_label(dataset.records, commit)}, mode {mode}, against {against}"
     if dataset.is_sample:
         title += " (sample data, not measured)"
-    print(report(records, limits, title), end="")
+    print(report(records, limits, title, resource), end="")
     return 0
 
 
