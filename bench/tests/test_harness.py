@@ -4619,10 +4619,16 @@ def test_settle_delegated_worker_observed_summary_rate_limit_is_infra(
 
 
 def test_worker_non_action_tools_contains_mandated_board_verbs() -> None:
-    """_WORKER_NON_ACTION_TOOLS must include all non-substantive board verbs a worker may call."""
-    assert {"kanban_show", "kanban_heartbeat", "kanban_comment", "kanban_create"}.issubset(
-        harness._WORKER_NON_ACTION_TOOLS
-    )
+    """_WORKER_NON_ACTION_TOOLS must include all non-substantive board verbs and read-only memory tools."""
+    assert {
+        "kanban_show",
+        "kanban_heartbeat",
+        "kanban_comment",
+        "kanban_create",
+        "memory",
+        "memory_recall",
+        "memory_reflect",
+    }.issubset(harness._WORKER_NON_ACTION_TOOLS)
 
 
 @pytest.mark.parametrize("tool_name", sorted(harness._WORKER_NON_ACTION_TOOLS))

@@ -204,8 +204,13 @@ _BOARD_NON_ACTION_TOOLS = frozenset({
     "kanban_unblock",
 })
 
-# Worker tools that do not count as substantive action (protocol reads and board management).
-_WORKER_NON_ACTION_TOOLS = _BOARD_NON_ACTION_TOOLS
+# Worker tools that do not count as substantive action (protocol reads, board management, and read-only memory).
+_WORKER_NON_ACTION_TOOLS = frozenset({
+    *_BOARD_NON_ACTION_TOOLS,
+    "memory",
+    "memory_recall",
+    "memory_reflect",
+})
 
 # Sanctioned front-door capabilities on the chat / delegation profile
 # (agents/chat/config.yaml, agents/chat/SOUL.md) that do not constitute
