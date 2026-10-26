@@ -711,8 +711,9 @@ refuses `EVAL_ROLLBACK_LANE=1` without the flag, before anything is built.
 The flag admits those jobs by name and nothing else without a pull request: section 2b of the
 deploy accepts `EVAL_MODE_NEXT=1` on a run that carries a `PULL_NUMBER` or whose `JOB_NAME` is
 listed in `EVAL_MODE_NEXT_JOB_NAMES` in `hack/ci-deploy.sh` (the merge-blocking presubmit, for
-its Tide batch runs, the today lane's periodic, the main nightly's two parts
-`ci-kube-agents-eval-nightly` and `ci-kube-agents-eval-nightly-writers`, the GitLab lane's nightly
+its Tide batch runs, the today lane's periodic, the main nightly's three parts
+`ci-kube-agents-eval-nightly`, `ci-kube-agents-eval-nightly-main-b` and
+`ci-kube-agents-eval-nightly-writers`, the GitLab lane's nightly
 under next, and the release-candidate eval's postsubmit, which grades a candidate in the mode a new
 install gets), and refuses it on any other Prow run, so the flag mis-set on the today-mode nightly
 `ci-kube-agents-eval-nightly-today` or another postsubmit still stops the deploy before anything is

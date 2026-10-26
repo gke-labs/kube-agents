@@ -313,8 +313,9 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # merge-blocking presubmit in a Tide batch (it grades next since next became
 # the mode new installs get, #2007, "The cutover itself"); the today lane's
 # six-hourly periodic on main, which deploys next and rolls it back to today
-# before its matrix (EVAL_ROLLBACK_LANE=1); the main nightly's two parts on
-# main, which grade the full catalog under next (the nightly the dashboard and
+# before its matrix (EVAL_ROLLBACK_LANE=1); the main nightly's three parts on
+# main (the main part's two halves, main-a and main-b, and the writers part),
+# which grade the full catalog under next (the nightly the dashboard and
 # the digest read; ci-kube-agents-eval-nightly-today, the today-mode nightly
 # kept as the rollback check, is not listed and so is refused the flag); the
 # GitLab lane's nightly under next (EVAL_FORGE=gitlab,
@@ -334,7 +335,7 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # a run graded through the inject door records under the version key's next
 # mode (bench-gate), and hack/ci-eval-pr.sh keeps the today lane, the GitLab
 # lane and a release candidate out of the recorder altogether.
-readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-today ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-gitlab-next post-kube-agents-eval-rc"
+readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-today ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-gitlab-next post-kube-agents-eval-rc"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
 # The broker Deployment, named after the CR the way the operator names it
