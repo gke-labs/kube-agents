@@ -203,7 +203,9 @@ the gap. The hourly scan reports the case-breaking half: `drift-outlier` asserts
 gate passes, and no re-apply clears it. A replaced peer is not asserted, since it leaves the
 finding standing. `drift-peer-a`, `-b` and `-d` assert that those three still carry the
 authorized-networks block, without which the vote falls to 2/4 and there is no finding
-either; a re-apply restores that one.
+either; a re-apply restores that one. A drifted `drift-outlier` excuses the case from a
+lease on that project; a drifted peer does not, because the case lists only `drift-outlier`
+in `fixtures:`, so it fails there until the block is back.
 
 ## The defects
 

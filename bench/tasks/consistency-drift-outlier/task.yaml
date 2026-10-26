@@ -85,15 +85,17 @@ domain: consistency
 # by cluster: each eval project carries its own trio and this case has to run
 # unchanged against all of them. Roles are defined in
 # bench/tf/fleet/fixtures.json; the rule is
-# docs/designs/bench-fleet-catalog.md. The drift-peer roles are the majority
-# seeded-c is outvoted by: the SOP files the finding only when 2/3 of the
-# cohort agree, so the hourly scan asserts each peer still carries its
-# authorized-networks block.
+# docs/designs/bench-fleet-catalog.md. The grade also depends on the
+# drift-peer-a, drift-peer-b and drift-peer-d roles, the majority seeded-c is
+# outvoted by (the SOP files the finding only when 2/3 of the cohort agree),
+# and the hourly scan asserts each still carries its authorized-networks
+# block. They are named here and not listed below on purpose: a `fixtures:`
+# list of more than one role, with no check reading one through
+# `fixture_role:`, excuses the case from nothing when a role drifts
+# (case_roles in bench/kube_agents_bench/fixture_drift.py), and the single
+# role keeps the excuse for a drifted or under-a-day-old seeded-c.
 fixtures:
   - drift-outlier
-  - drift-peer-a
-  - drift-peer-b
-  - drift-peer-d
 
 # Cluster C's name is a contract with bench/tf/fleet/ (the consistency
 # outlier); the fleet stack owns the name and this spec must change with it.

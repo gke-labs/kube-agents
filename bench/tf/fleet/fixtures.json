@@ -224,7 +224,7 @@
           "path": "masterAuthorizedNetworksConfig.enabled",
           "op": "eq",
           "value": true,
-          "why": "the drift SOP reads authorized-networks ON only when this is true and cidrBlocks is non-empty, and builds a baseline only when 2/3 of the cohort agree. With seeded-a OFF the vote is 2/4: no baseline and no finding against seeded-c (on a project without seeded-d the majority flips to OFF and the finding lands on the other peer), and consistency-drift-outlier fails every repetition. fleet_reconcile.py's daily re-apply restores the block; this says so the hour it goes"
+          "why": "the drift SOP reads authorized-networks ON only when this is true and cidrBlocks is non-empty, and builds a baseline only when 2/3 of the cohort agree. With seeded-a OFF the vote is 2/4: no baseline and no finding against seeded-c (on a project without seeded-d the baseline flips to OFF at 2/3, and the collector never flags ON against an OFF majority, so there is no finding anywhere), and consistency-drift-outlier fails every repetition. fleet_reconcile.py's daily re-apply restores the block; this says so the hour it goes"
         },
         {
           "subject": "cluster",
@@ -246,7 +246,7 @@
           "path": "masterAuthorizedNetworksConfig.enabled",
           "op": "eq",
           "value": true,
-          "why": "the drift SOP reads authorized-networks ON only when this is true and cidrBlocks is non-empty, and builds a baseline only when 2/3 of the cohort agree. With seeded-b OFF the vote is 2/4: no baseline and no finding against seeded-c (on a project without seeded-d the majority flips to OFF and the finding lands on the other peer), and consistency-drift-outlier fails every repetition. fleet_reconcile.py's daily re-apply restores the block; this says so the hour it goes"
+          "why": "the drift SOP reads authorized-networks ON only when this is true and cidrBlocks is non-empty, and builds a baseline only when 2/3 of the cohort agree. With seeded-b OFF the vote is 2/4: no baseline and no finding against seeded-c (on a project without seeded-d the baseline flips to OFF at 2/3, and the collector never flags ON against an OFF majority, so there is no finding anywhere), and consistency-drift-outlier fails every repetition. fleet_reconcile.py's daily re-apply restores the block; this says so the hour it goes"
         },
         {
           "subject": "cluster",
