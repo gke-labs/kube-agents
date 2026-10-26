@@ -15,6 +15,7 @@ fingerprint drifted; and doubling a row when the same event is handled twice.
 import io
 import json
 import sys
+import time
 import unittest
 import urllib.error
 import urllib.parse
@@ -29,6 +30,10 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 import notify_flaky_check as reporter
+
+CRAFTED_SEGMENTS = 10000
+CRAFTED_TAIL = 300000
+CRAFTED_LINE_BUDGET_SECONDS = 5.0
 
 REPO = "gke-labs/kube-agents"
 WORKFLOW_ID = 327115835
@@ -191,6 +196,16 @@ class FingerprintTest(unittest.TestCase):
                 "bench/tests/test_z.py::test_w",
             ],
         )
+
+    def test_a_long_crafted_pytest_line_costs_linear_time(self):
+        """A log line is the pull request's own test output. One with thousands of
+        `::` and an unclosed `[` must not send the pattern into a retry at every
+        `::`; the bound is a hundred times what the linear match takes."""
+        line = "FAILED " + "a::" * CRAFTED_SEGMENTS + "[" + "x" * CRAFTED_TAIL
+        started = time.monotonic()
+        ids = reporter.extract_test_ids(line)
+        self.assertLess(time.monotonic() - started, CRAFTED_LINE_BUDGET_SECONDS)
+        self.assertEqual(ids, [])
 
     def test_a_subtest_failure_is_its_test_not_its_parameters(self):
         """unittest prints `FAIL: test_x (m.C.test_x) (conclusion='a')` per
