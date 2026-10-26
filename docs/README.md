@@ -126,7 +126,8 @@ CI enforcement: `make docs-check` runs the same checks as
 
 - `docs-check-generated` — `scripts/generate_sop_geography.py --check` and
   `scripts/generate_docs.py --check`; fails if a generated region or prompt
-  line pin no longer matches its source.
+  line pin no longer matches its source. Needs `go` on `PATH` for the CRD
+  field pages, which `scripts/gen_crd_docs.go` reads from the Go API types.
 - `docs-check-links` — `scripts/check_docs_links.py`; relative links must
   resolve to **git-tracked** targets; a `#fragment` on a relative link, a
   same-page link or a site route whose target is a tracked Markdown file must

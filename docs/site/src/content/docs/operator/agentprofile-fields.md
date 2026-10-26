@@ -5,11 +5,11 @@ sidebar:
   order: 6
 ---
 
-Every field of the `AgentProfile` resource's `spec` and `status`, read from the operator's Go API types each time the operator's manifests are regenerated. The standard Kubernetes `apiVersion`, `kind` and `metadata` are not listed. A field whose type comes from the Kubernetes API (`corev1`, `metav1`, `networkingv1`, `resource.Quantity`) names that type and is not expanded; the Kubernetes API reference describes it. Paths read `parent.child`, with `[]` for each item of a list. For what the fields do together, read the [AgentProfile CRD](/kube-agents/operator/agentprofile-crd/) guide.
-
 <!-- BEGIN GENERATED: crd-fields-agentprofile -->
 <!-- Regenerate with: make docs-generate -- do not edit by hand. -->
 <!-- prettier-ignore-start -->
+
+Every field of the `AgentProfile` resource's `spec` and `status`, generated from the operator's Go API types. The standard Kubernetes `apiVersion`, `kind` and `metadata` are not listed. A field whose type comes from the Kubernetes API (`corev1`, `metav1`, `networkingv1`, `resource.Quantity`) names that type and is not expanded; the Kubernetes API reference describes it. Paths read `parent.child`, with `[]` for each item of a list and `{}` for each value of a map. Each description is the opening paragraph of the field's documentation, plus its deprecation notice when it has one, and names other fields in their Go spelling (`MaxSessions` for `maxSessions`); `kubectl explain agentprofile.spec.<field>` prints the whole text. For what the fields do together, read the [AgentProfile CRD](/kube-agents/operator/agentprofile-crd/) guide.
 
 ## Spec
 
@@ -42,10 +42,10 @@ Every field of the `AgentProfile` resource's `spec` and `status`, read from the 
 | `concurrency` | `integer` | yes |  | min `1` | Concurrency is the most pods this profile runs at once. |
 | `allowedTiers` | `[]string` | no |  | min items `1`; max items `2`; items one of `read`, `unattended` | AllowedTiers are the tiers this profile may run at. A task runs at its requester's tier, and the dispatcher refuses one whose tier is not listed here; a pinned production profile might allow only read. Tier is authority, so it lives on the CR, never in the persona. Absent means read alone (AllowedTierList). |
 | `resources` | `object` | yes |  |  | Resources is the pod resource class. |
-| `resources.requests` | `object` | yes |  |  |  |
+| `resources.requests` | `object` | yes |  |  | AgentProfileResourceList is a cpu and memory pair. |
 | `resources.requests.cpu` | `resource.Quantity` | yes |  |  |  |
 | `resources.requests.memory` | `resource.Quantity` | yes |  |  |  |
-| `resources.limits` | `object` | yes |  |  |  |
+| `resources.limits` | `object` | yes |  |  | AgentProfileResourceList is a cpu and memory pair. |
 | `resources.limits.cpu` | `resource.Quantity` | yes |  |  |  |
 | `resources.limits.memory` | `resource.Quantity` | yes |  |  |  |
 

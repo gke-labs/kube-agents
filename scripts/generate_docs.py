@@ -27,17 +27,20 @@ Usage::
     python3 scripts/generate_docs.py            # rewrite the generated targets
     python3 scripts/generate_docs.py --check    # exit 1 if anything is stale
     python3 scripts/generate_docs.py crd-fields-agentplugin   # one block only
+    python3 scripts/generate_docs.py --block-prefix crd-fields-  # one family
 
 ``--check`` is what CI runs: if regenerating would change a file, the committed
-documentation no longer matches its source. Naming blocks restricts a run to
-those regions; ``make -C k8s-operator manifests`` uses that to refresh the CRD
-field pages beside the CRD YAML.
+documentation no longer matches its source. Naming blocks, or a prefix,
+restricts a run to those regions; ``make -C k8s-operator manifests`` uses the
+prefix to refresh the CRD field pages beside the CRD YAML.
 
 Standard library only, deliberately -- this must run in CI and in a bare clone
 without installing anything. The one tool it calls out to is ``go``: the CRD
 field pages are read from the operator's Go API types by
 ``scripts/gen_crd_docs.go``, itself standard library and run with the
-installed toolchain.
+installed toolchain. Without ``go`` on PATH a write run skips those pages and
+says so, so the other regions still refresh; ``--check`` fails, since a check
+that cannot read the pages cannot vouch for them.
 """
 
 from __future__ import annotations
@@ -109,7 +112,30 @@ CRD_KINDS: dict[str, Path] = {
     "AgentProfile": OPERATOR_DOCS_DIR / "agentprofile-fields.md",
     "AgentPlugin": OPERATOR_DOCS_DIR / "agentplugin-fields.md",
 }
+# The narrative guide each field page points its reader at, as a site route.
+CRD_GUIDES = {
+    "PlatformAgent": "/kube-agents/operator/platformagent-crd/",
+    "AgentProfile": "/kube-agents/operator/agentprofile-crd/",
+    "AgentPlugin": "/kube-agents/operator/agentplugin-crd/",
+}
 CRD_BLOCK_PREFIX = "crd-fields-"
+# The paragraph above the tables, rendered once here rather than kept by hand
+# on each page, so the three pages cannot drift apart. It states what the
+# tables leave out: standard metadata, the inside of upstream Kubernetes
+# types, and every paragraph of a field's documentation after the first.
+CRD_INTRO = (
+    "Every field of the `{kind}` resource's `spec` and `status`, generated from the "
+    "operator's Go API types. The standard Kubernetes `apiVersion`, `kind` and "
+    "`metadata` are not listed. A field whose type comes from the Kubernetes API "
+    "(`corev1`, `metav1`, `networkingv1`, `resource.Quantity`) names that type and is "
+    "not expanded; the Kubernetes API reference describes it. Paths read "
+    "`parent.child`, with `[]` for each item of a list and `{{}}` for each value of a "
+    "map. Each description is the opening paragraph of the field's documentation, "
+    "plus its deprecation notice when it has one, and names other fields in their Go "
+    "spelling (`MaxSessions` for `maxSessions`); `kubectl explain "
+    "{resource}.spec.<field>` prints the whole text. For what the fields do together, "
+    "read the [{kind} CRD]({guide}) guide."
+)
 # The two trees each page carries, with the heading each is rendered under.
 CRD_TREES = (("spec", "Spec"), ("status", "Status"))
 CRD_TABLE_HEADER = (
@@ -117,6 +143,15 @@ CRD_TABLE_HEADER = (
     "| ----- | ---- | -------- | ------- | ----------- | ----------- |",
 )
 CRD_EMPTY_TREE = "No fields."
+REQUIRED_YES = "yes"
+REQUIRED_NO = "no"
+CONSTRAINT_SEPARATOR = "; "
+ENUM_MEMBER_SEPARATOR = ", "
+# Entities for the brackets a `.md` page would otherwise read as a tag, and
+# the escape GFM reads as a literal pipe inside a table cell.
+LT_ENTITY = "&lt;"
+GT_ENTITY = "&gt;"
+PIPE_ESCAPE = "\\|"
 # How a validation marker reads in the Constraints column. A marker on the
 # items of a list (`items:Pattern`) is labelled through the same table with
 # an `items:` prefix; a marker not listed here is shown as its own name.
@@ -287,10 +322,10 @@ def escape_cell(text: str) -> str:
     spans = CODE_SPAN_RE.findall(text)
     out: list[str] = []
     for index, part in enumerate(parts):
-        out.append(part.replace("<", "&lt;").replace(">", "&gt;"))
+        out.append(part.replace("<", LT_ENTITY).replace(">", GT_ENTITY))
         if index < len(spans):
             out.append(spans[index])
-    return "".join(out).replace("|", "\\|").replace("\n", " ").strip()
+    return "".join(out).replace("|", PIPE_ESCAPE).replace("\n", " ").strip()
 
 
 # --------------------------------------------------------------------------- #
@@ -634,19 +669,19 @@ def render_constraint(constraint: dict[str, str]) -> str:
         name = name[len(CONSTRAINT_ITEMS_PREFIX) :]
     label = CONSTRAINT_LABELS.get(name, name)
     if name == "Enum":
-        shown = ", ".join(f"`{member}`" for member in value.split(ENUM_SEPARATOR))
+        shown = ENUM_MEMBER_SEPARATOR.join(f"`{member}`" for member in value.split(ENUM_SEPARATOR))
     else:
         shown = f"`{value}`"
     return f"{prefix}{label} {shown}"
 
 
 def render_crd_row(field: dict) -> str:
-    constraints = "; ".join(render_constraint(c) for c in field["constraints"])
+    constraints = CONSTRAINT_SEPARATOR.join(render_constraint(c) for c in field["constraints"])
     default = f"`{field['default']}`" if field["default"] else ""
     return "| `{path}` | `{type}` | {required} | {default} | {constraints} | {description} |".format(
         path=field["path"],
         type=field["type"],
-        required="yes" if field["required"] else "no",
+        required=REQUIRED_YES if field["required"] else REQUIRED_NO,
         default=escape_cell(default),
         constraints=escape_cell(constraints),
         description=escape_cell(field["description"]),
@@ -654,9 +689,12 @@ def render_crd_row(field: dict) -> str:
 
 
 def gen_crd_fields(kind: str) -> str:
-    """Render one kind's spec and status trees as two tables."""
+    """Render one kind's page body: the intro paragraph, then a spec and a status table."""
     entry = crd_model()[kind]
-    out: list[str] = []
+    out: list[str] = [
+        CRD_INTRO.format(kind=kind, resource=kind.lower(), guide=CRD_GUIDES[kind]),
+        "",
+    ]
     for key, heading in CRD_TREES:
         out.append(f"## {heading}\n")
         fields = entry[key]
@@ -784,16 +822,35 @@ def display_path(path: Path) -> Path:
     return path.relative_to(REPO) if path.is_relative_to(REPO) else path
 
 
-def select_blocks(names: list[str], blocks=BLOCKS) -> dict:
-    """The blocks a run covers: every one, or the named ones in registry order."""
+def select_blocks(names: list[str], prefixes: list[str] = (), blocks=BLOCKS) -> dict:
+    """The blocks a run covers, in registry order.
+
+    No names and no prefixes selects every block. A name must be a registered
+    id and a prefix must match at least one, so a typo fails the run rather
+    than quietly covering nothing.
+    """
     unknown = sorted(set(names) - set(blocks))
     if unknown:
         raise SystemExit(
             f"unknown block id(s): {', '.join(unknown)}; known: {', '.join(blocks)}"
         )
-    if not names:
+    for prefix in prefixes:
+        if not any(block_id.startswith(prefix) for block_id in blocks):
+            raise SystemExit(
+                f"no block id starts with '{prefix}'; known: {', '.join(blocks)}"
+            )
+    if not names and not prefixes:
         return dict(blocks)
-    return {block_id: entry for block_id, entry in blocks.items() if block_id in names}
+    return {
+        block_id: entry
+        for block_id, entry in blocks.items()
+        if block_id in names or any(block_id.startswith(prefix) for prefix in prefixes)
+    }
+
+
+def needs_go(block_id: str) -> bool:
+    """Whether a block's generator reads the Go API types."""
+    return block_id.startswith(CRD_BLOCK_PREFIX)
 
 
 def main(argv: list[str] | None = None, blocks=BLOCKS) -> int:
@@ -804,6 +861,13 @@ def main(argv: list[str] | None = None, blocks=BLOCKS) -> int:
         help="do not write; exit non-zero if any generated region is out of date",
     )
     ap.add_argument(
+        "--block-prefix",
+        action="append",
+        default=[],
+        metavar="PREFIX",
+        help="also cover every block whose id starts with PREFIX (repeatable)",
+    )
+    ap.add_argument(
         "blocks",
         nargs="*",
         metavar="BLOCK",
@@ -811,7 +875,16 @@ def main(argv: list[str] | None = None, blocks=BLOCKS) -> int:
     )
     args = ap.parse_args(argv)
 
-    targets = collect_targets(select_blocks(args.blocks, blocks))
+    selected = select_blocks(args.blocks, args.block_prefix, blocks)
+    # A write run on a machine without Go still refreshes every region that
+    # needs none; the CRD pages are reported skipped, not silently left. A
+    # block asked for by name is wanted, so it fails as it would in --check.
+    if not args.check and not args.blocks and not args.block_prefix and shutil.which(GO_BINARY) is None:
+        for block_id in [b for b in selected if needs_go(b)]:
+            print(f"  skipped  [{block_id}]: needs `{GO_BINARY}` on PATH; regions that need none are refreshed")
+            del selected[block_id]
+
+    targets = collect_targets(selected)
 
     stale: list[str] = []
     for path, new_text, changed, block_id in targets:

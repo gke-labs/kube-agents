@@ -5,11 +5,11 @@ sidebar:
   order: 5
 ---
 
-Every field of the `AgentPlugin` resource's `spec` and `status`, read from the operator's Go API types each time the operator's manifests are regenerated. The standard Kubernetes `apiVersion`, `kind` and `metadata` are not listed. A field whose type comes from the Kubernetes API (`corev1`, `metav1`, `networkingv1`, `resource.Quantity`) names that type and is not expanded; the Kubernetes API reference describes it. Paths read `parent.child`, with `[]` for each item of a list. For what the fields do together, read the [AgentPlugin CRD](/kube-agents/operator/agentplugin-crd/) guide.
-
 <!-- BEGIN GENERATED: crd-fields-agentplugin -->
 <!-- Regenerate with: make docs-generate -- do not edit by hand. -->
 <!-- prettier-ignore-start -->
+
+Every field of the `AgentPlugin` resource's `spec` and `status`, generated from the operator's Go API types. The standard Kubernetes `apiVersion`, `kind` and `metadata` are not listed. A field whose type comes from the Kubernetes API (`corev1`, `metav1`, `networkingv1`, `resource.Quantity`) names that type and is not expanded; the Kubernetes API reference describes it. Paths read `parent.child`, with `[]` for each item of a list and `{}` for each value of a map. Each description is the opening paragraph of the field's documentation, plus its deprecation notice when it has one, and names other fields in their Go spelling (`MaxSessions` for `maxSessions`); `kubectl explain agentplugin.spec.<field>` prints the whole text. For what the fields do together, read the [AgentPlugin CRD](/kube-agents/operator/agentplugin-crd/) guide.
 
 ## Spec
 

@@ -48,6 +48,11 @@ FIXTURE = textwrap.dedent(
     // +kubebuilder:validation:Enum=fast;slow
     type Mode string
 
+    // Speed carries a default and an enum of its own, which a field overrides.
+    // +kubebuilder:validation:Enum=a;b
+    // +kubebuilder:default:="a"
+    type Speed string
+
     // WidgetCommon is embedded inline into the spec.
     type WidgetCommon struct {
     	// Owner names who holds the widget.
@@ -134,6 +139,29 @@ FIXTURE = textwrap.dedent(
     	//   kind: Widget
     	// +optional
     	Kind string `json:"kind,omitempty"`
+
+    	// Legacy is the old way to name the widget.
+    	//
+    	// This paragraph is an implementation note.
+    	//
+    	// Deprecated: use Name instead. It will be removed in a future version.
+    	//
+    	// And this one is another note.
+    	// +optional
+    	Legacy string `json:"legacy,omitempty"`
+
+    	// Levels are modes, so the type's enum applies to each item.
+    	// +kubebuilder:validation:MaxItems=2
+    	// +optional
+    	Levels []Mode `json:"levels,omitempty"`
+
+    	// Speed overrides its type's default and enum, the enum in the colon spelling.
+    	// +kubebuilder:default:="c"
+    	// +kubebuilder:validation:Enum:=b;c
+    	// +optional
+    	Speed Speed `json:"speed,omitempty"`
+
+    	Extra Part `json:"extra"`
     }
 
     // WidgetStatus defines the observed state of Widget.
@@ -295,17 +323,40 @@ class FixturePackageTest(unittest.TestCase):
         self.assertEqual(self.spec["pull"]["constraints"], [{"name": "Enum", "value": "Always;Never"}])
 
     def test_the_description_is_the_first_paragraph_without_citations(self):
-        self.assertEqual(
-            self.spec["name"]["description"],
-            "Name is the widget's name. See for the history; the rule is in.",
-        )
+        # A parenthetical citation is cut from its sentence; a sentence that
+        # cites an issue bare is dropped whole rather than left as "See for
+        # the history".
+        self.assertEqual(self.spec["name"]["description"], "Name is the widget's name.")
         self.assertNotIn("implementation note", self.spec["name"]["description"])
         self.assertEqual(self.spec["kind"]["description"], "Kind introduces the example below it.")
+
+    def test_a_deprecation_paragraph_is_kept_and_other_later_paragraphs_are_not(self):
+        self.assertEqual(
+            self.spec["legacy"]["description"],
+            "Legacy is the old way to name the widget. "
+            "Deprecated: use Name instead. It will be removed in a future version.",
+        )
+
+    def test_a_struct_field_without_a_comment_takes_its_type_s(self):
+        self.assertEqual(self.spec["extra"]["description"], "Part is one component of a widget.")
+        self.assertEqual(self.spec["extra"]["type"], "object")
+
+    def test_a_field_s_markers_win_over_its_type_s(self):
+        self.assertEqual(self.spec["speed"]["default"], "c")
+        self.assertEqual(self.spec["speed"]["constraints"], [{"name": "Enum", "value": "b;c"}])
+
+    def test_a_slice_of_a_named_type_carries_the_type_s_enum_on_its_items(self):
+        self.assertEqual(self.spec["levels"]["type"], "[]string")
+        self.assertEqual(
+            self.spec["levels"]["constraints"],
+            [{"name": "MaxItems", "value": "2"}, {"name": "items:Enum", "value": "fast;slow"}],
+        )
 
     def test_rows_keep_source_order(self):
         paths = [field["path"] for field in self.kind["spec"]]
         self.assertEqual(paths[:4], ["owner", "name", "alias", "replicas"])
         self.assertLess(paths.index("parts"), paths.index("parts[].name"))
+        self.assertEqual(paths[-3:], ["extra", "extra.name", "extra.weight"])
 
 
 @unittest.skipIf(shutil.which(generate_docs.GO_BINARY) is None, "needs a Go toolchain")
@@ -409,6 +460,42 @@ class CRDSchemaParityTest(unittest.TestCase):
                         )
                         self.assertEqual(generated, names, f"required under {parent or tree!r}")
 
+    def test_types_match(self):
+        for kind in CRD_FILES:
+            for tree, _ in generate_docs.CRD_TREES:
+                with self.subTest(kind=kind, tree=tree):
+                    rows = self.model[kind][tree]
+                    external = {row["path"] for row in rows if row["external"]}
+                    schemas: dict[str, dict] = {}
+                    collect_schemas(self.schema_tree(kind, tree), external, "", schemas)
+                    for row in rows:
+                        if row["external"]:
+                            # metav1.Time is a string, resource.Quantity an
+                            # int-or-string: the page names the Go type instead.
+                            continue
+                        self.assertEqual(
+                            schema_type(schemas[row["path"]]), row["type"], row["path"]
+                        )
+
+    def test_constraints_match(self):
+        for kind in CRD_FILES:
+            for tree, _ in generate_docs.CRD_TREES:
+                with self.subTest(kind=kind, tree=tree):
+                    rows = self.model[kind][tree]
+                    external = {row["path"] for row in rows if row["external"]}
+                    schemas: dict[str, dict] = {}
+                    collect_schemas(self.schema_tree(kind, tree), external, "", schemas)
+                    for row in rows:
+                        generated = sorted((c["name"], c["value"]) for c in row["constraints"])
+                        expected = sorted(schema_constraints(schemas[row["path"]]))
+                        if row["external"]:
+                            # An upstream type brings its own validation
+                            # (resource.Quantity's pattern); the page names the
+                            # type, so only the field's own markers must show.
+                            self.assertEqual(sorted(set(generated) - set(expected)), [], row["path"])
+                        else:
+                            self.assertEqual(generated, expected, row["path"])
+
     def test_defaults_match(self):
         for kind in CRD_FILES:
             for tree, _ in generate_docs.CRD_TREES:
@@ -419,6 +506,60 @@ class CRDSchemaParityTest(unittest.TestCase):
                     collect_defaults(self.schema_tree(kind, tree), external, "", defaults)
                     generated = {row["path"]: row["default"] for row in rows if row["default"]}
                     self.assertEqual(generated, defaults)
+
+
+# The schema keywords each validation marker writes, by marker name.
+SCHEMA_CONSTRAINT_KEYS = {
+    "Enum": "enum",
+    "Minimum": "minimum",
+    "Maximum": "maximum",
+    "MinLength": "minLength",
+    "MaxLength": "maxLength",
+    "MinItems": "minItems",
+    "MaxItems": "maxItems",
+    "Pattern": "pattern",
+}
+
+
+def schema_constraints(schema: dict) -> list[tuple[str, str]]:
+    """The constraints a schema node carries, spelled as the generator spells them."""
+    out: list[tuple[str, str]] = []
+    for node, prefix in ((schema, ""), (schema.get("items") or {}, "items:")):
+        for marker, key in SCHEMA_CONSTRAINT_KEYS.items():
+            if key not in node:
+                continue
+            value = node[key]
+            value = ";".join(value) if isinstance(value, list) else str(value)
+            out.append((prefix + marker, value))
+    return out
+
+
+def schema_type(schema: dict) -> str:
+    """A schema node's type as the generator renders it."""
+    if schema.get("type") == "array":
+        items = schema.get("items") or {}
+        return "[]" + ("object" if "properties" in items else items.get("type", "object"))
+    if schema.get("type") == "object" and "additionalProperties" in schema:
+        values = schema["additionalProperties"]
+        return "map[string]" + ("object" if "properties" in values else values.get("type", "object"))
+    return schema.get("type", "object")
+
+
+def collect_schemas(schema: dict, external: set[str], prefix: str, schemas: dict[str, dict]) -> None:
+    """Every property's schema node by its generated path, stopping at external leaves."""
+    for name, sub in (schema.get("properties") or {}).items():
+        path = f"{prefix}.{name}" if prefix else name
+        schemas[path] = sub
+        if path in external:
+            continue
+        items = sub.get("items")
+        values = sub.get("additionalProperties")
+        if "properties" in sub:
+            collect_schemas(sub, external, path, schemas)
+        elif isinstance(items, dict) and "properties" in items:
+            collect_schemas(items, external, f"{path}[]", schemas)
+        elif isinstance(values, dict) and "properties" in values:
+            collect_schemas(values, external, f"{path}{{}}", schemas)
 
 
 def collect_defaults(schema: dict, external: set[str], prefix: str, defaults: dict[str, str]) -> None:

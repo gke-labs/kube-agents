@@ -19,7 +19,10 @@
 // controller-gen's rule: +required (or the kubebuilder spelling) wins, then
 // +optional, then a field with neither is required unless its tag says
 // omitempty. Each field's description is the first paragraph of its doc
-// comment with the marker lines and issue citations removed.
+// comment, plus any later paragraph that opens with "Deprecated:", with the
+// marker lines removed, parenthetical issue citations cut, and a sentence that
+// cites an issue bare dropped; a struct-typed field with no comment of its
+// own takes its type's, as controller-gen does.
 package main
 
 import (
@@ -50,10 +53,20 @@ const (
 	specFieldJSON   = "spec"
 	statusFieldJSON = "status"
 
-	jsonTagKey       = "json"
-	jsonTagInline    = "inline"
-	jsonTagOmitEmpty = "omitempty"
-	jsonTagSkip      = "-"
+	jsonTagKey         = "json"
+	jsonTagInline      = "inline"
+	jsonTagOmitEmpty   = "omitempty"
+	jsonTagSkip        = "-"
+	jsonTagSeparator   = ","
+	structTagQuote     = "`"
+	lineCommentPrefix  = "//"
+	blockCommentOpen   = "/*"
+	blockCommentClose  = "*/"
+	commentLeadingPad  = " "
+	markerValueAssign  = "="
+	markerNameColon    = ":"
+	defaultValueCutset = ":="
+	patternQuote       = "`"
 
 	markerPrefix           = "+"
 	requiredMarker         = "+required"
@@ -61,7 +74,11 @@ const (
 	requiredMarkerKB       = "+kubebuilder:validation:Required"
 	optionalMarkerKB       = "+kubebuilder:validation:Optional"
 	validationMarkerPrefix = "+kubebuilder:validation:"
+	itemsMarkerPrefix      = "items:"
 	defaultMarkerPrefix    = "+kubebuilder:default"
+	// A paragraph after the first that opens this way is operative for a
+	// reader deciding whether to use the field, so it stays on the page.
+	deprecatedParagraphPrefix = "Deprecated:"
 	// Validation markers that shape a value rather than constrain it: CEL
 	// rules carry a message for the API server, not a bound a table can show.
 	xValidationMarker = "XValidation"
@@ -122,6 +139,9 @@ var (
 	citationBareRE  = regexp.MustCompile(`\s*(?:gke-labs)?#\d+\b`)
 	spaceRunRE      = regexp.MustCompile(`\s+`)
 	spaceBeforeRE   = regexp.MustCompile(`\s+([,.;:])(\s|$)`)
+	// Where one sentence ends and the next begins, for dropping the sentence
+	// that carries a bare citation rather than leaving it without its object.
+	sentenceBreakRE = regexp.MustCompile(`[.!?]\s+`)
 )
 
 // Field is one row of a tree: a dotted path from the tree's root, its type,
@@ -344,11 +364,18 @@ func (p *pkg) walk(typeName, prefix string) ([]Field, error) {
 			path = prefix + pathSeparator + jsonName
 		}
 		doc := commentLines(field.Doc)
-		markers := markerLines(doc)
+		fieldMarkers := markerLines(doc)
 		// A local named type carries its own markers (an enum on the type
-		// rather than on each field); the field's come after and win.
-		if typeMarkers := p.typeMarkers(field.Type); len(typeMarkers) > 0 {
-			markers = append(typeMarkers, markers...)
+		// rather than on each field). The field's are searched first, so
+		// its default and required setting win, and a constraint it names
+		// replaces the type's of the same name.
+		typeMarkers := p.typeMarkers(field.Type)
+		markers := append(append([]string{}, fieldMarkers...), typeMarkers...)
+		text := description(doc)
+		if text == "" && ref.local != "" {
+			// controller-gen's fallback: a struct-typed field with no
+			// comment of its own is described by its type's.
+			text = description(p.types[ref.local].doc)
 		}
 		row := Field{
 			Path:        path,
@@ -358,8 +385,8 @@ func (p *pkg) walk(typeName, prefix string) ([]Field, error) {
 			External:    ref.external,
 			Required:    required(markers, omitEmpty),
 			Default:     defaultValue(markers),
-			Constraints: constraints(markers),
-			Description: description(doc),
+			Constraints: mergeConstraints(constraints(typeMarkers), constraints(fieldMarkers)),
+			Description: text,
 		}
 		fields = append(fields, row)
 		if ref.local == "" {
@@ -440,7 +467,9 @@ func (p *pkg) resolve(expr ast.Expr) (typeRef, error) {
 }
 
 // typeMarkers returns the markers declared on a local named type the field
-// uses directly (through a pointer or not). A struct's markers describe the
+// uses directly (through a pointer or not), or as the element of a slice,
+// where controller-gen applies the type's validation to the items and this
+// returns it under the `items:` spelling. A struct's markers describe the
 // object, not the field, so only non-struct types contribute.
 func (p *pkg) typeMarkers(expr ast.Expr) []string {
 	for {
@@ -449,6 +478,15 @@ func (p *pkg) typeMarkers(expr ast.Expr) []string {
 			break
 		}
 		expr = star.X
+	}
+	if array, ok := expr.(*ast.ArrayType); ok {
+		var items []string
+		for _, m := range p.typeMarkers(array.Elt) {
+			if strings.HasPrefix(m, validationMarkerPrefix) {
+				items = append(items, validationMarkerPrefix+itemsMarkerPrefix+strings.TrimPrefix(m, validationMarkerPrefix))
+			}
+		}
+		return items
 	}
 	ident, ok := expr.(*ast.Ident)
 	if !ok {
@@ -470,12 +508,12 @@ func jsonTag(field *ast.Field) (name string, omitEmpty, inline, skip bool) {
 	if field.Tag == nil {
 		return "", false, false, false
 	}
-	raw := strings.Trim(field.Tag.Value, "`")
+	raw := strings.Trim(field.Tag.Value, structTagQuote)
 	tag, ok := reflect.StructTag(raw).Lookup(jsonTagKey)
 	if !ok {
 		return "", false, false, false
 	}
-	parts := strings.Split(tag, ",")
+	parts := strings.Split(tag, jsonTagSeparator)
 	name = parts[0]
 	if name == jsonTagSkip {
 		return "", false, false, true
@@ -518,10 +556,10 @@ func commentLines(group *ast.CommentGroup) []string {
 	for _, c := range group.List {
 		text := c.Text
 		switch {
-		case strings.HasPrefix(text, "//"):
-			lines = append(lines, strings.TrimPrefix(strings.TrimPrefix(text, "//"), " "))
-		case strings.HasPrefix(text, "/*"):
-			text = strings.TrimSuffix(strings.TrimPrefix(text, "/*"), "*/")
+		case strings.HasPrefix(text, lineCommentPrefix):
+			lines = append(lines, strings.TrimPrefix(strings.TrimPrefix(text, lineCommentPrefix), commentLeadingPad))
+		case strings.HasPrefix(text, blockCommentOpen):
+			text = strings.TrimSuffix(strings.TrimPrefix(text, blockCommentOpen), blockCommentClose)
 			for _, line := range strings.Split(text, "\n") {
 				lines = append(lines, strings.TrimSpace(line))
 			}
@@ -563,7 +601,7 @@ func defaultValue(markers []string) string {
 			continue
 		}
 		rest := strings.TrimPrefix(m, defaultMarkerPrefix)
-		rest = strings.TrimLeft(rest, ":=")
+		rest = strings.TrimLeft(rest, defaultValueCutset)
 		rest = strings.TrimSpace(rest)
 		var unquoted string
 		if json.Unmarshal([]byte(rest), &unquoted) == nil {
@@ -583,40 +621,101 @@ func constraints(markers []string) []Constraint {
 			continue
 		}
 		body := strings.TrimPrefix(m, validationMarkerPrefix)
-		name, value, hasValue := strings.Cut(body, "=")
+		name, value, hasValue := strings.Cut(body, markerValueAssign)
 		if !hasValue {
 			continue
 		}
+		// controller-gen accepts both `Enum=a;b` and `Enum:=a;b`.
+		name = strings.TrimSuffix(name, markerNameColon)
 		if strings.HasPrefix(name, xValidationMarker) {
 			continue
 		}
 		value = strings.TrimSpace(value)
-		value = strings.Trim(value, "`")
+		value = strings.Trim(value, patternQuote)
 		out = append(out, Constraint{Name: name, Value: value})
 	}
 	return out
 }
 
-// description is the first paragraph of a doc comment, markers and issue
-// citations removed, on one line.
+// mergeConstraints returns the field's constraints in their order, then
+// those of its type whose name the field did not set: a field's Enum stands
+// in for its type's rather than beside it.
+func mergeConstraints(typeOwned, fieldOwned []Constraint) []Constraint {
+	named := map[string]bool{}
+	out := []Constraint{}
+	for _, c := range fieldOwned {
+		named[c.Name] = true
+		out = append(out, c)
+	}
+	for _, c := range typeOwned {
+		if !named[c.Name] {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// description is the first paragraph of a doc comment and any later
+// paragraph that opens with "Deprecated:", each cleaned, on one line.
 func description(doc []string) string {
-	var paragraph []string
+	paragraphs := paragraphsOf(doc)
+	if len(paragraphs) == 0 {
+		return ""
+	}
+	kept := []string{paragraphs[0]}
+	for _, paragraph := range paragraphs[1:] {
+		if strings.HasPrefix(paragraph, deprecatedParagraphPrefix) {
+			kept = append(kept, paragraph)
+		}
+	}
+	var out []string
+	for _, paragraph := range kept {
+		if text := cleanParagraph(paragraph); text != "" {
+			out = append(out, text)
+		}
+	}
+	return strings.Join(out, " ")
+}
+
+// paragraphsOf splits a doc comment at blank lines, marker lines left out,
+// each paragraph joined on one line.
+func paragraphsOf(doc []string) []string {
+	var paragraphs []string
+	var current []string
+	flush := func() {
+		if len(current) > 0 {
+			paragraphs = append(paragraphs, strings.Join(current, " "))
+			current = nil
+		}
+	}
 	for _, line := range doc {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, markerPrefix) {
 			continue
 		}
 		if trimmed == "" {
-			if len(paragraph) > 0 {
-				break
-			}
+			flush()
 			continue
 		}
-		paragraph = append(paragraph, trimmed)
+		current = append(current, trimmed)
 	}
-	text := strings.Join(paragraph, " ")
+	flush()
+	return paragraphs
+}
+
+// cleanParagraph removes issue citations and tidies the spacing. A
+// parenthetical citation is cut; a sentence that cites an issue bare is
+// dropped whole, since without its object it would say "see for the history".
+func cleanParagraph(text string) string {
 	text = citationParenRE.ReplaceAllString(text, "")
-	text = citationBareRE.ReplaceAllString(text, "")
+	var sentences []string
+	for _, sentence := range splitSentences(text) {
+		if citationBareRE.MatchString(sentence) {
+			continue
+		}
+		sentences = append(sentences, sentence)
+	}
+	text = strings.Join(sentences, " ")
 	text = spaceRunRE.ReplaceAllString(text, " ")
 	text = spaceBeforeRE.ReplaceAllString(text, "$1$2")
 	text = strings.TrimSpace(text)
@@ -624,4 +723,19 @@ func description(doc []string) string {
 		text = strings.TrimSuffix(text, colonEnding) + periodEnding
 	}
 	return text
+}
+
+// splitSentences cuts text after each sentence-ending punctuation mark that
+// is followed by whitespace, keeping the mark with its sentence.
+func splitSentences(text string) []string {
+	var sentences []string
+	start := 0
+	for _, match := range sentenceBreakRE.FindAllStringIndex(text, -1) {
+		sentences = append(sentences, strings.TrimSpace(text[start:match[0]+1]))
+		start = match[1]
+	}
+	if rest := strings.TrimSpace(text[start:]); rest != "" {
+		sentences = append(sentences, rest)
+	}
+	return sentences
 }
