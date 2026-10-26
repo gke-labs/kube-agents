@@ -105,10 +105,11 @@ type slackHomeLearn struct {
 	record homeRecord
 	setter homeSetter
 	image  string
-	// armed is set once the boot read found no recorded channel; busy while
-	// a learn runs; refused once a refusal has been written this boot, so
-	// later refusals only log; closed once Run is shutting down, so no learn
-	// starts while Run waits for the ones in flight.
+	// armed is set once the boot read found no channel to adopt; busy while
+	// a learn runs; refused once a refusal is on the record this boot, so
+	// later refusals only log (a write that failed leaves it unset, so the
+	// next refusal tries again); closed once Run is shutting down, so no
+	// learn starts while Run waits for the ones in flight.
 	armed, busy, refused, closed bool
 	// wg counts the learn and adopt goroutines, so Run waits for a write in
 	// flight before the gateway exits.
@@ -126,11 +127,13 @@ func (s *SlackAdapter) SetHomeLearner(setter homeSetter, client kubernetes.Inter
 // AdoptHomeRecord reads the record once at boot, on its own goroutine so chat
 // ingress never waits on it. No recorded channel arms the learner. A recorded
 // one is checked again: a pass arms the route and stamps the reader (and
-// clears a stale refusal); a definite refusal is written and nothing is
-// adopted; a check that could not be made adopts the recorded channel without
-// a re-stamp, so the operator never trusts a record this boot did not confirm,
-// and the next boot checks again. A record that cannot be read leaves the
-// learn off this boot: nothing could be written either.
+// clears a stale refusal); a definite refusal is written, nothing is adopted
+// and the learner is armed, so the next admitted mention replaces the channel
+// (archived after it was learned is the ordinary way here); a check that
+// could not be made adopts the recorded channel without a re-stamp, so the
+// operator never trusts a record this boot did not confirm, and the next boot
+// checks again. A record that cannot be read leaves the learn off this boot:
+// nothing could be written either.
 func (s *SlackAdapter) AdoptHomeRecord(ctx context.Context) {
 	l := &s.homeLearn
 	if l.record.client == nil || l.setter == nil {
@@ -176,10 +179,17 @@ func (s *SlackAdapter) adoptHome(ctx context.Context) {
 		s.log.Warn("slack: recorded home channel adopted without a check; the reader key is not stamped", "channel", id, "err", err)
 		return
 	case refused != "":
-		s.log.Warn("slack: recorded home channel refused; nothing adopted", "channel", id, "reason", refused)
-		if cm.Data[homeRecordKeyRefused] != refused {
-			s.writeRefusal(ctx, cm, refused)
-		}
+		s.log.Warn("slack: recorded home channel refused; the first admitted channel mention replaces it", "channel", id, "reason", refused)
+		// The record's refusal describes the recorded channel, so the learn
+		// path's one write this boot is spent here: a refused candidate must
+		// not relabel it. A write that fails leaves the budget unspent, so
+		// until the next boot writes it again a refused candidate's reason
+		// can land beside the recorded channel.
+		recorded := cm.Data[homeRecordKeyRefused] == refused || s.writeRefusal(ctx, cm, refused)
+		l.mu.Lock()
+		l.refused = recorded
+		l.armed = true
+		l.mu.Unlock()
 		return
 	}
 	if err := l.setter.SetHome(id); err != nil {
@@ -316,14 +326,17 @@ func (s *SlackAdapter) checkHomeChannel(ctx context.Context, id string) (refused
 }
 
 // refuseHome records why a candidate was refused, once per boot: a channel
-// that keeps being refused is one log line per mention, not one write.
+// that keeps being refused is one log line per mention, not one write. The
+// budget is spent when the reason is on the record, not before: a read or a
+// write that failed is tried again at the next refusal. Learns run one at a
+// time (busy), so the flag is read and set without holding the lock across
+// the calls.
 func (s *SlackAdapter) refuseHome(ctx context.Context, reason string) {
 	l := &s.homeLearn
 	l.mu.Lock()
-	written := l.refused
-	l.refused = true
+	recorded := l.refused
 	l.mu.Unlock()
-	if written {
+	if recorded {
 		return
 	}
 	cm, err := l.record.get(ctx)
@@ -331,22 +344,30 @@ func (s *SlackAdapter) refuseHome(ctx context.Context, reason string) {
 		s.log.Warn("slack: home-channel refusal not recorded", "record", l.record.name, "err", err)
 		return
 	}
-	if cm.Data[homeRecordKeyRefused] != reason {
-		s.writeRefusal(ctx, cm, reason)
+	if cm.Data[homeRecordKeyRefused] != reason && !s.writeRefusal(ctx, cm, reason) {
+		return
 	}
+	l.mu.Lock()
+	l.refused = true
+	l.mu.Unlock()
 }
 
-func (s *SlackAdapter) writeRefusal(ctx context.Context, cm *corev1.ConfigMap, reason string) {
+// writeRefusal answers whether the reason landed.
+func (s *SlackAdapter) writeRefusal(ctx context.Context, cm *corev1.ConfigMap, reason string) bool {
 	l := &s.homeLearn
 	if err := l.record.patch(ctx, cm.ResourceVersion, map[string]*string{homeRecordKeyRefused: &reason}); err != nil {
 		s.log.Warn("slack: home-channel refusal not recorded", "record", l.record.name, "err", err)
+		return false
 	}
+	return true
 }
 
 // recordHome writes the learned channel, unless the record names one already:
 // then that one is checked and adopted instead, with the reader re-stamped as
-// at boot and nothing else written. A write the record changed under (409)
-// reads again and does the same. The answer is the channel to arm.
+// at boot and nothing else written; a recorded channel the check refuses (the
+// one a boot refused, or one archived since another writer learned it) is
+// replaced. A write the record changed under (409) reads again and does the
+// same. The answer is the channel to arm.
 func (s *SlackAdapter) recordHome(ctx context.Context, channel, member string) (string, error) {
 	l := &s.homeLearn
 	for attempt := 0; attempt < homeRecordAttempts; attempt++ {
@@ -359,12 +380,12 @@ func (s *SlackAdapter) recordHome(ctx context.Context, channel, member string) (
 			if err != nil {
 				return "", fmt.Errorf("the record already names %q, which could not be checked: %w", winner, err)
 			}
-			if refused != "" {
-				return "", fmt.Errorf("the record already names %q, refused: %s", winner, refused)
+			if refused == "" {
+				s.log.Info("slack: home channel recorded by another writer; adopting it", "channel", winner)
+				s.restampReader(ctx, cm)
+				return winner, nil
 			}
-			s.log.Info("slack: home channel recorded by another writer; adopting it", "channel", winner)
-			s.restampReader(ctx, cm)
-			return winner, nil
+			s.log.Warn("slack: recorded home channel refused; replacing it", "channel", winner, "reason", refused, "replacement", channel)
 		}
 		now := time.Now().UTC().Format(time.RFC3339)
 		err = l.record.patch(ctx, cm.ResourceVersion, map[string]*string{

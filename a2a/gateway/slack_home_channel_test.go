@@ -352,6 +352,91 @@ func TestSlackHomeWriteErrorLearnsNothing(t *testing.T) {
 	}
 }
 
+// failOnce fails the next configmaps action of verb once; later ones pass.
+func failOnce(cs *k8sfake.Clientset, verb string) {
+	failed := false
+	cs.PrependReactor(verb, "configmaps", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if failed {
+			return false, nil, nil
+		}
+		failed = true
+		return true, nil, errors.New("apiserver unavailable")
+	})
+}
+
+func TestSlackHomeRefusalThatDidNotLandIsWrittenAtTheNextRefusal(t *testing.T) {
+	for _, verb := range []string{"get", "patch"} {
+		t.Run("the record "+verb+" fails", func(t *testing.T) {
+			a, api, cs, setter := newHomeLearnAdapter(t, nil)
+			api.conversations["C0AA1"] = homeChannelInfo("C0AA1", func(c *slack.Channel) { c.IsArchived = true })
+			a.AdoptHomeRecord(context.Background())
+			failOnce(cs, verb)
+			homeMention(t, a, slackChannelTypeChannel, "C0AA1", "U1", "<@UBOT> hi", "100.0", "", true)
+			if data := homeRecordData(t, cs); data[homeRecordKeyRefused] != "" {
+				t.Fatalf("record after the failed %s = %v, want no refusal yet", verb, data)
+			}
+			// The same refusal again: the reason reaches the record this time.
+			homeMention(t, a, slackChannelTypeChannel, "C0AA1", "U2", "<@UBOT> again", "101.0", "", true)
+			if data := homeRecordData(t, cs); data[homeRecordKeyRefused] != homeRefusedArchived {
+				t.Fatalf("record after the retry = %v, want refused=%s", data, homeRefusedArchived)
+			}
+			// And once it is there, a third refusal is a log line.
+			patches := homePatches(cs)
+			homeMention(t, a, slackChannelTypeChannel, "C0AA1", "U3", "<@UBOT> once more", "102.0", "", true)
+			if homePatches(cs) != patches || len(setter.all()) != 0 || !a.homeLearn.armed {
+				t.Errorf("after a third refusal: patches %d (was %d), SetHome %v, armed %v", homePatches(cs), patches, setter.all(), a.homeLearn.armed)
+			}
+		})
+	}
+}
+
+func TestSlackHomeRefusedRecordIsReplacedByTheNextMention(t *testing.T) {
+	a, api, cs, setter := newHomeLearnAdapter(t, map[string]string{
+		homeRecordKeySlack: "C0AA1", homeRecordKeySetBy: "U0", homeRecordKeyWriter: homeTestOldImage, homeRecordKeyReader: homeTestOldImage,
+	})
+	api.conversations["C0AA1"] = homeChannelInfo("C0AA1", func(c *slack.Channel) { c.IsArchived = true })
+	a.AdoptHomeRecord(context.Background())
+	if data := homeRecordData(t, cs); data[homeRecordKeyRefused] != homeRefusedArchived || data[homeRecordKeySlack] != "C0AA1" || len(setter.all()) != 0 {
+		t.Fatalf("after boot: record %v, SetHome %v; want refused=%s on the recorded channel and nothing adopted", data, setter.all(), homeRefusedArchived)
+	}
+	if !a.homeLearn.armed {
+		t.Fatal("a refused recorded channel left the learner unarmed")
+	}
+	// A mention in the refused channel: a log line, no second write, the
+	// record keeps describing the recorded channel.
+	homeMention(t, a, slackChannelTypeChannel, "C0AA1", "U1", "<@UBOT> hi", "110.0", "", true)
+	if homePatches(cs) != 1 || len(setter.all()) != 0 {
+		t.Fatalf("after a mention in the refused channel: patches %d, SetHome %v; want 1 and none", homePatches(cs), setter.all())
+	}
+	// A mention in a channel that passes replaces it, as it would fill an
+	// empty record.
+	homeMention(t, a, slackChannelTypeChannel, "C0BB2", "U1", "<@UBOT> here then", "111.0", "", true)
+	data := homeRecordData(t, cs)
+	if data[homeRecordKeySlack] != "C0BB2" || data[homeRecordKeySetBy] != "U1" ||
+		data[homeRecordKeyWriter] != homeTestImage || data[homeRecordKeyReader] != homeTestImage {
+		t.Fatalf("record after the replacement = %v", data)
+	}
+	if _, stale := data[homeRecordKeyRefused]; stale {
+		t.Errorf("slack.refused still present: %v", data)
+	}
+	if got := setter.all(); len(got) != 1 || got[0] != "C0BB2" {
+		t.Errorf("SetHome = %v, want [C0BB2]", got)
+	}
+	if len(api.posted) != 1 || !strings.Contains(api.posted[0].text, "<#C0BB2>") || api.posted[0].thread != "111.0" {
+		t.Errorf("posts = %+v, want one line naming C0BB2 in the learning thread", api.posted)
+	}
+	if a.homeLearn.armed {
+		t.Error("the learner stayed armed after the replacement")
+	}
+	// The next boot adopts the replacement without a write.
+	b, bapi, _, bsetter := newHomeLearnAdapter(t, data)
+	bapi.conversations["C0BB2"] = homeChannelInfo("C0BB2", nil)
+	b.AdoptHomeRecord(context.Background())
+	if got := bsetter.all(); len(got) != 1 || got[0] != "C0BB2" || b.homeLearn.armed {
+		t.Errorf("next boot: SetHome %v, armed %v; want [C0BB2] and not armed", got, b.homeLearn.armed)
+	}
+}
+
 func TestSlackHomeBootAdopt(t *testing.T) {
 	valid := map[string]string{homeRecordKeySlack: "C0AA1", homeRecordKeyWriter: homeTestOldImage, homeRecordKeyReader: homeTestOldImage, homeRecordKeyRefused: homeRefusedArchived}
 	cases := []struct {
@@ -369,13 +454,13 @@ func TestSlackHomeBootAdopt(t *testing.T) {
 		{"record this image already stands behind: no write",
 			map[string]string{homeRecordKeySlack: "C0AA1", homeRecordKeyWriter: homeTestImage, homeRecordKeyReader: homeTestImage}, nil, nil,
 			[]string{"C0AA1"}, map[string]string{homeRecordKeySlack: "C0AA1", homeRecordKeyWriter: homeTestImage, homeRecordKeyReader: homeTestImage}, 0, false},
-		{"archived channel: refused, nothing adopted",
+		{"archived channel: refused, nothing adopted, the learner armed",
 			map[string]string{homeRecordKeySlack: "C0AA1", homeRecordKeyWriter: homeTestOldImage},
 			homeChannelInfo("C0AA1", func(c *slack.Channel) { c.IsArchived = true }), nil, nil,
-			map[string]string{homeRecordKeySlack: "C0AA1", homeRecordKeyWriter: homeTestOldImage, homeRecordKeyRefused: homeRefusedArchived}, 1, false},
-		{"malformed id: refused without a call",
+			map[string]string{homeRecordKeySlack: "C0AA1", homeRecordKeyWriter: homeTestOldImage, homeRecordKeyRefused: homeRefusedArchived}, 1, true},
+		{"malformed id: refused without a call, the learner armed",
 			map[string]string{homeRecordKeySlack: "general"}, nil, nil, nil,
-			map[string]string{homeRecordKeySlack: "general", homeRecordKeyRefused: homeRefusedMalformed}, 1, false},
+			map[string]string{homeRecordKeySlack: "general", homeRecordKeyRefused: homeRefusedMalformed}, 1, true},
 		{"check that cannot be made: adopted without a re-stamp",
 			map[string]string{homeRecordKeySlack: "C0AA1", homeRecordKeyReader: homeTestOldImage}, nil, errors.New("ratelimited"), []string{"C0AA1"},
 			map[string]string{homeRecordKeySlack: "C0AA1", homeRecordKeyReader: homeTestOldImage}, 0, false},
@@ -406,7 +491,7 @@ func TestSlackHomeBootAdopt(t *testing.T) {
 			if homePatches(cs) != tc.patches || a.homeLearn.armed != tc.armed {
 				t.Errorf("patches %d armed %v, want %d %v", homePatches(cs), a.homeLearn.armed, tc.patches, tc.armed)
 			}
-			if tc.name == "malformed id: refused without a call" && api.conversationInfoCalls != 0 {
+			if strings.HasPrefix(tc.name, "malformed id") && api.conversationInfoCalls != 0 {
 				t.Errorf("conversations.info called %d times for a malformed id", api.conversationInfoCalls)
 			}
 		})

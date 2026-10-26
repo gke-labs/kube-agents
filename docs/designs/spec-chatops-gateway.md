@@ -1591,15 +1591,18 @@ and `homeChannel` empty, the gateway reads the record at boot: a recorded channe
 with `conversations.info` and adopted, with `reader` re-stamped to the gateway's own image and a stale
 `slack.refused` cleared; one that is shared, archived, not joined, or not a channel id is written to
 `slack.refused` as one of the four words the operator matches, `shared`, `archived`, `not-member` or
-`malformed`, and nothing is adopted; one whose check cannot be made (a Slack API error) is adopted in
-memory for that boot with no re-stamp, so `reader` never claims a check that did not happen. An empty
-record arms the learn: the first verified, top-level channel mention that is not a command, whose
+`malformed`, nothing is adopted and the learn is armed, so the first mention that passes replaces the
+channel (one archived after it was learned is the ordinary case); one whose check cannot be made (a
+Slack API error) is adopted in memory for that boot with no re-stamp, so `reader` never claims a check
+that did not happen. An empty record arms the learn: the first verified, top-level channel mention that is not a command, whose
 channel passes the same check, is written once (`slack`, `slack.setBy`, `slack.setAt`, `writer`,
 `reader`), the gateway's notify route is armed on it, and one line in the learning thread names the
-channel; a candidate the check refuses is written to `slack.refused` once per boot and the next
-mention may learn; a record another writer filled first is adopted after the same check, with
-`reader` re-stamped; a group direct message is refused without a call and a direct message is never
-a candidate. One hand-reachable
+channel; a candidate the check refuses is written to `slack.refused` once per boot (a write that
+fails is tried again at the next refusal; a refusal written at boot describes the recorded channel,
+and a refused candidate does not relabel it) and the next mention may learn; a record another writer
+filled first is adopted after the same check, with `reader` re-stamped, or replaced when that check
+refuses it; a group direct message is refused without a call and a direct message is never a
+candidate. One hand-reachable
 state exists: `kubectl set env` of that switch on the gateway Deployment survives the operator's
 server-side apply, and the gateway then learns, writes and posts while the agent env stays unrouted
 and `HomeChannelUnset` stays True. `reader` compares the image reference only: under a floating tag
