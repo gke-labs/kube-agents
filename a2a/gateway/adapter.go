@@ -84,15 +84,22 @@ type InboundMessage struct {
 	// sender's such message is dropped without the public refusal notice,
 	// since they asked the bot nothing. False on every other path.
 	Unaddressed bool
+	// Shortcut marks a message a member sent by using the "ask about this"
+	// message shortcut on someone's message: the conversation is the thread
+	// under that message, MessageID names it, and Text quotes it. A sender
+	// the gateway cannot verify gets no refusal in that thread, which the
+	// channel reads; the adapter tells them privately. False on every other
+	// path, and on every backend but Slack.
+	Shortcut bool
 }
 
 // IntentCancel is the only Intent today: stop the conversation's running
-// task. The chat backends have no way to express it -- a human types "stop"
-// and the text matcher reads it -- but a program should not have to spell a
-// phrase to reach a control path, and a phrase that changes meaning is a
-// class of bug an API does not have. The inject door has an explicit route
-// for it, and it lands on the bus as kind: cancel exactly as the text route
-// does.
+// task. A chat message cannot express it -- a human types "stop" and the
+// text matcher reads it -- but a program should not have to spell a phrase
+// to reach a control path, and a phrase that changes meaning is a class of
+// bug an API does not have. The inject door has an explicit route for it,
+// Slack's Stop button arrives as it (slack_stop.go), and it lands on the bus
+// as kind: cancel exactly as the text route does.
 const IntentCancel = "cancel"
 
 // Adapter is the five-operation backend interface from the gateway design:

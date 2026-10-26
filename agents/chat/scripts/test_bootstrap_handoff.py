@@ -204,7 +204,10 @@ class ComposeTest(unittest.TestCase):
         self.assertIn("| Replicas | Startup Probe | Telemetry | ReadOnlyFS |", text)
         self.assertIn("| c | ns | api | Deployment | 2/2 | no | otlp | yes |", text)
         self.assertNotIn("Requests/Limits", text)
-        self.assertIn("are not checked by this scan: the first-run audits own them", text)
+        self.assertIn(inventory_findings.SCAN_SCOPE_LINE, text)
+        # The full inventory a user asks for names the checks.
+        for _, words in inventory_findings.SCAN_CHECKS:
+            self.assertIn(words, text)
 
     def test_a_blocked_card_is_a_named_gap(self):
         clusters = _all_done()[:1] + [("t_blocked", "blocked", None, "Cluster preflight check failed with exit code 255.")]

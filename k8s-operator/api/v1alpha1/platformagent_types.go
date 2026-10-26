@@ -18,6 +18,7 @@ package v1alpha1
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -50,6 +51,27 @@ type PlatformAgentSpec struct {
 	// sharedVpcHosts and metricsScopes selectors, which resolve to explicit projects.
 	// +optional
 	Scope *ScopeSpec `json:"scope,omitempty"`
+
+	// Storage sizes the agent's /opt/data volume and the shell sandbox's
+	// matching data volume.
+	// +optional
+	Storage *PlatformAgentStorageSpec `json:"storage,omitempty"`
+}
+
+// PlatformAgentStorageSpec sizes the agent's persistent data volumes.
+type PlatformAgentStorageSpec struct {
+	// Size is the request of the <name>-data claim and of the shell sandbox's
+	// data claim. The operator requests the same size for both claims and grows
+	// the sandbox's claim first, so the sandbox mirror fits. A StorageClass or a
+	// quota that refuses the growth of one claim can leave the two claims at
+	// different sizes. Absent, the operator default applies (50Gi). Raising it
+	// expands both existing claims online where the StorageClass sets
+	// allowVolumeExpansion; where it does not, the claims keep their size and
+	// the DataVolumeNotExpanded condition says so. The admission webhook refuses
+	// a lower value and a value of zero or less, because a claim cannot shrink.
+	// Removing the field never shrinks a claim.
+	// +optional
+	Size *resource.Quantity `json:"size,omitempty"`
 }
 
 // ScopeSpec is the opt-in set of projects, folders and organisations, plus the Shared
@@ -288,6 +310,9 @@ type SlackSpec struct {
 	AppTokenSecretRef *corev1.SecretKeySelector `json:"appTokenSecretRef,omitempty"`
 
 	// AllowedUsers is a list of allowed member IDs. If not present, all users will be allowed.
+	// A plain ID (U...) is a member of the install's own workspace. Under mode next, an entry
+	// T...:U... (a workspace ID, a colon, a member ID) admits that member of another workspace
+	// in a Slack Connect channel; nothing else admits one, an absent list included.
 	// +listType=set
 	// +optional
 	AllowedUsers []string `json:"allowedUsers,omitempty"`
@@ -299,6 +324,17 @@ type SlackSpec struct {
 	// HomeChannelName is the human-readable name for the home channel.
 	// +optional
 	HomeChannelName string `json:"homeChannelName,omitempty"`
+
+	// HomeChannelPolicy ("auto", also absent, or "manual") is accepted and
+	// recorded in this release but has no effect yet: the A2A gateway does not
+	// learn a home channel, so HomeChannel alone decides. It is rendered to
+	// the gateway as A2A_SLACK_HOME_POLICY for a gateway that learns the
+	// channel of the first admitted mention under "auto". No schema default:
+	// the API server would apply one to every stored object it reads, so
+	// absent is read as "auto" by the operator instead.
+	// +kubebuilder:validation:Enum=auto;manual
+	// +optional
+	HomeChannelPolicy string `json:"homeChannelPolicy,omitempty"`
 }
 
 // TeamsSpec contains the configuration for the Microsoft Teams integration.

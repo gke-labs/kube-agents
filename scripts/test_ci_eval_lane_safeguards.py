@@ -202,9 +202,10 @@ class InjectLaneTest(unittest.TestCase):
         # the list when the persona's rule put its manifest in the reply
         # (#2037), so it is graded at zero writes with the rest of the first
         # phase. pdb-remediation-pr, which asks for its pull request by its
-        # own check, was the presubmit's one requesting case until its
-        # demotion to the nightly (2026-10-17, #3120), so today the list is
-        # empty and the log says "none";
+        # own check, was the presubmit's one requesting case from 2026-10-14
+        # until its demotion to the nightly (2026-10-17, #3120); from
+        # 2026-10-23 that case was vcs-spent-branch-reuse, and since
+        # pdb-remediation-pr's return on 2026-10-26 the log names both;
         # test_the_requesting_cases_are_named_for_the_second_phase below
         # covers a matrix that holds them.
         requesting = requesting_among(presubmit_tasks())
@@ -311,12 +312,13 @@ class TwoPhaseFanOutTest(unittest.TestCase):
         """
     )
 
-    def run_fanout(self, requesting: str) -> list[str]:
+    def run_fanout(self, requesting: str, stopped: str = "") -> list[str]:
         body = "\n".join(
             [
                 "set -euo pipefail",
                 self.STUBS,
                 f'INJECT_LANE_REQUESTING="{requesting}"',
+                f'STOPPED_ASK_CASES="{stopped}"',
                 lifted_block(r"^# Two phases on the inject lane.*?^fi$"),
                 'echo "TOTAL=$((UNIT_TOTAL + WRITER_TOTAL))"',
             ]
@@ -348,6 +350,17 @@ class TwoPhaseFanOutTest(unittest.TestCase):
         self.assertFalse(any("every other unit is done" in line for line in lines))
         self.assertEqual(sum(1 for line in lines if line.startswith("END ")), 8)
 
+    def test_a_stopped_ask_runs_in_the_second_phase_without_requesting(self):
+        """A failed stop lets its card open a pull request; in the first
+        phase the write safeguard would charge it to every case beside it."""
+        lines = self.run_fanout("", stopped="v")
+        self.assertIn("TOTAL=8", lines)
+        v_starts = [i for i, line in enumerate(lines) if line.startswith("START v")]
+        others_ended = [i for i, line in enumerate(lines) if line.startswith("END ") and not line.startswith("END v")]
+        self.assertEqual(len(v_starts), 2)
+        self.assertLess(max(others_ended), min(v_starts))
+        self.assertTrue(any("the stopped asks (v)" in line for line in lines))
+
     def test_the_settle_equals_the_safeguards_clock_skew_default(self):
         """The settle exists so a write in the last seconds of the unit before
         is outside the next window, whose lower edge is the check's default
@@ -369,6 +382,45 @@ class WiringTest(unittest.TestCase):
         names = src.index("TASK_NAMES=()")
         self.assertLess(exclusions, step)
         self.assertLess(step, names)
+
+    def test_the_stopped_asks_are_named_after_the_lane_step_and_before_the_nightly_part(self):
+        src = SCRIPT.read_text(encoding="utf-8")
+        step = src.index("# ─── The inject lane's safeguards")
+        stopped = src.index('STOPPED_ASK_CASES=""')
+        part = src.index("# ─── The nightly part")
+        self.assertLess(step, stopped)
+        self.assertLess(stopped, part)
+
+
+class StoppedAsksTest(unittest.TestCase):
+    """The second phase's stopped asks are read from each task's prompt by
+    the harness's own grammar, on the inject lane only."""
+
+    STOP_CASE = "./tasks/chat-stop-halts-delegated-remediation/task.yaml"
+    OTHER_CASE = "./tasks/agent-kanban-smoke/task.yaml"
+
+    def run_block(self, transport: str) -> str:
+        body = "\n".join(
+            [
+                "set -euo pipefail",
+                UV_STUB,
+                f'BENCH_DIR="{BENCH_DIR}"',
+                'EVAL_INJECT_TRANSPORT="inject"',
+                f'AGENT_TRANSPORT="{transport}"',
+                f'TASKS=("{self.STOP_CASE}" "{self.OTHER_CASE}")',
+                lifted_block(r'^STOPPED_ASK_CASES="".*?^fi$'),
+                'echo "STOPPED=${STOPPED_ASK_CASES}"',
+            ]
+        )
+        result = subprocess.run(["bash", "-c", body], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return next(line for line in result.stdout.splitlines() if line.startswith("STOPPED="))
+
+    def test_the_inject_lane_names_the_stopped_ask_and_nothing_else(self):
+        self.assertEqual(self.run_block("inject"), "STOPPED=chat-stop-halts-delegated-remediation")
+
+    def test_another_lane_names_none(self):
+        self.assertEqual(self.run_block("api"), "STOPPED=")
 
     def test_the_unit_hands_the_bench_the_resolved_path(self):
         src = SCRIPT.read_text(encoding="utf-8")

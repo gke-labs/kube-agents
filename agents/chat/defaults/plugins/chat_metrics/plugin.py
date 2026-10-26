@@ -3,9 +3,11 @@
 Registered on `pre_gateway_dispatch`, the hook Hermes runs once per inbound
 gateway event, after it has dropped its own internal events and before it
 checks the sender against the allowlist and dispatches; `session_store`
-records its metadata on the same hook. So an unlisted user's message counts,
-and a message Hermes never hands to the hook does not. The hook rewrites
-nothing and never raises: a count must not cost a turn.
+records its metadata on the same hook, and counts each session it first sees
+on this plugin's registry (metrics.REGISTRY), so the listener below serves
+sessions beside messages. So an unlisted user's message counts, and a message
+Hermes never hands to the hook does not. The hook rewrites nothing and never
+raises: a count must not cost a turn.
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ from chat_metrics import metrics  # noqa: E402
 
 logger = logging.getLogger("hermes.plugin.chat_metrics")
 
-REGISTRY = metrics.ChatMetrics()
+REGISTRY = metrics.REGISTRY
 _listener = None
 # Every hermes process in the container (a CLI call, a worker) runs plugin
 # discovery, so each would otherwise try to bind the one port the pod has for
@@ -47,6 +49,7 @@ def _platform_of(event: Any) -> str:
 
 def count_inbound(event: Any = None, gateway: Any = None, session_store: Any = None, **kwargs: Any) -> Optional[Dict[str, str]]:
     """Count the event under its platform; rewrite nothing."""
+    metrics.note_gateway(gateway)
     try:
         REGISTRY.record_inbound(_platform_of(event))
     except Exception as exc:  # noqa: BLE001 -- the count never costs a turn

@@ -10,11 +10,11 @@ An audit request arrives in one of three distinct forms, distinguished by the re
 
 When you are delegated a task or kanban card to execute an audit stream following its standard operating procedure (e.g. _"Run the security and RBAC posture audit, following the compliance-audit SOP"_ or a card naming the stream and SOP):
 
-- **You are the audit worker.** You have been given a dedicated worker session and turn budget for this specific audit stream.
+- **You are the audit worker.** You have been given a dedicated worker session and turn budget for this specific audit stream. That budget is the kanban worker's, the profile's `agent.max_turns` (150), not the 250 the stream's roster entry gives its scheduled run (form 2 below). On a large fleet a cluster-by-cluster sweep can exhaust it; the worker then dies with the run still in flight, and the retry's `start` is refused as already running.
 - **Execute the audit following its SOP (mapped in `AUDITS` at the top of `audit_report.py`, e.g. `/opt/data/profiles/platform/governance/compliance_audit_sop.md` for `compliance-audit`) directly.** Use the two-command lifecycle ([lifecycle.md](lifecycle.md), [finish.md](finish.md)):
   1. `/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py start --audit <stream> [--repo "<owner>/<repo>"]`
   2. Read the SOP in full — `start` prints its path as `sop` — then enumerate clusters and run the checks as it says. Do not work the audit out from this skill and a script's `--help`: where the SOP runs a collector, it is the SOP that says how to invoke it and that every candidate in the manifest is a verified finding. A candidate your document leaves out is not published: `finish` reports it under `unpublished_candidates`, and holds it on the ledger if an earlier run already carried it.
-  3. `/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py finish --audit <stream> ...`
+  3. `/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py finish --audit <stream> ...`, without `--scheduled`: this run is on demand.
 - **Run `start` first, by its full path, and read the SOP at the full path it prints as `sop`. Do not search for the SOP.** On a kanban card your working directory is the card's own workspace, not the profile home, so a relative path such as `governance/…` or `./skills/…`, or a `search_files`, finds nothing there.
 - **Do not reach for `hermes cron run` or say "queued for the next cron tick":** This request is an explicit on-demand audit execution, not a request to trigger the scheduled cron job. Execute the SOP directly and report the ledger issue URL in your result.
 - **`start` refuses while a run of that stream is in flight, a scheduled tick's or another session's:**
@@ -31,7 +31,7 @@ When you are delegated a task or kanban card to execute an audit stream followin
   exited 2 (`FINDINGS REJECTED`) kept the lease, so after it the run is still yours and the next step
   is to fix the document and run `finish` again, never `start`.
 - **Alignment with `AGENTS.md`:** `AGENTS.md` ("'Run the `<x>` cron job now' → trigger the schedule, do not re-enact it") addresses requests asking to trigger the background cron job or to run multiple/all audits in a single session. When delegated a task to execute a single audit stream per its SOP, you are the dedicated worker session for that stream; execute the audit directly.
-- **A card whose result is "queued for later" must NEVER be marked `done` (#1876):** If an audit cannot be run in this session due to missing credentials or infrastructure failure, call `kanban_block` (or ask for input); **never** call `kanban_complete` claiming `done` when zero findings or ledger were produced.
+- **A card whose result is "queued for later" must NEVER be marked `done` (#1876):** If an audit cannot be run in this session due to missing credentials or infrastructure failure, call `kanban_block` (or ask for input); **never** call `kanban_complete` claiming `done` when zero findings or ledger were produced. `kanban_complete` refuses a call that has no `finish` result line after your last `start`. In that case, run `finish`, or call `kanban_block` with the reason. Another `kanban_complete` within 15 minutes only closes the card marked "Not published".
 
 ### 2. Asked to run or trigger the scheduled cron job, or to run multiple/all audits
 
@@ -47,7 +47,7 @@ HERMES_HOME=/opt/data/profiles/platform /opt/hermes/.venv/bin/hermes cron run co
 Every stream's cron job lives in this profile's own roster, ticked once a minute by the Chat Agent's
 `profile-cron-tick`. `hermes cron run` marks the job due rather than running it here; the next tick
 picks it up within a minute and runs it through the identical path the 06:20 tick uses, with the
-stream's prompt verbatim, its `skills` preloaded, and this profile's `max_turns`.
+stream's prompt verbatim, its `skills` preloaded, and the entry's own `max_turns`.
 
 `cronjob(action='run')` is not the route. Where the session cannot take a detached result — a
 one-shot `hermes -z`, a stateless HTTP turn, a Kanban worker, a nested cron run — or where the
@@ -78,10 +78,11 @@ A stream run as a delegated worker (form 1 above) holds no such lock, and the sc
 never sees it, so the guard lives in the script: `start` leaves an in-flight note for the stream and
 refuses while one younger than two hours exists, whichever side wrote it, and `finish` removes it
 when that `start`'s run is over, published (exit 0) or died (exit 1, whatever the cause), so a `finish` that died does not
-refuse the stream's next repository or your own retry. The note spans one `start`-`finish` pair, not
-a loop: a stream run repository by repository reclaims it at each `start`, so a refusal at
-`start --repo B` means the stream was taken between repositories; stop there and report the sweep
-as partial with B named as not audited. Two exits keep it: `--dry-run`, a preview mid-run, and exit
+refuse the stream's next run or your own retry. The note spans one `start`-`finish` pair, and a run
+publishes to one repository, the one with `role: gitops`: do not loop over the managed
+repositories. If a person asked for several repositories, each with its own `--repo`, a `start`
+refused between two of them means that another run took the stream; stop there and report the
+repositories not yet audited. Two exits keep it: `--dry-run`, a preview mid-run, and exit
 2, a rejected document you are about to fix and resubmit, which is still the run in flight. If
 `start` cannot take the guard at all it exits 2 too, rather than run unguarded, also as
 `START REFUSED`. A run that died before `finish` is forgotten after those two hours, so a dead run

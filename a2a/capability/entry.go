@@ -22,8 +22,10 @@ import (
 )
 
 // Tier is the authority tier an entry carries. The vocabulary is
-// 02-agent-personas §9's controller label `kube-agents/tier`, and the order
-// below is the whole lattice: platform ⊃ cluster-admin ⊃ developer-team.
+// 02-agent-personas §9's controller label `kube-agents/tier`. What a tier
+// permits is its verb set in tierVerbs (verb.go); the three below nest,
+// platform ⊃ cluster-admin ⊃ developer-team, but the sets, not an order, are
+// the rule.
 type Tier string
 
 const (
@@ -31,16 +33,6 @@ const (
 	TierClusterAdmin  Tier = "cluster-admin"
 	TierDeveloperTeam Tier = "developer-team"
 )
-
-// tierRank orders the lattice. Lower is narrower. A tier absent from this map
-// is not a tier: an entry carrying one is refused rather than ranked, because
-// the alternative is an unknown string comparing equal to itself and passing
-// the narrowing check against anything.
-var tierRank = map[Tier]int{
-	TierDeveloperTeam: 0,
-	TierClusterAdmin:  1,
-	TierPlatform:      2,
-}
 
 // Scope is a `/`-segmented resource path, and containment is segment prefix:
 //
@@ -201,11 +193,11 @@ func writerOf(key string) (principal string, isRoot bool, err error) {
 
 // Validate checks an entry is well formed before any rule is applied to it. An
 // entry that fails here is refused rather than interpreted: an unknown tier
-// would otherwise compare equal to itself and satisfy narrowing against any
-// parent carrying the same unknown string.
+// has no verb set, and treating that as an empty set would make it a subset of
+// every parent's.
 func (e Entry) Validate() error {
-	if _, ok := tierRank[e.Tier]; !ok {
-		return refuse("entry carries a tier that is not in the lattice")
+	if _, ok := tierVerbs[e.Tier]; !ok {
+		return refuse("entry carries a tier that is not a known tier")
 	}
 	if err := e.Scope.validate(); err != nil {
 		return err
@@ -279,16 +271,16 @@ func (s Scope) Contains(other Scope) bool {
 // do. What this rule buys is the bound that makes that survivable — a hop
 // cannot exceed what it was delegated.
 func Narrows(parent, child Entry) error {
-	pr, ok := tierRank[parent.Tier]
+	ps, ok := tierVerbs[parent.Tier]
 	if !ok {
-		return refuse("parent carries a tier that is not in the lattice")
+		return refuse("parent carries a tier that is not a known tier")
 	}
-	cr, ok := tierRank[child.Tier]
+	cs, ok := tierVerbs[child.Tier]
 	if !ok {
-		return refuse("child carries a tier that is not in the lattice")
+		return refuse("child carries a tier that is not a known tier")
 	}
-	if cr > pr {
-		return refuse("child widens the tier")
+	if !cs.subsetOf(ps) {
+		return refuse("child widens the tier: its verb set is not inside the parent's")
 	}
 	if !parent.Scope.Contains(child.Scope) {
 		return refuse("child widens the scope")

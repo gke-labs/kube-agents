@@ -74,15 +74,34 @@ type metrics struct {
 	// on this counter is the watcher's routine-churn volume, while any rate at
 	// all on the quota counter means alerts are being lost.
 	eventsPolicyFiltered *prometheus.CounterVec
+	// eventsFolded counts events the daemon recorded against an incident
+	// already open for the same workload (injectStatusFolded). Kept out of
+	// eventsInjected and triageSessions because no triage started for them;
+	// counted in either, one broken three-replica Deployment reads as three
+	// triage sessions.
+	eventsFolded *prometheus.CounterVec
 	// eventsPolicyReopened counts the escape hatch out of the above: a
 	// higher-severity member of the same canonical family arriving behind a
 	// policy-filtered event and re-opening the incident it was holding. A rate
 	// here is healthy — these are alerts that would otherwise have been
 	// swallowed by the family's Info member. See ReopenIfPolicyFiltered.
 	eventsPolicyReopened *prometheus.CounterVec
-	injectErrors         *prometheus.CounterVec
-	sessionCreates       *prometheus.CounterVec
-	activeIncidents      *prometheus.GaugeVec
+	// settleOutcomes counts what became of each key the settle gate held, and
+	// followups the quiet follow-ups sent for incidents whose object went
+	// unsighted after the alert.
+	settleOutcomes *prometheus.CounterVec
+	followups      *prometheus.CounterVec
+	injectErrors   *prometheus.CounterVec
+	sessionCreates *prometheus.CounterVec
+	// triageSessions counts the sessions this process opened whose event the
+	// daemon then delivered: one per injected event in per-incident mode,
+	// incremented after the inject returns delivered and never on the
+	// filtered, suppressed or failed paths, which leave a session nobody was
+	// told about. The operator reads it into status.usage.sessionsTotal
+	// (docs/designs/usage-counters-producer.md); sessionCreates stays the
+	// operational view of every create attempt by outcome.
+	triageSessions  *prometheus.CounterVec
+	activeIncidents *prometheus.GaugeVec
 	// clusterDiscoveryErrors and clusterUp are the two halves of "is this
 	// cluster actually being watched". Discovery skips profiles it cannot load
 	// and counts them here; everything after discovery — the dedup cache, the
@@ -142,10 +161,22 @@ func newMetrics() *metrics {
 			Name: "k8s_event_watcher_events_policy_filtered_total",
 			Help: "Total events the daemon accepted and then held back from chat as informational. These reached nobody either, but by design: they are counted in the daily recap and the dedup entry is kept, so the workload is not re-offered.",
 		}, []string{"cluster", "project", "location", "reason", "namespace"}),
+		eventsFolded: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "k8s_event_watcher_events_folded_total",
+			Help: "Total events the daemon recorded as another sighting of an incident already open for the same workload. No triage session started for them; the dedup entry is kept.",
+		}, []string{"cluster", "project", "location", "reason", "namespace"}),
 		eventsPolicyReopened: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_events_policy_reopened_total",
 			Help: "Total events that escaped deduplication because the entry holding their key was left behind by a policy-filtered event of the same canonical family. Each one is an alert that would otherwise have been silenced by an informational sibling.",
 		}, []string{"cluster", "project", "location", "reason", "namespace"}),
+		settleOutcomes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "k8s_event_watcher_settle_outcomes_total",
+			Help: "Settle-family keys a gate stopped (the settle gate or a count gate), by what became of them: forwarded once a later sighting was accepted, or self_resolved once the key went unsighted for the settle period plus the slack. Settle-held sightings themselves are events_filtered_total{gate=\"settle\"}.",
+		}, []string{"cluster", "project", "location", "reason", "outcome"}),
+		followups: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "k8s_event_watcher_followups_total",
+			Help: "Quiet follow-ups for incidents whose alert went out and whose object was then unsighted for --quiet-after, by outcome: sent (the daemon accepted it for the session's thread; it posts after answering, so a chat failure past that is invisible here), unrouted (it had no thread for the session and posted nothing), error (the inject failed).",
+		}, []string{"cluster", "project", "location", "reason", "outcome"}),
 		injectErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_inject_errors_total",
 			Help: "Total inject (or session-create) attempts that returned a non-2xx response or transport error.",
@@ -154,6 +185,10 @@ func newMetrics() *metrics {
 			Name: "k8s_event_watcher_session_creates_total",
 			Help: "Total POST /sessions attempts, labeled by outcome.",
 		}, []string{"cluster", "project", "location", "outcome"}),
+		triageSessions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "k8s_event_watcher_triage_sessions_total",
+			Help: "Total triage sessions opened: sessions this watcher created whose event the daemon then delivered (per-incident mode, one per injected event). A session whose inject was filtered, suppressed or failed is not counted.",
+		}, []string{"cluster", "project", "location"}),
 		activeIncidents: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "k8s_event_watcher_active_incidents",
 			Help: "Current number of incidents in a cluster's dedup cache.",
@@ -193,9 +228,13 @@ func newMetrics() *metrics {
 		m.eventsDedupSuppress,
 		m.eventsQuotaSuppress,
 		m.eventsPolicyFiltered,
+		m.eventsFolded,
 		m.eventsPolicyReopened,
+		m.settleOutcomes,
+		m.followups,
 		m.injectErrors,
 		m.sessionCreates,
+		m.triageSessions,
 		m.activeIncidents,
 		m.clusterDiscoveryErrors,
 		m.clusterUp,

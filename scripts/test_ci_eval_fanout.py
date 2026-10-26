@@ -23,6 +23,7 @@ and only that unit -- grades and records the case, and a repetition that gave
 up on its lock leaves the case for the loop after the fan-out.
 """
 
+import os
 import pathlib
 import re
 import subprocess
@@ -59,6 +60,47 @@ def run_bash(body: str) -> subprocess.CompletedProcess:
         text=True,
         check=False,
     )
+
+
+class EvalLogDirTest(unittest.TestCase):
+    """EVAL_LOG_DIR is absolute and exists once the script's top has run: the
+    write runs in a subshell that cds into BENCH_DIR, the reads do not."""
+
+    def setup_lines(self) -> str:
+        src = SCRIPT.read_text(encoding="utf-8")
+        match = re.search(r'^EVAL_LOG_DIR="\$\{EVAL_LOG_DIR:-/tmp\}"\n.*?^readonly EVAL_LOG_DIR$', src, re.DOTALL | re.MULTILINE)
+        self.assertIsNotNone(match, "the EVAL_LOG_DIR setup block moved or changed shape")
+        return match.group(0)
+
+    def test_a_relative_directory_is_created_and_made_absolute(self):
+        with tempfile.TemporaryDirectory() as cwd:
+            out = subprocess.run(
+                ["bash", "-c", "set -euo pipefail\n" + self.setup_lines() + '\necho "${EVAL_LOG_DIR}"'],
+                cwd=cwd, env={**os.environ, "EVAL_LOG_DIR": "logs", "CDPATH": ""},
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+            self.assertEqual(os.path.realpath(os.path.join(cwd, "logs")), os.path.realpath(out))
+            self.assertTrue(os.path.isabs(out))
+            self.assertTrue(os.path.isdir(out))
+
+    def test_cdpath_does_not_redirect_a_relative_directory(self):
+        with tempfile.TemporaryDirectory() as cwd, tempfile.TemporaryDirectory() as elsewhere:
+            os.mkdir(os.path.join(elsewhere, "logs"))
+            out = subprocess.run(
+                ["bash", "-c", "set -euo pipefail\n" + self.setup_lines() + '\necho "${EVAL_LOG_DIR}"'],
+                cwd=cwd, env={**os.environ, "EVAL_LOG_DIR": "logs", "CDPATH": elsewhere},
+                capture_output=True, text=True, check=True,
+            ).stdout
+            self.assertEqual(1, len(out.splitlines()), out)
+            self.assertEqual(os.path.realpath(os.path.join(cwd, "logs")), os.path.realpath(out.strip()))
+
+    def test_unset_keeps_tmp(self):
+        env = {k: v for k, v in os.environ.items() if k != "EVAL_LOG_DIR"}
+        out = subprocess.run(
+            ["bash", "-c", "set -euo pipefail\n" + self.setup_lines() + '\necho "${EVAL_LOG_DIR}"'],
+            env=env, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        self.assertEqual(os.path.realpath("/tmp"), os.path.realpath(out))
 
 
 class LockTest(unittest.TestCase):
@@ -280,6 +322,8 @@ _ts_lines() { cat; }
 uv() { echo "ran 1 task(s); results: /tmp/fake/run_${rep}/results.json"; }
 finish_case() { echo "FINISH_CASE $2 after rep ${rep}"; }
 STATE_DIR="$(mktemp -d)"; ARTIFACT_DIR="$(mktemp -d)"; BENCH_DIR=/tmp
+# A private log directory, so runs that share the machine do not share rep logs.
+EVAL_LOG_DIR="$(mktemp -d)"
 EVAL_REPETITIONS=3; INFRA_LOCK_DEADLINE=1; EVAL_INFLIGHT_GRACE_SECONDS=300
 release_inflight_note() { :; }
 EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_LOCATION=
@@ -617,9 +661,12 @@ class StateLockTest(unittest.TestCase):
     def state_lock(self, case: str) -> str:
         return shell_answer("unit_state_lock", f"unit_state_lock {case}").stdout.strip()
 
-    def test_only_oobe_first_run_audits_is_exempt(self):
-        self.assertTrue(self.exempt("oobe-first-run-audits"))
-        for case in ("bootstrap-discovery-fanout", "gpu-stress-test-diagnosis", "capacity-pinned-pool-probe"):
+    def test_only_the_listed_cases_are_exempt(self):
+        for case in ("oobe-first-run-audits", "autoops-warning-event-no-action-triage"):
+            with self.subTest(case=case):
+                self.assertTrue(self.exempt(case))
+        for case in ("bootstrap-discovery-fanout", "gpu-stress-test-diagnosis", "capacity-pinned-pool-probe",
+                     "autoops-warning-event-triage"):
             with self.subTest(case=case):
                 self.assertFalse(self.exempt(case))
 
@@ -653,11 +700,11 @@ class StateLockTest(unittest.TestCase):
         self.assertEqual(self.state_lock("capacity-pinned-pool-probe"), "")
 
     def test_an_exempt_stack_reaches_its_cluster_through_its_own_kubeconfig(self):
-        for case in ("oobe-first-run-audits",):
+        for case in ("oobe-first-run-audits", "autoops-warning-event-no-action-triage"):
             with self.subTest(case=case):
                 self.assertTrue(self.exempt(case))
                 main = (TF_ROOT / task_stack(case) / "main.tf").read_text(encoding="utf-8")
-                own = main.index('KUBECONFIG="$kubeconfig_dir/config"')
+                own = re.search(r'KUBECONFIG="\$\w+/config"', main).start()
                 self.assertLess(own, main.index("get-credentials"))
                 self.assertLess(own, main.index("kubectl"))
 
@@ -697,7 +744,7 @@ class StateLockTest(unittest.TestCase):
                 lifted("run_one_unit"),
                 PerCaseGradingTest.UNIT_STUBS,
                 lifted("release_state_lock"),
-                'ACQ_LOG="$(mktemp)"; rm -f /tmp/eval_case-x_rep1.log',
+                'ACQ_LOG="$(mktemp)"',
                 'lock_acquire() { echo "$(basename "$1")" >> "${ACQ_LOG}"; mkdir "$1" 2>/dev/null; }',
                 "unit_state_lock() { echo onboarding; }",
                 "state_lock_deadline() { echo 0; }",
@@ -706,7 +753,7 @@ class StateLockTest(unittest.TestCase):
                 f'( sleep {hold_state}; rmdir "${{STATE_DIR}}/lock-state-onboarding" ) &' if hold_state else ":",
                 'uv() { [ -d "${STATE_DIR}/lock-state-onboarding" ] && [ -d "${STATE_DIR}/lock-infra" ] && echo "BOTH"; echo "ran 1 task(s); results: /tmp/fake/run_1/results.json"; }',
                 'run_one_unit ./tasks/x/task.yaml case-x 1 "" true 1 2>&1 | tail -1',
-                "cat /tmp/eval_case-x_rep1.log 2>/dev/null",
+                'cat "${EVAL_LOG_DIR}/eval_case-x_rep1.log" 2>/dev/null',
                 'echo "INFRA_TRIES=$(grep -c lock-infra "${ACQ_LOG}")"',
                 'ls "${STATE_DIR}" | grep "^lock-" | tr "\\n" " "; echo',
             ]
@@ -744,7 +791,7 @@ class StateLockTest(unittest.TestCase):
                 'state_lock_deadline() { echo 1; }',
                 'uv() { [ -d "${STATE_DIR}/lock-state-onboarding" ] && echo "HELD"; echo "ran 1 task(s); results: /tmp/fake/run_1/results.json"; }',
                 'run_one_unit ./tasks/x/task.yaml case-x 1 "" "" 1 >/dev/null 2>&1',
-                'cat /tmp/eval_case-x_rep1.log',
+                'cat "${EVAL_LOG_DIR}/eval_case-x_rep1.log"',
                 '[ -d "${STATE_DIR}/lock-state-onboarding" ] && echo "LEFT" || echo "RELEASED"',
             ]
         )
@@ -783,7 +830,7 @@ class StateLockTest(unittest.TestCase):
                 PerCaseGradingTest.UNIT_STUBS,
                 lifted("release_state_lock"),
                 lifted("release_streams"),
-                'ACQ_LOG="$(mktemp)"; rm -f /tmp/eval_case-x_rep1.log',
+                'ACQ_LOG="$(mktemp)"',
                 'lock_acquire() { mkdir "$1" 2>/dev/null && echo "$(basename "$1")" >> "${ACQ_LOG}"; }',
                 "unit_state_lock() { echo onboarding; }",
                 "state_lock_deadline() { echo 0; }",
@@ -846,7 +893,7 @@ class StateLockTest(unittest.TestCase):
                 "export KUBECONFIG=/shared/config",
                 'uv() { echo "KUBECONFIG=${KUBECONFIG}"; echo "ran 1 task(s); results: /tmp/fake/run_1/results.json"; }',
                 'run_one_unit ./tasks/x/task.yaml case-x 1 "" "" 1 >/dev/null 2>&1',
-                "cat /tmp/eval_case-x_rep1.log",
+                'cat "${EVAL_LOG_DIR}/eval_case-x_rep1.log"',
                 'echo "AFTER=${KUBECONFIG}"',
             ]
         )

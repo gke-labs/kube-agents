@@ -1,13 +1,21 @@
-# ACTIVE — an entry in hack/eval/presubmit-cases.txt, and what takes
-# `consistency` off the coverage allowlist in docs/designs/domains.yaml.
+# NIGHTLY-ACTIVE — an entry in hack/eval/nightly-cases.txt since 2026-10-21,
+# demoted from the blocking roster on #3598 (on the Gemini setup it failed
+# about 30% of repetitions on unrelated pull requests and on main: Vertex
+# 429s, #3399, and real misses where the agent read seeded-c's leftover
+# masterAuthorizedNetworksConfig {gcpPublicCidrsAccessEnabled: true} as
+# configured or open); `consistency` is on the coverage allowlist in
+# docs/designs/domains.yaml until it returns, after #3448 merges, the
+# agent-side fix (#3605) lands and the case passes the roster's bar on the
+# Gemini nightly.
 #
 # A PROBE, not the audit. The full fleet-consistency-drift sweep exists and
 # is spec-ready (consistency-drift-outlier); on 2026-08-26 its run failed on
 # transport (agent-endpoint HTTP 502s), and its shape — cohort math over the
 # whole fleet plus a ledger write — budgets like the other audits at
 # 600-1300s. Presubmit coverage of this domain is therefore a targeted
-# question about the planted defect, answered from observed evidence and
-# graded on the reply. Full audit SOP fidelity lives in
+# question about the planted defect, answered through the drift collector's
+# run (SOUL.md's audit-stream row, #3609) and graded on the reply and on that
+# run. Full audit SOP fidelity lives in
 # the fleet-audits canary (compliance-rbac-overgrant, 606s measured
 # 2026-08-26; nightly 2026-09-22 to 2026-09-29, presubmit held out since
 # (#2013)) and, in the nightly tier, consistency-drift-outlier.
@@ -16,11 +24,16 @@
 # Planted defect required: the seeded fleet's slot-c cluster carries no
 # master authorized-networks config at all, where slots a and b both carry an
 # open-for-eval block — one cluster, one facet, against a two-peer majority.
+# (Slot d carries the block too, so the majority is three. GKE still returns
+# a leftover masterAuthorizedNetworksConfig {gcpPublicCidrsAccessEnabled:
+# true} with no `enabled` on slot c; the feature is off there. Reading that
+# leftover as configured is the miss #3598 records.)
 # "Master authorized networks" is the planted facet name, so an exact match
 # on it is fair.
 #
-# Isolation class: read-only (chat probe; no audit helper, no GitOps-repo
-# write). Eligible tier: presubmit.
+# Isolation class: read-only (chat probe; no ledger helper, no GitOps-repo
+# write). Eligible tier: presubmit; a blocking-roster case until its
+# demotion to the nightly on 2026-10-21 (#3598).
 #
 # No deterministic mutation safeguard, documented: the planted defect is a
 # GKE master authorized-networks facet, not a Kubernetes object, and the
@@ -83,4 +96,19 @@ verification_spec:
       # configuration") and "authorizednetworks" covers the API field forms
       # (masterAuthorizedNetworksConfig, authorizedNetworksConfig), which
       # lowercase without the space.
-      any_of_phrases: ["authorized network", "authorizednetworks"]
+      # "authorized-networks" is the drift collector's facet id, which the
+      # agent may quote once the question routes there (#3609).
+      any_of_phrases:
+        ["authorized network", "authorizednetworks", "authorized-networks"]
+  # The route (#3605, #3609): the comparison is the drift collector's run.
+  # Graded on api-lane runs (the nightly, where this case lives since #3598);
+  # an inject-lane run sets worker_commands checks aside as not applicable
+  # (#2039), so there the reply check alone grades. Same shape as
+  # drift-chat-request-runs-collector's the-drift-collector-ran.
+  - name: the-comparison-ran-the-drift-collector
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      required_runs:
+        - script: fleet_drift.py

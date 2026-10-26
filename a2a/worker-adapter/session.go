@@ -114,7 +114,11 @@ func runSessionLoop(ctx context.Context, cfg Config, b *busConns, firstTask stri
 			"resume", resume != "")
 		turn := cfg
 		turn.TaskID = origin.TaskID
-		out = newTaskAdapter(turn, b).execute(ctx, origin, seq, turnPlan{primer: primer, resume: resume})
+		// The cost baseline follows the session: the harness's running total
+		// continues across resumed runs, so the next run's first result
+		// line prices its own turn against what this run last read.
+		out = newTaskAdapter(turn, b).execute(ctx, origin, seq,
+			turnPlan{primer: primer, resume: resume, costSeen: out.costSeen, costKnown: out.costKnown})
 		out.task = origin.TaskID
 	}
 }

@@ -119,7 +119,7 @@ verification_spec:
       type: bootstrap_handoff
       require: ranking_card_filed
 
-  # The four first-run audits run after the scan and report their own checks
+  # The five first-run audits run after the scan and report their own checks
   # (oobe.py FIRST_RUN_AUDITS); a block line under one of their slugs reaches
   # the user a second time as a separate problem.
   - name: raw-report-no-first-run-audit-checks

@@ -138,7 +138,14 @@ TEST_ID_PATTERNS = (
     # pytest: `FAILED tests/test_x.py::test_y - AssertionError`, and
     # `ERROR tests/test_x.py::test_y - ...` for a fixture that failed to set
     # up, which is the shape a flaky fixture takes.
-    re.compile(r"^(?:FAILED|ERROR) (\S+::\S+)"),
+    # The id runs to the end of its `[...]` parameter part when it has one,
+    # so a parameter id holding a space, or ` - `, stays whole; the lazy
+    # bracket match stops at the first `]` that ` - ` or the line end
+    # follows, which is the id's own `]` rather than one in the message.
+    # The path and name segments exclude `:`, so each `::` is consumed
+    # where it stands and a long crafted line costs linear time, not the
+    # quadratic retry a `\S+::` prefix would pay at every `::`.
+    re.compile(r"^(?:FAILED|ERROR) ([^\s\[:]+(?:::[^\s\[:]+)+(?:\[.*?\])?)(?: - .*)?$"),
 )
 
 # Every line of a downloaded job log starts with an ISO timestamp, and the
@@ -276,8 +283,8 @@ WORKFLOW_FILE = ".github/workflows/flaky-check-notify.yml"
 # commit; `Security Scanning`, whose advisory database moves between attempts,
 # so a green re-run there is the database changing rather than the check
 # flaking; and the `pull_request_target` automations (`Risk Classification`,
-# `Hold Unresolved Threads`, `Auto Assign Milestone on Merge`, `Merge Gate`,
-# `Auto Enqueue`), which are not checks on the tree at all.
+# `Hold Unresolved Threads`, `Merge Gate`, `Auto Enqueue`), which are not checks
+# on the tree at all.
 # `test_integration_contracts.py` holds every pull-request check to this list
 # or to its exclusion list, and
 # `test_notify_flaky_check.py` checks that every name here is a workflow's.
@@ -285,6 +292,7 @@ WORKFLOW_FILE = ".github/workflows/flaky-check-notify.yml"
 WATCHED_WORKFLOWS = (
     "A2A Module Tests",
     "Actionlint",
+    "CodeQL",
     "Conformance",
     "Docker Build",
     "Docs Build",

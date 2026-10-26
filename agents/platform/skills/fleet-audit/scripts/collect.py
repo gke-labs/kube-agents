@@ -8,7 +8,7 @@ docs/designs/fleet-audit-collector-manifest.md, which `audit_report.py finish
 
 **Scope: three streams' check tables in full.** `obtainability-audit`'s
 twenty-four-check roster (§3.1–§3.24 of `governance/obtainability_audit_sop.md`),
-`compliance-audit`'s sixteen-check roster (§2.1–§2.16 of
+`compliance-audit`'s seventeen-check roster (§2.1–§2.17 of
 `governance/compliance_audit_sop.md`), and `ai-security-audit`'s six-check
 roster (§3.1–§3.6 of `governance/ai_security_audit_sop.md`). Every check the
 three SOPs define is mechanical — none needed a `needs_triage` judgment call
@@ -21,7 +21,7 @@ opening them (`TRIAGE_BY_SLUG`). Other streams have their own
 collectors (`fleet_drift.py`, `patch_readiness.py`) or none. The three streams
 collect in different shapes: obtainability answers every check from one
 workload dump plus the reads its declaration fields need; compliance issues
-several distinct `kubectl` and `gcloud` reads per cluster, three of them
+several distinct `kubectl` and `gcloud` reads per cluster, four of them
 best-effort because their CRDs are not installed everywhere; ai-security reads
 a workload dump and a Service dump, the second backing exactly one check
 (`inference-endpoint-public`) that joins it against the first.
@@ -517,6 +517,23 @@ MAX_KCC_WEDGE_MESSAGE_CHARS = 240
 # How many blocked objects an excerpt names before it stops and counts. Naming
 # all fifteen is not more informative than naming three and saying fifteen.
 MAX_KCC_BLOCKED_NAMED = 3
+# `check_configsync_reconciler_stalled`. The two Config Sync sync kinds, fully
+# qualified so the read cannot land on another group's `rootsyncs`. Read one
+# at a time: a comma-joined `kubectl get` fails wholesale when either kind is
+# unserved, and a cluster can serve RootSync without RepoSync.
+CONFIGSYNC_SYNC_KINDS = ("rootsyncs.configsync.gke.io", "reposyncs.configsync.gke.io")
+# The reconciler-manager's verdict that it cannot create or run the reconciler.
+CONFIGSYNC_STALLED_CONDITION = "Stalled"
+# The reconciler's verdict on the current commit; `errorSourceRefs` on it name
+# the stage summaries (`status.source.errors` and its siblings) that failed.
+CONFIGSYNC_SYNCING_CONDITION = "Syncing"
+# KNV2016 is Config Sync's transient error code: an error it retries by itself
+# (a render still in progress is the common one). A `Syncing` condition whose
+# only referenced errors carry it is a retry in flight, not a stall.
+CONFIGSYNC_TRANSIENT_ERROR_CODES = frozenset({"2016"})
+# How much of a reconciler message survives into the excerpt; the same budget
+# as a Config Connector message, for the same reason.
+MAX_CONFIGSYNC_MESSAGE_CHARS = MAX_KCC_WEDGE_MESSAGE_CHARS
 
 # The fleet-wide system-namespace set (S1), spelled identically in every SOP
 # that names it. Kept here rather than imported from audit_report.py: this
@@ -4375,7 +4392,7 @@ def check_untargeted_compute_class_workload(workload: dict, context: dict) -> di
 
 
 # --------------------------------------------------------------------------- #
-# compliance-audit: all sixteen checks of §2.
+# compliance-audit: all seventeen checks of §2.
 #
 # Unlike obtainability's Deployment/StatefulSet/DaemonSet templates, this
 # stream's workload dump includes bare Pods (owned ones excluded — audit the
@@ -6116,20 +6133,6 @@ _INLINE_OPTIONS_WITH_VALUE = {
 _INTERPRETER_FAMILIES = {"python": "python", "python2": "python", "python3": "python", "nodejs": "node"}
 
 
-def _container_argv(container: dict) -> list[str]:
-    """`command` then `args`, the order the kubelet hands them to the process.
-
-    `command` overrides the image's ENTRYPOINT and `args` its CMD, so this is the
-    process's real argv. The order is load-bearing for anything reading a flag's
-    value out of the next token: a `--model` ending `command` takes its value from
-    the first element of `args`, and the reversed concatenation this replaced
-    reported the flag with nothing beside it.
-    """
-    return [str(t) for t in (container.get("command") or [])] + [
-        str(t) for t in (container.get("args") or [])
-    ]
-
-
 class _Argv(NamedTuple):
     """How one container's `command`/`args` resolve for the checks that read them.
 
@@ -7637,6 +7640,90 @@ OBTAINABILITY_CHECKS: tuple[CheckSpec, ...] = (
     ),
 )
 
+def _condition(item: dict, condition_type: str) -> dict | None:
+    """One typed condition off an object's `status.conditions`, if it has one."""
+    status = item.get("status")
+    conditions = status.get("conditions") if isinstance(status, dict) else None
+    for condition in conditions or []:
+        if isinstance(condition, dict) and condition.get("type") == condition_type:
+            return condition
+    return None
+
+
+def _condition_why(condition: dict) -> str:
+    reason = str(condition.get("reason") or "").strip()
+    message = str(condition.get("message") or "").strip()
+    why = f"{reason}: {message}" if reason and message else (reason or message or "no reason given")
+    return " ".join(why.split())[:MAX_CONFIGSYNC_MESSAGE_CHARS]
+
+
+def _configsync_stage_errors(item: dict, ref: str) -> list[dict]:
+    """The error list an `errorSourceRefs` entry such as `status.source.errors` names."""
+    node: object = item
+    for part in str(ref).split("."):
+        node = node.get(part) if isinstance(node, dict) else None
+    return [e for e in node if isinstance(e, dict)] if isinstance(node, list) else []
+
+
+def check_configsync_reconciler_stalled(context: dict) -> list[dict]:
+    """Cluster-scoped: Config Sync RootSync and RepoSync objects whose
+    reconciler has stopped applying the repository.
+
+    §2.12 covers Config Connector, the controller that turns the repository
+    into GCP state. This covers Config Sync, the one that turns it into
+    cluster state, which nothing else in the skill reads either: a stalled
+    RootSync drifts the cluster from Git while every `manifest` remediation
+    this audit opens against that cluster merges and applies nothing.
+
+    Two signals, both the reconciler's own verdict on the object. `Stalled=True`
+    is the reconciler-manager saying it cannot create or run the reconciler
+    (a Deployment that will not come up, an invalid spec). A `Syncing`
+    condition naming `errorSourceRefs` is the reconciler saying the current
+    commit failed to fetch, render or apply, and the stage it names holds the
+    error line. The stage summaries are not read on their own: they keep the
+    previous commit's errors until the next stage overwrites them, and a
+    render in progress writes a transient error there that clears by itself,
+    so a count over them fires on a fix in flight. `Reconciling=True` alone
+    is not a finding: it is the state of every first sync, and a large
+    repository can hold it for longer than any threshold this check could
+    defend.
+    """
+    hits = []
+    for item in context.get("configsync_objects") or []:
+        if not isinstance(item, dict):
+            continue
+        meta = item.get("metadata") or {}
+        kind = str(item.get("kind") or "")
+        name = str(meta.get("name") or "")
+        if not kind or not name:
+            continue
+        why = ""
+        stalled = _condition(item, CONFIGSYNC_STALLED_CONDITION)
+        syncing = _condition(item, CONFIGSYNC_SYNCING_CONDITION)
+        if stalled is not None and str(stalled.get("status")) == "True":
+            why = _condition_why(stalled)
+        elif syncing is not None and syncing.get("errorSourceRefs"):
+            refs = [str(r) for r in syncing["errorSourceRefs"] if r]
+            errors = [e for ref in refs for e in _configsync_stage_errors(item, ref)]
+            real = [e for e in errors if str(e.get("code")) not in CONFIGSYNC_TRANSIENT_ERROR_CODES]
+            if errors and not real:
+                continue
+            first = next((str(e.get("errorMessage") or "").strip() for e in real if e.get("errorMessage")), "")
+            why = _condition_why({"reason": syncing.get("reason"), "message": first or syncing.get("message")})
+            if refs:
+                why = f"{why} (errors in {', '.join(refs)})"
+        if not why:
+            continue
+        hits.append(
+            {
+                "namespace": str(meta.get("namespace") or ""),
+                "object": f"{kind}/{name}",
+                "excerpt": f"Config Sync reports {kind}/{name} is not applying its repository: {why}",
+            }
+        )
+    return sorted(hits, key=lambda h: (h["namespace"], h["object"]))
+
+
 COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
     CheckSpec(
         "privileged-container",
@@ -7799,6 +7886,18 @@ COMPLIANCE_CHECKS: tuple[CheckSpec, ...] = (
         # sets of callers and a sentence true of one is false of the other.
         # This is the anonymous arm's, which is the one a reader reaches for.
         _IMPACT_ANONYMOUS_RBAC_ANONYMOUS,
+    ),
+    CheckSpec(
+        "configsync-reconciler-stalled",
+        "cluster",
+        check_configsync_reconciler_stalled,
+        "critical",
+        None,
+        "Config Sync has stopped applying this repository to the cluster. The "
+        "cluster holds whatever state it drifted to, the repository says "
+        "something else, and every pull request merged for this cluster -- "
+        "including a remediation this audit proposes -- changes nothing on it "
+        "until the reconciler is unblocked.",
     ),
 )
 
@@ -8019,6 +8118,7 @@ _COMPLIANCE_CHECK_SOURCES: dict[str, tuple[str, ...]] = {
     "legacy-metadata": ("node_pools",),
     "public-control-plane": ("describe",),
     "kcc-object-wedged": ("kcc",),
+    "configsync-reconciler-stalled": ("configsync",),
     "lb-world-open": ("services",),
 }
 
@@ -8095,6 +8195,69 @@ _COMPLIANCE_AUTOPILOT_NOT_APPLICABLE: tuple[tuple[str, str], ...] = (
         "that would exempt one.",
     ),
 )
+
+
+def _configsync_disposition(runs: list[tuple[str, dict | None, Run]]) -> tuple[str, dict]:
+    """One answer for §2.17's two reads.
+
+    Returns `(reason, record)`: an `Undetermined:` reason when any read failed
+    for a cause other than the API server not serving the kind (that read
+    cleared nothing, so the check did not run); a not-applicable reason when
+    every kind is unserved or the served kinds hold no objects; else an empty
+    reason and one `commands` record over the served reads, pasteable as one
+    line. The record carries `rc` 0, which is what `cross_check_manifest`
+    reads as the check having run; the unserved kind's non-zero exit is the
+    cluster's shape, not a failure of the read that did happen.
+    """
+    served = [(cmd, result) for cmd, parsed, result in runs if parsed is not None]
+    for cmd, parsed, result in runs:
+        if parsed is not None:
+            continue
+        kind = cmd.split(" get ", 1)[-1].split(" ", 1)[0]
+        if result.rc == TIMEOUT_RC:
+            return (
+                f"{UNDETERMINED_PREFIX} `kubectl get {kind} -A` did not finish within "
+                f"{DEFAULT_TIMEOUT_S}s and was killed, so whether Config Sync is installed "
+                "here -- and whether anything it syncs is stalled -- was not established. "
+                "This check cleared nothing on this cluster.",
+                {},
+            )
+        if result.rc != 0 and RESOURCE_TYPE_ABSENT_MARKER in result.stderr:
+            continue
+        stderr = result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
+        detail = (
+            f"exited {result.rc} without saying the kind is unserved ({stderr})"
+            if result.rc != 0
+            else "exited 0 but returned output this collector could not read as a list of objects"
+        )
+        return (
+            f"{UNDETERMINED_PREFIX} `kubectl get {kind} -A` {detail}, so whether Config "
+            "Sync is installed here -- and whether anything it syncs is stalled -- was "
+            "not established. This check cleared nothing on this cluster.",
+            {},
+        )
+    if not served:
+        return (
+            "Config Sync is not installed on this cluster: `kubectl get` answered that "
+            f"the server serves neither {CONFIGSYNC_SYNC_KINDS[0]} nor "
+            f"{CONFIGSYNC_SYNC_KINDS[1]}. Nothing here is reconciled by Config Sync.",
+            {},
+        )
+    if not any((parsed or {}).get("items") for _, parsed, _ in runs if parsed is not None):
+        return (
+            "Config Sync is installed on this cluster -- its sync kinds are served -- but "
+            "it declares no RootSync or RepoSync, so there is nothing whose "
+            "reconciliation could stall.",
+            {},
+        )
+    combined = Run(
+        [],
+        0,
+        "".join(result.stdout for _, result in served),
+        "",
+        sum(result.duration_s for _, result in served),
+    )
+    return "", _record("; ".join(cmd for cmd, _ in served), combined)
 
 
 def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec, ...], *, run: RunFn) -> CollectedContext:
@@ -8283,6 +8446,26 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
         commands["kcc-object-wedged"] = _record(
             f"KUBECONFIG={kubeconfig} {shlex.join(kcc_argv)}", kcc_result
         )
+
+    # Config Sync's sync objects, for §2.17. Ungated like the `gcp` read above
+    # and for the same reason: most clusters do not run Config Sync, and an
+    # absent CRD is the normal answer, not a failed collection. One read per
+    # kind; `_configsync_disposition` folds the two into one answer.
+    configsync_runs: list[tuple[str, dict | None, Run]] = []
+    context["configsync_objects"] = []
+    for kind in CONFIGSYNC_SYNC_KINDS:
+        argv = ["kubectl", "get", kind, "-A", "-o", "json"]
+        parsed, result = run_and_gate(argv, kubeconfig, run=run)
+        configsync_runs.append((f"KUBECONFIG={kubeconfig} {shlex.join(argv)}", parsed, result))
+        if parsed is not None:
+            context["configsync_objects"].extend((parsed or {}).get("items") or [])
+    configsync_reason, configsync_record = _configsync_disposition(configsync_runs)
+    if configsync_reason.startswith(UNDETERMINED_PREFIX):
+        context.setdefault("unevaluated", {})["configsync-reconciler-stalled"] = configsync_reason
+    elif configsync_reason:
+        context.setdefault("not_applicable", {})["configsync-reconciler-stalled"] = configsync_reason
+    else:
+        commands["configsync-reconciler-stalled"] = configsync_record
 
     # Every ServiceAccount, not only `default`: §2.14 looks up the one each
     # workload names, and a read narrowed to `default` left it nothing to find

@@ -547,8 +547,9 @@ func TestTheRegistryIsTheProvidersTheAgentServes(t *testing.T) {
 	// ForgeSpec.Provider grow together with the agent-side provider. If this
 	// fails, check that the CRD enum was widened to match.
 	names := GitProviderNames()
-	if strings.Join(names, ",") != GitProviderGitHub+","+GitProviderGitLab {
-		t.Errorf("GitProviderNames() = %v, expected %q and %q", names, GitProviderGitHub, GitProviderGitLab)
+	expected := []string{GitProviderGitea, GitProviderGitHub, GitProviderGitLab}
+	if strings.Join(names, ",") != strings.Join(expected, ",") {
+		t.Errorf("GitProviderNames() = %v, expected %v", names, expected)
 	}
 }
 
@@ -1058,5 +1059,252 @@ func TestEgressPatternsAddAForeignHostAsALiteral(t *testing.T) {
 	got[0] = "mutated"
 	if provider.Egress[0] == "mutated" {
 		t.Error("EgressPatterns returned the registry's own slice")
+	}
+}
+
+func TestGiteaForgeValidationAndResolution(t *testing.T) {
+	giteaForge := func(host, scheme string, port int32, secret string) ForgeSpec {
+		var ref *ForgeCredentialsRef
+		if secret != "" {
+			ref = &ForgeCredentialsRef{Name: secret}
+		}
+		return ForgeSpec{
+			Name:           "gitea",
+			Provider:       GitProviderGitea,
+			Host:           host,
+			Namespace:      "platform.team",
+			Scheme:         scheme,
+			Port:           port,
+			CredentialsRef: ref,
+		}
+	}
+
+	validSpec := &IntegrationSpec{
+		Forges: []ForgeSpec{giteaForge("gitea.gitea.svc.cluster.local", ForgeSchemeHTTP, 3000, "gitea-token")},
+		Repositories: []RepositorySpec{
+			repo("gitea", "gitops", RepositoryRoleGitOps),
+			repo("gitea", "http://gitea.gitea.svc.cluster.local:3000/platform.team/apps.git", RepositoryRoleManaged),
+		},
+	}
+	if err := validSpec.ValidateGit(); err != nil {
+		t.Fatalf("ValidateGit() on valid Gitea spec = %v", err)
+	}
+	resolved, err := validSpec.ResolveGit()
+	if err != nil {
+		t.Fatalf("ResolveGit() = %v", err)
+	}
+	if got := resolved.BrokerForges("/creds", "/ca"); len(got) != 2 || got[1].Provider != GitProviderGitea || got[1].Scheme != ForgeSchemeHTTP || got[1].Port != 3000 {
+		t.Fatalf("BrokerForges() = %+v, want github + gitea http:3000", got)
+	}
+	entry, err := resolved.GitOps().ManagedRepoEntry()
+	if err != nil {
+		t.Fatalf("ManagedRepoEntry() = %v", err)
+	}
+	wantEntry := ManagedRepoEntry{
+		Type: GitProviderGitea,
+		URL:  "http://gitea.gitea.svc.cluster.local:3000/platform.team/gitops",
+	}
+	if entry != wantEntry {
+		t.Errorf("ManagedRepoEntry() = %+v, want %+v", entry, wantEntry)
+	}
+	warnings := resolved.Warnings()
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "spec.integration.forges[0].scheme is http") {
+		t.Errorf("Warnings() = %v, expected http warning on forges[0].scheme", warnings)
+	}
+	egress := ForgeEgressPatterns(validSpec)
+	if egress[len(egress)-1] != "gitea.gitea.svc.cluster.local" {
+		t.Errorf("ForgeEgressPatterns() = %v, expected gitea.gitea.svc.cluster.local at the end", egress)
+	}
+
+	refusalCases := []struct {
+		name string
+		spec *IntegrationSpec
+		want []string
+	}{
+		{
+			name: "missing host on gitea",
+			spec: &IntegrationSpec{Forges: []ForgeSpec{giteaForge("", ForgeSchemeHTTPS, 0, "gitea-token")}},
+			want: []string{"forges[0].host"},
+		},
+		{
+			name: "reserved github host on gitea",
+			spec: &IntegrationSpec{Forges: []ForgeSpec{giteaForge("github.com", ForgeSchemeHTTPS, 0, "gitea-token")}},
+			want: []string{"forges[0].host"},
+		},
+		{
+			name: "reserved gitlab host on gitea",
+			spec: &IntegrationSpec{Forges: []ForgeSpec{giteaForge("gitlab.com", ForgeSchemeHTTPS, 0, "gitea-token")}},
+			want: []string{"forges[0].host"},
+		},
+		{
+			name: "missing credentialsRef on gitea",
+			spec: &IntegrationSpec{Forges: []ForgeSpec{giteaForge("gitea.example.com", ForgeSchemeHTTPS, 0, "")}},
+			want: []string{"forges[0].credentialsRef"},
+		},
+		{
+			name: "http scheme on github",
+			spec: &IntegrationSpec{Forges: []ForgeSpec{{Name: "gh", Provider: GitProviderGitHub, Scheme: ForgeSchemeHTTP}}},
+			want: []string{"forges[0].scheme"},
+		},
+		{
+			name: "http scheme on external gitea host",
+			spec: &IntegrationSpec{Forges: []ForgeSpec{giteaForge("gitea.example.com", ForgeSchemeHTTP, 3000, "gitea-token")}},
+			want: []string{"forges[0].scheme"},
+		},
+		{
+			name: "caBundleRef on http gitea forge",
+			spec: &IntegrationSpec{Forges: []ForgeSpec{{
+				Name:           "gitea",
+				Provider:       GitProviderGitea,
+				Host:           "gitea.gitea.svc.cluster.local",
+				Namespace:      "platform.team",
+				Scheme:         ForgeSchemeHTTP,
+				Port:           3000,
+				CredentialsRef: &ForgeCredentialsRef{Name: "gitea-token"},
+				CABundleRef:    &ForgeCABundleRef{Name: "gitea-ca"},
+			}}},
+			want: []string{"forges[0].caBundleRef"},
+		},
+		{
+			name: "port on github",
+			spec: &IntegrationSpec{Forges: []ForgeSpec{{Name: "gh", Provider: GitProviderGitHub, Port: 8443}}},
+			want: []string{"forges[0].port"},
+		},
+		{
+			name: "duplicate self-managed host across two forges",
+			spec: &IntegrationSpec{
+				Forges: []ForgeSpec{
+					giteaForge("gitea.example.com", ForgeSchemeHTTPS, 0, "token-a"),
+					{
+						Name:           "gitea-two",
+						Provider:       GitProviderGitea,
+						Host:           "Gitea.Example.COM",
+						CredentialsRef: &ForgeCredentialsRef{Name: "token-b"},
+					},
+				},
+				Repositories: []RepositorySpec{repo("gitea-two", "org/repo", RepositoryRoleGitOps)},
+			},
+			want: []string{"forges[1].host"},
+		},
+		{
+			name: "duplicate self-managed host across gitlab and gitea forges",
+			spec: &IntegrationSpec{
+				Forges: []ForgeSpec{
+					{
+						Name:           "gl",
+						Provider:       GitProviderGitLab,
+						Host:           "forge.example.com",
+						Namespace:      "acme",
+						CredentialsRef: &ForgeCredentialsRef{Name: "gl-token"},
+					},
+					{
+						Name:           "gt",
+						Provider:       GitProviderGitea,
+						Host:           "FORGE.example.com",
+						Namespace:      "acme",
+						CredentialsRef: &ForgeCredentialsRef{Name: "gt-token"},
+					},
+				},
+			},
+			want: []string{"forges[1].host"},
+		},
+		{
+			name: "ported https gitea repository whose seeded RepoURL exceeds 256 chars while ref.URL() is 254",
+			spec: &IntegrationSpec{
+				Forges: []ForgeSpec{giteaForge(
+					strings.Repeat("a", 60)+"."+strings.Repeat("b", 60)+"."+strings.Repeat("c", 22),
+					ForgeSchemeHTTPS,
+					3000,
+					"gitea-token",
+				)},
+				Repositories: []RepositorySpec{repo(
+					"gitea",
+					strings.Repeat("o", 40)+"/"+strings.Repeat("r", 60),
+					RepositoryRoleGitOps,
+				)},
+			},
+			want: []string{"repositories[0].repository"},
+		},
+		{
+			name: "ported http gitea repository whose seeded RepoURL exceeds 256 chars while ref.URL() is 254",
+			spec: &IntegrationSpec{
+				Forges: []ForgeSpec{giteaForge(
+					strings.Repeat("a", 60)+"."+strings.Repeat("b", 60)+"."+strings.Repeat("c", 18)+".svc",
+					ForgeSchemeHTTP,
+					3000,
+					"gitea-token",
+				)},
+				Repositories: []RepositorySpec{repo(
+					"gitea",
+					strings.Repeat("o", 40)+"/"+strings.Repeat("r", 60),
+					RepositoryRoleGitOps,
+				)},
+			},
+			want: []string{"repositories[0].repository"},
+		},
+	}
+	for _, tc := range refusalCases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := tc.spec.ResolveGit()
+			if err != nil {
+				t.Fatalf("ResolveGit() = %v", err)
+			}
+			var got []string
+			for _, p := range res.Problems() {
+				got = append(got, p.Path.String())
+			}
+			if strings.Join(got, " ") != strings.Join(tc.want, " ") {
+				t.Errorf("Problems() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	// Exactly 256 characters when seeded with `:3000` is accepted.
+	exact256Spec := &IntegrationSpec{
+		Forges: []ForgeSpec{{
+			Name:           "gitea",
+			Provider:       GitProviderGitea,
+			Host:           strings.Repeat("a", 60) + "." + strings.Repeat("b", 60) + "." + strings.Repeat("c", 22),
+			Scheme:         ForgeSchemeHTTPS,
+			Port:           3000,
+			CredentialsRef: &ForgeCredentialsRef{Name: "gitea-token"},
+			CABundleRef:    &ForgeCABundleRef{Name: "gitea-ca"},
+		}},
+		Repositories: []RepositorySpec{repo(
+			"gitea",
+			strings.Repeat("o", 40)+"/"+strings.Repeat("r", 57),
+			RepositoryRoleGitOps,
+		)},
+	}
+	if err := exact256Spec.ValidateGit(); err != nil {
+		t.Fatalf("expected 256-character ported RepoURL to be accepted, got %v", err)
+	}
+	if secrets := exact256Spec.ForgeCredentialSecretNames(); strings.Join(secrets, ",") != "gitea-token" {
+		t.Errorf("ForgeCredentialSecretNames() = %v, want [gitea-token]", secrets)
+	}
+}
+
+// TestValidatePortNamesTheProvidersThatAcceptOne pins the refusal's reason: a
+// self-managed GitLab is refused a port because its broker client composes no
+// port, not because it serves fixed endpoints, so the message names the
+// providers that do accept one.
+func TestValidatePortNamesTheProvidersThatAcceptOne(t *testing.T) {
+	for _, name := range []string{GitProviderGitHub, GitProviderGitLab} {
+		provider, err := LookupGitProvider(name)
+		if err != nil {
+			t.Fatalf("LookupGitProvider(%q): %v", name, err)
+		}
+		err = provider.ValidatePort(8443)
+		want := "provider " + name + " does not accept a port; only gitea does"
+		if err == nil || err.Error() != want {
+			t.Errorf("%s ValidatePort(8443) = %v, want %q", name, err, want)
+		}
+	}
+	gitea, err := LookupGitProvider(GitProviderGitea)
+	if err != nil {
+		t.Fatalf("LookupGitProvider(gitea): %v", err)
+	}
+	if err := gitea.ValidatePort(3000); err != nil {
+		t.Errorf("gitea ValidatePort(3000) = %v, want nil", err)
 	}
 }
