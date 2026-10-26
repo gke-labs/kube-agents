@@ -103,7 +103,6 @@ FLAKY_CHECK_EXCLUDED_WORKFLOWS = (
     # The advisory database moves between attempts.
     "Security Scanning",
     # pull_request_target automations, not checks on the tree.
-    "Auto Assign Milestone on Merge",
     "Auto Enqueue",
     "Hold Unresolved Threads",
     "Merge Gate",

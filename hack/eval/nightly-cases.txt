@@ -969,6 +969,16 @@
 # install. One case, three units. deployer: noop, read-only over the seeded fleet.
 ./tasks/cost-rightsizing-names-dependencies/task.yaml
 
+# An on-demand audit that moved nothing still reports its ledger URL (#1929).
+# prebuilt/stale-audit-ledger with ledger_kind "gap" opens an ai-security-audit
+# ledger that a coverage gap opened; the clean run closes it with nothing new
+# and nothing resolved, which `finish` calls quiet only with `--scheduled`.
+# Red observed on a dev install on main d05869ae (2026-10-20): the report
+# named no ledger URL. The red depends on the worker: one that obeys the SOP's
+# on-demand rule passes on main too (the task header says more). No fixture. The same tofu shape and
+# audit band as fleet-audit-clean-close-reads-clean, so it holds the infra lock.
+./tasks/fleet-audit-on-demand-run-reports/task.yaml
+
 # A user asks for the fleet audits' summaries that never reached the chat by
 # naming them; this sends that request for every shipped fleet audit and
 # grades the reply audit by audit against the report store
