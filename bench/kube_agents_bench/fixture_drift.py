@@ -36,7 +36,7 @@ shape (the planted role, then one role per slot so the report can be held to
 every cluster): neither says the grade depends on that role's state, so
 neither excuses the case, and it is graded as usual.
 
-The change under test cannot widen any of this. On a pull request
+The change under test cannot widen any of this. On a pull request or a Tide batch
 ``hack/ci-eval-pr.sh`` passes the files it changes (``--changed-files``): a
 change to what decides drift (the catalog, the scan, the runner that
 addresses the clusters, this module) excuses nothing, and a case whose own

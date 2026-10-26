@@ -2084,8 +2084,10 @@ def assess(runs, now: datetime, roster: Roster, fixture_state_doc: dict | None =
         state, condition = DEGRADED, FIXTURE_DRIFT
         cause = CAUSE_FIXTURE_DRIFT.format(roles=", ".join(r3c["roles"]), projects=len(r3c["projects"]))
     elif r3e["fires"]:
-        # Below fixture drift: a drifted fixture reds the cases that read it,
-        # a drifted grant reds whatever the agent asks of it; both are the
+        # Below fixture drift: a drifted fixture takes the cases that read it
+        # out of the gate (they red only on a run whose own lease-time scan
+        # could not read the role), a drifted grant reds whatever the agent
+        # asks of it; both are the
         # pool's and neither is a run-based signal. A finding a leased run
         # passes with (`passes_leases`) reds nothing, and the advice says so.
         state, condition = DEGRADED, POOL_DRIFT

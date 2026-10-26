@@ -121,7 +121,7 @@ class MatchStepTest(unittest.TestCase):
         (self.tmp / "state").mkdir()
         self.calls = self.tmp / "uv-args"
 
-    def _step(self, pull_number="", base_sha="", git_ok=True, uv_ok=True):
+    def _step(self, pull_number="", base_sha="", git_ok=True, uv_ok=True, job_type="periodic"):
         script = "\n".join(
             [
                 "set -euo pipefail",
@@ -143,6 +143,7 @@ class MatchStepTest(unittest.TestCase):
                 "UV_ARGS": str(self.calls),
                 "PULL_NUMBER": pull_number,
                 "PULL_BASE_SHA": base_sha,
+                "JOB_TYPE": job_type,
             }
         )
         proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, check=False)
@@ -156,6 +157,20 @@ class MatchStepTest(unittest.TestCase):
         self.assertNotIn("--changed-files", args)
         self.assertIn("./tasks/a/task.yaml ./tasks/b/task.yaml", args)
         self.assertIn("marked-case", proc.stdout)
+
+    def test_a_tide_batch_hands_over_the_files_its_pulls_change(self):
+        # A batch carries PULL_BASE_SHA and JOB_TYPE=batch and no PULL_NUMBER;
+        # its pulls are the change under test as much as a presubmit's one.
+        self._step(base_sha="abc123", job_type="batch")
+        self.assertIn("--changed-files", self.calls.read_text())
+
+    def test_a_tide_batch_with_no_change_list_excuses_nothing(self):
+        for base, git_ok in (("", True), ("abc123", False)):
+            with self.subTest(base=base, git_ok=git_ok):
+                self.calls.unlink(missing_ok=True)
+                proc = self._step(base_sha=base, git_ok=git_ok, job_type="batch")
+                self.assertFalse(self.calls.exists(), "the mapping did not run")
+                self.assertIn("every case is graded as usual", proc.stderr)
 
     def test_a_pull_request_hands_over_the_files_it_changes(self):
         self._step(pull_number="3990", base_sha="abc123")

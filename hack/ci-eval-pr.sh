@@ -3417,21 +3417,25 @@ STATE_DIR="$(mktemp -d)"
 # (scan_lease_fixtures): one reason file each under EVAL_FIXTURE_DRIFT_DIR,
 # read by run_one_unit. The module grades every case as usual, and says so,
 # when the report is missing or unreadable; a failure to run it at all does
-# the same here. On a pull request it is handed the files the change edits
+# the same here. On a run that merges a change onto a base -- a presubmit
+# (PULL_NUMBER), a Tide batch (JOB_TYPE=batch, every pull of the batch merged
+# onto PULL_BASE_SHA, no PULL_NUMBER), or anything else carrying PULL_BASE_SHA
+# (a postsubmit's diff is empty) -- it is handed the files the change edits
 # (PULL_BASE_SHA to the merged HEAD clonerefs checked out), so a change to
-# what decides drift, or to a case, cannot excuse a case; a pull request
-# whose file list cannot be read excuses nothing.
+# what decides drift, or to a case, cannot excuse a case; such a run whose
+# file list cannot be read excuses nothing. Only a periodic, which carries
+# none of the three, maps without a list.
 FIXTURE_DRIFT_DIR="${STATE_DIR}/${EVAL_FIXTURE_DRIFT_DIR}"
 mkdir -p "${FIXTURE_DRIFT_DIR}"
 FIXTURE_DRIFT_ARGS=()
 FIXTURE_DRIFT_MATCH="true"
-if [ -n "${PULL_NUMBER:-}" ]; then
+if [ -n "${PULL_NUMBER:-}" ] || [ -n "${PULL_BASE_SHA:-}" ] || [ "${JOB_TYPE:-}" = "batch" ]; then
   FIXTURE_DRIFT_CHANGED="${STATE_DIR}/${EVAL_FIXTURE_DRIFT_CHANGED_FILES}"
   if [ -n "${PULL_BASE_SHA:-}" ] && git -C "${SCRIPT_DIR}/.." diff --name-only "${PULL_BASE_SHA}" HEAD > "${FIXTURE_DRIFT_CHANGED}" 2>/dev/null; then
     FIXTURE_DRIFT_ARGS=(--changed-files "${FIXTURE_DRIFT_CHANGED}")
   else
     FIXTURE_DRIFT_MATCH=""
-    echo "WARNING: the files this pull request changes could not be listed against PULL_BASE_SHA, so no case is excused for a drifted fixture; every case is graded as usual." >&2
+    echo "WARNING: the files this run's change edits could not be listed against PULL_BASE_SHA, so no case is excused for a drifted fixture; every case is graded as usual." >&2
   fi
 fi
 if [ -n "${FIXTURE_DRIFT_MATCH}" ] && ! (cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.fixture_drift \

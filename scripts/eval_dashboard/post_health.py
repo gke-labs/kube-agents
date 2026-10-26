@@ -763,7 +763,8 @@ def fixture_drift_sentence(health: dict, since: str) -> str:
     return (
         f"seeded {plural(len(roles), 'fixture')} {', '.join(roles) or '(unnamed)'} out of designed state"
         f" on {len(projects)} pool {plural(len(projects), 'project')} since {since};"
-        f" a red on a case that depends on {plural(len(roles), 'it', 'them')} from a run that leased one of those projects is the fixture, not the code."
+        f" a case that depends on {plural(len(roles), 'it', 'them')} is recorded as infrastructure on a run whose own scan saw the drift,"
+        f" and a red on one from a run whose scan could not read the role is the fixture, not the code."
     )
 
 
@@ -1443,7 +1444,7 @@ def fixture_digest_line(health: dict) -> str | None:
         roles = sorted({role for roles in drifted.values() for role in roles})
         return (
             f"🧭 *Seeded fleet:* {len(drifted)} of {checked} checked pool projects drifted at {when}"
-            f" ({', '.join(roles)}); a red on a case that depends on {plural(len(roles), 'it', 'them')} there is the fixture, not the code."
+            f" ({', '.join(roles)}); a case that depends on {plural(len(roles), 'it', 'them')} is not run there and counts as infrastructure."
         )
     unchecked = f", {total - checked} not checked" if total > checked else ""
     unread = int(block.get("unread_units") or 0)
