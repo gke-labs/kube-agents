@@ -150,7 +150,14 @@ CI enforcement: `make docs-check` runs the same checks as
   the page that owns its topic, not listed anywhere.
 - `docs-check-terminology` — `hack/check-docs-terminology.sh`; identifiers in
   prose must match their source (service-account names, versions, the
-  fleet-audit finding-id pattern and rendering caps, …).
+  fleet-audit finding-id pattern and rendering caps, …). Then
+  `scripts/check_docs_contracts.py`: on the site, `INSTALL.md` and `README.md`,
+  a flag cited on `install.sh`, `upgrade.sh` or `uninstall.sh` must be one its
+  `case` arms accept, every `json` field of the three CRDs must appear on its
+  CRD page, and a number directly before `fleet audits`, `A2A … images`,
+  `release images` or `<persona> skills` must equal the source's. Known
+  mismatches are listed in `scripts/docs_contracts_allowlist.txt`, which only
+  shrinks: an entry with no finding fails the check until it is dropped.
 - `docs-check-audience` — `scripts/check_docs_audience.py`; no page under
   `docs/site/src/content/docs/` may match a shape in
   `scripts/docs_audience_denylist.txt` (workflow secret and variable names, App

@@ -763,7 +763,10 @@ docs-check-links:
 	@python3 scripts/check_docs_links.py
 
 docs-check-terminology:
-	@./hack/check-docs-terminology.sh
+	@failed=0; \
+	./hack/check-docs-terminology.sh || failed=1; \
+	python3 scripts/check_docs_contracts.py || failed=1; \
+	exit $$failed
 
 docs-check-audience: ## Fail when a published site page carries a maintainer identifier (shapes: scripts/docs_audience_denylist.txt).
 	@python3 scripts/check_docs_audience.py

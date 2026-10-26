@@ -1,0 +1,37 @@
+# Findings scripts/check_docs_contracts.py reports today, one per line as
+# `<check> <path> <token>`: the check (`flag`, `field` or `count`), the document,
+# and the flag, field name or count phrase the report names. The list only
+# shrinks: an allowlisted finding passes, and an entry that matches no finding
+# fails the run until it is dropped. Fix the document and drop its line in the
+# same change; add a line only for a mismatch whose fix is pending review.
+
+# Flags. The gVisor opt-out names a flag install.sh does not accept. The other
+# two are another tool's flag (`git clone --branch`, `helm --set`) in a
+# paragraph about install.sh; naming the tool's command beside the flag clears
+# the entry.
+flag docs/site/src/content/docs/install/helm-and-kind.md --set
+flag docs/site/src/content/docs/install/prerequisites.md --gvisor
+flag docs/site/src/content/docs/install/quickstart-gke.mdx --branch
+
+# CRD fields the pages do not yet describe.
+field docs/site/src/content/docs/operator/agentplugin-crd.md conditions
+field docs/site/src/content/docs/operator/agentplugin-crd.md lastUpdated
+field docs/site/src/content/docs/operator/agentplugin-crd.md targetAgents
+field docs/site/src/content/docs/operator/agentprofile-crd.md clusterRef
+field docs/site/src/content/docs/operator/agentprofile-crd.md conditions
+field docs/site/src/content/docs/operator/agentprofile-crd.md location
+field docs/site/src/content/docs/operator/agentprofile-crd.md observedGeneration
+field docs/site/src/content/docs/operator/agentprofile-crd.md projectId
+field docs/site/src/content/docs/operator/agentprofile-crd.md queueTimeoutSeconds
+field docs/site/src/content/docs/operator/platformagent-crd.md accessModes
+field docs/site/src/content/docs/operator/platformagent-crd.md defaultStorageClassName
+field docs/site/src/content/docs/operator/platformagent-crd.md mountPath
+field docs/site/src/content/docs/operator/platformagent-crd.md readOnly
+field docs/site/src/content/docs/operator/platformagent-crd.md storageClassName
+field docs/site/src/content/docs/operator/platformagent-crd.md storageSize
+
+# Counts that predate the tenth fleet audit and the fifth A2A image.
+count docs/site/src/content/docs/deploy/docker-images.md four A2A next-stack images
+count docs/site/src/content/docs/operator/platformagent-crd.md nine fleet audits
+count docs/site/src/content/docs/reference/credential-isolation.md six audit crons
+count docs/site/src/content/docs/reference/cron-jobs.md nine governance watchdogs
