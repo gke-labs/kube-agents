@@ -29,3 +29,11 @@ oss\.gprow\.dev
 
 # Internal repositories.
 gke-internal/
+
+# Maintainer release-pipeline markers: the eval-candidate and release-candidate
+# tag families and the release workflows. A page that needs them is a release
+# runbook, and its home is scripts/release/README.md. The word boundary keeps
+# `src_1` and the like clear of the `rc_` family.
+evalcand_
+\brc_[0-9]
+\.github/workflows/release-

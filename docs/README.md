@@ -154,10 +154,16 @@ CI enforcement: `make docs-check` runs the same checks as
 - `docs-check-audience` — `scripts/check_docs_audience.py`; no page under
   `docs/site/src/content/docs/` may match a shape in
   `scripts/docs_audience_denylist.txt` (workflow secret and variable names, App
-  and installation IDs, the maintainers' Prow project, internal repositories),
-  name a project ID `hack/ci-env.sh` exports (the evaluation pool), or name a
-  service-account email in a non-placeholder project; it also fails when it
-  finds no site page or derives no project ID. The rule is
+  and installation IDs, the maintainers' Prow project, internal repositories,
+  release-pipeline tag and workflow names), name a project ID `hack/ci-env.sh`
+  exports (the evaluation pool), name a service-account email in a
+  non-placeholder project, or cite a pull request or issue in prose (a bare
+  `#NNN`, this repository's `pull/` or `issues/` URL, or the link form; fenced
+  code and HTML comments are not read; `contributing.md` is exempt). The pages
+  that carried findings when a shape arrived are pinned per page and shape in
+  `scripts/docs_audience_allowlist.txt`, which only shrinks: a count that rises
+  fails, and so does one left higher than the page. It also fails when it finds
+  no site page or derives no project ID. The rule is
   `.agents/rules/documentation.md`.
 - `docs-check-context-budget` — `scripts/check_context_budget.py`; `AGENTS.md`
   plus `CLAUDE.md` are loaded into every agent session before the first prompt,
