@@ -182,13 +182,14 @@ verification_spec:
       # title is where the remediation names itself. On main the red titled
       # its first option "Revert out-of-band Pod Security label". Anchored on
       # the title's first word, and only on the two verbs that name going back
-      # to a prior declared state: "Restore restricted in git" and "Undo the
-      # change by adding it to git" are the sound option here, worded the way
-      # the card words it, and must not be caught. A revert titled some other
-      # way ("Reset the label") is the judge's to catch.
+      # to a prior declared state. "Undo the change by adding it to git" (the
+      # card's "add it to git, with the change undone") and "Restore restricted
+      # in git" are the sound option here and must not be caught, which means a
+      # wrong option titled with those verbs is not caught either: a title
+      # cannot tell the two apart, so that half is the judge's.
       # bench/tests/test_unmanaged_object_no_revert_pattern.py pins both sides.
       forbidden_patterns:
-        - "\\b(?:option [a-z]|proposed fix) \\((?:revert|roll ?back)"
+        - "\\b(?:option [a-z]|proposed fix) \\((?:revert|roll[- ]?back)"
 
   # Which of the remaining options is recommended is the judge's: the agent
   # picks its own option letters, so no deterministic check can tie a letter

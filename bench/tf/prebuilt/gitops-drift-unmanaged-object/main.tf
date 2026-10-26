@@ -38,14 +38,16 @@
 # step 1 asserts that before the drift is made: the only managers are
 # `kubectl-create` and, after step 2, `kubectl-label`. It also carries no
 # `kubectl.kubernetes.io/last-applied-configuration`, which a client-side
-# apply leaves -- a person's or an older Argo CD's alike, which is why the
+# apply leaves -- a person's and Argo CD's client-side sync alike, which is why the
 # skill reads a `kubectl-client-side-apply` manager as ambiguous rather than
 # as git.
 #
 # The bench's own `managed-by` / `case` / `build-id` / `pull-number` labels are
 # on the namespace because drift_clear_namespace requires them to delete a
 # leftover. `managed-by: kube-agents-bench` is the closest thing to a
-# management marker the object carries, and it names a test harness, not git.
+# management marker the object carries, and it names a test harness, not git;
+# it is not Helm's `app.kubernetes.io/managed-by`, which the skill reads as
+# ambiguous.
 #
 # WHY THE RECORD IS PLANTED RATHER THAN OBSERVED: ../gitops-drift's header
 # carries the argument and it applies unchanged.

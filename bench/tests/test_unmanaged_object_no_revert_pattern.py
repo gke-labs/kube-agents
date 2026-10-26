@@ -1,10 +1,25 @@
+# Copyright 2026 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """gitops-drift-unmanaged-object-triage's two report checks on the conclusion.
 
 The report_contains verifier ``re.search``es each pattern over
 ``_normalize_lines`` (lowercased, emphasis and backticks dropped). The
 object in that case is one git never declared, so no option may be a
-revert, while "add it to git with the change undone" -- worded however the
-agent likes -- is the sound option and must pass.
+revert, while "add it to git with the change undone" is the sound option and
+must pass in the wordings below. A title cannot tell a wrong "Undo ..." from a
+right one, so the pattern leaves both to the judge.
 """
 
 from __future__ import annotations
@@ -64,7 +79,8 @@ def test_the_sound_option_is_not_taken_for_a_revert():
 
 
 def test_a_single_option_revert_is_caught():
-    assert not _offers_no_revert("- **Proposed fix (Roll back the label):** Remove it in GitOps.")
+    for title in ("Roll back the label", "Roll-back the label", "Revert the label"):
+        assert not _offers_no_revert(f"- **Proposed fix ({title}):** Remove it in GitOps."), title
 
 
 def test_the_red_does_not_say_git_lacks_the_object_and_the_green_does():
