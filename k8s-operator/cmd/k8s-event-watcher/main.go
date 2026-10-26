@@ -87,9 +87,12 @@ const (
 	// the watcher knows, and no more.
 	followupMessage = "no new events for this object since the last sighting"
 	// The outcomes of k8s_event_watcher_followups_total: the daemon accepted
-	// the line for the session's thread (it posts after answering, so a chat
-	// failure past that point is invisible here, as for the alert), it had
-	// neither a thread nor a card to post into, or the inject failed.
+	// the line (for a session with a thread it posts after answering, so a
+	// chat failure past that point is invisible here, as for the alert; for
+	// one with a card but no thread the card line was already written), it
+	// had neither a thread nor a card to post into, or the inject failed,
+	// which includes the daemon's 503 for a card still to come, retried each
+	// sweep for an hour.
 	followupOutcomeSent     = "sent"
 	followupOutcomeUnrouted = "unrouted"
 	followupOutcomeError    = "error"
