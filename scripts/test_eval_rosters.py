@@ -566,13 +566,14 @@ class SplitLostNothingTest(unittest.TestCase):
 
 
 # The inject lane's exclusions, introduced by #2039 (2026-09-25); #4004 put the
-# front door's delegation and question cases back, agent-kanban-smoke among
-# them. An edit to the file edits this set in the same pull request, for the
+# front door's delegation cases and two question cases back, agent-kanban-smoke
+# among them. An edit to the file edits this set in the same pull request, for the
 # reason the sets above are pinned.
 INJECT_LANE_EXCLUDED = [
     "chat-voice-retry-says-it-is-retried",  # #4004: grades the front door's reply to a crashed card's wake, which under next reaches no user
     "chat-voice-final-attempt-is-not-retried",  # the same for a card's last-attempt wake
     "chat-voice-failure-leads-with-fact",  # the same for a blocked card's wake
+    "chat-question-typed-answer-fresh-session",  # #4004: its answer turn is today's Slack thread context, which next's door does not send
     "chat-reset-history-names-the-command",  # #2039: grades the front door's answer to a reset request; excluded under cli, not yet graded on api
     "chat-routing-board-read",  # the same for the front door reading the board instead of filing a card
     "first-install-hello-running",  # #2039: grades the chat profile's onboarding greeting; excluded under cli, not yet graded on api
@@ -585,6 +586,7 @@ INJECT_LANE_EXCLUDED_TIER = {
     "chat-voice-retry-says-it-is-retried": "nightly",
     "chat-voice-final-attempt-is-not-retried": "nightly",
     "chat-voice-failure-leads-with-fact": "nightly",
+    "chat-question-typed-answer-fresh-session": "nightly",
     "chat-reset-history-names-the-command": "nightly",
     "chat-routing-board-read": "nightly",
     "first-install-hello-running": "nightly",

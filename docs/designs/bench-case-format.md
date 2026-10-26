@@ -59,7 +59,9 @@ replay of a card's wake rather than an ask
 ([`bench/kube_agents_bench/card_wake.py`](../../bench/kube_agents_bench/card_wake.py)); a replay
 sends its turns to the agent's API server under either `AGENT_TRANSPORT`, as a card's wake reaches
 the front door there under `spec.mode: next` too. Under next the reply to that wake is posted
-nowhere, so a case that grades it stays in `hack/eval/inject-lane-exclusions.txt`. A first line of
+nowhere, and a `session: fresh` answer carries today's Slack thread context, which next's door
+does not send, so a case that grades either stays in `hack/eval/inject-lane-exclusions.txt`. A
+first line of
 `[bench:stop-after-first-card]`, optionally with `observe=<seconds>`, makes the rest of the
 prompt an ask the harness stops once it has filed a card
 ([`bench/kube_agents_bench/stop_hook.py`](../../bench/kube_agents_bench/stop_hook.py)); it runs

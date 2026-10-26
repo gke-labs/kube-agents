@@ -1969,7 +1969,9 @@ class KubeAgentsHarness(AgentHarness):
         # next; here it runs as the bridge's api executor would run it,
         # without the door. For an ordinary label the click turn the plant
         # builds (slack_ux_clicks._turn_text) is the text next's gateway sends
-        # for a click (chat_message.NEEDS_YOU_REPLY, slack_interactive.go).
+        # for a click (chat_message.NEEDS_YOU_REPLY, slack_interactive.go); a
+        # session: fresh answer carries today's Slack thread context, which
+        # next's door does not send.
         try:
             planted = card_wake.plant(_agent_shell, replay, _EXEC_TIMEOUT)
         except card_wake.ReplayMismatch as exc:

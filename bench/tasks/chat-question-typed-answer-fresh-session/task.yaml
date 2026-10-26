@@ -33,6 +33,9 @@
 # ON SPEC.MODE NEXT (#4004). The case grades what the user sees: the thread's
 # card carries the answer and is unblocked, and the decoy is untouched. It does
 # not grade how the agent got there (kanban_comment or kanban_unblock called).
+# It stays off the inject lane (hack/eval/inject-lane-exclusions.txt): its
+# answer turn carries today's Slack thread context, which next's door does
+# not send.
 id: chat-question-typed-answer-fresh-session
 name: A typed answer from a new thread session reaches the card whose question the thread shows
 prompt: |-

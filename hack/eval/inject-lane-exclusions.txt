@@ -50,6 +50,15 @@ chat-voice-final-attempt-is-not-retried
 # blocked card sends.
 chat-voice-failure-leads-with-fact
 
+# #4004: grades a typed answer sent on a new session that starts from the
+# thread's context as today's Slack adapter renders it
+# (bench/kube_agents_bench/card_wake.py, session: fresh). Next's door sends
+# the message's own text, and a cold conversation is primed from the bus in
+# another frame (a2a/worker-adapter/adapter.go), so the replay's answer turn
+# is one no next-mode user sends. Returns to the lane when the replay builds
+# that turn as next's door does.
+chat-question-typed-answer-fresh-session
+
 # #2039: a nightly-only case that grades the front door's answer to a reset
 # request. It was excluded while the lane pinned the bridge's cli executor,
 # under which the door's task reached `platform` and no front door took the

@@ -558,7 +558,9 @@ card-wake replays run on this lane as well, because under `next` a card's wake r
 door through the in-pod API server, not the gateway; the question cases grade the reply to the
 user's answer and the card, not the reply to the wake. What stays listed is the cases that grade
 the front door's reply to a failed card's wake, which under `next` reaches no user: the notifier
-posts its own text about the failure and the reply stays in the session. A case
+posts its own text about the failure and the reply stays in the session. So does the
+fresh-session question case, whose answer turn carries today's Slack thread context, a turn
+next's door never sends. A case
 excluded while the lane pinned the `cli` executor, for a reason only that executor gave, stays
 listed until a run on `api` grades it.
 `hack/ci-eval-pr.sh` drops the listed cases from the matrix on that lane only, and says so in
