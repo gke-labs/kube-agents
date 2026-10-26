@@ -160,6 +160,7 @@ from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     DELEGATION_TOOL,
     STATUS_TOOL,
+    _json_object,
     delegated_task_ids,
     delivered_results,
     merge_new,
@@ -3319,13 +3320,34 @@ class KubeAgentsHarness(AgentHarness):
                 if infra_reason:
                     break
 
+        # Collect the last kanban_show payload per awaited card from observed.
+        # We read status and runs[-1].summary from the same final payload rather than
+        # relying on delivered_results (which has first-payload-wins semantics for deliverables).
+        # Note: Assumes Hermes _handle_show lists task_runs ascending by id so runs[-1] is the newest run.
+        last_observed_show: dict[str, tuple[str | None, str | None]] = {}
+        for entry in observed or []:
+            payload = _json_object(entry.get("result"))
+            shown = payload.get("task")
+            if not isinstance(shown, dict) or shown.get("id") not in awaited:
+                continue
+            tid = str(shown["id"])
+            status = shown.get("status")
+            summary = None
+            runs = payload.get("runs")
+            if isinstance(runs, list) and runs:
+                last_run = runs[-1]
+                if isinstance(last_run, dict):
+                    s = last_run.get("summary")
+                    if isinstance(s, str) and s.strip():
+                        summary = s
+            last_observed_show[tid] = (status, summary)
+
         obs_statuses = reported_statuses(observed)
         all_messages: list[str] = list(board_messages)
-        all_messages.extend(
-            text
-            for tid, text in delivered_results(observed, awaited).items()
-            if obs_statuses.get(tid) == "blocked" or not obs_statuses
-        )
+        for tid, (status, summary) in last_observed_show.items():
+            final_status = obs_statuses.get(tid, status)
+            if (final_status == "blocked" or not obs_statuses) and summary:
+                all_messages.append(summary)
 
         if not infra_reason and all_messages:
             for text in all_messages:

@@ -448,3 +448,24 @@ def test_read_board_state_newest_run_empty_summary_does_not_fall_back_to_older_r
     assert statuses == {"t_failed": "blocked"}
     assert "t_failed" not in summaries
     assert errors == {"t_failed": "model replied in text and made no terminal kanban call"}
+
+
+def test_read_session_cards_newest_run_empty_summary_does_not_fall_back_to_older_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_session_store(tmp_path, created=[FRONT])
+    set_card(
+        tmp_path,
+        FRONT,
+        "blocked",
+        summary="provider rate limit: API retries exhausted (failure_reason=rate_limit)",
+    )
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, summary) VALUES (?, 'platform', 'blocked', '')",
+            (FRONT,),
+        )
+    shell = local_shell(tmp_path, monkeypatch)
+    read = board.read_session_cards(shell, SESSION, 5, want=[FRONT])
+    assert read is not None
+    assert read.cards[FRONT]["summary"] is None
