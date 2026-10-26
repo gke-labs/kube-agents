@@ -616,7 +616,7 @@ kubectl get platformagent platform-agent -n kubeagents-system \
 - **The home channel only from `install.env`**, as in step 2 above.
 
 Slash commands, buttons, cards and the other Slack features that do not carry over are listed in
-[ChatOps → What carries over from default mode](/kube-agents/concepts/chatops/#what-carries-over-from-default-mode).
+[ChatOps → What carries over from `today`](/kube-agents/concepts/chatops/#what-carries-over-from-today).
 
 ### After the switch: the Slack app
 
