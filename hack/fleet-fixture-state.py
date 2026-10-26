@@ -681,9 +681,15 @@ def evaluate(entry: dict, objects: list, *, channel_default=None, channel_valid=
             version = _gke_version(values[0])
             if version is None:
                 return f"{label}: {_describe(values)}, not a GKE version"
-            offered = [(key, str(v)) for v in valid if (key := _gke_version(v))]
-            if not offered:
-                raise Unreadable(f"none of {name}'s {len(valid)} valid versions is a GKE version, so nothing can be ordered against them")
+            # Any entry outside the GKE shape refuses the roster, as
+            # seeded_b_pin.py does: ordering against the rest could drop the
+            # newest patch and read the master as ahead.
+            offered = []
+            for v in valid:
+                key = _gke_version(v)
+                if key is None:
+                    raise Unreadable(f"{name}'s {SERVER_CONFIG_VALID} entry {v!r} is not a GKE version, so nothing can be ordered against the roster")
+                offered.append((key, str(v)))
             same_minor = [(key, v) for key, v in offered if key[:MINOR_PREFIX_LEN] == version[:MINOR_PREFIX_LEN]]
             ok = str(values[0]) in valid or any(key > version for key, _ in same_minor or offered)
             if not ok:
@@ -717,7 +723,9 @@ class Reader:
         self.directory = directory
         self.project = project
         self.context = context
-        self._channels: dict[tuple[str, str], dict | None] = {}
+        # A failed read is kept too, so the pass pays one get-server-config
+        # per location and channel whichever way it went.
+        self._channels: dict[tuple[str, str], dict | None | Unreadable] = {}
         self._pods: dict[Path, dict[str, list]] = {}
 
     def objects_for(self, role: str, spec: dict, subject: str) -> list:
@@ -741,8 +749,14 @@ class Reader:
             raise Unreadable(f"{CONTEXT_FILE} records no location for slot {slot!r}")
         key = (location, channel)
         if key not in self._channels:
-            self._channels[key] = read_channel(self.project, location, channel)
-        return self._channels[key]
+            try:
+                self._channels[key] = read_channel(self.project, location, channel)
+            except Unreadable as exc:
+                self._channels[key] = exc
+        cached = self._channels[key]
+        if isinstance(cached, Unreadable):
+            raise cached
+        return cached
 
     def channel_default_for(self, spec: dict):
         def lookup(channel: str) -> str | None:

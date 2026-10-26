@@ -119,6 +119,9 @@ if args[:3] == ["container", "clusters", "describe"]:
         sys.exit(1)
     print(json.dumps(doc))
 elif args[:2] == ["container", "get-server-config"]:
+    if world.get("server_config") == "UNREACHABLE":
+        print("ERROR: (gcloud.container.get-server-config) ResponseError: code=503", file=sys.stderr)
+        sys.exit(1)
     print(json.dumps(world.get("server_config", {})))
 else:
     print("unexpected gcloud call: " + " ".join(args), file=sys.stderr)
@@ -614,6 +617,10 @@ class EvaluateTest(unittest.TestCase):
         # never "ahead of every version it offers".
         with self.assertRaises(ffs.Unreadable):
             ffs.evaluate(entry, [on_channel], channel_valid={"REGULAR": ["1.34", "latest"]}.get)
+        # One stray entry is enough: ordering against the rest could drop the
+        # newest patch of the minor and read the master as ahead.
+        with self.assertRaises(ffs.Unreadable):
+            ffs.evaluate(entry, [ahead], channel_valid={"REGULAR": ["1.34.11-gke.1209000", "1.34.13"]}.get)
 
     def test_not_ahead_of_channel_is_cluster_only_and_takes_no_value(self):
         def load(entry):
@@ -1112,6 +1119,14 @@ class PassTest(_Harness):
         done = self.run_script(world)
         assert "0 drifted" in done.stderr, done.stderr
         assert self.drift_files() == {}
+
+    def test_a_failed_server_config_read_is_made_once_per_pass(self):
+        world = _healthy_world()
+        world["server_config"] = "UNREACHABLE"
+        done = self.run_script(world)
+        assert "version-laggard" not in self.drift_files(), done.stderr
+        assert "1 not checked" in done.stderr, done.stderr
+        assert self.log.read_text().count("get-server-config") == 1, self.log.read_text()
 
     def test_a_channel_entry_without_valid_versions_leaves_the_laggard_not_checked(self):
         for roster in (None, []):
