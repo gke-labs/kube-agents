@@ -212,6 +212,7 @@ _FRONT_DOOR_NON_ACTION_TOOLS = frozenset({
     "list_agents",
     "mcp__router__list_agents",
     "memory",
+    "multiuser_memory",
     "memory_recall",
     "memory_retain",
     "memory_reflect",
@@ -3082,13 +3083,17 @@ class KubeAgentsHarness(AgentHarness):
             if bstate is not None:
                 on_board, bsummaries, berrors = bstate
                 for t in on_board:
-                    if t in bsummaries:
-                        last_board_summaries[t] = bsummaries[t]
+                    if on_board[t] == "blocked":
+                        if t in bsummaries:
+                            last_board_summaries[t] = bsummaries[t]
+                        else:
+                            last_board_summaries.pop(t, None)
+                        if t in berrors:
+                            last_board_errors[t] = berrors[t]
+                        else:
+                            last_board_errors.pop(t, None)
                     else:
                         last_board_summaries.pop(t, None)
-                    if t in berrors:
-                        last_board_errors[t] = berrors[t]
-                    else:
                         last_board_errors.pop(t, None)
                 latest.update(on_board)
                 if all(t in on_board for t in outstanding) and not any(
@@ -3179,6 +3184,10 @@ class KubeAgentsHarness(AgentHarness):
             # every turn after the first terminal card as settled.
             fresh_reported = reported_statuses(new_calls(status_turn, seen_calls))
             latest.update(fresh_reported)
+            for t, st in fresh_reported.items():
+                if st not in _TERMINAL_STATUSES:
+                    last_board_summaries.pop(t, None)
+                    last_board_errors.pop(t, None)
             _fold_status_turn(
                 result,
                 status_turn,
@@ -3325,33 +3334,38 @@ class KubeAgentsHarness(AgentHarness):
                 if infra_reason:
                     break
 
-        # Collect the last kanban_show payload per awaited card from observed.
-        # We read status and runs[-1].summary from the same final payload rather than
+        # Collect the last observed board payload per awaited card from observed.
+        # We read status and newest run summary from the same final payload rather than
         # relying on delivered_results (which has first-payload-wins semantics for deliverables).
+        # Both kanban_show ({"task": {...}, "runs": [...]}) and kanban_list ({"tasks": [...]})
+        # are tracked so that a later batched status read supersedes an earlier show's summary.
         # Note: Assumes Hermes _handle_show lists task_runs ascending by id so runs[-1] is the newest run.
-        last_observed_show: dict[str, tuple[str | None, str | None]] = {}
+        last_observed_cards: dict[str, tuple[str | None, str | None]] = {}
         for entry in observed or []:
             payload = _json_object(entry.get("result"))
             shown = payload.get("task")
-            if not isinstance(shown, dict) or shown.get("id") not in awaited:
-                continue
-            tid = str(shown["id"])
-            status = shown.get("status")
-            summary = None
-            runs = payload.get("runs")
-            if isinstance(runs, list) and runs:
-                last_run = runs[-1]
-                if isinstance(last_run, dict):
-                    s = last_run.get("summary")
-                    if isinstance(s, str) and s.strip():
-                        summary = s
-            last_observed_show[tid] = (status, summary)
+            if isinstance(shown, dict) and (shown.get("id") in awaited or str(shown.get("id")) in awaited):
+                tid = str(shown["id"])
+                status = shown.get("status")
+                summary = None
+                runs = payload.get("runs")
+                if isinstance(runs, list) and runs:
+                    last_run = runs[-1]
+                    if isinstance(last_run, dict):
+                        s = last_run.get("summary")
+                        if isinstance(s, str) and s.strip():
+                            summary = s
+                last_observed_cards[tid] = (status, summary)
+            tasks = payload.get("tasks")
+            if isinstance(tasks, list):
+                for task in tasks:
+                    if isinstance(task, dict) and (task.get("id") in awaited or str(task.get("id")) in awaited):
+                        tid = str(task["id"])
+                        last_observed_cards[tid] = (task.get("status"), None)
 
-        obs_statuses = reported_statuses(observed)
         all_messages: list[str] = list(board_messages)
-        for tid, (status, summary) in last_observed_show.items():
-            final_status = obs_statuses.get(tid, status)
-            if (final_status == "blocked" or not obs_statuses) and summary:
+        for tid, (status, summary) in last_observed_cards.items():
+            if status == "blocked" and summary:
                 all_messages.append(summary)
 
         if not infra_reason and all_messages:

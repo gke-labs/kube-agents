@@ -2249,6 +2249,78 @@ def test_delegated_worker_board_rate_limit_cleared_on_retry_stays_graded(
     assert read_count >= 2
 
 
+def test_delegated_worker_board_rate_limit_errors_cleared_on_retry_stays_graded(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When a card is unblocked and retried, earlier board rate limit errors are discarded and the run stays graded."""
+    rate_limit_msg = "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"
+    read_count = 0
+
+    def _shell(script: str, timeout: float) -> str:
+        nonlocal read_count
+        if board.BOARD_PRESENT in script:
+            read_count += 1
+            if read_count == 1:
+                payload = {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {},
+                    "errors": {_TASK_ID: rate_limit_msg},
+                }
+            else:
+                payload = {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {},
+                    "errors": {},
+                }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        if worker_trajectory.CAPTURE_PRESENT in script or "kanban_worker_children" in script:
+            payload = {"cards": [], "calls": [], "errors": [], "unread": [], "clipped": []}
+            return f"{worker_trajectory.CAPTURE_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    stub_agent.turns = [_create_turn(), _show_turn("running"), _show_turn("blocked")]
+
+    result = KubeAgentsHarness().run("Find the root cause of the frontend outage.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert read_count >= 2
+
+
+def test_delegated_worker_board_rate_limit_cleared_on_status_turn_unblock_even_if_next_board_exec_fails(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A board summary from run 1 is dropped when a status turn reports the card non-terminal, even if the subsequent board exec fails."""
+    rate_limit_msg = "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"
+    read_count = 0
+
+    def _shell(script: str, timeout: float) -> str:
+        nonlocal read_count
+        if board.BOARD_PRESENT in script:
+            read_count += 1
+            if read_count == 1:
+                payload = {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {_TASK_ID: rate_limit_msg},
+                    "errors": {},
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            # Read 2 fails (e.g. transient kubectl exec failure)
+            return ""
+        if worker_trajectory.CAPTURE_PRESENT in script or "kanban_worker_children" in script:
+            payload = {"cards": [], "calls": [], "errors": [], "unread": [], "clipped": []}
+            return f"{worker_trajectory.CAPTURE_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    stub_agent.turns = [_create_turn(), _show_turn("running"), _show_turn("blocked")]
+
+    result = KubeAgentsHarness().run("Find the root cause of the frontend outage.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert read_count >= 2
+
+
 def test_a_mute_agent_leaves_no_transcript_behind(
     stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -4167,6 +4239,7 @@ def test_settle_delegated_worker_rate_limit_sanctioned_front_door_tools_is_infra
     trajectory = [
         {"name": "list_agents"},
         {"name": "memory_recall"},
+        {"name": "multiuser_memory"},
         {"name": "kanban_create"},
         {"name": "kanban_comment"},
         {"name": "kanban_unblock"},
@@ -4273,6 +4346,33 @@ def test_settle_delegated_worker_rate_limit_with_worker_actions_stays_graded(
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
     assert res.output == "router ack"
     assert tool_entry in res.trajectory
+
+
+def test_settle_delegated_worker_rate_limit_with_worker_commands_in_log_stays_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When captured entries are empty but worker log contains executed commands, worker acted and stays graded."""
+    body = (
+        "  ┊ 💻 $ kubectl get pods 0.4s [exit 0]\n"
+        "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429\n"
+    )
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+    assert res.output == "router ack"
+    assert res.metadata.get("worker_commands") == [{"task": "t_1", "command": "kubectl get pods"}]
 
 
 def test_settle_delegated_worker_board_summary_rate_limit_is_infra(
@@ -4561,6 +4661,44 @@ def test_settle_two_kanban_shows_newer_unblocked_run_empty_summary_stays_graded(
         }),
     }
     observed = [show_1, show_2]
+    harness.KubeAgentsHarness._settle(
+        res,
+        observed,
+        ["t_1"],
+        board_messages=[],
+    )
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+def test_settle_kanban_list_after_kanban_show_unblocked_retry_stays_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a kanban_list reading occurs after a kanban_show, the later reading supersedes the show's summary."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {})
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    rate_limit_text = "provider rate limit: API retries exhausted (failure_reason=rate_limit) on card t_1"
+    show_1 = {
+        "name": "kanban_show",
+        "result": json.dumps({
+            "task": {"id": "t_1", "status": "blocked"},
+            "runs": [{"summary": rate_limit_text}],
+        }),
+    }
+    list_entry = {
+        "name": "kanban_list",
+        "result": json.dumps({
+            "tasks": [{"id": "t_1", "status": "blocked"}],
+        }),
+    }
+    observed = [show_1, list_entry]
     harness.KubeAgentsHarness._settle(
         res,
         observed,
