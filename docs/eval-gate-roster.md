@@ -333,7 +333,7 @@ Admitted on the record since the split:
   adds a second objective, that the collector ran. The record behind this line is measured on
   its own pull request, #3975, rather than on three nightlies, because no nightly has graded the case since
   the fix: `ci-kube-agents-eval-nightly` and `ci-kube-agents-eval-nightly-today` hit their ceilings between the matrix's second and third
-  repetition rounds on 2026-10-23, 10-24 and 10-25 (the lane outgrew its budget,
+  repetition rounds on 2026-10-24, 10-25 and 10-26 (UTC start, as this page dates nightly builds; the lane outgrew its budget,
   [#3821](https://github.com/gke-labs/kube-agents/issues/3821)), so no case got a verdict row.
   The measurement: a temporary commit ran the probe at ten repetitions on
   `pull-kube-agents-smoke-test` (Claude, inject lane, build 2114752100574433280 on
@@ -342,7 +342,7 @@ Admitted on the record since the split:
   (api lane, build 2114768845334908928 on kube-agents-evals-14: 10/10 with the route objective
   graded on every repetition), judge 1.0 throughout, against the 18/21 Gemini record; on the Gemini presubmit, before the
   agent model moved, the route measured 10/10 (build 2112734825008861184, 2026-10-20). The two
-  nights between the demotion and the fix, 2026-10-21 (2113057845506215936) and 10-22
+  nights between the demotion and the fix, 2026-10-22 (2113057845506215936) and 10-23
   (2113420200605913088), were 3/3; the Claude nightlies never failed the case. The demotion's
   exit condition named 90% over 20 runs on the Gemini nightly; no eval job has run the agent on
   Gemini since the presubmit moved to Claude on 2026-10-22 (GoogleCloudPlatform/oss-test-infra#2737,
