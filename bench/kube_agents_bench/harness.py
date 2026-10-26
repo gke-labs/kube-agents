@@ -3317,6 +3317,7 @@ class KubeAgentsHarness(AgentHarness):
         front_door_acted = any(
             isinstance(e, dict)
             and not e.get("agent")
+            and bool(e.get("name"))
             and e.get("name") not in _FRONT_DOOR_NON_ACTION_TOOLS
             for e in result.trajectory
         )

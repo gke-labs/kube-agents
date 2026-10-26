@@ -2321,6 +2321,112 @@ def test_delegated_worker_board_rate_limit_cleared_on_status_turn_unblock_even_i
     assert read_count >= 2
 
 
+@pytest.mark.parametrize(
+    ("branch_name", "board_replies", "stub_turn_factories"),
+    [
+        pytest.param(
+            "gate_non_terminal_read_drops_summary",
+            [
+                {
+                    "statuses": {_TASK_ID: "running"},
+                    "summaries": {_TASK_ID: "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"},
+                    "errors": {},
+                },
+                None,  # second read fails (returns "")
+            ],
+            [_create_turn, lambda: _show_turn("blocked")],
+            id="gate_non_terminal_read",
+        ),
+        pytest.param(
+            "read2_pop_missing_summary_on_blocked_read",
+            [
+                {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {_TASK_ID: "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"},
+                    "errors": {},
+                },
+                {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {},
+                    "errors": {},
+                },
+            ],
+            [_create_turn, lambda: _turn(_text("investigating...")), lambda: _show_turn("blocked")],
+            id="read2_pop_summary",
+        ),
+        pytest.param(
+            "read2_pop_missing_error_on_blocked_read",
+            [
+                {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {},
+                    "errors": {_TASK_ID: "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"},
+                },
+                {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {},
+                    "errors": {},
+                },
+            ],
+            [_create_turn, lambda: _turn(_text("investigating...")), lambda: _show_turn("blocked")],
+            id="read2_pop_error",
+        ),
+        pytest.param(
+            "filter_terminal_status_done_ignores_stale_summary",
+            [
+                {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {_TASK_ID: "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"},
+                    "errors": {},
+                },
+            ],
+            [_create_turn, lambda: _show_turn("done")],
+            id="filter_status_done_summary",
+        ),
+        pytest.param(
+            "filter_terminal_status_done_ignores_stale_error",
+            [
+                {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {},
+                    "errors": {_TASK_ID: "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"},
+                },
+            ],
+            [_create_turn, lambda: _show_turn("done")],
+            id="filter_status_done_error",
+        ),
+    ],
+)
+def test_delegated_worker_board_rate_limit_clearing_branches_pinned(
+    branch_name: str,
+    board_replies: list[dict[str, Any] | None],
+    stub_turn_factories: list[Any],
+    stub_agent: _StubAgentServer,
+    instant_polls: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each clearing branch in _await_delegated_work's per-card board tracking decides independently."""
+    replies_iter = iter(board_replies)
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = next(replies_iter, None)
+            if payload is None:
+                return ""
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        if worker_trajectory.CAPTURE_PRESENT in script or "kanban_worker_children" in script:
+            payload = {"cards": [], "calls": [], "errors": [], "unread": [], "clipped": []}
+            return f"{worker_trajectory.CAPTURE_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    stub_agent.turns = [f() for f in stub_turn_factories]
+
+    result = KubeAgentsHarness().run("Find the root cause of the frontend outage.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+
+
 def test_a_mute_agent_leaves_no_transcript_behind(
     stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -4252,6 +4358,58 @@ def test_settle_delegated_worker_rate_limit_sanctioned_front_door_tools_is_infra
     assert "delegated worker hit infrastructure failure (rate_limit)" in res.errors[0]
     assert res.output == "router ack"
     assert res.trajectory == trajectory
+
+
+@pytest.mark.parametrize("tool_name", sorted(harness._FRONT_DOOR_NON_ACTION_TOOLS))
+def test_settle_delegated_worker_rate_limit_every_sanctioned_tool_individually_is_infra(
+    tool_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every member of _FRONT_DOOR_NON_ACTION_TOOLS individually permits classification as infra."""
+    body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    trajectory = [{"name": tool_name}]
+    res = harness.AgentResult(output="router ack", trajectory=list(trajectory))
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+
+    assert res.has_errors()
+    assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "delegated worker hit infrastructure failure (rate_limit)" in res.errors[0]
+
+
+def test_settle_delegated_worker_rate_limit_orphaned_tool_output_is_infra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An orphaned tool output with empty name synthesised by parse_response does not count as front-door action."""
+    body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    orphan_entry = {"name": "", "args": {}, "result": "orphan", "status": "completed"}
+    res = harness.AgentResult(output="router ack", trajectory=[orphan_entry])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+
+    assert res.has_errors()
+    assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "delegated worker hit infrastructure failure (rate_limit)" in res.errors[0]
 
 
 def test_settle_delegated_worker_rate_limit_preserves_front_door_trajectory(
