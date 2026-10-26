@@ -13,19 +13,18 @@
 # agents/platform/SOUL.md §0 step 3 and agents/cluster/SOUL.md §6 step 4 say
 # whoever owns the user's card blocks with the question.
 #
-# The objectives read the platform worker's kanban_block call (scope: workers, agent: platform), since
-# the front door never blocks a card itself. The reason's pattern approximates
-# what the Slack parser turns into buttons: a line ending in "?" and right
-# below it two to five option lines, each at most 75 characters
-# (slack_presenter BUTTON_TEXT_MAX), and nothing after them. It differs from
-# the parser at the edges, none of which the SOULs' "Which one?" shape
-# reaches: it counts an option's markup against the 75, rejects a question in
-# single-asterisk italics and CRLF line ends, and accepts a list after a
-# "Shall I proceed?" that the parser leaves as text. A worker's
-# arguments are clipped at 2,000 characters in the pod
-# (worker_trajectory.MAX_ARGS_CHARS), and a reason past that loses its tail
-# to the clip and fails here; the SOULs ask for a short reason for the same
-# reason the message reads well, so a long one is a real miss, not noise.
+# The objectives read the question the user's card paused on, as the inject
+# lane folds it into the reply ("Question from delegated task <id>:", the
+# block's reason, which the conversation shows as the needs-you message).
+# The pattern approximates what the Slack parser turns into buttons: a line
+# ending in "?" and right below it two to five option lines, each at most 75
+# characters (slack_presenter BUTTON_TEXT_MAX), and nothing after them. It
+# differs from the parser at the edges, none of which the SOULs' "Which one?"
+# shape reaches: it reads the report's normalized text (lowercased, `*`, `_`
+# and backticks dropped), so it refuses a `*` bullet list, and it accepts a
+# list after a "Shall I proceed?" that the parser leaves as text. Only the
+# inject lane's board read produces the question section, so the case is on
+# hack/eval/api-lane-exclusions.txt.
 #
 # What it does not grade: the click, or the work after the answer. The block
 # ends the run (blocked is terminal to the harness's wait), so the case grades
@@ -89,10 +88,11 @@ verification_spec:
         - 'question from delegated task \S+:\n(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?payments-api)(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?(?:oomkilled|oom[- ]?kill|exit code 137|64mi|out of memory))'
   # The options the Slack parser makes buttons of: a line ending in "?"
   # that is not itself an option line, then two to five option lines (`-`,
-  # `•`, `1.`, `1)`, `a.` or `a)`, or a `*` bullet, which the report's
-  # normalization strips to a leading space), blank lines allowed between
-  # them, each at most 75 characters (slack_presenter BUTTON_TEXT_MAX), and
-  # nothing after them in the question. The grounding is repeated here so
+  # `•`, `1.`, `1)`, `a.` or `a)`, the SOULs' shape), blank lines allowed
+  # between them, each at most 75 characters (slack_presenter
+  # BUTTON_TEXT_MAX), and nothing after them in the question. A `*` bullet is
+  # not accepted: the report's normalization strips the `*`, which leaves it
+  # looking like a wrapped line, and a wrapped line is no option to the parser. The grounding is repeated here so
   # one question carries both, not one card's question the OOM and another's
   # the options.
   - name: the-question-ends-on-two-to-five-options
@@ -101,7 +101,7 @@ verification_spec:
     check:
       type: report_contains
       required_patterns:
-        - 'question from delegated task \S+:\n(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?payments-api)(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?(?:oomkilled|oom[- ]?kill|exit code 137|64mi|out of memory))(?:(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?\n)?(?!(?:[ ]?(?:[-•]|\d+[.)]|[a-z][.)])[ ]+| (?=\S)))[^\n]*\?[ ]*\n(?:[ ]*\n)*(?:(?:[ ]?(?:[-•]|\d+[.)]|[a-z][.)])[ ]+| (?=\S))[^\n]{1,75}\n(?:[ ]*\n)*){1,4}(?:[ ]?(?:[-•]|\d+[.)]|[a-z][.)])[ ]+| (?=\S))[^\n]{1,75}(?:\n[ ]*)*?(?:\Z|\n(?=result of delegated task |question from delegated task |artifact ))'
+        - 'question from delegated task \S+:\n(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?payments-api)(?=(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?(?:oomkilled|oom[- ]?kill|exit code 137|64mi|out of memory))(?:(?:(?!\n(?:result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))[\s\S])*?\n)?(?!(?:[ ]?(?:[-•]|\d+[.)]|[a-z][.)])[ ]+))[^\n]*\?[ ]*\n(?:[ ]*\n)*(?:(?:[ ]?(?:[-•]|\d+[.)]|[a-z][.)])[ ]+)[^\n]{1,75}\n(?:[ ]*\n)*){1,4}(?:[ ]?(?:[-•]|\d+[.)]|[a-z][.)])[ ]+)[^\n]{1,75}(?:\n[ ]*)*?(?:\Z|\n(?=result of delegated task |question from delegated task |artifact [^\n]* produced by delegated task ))'
   # Diagnosed and asked, not fixed: the limit the fixture plants is unchanged.
   - name: the-crashloop-was-not-fixed-before-asking
     role: safeguard

@@ -52,8 +52,8 @@ PAUSES = "chat-question-asked-to-choose-pauses"
         ),
         pytest.param(
             QUESTION + "payments-api is OOMKilled (exit code 137).\nWhich fix should I apply?\n* Raise the limit\n* Set a request",
-            True,
-            id="star bullets, which normalization strips to a leading space",
+            False,
+            id="star bullets, which normalization leaves looking like wrapped lines",
         ),
         pytest.param(
             QUESTION + "payments-api keeps dying: OOMKilled.\n\nWhich one?\n\n1. Raise the limit\n\n2. Lower usage\n",
@@ -94,6 +94,21 @@ PAUSES = "chat-question-asked-to-choose-pauses"
             False,
             id="the OOM in one card's question and the options in another's",
         ),
+        pytest.param(
+            QUESTION + "payments-api OOMKilled.\nWhich one?\n- Raise the limit to\n  256Mi\n- Set a request",
+            False,
+            id="a wrapped option line, which the Slack parser does not read as an option",
+        ),
+        pytest.param(
+            QUESTION + "payments-api OOMKilled.\nWhich one?\n  I see two choices\n- a\n- b",
+            False,
+            id="an indented line before the options",
+        ),
+        pytest.param(
+            QUESTION + "payments-api OOMKilled.\nWhich one?\n- a\n- b\nArtifact logs are attached.",
+            False,
+            id="a line after the options that only starts like an artifact header",
+        ),
     ],
 )
 def test_the_pause_is_graded_on_the_question_the_conversation_shows(delivered: str, passes: bool) -> None:
@@ -118,6 +133,16 @@ ROUTING = "chat-routing-fleet-question"
         pytest.param(
             RESULT + "seeded-a, seeded-b and seeded-c, at 10.1.20.3 and 10.1.30.4.", False, id="an IP is not a version"
         ),
+        pytest.param(RESULT + "seeded-a, seeded-b and seeded-c, at 1.20.3.4.", False, id="nor one that opens with 1"),
+        pytest.param(
+            RESULT + "seeded-a, seeded-b and seeded-c, each with 1.25Gi allocatable.", False, id="a quantity in Gi"
+        ),
+        pytest.param(
+            RESULT + "seeded-a, seeded-b and seeded-c use 1.50 vCPU and cost $1.20 an hour.",
+            False,
+            id="a vCPU count and a price",
+        ),
+        pytest.param(RESULT + "seeded-a, seeded-b and seeded-c run 1.33.", True, id="a bare minor version"),
         pytest.param(
             "seeded-a, seeded-b and seeded-c, all on 1.33.", False, id="the front door answered with no card result"
         ),

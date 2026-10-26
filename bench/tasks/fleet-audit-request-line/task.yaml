@@ -21,7 +21,8 @@
 # route objective and safeguards this case carries.
 #
 # ON SPEC.MODE NEXT (#4004). The case grades what the user sees: each audit's
-# latest report from the store; the write and whole-envelope safeguards stay.
+# latest report from the store. The write and whole-envelope safeguards stay
+# declared; they read the workers' commands, which the inject lane sets aside.
 # It does not grade how the agent got there (which script the worker ran to
 # read the store).
 id: fleet-audit-request-line

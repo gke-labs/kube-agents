@@ -18,7 +18,8 @@
 # slot a), so a fan-out that reads nothing still fails.
 #
 # The Slack rendering itself is not graded here: the harness talks to the
-# gateway's inject door, not Slack. The patch tests cover the rows' wiring.
+# agent's API server or the gateway's inject door, not Slack. The patch tests
+# cover the rows' wiring.
 #
 # Planted defect required: crashloop-workload, the payments-api Deployment in
 # seeded-debug on slot a, OOMKilled on every start. Isolation class: read-only.

@@ -737,6 +737,7 @@ class InjectLaneExclusionsTest(unittest.TestCase):
 # inject door can carry. An edit to the file edits this set.
 API_LANE_EXCLUDED = [
     "chat-stop-halts-delegated-remediation",  # #3263: the harness types `stop` through the door
+    "chat-question-asked-to-choose-pauses",  # #4004: grades the question only the inject lane's board read folds in
 ]
 
 
