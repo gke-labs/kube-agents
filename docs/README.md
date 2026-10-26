@@ -125,11 +125,14 @@ CI enforcement: `make docs-check` runs the same checks as
   `scripts/generate_docs.py --check`; fails if a generated region or prompt
   line pin no longer matches its source.
 - `docs-check-links` — `scripts/check_docs_links.py`; relative links must
-  resolve to **git-tracked** targets, a `#fragment` on a link to a Markdown
-  file or a site page must name a heading or an explicit `id` there, and a
-  `docs/designs/…` or
-  `docs/architecture/…` path cited from a code or configuration file (Python,
-  Go, shell, Dockerfiles, YAML, Terraform, TypeScript) must be one too. The
+  resolve to **git-tracked** targets; a `#fragment` on a relative link, a
+  same-page link or a site route whose target is a tracked Markdown file must
+  name a heading there (slugged as GitHub and Starlight slug it), an explicit
+  `id` or `<a name>`, or `_top` on a site page, and a break that has to be
+  staged goes in the script's second allowlist, which only shrinks the same
+  way and starts empty; and a `docs/designs/…` or `docs/architecture/…` path
+  cited from a code or configuration file (Python, Go, shell, Dockerfiles,
+  YAML, Terraform, TypeScript) must be one too. The
   same script holds the **reachability rule**: every tracked `.md`/`.mdx`
   outside a root-level dot-directory, the skill overlays' `append.md` fragments aside, must be reachable from where a reader
   starts. The starting points are files at the repository root, any

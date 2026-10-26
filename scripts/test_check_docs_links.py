@@ -436,7 +436,8 @@ SITE_INDEX_COMMENTED_CARD_LINES = (
 # right, a heading inside a generated region, explicit `id` and `name`
 # anchors, and three anchors no reader can reach: a heading inside a fence,
 # one inside a comment, and an `id` quoted in a code span. The site page's
-# frontmatter holds a `#` line that is not a heading, and its title is `_top`.
+# frontmatter holds a `#` line that is not a heading, its title is `_top`, and
+# a heading whose GitHub slug ends in a hyphen loses it, as Astro trims one.
 ANCHORS = "anchors.md"
 ANCHORED = "docs/anchored.md"
 SITE_ANCHORED = SITE + "concepts/anchored.md"
@@ -488,6 +489,7 @@ SITE_ANCHORED_LINES = (
     "---",
     "",
     "## On the site",
+    "## What next ?",
 )
 ANCHORS_SAME_GONE = "[same, gone](#gone)"
 ANCHORS_FENCED = f"[fenced]({ANCHORED}#fenced-heading)"
@@ -859,7 +861,7 @@ class SyntheticRepoTest(unittest.TestCase):
     def test_a_page_yields_each_heading_shape_and_explicit_anchor_and_hides_the_rest(self) -> None:
         self._track_anchor_fixtures()
         self.assertEqual(cdl.page_anchors(self.root / ANCHORED), ANCHORED_ANCHORS)
-        self.assertEqual(cdl.page_anchors(self.root / SITE_ANCHORED), {cdl.SITE_TITLE_ANCHOR, "on-the-site"})
+        self.assertEqual(cdl.page_anchors(self.root / SITE_ANCHORED), {cdl.SITE_TITLE_ANCHOR, "on-the-site", "what-next"})
 
     def test_a_fragment_its_page_lacks_is_reported_with_its_line(self) -> None:
         anchors = self._track_anchor_fixtures()
@@ -877,13 +879,16 @@ class SyntheticRepoTest(unittest.TestCase):
             self.assertEqual(cdl.check_anchor_allowlist(tracked, links), [])
         resolves = f"{ANCHORS}{cdl.ANCHOR_ALLOWLIST_SEPARATOR}#here"
         never_written = f"{ANCHORS}{cdl.ANCHOR_ALLOWLIST_SEPARATOR}#never-written"
+        page_gone = f"{ANCHORS}{cdl.ANCHOR_ALLOWLIST_SEPARATOR}{MISSING_PLAIN}#gone"
         untracked = f"docs/nowhere.md{cdl.ANCHOR_ALLOWLIST_SEPARATOR}#gone"
-        with mock.patch.object(cdl, "BROKEN_ANCHOR_ALLOWLIST", frozenset({resolves, never_written, untracked})):
+        stale = frozenset({resolves, never_written, page_gone, untracked})
+        with mock.patch.object(cdl, "BROKEN_ANCHOR_ALLOWLIST", stale):
             self.assertEqual(
                 cdl.check_anchor_allowlist(tracked, links),
                 [
                     f"{resolves}: {cdl.ANCHOR_ALLOWLIST_RESOLVES_MESSAGE}",
                     f"{never_written}: {cdl.ANCHOR_ALLOWLIST_GONE_MESSAGE}",
+                    f"{page_gone}: {cdl.ANCHOR_ALLOWLIST_UNREAD_MESSAGE}",
                     f"{untracked}: {cdl.ANCHOR_ALLOWLIST_GONE_MESSAGE}",
                 ],
             )
@@ -970,6 +975,7 @@ class HeadingSlugTest(unittest.TestCase):
             ("`snake_case` and __init__", "snake_case-and-init"),
             ("A <code>tag</code> and [a link](docs/x.md) and [a ref][r]", "a-tag-and-a-link-and-a-ref"),
             ("Step 1: `kubectl get` -- then", "step-1-kubectl-get----then"),
+            ("What next ?", "what-next-"),
             ("Ünïcödé 日本語 123", "ünïcödé-日本語-123"),
             ("", ""),
         ):

@@ -26,11 +26,11 @@ Scope is deliberately narrow and offline:
   an ``<a>``, and on a site page ``_top``, the frontmatter title's anchor.
   A heading inside a generated region counts; one inside a fenced block or
   a comment does not. A fragment on a repository blob URL or on a
-  non-Markdown target is not checked. The breaks already on ``main`` when
-  the rule arrived are named in ``BROKEN_ANCHOR_ALLOWLIST``, keyed by source
-  and target as written; the list only shrinks -- an entry whose link is no
-  longer written or whose anchor now resolves fails the check until it is
-  dropped;
+  non-Markdown target is not checked. A break that has to be staged is
+  named in ``BROKEN_ANCHOR_ALLOWLIST``, keyed by source and target as
+  written; the list only shrinks -- an entry whose link is no longer
+  written, whose target is no longer a page the rule reads, or whose anchor
+  now resolves fails the check until it is dropped;
 * a ``docs/designs/...`` or ``docs/architecture/...`` path written inside a
   code or configuration file (the ``CODE_GLOBS`` below: Python, Go, shell,
   Dockerfiles, YAML, Terraform, TypeScript) is resolved from the repository
@@ -365,7 +365,9 @@ LINK_SUFFIX_RE = re.compile(r"[#?].*\Z")
 # Astro's heading ids (Starlight's pages) both use: lowercased; every
 # character dropped except a letter, a mark, a decimal digit, a connector
 # punctuation (`_`), a space or a hyphen; spaces to hyphens; a repeated slug
-# suffixed `-1`, `-2`, in order of appearance. The slugger reads the rendered
+# suffixed `-1`, `-2`, in order of appearance. Astro then trims one trailing
+# hyphen from the result (`## What next ?` is `#what-next` on the site) and
+# GitHub does not, so a site page's slugs are trimmed. The slugger reads the rendered
 # text, so what Markdown syntax removes is removed first: a code span's
 # backticks (its content stays), an HTML tag outside a code span, a link's
 # destination (`[text](url)` and `[text][ref]` render `text`), and an
@@ -391,19 +393,17 @@ HTML_ANCHOR_RE = re.compile(
 FRONTMATTER_FENCE = "---"
 # Starlight renders the frontmatter title as the page's `<h1 id="_top">`.
 SITE_TITLE_ANCHOR = "_top"
+SITE_SLUG_TRAILING = "-"
 FRAGMENT_MARK = "#"
 
-# Section links already broken when the rule arrived, each written
-# `<source path> -> <target as written>`. Each stays here until the link is
-# fixed or removed; the check fails on an entry whose link is no longer
-# written in its source, or whose anchor now resolves, so the list can only
-# shrink. Do not add to it: a new link names a heading that exists.
-BROKEN_ANCHOR_ALLOWLIST = frozenset(
-    {
-        "agents/platform/docs/glossary.md -> #work-item-shared-state",
-        "docs/site/src/content/docs/install/upgrade.md -> /kube-agents/concepts/chatops/#what-carries-over-from-default-mode",
-    }
-)
+# Section links broken on `main` that a pull request has to stage rather than
+# fix, each written `<source path> -> <target as written>`. The two the rule
+# found when it arrived were fixed with it, so the list starts empty. An entry
+# stays here until the link is fixed or removed; the check fails on an entry
+# whose link is no longer written in its source, whose target is no longer a
+# page the rule reads, or whose anchor now resolves, so the list can only
+# shrink. The fix is the link, never a new entry.
+BROKEN_ANCHOR_ALLOWLIST: frozenset[str] = frozenset()
 ANCHOR_ALLOWLIST_SEPARATOR = " -> "
 
 UNLINKED_MESSAGE = "no reader reaches it -- link it from the page that owns its topic"
@@ -412,6 +412,7 @@ ALLOWLIST_EXEMPT_MESSAGE = "in UNLINKED_ALLOWLIST but is now exempt by shape -- 
 ALLOWLIST_UNTRACKED_MESSAGE = "in UNLINKED_ALLOWLIST but is not tracked -- drop the entry"
 ANCHOR_ALLOWLIST_GONE_MESSAGE = "in BROKEN_ANCHOR_ALLOWLIST but the link is no longer written there -- drop the entry"
 ANCHOR_ALLOWLIST_RESOLVES_MESSAGE = "in BROKEN_ANCHOR_ALLOWLIST but the anchor now resolves -- drop the entry"
+ANCHOR_ALLOWLIST_UNREAD_MESSAGE = "in BROKEN_ANCHOR_ALLOWLIST but its target is no longer a page the rule reads -- drop the entry"
 
 
 def tracked_paths() -> set[Path]:
@@ -671,11 +672,13 @@ def page_anchors(path: Path, cache: dict[Path, frozenset[str]] | None = None) ->
     blocks, code spans and comments, so a generated region's headings count
     and a quoted specimen does not; a heading's own code spans are read from
     the unstripped line, since their content is part of its text. A site page
-    carries ``_top`` as well. ``cache``, by resolved path, is shared across a
-    run so a page linked from many is read once.
+    carries ``_top`` as well, and its slugs lose a trailing hyphen, as Astro
+    trims them. ``cache``, by resolved path, is shared across a run so a page
+    linked from many is read once.
     """
     if cache is not None and path in cache:
         return cache[path]
+    site_page = path.relative_to(REPO).as_posix().startswith(SITE_CONTENT_DIR)
     comments = (HTML_COMMENT, MDX_COMMENT) if path.suffix == MDX_SUFFIX else (HTML_COMMENT,)
     kept = strip_code_fences(body_text(path))
     original = dict(kept)
@@ -683,10 +686,11 @@ def page_anchors(path: Path, cache: dict[Path, frozenset[str]] | None = None) ->
     occurrences: dict[str, int] = {}
     for lineno, visible in strip_specimens(kept, comments):
         if HEADING_RE.match(visible) and (heading := HEADING_RE.match(original[lineno])):
-            anchors.add(unique_slug(heading_slug(heading.group("text") or ""), occurrences))
+            slug = unique_slug(heading_slug(heading.group("text") or ""), occurrences)
+            anchors.add(slug.removesuffix(SITE_SLUG_TRAILING) if site_page else slug)
         for match in HTML_ANCHOR_RE.finditer(visible):
             anchors.add(match.group("anchor"))
-    if path.relative_to(REPO).as_posix().startswith(SITE_CONTENT_DIR):
+    if site_page:
         anchors.add(SITE_TITLE_ANCHOR)
     found = frozenset(anchors)
     if cache is not None:
@@ -813,10 +817,12 @@ def check_anchor_allowlist(
     links: Mapping[Path, Sequence[tuple[int, str]]],
     anchors: dict[Path, frozenset[str]] | None = None,
 ) -> list[str]:
-    """Report every ``BROKEN_ANCHOR_ALLOWLIST`` entry whose link is gone or whose anchor now resolves.
+    """Report every ``BROKEN_ANCHOR_ALLOWLIST`` entry that is stale.
 
-    ``links`` is every tracked document's links by resolved path, as
-    ``main()`` read them; ``anchors`` is the run's cache.
+    Stale: its link is no longer written in its source, its target is no
+    longer a page the rule reads (untracked, or not Markdown), or its anchor
+    now resolves. ``links`` is every tracked document's links by resolved
+    path, as ``main()`` read them; ``anchors`` is the run's cache.
     """
     problems: list[str] = []
     anchors = {} if anchors is None else anchors
@@ -825,6 +831,8 @@ def check_anchor_allowlist(
         path = (REPO / rel).resolve()
         if target not in {written for _, written in links.get(path, ())}:
             problems.append(f"{entry}: {ANCHOR_ALLOWLIST_GONE_MESSAGE}")
+        elif anchor_page(path, target, tracked) is None:
+            problems.append(f"{entry}: {ANCHOR_ALLOWLIST_UNREAD_MESSAGE}")
         elif not missing_anchor(path, target, tracked, anchors):
             problems.append(f"{entry}: {ANCHOR_ALLOWLIST_RESOLVES_MESSAGE}")
     return problems
