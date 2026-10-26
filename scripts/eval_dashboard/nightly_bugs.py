@@ -571,9 +571,10 @@ def still_tracks(issue: dict, newest: dict, good: list[dict], horizon=None) -> b
 
 
 def infra_issue_part(issue: dict) -> str:
-    """The part an open kept-case issue names: writers when its body names
-    the writers job, else main."""
-    return nightly.PART_WRITERS if f"`{nightly.NIGHTLY_WRITERS_JOB}`" in (issue.get("body") or "") else nightly.PART_MAIN
+    """The part an open kept-case issue names: the part of the job its body
+    names (main-b or writers), else main."""
+    body = issue.get("body") or ""
+    return next((part for job, part in nightly.PART_JOBS.items() if f"`{job}`" in body), nightly.PART_MAIN)
 
 
 def listing_doubt(gh: ghcli.Gh, open_issues: list, closed_issues: list, since: str | None) -> str | None:

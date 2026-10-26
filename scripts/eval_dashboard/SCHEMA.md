@@ -877,8 +877,8 @@ when none is on record),
 each `{build, job, head_sha, project, started, finished, duration_s, result,
 log_url, truncated, complete, counts{expected, recorded, passed, partial,
 failed, infra, missing}, missing[], newly_failing[], fixed[],
-previous_build, parts[], missing_parts[], running_parts[], turn1_p50_s,
-turn1_p95_s, cases[]}`. A
+previous_build, parts[], missing_parts[], running_parts[],
+verdict_withheld_by, turn1_p50_s, turn1_p95_s, cases[]}`. A
 night is one nightly run, or the main, main-b and writers parts' runs of
 one date:
 a run's date is the UTC date of its start plus 15 minutes
@@ -919,6 +919,12 @@ run is on record no night names main-b; once the main job runs the whole
 matrix again, a night short of a main case is incomplete without naming a
 part, and one short of a former main-b or writers case reports that part
 missing.
+`verdict_withheld_by` is the first of `main` and `main-b` the night lacks
+— in `missing_parts[]` or `running_parts[]`, or, for `main`, absent from
+`parts[]` — and `null` otherwise: that half's cases were never compared, so
+neither the digest nor the Nightly page and the Brief give a newly-failing
+verdict for the night, though `newly_failing` still lists what the parts on
+record show.
 `cases[]` is every task row the night measured,
 sorted by domain then name, as `{case, domain, state, reps{pass, fail,
 infra}, reason, transcript_url, turn1_p50_s, turn1_p90_s, agent_p50_s, agent_p90_s}` with `state` in `pass|partial|fail|infra`

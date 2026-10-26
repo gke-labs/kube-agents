@@ -249,6 +249,16 @@ class SpecToolRegistryTest(unittest.TestCase):
     INJECT_TRANSPORT = "bench/kube_agents_bench/inject_transport.py"
     SCORING = "bench/kube_agents_bench/scoring.py"
 
+    # Trajectory entries the harness writes itself after a stopped ask's
+    # opening turn (bench/kube_agents_bench/stop_hook.py): what it did, not a
+    # tool the agent called. A spec names them in `tool_called` with
+    # `require_success`. Evidence of each is a constant in the stop hook that
+    # the harness puts on an entry's `name`
+    # (test_the_harness_entries_still_have_evidence_in_the_hook_and_harness).
+    HARNESS_ENTRIES = {"harness_stop_sent", "harness_cards_stopped"}
+    STOP_HOOK = "bench/kube_agents_bench/stop_hook.py"
+    HARNESS = "bench/kube_agents_bench/harness.py"
+
     def _mcp_server_aliases(self):
         """Alias → the local server script it launches, from every agent config.
 
@@ -380,6 +390,7 @@ class SpecToolRegistryTest(unittest.TestCase):
             | self.HERMES_CORE_TOOLS
             | self.SESSION_HARNESS_TOOLS
             | self.TRANSPORT_MARKERS
+            | self.HARNESS_ENTRIES
         )
         unresolved = [
             f"{path.parent.name}: {name}"
@@ -552,6 +563,18 @@ class SpecToolRegistryTest(unittest.TestCase):
                 any(re.search(rf"\b{const}\b", reader.group(0)) for const in readers),
                 f"{marker} is registered as a transport marker but scoring's _inject_record "
                 "no longer reads it — stale registry entry",
+            )
+
+    def test_the_harness_entries_still_have_evidence_in_the_hook_and_harness(self):
+        hook = (REPO_ROOT / self.STOP_HOOK).read_text(errors="replace")
+        harness = (REPO_ROOT / self.HARNESS).read_text(errors="replace")
+        for entry in sorted(self.HARNESS_ENTRIES):
+            literal = re.escape(json.dumps(entry))
+            consts = re.findall(rf"^(\w+)\s*=\s*{literal}\s*$", hook, re.M)
+            self.assertTrue(
+                any(f'"name": stop_hook.{const}' in harness for const in consts),
+                f"{entry} is registered as a harness entry but {self.HARNESS} no longer "
+                f"writes it from a {self.STOP_HOOK} constant — stale registry entry",
             )
 
 

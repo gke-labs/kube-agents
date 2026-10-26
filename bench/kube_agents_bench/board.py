@@ -115,7 +115,7 @@ API_CONTEXT_ID_MAX_LEN = 128
 _API_SAFE_CONTEXT_ID = re.compile(r"\A[A-Za-z0-9_-]+\Z")
 
 # The default profile's session store under DATA_ROOT, the store the API server
-# writes (worker_trajectory.state_db("default")).
+# writes (worker_transcript.profile_state_db_path for the default profile).
 STORE_FILE = "state.db"
 
 # Line the session-cards script prints before its JSON.

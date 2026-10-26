@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -587,4 +588,65 @@ func TestTheMCPDoorLeavesTheGatewaysConsoleDoorAlone(t *testing.T) {
 			t.Errorf("MCP flag %q: the gateway carries %s %d times (value %q), want once, true", flag, a2aConsoleDoorEnvVar, n, value)
 		}
 	}
+}
+
+// The MCP container's GOMEMLIMIT is 85% of its memory limit, both read off
+// the rendered pod, with broker access on and off: a later change to the
+// limit cannot leave the runtime's soft limit at the old size, or above the
+// limit. Go's syntax for the value is bytes with an optional B, KiB, MiB or
+// GiB suffix.
+func TestTheMCPGoMemLimitIs85PercentOfTheContainerLimit(t *testing.T) {
+	for _, brokerOn := range []bool{false, true} {
+		t.Run(map[bool]string{false: "broker access off", true: "broker access on"}[brokerOn], func(t *testing.T) {
+			t.Setenv(a2aMCPDoorEnvVar, map[bool]string{false: "", true: "true"}[brokerOn])
+			pod := buildA2AMCPDeployment(a2aTestAgent()).Spec.Template.Spec
+			if len(pod.Containers) != 1 {
+				t.Fatalf("%d containers; want one", len(pod.Containers))
+			}
+			c := pod.Containers[0]
+			limit, ok := c.Resources.Limits[corev1.ResourceMemory]
+			if !ok {
+				t.Fatal("the MCP container has no memory limit")
+			}
+			var values []string
+			for _, e := range c.Env {
+				if e.Name == "GOMEMLIMIT" {
+					if e.ValueFrom != nil {
+						t.Fatalf("GOMEMLIMIT is a reference, %v; want a value", e.ValueFrom)
+					}
+					values = append(values, e.Value)
+				}
+			}
+			if len(values) != 1 {
+				t.Fatalf("GOMEMLIMIT set %d times (%v); want once", len(values), values)
+			}
+			got, err := parseGoMemLimit(values[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := limit.Value() * 85 / 100; got != want {
+				t.Errorf("GOMEMLIMIT = %q (%d bytes); want 85%% of the %s limit, %d bytes", values[0], got, limit.String(), want)
+			}
+		})
+	}
+}
+
+// parseGoMemLimit reads a GOMEMLIMIT value as the Go runtime does: an integer
+// number of bytes, optionally suffixed B, KiB, MiB, GiB or TiB.
+func parseGoMemLimit(v string) (int64, error) {
+	mult := int64(1)
+	for _, u := range []struct {
+		suffix string
+		mult   int64
+	}{{"TiB", 1 << 40}, {"GiB", 1 << 30}, {"MiB", 1 << 20}, {"KiB", 1 << 10}, {"B", 1}} {
+		if n, ok := strings.CutSuffix(v, u.suffix); ok {
+			v, mult = n, u.mult
+			break
+		}
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("GOMEMLIMIT %q is not a byte count Go accepts", v)
+	}
+	return n * mult, nil
 }

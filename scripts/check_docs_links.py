@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Verify that relative links in Markdown resolve, and that every document is linked.
+"""Verify that relative links in Markdown resolve, name a real section, and that every document is linked.
 
 This catches the failure mode that actually occurs in this repository: a
 relative path that was correct when written and silently broke when a file
-moved or a directory was renamed. It also catches the opposite: a document
-that nothing points at, which no reader will find and no review will re-read.
+moved or a directory was renamed, or a ``#section`` that was correct when
+written and silently broke when the heading was reworded. It also catches
+the opposite: a document that nothing points at, which no reader will find
+and no review will re-read.
 
 Scope is deliberately narrow and offline:
 
@@ -14,9 +16,25 @@ Scope is deliberately narrow and offline:
   not in a fresh checkout or on GitHub;
 * ``http(s)``, ``mailto:`` and protocol-relative links are not fetched;
 * site-absolute routes (``/kube-agents/...``) are Starlight routes rather than
-  paths on disk, so they are skipped -- broken ones surface as a failed site
-  build in ``docs-build.yml``;
-* anchors are stripped before resolution, and a bare ``#anchor`` is skipped;
+  paths on disk, so their existence is not checked here -- broken ones
+  surface as a failed site build in ``docs-build.yml``;
+* a ``#fragment`` on a link whose target is a tracked ``.md``/``.mdx`` (a
+  relative link, a same-page ``#anchor``, or a site route) must name an
+  anchor on that page: a heading, slugged as GitHub and Starlight both slug
+  one (lowercased, punctuation dropped, spaces to hyphens, a repeat suffixed
+  ``-1``, ``-2``), or an explicit ``id`` attribute on an HTML tag or ``name``
+  on an ``<a>``. A site page is read two ways: named by its route or linked
+  from another site page it is served by Starlight, which adds ``_top``, the
+  frontmatter title's anchor, and trims a slug's trailing hyphen as Astro
+  does; linked by a relative path from any other document it is read on
+  GitHub, which does neither.
+  A heading inside a generated region counts; one inside a fenced block or
+  a comment does not. A fragment on a repository blob URL or on a
+  non-Markdown target is not checked. A break that has to be staged is
+  named in ``BROKEN_ANCHOR_ALLOWLIST``, keyed by source and target as
+  written; the list only shrinks -- an entry whose link is no longer
+  written, whose target is no longer a page the rule reads, or whose anchor
+  now resolves fails the check until it is dropped;
 * a ``docs/designs/...`` or ``docs/architecture/...`` path written inside a
   code or configuration file (the ``CODE_GLOBS`` below: Python, Go, shell,
   Dockerfiles, YAML, Terraform, TypeScript) is resolved from the repository
@@ -66,6 +84,7 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+import unicodedata
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from itertools import islice
 from pathlib import Path
@@ -74,6 +93,7 @@ from urllib.parse import unquote
 REPO = Path(__file__).resolve().parent.parent
 
 MARKDOWN_GLOBS = ("*.md", "*.mdx")
+MARKDOWN_SUFFIXES = (".md", ".mdx")
 # Where a design document gets cited as the reasoning behind something: code,
 # shell, container builds, Helm and cron configuration, Terraform, the A2A web
 # client. Selected by name pattern because `git ls-files` takes one; the
@@ -270,7 +290,7 @@ SITE_SIDEBAR_SLUG_RE = re.compile(rf"\bslug:\s*{JS_QUOTED_VALUE_RE}")
 SITE_SIDEBAR_SHORTHAND_RE = re.compile(rf"(?<=[\[,])\s*{JS_QUOTED_VALUE_RE}\s*(?=[,\]])")
 SITE_ROUTE_PREFIX = "/kube-agents/"  # the Astro `base`; a sidebar `link:` omits it
 SITE_ROUTE_SEPARATOR = "/"  # a `link:` value starts with it; a slug is wrapped in it to make a route
-SITE_PAGE_SUFFIXES = (".md", ".mdx")
+SITE_PAGE_SUFFIXES = MARKDOWN_SUFFIXES
 SITE_INDEX_STEM = "index"
 SITE_CONVENTION_PAGES = frozenset({"404.md"})
 
@@ -340,10 +360,74 @@ SELF = Path(__file__).resolve()
 # rendered view.
 LINK_SUFFIX_RE = re.compile(r"[#?].*\Z")
 
+# --- The anchor rule -------------------------------------------------------- #
+
+# What a link's fragment names on its target page. An ATX heading: up to three
+# spaces, one to six `#`, a space, the text, and an optional closing run of
+# `#` after a space; a setext heading is not read, prettier rewrites them. The
+# text is slugged the way `github-slugger` does, which is what GitHub and
+# Astro's heading ids (Starlight's pages) both use: lowercased; every
+# character dropped except a letter, a mark, a decimal digit, a connector
+# punctuation (`_`), a space or a hyphen; spaces to hyphens; a repeated slug
+# suffixed `-1`, `-2`, in order of appearance. Astro then trims one trailing
+# hyphen from the result (`## What next ?` is `#what-next` on the site) and
+# GitHub does not, so a page read on the site has its slugs trimmed
+# (`page_anchors()` keeps both readers' sets). The slugger reads the rendered
+# text, so what Markdown syntax removes is removed first: a code span's
+# backticks (its content stays), an HTML tag outside a code span, a link's
+# destination (`[text](url)` and `[text][ref]` render `text`), and the pair of
+# underscore runs that opens and closes one emphasis (`_is_`, `__init__`). An
+# underscore is emphasis only in a pair, as CommonMark reads `_`: an opener
+# not preceded by a word character, a closer of the same length not followed
+# by one, neither escaped. One inside a word (`snake_case`), one with no
+# partner (`FOO_`, `__dirname`) or an escaped one (`\_private`) is text, and
+# GitHub keeps it in the slug.
+HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?:[ \t]+(?P<text>.*?))?(?:[ \t]+#+)?[ \t]*$")
+HEADING_SYNTAX_RE = re.compile(
+    r"(?P<run>`+)(?P<code>.+?)(?P=run)"
+    r"|<[^<>]+>"
+    r"|(?P<bracket>\])(?:\([^)]*\)|\[[^\]]*\])"
+    r"|(?<![^\W_])(?<!\\)(?P<emphasis>_+)(?=\S)(?P<emphasized>.+?)(?<=\S)(?<!\\)(?P=emphasis)(?![^\W_])"
+)
+SLUG_CATEGORY_PREFIXES = ("L", "M")  # Unicode letters and marks
+SLUG_CATEGORIES = ("Nd", "Pc")  # decimal digits and connector punctuation
+SLUG_SPACE, SLUG_HYPHEN = " ", "-"
+SLUG_REPEAT_SEPARATOR = "-"
+# An explicit anchor: an `id` attribute on any HTML tag, or `name` on an `<a>`.
+# Each attribute name is preceded by whitespace, so `data-id` and `data-name`
+# are not read as one.
+HTML_ANCHOR_RE = re.compile(
+    r"""<(?:[A-Za-z][^<>]*?\sid|a\s(?:[^<>]*?\s)?name)=(?P<quote>["'])(?P<anchor>[^"'<>]*)(?P=quote)"""
+)
+# YAML frontmatter, which a `#` comment line inside would otherwise read as a
+# heading; it is the lines between a `---` on the first line and the next. A
+# first `---` with no second is a thematic break, and the whole text is body.
+FRONTMATTER_FENCE = "---"
+# Starlight renders the frontmatter title as the page's `<h1 id="_top">`.
+SITE_TITLE_ANCHOR = "_top"
+SITE_SLUG_TRAILING = "-"
+FRAGMENT_MARK = "#"
+
+# Section links broken on `main` that a pull request has to stage rather than
+# fix, each written `<source path> -> <target as written>`. The two the rule
+# found when it arrived were fixed with it, so the list starts empty. An entry
+# stays here until the link is fixed or removed; the check fails on an entry
+# whose link is no longer written in its source, whose target is no longer a
+# page the rule reads, or whose anchor now resolves, so the list can only
+# shrink. The fix is the link, never a new entry.
+BROKEN_ANCHOR_ALLOWLIST: frozenset[str] = frozenset()
+ANCHOR_ALLOWLIST_SEPARATOR = " -> "
+# A run's cache of each page's anchors, by resolved path and reader: False for
+# GitHub's anchors, True for the site's (`page_anchors()`).
+AnchorCache = dict[tuple[Path, bool], frozenset[str]]
+
 UNLINKED_MESSAGE = "no reader reaches it -- link it from the page that owns its topic"
 ALLOWLIST_LINKED_MESSAGE = "in UNLINKED_ALLOWLIST but is now reachable -- drop the entry"
 ALLOWLIST_EXEMPT_MESSAGE = "in UNLINKED_ALLOWLIST but is now exempt by shape -- drop the entry"
 ALLOWLIST_UNTRACKED_MESSAGE = "in UNLINKED_ALLOWLIST but is not tracked -- drop the entry"
+ANCHOR_ALLOWLIST_GONE_MESSAGE = "in BROKEN_ANCHOR_ALLOWLIST but the link is no longer written there -- drop the entry"
+ANCHOR_ALLOWLIST_RESOLVES_MESSAGE = "in BROKEN_ANCHOR_ALLOWLIST but the anchor now resolves -- drop the entry"
+ANCHOR_ALLOWLIST_UNREAD_MESSAGE = "in BROKEN_ANCHOR_ALLOWLIST but its target is no longer a page the rule reads -- drop the entry"
 
 
 def tracked_paths() -> set[Path]:
@@ -553,6 +637,105 @@ def file_part(target: str) -> str:
     return unquote(LINK_SUFFIX_RE.sub("", target))
 
 
+def fragment_part(target: str) -> str:
+    """A link target's fragment, percent-decoded, or "" when it carries none."""
+    _, mark, fragment = target.partition(FRAGMENT_MARK)
+    return unquote(fragment) if mark else ""
+
+
+def heading_slug(text: str) -> str:
+    """The anchor GitHub and Starlight give a heading whose Markdown source text is ``text``."""
+
+    def rendered(match: re.Match[str]) -> str:
+        if match.group("code") is not None:
+            return match.group("code")
+        if match.group("emphasized") is not None:
+            return HEADING_SYNTAX_RE.sub(rendered, match.group("emphasized"))
+        return match.group("bracket") or ""
+
+    out: list[str] = []
+    for char in HEADING_SYNTAX_RE.sub(rendered, text).strip().lower():
+        category = unicodedata.category(char)
+        if category.startswith(SLUG_CATEGORY_PREFIXES) or category in SLUG_CATEGORIES or char == SLUG_HYPHEN:
+            out.append(char)
+        elif char == SLUG_SPACE:
+            out.append(SLUG_HYPHEN)
+    return "".join(out)
+
+
+def unique_slug(slug: str, occurrences: dict[str, int]) -> str:
+    """``slug``, or the ``-n`` suffixed form a repeat takes; ``occurrences`` is the page's count so far."""
+    original = slug
+    while slug in occurrences:
+        occurrences[original] += 1
+        slug = f"{original}{SLUG_REPEAT_SEPARATOR}{occurrences[original]}"
+    occurrences[slug] = 0
+    return slug
+
+
+def body_text(path: Path) -> str:
+    """The document's text after its frontmatter, if it has one.
+
+    Frontmatter is closed by definition, so a first ``---`` with no second is
+    a thematic break and the whole text is the body.
+    """
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if not lines or lines[0].strip() != FRONTMATTER_FENCE:
+        return "\n".join(lines)
+    close = next((i for i in range(1, len(lines)) if lines[i].strip() == FRONTMATTER_FENCE), None)
+    return "\n".join(lines if close is None else lines[close + 1 :])
+
+
+def site_page(path: Path) -> bool:
+    """Whether ``path`` is a page under the site's content root."""
+    return path.relative_to(REPO).as_posix().startswith(SITE_CONTENT_DIR)
+
+
+def read_on_site(path: Path, target: str, page: Path) -> bool:
+    """Whether the fragment of ``target``, linked from ``path`` to ``page``, is read on the site.
+
+    A site page is served by Starlight when it is named by its route or
+    linked from another site page, and that reader finds Astro's anchors. A
+    relative path to it from any other document is followed on GitHub, which
+    gives it GitHub's, as it does every page outside the content root.
+    """
+    return site_page(page) and (target.startswith(SITE_ROUTE_PREFIX) or site_page(path))
+
+
+def page_anchors(path: Path, cache: AnchorCache | None = None, site: bool = False) -> frozenset[str]:
+    """Every anchor a fragment may name on a page, as GitHub gives them or, with ``site``, as Astro does.
+
+    Headings and explicit ``id``/``name`` attributes are read outside fenced
+    blocks, code spans and comments, so a generated region's headings count
+    and a quoted specimen does not; a heading's own code spans are read from
+    the unstripped line, since their content is part of its text. On the
+    site the page carries ``_top`` as well, and its slugs lose a trailing
+    hyphen, as Astro trims them. ``cache``, by resolved path and reader, is
+    shared across a run; one read fills both readers' entries, so a page
+    linked from many is read once.
+    """
+    if cache is not None and (path, site) in cache:
+        return cache[(path, site)]
+    comments = (HTML_COMMENT, MDX_COMMENT) if path.suffix == MDX_SUFFIX else (HTML_COMMENT,)
+    kept = strip_code_fences(body_text(path))
+    original = dict(kept)
+    slugs: list[str] = []
+    explicit: set[str] = set()
+    occurrences: dict[str, int] = {}
+    for lineno, visible in strip_specimens(kept, comments):
+        if HEADING_RE.match(visible) and (heading := HEADING_RE.match(original[lineno])):
+            slugs.append(unique_slug(heading_slug(heading.group("text") or ""), occurrences))
+        for match in HTML_ANCHOR_RE.finditer(visible):
+            explicit.add(match.group("anchor"))
+    found = {
+        False: frozenset(slugs) | explicit,
+        True: frozenset(slug.removesuffix(SITE_SLUG_TRAILING) for slug in slugs) | explicit | {SITE_TITLE_ANCHOR},
+    }
+    if cache is not None:
+        cache.update(((path, reader), anchors) for reader, anchors in found.items())
+    return found[site]
+
+
 def site_route_page(route: str) -> Path:
     """The content file a site route denotes.
 
@@ -608,23 +791,88 @@ def code_citations(path: Path) -> Iterator[tuple[int, str]]:
             yield lineno, m.group(0)
 
 
-def check_file(path: Path, tracked: set[Path], links: Iterable[tuple[int, str]] | None = None) -> list[str]:
-    """Report every relative link in a document whose target is not tracked.
+def anchor_page(path: Path, target: str, tracked: set[Path]) -> Path | None:
+    """The tracked Markdown page whose anchors a link's fragment names, resolved, or None.
+
+    None for a target with no fragment, a repository blob URL (a remote
+    resource here), a target that is not a tracked ``.md``/``.mdx`` (a
+    directory, an image, a missing file, which the link rule reports), and
+    any other link that names no file here. A bare ``#anchor`` names the
+    linking document itself.
+    """
+    if FRAGMENT_MARK not in target or target.startswith(REPO_BLOB_URL_PREFIXES):
+        return None
+    page = path if target.startswith(FRAGMENT_MARK) else link_target(path, target)
+    if page is None:
+        return None
+    page = page.resolve()
+    if page not in tracked or page.suffix not in MARKDOWN_SUFFIXES:
+        return None
+    return page
+
+
+def missing_anchor(path: Path, target: str, tracked: set[Path], anchors: AnchorCache) -> bool:
+    """Whether ``target``, linked from ``path``, carries a fragment its page does not have for the reader who follows it."""
+    page = anchor_page(path, target, tracked)
+    if page is None:
+        return False
+    fragment = fragment_part(target)
+    return bool(fragment) and fragment not in page_anchors(page, anchors, read_on_site(path, target, page))
+
+
+def check_file(
+    path: Path,
+    tracked: set[Path],
+    links: Iterable[tuple[int, str]] | None = None,
+    anchors: AnchorCache | None = None,
+) -> list[str]:
+    """Report every relative link in a document whose target is not tracked, and every fragment its page lacks.
 
     ``links`` is the document's links when the caller has read them already;
     ``main()`` reads each document once and hands the same links here and to
-    ``reached_files()``.
+    ``reached_files()``. ``anchors`` is the run's cache of each page's anchors,
+    shared the same way. A break in ``BROKEN_ANCHOR_ALLOWLIST`` is not
+    reported; ``check_anchor_allowlist()`` reports the entry once it is stale.
     """
     problems: list[str] = []
+    anchors = {} if anchors is None else anchors
+    rel = path.relative_to(REPO)
     for lineno, target in markdown_links(path) if links is None else links:
-        if target.startswith(REPO_BLOB_URL_PREFIXES) or target.startswith(SKIP_PREFIXES):
-            continue  # a remote resource or a Starlight route; existence is not checked here
-        resolved = link_target(path, target)
-        if resolved is None:
-            continue
-        if resolved.resolve() not in tracked and not resolved.is_dir():
-            rel = path.relative_to(REPO)
-            problems.append(f"{rel}:{lineno}: broken link -> {target}")
+        if not target.startswith(REPO_BLOB_URL_PREFIXES) and not target.startswith(SKIP_PREFIXES):
+            resolved = link_target(path, target)  # a remote resource or a Starlight route: existence is not checked here
+            if resolved is not None and resolved.resolve() not in tracked and not resolved.is_dir():
+                problems.append(f"{rel}:{lineno}: broken link -> {target}")
+                continue
+        if missing_anchor(path, target, tracked, anchors):
+            if f"{rel.as_posix()}{ANCHOR_ALLOWLIST_SEPARATOR}{target}" in BROKEN_ANCHOR_ALLOWLIST:
+                continue
+            problems.append(f"{rel}:{lineno}: broken anchor -> {target}")
+    return problems
+
+
+def check_anchor_allowlist(
+    tracked: set[Path],
+    links: Mapping[Path, Sequence[tuple[int, str]]],
+    anchors: AnchorCache | None = None,
+) -> list[str]:
+    """Report every ``BROKEN_ANCHOR_ALLOWLIST`` entry that is stale.
+
+    Stale: its link is no longer written in its source, its target is no
+    longer a page the rule reads (untracked, or not Markdown), or its anchor
+    now resolves. ``links`` is every tracked document's links by resolved
+    path, as ``main()`` read them; ``anchors`` is the run's cache.
+    """
+    problems: list[str] = []
+    anchors = {} if anchors is None else anchors
+    for entry in sorted(BROKEN_ANCHOR_ALLOWLIST):
+        rel, _, target = entry.partition(ANCHOR_ALLOWLIST_SEPARATOR)
+        path = (REPO / rel).resolve()
+        if target not in {written for _, written in links.get(path, ())}:
+            problems.append(f"{entry}: {ANCHOR_ALLOWLIST_GONE_MESSAGE}")
+        elif anchor_page(path, target, tracked) is None:
+            problems.append(f"{entry}: {ANCHOR_ALLOWLIST_UNREAD_MESSAGE}")
+        elif not missing_anchor(path, target, tracked, anchors):
+            problems.append(f"{entry}: {ANCHOR_ALLOWLIST_RESOLVES_MESSAGE}")
     return problems
 
 
@@ -832,8 +1080,10 @@ def main() -> int:
     tracked = tracked_paths()
     problems: list[str] = []
     links = {f.resolve(): tuple(markdown_links(f)) for f in files}
+    anchors: AnchorCache = {}
     for f in files:
-        problems.extend(check_file(f, tracked, links[f.resolve()]))
+        problems.extend(check_file(f, tracked, links[f.resolve()], anchors))
+    problems.extend(check_anchor_allowlist(tracked, links, anchors))
 
     code = tracked_code()
     citations = {f: tuple(code_citations(f)) for f in code}
@@ -844,20 +1094,20 @@ def main() -> int:
     problems.extend(check_unlinked(files, reached_files(files, code, links, citations, sidebar), sidebar[0]))
 
     print(
-        f"Checked relative links in {len(files)} Markdown files "
+        f"Checked relative links and section anchors in {len(files)} Markdown files "
         f"and design-doc citations in {len(code)} code files, "
         f"and that a reader reaches every document "
-        f"({len(UNLINKED_ALLOWLIST)} allowlisted)."
+        f"({len(BROKEN_ANCHOR_ALLOWLIST)} broken anchors and {len(UNLINKED_ALLOWLIST)} unreachable documents allowlisted)."
     )
     if problems:
         print(
-            f"\n{len(problems)} broken link(s), citation(s) or unreachable document(s):\n",
+            f"\n{len(problems)} broken link(s), anchor(s), citation(s) or unreachable document(s):\n",
             file=sys.stderr,
         )
         for p in problems:
             print(f"    {p}", file=sys.stderr)
         return 1
-    print("All relative links and design-doc citations resolve, and a reader reaches every document.")
+    print("All relative links, section anchors and design-doc citations resolve, and a reader reaches every document.")
     return 0
 
 

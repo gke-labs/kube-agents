@@ -114,6 +114,7 @@ type gatewayScenario struct {
 	finish   bool // the root task completes with answerText
 	delegate bool // the root delegates; a child runs and a wake task carries the answer
 	handoff  bool // the root acknowledges and hands its work to kanban cards (no wake task ever)
+	bigChild bool // with delegate: the child's events total more than readMaxBytes, and no wake task comes
 	decoys   bool // before the root: another conversation's turn, a delegated child here, an earlier turn's late submission, and a cancel here
 	// lateStart delays the root's first event after its submission, as an
 	// executor's cold start does.
@@ -175,6 +176,13 @@ func runFakeGateway(t *testing.T, url string, js jetstream.JetStream, sc gateway
 			publishStatus(t, js, fakeAddressee, root, lib.StateCompleted, true)
 			child := fmt.Sprintf("task-deleg%d", i)
 			publishSubmission(t, js, "cluster-a", child, conv, "look at checkout", root)
+			if sc.bigChild {
+				publishRun(t, js, "cluster-a", child, "", false)
+				for range readMaxBytes/(800<<10) + 1 {
+					publishArtifact(t, js, "cluster-a", child, lib.ArtifactResult, strings.Repeat("x", 800<<10))
+				}
+				return
+			}
 			publishRun(t, js, "cluster-a", child, "child notes", true)
 			wake := fmt.Sprintf("task-wake%d", i)
 			publishSubmission(t, js, fakeAddressee, wake, conv, "child finished", child)
@@ -254,6 +262,58 @@ func TestADelegationsAnswerComesFromTheWakeTask(t *testing.T) {
 		t.Fatalf("send_message failed: %s", res.Content[0].Text)
 	}
 	mustContain(t, res.Content[0].Text, "answer came from a delegated task", fakeAddressee+"/task-wake1", wakeAnswer, "cluster-a/task-deleg1")
+}
+
+// A delegated task too large to read is read once, not again every 200 ms
+// for the rest of the wait, each read holding a reader slot until every
+// other caller is refused.
+func TestAFollowedTaskTooLargeToReadIsReadOnce(t *testing.T) {
+	url, js := bigBus(t)
+	runFakeGateway(t, url, js, gatewayScenario{delegate: true, bigChild: true})
+	var reads atomic.Int32
+	sub, err := js.Conn().Subscribe("$JS.API.CONSUMER.CREATE.>", func(m *nats.Msg) {
+		if strings.Contains(string(m.Data), "task-deleg1") {
+			reads.Add(1)
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+	b := dial(t, url)
+	s := mustServer(t, SendMessageTool(b, NewConversations()))
+	res := callTool(t, s, ToolSendMessage, map[string]any{"text": "delegate check the rollout", "wait_seconds": 3})
+	if res.IsError {
+		t.Fatalf("send_message failed: %s", res.Content[0].Text)
+	}
+	if n := reads.Load(); n != 1 {
+		t.Errorf("read the over-budget task %d times in a 3s wait; want once", n)
+	}
+	// The turn leaves that task as the conversation's running one, and the
+	// next message can't wait on a task it can't read: it goes, rather than
+	// the conversation refusing every message from now on.
+	res = callTool(t, s, ToolSendMessage, map[string]any{"text": "delegate check it again", "wait_seconds": 3})
+	if res.IsError || strings.Contains(res.Content[0].Text, "running task") {
+		t.Fatalf("a second message after a too-large task: %s", res.Content[0].Text)
+	}
+}
+
+// oneMsgSource is a read whose every wait brings one message.
+type oneMsgSource struct{}
+
+func (oneMsgSource) Fetch(int, ...nats.PullOpt) ([]*nats.Msg, error) {
+	return []*nats.Msg{{Subject: "a2a.tasks.x", Data: []byte("{}")}}, nil
+}
+func (oneMsgSource) Unsubscribe() error { return nil }
+
+// A task read past maxTaskEvents fails as too large to read, which a turn
+// takes as final for that task rather than reading it again.
+func TestATaskPastItsEventCapIsTooLargeToRead(t *testing.T) {
+	w := &taskWatch{ref: TaskRef{Addressee: fakeAddressee, TaskID: "task-chatty"}, r: &budgetReader{sub: oneMsgSource{}, batch: 1, budget: readMaxBytes}, seen: maxTaskEvents, pending: 1, release: func(bool) {}}
+	err := w.next(context.Background())
+	if !tooLargeToRead(err) {
+		t.Fatalf("a read past %d events returned %v; want it too large to read", maxTaskEvents, err)
+	}
 }
 
 // A turn that hands its work to kanban cards completes with its
@@ -690,27 +750,17 @@ func TestAResumedConversationIsNamedByItsToken(t *testing.T) {
 	mustNotContain(t, res.Content[0].Text, "Conversation `default`")
 }
 
-// emptyFetchConsumer is a consumer whose every fetch comes back empty, as a
-// stalled read's would.
-type emptyFetchConsumer struct{ jetstream.Consumer }
+// emptySource is a read whose every wait comes back empty, as a stalled
+// read's would.
+type emptySource struct{}
 
-func (emptyFetchConsumer) Fetch(int, ...jetstream.FetchOpt) (jetstream.MessageBatch, error) {
-	return emptyBatch{}, nil
-}
-
-type emptyBatch struct{}
-
-func (emptyBatch) Messages() <-chan jetstream.Msg {
-	c := make(chan jetstream.Msg)
-	close(c)
-	return c
-}
-func (emptyBatch) Error() error { return nil }
+func (emptySource) Fetch(int, ...nats.PullOpt) ([]*nats.Msg, error) { return nil, nats.ErrTimeout }
+func (emptySource) Unsubscribe() error                              { return nil }
 
 // A task read whose fetch comes back empty while events are still pending
 // is an error, not the task's end folded from what was read so far.
 func TestAStalledTaskReadIsAnError(t *testing.T) {
-	w := &taskWatch{ref: TaskRef{Addressee: fakeAddressee, TaskID: "task-stall"}, cons: emptyFetchConsumer{}, pending: 5, release: func(bool) {}}
+	w := &taskWatch{ref: TaskRef{Addressee: fakeAddressee, TaskID: "task-stall"}, r: &budgetReader{sub: emptySource{}, budget: readMaxBytes}, pending: 5, release: func(bool) {}}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := w.next(ctx); err == nil || !strings.Contains(err.Error(), "still pending") {
