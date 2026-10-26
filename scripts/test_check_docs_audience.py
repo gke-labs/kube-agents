@@ -14,9 +14,11 @@ shrinking allowlist that holds the backlog at its count and nowhere above it.
 
 import contextlib
 import io
+import os
 import re
+import subprocess
+import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 
@@ -41,7 +43,11 @@ CITATION = check_docs_audience.CITATION_SHAPE
 ISSUE_URL = "https://github.com/gke-labs/kube-agents/issues/3072"
 PULL_URL = "https://github.com/gke-labs/kube-agents/pull/2801"
 # The acceptance criterion: standard library only, under two seconds on the committed site.
+# Measured on the script's own run, `python3 scripts/check_docs_audience.py`, in a child
+# process: `make coverage` traces this process, and a tracer inflates CPU time by more than
+# the budget's headroom on a loaded runner, while the child runs untraced as a user runs it.
 RUN_BUDGET_SECONDS = 2.0
+SCRIPT = Path(check_docs_audience.__file__)
 
 
 class SiteFixture(unittest.TestCase):
@@ -292,11 +298,13 @@ class CommittedSiteTest(unittest.TestCase):
         self.assertEqual(check_docs_audience.main(), 0)
 
     def test_main_runs_inside_the_budget(self):
-        """CPU time, not wall clock, so a loaded runner does not fail an unrelated pull request."""
-        started = time.process_time()
-        with contextlib.redirect_stdout(io.StringIO()):
-            check_docs_audience.main()
-        self.assertLess(time.process_time() - started, RUN_BUDGET_SECONDS)
+        """The script's own run as a child: its CPU time, not wall clock, and not this process's tracer."""
+        before = os.times()
+        run = subprocess.run([sys.executable, str(SCRIPT)], capture_output=True, text=True, check=False)
+        after = os.times()
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        spent = (after.children_user - before.children_user) + (after.children_system - before.children_system)
+        self.assertLess(spent, RUN_BUDGET_SECONDS)
 
 
 class CitationShapeTest(SiteFixture):
