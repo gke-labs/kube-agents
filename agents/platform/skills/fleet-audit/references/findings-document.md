@@ -242,6 +242,27 @@ field, and publishes nothing:
   missing parents and commit the file happily. A manifest in a directory the deploying tool does not
   apply merges clean, closes the finding for exactly one run, and changes nothing on the cluster —
   then returns next run as `pr-merged-persists`, where neither documented explanation fits.
+- **`finish` adds to each `manual` `note` where the fix belongs, from the collector's candidate.**
+  It names the `declaration` file, or else the `release_declaration` file (its next sync or upgrade
+  can revert a patch to the live object), or else the `namespace_directory` for a new object (with
+  the `resources:` entry that an `overlay` source needs, or the `metadata.namespace` that a
+  `cluster` source needs). It skips that location note when your note names the same path and the
+  cut below keeps that mention. It also names the `reconciler`, whose next sync or upgrade can
+  revert a change made by hand. The notes go in a paragraph of their own after your note. It writes
+  no note for a candidate without these fields, and none for a fix that `finish` wrote itself, that
+  you declined with `--decline-fix`, or that an open pull request carries. A fix whose pull request
+  merged while the finding still reproduces, or that a person closed, gets the notes. It removes
+  route notes that your note copied from an earlier ledger, from a note of every remediation kind.
+  It closes a code fence that your note
+  leaves open. When your note and the route notes together are longer than the note cap, it cuts
+  your note and ends it with ` …(truncated)`, so that the route notes fit. The cut does not go into
+  the text that `finish` adds after your note when the audit did not write your file, or into the
+  text and the copy of your file that `finish` adds before your note when a kustomization does not
+  list your file. That copy can become shorter by whole lines to make room for the reconciler note.
+  A cut never
+  goes into a code block: your first code block and all text after it go, and the text before the
+  block is cut. When the route notes still do not fit, the location note goes first; the reconciler
+  note always stays. A `--dry-run` can leave out a note the real run adds. Do not copy these notes into your `note`.
 
 ### Scope, skipped, and limitations
 

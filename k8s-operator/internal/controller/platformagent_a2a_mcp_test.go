@@ -18,7 +18,9 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"path"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -151,33 +153,93 @@ func TestBuildA2AMCPDeployment(t *testing.T) {
 
 // The creds Secret holds every static user's password. The MCP pod gets the
 // console's and nothing else, and its only other Secret is its own token.
+// With broker access on (A2A_MCP_DOOR=true on a next install) it also holds
+// exactly one projected token, for the broker's mcp audience and nothing else;
+// with it off, none.
 func TestTheMCPPodHoldsTheConsolePasswordAndItsOwnTokenOnly(t *testing.T) {
-	agent := a2aTestAgent()
-	pod := buildA2AMCPDeployment(agent).Spec.Template.Spec
-	secrets := map[string]*corev1.SecretVolumeSource{}
-	for _, v := range pod.Volumes {
-		if v.Projected != nil {
-			t.Errorf("projected volume %s: the MCP pod holds no projected token", v.Name)
-		}
-		if v.Secret != nil {
-			secrets[v.Secret.SecretName] = v.Secret
-		}
-	}
-	if len(secrets) != 2 {
-		t.Fatalf("secret volumes = %v, want the creds Secret and the token Secret", secrets)
-	}
-	for name, key := range map[string]string{a2aCredsSecretName(agent): a2aConsolePasswordKey, a2aMCPAccessName(agent): a2aMCPAccessKey} {
-		src := secrets[name]
-		if src == nil {
-			t.Errorf("no volume from Secret %s", name)
-			continue
-		}
-		if len(src.Items) != 1 || src.Items[0].Key != key {
-			t.Errorf("Secret %s projects %+v, want exactly %s", name, src.Items, key)
-		}
-		if src.Optional != nil && *src.Optional {
-			t.Errorf("Secret %s is optional; the server must not start without it", name)
-		}
+	for _, brokerOn := range []bool{false, true} {
+		t.Run(map[bool]string{false: "broker access off", true: "broker access on"}[brokerOn], func(t *testing.T) {
+			t.Setenv(a2aMCPDoorEnvVar, map[bool]string{false: "", true: "true"}[brokerOn])
+			agent := a2aTestAgent()
+			pod := buildA2AMCPDeployment(agent).Spec.Template.Spec
+			secrets := map[string]*corev1.SecretVolumeSource{}
+			var projected []corev1.Volume
+			for _, v := range pod.Volumes {
+				if v.Projected != nil {
+					projected = append(projected, v)
+				}
+				if v.Secret != nil {
+					secrets[v.Secret.SecretName] = v.Secret
+				}
+			}
+			if len(secrets) != 2 {
+				t.Fatalf("secret volumes = %v, want the creds Secret and the token Secret", secrets)
+			}
+			for name, key := range map[string]string{a2aCredsSecretName(agent): a2aConsolePasswordKey, a2aMCPAccessName(agent): a2aMCPAccessKey} {
+				src := secrets[name]
+				if src == nil {
+					t.Errorf("no volume from Secret %s", name)
+					continue
+				}
+				if len(src.Items) != 1 || src.Items[0].Key != key {
+					t.Errorf("Secret %s projects %+v, want exactly %s", name, src.Items, key)
+				}
+				if src.Optional != nil && *src.Optional {
+					t.Errorf("Secret %s is optional; the server must not start without it", name)
+				}
+			}
+
+			if !brokerOn {
+				if len(projected) != 0 {
+					t.Errorf("projected volumes %v: the MCP pod holds no projected token without broker access", projected)
+				}
+				return
+			}
+			if len(projected) != 1 {
+				t.Fatalf("projected volumes = %d, want exactly the broker token", len(projected))
+			}
+			vol := projected[0]
+			sources := vol.Projected.Sources
+			if len(sources) != 1 {
+				t.Fatalf("projected volume %s has %d sources, want only the broker token", vol.Name, len(sources))
+			}
+			src := sources[0]
+			if src.ServiceAccountToken == nil || src.Secret != nil || src.ConfigMap != nil || src.DownwardAPI != nil || src.ClusterTrustBundle != nil {
+				t.Fatalf("projected source %+v, want a ServiceAccount token and nothing else", src)
+			}
+			if src.ServiceAccountToken.Audience != credentialProxyMCPAudience {
+				t.Errorf("token audience = %q, want the broker's mcp audience %q", src.ServiceAccountToken.Audience, credentialProxyMCPAudience)
+			}
+
+			// Mounted read-only, in the one container, at exactly the path
+			// the MCP binary is told to read.
+			c := pod.Containers[0]
+			tokenFile := ""
+			for _, e := range c.Env {
+				if e.Name == a2aMCPBrokerTokenFileEnvVar {
+					tokenFile = e.Value
+				}
+			}
+			if tokenFile == "" {
+				t.Fatalf("%s is not set on the MCP container", a2aMCPBrokerTokenFileEnvVar)
+			}
+			var mounts []corev1.VolumeMount
+			for _, m := range c.VolumeMounts {
+				if m.Name == vol.Name {
+					mounts = append(mounts, m)
+				}
+			}
+			if len(mounts) != 1 {
+				t.Fatalf("volume %s mounted %d times, want once", vol.Name, len(mounts))
+			}
+			m := mounts[0]
+			if !m.ReadOnly || m.SubPath != "" {
+				t.Errorf("token mount %+v, want a read-only directory mount", m)
+			}
+			if want := path.Join(m.MountPath, src.ServiceAccountToken.Path); tokenFile != want {
+				t.Errorf("%s = %q, but the token is mounted at %q", a2aMCPBrokerTokenFileEnvVar, tokenFile, want)
+			}
+		})
 	}
 }
 
@@ -257,6 +319,37 @@ func TestTheMCPTokenIsMintedOnceAndNeverAdopted(t *testing.T) {
 			filled, err := readMCPToken(t, cl)
 			if err != nil || strings.TrimSpace(string(filled.Data[a2aMCPAccessKey])) == "" {
 				t.Fatalf("the owned, %s token Secret was not filled: %v", name, err)
+			}
+		})
+	}
+
+	// A value no Authorization header can carry, a control byte inside it,
+	// is minted over; a printable value a person wrote is kept, its ends
+	// trimmed by the server.
+	for value, kept := range map[string]bool{
+		"ab\ncd": false, "ab\rcd": false, "ab\x00cd": false, "ab\x7fcd": false, "ab\tcd": true,
+		" valid-token \n": true, "with space inside": true,
+	} {
+		t.Run(fmt.Sprintf("an owned Secret holding %q is kept: %v", value, kept), func(t *testing.T) {
+			held := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPAccessName(agent), Namespace: agent.Namespace},
+				Data: map[string][]byte{a2aMCPAccessKey: []byte(value)}}
+			if err := ctrl.SetControllerReference(agent, held, setupScheme()); err != nil {
+				t.Fatal(err)
+			}
+			r, cl := mcpTestReconciler(t, held)
+			if err := r.ensureA2AMCPToken(ctx, agent); err != nil {
+				t.Fatal(err)
+			}
+			got, err := readMCPToken(t, cl)
+			if err != nil {
+				t.Fatal(err)
+			}
+			v := got.Data[a2aMCPAccessKey]
+			if kept && string(v) != value {
+				t.Errorf("the token %q was replaced with %q", value, v)
+			}
+			if !kept && (string(v) == value || !a2aMCPTokenUsable(v)) {
+				t.Errorf("the token %q was not minted over: now %q", value, v)
 			}
 		})
 	}
@@ -386,20 +479,92 @@ func TestTheMCPFenceWaitsForThePodToGo(t *testing.T) {
 	}
 }
 
-// Nothing else carries a credential into the pod: no env from a Secret, no
-// second container, no init container, no ServiceAccount of its own.
-func TestTheMCPPodCarriesNoOtherCredential(t *testing.T) {
-	pod := buildA2AMCPDeployment(a2aTestAgent()).Spec.Template.Spec
-	if len(pod.Containers) != 1 || len(pod.InitContainers) != 0 || len(pod.EphemeralContainers) != 0 {
-		t.Errorf("containers %d, init %d, ephemeral %d; want one container", len(pod.Containers), len(pod.InitContainers), len(pod.EphemeralContainers))
+// With the flag off, an unowned NetworkPolicy under the fence's name is not
+// ours either: with no MCP pod left, the removal skips it rather than
+// failing the reconcile, and leaves it standing.
+func TestTheFlagOffMCPRemovalSkipsAnUnownedFence(t *testing.T) {
+	t.Setenv(a2aMCPDoorEnvVar, "")
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	squatter := buildA2AMCPNetworkPolicy(agent)
+	r, cl := mcpTestReconciler(t, squatter)
+	if err := r.reconcileA2AMCP(ctx, agent); err != nil {
+		t.Fatalf("an unowned NetworkPolicy under the fence's name stopped the reconcile: %v", err)
 	}
-	if pod.ServiceAccountName != "" {
-		t.Errorf("serviceAccountName = %q, want the namespace default with no token mounted", pod.ServiceAccountName)
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(squatter), &networkingv1.NetworkPolicy{}); err != nil {
+		t.Errorf("the unowned NetworkPolicy was touched: %v", err)
 	}
-	for _, c := range pod.Containers {
-		if len(c.EnvFrom) != 0 {
-			t.Errorf("container %s has envFrom %v; every credential here is one mounted file", c.Name, c.EnvFrom)
+}
+
+// getCounter counts the reads of each object through it.
+type getCounter struct {
+	client.Client
+	gets map[string]int
+}
+
+func (c *getCounter) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	c.gets[fmt.Sprintf("%T %s", obj, key)]++
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+// The removal reads each of its objects once a pass, owned or not: the
+// token Secret's read is uncached, and runs on every flag-off reconcile.
+func TestTheMCPRemovalReadsEachObjectOnce(t *testing.T) {
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	unowned := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPAccessName(agent), Namespace: agent.Namespace}}
+	owned := buildA2AMCPService(agent)
+	if err := ctrl.SetControllerReference(agent, owned, setupScheme()); err != nil {
+		t.Fatal(err)
+	}
+	r, _ := mcpTestReconciler(t, unowned, owned, buildA2AMCPNetworkPolicy(agent))
+	counter := &getCounter{Client: r.Client, gets: map[string]int{}}
+	r.Client = counter
+	if err := r.removeA2AMCP(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if len(counter.gets) != len(r.a2aMCPObjects(agent)) {
+		t.Errorf("reads = %v, want one of each of the %d objects", counter.gets, len(r.a2aMCPObjects(agent)))
+	}
+	for obj, n := range counter.gets {
+		if n != 1 {
+			t.Errorf("%s was read %d times, want once", obj, n)
 		}
+	}
+}
+
+// Nothing else carries a credential into the pod: no env from a Secret, no
+// second container, no init container. Without broker access it runs as the
+// namespace default with no token mounted; with it, as its own ServiceAccount,
+// whose only token is the projected broker one the test above pins.
+func TestTheMCPPodCarriesNoOtherCredential(t *testing.T) {
+	for _, brokerOn := range []bool{false, true} {
+		t.Run(map[bool]string{false: "broker access off", true: "broker access on"}[brokerOn], func(t *testing.T) {
+			t.Setenv(a2aMCPDoorEnvVar, map[bool]string{false: "", true: "true"}[brokerOn])
+			agent := a2aTestAgent()
+			pod := buildA2AMCPDeployment(agent).Spec.Template.Spec
+			if len(pod.Containers) != 1 || len(pod.InitContainers) != 0 || len(pod.EphemeralContainers) != 0 {
+				t.Errorf("containers %d, init %d, ephemeral %d; want one container", len(pod.Containers), len(pod.InitContainers), len(pod.EphemeralContainers))
+			}
+			if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken {
+				t.Error("the default-audience ServiceAccount token is mounted; the pod never talks to the API server")
+			}
+			wantSA := ""
+			if brokerOn {
+				wantSA = a2aMCPName(agent)
+			}
+			if pod.ServiceAccountName != wantSA {
+				t.Errorf("serviceAccountName = %q, want %q", pod.ServiceAccountName, wantSA)
+			}
+			if pod.DeprecatedServiceAccount != "" {
+				t.Errorf("serviceAccount = %q, want none", pod.DeprecatedServiceAccount)
+			}
+			for _, c := range pod.Containers {
+				if len(c.EnvFrom) != 0 {
+					t.Errorf("container %s has envFrom %v; every credential here is one mounted file", c.Name, c.EnvFrom)
+				}
+			}
+		})
 	}
 }
 
@@ -423,4 +588,65 @@ func TestTheMCPDoorLeavesTheGatewaysConsoleDoorAlone(t *testing.T) {
 			t.Errorf("MCP flag %q: the gateway carries %s %d times (value %q), want once, true", flag, a2aConsoleDoorEnvVar, n, value)
 		}
 	}
+}
+
+// The MCP container's GOMEMLIMIT is 85% of its memory limit, both read off
+// the rendered pod, with broker access on and off: a later change to the
+// limit cannot leave the runtime's soft limit at the old size, or above the
+// limit. Go's syntax for the value is bytes with an optional B, KiB, MiB or
+// GiB suffix.
+func TestTheMCPGoMemLimitIs85PercentOfTheContainerLimit(t *testing.T) {
+	for _, brokerOn := range []bool{false, true} {
+		t.Run(map[bool]string{false: "broker access off", true: "broker access on"}[brokerOn], func(t *testing.T) {
+			t.Setenv(a2aMCPDoorEnvVar, map[bool]string{false: "", true: "true"}[brokerOn])
+			pod := buildA2AMCPDeployment(a2aTestAgent()).Spec.Template.Spec
+			if len(pod.Containers) != 1 {
+				t.Fatalf("%d containers; want one", len(pod.Containers))
+			}
+			c := pod.Containers[0]
+			limit, ok := c.Resources.Limits[corev1.ResourceMemory]
+			if !ok {
+				t.Fatal("the MCP container has no memory limit")
+			}
+			var values []string
+			for _, e := range c.Env {
+				if e.Name == "GOMEMLIMIT" {
+					if e.ValueFrom != nil {
+						t.Fatalf("GOMEMLIMIT is a reference, %v; want a value", e.ValueFrom)
+					}
+					values = append(values, e.Value)
+				}
+			}
+			if len(values) != 1 {
+				t.Fatalf("GOMEMLIMIT set %d times (%v); want once", len(values), values)
+			}
+			got, err := parseGoMemLimit(values[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := limit.Value() * 85 / 100; got != want {
+				t.Errorf("GOMEMLIMIT = %q (%d bytes); want 85%% of the %s limit, %d bytes", values[0], got, limit.String(), want)
+			}
+		})
+	}
+}
+
+// parseGoMemLimit reads a GOMEMLIMIT value as the Go runtime does: an integer
+// number of bytes, optionally suffixed B, KiB, MiB, GiB or TiB.
+func parseGoMemLimit(v string) (int64, error) {
+	mult := int64(1)
+	for _, u := range []struct {
+		suffix string
+		mult   int64
+	}{{"TiB", 1 << 40}, {"GiB", 1 << 30}, {"MiB", 1 << 20}, {"KiB", 1 << 10}, {"B", 1}} {
+		if n, ok := strings.CutSuffix(v, u.suffix); ok {
+			v, mult = n, u.mult
+			break
+		}
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("GOMEMLIMIT %q is not a byte count Go accepts", v)
+	}
+	return n * mult, nil
 }

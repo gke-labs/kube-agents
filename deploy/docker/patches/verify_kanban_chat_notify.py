@@ -95,10 +95,20 @@ def main() -> None:
     GCHAT = Platform("google_chat")
     sub = {"task_id": "t_1", "platform": "google_chat", "chat_id": "spaces/H", "thread_id": "spaces/H/threads/T"}
 
+    # The console has no platform in Hermes; loading the patched notifier
+    # registered one, so a console card's subscription string resolves the
+    # way the notifier resolves every subscription's (Platform(str)).
+    try:
+        console = Platform("console")
+    except ValueError:
+        console = None
+    check(console is not None and console.value == "console", "console: Platform('console') resolves")
+
     os.environ.pop(NOTIFY_PLATFORM_ENV, None)
     runner = _Runner()
     collector = notifier._Collector(runner, kb=None, notifier_profile=None, gc_due=False, gc_retention_days=30)
     check("google_chat" not in collector.active_platforms, "unrouted: google_chat is not served")
+    check("console" in collector.active_platforms, "console: served with no variable naming it")
     check(notifier._adapter_for_subscription(runner, GCHAT, sub, None) is None,
           "unrouted: no adapter for google_chat")
 

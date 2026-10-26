@@ -2430,7 +2430,7 @@ apiVersion: v1
 data:
   identities.json: |
     {
-      "version": "72b81cbcb7a7a0e1",
+      "version": "716f41c4978f44d3",
       "identities": [
         {
           "serviceAccount": "system:serviceaccount:kubeagents-system:platformagent-a2a-provision",
@@ -2491,6 +2491,7 @@ data:
               "$JS.API.DIRECT.GET.TOPICS-JOURNAL.>",
               "chat.notify.gchat",
               "chat.notify.slack",
+              "chat.notify.console",
               "_INBOX.agent.>"
             ],
             "subscribe": [
@@ -2523,7 +2524,7 @@ data:
 kind: ConfigMap
 metadata:
   annotations:
-    kubeagents.x-k8s.io/a2a-authmap-version: 72b81cbcb7a7a0e1
+    kubeagents.x-k8s.io/a2a-authmap-version: 716f41c4978f44d3
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -2735,6 +2736,7 @@ stringData:
                   "chat.console.*.in",
                   "chat.notify.gchat",
                   "chat.notify.slack",
+                  "chat.notify.console",
                   "chat.board.reply.gateway.>",
                   "_INBOX.gateway.>"
                 ]
@@ -4092,6 +4094,15 @@ rules:
       - platformagents
     verbs:
       - get
+  - apiGroups:
+      - ""
+    resourceNames:
+      - platformagent-home-channel
+    resources:
+      - configmaps
+    verbs:
+      - get
+      - patch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -4119,6 +4130,25 @@ subjects:
   - kind: ServiceAccount
     name: platformagent-a2a-gateway
     namespace: kubeagents-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: gateway
+  name: platformagent-home-channel
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
 ---
 apiVersion: batch/v1
 kind: Job

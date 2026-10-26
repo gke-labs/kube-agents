@@ -235,6 +235,201 @@ class LedgerMintRetryTest(unittest.TestCase):
 _SCORING = _REPO_ROOT / "bench" / "kube_agents_bench" / "scoring.py"
 
 
+class LedgerTokenRenewalTest(unittest.TestCase):
+    """The unit's grading token is renewed into a file while devops-bench runs.
+
+    oobe-first-run-audits' first repetition spent 1h18m in its stack on
+    2026-10-17 and 2026-10-18, so the token minted just before launch had
+    expired when the inject lane's github_writes safeguard read GitHub: a 401,
+    a rung-2 "checks errored" red on a run that wrote nothing. The checks read
+    BENCH_GITHUB_TOKEN_FILE at verify time (bench/kube_agents_bench/forges.py),
+    and these run the real start/stop pair with the mint stubbed and the
+    renewal period cut to seconds.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = pathlib.Path(tmp.name)
+
+    def _run(self, body, **env):
+        key_file = self.tmp / "ledger.pem"
+        key_file.write_text("not a real key -- the mint itself is stubbed\n")
+        script = "\n".join(
+            [
+                "set -euo pipefail",
+                _extract(r"^LEDGER_MINT_RETRYABLE=\d+$", "LEDGER_MINT_RETRYABLE"),
+                _extract(r"^LEDGER_MINT_ATTEMPTS=\d+$", "LEDGER_MINT_ATTEMPTS"),
+                _extract(r"^LEDGER_GRADING_MINT_BODY=[^\n]*$", "LEDGER_GRADING_MINT_BODY"),
+                _extract(r"^mint_ledger_token\(\) \{.*?^\}", "mint_ledger_token"),
+                _extract(r"^start_ledger_token_renewal\(\) \{.*?^\}", "start_ledger_token_renewal"),
+                _extract(r"^stop_ledger_token_renewal\(\) \{.*?^\}", "stop_ledger_token_renewal"),
+                # Seconds rather than forty minutes, so the renewal is observable.
+                "LEDGER_TOKEN_RENEW_SECONDS=2",
+                "LEDGER_TOKEN_RENEW_TICK_SECONDS=1",
+                "LEDGER_TOKEN_RENEW_RETRY_SECONDS=1",
+                # Fails (a credential fault, so mint_ledger_token does not retry
+                # it itself) as many times as MINT_FAILURES says, then mints.
+                'echo 0 > "${COUNT_FILE}"',
+                "_ledger_token_mint() {",
+                '  local n=$(( $(cat "${COUNT_FILE}") + 1 ))',
+                '  echo "${n}" > "${COUNT_FILE}"',
+                '  if [ "${n}" -le "${MINT_FAILURES:-0}" ]; then echo "stub refusal ${n}" >&2; return 1; fi',
+                '  echo "tok-renewed 2026-10-17T09:00:00Z"',
+                "}",
+                body,
+            ]
+        )
+        overrides = {
+            "EVAL_LEDGER_APP_KEY_FILE": str(key_file),
+            "EVAL_LEDGER_APP_ID": "4739812",
+            "EVAL_LEDGER_INSTALLATION_ID": "157029058",
+            "BENCH_GITHUB_TOKEN": "tok-at-launch",
+            "TOKEN_FILE": str(self.tmp / "unit.ledger-token"),
+            "COUNT_FILE": str(self.tmp / "mint-count"),
+        }
+        overrides.update(env)
+        return subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=get_isolated_test_env(overrides=overrides),
+        )
+
+    def test_the_file_starts_with_the_launch_token_and_is_renewed_then_removed(self):
+        proc = self._run(
+            textwrap.dedent(
+                """\
+                start_ledger_token_renewal "case rep 1" "${TOKEN_FILE}"
+                echo "EXPORTED=${BENCH_GITHUB_TOKEN_FILE}"
+                echo "AT_LAUNCH=$(cat "${TOKEN_FILE}")"
+                echo "MODE=$(stat -c %a "${TOKEN_FILE}" 2>/dev/null || stat -f %Lp "${TOKEN_FILE}")"
+                for _ in $(seq 1 20); do
+                  grep -q tok-renewed "${TOKEN_FILE}" && break
+                  command sleep 0.5
+                done
+                echo "RENEWED=$(cat "${TOKEN_FILE}")"
+                renewer="${LEDGER_TOKEN_RENEWER}"
+                stop_ledger_token_renewal "${TOKEN_FILE}"
+                kill -0 "${renewer}" 2>/dev/null && echo "RENEWER=alive" || echo "RENEWER=gone"
+                [ -e "${TOKEN_FILE}" ] && echo "FILE=left" || echo "FILE=removed"
+                echo "UNSET=${BENCH_GITHUB_TOKEN_FILE:-}"
+                """
+            )
+        )
+        out = proc.stdout
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn(f"EXPORTED={self.tmp / 'unit.ledger-token'}", out)
+        self.assertIn("AT_LAUNCH=tok-at-launch", out)
+        self.assertIn("MODE=600", out)
+        self.assertIn("RENEWED=tok-renewed", out)
+        self.assertIn("RENEWER=gone", out)
+        self.assertIn("FILE=removed", out)
+        self.assertIn("UNSET=\n", out + "\n")
+        self.assertNotIn("tok-renewed", proc.stderr, "a renewal never prints the token")
+
+    def test_a_failed_renewal_is_retried_soon_rather_than_a_period_later(self):
+        # Two refusals, then a mint. With the retry at a whole period the
+        # third attempt would come six seconds in; at the retry step it comes
+        # in about four, well inside the wait below.
+        proc = self._run(
+            textwrap.dedent(
+                """\
+                start_ledger_token_renewal "case rep 1" "${TOKEN_FILE}"
+                for _ in $(seq 1 12); do
+                  grep -q tok-renewed "${TOKEN_FILE}" && break
+                  command sleep 0.5
+                done
+                echo "RENEWED=$(cat "${TOKEN_FILE}")"
+                stop_ledger_token_renewal "${TOKEN_FILE}"
+                """
+            ),
+            MINT_FAILURES="2",
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("RENEWED=tok-renewed", proc.stdout)
+        self.assertIn("renewed after 2 failed attempt(s)", proc.stderr)
+
+    def test_a_failure_streak_warns_once_without_the_mints_error_block(self):
+        # The mint's ERROR block says grading cannot proceed, which is false
+        # while the file still holds a live token; repeated on every retry it
+        # filled the job log for the rest of the unit.
+        proc = self._run(
+            textwrap.dedent(
+                """\
+                start_ledger_token_renewal "case rep 1" "${TOKEN_FILE}"
+                for _ in $(seq 1 16); do
+                  grep -q tok-renewed "${TOKEN_FILE}" && break
+                  command sleep 0.5
+                done
+                echo "RENEWED=$(cat "${TOKEN_FILE}")"
+                stop_ledger_token_renewal "${TOKEN_FILE}"
+                echo "MINTS=$(cat "${COUNT_FILE}")"
+                """
+            ),
+            MINT_FAILURES="3",
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("RENEWED=tok-renewed", proc.stdout)
+        self.assertIn("MINTS=4", proc.stdout)
+        self.assertEqual(1, proc.stderr.count("WARNING: case rep 1: could not renew"), proc.stderr)
+        self.assertIn("(stub refusal 1); the previous token stays in", proc.stderr)
+        self.assertNotIn("Grading a ledger issue needs it", proc.stderr)
+        self.assertNotIn("ERROR:", proc.stderr)
+        self.assertIn("renewed after 3 failed attempt(s)", proc.stderr)
+
+    def test_the_renewer_ends_when_its_unit_is_gone(self):
+        # A unit killed before it reaches stop_ledger_token_renewal must not
+        # leave the loop running for the rest of the job.
+        proc = self._run(
+            textwrap.dedent(
+                """\
+                [ -n "${BASHPID:-}" ] || { echo "SKIP=no BASHPID"; exit 0; }
+                ( start_ledger_token_renewal "case rep 1" "${TOKEN_FILE}"
+                  echo "${LEDGER_TOKEN_RENEWER}" > "${TOKEN_FILE}.pid" )
+                renewer="$(cat "${TOKEN_FILE}.pid")"
+                for _ in $(seq 1 10); do
+                  kill -0 "${renewer}" 2>/dev/null || break
+                  command sleep 0.5
+                done
+                kill -0 "${renewer}" 2>/dev/null && echo "RENEWER=alive" || echo "RENEWER=gone"
+                kill "${renewer}" 2>/dev/null || true
+                """
+            )
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        if "SKIP=" in proc.stdout:
+            self.skipTest("this bash has no BASHPID; the Prow image's does")
+        self.assertIn("RENEWER=gone", proc.stdout)
+
+    def test_nothing_is_renewed_without_the_app_key(self):
+        # The mounted PAT does not expire, and there is nothing to mint it from.
+        proc = self._run(
+            textwrap.dedent(
+                """\
+                start_ledger_token_renewal "case rep 1" "${TOKEN_FILE}"
+                echo "EXPORTED=${BENCH_GITHUB_TOKEN_FILE:-}"
+                [ -e "${TOKEN_FILE}" ] && echo "FILE=written" || echo "FILE=none"
+                stop_ledger_token_renewal "${TOKEN_FILE}"
+                """
+            ),
+            EVAL_LEDGER_APP_KEY_FILE="",
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("EXPORTED=\n", proc.stdout)
+        self.assertIn("FILE=none", proc.stdout)
+
+    def test_run_one_unit_holds_the_renewal_around_devops_bench(self):
+        unit = _lift_function("run_one_unit")
+        start = unit.index('start_ledger_token_renewal "${name} rep ${rep}" "${token_file}"')
+        bench = unit.index("uv run devops-bench")
+        stop = unit.index('stop_ledger_token_renewal "${token_file}"')
+        self.assertLess(unit.index('mint_ledger_token "${name} rep ${rep}"'), start)
+        self.assertLess(start, bench)
+        self.assertLess(bench, stop)
+
+
 def _lift_function(name):
     return _extract(rf"^{name}\(\) \{{.*?^\}}", name)
 
@@ -316,12 +511,17 @@ class UnitNotRunTest(unittest.TestCase):
                 _extract(r"^LEDGER_MINT_ATTEMPTS=\d+$", "LEDGER_MINT_ATTEMPTS"),
                 _extract(r"^LEDGER_RESET_MINT_ATTEMPTS=\d+$", "LEDGER_RESET_MINT_ATTEMPTS"),
                 _extract(r"^LEDGER_RESET_MINT_RETRY_DELAY=\d+$", "LEDGER_RESET_MINT_RETRY_DELAY"),
+                _extract(r"^LEDGER_TOKEN_RENEW_SECONDS=\d+$", "LEDGER_TOKEN_RENEW_SECONDS"),
+                _extract(r"^LEDGER_TOKEN_RENEW_TICK_SECONDS=\d+$", "LEDGER_TOKEN_RENEW_TICK_SECONDS"),
+                _extract(r"^LEDGER_TOKEN_RENEW_RETRY_SECONDS=\d+$", "LEDGER_TOKEN_RENEW_RETRY_SECONDS"),
                 _extract(r"^LEDGER_GRADING_MINT_BODY=[^\n]*$", "LEDGER_GRADING_MINT_BODY"),
                 _extract(r"^AGENT_PULLS_RESET_PERMISSIONS=[^\n]*$", "AGENT_PULLS_RESET_PERMISSIONS"),
                 *(
                     _lift_function(f)
                     for f in (
                         "mint_ledger_token",
+                        "start_ledger_token_renewal",
+                        "stop_ledger_token_renewal",
                         "ledger_reset_token",
                         "forge_write_token",
                         "reset_agent_pulls",

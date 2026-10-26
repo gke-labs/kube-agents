@@ -24,10 +24,11 @@ name: A request for every fleet audit's latest report is answered from the repor
 prompt: >-
   Show me the latest report of each of these fleet audits from the report
   store: fleet-wide-cost-analysis, compliance-audit, obtainability-audit,
-  stockout-prevention, security-patch-orchestrator, fleet-consistency-drift,
-  ai-security-audit, gcp-networking-fabric-audit, gce-compute-fleet-audit.
+  stockout-prevention, upgrade-retrospective, security-patch-orchestrator,
+  fleet-consistency-drift, ai-security-audit, gcp-networking-fabric-audit,
+  gce-compute-fleet-audit.
 expected_output: >-
-  One entry for each of the nine audits, from the report store: the last
+  One entry for each of the ten audits, from the report store: the last
   run's status, its number of critical findings and its own ledger issue URL
   beside it (never another audit's). An audit whose last stored run is CLEAN
   is reported clean. An audit the store holds no run for is reported as
@@ -57,6 +58,7 @@ verification_spec:
           compliance-audit,
           obtainability-audit,
           stockout-prevention,
+          upgrade-retrospective,
           security-patch-orchestrator,
           fleet-consistency-drift,
           ai-security-audit,

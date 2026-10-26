@@ -199,6 +199,48 @@ func TestSlackClickThatIsNotOursIsNoTurn(t *testing.T) {
 	}
 }
 
+func TestSlackClickFromAListedGuestIsATurn(t *testing.T) {
+	api := &fakeSlackAPI{}
+	a, _ := newUXSlackAdapter(api)
+	a.SetAllowedGuests([]string{"T2:U9"})
+	msg, ok := a.interactive(clickPayload(t, "U9", "T2", "C1", "40.0", "kage.choice.0", "Option A", "x", "65.0"))
+	if !ok || msg.AuthorID != "T2:U9" {
+		t.Fatalf("a listed guest's click = (%+v, %v), want a turn authored T2:U9", msg, ok)
+	}
+	if _, ok := a.interactive(clickPayload(t, "U8", "T2", "C1", "41.0", "kage.choice.0", "Option A", "x", "66.0")); ok {
+		t.Error("an unlisted member of the same workspace clicked through")
+	}
+	if len(api.posted) != 1 || !strings.Contains(api.posted[0].text, "`T2:U8`") {
+		t.Errorf("posts = %+v, want one notice naming the entry T2:U8", api.posted)
+	}
+}
+
+func TestSlackClickGuestWorkspaceFields(t *testing.T) {
+	api := &fakeSlackAPI{}
+	a, _ := newUXSlackAdapter(api)
+	a.SetAllowedGuests([]string{"T2:U9"})
+	withTeams := func(raw json.RawMessage, userTeam, team string) json.RawMessage {
+		var p map[string]any
+		if err := json.Unmarshal(raw, &p); err != nil {
+			t.Fatal(err)
+		}
+		p["user"].(map[string]any)["team_id"] = userTeam
+		p["team"].(map[string]any)["id"] = team
+		out, _ := json.Marshal(p)
+		return out
+	}
+	// Only the click's team names the workspace: matched by it.
+	teamOnly := withTeams(clickPayload(t, "U9", "T2", "C1", "40.0", "kage.choice.0", "Option A", "x", "67.0"), "", "T2")
+	if msg, ok := a.interactive(teamOnly); !ok || msg.AuthorID != "T2:U9" {
+		t.Errorf("a listed guest named only by team.id = (%+v, %v), want T2:U9", msg, ok)
+	}
+	// The two fields disagree: no entry matches.
+	disagree := withTeams(clickPayload(t, "U9", "T2", "C1", "41.0", "kage.choice.0", "Option A", "x", "68.0"), "T2", "T3")
+	if _, ok := a.interactive(disagree); ok {
+		t.Error("a click whose two workspace fields disagree was admitted")
+	}
+}
+
 func TestSlackVerifiedClickRewritesTheQuestion(t *testing.T) {
 	api := &fakeSlackAPI{users: map[string]*slack.User{"U1": {Name: "jay", Profile: slack.UserProfile{DisplayName: "Jayanti"}}}}
 	a, _ := newUXSlackAdapter(api)

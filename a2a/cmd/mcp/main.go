@@ -31,6 +31,12 @@ const (
 	envAgent        = "MCP_AGENT_NAME"
 	envNamespace    = "MCP_NAMESPACE"
 	envCluster      = "MCP_CLUSTER_NAME"
+	// The credential broker and the projected token (audience
+	// kubeagents-credential-proxy-mcp) this pod presents to it, as the
+	// operator renders them. inspect_pr is registered only when the URL is
+	// set.
+	envBrokerURL       = "A2A_MCP_BROKER_URL"
+	envBrokerTokenFile = "A2A_MCP_BROKER_TOKEN_FILE" // #nosec G101 -- an env var name, not a credential
 
 	defaultListen       = ":8089"
 	defaultTokenFile    = "/var/run/secrets/a2a-mcp/token"
@@ -45,14 +51,15 @@ const (
 
 	readHeaderTimeout = 10 * time.Second
 	idleTimeout       = 60 * time.Second
-	// writeTimeout bounds one response. Every answer here is one JSON
-	// document, and the slowest, connection_status, bounds its own read
-	// (mcp.statusTimeout); a streamed answer, if a later tool adds one,
-	// has to revisit this.
-	writeTimeout = 30 * time.Second
-	// shutdownGrace outlasts the slowest request in flight, a status read
-	// (mcp's statusTimeout, 8 s), so a stop during one is a clean drain,
-	// well inside the pod's default 30 s termination grace.
+	// writeTimeout bounds one response, so it must outlast the slowest call
+	// a caller may ask for: send_message waits for the gateway's submission
+	// and then up to the longest answer wait (mcp.MaxTurnWait), which also
+	// outlasts inspect_pr's own bound (mcp.InspectTimeout). A streamed
+	// answer, if a later tool adds one, has to revisit this.
+	writeTimeout = mcp.MaxTurnWait + time.Minute
+	// shutdownGrace is how long a stop waits for the requests in flight,
+	// whose contexts the stop has already ended (serve), so a stop is a
+	// clean drain well inside the pod's default 30 s termination grace.
 	shutdownGrace = 10 * time.Second
 	// dialTimeout bounds one attempt at the first connect to the bus.
 	dialTimeout = 30 * time.Second
@@ -84,6 +91,10 @@ type settings struct {
 	listen    string
 	tokenFile string
 	bus       mcp.BusConfig
+	// broker is nil when the install gave this pod no broker, and then
+	// inspect_pr is not offered at all: a tool in tools/list that can only
+	// fail tells the caller's model something untrue about this install.
+	broker *mcp.BrokerClient
 }
 
 // configFromEnv reads the settings and the bus password. The token file is
@@ -119,7 +130,24 @@ func configFromEnv(getenv func(string) string) (settings, error) {
 	if password == "" {
 		return settings{}, fmt.Errorf("%s: %s is empty", envPasswordFile, passwordFile)
 	}
+	var broker *mcp.BrokerClient
+	if brokerURL := strings.TrimSpace(getenv(envBrokerURL)); brokerURL != "" {
+		// Set means meant: a broker URL with no usable token is a pod that
+		// fails at start, not one that quietly drops the tool.
+		brokerTokenFile := strings.TrimSpace(getenv(envBrokerTokenFile))
+		if brokerTokenFile == "" {
+			return settings{}, fmt.Errorf("%s is set, so %s is required", envBrokerURL, envBrokerTokenFile)
+		}
+		if _, err := mcp.ReadToken(brokerTokenFile); err != nil {
+			return settings{}, fmt.Errorf("%s: %w", envBrokerTokenFile, err)
+		}
+		broker, err = mcp.NewBrokerClient(mcp.BrokerConfig{URL: brokerURL, TokenFile: brokerTokenFile})
+		if err != nil {
+			return settings{}, fmt.Errorf("%s: %w", envBrokerURL, err)
+		}
+	}
 	return settings{
+		broker:    broker,
 		listen:    or(envListen, defaultListen),
 		tokenFile: tokenFile,
 		bus: mcp.BusConfig{
@@ -159,7 +187,8 @@ func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string)
 		return err
 	}
 	defer bus.Close()
-	srv, err := mcp.NewServer(mcp.ConnectionStatusTool(bus))
+	convs := mcp.NewConversations()
+	srv, err := mcp.NewServer(toolsFor(bus, convs, s.broker)...)
 	if err != nil {
 		log.Error("mcp server", "err", err)
 		return err
@@ -170,6 +199,27 @@ func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string)
 		return err
 	}
 	return serve(ctx, log, ln, mcp.Handler(srv, s.tokenFile, log))
+}
+
+// toolsFor is the tools this pod offers: inspect_pr only when it has a
+// broker.
+// toolBus is what the tools read and send through: the status read and the
+// turn tools' bus.
+type toolBus interface {
+	mcp.Bus
+	mcp.TurnBus
+}
+
+func toolsFor(bus toolBus, convs *mcp.Conversations, broker *mcp.BrokerClient) []mcp.Tool {
+	tools := []mcp.Tool{
+		mcp.ConnectionStatusTool(bus),
+		mcp.SendMessageTool(bus, convs),
+		mcp.TaskControlTool(bus, convs),
+	}
+	if broker != nil {
+		tools = append(tools, mcp.InspectPRTool(broker))
+	}
+	return tools
 }
 
 // dialWithRetry calls dial until it succeeds, the bus refuses it for good
@@ -200,9 +250,12 @@ func dialWithRetry[B any](ctx context.Context, log *slog.Logger, backoff time.Du
 	}
 }
 
-// serve runs until ctx is done or the server fails.
+// serve runs until ctx is done or the server fails. Every request's context
+// derives from ctx, so a stop ends the requests in flight rather than waiting
+// them out past shutdownGrace.
 func serve(ctx context.Context, log *slog.Logger, ln net.Listener, h http.Handler) error {
-	srv := &http.Server{Handler: h, ReadHeaderTimeout: readHeaderTimeout, IdleTimeout: idleTimeout, WriteTimeout: writeTimeout}
+	srv := &http.Server{Handler: h, ReadHeaderTimeout: readHeaderTimeout, IdleTimeout: idleTimeout, WriteTimeout: writeTimeout,
+		BaseContext: func(net.Listener) context.Context { return ctx }}
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
 	log.Info("mcp serving", "addr", ln.Addr().String(), "path", mcp.Path)

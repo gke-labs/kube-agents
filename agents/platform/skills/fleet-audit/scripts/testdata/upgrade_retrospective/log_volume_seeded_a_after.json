@@ -1,0 +1,1034 @@
+{
+  "body": {
+    "timeSeries": [
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "7555"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "ksm-metrics-collector",
+            "namespace_name": "gke-managed-cim",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "151846"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "kube-state-metrics",
+            "namespace_name": "gke-managed-cim",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "20231"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "config-reloader",
+            "namespace_name": "gmp-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "375552"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "operator",
+            "namespace_name": "gmp-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "16400841"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "prometheus",
+            "namespace_name": "gmp-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "68281"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "autoscaler",
+            "namespace_name": "kube-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "519946"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "core-metrics-exporter",
+            "namespace_name": "kube-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "32415"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "csi-driver-registrar",
+            "namespace_name": "kube-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "115772"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "default-http-backend",
+            "namespace_name": "kube-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "7187891"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "dnsmasq",
+            "namespace_name": "kube-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "26284"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "event-exporter",
+            "namespace_name": "kube-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "1096135"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "fluentbit",
+            "namespace_name": "kube-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "65565"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "fluentbit-gke",
+            "namespace_name": "kube-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "12309"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "fluentbit-metrics-collector",
+            "namespace_name": "kube-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "30295212"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "gce-pd-driver",
+            "namespace_name": "kube-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "19095818"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "gke-metadata-server",
+            "namespace_name": "kube-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "795385"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "gke-metrics-agent",
+            "namespace_name": "kube-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "149195"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "install-cni",
+            "namespace_name": "kube-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "316141971"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "konnectivity-agent",
+            "namespace_name": "kube-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "21537"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "konnectivity-agent-metrics-collector",
+            "namespace_name": "kube-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "1934906"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "kubedns",
+            "namespace_name": "kube-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "10847"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "kubedns-metrics-collector",
+            "namespace_name": "kube-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "39719"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "metrics-server",
+            "namespace_name": "kube-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "31573119"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "netd",
+            "namespace_name": "kube-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "10944"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "netd-metrics-collector",
+            "namespace_name": "kube-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "365774"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "node-cache",
+            "namespace_name": "kube-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "11589"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "nodelocaldns-metrics-collector",
+            "namespace_name": "kube-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "2259279"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "pdcsi-metrics-collector",
+            "namespace_name": "kube-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "133131"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "prometheus-metrics-collector",
+            "namespace_name": "kube-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "6476"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "prometheus-to-sd-exporter",
+            "namespace_name": "kube-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "21232"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "sidecar",
+            "namespace_name": "kube-system",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "727"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "worker",
+            "namespace_name": "seeded-defaults",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "1069794"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "writer",
+            "namespace_name": "seeded-deprecation",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "1437"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "relay",
+            "namespace_name": "seeded-intent",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "1440"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "gateway",
+            "namespace_name": "seeded-reliability",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "1492"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "agent",
+            "namespace_name": "seeded-shapes",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "2162"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "jvm",
+            "namespace_name": "seeded-shapes",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "3919065"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "kubectl",
+            "namespace_name": "seeded-shapes",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      },
+      {
+        "metric": {
+          "type": "logging.googleapis.com/byte_count"
+        },
+        "metricKind": "DELTA",
+        "points": [
+          {
+            "interval": {
+              "endTime": "2026-10-22T19:26:02Z",
+              "startTime": "2026-10-15T19:26:02Z"
+            },
+            "value": {
+              "int64Value": "725"
+            }
+          }
+        ],
+        "resource": {
+          "labels": {
+            "container_name": "pause",
+            "namespace_name": "seeded-shapes",
+            "project_id": "example-project"
+          },
+          "type": "k8s_container"
+        },
+        "valueType": "INT64"
+      }
+    ],
+    "unit": "By"
+  },
+  "params": {
+    "aggregation.alignmentPeriod": "604800s",
+    "aggregation.crossSeriesReducer": "REDUCE_SUM",
+    "aggregation.groupByFields": [
+      "resource.labels.namespace_name",
+      "resource.labels.container_name"
+    ],
+    "aggregation.perSeriesAligner": "ALIGN_SUM",
+    "filter": "metric.type=\"logging.googleapis.com/byte_count\" AND resource.type=\"k8s_container\" AND resource.labels.cluster_name=\"seeded-a\" AND resource.labels.location=\"us-central1-a\"",
+    "interval.endTime": "2026-10-22T19:26:02Z",
+    "interval.startTime": "2026-10-15T19:26:02Z",
+    "pageSize": "2000"
+  }
+}

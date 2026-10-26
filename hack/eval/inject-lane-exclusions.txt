@@ -23,7 +23,7 @@
 # lane").
 #
 # What does NOT belong here: a case whose only problem on the inject lane is
-# a `worker_commands` or `worker_agents` check, or a `tool_called` check on
+# a `worker_commands`, `worker_agents` or `worker_budget` check, or a `tool_called` check on
 # a door that shows no tool-call trace. The scorer sets such a check aside
 # as not applicable on that transport and grades the rest, so the case
 # still runs and still reports (docs/designs/eval-scorer.md). An entry here

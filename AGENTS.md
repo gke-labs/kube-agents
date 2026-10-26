@@ -42,7 +42,7 @@ Tests live in many places. **Decide by whether a model call is in the loop:**
 - **Yes, and you plant the defect it has to find** — it is an eval in
   `bench/tasks/<name>/task.yaml` and runs in CI. [`docs/designs/bench-case-format.md`](docs/designs/bench-case-format.md)
   is the contract (`make bench-case-check`, `scripts/test_task_registration.py`). **A change to
-  agent behaviour starts from one:** red locally, implement, green three times, registered:
+  agent behaviour starts from one:** red, implement, three greens, registered, or exempt:
   [`.agents/rules/eval_driven_development.md`](.agents/rules/eval_driven_development.md).
 - **Yes, and it checks an install you already have** — it is a critical user journey in
   `bench/cuj/` ([`bench/cuj/README.md`](bench/cuj/README.md)). Manual by design: it grades a live
@@ -192,9 +192,9 @@ user" clauses here. Agents with a user in the loop follow this file.
   merged disposition list under **Self-Review**: what you looked for, what was found, the context
   used. Mechanics: [`.agents/rules/pre_pr_review.md`](.agents/rules/pre_pr_review.md).
 - **Live-test the change before opening a PR:** fill in **Testing → Live validation** with how the
-  change was exercised against a running installation ([INSTALL.md](INSTALL.md)), the red-to-green
-  eval loop for agent behaviour changes, or "Not live-tested" with the reason when no install can
-  reach it. Mechanics and shared-install lease rules:
+  change ran against a running installation ([INSTALL.md](INSTALL.md)), the eval loop or
+  exemption record for agent behaviour changes, or "Not live-tested" with the reason when no install
+  can reach it. Mechanics and shared-install lease rules:
   [`.agents/rules/pre_pr_review.md`](.agents/rules/pre_pr_review.md).
 - **Keep `Self-Review` and `Live validation` current, not chronological:** fold later passes and
   fixes into the sections rather than appending rounds; round-by-round history belongs in the
