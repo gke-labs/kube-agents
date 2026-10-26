@@ -424,8 +424,8 @@ which made several cases a little worse without making any one of them fail thre
 version key carries the mode ([`bench/baselines/README.md`](../bench/baselines/README.md)), so the
 presubmit's `next` is compared only with lines a next-mode run on `main` recorded at its key, and
 the today lane's `today` only with today's; a case with no line at its key contributes nothing to
-`main`'s side, with one exception below. The main nightly (`ci-kube-agents-eval-nightly` and its
-`-writers` part) is the next-mode run on `main` that records, on the presubmit's agent model. A case
+`main`'s side, with one exception below. The main nightly (`ci-kube-agents-eval-nightly`, its
+`-main-b` half and its `-writers` part) is the next-mode run on `main` that records, on the presubmit's agent model. A case
 with no line at its next key (one the inject lane excludes, or whose window has not filled) falls
 back, for this number only, to its today-mode lines at the same key otherwise, which
 `ci-kube-agents-eval-nightly-today` records, and the verdict names those cases in a note; rung 6
