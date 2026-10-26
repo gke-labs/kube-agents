@@ -958,6 +958,16 @@
 # audit band as fleet-audit-clean-close-reads-clean, so it holds the infra lock.
 ./tasks/fleet-audit-on-demand-run-reports/task.yaml
 
+# gke-labs#2610: a request to propose a fix, delegated to a platform card, is
+# answered in the card's result with the PodDisruptionBudget manifest, and no
+# worker runs submit_suggestion.py, during its run or after kanban_complete.
+# The prompt is the card body the gate's failing repetitions carried. About
+# one repetition in 25 failed on main, so a night's three are a sample, not a
+# red on demand. deployer: noop, read-only, the no-pdb-workload fixture plus
+# the pool repository's checkout-gateway declaration (#3145); first phase,
+# like obtainability-remediation-proposal. Nightly from its first merge.
+./tasks/delegated-proposal-stays-in-reply/task.yaml
+
 # A user asks for the fleet audits' summaries that never reached the chat by
 # naming them; this sends that request for every shipped fleet audit and
 # grades the reply audit by audit against the report store
