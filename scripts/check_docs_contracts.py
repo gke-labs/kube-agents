@@ -78,8 +78,10 @@ CHECKS = (CHECK_FLAG, CHECK_FIELD, CHECK_COUNT)
 INSTALLER_SCRIPTS_REL = (Path("install.sh"), Path("upgrade.sh"), Path("uninstall.sh"))
 # One `case` arm whose pattern carries a long option: `--flag)`, `--flag=*)`,
 # `-y|--yes|--non-interactive)`. The help text lists the same names but follows
-# each with a value or a description rather than `)`, so it does not match.
-CASE_ARM_RE = re.compile(r"^\s*(?:[^\s()|]+\|)*--[a-z0-9][a-z0-9-]*(?:=\*)?(?:\|[^\s()]+)*\)")
+# each with a value or a description rather than `)`, so it does not match. The
+# alternatives on either side of the option exclude `|` from their characters,
+# so a `|` is always a separator and the pattern has one parse per line.
+CASE_ARM_RE = re.compile(r"^\s*(?:[^\s()|]+\|)*--[a-z0-9][a-z0-9-]*(?:=\*)?(?:\|[^\s()|]+)*\)")
 CASE_ARM_SEPARATOR = "|"
 CASE_ARM_CLOSE = ")"
 LONG_OPTION_PREFIX = "--"
@@ -96,8 +98,10 @@ COMMAND_SEPARATOR_RE = re.compile(r"\|\||&&|;|\|")
 # The segment after `curl … script.sh |` that runs what curl fetched: optional
 # environment assignments, optional sudo, then bash or sh.
 # An environment assignment before a command; its value may be a `<(…)`
-# process substitution, which carries spaces and pipes of its own.
-ASSIGNMENT_RE_FRAGMENT = r"(?:[A-Za-z_][A-Za-z0-9_]*=(?:<\([^)]*\)|\S)*\s+)*"
+# process substitution, which carries spaces and pipes of its own. A `<` that
+# opens a closed substitution is read only as that, and any other `<` only as a
+# character, so each value has one parse and no backtracking.
+ASSIGNMENT_RE_FRAGMENT = r"(?:[A-Za-z_][A-Za-z0-9_]*=(?:<\([^)]*\)|<(?!\([^)]*\))|[^\s<])*\s+)*"
 PIPED_RUNNER_RE = re.compile(r"^\s*" + ASSIGNMENT_RE_FRAGMENT + r"(?:sudo(?:\s+-\S+)*\s+)?(?:bash|sh)\b")
 # What may stand before a script's name when the script is the segment's
 # command: a prompt, environment assignments, sudo or time with options, a

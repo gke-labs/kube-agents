@@ -18,6 +18,7 @@ import contextlib
 import io
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -543,6 +544,30 @@ class SourceFileTest(RepoFixture):
         code, out = self.run_main()
         self.assertEqual(code, 1)
         self.assertIn("scans nothing", out)
+
+
+class PatternBacktrackingTest(unittest.TestCase):
+    """Each shell pattern has one parse per input, so a crafted line cannot stall the check."""
+
+    REPETITIONS = 60
+    TIME_BOUND_SECONDS = 1.0
+
+    def assert_fast(self, pattern, text):
+        started = time.monotonic()
+        pattern.match(text)
+        self.assertLess(time.monotonic() - started, self.TIME_BOUND_SECONDS)
+
+    def test_case_arm_with_many_bare_separators(self):
+        self.assert_fast(contracts.CASE_ARM_RE, "--0|" + "!|" * self.REPETITIONS)
+
+    def test_assignment_with_many_process_substitutions(self):
+        value = "X=" + "<(a)" * self.REPETITIONS
+        self.assert_fast(contracts.PIPED_RUNNER_RE, value)
+        self.assert_fast(contracts.SCRIPT_COMMAND_PREFIX_RE, value)
+
+    def test_unclosed_substitution_is_a_value_character(self):
+        self.assertIsNotNone(contracts.SCRIPT_COMMAND_PREFIX_RE.match("X=<(a ./"))
+        self.assertIsNotNone(contracts.PIPED_RUNNER_RE.match("X=<(a bash -s -- "))
 
 
 class RealTreeTest(unittest.TestCase):
