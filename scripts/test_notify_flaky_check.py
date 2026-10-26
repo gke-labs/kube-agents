@@ -177,8 +177,20 @@ class FingerprintTest(unittest.TestCase):
         log = (
             "2026-09-09T01:04:59.4322202Z FAILED bench/tests/test_x.py::test_y - AssertionError: boom\n"
             "2026-09-09T01:04:59.4322202Z ERROR bench/tests/test_z.py::test_w - fixture 'tmp' errored\n"
+            "2026-09-09T01:04:59.4322202Z FAILED bench/tests/test_x.py::test_v[a parent that did not end in compression] - AssertionError: boom\n"
+            "2026-09-09T01:04:59.4322202Z FAILED bench/tests/test_x.py::test_u[cd /tmp && audit_report.py start --audit compliance-audit > start.json]\n"
+            "2026-09-09T01:04:59.4322202Z FAILED bench/tests/test_x.py::test_t[failed-reason: bridge-queue-overflow - detail-True] - AssertionError: Lists differ: [1] != [2]\n"
         )
-        self.assertEqual(reporter.extract_test_ids(log), ["bench/tests/test_x.py::test_y", "bench/tests/test_z.py::test_w"])
+        self.assertEqual(
+            reporter.extract_test_ids(log),
+            [
+                "bench/tests/test_x.py::test_t[failed-reason: bridge-queue-overflow - detail-True]",
+                "bench/tests/test_x.py::test_u[cd /tmp && audit_report.py start --audit compliance-audit > start.json]",
+                "bench/tests/test_x.py::test_v[a parent that did not end in compression]",
+                "bench/tests/test_x.py::test_y",
+                "bench/tests/test_z.py::test_w",
+            ],
+        )
 
     def test_a_subtest_failure_is_its_test_not_its_parameters(self):
         """unittest prints `FAIL: test_x (m.C.test_x) (conclusion='a')` per
