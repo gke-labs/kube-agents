@@ -269,10 +269,12 @@ class CommittedSiteTest(unittest.TestCase):
         self.assertEqual(problems, [])
 
     def test_the_committed_allowlist_only_pins_the_backlog(self):
-        """Every entry names a page the site has and a shape the check reports; none is a free pass."""
+        """Every entry names a page the site has and a shape the check reports; none is a free pass.
+
+        An empty list passes vacuously: the cleanup ends with no entry left.
+        """
         entries, _ = check_docs_audience.load_allowlist()
         pages = {p.relative_to(check_docs_audience.SITE_ROOT).as_posix() for p in check_docs_audience.site_pages()}
-        self.assertTrue(entries)
         for entry in entries:
             with self.subTest(entry=repr(entry)):
                 self.assertIn(entry.page, pages)
@@ -319,6 +321,17 @@ class CitationShapeTest(SiteFixture):
         ):
             with self.subTest(body=body):
                 self.assertEqual(self.citations_for(body + "\n"), [(1, body)])
+
+    def test_link_target_path_query_and_title_do_not_change_the_count(self):
+        """Whatever Markdown admits between the URL and the closing parenthesis stays inside the one link."""
+        for body in (
+            f"[#2801]({PULL_URL}/files)",
+            f"[#2801]({PULL_URL}/commits?diff=split)",
+            f'[#2801]({PULL_URL} "merged in 0.19")',
+            f"[#2801]({PULL_URL}#discussion_r1 'title')",
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(self.citations_for(body + " and (#2802)\n"), [(1, body), (1, "#2802")])
 
     def test_link_text_number_to_another_target_is_one_bare_citation(self):
         self.assertEqual(self.citations_for("[PR #2801](/kube-agents/install/)\n"), [(1, "#2801")])
@@ -368,9 +381,33 @@ class CitationShapeTest(SiteFixture):
         body = "````md\n```\n#1234\n```\n#5678\n````\n#2801\n"
         self.assertEqual(self.citations_for(body), [(7, "#2801")])
 
+    def test_backtick_fence_info_string_with_a_backtick_is_a_code_span_not_a_fence(self):
+        """CommonMark: a backtick fence's info string may not hold a backtick; a tilde fence's may."""
+        body = "```yaml``` is the fence you want, see #2801\n```bash\n# see #1234\n```\n#5678\n~~~a`b\n#4321\n~~~\n#3333\n"
+        self.assertEqual(self.citations_for(body), [(1, "#2801"), (5, "#5678"), (9, "#3333")])
+
     def test_number_inside_an_html_comment_passes(self):
         body = "a <!-- #1234 --> b\n<!--\n#5678\n-->\n#2801 <!-- open #4321\nstill #8765 --> #3333\n"
         self.assertEqual(self.citations_for(body), [(5, "#2801"), (6, "#3333")])
+
+    def test_code_span_after_a_multiline_comment_closes_is_blanked(self):
+        """The prose after a mid-line closer gets the same code-span blanking as any other prose."""
+        body = "<!-- reviewer note\n--> the proxy listens on `#8080`; the `<!--` marker opens a comment\nlater #2801\n"
+        self.assertEqual(self.citations_for(body), [(3, "#2801")])
+        body = "{/* note\n*/} port `#8080` and `{/*` quoted\nlater #2801\n"
+        self.assertEqual(self.citations_for(body), [(3, "#2801")])
+
+    def test_an_opener_nothing_closes_is_text(self):
+        """A stray `<!--` or `{/*` hides nothing after it, as the links checker reads the same page."""
+        self.assertEqual(self.citations_for("a <!-- b\n#2801\n"), [(2, "#2801")])
+        self.assertEqual(self.citations_for("a {/* b #2801\n#2802\n"), [(1, "#2801"), (2, "#2802")])
+        body = "a <!-- b #1234\n#5678 --> #2801\nc <!-- d\n#2802\n"
+        self.assertEqual(self.citations_for(body), [(2, "#2801"), (4, "#2802")])
+
+    def test_a_closer_inside_a_fence_does_not_close_a_comment(self):
+        """Fences are read first, so a closer in code is not the one an opener waits for."""
+        body = "a <!-- b\n```\n-->\n```\n#2801\n"
+        self.assertEqual(self.citations_for(body), [(5, "#2801")])
 
     def test_blanked_comment_does_not_fuse_its_neighbours(self):
         self.assertEqual(self.citations_for("word<!-- c -->#2801\n"), [(1, "#2801")])
@@ -487,6 +524,13 @@ class AllowlistTest(SiteFixture):
         for number, error in enumerate(errors, start=1):
             self.assertIn(f"{self.allowlist}:{number}: expected `<page> <count> <shape>` with a count above zero", error)
 
+    def test_a_non_decimal_digit_count_is_malformed_not_a_traceback(self):
+        """`str.isdigit` accepts a superscript two that `int` refuses; the line is reported, not raised."""
+        self.write_page("#2801\n")
+        _, _, errors = self._reconcile(f"page.md \u00b2 {CITATION}\n")
+        self.assertEqual(len(errors), 1)
+        self.assertIn(f"{self.allowlist}:1: expected `<page> <count> <shape>` with a count above zero", errors[0])
+
     def test_only_the_backlog_shapes_can_be_pinned(self):
         """An entry for a workflow secret or an App ID is refused: those shapes have always held at zero."""
         self.write_page("secrets.API_TOKEN and app_id = 1\n")
@@ -576,6 +620,23 @@ class MainRedPathTest(SiteFixture):
         self.assertIn("1 allowlist entr(y/ies) out of step", out)
         self.assertIn(f"page.md: no finding of shape {CITATION!r} left, the allowlist entry at {self.allowlist}:1", out)
         self.assertIn("remove the entry", out)
+
+    def test_a_rise_header_counts_the_listed_findings_as_above_the_allowlist(self):
+        """The header and the entry line agree: the pinned finding is listed, not reported as uncovered."""
+        (self.site / "page.md").write_text("see #2801 and #2802\n", encoding="utf-8")
+        self.allowlist.write_text(f"page.md 1 {CITATION}\n", encoding="utf-8")
+        code, out = self._run_main()
+        self.assertEqual(code, 1)
+        self.assertIn(f"2 maintainer identifier(s) or pull-request citation(s) on the published site outside or above what {self.allowlist} allows", out)
+        self.assertNotIn("does not cover", out)
+        self.assertIn("remove enough of the 2 listed below to return to 1", out)
+
+    def test_an_empty_allowlist_passes_a_clean_site(self):
+        """The cleanup's end state: a list of comments only, a clean site, exit 0."""
+        (self.site / "page.md").write_text("clean\n", encoding="utf-8")
+        code, out = self._run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("0 allowlist entr(y/ies)", out)
 
     def test_an_exact_allowlist_match_passes(self):
         (self.site / "page.md").write_text("see #2801\n", encoding="utf-8")

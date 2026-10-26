@@ -23,11 +23,15 @@ review-time hope. Four sources feed it:
   agent domain (``gcp-sa-*``, ``*-robot``, ``*-system``, ``cloudservices``).
 * **Pull-request and issue citations** -- a bare ``#NNN`` of three or more
   digits, a ``github.com/gke-labs/kube-agents/pull|issues/N`` URL, or a link
-  whose text carries the number and whose target is that URL, counted once
-  each. This shape reads prose only: fenced code blocks, inline code spans
-  and HTML or MDX comments are blanked first, line by line so the reported
-  line numbers stay true, which is what keeps a shell comment inside a fence
-  from matching. A ``#NNN`` glued to a word or a ``/``
+  whose text carries the number and whose target starts with that URL (any
+  path, query, fragment or title after it is part of the link), counted once
+  each; a reference-style link counts its text and its definition
+  separately. This shape reads prose only: fenced code blocks, inline code
+  spans and HTML or MDX comments are blanked first, line by line so the
+  reported line numbers stay true, which is what keeps a shell comment inside
+  a fence from matching. A comment opener nothing later in the page closes is
+  text, as ``scripts/check_docs_links.py`` reads it, so a stray ``<!--`` does
+  not hide the rest of the page. A ``#NNN`` glued to a word or a ``/``
   (``kubernetes/kubernetes#68078``) is a cross-repository reference, one
   followed by a word character, ``-`` or ``;`` (``#404-errors``, ``&#160;``)
   is an anchor or an entity, and both are excused. ``contributing.md`` is
@@ -110,15 +114,19 @@ SERVICE_ACCOUNT_SHAPE = "service-account email in a non-placeholder project"
 
 # A pull-request or issue citation in prose. The three forms are one
 # alternation so `finditer` counts a linked citation once: the link branch is
-# tried first and consumes the number in its text, the URL it points at and any
-# fragment after it; the bare `#NNN` branch asks for three or more digits so a
+# tried first and consumes the number in its text, the URL it points at and
+# whatever follows the URL up to the closing parenthesis (a `/files` path, a
+# `?diff=` query, a `#issuecomment` fragment, a quoted title), so no form of
+# the target falls through to the other two branches; a reference-style link
+# keeps its text and its definition on separate lines and counts twice, a
+# limit this grammar accepts. The bare `#NNN` branch asks for three or more digits so a
 # `#2` list marker does not match, its lookbehind excuses a number glued to a
 # word or a `/` (a cross-repository reference, `kubernetes/kubernetes#68078`),
 # and its lookahead excuses a number that runs on into a word, a `-` or a `;`
 # (a heading anchor such as `#404-errors`, a numeric entity such as `&#160;`).
 REPO_ISSUE_URL_RE = r"(?:https?://)?github\.com/gke-labs/kube-agents/(?:pull|issues)/[0-9]+"
 CITATION_RE = re.compile(
-    rf"\[[^\]]*#[0-9]{{3,}}[^\]]*\]\({REPO_ISSUE_URL_RE}(?:#[^)\s]*)?\)"
+    rf"\[[^\]]*#[0-9]{{3,}}[^\]]*\]\({REPO_ISSUE_URL_RE}[^)]*\)"
     rf"|(?<![\w/])#[0-9]{{3,}}(?![-;\w])"
     rf"|{REPO_ISSUE_URL_RE}"
 )
@@ -130,13 +138,19 @@ CITATION_EXEMPT_PAGES = (Path("contributing.md"),)
 # What the citation shape does not read. A fenced code block: a backtick or
 # tilde fence at any indentation (a fence inside a list item sits at the item's
 # content column), closed by a fence of the same character at least as long
-# with nothing after it. An inline code span: a backtick run closed by a run of
-# the same length on the same line. A comment, HTML or MDX, which may span
-# lines. All are blanked in place so line numbers stay true, and code spans go
-# first so a comment opener quoted in one does not open a comment.
-FENCE_RE = re.compile(r"^\s*(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
+# with nothing after it; a backtick fence's info string may not contain a
+# backtick (CommonMark), which is what keeps a line opening with a
+# triple-backtick code span from opening a fence, while a tilde fence's may.
+# An inline code span: a backtick run closed by a run of the same length on
+# the same line. A comment, HTML or MDX, which may span lines, believed only
+# when its closer follows somewhere in the page. All are blanked in place so
+# line numbers stay true, and code spans go first so a comment opener quoted
+# in one does not open a comment; the text after a comment closes gets the
+# same treatment.
+FENCE_RE = re.compile(r"^\s*(?P<fence>(?P<backtick>`{3,})|~{3,})(?P<info>(?(backtick)[^`]*|.*))$")
 CODE_SPAN_RE = re.compile(r"(?P<ticks>`+)(?!`).+?(?<!`)(?P=ticks)(?!`)")
 COMMENT_DELIMITERS = (("<!--", "-->"), ("{/*", "*/}"))
+COMMENT_CLOSERS = dict(COMMENT_DELIMITERS)
 # A blanked span or comment leaves one space, so the text either side of it
 # does not fuse into a token neither side wrote.
 BLANK = " "
@@ -258,49 +272,78 @@ def pattern_findings(path: Path, text: str, shapes: Iterable[tuple[str, re.Patte
     return findings
 
 
-def blank_comments(line: str, open_delimiter: str | None) -> tuple[str, str | None]:
-    """The line with every comment segment blanked, and the delimiter of a comment left open at its end."""
+def blank_comments(line: str, open_delimiter: str | None, later_closers: set[str]) -> tuple[str, str | None]:
+    """The line with every comment segment blanked, and the delimiter of a comment left open at its end.
+
+    Code spans are blanked before the comment scan on every prose segment,
+    including the text after a comment closes, so an opener quoted in one
+    never opens a comment. An opener whose closer is neither on this line nor
+    among ``later_closers``, the closers that appear on a later line, is text.
+    """
     kept: list[str] = []
     pos = 0
     while pos < len(line):
         if open_delimiter is not None:
-            close = dict(COMMENT_DELIMITERS)[open_delimiter]
+            close = COMMENT_CLOSERS[open_delimiter]
             end = line.find(close, pos)
             if end == -1:
                 return "".join(kept), open_delimiter
             open_delimiter = None
             pos = end + len(close)
+            line = line[:pos] + CODE_SPAN_RE.sub(BLANK, line[pos:])
             continue
         starts = [(line.find(opener, pos), opener) for opener, _ in COMMENT_DELIMITERS]
         starts = [(at, opener) for at, opener in starts if at != -1]
         if not starts:
             kept.append(line[pos:])
             break
-        at, open_delimiter = min(starts)
+        at, opener = min(starts)
+        after = at + len(opener)
+        close = COMMENT_CLOSERS[opener]
+        if line.find(close, after) == -1 and close not in later_closers:
+            kept.append(line[pos:after])
+            pos = after
+            continue
+        open_delimiter = opener
         kept.append(line[pos:at])
         kept.append(BLANK)
-        pos = at + len(open_delimiter)
+        pos = after
     return "".join(kept), open_delimiter
+
+
+def unfenced_lines(text: str) -> list[str]:
+    """The page's lines with every fenced code block, fences included, replaced by an empty line."""
+    lines: list[str] = []
+    fence: str | None = None
+    for raw in text.splitlines():
+        match = FENCE_RE.match(raw)
+        if fence is None and match:
+            fence = match.group("fence")
+            lines.append("")
+        elif fence is not None:
+            if match and match.group("fence").startswith(fence) and not match.group("info").strip():
+                fence = None
+            lines.append("")
+        else:
+            lines.append(raw)
+    return lines
 
 
 def prose_lines(text: str) -> list[str]:
     """The page's lines with fenced code, inline code spans and comments blanked, one entry per source line."""
+    unfenced = unfenced_lines(text)
+    # The last unfenced line each closer appears on, so an opener is believed
+    # only when its closer follows it somewhere in the page.
+    last_closer_line = {
+        close: max((index for index, line in enumerate(unfenced) if close in line), default=-1)
+        for _, close in COMMENT_DELIMITERS
+    }
     lines: list[str] = []
-    fence: str | None = None
     open_delimiter: str | None = None
-    for raw in text.splitlines():
-        match = FENCE_RE.match(raw)
-        if fence is None and match and open_delimiter is None:
-            fence = match.group("fence")
-            lines.append("")
-            continue
-        if fence is not None:
-            if match and match.group("fence").startswith(fence) and not match.group("info").strip():
-                fence = None
-            lines.append("")
-            continue
+    for index, raw in enumerate(unfenced):
+        later_closers = {close for close, last in last_closer_line.items() if last > index}
         line = raw if open_delimiter is not None else CODE_SPAN_RE.sub(BLANK, raw)
-        line, open_delimiter = blank_comments(line, open_delimiter)
+        line, open_delimiter = blank_comments(line, open_delimiter, later_closers)
         lines.append(line)
     return lines
 
@@ -322,7 +365,7 @@ def load_allowlist(path: Path = ALLOWLIST) -> tuple[list[AllowlistEntry], list[s
     shown = display_path(path)
     for number, line in list_file_lines(path):
         fields = line.split(None, ALLOWLIST_FIELDS - 1)
-        count = int(fields[1]) if len(fields) == ALLOWLIST_FIELDS and fields[1].isdigit() else 0
+        count = int(fields[1]) if len(fields) == ALLOWLIST_FIELDS and fields[1].isdecimal() else 0
         if count < 1:
             errors.append(ALLOWLIST_MALFORMED_ERROR.format(allowlist=shown, line=number, text=line))
             continue
@@ -446,9 +489,9 @@ def main(
     pages = len(site_pages(root))
     if findings or problems:
         print(
-            f"{len(findings)} maintainer identifier(s) or pull-request citation(s) on the published site that "
-            f"{display_path(allowlist)} does not cover, and {len(problems)} allowlist entr(y/ies) out of step with "
-            f"the site (rule: .agents/rules/documentation.md; shapes: {display_path(denylist)}). "
+            f"{len(findings)} maintainer identifier(s) or pull-request citation(s) on the published site outside "
+            f"or above what {display_path(allowlist)} allows, and {len(problems)} allowlist entr(y/ies) out of step "
+            f"with the site (rule: .agents/rules/documentation.md; shapes: {display_path(denylist)}). "
             "Move the page to the home the AGENTS.md canonical-home table names, replace "
             "the value with a placeholder the reader fills in, or state the reason in prose:"
         )
