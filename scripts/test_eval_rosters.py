@@ -565,63 +565,31 @@ class SplitLostNothingTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
 
-# The inject lane's exclusions at their introduction (#2039, 2026-09-25): the
-# one presubmit case whose premise needs the chat front door. An edit to the
-# file edits this set in the same pull request, for the reason the sets above
-# are pinned.
+# The inject lane's exclusions, introduced by #2039 (2026-09-25); #4004 put the
+# front door's delegation and question cases back, agent-kanban-smoke among
+# them. An edit to the file edits this set in the same pull request, for the
+# reason the sets above are pinned.
 INJECT_LANE_EXCLUDED = [
-    "agent-kanban-smoke",  # #2039: grades kanban_create by the front door and the specialist's answer folded back, which the door's thread never gets
-    "chat-voice-retry-says-it-is-retried",  # #2039: grades the front door's reply to a crashed card's wake; a card-wake replay runs on the api transport only
+    "chat-voice-retry-says-it-is-retried",  # #4004: grades the front door's reply to a crashed card's wake, which under next reaches no user
     "chat-voice-final-attempt-is-not-retried",  # the same for a card's last-attempt wake
-    "chat-voice-failure-leads-with-fact",  # #2039: grades the front door's reply to a blocked card's wake; same reason
-    "chat-question-wake-stays-silent",  # #2039: grades the front door's silence on a posted question's wake; same reason
-    "chat-question-typed-answer-fresh-session",  # the same for a typed answer in a session the wake never reached
-    "chat-question-click-answer-stays-silent",  # the same for an answer given by clicking the question's button
-    "chat-voice-ack-names-target",  # #2039: grades the front door's delegation ack with the specialist's answer after it, which the door's thread never gets
+    "chat-voice-failure-leads-with-fact",  # the same for a blocked card's wake
     "chat-reset-history-names-the-command",  # #2039: grades the front door's answer to a reset request; excluded under cli, not yet graded on api
     "chat-routing-board-read",  # the same for the front door reading the board instead of filing a card
-    "chat-routing-fleet-question",  # the same as the ack: the answer is the specialist's, which the door's thread never gets
     "first-install-hello-running",  # #2039: grades the chat profile's onboarding greeting; excluded under cli, not yet graded on api
     "first-install-hello-done",  # the same once the first-look scan has finished
-    "chat-voice-answer-first",  # #2039: grades the card result the front door delivers; the inject door files no card
-    "chat-fanout-fleet-restarts-rows",  # #2039: grades the front door's ack and the fan-out under its one card; same door
-    "chat-question-asked-to-choose-pauses",  # #2039: grades the worker's needs_input block under the door's one card; same door
-    "chat-failure-reply-declares-next-step",  # #2039: grades the front door's reply to a blocked card's wake; a card-wake replay
-    "chat-answer-declares-next-step",  # #2039: grades the worker's answer under the door's one card; same door
-    "chat-answer-tangent-offer-declares-no-step",  # the same
-    "fleet-audit-request-line",  # #2619: grades the worker's answer the api lane folds into the reply; the door's thread never gets it
+    "chat-failure-reply-declares-next-step",  # #4004: the same as chat-voice-failure-leads-with-fact, for the step its reply declares
 ]
-# The directives a case's prompt opens with to replay a wake into the chat
-# front door (bench/kube_agents_bench/card_wake.py); the harness errors such
-# a run on any transport but api.
-FRONT_DOOR_WAKE_DIRECTIVES = ("[bench:card-failure-wake]", "[bench:slack-question-wake]")
-# Check types that read what only the chat front door's card round trip
-# delivers; on the inject lane there is no card, so the check fails rather
-# than being set aside (bench/README.md, the transport table).
-FRONT_DOOR_DELIVERY_CHECK_TYPES = frozenset({"answer_first", "report_store_reply"})
 # Each exclusion's api-lane tier, pinned beside it: an entry is not a
 # demotion, so a case that leaves its tier's file while still excluded reds.
 INJECT_LANE_EXCLUDED_TIER = {
-    "agent-kanban-smoke": "presubmit",
     "chat-voice-retry-says-it-is-retried": "nightly",
     "chat-voice-final-attempt-is-not-retried": "nightly",
     "chat-voice-failure-leads-with-fact": "nightly",
-    "chat-question-wake-stays-silent": "nightly",
-    "chat-question-typed-answer-fresh-session": "nightly",
-    "chat-question-click-answer-stays-silent": "nightly",
-    "chat-voice-ack-names-target": "nightly",
     "chat-reset-history-names-the-command": "nightly",
     "chat-routing-board-read": "nightly",
-    "chat-routing-fleet-question": "nightly",
     "first-install-hello-running": "nightly",
     "first-install-hello-done": "nightly",
-    "chat-voice-answer-first": "nightly",
-    "chat-fanout-fleet-restarts-rows": "nightly",
-    "chat-question-asked-to-choose-pauses": "nightly",
     "chat-failure-reply-declares-next-step": "nightly",
-    "chat-answer-declares-next-step": "nightly",
-    "chat-answer-tangent-offer-declares-no-step": "nightly",
-    "fleet-audit-request-line": "nightly",
 }
 
 
@@ -736,7 +704,7 @@ class InjectLaneExclusionsTest(unittest.TestCase):
         # docs/eval-gate-roster.md ("The inject lane"), not a side effect of an
         # exclusion entry.
         roster = set(eval_rosters.blocking_roster())
-        self.assertEqual([case for case in eval_rosters.inject_lane_exclusions() if case in roster], ["agent-kanban-smoke"])
+        self.assertEqual([case for case in eval_rosters.inject_lane_exclusions() if case in roster], [])
 
     def test_every_exclusion_names_a_registered_case(self):
         registered = set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases())
@@ -750,42 +718,6 @@ class InjectLaneExclusionsTest(unittest.TestCase):
             with self.subTest(case=case):
                 self.assertTrue(reason, f"{case}: no reason in the comment block above it")
                 self.assertRegex(reason, eval_rosters.ISSUE_REFERENCE_RE, f"{case}: the reason names no issue")
-
-    def test_every_registered_wake_replay_is_excluded(self):
-        # A replay errors on the inject lane, so an unlisted one reds there
-        # every repetition; the docs' rule is enforced here, on the loaded
-        # prompt's first line as card_wake.parse reads it.
-        import yaml
-
-        excluded = eval_rosters.inject_lane_exclusions()
-        for case in set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()):
-            doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
-            lines = str(doc.get("prompt") or "").strip().splitlines()
-            if lines and lines[0].strip() in FRONT_DOOR_WAKE_DIRECTIVES:
-                with self.subTest(case=case):
-                    self.assertIn(case, excluded, f"{case} replays a wake but is not in {eval_rosters.INJECT_LANE_EXCLUSIONS_FILE.name}")
-
-    def test_every_registered_front_door_delivery_case_is_excluded(self):
-        # answer_first fails on the inject lane rather than being set aside,
-        # so an unlisted case carrying one reds there every repetition.
-        import yaml
-
-        def check_types(node):
-            if isinstance(node, dict):
-                if isinstance(node.get("type"), str):
-                    yield node["type"]
-                for value in node.values():
-                    yield from check_types(value)
-            elif isinstance(node, list):
-                for value in node:
-                    yield from check_types(value)
-
-        excluded = eval_rosters.inject_lane_exclusions()
-        for case in set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()):
-            doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
-            if FRONT_DOOR_DELIVERY_CHECK_TYPES & set(check_types(doc.get("verification_spec"))):
-                with self.subTest(case=case):
-                    self.assertIn(case, excluded, f"{case} reads a delivered card result but is not in {eval_rosters.INJECT_LANE_EXCLUSIONS_FILE.name}")
 
     def test_an_exclusion_is_not_a_demotion(self):
         # The api lane's roster is untouched by an entry here: an excluded
@@ -1009,7 +941,7 @@ class InjectLaneSafeguardsTest(unittest.TestCase):
         # runs: the lane's matrix is the presubmit file less the exclusions,
         # exactly as before this file existed.
         self.assertTrue(self.lane_cases())
-        self.assertNotIn("agent-kanban-smoke", self.lane_cases())
+        self.assertIn("agent-kanban-smoke", self.lane_cases())
 
 
 if __name__ == "__main__":

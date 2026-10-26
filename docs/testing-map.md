@@ -129,7 +129,7 @@ When diagnosing failures or reporting incidents, name the specific job rather th
 
 `staging-promotion-pipeline.yml` is the GitHub Actions workflow that runs the full E2E matrix and promotes validated release candidates to staging.
 
-`post-kube-agents-eval-rc` grades nominated candidates on a `spec.mode: next` install, the mode a new install gets (`EVAL_MODE_NEXT=1` on the job), against the merge-blocking presubmit matrix less the inject lane's exclusions (`agent-kanban-smoke` among them; [`docs/eval-gate-roster.md`](eval-gate-roster.md#the-inject-lane)), the tier the pull-request gate runs, not the full catalog the nightly runs (`hack/ci-eval-rc.sh` pins `RC_EVAL_TIER`; the reason is the 360m budget, [`docs/designs/testing-strategy.md`](designs/testing-strategy.md)), under a postsubmit trigger and lower task parallelism (4 vs 6); neither failure implies the other, and a regression only a nightly-only case would catch reaches staging and is reported by the nightly afterwards.
+`post-kube-agents-eval-rc` grades nominated candidates on a `spec.mode: next` install, the mode a new install gets (`EVAL_MODE_NEXT=1` on the job), against the merge-blocking presubmit matrix less the inject lane's exclusions ([`docs/eval-gate-roster.md`](eval-gate-roster.md#the-inject-lane)), the tier the pull-request gate runs, not the full catalog the nightly runs (`hack/ci-eval-rc.sh` pins `RC_EVAL_TIER`; the reason is the 360m budget, [`docs/designs/testing-strategy.md`](designs/testing-strategy.md)), under a postsubmit trigger and lower task parallelism (4 vs 6); neither failure implies the other, and a regression only a nightly-only case would catch reaches staging and is reported by the nightly afterwards.
 
 ## Running on a pull request is not gating a merge
 

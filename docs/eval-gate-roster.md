@@ -439,8 +439,8 @@ what it ran by hand.
 ## The whole-suite rate
 
 Beside the per-case rungs the verdict carries one number for the whole pull request: the pooled
-pass rate of every roster case's scored repetitions — on the presubmit, the roster less
-`agent-kanban-smoke`, which is off the inject lane ([below](#the-inject-lane)), and on the today
+pass rate of every roster case's scored repetitions — on the presubmit, the roster less any
+case the inject lane excludes ([below](#the-inject-lane)), and on the today
 lane the whole roster, each case at three repetitions (`python3 scripts/eval_rosters.py --summary`
 has the roster's count), `infra` repetitions left out — against `main`'s rate over the same cases from the evidence store (the
 newest seven nightly lines per case). It is the rule that can see a pull request
@@ -550,14 +550,15 @@ rebuilt, but the worker half stays until `scoring.py` takes those entries out of
 `worker_blind_checks` for a record that carries the workers.
 
 A premise the transport removes is the lane's exclusion list,
-`hack/eval/inject-lane-exclusions.txt`. `agent-kanban-smoke`'s objective is the default profile
-filing a `kanban_create` and the specialist's answer coming back to the thread. Under the bridge's
-default `api` executor the default profile answers the door's task and can file the card, but the
-card's completion never reaches the A2A thread. The lane's delegation wait reads the card's
-result from the pod and appends it to the graded answer, but that is the harness's view, not the
-thread's, so grading it would pass a premise the case does not have there. The card-wake
-cases replay a wake whose reply under `next` is posted nowhere, so they stay listed until each is
-ported to grade what a next-mode user sees. A case
+`hack/eval/inject-lane-exclusions.txt`. The front door's delegation cases are not on it: the
+lane's delegation wait reads each card's result from the pod, which is the report the notifier
+posts into the conversation under `next`, and a card paused on a question as the question it
+asks, and those cases grade that outcome rather than the `kanban_create` behind it. The
+card-wake replays run on this lane as well, because under `next` a card's wake reaches the front
+door through the in-pod API server, not the gateway; the question cases grade the reply to the
+user's answer and the card, not the reply to the wake. What stays listed is the cases that grade
+the front door's reply to a failed card's wake, which under `next` reaches no user: the notifier
+posts its own text about the failure and the reply stays in the session. A case
 excluded while the lane pinned the `cli` executor, for a reason only that executor gave, stays
 listed until a run on `api` grades it.
 `hack/ci-eval-pr.sh` drops the listed cases from the matrix on that lane only, and says so in
@@ -568,12 +569,10 @@ fixture to an issue. An entry is not a demotion: the case keeps its seat in
 `presubmit-cases.txt` or `nightly-cases.txt` and on the blocking roster, and runs over the api
 transport on the today lane and in the nightlies. It does leave what can red a pull request,
 though, because the merge-blocking presubmit is on the inject lane: `hack/ci-eval-pr.sh` drops it
-from the matrix and from `BOOTSTRAP_ADMITTED` there. `agent-kanban-smoke` is the one roster case
-listed, so until the lane's delegation wait reads card ids on this path, or the case is rewritten
-for a premise both transports have, no merge-blocking run grades delegation through the chat
-front door; the today lane and the nightlies do. `scripts/test_eval_rosters.py` pins
-that set, so listing a second roster case is a decision made in that test and on this page, not a
-side effect of an exclusion entry.
+from the matrix and from `BOOTSTRAP_ADMITTED` there. No roster case is listed, so the
+merge-blocking run grades delegation through the chat front door with `agent-kanban-smoke`.
+`scripts/test_eval_rosters.py` pins that set, so listing a roster case is a decision made in that
+test and on this page, not a side effect of an exclusion entry.
 The file needs an `eval-crew` approval, as `presubmit-cases.txt` does: it changes what every
 pull request runs.
 
