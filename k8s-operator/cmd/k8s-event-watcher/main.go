@@ -991,8 +991,9 @@ func (d *dispatcher) Sweep(ctx context.Context) {
 		}
 		outcome := followupOutcomeSent
 		if answer.Status == injectStatusUnrouted {
-			// The daemon had no thread for the session (the alert never
-			// reached chat), so it posted nothing; there is nothing to retry.
+			// The daemon had neither a thread nor a card for the session (the
+			// alert never reached chat, and its card never came), so it posted
+			// nothing; there is nothing to retry.
 			outcome = followupOutcomeUnrouted
 		}
 		d.metrics.followups.WithLabelValues(d.cluster.Name, d.cluster.ProjectID, d.cluster.Location, q.Key.Reason, outcome).Inc()

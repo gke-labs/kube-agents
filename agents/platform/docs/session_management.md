@@ -232,8 +232,10 @@ leaves the same line as a comment on the card the session filed, found by `tasks
 stall watch finds its card. It writes no ledger row, claims no quota and starts no turn: nothing new
 happened, something stopped happening. The line says what it is, silence and not a confirmed recovery,
 since the watcher reads events only. A session with a card but no thread, every session on an install
-without a chat surface, gets the line on its card alone; one with neither is answered `unrouted`. It
-is a reply rather than an edit of the alert: the gateway edits by update key only inside a
+without a chat surface, gets the line on its card alone, written before the answer; while the card is
+still to come (triage queued or running) the answer is a 503 the watcher retries each sweep, for an hour
+after the object's last sighting (`FOLLOWUP_CARD_WAIT_SECONDS`); past that, and for a session with
+neither, it is answered `unrouted`. It is a reply rather than an edit of the alert: the gateway edits by update key only inside a
 conversation request, and the alert was a home-channel post whose key was never bound.
 
 An alert whose investigation never starts gets the same thread's line from `_triage_watchdog`,

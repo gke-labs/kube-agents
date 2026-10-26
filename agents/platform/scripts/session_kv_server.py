@@ -944,6 +944,11 @@ SECONDS_PER_MINUTE = 60
 # taking the whole server down with it.
 DEFAULT_TRIAGE_WATCHDOG_SECONDS = 3600
 TRIAGE_WATCHDOG_SECONDS = _alert_daily_limit("TRIAGE_WATCHDOG_SECONDS", DEFAULT_TRIAGE_WATCHDOG_SECONDS)
+# How long after the object's last sighting a quiet follow-up with no chat
+# thread keeps waiting for the alert's card (a 503 the watcher retries each
+# sweep) before it is answered `unrouted` for good: the watchdog's hour, the
+# time triage is allowed before its absence is called out.
+FOLLOWUP_CARD_WAIT_SECONDS = TRIAGE_WATCHDOG_SECONDS
 # The busy timeout of the sqlite connects the follow-up and the watchdog open.
 SQLITE_BUSY_TIMEOUT_SECONDS = 5.0
 
@@ -6388,10 +6393,13 @@ def _card_for_alert_session(session_id: str) -> Optional[str]:
         return BOARD_UNREADABLE
 
 
-def _comment_alert_card(session_id: str, text: str) -> bool:
+def _comment_alert_card(session_id: str, text: str, card: Optional[str] = None) -> bool:
     """Leave ``text`` as a comment on the alert's card, so the board carries the
-    follow-up beside the report. False when there is no card or the board refused."""
-    card = _card_for_alert_session(session_id)
+    follow-up beside the report. ``card`` is the id when the caller has already
+    read it; otherwise it is looked up. False when there is no card or the
+    board refused; the caller decides whether that loses anything."""
+    if card is None:
+        card = _card_for_alert_session(session_id)
     if not card or card == BOARD_UNREADABLE:
         return False
     try:
@@ -6399,9 +6407,21 @@ def _comment_alert_card(session_id: str, text: str) -> bool:
 
         kanban(f"comment {shlex.quote(card)} {shlex.quote(text)}")
         return True
-    except Exception as exc:  # noqa: BLE001 - reported; the chat line is the delivery that matters
+    except Exception as exc:  # noqa: BLE001 - reported; the caller answers for the delivery
         logger.warning(f"Could not comment on card {card} for session {session_id}: {exc}")
         return False
+
+
+def _followup_can_wait_for_card(payload: Dict[str, Any], now: Optional[datetime] = None) -> bool:
+    """Whether a follow-up with no chat thread and no card to comment on yet
+    should be retried: true while the object's last sighting is younger than
+    FOLLOWUP_CARD_WAIT_SECONDS. A payload with no readable stamp cannot be
+    bounded and does not wait."""
+    try:
+        last = datetime.fromisoformat(str(payload.get("last_seen")).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    return ((now or datetime.now(timezone.utc)) - last).total_seconds() < FOLLOWUP_CARD_WAIT_SECONDS
 
 
 def _followup_message(session_id: str, payload: Dict[str, Any], now: Optional[datetime] = None) -> str:
@@ -6459,10 +6479,14 @@ def _inject_followup(
     the cluster, something stopped happening. The card does not need the
     thread: an install with no chat surface (every eval install) routes no
     session anywhere, and its cards still have to say the object went quiet.
-    `unrouted` is the answer only when there is neither a thread nor a card,
-    and the watcher marks the incident notified on it, which is right, since
-    there is nowhere to tell. A board that cannot say whether the card exists
-    is a 503, so the watcher retries on its next sweep rather than giving up.
+    With no thread the card is the only delivery, so it is written here,
+    before the answer, and a comment that fails is a 503 the watcher retries
+    on its next sweep. A card not filed yet, or a board that cannot say, is
+    the same 503 while the object's last sighting is younger than
+    FOLLOWUP_CARD_WAIT_SECONDS (triage may still be queued); past that, and
+    for a session with neither thread nor card, the answer is `unrouted`, on
+    which the watcher marks the incident notified, since there is nowhere to
+    tell.
 
     A reply, not an edit of the alert: the gateway edits by update key only
     inside a conversation request (a2a/gateway/notify.go, postConversation),
@@ -6471,14 +6495,17 @@ def _inject_followup(
     message had taken that key since, the triage report included.
     """
     platform, chat_id, thread_id = _lookup_session_routing(session_id)
+    text = _followup_message(session_id, payload)
     if not platform or not thread_id:
         card = _card_for_alert_session(session_id)
-        if card == BOARD_UNREADABLE:
-            raise HTTPException(status_code=503, detail="the board cannot say whether the session has a card; retry")
-        if not card:
+        if not card or card == BOARD_UNREADABLE:
+            if _followup_can_wait_for_card(payload):
+                raise HTTPException(status_code=503, detail="no chat thread, and the alert's card is not on the board yet; retry")
             logger.info(f"Follow-up for session {session_id}: no chat thread and no card; nothing posted")
             return {"status": "unrouted"}
-    text = _followup_message(session_id, payload)
+        if not _comment_alert_card(session_id, text, card=card):
+            raise HTTPException(status_code=503, detail=f"no chat thread, and the comment on card {card} did not land; retry")
+        return {"status": "followup"}
     background_tasks.add_task(_post_followup, session_id, platform, chat_id, thread_id, text)
     return {"status": "followup"}
 
