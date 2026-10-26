@@ -24,20 +24,27 @@ review-time hope. Four sources feed it:
 * **Pull-request and issue citations** -- a bare ``#NNN`` of three or more
   digits, a ``github.com/gke-labs/kube-agents/pull|issues/N`` URL, or a link
   whose text carries the number and whose target starts with that URL (any
-  path, query, fragment or title after it is part of the link), counted once
-  each; a reference-style link counts its text and its definition
-  separately, and a number cited twice on one line, as a wrapped link's text
-  and target are, counts once. This shape reads prose only: fenced code
-  blocks are dropped, then inline code spans and comments are blanked by the
-  reader ``scripts/check_docs_links.py`` applies to the same pages, a
-  paragraph at a time, so a span that wraps is still a span, a comment opener
-  is believed only where a renderer would close it (a stray ``<!--`` hides
-  nothing past its paragraph), and ``{/* */}`` is a comment in ``.mdx`` pages
-  only. Reported line numbers stay true throughout, which is what keeps a
-  shell comment inside a fence from matching. A ``#NNN`` glued to a word or a
-  ``/`` (``kubernetes/kubernetes#68078``) is a cross-repository reference, one
-  that runs on into a word (``#2801v2``), a numeric entity (``&#160;``) and a
-  link target (``[0.14.0](#0140)``) are not citations, and all are excused.
+  path, query, fragment or title after it is part of the link). A number is
+  counted once per line, so a link that wraps before its number, an
+  angle-bracket destination and an ``href`` attribute count once; a number on
+  two lines counts twice, which is a reference-style link's text and its
+  definition, and a link whose text wraps after its number (``[pull request
+  #2801 was`` / ``merged](url)``). This shape reads prose only: fenced code
+  blocks are dropped (a fence opened on a list or blockquote marker line
+  closes when its container does), then inline code spans and comments are
+  blanked by the reader ``scripts/check_docs_links.py`` applies to the same
+  pages, a paragraph at a time, so a span that wraps is still a span, a
+  comment opener is believed only where a renderer would close it (a stray
+  ``<!--`` hides nothing past its paragraph), and ``{/* */}`` is a comment in
+  ``.mdx`` pages only. One limit of that reader: an HTML comment that opens a
+  block takes the rest of its closer's line with it, so prose written on the
+  line a multi-line ``<!-- -->`` closes on is not read. Reported line numbers
+  stay true throughout, which is what keeps a shell comment inside a fence
+  from matching. A ``#NNN`` glued to a word or a ``/``
+  (``kubernetes/kubernetes#68078``) is a cross-repository reference, one that
+  runs on into a word (``#2801v2``), a numeric entity (``&#160;``) and a link
+  target in any spelling (``[0.14.0](#0140)``, ``[0.14.0](<#0140>)``,
+  ``href="#0140"``) are not citations, and all are excused.
   ``contributing.md`` is exempt from this shape alone: it is the one site
   page written for contributors.
 
@@ -74,7 +81,7 @@ import sys
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 
-from check_docs_links import BLOCK_PREFIX_RE, HTML_COMMENT, MDX_COMMENT, MDX_SUFFIX, strip_specimens
+from check_docs_links import BLOCK_PREFIX_RE, HTML_COMMENT, MDX_COMMENT, MDX_SUFFIX, strip_specimens, unquoted
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -126,23 +133,28 @@ SERVICE_ACCOUNT_SHAPE = "service-account email in a non-placeholder project"
 # admits that the link branch cannot see as one (a link whose text wraps onto
 # the target's line, an angle-bracket destination, an `<a href>` or a
 # `<LinkCard>` attribute) match twice, as a bare number and a URL, so each
-# match's number is read out (`CITATION_NUMBER_RE`, the first `#N` or
-# `/pull/N`) and a number is reported once per line; a reference-style link
-# keeps its text and its definition on separate lines and counts twice, a
-# limit this grammar accepts. The bare `#NNN` branch asks for three or more
-# digits so a `#2` list marker does not match, and its lookarounds excuse by
-# construct rather than by the next character: a number glued to a word or a
-# `/` is a cross-repository reference (`kubernetes/kubernetes#68078`), one
-# after `&` is a numeric entity (`&#160;`), one after `](` is a link target
-# (`[0.14.0](#0140)`, the slug of a version heading), and one that runs on
-# into a word is neither (`#2801v2`); `#2801;` and `#2801-` are citations.
+# match's number is read out (`CITATION_NUMBER_RE`: the first `#` followed by
+# three digits, since a link's text may carry a shorter `#N` before its
+# citation, or `/pull/N`, any length) and a number is reported once per line.
+# Two forms put one citation on two lines and count twice, a limit this
+# grammar accepts: a reference-style link, whose text and definition are
+# apart by design, and a link whose text wraps after its number, so the bare
+# number sits a line above its target. The bare `#NNN` branch asks for three
+# or more digits so a `#2` list marker does not match, and its lookarounds
+# excuse by construct rather than by the next character: a number glued to a
+# word or a `/` is a cross-repository reference (`kubernetes/kubernetes#68078`),
+# one after `&` is a numeric entity (`&#160;`), one after `](`, `](<` or
+# `href="` / `href='` is a link target in one of its spellings
+# (`[0.14.0](#0140)`, the slug of a version heading, or an `<a>` or
+# `<LinkCard>` to it), and one that runs on into a word is neither
+# (`#2801v2`); `#2801;` and `#2801-` are citations.
 REPO_ISSUE_URL_RE = r"(?:https?://)?github\.com/gke-labs/kube-agents/(?:pull|issues)/[0-9]+"
 CITATION_RE = re.compile(
     rf"\[[^\]]*#[0-9]{{3,}}[^\]]*\]\({REPO_ISSUE_URL_RE}[^)]*\)"
-    rf"|(?<![\w/&])(?<!\]\()#[0-9]{{3,}}(?!\w)"
+    rf"|(?<![\w/&])(?<!\]\()(?<!\]\(<)(?<!href=\")(?<!href=')#[0-9]{{3,}}(?!\w)"
     rf"|{REPO_ISSUE_URL_RE}"
 )
-CITATION_NUMBER_RE = re.compile(r"(?:#|/(?:pull|issues)/)(?P<number>[0-9]+)")
+CITATION_NUMBER_RE = re.compile(r"(?:#(?=[0-9]{3})|/(?:pull|issues)/)(?P<number>[0-9]+)")
 CITATION_SHAPE = "pull-request or issue citation"
 # The one site page written for contributors (.agents/rules/documentation.md,
 # "Who the site is for"); relative to the site root.
@@ -154,7 +166,13 @@ CITATION_EXEMPT_PAGES = (Path("contributing.md"),)
 # opens one on the marker line too, `- ```bash` or `> ```yaml`; the markers
 # are the links checker's `BLOCK_PREFIX_RE`), closed by a fence of the same
 # character at least as long with nothing after it, at the same blockquote
-# depth; a backtick fence's info string may not contain a backtick
+# depth, or by the end of the container it was opened in, as CommonMark
+# closes it: a quoted fence at the first line with fewer `>` than the opener
+# (a blank line included), a fence opened on a list marker line at the first
+# non-blank line indented less than the item's content, so an opener nothing
+# closes hides the container's lines and not the rest of the page. A fence
+# behind indentation alone is not known to be in an item, and waits for its
+# closer; a backtick fence's info string may not contain a backtick
 # (CommonMark), which is what keeps a line opening with a triple-backtick code
 # span from opening a fence, while a tilde fence's may. The lines outside
 # fences are then read by `scripts/check_docs_links.py`'s `strip_specimens`,
@@ -296,16 +314,42 @@ def fence_on(line: str) -> re.Match[str] | None:
     return None
 
 
+def item_column(prefix: str) -> int | None:
+    """The content column of the list item a fence's prefix opens, or None when the prefix opens no item.
+
+    The prefix is what `fence_on` admitted before the run: indentation and
+    container markers. With the quote markers removed, anything left but
+    whitespace is a list marker; a prefix that nests a quote inside an item is
+    not read as an item, and such a fence waits for its closer as before.
+    """
+    _, rest = unquoted(prefix)
+    if rest.strip() and QUOTE_MARKER not in rest:
+        return len(rest)
+    return None
+
+
+def container_ended(raw: str, depth: int, column: int | None) -> bool:
+    """Whether a line ends the blockquote or list item an open fence was opened in."""
+    line_depth, content = unquoted(raw)
+    if line_depth < depth:
+        return True
+    return column is not None and bool(content.strip()) and len(content) - len(content.lstrip()) < column
+
+
 def unfenced_lines(text: str) -> list[tuple[int, str]]:
     """(line number, line) for every line outside a fenced code block, the fences themselves excluded."""
     kept: list[tuple[int, str]] = []
     fence: str | None = None
     depth = 0
+    column: int | None = None
     for number, raw in enumerate(text.splitlines(), start=1):
         match = fence_on(raw)
+        if fence is not None and container_ended(raw, depth, column):
+            fence = None
         if fence is None and match:
             fence = match.group("fence")
             depth = raw[: match.start()].count(QUOTE_MARKER)
+            column = item_column(raw[: match.start()])
         elif fence is not None:
             if (
                 match

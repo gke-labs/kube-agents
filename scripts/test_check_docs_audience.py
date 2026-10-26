@@ -371,6 +371,12 @@ class CitationShapeTest(SiteFixture):
         """The slug of a version or year heading is digits only; a link to it is not a citation."""
         self.assertEqual(self.citations_for("[0.14.0](#0140) and [2026](#2026) and [#1](#2026)\n"), [])
 
+    def test_anchor_targets_in_an_attribute_or_angle_brackets_pass(self):
+        """The same target spelled as an `href` attribute or an angle-bracket destination is a link target too."""
+        body = '<a href="#404-errors">errors</a>, <a href=\'#2026\'>year</a>, [0.14.0](<#0140>), see #2801\n'
+        self.assertEqual(self.citations_for(body), [(1, "#2801")])
+        self.assertEqual(self.mdx_citations_for('<LinkCard href="#2026-roadmap" title="Roadmap" />\n'), [])
+
     def test_link_forms_the_link_branch_cannot_see_count_once(self):
         """A wrapped link, an angle-bracket destination and an HTML or MDX attribute cite one number once."""
         self.assertEqual(self.citations_for(f"see [pull request\n#2801]({PULL_URL}) for why\n"), [(2, "#2801")])
@@ -383,6 +389,17 @@ class CitationShapeTest(SiteFixture):
             with self.subTest(body=body):
                 self.assertEqual(len(self.citations_for(body + "\n")), 1)
         self.assertEqual(len(self.citations_for(f'<a href="{PULL_URL}">#2802</a>\n')), 2)
+
+    def test_a_link_is_keyed_on_its_citation_not_a_shorter_number_before_it(self):
+        """A link's text may carry `#2` before `#2801`; the link and a bare `#2801` on the line are one citation."""
+        body = f"[step #2 of #2801]({PULL_URL}), see #2801 below\n"
+        self.assertEqual(len(self.citations_for(body)), 1)
+        self.assertEqual(len(self.citations_for(f"[step #2 of #2801]({PULL_URL}) and #2802\n")), 2)
+
+    def test_a_link_wrapped_after_its_number_counts_twice(self):
+        """The stated limit: the bare number and its target sit on two lines, as a reference-style link's do."""
+        body = f"[pull request #2801 was\nmerged]({PULL_URL}) and [other][ref]\n\n[ref]: {ISSUE_URL}\n"
+        self.assertEqual(self.citations_for(body), [(1, "#2801"), (2, PULL_URL), (4, ISSUE_URL)])
 
     def test_fewer_than_three_digits_pass(self):
         self.assertEqual(self.citations_for("item #12 and #99\n"), [])
@@ -420,6 +437,18 @@ class CitationShapeTest(SiteFixture):
         )
         self.assertEqual(self.citations_for(body), [(4, "#2801"), (10, "#2802"), (14, "#2803")])
 
+    def test_a_fence_opened_on_a_marker_line_closes_when_its_container_does(self):
+        """CommonMark ends a quoted fence at the first line with fewer `>`, and an item's at a less-indented line."""
+        self.assertEqual(self.citations_for("> ```yaml\n> a: #1234\n\nprose #2801\n"), [(4, "#2801")])
+        self.assertEqual(self.citations_for("> ```yaml\n> a: #1234\nprose #2801\n```\n#5678\n```\n#2802\n"), [(3, "#2801"), (7, "#2802")])
+        self.assertEqual(self.citations_for("- ```bash\n  echo #1234\n\nprose #2801\n"), [(4, "#2801")])
+        self.assertEqual(self.citations_for("1. ```bash\n   echo #1234\n\n   #5678\nprose #2801\n"), [(5, "#2801")])
+        self.assertEqual(self.citations_for("- ```bash\n  echo #1234\n- next #2801\n"), [(3, "#2801")])
+
+    def test_a_fence_behind_indentation_alone_waits_for_its_closer(self):
+        """An indented fence is not known to be in an item; a less-indented line inside it is still code."""
+        self.assertEqual(self.citations_for("   ```\n#5678\n   ```\n#2801\n"), [(4, "#2801")])
+
     def test_a_fence_closes_at_its_own_blockquote_depth(self):
         """A quoted fence line inside an unquoted block is content, not the block's closer."""
         self.assertEqual(self.citations_for("```md\n> ```\n```\n#2801\n"), [(4, "#2801")])
@@ -433,8 +462,8 @@ class CitationShapeTest(SiteFixture):
         body = "a <!-- #1234 --> b\n<!--\n#5678\n-->\n#2801 <!-- open #4321\nstill #8765 --> #3333\n"
         self.assertEqual(self.citations_for(body), [(5, "#2801"), (6, "#3333")])
 
-    def test_the_line_after_a_comment_closes_is_read_as_a_renderer_shows_it(self):
-        """An HTML block runs to the end of its closer's line (raw HTML, the links checker's rule); an MDX comment ends at its closer."""
+    def test_prose_on_the_closer_line_of_a_block_html_comment_is_not_read(self):
+        """The shared reader's limit, pinned: a browser shows the text after `-->`, this check does not read it; an MDX comment ends at its closer."""
         body = "<!-- reviewer note\n--> the proxy listens on `#8080`; see #2803\nlater #2801\n"
         self.assertEqual(self.citations_for(body), [(3, "#2801")])
         body = "{/* note\n*/} port `#8080` and `{/*` quoted, see #2803\nlater #2801\n"
