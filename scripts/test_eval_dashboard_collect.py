@@ -1518,7 +1518,8 @@ class TestRepoDerivedFacts(unittest.TestCase):
         # demoted to the nightly on 2026-10-16 (#3269), uncovering upgrades,
         # and took its line back on 2026-10-23 after #3338, covering it again.
         # pdb-remediation-pr, remediation's only roster case, was demoted to
-        # the nightly on 2026-10-17 (#3120), uncovering remediation again.
+        # the nightly on 2026-10-17 (#3120), uncovering remediation again,
+        # and took its line back on 2026-10-26 after #3145, covering it again.
         # consistency-authorized-networks-probe, consistency's only roster
         # case, was demoted to the nightly on 2026-10-21 (#3598), uncovering
         # consistency.
@@ -1527,7 +1528,7 @@ class TestRepoDerivedFacts(unittest.TestCase):
         # off on 2026-10-23, when vcs-spent-branch-reuse took a roster seat.
         self.assertEqual(
             cov["uncovered"],
-            ["fleet-audits", "remediation", "consistency", "observability"],
+            ["fleet-audits", "consistency", "observability"],
         )
         self.assertEqual(cov["domains_covered"], cov["domains_total"] - len(cov["uncovered"]))
 
@@ -1536,7 +1537,7 @@ class TestRepoDerivedFacts(unittest.TestCase):
         self.assertIn("reliability-pdb-probe", active)
         self.assertIn("incident-triage-oom-event-probe", active)  # a roster seat since 2026-09-22
         self.assertIn("compliance-rbac-overgrant", active)  # held out in the presubmit since 2026-09-29 (#2013), off the roster
-        self.assertNotIn("pdb-remediation-pr", active)  # held out from 2026-09-28, on the roster 2026-10-14 (#2016), nightly only since 2026-10-17 (#3120)
+        self.assertIn("pdb-remediation-pr", active)  # held out from 2026-09-28, on the roster 2026-10-14 (#2016), nightly only 2026-10-17 to 10-26 (#3120)
         self.assertNotIn("consistency-authorized-networks-probe", active)  # on the roster from the split, nightly only since 2026-10-21 (#3598)
         self.assertNotIn("obtainability-planted-pdb", active)  # nightly only
         self.assertNotIn("stockout-pinned-pool", active)

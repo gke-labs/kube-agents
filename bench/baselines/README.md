@@ -115,7 +115,7 @@ candidate's record and `main`'s are the same record once written — and the
 candidate would then be judged non-inferior to a window it had just moved.
 
 A next-mode run on `main` does append. The main nightly
-(`ci-kube-agents-eval-nightly` and its `-writers` part) is a periodic with no
+(`ci-kube-agents-eval-nightly`, its `-main-b` half and its `-writers` part) is a periodic with no
 `PULL_NUMBER` whose matrix runs through the inject door, which `bench-gate`
 reads as the key's `next` mode, so its lines file under a key of their own and
 never reach today's window. Today's window is appended by
