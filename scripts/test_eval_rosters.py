@@ -92,7 +92,7 @@ NIGHTLY_AT_SPLIT = [
     "knowledge-grounding-sources-probe",
     "cluster-agent-stalled-controller-healthy-silence",
     "chat-routing-board-read",
-    "pdb-remediation-pr",  # its 2026-09-22 promotion was withdrawn (the record predated its #1780 grader); seated held out 2026-09-28, promoted 2026-10-14 (#2016), demoted 2026-10-17 (#3120)
+    "pdb-remediation-pr",  # its 2026-09-22 promotion was withdrawn (the record predated its #1780 grader); seated held out 2026-09-28, promoted 2026-10-14 (#2016), demoted 2026-10-17 (#3120), back 2026-10-26
 ]
 # The nine cases TASKS held commented out at the split, moved into the
 # nightly by the same decision. The two commented-out cases NOT here had no
@@ -231,6 +231,7 @@ ADMITTED_AFTER_THE_SPLIT = [
     # 2026-09-22 (#1023): 10/12 on the same four nights, both misses platform bugs (#1840, #1874).
     ("incident-triage-oom-event-probe", "cluster-agent-crashloop-evidence-chain"),
     # 2026-10-14 (#2016): 3/3 on the three writers nightlies 10-12 to 10-14, the store at would-admit, 90.2% of 2,086 graded presubmit repetitions since #2263 (10-03).
+    # Demoted 2026-10-17 (#3120); back 2026-10-26 after #3145: 21/21 on the writers nightlies since the claude-opus-5-5 key of 10-19, 9/9 since #3145, the store at collecting.
     ("pdb-remediation-pr", "obtainability-remediation-proposal"),
     # 2026-10-23: 42/42 on the fourteen writers nightlies 10-09 to 10-22 (12/12 since the claude-opus-5-5 key of 10-19), the store at collecting.
     ("vcs-spent-branch-reuse", "agent-kanban-smoke"),
@@ -241,7 +242,7 @@ ADMITTED_AFTER_THE_SPLIT = [
 # it), since the nightly runs both files and lists no case twice.
 PROMOTED_AFTER_THE_SPLIT = [
     ("incident-triage-oom-event-probe", "cluster-agent-healthy-workload-no-finding"),  # 2026-09-22 (#1023)
-    ("pdb-remediation-pr", "obtainability-remediation-proposal"),  # 2026-10-14 (#2016), from its held-out seat
+    ("pdb-remediation-pr", "obtainability-remediation-proposal"),  # 2026-10-14 (#2016), from its held-out seat; again 2026-10-26, from the nightly file (#3120)
     ("vcs-spent-branch-reuse", "agent-kanban-smoke"),  # 2026-10-23, from the nightly file's frozen part
 ]
 # Moved from the presubmit file to the end of the nightly one on 2026-09-22
@@ -286,16 +287,17 @@ HELD_OUT_IN_PRESUBMIT = [
 DEMOTED_AFTER_THE_SPLIT = [
     # upgrades-lagging-master-probe sat here 2026-10-16 to 2026-10-23 (#3269; its line followed
     # fleet-cost-idle-pool) and took its roster line back on three clean nightlies after #3338.
-    ("pdb-remediation-pr", "fleet-cost-idle-pool"),  # 2026-10-17, #3120 (worker declines a pull request into an -infra repo with no manifest; #3145)
+    # pdb-remediation-pr sat here 2026-10-17 to 2026-10-26 (#3120; its line followed
+    # fleet-cost-idle-pool) and took its roster line back after #3145 seeded the manifest it needs.
     ("consistency-authorized-networks-probe", None),  # 2026-10-21, #3598 (Gemini reads seeded-c's leftover authorized-networks block as configured; #3448 for the 429s)
 ]
 DEMOTED = {case for case, _ in DEMOTED_AFTER_THE_SPLIT}
 # The demotions recorded before the freeze (#3495), whose lines sit in the
 # frozen part after a named predecessor. Written out and not to grow: every
 # later demotion goes in the sorted section, recorded with None.
-DEMOTED_INTO_THE_FROZEN_PART = frozenset({
-    ("pdb-remediation-pr", "fleet-cost-idle-pool"),  # followed upgrades-lagging-master-probe until that line left, 2026-10-23
-})
+# Empty since pdb-remediation-pr, the last of them, returned to the roster on
+# 2026-10-26.
+DEMOTED_INTO_THE_FROZEN_PART: frozenset[tuple[str, str]] = frozenset()
 # Held-out seats withdrawn since #3495: a withdrawal moves the line to the
 # nightly file's sorted section and records the case here, in the same edit
 # that deletes its HELD_OUT_IN_PRESUBMIT entry.
