@@ -418,7 +418,7 @@ def graded_nights(data: dict) -> dict[str, list[dict]]:
                     "outcome": outcome,
                     "passed": counts["pass"],
                     "graded": counts["pass"] + counts["fail"],
-                    "infra": counts["infra"] + counts["ceiling"],
+                    "infra": counts["infra"] + counts["ceiling"] + counts["fixture"],
                     "reasons": reasons[:REASONS_PER_NIGHT],
                     "run_url": nightly.build_url(run),
                     "transcript_url": nightly.transcript_url(run, name),

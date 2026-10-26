@@ -168,6 +168,13 @@ layout and are collected from the moment they start running.
       `delegation-ceiling`. The run page, the PR view and the PR comment's
       result cell count it in a case's total and name it apart; the Cases
       page's per-run counts (`render.rep_counts`) still fold it into `infra`.
+      An `infra` rep whose `reason` carries `fixture-drift:<role>` is a
+      **fixture** rep: `hack/ci-eval-pr.sh` recorded it without running it
+      because the lease-time seeded-fleet scan saw a fixture the case needs
+      out of its designed state (`bench/kube_agents_bench/fixture_drift.py`).
+      The same readers count it apart from the storm and the ceiling, and
+      `classify.py` classes a case whose ungraded reps are all of this kind
+      `fixture-drift`.
       Similarly, a harness-declared card-wake replay error (`ReplayMismatch`
       or `ReplayBroken`, e.g. `failure wake:`, `question wake:`, `thread context:`
       in the reason) is recognized by `classify.py` and `health.py` as `fail`,
@@ -820,7 +827,7 @@ recorded `null` from a pre-field record), `not_evaluated[]` (the case ids
 the suite could not evaluate; empty on every other verdict), `cases[]`
 (`{case, outcome, cls, also_failing_prs, pass_rate_30d, reason, excerpt, rep_n,
 do, admitted, reps, nightly_failed_recent}`, `reps` being `{pass, fail, infra,
-ceiling}`) and `health_at` (the verdict in force when it finished, from
+ceiling, fixture}`) and `health_at` (the verdict in force when it finished, from
 history; `null` without history). `rep_n` is the 1-based
 repetition the row is about — the one whose `reason` is shown, else the
 one whose `excerpt` is (`null` when there is neither); the pages link that

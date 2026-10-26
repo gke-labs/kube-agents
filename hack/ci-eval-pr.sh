@@ -88,6 +88,18 @@ readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
 # STATE_DIR, holds one such record per skipped repetition.
 readonly EVAL_INFRA_FAILURE_MARKER="KUBE_AGENTS_INFRA_FAILURE"
 readonly EVAL_NOT_RUN_DIR="not-run"
+# The lease-time seeded-fleet scan (scan_lease_fixtures, after the fleet
+# kubeconfigs): hack/fleet-fixture-state.py's --report, kept as an artifact
+# under this name; the bound on the whole scan (a healthy project reads in
+# about 20 s, and every read inside it is bounded already); and the directory,
+# under STATE_DIR, where kube_agents_bench.fixture_drift writes one reason
+# file per case that needs a drifted fixture, which run_one_unit records as
+# infrastructure instead of running; and, under STATE_DIR, the list of files
+# a pull request changes, which that module reads.
+readonly EVAL_LEASE_FIXTURE_REPORT="fixture-state-lease.json"
+readonly EVAL_LEASE_FIXTURE_SCAN_TIMEOUT_SECONDS=300
+readonly EVAL_FIXTURE_DRIFT_DIR="fixture-drift"
+readonly EVAL_FIXTURE_DRIFT_CHANGED_FILES="fixture-drift-changed-files.txt"
 # The opening chat turn's seconds beside results.json, where
 # bench/kube_agents_bench/scoring.py (_TIMING_FILE) reads them.
 readonly EVAL_TIMING_FILE="timing.json"
@@ -886,6 +898,52 @@ write_fleet_kubeconfigs || {
   echo "WARNING: the seeded-fleet catalog or output directory is unusable, so no fleet kubeconfigs were written at all; every fleet fixture check will report status=error" >&2
 }
 echo "✓ Seeded-fleet credentials finished in $((SECONDS - STEP_START))s"
+
+# ─── The leased project's fixtures, in their designed state? ─────────────────
+# hack/fleet-fixture-state.py over the kubeconfigs just written, one pass
+# (--wait 0), the same check the CI health bot's hourly scan runs against every
+# pool project (docs/ci-health.md, "The seeded-fleet scan"). Run here, per
+# lease, rather than read from the published fixture-state.json: that file is
+# up to an hour old in both directions, so a fixture that drifted since would
+# still red the cases on it, and one repaired since would excuse cases that
+# could have been graded. This read is of this project, now, and costs one
+# kubectl read per assertion and one describe per control-plane role.
+# Read-only: every call is a `kubectl get` through the role kubeconfigs (the
+# fleet reader's token) or a `gcloud container clusters describe` on this job's
+# own credential, which already lists the same clusters above.
+#
+# What it feeds: kube_agents_bench.fixture_drift, before the fan-out, marks each
+# case whose grade depends on a role the scan positively saw drifted (a role a
+# check reads, or the case's single `fixtures:` role), and
+# run_one_unit records that case's repetitions as infrastructure under
+# `fixture-drift:<role>` instead of running them. A role the scan could not read
+# is not drift, and a scan that fails or times out leaves no report: either way
+# every case is graded as usual and the log says why. Never fatal.
+scan_lease_fixtures() { # <report path>
+  local report="$1" status=0
+  local -a bound=()
+  rm -f "${report}"
+  if [ -z "${BENCH_FLEET_KUBECONFIG_DIR:-}" ]; then
+    echo "WARNING: no fleet kubeconfig directory, so the leased project's fixtures were not checked; every case is graded as usual." >&2
+    return 0
+  fi
+  if command -v timeout >/dev/null 2>&1; then
+    bound=(timeout "${EVAL_LEASE_FIXTURE_SCAN_TIMEOUT_SECONDS}")
+  fi
+  ${bound[@]+"${bound[@]}"} python3 "${SCRIPT_DIR}/fleet-fixture-state.py" \
+    --dir "${BENCH_FLEET_KUBECONFIG_DIR}" --project "${PROJECT_ID}" \
+    --wait 0 --report "${report}" || status=$?
+  if [ "${status}" -ne 0 ]; then
+    rm -f "${report}"
+    echo "WARNING: the lease-time fixture scan failed (exit ${status}; 124 is the ${EVAL_LEASE_FIXTURE_SCAN_TIMEOUT_SECONDS}s bound), so nothing is known about the leased project's fixtures; every case is graded as usual." >&2
+  fi
+}
+profile_begin "fleet-fixture-state: the leased project's fixtures"
+STEP_START=$SECONDS
+mkdir -p "${ARTIFACTS:-/tmp/artifacts}"
+EVAL_LEASE_FIXTURE_REPORT_PATH="${ARTIFACTS:-/tmp/artifacts}/${EVAL_LEASE_FIXTURE_REPORT}"
+scan_lease_fixtures "${EVAL_LEASE_FIXTURE_REPORT_PATH}"
+echo "✓ Seeded-fleet fixture state read in $((SECONDS - STEP_START))s"
 
 # Section 2c resized slot a's default pool to two nodes here (#1278). The incident's
 # own manual sweep had already raised all 30 projects and main.tf declares the same
@@ -3355,6 +3413,34 @@ echo "Infra lock: ${STACK_CONTENDERS} stack-bearing task(s); a unit waits up to 
 # silently un-gate transcript-read checks.
 STATE_DIR="$(mktemp -d)"
 
+# The cases that need a fixture the lease-time scan saw drifted
+# (scan_lease_fixtures): one reason file each under EVAL_FIXTURE_DRIFT_DIR,
+# read by run_one_unit. The module grades every case as usual, and says so,
+# when the report is missing or unreadable; a failure to run it at all does
+# the same here. On a pull request it is handed the files the change edits
+# (PULL_BASE_SHA to the merged HEAD clonerefs checked out), so a change to
+# what decides drift, or to a case, cannot excuse a case; a pull request
+# whose file list cannot be read excuses nothing.
+FIXTURE_DRIFT_DIR="${STATE_DIR}/${EVAL_FIXTURE_DRIFT_DIR}"
+mkdir -p "${FIXTURE_DRIFT_DIR}"
+FIXTURE_DRIFT_ARGS=()
+FIXTURE_DRIFT_MATCH="true"
+if [ -n "${PULL_NUMBER:-}" ]; then
+  FIXTURE_DRIFT_CHANGED="${STATE_DIR}/${EVAL_FIXTURE_DRIFT_CHANGED_FILES}"
+  if [ -n "${PULL_BASE_SHA:-}" ] && git -C "${SCRIPT_DIR}/.." diff --name-only "${PULL_BASE_SHA}" HEAD > "${FIXTURE_DRIFT_CHANGED}" 2>/dev/null; then
+    FIXTURE_DRIFT_ARGS=(--changed-files "${FIXTURE_DRIFT_CHANGED}")
+  else
+    FIXTURE_DRIFT_MATCH=""
+    echo "WARNING: the files this pull request changes could not be listed against PULL_BASE_SHA, so no case is excused for a drifted fixture; every case is graded as usual." >&2
+  fi
+fi
+if [ -n "${FIXTURE_DRIFT_MATCH}" ] && ! (cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.fixture_drift \
+    --report "${EVAL_LEASE_FIXTURE_REPORT_PATH:-}" --out-dir "${FIXTURE_DRIFT_DIR}" \
+    ${FIXTURE_DRIFT_ARGS[@]+"${FIXTURE_DRIFT_ARGS[@]}"} "${TASKS[@]}"); then
+  rm -f "${FIXTURE_DRIFT_DIR:?}"/*
+  echo "WARNING: could not match the lease-time fixture scan to the matrix (kube_agents_bench.fixture_drift, above); every case is graded as usual." >&2
+fi
+
 # mkdir is the mutex: atomic on every filesystem this runs on. A holder that
 # dies without releasing (an OOM-killed subshell releases nothing) would
 # otherwise strand every contender in a silent spin that `wait` can never
@@ -3711,6 +3797,24 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on its task lock" >&2
     return 0
   fi
+  # A fixture this case needs was out of its designed state when the lease was
+  # scanned (scan_lease_fixtures): the repetition is recorded as
+  # infrastructure under the scan's `fixture-drift:<role>` reason and never
+  # launched, so it cannot red the pull request, and the gate keeps the case
+  # out of its coverage floor (bench/kube_agents_bench/scoring.py,
+  # grade_suite). Unwound like the install-gone skip below: only the task lock
+  # is held.
+  local drift_file="${FIXTURE_DRIFT_DIR:-}/${name}" drift_reps=0
+  if [ -n "${FIXTURE_DRIFT_DIR:-}" ] && [ -s "${drift_file}" ]; then
+    record_unit_not_run "${name}" "${rep}" "$(head -n 1 "${drift_file}")"
+    drift_reps="$(finished_rep_count "${name}")"
+    lock_release "${STATE_DIR}/lock-task-${name}"
+    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} did not run: a fixture it needs drifted on the leased project" >&2
+    if [ "${drift_reps}" -ge "${EVAL_REPETITIONS}" ]; then
+      finish_case "${task}" "${name}"
+    fi
+    return 0
+  fi
   # A ledger-writing unit also holds the stream lock from here until its
   # state files are written, released with the task lock below: cases on
   # one stream (the consistency trio, the three patch cases, the obtainability pair)
@@ -4036,8 +4140,12 @@ launch_units() { # <queue: "REP COST IDX" lines> <parallelism> <seconds before e
     # Staggered, so N units do not open their first model call in the same
     # second -- burst 429s at the model quota are the fan-out's failure mode;
     # in the second phase the pause is the lane's writer pause instead (the
-    # settle on the inject lane, this stagger on the api lane).
-    sleep "${pause}"
+    # settle on the inject lane, this stagger on the api lane). A unit of a
+    # case marked for a drifted fixture makes no model call and no write, so
+    # it skips the pause.
+    if [ -z "${FIXTURE_DRIFT_DIR:-}" ] || [ ! -s "${FIXTURE_DRIFT_DIR}/${TASK_NAMES[IDX]}" ]; then
+      sleep "${pause}"
+    fi
     echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] launching ${TASK_NAMES[IDX]} rep ${REP}/${EVAL_REPETITIONS}"
     UNIT_SEQ=$((${UNIT_SEQ:-0} + 1))
     run_one_unit "${TASKS[IDX]}" "${TASK_NAMES[IDX]}" "${REP}" "${TASK_REUSE[IDX]}" "${TASK_HAS_STACK[IDX]}" "${UNIT_SEQ}" "${TASK_STREAMS[IDX]}" &

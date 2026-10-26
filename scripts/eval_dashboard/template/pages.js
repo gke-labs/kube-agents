@@ -1121,29 +1121,36 @@ function tagFor(c) {
   if (c.cls === "only-this-pr") return '<span class="tag yours">only your PR</span>';
   if (c.cls === "storm") return '<span class="tag storm">quota storm</span>';
   if (c.cls === "delegation-ceiling") return '<span class="tag storm">delegation ceiling</span>';
+  if (c.cls === "fixture-drift") return '<span class="tag storm">fixture drifted</span>';
   return '<span class="tag unclear">unexplained</span>';
 }
 
 // A case's repetitions by kind. `ceiling` is the repetitions the harness
 // stopped watching at its delegation wait with the worker still running
 // (#1874): ungraded like a storm-lost rep, counted apart from it, and part of
-// the total or a three-rep case would read "all 0 reps lost".
-function repTotal(reps) { return reps.pass + reps.fail + reps.infra + (reps.ceiling || 0); }
+// the total or a three-rep case would read "all 0 reps lost". `fixture` is
+// the repetitions never run because the lease-time scan saw a fixture the
+// case needs drifted (classify.py's REP_FIXTURE), counted apart the same way.
+function repTotal(reps) { return reps.pass + reps.fail + reps.infra + (reps.ceiling || 0) + (reps.fixture || 0); }
 function lostText(reps) {
   const parts = [];
   if (reps.infra) parts.push(`${reps.infra} lost`);
   if (reps.ceiling) parts.push(`${reps.ceiling} at the delegation ceiling`);
+  if (reps.fixture) parts.push(`${reps.fixture} not run, fixture drifted`);
   return parts.length ? ` (${parts.join(", ")})` : "";
 }
 function ungradedText(reps) {
   const total = plural(repTotal(reps), "rep");
+  if (reps.fixture && !reps.infra && !reps.ceiling) return `all ${total} not run: a seeded-fleet fixture this case needs had drifted on the leased project`;
   if (reps.ceiling && !reps.infra) return `all ${total} hit the delegation ceiling with the worker still running`;
-  if (reps.ceiling) return `all ${total} ungraded: ${reps.infra} lost before grading, ${reps.ceiling} at the delegation ceiling`;
+  const fixture = reps.fixture ? `, ${reps.fixture} not run, fixture drifted` : "";
+  if (reps.ceiling) return `all ${total} ungraded: ${reps.infra} lost before grading, ${reps.ceiling} at the delegation ceiling${fixture}`;
+  if (reps.fixture) return `all ${total} ungraded: ${reps.infra} lost before grading${fixture}`;
   return `all ${total} lost before grading`;
 }
 
 function caseCard(run, c) {
-  const reps = c.reps || { pass: 0, fail: 0, infra: 0, ceiling: 0 };
+  const reps = c.reps || { pass: 0, fail: 0, infra: 0, ceiling: 0, fixture: 0 };
   const total = repTotal(reps);
   const how = c.outcome === "failed" ? `failed all ${plural(reps.fail, "graded rep")}${lostText(reps)}` : c.outcome === "infra" ? ungradedText(reps) : `${reps.pass} of ${total} reps passed${lostText(reps)}`;
   const rate = c.pass_rate_30d != null ? ` · this case passed ${pct(c.pass_rate_30d)} of the time over the last 30 days on PRs` : "";
@@ -1299,6 +1306,7 @@ function lastFailureHtml(c) {
   else if (f.cls === "shared") head = f.also_failing_prs >= 1 ? `the gate's: failing on ${plural(f.also_failing_prs, "other PR")} at the time` : "the gate's: in the outage at the time";
   else if (f.cls === "storm") head = "a quota storm: repetitions lost before grading";
   else if (f.cls === "delegation-ceiling") head = "the delegation ceiling: the harness stopped waiting with the worker still running";
+  else if (f.cls === "fixture-drift") head = "a drifted fixture: the case was not run on that lease";
   else if (f.cls === "only-this-pr") head = "PR-caused: passed on other PRs around it";
   else if (f.event) head = "failed all reps in a run where almost everything failed";
   else head = "failed all reps";
@@ -1564,7 +1572,7 @@ function detailHtml() {
   const run = runs().find((r) => String(r.build) === sel.build);
   const c = run ? (run.cases || []).find((x) => x.case === sel.case) : null;
   if (!run || !c) return "";
-  const reps = c.reps || { pass: 0, fail: 0, infra: 0, ceiling: 0 };
+  const reps = c.reps || { pass: 0, fail: 0, infra: 0, ceiling: 0, fixture: 0 };
   const total = repTotal(reps);
   const how = c.outcome === "failed" ? `failed all ${plural(reps.fail, "graded rep")}${lostText(reps)}` : c.outcome === "infra" ? ungradedText(reps) : c.outcome === "partial" ? `${reps.fail} of ${total} reps failed${lostText(reps)}` : `passed all ${plural(reps.pass, "rep")}${lostText(reps)}`;
   const others = (run.cases || []).filter((x) => x.case !== c.case && x.outcome === "passed").length;

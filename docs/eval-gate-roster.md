@@ -649,6 +649,17 @@ erroring verifier, an empty record on a task that provisions nothing — a recor
 deployer died before any agent ran grades INFRA and reds nobody) does not stop when its
 case leaves the list.
 
+A broken seeded-fleet fixture is not a reason to demote. After it writes the fleet kubeconfigs,
+`hack/ci-eval-pr.sh` runs `hack/fleet-fixture-state.py` against the leased project. A case
+whose grade depends on a role that scan read and found out of its designed state (a role a
+`fixture_role:` check reads, or the case's only `fixtures:` role) is not run. Each of its repetitions is recorded as infrastructure under `fixture-drift:<role>` and
+the scan's own words, and the suite leaves the case out of its coverage floor, so it cannot
+red or hold a pull request ([the scorer](designs/eval-scorer.md#the-verdict-ladder)). The
+dashboard classes the case `fixture-drift`, the nightly files no `nightly-red` issue for it
+(three such nights in a row file the infra owner's kept-from-running issue, one per case), and the fixture itself is the [seeded-fleet scan](ci-health.md#the-seeded-fleet-scan)'s to
+report. A role the scan could not read, a scan that failed, a pull request that changes the
+fleet catalog, the scan or the case itself: each leaves the case graded as usual.
+
 Nothing automatic demotes a listed case under the default `roster` mode, which is why the
 manual edit is the lever. The record is the evidence for it: when the store holds a full
 window for the case, the verdict's **Record says** column reads `would-demote` and the

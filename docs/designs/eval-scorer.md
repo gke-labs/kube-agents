@@ -240,6 +240,13 @@ not grade is neither: it ran and was read, so it is not a wiped case for the flo
 arms nor disarms the all-cases guard, which reads the gradable cases alone. It is listed under
 its own key, `not_graded`, and named in a note; a run whose every case was not graded is
 `not_evaluated` with a reason saying the suite graded nothing, not that infrastructure took it.
+A case not run because the lease-time seeded-fleet scan saw a fixture it needs drifted
+(`hack/ci-eval-pr.sh` records every repetition under `fixture-drift:<role>`;
+`kube_agents_bench/fixture_drift.py` maps the scan onto the matrix) is infrastructure, but it is
+not a wiped case for the floor either: a rerun lands on the same fixture, and nothing in the
+change can repair it. It is listed under `fixture_drift` (`{case: [fixture-drift:<role>]}`) and
+named in a note. It still counts toward the all-cases guard, and a case with even one repetition
+lost some other way is weather as before.
 A blocking case outranks the
 weather: the outcome is red, with the lost cases still listed among the reasons. `green` stays in
 the JSON, derived from `outcome`, so a reader that only knows the boolean sees not-evaluated as
