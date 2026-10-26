@@ -276,12 +276,16 @@ def prose_lines(text: str) -> list[str]:
         if IMPORT_LINE_RE.match(raw) or TAG_LINE_RE.match(raw):
             out.append("")
             continue
-        line = CODE_SPAN_RE.sub(CODE_SPAN_PLACEHOLDER, raw)
+        # A `* item` bullet keeps its marker: the emphasis strip below would
+        # otherwise turn it into plain text and merge it into the paragraph.
+        marker = LIST_ITEM_RE.match(raw)
+        prefix, line = (marker.group(0), raw[marker.end() :]) if marker else ("", raw)
+        line = CODE_SPAN_RE.sub(CODE_SPAN_PLACEHOLDER, line)
         line = LINK_URL_RE.sub(LINK_URL_PLACEHOLDER, line)
         line = BARE_URL_RE.sub(BARE_URL_PLACEHOLDER, line)
         line = INLINE_TAG_RE.sub(" ", line)
         line = EMPHASIS_RE.sub("", line)
-        out.append(line)
+        out.append(prefix + line)
     return out
 
 

@@ -183,6 +183,8 @@ class StructuralCeilingTest(SiteFixture):
             f"{half}\n\n{half}\n",
             f"{half}\n## Heading\n{half}\n",
             f"{half}\n- {half}\n",
+            f"{half}\n* {half}\n",
+            f"{half}\n1. {half}\n",
             f"{half}\n| a |\n| --- |\n{half}\n",
         ):
             with self.subTest(body=body[:40]):
