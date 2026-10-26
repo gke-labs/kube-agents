@@ -21,10 +21,6 @@
     "long-paragraph": 4,
     "long-sentence": 17
   },
-  "concepts/index.mdx": {
-    "long-paragraph": 1,
-    "long-sentence": 1
-  },
   "concepts/inference-gateway.md": {
     "long-paragraph": 9,
     "long-sentence": 18
@@ -161,10 +157,6 @@
   "reference/glossary.md": {
     "long-paragraph": 1,
     "long-sentence": 2
-  },
-  "reference/index.mdx": {
-    "long-paragraph": 1,
-    "long-sentence": 1
   },
   "reference/resource-labels.md": {
     "long-paragraph": 3,

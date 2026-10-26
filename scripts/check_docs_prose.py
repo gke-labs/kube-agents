@@ -21,10 +21,12 @@ a time. This check counts five kinds of finding per page under
 * **sentence over ``SENTENCE_WORD_LIMIT`` words**.
 
 Only prose is read. Frontmatter, fenced code (backtick and tilde), HTML and
-MDX comments, generated regions, MDX ``import`` lines and component tag lines
-are blanked line for line, so every finding keeps its 1-based line number;
-inline code spans and link URLs are replaced in place so an identifier in
-backticks never counts as a word or a banned one.
+MDX comments, generated regions, MDX ``import`` lines and component tags
+(one-line, or an opening tag whose attributes run on to a closing ``>``) are
+blanked line for line, so every finding keeps its 1-based line number; inline
+code spans and link URLs are replaced in place so an identifier in backticks
+never counts as a word or a banned one. A long paragraph or sentence is
+reported at the line it starts on, with its opening words.
 
 **The ratchet.** ``scripts/docs_prose_ratchet.json`` records, per page and
 per kind, the count the page carried when the check arrived. A page with no
@@ -150,6 +152,12 @@ IMPORT_LINE_RE = re.compile(r"^\s*import\s+.*\sfrom\s+['\"].*['\"];?\s*$")
 # A line that is only an MDX/HTML tag (open, close or self-closing), such as
 # `<Aside type="note">` or `</Steps>`; prose inside the component stays.
 TAG_LINE_RE = re.compile(r"^\s*</?[A-Za-z][\w.-]*(?:\s[^<>]*)?/?>\s*$")
+# A tag whose attributes continue on the next lines (`<LinkCard` / `title="…"`
+# / `/>`); the span is blanked through the line that closes it. The attribute
+# text is not prose for the check in either layout, so a card description
+# reads the same whether prettier wrapped it or not.
+TAG_OPEN_RE = re.compile(r"^\s*<[A-Za-z][\w.-]*(?:\s[^<>]*)?$")
+TAG_CLOSE_RE = re.compile(r"/?>\s*$")
 HTML_COMMENT_OPEN = "<!--"
 HTML_COMMENT_CLOSE = "-->"
 MDX_COMMENT_OPEN = "{/*"
@@ -182,6 +190,14 @@ WORD_RE = re.compile(r"[\w][\w'’./:-]*")
 SENTENCE_END_RE = re.compile(r"(?<=[.!?])(?<!\be\.g\.)(?<!\bi\.e\.)[\"')\]]*\s+(?=[\"'(\[A-Z0-9])")
 # Table cell boundary: an unescaped pipe.
 CELL_SPLIT_RE = re.compile(r"(?<!\\)\|")
+
+# How a long paragraph or sentence is named in the report: the count, then
+# the opening words so the author can find it without counting.
+DETAIL_OPENING_WORDS = 6
+LENGTH_DETAIL = "{words} words (limit {limit}): {opening}..."
+# Wrapped lines of one paragraph are joined with this, so a sentence's offset
+# maps back to its source line.
+PARAGRAPH_JOIN = "\n"
 
 # Report wording.
 ABOVE_MESSAGE = (
@@ -228,6 +244,7 @@ def prose_lines(text: str) -> list[str]:
     fence: str | None = None
     in_comment: str | None = None
     in_generated = False
+    in_tag = False
     for index, raw in enumerate(lines):
         stripped = raw.strip()
         if index == 0 and stripped == FRONTMATTER_DELIMITER:
@@ -273,6 +290,15 @@ def prose_lines(text: str) -> list[str]:
         if not raw:
             out.append("")
             continue
+        if in_tag:
+            if TAG_CLOSE_RE.search(raw):
+                in_tag = False
+            out.append("")
+            continue
+        if TAG_OPEN_RE.match(raw):
+            in_tag = True
+            out.append("")
+            continue
         if IMPORT_LINE_RE.match(raw) or TAG_LINE_RE.match(raw):
             out.append("")
             continue
@@ -306,7 +332,7 @@ def paragraphs(lines: list[str]) -> list[tuple[int, str]]:
 
     def flush() -> None:
         if buffer:
-            blocks.append((start, " ".join(buffer)))
+            blocks.append((start, PARAGRAPH_JOIN.join(buffer)))
             buffer.clear()
 
     for index, line in enumerate(lines, start=1):
@@ -338,8 +364,42 @@ def table_cells(lines: list[str]) -> list[tuple[int, str]]:
     return cells
 
 
-def sentences(text: str) -> list[str]:
-    return [s for s in SENTENCE_END_RE.split(text) if s.strip()]
+def sentences(text: str) -> list[tuple[int, str]]:
+    """(offset into ``text``, sentence) for every non-blank sentence."""
+    out: list[tuple[int, str]] = []
+    offset = 0
+    for match in SENTENCE_END_RE.finditer(text):
+        out.append((offset, text[offset : match.start()]))
+        offset = match.end()
+    out.append((offset, text[offset:]))
+    return [(o, s) for o, s in out if s.strip()]
+
+
+def length_detail(text: str, words: int, limit: int) -> str:
+    opening = " ".join(WORD_RE.findall(text)[:DETAIL_OPENING_WORDS])
+    return LENGTH_DETAIL.format(words=words, limit=limit, opening=opening)
+
+
+def line_at(start: int, text: str, offset: int) -> int:
+    """The source line of ``offset`` in a block that starts on line ``start``."""
+    return start + text[:offset].count(PARAGRAPH_JOIN)
+
+
+def text_findings(path: Path, start: int, text: str, kind: str, limit: int) -> list[Finding]:
+    """The antithesis, length and sentence findings of one paragraph or cell."""
+    findings: list[Finding] = []
+    for pattern in ANTITHESIS_RES:
+        for match in pattern.finditer(text):
+            findings.append(Finding(path, line_at(start, text, match.start()), KIND_ANTITHESIS, match.group(0)))
+    words = word_count(text)
+    if words > limit:
+        findings.append(Finding(path, start, kind, length_detail(text, words, limit)))
+    for offset, sentence in sentences(text):
+        words = word_count(sentence)
+        if words > SENTENCE_WORD_LIMIT:
+            detail = length_detail(sentence, words, SENTENCE_WORD_LIMIT)
+            findings.append(Finding(path, line_at(start, text, offset), KIND_SENTENCE, detail))
+    return findings
 
 
 def page_findings(path: Path, text: str) -> list[Finding]:
@@ -351,29 +411,10 @@ def page_findings(path: Path, text: str) -> list[Finding]:
             findings.append(Finding(path, number, KIND_BANNED_WORD, match.group(0)))
         for match in LEVERAGE_VERB_RE.finditer(line):
             findings.append(Finding(path, number, KIND_BANNED_WORD, match.group(0)))
-    blocks = paragraphs(lines)
-    for start, block in blocks:
-        for pattern in ANTITHESIS_RES:
-            for match in pattern.finditer(block):
-                findings.append(Finding(path, start, KIND_ANTITHESIS, match.group(0)))
-        words = word_count(block)
-        if words > PARAGRAPH_WORD_LIMIT:
-            findings.append(Finding(path, start, KIND_PARAGRAPH, f"{words} words (limit {PARAGRAPH_WORD_LIMIT})"))
-        for sentence in sentences(block):
-            words = word_count(sentence)
-            if words > SENTENCE_WORD_LIMIT:
-                findings.append(Finding(path, start, KIND_SENTENCE, f"{words} words (limit {SENTENCE_WORD_LIMIT})"))
+    for start, block in paragraphs(lines):
+        findings.extend(text_findings(path, start, block, KIND_PARAGRAPH, PARAGRAPH_WORD_LIMIT))
     for number, cell in table_cells(lines):
-        for pattern in ANTITHESIS_RES:
-            for match in pattern.finditer(cell):
-                findings.append(Finding(path, number, KIND_ANTITHESIS, match.group(0)))
-        words = word_count(cell)
-        if words > CELL_WORD_LIMIT:
-            findings.append(Finding(path, number, KIND_CELL, f"{words} words (limit {CELL_WORD_LIMIT})"))
-        for sentence in sentences(cell):
-            words = word_count(sentence)
-            if words > SENTENCE_WORD_LIMIT:
-                findings.append(Finding(path, number, KIND_SENTENCE, f"{words} words (limit {SENTENCE_WORD_LIMIT})"))
+        findings.extend(text_findings(path, number, cell, KIND_CELL, CELL_WORD_LIMIT))
     findings.sort(key=lambda f: (f.line, KINDS.index(f.kind)))
     return findings
 

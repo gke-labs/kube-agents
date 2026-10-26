@@ -768,7 +768,7 @@ docs-check-terminology:
 docs-check-audience: ## Fail when a published site page carries a maintainer identifier (shapes: scripts/docs_audience_denylist.txt).
 	@python3 scripts/check_docs_audience.py
 
-docs-check-prose: ## Fail when a published site page's prose regresses past scripts/docs_prose_ratchet.json (banned words, epigrams, long paragraphs, cells and sentences).
+docs-check-prose: ## Fail when a published site page's prose is out of step with scripts/docs_prose_ratchet.json (above a ceiling: fix the prose; below: lower the entry).
 	@python3 scripts/check_docs_prose.py
 
 docs-check-context-budget:

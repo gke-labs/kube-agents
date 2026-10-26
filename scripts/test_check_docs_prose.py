@@ -107,6 +107,17 @@ class ExtractionTest(SiteFixture):
         body = '<Aside type="note">\n  This is simply text.\n</Aside>\n'
         self.assertEqual(self.kinds(body), [prose.KIND_BANNED_WORD])
 
+    def test_multi_line_component_tag_is_not_prose(self):
+        body = (
+            "<CardGrid>\n  <LinkCard\n    title=\"Seamless\"\n    description=\"A robust card, simply put.\"\n"
+            "    href=\"/x/\"\n  />\n</CardGrid>\n\nAfter the grid.\n"
+        )
+        self.assertEqual(self.kinds(body), [])
+
+    def test_one_line_component_tag_reads_the_same_as_the_wrapped_one(self):
+        body = '<LinkCard title="Seamless" description="A robust card, simply put." href="/x/" />\n'
+        self.assertEqual(self.kinds(body), [])
+
     def test_line_numbers_are_one_based_source_lines(self):
         body = "First line.\n\n```\ncode\n```\n\nThis is simply text.\n"
         finding = self.findings(body)[0]
@@ -209,6 +220,14 @@ class StructuralCeilingTest(SiteFixture):
         body = one_sentence(prose.SENTENCE_WORD_LIMIT + 1) + ". Short.\n"
         self.assertEqual(self.kinds(body), [prose.KIND_SENTENCE])
 
+    def test_long_sentence_names_its_own_line_and_opening_words(self):
+        body = "First line is short.\nSecond line is short too.\nThird starts here " + one_sentence(prose.SENTENCE_WORD_LIMIT) + ".\n"
+        finding = self.findings(body)[0]
+        frontmatter_lines = FRONTMATTER.count("\n")
+        self.assertEqual(finding.kind, prose.KIND_SENTENCE)
+        self.assertEqual(finding.line, frontmatter_lines + 3)
+        self.assertIn("Third starts here word word word", finding.detail)
+
     def test_abbreviation_and_version_do_not_split_a_sentence(self):
         text = "Use e.g. `flag` and v1.2 (i.e. `two`). " + one_sentence(prose.SENTENCE_WORD_LIMIT - 5) + "."
         self.assertEqual(self.kinds(text + "\n"), [prose.KIND_SENTENCE])
@@ -236,7 +255,7 @@ class RatchetTest(SiteFixture):
         self.assertEqual(code, 1)
         self.assertIn("new.md: banned-word 1 > ceiling 0", out)
         self.assertIn("fix the prose", out)
-        self.assertIn("'simply'", out.replace("simply", "'simply'"))
+        self.assertIn("simply", out)
 
     def test_recorded_count_passes(self):
         self.write_page("This is simply text.\n")
@@ -348,9 +367,10 @@ class RealSiteTest(unittest.TestCase):
             self.assertNotIn(0, kinds.values(), page)
 
     def test_site_scan_runs_inside_the_time_budget(self):
-        start = time.monotonic()
+        """CPU time rather than wall clock, so a loaded runner does not fail it on its own."""
+        start = time.process_time()
         prose.scan()
-        self.assertLess(time.monotonic() - start, SITE_TIME_BUDGET_SECONDS)
+        self.assertLess(time.process_time() - start, SITE_TIME_BUDGET_SECONDS)
 
 
 if __name__ == "__main__":
