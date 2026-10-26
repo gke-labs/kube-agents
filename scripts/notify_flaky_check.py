@@ -138,7 +138,14 @@ TEST_ID_PATTERNS = (
     # pytest: `FAILED tests/test_x.py::test_y - AssertionError`, and
     # `ERROR tests/test_x.py::test_y - ...` for a fixture that failed to set
     # up, which is the shape a flaky fixture takes.
-    re.compile(r"^(?:FAILED|ERROR) (\S+::\S+)"),
+    # The id runs to the end of its `[...]` parameter part when it has one,
+    # so a parameter id holding a space, or ` - `, stays whole; the lazy
+    # bracket match stops at the first `]` that ` - ` or the line end
+    # follows, which is the id's own `]` rather than one in the message.
+    # The path and name segments exclude `:`, so each `::` is consumed
+    # where it stands and a long crafted line costs linear time, not the
+    # quadratic retry a `\S+::` prefix would pay at every `::`.
+    re.compile(r"^(?:FAILED|ERROR) ([^\s\[:]+(?:::[^\s\[:]+)+(?:\[.*?\])?)(?: - .*)?$"),
 )
 
 # Every line of a downloaded job log starts with an ISO timestamp, and the

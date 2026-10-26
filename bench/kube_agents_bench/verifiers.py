@@ -882,7 +882,10 @@ _KANBAN_TOOL_PREFIX = "kanban_"
 # What worker_trajectory's in-pod script puts in place of a result when the
 # pod's redactor will not load (its WITHHELD), and the marker its clip ends a
 # cut result with. Both live inside that script's source, so they are
-# spelled again here; test_report_times_in_window.py pins them to it.
+# spelled again here; test_report_times_in_window.py pins them to it. The
+# script's other placeholder, worker_trajectory.WITHHELD_READ_RESULT for the
+# one result of a call that read a credential, is a recorded call whose
+# output is redacted: it starts with `[REDACTED_` and is never a read gap.
 _WITHHELD_RESULT = "[WITHHELD: redactor unavailable in the pod]"
 _CLIPPED_RESULT = re.compile(r" \.\.\.\[clipped \d+ chars\]$")
 
@@ -972,6 +975,10 @@ def _read_minutes(trajectory: list[dict[str, Any]], dates: list[str]) -> tuple[s
             continue
         if result == _WITHHELD_RESULT:
             withheld.append(f"a {name or 'tool'} result was withheld")
+            continue
+        if result == worker_trajectory.WITHHELD_READ_RESULT:
+            # A credential read, recorded without its output: no time in it,
+            # and no gap in the capture.
             continue
         if _CLIPPED_RESULT.search(result):
             clipped += 1
@@ -1747,6 +1754,9 @@ class ToolCalledVerifier(BaseVerifier):
     check ``status="error"``, since a pattern over it would read as no match --
     but only when its arguments are withheld too or still match ``arguments``;
     an unread call whose readable arguments rule it out is left out instead.
+    A call that read a credential has its result recorded as
+    ``worker_trajectory.WITHHELD_READ_RESULT``: a recorded call whose output is
+    redacted, matched against the pattern like any other.
     """
 
     type: Literal["tool_called"]
@@ -1879,9 +1889,11 @@ class ToolCalledVerifier(BaseVerifier):
             and not (self.require_success and entry.get("status") == "error")
         ]
         if self.result is not None:
-            # A pod that withholds results withholds arguments too, so the
-            # arguments filter cannot rule out a withheld call; it still rules
-            # out an unread call whose readable arguments name something else.
+            # A pod whose redactor did not load withholds results and
+            # arguments alike, so the arguments filter cannot rule out such a
+            # call; it still rules out an unread call whose readable arguments
+            # name something else. A credential read's WITHHELD_READ_RESULT is
+            # a recorded result, not an unread one.
             unread = [
                 entry for entry in named
                 if (entry.get("result") is None or entry.get("result") == worker_trajectory.WITHHELD)
@@ -3377,7 +3389,10 @@ class WorkerBudgetVerifier(BaseVerifier):
             calls[task] = calls.get(task, 0) + 1
             tagged += 1
             result = entry.get("result")
-            if result is None or result == worker_trajectory.WITHHELD:
+            # A credential read's result is withheld whole, the checkpoint
+            # notice that may have landed in it with the rest: unreadable
+            # here, as a redactor-less pod's results are.
+            if result is None or result in (worker_trajectory.WITHHELD, worker_trajectory.WITHHELD_READ_RESULT):
                 unreadable += 1
                 continue
             match = _BUDGET_NOTICE_RE.search(str(result))

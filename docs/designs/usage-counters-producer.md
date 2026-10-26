@@ -457,7 +457,7 @@ The reconciler publishes the CR as it reads it. Right after the `Get` that opens
 reconcile, the operator sets three gauge families on controller-runtime's registry
 (`k8s-operator/internal/controller/usage_gauges.go`): `kubeagents_platformagent_usage`
 with a `field` label per numeric field of `status.usage`, `kubeagents_platformagent_usage_time_seconds`
-for the two times as unix seconds, and `kubeagents_platformagent_phase`, one-hot over the
+for the two times, and the CR's creation time, as unix seconds, and `kubeagents_platformagent_phase`, one-hot over the
 phase vocabulary. The labels are the agent's namespace and name as `agent_namespace` and `agent` (a Managed Prometheus scrape owns `namespace` as a target label and renames a metric's to `exported_namespace`, as the watcher's `cluster` and `location` already arrive) and those two closed sets;
 nothing from conditions, messages or `activeInterfaces` is exported, and a reflection test
 holds the field list to the struct so a new counter cannot be added to the status without a
@@ -494,7 +494,7 @@ below, the reconciler reads a status the server pruned, and its zeros mean unkno
 reads the writers' own records, at any age, since a record's freshness is the writers' reprobe
 gate and a sample must not lapse into zero with it: while the shared whole-block record is held,
 or the block reads entirely empty (a pruned status before this process recorded it), every usage
-and time sample is dropped for the agent and the phase alone is served; while a per-field record
+and time sample of the block is dropped for the agent and the phase and `createdTime` alone are served; while a per-field record
 is held, the records the poller keeps for the newer fields a CRD at an intermediate schema prunes
 while serving the rest, that field's sample alone is dropped and the others are published. The
 per-field records therefore live on the reconciler beside the shared one, written and read by
@@ -502,6 +502,46 @@ the poller as before and read by the publish. What remains is a window of at mos
 an operator restart a status pruned per field reads as zeros until the first poll writes, is
 echoed, and records the pruning, and a new agent's block carries zeros from the Ready writer's
 first write until its first poll, which for a new agent is the truth.
+
+### Health-cohort rules
+
+The gauges exist so that a rule can read them. The chart renders one Managed Prometheus
+`Rules` object per install, `<name>-health-rules`
+(`charts/kube-agents/templates/platform-agent-health-rules.yaml`), behind
+`platformAgent.healthRules.enabled`, off by default: a scrape is silent and an alert is not, so
+an upgrade must not start one. It is a plain boolean rather than the `PodMonitoring`s'
+tri-state for the same reason. Recording rules compute the ratios once, per agent by
+`agent_namespace` and `agent`. Three rules of PromQL hold throughout, each pinned by the chart
+test: an `increase()` is folded with `sum by` over the agent's labels, since an operator roll-over
+splits a window's increase across two pod series and the sum is the total; an instantaneous read
+is `max by`, which folds the old leader's series for its staleness window; and every `and` or
+`unless` matches `on` the agent's labels, because the rule-evaluator appends its scoping labels to
+a recorded series and an inline side does not carry them. A day-long condition is a plain `for`: a window
+in the expression over a subquery would survive a rule-evaluator restart, which resets a pending
+alert, but it fires on a young series, since five minutes of Degraded after an upgrade reads as a
+whole day when the day's other samples do not exist; a restart delays an alert and a young series
+would invent one. The stalled-onboarding rule reads the status's own `lastHumanActiveTime` rather
+than an `increase()` over the chat counter for the same reason, with the chat counter present at zero as
+its never-spoken case, not the time's absence, since under the served-CRD skew the operator
+holds that time's sample back while `createdTime` stays; it departs from the epic's form by not reading proposals, which
+are the agent's own activity and not the person's. Enabling the rules without the operator's scrape
+fails at render, since nothing would ever fire; the alerts read the recorded ratios and the gauges, and one reads `up`, labelled `severity: at_risk` or `friction`.
+Every threshold and sample floor is a chart value with its default in `values.yaml`, and
+the template requires the thresholds block when the rules are on, so a `--reuse-values`
+upgrade from an older release fails with a message rather than rendering numbers the template
+made up.
+
+The stalled-onboarding rule needs an install's age before anyone has spoken to it, which no
+status field carries, so the time family gains one sample that is not `status.usage`'s:
+`createdTime`, the CR's creation timestamp, published beside the phase and outside every hold
+on the usage block. `rate()` and `increase()` over gauges that mirror monotonic counters read
+as they would over the counters; a status pruned by the served CRD has no sample rather than a
+zero, so a ratio over it is absent, not infinite.
+
+Not in the first set, with the reason on the epic: pod restarts, the memory limit and the
+operator's observed version, whose series a stock install does not produce (kube-state-metrics
+would), and the "GMP enabled but no `PodMonitoring` matched" cohort, since a job that matches
+no pod has no `up` series to alert on; the scrape alert covers a job whose targets fail.
 
 ## The served-CRD skew
 
