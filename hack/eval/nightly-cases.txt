@@ -17,8 +17,7 @@
 # EVAL_NIGHTLY_PART=writers, the cases that request a pull request, on a
 # second project (the variable's comment in the script says why).
 # EVAL_NIGHTLY_PART=main-a and main-b halve the main part again, for two jobs
-# on two projects (#3384). ci-kube-agents-eval-nightly-today runs the whole
-# matrix on spec.mode today as the rollback check.
+# on two projects (#3384).
 #
 # WHO APPROVES. The normal approvers (root OWNERS). Only the presubmit files
 # beside this one carry the eval-crew rule (#1546, decided 2026-09-15).
@@ -1089,9 +1088,7 @@
 # 5-section escalation bundle with read-only Cloud Logging and Compute Engine
 # get-serial-port-output triage commands. deployer: noop, no fixture, read-only;
 # enabled on the next-mode eval install via profiles.tse.enabled=true in
-# hack/ci-deploy.sh's MODE_NEXT_ENV_ARGS (on the today-mode nightly where
-# AgentProfile/tse renders nothing, it fails and appends evidence keeping it out
-# of presubmit per the header's L40-45 rule). Nightly from its first merge.
+# hack/ci-deploy.sh's MODE_NEXT_ENV_ARGS. Nightly from its first merge.
 ./tasks/tse-node-notready-pleg-probe/task.yaml
 
 # Catalogue entry 23 through the readiness report's control-plane-upgrade-history

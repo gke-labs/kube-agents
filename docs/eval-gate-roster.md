@@ -427,8 +427,8 @@ the today lane's `today` only with today's; a case with no line at its key contr
 `main`'s side, with one exception below. The main nightly (`ci-kube-agents-eval-nightly` and its
 `-writers` part) is the next-mode run on `main` that records, on the presubmit's agent model. A case
 with no line at its next key (one the inject lane excludes, or whose window has not filled) falls
-back, for this number only, to its today-mode lines at the same key otherwise, which
-`ci-kube-agents-eval-nightly-today` records, and the verdict names those cases in a note; rung 6
+back, for this number only, to its today-mode lines at the same key otherwise, which the store
+already holds (no job appends them now), and the verdict names those cases in a note; rung 6
 never falls back. The verdict prints it on every
 run:
 
@@ -576,12 +576,13 @@ on every pull request.
 Rung 6 compares an inject run only with next-mode history. The version key carries the mode
 ([`bench/baselines/README.md`](../bench/baselines/README.md)), and `bench-gate` reads
 `AGENT_TRANSPORT=inject` as `next`, so an inject run's judged mean is set against the means a
-next-mode run on `main` recorded at the same key, never against the today-mode nightly's: that
+next-mode run on `main` recorded at the same key, never against today-mode history: that
 comparison measured the lane rather than the pull request, and redded four admitted cases at once
 on 2026-10-17 with nothing changed on their side. Where no next-mode line exists at the key, rung 6
 is quiet; a partial window is compared, as it is for `today`. The today lane reads today's history
-only. The key includes the agent model, and the main nightly runs the presubmit's, so its next-mode
-lines are the presubmit's rung 6 history.
+only, which no job appends to now, so rung 6 there is quiet once the key moves past the stored
+lines. The key includes the agent model, and the main nightly runs the presubmit's, so its
+next-mode lines are the presubmit's rung 6 history.
 
 One thing about the lane's install differs too. That write safeguard
 (`no-github-writes-the-case-did-not-request`) charges every pull request opened in a repetition's

@@ -97,7 +97,7 @@ _FLAG_UNSET_SPELLINGS = (None, "", "0", "true", "yes")
 # The Prow jobs (oss-test-infra) section 2b admits the flag on without a pull
 # request: the merge-blocking presubmit (in a Tide batch), the today lane's
 # periodic, the main nightly's two parts and the GitLab next nightly; the
-# today-mode nightly and a made-up job stand for every other Prow run.
+# today-mode GitLab nightly and a made-up job stand for every other Prow run.
 _NEXT_LANE_JOB_NAMES = (
     "pull-kube-agents-smoke-test",
     "ci-kube-agents-eval-today",
@@ -109,7 +109,7 @@ _NEXT_LANE_JOB_NAMES = (
 )
 _RC_REGISTRY_PREFIX = "ghcr.io/gke-labs/kube-agents"
 _RC_COMMIT_SHA = "b4ee5f3eb9c2aceb7f03460d2e573278ab9483fe"
-_NIGHTLY_JOB_NAME = "ci-kube-agents-eval-nightly-today"
+_NIGHTLY_JOB_NAME = "ci-kube-agents-eval-nightly-gitlab"
 _OTHER_JOB_NAME = "ci-x"
 
 _BUILD_SECTION = (r"^# ─── 4\. Build Container Images.*?", r"^# ─── 5\. Chart Deployment")

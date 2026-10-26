@@ -315,9 +315,7 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # six-hourly periodic on main, which deploys next and rolls it back to today
 # before its matrix (EVAL_ROLLBACK_LANE=1); the main nightly's two parts on
 # main, which grade the full catalog under next (the nightly the dashboard and
-# the digest read; ci-kube-agents-eval-nightly-today, the today-mode nightly
-# kept as the rollback check, is not listed and so is refused the flag); the
-# GitLab lane's nightly under next (EVAL_FORGE=gitlab,
+# the digest read); the GitLab lane's nightly under next (EVAL_FORGE=gitlab,
 # hack/eval/gitlab-cases.txt, beside the today-mode GitLab nightly); and the
 # release-candidate eval's postsubmit, which grades a candidate in the mode a
 # new install gets (hack/ci-eval-rc.sh). The today lane's on-demand presubmit
@@ -327,7 +325,7 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # -- a presubmit is admitted by the second on a pull request and the blocking
 # one by the first on a Tide batch, the periodic, the nightlies and the RC
 # postsubmit only by the first -- and refuses it on any other Prow run, so
-# the flag leaking into the today nightly's or another postsubmit's environment
+# the flag leaking into the today-mode GitLab nightly's or another postsubmit's environment
 # still stops the deploy at second zero. The names are the jobs' own in
 # oss-test-infra (prow/prowjobs/gke-labs/kube-agents/); a rename there is a
 # one-line edit here. Admitting a job here never lets it write today's window:
@@ -982,7 +980,7 @@ fi
 # today's window (bench-gate reads the mode off the transport; hack/ci-eval-pr.sh
 # keeps the today lane out of the recorder, and bench-gate separately refuses
 # a pull request's sample, bench/baselines/README.md), so what the flag
-# mis-set on a job that is not the lane's -- the today nightly, another
+# mis-set on a job that is not the lane's -- the today-mode GitLab nightly, another
 # postsubmit -- would do is run that job in next mode and leave today's
 # window and dashboard silently missing it, its verdict measuring the wrong
 # stack. Keyed on the job's name rather than on PULL_NUMBER, so the lane's

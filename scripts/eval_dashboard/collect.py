@@ -215,9 +215,7 @@ SCHEMA_VERSION = 1
 
 # The nightly periodic (oss-test-infra: ci-kube-agents-eval-nightly, the
 # EVAL_TIER=nightly companion of the presubmit, on spec.mode next like it)
-# and where Prow archives it. The today-mode nightly kept as the rollback
-# check (ci-kube-agents-eval-nightly-today) logs to the same bucket and is
-# not collected.
+# and where Prow archives it.
 # A periodic's log prefix holds one directory per build and a
 # latest-build.txt, so listing it is the directory index; there is no
 # pointer object to follow. The bucket is the nightly's own, not the
