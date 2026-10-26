@@ -6579,6 +6579,33 @@ class TestDriftInject(unittest.TestCase):
         )
         self.assertTrue(bundle.is_file(), f"{bundle} is named by the drift card and does not exist")
 
+    def test_the_card_handles_an_object_git_does_not_declare(self):
+        """No declared state means no revert, and the card has to say so twice.
+
+        Once as the instruction, and once in **Done when**, which otherwise
+        demands revert-or-codify and so makes a report that correctly offers no
+        revert unfinishable. The card defers the list of GitOps markers to the
+        skill ("the skill lists them"), so the skill has to carry one: the
+        worker has no repository to check, and the markers are all it has.
+        """
+        card = session_kv_server._drift_task_body(self._payload())
+        self.assertIn("establish whether git declares this object at all", card)
+        self.assertIn("no declared state to revert to", card)
+        done_when = card.split("**Done when:**", 1)[1].split("\n\n", 1)[0]
+        self.assertIn("for an object git does not declare", done_when)
+        self.assertIn("leaving it unmanaged", done_when)
+
+        skill = (
+            Path(__file__).resolve().parents[3]
+            / "agents"
+            / "cluster"
+            / "skills"
+            / "gke-load-bearing-change"
+            / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        for marker in ("argocd-controller", "kustomize-controller", "configsync.gke.io"):
+            self.assertIn(marker, skill, f"the skill the card defers to no longer names {marker}")
+
     @patch.object(session_kv_server, "trigger_agent_troubleshooter")
     def test_drift_has_its_own_ceiling(self, trigger):
         """Capped, and capped on its own budget."""

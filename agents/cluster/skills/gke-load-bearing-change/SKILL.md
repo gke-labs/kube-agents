@@ -19,6 +19,35 @@ It does not try to learn why the change was made. An operator unblocking a deplo
 
 Skip it when the live object already matches the declared state: a GitOps controller reconciled the change away and there is nothing left to decide.
 
+## First: does git declare this object at all?
+
+Everything below assumes git holds a copy of the object to put back. Check that first: the drift detector forwards a change to an object nobody ever put in git exactly as it forwards one to an object a GitOps tool syncs.
+
+You cannot read the repository, so read what a GitOps tool leaves on the objects it applies:
+
+| Tool | Field manager in `managedFields` | Label or annotation |
+| --- | --- | --- |
+| Argo CD | `argocd-controller`; `kubectl-client-side-apply` on older installs | annotation `argocd.argoproj.io/tracking-id`, or label `app.kubernetes.io/instance` under label tracking |
+| Flux | `kustomize-controller`, `helm-controller` | labels `kustomize.toolkit.fluxcd.io/name`, `helm.toolkit.fluxcd.io/name` |
+| Config Sync | `configsync.gke.io` | annotations `configmanagement.gke.io/managed`, `configsync.gke.io/resource-id` |
+
+The card's ownership block already lists the field managers. Read the markers by name rather than dumping every annotation: `last-applied-configuration` on a Secret or ConfigMap carries its data.
+
+```bash
+kubectl get <kind> <name> [-n <namespace>] -o jsonpath='{.metadata.labels}{"\n"}{.metadata.annotations.argocd\.argoproj\.io/tracking-id}{"\n"}{.metadata.annotations.configmanagement\.gke\.io/managed}'
+```
+
+- **Any of them present:** a tool syncs it from git. Go on to the method.
+- **None present:** say the object is probably not declared in git, and list what you checked. Probably, not certainly: a pipeline that applies a repository under a field manager of its own leaves nothing this table names, so name any manager you do not recognise and say it may be one. `kubectl-create`, `kubectl-edit`, `kubectl-label` and `kubectl-patch` are a person at a terminal.
+
+An object git does not declare has no declared state, so there is nothing to revert to, and the method below does not apply. Do not offer "revert to the declared state". The choices are:
+
+- **Add it to git with the change undone.** This is how undoing the change is written for an object git never held; it also brings the object under management.
+- **Add it to git as it is now.**
+- **Leave it unmanaged**, with no pull request.
+
+Weigh them the way "What you conclude" weighs a revert against a codify: a loosening nothing depends on goes into git with the change undone; one something depends on goes in as it is now, with its durable fix named.
+
 ## The method
 
 Four steps, and they do not depend on what kind of object changed. Step 3 is where the evidence location varies, and the table below is for that step.

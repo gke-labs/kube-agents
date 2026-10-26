@@ -3275,6 +3275,14 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
     establishing whether the state git declares still runs before proposing that
     the change be undone.
 
+    The detector does not consult git, so the object may be one git does not
+    declare at all, and then there is no declared state to revert to
+    (docs/designs/drift-detection.md, "Resources not in Git at all"). The
+    worker has no repository to check, so the body tells it to read that off
+    the live object's GitOps markers, which the skill lists, and widens the
+    options and the **Done when** line to adding it to git or leaving it
+    unmanaged. bench/tasks/gitops-drift-unmanaged-object-triage grades it.
+
     On an install with no usable GitOps repository the card is
     :func:`_drift_task_body_without_gitops` instead: an explanation with no
     options. The bench contract above binds only this, the registered path.
@@ -3296,6 +3304,11 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"one a revert would take down, while a change nothing depends on is one a codify would write somebody's "
         f"accident into git. The skill says where the evidence for that lives for each kind of change, and "
         f"whichever way it comes out belongs in the report.\n\n"
+        f"**Before any of that, establish whether git declares this object at all.** You have no access to the "
+        f"repository; the live object tells you. A GitOps tool marks what it applies — its field manager, or its "
+        f"tracking label or annotation — and the skill lists them. If the object carries none, say it is probably "
+        f"not in git and what you checked. There is then no declared state to revert to, so do not offer one: the "
+        f"options are to add it to git, with the change undone or as it is now, or to leave it unmanaged.\n\n"
         f"**Finish by calling `kanban_complete(result=<your full report>, summary=<one line>)`.** "
         f"Pass the entire report as `result`, not a summary of it: this card is subscribed to the chat thread where "
         f"the alert was raised, and `result` is what gets posted there. A card completed with a one-line `result` "
@@ -3304,7 +3317,8 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"says whether the change still stands or was already reconciled away, with the evidence; and proposes "
         f"either reverting it to the declared state or codifying it in git, with the consequence of each — a "
         f"revert's consequence being whether the state git declares would still run, read off this cluster or "
-        f"reported as not established. "
+        f"reported as not established — or, for an object git does not declare, proposes adding it to git or "
+        f"leaving it unmanaged. "
         f"Nothing else is a condition of finishing. State those three things in `summary`'s one line as well: "
         f"a judge that grades this card reads `summary` before `result`.\n\n"
         f"**Do this yourself. Do not delegate it to another agent, and do not open child cards for it** — "
@@ -3315,7 +3329,8 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"the declared state is the one that should win.\n\n"
         f"Propose as many options as the situation genuinely warrants. Usually there are two — revert to what git "
         f"declares, or change git to declare what is now live — and both are worth stating even when one is "
-        f"obviously right, because the reader is deciding which state wins.\n\n"
+        f"obviously right, because the reader is deciding which state wins. For an object git does not declare "
+        f"they are the ones above.\n\n"
         f"**With two or more options:** label them 'Option A', 'Option B', ... in order, name those same letters "
         f"in the call to action, and mark exactly one of them '✅ **Recommended: Option <letter>**'. "
         f"The template below shows that shape; repeat its Option line once for each further option.\n\n"
@@ -3335,7 +3350,8 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"## What's wrong\n\n"
         f"<1 sentence: who changed what, and whether it is still live>\n\n"
         f"## Why\n\n"
-        f"- <What the live object shows now, and how it differs from what git declares, with the evidence>\n"
+        f"- <What the live object shows now, and how it differs from what git declares (or that git declares "
+        f"nothing for it), with the evidence>\n"
         f"- <What the change affects — availability, cost, security posture — in 1-2 sentences>\n\n"
         f"## What to do\n\n"
         f"- **Option A (<Action Title>):** <1-sentence description of Option A GitOps fix>.\n"
