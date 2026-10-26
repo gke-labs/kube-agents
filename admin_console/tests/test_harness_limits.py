@@ -1197,9 +1197,6 @@ class ChurnAxisTest(unittest.TestCase):
         self.assertEqual(hl.factor_value(record, hl.CHURN), 260.0)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class Phase2FactorTest(unittest.TestCase):
     def test_a_combined_point_is_no_axis_and_is_checked_against_the_prediction(self):
@@ -1331,3 +1328,22 @@ class ProxyCapacityTest(unittest.TestCase):
         self.assertEqual(demand.commands_per_minute, 8.0)
         self.assertEqual(demand.per_cluster_per_minute, 1.0)
         self.assertEqual(demand.seconds_per_command, 2.0)
+
+    def test_points_at_one_cluster_count_are_kept_apart(self):
+        # Ten concurrent questions on two clusters say nothing about what one cluster asks.
+        records = parse(
+            record(operation="fan_out", metrics=((hl.PROXY_COMMANDS, None, 60.0),), totals={"clusters": 2}),
+            *(
+                record("concurrent", 10, "fan_out", run, metrics=((hl.PROXY_COMMANDS, None, 600.0),),
+                       totals={"clusters": 2})
+                for run in (1, 2)
+            ),
+        )
+        base, concurrent = hl.proxy_demand(records)
+        self.assertEqual((base.factor, base.commands_per_minute, base.per_cluster_per_minute), ("base", 2.0, 1.0))
+        self.assertEqual((concurrent.factor, concurrent.runs, concurrent.commands_per_minute), ("concurrent", 2, 20.0))
+        self.assertIsNone(concurrent.per_cluster_per_minute)
+
+
+if __name__ == "__main__":
+    unittest.main()

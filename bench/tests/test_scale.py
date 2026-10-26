@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -552,12 +554,17 @@ def test_a_proxy_load_that_cannot_run_is_an_error(monkeypatch):
 
 
 def test_counter_metrics_count_brokered_commands_and_their_seconds():
+    # A command refused by policy or by the slot wait is an invocation that never ran: not counted.
     before = Snapshot(scraped={"proxy": {"uid": collect.parse_prometheus(
         'kubeagents_tool_invocations_total{tool="kubectl",subcommand="get",status="success"} 20\n'
+        'kubeagents_tool_execution_duration_seconds_count{tool="kubectl"} 20\n'
         'kubeagents_tool_execution_duration_seconds_sum{tool="kubectl"} 25.0\n')}})
     after = Snapshot(scraped={"proxy": {"uid": collect.parse_prometheus(
         'kubeagents_tool_invocations_total{tool="kubectl",subcommand="get",status="success"} 50\n'
+        'kubeagents_tool_invocations_total{tool="kubectl",subcommand="delete",status="blocked"} 6\n'
         'kubeagents_tool_invocations_total{tool="gcloud",subcommand="container",status="success"} 4\n'
+        'kubeagents_tool_execution_duration_seconds_count{tool="kubectl"} 50\n'
+        'kubeagents_tool_execution_duration_seconds_count{tool="gcloud"} 4\n'
         'kubeagents_tool_execution_duration_seconds_sum{tool="kubectl"} 61.0\n'
         'kubeagents_tool_execution_duration_seconds_sum{tool="gcloud"} 8.0\n')}})
     metrics = {m.name: m.value for m in collect.counter_metrics(before, after)}
@@ -628,3 +635,107 @@ def test_requests_and_limits_are_read_per_container(monkeypatch):
     assert install.requests() == {"envoy-credential-proxy": {"memory_bytes": 1024**3, "cpu_cores": 0.5},
                                   "fluent-bit": {"memory_bytes": 64 * 1024**2}}
     assert install.limits() == {"envoy-credential-proxy": {"memory_bytes": 2 * 1024**3, "cpu_cores": 1.0}}
+
+
+def test_a_restarted_watcher_is_polled_until_it_reports_the_fleet(monkeypatch, tmp_path):
+    fleet = {"scale-01", "scale-02"}
+    run = runner.Runner(load_plan(PHASE2, environ=ENV), tmp_path / "data.json")
+    reports = iter([{"scale-01"}, {"scale-01"}, fleet])
+    run.install = type("Install", (), {"watched_clusters": lambda self: next(reports)})()
+    clock = iter(range(0, 10_000, 30))
+    monkeypatch.setattr(runner.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(runner.time, "sleep", lambda s: None)
+    assert run._wait_watched(fleet) == fleet
+
+
+def test_cluster_creation_runs_at_most_the_bound_at_once(monkeypatch, tmp_path):
+    run = runner.Runner(load_plan(PHASE2, environ=ENV), tmp_path / "data.json")
+    run.settings["cluster_create_parallelism"] = 2
+    lock, live, peak = threading.Lock(), [0], [0]
+
+    def create(name):
+        with lock:
+            live[0] += 1
+            peak[0] = max(peak[0], live[0])
+        time.sleep(0.05)
+        with lock:
+            live[0] -= 1
+
+    monkeypatch.setattr(runner.kube, "clusters_with_prefix", lambda *a: [])
+    monkeypatch.setattr(run, "_create_cluster", create)
+    monkeypatch.setattr(runner.kube, "has_context", lambda *a: True)
+    monkeypatch.setattr(run, "wait_registered", lambda count: None)
+    run.ensure_clusters(5)
+    assert peak[0] == 2
+
+
+def test_a_failed_reconcile_falls_back_to_waiting(monkeypatch, tmp_path):
+    fleet = {"scale-01", "scale-02", "scale-03"}
+    run, _ = _registration_runner(monkeypatch, tmp_path, [{"scale-01"}, {"scale-01"}, fleet], fleet)
+
+    def fail(*a):
+        raise kube.CommandError("exec failed")
+    monkeypatch.setattr(runner.operations, "reconcile_profiles", fail)
+    run.wait_registered(3)
+    assert run.watch_errors == []
+
+
+def test_a_new_objects_level_replaces_the_old_one(monkeypatch, tmp_path):
+    run = runner.Runner(load_plan(PHASE2, environ=ENV), tmp_path / "data.json")
+    steps = []
+    monkeypatch.setattr(run, "_applied_level", lambda context, fixture: 4000)
+    monkeypatch.setattr(runner.fixtures, "delete_fixture", lambda context, fixture: steps.append("delete"))
+    monkeypatch.setattr(run, "_wait_fixture_gone", lambda context, fixture: steps.append("wait"))
+    monkeypatch.setattr(runner.kube, "apply", lambda context, manifests: steps.append("apply"))
+    run._ensure_objects("ctx", 100)
+    assert steps == ["delete", "wait", "apply"]
+    steps.clear()
+    monkeypatch.setattr(run, "_applied_level", lambda context, fixture: 100)
+    run._ensure_objects("ctx", 100)
+    assert steps == ["apply"]
+
+
+def test_a_stored_combined_run_of_another_point_is_pending(monkeypatch, tmp_path):
+    plan = load_plan(PHASE2, environ=ENV)
+    path = tmp_path / "data.json"
+    commit = "eeb8a95ceb0a9efd66434161f87820b35b65360c"
+    records.merge(path, [records.Record(
+        commit=commit, mode="next", phase="phase2", factor="combined", level=1, operation="fan_out", run=run_number,
+        started="2026-10-27T00:00:00Z", ended="2026-10-27T00:10:00Z",
+        values={**plan.base, "clusters": 8.0, "objects": objects}) for run_number, objects in ((1, 4000.0), (2, 999.0))])
+    run = runner.Runner(plan, path)
+    run.install = type("Install", (), {"image": lambda self: f"x:{commit}", "mode": lambda self: "next",
+                                       "context": "ctx", "namespace": "ns"})()
+    monkeypatch.setattr(runner.operations, "wait_gateway_ready", lambda *a, **k: None)
+    specs = [s for s in plan.matrix() if s.factor == "combined" and s.operation.name == "fan_out"]
+    assert [s.run for s in run.pending(specs)] == [2, 3]
+
+
+def test_a_proxy_load_needs_a_list_command(tmp_path):
+    text = PHASE2.read_text().replace(
+        "    command:\n      - kubectl\n      - --kubeconfig\n      - \"{kubeconfig}\"\n      - get\n      - pods\n"
+        "      - --all-namespaces\n      - --no-headers\n", "    command: kubectl get pods\n")
+    path = tmp_path / "plan.yaml"
+    path.write_text(text)
+    with pytest.raises(ValueError, match="needs a command"):
+        load_plan(path, environ=ENV)
+
+
+def test_a_level_that_failed_half_way_is_settled_next_time(monkeypatch, tmp_path):
+    run = runner.Runner(load_plan(PHASE2, environ=ENV), tmp_path / "data.json")
+    sleeps = []
+    for name in ("preflight", "ensure_clusters", "ensure_nodes"):
+        monkeypatch.setattr(run, name, lambda *a: None)
+    monkeypatch.setattr(runner.fixtures.Churner, "start", lambda self: None)
+    monkeypatch.setattr(runner.time, "sleep", sleeps.append)
+    monkeypatch.setattr(run, "ensure_fixtures", lambda *a: None)
+    run.apply_level("proxy_concurrency", 4)
+
+    def broken(*a):
+        raise kube.CommandError("apply failed")
+    monkeypatch.setattr(run, "ensure_fixtures", broken)
+    with pytest.raises(kube.CommandError):
+        run.apply_level("failing_pods", 10)
+    monkeypatch.setattr(run, "ensure_fixtures", lambda *a: None)
+    run.apply_level("proxy_concurrency", 8)
+    assert sleeps == [300, 300]

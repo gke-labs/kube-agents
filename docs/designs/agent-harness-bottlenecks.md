@@ -209,24 +209,27 @@ Steps, in order:
 
 Phase 2 (`bench/scale/phase2.yaml`) measures where the Phase 1 lines come close to a threshold, the combined point, and the credential proxy's own throughput. It runs on the same image as Phase 1, so it reuses the Phase 1 base runs.
 
-| Factor                        | Levels          | Operations                        | Why                                                                                                   |
-| ----------------------------- | --------------- | --------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| Credential proxy load workers | 1, 4, 8, 16, 32 | Proxy load                        | The broker's throughput and latency with no model call, and whether its CPU or its 8 slots bind first |
-| Concurrent requests           | 8, 10, 12       | Fan-out                           | The step at the 10 Hermes run slots                                                                   |
-| Pods failing at once          | 10, 30          | Event watcher soak, boot burst    | How the session storm grows between 1 and 100 Pods                                                    |
-| 8 clusters × 4,000 objects    | one point       | Onboarding, watcher soak, fan-out | The first open question: whether the factors add up                                                   |
-| Number of clusters            | 16, 32          | Onboarding, watcher soak, fan-out | Where the credential proxy queues, and how memory and the event watcher grow with the fleet           |
+| Factor                        | Levels          | Operations                        | Why                                                                                                                                           |
+| ----------------------------- | --------------- | --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| Credential proxy load workers | 1, 4, 8, 16, 32 | Proxy load                        | The brokered command path's throughput and latency with no model call, and what binds first: the shell's CPU, the broker's CPU or its 8 slots |
+| Concurrent requests           | 8, 10, 12       | Fan-out                           | The step at the 10 Hermes run slots                                                                                                           |
+| Pods failing at once          | 10, 30          | Event watcher soak, boot burst    | How the session storm grows between 1 and 100 Pods                                                                                            |
+| 8 clusters × 4,000 objects    | one point       | Onboarding, watcher soak, fan-out | The first open question: whether the factors add up                                                                                           |
+| Number of clusters            | 16, 32          | Onboarding, watcher soak, fan-out | Where the credential proxy queues, and how memory and the event watcher grow with the fleet                                                   |
 
-The proxy load is a new operation. Workers in the sandbox shell repeat one brokered `kubectl get pods --all-namespaces` against the first test cluster through `credential-proxy-exec`, the path every agent command takes, for 3 minutes; the run records the commands completed per second and their latency. Every run now also records the commands the broker ran and the seconds they ran for (`kubeagents_tool_invocations_total`, `kubeagents_tool_execution_duration_seconds`), so each operation's demand on the broker can be set against that throughput, and each container's requests beside its limits. The runner runs the Cluster Agent reconcile when the profiles differ from the test fleet, instead of waiting up to an hour for its scheduled run.
+The proxy load is a new operation. Workers in the sandbox shell repeat one brokered `kubectl get pods --all-namespaces` against the first test cluster through `credential-proxy-exec`, the path every agent command takes, for 3 minutes; the run records the commands completed per second and their latency. The client runs in the shell and the command in the broker, so the shell's and the broker's CPU peaks show which of them sets the throughput. Every run now also records the commands the broker ran and the seconds they ran for (`kubeagents_tool_invocations_total`, `kubeagents_tool_execution_duration_seconds`), so each operation's demand on the broker can be set against that throughput, and each container's requests beside its limits. The runner runs the Cluster Agent reconcile when the profiles differ from the test fleet, instead of waiting up to an hour for its scheduled run.
 
 That is 55 runs, 47 of them new, and about 18 hours. The remaining candidates are not measured yet:
 
-- the remaining planned levels and the 64-cluster level;
+- the remaining planned levels, and the 64-cluster level after a quota and cost check (cluster management costs about $0.10 per cluster-hour);
+- a churn fixture that applies batches in parallel, so the 1,000 per minute level is reached;
 - 3 runs for the onboarding window and the watcher soak;
 - the Config Connector read, on a test cluster with Config Connector installed;
 - the scheduled jobs' sweep duration, kanban queue depth, CPU throttling, network throughput, time to first card and time to first token;
 - the instrumentation: a counter for triage starts lost ([#3583](https://github.com/gke-labs/kube-agents/issues/3583)) and a gauge for occupied Hermes run slots ([#3724](https://github.com/gke-labs/kube-agents/issues/3724));
 - a recurring run: the Phase 1 plan on each release candidate, with the page flagging a metric that moved past a set fraction of the previous release.
+
+Each limit the data shows below a realistic fleet size gets an issue, linked from the Known Issues table.
 
 # Phase 1 results
 

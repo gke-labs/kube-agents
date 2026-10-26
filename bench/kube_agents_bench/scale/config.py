@@ -24,6 +24,7 @@ BASE_FACTOR = "base"
 # plan's order decides when it runs.
 COMBINED_FACTOR = "combined"
 ENV_PREFIX = "SCALE_"
+PROXY_LOAD_KIND = "proxy_load"
 TARGET_KEYS = (
     "project_id",
     "host_context",
@@ -138,6 +139,13 @@ def load_plan(path: Path, environ: dict[str, str] | None = None, validate_target
         for name, spec in (raw.get("operations") or {}).items()
     ]
     factors = {name: [float(level) for level in levels] for name, levels in raw["factors"].items()}
+    for op, spec in zip(operations, (raw.get("operations") or {}).values()):
+        command = spec.get("command")
+        if op.kind == PROXY_LOAD_KIND and not (
+            isinstance(command, list) and command and all(isinstance(word, str) for word in command)
+            and op.window_seconds > 0
+        ):
+            raise ValueError(f"{path}: operation {op.name} needs a command (a list of words) and window_seconds")
     unknown = sorted({f for op in operations for f in op.factors} - set(factors))
     if unknown:
         raise ValueError(f"{path}: operations name unknown factors {unknown}")

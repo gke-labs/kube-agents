@@ -16,7 +16,6 @@ which is what an Autopilot cluster without bursting gives each container, and
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
@@ -26,7 +25,6 @@ import yaml
 from admin_console import harness_limits as hl
 
 TABLE_SEPARATOR = " | "
-NOT_REACHED = "not below {ceiling}"
 # Fleets the sizing table answers question 2 for: this many clusters, each shaped like the base.
 REFERENCE_CLUSTERS = (8, 16, 32, 64, 128)
 CELL_SEPARATOR = " · "
@@ -39,7 +37,17 @@ def _table(headers: Sequence[str], rows: Iterable[Sequence[str]]) -> str:
 
 
 def _number(value: float | None) -> str:
+    """A measured quantity."""
     return hl.NO_VALUE if value is None else hl._number_text(value)
+
+
+def _count(value: float | None) -> str:
+    """A count or a planned value: no decimals when it is whole."""
+    return hl._optional_number(value)
+
+
+def _point(item: hl.ProxyDemand) -> str:
+    return hl.BASE_LEVEL if item.factor == hl.BASE_FACTOR else f"{hl.factor_label(item.factor)} {_count(item.level)}"
 
 
 def _threshold(check: hl.Check) -> str:
@@ -75,13 +83,17 @@ def proxy_section(records: Sequence[hl.Record]) -> str:
     parts = []
     if levels:
         parts.append(
-            _table(
+            "Brokered commands from the sandbox shell with no model call. The shell runs the client of "
+            "every command, so whichever of the two containers reaches its CPU limit first sets the "
+            "throughput; a broker whose slots are full shows a median admission wait above its lowest "
+            "bucket.\n\n"
+            + _table(
                 ("Workers", "Runs", "Commands per second", "Median s", "95th percentile s", "Failed",
-                 "Proxy CPU peak (cores)"),
+                 "Proxy CPU peak (cores)", "Shell CPU peak (cores)", "Admission wait, median s"),
                 (
-                    (_number(level.workers), str(level.runs), _number(level.per_second),
-                     _number(level.p50_seconds), _number(level.p95_seconds), _number(level.errors),
-                     _number(level.cpu_cores))
+                    (_count(level.workers), str(level.runs), _number(level.per_second),
+                     _number(level.p50_seconds), _number(level.p95_seconds), _count(level.errors),
+                     _number(level.cpu_cores), _number(level.shell_cpu_cores), _number(level.wait_p50_seconds))
                     for level in levels
                 ),
             )
@@ -90,19 +102,20 @@ def proxy_section(records: Sequence[hl.Record]) -> str:
     if demand:
         rows = []
         for item in demand:
-            served = (
-                saturation * hl.SECONDS_PER_MINUTE / item.per_cluster_per_minute
-                if saturation and item.per_cluster_per_minute
-                else None
-            )
+            per_cluster = item.per_cluster_per_minute
+            served = saturation * hl.SECONDS_PER_MINUTE / per_cluster if saturation and per_cluster else None
             rows.append(
-                (item.operation, _number(item.clusters), str(item.runs), _number(item.commands_per_minute),
-                 _number(item.per_cluster_per_minute), _number(item.seconds_per_command), _number(served))
+                (item.operation, _point(item), _count(item.clusters), str(item.runs),
+                 _number(item.commands_per_minute), _number(per_cluster), _number(item.seconds_per_command),
+                 _number(served))
             )
         parts.append(
-            _table(
-                ("Operation", "Clusters", "Runs", "Commands per minute", "Per cluster per minute",
-                 "Seconds per command", "Clusters at the proxy's measured maximum"),
+            "The commands each operation sent. The per-cluster demand, and the fleet the measured "
+            "throughput serves, are given only for points that differ from the base in their cluster "
+            "count alone.\n\n"
+            + _table(
+                ("Operation", "Point", "Clusters", "Runs", "Commands per minute", "Per cluster per minute",
+                 "Seconds per command", "Clusters at the measured throughput"),
                 rows,
             )
         )
@@ -139,7 +152,7 @@ def sizing_section(records: Sequence[hl.Record], base: Mapping[str, float]) -> s
     headers = ("Container: memory · CPU limit", *(f"{clusters} clusters" for clusters in REFERENCE_CLUSTERS))
     return (
         "## Limits and nodes for larger fleets\n\n"
-        "Each limit is the predicted peak plus 30%, for that many clusters shaped like the base; "
+        f"Each limit is the predicted peak plus {hl.SAFETY_MARGIN:.0%}, for that many clusters shaped like the base; "
         "the node pool holds every long-running pod at its limits.\n\n" + _table(headers, rows)
     )
 
@@ -152,7 +165,7 @@ def report(
     containers = hl.containers(records)
     base = hl.base_fleet(records)
     sections = [f"# Harness breaking points: {title}"]
-    shape = ", ".join(f"{hl.FACTORS[factor].input_label} {hl._number_text(value)}" for factor, value in base.items())
+    shape = ", ".join(f"{hl.FACTORS[factor].input_label} {_count(value)}" for factor, value in base.items())
     sections.append(f"Base point: {shape}.")
     cluster_ceiling = base[hl.CLUSTERS] * hl.CAPACITY_CEILING
     shaped = hl.cluster_capacities(records, containers, limits, base)
@@ -190,8 +203,8 @@ def report(
             + _table(
                 ("Count", "Factor", "Zero up to", "Above zero at", "Runs above zero"),
                 (
-                    (onset.label, hl.FACTORS[onset.factor].input_label, _number(onset.last_zero),
-                     _number(onset.first_above), f"{onset.runs_above} of {onset.runs}")
+                    (onset.label, hl.FACTORS[onset.factor].input_label, _count(onset.last_zero),
+                     _count(onset.first_above), f"{onset.runs_above} of {onset.runs}")
                     for onset in onsets
                 ),
             )
@@ -221,9 +234,19 @@ def main(argv: list[str] | None = None) -> int:
     if not available:
         print(f"{hl.display_path(dataset.path)} has no records.", file=sys.stderr)
         return 1
-    commit = next((item for item in available if args.commit and item.startswith(args.commit)), available[0])
+    commit = available[0]
+    if args.commit:
+        matching = [item for item in available if item.startswith(args.commit)]
+        if not matching:
+            print(f"No record of commit {args.commit}; measured: {', '.join(available)}.", file=sys.stderr)
+            return 2
+        commit = matching[0]
     modes = hl.modes(dataset.records, commit)
     mode = args.mode or modes[hl.default_mode_index(modes)]
+    if mode not in modes:
+        print(f"No record of mode {mode} at {commit[:hl.COMMIT_LABEL_LENGTH]}; measured: {', '.join(modes)}.",
+              file=sys.stderr)
+        return 2
     records = hl.select(dataset.records, commit, mode)
     if args.limits:
         limits, against = read_limits(args.limits), f"limits from {args.limits}"

@@ -388,12 +388,13 @@ QUERY_METRICS = (RESPONSE,)
 
 # How far a capacity search looks: up to this multiple of the input's base value.
 CAPACITY_CEILING = 1000.0
-# Halvings of the search interval; 60 resolve any ceiling to well under one unit.
-CAPACITY_STEPS = 60
+# Halvings of the search interval; 30 resolve a ceiling of thousands to a thousandth.
+CAPACITY_STEPS = 30
 # Fleet-wide factors: a fleet with more clusters of the same shape has proportionally more of them.
 FLEET_WIDE_FACTORS = (CHURN, FAILING_PODS)
 # The credential proxy's container, and the operation that loads it with no model call.
 PROXY_CONTAINER = "envoy-credential-proxy"
+SHELL_CONTAINER = "shell"
 PROXY_LOAD_OPERATION = "proxy_load"
 SECONDS_PER_MINUTE = 60.0
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -1470,33 +1471,33 @@ def capacities(
     that fails stays failed as the input grows, which holds for the straight
     lines the predictions are made of when they rise.
     """
-    cache: dict[float, dict[tuple[str, str | None], Check]] = {}
-
-    def checks_at(x: float) -> dict[tuple[str, str | None], Check]:
-        if x not in cache:
-            cache[x] = {
-                (check.metric, check.container): check
-                for check in all_checks(records, fleet_at(x), containers, limits)
-            }
-        return cache[x]
-
+    bottom = {
+        (check.metric, check.container): check
+        for check in all_checks(records, fleet_at(start), containers, limits)
+    }
     results = []
-    for key, top in checks_at(ceiling).items():
-        first = checks_at(start)[key]
-        if first.status == FAIL:
+    for top in all_checks(records, fleet_at(ceiling), containers, limits):
+        first = bottom[(top.metric, top.container)]
+        if past_at_base(first):
             results.append(Capacity(first, start, at_base=True))
             continue
         if top.status != FAIL:
             results.append(Capacity(top, None))
             continue
+        only = gated_operations(top.metric)
+
+        def check_at(x: float, top: Check = top, only: tuple[str, ...] | None = only) -> Check:
+            prediction = predict(records, top.metric, top.container, fleet_at(x), only=only)
+            return _check(top.metric, top.container, top.lines, prediction)
+
         low, high = start, ceiling
         for _ in range(CAPACITY_STEPS):
             middle = (low + high) / 2
-            if checks_at(middle)[key].status == FAIL:
+            if check_at(middle).status == FAIL:
                 high = middle
             else:
                 low = middle
-        results.append(Capacity(checks_at(high)[key], high))
+        results.append(Capacity(check_at(high), high))
     return sorted(
         results,
         key=lambda item: (not item.at_base, item.value is None, item.value or 0.0, item.check.label),
@@ -1615,24 +1616,36 @@ class ProxyLevel:
     p50_seconds: float | None
     p95_seconds: float | None
     errors: float
-    # The proxy container's largest CPU peak over the runs.
+    # The largest CPU peaks over the runs: the broker's, and the sandbox shell's, where the
+    # client of every brokered command runs.
     cpu_cores: float | None
+    shell_cpu_cores: float | None = None
+    # The broker's largest median admission wait: near zero while its slots are free.
+    wait_p50_seconds: float | None = None
 
 
 @dataclass(frozen=True)
 class ProxyDemand:
-    """The brokered commands one operation sent at one fleet size, averaged over its runs."""
+    """The brokered commands one operation sent at one point, averaged over its runs."""
 
     operation: str
+    factor: str
+    level: float
     clusters: float
     runs: int
     commands_per_minute: float
-    # Seconds a command held its slot, on average.
+    # Seconds a command ran for, on average.
     seconds_per_command: float | None
 
     @property
-    def per_cluster_per_minute(self) -> float:
-        return self.commands_per_minute / self.clusters if self.clusters else 0.0
+    def base_shaped(self) -> bool:
+        """Whether the point differs from the base in its cluster count alone."""
+        return self.factor in (BASE_FACTOR, CLUSTERS)
+
+    @property
+    def per_cluster_per_minute(self) -> float | None:
+        """The demand of one cluster, for a point whose clusters are shaped like the base's."""
+        return self.commands_per_minute / self.clusters if self.clusters and self.base_shaped else None
 
 
 def _optional_mean(values: Sequence[float | None]) -> float | None:
@@ -1656,6 +1669,8 @@ def proxy_levels(records: Iterable[Record]) -> list[ProxyLevel]:
     levels = []
     for workers, runs in sorted(groups.items()):
         peaks = [value for run in runs if (value := run.value(CPU_PEAK, PROXY_CONTAINER)) is not None]
+        shell = [value for run in runs if (value := run.value(CPU_PEAK, SHELL_CONTAINER)) is not None]
+        waits = [value for run in runs if (value := run.value(PROXY_WAIT_P50)) is not None]
         levels.append(
             ProxyLevel(
                 workers,
@@ -1665,27 +1680,37 @@ def proxy_levels(records: Iterable[Record]) -> list[ProxyLevel]:
                 _optional_mean([run.value(PROXY_LOAD_P95) for run in runs]),
                 sum(run.value(PROXY_LOAD_ERRORS) or 0.0 for run in runs),
                 max(peaks) if peaks else None,
+                max(shell) if shell else None,
+                max(waits) if waits else None,
             )
         )
     return levels
 
 
 def proxy_demand(records: Iterable[Record]) -> list[ProxyDemand]:
-    """Brokered commands per minute by operation and fleet size, the proxy load runs aside."""
-    groups: dict[tuple[str, float], list[Record]] = {}
+    """Brokered commands per minute by operation and point, the proxy load runs aside.
+
+    Points are kept apart: ten concurrent questions on two clusters are no
+    measure of what one cluster asks of the broker.
+    """
+    groups: dict[tuple[str, str, float], list[Record]] = {}
     for record in records:
-        clusters = record.totals.get(CLUSTERS)
-        if record.operation == PROXY_LOAD_OPERATION or record.value(PROXY_COMMANDS) is None or not clusters:
+        if record.operation == PROXY_LOAD_OPERATION or record.value(PROXY_COMMANDS) is None:
             continue
-        groups.setdefault((record.operation, clusters), []).append(record)
+        if not record.totals.get(CLUSTERS):
+            continue
+        groups.setdefault((record.operation, record.factor, record.level), []).append(record)
     demand = []
-    for (operation, clusters), runs in sorted(groups.items()):
+    for (operation, factor, level), runs in sorted(groups.items()):
+        clusters = _mean([run.totals[CLUSTERS] for run in runs])
         commands = sum(run.value(PROXY_COMMANDS) or 0.0 for run in runs)
         timed = [value for run in runs if (value := run.value(PROXY_COMMAND_SECONDS)) is not None]
         minutes = sum(_minutes(run) for run in runs)
         demand.append(
             ProxyDemand(
                 operation,
+                factor,
+                level,
                 clusters,
                 len(runs),
                 commands / minutes,
@@ -2041,7 +2066,8 @@ def combined_rows(records: Sequence[Record], containers: Iterable[str]) -> list[
                 ]
                 if not measured:
                     continue
-                prediction = predict(single, metric, container, fleet)
+                # The operations the point ran, so the prediction and the peak measure the same work.
+                prediction = predict(single, metric, container, fleet, only=sorted({r.operation for r in runs}))
                 predicted = prediction.value if prediction is not None else None
                 rows.append(
                     {
@@ -2122,7 +2148,6 @@ def metric_charts(
     """One chart per metric the factor's runs of the operation measured."""
     fleet_x = fleet_value(factor, fleet)
     limits = latest_limits(records)
-    spec = FACTORS.get(factor)
     charts = []
     for metric in metric_names(records):
         owners = {
@@ -2156,7 +2181,7 @@ def metric_charts(
                 factor=factor,
                 operation=operation,
                 title=metric_info.label,
-                x_title=spec.input_label if spec else factor,
+                x_title=factor_label(factor),
                 y_title=f"{metric_info.label} ({metric_info.unit})"
                 if metric_info.unit
                 else metric_info.label,

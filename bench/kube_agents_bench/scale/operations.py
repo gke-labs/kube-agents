@@ -306,7 +306,9 @@ def proxy_load(context: str, namespace: str, operation: Operation, concurrency: 
     ``concurrency`` workers in the sandbox shell each repeat ``operation.command``
     through ``credential-proxy-exec`` for ``operation.window_seconds``; the run
     records the commands completed per second and their latency. No model call
-    is involved, so the result is the broker's own capacity.
+    is involved, so the result is the capacity of the path every agent command
+    takes: the client in the sandbox shell, whose CPU the shell's other work
+    shares, and the broker. Which of them binds shows in their CPU peaks.
     """
     outcome = OperationResult()
     argv = [PROXY_CLIENT, *operation.command]

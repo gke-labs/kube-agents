@@ -86,9 +86,10 @@ WATCHER_COUNTERS = {
     "watcher_quota_suppressed": "k8s_event_watcher_events_quota_suppressed_total",
 }
 PROXY_REFUSALS = "kubeagents_credential_proxy_admission_refusals_total"
-# Every brokered command the proxy ran, and the seconds they ran for: the demand a fleet puts
-# on the broker, and how much of its slots that demand held.
-PROXY_COMMANDS = "kubeagents_tool_invocations_total"
+# Every brokered command the proxy ran, and the seconds they ran for: the demand a fleet puts on
+# the broker. The duration histogram's count covers exactly the commands its sum does; the
+# invocation counter also counts the ones refused by policy or by the slot wait, which never ran.
+PROXY_COMMANDS = "kubeagents_tool_execution_duration_seconds_count"
 PROXY_COMMAND_SECONDS = "kubeagents_tool_execution_duration_seconds_sum"
 PROXY_WAIT = "kubeagents_credential_proxy_admission_wait_seconds"
 PROXY_WAIT_QUANTILES = (("proxy_wait_p50_seconds", 0.5), ("proxy_wait_max_seconds", 1.0))

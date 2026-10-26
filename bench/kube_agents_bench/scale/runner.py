@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from kube_agents_bench.scale import collect, fixtures, kube, operations, records
-from kube_agents_bench.scale.config import BASE_FACTOR, Plan, RunSpec, load_plan
+from kube_agents_bench.scale.config import BASE_FACTOR, COMBINED_FACTOR, Plan, RunSpec, load_plan
 
 LOG = logging.getLogger("harness-scale")
 
@@ -134,6 +134,13 @@ class Runner:
 
     # --- the fleet ----------------------------------------------------------------------------
 
+    def parallelism(self, jobs: int) -> int:
+        """How many GKE operations to run at once: ``cluster_create_parallelism``, or all of them.
+
+        A bound keeps a large level from opening dozens of cluster or node-pool operations at once.
+        """
+        return int(self.settings.get("cluster_create_parallelism", 0)) or jobs
+
     def cluster_names(self, count: int) -> list[str]:
         return [TEST_CLUSTER_FORMAT.format(prefix=self.prefix, index=index) for index in range(1, count + 1)]
 
@@ -153,9 +160,8 @@ class Runner:
         missing = [name for name in wanted if name not in existing]
         extra = [name for name in existing if name not in wanted]
         if missing or extra:
-            # A bound keeps a large level from opening dozens of GKE operations at once.
-            parallel = int(self.settings.get("cluster_create_parallelism", 0)) or len(missing) + len(extra)
-            with ThreadPoolExecutor(max_workers=min(parallel, len(missing) + len(extra))) as pool:
+            changes = len(missing) + len(extra)
+            with ThreadPoolExecutor(max_workers=min(self.parallelism(changes), changes)) as pool:
                 jobs = [pool.submit(self._create_cluster, name) for name in missing]
                 jobs += [pool.submit(kube.delete_cluster, self.project, self.zone, name) for name in extra]
                 for job in jobs:
@@ -248,7 +254,7 @@ class Runner:
             sizes[name] = max(int(values["nodes"]), DEFAULT_POOL_NODES + math.ceil(pods / per_node)) - DEFAULT_POOL_NODES
         if not names:
             return
-        with ThreadPoolExecutor(max_workers=len(names)) as pool:
+        with ThreadPoolExecutor(max_workers=min(self.parallelism(len(names)), len(names))) as pool:
             jobs = [
                 pool.submit(kube.ensure_node_pool, self.project, self.zone, name, self.settings["fixture_pool"],
                             self.settings["fixture_machine_type"], size)
@@ -309,6 +315,8 @@ class Runner:
     def apply_level(self, factor: str, level: float) -> dict[str, float]:
         values = self.plan.level_values(factor, level)
         LOG.info("applying %s=%s: %s", factor, level, values)
+        # Forgotten until the level is in place, so a level that fails half-way is settled after.
+        previous, self.applied_fleet = self.applied_fleet, None
         self.preflight()
         self.stop_churn()
         self.ensure_clusters(int(values["clusters"]))
@@ -318,7 +326,7 @@ class Runner:
                                         int(self.settings["churn_pod_lifetime_seconds"]))
         self.churner.start()
         fleet = {key: values[key] for key in FLEET_VALUES if key in values}
-        if fleet != self.applied_fleet:
+        if fleet != previous:
             settle = int(self.settings.get("settle_seconds", 0))
             LOG.info("settling for %ss", settle)
             time.sleep(settle)
@@ -482,13 +490,25 @@ class Runner:
 
     def pending(self, specs: list[RunSpec]) -> list[RunSpec]:
         """The runs whose key is not in the data file yet, for the build the install runs now."""
-        done = records.existing_keys(self.data_file)
+        done = {record["key"]: record.get("values", {}) for record in records.load(self.data_file)["records"]}
         operations.wait_gateway_ready(self.install.context, self.install.namespace)
         image = self.install.image()
         commit = commit_of(image) or image.rsplit(":", 1)[-1] or "unknown"
         mode = self.install.mode() or self.plan.target["mode"]
-        return [s for s in specs
-                if records.record_key(commit, mode, s.factor, s.level, s.operation.name, s.run) not in done]
+        pending = []
+        for spec in specs:
+            key = records.record_key(commit, mode, spec.factor, spec.level, spec.operation.name, spec.run)
+            if key not in done or not self.same_point(done[key], spec):
+                pending.append(spec)
+        return pending
+
+    def same_point(self, stored: dict[str, float], spec: RunSpec) -> bool:
+        """Whether a stored combined run measured this plan's point: a combined level is only an
+        index, so another plan's (or an edited) Nth point has the same key."""
+        if spec.factor != COMBINED_FACTOR:
+            return True
+        point = self.plan.combined[int(spec.level) - 1]
+        return all(stored.get(name) == value for name, value in point.items())
 
     def run(self, specs: list[RunSpec], force: bool, limit: int = 0) -> None:
         self.backfill_peaks()

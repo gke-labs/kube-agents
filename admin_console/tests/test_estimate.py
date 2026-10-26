@@ -55,7 +55,8 @@ class EstimateTest(unittest.TestCase):
     def test_the_report_names_the_breaking_point_and_the_proxy_demand(self):
         text = self.run_main()
         self.assertIn("| Memory peak · platform-agent | 1,000 MiB (platform-agent limit) | 500 MiB | 12.0 clusters |", text)
-        self.assertIn("| watcher_soak | 8.0 | 1 | 8.0 | 1.0 | — | — |", text)
+        self.assertIn("| watcher_soak | base | 2 | 1 | 2.0 | 1.0 | — | — |", text)
+        self.assertIn("| watcher_soak | Clusters 8 | 8 | 1 | 8.0 | 1.0 | — | — |", text)
         # 8 clusters: 800 MiB predicted, 1,040 MiB with the 30% margin.
         self.assertIn("| platform-agent | 1040Mi · — |", text)
         self.assertIn("| Node pool | 1 × e2-standard-2 |", text)
@@ -74,3 +75,8 @@ class EstimateTest(unittest.TestCase):
         text = self.run_main("--against", "requests")
         self.assertIn("against the latest run's requests", text)
         self.assertIn("| 600 MiB (platform-agent limit) | 500 MiB | 4.0 clusters |", text)
+
+    def test_an_unknown_commit_or_mode_is_an_error(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(estimate.main(["--data", str(self.data), "--commit", "deadbeef"]), 2)
+            self.assertEqual(estimate.main(["--data", str(self.data), "--mode", "today"]), 2)
