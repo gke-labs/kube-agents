@@ -1004,7 +1004,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ "${IS_PROW_RUN}" = "true" ] && [ -z "${P
     echo "       The flag is for a pull request's presubmit or a job named in" >&2
     echo "       EVAL_MODE_NEXT_JOB_NAMES (${EVAL_MODE_NEXT_JOB_NAMES}); any other periodic or" >&2
     echo "       postsubmit under it would run in next mode instead of today's, leaving" >&2
-    echo "       today's baseline and dashboard silently missing that run." >&2
+    echo "       its today-mode dashboard record silently missing." >&2
     exit 1
   fi
 fi

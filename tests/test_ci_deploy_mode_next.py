@@ -599,8 +599,8 @@ class FlagSetIsNextTest(unittest.TestCase):
                     self.assertIn(f"no PULL_NUMBER (JOB_NAME={job})", result.stderr)
                     # The consequence the error names is the one the tree has:
                     # a flagged run records under next's key, so the refused
-                    # job would go missing from today's record, not move it.
-                    self.assertIn("leaving\n       today's baseline and dashboard silently missing", result.stderr)
+                    # job's today-mode dashboard record would go missing.
+                    self.assertIn("leaving\n       its today-mode dashboard record silently missing", result.stderr)
                     self.assertNotIn("would record next-mode samples", result.stderr)
                     self.assertEqual(result.stdout, "")
                 elif flag == "1" and prow == "true" and not pull:

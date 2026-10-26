@@ -785,10 +785,10 @@ class InjectLaneExclusionsTest(unittest.TestCase):
                 with self.subTest(case=case):
                     self.assertIn(case, excluded, f"{case} reads a delivered card result but is not in {eval_rosters.INJECT_LANE_EXCLUSIONS_FILE.name}")
 
-    def test_an_exclusion_is_not_a_demotion(self):
-        # The api lane's roster is untouched by an entry here: an excluded
-        # presubmit case still runs on every pull request and can still red
-        # one, and an excluded nightly case still runs every night.
+    def test_an_exclusion_keeps_the_case_on_its_roster(self):
+        # An entry here leaves the case on its roster: the today lane still
+        # grades an excluded presubmit case, and an excluded nightly case runs
+        # nowhere in CI until it can go through the inject door.
         self.assertEqual(sorted(INJECT_LANE_EXCLUDED_TIER), sorted(INJECT_LANE_EXCLUDED))
         for case, tier in INJECT_LANE_EXCLUDED_TIER.items():
             with self.subTest(case=case, tier=tier):
