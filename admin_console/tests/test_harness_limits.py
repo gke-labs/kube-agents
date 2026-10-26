@@ -1199,3 +1199,135 @@ class ChurnAxisTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Phase2FactorTest(unittest.TestCase):
+    def test_a_combined_point_is_no_axis_and_is_checked_against_the_prediction(self):
+        container = "platform-agent"
+        records = parse(
+            record(metrics=(memory(container, 500),), values=planned()),
+            record(
+                "clusters",
+                8,
+                metrics=(memory(container, 800),),
+                totals={"clusters": 8, "nodes": 16},
+                values=planned(clusters=8),
+            ),
+            record(
+                "combined",
+                1,
+                metrics=(memory(container, 1000),),
+                totals={"clusters": 8, "nodes": 16},
+                values=planned(clusters=8, objects=4000),
+            ),
+        )
+        self.assertEqual(hl.factors(records), [hl.CLUSTERS])
+        self.assertEqual(hl.unmapped_factors(records), [])
+        [row] = hl.combined_rows(records, [container])
+        # Objects has no single-factor runs here, so the prediction is the clusters line alone.
+        self.assertEqual(row["Point"], "Clusters 8.0, Objects per cluster 4,000")
+        self.assertEqual(row["Measured (largest run)"], hl.format_value(hl.MEMORY_PEAK, 1000 * MIB))
+        self.assertEqual(row["Predicted"], hl.format_value(hl.MEMORY_PEAK, 800 * MIB))
+        self.assertEqual(row["Measured ÷ predicted"], "1.25")
+
+    def test_proxy_load_workers_are_charted_but_move_no_prediction(self):
+        records = parse(
+            record(operation="proxy_load", metrics=((hl.CPU_PEAK, "credential-proxy", 0.4),),
+                   values=planned(proxy_concurrency=1)),
+            record("proxy_concurrency", 8, operation="proxy_load",
+                   metrics=((hl.CPU_PEAK, "credential-proxy", 1.0),), values=planned(proxy_concurrency=8)),
+        )
+        self.assertEqual(hl.factors(records, "proxy_load"), [hl.PROXY_CONCURRENCY])
+        self.assertEqual(hl.unmapped_factors(records), [])
+        self.assertEqual(hl.factor_label(hl.PROXY_CONCURRENCY), "Credential proxy load workers")
+        prediction = hl.predict(records, hl.CPU_PEAK, "credential-proxy", hl.base_fleet(records))
+        self.assertEqual(prediction.contributions, ())
+        self.assertAlmostEqual(prediction.value, 0.4)
+        points = hl.series_points(records, "proxy_load", hl.PROXY_CONCURRENCY, hl.CPU_PEAK, "credential-proxy")
+        self.assertEqual([p.x for p in points], [1.0, 8.0])
+
+
+class CapacityTest(unittest.TestCase):
+    CONTAINER = "platform-agent"
+    LIMITS = {"platform-agent": {"memory_bytes": 1000 * MIB}}
+
+    def records(self) -> tuple[hl.Record, ...]:
+        """Memory 500 MiB at 2 clusters and 800 MiB at 8: 50 MiB per cluster."""
+        return parse(
+            record(metrics=(memory(self.CONTAINER, 500),), values=planned()),
+            record(
+                "clusters",
+                8,
+                metrics=(memory(self.CONTAINER, 800),),
+                totals={"clusters": 8, "nodes": 16},
+                values=planned(clusters=8),
+            ),
+        )
+
+    def test_a_fleet_of_more_clusters_keeps_their_shape(self):
+        fleet = hl.scaled_fleet(planned(), 8)
+        self.assertEqual(fleet[hl.CLUSTERS], 8)
+        self.assertEqual(fleet[hl.CHURN], 40.0)
+        self.assertEqual(fleet[hl.FAILING_PODS], 4.0)
+        self.assertEqual(fleet[hl.OBJECTS], planned()[hl.OBJECTS])
+
+    def test_the_breaking_point_is_where_the_line_meets_the_limit(self):
+        [memory_check] = [
+            item
+            for item in hl.cluster_capacities(self.records(), [self.CONTAINER], self.LIMITS)
+            if item.check.metric == hl.MEMORY_PEAK
+        ]
+        self.assertFalse(memory_check.at_base)
+        self.assertAlmostEqual(memory_check.value, 12.0, places=3)
+
+    def test_a_limit_below_the_base_fails_at_the_base(self):
+        limits = {"platform-agent": {"memory_bytes": 400 * MIB}}
+        [memory_check] = hl.cluster_capacities(self.records(), [self.CONTAINER], limits)
+        self.assertTrue(memory_check.at_base)
+
+    def test_a_flat_metric_never_fails(self):
+        limits = {"platform-agent": {"memory_bytes": 100_000 * MIB}}
+        [memory_check] = hl.factor_capacities(self.records(), [self.CONTAINER], limits, hl.NODES)
+        self.assertIsNone(memory_check.value)
+
+    def test_a_count_onset_is_the_measured_step(self):
+        refusals = hl.RUN_SLOT_REFUSALS
+        records = parse(
+            record(operation="fan_out", metrics=((refusals, None, 0),), values=planned()),
+            *(
+                record("concurrent", level, "fan_out", run, metrics=((refusals, None, count),),
+                       values=planned(concurrent=level))
+                for level, run, count in ((10, 1, 0), (10, 2, 0), (12, 1, 0), (12, 2, 2), (15, 1, 5))
+            ),
+        )
+        [onset] = hl.count_onsets(records, hl.CONCURRENT)
+        self.assertEqual((onset.last_zero, onset.first_above), (10.0, 12.0))
+        self.assertEqual((onset.runs_above, onset.runs), (1, 2))
+
+
+class ProxyCapacityTest(unittest.TestCase):
+    def test_load_levels_average_their_runs(self):
+        records = parse(
+            *(
+                record("proxy_concurrency", workers, "proxy_load", run,
+                       metrics=((hl.PROXY_LOAD_RATE, None, rate), (hl.PROXY_LOAD_P50, None, 1.0 * workers),
+                                (hl.CPU_PEAK, hl.PROXY_CONTAINER, cpu)),
+                       values=planned(proxy_concurrency=workers))
+                for workers, run, rate, cpu in ((4, 1, 2.0, 0.6), (4, 2, 3.0, 0.7), (8, 1, 3.5, 1.0))
+            ),
+        )
+        levels = hl.proxy_levels(records)
+        self.assertEqual([(level.workers, level.runs, level.per_second) for level in levels],
+                         [(4.0, 2, 2.5), (8.0, 1, 3.5)])
+        self.assertEqual(levels[0].cpu_cores, 0.7)
+
+    def test_demand_is_commands_per_minute_per_cluster(self):
+        records = parse(
+            record("clusters", 8, "watcher_soak", metrics=((hl.PROXY_COMMANDS, None, 240.0),
+                                                         (hl.PROXY_COMMAND_SECONDS, None, 480.0)),
+                   totals={"clusters": 8}, started="2026-10-23T01:00:00Z"),
+        )
+        [demand] = hl.proxy_demand(records)
+        self.assertEqual(demand.commands_per_minute, 8.0)
+        self.assertEqual(demand.per_cluster_per_minute, 1.0)
+        self.assertEqual(demand.seconds_per_command, 2.0)

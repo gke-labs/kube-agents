@@ -28,8 +28,9 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -57,6 +58,10 @@ CHURN = "churn_per_minute"
 FAILING_PODS = "failing_pods"
 CONCURRENT = "concurrent"
 LISTING_PODS = "listing_pods"
+# Not fleet inputs. The proxy load's workers are a load the runner sets (bench/scale/phase2.yaml);
+# a combined level is a point that moves several factors at once, not a place on an axis.
+PROXY_CONCURRENCY = "proxy_concurrency"
+COMBINED = "combined"
 # The kinds the design counts as objects. Their summed totals, per cluster, are
 # the objects factor's measured value, so the cluster's own objects count too.
 OBJECT_KINDS = ("namespaces", "deployments", "services", "hpas", "pods", "configmaps")
@@ -88,6 +93,14 @@ PROFILES = "profiles"
 PROXY_WAIT_P50 = "proxy_wait_p50_seconds"
 PROXY_WAIT_MAX = "proxy_wait_max_seconds"
 PROXY_REFUSALS = "proxy_refusals"
+PROXY_COMMANDS = "proxy_commands"
+PROXY_COMMAND_SECONDS = "proxy_command_seconds"
+PROXY_LOAD_COMPLETED = "proxy_load_completed"
+PROXY_LOAD_ERRORS = "proxy_load_errors"
+PROXY_LOAD_RATE = "proxy_load_per_second"
+PROXY_LOAD_P50 = "proxy_load_p50_seconds"
+PROXY_LOAD_P95 = "proxy_load_p95_seconds"
+PROXY_LOAD_MAX = "proxy_load_max_seconds"
 WATCHER_SEEN = "watcher_events_seen"
 WATCHER_SEEN_RATE = "watcher_events_seen_per_minute"
 WATCHER_CREATES = "watcher_session_creates"
@@ -279,6 +292,9 @@ FACTORS = MappingProxyType(
         ),
     }
 )
+# Factors that are a load the runner applies, not a property of the fleet: charted against their
+# own runs, never a fleet input, so a prediction does not move with them.
+LOAD_FACTORS = MappingProxyType({PROXY_CONCURRENCY: "Credential proxy load workers"})
 
 
 @dataclass(frozen=True)
@@ -301,6 +317,14 @@ METRICS = MappingProxyType(
         PROXY_WAIT_P50: MetricSpec("Credential proxy wait, median", "s"),
         PROXY_WAIT_MAX: MetricSpec("Credential proxy wait, maximum", "s"),
         PROXY_REFUSALS: MetricSpec("Credential proxy refusals"),
+        PROXY_COMMANDS: MetricSpec("Brokered commands"),
+        PROXY_COMMAND_SECONDS: MetricSpec("Brokered command time, summed", "s"),
+        PROXY_LOAD_COMPLETED: MetricSpec("Proxy load: commands completed"),
+        PROXY_LOAD_ERRORS: MetricSpec("Proxy load: commands failed"),
+        PROXY_LOAD_RATE: MetricSpec("Proxy load: commands per second"),
+        PROXY_LOAD_P50: MetricSpec("Proxy load: command time, median", "s"),
+        PROXY_LOAD_P95: MetricSpec("Proxy load: command time, 95th percentile", "s"),
+        PROXY_LOAD_MAX: MetricSpec("Proxy load: command time, maximum", "s"),
         WATCHER_SEEN: MetricSpec("Watcher events seen"),
         WATCHER_SEEN_RATE: MetricSpec("Watcher events seen per minute"),
         WATCHER_CREATES: MetricSpec("Watcher session creates"),
@@ -362,6 +386,18 @@ CAPACITY_METRICS = MappingProxyType({PVC_USED: PVC_CAPACITY})
 QUERY_OPERATIONS = ("fan_out",)
 QUERY_METRICS = (RESPONSE,)
 
+# How far a capacity search looks: up to this multiple of the input's base value.
+CAPACITY_CEILING = 1000.0
+# Halvings of the search interval; 60 resolve any ceiling to well under one unit.
+CAPACITY_STEPS = 60
+# Fleet-wide factors: a fleet with more clusters of the same shape has proportionally more of them.
+FLEET_WIDE_FACTORS = (CHURN, FAILING_PODS)
+# The credential proxy's container, and the operation that loads it with no model call.
+PROXY_CONTAINER = "envoy-credential-proxy"
+PROXY_LOAD_OPERATION = "proxy_load"
+SECONDS_PER_MINUTE = 60.0
+TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
 
 @dataclass(frozen=True)
 class MachineType:
@@ -419,6 +455,7 @@ class Record:
     values: Mapping[str, float] = field(default_factory=dict)
     totals: Mapping[str, float] = field(default_factory=dict)
     limits: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
+    requests: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
     # Per container, the running pods that carried it.
     replicas: Mapping[str, float] = field(default_factory=dict)
     provider_429s: int = 0
@@ -731,9 +768,17 @@ def _record(item: Any, where: str) -> Record:
     metrics = item.get("metrics")
     if not isinstance(metrics, list):
         raise HarnessDataError(f"{where}: metrics is not a list")
-    limits = item.get("limits", {})
-    if not isinstance(limits, dict):
-        raise HarnessDataError(f"{where}: limits is not an object")
+    resources = {}
+    for kind in ("limits", "requests"):
+        raw = item.get(kind, {})
+        if not isinstance(raw, dict):
+            raise HarnessDataError(f"{where}: {kind} is not an object")
+        resources[kind] = MappingProxyType(
+            {
+                str(container): MappingProxyType(_numbers(values, f"{where}: {kind}.{container}"))
+                for container, values in raw.items()
+            }
+        )
     measurements = (
         _measurement(entry, f"{where}: metric {index + 1}")
         for index, entry in enumerate(metrics)
@@ -756,14 +801,8 @@ def _record(item: Any, where: str) -> Record:
         image=image,
         values=MappingProxyType(_numbers(item.get("values", {}), f"{where}: values")),
         totals=MappingProxyType(_numbers(item.get("totals", {}), f"{where}: totals")),
-        limits=MappingProxyType(
-            {
-                str(container): MappingProxyType(
-                    _numbers(values, f"{where}: limits.{container}")
-                )
-                for container, values in limits.items()
-            }
-        ),
+        limits=resources["limits"],
+        requests=resources["requests"],
         replicas=MappingProxyType(_numbers(item.get("replicas", {}), f"{where}: replicas")),
         provider_429s=int(_number(item.get("provider_429s", 0), f"{where}: provider_429s")),
         excluded_from=_texts(item, "excluded_from", where),
@@ -852,18 +891,30 @@ def operations(records: Iterable[Record]) -> list[str]:
 
 
 def factors(records: Iterable[Record], operation: str | None = None) -> list[str]:
-    """Every factor with runs of its own: the planned ones first, in plan order."""
+    """Every factor with runs of its own: the planned ones first, in plan order.
+
+    Combined points are not a factor's axis; ``combined_rows`` reports them.
+    """
     found = {
         record.factor
         for record in records
-        if not record.is_base and (operation is None or record.operation == operation)
+        if not record.is_base
+        and record.factor != COMBINED
+        and (operation is None or record.operation == operation)
     }
     return [name for name in FACTORS if name in found] + sorted(found - set(FACTORS))
 
 
 def unmapped_factors(records: Iterable[Record]) -> list[str]:
     """Factors that have no fleet input, so predictions hold them at their base."""
-    return [name for name in factors(records) if name not in FACTORS]
+    return [name for name in factors(records) if name not in FACTORS and name not in LOAD_FACTORS]
+
+
+def factor_label(factor: str) -> str:
+    """A factor's name as the page shows it."""
+    if factor in FACTORS:
+        return FACTORS[factor].input_label
+    return LOAD_FACTORS.get(factor, factor)
 
 
 def containers(records: Iterable[Record]) -> list[str]:
@@ -909,6 +960,15 @@ def latest_limits(records: Iterable[Record]) -> dict[str, dict[str, float]]:
         for container, values in record.limits.items():
             limits[container] = dict(values)
     return limits
+
+
+def latest_requests(records: Iterable[Record]) -> dict[str, dict[str, float]]:
+    """Per container, the requests of the latest run that read them."""
+    requests: dict[str, dict[str, float]] = {}
+    for record in sorted(records, key=lambda item: (item.started, item.key)):
+        for container, values in record.requests.items():
+            requests[container] = dict(values)
+    return requests
 
 
 def limit_table(
@@ -1153,6 +1213,8 @@ def predict(
     base_operation = max(bases, key=lambda operation: bases[operation])
     contributions = []
     for factor in factors(records):
+        if factor in LOAD_FACTORS:
+            continue
         candidates = [
             item
             for operation in names
@@ -1353,6 +1415,284 @@ def headroom(check: Check) -> float | None:
     if check.prediction is None or not check.lines:
         return None
     return check.lines[0].value - check.prediction.value
+
+
+# --- capacity ---------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Capacity:
+    """Where one check first fails as an input grows from the base point."""
+
+    check: Check
+    # The input's value at the first failure; None when the check passes up to the ceiling.
+    value: float | None
+    # True when the base point itself fails the check.
+    at_base: bool = False
+
+
+def all_checks(
+    records: Sequence[Record],
+    fleet: Mapping[str, float],
+    containers: Sequence[str],
+    limits: Mapping[str, Mapping[str, float]],
+) -> list[Check]:
+    return resource_checks(records, fleet, containers, limits) + threshold_checks(
+        records, fleet, containers
+    )
+
+
+def scaled_fleet(base: Mapping[str, float], clusters: float) -> dict[str, float]:
+    """The base fleet with ``clusters`` clusters of the same shape.
+
+    Per-cluster inputs (nodes, objects) and the request-side inputs stay; the
+    fleet-wide inputs (pod churn, Pods failing at once) grow with the clusters.
+    """
+    ratio = clusters / base[CLUSTERS]
+    fleet = dict(base)
+    fleet[CLUSTERS] = clusters
+    for factor in FLEET_WIDE_FACTORS:
+        fleet[factor] = base[factor] * ratio
+    return fleet
+
+
+def capacities(
+    records: Sequence[Record],
+    containers: Sequence[str],
+    limits: Mapping[str, Mapping[str, float]],
+    fleet_at: Callable[[float], Mapping[str, float]],
+    start: float,
+    ceiling: float,
+) -> list[Capacity]:
+    """For every check, the smallest input in [start, ceiling] at which it fails.
+
+    ``fleet_at`` maps the input to a whole fleet. The search assumes a check
+    that fails stays failed as the input grows, which holds for the straight
+    lines the predictions are made of when they rise.
+    """
+    cache: dict[float, dict[tuple[str, str | None], Check]] = {}
+
+    def checks_at(x: float) -> dict[tuple[str, str | None], Check]:
+        if x not in cache:
+            cache[x] = {
+                (check.metric, check.container): check
+                for check in all_checks(records, fleet_at(x), containers, limits)
+            }
+        return cache[x]
+
+    results = []
+    for key, top in checks_at(ceiling).items():
+        first = checks_at(start)[key]
+        if first.status == FAIL:
+            results.append(Capacity(first, start, at_base=True))
+            continue
+        if top.status != FAIL:
+            results.append(Capacity(top, None))
+            continue
+        low, high = start, ceiling
+        for _ in range(CAPACITY_STEPS):
+            middle = (low + high) / 2
+            if checks_at(middle)[key].status == FAIL:
+                high = middle
+            else:
+                low = middle
+        results.append(Capacity(checks_at(high)[key], high))
+    return sorted(
+        results,
+        key=lambda item: (not item.at_base, item.value is None, item.value or 0.0, item.check.label),
+    )
+
+
+def cluster_capacities(
+    records: Sequence[Record],
+    containers: Sequence[str],
+    limits: Mapping[str, Mapping[str, float]],
+    base: Mapping[str, float] | None = None,
+) -> list[Capacity]:
+    """Each check's breaking point in clusters, for a fleet of clusters shaped like the base."""
+    base = dict(base or base_fleet(records))
+    return capacities(
+        records,
+        containers,
+        limits,
+        lambda clusters: scaled_fleet(base, clusters),
+        base[CLUSTERS],
+        base[CLUSTERS] * CAPACITY_CEILING,
+    )
+
+
+def factor_capacities(
+    records: Sequence[Record],
+    containers: Sequence[str],
+    limits: Mapping[str, Mapping[str, float]],
+    factor: str,
+    base: Mapping[str, float] | None = None,
+) -> list[Capacity]:
+    """Each check's breaking point in one factor, with every other factor at the base."""
+    base = dict(base or base_fleet(records))
+    return capacities(
+        records,
+        containers,
+        limits,
+        lambda value: {**base, factor: value},
+        base[factor],
+        max(base[factor], 1.0) * CAPACITY_CEILING,
+    )
+
+
+@dataclass(frozen=True)
+class Onset:
+    """Where a count that has to stay at zero was first measured above it, along one factor."""
+
+    metric: str
+    container: str | None
+    factor: str
+    # The largest measured point below the onset, where every run counted zero.
+    last_zero: float | None
+    # The smallest measured point where a run counted above zero, and how many of its runs did.
+    first_above: float
+    runs_above: int
+    runs: int
+
+    @property
+    def label(self) -> str:
+        name = metric_spec(self.metric).label
+        return f"{name} · {self.container}" if self.container else name
+
+
+def count_onsets(records: Sequence[Record], factor: str) -> list[Onset]:
+    """The measured onset of every count whose threshold is "above 0", along ``factor``.
+
+    A straight line through counts that stay at zero up to a queue's capacity
+    and then jump crosses zero at once, so these are reported as measured:
+    the last point at zero and the first above it, with no line between them.
+    """
+    counts = [metric for metric, lines in FIXED_LINES.items() if lines == ABOVE_ZERO]
+    onsets = []
+    for metric in counts:
+        owners = sorted(
+            {m.container for record in records for m in record.metrics if m.name == metric},
+            key=lambda owner: owner or "",
+        )
+        for owner in owners:
+            groups: dict[str, list[tuple[float, float]]] = {}
+            for record in records:
+                if not (record.is_base or record.factor == factor):
+                    continue
+                y = record.value(metric, owner)
+                x = factor_value(record, factor)
+                if x is not None and y is not None:
+                    groups.setdefault(BASE_LEVEL if record.is_base else f"{record.level:g}", []).append((x, y))
+            ordered = sorted(groups.values(), key=lambda runs: _mean([x for x, _ in runs]))
+            above = next((index for index, runs in enumerate(ordered) if any(y > 0 for _, y in runs)), None)
+            if above is None:
+                continue
+            runs = ordered[above]
+            onsets.append(
+                Onset(
+                    metric,
+                    owner,
+                    factor,
+                    _mean([x for x, _ in ordered[above - 1]]) if above else None,
+                    _mean([x for x, _ in runs]),
+                    sum(1 for _, y in runs if y > 0),
+                    len(runs),
+                )
+            )
+    return onsets
+
+
+# --- the credential proxy's capacity --------------------------------------
+
+
+@dataclass(frozen=True)
+class ProxyLevel:
+    """The proxy load runs at one worker count, averaged."""
+
+    workers: float
+    runs: int
+    per_second: float
+    p50_seconds: float | None
+    p95_seconds: float | None
+    errors: float
+    # The proxy container's largest CPU peak over the runs.
+    cpu_cores: float | None
+
+
+@dataclass(frozen=True)
+class ProxyDemand:
+    """The brokered commands one operation sent at one fleet size, averaged over its runs."""
+
+    operation: str
+    clusters: float
+    runs: int
+    commands_per_minute: float
+    # Seconds a command held its slot, on average.
+    seconds_per_command: float | None
+
+    @property
+    def per_cluster_per_minute(self) -> float:
+        return self.commands_per_minute / self.clusters if self.clusters else 0.0
+
+
+def _optional_mean(values: Sequence[float | None]) -> float | None:
+    present = [value for value in values if value is not None]
+    return _mean(present) if present else None
+
+
+def _minutes(record: Record) -> float:
+    started = datetime.strptime(record.started, TIMESTAMP_FORMAT)
+    ended = datetime.strptime(record.ended, TIMESTAMP_FORMAT)
+    return max((ended - started).total_seconds(), 1.0) / SECONDS_PER_MINUTE
+
+
+def proxy_levels(records: Iterable[Record]) -> list[ProxyLevel]:
+    """The proxy load runs, one row per worker count, in rising order."""
+    groups: dict[float, list[Record]] = {}
+    for record in records:
+        workers = factor_value(record, PROXY_CONCURRENCY)
+        if record.value(PROXY_LOAD_RATE) is not None and workers is not None:
+            groups.setdefault(workers, []).append(record)
+    levels = []
+    for workers, runs in sorted(groups.items()):
+        peaks = [value for run in runs if (value := run.value(CPU_PEAK, PROXY_CONTAINER)) is not None]
+        levels.append(
+            ProxyLevel(
+                workers,
+                len(runs),
+                _mean([run.value(PROXY_LOAD_RATE) for run in runs]),
+                _optional_mean([run.value(PROXY_LOAD_P50) for run in runs]),
+                _optional_mean([run.value(PROXY_LOAD_P95) for run in runs]),
+                sum(run.value(PROXY_LOAD_ERRORS) or 0.0 for run in runs),
+                max(peaks) if peaks else None,
+            )
+        )
+    return levels
+
+
+def proxy_demand(records: Iterable[Record]) -> list[ProxyDemand]:
+    """Brokered commands per minute by operation and fleet size, the proxy load runs aside."""
+    groups: dict[tuple[str, float], list[Record]] = {}
+    for record in records:
+        clusters = record.totals.get(CLUSTERS)
+        if record.operation == PROXY_LOAD_OPERATION or record.value(PROXY_COMMANDS) is None or not clusters:
+            continue
+        groups.setdefault((record.operation, clusters), []).append(record)
+    demand = []
+    for (operation, clusters), runs in sorted(groups.items()):
+        commands = sum(run.value(PROXY_COMMANDS) or 0.0 for run in runs)
+        timed = [value for run in runs if (value := run.value(PROXY_COMMAND_SECONDS)) is not None]
+        minutes = sum(_minutes(run) for run in runs)
+        demand.append(
+            ProxyDemand(
+                operation,
+                clusters,
+                len(runs),
+                commands / minutes,
+                sum(timed) / commands if timed and commands else None,
+            )
+        )
+    return demand
 
 
 # --- recommendations --------------------------------------------------------
@@ -1669,6 +2009,53 @@ def unfixable_rows(checks: Iterable[Check]) -> list[dict[str, str]]:
         for check in checks
         if check.metric in UNFIXABLE
     ]
+
+
+def combined_rows(records: Sequence[Record], containers: Iterable[str]) -> list[dict[str, str]]:
+    """Each combined point's measured peaks against the page's prediction for its fleet.
+
+    A prediction adds the factors one by one, and a combined point moves several
+    at once, so a measured peak above the prediction is an interaction the sum
+    misses. The prediction is made from every run except the combined ones.
+    """
+    single = [record for record in records if record.factor != COMBINED]
+    base_values = next((record.values for record in single if record.is_base and record.values), {})
+    rows = []
+    for level in sorted({record.level for record in records if record.factor == COMBINED}):
+        runs = [record for record in records if record.factor == COMBINED and record.level == level]
+        fleet = base_fleet(single)
+        moved = [
+            factor
+            for factor in FACTORS
+            if factor in runs[0].values and runs[0].values[factor] != base_values.get(factor)
+        ]
+        for factor in moved:
+            values = [value for record in runs if (value := factor_value(record, factor)) is not None]
+            if values:
+                fleet[factor] = _mean(values)
+        point = ", ".join(f"{FACTORS[factor].input_label} {_number_text(fleet[factor])}" for factor in moved)
+        for metric in (MEMORY_PEAK, CPU_PEAK):
+            for container in containers:
+                measured = [
+                    value for record in runs if (value := record.value(metric, container)) is not None
+                ]
+                if not measured:
+                    continue
+                prediction = predict(single, metric, container, fleet)
+                predicted = prediction.value if prediction is not None else None
+                rows.append(
+                    {
+                        "Point": point,
+                        "Container": container,
+                        "Metric": METRICS[metric].label,
+                        "Measured (largest run)": format_value(metric, max(measured)),
+                        "Predicted": format_value(metric, predicted),
+                        "Measured ÷ predicted": (
+                            f"{max(measured) / predicted:.2f}" if predicted else NO_VALUE
+                        ),
+                    }
+                )
+    return rows
 
 
 def record_rows(records: Iterable[Record]) -> list[dict[str, Any]]:

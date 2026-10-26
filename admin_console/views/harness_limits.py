@@ -91,6 +91,12 @@ CHART_CAPTION = (
     "warning and failure colours."
 )
 
+COMBINED_CAPTION = (
+    "A prediction adds each factor's effect as if the factors were independent. "
+    "Above 1, the measured peak exceeds the prediction: the factors interact, and "
+    "predictions for fleets that move the same factors are low."
+)
+
 recover_app_shell()
 
 
@@ -297,7 +303,7 @@ else:
     factor = factor_column.selectbox(
         "Factor",
         operation_factors,
-        format_func=lambda item: hl.FACTORS[item].input_label if item in hl.FACTORS else item,
+        format_func=hl.factor_label,
         key=f"{KEY_PREFIX}:factor:{scope}:{operation}",
     )
     charts = hl.metric_charts(records, operation, factor, selected, fleet)
@@ -313,6 +319,16 @@ else:
                     key=f"{KEY_PREFIX}:chart:{scope}:{operation}:{factor}:{chart.metric}",
                 )
     st.caption(CHART_CAPTION)
+
+combined = hl.combined_rows(records, selected)
+if combined:
+    section_title(
+        "Combined points",
+        "Runs that move several factors at once, against what this page predicts for "
+        "the same fleet from the single-factor runs.",
+    )
+    table(combined)
+    st.caption(COMBINED_CAPTION)
 
 with st.expander("Raw records"):
     st.caption(

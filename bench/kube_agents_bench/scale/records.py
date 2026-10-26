@@ -68,6 +68,7 @@ class Record:
     values: dict[str, float] = field(default_factory=dict)
     totals: dict[str, int] = field(default_factory=dict)
     limits: dict[str, dict[str, float]] = field(default_factory=dict)
+    requests: dict[str, dict[str, float]] = field(default_factory=dict)
     # Per container name, how many running pods carried it.
     replicas: dict[str, int] = field(default_factory=dict)
     metrics: list[Metric] = field(default_factory=list)

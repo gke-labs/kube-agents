@@ -616,3 +616,15 @@ def test_a_level_that_keeps_the_fleet_skips_the_settle(monkeypatch, tmp_path):
     run.apply_level("concurrent", 8)
     run.apply_level("failing_pods", 10)
     assert sleeps == [300, 300]
+
+
+def test_requests_and_limits_are_read_per_container(monkeypatch):
+    install = collect.Install("p", "ctx", "ns", "host", "zone")
+    pod = {"spec": {"containers": [{"name": "envoy-credential-proxy", "resources": {
+        "requests": {"cpu": "500m", "memory": "1Gi"}, "limits": {"cpu": "1", "memory": "2Gi"}}}],
+        "initContainers": [{"name": "fluent-bit", "restartPolicy": "Always",
+                            "resources": {"requests": {"memory": "64Mi"}}}]}}
+    monkeypatch.setattr(install, "pods", lambda *a: [pod])
+    assert install.requests() == {"envoy-credential-proxy": {"memory_bytes": 1024**3, "cpu_cores": 0.5},
+                                  "fluent-bit": {"memory_bytes": 64 * 1024**2}}
+    assert install.limits() == {"envoy-credential-proxy": {"memory_bytes": 2 * 1024**3, "cpu_cores": 1.0}}

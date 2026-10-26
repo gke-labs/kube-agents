@@ -233,15 +233,22 @@ class Install:
         return ""
 
     def limits(self) -> dict[str, dict[str, float]]:
+        return self._resources("limits")
+
+    def requests(self) -> dict[str, dict[str, float]]:
+        """What each container requests: on Autopilot without bursting, also its limit."""
+        return self._resources("requests")
+
+    def _resources(self, kind: str) -> dict[str, dict[str, float]]:
         result: dict[str, dict[str, float]] = {}
         for pod in self.pods():
             for container in _running_containers(pod):
-                limits = container.get("resources", {}).get("limits", {})
+                resources = container.get("resources", {}).get(kind, {})
                 entry: dict[str, float] = {}
-                if "memory" in limits:
-                    entry["memory_bytes"] = parse_quantity(limits["memory"])
-                if "cpu" in limits:
-                    entry["cpu_cores"] = parse_quantity(limits["cpu"])
+                if "memory" in resources:
+                    entry["memory_bytes"] = parse_quantity(resources["memory"])
+                if "cpu" in resources:
+                    entry["cpu_cores"] = parse_quantity(resources["cpu"])
                 if entry:
                     result[container["name"]] = entry
         return result

@@ -213,7 +213,11 @@ fixture achieved; any other factor sits at the run's planned value. Each chart h
 its dashed prediction. A line through two distinct planned points is a two-point
 estimate; past the largest measured value it is predicted, not measured. A run
 with a provider 429, a failed prompt or an unfinished one (the record's
-`excluded_from`) stays out of the response-time fit.
+`excluded_from`) stays out of the response-time fit. A factor that is a load the
+runner applies, such as the credential proxy load's workers, is charted against
+its runs but is no fleet input. Runs at a combined point, which move several
+factors at once, are listed against the page's prediction for the same fleet; a
+ratio above 1 is an interaction that the sum of single-factor lines misses.
 
 For the fleet entered on the page, the page answers the design's two questions:
 are the container limits enough, and which limits, machine type and node count
@@ -221,6 +225,13 @@ does the fleet need. The machine type is the smallest that holds the largest
 pod's recommended requests; the node count holds every long-running pod,
 replicas included (a Job's or an init container's peak holds no node).
 The raw records, with each run's errors, are in a collapsed section.
+
+`python3 -m admin_console.estimate` prints the same model as Markdown: for each
+check, the cluster count at which it fails for clusters shaped like the base
+point, and the value at which it fails for each factor alone; the measured onset
+of each count that has to stay at zero; and the credential proxy's throughput
+against the commands each operation sent. `--limits` reads other limits, such as
+the requests an Autopilot cluster guarantees, from a JSON or YAML file.
 
 ## Chat
 

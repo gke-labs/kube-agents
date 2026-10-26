@@ -14,6 +14,8 @@ console's Harness limits page reads `harness-limits.json`.
 
 - `phase1.yaml`: the Phase 1 plan: target, factors and levels, operations and run counts. A later
   phase is another file of the same shape.
+- `phase2.yaml`: the Phase 2 plan. Its base is Phase 1's, so an install that runs the same build
+  reuses the Phase 1 base runs.
 - `harness-limits.json`: every measured run. A run merges its records in and replaces only a record with the same key; a record leaves the file only by hand, as Phase 1's runs spoiled by an outside IAM change did before their re-runs.
 - `harness-limits.sample.json`: a small fake data set the console page and its tests use when
   `harness-limits.json` does not exist.
@@ -51,6 +53,18 @@ python3 -m kube_agents_bench.scale.runner apply <plan> --factor objects --level 
 python3 -m kube_agents_bench.scale.runner teardown <plan>             # remove fixtures, shrink pools
 python3 -m kube_agents_bench.scale.runner teardown <plan> --delete-fleet
 ```
+
+An operation's `kind` says what a run does: `prompt` sends the operation's `prompt` (and, above a
+concurrency of 1, its `follow_up`) through the agent API; `soak` waits `window_seconds`;
+`restart_soak` restarts the gateway pod first; `reset_soak` resets the install's state volumes
+first; `proxy_load` runs the operation's `command` through `credential-proxy-exec` in the sandbox
+shell, from `proxy_concurrency` workers at once for `window_seconds`, with no model call. A factor
+named `combined` has points rather than values as levels: level N applies the plan's Nth `combined`
+point, which sets several factors at once. The levels run in the order the plan lists the factors.
+In `settings`, `trigger_reconcile` runs the Cluster Agent reconcile when the profiles differ from
+the test fleet instead of waiting for its hourly run, `cluster_create_parallelism` bounds how many
+clusters are created at once, and `watcher_wait_seconds` is how long a restarted event watcher may
+take to report every test cluster.
 
 The agent API is reached through the repository's `kubectl exec` relay
 (`scripts/hermes-dashboard-tunnel.py`), because the agent pod runs under gVisor
@@ -99,6 +113,9 @@ The agent API is reached through the repository's `kubectl exec` relay
       "limits": {
         "agent-api-auth": { "memory_bytes": 2147483648, "cpu_cores": 1.0 }
       },
+      "requests": {
+        "agent-api-auth": { "memory_bytes": 402653184, "cpu_cores": 0.15 }
+      },
       "replicas": { "agent-api-auth": 1, "litellm-container": 2 },
       "metrics": [
         {
@@ -120,8 +137,8 @@ The agent API is reached through the repository's `kubectl exec` relay
 one. `commit` is the commit the agent image's tag pins (the tag itself when it is not a commit), read
 from the install. The key holds the commit's first 8 characters, or the whole tag when the tag is not a commit, so a new build is a new set of keys. A base record has `factor` `base` and `level`
 0; `values` holds every factor's planned value at the point, base records included. `totals` holds
-what the test clusters really had, summed over the fleet; fits use the totals for the factors the totals count (clusters, nodes, objects), the achieved rate for churn (`churn_achieved_per_minute`), and `values` for the rest. `limits` and
-`replicas` are read from the live pods during the run, and `mode` from the install's `PlatformAgent` (`today` when its spec leaves the mode unset). `answers` holds the start of each prompt's answer, with the project ID replaced by `<project>`, so a response time can be checked against what the agent said. `runner` is the measurement runner's own commit, so a change in how a metric is read shows in the data. A metric without `container` belongs to the
+what the test clusters really had, summed over the fleet; fits use the totals for the factors the totals count (clusters, nodes, objects), the achieved rate for churn (`churn_achieved_per_minute`), and `values` for the rest. `limits`, `requests` and
+`replicas` are read from the live pods during the run (records written before the runner read requests have none), and `mode` from the install's `PlatformAgent` (`today` when its spec leaves the mode unset). `answers` holds the start of each prompt's answer, with the project ID replaced by `<project>`, so a response time can be checked against what the agent said. `runner` is the measurement runner's own commit, so a change in how a metric is read shows in the data. A metric without `container` belongs to the
 run. `excluded_from` names the fits the record is left out of: `["response_seconds"]` when a prompt
 run saw a provider 429 or an unfinished prompt, or, for a fleet audit or upgrade readiness record written
 before answers were kept, when its completion cannot be checked. `python3 -m kube_agents_bench.scale.runner reclassify <plan>` re-applies these rules to the stored records. `errors` lists what made the run differ from its plan: a failed prompt, a
@@ -131,7 +148,11 @@ Metric names:
 
 - per container: `memory_peak_bytes`, `cpu_peak_cores`, `restarts`, `oomkills`;
 - the data volume: `pvc_used_bytes`, `pvc_capacity_bytes`, `profile_bytes_max`, `profiles`;
-- the credential proxy: `proxy_wait_p50_seconds`, `proxy_wait_max_seconds`, `proxy_refusals`;
+- the credential proxy: `proxy_wait_p50_seconds`, `proxy_wait_max_seconds`, `proxy_refusals`,
+  `proxy_commands` (brokered commands run) and `proxy_command_seconds` (the seconds they ran, summed);
+- a proxy load run: `proxy_load_completed`, `proxy_load_errors`, `proxy_load_per_second` (commands
+  completed per second), and `proxy_load_p50_seconds`, `proxy_load_p95_seconds`,
+  `proxy_load_max_seconds` (each command's time as `credential-proxy-exec` saw it);
 - the event watcher: `watcher_events_seen`, `watcher_events_seen_per_minute`,
   `watcher_session_creates`, `watcher_events_injected`, `watcher_quota_suppressed`;
 - the agent: `triage_lost`, `run_slot_refusals`, `failed_prompts`, `unfinished_prompts`,

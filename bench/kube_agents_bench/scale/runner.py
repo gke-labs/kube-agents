@@ -405,6 +405,7 @@ class Runner:
         contexts = self.contexts(count)
         totals = kube.totals(contexts)
         limits = self.install.limits()
+        requests = self.install.requests()
         replicas = self.install.replicas()
         image = self.install.image()
         mode = self.install.mode() or self.plan.target["mode"]
@@ -474,7 +475,7 @@ class Runner:
             commit=commit, mode=mode, phase=self.plan.phase, runner=RUNNER_REVISION,
             factor=spec.factor, level=spec.level, operation=op.name, run=spec.run,
             started=started_iso, ended=ended_iso, image=image, values=values, totals=totals,
-            limits=limits, replicas=replicas, metrics=metrics,
+            limits=limits, requests=requests, replicas=replicas, metrics=metrics,
             provider_429s=provider_429s, answers=[self.scrub(a) for a in outcome.previews],
             excluded_from=list(excluded), errors=errors,
         )

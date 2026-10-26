@@ -86,4 +86,11 @@ operations:
     factors: [proxy_concurrency]
     runs: 3
     window_seconds: 180
-    command: [kubectl, --kubeconfig, "{kubeconfig}", get, pods, --all-namespaces, --no-headers]
+    command:
+      - kubectl
+      - --kubeconfig
+      - "{kubeconfig}"
+      - get
+      - pods
+      - --all-namespaces
+      - --no-headers
