@@ -722,7 +722,8 @@ inject lane compares only with next-mode history at its own key (agent model inc
 nightly and the presubmit run the same one). The today lane is the rollback check, and it stays
 out of the recorder and the dashboard publisher (`EVAL_ROLLBACK_LANE=1`): its key reads `today`,
 but it grades a rolled-back install. No job appends today's window now. The dashboard's Trend page
-keeps a series per mode, drawing today's from the lines the store already holds; its Nightly page
+keeps a series per mode, drawing today's from the lines the store already holds until they age
+out of its window; its Nightly page
 reads the main nightly's runs, so it shows `next`.
 
 ## Open questions

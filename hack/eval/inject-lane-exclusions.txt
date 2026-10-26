@@ -15,9 +15,11 @@
 # only under AGENT_TRANSPORT=inject, drops the named cases from TASKS before the fan-out
 # and says so in the log; on the api transport the file changes nothing,
 # and the api lane's rosters (presubmit-cases.txt, blocking-roster.txt,
-# nightly-cases.txt) are untouched -- an entry here is not a demotion, and
-# a presubmit case still runs on the today lane (ci-kube-agents-eval-today),
-# which grades over the api transport. The
+# nightly-cases.txt) are untouched. An entry still takes a case out of CI:
+# the nightlies grade over inject, and the only api-transport job on main is
+# the today lane (ci-kube-agents-eval-today), which runs the presubmit matrix,
+# so a listed presubmit case runs there and a listed nightly case runs
+# nowhere. The
 # same shape as the validator's FIXTURE_NOT_READY: an exclusion with a
 # reason, not a marker on the case (docs/eval-gate-roster.md, "The inject
 # lane").

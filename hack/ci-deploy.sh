@@ -258,9 +258,9 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 # What the flag has to do, and where:
 #   - section 2b refuses it on a Prow
 #     run that is neither a pull request's nor one of the jobs
-#     named below (a mis-set variable on the nightly or another postsubmit would
-#     otherwise run that job in next mode, so today's window and dashboard
-#     would silently miss it), and refuses a
+#     named below (a mis-set variable on any other periodic or postsubmit
+#     would otherwise run that job in next mode, so its today-mode record
+#     would silently go missing), and refuses a
 #     fan-out the bridge cannot be given as its concurrency, before anything
 #     is built;
 #   - step 4 also builds the A2A gateway, auth callout, worker and console
@@ -981,9 +981,9 @@ fi
 # keeps the today lane out of the recorder, and bench-gate separately refuses
 # a pull request's sample, bench/baselines/README.md), so what the flag
 # mis-set on a job that is not the lane's -- the today-mode GitLab nightly, another
-# postsubmit -- would do is run that job in next mode and leave today's
-# window and dashboard silently missing it, its verdict measuring the wrong
-# stack. Keyed on the job's name rather than on PULL_NUMBER, so the lane's
+# postsubmit -- would do is run that job in next mode and leave the
+# dashboard silently missing its today-mode run, its verdict measuring the
+# wrong stack. Keyed on the job's name rather than on PULL_NUMBER, so the lane's
 # scheduled jobs are admitted by being named and every other Prow run without
 # a pull request is still refused.
 if [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ "${IS_PROW_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then
