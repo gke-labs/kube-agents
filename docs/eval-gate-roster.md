@@ -278,8 +278,9 @@ Admitted on the record since the split:
   pull request URL" shape #3145 addresses (10-16 also had one infra repetition). Median repetition
   172 s (142–265 s) over the nine since #3145. The four Claude nights before #3145 merged passed
   too (12/12), so the record does not separate #3145's effect from the model change's; either way
-  the miss has not recurred in 21 repetitions. The store reads `collecting: 9/9 runs recorded at
-  this key across 3 recorded run(s), 11 more needed` at the next-mode key, which the model change
+  the miss has not recurred in 21 repetitions. The store reads
+  `collecting: 9/9 runs recorded at this key across 3 recorded run(s), 11 more needed` at the
+  next-mode key, which the model change
   and then the move to next mode each reset (the last Gemini key reads `would-demote`, 16/20, on
   the pre-fix misses). So the citation is the nightly record, as for vcs-spent-branch-reuse below,
   and the eval crew's approval of this line is the call that it suffices before the window fills.
