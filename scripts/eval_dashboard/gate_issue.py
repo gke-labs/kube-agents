@@ -227,7 +227,7 @@ Filed automatically by the smoke health bot; edit freely. Fix PRs: reference thi
 FIXTURE_DRIFT_TITLE = "Seeded fleet drift: {roles} out of designed state on {projects} pool {noun} since {since}"
 PROJECT_NOUN = ("project", "projects")
 FIXTURE_DRIFT_BODY = """\
-The seeded fleet's fixture role(s) below are present but not in the state the cases depend on, on the pool projects named, and have been so on two consecutive hourly scans or on three projects at once. Nothing in the presubmit runs this check and nothing acts on a drift (decision 2026-09-14: evals v1 detects, does not act), so the cases that depend on a drifted role run against it and red on every run that leases one of these projects; that red is the fixture's, not the pull request's, and a retest is worth it only after the repair below.
+The seeded fleet's fixture role(s) below are present but not in the state the cases depend on, on the pool projects named, and have been so on two consecutive hourly scans or on three projects at once. The presubmit and the nightly run the same check on their own lease and record each case whose grade depends on a drifted role as infrastructure (`fixture-drift:<role>`) instead of running it, so while the drift lasts those cases red no pull request and guard nothing either. A red on such a case comes only from a run whose own scan could not read the role; that red is the fixture's, not the pull request's. The repair below puts the cases back in the gate.
 
 **Drifted roles**
 
@@ -262,7 +262,7 @@ POOL_DRIFT_MARKER = "<!-- kube-agents-bot:pool-drift {findings} -->"
 POOL_DRIFT_MARKER_RE = re.compile(r"<!-- kube-agents-bot:pool-drift ([^ >]*) -->")
 POOL_DRIFT_BODY = """\
 {marker}
-The hourly pool-state scan (`scripts/eval_dashboard/pool_state.py`, which runs `scripts/verify_ci_pool_project.py`'s read-only checks against every pool project) found the pool projects below no longer shaped the way the verifier requires, on two consecutive hourly scans or on three projects at once. Nothing in the presubmit runs this check and nothing acts on a drift (decision 2026-09-14: evals v1 detects, does not act), {consequence}
+The hourly pool-state scan (`scripts/eval_dashboard/pool_state.py`, which runs `scripts/verify_ci_pool_project.py`'s read-only checks against every pool project) found the pool projects below no longer shaped the way the verifier requires, on two consecutive hourly scans or on three projects at once. Nothing in the presubmit runs this check and nothing acts on a pool drift, {consequence}
 
 **Findings**
 

@@ -33,13 +33,16 @@ the scan keeps for the next fixtures, ten of them at 10m (#3607: a 10m
 DaemonSet pod stranded for three days and read as drift on its own role,
 which a re-apply cannot fix).
 
-It runs in two places. `scripts/verify_ci_pool_project.py` runs it after the
+It runs in three places. `scripts/verify_ci_pool_project.py` runs it after the
 presence pass and fails a project whose fixtures have drifted. The CI health
 bot's hourly scan (`scripts/eval_dashboard/fixture_state.py`, #1550) runs it
 against every pool project with `--report`, which writes each role's verdict
-as JSON beside the summary so the scan need not parse the warnings. Detection
-is this script's whole job -- nothing here, and nothing in the presubmit, acts
-on a drift.
+as JSON beside the summary so the scan need not parse the warnings. And
+`hack/ci-eval-pr.sh` runs it with `--report` against its leased project,
+where `bench/kube_agents_bench/fixture_drift.py` turns each `drifted` role
+into a `fixture-drift:<role>` infrastructure record for the cases that need
+it. Detection is this script's whole job -- nothing here acts on a drift, and
+nothing anywhere repairs one.
 `--wait` is for a fixture that has just been rescheduled -- the crashloop needs
 its first restart before OOMKilled evidence exists -- and keeps re-reading a
 role that is positively out of shape until it converges or the deadline

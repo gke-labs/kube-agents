@@ -12575,7 +12575,9 @@ class MCPVcsVerbGateTest(unittest.TestCase):
         handler.headers = {"Content-Length": str(len(encoded))}
         handler.rfile = io.BytesIO(encoded)
         handler.vcs = mock.Mock()
-        handler.vcs.registry.resolve.return_value = (mock.Mock(), "acme/infra")
+        forge = mock.Mock()
+        forge.name = "github"
+        handler.vcs.registry.resolve.return_value = (forge, "acme/infra")
         return handler
 
     def _refused_without_touching_anything(self, verb_path):
@@ -12608,8 +12610,12 @@ class MCPVcsVerbGateTest(unittest.TestCase):
         for verb in sorted(verbs):
             with self.subTest(verb=verb):
                 handler = self._refused_without_touching_anything(verb)
-                # Counted as a refusal under the verb's own label.
-                self.assertEqual({(verb, credential_proxy.TOOL_STATUS_BLOCKED): 1}, handler.metrics._vcs)
+                # Counted as a refusal under the verb's own label, with no
+                # provider: the refusal came before any forge resolved.
+                self.assertEqual(
+                    {(verb, credential_proxy.TOOL_STATUS_BLOCKED, credential_proxy.VCS_PROVIDER_NONE): 1},
+                    handler.metrics._vcs,
+                )
 
     def test_spellings_that_normalise_to_a_write_or_no_verb_are_refused_for_mcp(self):
         for spelling in (
@@ -12639,7 +12645,7 @@ class MCPVcsVerbGateTest(unittest.TestCase):
                 self.assertEqual(HTTPStatus.OK, handler.replies[0][0])
                 self.assertEqual([self.PAYLOAD], seen)
                 self.assertEqual(
-                    {("proposal-view", credential_proxy.TOOL_STATUS_SUCCESS): 1}, handler.metrics._vcs
+                    {("proposal-view", credential_proxy.TOOL_STATUS_SUCCESS, "github"): 1}, handler.metrics._vcs
                 )
 
     def test_proposal_view_for_mcp_still_meets_the_managed_repository_check(self):

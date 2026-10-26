@@ -560,6 +560,101 @@
         "annotations": {
           "type": "object"
         },
+        "healthRules": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "thresholds": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "degradedFor",
+                "unwatchedClustersFor",
+                "chatTurnsErroredRatio",
+                "chatTurnsErroredMinMessages",
+                "brokerFailureRatio",
+                "brokerFailureMinCalls",
+                "backgroundTasksGaveUp7d",
+                "stalledOnboardingDays",
+                "stalledOnboardingSilentDays",
+                "proposalsRejectedMin14d",
+                "proposalsDecidedMin14d",
+                "proposalsRejectedRatio",
+                "proposalsProposedMin14d",
+                "proposalsMergeRateBelow",
+                "commandsBlockedRatio",
+                "commandsBlockedMinCalls",
+                "negativeFeedbackPerDay",
+                "scrapeBrokenFor",
+                "ratiosFor"
+              ],
+              "properties": {
+                "degradedFor": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^(([0-9]+)y)?(([0-9]+)w)?(([0-9]+)d)?(([0-9]+)h)?(([0-9]+)m)?(([0-9]+)s)?(([0-9]+)ms)?$"
+                },
+                "unwatchedClustersFor": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^(([0-9]+)y)?(([0-9]+)w)?(([0-9]+)d)?(([0-9]+)h)?(([0-9]+)m)?(([0-9]+)s)?(([0-9]+)ms)?$"
+                },
+                "chatTurnsErroredRatio": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "chatTurnsErroredMinMessages": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "brokerFailureRatio": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "brokerFailureMinCalls": { "type": "number", "minimum": 0 },
+                "backgroundTasksGaveUp7d": { "type": "number", "minimum": 0 },
+                "stalledOnboardingDays": { "type": "number", "minimum": 0 },
+                "stalledOnboardingSilentDays": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "proposalsRejectedMin14d": { "type": "number", "minimum": 0 },
+                "proposalsDecidedMin14d": { "type": "number", "minimum": 0 },
+                "proposalsRejectedRatio": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "proposalsProposedMin14d": { "type": "number", "minimum": 0 },
+                "proposalsMergeRateBelow": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "commandsBlockedRatio": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "commandsBlockedMinCalls": { "type": "number", "minimum": 0 },
+                "negativeFeedbackPerDay": { "type": "number", "minimum": 0 },
+                "scrapeBrokenFor": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^(([0-9]+)y)?(([0-9]+)w)?(([0-9]+)d)?(([0-9]+)h)?(([0-9]+)m)?(([0-9]+)s)?(([0-9]+)ms)?$"
+                },
+                "ratiosFor": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^(([0-9]+)y)?(([0-9]+)w)?(([0-9]+)d)?(([0-9]+)h)?(([0-9]+)m)?(([0-9]+)s)?(([0-9]+)ms)?$"
+                }
+              }
+            }
+          }
+        },
         "podMonitoring": {
           "type": ["boolean", "null"]
         },

@@ -1669,6 +1669,19 @@ def test_worker_budget_withheld_results_are_unreadable_not_a_wrong_cap():
     assert "withheld" in res.reason and res.reason.startswith("no delegated worker")
 
 
+def test_worker_budget_withheld_credential_reads_are_unreadable_not_a_wrong_cap():
+    # Every call read a secret, so every result is the read placeholder: the
+    # checkpoint notice went with the output. An error, not "the cap was larger".
+    from kube_agents_bench import worker_trajectory
+    worker = [{"name": "terminal", "args": {"command": "kubectl get secret db -o yaml"},
+               "result": worker_trajectory.WITHHELD_READ_RESULT, "agent": "platform", "task": "t_1"}] * 137
+    transcript.set("ok", _TRAJECTORY + worker,
+                   worker_runs=[{"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed", "error": None}])
+    res = _budget(150).verify(5.0)
+    assert res.status == "error"
+    assert "withheld" in res.reason and res.reason.startswith("no delegated worker")
+
+
 def test_worker_budget_one_missing_result_among_readable_ones_keeps_the_fail():
     # A worker killed mid-call leaves one call with no result row; the notice
     # would have landed on one of the other 200 readable results, so the plain
@@ -2887,10 +2900,34 @@ def test_tool_called_result_ignores_an_unread_call_whose_arguments_rule_it_out()
     assert res.raw == {"matching_calls": 0}
 
 
+def test_tool_called_result_reads_a_redacted_credential_read_as_a_recorded_call():
+    from kube_agents_bench import worker_trajectory
+
+    entry = {
+        "name": "terminal",
+        "args": {"command": "kubectl get secret db -o yaml"},
+        "result": worker_trajectory.WITHHELD_READ_RESULT,
+        "status": "completed",
+        "agent": "platform",
+    }
+    transcript.set("done", [entry])
+    res = ToolCalledVerifier(
+        type="tool_called", tool_names=["terminal"], scope="workers", result=r"^<persisted-output>"
+    ).verify(5.0)
+    assert res.status == "fail"
+    assert "no readable result" not in res.reason
+    assert ToolCalledVerifier(
+        type="tool_called", tool_names=["terminal"], scope="workers", result=r"^\[REDACTED_RESULT"
+    ).verify(5.0).status == "pass"
+
+
 def test_the_withheld_marker_matches_the_in_pod_script():
     from kube_agents_bench import worker_trajectory
 
     assert f'WITHHELD = "{worker_trajectory.WITHHELD}"' in worker_trajectory._IN_POD_SCRIPT
+    assert f'WITHHELD_READ_RESULT = "{worker_trajectory.WITHHELD_READ_RESULT}"' in worker_trajectory._IN_POD_SCRIPT
+    # Starts with the verifiers' redaction prefix: a redacted result, not an unread one.
+    assert worker_trajectory.WITHHELD_READ_RESULT.startswith(verifiers._REDACTED_PREFIX)
 
 
 def test_tool_called_result_must_be_a_pattern():
@@ -10396,6 +10433,16 @@ def test_verified_claims_backed_masks_addresses_as_the_pod_does():
 def test_verified_claims_backed_a_capture_gap_is_an_error():
     res = _grade_claims(_EVIDENCE, [], gaps=["profile platform: state.db missing"])
     assert res.status == "error" and "state.db missing" in res.reason
+
+
+def test_verified_claims_backed_a_redacted_credential_read_is_not_checked():
+    from kube_agents_bench import worker_trajectory
+
+    command = "kubectl get secret db -o yaml"
+    read = _terminal(command, result=worker_trajectory.WITHHELD_READ_RESULT)
+    res = _grade_claims(_block(command, "type: kubernetes.io/tls"), [read])
+    assert res.status == "pass", res
+    assert "not checked" in res.reason and command in res.reason
 
 
 def test_verified_claims_backed_withheld_arguments_are_an_error():
