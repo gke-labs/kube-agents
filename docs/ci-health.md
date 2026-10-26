@@ -934,8 +934,9 @@ or a record with `since`, `issue`, `expires` and optional `owner` and
 `domain:<slug>` and assigned to the domain's `owner:` (a record's own `owner:`
 wins), with `backup:` mentioned; when GitHub refuses the owner as assignee it
 is filed unassigned and says so. Its body names how many days the domain has
-been uncovered, from a record's `since:`, or from `since YYYY-MM-DD` in the
-comment above a bare slug, or "start date not recorded"; why, from the entry
+been uncovered (counted on UTC dates, as expiry is), from a record's `since:`,
+or from the opening `<slug>, since YYYY-MM-DD` of the comment above a bare slug,
+or "start date not recorded" (also for a date that does not parse); why, from the entry
 and the issue it cites; and the candidates. A candidate is a case of the
 domain on the nightly matrix with a `verification_spec`, not `expected_fail`,
 not on the roster, with its

@@ -96,7 +96,7 @@ try:
 except ImportError:
     domain_allowlist = None
 from eval_dashboard import ghcli, nightly, nightly_bugs, trend
-from eval_dashboard.post_health import LOCAL_TZ, NIGHTLY_URL
+from eval_dashboard.post_health import NIGHTLY_URL
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 BLOCKING_ROSTER_PATH = domain_coverage.BLOCKING_ROSTER_PATH
@@ -115,7 +115,9 @@ BAR_RATE = trend.ADMISSION_RATE
 BAR_RUNS = trend.ADMISSION_MIN_RUNS
 CANDIDATES_IN_ISSUE = 5
 # "remediation, since 2026-10-17 (#3120): ..." in the comment above a bare slug.
-COMMENT_SINCE_RE = re.compile(r"\bsince (\d{4}-\d{2}-\d{2})(?: \(#(\d+)\))?")
+# Only the block's own opening ("<slug>, since ..."): a later sentence's
+# "since" dates something else.
+COMMENT_SINCE_RE = r"^#\s*{slug}, since (\d{{4}}-\d{{2}}-\d{{2}})(?: \(#(\d+)\))?"
 ALLOWLIST_KEY_RE = re.compile(r"^allowlist:\s*(#.*)?$")
 TOP_LEVEL_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*:")
 BARE_ENTRY_RE = re.compile(r"^\s*-\s*([A-Za-z0-9_-]+)\s*(#.*)?$")
@@ -141,7 +143,7 @@ Nightly report: {nightly_url}
 - **Fix the demoted case** and restore its roster line the same way.
 - **Keep it held out** on the presubmit (docs/eval-gate-roster.md), with the allowlist entry kept and its exit condition named.
 
-Kept current by `scripts/eval_dashboard/coverage_gaps.py` on the CI-health tick (docs/ci-health.md, "Coverage gaps"). It rewrites this body as the record moves, so put notes in comments; it finds the issue by the `presubmit-gate` label and the marker at the top, so keep both. It closes the issue with a comment when a roster case covers the domain again. It does not open the roster pull request.
+Kept current by `scripts/eval_dashboard/coverage_gaps.py` on the CI-health tick (docs/ci-health.md, "Coverage gaps"). It rewrites this body as the record moves, so put notes in comments; it finds the issue by the `presubmit-gate` label and the marker at the top, so keep both. Closing it as not planned keeps it closed for this gap; any other close is filed again on the next tick. It closes the issue with a comment when a roster case covers the domain again. It does not open the roster pull request.
 """
 TABLE_HEAD = "| Case | Nightly record | Bar | Evidence store |\n|---|---|---|---|"
 TABLE_ROW = "| `{case}`{held} | {record} | {bar} | {store} |"
@@ -160,7 +162,7 @@ UNASSIGNED_NO_OWNER = "**Unassigned:** `docs/designs/domains.yaml` names no owne
 ASSIGNED_NOW = "**Assigned to** {logins}.{owner}{backup}"
 OWNER_TOO = " Owner: @{owner} ({source})."
 UNASSIGNED_NOW = "**Unassigned.** Owner: @{owner} ({source}).{backup}"
-REFUSED_TEXT = "**Unassigned:** GitHub refused"
+REFUSED_RE = re.compile(r"\*\*Unassigned:\*\* GitHub refused `([^`]+)`")
 # A record past its `expires` date does not fail pull requests; this issue
 # is where it is chased (``expired``).
 EXPIRED_LINE = "**The allowlist exception expired on {expires}, {days} ago.** Seat a case, keep one held out, or move `expires` in a pull request that says why.\n\n"
@@ -228,14 +230,19 @@ def comment_dates(text: str) -> dict[str, tuple[datetime.date | None, int | None
         if TOP_LEVEL_KEY_RE.match(line):
             break
         stripped = line.strip()
+        if not stripped:
+            continue  # a blank line between a block and its entry keeps the block
         if stripped.startswith("#"):
             block.append(stripped)
             continue
         found = BARE_ENTRY_RE.match(line)
-        if found:
-            match = COMMENT_SINCE_RE.search(" ".join(block))
-            if match:
-                out[found.group(1)] = (datetime.date.fromisoformat(match.group(1)), int(match.group(2)) if match.group(2) else None)
+        if found and block:
+            match = re.match(COMMENT_SINCE_RE.format(slug=re.escape(found.group(1))), block[0])
+            try:
+                if match:
+                    out[found.group(1)] = (datetime.date.fromisoformat(match.group(1)), int(match.group(2)) if match.group(2) else None)
+            except ValueError:  # a typo reads as "start date not recorded", as on the record path
+                log(f"warning: allowlist comment for {found.group(1)}: {match.group(1)} is not a date")
         block = []
     return out
 
@@ -325,8 +332,10 @@ def find_gaps(repo_root: pathlib.Path, data: dict, store: dict | None, now: date
     nights = nightly_bugs.graded_nights(data)
     records = store_records(store, data)
     matrix = set(nightly.expected_cases(data))
-    today = now.astimezone(LOCAL_TZ).date()
-    past = expired(repo_root, now.astimezone(datetime.timezone.utc).date())
+    # One calendar for both day counts in the body, UTC, the one expiry is
+    # read on: they roll over on the same tick.
+    today = now.astimezone(datetime.timezone.utc).date()
+    past = expired(repo_root, today)
     # A case with no verification_spec would cover nothing once seated.
     specced = {case_of(path) for path, _, has_spec in domain_coverage.task_claims(repo_root) if has_spec}
     by_domain: dict[str, list[str]] = {}
@@ -427,6 +436,9 @@ def addressee(gap: dict, refused: bool = False, assignees: list[str] | None = No
     backup = BACKUP.format(backup=gap["backup"]) if gap.get("backup") else ""
     owner = gap.get("owner")
     source = OWNER_FROM_RECORD if gap.get("owner_from_record") else OWNER_FROM_DOMAIN
+    if assignees and owner and [a.lower() for a in assignees] == [owner.lower()]:
+        # As filed: the same line, so the first tick after filing edits nothing.
+        return ASSIGNED.format(owner=owner, source=source, backup=backup)
     if assignees:
         too = OWNER_TOO.format(owner=owner, source=source) if owner and owner.lower() not in {a.lower() for a in assignees} else ""
         return ASSIGNED_NOW.format(logins=", ".join(f"@{a}" for a in assignees), owner=too, backup=backup)
@@ -562,7 +574,10 @@ class GapFiler(nightly_bugs.Filer):
             result["unchanged"].append({"slug": gap["slug"], "issue": issue["number"]})
             return
         logins = [a.get("login") for a in issue.get("assignees") or [] if isinstance(a, dict) and a.get("login")]
-        refused = not logins and REFUSED_TEXT in (issue.get("body") or "")
+        # Still "refused" only for the login GitHub refused; a corrected owner
+        # was never tried, and the line says so plainly.
+        was = REFUSED_RE.search(issue.get("body") or "")
+        refused = not logins and bool(was) and was.group(1).lower() == (gap.get("owner") or "").lower()
         title, body = render_issue(gap, refused, logins)
         if body.strip() == (issue.get("body") or "").strip() and title == issue.get("title"):
             result["unchanged"].append({"slug": gap["slug"], "issue": issue["number"]})

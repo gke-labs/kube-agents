@@ -228,6 +228,24 @@ class FindGapsTest(Harness):
         self.assertIsNone(coverage_gaps.allowlist_entry(""))
         self.assertIsNone(coverage_gaps.allowlist_entry({"slug": "x", "since": "soon"})["since"])
 
+    def test_a_bad_or_misplaced_comment_date_reads_as_not_recorded(self):
+        line = "  # beta, since 2026-10-17 (#3120): its one roster case was demoted.\n"
+        for comment, since in (
+            ("  # beta, since 2026-13-17 (#3120): typo.\n", None),
+            ("  # beta: demoted.\n  # since 2026-09-29 it is seated held out.\n", None),
+            (line + "\n", datetime.date(2026, 10, 17)),
+        ):
+            (self.root / "docs" / "designs" / "domains.yaml").write_text(DOMAINS.replace(line, comment))
+            with contextlib.redirect_stderr(io.StringIO()):
+                beta = next(g for g in self.gaps() if g["slug"] == "beta")
+            self.assertEqual(beta["since"], since, comment)
+
+    def test_both_day_counts_roll_over_on_the_same_utc_day(self):
+        (self.root / "docs" / "designs" / "domains.yaml").write_text(DOMAINS.replace("expires: 2026-11-04", "expires: 2026-10-23"))
+        late = datetime.datetime(2026, 10, 27, 1, 0, tzinfo=datetime.timezone.utc)  # Oct 26, 9 PM in Toronto
+        gamma = coverage_gaps.find_gaps(self.root, data_doc(), None, late)[-1]
+        self.assertEqual((gamma["days"], gamma["expired_days"]), (6, 4))
+
     def test_an_entry_with_no_date_says_so(self):
         text = DOMAINS.replace("  # beta, since 2026-10-17 (#3120): its one roster case was demoted.\n", "  # beta, since the row was added.\n")
         (self.root / "docs" / "designs" / "domains.yaml").write_text(text)
@@ -283,6 +301,22 @@ class FilingTest(Harness):
         gh, _, _ = self.run_once(FakeGh(open_issues=[refused]))
         [body] = [b["body"] for m, p, b in gh.writes() if m == "PATCH"]
         self.assertIn("**Unassigned:** GitHub refused `carol`", body)
+        # The owner corrected in domains.yaml: GitHub never saw the new login.
+        (self.root / "docs" / "designs" / "domains.yaml").write_text(DOMAINS.replace("owner: carol", "owner: carol2"))
+        gh, _, _ = self.run_once(FakeGh(open_issues=[refused]))
+        [body] = [b["body"] for m, p, b in gh.writes() if m == "PATCH"]
+        self.assertNotIn("refused", body)
+        self.assertIn("**Unassigned.** Owner: @carol2", body)
+
+    def test_an_issue_as_filed_is_not_rewritten_on_the_next_tick(self):
+        filed = FakeGh()
+        self.run_once(filed)
+        issues = [dict(b, number=4300 + i, created_at="2026-10-26T13:00:00Z", comments=0, assignees=[{"login": b["assignees"][0]}])
+                  for i, b in enumerate(self.posted(filed))]
+        gh, out, _ = self.run_once(FakeGh(open_issues=issues))
+        self.assertEqual(gh.writes(), [])
+        self.assertIn("unchanged: beta on #4300", out)
+        self.assertIn("Closing it as not planned keeps it closed for this gap", issues[0]["body"])
 
     def test_a_human_issue_without_the_marker_is_not_taken_for_the_bots(self):
         human = {"number": 4300, "title": "beta has no presubmit seat", "body": "beta is uncovered", "created_at": "2026-10-18T00:00:00Z"}
@@ -352,6 +386,15 @@ class FilingTest(Harness):
         stale = dict(closed, closed_at="2025-06-01T10:00:00Z")
         gh, _, _ = self.run_once(FakeGh(closed_issues=[stale]))
         self.assertEqual(len(self.posted(gh)), 2)
+        (self.root / "docs" / "designs" / "domains.yaml").write_text(DOMAINS)
+        # A not-planned close from before this gap began (inside 90 days):
+        # holds an undated gap back, not a dated one.
+        earlier = dict(closed, closed_at="2026-10-01T10:00:00Z")
+        gh, _, _ = self.run_once(FakeGh(closed_issues=[earlier]))
+        self.assertEqual(len(self.posted(gh)), 2, "dated: the close is from an earlier gap")
+        (self.root / "docs" / "designs" / "domains.yaml").write_text(text)
+        gh, _, _ = self.run_once(FakeGh(closed_issues=[earlier]))
+        self.assertEqual([b["labels"][1] for b in self.posted(gh)], ["domain:gamma"], "undated: any close in 90 days")
         (self.root / "docs" / "designs" / "domains.yaml").write_text(DOMAINS)
         # A completed close (the bot's own, from an earlier gap) does not hold a new one back.
         done = dict(closed, state_reason="completed")
