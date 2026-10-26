@@ -204,13 +204,50 @@ _BOARD_NON_ACTION_TOOLS = frozenset({
     "kanban_unblock",
 })
 
-# Worker tools that do not count as substantive action (protocol reads, board management, and read-only memory).
+# Worker tools that do not count as substantive action (protocol reads, board management, read-only memory, and research lookups).
 _WORKER_NON_ACTION_TOOLS = frozenset({
     *_BOARD_NON_ACTION_TOOLS,
     "memory",
     "memory_recall",
     "memory_reflect",
+    "multiuser_memory",
+    "web_search",
+    "tool_search",
+    "skill_view",
+    "todo",
+    "todo_list",
+    "session_search",
+    "mcp__developer_knowledge__search_documents",
 })
+
+
+def _is_substantive_worker_action(name: str | None) -> bool:
+    """Whether a tool entry recorded for a delegated worker constitutes substantive action.
+
+    Action is defined affirmatively by verbs and toolsets that mutate state or execute
+    infrastructure operations: terminal/shell commands, code execution, file mutation
+    tools, platform control / GKE MCP tools, and worker completion/block verbs.
+    Protocol reads, board queries, memory lookups, and research tools (such as web_search
+    and developer knowledge document lookups) are non-action lookups.
+    """
+    if not name:
+        return False
+    # Worker terminal verbs that complete or block cards
+    if name in {"kanban_complete", "kanban_block"}:
+        return True
+    # Terminal, shell, and direct command execution
+    if name in {"terminal", "bash", "sh", "exec", "shell", "kubectl", "gcloud"}:
+        return True
+    # Code execution toolset
+    if name in {"execute_code"}:
+        return True
+    # File tools
+    if name in {"write_file", "patch", "read_file", "search_files"}:
+        return True
+    # Platform control and GKE infrastructure MCP tools
+    if name.startswith(("mcp__platform_control__", "mcp__gke__", "mcp__platform_control_", "mcp__gke_")):
+        return True
+    return False
 
 # Sanctioned front-door capabilities on the chat / delegation profile
 # (agents/chat/config.yaml, agents/chat/SOUL.md) that do not constitute
@@ -3092,7 +3129,7 @@ class KubeAgentsHarness(AgentHarness):
             if bstate is not None:
                 on_board, bsummaries, berrors = bstate
                 for t in on_board:
-                    if on_board[t] == "blocked":
+                    if on_board[t] in {"blocked", "triage"}:
                         if t in bsummaries:
                             last_board_summaries[t] = bsummaries[t]
                         else:
@@ -3106,7 +3143,8 @@ class KubeAgentsHarness(AgentHarness):
                         last_board_errors.pop(t, None)
                 latest.update(on_board)
                 if all(t in on_board for t in outstanding) and not any(
-                    on_board[t] in _TERMINAL_STATUSES for t in outstanding
+                    (on_board[t] in _TERMINAL_STATUSES or (on_board[t] == "triage" and (t in bsummaries or t in berrors)))
+                    for t in outstanding
                 ):
                     continue
 
@@ -3239,11 +3277,11 @@ class KubeAgentsHarness(AgentHarness):
         board_messages = [
             last_board_summaries[t]
             for t in awaited
-            if latest.get(t) == "blocked" and t in last_board_summaries
+            if latest.get(t) in {"blocked", "triage"} and t in last_board_summaries
         ] + [
             last_board_errors[t]
             for t in awaited
-            if latest.get(t) == "blocked" and t in last_board_errors
+            if latest.get(t) in {"blocked", "triage"} and t in last_board_errors
         ]
         # Only the deadline path leaves transcripts behind: a card still
         # outstanding after a transport failure or a mute agent did not stall,
@@ -3315,11 +3353,11 @@ class KubeAgentsHarness(AgentHarness):
             result.tokens["workers"] = _worker_token_buckets(captured.tokens, captured.unbilled)
 
         trajectory_clean = captured is not None and not bool(worker_trajectory.gaps(captured.summary))
+        logs_clean = logs is None or all(l is not None for l in logs.values())
         worker_acted = (
             any(
                 isinstance(e, dict)
-                and bool(e.get("name"))
-                and e.get("name") not in _WORKER_NON_ACTION_TOOLS
+                and _is_substantive_worker_action(e.get("name"))
                 for e in (captured.entries if captured else [])
             )
             or bool(result.metadata.get("worker_commands"))
@@ -3372,11 +3410,16 @@ class KubeAgentsHarness(AgentHarness):
                 for task in tasks:
                     if isinstance(task, dict) and (task.get("id") in awaited or str(task.get("id")) in awaited):
                         tid = str(task["id"])
-                        last_observed_cards[tid] = (task.get("status"), None)
+                        new_status = task.get("status")
+                        prev_status, prev_summary = last_observed_cards.get(tid, (None, None))
+                        if new_status == prev_status:
+                            last_observed_cards[tid] = (new_status, prev_summary)
+                        else:
+                            last_observed_cards[tid] = (new_status, None)
 
         all_messages: list[str] = list(board_messages)
         for tid, (status, summary) in last_observed_cards.items():
-            if status == "blocked" and summary:
+            if status in {"blocked", "triage"} and summary:
                 all_messages.append(summary)
 
         if not infra_reason and all_messages:
@@ -3397,7 +3440,7 @@ class KubeAgentsHarness(AgentHarness):
 
         _purge_card_state(awaited, _EXEC_TIMEOUT)
 
-        if infra_reason and trajectory_clean and not agent_acted:
+        if infra_reason and trajectory_clean and logs_clean and not agent_acted:
             _mark_result_infra_failure(
                 result,
                 f"delegated worker hit infrastructure failure ({infra_reason}): {infra_detail}",

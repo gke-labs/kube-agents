@@ -2679,7 +2679,14 @@ def test_inject_transport_delegated_worker_rate_limit_marks_run_infra(
     build_session_store(tmp_path, created=[CARD_A])
     rate_limit_msg = f"{harness._RATE_LIMIT_REASON_PREFIX} (failure_reason=rate_limit): 429 TPM quota exhausted"
     set_card(tmp_path, CARD_A, "blocked", summary=rate_limit_msg)
-    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+    real_shell = local_shell(tmp_path, monkeypatch)
+
+    def shell(script: str, timeout: float) -> str:
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} {CARD_A} 0\n"
+        return real_shell(script, timeout)
+
+    monkeypatch.setattr(harness, "_agent_shell", shell)
     monkeypatch.setattr(
         harness.worker_trajectory,
         "capture",
