@@ -83,6 +83,39 @@ def test_a_single_option_revert_is_caught():
         assert not _offers_no_revert(f"- **Proposed fix ({title}):** Remove it in GitOps."), title
 
 
+def _does_not_offer_to_apply_leaving(report: str) -> bool:
+    text = _normalize_lines(report)
+    patterns = _check("triage-does-not-offer-to-apply-leaving-it")["forbidden_patterns"]
+    return not any(re.search(p, text) for p in patterns)
+
+
+# Observed on the d8836c11a build, verbatim but for the option bodies.
+OFFERS_TO_APPLY_LEAVING = (
+    "- **Option A (Codify namespace without privileged label):** Add it to GitOps.\n"
+    "- **Option C (Leave unmanaged):** Leave namespace eval-drift-unmanaged unmanaged.\n"
+    "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix, or name one "
+    "directly with **'apply Option A'** / **'apply Option B'** / **'apply Option C'**."
+)
+NAMES_ONLY_PULL_REQUESTS = (
+    "- **Option A (Codify namespace in GitOps with change undone):** Add a manifest.\n"
+    "- **Option B (Codify namespace in GitOps as live):** Add a manifest.\n"
+    "- **Option C (Leave unmanaged):** Leave it with no GitOps manifest.\n"
+    "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix, or name one "
+    "directly with **'apply Option A'** / **'apply Option B'**."
+)
+
+
+def test_offering_to_apply_the_leave_option_is_caught():
+    assert not _does_not_offer_to_apply_leaving(OFFERS_TO_APPLY_LEAVING)
+    keep = OFFERS_TO_APPLY_LEAVING.replace("Leave unmanaged", "Keep it unmanaged")
+    assert not _does_not_offer_to_apply_leaving(keep)
+
+
+def test_naming_only_the_pull_request_options_passes():
+    assert _does_not_offer_to_apply_leaving(NAMES_ONLY_PULL_REQUESTS)
+    assert _does_not_offer_to_apply_leaving(RED)
+
+
 def test_the_red_does_not_say_git_lacks_the_object_and_the_green_does():
     assert not _says_git_does_not_declare(RED)
     assert _says_git_does_not_declare(

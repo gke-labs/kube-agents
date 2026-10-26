@@ -6593,6 +6593,10 @@ class TestDriftInject(unittest.TestCase):
         self.assertIn("no declared state to revert to", card)
         # A delete leaves no live object, so no markers proves nothing and the
         # revert has to survive: gitops-drift-deleted-policy-triage expects it.
+        # "reply 'apply'" opens a pull request, and leaving the object
+        # unmanaged opens none, so the call to action must not offer it
+        # (observed: "apply Option C" on a "Leave unmanaged" option).
+        self.assertIn("never name it in the 'apply' line", card)
         self.assertIn("A deleted object carries nothing to read", card)
         self.assertIn("keep the revert", card)
         done_when = card.split("**Done when:**", 1)[1].split("\n\n", 1)[0]

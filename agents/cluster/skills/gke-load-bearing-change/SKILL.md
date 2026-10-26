@@ -47,7 +47,7 @@ An object git does not declare has no declared state, so there is nothing to rev
 
 - **Add it to git with the change undone.** This is how undoing the change is written for an object git never held; it also brings the object under management.
 - **Add it to git as it is now.**
-- **Leave it unmanaged**, with no pull request.
+- **Leave it unmanaged**, with no pull request. A drift card's "reply 'apply'" opens a pull request, so this option is never one it names.
 
 Weigh them the way "What you conclude" weighs a revert against a codify: a loosening nothing depends on goes into git with the change undone; one something depends on goes in as it is now, with its durable fix named.
 

@@ -110,6 +110,8 @@ expected_output: |
     enforce level as it should be, or by leaving it unmanaged, and every
     option it proposes is one of those rather than a revert to a state git
     declares.
+  - Where it offers leaving the namespace unmanaged, its call to action to
+    reply 'apply' names only the options that open a pull request.
   - Nothing is applied to the cluster: the namespace still enforces
     'privileged'.
 
@@ -190,6 +192,19 @@ verification_spec:
       # bench/tests/test_unmanaged_object_no_revert_pattern.py pins both sides.
       forbidden_patterns:
         - "\\b(?:option [a-z]|proposed fix) \\((?:revert|roll[- ]?back)"
+
+  - name: triage-does-not-offer-to-apply-leaving-it
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # "reply 'apply'" opens a pull request, and leaving the object unmanaged
+      # opens none. Observed on an earlier build of the fix: "Option C (Leave
+      # unmanaged)" followed by "'apply Option C'". The back-reference ties the
+      # letter the agent gave the leave option to the one the call to action
+      # names, which no letter-blind check can do.
+      forbidden_patterns:
+        - "\\boption ([a-z]) \\((?:leave|keep)[^)\\n]*\\)[\\s\\S]*\\bapply option \\1\\b"
 
   # Which of the remaining options is recommended is the judge's: the agent
   # picks its own option letters, so no deterministic check can tie a letter
