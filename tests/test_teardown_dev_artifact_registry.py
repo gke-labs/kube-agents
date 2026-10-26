@@ -19,8 +19,12 @@ RUN_TIMEOUT_SECONDS = 60
 STUB_GCLOUD = """#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$GCLOUD_CALLS"
 case "$*" in
-  "config get-value project"*) echo "stub-active-project" ;;
-  "artifacts repositories describe"*) echo "projects/p/locations/r/repositories/kube-agents" ;;
+  "artifacts repositories describe"*)
+    case "${STUB_DESCRIBE:-found}" in
+      found) echo "projects/p/locations/r/repositories/kube-agents" ;;
+      not-found) echo "ERROR: (gcloud.artifacts.repositories.describe) NOT_FOUND: Requested entity was not found." >&2; exit 1 ;;
+      *) echo "ERROR: (gcloud.artifacts.repositories.describe) PERMISSION_DENIED: Permission denied on resource" >&2; exit 1 ;;
+    esac ;;
   "artifacts repositories delete"*)
     if [ "${STUB_DELETE_EXIT:-0}" -ne 0 ]; then
       echo "ERROR: (gcloud.artifacts.repositories.delete) PERMISSION_DENIED" >&2
@@ -55,8 +59,8 @@ class TeardownDevArtifactRegistryTest(unittest.TestCase):
             "GCLOUD_CALLS": str(self.calls),
         }
 
-    def run_script(self, *args, delete_exit=0):
-        env = {**self.env, "STUB_DELETE_EXIT": str(delete_exit)}
+    def run_script(self, *args, delete_exit=0, describe="found"):
+        env = {**self.env, "STUB_DELETE_EXIT": str(delete_exit), "STUB_DESCRIBE": describe}
         return subprocess.run(
             ["bash", str(self.root / SCRIPT), *args],
             cwd=self.root, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=RUN_TIMEOUT_SECONDS,
@@ -73,7 +77,7 @@ class TeardownDevArtifactRegistryTest(unittest.TestCase):
         proc = self.run_script("--dry-run")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("[DRY-RUN] Would delete", proc.stdout)
-        self.assertEqual([c for c in self.gcloud_calls() if not c.startswith("config get-value")], [], "a dry run called gcloud for something other than reading the active project")
+        self.assertEqual(self.gcloud_calls(), [], "a dry run called gcloud")
         self.assertNotIn(OWNERSHIP_CLEARED, self.vars_text())
 
     def test_a_refused_delete_fails_the_script_and_keeps_the_ownership_flag(self):
@@ -82,6 +86,20 @@ class TeardownDevArtifactRegistryTest(unittest.TestCase):
         self.assertNotIn("successfully deleted", proc.stdout)
         self.assertIn("Could not delete Artifact Registry repository", proc.stdout + proc.stderr)
         self.assertNotIn(OWNERSHIP_CLEARED, self.vars_text())
+
+    def test_a_probe_that_fails_for_any_reason_but_not_found_stops_the_script(self):
+        proc = self.run_script("-y", describe="denied")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("PERMISSION_DENIED", proc.stdout + proc.stderr)
+        self.assertNotIn("already deleted", proc.stdout)
+        self.assertNotIn("successfully deleted", proc.stdout)
+        self.assertNotIn(OWNERSHIP_CLEARED, self.vars_text())
+
+    def test_a_repository_that_is_not_found_reads_as_already_deleted(self):
+        proc = self.run_script("-y", describe="not-found")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("already deleted or does not exist", proc.stdout)
+        self.assertIn(OWNERSHIP_CLEARED, self.vars_text())
 
     def test_a_delete_that_succeeds_clears_the_ownership_flag(self):
         proc = self.run_script("-y")
