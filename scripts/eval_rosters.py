@@ -44,6 +44,9 @@ GITLAB_CASES_FILE = EVAL_DIR / "gitlab-cases.txt"
 # under AGENT_TRANSPORT=inject, each with its reason as the comment block
 # directly above it.
 INJECT_LANE_EXCLUSIONS_FILE = EVAL_DIR / "inject-lane-exclusions.txt"
+# Its mirror (#3263): the cases every lane but the inject one drops, because
+# their premise needs the inject door. Same shape, same reason rule.
+API_LANE_EXCLUSIONS_FILE = EVAL_DIR / "api-lane-exclusions.txt"
 # The inject lane's safeguards (#2079): the verification_spec entries the
 # script appends to every case it runs on that lane. YAML, so this
 # stdlib-only module names the path and bench/kube_agents_bench/lane.py
@@ -181,6 +184,10 @@ def inject_lane_exclusions(path: pathlib.Path = INJECT_LANE_EXCLUSIONS_FILE) -> 
     return parse_lane_exclusions(path.read_text(encoding="utf-8"))
 
 
+def api_lane_exclusions(path: pathlib.Path = API_LANE_EXCLUSIONS_FILE) -> dict[str, str]:
+    return parse_lane_exclusions(path.read_text(encoding="utf-8"))
+
+
 # The nightly file's last section opens with this line (#3495). Entries above
 # it are frozen in the order they landed; entries below it are kept in case-id
 # order, each with its reason as the comment lines directly above it, so two
@@ -218,6 +225,7 @@ def summary(repetitions: int = 3) -> dict[str, int]:
         "presubmit units": len(presubmit) * repetitions,
         "gitlab lane cases": len(gitlab_cases()),
         "inject lane exclusions": len(inject_lane_exclusions()),
+        "api lane exclusions": len(api_lane_exclusions()),
     }
 
 

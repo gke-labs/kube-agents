@@ -661,6 +661,11 @@ def joined_night_document(night: dict[str, dict], data: dict, previous: dict[str
     # ``truncated``: the main parts' results stand, and the night is not
     # complete.
     held = [p for p in parts if p["part"] in MAIN_PARTS]
+    # A night without either half of the main matrix -- missing, still
+    # running, or (the main part, defensively) absent from the night at all
+    # -- never compared that half's cases, so it gives no newly-failing
+    # verdict. The digest and the page both read this one decision.
+    withheld_by = next((p for p in MAIN_PARTS if p in missing_parts or p in running_parts or (p == PART_MAIN and PART_MAIN not in night)), None)
     truncated = any(p["truncated"] for p in held) if held else all(p["truncated"] for p in parts)
     own = [p for p in parts if p["part"] not in borrowed]
     starts = [parse_iso(p["started"]) for p in own if p["started"]]
@@ -698,6 +703,7 @@ def joined_night_document(night: dict[str, dict], data: dict, previous: dict[str
         "parts": parts,
         "missing_parts": missing_parts,
         "running_parts": running_parts,
+        "verdict_withheld_by": withheld_by,
         # The opening chat turn over every rep of the night that is not
         # infra; advisory beside TURN1_P95_TARGET_S, never a verdict.
         "turn1_p50_s": percentile(turn1, 50),
@@ -869,7 +875,8 @@ def digest_line(data: dict | None, now: datetime.datetime, clock=None) -> str:
     and so does a split night whose main or main-b part is still running; a
     split night with one part cut short, missing or still running otherwise
     has its numbers and says which part, without a newly-failing verdict
-    when the main part is missing. A night with numbers whose reps carried the
+    when either main half is absent (the night's ``verdict_withheld_by``,
+    which the page reads too). A night with numbers whose reps carried the
     opening chat turn's time gives its p50 and p95, as advice
     (``turn1_note``)."""
     when = clock or (lambda value: value.isoformat(timespec="minutes"))
@@ -915,10 +922,9 @@ def digest_line(data: dict | None, now: datetime.datetime, clock=None) -> str:
     parts = [f"{counts['recorded']} cases", f"{counts['passed']} passed all reps", f"{counts['partial']} partial", f"{counts['failed']} failed"]
     if counts["infra"]:
         parts.append(f"{counts['infra']} infra")
-    # Without either half of the main matrix, the cases that half runs were
-    # never compared, so no verdict on what is newly failing; the part notes
-    # say which part is missing.
-    if any(p in night.get("missing_parts", []) for p in MAIN_PARTS):
+    # No verdict on what is newly failing without either half of the main
+    # matrix (``verdict_withheld_by``); the part notes say which part.
+    if night.get("verdict_withheld_by"):
         pass
     elif night["newly_failing"]:
         parts.append(f"newly failing: {name_cases(night['newly_failing'])}")
