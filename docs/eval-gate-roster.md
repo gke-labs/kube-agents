@@ -678,8 +678,14 @@ a record to the `allowlist` in [`docs/designs/domains.yaml`](designs/domains.yam
 `issue`, `owner` and `expires`, the expiry at most 14 days after `since` unless a `why:` says why.
 The issue is the one that says how the domain gets a roster case back. A held-out seat still needs
 the record, with the case named in its `held_out:` field. `scripts/test_domain_coverage.py`
-enforces this: it fails on an uncovered domain with no record, and on every pull request once a
-record's `expires` date has passed (by the UTC date), until the domain is covered or a pull request moves the date.
+enforces this: it fails on an uncovered domain with no record, and on a record that is missing a
+field or runs past the 14-day cap without a `why:`.
+
+Once a record's `expires` date has passed (by the UTC date), pull requests are not blocked: a date
+passing would red contributors who do not own the gap. Instead the CI-health bot escalates to the
+record's owner on its issue, and the daily digest says how many days ago the exception expired.
+`scripts/domain_allowlist.py` is the expiry rule it reads. The owner either covers the domain or
+moves the date in a pull request that says why.
 
 ## Switching to `record`
 

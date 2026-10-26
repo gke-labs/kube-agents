@@ -35,8 +35,8 @@
 # each with an owner, an issue and an expiry date (the fields are described
 # above the list). Delete entries as Phase 2 ACTIVATES scenarios; the lint
 # refuses an uncovered domain that is not listed (a regression), a listed
-# domain that is covered (a stale entry hiding progress), and a record whose
-# `expires` date has passed. The shrinking allowlist is the tier-2 progress
+# domain that is covered (a stale entry hiding progress), and a record
+# missing a field or running past the expiry cap. The shrinking allowlist is the tier-2 progress
 # metric of the testing implementation plan, as line coverage is the tier-1
 # one.
 #
@@ -178,12 +178,12 @@ domains:
 #   owner     the GitHub login who brings it back; the domain row's owner
 #             unless someone else took it. Must be in the root OWNERS file.
 #   expires   the date the record stops excusing the gap: at most 14 days
-#             after `since`, unless `why` says why it is longer. From the day
-#             after `expires` (UTC, so 8 PM ET on the date itself in
-#             daylight time), scripts/test_domain_coverage.py fails on every
-#             pull request until the domain is covered or the date is moved.
-#             Moving it is an edit to this line in a pull request, so the
-#             record shows who moved it and why.
+#             after `since`, unless `why` says why it is longer. Past
+#             `expires` (by the UTC date) pull requests are not blocked; the
+#             CI-health bot escalates to the owner on the record's issue
+#             (scripts/domain_allowlist.py finds expired records). Moving the
+#             date is an edit to this line in a pull request, so the record
+#             shows who moved it and why.
 #   why       required only when `expires` is more than 14 days after
 #             `since`: one sentence saying why.
 #   held_out  optional: a case of this domain still running on the presubmit

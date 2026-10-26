@@ -18,9 +18,9 @@ This test is what makes the rule a build failure:
   optional ``held_out`` case really is a held-out presubmit seat of that
   domain -- so a demotion that uncovers a domain names who brings it back,
   where, and by when;
-* a record whose ``expires`` date is before today (UTC) fails, naming the
-  domain, its owner and its issue: the gap is no longer excused, and moving
-  the date is an edit someone signs in a pull request.
+* an expired record does NOT fail here: a date passing would red unrelated
+  pull requests. ``domain_allowlist.expired_records`` is the rule the
+  CI-health tick reads to escalate to the record's owner.
 
 Delete allowlist entries as Phase 2 ACTIVATES scenarios. The shrinking
 allowlist is the tier-2 progress metric of the testing implementation plan.
@@ -43,7 +43,10 @@ import yaml
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-import eval_rosters
+import domain_allowlist  # noqa: E402
+import eval_rosters  # noqa: E402
+from domain_allowlist import expired_records, record_owner  # noqa: E402
+from domain_allowlist import is_date as _is_date  # noqa: E402
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 DOMAINS_FILE = REPO_ROOT / "docs" / "designs" / "domains.yaml"
@@ -72,22 +75,6 @@ def load_domains():
 def load_allowlist():
     """The allowlist records as written, not validated."""
     return yaml.safe_load(DOMAINS_FILE.read_text()).get("allowlist") or []
-
-
-def utc_today() -> datetime.date:
-    return datetime.datetime.now(datetime.timezone.utc).date()
-
-
-def _is_date(value) -> bool:
-    # yaml.safe_load reads an unquoted YYYY-MM-DD as a date; a timestamp
-    # (a datetime, which is a date subclass) or a quoted string is not one.
-    return isinstance(value, datetime.date) and not isinstance(value, datetime.datetime)
-
-
-def record_owner(entry: dict, domain_owners: dict) -> str | None:
-    """The record's `owner:`, else its domain row's."""
-    owner = entry.get("owner")
-    return owner if isinstance(owner, str) and owner.strip() else domain_owners.get(entry.get("slug"))
 
 
 def allowlist_shape_problems(entries) -> list[str]:
@@ -134,21 +121,6 @@ def allowlist_shape_problems(entries) -> list[str]:
                     "or add `why:` saying why it needs longer"
                 )
     return problems
-
-
-def expired_records(entries, domain_owners: dict, today: datetime.date) -> list[str]:
-    """One line per record whose `expires` date is before `today`."""
-    expired = []
-    for entry in entries:
-        if not isinstance(entry, dict) or not _is_date(entry.get("expires")):
-            continue  # allowlist_shape_problems reports it
-        if entry["expires"] < today:
-            expired.append(
-                f"{entry.get('slug')}: expired {entry['expires']} "
-                f"(owner: {record_owner(entry, domain_owners) or 'none named'}, "
-                f"issue: #{entry.get('issue')})"
-            )
-    return expired
 
 
 def held_out_problems(entries, task_domain, presubmit: set, blocking: set) -> list[str]:
@@ -370,20 +342,6 @@ class TestDomainCoverage(unittest.TestCase):
             "Start each allowlist record with `- slug: <domain>`, in block style.",
         )
 
-    def test_no_allowlist_record_has_expired(self):
-        domains, _ = load_domains()
-        expired = expired_records(load_allowlist(), {d["slug"]: d.get("owner") for d in domains}, utc_today())
-        self.assertEqual(
-            expired,
-            [],
-            "\n\nThese domains have had no blocking case past the date their "
-            "allowlist record in docs/designs/domains.yaml allowed:\n  "
-            + "\n  ".join(expired)
-            + "\n\nCover the domain (seat a case from it on "
-            "hack/eval/blocking-roster.txt and delete the record), or move "
-            "`expires` in a pull request that says why, with `why:` once it runs "
-            f"past {MAX_ALLOWLIST_DAYS} days after `since`.",
-        )
 
 
 D = datetime.date
@@ -432,13 +390,18 @@ class TestAllowlistRules(unittest.TestCase):
         owners = {"remediation": "Fuxiao-Gao"}
         self.assertEqual(expired_records([RECORD], owners, D(2026, 10, 31)), [])
         self.assertEqual(
-            expired_records([RECORD], owners, D(2026, 11, 1)),
-            ["remediation: expired 2026-10-31 (owner: Fuxiao-Gao, issue: #3120)"],
+            [tuple(r) for r in expired_records([RECORD], owners, D(2026, 11, 3))],
+            [("remediation", "Fuxiao-Gao", 3120, D(2026, 10, 31), 3)],
         )
-        self.assertEqual(
-            expired_records([{**RECORD, "owner": "lapis2002"}], owners, D(2026, 11, 1)),
-            ["remediation: expired 2026-10-31 (owner: lapis2002, issue: #3120)"],
-        )
+        self.assertEqual(expired_records([{**RECORD, "owner": "lapis2002"}], owners, D(2026, 11, 1))[0].owner, "lapis2002")
+        self.assertEqual(expired_records(["remediation", {"slug": "x"}], owners, D(2026, 11, 1)), [])
+
+    def test_an_expired_record_on_the_real_file_is_found_and_does_not_fail_here(self):
+        # The presubmit has no expiry test (module docstring); this pins that
+        # the rule reads the real file the way the CI-health tick will.
+        owners, entries = domain_allowlist.load()
+        far = max(e["expires"] for e in entries) + datetime.timedelta(days=1)
+        self.assertEqual([r.slug for r in expired_records(entries, owners, far)], [e["slug"] for e in entries])
 
     def test_a_held_out_case_must_be_an_off_roster_presubmit_seat_of_the_domain(self):
         entry = {**RECORD, "held_out": "pdb-remediation-pr"}
