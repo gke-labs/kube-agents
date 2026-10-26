@@ -32,11 +32,10 @@ import yaml
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-import eval_rosters  # noqa: E402
+import domain_coverage  # noqa: E402
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 DOMAINS_FILE = REPO_ROOT / "docs" / "designs" / "domains.yaml"
-TASKS_GLOB = "bench/tasks/*/task.yaml"
 
 
 def load_domains():
@@ -44,34 +43,16 @@ def load_domains():
     return data["domains"], set(data.get("allowlist") or [])
 
 
-def blocking_task_paths():
-    """Task paths that can red a pull request: the entries of hack/eval/blocking-roster.txt.
-
-    The roster is a subset of the presubmit file by construction (the script
-    refuses a roster name outside it; scripts/test_task_registration.py pins
-    it), so a roster case runs on every pull request AND blocks there. A
-    presubmit seat held out of the roster (HELD_OUT_IN_PRESUBMIT in
-    scripts/test_eval_rosters.py) runs without blocking and covers nothing
-    until its roster line lands.
-    """
-    names = eval_rosters.blocking_roster()
-    if not names:
-        raise AssertionError(f"{eval_rosters.BLOCKING_ROSTER_FILE} parsed to no cases")
-    return {f"bench/tasks/{name}/task.yaml" for name in names}
-
-
 def covered_domains():
-    """Domain slugs claimed by a BLOCKING task carrying a non-empty spec."""
-    active = blocking_task_paths()
-    claimed = {}
-    for task_file in sorted(REPO_ROOT.glob(TASKS_GLOB)):
-        task = yaml.safe_load(task_file.read_text()) or {}
-        domain = task.get("domain")
-        if domain:
-            rel = task_file.relative_to(REPO_ROOT).as_posix()
-            counts = bool(task.get("verification_spec")) and rel in active
-            claimed.setdefault(domain, []).append((rel, counts))
-    return claimed
+    """``{domain: [(task path, counts)]}``: ``counts`` when the task is on
+    hack/eval/blocking-roster.txt (a subset of the presubmit file by
+    construction; a presubmit seat held out of the roster, HELD_OUT_IN_PRESUBMIT
+    in scripts/test_eval_rosters.py, covers nothing until its roster line
+    lands) and carries a non-empty spec. The CI-health coverage-gap filer
+    (scripts/eval_dashboard/coverage_gaps.py) reads coverage through the same
+    function (scripts/domain_coverage.py), so the two cannot disagree on what
+    covers a domain."""
+    return domain_coverage.domain_claims(REPO_ROOT)
 
 
 class TestDomainCoverage(unittest.TestCase):

@@ -667,7 +667,9 @@ with the issue that names its re-admission condition, and date it as `demoted YY
 reads that phrase from those bullets for the case's "demoted" pill. That issue goes to the case's effective owner — its `owner:`, or
 its domain's owner ([`bench/CONTRIBUTING.md`](../bench/CONTRIBUTING.md#ownership)) —
 who investigates and either fixes the case or proposes retiring it. A case whose owner does
-not answer stays demoted. The bar is the same for a contributed case and an in-house one;
+not answer stays demoted. While a demotion leaves a domain with no roster case, the CI-health
+tick keeps an issue open for the domain's owner with the domain's best nightly candidates
+([`ci-health.md`](ci-health.md#coverage-gaps)). The bar is the same for a contributed case and an in-house one;
 [`bench/CONTRIBUTING.md`](../bench/CONTRIBUTING.md) is what a contributor signs up to.
 
 ## Switching to `record`
