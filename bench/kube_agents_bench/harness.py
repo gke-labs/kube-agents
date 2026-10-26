@@ -638,6 +638,29 @@ _OPENER = urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({
 _SESSION_ID_HEADER = "X-Hermes-Session-Id"
 _FAILURE_REASON_HEADER = "X-Hermes-Failure-Reason"
 _INFRA_FAILURE_REASONS = frozenset({"rate_limit", "billing"})
+_RATE_LIMIT_REASON_PREFIX = "provider rate limit: API retries exhausted"
+_FAILURE_REASON_PATTERN = re.compile(r"\bfailure_reason=([a-zA-Z0-9_]+)\b")
+
+
+def _extract_infra_failure_reason(text: str | None) -> str | None:
+    """Extract an infrastructure failure reason if text opens with the hermes failure prefix."""
+    if not text:
+        return None
+    text = text.strip()
+    if text.startswith(_RATE_LIMIT_REASON_PREFIX):
+        match = _FAILURE_REASON_PATTERN.search(text)
+        if match:
+            return match.group(1) if match.group(1) in _INFRA_FAILURE_REASONS else None
+        return "rate_limit"
+    return None
+
+
+def _mark_result_infra_failure(result: AgentResult, detail: str) -> None:
+    """Convert an AgentResult in-place into an infrastructure failure."""
+    result.output = ""
+    del result.trajectory[:]
+    result.errors = [f"{INFRA_FAILURE_MARKER}: {detail}"]
+    result.metadata["infra_failure"] = detail
 
 # The session lookup only refines accounting, so it never inherits the agent's
 # (minutes-long) budget: a hung route would be billed as the agent's latency.
@@ -1289,13 +1312,15 @@ def _record_ceiling(
     outstanding: list[str],
     statuses: dict[str, str],
     delegation_timeout: float,
+    *,
+    worker_acted: bool = False,
 ) -> None:
     """Record that ``outstanding`` cards outran the delegation budget.
 
-    With nothing delivered the record holds the acknowledgement alone; the
-    marker routes it to its own class in the scorer rather than a graded
-    failure of the agent under test. A partial delivery keeps the plain report
-    and grades on what arrived. Both delegation waits end their deadline path
+    With nothing delivered and no worker action, the record holds the acknowledgement
+    alone; the marker routes it to its own class in the scorer rather than a graded
+    failure of the agent under test. A partial delivery or worker tool execution keeps
+    the plain report and grades on what arrived. Both delegation waits end their deadline path
     here, so the two transports cannot drift on what the scorer reads.
     """
     if not outstanding:
@@ -1305,7 +1330,7 @@ def _record_ceiling(
         f"{delegation_timeout:.0f}s: "
         + ", ".join(f"{t} ({statuses.get(t, 'unknown')})" for t in outstanding)
     )
-    if not delivered_results(observed, awaited):
+    if not delivered_results(observed, awaited) and not worker_acted:
         report = f"{DELEGATION_CEILING_MARKER}: {report}"
     result.errors.append(report)
 
@@ -2898,7 +2923,18 @@ class KubeAgentsHarness(AgentHarness):
         # checks that could read them are set aside on inject records anyway.
         shown = any(e.get("name") == inject.EVENT_ENTRY_ACTIVITY for e in result.trajectory)
         before = len(result.trajectory)
-        self._settle(result, observed, awaited, stalled=outstanding if timed_out else [])
+        board_messages = [
+            str(c.get("summary") or "") for c in read.cards.values() if c.get("summary")
+        ] + [
+            str(c.get("result") or "") for c in read.cards.values() if c.get("result")
+        ]
+        self._settle(
+            result,
+            observed,
+            awaited,
+            stalled=outstanding if timed_out else [],
+            board_messages=board_messages,
+        )
         if not shown and len(result.trajectory) > before:
             withheld = result.trajectory[before:]
             del result.trajectory[before:]
@@ -2983,6 +3019,7 @@ class KubeAgentsHarness(AgentHarness):
         transport_failures = 0
         had_answered_failure = False
         timed_out = True
+        board_messages: list[str] = []
         # The freshest status seen for each card, from whichever source read
         # it last -- the board or a status turn -- for the deadline report.
         # ``statuses`` stays the agent's own readings, which are what settle a
@@ -3015,8 +3052,11 @@ class KubeAgentsHarness(AgentHarness):
             # that fails, or does not know every outstanding card, decides
             # nothing: the turn is made exactly as before, so the silent-turn
             # ceiling still ends a wait on a card the agent cannot see.
-            on_board = board.read_statuses(_agent_shell, outstanding, _EXEC_TIMEOUT)
-            if on_board is not None:
+            bstate = board.read_board_state(_agent_shell, outstanding, _EXEC_TIMEOUT)
+            if bstate is not None:
+                on_board, bsummaries, berrors = bstate
+                board_messages.extend(bsummaries.values())
+                board_messages.extend(berrors.values())
                 latest.update(on_board)
                 if all(t in on_board for t in outstanding) and not any(
                     on_board[t] in _TERMINAL_STATUSES for t in outstanding
@@ -3145,7 +3185,13 @@ class KubeAgentsHarness(AgentHarness):
         # Only the deadline path leaves transcripts behind: a card still
         # outstanding after a transport failure or a mute agent did not stall,
         # and the run stopped for a reason the record already names.
-        self._settle(result, observed, awaited, stalled=outstanding if timed_out else [])
+        self._settle(
+            result,
+            observed,
+            awaited,
+            stalled=outstanding if timed_out else [],
+            board_messages=board_messages,
+        )
         return session_id
 
     @staticmethod
@@ -3155,6 +3201,7 @@ class KubeAgentsHarness(AgentHarness):
         awaited: list[str],
         *,
         stalled: Sequence[str] = (),
+        board_messages: Sequence[str] = (),
     ) -> None:
         """Collect everything the delegated cards produced, then clear them out.
 
@@ -3203,7 +3250,33 @@ class KubeAgentsHarness(AgentHarness):
             result.trajectory.extend(captured.entries)
             result.metadata["worker_trajectory"] = captured.summary
             result.tokens["workers"] = _worker_token_buckets(captured.tokens, captured.unbilled)
+
+        worker_acted = bool(captured and captured.entries)
+        infra_reason: str | None = None
+        infra_detail: str = ""
+        for tid, wlog in (logs or {}).items():
+            if wlog and wlog.body:
+                reason = _extract_infra_failure_reason(wlog.body)
+                if reason:
+                    infra_reason = reason
+                    infra_detail = f"worker transcript for {tid} logged {reason}"
+                    break
+
+        if not infra_reason and board_messages:
+            for text in board_messages:
+                reason = _extract_infra_failure_reason(text)
+                if reason:
+                    infra_reason = reason
+                    infra_detail = f"card on board recorded {reason}: {text[:200]}"
+                    break
+
         _purge_card_state(awaited, _EXEC_TIMEOUT)
+
+        if infra_reason and not worker_acted:
+            _mark_result_infra_failure(
+                result,
+                f"delegated worker hit infrastructure failure ({infra_reason}): {infra_detail}",
+            )
 
     @staticmethod
     def _capped(task_ids: list[str], result: AgentResult | None) -> list[str]:

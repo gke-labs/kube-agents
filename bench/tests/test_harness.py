@@ -3946,3 +3946,126 @@ def test_a_fresh_session_replay_whose_context_failed_in_the_image_sends_no_answe
     assert not result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
     assert len(stub_agent.requests) == 1
     assert _archived(scripts)
+
+
+def test_extract_infra_failure_reason():
+    """Only text opening with the Hermes failure prefix is classified as rate_limit."""
+    prefix = "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"
+    assert harness._extract_infra_failure_reason(prefix) == "rate_limit"
+
+    billing = "provider rate limit: API retries exhausted (failure_reason=billing): quota exceeded"
+    assert harness._extract_infra_failure_reason(billing) == "billing"
+
+    plain_prefix = "provider rate limit: API retries exhausted: 429 Too Many Requests"
+    assert harness._extract_infra_failure_reason(plain_prefix) == "rate_limit"
+
+    # Arbitrary / spoofed 429 without the Hermes prefix must NOT match
+    assert harness._extract_infra_failure_reason("HTTP 429 Too Many Requests: TPM quota exhausted") is None
+    assert harness._extract_infra_failure_reason("agent error: rate limit hit") is None
+    assert harness._extract_infra_failure_reason("transient rate limit on cluster") is None
+    assert harness._extract_infra_failure_reason("") is None
+    assert harness._extract_infra_failure_reason(None) is None
+
+
+def test_settle_delegated_worker_rate_limit_with_no_worker_actions_is_infra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a worker hits the Hermes rate limit and executed zero tools, the run is marked infra."""
+    body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "delegate"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+
+    assert res.has_errors()
+    assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "delegated worker hit infrastructure failure (rate_limit)" in res.errors[0]
+    assert res.output == ""
+    assert res.trajectory == []
+
+
+def test_settle_delegated_worker_rate_limit_with_worker_actions_stays_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When a worker executed a tool before hitting a rate limit, it acted and stays graded."""
+    body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    # Worker executed a tool call
+    tool_entry = {"name": "kubectl", "args": {"command": "get pods"}, "result": "ok"}
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[tool_entry],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "delegate"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+
+    # Result was NOT converted to infra failure because worker acted
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+    assert res.output == "router ack"
+    assert tool_entry in res.trajectory
+
+
+def test_settle_delegated_worker_board_summary_rate_limit_is_infra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A board message carrying the Hermes rate limit prefix with no worker actions marks infra."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {})
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "delegate"}])
+    harness.KubeAgentsHarness._settle(
+        res,
+        [],
+        ["t_1"],
+        board_messages=["provider rate limit: API retries exhausted (failure_reason=rate_limit) on card t_1"],
+    )
+
+    assert res.has_errors()
+    assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "card on board recorded rate_limit" in res.errors[0]
+
+
+def test_settle_spoofed_rate_limit_without_hermes_prefix_stays_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A board message without the exact Hermes rate-limit prefix does not mark infra."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {})
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "delegate"}])
+    harness.KubeAgentsHarness._settle(
+        res,
+        [],
+        ["t_1"],
+        board_messages=["HTTP 429: rate limit error occurred"],
+    )
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+    assert res.output == "router ack"
