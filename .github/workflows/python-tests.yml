@@ -65,21 +65,23 @@ jobs:
   # coverage.py writing its own data, which are the two things that should.
   test:
     name: Run Python Unit Tests
-    # Pinned to ubuntu-24.04, not ubuntu-latest, since 2026-10-26, when
-    # `ubuntu-latest` became Ubuntu 26.04 and this job went red on every pull
-    # request with no change in the tree. Two of the suites read the runner's
-    # own shell and coreutils rather than a Python module, and 26.04 changes
-    # both: its coreutils are uutils (rust-coreutils 0.8/0.10), whose
-    # `tail -c N` on a pipe prints more than N bytes after short reads
-    # (uutils/coreutils#15804), which is the byte cap hack/ci-env.sh's
-    # collectors apply and scripts/test_ci_env_*.py pin; and its bash is 5.3,
-    # which names a stdin script's frames after $0 in BASH_SOURCE, which
-    # tests/test_install_script.py reads through install.sh's abort banner.
-    # The bash half is fixed in install.sh alongside this pin; the tail half
-    # is not yet, so the pin stays until hack/ci-env.sh bounds its captures
-    # without `tail -c` on a pipe or the image ships a coreutils with the fix.
-    # bench-tests below is not pinned: nothing it runs reads the runner's
-    # shell or coreutils, and it stayed green on 26.04.
+    # Pinned to ubuntu-24.04, not ubuntu-latest, since 2026-10-26. GitHub is
+    # moving `ubuntu-latest` from Ubuntu 24.04 to 26.04 between 2026-10-19 and
+    # 2026-11-19, and from the morning of the 26th every run of this job
+    # landed on 26.04 and went red with no change in the tree. Two of the
+    # suites read the runner's own shell and coreutils rather than a Python
+    # module, and 26.04 changes both: its coreutils are uutils (rust-coreutils
+    # 0.8.0 in release, 0.10.0 in updates), whose `tail -c N` on a pipe prints
+    # more than N bytes after short reads (uutils/coreutils#15804), which is
+    # the byte cap hack/ci-env.sh's collectors apply and scripts/test_ci_env_*.py
+    # pin; and its bash is 5.3, which names a stdin script's frames after $0
+    # in BASH_SOURCE, which tests/test_install_script.py reads through the
+    # three front doors' abort banner. The bash half is fixed in install.sh,
+    # upgrade.sh and uninstall.sh beside this pin; the tail half is the
+    # change that bounds the captures without `tail -c` on a pipe (#3960),
+    # and that change lifts this pin when it lands. bench-tests below is not
+    # pinned: nothing it runs reads the runner's shell or coreutils, and its
+    # job on the first red run (121454252239, image ubuntu-26.04) was green.
     runs-on: ubuntu-24.04
     timeout-minutes: 45
 

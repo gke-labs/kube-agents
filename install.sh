@@ -175,12 +175,21 @@ on_error() {
   # counts from the top of whichever file the command sat in, so a bare line
   # number sent the reader to that line of install.sh instead. Piped through
   # stdin, bash labels this script's frames `main` (bash 5.2), after $0 (bash
-  # 5.3: `bash`, or the path it was invoked by), or not at all (bash 3.2);
-  # all read as the script by name. A frame run from a file keeps the path
-  # bash recorded, so `bash ./install.sh` still names the file it ran.
+  # 5.3, measured: `bash` for the documented one-liner, `/bin/bash` when the
+  # interpreter is invoked by path, `sh` where that is bash), or not at all
+  # (bash 3.2); all read as the script by name. The $0 of a stdin or -c
+  # script is the shell as invoked, and resolves to the running interpreter,
+  # $BASH; a frame run from a file (`bash ./install.sh`) is labelled $0 on
+  # every bash too, and that $0 is the script, not $BASH, which keeps its
+  # path. A sourced file is never $0, whatever it is named.
   local source_file="${BASH_SOURCE[1]:-}"
   case "$source_file" in
-    ""|main|bash|*/bash) source_file="$INSTALL_SCRIPT_NAME" ;;
+    ""|main) source_file="$INSTALL_SCRIPT_NAME" ;;
+    "$0")
+      if [ "$(command -v -- "$0" 2>/dev/null || true)" = "$BASH" ]; then
+        source_file="$INSTALL_SCRIPT_NAME"
+      fi
+      ;;
   esac
   local func_name="${FUNCNAME[1]:-main}"
   echo -e "\n\033[91m\033[1m✗ Error encountered at ${source_file}:${line_no} in ${func_name} (exit code ${exit_code}): ${bash_cmd}\033[0m" >&2
