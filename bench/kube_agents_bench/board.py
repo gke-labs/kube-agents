@@ -150,8 +150,12 @@ WANT = [a for a in sys.argv[10:] if a][:MAX_WANT]
 SQLITE_BUSY_TIMEOUT = 10
 # Rows per IN (...) query, under every sqlite's bound-parameter limit.
 CHUNK = 500
-# A blocked card's question is the payload of its newest ``blocked`` event.
+# A blocked card's question is the payload of its newest stop when that stop
+# is a ``blocked`` event: a card answered (``unblocked``) and then parked by the
+# breaker (``gave_up``) is blocked too, on no question. The image's own readers
+# take the newest of the three the same way (kanban_progress_lines.GAVE_UP_SQL).
 BLOCKED = "blocked"
+STOP_KINDS = ("blocked", "unblocked", "gave_up")
 JSON_PREFIX = "\x00json:"
 out = {"session": False, "sessions": [], "created": [], "created_total": 0,
        "subscribed": [], "subscribed_total": 0, "cards": {}, "error": None}
@@ -309,10 +313,10 @@ if out["error"] is None:
                     if out["cards"][tid]["status"] != BLOCKED:
                         continue
                     row = board.execute(
-                        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
-                        "ORDER BY id DESC LIMIT 1", (tid, BLOCKED)).fetchone()
+                        "SELECT kind, payload FROM task_events WHERE task_id = ? AND kind IN (%s) "
+                        "ORDER BY id DESC LIMIT 1" % marks(STOP_KINDS), (tid, *STOP_KINDS)).fetchone()
                     try:
-                        block = json.loads(row[0]) if row and row[0] else None
+                        block = json.loads(row[1]) if row and row[0] == BLOCKED and row[1] else None
                     except ValueError:
                         block = None
                     if isinstance(block, dict):
@@ -403,8 +407,8 @@ class SessionCards:
     ``cards`` maps each id the board knows to its ``status``, and, for the
     ids the read was asked for (``want``), its ``result`` (``tasks.result``)
     and ``summary`` (the newest non-empty ``task_runs.summary``), and for a
-    blocked one its ``block`` (the newest ``blocked`` event's ``kind`` and
-    ``reason``); ``None`` for the rest. An id in ``card_ids`` and not in
+    blocked one its ``block`` (the newest stop event's ``kind`` and
+    ``reason`` when that stop is a ``blocked`` one); ``None`` for the rest. An id in ``card_ids`` and not in
     ``cards`` is one the board has no row for.
     """
 
