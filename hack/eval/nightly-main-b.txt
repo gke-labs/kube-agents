@@ -45,9 +45,8 @@ gitops-drift-backlog-digest
 # the halves balance identically on the hint and this way balances better on
 # the clock.
 #
-# No periodic sets main-a or main-b today; the recorder logs "Nightly part:
-# main". This line is inert until they exist, which is why it is placed on
-# the arithmetic alone.
+# Placed on the arithmetic alone: no periodic set main-a or main-b when it
+# was added, so no night had measured the halves.
 gitops-drift-load-bearing-change-triage
 # Registered 2026-10-22 (#3583) at 1500s. With autoops-quiet-followup (1800s)
 # on main-a since #3617, the halves stand at 11250s (main-a) against 11100s
