@@ -163,7 +163,7 @@ Each operation runs against the factors that load it, not against every factor. 
 
 # Phases
 
-The work runs in two phases. Phase 1 ran from 2026-10-22 to 2026-10-24; its results are under Phase 1 results below. Phase 2 is decided from what Phase 1 shows.
+The work runs in two phases. Phase 1 ran from 2026-10-22 to 2026-10-24; its results are under Phase 1 results below. Phase 2 started on 2026-10-26 with the points the Phase 1 data pointed at.
 
 ## Phase 1: two data points per factor
 
@@ -205,23 +205,28 @@ Steps, in order:
 4. The other runs.
 5. An admin console page that loads `bench/scale/harness-limits.json` and shows, per metric, the two points against the metric's threshold, with the raw data in a toggled section. It answers the two sizing questions from the two-point estimates.
 
-## Phase 2: decided from the Phase 1 result
+## Phase 2: the points Phase 1 pointed at
 
-Phase 1's chart decides what follows. Its data points at four of the candidates first: event volume, where the session storm grows (more levels between 68 and 1,200 events per minute); the cluster count, where the credential proxy starts to queue (16 and 32 clusters); concurrency around the 10 run slots (10 and 12); and a churn fixture that applies batches in parallel, so the 1,000 per minute level is reached. The candidates:
+Phase 2 (`bench/scale/phase2.yaml`) measures where the Phase 1 lines come close to a threshold, the combined point, and the credential proxy's own throughput. It runs on the same image as Phase 1, so it reuses the Phase 1 base runs.
 
-- The remaining planned levels, for the metrics whose line comes close to a threshold inside realistic fleet sizes.
-- More points near a threshold, to find the knee for the queue metrics.
-- The 64-cluster level, after a quota check (cluster management costs about $0.10 per cluster-hour).
-- The combined point (8 clusters × 4,000 objects).
-- 3 runs for the onboarding window and the watcher soak.
-- The Config Connector read, on a test cluster with Config Connector installed.
-- The scheduled jobs' sweep duration, kanban queue depth, CPU throttling, network throughput, time to first card and time to first token.
-- New stress points the Phase 1 data suggests.
-- The instrumentation: a counter for triage starts lost ([#3583](https://github.com/gke-labs/kube-agents/issues/3583)) and a gauge for occupied Hermes run slots ([#3724](https://github.com/gke-labs/kube-agents/issues/3724)).
-- An issue for each limit the data shows below a realistic fleet size, linked from the Known Issues table.
-- A recurring run: the Phase 1 config on each release candidate, with the page flagging a metric that moved past a set fraction of the previous release.
+| Factor                        | Levels          | Operations                        | Why                                                                                                   |
+| ----------------------------- | --------------- | --------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Credential proxy load workers | 1, 4, 8, 16, 32 | Proxy load                        | The broker's throughput and latency with no model call, and whether its CPU or its 8 slots bind first |
+| Concurrent requests           | 8, 10, 12       | Fan-out                           | The step at the 10 Hermes run slots                                                                   |
+| Pods failing at once          | 10, 30          | Event watcher soak, boot burst    | How the session storm grows between 1 and 100 Pods                                                    |
+| 8 clusters × 4,000 objects    | one point       | Onboarding, watcher soak, fan-out | The first open question: whether the factors add up                                                   |
+| Number of clusters            | 16, 32          | Onboarding, watcher soak, fan-out | Where the credential proxy queues, and how memory and the event watcher grow with the fleet           |
 
-All planned points at 3 runs each would take about 95–115 h of machine time, 1.5–2 weeks of calendar time with re-runs.
+The proxy load is a new operation. Workers in the sandbox shell repeat one brokered `kubectl get pods --all-namespaces` against the first test cluster through `credential-proxy-exec`, the path every agent command takes, for 3 minutes; the run records the commands completed per second and their latency. Every run now also records the commands the broker ran and the seconds they ran for (`kubeagents_tool_invocations_total`, `kubeagents_tool_execution_duration_seconds`), so each operation's demand on the broker can be set against that throughput, and each container's requests beside its limits. The runner runs the Cluster Agent reconcile when the profiles differ from the test fleet, instead of waiting up to an hour for its scheduled run.
+
+That is 55 runs, 47 of them new, and about 18 hours. The remaining candidates are not measured yet:
+
+- the remaining planned levels and the 64-cluster level;
+- 3 runs for the onboarding window and the watcher soak;
+- the Config Connector read, on a test cluster with Config Connector installed;
+- the scheduled jobs' sweep duration, kanban queue depth, CPU throttling, network throughput, time to first card and time to first token;
+- the instrumentation: a counter for triage starts lost ([#3583](https://github.com/gke-labs/kube-agents/issues/3583)) and a gauge for occupied Hermes run slots ([#3724](https://github.com/gke-labs/kube-agents/issues/3724));
+- a recurring run: the Phase 1 plan on each release candidate, with the page flagging a metric that moved past a set fraction of the previous release.
 
 # Phase 1 results
 
