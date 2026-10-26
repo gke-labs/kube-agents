@@ -2313,7 +2313,7 @@ def test_delegated_worker_board_rate_limit_cleared_on_status_turn_unblock_even_i
         return ""
 
     monkeypatch.setattr(harness, "_agent_shell", _shell)
-    stub_agent.turns = [_create_turn(), _show_turn("running"), _show_turn("blocked")]
+    stub_agent.turns = [_create_turn(), _show_turn("running"), _show_turn("blocked", call_id="call_show_2")]
 
     result = KubeAgentsHarness().run("Find the root cause of the frontend outage.")
 
@@ -4618,21 +4618,64 @@ def test_settle_delegated_worker_observed_summary_rate_limit_is_infra(
     assert "card on board recorded rate_limit" in res.errors[0]
 
 
+def test_worker_non_action_tools_contains_mandated_board_verbs() -> None:
+    """_WORKER_NON_ACTION_TOOLS must include all non-substantive board verbs a worker may call."""
+    assert {"kanban_show", "kanban_heartbeat", "kanban_comment", "kanban_create"}.issubset(
+        harness._WORKER_NON_ACTION_TOOLS
+    )
+
+
+@pytest.mark.parametrize("tool_name", sorted(harness._WORKER_NON_ACTION_TOOLS))
 def test_settle_delegated_worker_rate_limit_after_kanban_show_is_infra(
     monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
 ) -> None:
-    """A worker whose only tool call was the mandated kanban_show before hitting 429 is marked infra."""
+    """A worker whose only tool call was a protocol / non-action board tool before hitting 429 is marked infra."""
     body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
     monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
         "t_1": harness._WorkerLog(body, "100", "100")
     })
     monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
         entries=[{
-            "name": "kanban_show",
+            "name": tool_name,
             "agent": "platform",
             "task": "t_1",
             "session": "sess_1",
             "args": {"task_id": "t_1"},
+            "result": None,
+            "failed": None,
+            "at": "2026-10-26T12:00:00Z",
+            "_id": "call_1",
+        }],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+
+    assert res.has_errors()
+    assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "worker transcript for t_1 logged rate_limit" in res.errors[0]
+
+
+def test_settle_delegated_worker_rate_limit_worker_orphaned_tool_output_is_infra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An orphaned worker tool output with empty name does not count as worker action."""
+    body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[{
+            "name": "",
+            "agent": "platform",
+            "task": "t_1",
+            "session": "sess_1",
+            "args": {},
             "result": None,
             "failed": None,
             "at": "2026-10-26T12:00:00Z",

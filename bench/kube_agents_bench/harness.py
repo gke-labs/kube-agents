@@ -193,22 +193,26 @@ TRANSPORT_API = "api"
 TRANSPORT_INJECT = "inject"
 _TRANSPORTS = frozenset({TRANSPORT_API, TRANSPORT_INJECT})
 
-# Worker tools that do not count as substantive action (protocol reads).
-_WORKER_NON_ACTION_TOOLS = frozenset({
-    "kanban_show",
+# Board management tools that do not count as substantive worker action or final answer generation.
+_BOARD_NON_ACTION_TOOLS = frozenset({
+    DELEGATION_TOOL,
+    STATUS_TOOL,
     "kanban_heartbeat",
+    "kanban_comment",
+    "kanban_list",
+    "kanban_link",
+    "kanban_unblock",
 })
+
+# Worker tools that do not count as substantive action (protocol reads and board management).
+_WORKER_NON_ACTION_TOOLS = _BOARD_NON_ACTION_TOOLS
 
 # Sanctioned front-door capabilities on the chat / delegation profile
 # (agents/chat/config.yaml, agents/chat/SOUL.md) that do not constitute
 # substantive worker action or final answer generation: board management,
 # roster discovery, memory queries, and transport envelopes.
 _FRONT_DOOR_NON_ACTION_TOOLS = frozenset({
-    DELEGATION_TOOL,
-    STATUS_TOOL,
-    "kanban_list",
-    "kanban_comment",
-    "kanban_unblock",
+    *_BOARD_NON_ACTION_TOOLS,
     "list_agents",
     "mcp__router__list_agents",
     "memory",
@@ -3309,6 +3313,7 @@ class KubeAgentsHarness(AgentHarness):
         worker_acted = (
             any(
                 isinstance(e, dict)
+                and bool(e.get("name"))
                 and e.get("name") not in _WORKER_NON_ACTION_TOOLS
                 for e in (captured.entries if captured else [])
             )
