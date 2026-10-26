@@ -114,7 +114,7 @@
 # it. It reads seeded-c's drift-outlier role, which the hourly fleet scan
 # asserts (masterAuthorizedNetworksConfig.enabled never true). It requests
 # no pull request (the audit's remediation sweep is off on the inject lane,
-# #3439), so it runs in the first phase. Hinted at 900s in unit_cost_hint.
+# #3439), so it runs in the first phase. Hinted at 600s in unit_cost_hint.
 # This line took consistency off the docs/designs/domains.yaml allowlist.
 ./tasks/consistency-drift-outlier/task.yaml
 

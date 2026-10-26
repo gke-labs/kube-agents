@@ -3113,13 +3113,15 @@ unit_cost_hint() {
     # 962s the one clean measurement. Priced with the 900 band so a nightly
     # run launches them first. fleet-cost-idle-pool joined the nightly
     # 2026-09-15 unmeasured; same SOP-faithful audit shape, same band.
-    # consistency-drift-outlier is on the blocking roster since 2026-10-26
-    # and ran 165-397s on the claude-opus-5-5 nightlies (median 198s); the
-    # hint stays, launching it early in each presubmit round and first in the
-    # nightly, and scripts/test_ci_eval_nightly.py's audit-band test holds
-    # these hints at 600 or more.
     obtainability-planted-pdb | stockout-pinned-pool) echo 900 ;;
-    upgrade-readiness-lagging-cluster | consistency-drift-outlier) echo 900 ;;
+    upgrade-readiness-lagging-cluster) echo 900 ;;
+    # On the blocking roster since 2026-10-26. Measured on the claude-opus-5-5
+    # main nightlies 2026-10-20 to 10-26: median 198s, 165-397s over 14
+    # repetitions. Priced at 600s, the floor scripts/test_ci_eval_nightly.py's
+    # audit-band test allows, rather than 900: the hint still launches it early
+    # in each round, and the presubmit wall estimate in
+    # scripts/eval_rosters.py (#3987) is priced from these hints.
+    consistency-drift-outlier) echo 600 ;;
     consistency-no-environment-label) echo 900 ;;
     # Not measured yet: the same stream as the case above, plus a stack that
     # opens the ledger, so it takes that case's hint until its record says

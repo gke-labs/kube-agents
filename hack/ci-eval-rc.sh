@@ -130,8 +130,8 @@ set -euo pipefail
 # minutes at its 172 s median since #3145, ~69 at its 1250 s hint.
 # consistency-drift-outlier (roster since 2026-10-26) adds three units in the
 # first phase, beside the other cases and serialized on its task lock: a ~10
-# minute chain at its 198 s median on the claude-opus-5-5 nightlies, ~45 at
-# its 900 s hint. A graded miss on the
+# minute chain at its 198 s median on the claude-opus-5-5 nightlies, ~30 at
+# its 600 s hint. A graded miss on the
 # canary leaves the verdict alone, since it is not admitted; an erroring check
 # (rungs 1-3) turns the verdict RED like any case's.
 #

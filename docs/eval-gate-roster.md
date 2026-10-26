@@ -289,8 +289,8 @@ Admitted on the record since the split:
   replacing any seeded cluster silences the finding for a day (`docs/designs/fleet-fixtures.yaml`).
   What it costs: it requests no pull request (the lane's install turns the audits' remediation
   sweep off, [The inject lane](#the-inject-lane)), so it runs in the first phase beside the other
-  cases, its three repetitions one after another on its task lock, hinted at 900 s in
-  `unit_cost_hint`. Taking the line took `consistency` off the `docs/designs/domains.yaml`
+  cases, its three repetitions one after another on its task lock, hinted at 600 s in
+  `unit_cost_hint` (down from the audits' 900 s on its measured 165–397 s). Taking the line took `consistency` off the `docs/designs/domains.yaml`
   allowlist, and made the ledger path blocking (below).
 - **pdb-remediation-pr**, 2026-10-26
   ([#3120](https://github.com/gke-labs/kube-agents/issues/3120)), back from its demotion on

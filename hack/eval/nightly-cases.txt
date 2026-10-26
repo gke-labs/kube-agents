@@ -82,7 +82,8 @@
 #      roster on its nightly record (docs/eval-gate-roster.md, "Admitted on
 #      the record since the split"), the consistency probe being nightly.
 # All four hinted at 900s in unit_cost_hint so a nightly launches them first
-# (consistency-drift-outlier now from presubmit-cases.txt).
+# (consistency-drift-outlier, now from presubmit-cases.txt, at 600s since
+# 2026-10-26 on its measured cost).
 ./tasks/obtainability-planted-pdb/task.yaml
 ./tasks/stockout-pinned-pool/task.yaml
 ./tasks/upgrade-readiness-lagging-cluster/task.yaml
