@@ -659,7 +659,6 @@ def _extract_infra_failure_reason(text: str | None) -> str | None:
 
 def _mark_result_infra_failure(result: AgentResult, detail: str) -> None:
     """Convert an AgentResult in-place into an infrastructure failure."""
-    result.output = ""
     result.errors.insert(0, f"{INFRA_FAILURE_MARKER}: {detail}")
     result.metadata["infra_failure"] = detail
 
@@ -2922,17 +2921,11 @@ class KubeAgentsHarness(AgentHarness):
         # checks that could read them are set aside on inject records anyway.
         shown = any(e.get("name") == inject.EVENT_ENTRY_ACTIVITY for e in result.trajectory)
         before = len(result.trajectory)
-        board_messages = [
-            str(c.get("summary") or "") for c in read.cards.values() if c.get("summary")
-        ] + [
-            str(c.get("result") or "") for c in read.cards.values() if c.get("result")
-        ]
         self._settle(
             result,
             observed,
             awaited,
             stalled=outstanding if timed_out else [],
-            board_messages=board_messages,
         )
         if not shown and len(result.trajectory) > before:
             withheld = result.trajectory[before:]
@@ -3252,11 +3245,22 @@ class KubeAgentsHarness(AgentHarness):
 
         trajectory_clean = captured is not None and not bool(worker_trajectory.gaps(captured.summary))
         worker_acted = bool(captured and captured.entries) or bool(result.metadata.get("worker_commands"))
+        # Sanctioned front-door capabilities on the chat / delegation profile
+        # (agents/chat/config.yaml, agents/chat/SOUL.md) that do not constitute
+        # substantive worker action or final answer generation: board management,
+        # roster discovery, memory queries, and transport envelopes.
         non_action = {
             DELEGATION_TOOL,
             STATUS_TOOL,
             "kanban_list",
-            "delegate",
+            "kanban_comment",
+            "kanban_unblock",
+            "list_agents",
+            "mcp__router__list_agents",
+            "memory",
+            "memory_recall",
+            "memory_retain",
+            "memory_reflect",
             inject.EVENT_ENTRY_POST,
             inject.EVENT_ENTRY_EDIT,
             inject.EVENT_ENTRY_TASK,

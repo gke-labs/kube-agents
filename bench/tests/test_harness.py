@@ -4018,7 +4018,7 @@ def test_settle_delegated_worker_rate_limit_with_no_worker_actions_is_infra(
     ))
     monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
 
-    res = harness.AgentResult(output="router ack", trajectory=[{"name": "delegate"}], errors=["pre-existing ceiling note"])
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}], errors=["pre-existing ceiling note"])
     harness.KubeAgentsHarness._settle(res, [], ["t_1"])
 
     assert res.has_errors()
@@ -4027,9 +4027,10 @@ def test_settle_delegated_worker_rate_limit_with_no_worker_actions_is_infra(
     # Existing errors are preserved, with the infra marker inserted at index 0
     assert len(res.errors) == 2
     assert res.errors[1] == "pre-existing ceiling note"
-    assert res.output == ""
+    # Output is preserved rather than blanked so results.json / build logs retain diagnostics
+    assert res.output == "router ack"
     # Trajectory is preserved rather than wiped so downstream safeguards can inspect it
-    assert res.trajectory == [{"name": "delegate"}]
+    assert res.trajectory == [{"name": "kanban_create"}]
 
 
 def test_settle_delegated_worker_rate_limit_front_door_acted_stays_graded(
@@ -4055,6 +4056,39 @@ def test_settle_delegated_worker_rate_limit_front_door_acted_stays_graded(
 
     # Must stay graded so Rung 1 catastrophic safeguard can block
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+    assert res.output == "router ack"
+    assert res.trajectory == trajectory
+
+
+def test_settle_delegated_worker_rate_limit_sanctioned_front_door_tools_is_infra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sanctioned front-door tools (roster, memory, card updates) do not count as acting; rate limit is infra."""
+    body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    trajectory = [
+        {"name": "list_agents"},
+        {"name": "memory_recall"},
+        {"name": "kanban_create"},
+        {"name": "kanban_comment"},
+        {"name": "kanban_unblock"},
+    ]
+    res = harness.AgentResult(output="router ack", trajectory=list(trajectory))
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+
+    assert res.has_errors()
+    assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "delegated worker hit infrastructure failure (rate_limit)" in res.errors[0]
     assert res.output == "router ack"
     assert res.trajectory == trajectory
 
@@ -4096,7 +4130,7 @@ def test_settle_delegated_worker_rate_limit_with_failed_capture_stays_graded(
     monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: None)
     monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
 
-    res = harness.AgentResult(output="router ack", trajectory=[{"name": "delegate"}])
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
     harness.KubeAgentsHarness._settle(res, [], ["t_1"])
 
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
@@ -4119,7 +4153,7 @@ def test_settle_delegated_worker_rate_limit_with_capture_gaps_stays_graded(
     ))
     monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
 
-    res = harness.AgentResult(output="router ack", trajectory=[{"name": "delegate"}])
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
     harness.KubeAgentsHarness._settle(res, [], ["t_1"])
 
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
@@ -4144,7 +4178,7 @@ def test_settle_delegated_worker_rate_limit_with_worker_actions_stays_graded(
     ))
     monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
 
-    res = harness.AgentResult(output="router ack", trajectory=[{"name": "delegate"}])
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
     harness.KubeAgentsHarness._settle(res, [], ["t_1"])
 
     # Result was NOT converted to infra failure because worker acted
@@ -4166,7 +4200,7 @@ def test_settle_delegated_worker_board_summary_rate_limit_is_infra(
     ))
     monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
 
-    res = harness.AgentResult(output="router ack", trajectory=[{"name": "delegate"}])
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
     harness.KubeAgentsHarness._settle(
         res,
         [],
@@ -4192,7 +4226,7 @@ def test_settle_spoofed_rate_limit_without_hermes_prefix_stays_graded(
     ))
     monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
 
-    res = harness.AgentResult(output="router ack", trajectory=[{"name": "delegate"}])
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
     harness.KubeAgentsHarness._settle(
         res,
         [],
@@ -4217,7 +4251,7 @@ def test_settle_delegated_worker_observed_summary_rate_limit_is_infra(
     ))
     monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
 
-    res = harness.AgentResult(output="router ack", trajectory=[{"name": "delegate"}])
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
     rate_limit_text = "provider rate limit: API retries exhausted (failure_reason=rate_limit) on card t_1"
     observed = [{
         "name": "kanban_show",
