@@ -175,7 +175,8 @@ SERVICE_API_PORT = 8642
 
 # Prefix on ``AgentResult.errors[0]`` that marks a run when the harness
 # recorded a condition under which no answer can be graded: transport exhausted,
-# or the server reporting a provider rate limit or billing stop on the opening turn.
+# the server reporting a provider rate limit or billing stop on the opening turn,
+# or a delegated worker encountering quota exhaustion before acting.
 # ``scoring.py`` matches this string on a record's error and classifies the repetition
 # as infrastructure rather than grading it. The literal is duplicated there (importing
 # the harness would drag ``devops_bench`` into the scorer), and ``test_scoring.py``
@@ -659,7 +660,7 @@ def _mark_result_infra_failure(result: AgentResult, detail: str) -> None:
     """Convert an AgentResult in-place into an infrastructure failure."""
     result.output = ""
     del result.trajectory[:]
-    result.errors = [f"{INFRA_FAILURE_MARKER}: {detail}"]
+    result.errors.insert(0, f"{INFRA_FAILURE_MARKER}: {detail}")
     result.metadata["infra_failure"] = detail
 
 # The session lookup only refines accounting, so it never inherits the agent's
@@ -1312,15 +1313,13 @@ def _record_ceiling(
     outstanding: list[str],
     statuses: dict[str, str],
     delegation_timeout: float,
-    *,
-    worker_acted: bool = False,
 ) -> None:
     """Record that ``outstanding`` cards outran the delegation budget.
 
-    With nothing delivered and no worker action, the record holds the acknowledgement
-    alone; the marker routes it to its own class in the scorer rather than a graded
-    failure of the agent under test. A partial delivery or worker tool execution keeps
-    the plain report and grades on what arrived. Both delegation waits end their deadline path
+    With nothing delivered the record holds the acknowledgement alone; the
+    marker routes it to its own class in the scorer rather than a graded
+    failure of the agent under test. A partial delivery keeps the plain report
+    and grades on what arrived. Both delegation waits end their deadline path
     here, so the two transports cannot drift on what the scorer reads.
     """
     if not outstanding:
@@ -1330,7 +1329,7 @@ def _record_ceiling(
         f"{delegation_timeout:.0f}s: "
         + ", ".join(f"{t} ({statuses.get(t, 'unknown')})" for t in outstanding)
     )
-    if not delivered_results(observed, awaited) and not worker_acted:
+    if not delivered_results(observed, awaited):
         report = f"{DELEGATION_CEILING_MARKER}: {report}"
     result.errors.append(report)
 
@@ -3251,28 +3250,37 @@ class KubeAgentsHarness(AgentHarness):
             result.metadata["worker_trajectory"] = captured.summary
             result.tokens["workers"] = _worker_token_buckets(captured.tokens, captured.unbilled)
 
-        worker_acted = bool(captured and captured.entries)
+        trajectory_clean = captured is not None and not bool(worker_trajectory.gaps(captured.summary))
+        worker_acted = bool(captured and captured.entries) or bool(result.metadata.get("worker_commands"))
         infra_reason: str | None = None
         infra_detail: str = ""
         for tid, wlog in (logs or {}).items():
             if wlog and wlog.body:
-                reason = _extract_infra_failure_reason(wlog.body)
-                if reason:
-                    infra_reason = reason
-                    infra_detail = f"worker transcript for {tid} logged {reason}"
+                for line in wlog.body.splitlines():
+                    reason = _extract_infra_failure_reason(line)
+                    if reason:
+                        infra_reason = reason
+                        infra_detail = f"worker transcript for {tid} logged {reason}"
+                        break
+                if infra_reason:
                     break
 
         if not infra_reason and board_messages:
             for text in board_messages:
-                reason = _extract_infra_failure_reason(text)
-                if reason:
-                    infra_reason = reason
-                    infra_detail = f"card on board recorded {reason}: {text[:200]}"
+                if not text:
+                    continue
+                for line in text.splitlines():
+                    reason = _extract_infra_failure_reason(line)
+                    if reason:
+                        infra_reason = reason
+                        infra_detail = f"card on board recorded {reason}: {line[:200]}"
+                        break
+                if infra_reason:
                     break
 
         _purge_card_state(awaited, _EXEC_TIMEOUT)
 
-        if infra_reason and not worker_acted:
+        if infra_reason and trajectory_clean and not worker_acted:
             _mark_result_infra_failure(
                 result,
                 f"delegated worker hit infrastructure failure ({infra_reason}): {infra_detail}",

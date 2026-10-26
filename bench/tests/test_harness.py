@@ -2149,6 +2149,38 @@ def test_a_ceiling_hit_keeps_the_stalled_cards_transcript_under_artifacts(
     assert (tmp_path / "worker-logs" / f"{_TASK_ID}.log").read_text() == "worker was here\n"
 
 
+def test_delegated_worker_board_rate_limit_marks_run_infra(
+    stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A delegated card whose board state records Hermes rate limit is marked infra."""
+    rate_limit_msg = "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            reads.append(script)
+            payload = {
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {_TASK_ID: rate_limit_msg},
+                "errors": {},
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        if worker_trajectory.CAPTURE_PRESENT in script or "kanban_worker_children" in script:
+            payload = {"cards": [], "calls": [], "errors": [], "unread": [], "clipped": []}
+            return f"{worker_trajectory.CAPTURE_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    stub_agent.turns = [_create_turn(), _show_turn("failed")]
+
+    result = KubeAgentsHarness().run("Find the root cause of the frontend outage.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "card on board recorded rate_limit" in result.errors[0]
+    assert reads
+
+
 def test_a_mute_agent_leaves_no_transcript_behind(
     stub_agent: _StubAgentServer, instant_polls: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -3971,7 +4003,10 @@ def test_settle_delegated_worker_rate_limit_with_no_worker_actions_is_infra(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When a worker hits the Hermes rate limit and executed zero tools, the run is marked infra."""
-    body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+    body = (
+        "  ┊ 💻 preparing terminal…\n"
+        "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429\n"
+    )
     monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
         "t_1": harness._WorkerLog(body, "100", "100")
     })
@@ -3983,14 +4018,58 @@ def test_settle_delegated_worker_rate_limit_with_no_worker_actions_is_infra(
     ))
     monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
 
-    res = harness.AgentResult(output="router ack", trajectory=[{"name": "delegate"}])
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "delegate"}], errors=["pre-existing ceiling note"])
     harness.KubeAgentsHarness._settle(res, [], ["t_1"])
 
     assert res.has_errors()
     assert res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
     assert "delegated worker hit infrastructure failure (rate_limit)" in res.errors[0]
+    # Existing errors are preserved, with the infra marker inserted at index 0
+    assert len(res.errors) == 2
+    assert res.errors[1] == "pre-existing ceiling note"
     assert res.output == ""
     assert res.trajectory == []
+
+
+def test_settle_delegated_worker_rate_limit_with_failed_capture_stays_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When worker trajectory capture failed (None), we cannot verify 0 actions; run stays graded."""
+    body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: None)
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "delegate"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+    assert res.output == "router ack"
+
+
+def test_settle_delegated_worker_rate_limit_with_capture_gaps_stays_graded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When worker trajectory capture has unread errors/gaps, 0 actions cannot be trusted; run stays graded."""
+    body = "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {
+        "t_1": harness._WorkerLog(body, "100", "100")
+    })
+    monkeypatch.setattr(harness.worker_trajectory, "capture", lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+        entries=[],
+        tokens={},
+        unbilled=[],
+        summary={"unread": ["session store for platform: locked"], "errors": []},
+    ))
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "delegate"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+    assert res.output == "router ack"
 
 
 def test_settle_delegated_worker_rate_limit_with_worker_actions_stays_graded(
